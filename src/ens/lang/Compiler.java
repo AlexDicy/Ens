@@ -1,10 +1,14 @@
 package ens.lang;
 
+import ens.lang.tokenizer.Token;
+import ens.lang.tokenizer.Tokenizer;
+
 import java.io.*;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.stream.Collectors;
 
 public class Compiler {
     private static final FileFilter ensFileFilter = file -> file.isDirectory() || (file.isFile() && file.getName().endsWith(".ens"));
@@ -47,7 +51,7 @@ public class Compiler {
 
     public static boolean compileSingle(File root, File source, File outputFolder) {
         String filePath = (root == null ? "" : root.getPath() + File.separatorChar) + source.getPath();
-        try (FileReader reader = new FileReader(new File(filePath))) {
+        try (FileReader reader = new FileReader(filePath)) {
             // If we're compiling a single file the file path shouldn't be added to the output path
             String relativePath = root == null ? source.getName() :  source.getPath();
             // Add output folder + subfolder + file name
@@ -63,6 +67,13 @@ public class Compiler {
     }
 
     public static boolean compileSingle(Reader source, File outputFolder) {
-        return true;
+        try (BufferedReader reader = new BufferedReader(source)) {
+            String code = reader.lines().collect(Collectors.joining("\n"));
+            List<Token> tokens = Tokenizer.tokenize(code);
+            return true;
+        } catch (IOException e) {
+            e.printStackTrace();
+            return false;
+        }
     }
 }
