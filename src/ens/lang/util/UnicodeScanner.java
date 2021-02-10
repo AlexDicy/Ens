@@ -64,7 +64,7 @@ public class UnicodeScanner {
         }
     }
 
-    private int peekSurrogates() {
+    public int peekSurrogates() {
         if (Character.isHighSurrogate(c)) {
             char high = c;
             int prevBP = pointer;
