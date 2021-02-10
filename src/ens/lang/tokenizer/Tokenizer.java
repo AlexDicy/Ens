@@ -47,9 +47,7 @@ public class Tokenizer {
 
     private void scanIdent() {
         boolean isJavaIdentifierPart;
-        StringBuilder identifier = new StringBuilder();
-        identifier.append(scanner.currentChar());
-        identifier.append(scanner.scanChar());
+        scanner.putChar(true);
         do {
             switch (scanner.currentChar()) {
                 case 'A': case 'B': case 'C': case 'D': case 'E':
@@ -77,32 +75,52 @@ public class Tokenizer {
                 case '\u007F':
                     scanner.scanChar();
                     continue;
+                case '\u001A': // EOI is also a legal identifier part
+                    if (scanner.bp >= scanner.buflen) {
+                        name = scanner.name();
+                        tk = tokens.lookupKind(name);
+                        return;
+                    }
+                    scanner.scanChar();
+                    continue;
                 default:
-                    if (reader.ch < '\u0080') {
+                    if (scanner.currentChar() < '\u0080') {
                         // all ASCII range chars already handled, above
                         isJavaIdentifierPart = false;
                     } else {
-                        if (Character.isIdentifierIgnorable(reader.ch)) {
+                        if (Character.isIdentifierIgnorable(scanner.currentChar())) {
                             scanner.scanChar();
                             continue;
                         } else {
-                            int codePoint = reader.peekSurrogates();
+                            int codePoint = scanner.peekSurrogates();
                             if (codePoint >= 0) {
                                 if (isJavaIdentifierPart = Character.isJavaIdentifierPart(codePoint)) {
-                                    reader.putChar(true);
+                                    scanner.putChar(true);
                                 }
                             } else {
-                                isJavaIdentifierPart = Character.isJavaIdentifierPart(reader.ch);
+                                isJavaIdentifierPart = Character.isJavaIdentifierPart(scanner.currentChar());
                             }
                         }
                     }
                     if (!isJavaIdentifierPart) {
-                        name = reader.name();
+                        name = scanner.name();
                         tk = tokens.lookupKind(name);
                         return;
                     }
             }
-            identifier.append(scanner.scanChar());
+            scanner.putChar(true);
         } while (true);
+    }
+
+    private boolean isSpecial(char ch) {
+        switch (ch) {
+            case '!': case '%': case '&': case '*': case '?':
+            case '+': case '-': case ':': case '<': case '=':
+            case '>': case '^': case '|': case '~':
+            case '@':
+                return true;
+            default:
+                return false;
+        }
     }
 }
