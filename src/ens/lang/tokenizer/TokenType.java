@@ -1,6 +1,8 @@
 package ens.lang.tokenizer;
 
 public enum TokenType {
+    EOF(),
+    ERROR,
     L_PAREN("("),
     R_PAREN(")"),
     L_BRACE("{"),
@@ -10,6 +12,7 @@ public enum TokenType {
     SEMI(";"),
     COMMA(","),
     DOT("."),
+    ELLIPSIS("..."),
     PLUS("+"),
     SUB("-"),
     STAR("*"),
@@ -53,12 +56,46 @@ public enum TokenType {
     LONG("long"),
     FLOAT("float"),
     DOUBLE("double"),
-    CHARLITERAL,
-    INTLITERAL,
-    LONGLITERAL,
-    FLOATLITERAL,
-    DOUBLELITERAL,
-    STRINGLITERA;
+    SHORT("short"),
+    BOOLEAN("boolean"),
+    CHAR_LITERAL,
+    INT_LITERAL,
+    LONG_LITERAL,
+    FLOAT_LITERAL,
+    DOUBLE_LITERAL,
+    STRING_LITERAL,
+    IDENTIFIER(),
+    ASSERT("assert"),
+    BREAK("break"),
+    CASE("case"),
+    CATCH("catch"),
+    CLASS("class"),
+    CONST("const"),
+    CONTINUE("continue"),
+    DEFAULT("default"),
+    DO("do"),
+    ELSE("else"),
+    ENUM("enum"),
+    EXTENDS("extends"),
+    FINAL("final"),
+    FINALLY("finally"),
+    FOR("for"),
+    GOTO("goto"),
+    IF("if"),
+    IMPORT("import"),
+    NEW("new"),
+    PACKAGE("package"),
+    PUBLIC("public"),
+    RETURN("return"),
+    STATIC("static"),
+    SUPER("super"),
+    SWITCH("switch"),
+    THIS("this"),
+    THROW("throw"),
+    THROWS("throws"),
+    TRY("try"),
+    VOID("void"),
+    WHILE("while");
 
     private String name;
 
@@ -71,5 +108,14 @@ public enum TokenType {
 
     public String getName() {
         return name;
+    }
+
+    public static TokenType lookup(String name) {
+        for (TokenType t : TokenType.values()) {
+            if (name.equals(t.name)) {
+                return t;
+            }
+        }
+        return IDENTIFIER;
     }
 }

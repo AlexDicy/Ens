@@ -15,4 +15,11 @@ public class Token {
         this.endColumn = startColumn + text.length();
     }
 
+    public TokenType getType() {
+        return type;
+    }
+
+    public String getText() {
+        return text;
+    }
 }
