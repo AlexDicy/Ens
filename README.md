@@ -21,4 +21,5 @@ Also, we're trying to leave pointers out for now.
 Ens has an official coding standard, you're free to choose another one of your likings.
 
 TODO: define Ens' syntax
+
 TODO: define official coding standards
