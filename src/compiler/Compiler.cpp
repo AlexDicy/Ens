@@ -2,6 +2,7 @@
 #include "../tokenizer/Tokenizer.h"
 #include "../parser/Parser.h"
 #include "../semantic/Analyzer.h"
+#include "../codegen/CodeGenerator.h"
 #include "../diagnostics/Diagnostic.h"
 #include "../diagnostics/SourceFile.h"
 
@@ -88,6 +89,16 @@ bool Compiler::compileSingle(std::istream& source, const fs::path& /*outputFolde
             }
             return false;
         }
+
+        CodeGenerator codegen("ens_module", filename);
+        if (!codegen.generate(stmts)) {
+            for (const auto& d : codegen.getDiagnostics()) {
+                d.print(sourceFile, std::cerr);
+            }
+            return false;
+        }
+        std::cout << "--- LLVM IR ---\n";
+        codegen.print(std::cout);
     } catch (const Diagnostic& d) {
         d.print(sourceFile, std::cerr);
         return false;
