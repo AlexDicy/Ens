@@ -24,22 +24,24 @@ UnicodeScanner::UnicodeScanner(std::u16string_view src) {
 }
 
 char16_t UnicodeScanner::scanChar() {
-    if (pointer < (int)buffer.size()) {
-        if (c == LF) {
-            if (!prevWasCR) {
-                line++;
-            }
-            column = 1;
-            prevWasCR = false;
-        } else if (c == CR) {
+    if (pointer >= (int)buffer.size()) return c;
+    if (c == LF) {
+        if (!prevWasCR) {
             line++;
-            column = 1;
-            prevWasCR = true;
-        } else {
-            column++;
-            prevWasCR = false;
         }
-        c = buffer[++pointer];
+        column = 1;
+        prevWasCR = false;
+    } else if (c == CR) {
+        line++;
+        column = 1;
+        prevWasCR = true;
+    } else {
+        column++;
+        prevWasCR = false;
+    }
+    pointer++;
+    if (pointer < (int)buffer.size()) {
+        c = buffer[pointer];
         if (c == u'\\') {
             convertUnicode();
         }
@@ -128,7 +130,9 @@ void UnicodeScanner::skipChar() {
 }
 
 char16_t UnicodeScanner::peekChar() const {
-    return buffer[pointer + 1];
+    int next = pointer + 1;
+    if (next < 0 || next >= (int)buffer.size()) return EOI;
+    return buffer[next];
 }
 
 int UnicodeScanner::peekSurrogates() {
