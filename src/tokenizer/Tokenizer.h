@@ -18,8 +18,10 @@ protected:
 private:
     UnicodeScanner* scanner = nullptr;
     std::optional<TokenType> tokenType;
+    int line = 0;
+    int col = 0;
 
-    void error(int pos, const char* msg);
+    void error(const char* msg);
     bool isSpecial(char16_t ch);
     void scanOperator();
     void scanIdentifier();

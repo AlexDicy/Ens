@@ -71,9 +71,9 @@ bool Compiler::compileSingle(std::istream& source, const fs::path& /*outputFolde
     std::string code((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
     std::u16string u16code(code.begin(), code.end());
     SourceFile sourceFile(filename, std::move(u16code));
-    auto tokens = Tokenizer::tokenize(sourceFile.getSource());
 
     try {
+        auto tokens = Tokenizer::tokenize(sourceFile.getSource());
         Parser parser(std::move(tokens));
         auto expr = parser.parseExpression();
         std::cout << "--- AST ---\n";

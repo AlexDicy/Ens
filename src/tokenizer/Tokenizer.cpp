@@ -2,6 +2,7 @@
 #include <memory>
 #include "Tokenizer.h"
 #include "../util/UnicodeScanner.h"
+#include "../diagnostics/Diagnostic.h"
 
 
 std::vector<Token> Tokenizer::tokenize(std::u16string_view code) {
@@ -31,12 +32,12 @@ std::optional<Token> Tokenizer::readToken() {
     int pos = scanner->pointer;
     tokenType = std::nullopt;
     bool loop = true;
-    int tokLine = scanner->line;
-    int tokCol = scanner->column;
+    line = scanner->line;
+    col = scanner->column;
 
     while (loop) {
-        tokLine = scanner->line;
-        tokCol = scanner->column;
+        line = scanner->line;
+        col = scanner->column;
         switch (scanner->c) {
             case ' ':
             case '\t':
@@ -82,12 +83,11 @@ std::optional<Token> Tokenizer::readToken() {
                 } else {
                     scanner->putChar(u'0');
                     if (scanner->c == '_') {
-                        int savePos = scanner->pointer;
                         do {
                             scanner->scanChar();
                         } while (scanner->c == '_');
                         if (scanner->digit(pos, 10) < 0) {
-                            error(savePos, "Illegal Underscore");
+                            error("Illegal Underscore");
                         }
                     }
                     scanNumber(pos, 8);
@@ -106,7 +106,6 @@ std::optional<Token> Tokenizer::readToken() {
                     scanner->putChar(u'.');
                     scanFractionAndSuffix(pos);
                 } else if (scanner->c == '.') {
-                    int savePos = scanner->pointer;
                     scanner->putChar(u'.');
                     scanner->putChar(u'.', true);
                     if (scanner->c == '.') {
@@ -114,7 +113,7 @@ std::optional<Token> Tokenizer::readToken() {
                         scanner->putChar(u'.');
                         tokenType = TokenType::ELLIPSIS;
                     } else {
-                        error(savePos, "Illegal Dot");
+                        error("Illegal Dot");
                     }
                 } else {
                     tokenType = TokenType::DOT;
@@ -182,7 +181,7 @@ std::optional<Token> Tokenizer::readToken() {
                     if (scanner->c == '/') {
                         scanner->scanChar();
                     } else {
-                        error(pos, "Unclosed Comment");
+                        error("Unclosed Comment");
                         loop = false;
                     }
                     break;
@@ -197,17 +196,17 @@ std::optional<Token> Tokenizer::readToken() {
             case '\'':
                 scanner->scanChar();
                 if (scanner->c == '\'') {
-                    error(pos, "Empty CharLit");
+                    error("Empty CharLit");
                     scanner->scanChar();
                 } else {
                     if (scanner->c == UnicodeScanner::LF || scanner->c == UnicodeScanner::CR)
-                        error(pos, "Illegal LineEnd In CharLit");
+                        error("Illegal LineEnd In CharLit");
                     scanLitChar(pos, true, false);
                     if (scanner->c == '\'') {
                         scanner->scanChar();
                         tokenType = TokenType::CHAR_LITERAL;
                     } else {
-                        error(pos, "Unclosed CharLit");
+                        error("Unclosed CharLit");
                     }
                 }
                 loop = false;
@@ -232,11 +231,16 @@ std::optional<Token> Tokenizer::readToken() {
     }
 
     if (!tokenType.has_value()) return std::nullopt;
-    return Token(*tokenType, scanner->getSaved(), tokLine, tokCol);
+    return Token(*tokenType, scanner->getSaved(), line, col);
 }
 
-void Tokenizer::error(int pos, const char* msg) {
-    tokenType = TokenType::ERROR;
+void Tokenizer::error(const char* msg) {
+    int len = 1;
+    if (scanner->line == line && scanner->column > col) {
+        len = scanner->column - col;
+    }
+    SourceSpan span{line, col, len};
+    throw Diagnostic(DiagnosticLevel::Error, span, msg);
 }
 
 bool Tokenizer::isSpecial(char16_t ch) {
@@ -315,8 +319,8 @@ void Tokenizer::scanNumber(int pos, int radix) {
     } else {
         if (!seenValidDigit) {
             switch (radix) {
-                case 2:  error(pos, "Invalid Binary Number"); break;
-                case 16: error(pos, "Invalid Hex Number");    break;
+                case 2:  error("Invalid Binary Number"); break;
+                case 16: error("Invalid Hex Number");    break;
             }
         }
         if (scanner->c == 'l' || scanner->c == 'L') {
@@ -330,17 +334,15 @@ void Tokenizer::scanNumber(int pos, int radix) {
 
 void Tokenizer::scanDigits(int pos, int digitRadix) {
     char16_t saveCh;
-    int savePos;
     do {
         if (scanner->c != '_') {
             scanner->putChar(false);
         }
         saveCh = scanner->c;
-        savePos = scanner->pointer;
         scanner->scanChar();
     } while (scanner->digit(pos, digitRadix) >= 0 || scanner->c == '_');
     if (saveCh == '_')
-        error(savePos, "Illegal Underscore");
+        error("Illegal Underscore");
 }
 
 void Tokenizer::scanHexExponentAndSuffix(int pos) {
@@ -352,10 +354,10 @@ void Tokenizer::scanHexExponentAndSuffix(int pos) {
         if (scanner->digit(pos, 10) >= 0) {
             scanDigits(pos, 10);
         } else {
-            error(pos, "MalformedFpLit");
+            error("MalformedFpLit");
         }
     } else {
-        error(pos, "MalformedFpLit");
+        error("MalformedFpLit");
     }
     if (scanner->c == 'f' || scanner->c == 'F') {
         scanner->putChar(true);
@@ -384,7 +386,7 @@ void Tokenizer::scanFraction(int pos) {
             scanDigits(pos, 10);
             return;
         }
-        error(pos, "MalformedFpLit");
+        error("MalformedFpLit");
         scanner->spointer = sp1;
     }
 }
@@ -411,7 +413,7 @@ void Tokenizer::scanHexFractionAndSuffix(int pos, bool seendigit) {
         scanDigits(pos, 16);
     }
     if (!seendigit)
-        error(pos, "Invalid Hex Number");
+        error("Invalid Hex Number");
     else
         scanHexExponentAndSuffix(pos);
 }
@@ -471,7 +473,7 @@ void Tokenizer::scanLitChar(int pos, bool translateEscapesNow, bool multiline) {
                 case '\n':
                 case '\r':
                     if (!multiline) {
-                        error(scanner->pointer, "Illegal Esc Char");
+                        error("Illegal Esc Char");
                     } else {
                         if (scanner->pointer == '\r' && scanner->peekChar() == '\n') {
                             scanner->nextChar(translateEscapesNow);
@@ -480,7 +482,7 @@ void Tokenizer::scanLitChar(int pos, bool translateEscapesNow, bool multiline) {
                     }
                     break;
                 default:
-                    error(scanner->pointer, "Illegal Esc Char");
+                    error("Illegal Esc Char");
             }
         }
     } else if (scanner->pointer != (int)scanner->buffer.size()) {
@@ -526,7 +528,7 @@ void Tokenizer::scanString(int pos) {
             if (scanner->c == UnicodeScanner::LF || scanner->c == UnicodeScanner::CR) {
                 skipLineTerminator();
             } else {
-                error(scanner->pointer, "Illegal TextBlock Open");
+                error("Illegal TextBlock Open");
                 return;
             }
             break;
@@ -555,7 +557,7 @@ void Tokenizer::scanString(int pos) {
             scanner->putChar(true);
         }
     }
-    error(pos, openCount == 1 ? "Unclosed StrLit" : "Unclosed TextBlock");
+    error(openCount == 1 ? "Unclosed StrLit" : "Unclosed TextBlock");
     if (firstEOLN != -1) {
         scanner->reset(firstEOLN);
     }
