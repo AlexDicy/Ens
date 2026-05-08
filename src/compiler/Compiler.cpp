@@ -1,5 +1,6 @@
 #include "Compiler.h"
 #include "../tokenizer/Tokenizer.h"
+#include "../parser/Parser.h"
 
 #include <algorithm>
 #include <fstream>
@@ -64,9 +65,22 @@ bool Compiler::compileSingle(const std::optional<fs::path>& root,
     return compileSingle(file, outputFolder);
 }
 
-bool Compiler::compileSingle(std::istream& source, const fs::path& outputFolder) {
+bool Compiler::compileSingle(std::istream& source, const fs::path& /*outputFolder*/) {
     std::string code((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
     std::u16string u16code(code.begin(), code.end());
-    Tokenizer::tokenize(u16code);
+    auto tokens = Tokenizer::tokenize(u16code);
+
+    try {
+        Parser parser(std::move(tokens));
+        auto expr = parser.parseExpression();
+        std::cout << "--- AST ---\n";
+        expr->dump(std::cout, 0);
+        if (!parser.atEnd()) {
+            std::cout << "(stopped before end of token stream)\n";
+        }
+    } catch (const ParseError& e) {
+        std::cerr << e.what() << '\n';
+        return false;
+    }
     return true;
 }

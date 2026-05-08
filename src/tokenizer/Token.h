@@ -10,6 +10,9 @@ public:
 
     TokenType getType() const { return type; }
     const std::u16string& getText() const { return text; }
+    int getLine() const { return line; }
+    int getStartColumn() const { return startColumn; }
+    int getEndColumn() const { return endColumn; }
 
 private:
     TokenType type;
