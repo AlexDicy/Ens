@@ -10,7 +10,6 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
-#include <sstream>
 
 namespace fs = std::filesystem;
 
@@ -69,7 +68,7 @@ bool Compiler::compileSingle(const std::optional<fs::path>& root,
     return compileSingle(file, outputFolder, filePath.string());
 }
 
-bool Compiler::compileSingle(std::istream& source, const fs::path& /*outputFolder*/, const std::string& filename) {
+bool Compiler::compileSingle(std::istream& source, const fs::path& outputFile, const std::string& filename) {
     std::string code((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
     std::u16string u16code(code.begin(), code.end());
     SourceFile sourceFile(filename, std::move(u16code));
@@ -78,8 +77,6 @@ bool Compiler::compileSingle(std::istream& source, const fs::path& /*outputFolde
         auto tokens = Tokenizer::tokenize(sourceFile.getSource());
         Parser parser(std::move(tokens));
         auto stmts = parser.parseProgram();
-        std::cout << "--- AST ---\n";
-        for (const auto& s : stmts) s->dump(std::cout, 0);
 
         Analyzer analyzer;
         analyzer.analyze(stmts);
@@ -97,11 +94,49 @@ bool Compiler::compileSingle(std::istream& source, const fs::path& /*outputFolde
             }
             return false;
         }
-        std::cout << "--- LLVM IR ---\n";
-        codegen.print(std::cout);
+
+        // Pick output mode by --output extension; default is IR to stdout.
+        std::string ext = outputFile.extension().string();
+        for (auto& c : ext) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+
+        if (outputFile.empty()) {
+            std::cout << "--- LLVM IR ---\n";
+            codegen.print(std::cout);
+            return true;
+        }
+        if (ext == ".ll") {
+            std::ofstream out(outputFile);
+            if (!out) {
+                std::cerr << "Could not open '" << outputFile << "' for writing\n";
+                return false;
+            }
+            codegen.print(out);
+            return true;
+        }
+        if (ext == ".obj" || ext == ".o") {
+            if (!codegen.emitObjectFile(outputFile.string())) {
+                for (const auto& d : codegen.getDiagnostics()) d.print(sourceFile, std::cerr);
+                return false;
+            }
+            return true;
+        }
+        if (ext == ".exe" || ext.empty()) {
+            fs::path objPath = outputFile;
+            objPath.replace_extension(".obj");
+            if (!codegen.emitObjectFile(objPath.string())) {
+                for (const auto& d : codegen.getDiagnostics()) d.print(sourceFile, std::cerr);
+                return false;
+            }
+            if (!codegen.linkExecutable(objPath.string(), outputFile.string())) {
+                for (const auto& d : codegen.getDiagnostics()) d.print(sourceFile, std::cerr);
+                return false;
+            }
+            return true;
+        }
+        std::cerr << "Unsupported --output extension: '" << ext << "'\n";
+        return false;
     } catch (const Diagnostic& d) {
         d.print(sourceFile, std::cerr);
         return false;
     }
-    return true;
 }

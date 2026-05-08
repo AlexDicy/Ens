@@ -13,14 +13,30 @@
 #include "llvm/IR/Verifier.h"
 #include "llvm/IR/DIBuilder.h"
 #include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/BinaryFormat/Dwarf.h"
+#include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/CodeGen.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Target/TargetOptions.h"
+#include "llvm/TargetParser/Host.h"
+
+#include "lld/Common/Driver.h"
 
 #include <filesystem>
+#include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+LLD_HAS_DRIVER(coff)
+LLD_HAS_DRIVER(elf)
+LLD_HAS_DRIVER(macho)
 
 static std::string asAscii(const std::u16string& s) {
     std::string r;
@@ -564,6 +580,107 @@ struct CodeGenerator::Impl {
         module->print(rso, nullptr);
         os << text;
     }
+
+    bool initializeNativeTargetOnce() {
+        static const bool ok = []() {
+            llvm::InitializeNativeTarget();
+            llvm::InitializeNativeTargetAsmPrinter();
+            llvm::InitializeNativeTargetAsmParser();
+            return true;
+        }();
+        return ok;
+    }
+
+    bool emitObjectFile(const std::string& path) {
+        initializeNativeTargetOnce();
+
+        std::string triple = llvm::sys::getDefaultTargetTriple();
+        std::string lookupErr;
+        const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, lookupErr);
+        if (!target) {
+            error(0, 0, "Failed to find target '" + triple + "': " + lookupErr);
+            return false;
+        }
+
+        llvm::TargetOptions opts;
+        std::optional<llvm::Reloc::Model> rm = llvm::Reloc::PIC_;
+        auto* machine = target->createTargetMachine(llvm::Triple(triple), "generic", "", opts, rm);
+        if (!machine) {
+            error(0, 0, "Failed to create TargetMachine for '" + triple + "'");
+            return false;
+        }
+
+        module->setDataLayout(machine->createDataLayout());
+        module->setTargetTriple(llvm::Triple(triple));
+
+        std::error_code ec;
+        llvm::raw_fd_ostream dest(path, ec, llvm::sys::fs::OF_None);
+        if (ec) {
+            error(0, 0, "Could not open '" + path + "' for writing: " + ec.message());
+            return false;
+        }
+
+        llvm::legacy::PassManager pass;
+        if (machine->addPassesToEmitFile(pass, dest, nullptr, llvm::CodeGenFileType::ObjectFile)) {
+            error(0, 0, "Target does not support object-file emission");
+            return false;
+        }
+        pass.run(*module);
+        dest.flush();
+        return true;
+    }
+
+    bool linkExecutable(const std::string& objectPath, const std::string& exePath) {
+        // Build a platform-appropriate driver argv. For now we support COFF (Windows).
+        // ELF and Mach-O drivers are linked in too via LLD_HAS_DRIVER above so the
+        // build remains portable; we just need to choose the right driver per host.
+        const std::string triple = llvm::sys::getDefaultTargetTriple();
+        const bool isWindowsCoff = triple.find("windows") != std::string::npos
+                                || triple.find("win32") != std::string::npos
+                                || triple.find("msvc") != std::string::npos;
+
+        std::vector<std::string> argv;
+        if (isWindowsCoff) {
+            argv = {
+                "lld-link",
+                "/nologo",
+                "/subsystem:console",
+                objectPath,
+                "/out:" + exePath,
+                "/defaultlib:libcmt",      // static C runtime
+                "/defaultlib:oldnames",
+            };
+        } else {
+            // Best-effort ELF default; users on non-Windows can iterate.
+            argv = {"ld.lld", objectPath, "-o", exePath};
+        }
+
+        std::vector<const char*> args;
+        args.reserve(argv.size());
+        for (auto& s : argv) args.push_back(s.c_str());
+
+        std::string outBuf, errBuf;
+        llvm::raw_string_ostream outStream(outBuf);
+        llvm::raw_string_ostream errStream(errBuf);
+
+        bool ok = false;
+        if (isWindowsCoff) {
+            ok = lld::coff::link(args, outStream, errStream, /*exitEarly*/ false, /*disableOutput*/ false);
+        } else if (triple.find("darwin") != std::string::npos || triple.find("apple") != std::string::npos) {
+            ok = lld::macho::link(args, outStream, errStream, false, false);
+        } else {
+            ok = lld::elf::link(args, outStream, errStream, false, false);
+        }
+        outStream.flush();
+        errStream.flush();
+        if (!outBuf.empty()) std::cout << outBuf;
+        if (!ok && !errBuf.empty()) {
+            error(0, 0, "Linker failed:\n" + errBuf);
+        } else if (!errBuf.empty()) {
+            std::cerr << errBuf;
+        }
+        return ok;
+    }
 };
 
 CodeGenerator::CodeGenerator(std::string moduleName, std::string sourceFilename)
@@ -577,6 +694,14 @@ bool CodeGenerator::generate(const std::vector<StmtPtr>& program) {
 
 void CodeGenerator::print(std::ostream& os) const {
     impl->print(os);
+}
+
+bool CodeGenerator::emitObjectFile(const std::string& path) {
+    return impl->emitObjectFile(path);
+}
+
+bool CodeGenerator::linkExecutable(const std::string& objectPath, const std::string& exePath) {
+    return impl->linkExecutable(objectPath, exePath);
 }
 
 bool CodeGenerator::hasErrors() const {

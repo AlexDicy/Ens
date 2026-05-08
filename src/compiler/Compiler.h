@@ -15,7 +15,7 @@ public:
                               const std::filesystem::path& outputFolder);
 
     static bool compileSingle(std::istream& source,
-                              const std::filesystem::path& outputFolder,
+                              const std::filesystem::path& outputFile,
                               const std::string& filename = "<stdin>");
 
 private:

@@ -8,17 +8,20 @@
 namespace fs = std::filesystem;
 
 static bool execute(const std::unordered_map<std::string, std::string>& arguments) {
-    fs::path outputFolder = arguments.count("--output") ? arguments.at("--output") : ".";
-    if (fs::exists(outputFolder) && !fs::is_directory(outputFolder)) {
-        throw std::invalid_argument("The specified output directory is not a directory, please choose a different folder");
+    // --output is the output file path. Empty = print LLVM IR to stdout.
+    // The extension drives the pipeline: .ll = IR text, .obj/.o = object file,
+    // .exe (or no extension) = link to executable.
+    fs::path outputFile = arguments.count("--output") ? fs::path(arguments.at("--output")) : fs::path();
+    if (!outputFile.empty() && fs::exists(outputFile) && fs::is_directory(outputFile)) {
+        throw std::invalid_argument("The specified output is a directory; please specify a file path");
     }
 
     if (arguments.count("--source")) {
         fs::path source = arguments.at("--source");
         fs::path sourcePath = fs::is_directory(source) ? source : source.parent_path();
-        return Compiler::compile(source, outputFolder, sourcePath);
+        return Compiler::compile(source, outputFile, sourcePath);
     } else {
-        return Compiler::compileSingle(std::cin, outputFolder);
+        return Compiler::compileSingle(std::cin, outputFile);
     }
 }
 
