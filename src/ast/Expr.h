@@ -29,6 +29,18 @@ public:
     void dump(std::ostream& os, int indent) const override;
 };
 
+class BoolLitExpr : public Expr {
+public:
+    bool value;
+    explicit BoolLitExpr(bool v) : value(v) {}
+    void dump(std::ostream& os, int indent) const override;
+};
+
+class NullLitExpr : public Expr {
+public:
+    void dump(std::ostream& os, int indent) const override;
+};
+
 class IdentExpr : public Expr {
 public:
     std::u16string name;
@@ -69,5 +81,24 @@ public:
     std::u16string member;
     MemberExpr(ExprPtr o, std::u16string m)
         : object(std::move(o)), member(std::move(m)) {}
+    void dump(std::ostream& os, int indent) const override;
+};
+
+class SubscriptExpr : public Expr {
+public:
+    ExprPtr object;
+    ExprPtr index;
+    SubscriptExpr(ExprPtr o, ExprPtr i)
+        : object(std::move(o)), index(std::move(i)) {}
+    void dump(std::ostream& os, int indent) const override;
+};
+
+class AssignExpr : public Expr {
+public:
+    TokenType op;
+    ExprPtr target;
+    ExprPtr value;
+    AssignExpr(TokenType op, ExprPtr t, ExprPtr v)
+        : op(op), target(std::move(t)), value(std::move(v)) {}
     void dump(std::ostream& os, int indent) const override;
 };

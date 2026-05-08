@@ -26,6 +26,16 @@ void StringLitExpr::dump(std::ostream& os, int indent) const {
     os << "StringLit(\"" << asciiOf(value) << "\")\n";
 }
 
+void BoolLitExpr::dump(std::ostream& os, int indent) const {
+    writeIndent(os, indent);
+    os << "BoolLit(" << (value ? "true" : "false") << ")\n";
+}
+
+void NullLitExpr::dump(std::ostream& os, int indent) const {
+    writeIndent(os, indent);
+    os << "NullLit\n";
+}
+
 void IdentExpr::dump(std::ostream& os, int indent) const {
     writeIndent(os, indent);
     os << "Ident(" << asciiOf(name) << ")\n";
@@ -59,4 +69,26 @@ void MemberExpr::dump(std::ostream& os, int indent) const {
     writeIndent(os, indent);
     os << "Member(." << asciiOf(member) << ")\n";
     object->dump(os, indent + 1);
+}
+
+void SubscriptExpr::dump(std::ostream& os, int indent) const {
+    writeIndent(os, indent);
+    os << "Subscript\n";
+    writeIndent(os, indent + 1);
+    os << "object:\n";
+    object->dump(os, indent + 2);
+    writeIndent(os, indent + 1);
+    os << "index:\n";
+    index->dump(os, indent + 2);
+}
+
+void AssignExpr::dump(std::ostream& os, int indent) const {
+    writeIndent(os, indent);
+    os << "Assign(" << opName(op) << ")\n";
+    writeIndent(os, indent + 1);
+    os << "target:\n";
+    target->dump(os, indent + 2);
+    writeIndent(os, indent + 1);
+    os << "value:\n";
+    value->dump(os, indent + 2);
 }

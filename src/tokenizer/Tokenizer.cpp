@@ -68,10 +68,12 @@ std::optional<Token> Tokenizer::readToken() {
             case '0':
                 scanner->scanChar();
                 if (scanner->c == 'x' || scanner->c == 'X') {
-                    scanner->scanChar();
+                    scanner->putChar(u'0');
+                    scanner->putChar(true);
                     scanNumber(pos, 16);
                 } else if (scanner->c == 'b' || scanner->c == 'B') {
-                    scanner->scanChar();
+                    scanner->putChar(u'0');
+                    scanner->putChar(true);
                     scanNumber(pos, 2);
                 } else {
                     scanner->putChar(u'0');

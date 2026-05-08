@@ -45,7 +45,28 @@ void Parser::error(const Token& t, const std::string& msg) const {
     throw ParseError(t.getLine(), oss.str());
 }
 
+static bool isAssignmentOp(TokenType t) {
+    switch (t) {
+        case TokenType::EQ:
+        case TokenType::PLUS_EQ:
+        case TokenType::SUB_EQ:
+        case TokenType::STAR_EQ:
+        case TokenType::SLASH_EQ:
+        case TokenType::PERCENT_EQ:
+        case TokenType::BIT_AND_EQ:
+        case TokenType::BIT_OR_EQ:
+        case TokenType::CARET_EQ:
+        case TokenType::LT_LT_EQ:
+        case TokenType::GT_GT_EQ:
+        case TokenType::GT_GT_GT_EQ:
+            return true;
+        default:
+            return false;
+    }
+}
+
 int Parser::infixPrecedence(TokenType type) const {
+    if (isAssignmentOp(type)) return 1;
     switch (type) {
         case TokenType::OR:        return 2;
         case TokenType::AND:       return 3;
@@ -67,23 +88,28 @@ int Parser::infixPrecedence(TokenType type) const {
         case TokenType::SLASH:
         case TokenType::PERCENT:   return 11;
         case TokenType::DOT:
-        case TokenType::L_PAREN:   return PREC_POSTFIX;
+        case TokenType::L_PAREN:
+        case TokenType::L_BRACKET: return PREC_POSTFIX;
         default:                   return 0;
     }
 }
 
-bool Parser::isRightAssoc(TokenType /*type*/) const {
-    return false;
+bool Parser::isRightAssoc(TokenType type) const {
+    return isAssignmentOp(type);
 }
 
 static long long parseIntText(std::u16string_view text) {
-    long long v = 0;
-    for (char16_t c : text) {
-        if (c >= u'0' && c <= u'9') {
-            v = v * 10 + (c - u'0');
+    std::string s;
+    s.reserve(text.size());
+    for (char16_t c : text) s.push_back(static_cast<char>(c));
+    try {
+        if (s.size() > 2 && s[0] == '0' && (s[1] == 'b' || s[1] == 'B')) {
+            return std::stoll(s.substr(2), nullptr, 2);
         }
+        return std::stoll(s, nullptr, 0);
+    } catch (...) {
+        return 0;
     }
-    return v;
 }
 
 static double parseDoubleText(std::u16string_view text) {
@@ -128,6 +154,20 @@ ExprPtr Parser::parsePrefix() {
             e->line = line;
             return e;
         }
+        case TokenType::TRUE_KW:
+        case TokenType::FALSE_KW: {
+            bool v = tok.getType() == TokenType::TRUE_KW;
+            consume();
+            auto e = std::make_unique<BoolLitExpr>(v);
+            e->line = line;
+            return e;
+        }
+        case TokenType::NULL_KW: {
+            consume();
+            auto e = std::make_unique<NullLitExpr>();
+            e->line = line;
+            return e;
+        }
         case TokenType::L_PAREN: {
             consume();
             auto inner = parseExpression();
@@ -135,7 +175,9 @@ ExprPtr Parser::parsePrefix() {
             return inner;
         }
         case TokenType::SUB:
-        case TokenType::NOT: {
+        case TokenType::NOT:
+        case TokenType::PLUS_PLUS:
+        case TokenType::SUB_SUB: {
             Token op = consume();
             auto operand = parsePrecedence(PREC_UNARY);
             auto e = std::make_unique<UnaryExpr>(op.getType(), std::move(operand));
@@ -169,11 +211,24 @@ ExprPtr Parser::parsePrecedence(int minPrec) {
             int line = left->line;
             left = std::make_unique<CallExpr>(std::move(left), std::move(args));
             left->line = line;
+        } else if (tt == TokenType::L_BRACKET) {
+            consume();
+            auto index = parseExpression();
+            expect(TokenType::R_BRACKET, "']' after subscript");
+            int line = left->line;
+            left = std::make_unique<SubscriptExpr>(std::move(left), std::move(index));
+            left->line = line;
         } else if (tt == TokenType::DOT) {
             consume();
             const Token& nameTok = expect(TokenType::IDENTIFIER, "identifier after '.'");
             int line = left->line;
             left = std::make_unique<MemberExpr>(std::move(left), nameTok.getText());
+            left->line = line;
+        } else if (isAssignmentOp(tt)) {
+            consume();
+            auto right = parsePrecedence(prec);
+            int line = left->line;
+            left = std::make_unique<AssignExpr>(tt, std::move(left), std::move(right));
             left->line = line;
         } else {
             consume();
