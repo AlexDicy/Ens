@@ -66,3 +66,34 @@ void WhileStmt::dump(std::ostream& os, int indent) const {
     os << "body:\n";
     body->dump(os, indent + 2);
 }
+
+static const char* visName(Visibility v) {
+    switch (v) {
+        case Visibility::Public:    return "public";
+        case Visibility::Private:   return "private";
+        case Visibility::Protected: return "protected";
+    }
+    return "?";
+}
+
+void FuncDecl::dump(std::ostream& os, int indent) const {
+    writeIndent(os, indent);
+    os << "FuncDecl(" << visName(visibility) << " " << asciiOf(name) << ")\n";
+    if (!parameters.empty()) {
+        writeIndent(os, indent + 1);
+        os << "params:\n";
+        for (const auto& p : parameters) {
+            writeIndent(os, indent + 2);
+            os << asciiOf(p.name) << ":\n";
+            p.type->dump(os, indent + 3);
+        }
+    }
+    if (returnType) {
+        writeIndent(os, indent + 1);
+        os << "returns:\n";
+        returnType->dump(os, indent + 2);
+    }
+    writeIndent(os, indent + 1);
+    os << "body:\n";
+    body->dump(os, indent + 2);
+}

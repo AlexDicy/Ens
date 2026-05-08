@@ -1,12 +1,23 @@
 #pragma once
 #include <memory>
+#include <string>
 #include <vector>
 #include "Node.h"
 #include "Expr.h"
 #include "Type.h"
 
+class Symbol;
+
 class Stmt : public Node {};
 using StmtPtr = std::unique_ptr<Stmt>;
+
+enum class Visibility { Public, Private, Protected };
+
+struct Parameter {
+    TypePtr type;
+    std::u16string name;
+    Symbol* resolvedSymbol = nullptr;
+};
 
 class BlockStmt : public Stmt {
 public:
@@ -19,6 +30,7 @@ public:
     TypePtr type;
     std::u16string name;
     ExprPtr init;
+    Symbol* resolvedSymbol = nullptr;
 
     VarDeclStmt(TypePtr t, std::u16string n, ExprPtr i)
         : type(std::move(t)), name(std::move(n)), init(std::move(i)) {}
@@ -57,5 +69,17 @@ public:
 
     WhileStmt(ExprPtr c, StmtPtr b)
         : condition(std::move(c)), body(std::move(b)) {}
+    void dump(std::ostream& os, int indent) const override;
+};
+
+class FuncDecl : public Stmt {
+public:
+    Visibility visibility = Visibility::Public;
+    std::u16string name;
+    std::vector<Parameter> parameters;
+    TypePtr returnType;
+    std::unique_ptr<BlockStmt> body;
+    Symbol* resolvedSymbol = nullptr;
+
     void dump(std::ostream& os, int indent) const override;
 };

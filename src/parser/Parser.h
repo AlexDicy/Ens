@@ -27,6 +27,7 @@ private:
     const Token& expect(TokenType type, const char* what);
     bool isPrimitiveType(TokenType t) const;
     bool looksLikeTypedDecl() const;
+    bool looksLikeFuncDecl() const;
 
     ExprPtr parsePrecedence(int minPrec);
     ExprPtr parsePrefix();
@@ -39,6 +40,8 @@ private:
     StmtPtr parseWhile();
     StmtPtr parseReturn();
     StmtPtr parseExprStmt();
+    StmtPtr parseFuncDecl(Visibility vis);
+    Parameter parseParameter();
 
     [[noreturn]] void error(const Token& t, const std::string& msg) const;
 };

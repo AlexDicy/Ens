@@ -138,6 +138,7 @@ bool Parser::isPrimitiveType(TokenType t) const {
         case TokenType::DECIMAL:
         case TokenType::CHAR:
         case TokenType::STRING:
+        case TokenType::VOID:
             return true;
         default:
             return false;
@@ -172,6 +173,21 @@ std::vector<StmtPtr> Parser::parseProgram() {
 
 StmtPtr Parser::parseStatement() {
     const Token& tok = peek();
+
+    if (tok.getType() == TokenType::PRIVATE ||
+        tok.getType() == TokenType::PROTECTED ||
+        tok.getType() == TokenType::PUBLIC) {
+        Visibility vis = (tok.getType() == TokenType::PRIVATE)   ? Visibility::Private
+                       : (tok.getType() == TokenType::PROTECTED) ? Visibility::Protected
+                                                                 : Visibility::Public;
+        consume();
+        return parseFuncDecl(vis);
+    }
+
+    if (tok.getType() == TokenType::IDENTIFIER && looksLikeFuncDecl()) {
+        return parseFuncDecl(Visibility::Public);
+    }
+
     switch (tok.getType()) {
         case TokenType::LET:      return parseLet();
         case TokenType::IF:       return parseIf();
@@ -185,6 +201,52 @@ StmtPtr Parser::parseStatement() {
             }
             return parseExprStmt();
     }
+}
+
+bool Parser::looksLikeFuncDecl() const {
+    if (pos >= tokens.size() || tokens[pos].getType() != TokenType::IDENTIFIER) return false;
+    if (pos + 1 >= tokens.size() || tokens[pos + 1].getType() != TokenType::L_PAREN) return false;
+    int depth = 1;
+    size_t j = pos + 2;
+    while (j < tokens.size() && depth > 0) {
+        TokenType t = tokens[j].getType();
+        if (t == TokenType::L_PAREN) depth++;
+        else if (t == TokenType::R_PAREN) depth--;
+        j++;
+    }
+    if (depth != 0 || j >= tokens.size()) return false;
+    TokenType after = tokens[j].getType();
+    return after == TokenType::ARROW || after == TokenType::L_BRACE;
+}
+
+StmtPtr Parser::parseFuncDecl(Visibility vis) {
+    const Token& nameTok = expect(TokenType::IDENTIFIER, "function name");
+    expect(TokenType::L_PAREN, "'(' after function name");
+    auto fn = std::make_unique<FuncDecl>();
+    fn->visibility = vis;
+    fn->name = nameTok.getText();
+    fn->line = nameTok.getLine();
+    fn->column = nameTok.getColumn();
+    if (!check(TokenType::R_PAREN)) {
+        fn->parameters.push_back(parseParameter());
+        while (match(TokenType::COMMA)) {
+            fn->parameters.push_back(parseParameter());
+        }
+    }
+    expect(TokenType::R_PAREN, "')' after parameters");
+    if (match(TokenType::ARROW)) {
+        fn->returnType = parseType();
+    }
+    fn->body = parseBlock();
+    return fn;
+}
+
+Parameter Parser::parseParameter() {
+    Parameter p;
+    p.type = parseType();
+    const Token& nameTok = expect(TokenType::IDENTIFIER, "parameter name");
+    p.name = nameTok.getText();
+    return p;
 }
 
 bool Parser::looksLikeTypedDecl() const {
@@ -300,6 +362,7 @@ StmtPtr Parser::parseExprStmt() {
 ExprPtr Parser::parsePrefix() {
     const Token& tok = peek();
     int line = tok.getLine();
+    int column = tok.getColumn();
 
     switch (tok.getType()) {
         case TokenType::INT_LITERAL:
@@ -307,6 +370,7 @@ ExprPtr Parser::parsePrefix() {
             consume();
             auto e = std::make_unique<IntLitExpr>(parseIntText(tok.getText()));
             e->line = line;
+            e->column = column;
             return e;
         }
         case TokenType::DOUBLE_LITERAL:
@@ -314,18 +378,21 @@ ExprPtr Parser::parsePrefix() {
             consume();
             auto e = std::make_unique<DoubleLitExpr>(parseDoubleText(tok.getText()));
             e->line = line;
+            e->column = column;
             return e;
         }
         case TokenType::STRING_LITERAL: {
             consume();
             auto e = std::make_unique<StringLitExpr>(tok.getText());
             e->line = line;
+            e->column = column;
             return e;
         }
         case TokenType::IDENTIFIER: {
             consume();
             auto e = std::make_unique<IdentExpr>(tok.getText());
             e->line = line;
+            e->column = column;
             return e;
         }
         case TokenType::TRUE_KW:
@@ -334,12 +401,14 @@ ExprPtr Parser::parsePrefix() {
             consume();
             auto e = std::make_unique<BoolLitExpr>(v);
             e->line = line;
+            e->column = column;
             return e;
         }
         case TokenType::NULL_KW: {
             consume();
             auto e = std::make_unique<NullLitExpr>();
             e->line = line;
+            e->column = column;
             return e;
         }
         case TokenType::L_PAREN: {
@@ -356,6 +425,7 @@ ExprPtr Parser::parsePrefix() {
             auto operand = parsePrecedence(PREC_UNARY);
             auto e = std::make_unique<UnaryExpr>(op.getType(), std::move(operand));
             e->line = line;
+            e->column = column;
             return e;
         }
         default:
@@ -383,34 +453,44 @@ ExprPtr Parser::parsePrecedence(int minPrec) {
             }
             expect(TokenType::R_PAREN, "')' after arguments");
             int line = left->line;
+            int column = left->column;
             left = std::make_unique<CallExpr>(std::move(left), std::move(args));
             left->line = line;
+            left->column = column;
         } else if (tt == TokenType::L_BRACKET) {
             consume();
             auto index = parseExpression();
             expect(TokenType::R_BRACKET, "']' after subscript");
             int line = left->line;
+            int column = left->column;
             left = std::make_unique<SubscriptExpr>(std::move(left), std::move(index));
             left->line = line;
+            left->column = column;
         } else if (tt == TokenType::DOT) {
             consume();
             const Token& nameTok = expect(TokenType::IDENTIFIER, "identifier after '.'");
             int line = left->line;
+            int column = left->column;
             left = std::make_unique<MemberExpr>(std::move(left), nameTok.getText());
             left->line = line;
+            left->column = column;
         } else if (isAssignmentOp(tt)) {
             consume();
             auto right = parsePrecedence(prec);
             int line = left->line;
+            int column = left->column;
             left = std::make_unique<AssignExpr>(tt, std::move(left), std::move(right));
             left->line = line;
+            left->column = column;
         } else {
             consume();
             int nextMin = isRightAssoc(tt) ? prec : prec + 1;
             auto right = parsePrecedence(nextMin);
             int line = left->line;
+            int column = left->column;
             left = std::make_unique<BinaryExpr>(tt, std::move(left), std::move(right));
             left->line = line;
+            left->column = column;
         }
     }
     return left;

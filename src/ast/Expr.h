@@ -5,7 +5,13 @@
 #include "Node.h"
 #include "../tokenizer/TokenType.h"
 
-class Expr : public Node {};
+class Type;
+class Symbol;
+
+class Expr : public Node {
+public:
+    Type* resolvedType = nullptr;
+};
 using ExprPtr = std::unique_ptr<Expr>;
 
 class IntLitExpr : public Expr {
@@ -44,6 +50,7 @@ public:
 class IdentExpr : public Expr {
 public:
     std::u16string name;
+    Symbol* resolvedSymbol = nullptr;
     explicit IdentExpr(std::u16string n) : name(std::move(n)) {}
     void dump(std::ostream& os, int indent) const override;
 };

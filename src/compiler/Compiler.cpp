@@ -1,6 +1,7 @@
 #include "Compiler.h"
 #include "../tokenizer/Tokenizer.h"
 #include "../parser/Parser.h"
+#include "../semantic/Analyzer.h"
 #include "../diagnostics/Diagnostic.h"
 #include "../diagnostics/SourceFile.h"
 
@@ -78,6 +79,15 @@ bool Compiler::compileSingle(std::istream& source, const fs::path& /*outputFolde
         auto stmts = parser.parseProgram();
         std::cout << "--- AST ---\n";
         for (const auto& s : stmts) s->dump(std::cout, 0);
+
+        Analyzer analyzer;
+        analyzer.analyze(stmts);
+        if (analyzer.hasErrors()) {
+            for (const auto& d : analyzer.getDiagnostics()) {
+                d.print(sourceFile, std::cerr);
+            }
+            return false;
+        }
     } catch (const Diagnostic& d) {
         d.print(sourceFile, std::cerr);
         return false;
