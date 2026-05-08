@@ -75,12 +75,9 @@ bool Compiler::compileSingle(std::istream& source, const fs::path& /*outputFolde
     try {
         auto tokens = Tokenizer::tokenize(sourceFile.getSource());
         Parser parser(std::move(tokens));
-        auto expr = parser.parseExpression();
+        auto stmts = parser.parseProgram();
         std::cout << "--- AST ---\n";
-        expr->dump(std::cout, 0);
-        if (!parser.atEnd()) {
-            std::cout << "(stopped before end of token stream)\n";
-        }
+        for (const auto& s : stmts) s->dump(std::cout, 0);
     } catch (const Diagnostic& d) {
         d.print(sourceFile, std::cerr);
         return false;

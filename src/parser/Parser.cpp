@@ -123,6 +123,180 @@ ExprPtr Parser::parseExpression() {
     return parsePrecedence(1);
 }
 
+bool Parser::isPrimitiveType(TokenType t) const {
+    switch (t) {
+        case TokenType::BOOL:
+        case TokenType::BYTE:
+        case TokenType::SHORT:
+        case TokenType::USHORT:
+        case TokenType::INT:
+        case TokenType::UINT:
+        case TokenType::LONG:
+        case TokenType::ULONG:
+        case TokenType::FLOAT:
+        case TokenType::DOUBLE:
+        case TokenType::DECIMAL:
+        case TokenType::CHAR:
+        case TokenType::STRING:
+            return true;
+        default:
+            return false;
+    }
+}
+
+TypePtr Parser::parseType() {
+    const Token& tok = peek();
+    int line = tok.getLine();
+    int column = tok.getColumn();
+    std::u16string name;
+    if (isPrimitiveType(tok.getType()) || tok.getType() == TokenType::IDENTIFIER) {
+        name = tok.getText();
+        consume();
+    } else {
+        error(tok, "Expected type name");
+    }
+    bool isOptional = match(TokenType::QUES);
+    auto t = std::make_unique<TypeNode>(std::move(name), isOptional);
+    t->line = line;
+    t->column = column;
+    return t;
+}
+
+std::vector<StmtPtr> Parser::parseProgram() {
+    std::vector<StmtPtr> stmts;
+    while (!atEnd()) {
+        stmts.push_back(parseStatement());
+    }
+    return stmts;
+}
+
+StmtPtr Parser::parseStatement() {
+    const Token& tok = peek();
+    switch (tok.getType()) {
+        case TokenType::LET:      return parseLet();
+        case TokenType::IF:       return parseIf();
+        case TokenType::WHILE:    return parseWhile();
+        case TokenType::RETURN:   return parseReturn();
+        case TokenType::L_BRACE:  return parseBlock();
+        default:
+            if (isPrimitiveType(tok.getType())) return parseTypedVarDecl();
+            if (tok.getType() == TokenType::IDENTIFIER && looksLikeTypedDecl()) {
+                return parseTypedVarDecl();
+            }
+            return parseExprStmt();
+    }
+}
+
+bool Parser::looksLikeTypedDecl() const {
+    size_t i = pos + 1;
+    if (i < tokens.size() && tokens[i].getType() == TokenType::QUES) {
+        i++;
+    }
+    if (i >= tokens.size() || tokens[i].getType() != TokenType::IDENTIFIER) return false;
+    i++;
+    if (i >= tokens.size()) return false;
+    TokenType after = tokens[i].getType();
+    return after == TokenType::EQ || after == TokenType::SEMI;
+}
+
+std::unique_ptr<BlockStmt> Parser::parseBlock() {
+    const Token& open = expect(TokenType::L_BRACE, "'{'");
+    auto block = std::make_unique<BlockStmt>();
+    block->line = open.getLine();
+    block->column = open.getColumn();
+    while (!check(TokenType::R_BRACE) && !atEnd()) {
+        block->statements.push_back(parseStatement());
+    }
+    expect(TokenType::R_BRACE, "'}'");
+    return block;
+}
+
+StmtPtr Parser::parseLet() {
+    const Token& kw = expect(TokenType::LET, "'let'");
+    const Token& name = expect(TokenType::IDENTIFIER, "identifier after 'let'");
+    TypePtr type;
+    if (match(TokenType::COLON)) {
+        type = parseType();
+    }
+    ExprPtr init;
+    if (match(TokenType::EQ)) {
+        init = parseExpression();
+    }
+    expect(TokenType::SEMI, "';' after let declaration");
+    auto s = std::make_unique<VarDeclStmt>(std::move(type), name.getText(), std::move(init));
+    s->line = kw.getLine();
+    s->column = kw.getColumn();
+    return s;
+}
+
+StmtPtr Parser::parseTypedVarDecl() {
+    auto type = parseType();
+    int line = type->line;
+    int column = type->column;
+    const Token& name = expect(TokenType::IDENTIFIER, "identifier after type");
+    ExprPtr init;
+    if (match(TokenType::EQ)) {
+        init = parseExpression();
+    }
+    expect(TokenType::SEMI, "';' after declaration");
+    auto s = std::make_unique<VarDeclStmt>(std::move(type), name.getText(), std::move(init));
+    s->line = line;
+    s->column = column;
+    return s;
+}
+
+StmtPtr Parser::parseReturn() {
+    const Token& kw = expect(TokenType::RETURN, "'return'");
+    ExprPtr e;
+    if (!check(TokenType::SEMI)) {
+        e = parseExpression();
+    }
+    expect(TokenType::SEMI, "';' after return");
+    auto s = std::make_unique<ReturnStmt>(std::move(e));
+    s->line = kw.getLine();
+    s->column = kw.getColumn();
+    return s;
+}
+
+StmtPtr Parser::parseIf() {
+    const Token& kw = expect(TokenType::IF, "'if'");
+    auto cond = parseExpression();
+    auto thenB = parseBlock();
+    StmtPtr elseB;
+    if (match(TokenType::ELSE)) {
+        if (check(TokenType::IF)) {
+            elseB = parseIf();
+        } else {
+            elseB = parseBlock();
+        }
+    }
+    auto s = std::make_unique<IfStmt>(std::move(cond), std::move(thenB), std::move(elseB));
+    s->line = kw.getLine();
+    s->column = kw.getColumn();
+    return s;
+}
+
+StmtPtr Parser::parseWhile() {
+    const Token& kw = expect(TokenType::WHILE, "'while'");
+    auto cond = parseExpression();
+    auto body = parseBlock();
+    auto s = std::make_unique<WhileStmt>(std::move(cond), std::move(body));
+    s->line = kw.getLine();
+    s->column = kw.getColumn();
+    return s;
+}
+
+StmtPtr Parser::parseExprStmt() {
+    auto e = parseExpression();
+    int line = e->line;
+    int column = e->column;
+    expect(TokenType::SEMI, "';' after expression");
+    auto s = std::make_unique<ExprStmt>(std::move(e));
+    s->line = line;
+    s->column = column;
+    return s;
+}
+
 ExprPtr Parser::parsePrefix() {
     const Token& tok = peek();
     int line = tok.getLine();
