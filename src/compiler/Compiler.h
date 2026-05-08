@@ -15,7 +15,8 @@ public:
                               const std::filesystem::path& outputFolder);
 
     static bool compileSingle(std::istream& source,
-                              const std::filesystem::path& outputFolder);
+                              const std::filesystem::path& outputFolder,
+                              const std::string& filename = "<stdin>");
 
 private:
     static std::vector<std::filesystem::path> getFileTree(

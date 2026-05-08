@@ -25,6 +25,20 @@ UnicodeScanner::UnicodeScanner(std::u16string_view src) {
 
 char16_t UnicodeScanner::scanChar() {
     if (pointer < (int)buffer.size()) {
+        if (c == LF) {
+            if (!prevWasCR) {
+                line++;
+            }
+            column = 1;
+            prevWasCR = false;
+        } else if (c == CR) {
+            line++;
+            column = 1;
+            prevWasCR = true;
+        } else {
+            column++;
+            prevWasCR = false;
+        }
         c = buffer[++pointer];
         if (c == u'\\') {
             convertUnicode();

@@ -31,8 +31,12 @@ std::optional<Token> Tokenizer::readToken() {
     int pos = scanner->pointer;
     tokenType = std::nullopt;
     bool loop = true;
+    int tokLine = scanner->line;
+    int tokCol = scanner->column;
 
     while (loop) {
+        tokLine = scanner->line;
+        tokCol = scanner->column;
         switch (scanner->c) {
             case ' ':
             case '\t':
@@ -228,7 +232,7 @@ std::optional<Token> Tokenizer::readToken() {
     }
 
     if (!tokenType.has_value()) return std::nullopt;
-    return Token(*tokenType, scanner->getSaved(), pos, scanner->pointer);
+    return Token(*tokenType, scanner->getSaved(), tokLine, tokCol);
 }
 
 void Tokenizer::error(int pos, const char* msg) {

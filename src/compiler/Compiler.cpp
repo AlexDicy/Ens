@@ -1,6 +1,8 @@
 #include "Compiler.h"
 #include "../tokenizer/Tokenizer.h"
 #include "../parser/Parser.h"
+#include "../diagnostics/Diagnostic.h"
+#include "../diagnostics/SourceFile.h"
 
 #include <algorithm>
 #include <fstream>
@@ -62,13 +64,14 @@ bool Compiler::compileSingle(const std::optional<fs::path>& root,
     // Print result
     std::cout << "Compiling " << source << " to " << output << '\n';
 
-    return compileSingle(file, outputFolder);
+    return compileSingle(file, outputFolder, filePath.string());
 }
 
-bool Compiler::compileSingle(std::istream& source, const fs::path& /*outputFolder*/) {
+bool Compiler::compileSingle(std::istream& source, const fs::path& /*outputFolder*/, const std::string& filename) {
     std::string code((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
     std::u16string u16code(code.begin(), code.end());
-    auto tokens = Tokenizer::tokenize(u16code);
+    SourceFile sourceFile(filename, std::move(u16code));
+    auto tokens = Tokenizer::tokenize(sourceFile.getSource());
 
     try {
         Parser parser(std::move(tokens));
@@ -78,8 +81,8 @@ bool Compiler::compileSingle(std::istream& source, const fs::path& /*outputFolde
         if (!parser.atEnd()) {
             std::cout << "(stopped before end of token stream)\n";
         }
-    } catch (const ParseError& e) {
-        std::cerr << e.what() << '\n';
+    } catch (const Diagnostic& d) {
+        d.print(sourceFile, std::cerr);
         return false;
     }
     return true;

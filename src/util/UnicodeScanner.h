@@ -20,6 +20,10 @@ public:
     int realLength = 0;
     int spointer = 0;
 
+    int line = 1;
+    int column = 0;
+    bool prevWasCR = false;
+
     explicit UnicodeScanner(std::u16string_view src);
 
     char16_t scanChar();

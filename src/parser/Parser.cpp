@@ -1,13 +1,14 @@
 #include "Parser.h"
-#include <sstream>
+#include "../diagnostics/Diagnostic.h"
 #include <string>
 
 static constexpr int PREC_UNARY = 12;
 static constexpr int PREC_POSTFIX = 13;
 
 Parser::Parser(std::vector<Token> ts) : tokens(std::move(ts)) {
-    int line = tokens.empty() ? 0 : tokens.back().getLine();
-    tokens.emplace_back(TokenType::END_OF_FILE, std::u16string{}, line, 0);
+    int line = tokens.empty() ? 1 : tokens.back().getLine();
+    int col = tokens.empty() ? 1 : tokens.back().getColumn() + tokens.back().getLength();
+    tokens.emplace_back(TokenType::END_OF_FILE, std::u16string{}, line, col);
 }
 
 bool Parser::atEnd() const {
@@ -40,9 +41,8 @@ const Token& Parser::expect(TokenType type, const char* what) {
 }
 
 void Parser::error(const Token& t, const std::string& msg) const {
-    std::ostringstream oss;
-    oss << "Parse error at line " << t.getLine() << ": " << msg;
-    throw ParseError(t.getLine(), oss.str());
+    SourceSpan span{t.getLine(), t.getColumn(), t.getLength() > 0 ? t.getLength() : 1};
+    throw Diagnostic(DiagnosticLevel::Error, span, msg);
 }
 
 static bool isAssignmentOp(TokenType t) {

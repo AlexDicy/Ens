@@ -1,16 +1,8 @@
 #pragma once
-#include <stdexcept>
 #include <string>
 #include <vector>
 #include "../tokenizer/Token.h"
 #include "../ast/Expr.h"
-
-class ParseError : public std::runtime_error {
-public:
-    int line;
-    ParseError(int line, const std::string& msg)
-        : std::runtime_error(msg), line(line) {}
-};
 
 class Parser {
 public:
