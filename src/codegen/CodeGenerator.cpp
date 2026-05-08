@@ -11,8 +11,12 @@
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/IR/DIBuilder.h"
+#include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -29,18 +33,53 @@ struct CodeGenerator::Impl {
     llvm::LLVMContext ctx;
     std::unique_ptr<llvm::Module> module;
     std::unique_ptr<llvm::IRBuilder<>> builder;
+    std::unique_ptr<llvm::DIBuilder> diBuilder;
     std::unordered_map<Symbol*, llvm::Value*> values;
+    std::unordered_map<int, llvm::DIType*> diTypeCache;  // keyed by TypeKind
     llvm::Function* currentFunction = nullptr;
+    llvm::DIScope* currentDIScope = nullptr;
+    llvm::DICompileUnit* diCU = nullptr;
+    llvm::DIFile* diFile = nullptr;
+    bool debugEnabled = true;
     std::vector<Diagnostic> diagnostics;
 
     Impl(const std::string& moduleName, const std::string& filename) {
         module = std::make_unique<llvm::Module>(moduleName, ctx);
         module->setSourceFileName(filename);
         builder = std::make_unique<llvm::IRBuilder<>>(ctx);
+
+        if (debugEnabled) {
+            module->addModuleFlag(llvm::Module::Warning, "Debug Info Version", llvm::DEBUG_METADATA_VERSION);
+            module->addModuleFlag(llvm::Module::Warning, "Dwarf Version", 4);
+
+            diBuilder = std::make_unique<llvm::DIBuilder>(*module);
+            std::filesystem::path p(filename);
+            std::string fname = p.filename().string();
+            std::string dir   = p.parent_path().string();
+            if (fname.empty()) fname = filename;
+            diFile = diBuilder->createFile(fname, dir);
+            diCU = diBuilder->createCompileUnit(
+                llvm::dwarf::DW_LANG_C,
+                diFile,
+                "Ens compiler",
+                /*isOptimized*/ false,
+                /*flags*/ "",
+                /*runtimeVersion*/ 0);
+            currentDIScope = diCU;
+        }
     }
 
-    // Hook for future debug info: would call builder->SetCurrentDebugLocation here.
-    void setLocation(Node* /*n*/) {}
+    // Attach !dbg metadata to instructions emitted hereafter.
+    void setLocation(Node* n) {
+        if (!debugEnabled || !n || !currentDIScope) return;
+        builder->SetCurrentDebugLocation(
+            llvm::DILocation::get(ctx, static_cast<unsigned>(n->line),
+                                  static_cast<unsigned>(n->column), currentDIScope));
+    }
+
+    void clearLocation() {
+        builder->SetCurrentDebugLocation(llvm::DebugLoc());
+    }
 
     void error(int line, int col, std::string msg) {
         diagnostics.emplace_back(DiagnosticLevel::Error, SourceSpan{line, col, 1}, std::move(msg));
@@ -92,6 +131,38 @@ struct CodeGenerator::Impl {
         }
     }
 
+    llvm::DIType* mapDIType(::Type* t) {
+        if (!debugEnabled || !diBuilder || !t) return nullptr;
+        int key = static_cast<int>(t->kind);
+        auto it = diTypeCache.find(key);
+        if (it != diTypeCache.end()) return it->second;
+        llvm::DIType* result = nullptr;
+        switch (t->kind) {
+            case TypeKind::Bool:   result = diBuilder->createBasicType("bool",   1,  llvm::dwarf::DW_ATE_boolean); break;
+            case TypeKind::Byte:   result = diBuilder->createBasicType("byte",   8,  llvm::dwarf::DW_ATE_signed); break;
+            case TypeKind::Short:  result = diBuilder->createBasicType("short",  16, llvm::dwarf::DW_ATE_signed); break;
+            case TypeKind::UShort: result = diBuilder->createBasicType("ushort", 16, llvm::dwarf::DW_ATE_unsigned); break;
+            case TypeKind::Int:    result = diBuilder->createBasicType("int",    32, llvm::dwarf::DW_ATE_signed); break;
+            case TypeKind::UInt:   result = diBuilder->createBasicType("uint",   32, llvm::dwarf::DW_ATE_unsigned); break;
+            case TypeKind::Long:   result = diBuilder->createBasicType("long",   64, llvm::dwarf::DW_ATE_signed); break;
+            case TypeKind::ULong:  result = diBuilder->createBasicType("ulong",  64, llvm::dwarf::DW_ATE_unsigned); break;
+            case TypeKind::Char:   result = diBuilder->createBasicType("char",   32, llvm::dwarf::DW_ATE_UTF); break;
+            case TypeKind::Float:  result = diBuilder->createBasicType("float",  32, llvm::dwarf::DW_ATE_float); break;
+            case TypeKind::Double: result = diBuilder->createBasicType("double", 64, llvm::dwarf::DW_ATE_float); break;
+            default:               break;  // void and unsupported types stay null
+        }
+        if (result) diTypeCache[key] = result;
+        return result;
+    }
+
+    llvm::DISubroutineType* createDISubroutineType(Symbol* fn) {
+        if (!debugEnabled || !diBuilder) return nullptr;
+        std::vector<llvm::Metadata*> elems;
+        elems.push_back(mapDIType(fn->returnType));  // index 0 is the return type (null = void)
+        for (auto* pt : fn->paramTypes) elems.push_back(mapDIType(pt));
+        return diBuilder->createSubroutineType(diBuilder->getOrCreateTypeArray(elems));
+    }
+
     bool generate(const std::vector<StmtPtr>& program) {
         for (auto& s : program) {
             if (auto* fn = dynamic_cast<FuncDecl*>(s.get())) {
@@ -103,6 +174,7 @@ struct CodeGenerator::Impl {
                 emitFunction(fn);
             }
         }
+        if (debugEnabled && diBuilder) diBuilder->finalize();
         if (!diagnostics.empty()) return false;
 
         std::string verifyErr;
@@ -151,6 +223,26 @@ struct CodeGenerator::Impl {
         currentFunction = llvm::cast<llvm::Function>(it->second);
         auto* entry = llvm::BasicBlock::Create(ctx, "entry", currentFunction);
         builder->SetInsertPoint(entry);
+
+        llvm::DISubprogram* sp = nullptr;
+        llvm::DIScope* prevScope = currentDIScope;
+        if (debugEnabled && diBuilder) {
+            sp = diBuilder->createFunction(
+                diCU,
+                asAscii(fn->name),
+                /*linkageName*/ asAscii(fn->name),
+                diFile,
+                static_cast<unsigned>(fn->line),
+                createDISubroutineType(sym),
+                /*scopeLine*/ static_cast<unsigned>(fn->line),
+                llvm::DINode::FlagPrototyped,
+                llvm::DISubprogram::SPFlagDefinition);
+            currentFunction->setSubprogram(sp);
+            currentDIScope = sp;
+        }
+
+        // Prologue: parameter allocas and stores. Use the function's location so
+        // verifyModule is happy with !dbg on every instruction.
         setLocation(fn);
 
         size_t i = 0;
@@ -162,6 +254,21 @@ struct CodeGenerator::Impl {
             auto* alloca = createEntryAlloca(currentFunction, lt, pname);
             builder->CreateStore(&arg, alloca);
             values[param.resolvedSymbol] = alloca;
+
+            if (debugEnabled && diBuilder && sp) {
+                int pline = param.type ? param.type->line : fn->line;
+                int pcol  = param.type ? param.type->column : fn->column;
+                auto* diVar = diBuilder->createParameterVariable(
+                    sp, pname, static_cast<unsigned>(i + 1), diFile,
+                    static_cast<unsigned>(pline),
+                    mapDIType(param.resolvedSymbol->type),
+                    /*AlwaysPreserve*/ true);
+                diBuilder->insertDeclare(
+                    alloca, diVar, diBuilder->createExpression(),
+                    llvm::DILocation::get(ctx, static_cast<unsigned>(pline),
+                                          static_cast<unsigned>(pcol), sp),
+                    builder->GetInsertBlock());
+            }
             i++;
         }
 
@@ -178,6 +285,9 @@ struct CodeGenerator::Impl {
                 builder->CreateUnreachable();
             }
         }
+
+        if (debugEnabled && diBuilder && sp) diBuilder->finalizeSubprogram(sp);
+        currentDIScope = prevScope;
         currentFunction = nullptr;
     }
 
@@ -192,10 +302,18 @@ struct CodeGenerator::Impl {
     }
 
     void emitBlock(BlockStmt* s) {
+        llvm::DIScope* prev = currentDIScope;
+        if (debugEnabled && diBuilder && currentDIScope) {
+            currentDIScope = diBuilder->createLexicalBlock(
+                currentDIScope, diFile,
+                static_cast<unsigned>(s->line),
+                static_cast<unsigned>(s->column));
+        }
         for (auto& child : s->statements) {
             emitStmt(child.get());
             if (builder->GetInsertBlock()->getTerminator()) break;
         }
+        currentDIScope = prev;
     }
 
     void emitVarDecl(VarDeclStmt* s) {
@@ -209,9 +327,26 @@ struct CodeGenerator::Impl {
         llvm::Type* lt = mapType(sym->type);
         auto* alloca = createEntryAlloca(currentFunction, lt, asAscii(s->name));
         values[sym] = alloca;
+
+        if (debugEnabled && diBuilder && currentDIScope) {
+            auto* diVar = diBuilder->createAutoVariable(
+                currentDIScope, asAscii(s->name), diFile,
+                static_cast<unsigned>(s->line),
+                mapDIType(sym->type));
+            diBuilder->insertDeclare(
+                alloca, diVar, diBuilder->createExpression(),
+                llvm::DILocation::get(ctx, static_cast<unsigned>(s->line),
+                                      static_cast<unsigned>(s->column), currentDIScope),
+                builder->GetInsertBlock());
+        }
+
         if (s->init) {
+            setLocation(s);
             llvm::Value* v = emitExpr(s->init.get());
-            if (v) builder->CreateStore(v, alloca);
+            if (v) {
+                setLocation(s);
+                builder->CreateStore(v, alloca);
+            }
         }
     }
 
