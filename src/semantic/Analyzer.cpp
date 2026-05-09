@@ -654,10 +654,38 @@ Type* Analyzer::analyzeNew(NewExpr* e) {
     }
     e->resolvedClassType = t;
 
-    if (!e->args.empty()) {
-        error(e->line, e->column, 1,
-              "Constructors are not yet implemented; use 'new " + asciiOf(e->typeName) + "()'");
-        for (auto& a : e->args) analyzeExpr(a.get());
+    // A constructor is a method whose name matches the class name. Look it up
+    // so we can validate the argument list at the `new` site.
+    Symbol* ctor = nullptr;
+    int ctorIdx = t->structInfo->findMethodIndex(t->structInfo->name);
+    if (ctorIdx >= 0) ctor = t->structInfo->methods[ctorIdx].symbol;
+
+    if (ctor) {
+        if (e->args.size() != ctor->paramTypes.size()) {
+            error(e->line, e->column, 1,
+                  "Constructor '" + asciiOf(e->typeName) + "' expects " +
+                  std::to_string(ctor->paramTypes.size()) + " argument(s), got " +
+                  std::to_string(e->args.size()));
+        }
+        size_t n = std::min(e->args.size(), ctor->paramTypes.size());
+        for (size_t i = 0; i < n; ++i) {
+            Type* argT = analyzeExpr(e->args[i].get());
+            Type* paramT = ctor->paramTypes[i];
+            if (!paramT->assignableFrom(argT)) {
+                error(e->args[i]->line, e->args[i]->column, 1,
+                      "Argument " + std::to_string(i + 1) + ": expected '" +
+                      paramT->toString() + "', got '" + argT->toString() + "'");
+            }
+        }
+        for (size_t i = n; i < e->args.size(); ++i) analyzeExpr(e->args[i].get());
+    } else {
+        // No constructor declared. `new ClassName()` is fine; passing args is not.
+        if (!e->args.empty()) {
+            error(e->line, e->column, 1,
+                  "Class '" + asciiOf(e->typeName) + "' has no constructor; use 'new " +
+                  asciiOf(e->typeName) + "()'");
+            for (auto& a : e->args) analyzeExpr(a.get());
+        }
     }
     return t;
 }

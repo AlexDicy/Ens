@@ -755,7 +755,28 @@ struct CodeGenerator::Impl {
 
         auto* mallocFn = getOrDeclareMalloc();
         llvm::Value* sizeArg = llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), sizeBytes);
-        return builder->CreateCall(mallocFn, {sizeArg}, "new." + asAscii(t->structInfo->name));
+        llvm::Value* heapPtr = builder->CreateCall(mallocFn, {sizeArg},
+                                                    "new." + asAscii(t->structInfo->name));
+
+        // Invoke constructor (a method whose name matches the class name).
+        int ctorIdx = t->structInfo->findMethodIndex(t->structInfo->name);
+        if (ctorIdx >= 0) {
+            Symbol* ctorSym = t->structInfo->methods[ctorIdx].symbol;
+            auto fnIt = values.find(ctorSym);
+            if (fnIt != values.end()) {
+                std::vector<llvm::Value*> args;
+                args.reserve(e->args.size() + 1);
+                args.push_back(heapPtr);
+                for (auto& a : e->args) {
+                    llvm::Value* v = emitExpr(a.get());
+                    if (!v) return nullptr;
+                    args.push_back(v);
+                }
+                auto* fn = llvm::cast<llvm::Function>(fnIt->second);
+                builder->CreateCall(fn, args);
+            }
+        }
+        return heapPtr;
     }
 
     llvm::Value* emitBuiltinCall(Symbol* sym, CallExpr* e) {
