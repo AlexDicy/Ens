@@ -2,8 +2,8 @@
 #include "../diagnostics/Diagnostic.h"
 #include <string>
 
-static constexpr int PREC_UNARY = 12;
-static constexpr int PREC_POSTFIX = 13;
+static constexpr int PREC_UNARY = 13;
+static constexpr int PREC_POSTFIX = 14;
 
 Parser::Parser(std::vector<Token> ts) : tokens(std::move(ts)) {
     int line = tokens.empty() ? 1 : tokens.back().getLine();
@@ -65,28 +65,32 @@ static bool isAssignmentOp(TokenType t) {
     }
 }
 
+// Ternary `?:` precedence — between assignment (1) and logical OR (3).
+static constexpr int PREC_TERNARY = 2;
+
 int Parser::infixPrecedence(TokenType type) const {
     if (isAssignmentOp(type)) return 1;
     switch (type) {
-        case TokenType::OR:        return 2;
-        case TokenType::AND:       return 3;
-        case TokenType::BIT_OR:    return 4;
-        case TokenType::CARET:     return 5;
-        case TokenType::BIT_AND:   return 6;
+        case TokenType::QUES:      return PREC_TERNARY;
+        case TokenType::OR:        return 3;
+        case TokenType::AND:       return 4;
+        case TokenType::BIT_OR:    return 5;
+        case TokenType::CARET:     return 6;
+        case TokenType::BIT_AND:   return 7;
         case TokenType::EQ_EQ:
-        case TokenType::NOT_EQ:    return 7;
+        case TokenType::NOT_EQ:    return 8;
         case TokenType::LT:
         case TokenType::GT:
         case TokenType::LT_EQ:
-        case TokenType::GT_EQ:     return 8;
+        case TokenType::GT_EQ:     return 9;
         case TokenType::LT_LT:
         case TokenType::GT_GT:
-        case TokenType::GT_GT_GT:  return 9;
+        case TokenType::GT_GT_GT:  return 10;
         case TokenType::PLUS:
-        case TokenType::SUB:       return 10;
+        case TokenType::SUB:       return 11;
         case TokenType::STAR:
         case TokenType::SLASH:
-        case TokenType::PERCENT:   return 11;
+        case TokenType::PERCENT:   return 12;
         case TokenType::DOT:
         case TokenType::L_PAREN:
         case TokenType::L_BRACKET: return PREC_POSTFIX;
@@ -472,6 +476,16 @@ ExprPtr Parser::parsePrecedence(int minPrec) {
             int line = left->line;
             int column = left->column;
             left = std::make_unique<MemberExpr>(std::move(left), nameTok.getText());
+            left->line = line;
+            left->column = column;
+        } else if (tt == TokenType::QUES) {
+            consume();
+            auto thenE = parseExpression();
+            expect(TokenType::COLON, "':' in ternary expression");
+            auto elseE = parsePrecedence(1);  // right-assoc; allow assignment on RHS
+            int line = left->line;
+            int column = left->column;
+            left = std::make_unique<TernaryExpr>(std::move(left), std::move(thenE), std::move(elseE));
             left->line = line;
             left->column = column;
         } else if (isAssignmentOp(tt)) {

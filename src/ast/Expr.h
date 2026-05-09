@@ -109,3 +109,13 @@ public:
         : op(op), target(std::move(t)), value(std::move(v)) {}
     void dump(std::ostream& os, int indent) const override;
 };
+
+class TernaryExpr : public Expr {
+public:
+    ExprPtr cond;
+    ExprPtr thenExpr;
+    ExprPtr elseExpr;
+    TernaryExpr(ExprPtr c, ExprPtr t, ExprPtr e)
+        : cond(std::move(c)), thenExpr(std::move(t)), elseExpr(std::move(e)) {}
+    void dump(std::ostream& os, int indent) const override;
+};

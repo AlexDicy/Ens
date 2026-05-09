@@ -92,3 +92,17 @@ void AssignExpr::dump(std::ostream& os, int indent) const {
     os << "value:\n";
     value->dump(os, indent + 2);
 }
+
+void TernaryExpr::dump(std::ostream& os, int indent) const {
+    writeIndent(os, indent);
+    os << "Ternary\n";
+    writeIndent(os, indent + 1);
+    os << "cond:\n";
+    cond->dump(os, indent + 2);
+    writeIndent(os, indent + 1);
+    os << "then:\n";
+    thenExpr->dump(os, indent + 2);
+    writeIndent(os, indent + 1);
+    os << "else:\n";
+    elseExpr->dump(os, indent + 2);
+}

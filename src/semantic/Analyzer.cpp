@@ -14,6 +14,20 @@ Analyzer::Analyzer() {
     globalScope = scope.get();
     currentScope = globalScope;
     ownedScopes.push_back(std::move(scope));
+
+    registerBuiltins();
+}
+
+void Analyzer::registerBuiltins() {
+    // print(string) -> void  (maps to C `puts` in codegen)
+    Type* voidTy   = typeCtx.getPrimitive(TypeKind::Void);
+    Type* stringTy = typeCtx.getPrimitive(TypeKind::String);
+
+    Symbol* printSym = makeSymbol(SymbolKind::Function, std::u16string(u"print"), nullptr, 0, 0);
+    printSym->returnType = voidTy;
+    printSym->paramTypes = {stringTy};
+    printSym->isBuiltin = true;
+    globalScope->define(printSym);
 }
 
 Symbol* Analyzer::makeSymbol(SymbolKind k, std::u16string n, Type* t, int line, int col) {
@@ -254,6 +268,7 @@ Type* Analyzer::analyzeExpr(Expr* e) {
     else if (auto* m = dynamic_cast<MemberExpr*>(e))   t = analyzeMember(m);
     else if (auto* a = dynamic_cast<AssignExpr*>(e))   t = analyzeAssign(a);
     else if (auto* sub = dynamic_cast<SubscriptExpr*>(e)) t = analyzeSubscript(sub);
+    else if (auto* tern = dynamic_cast<TernaryExpr*>(e))  t = analyzeTernary(tern);
     else                                                t = typeCtx.getError();
     e->resolvedType = t;
     return t;
@@ -447,6 +462,25 @@ Type* Analyzer::analyzeSubscript(SubscriptExpr* e) {
     analyzeExpr(e->object.get());
     analyzeExpr(e->index.get());
     error(e->line, e->column, 1, "Subscript access is not yet supported");
+    return typeCtx.getError();
+}
+
+Type* Analyzer::analyzeTernary(TernaryExpr* e) {
+    Type* condT = analyzeExpr(e->cond.get());
+    Type* thenT = analyzeExpr(e->thenExpr.get());
+    Type* elseT = analyzeExpr(e->elseExpr.get());
+
+    if (!condT->isError() && !condT->isBool()) {
+        error(e->cond->line, e->cond->column, 1,
+              "Ternary condition must be 'bool', got '" + condT->toString() + "'");
+    }
+    if (thenT->isError() || elseT->isError()) return typeCtx.getError();
+    if (thenT->equals(elseT)) return thenT;
+    if (thenT->assignableFrom(elseT)) return thenT;
+    if (elseT->assignableFrom(thenT)) return elseT;
+    error(e->line, e->column, 1,
+          "Ternary branches have incompatible types '" + thenT->toString() +
+          "' and '" + elseT->toString() + "'");
     return typeCtx.getError();
 }
 

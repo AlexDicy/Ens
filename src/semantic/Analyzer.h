@@ -32,6 +32,7 @@ private:
     Symbol* makeSymbol(SymbolKind k, std::u16string n, Type* t, int line, int col);
     Scope* pushScope();
     void popScope();
+    void registerBuiltins();
 
     void collectFunctions(const std::vector<StmtPtr>& program);
     void analyzeFunctionBody(FuncDecl* fn);
@@ -52,6 +53,7 @@ private:
     Type* analyzeMember(MemberExpr* e);
     Type* analyzeAssign(AssignExpr* e);
     Type* analyzeSubscript(SubscriptExpr* e);
+    Type* analyzeTernary(TernaryExpr* e);
 
     Type* resolveTypeNode(TypeNode* node);
     bool isLValue(Expr* e);

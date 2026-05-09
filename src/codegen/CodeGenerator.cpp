@@ -105,7 +105,6 @@ struct CodeGenerator::Impl {
         if (!t) return true;
         switch (t->kind) {
             case TypeKind::Decimal:
-            case TypeKind::String:
             case TypeKind::Optional:
             case TypeKind::Null:
             case TypeKind::Error:
@@ -130,6 +129,7 @@ struct CodeGenerator::Impl {
             case TypeKind::Float:   return llvm::Type::getFloatTy(ctx);
             case TypeKind::Double:  return llvm::Type::getDoubleTy(ctx);
             case TypeKind::Void:    return llvm::Type::getVoidTy(ctx);
+            case TypeKind::String:  return llvm::PointerType::get(ctx, 0);
             default:                return nullptr;
         }
     }
@@ -165,6 +165,11 @@ struct CodeGenerator::Impl {
             case TypeKind::Char:   result = diBuilder->createBasicType("char",   32, llvm::dwarf::DW_ATE_UTF); break;
             case TypeKind::Float:  result = diBuilder->createBasicType("float",  32, llvm::dwarf::DW_ATE_float); break;
             case TypeKind::Double: result = diBuilder->createBasicType("double", 64, llvm::dwarf::DW_ATE_float); break;
+            case TypeKind::String: {
+                auto* byteCharTy = diBuilder->createBasicType("char", 8, llvm::dwarf::DW_ATE_signed_char);
+                result = diBuilder->createPointerType(byteCharTy, 64);
+                break;
+            }
             default:               break;  // void and unsupported types stay null
         }
         if (result) diTypeCache[key] = result;
@@ -432,7 +437,22 @@ struct CodeGenerator::Impl {
             return builder->getInt1(lit->value);
         }
         if (dynamic_cast<NullLitExpr*>(e))   { error(e->line, e->column, "null codegen not yet supported"); return nullptr; }
-        if (dynamic_cast<StringLitExpr*>(e)) { error(e->line, e->column, "string codegen not yet supported"); return nullptr; }
+        if (auto* lit = dynamic_cast<StringLitExpr*>(e)) {
+            std::string utf8;
+            for (char16_t c : lit->value) {
+                if (c < 0x80) {
+                    utf8.push_back(static_cast<char>(c));
+                } else if (c < 0x800) {
+                    utf8.push_back(static_cast<char>(0xC0 | (c >> 6)));
+                    utf8.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+                } else {
+                    utf8.push_back(static_cast<char>(0xE0 | (c >> 12)));
+                    utf8.push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F)));
+                    utf8.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+                }
+            }
+            return builder->CreateGlobalString(utf8, ".str");
+        }
         if (auto* id = dynamic_cast<IdentExpr*>(e))   return emitIdent(id);
         if (auto* b = dynamic_cast<BinaryExpr*>(e))   return emitBinary(b);
         if (auto* u = dynamic_cast<UnaryExpr*>(e))    return emitUnary(u);
@@ -440,7 +460,40 @@ struct CodeGenerator::Impl {
         if (auto* a = dynamic_cast<AssignExpr*>(e))   return emitAssign(a);
         if (dynamic_cast<MemberExpr*>(e))    { error(e->line, e->column, "member access codegen not yet supported"); return nullptr; }
         if (dynamic_cast<SubscriptExpr*>(e)) { error(e->line, e->column, "subscript codegen not yet supported"); return nullptr; }
+        if (auto* tern = dynamic_cast<TernaryExpr*>(e)) return emitTernary(tern);
         return nullptr;
+    }
+
+    llvm::Value* emitTernary(TernaryExpr* e) {
+        llvm::Value* cond = emitExpr(e->cond.get());
+        if (!cond) return nullptr;
+
+        auto* thenBB  = llvm::BasicBlock::Create(ctx, "tern.then", currentFunction);
+        auto* elseBB  = llvm::BasicBlock::Create(ctx, "tern.else", currentFunction);
+        auto* mergeBB = llvm::BasicBlock::Create(ctx, "tern.end",  currentFunction);
+
+        builder->CreateCondBr(cond, thenBB, elseBB);
+
+        builder->SetInsertPoint(thenBB);
+        llvm::Value* thenV = emitExpr(e->thenExpr.get());
+        llvm::BasicBlock* thenEnd = builder->GetInsertBlock();
+        if (thenV && !thenEnd->getTerminator()) builder->CreateBr(mergeBB);
+
+        builder->SetInsertPoint(elseBB);
+        llvm::Value* elseV = emitExpr(e->elseExpr.get());
+        llvm::BasicBlock* elseEnd = builder->GetInsertBlock();
+        if (elseV && !elseEnd->getTerminator()) builder->CreateBr(mergeBB);
+
+        builder->SetInsertPoint(mergeBB);
+        if (!thenV || !elseV) return nullptr;
+        if (thenV->getType() != elseV->getType()) {
+            error(e->line, e->column, "Ternary branches produce different LLVM types");
+            return nullptr;
+        }
+        auto* phi = builder->CreatePHI(thenV->getType(), 2);
+        phi->addIncoming(thenV, thenEnd);
+        phi->addIncoming(elseV, elseEnd);
+        return phi;
     }
 
     llvm::Value* emitIdent(IdentExpr* e) {
@@ -528,13 +581,42 @@ struct CodeGenerator::Impl {
         }
     }
 
+    llvm::Function* getOrDeclarePuts() {
+        if (auto* existing = module->getFunction("puts")) return existing;
+        auto* ty = llvm::FunctionType::get(
+            llvm::Type::getInt32Ty(ctx),
+            { llvm::PointerType::get(ctx, 0) },
+            /*isVarArg*/ false);
+        return llvm::Function::Create(ty, llvm::Function::ExternalLinkage, "puts", module.get());
+    }
+
+    llvm::Value* emitBuiltinCall(Symbol* sym, CallExpr* e) {
+        std::string name = asAscii(sym->name);
+        if (name == "print") {
+            if (e->args.size() != 1) {
+                error(e->line, e->column, "print expects exactly 1 argument");
+                return nullptr;
+            }
+            llvm::Value* arg = emitExpr(e->args[0].get());
+            if (!arg) return nullptr;
+            auto* puts = getOrDeclarePuts();
+            builder->CreateCall(puts, {arg});
+            return nullptr;  // void
+        }
+        error(e->line, e->column, "Unknown builtin '" + name + "'");
+        return nullptr;
+    }
+
     llvm::Value* emitCall(CallExpr* e) {
         auto* idCallee = dynamic_cast<IdentExpr*>(e->callee.get());
         if (!idCallee || !idCallee->resolvedSymbol) {
             error(e->line, e->column, "Only direct function calls are supported");
             return nullptr;
         }
-        auto it = values.find(idCallee->resolvedSymbol);
+        Symbol* sym = idCallee->resolvedSymbol;
+        if (sym->isBuiltin) return emitBuiltinCall(sym, e);
+
+        auto it = values.find(sym);
         if (it == values.end()) {
             error(e->line, e->column, "Internal: callee has no LLVM function");
             return nullptr;

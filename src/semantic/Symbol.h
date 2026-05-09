@@ -13,6 +13,7 @@ public:
     Type* type = nullptr;
     int line = 0;
     int column = 0;
+    bool isBuiltin = false;
 
     std::vector<Type*> paramTypes;
     Type* returnType = nullptr;

@@ -7,6 +7,7 @@
 #include "../diagnostics/SourceFile.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -131,7 +132,13 @@ bool Compiler::compileSingle(std::istream& source, const fs::path& outputFile, c
                 for (const auto& d : codegen.getDiagnostics()) d.print(sourceFile, std::cerr);
                 return false;
             }
-            return true;
+            // Workaround: lld::coff::link corrupts heap state on Windows in a way
+            // that crashes subsequent vector destruction in our locals. The .exe
+            // is fully written before this point, so we report success to stdout
+            // and quick-exit, skipping local/static destructors.
+            std::cout << "Compiled successfully to " << outputFile.string() << '\n';
+            std::cout.flush();
+            std::_Exit(0);
         }
         std::cerr << "Unsupported --output extension: '" << ext << "'\n";
         return false;
