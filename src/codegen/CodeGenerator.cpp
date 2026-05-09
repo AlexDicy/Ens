@@ -43,6 +43,7 @@ struct CodeGenerator::Impl {
     std::unique_ptr<llvm::Module> module;
     std::unique_ptr<llvm::IRBuilder<>> builder;
     std::unique_ptr<llvm::DIBuilder> diBuilder;
+    std::unique_ptr<llvm::TargetMachine> targetMachine;
     std::unordered_map<Symbol*, llvm::Value*> values;
     std::unordered_map<int, llvm::DIType*> diTypeCache;  // keyed by TypeKind
     std::unordered_map<::Type*, llvm::StructType*> structTypeCache;
@@ -169,7 +170,7 @@ struct CodeGenerator::Impl {
 
     llvm::DIType* mapDIType(::Type* t) {
         if (!debugEnabled || !diBuilder || !t) return nullptr;
-        if (t->kind == TypeKind::Struct) return nullptr;  // struct DI temporarily disabled
+        if (t->kind == TypeKind::Struct) return mapDIStructType(t);
         int key = static_cast<int>(t->kind);
         auto it = diTypeCache.find(key);
         if (it != diTypeCache.end()) return it->second;
@@ -206,26 +207,39 @@ struct CodeGenerator::Impl {
         for (char16_t c : t->structInfo->name)
             sname.push_back(c < 128 ? static_cast<char>(c) : '?');
 
-        // Compute offsets sequentially from field DIType sizes. This ignores
-        // platform alignment padding — fine for first iteration; revisit when
-        // we add real layout/alignment control.
+        // Use the LLVM struct layout (driven by the module's DataLayout) for
+        // accurate field offsets and total size — matches what mapStructType
+        // produces and what codegen actually accesses via GEP.
+        auto* st = mapStructType(t);
+        const llvm::DataLayout& dl = module->getDataLayout();
+        const llvm::StructLayout* sl = dl.getStructLayout(st);
+
+        unsigned structLine = static_cast<unsigned>(t->structInfo->line);
         std::vector<llvm::Metadata*> members;
-        uint64_t offsetBits = 0;
-        for (const auto& f : t->structInfo->fields) {
+        members.reserve(t->structInfo->fields.size());
+        for (size_t i = 0; i < t->structInfo->fields.size(); ++i) {
+            const auto& f = t->structInfo->fields[i];
             std::string fname;
             for (char16_t c : f.name)
                 fname.push_back(c < 128 ? static_cast<char>(c) : '?');
             auto* memberType = mapDIType(f.type);
-            uint64_t sizeBits = memberType ? memberType->getSizeInBits() : 0;
+            uint64_t offsetBits = sl->getElementOffsetInBits(static_cast<unsigned>(i));
+            uint64_t sizeBits = memberType
+                ? memberType->getSizeInBits()
+                : dl.getTypeSizeInBits(st->getElementType(static_cast<unsigned>(i)));
+            uint32_t alignBits = static_cast<uint32_t>(
+                dl.getABITypeAlign(st->getElementType(static_cast<unsigned>(i))).value() * 8);
             members.push_back(diBuilder->createMemberType(
-                diCU, fname, diFile, /*line*/ 0,
-                sizeBits, /*alignInBits*/ 0, offsetBits,
+                diCU, fname, diFile, static_cast<unsigned>(f.line),
+                sizeBits, alignBits, offsetBits,
                 llvm::DINode::FlagZero, memberType));
-            offsetBits += sizeBits;
         }
+
+        uint64_t totalBits = dl.getTypeSizeInBits(st);
+        uint32_t structAlignBits = static_cast<uint32_t>(dl.getABITypeAlign(st).value() * 8);
         auto* finalTy = diBuilder->createStructType(
-            diCU, sname, diFile, /*line*/ 0,
-            offsetBits, /*alignInBits*/ 0,
+            diCU, sname, diFile, structLine,
+            totalBits, structAlignBits,
             llvm::DINode::FlagZero, /*derivedFrom*/ nullptr,
             diBuilder->getOrCreateArray(members));
         diStructTypeCache[t] = finalTy;
@@ -241,6 +255,9 @@ struct CodeGenerator::Impl {
     }
 
     bool generate(const std::vector<StmtPtr>& program) {
+        // Set DataLayout up front so DI emission can compute struct offsets.
+        if (!initializeTargetMachine()) return false;
+
         for (auto& s : program) {
             if (auto* fn = dynamic_cast<FuncDecl*>(s.get())) {
                 declareFunction(fn);
@@ -757,7 +774,11 @@ struct CodeGenerator::Impl {
         return ok;
     }
 
-    bool emitObjectFile(const std::string& path) {
+    // Create a persistent TargetMachine for the host triple and stamp its
+    // DataLayout onto the module. Idempotent. Done up front so DI emission
+    // can compute correct struct field offsets via getStructLayout.
+    bool initializeTargetMachine() {
+        if (targetMachine) return true;
         initializeNativeTargetOnce();
 
         std::string triple = llvm::sys::getDefaultTargetTriple();
@@ -770,14 +791,19 @@ struct CodeGenerator::Impl {
 
         llvm::TargetOptions opts;
         std::optional<llvm::Reloc::Model> rm = llvm::Reloc::PIC_;
-        auto* machine = target->createTargetMachine(llvm::Triple(triple), "generic", "", opts, rm);
-        if (!machine) {
+        targetMachine.reset(target->createTargetMachine(
+            llvm::Triple(triple), "generic", "", opts, rm));
+        if (!targetMachine) {
             error(0, 0, "Failed to create TargetMachine for '" + triple + "'");
             return false;
         }
-
-        module->setDataLayout(machine->createDataLayout());
+        module->setDataLayout(targetMachine->createDataLayout());
         module->setTargetTriple(llvm::Triple(triple));
+        return true;
+    }
+
+    bool emitObjectFile(const std::string& path) {
+        if (!targetMachine && !initializeTargetMachine()) return false;
 
         std::error_code ec;
         llvm::raw_fd_ostream dest(path, ec, llvm::sys::fs::OF_None);
@@ -787,7 +813,7 @@ struct CodeGenerator::Impl {
         }
 
         llvm::legacy::PassManager pass;
-        if (machine->addPassesToEmitFile(pass, dest, nullptr, llvm::CodeGenFileType::ObjectFile)) {
+        if (targetMachine->addPassesToEmitFile(pass, dest, nullptr, llvm::CodeGenFileType::ObjectFile)) {
             error(0, 0, "Target does not support object-file emission");
             return false;
         }

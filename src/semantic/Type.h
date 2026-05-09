@@ -16,11 +16,15 @@ class Type;
 struct FieldInfo {
     std::u16string name;
     Type* type;
+    int line = 0;
+    int column = 0;
 };
 
 struct StructInfo {
     std::u16string name;
     std::vector<FieldInfo> fields;
+    int line = 0;
+    int column = 0;
 
     int findFieldIndex(const std::u16string& fieldName) const {
         for (size_t i = 0; i < fields.size(); ++i) {

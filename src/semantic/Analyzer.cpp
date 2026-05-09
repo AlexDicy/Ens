@@ -82,6 +82,8 @@ void Analyzer::collectStructs(const std::vector<StmtPtr>& program) {
             continue;
         }
         sd->resolvedType = typeCtx.registerStruct(sd->name);
+        sd->resolvedType->structInfo->line = sd->line;
+        sd->resolvedType->structInfo->column = sd->column;
     }
     // Second pass: resolve field types now that all struct names exist.
     for (const auto& s : program) {
@@ -89,7 +91,12 @@ void Analyzer::collectStructs(const std::vector<StmtPtr>& program) {
         if (!sd || !sd->resolvedType) continue;
         for (auto& f : sd->fields) {
             Type* ft = resolveTypeNode(f.type.get());
-            sd->resolvedType->structInfo->fields.push_back({f.name, ft});
+            FieldInfo fi;
+            fi.name = f.name;
+            fi.type = ft;
+            fi.line = f.line;
+            fi.column = f.column;
+            sd->resolvedType->structInfo->fields.push_back(std::move(fi));
         }
     }
 }
