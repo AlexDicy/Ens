@@ -3,7 +3,6 @@
 #include <algorithm>
 #include "../../diagnostics/Diagnostic.h"
 #include "../../diagnostics/DiagnosticSink.h"
-#include "../../tokenizer/TokenType.h"
 
 namespace cst::semantic {
 
@@ -620,31 +619,6 @@ Type* CstAnalyzer::analyzeThis(const ast::ThisExpression& expr) {
     return currentThis->type ? currentThis->type : typeCtx.getError();
 }
 
-static TokenType toTokenType(SyntaxKind k) {
-    switch (k) {
-        case SyntaxKind::Plus:      return TokenType::PLUS;
-        case SyntaxKind::Minus:     return TokenType::SUB;
-        case SyntaxKind::Star:      return TokenType::STAR;
-        case SyntaxKind::Slash:     return TokenType::SLASH;
-        case SyntaxKind::Percent:   return TokenType::PERCENT;
-        case SyntaxKind::EqEq:      return TokenType::EQ_EQ;
-        case SyntaxKind::NotEq:     return TokenType::NOT_EQ;
-        case SyntaxKind::Lt:        return TokenType::LT;
-        case SyntaxKind::Gt:        return TokenType::GT;
-        case SyntaxKind::LtEq:      return TokenType::LT_EQ;
-        case SyntaxKind::GtEq:      return TokenType::GT_EQ;
-        case SyntaxKind::AmpAmp:    return TokenType::AND;
-        case SyntaxKind::PipePipe:  return TokenType::OR;
-        case SyntaxKind::Amp:       return TokenType::BIT_AND;
-        case SyntaxKind::Pipe:      return TokenType::BIT_OR;
-        case SyntaxKind::Caret:     return TokenType::CARET;
-        case SyntaxKind::LtLt:      return TokenType::LT_LT;
-        case SyntaxKind::GtGt:      return TokenType::GT_GT;
-        case SyntaxKind::GtGtGt:    return TokenType::GT_GT_GT;
-        default:                    return TokenType::ERROR;
-    }
-}
-
 Type* CstAnalyzer::analyzeBinary(const ast::BinaryExpression& expr) {
     auto left = expr.left();
     auto right = expr.right();
@@ -654,15 +628,14 @@ Type* CstAnalyzer::analyzeBinary(const ast::BinaryExpression& expr) {
     if (l->isError() || r->isError()) return typeCtx.getError();
 
     auto opTok = expr.operatorToken();
-    SyntaxKind opKind = opTok ? opTok->kind() : SyntaxKind::Invalid;
-    TokenType op = toTokenType(opKind);
+    SyntaxKind op = opTok ? opTok->kind() : SyntaxKind::Invalid;
 
     switch (op) {
-        case TokenType::PLUS:
-        case TokenType::SUB:
-        case TokenType::STAR:
-        case TokenType::SLASH:
-        case TokenType::PERCENT:
+        case SyntaxKind::Plus:
+        case SyntaxKind::Minus:
+        case SyntaxKind::Star:
+        case SyntaxKind::Slash:
+        case SyntaxKind::Percent:
             if (!l->isNumeric() || !r->isNumeric()) {
                 errorAtNode(expr.node, "Operator requires numeric operands, got '" +
                     l->toString() + "' and '" + r->toString() + "'");
@@ -675,37 +648,37 @@ Type* CstAnalyzer::analyzeBinary(const ast::BinaryExpression& expr) {
             }
             return l;
 
-        case TokenType::EQ_EQ:
-        case TokenType::NOT_EQ:
+        case SyntaxKind::EqEq:
+        case SyntaxKind::NotEq:
             if (!l->assignableFrom(r) && !r->assignableFrom(l)) {
                 errorAtNode(expr.node, "Cannot compare '" + l->toString() + "' and '" + r->toString() + "'");
             }
             return typeCtx.getPrimitive(TypeKind::Bool);
 
-        case TokenType::LT:
-        case TokenType::GT:
-        case TokenType::LT_EQ:
-        case TokenType::GT_EQ:
+        case SyntaxKind::Lt:
+        case SyntaxKind::Gt:
+        case SyntaxKind::LtEq:
+        case SyntaxKind::GtEq:
             if (!l->isNumeric() || !r->isNumeric() || !l->equals(r)) {
                 errorAtNode(expr.node, "Comparison requires matching numeric operands, got '" +
                     l->toString() + "' and '" + r->toString() + "'");
             }
             return typeCtx.getPrimitive(TypeKind::Bool);
 
-        case TokenType::AND:
-        case TokenType::OR:
+        case SyntaxKind::AmpAmp:
+        case SyntaxKind::PipePipe:
             if (!l->isBool() || !r->isBool()) {
                 errorAtNode(expr.node, "Logical operator requires bool operands, got '" +
                     l->toString() + "' and '" + r->toString() + "'");
             }
             return typeCtx.getPrimitive(TypeKind::Bool);
 
-        case TokenType::BIT_AND:
-        case TokenType::BIT_OR:
-        case TokenType::CARET:
-        case TokenType::LT_LT:
-        case TokenType::GT_GT:
-        case TokenType::GT_GT_GT:
+        case SyntaxKind::Amp:
+        case SyntaxKind::Pipe:
+        case SyntaxKind::Caret:
+        case SyntaxKind::LtLt:
+        case SyntaxKind::GtGt:
+        case SyntaxKind::GtGtGt:
             if (!l->isInteger() || !r->isInteger() || !l->equals(r)) {
                 errorAtNode(expr.node, "Bitwise operator requires matching integer operands, got '" +
                     l->toString() + "' and '" + r->toString() + "'");

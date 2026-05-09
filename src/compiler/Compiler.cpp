@@ -1,8 +1,4 @@
 #include "Compiler.h"
-#include "../tokenizer/Tokenizer.h"
-#include "../parser/Parser.h"
-#include "../semantic/Analyzer.h"
-#include "../codegen/CodeGenerator.h"
 #include "../codegen/Linker.h"
 #include "../cst/CstParser.h"
 #include "../cst/SyntaxNode.h"
@@ -171,7 +167,7 @@ bool Compiler::analyzeCst(std::istream& source, const std::string& filename) {
     return !sink.hasErrors();
 }
 
-bool Compiler::compileViaCst(std::istream& source, const fs::path& outputFile, const std::string& filename) {
+bool Compiler::compileSingle(std::istream& source, const fs::path& outputFile, const std::string& filename) {
     std::string code((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
     std::u16string u16code(code.begin(), code.end());
     SourceFile sourceFile(filename, std::move(u16code));
@@ -242,88 +238,4 @@ bool Compiler::compileViaCst(std::istream& source, const fs::path& outputFile, c
         return true;
     }
     return true;
-}
-
-bool Compiler::compileSingle(std::istream& source, const fs::path& outputFile, const std::string& filename) {
-    std::string code((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
-    std::u16string u16code(code.begin(), code.end());
-    SourceFile sourceFile(filename, std::move(u16code));
-
-    try {
-        auto tokens = Tokenizer::tokenize(sourceFile.getSource());
-        Parser parser(std::move(tokens));
-        auto stmts = parser.parseProgram();
-
-        Analyzer analyzer;
-        analyzer.analyze(stmts);
-        if (analyzer.hasErrors()) {
-            for (const auto& d : analyzer.getDiagnostics()) {
-                d.print(sourceFile, std::cerr);
-            }
-            return false;
-        }
-
-        // Pick output mode from --output extension; default is IR to stdout.
-        std::string ext = outputFile.extension().string();
-        for (auto& c : ext) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
-        const bool linkToExe = !outputFile.empty() && (ext == ".exe" || ext.empty());
-
-        // For exe output, emit object to a sibling .obj path, then drop codegen
-        // BEFORE invoking the linker.
-        fs::path objPath;
-        if (linkToExe) {
-            objPath = outputFile;
-            objPath.replace_extension(".obj");
-        }
-
-        {
-            CodeGenerator codegen("ens_module", filename);
-            if (!codegen.generate(stmts)) {
-                for (const auto& d : codegen.getDiagnostics()) d.print(sourceFile, std::cerr);
-                return false;
-            }
-
-            if (outputFile.empty()) {
-                std::cout << "--- LLVM IR ---\n";
-                codegen.print(std::cout);
-                return true;
-            }
-            if (ext == ".ll") {
-                std::ofstream out(outputFile);
-                if (!out) {
-                    std::cerr << "Could not open '" << outputFile << "' for writing\n";
-                    return false;
-                }
-                codegen.print(out);
-                return true;
-            }
-            if (ext == ".obj" || ext == ".o") {
-                if (!codegen.emitObjectFile(outputFile.string())) {
-                    for (const auto& d : codegen.getDiagnostics()) d.print(sourceFile, std::cerr);
-                    return false;
-                }
-                return true;
-            }
-            if (linkToExe) {
-                if (!codegen.emitObjectFile(objPath.string())) {
-                    for (const auto& d : codegen.getDiagnostics()) d.print(sourceFile, std::cerr);
-                    return false;
-                }
-            } else {
-                std::cerr << "Unsupported --output extension: '" << ext << "'\n";
-                return false;
-            }
-        }  // codegen LLVM context destroyed
-
-        if (linkToExe) {
-            if (!Linker::link(objPath.string(), outputFile.string(), std::cerr)) {
-                return false;
-            }
-            return true;
-        }
-        return true;
-    } catch (const Diagnostic& d) {
-        d.print(sourceFile, std::cerr);
-        return false;
-    }
 }

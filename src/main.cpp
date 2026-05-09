@@ -42,19 +42,6 @@ static bool execute(const std::unordered_map<std::string, std::string>& argument
         throw std::invalid_argument("The specified output is a directory; please specify a file path");
     }
 
-    if (arguments.count("--cst-compile")) {
-        if (arguments.count("--source")) {
-            fs::path source = arguments.at("--source");
-            std::ifstream file(source);
-            if (!file) {
-                std::cerr << "ERROR: Couldn't read " << source << '\n';
-                return false;
-            }
-            return Compiler::compileViaCst(file, outputFile, source.string());
-        }
-        return Compiler::compileViaCst(std::cin, outputFile);
-    }
-
     if (arguments.count("--source")) {
         fs::path source = arguments.at("--source");
         fs::path sourcePath = fs::is_directory(source) ? source : source.parent_path();
@@ -65,8 +52,7 @@ static bool execute(const std::unordered_map<std::string, std::string>& argument
 }
 
 static bool isBooleanFlag(const std::string& arg) {
-    return arg == "-h" || arg == "--help" || arg == "--cst-dump" || arg == "--cst-analyze" ||
-           arg == "--cst-compile";
+    return arg == "-h" || arg == "--help" || arg == "--cst-dump" || arg == "--cst-analyze";
 }
 
 static std::unordered_map<std::string, std::string> parseArguments(int argc, char* argv[]) {

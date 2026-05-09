@@ -5,7 +5,6 @@
 #include "../ast/TypeReference.h"
 #include "../../semantic/Symbol.h"
 #include "../../semantic/Type.h"
-#include "../../tokenizer/TokenType.h"
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -742,31 +741,6 @@ struct CstCodeGenerator::Impl {
         return builder->CreateLoad(llvm::PointerType::get(ctx, 0), it->second, "this");
     }
 
-    static TokenType binaryOpFromKind(SyntaxKind k) {
-        switch (k) {
-            case SyntaxKind::Plus:      return TokenType::PLUS;
-            case SyntaxKind::Minus:     return TokenType::SUB;
-            case SyntaxKind::Star:      return TokenType::STAR;
-            case SyntaxKind::Slash:     return TokenType::SLASH;
-            case SyntaxKind::Percent:   return TokenType::PERCENT;
-            case SyntaxKind::EqEq:      return TokenType::EQ_EQ;
-            case SyntaxKind::NotEq:     return TokenType::NOT_EQ;
-            case SyntaxKind::Lt:        return TokenType::LT;
-            case SyntaxKind::Gt:        return TokenType::GT;
-            case SyntaxKind::LtEq:      return TokenType::LT_EQ;
-            case SyntaxKind::GtEq:      return TokenType::GT_EQ;
-            case SyntaxKind::AmpAmp:    return TokenType::AND;
-            case SyntaxKind::PipePipe:  return TokenType::OR;
-            case SyntaxKind::Amp:       return TokenType::BIT_AND;
-            case SyntaxKind::Pipe:      return TokenType::BIT_OR;
-            case SyntaxKind::Caret:     return TokenType::CARET;
-            case SyntaxKind::LtLt:      return TokenType::LT_LT;
-            case SyntaxKind::GtGt:      return TokenType::GT_GT;
-            case SyntaxKind::GtGtGt:    return TokenType::GT_GT_GT;
-            default:                    return TokenType::ERROR;
-        }
-    }
-
     llvm::Value* emitBinary(const ast::BinaryExpression& e) {
         auto leftE = e.left();
         auto rightE = e.right();
@@ -778,27 +752,27 @@ struct CstCodeGenerator::Impl {
         bool flt = leftType && leftType->isFloat();
         bool sgn = isSigned(leftType);
         auto opTok = e.operatorToken();
-        TokenType op = opTok ? binaryOpFromKind(opTok->kind()) : TokenType::ERROR;
+        SyntaxKind op = opTok ? opTok->kind() : SyntaxKind::Invalid;
         switch (op) {
-            case TokenType::PLUS:    return flt ? builder->CreateFAdd(L, R) : builder->CreateAdd(L, R);
-            case TokenType::SUB:     return flt ? builder->CreateFSub(L, R) : builder->CreateSub(L, R);
-            case TokenType::STAR:    return flt ? builder->CreateFMul(L, R) : builder->CreateMul(L, R);
-            case TokenType::SLASH:   return flt ? builder->CreateFDiv(L, R) : (sgn ? builder->CreateSDiv(L, R) : builder->CreateUDiv(L, R));
-            case TokenType::PERCENT: return flt ? builder->CreateFRem(L, R) : (sgn ? builder->CreateSRem(L, R) : builder->CreateURem(L, R));
-            case TokenType::EQ_EQ:   return flt ? builder->CreateFCmpOEQ(L, R) : builder->CreateICmpEQ(L, R);
-            case TokenType::NOT_EQ:  return flt ? builder->CreateFCmpONE(L, R) : builder->CreateICmpNE(L, R);
-            case TokenType::LT:      return flt ? builder->CreateFCmpOLT(L, R) : (sgn ? builder->CreateICmpSLT(L, R) : builder->CreateICmpULT(L, R));
-            case TokenType::GT:      return flt ? builder->CreateFCmpOGT(L, R) : (sgn ? builder->CreateICmpSGT(L, R) : builder->CreateICmpUGT(L, R));
-            case TokenType::LT_EQ:   return flt ? builder->CreateFCmpOLE(L, R) : (sgn ? builder->CreateICmpSLE(L, R) : builder->CreateICmpULE(L, R));
-            case TokenType::GT_EQ:   return flt ? builder->CreateFCmpOGE(L, R) : (sgn ? builder->CreateICmpSGE(L, R) : builder->CreateICmpUGE(L, R));
-            case TokenType::AND:
-            case TokenType::BIT_AND: return builder->CreateAnd(L, R);
-            case TokenType::OR:
-            case TokenType::BIT_OR:  return builder->CreateOr(L, R);
-            case TokenType::CARET:   return builder->CreateXor(L, R);
-            case TokenType::LT_LT:   return builder->CreateShl(L, R);
-            case TokenType::GT_GT:   return sgn ? builder->CreateAShr(L, R) : builder->CreateLShr(L, R);
-            case TokenType::GT_GT_GT: return builder->CreateLShr(L, R);
+            case SyntaxKind::Plus:    return flt ? builder->CreateFAdd(L, R) : builder->CreateAdd(L, R);
+            case SyntaxKind::Minus:   return flt ? builder->CreateFSub(L, R) : builder->CreateSub(L, R);
+            case SyntaxKind::Star:    return flt ? builder->CreateFMul(L, R) : builder->CreateMul(L, R);
+            case SyntaxKind::Slash:   return flt ? builder->CreateFDiv(L, R) : (sgn ? builder->CreateSDiv(L, R) : builder->CreateUDiv(L, R));
+            case SyntaxKind::Percent: return flt ? builder->CreateFRem(L, R) : (sgn ? builder->CreateSRem(L, R) : builder->CreateURem(L, R));
+            case SyntaxKind::EqEq:    return flt ? builder->CreateFCmpOEQ(L, R) : builder->CreateICmpEQ(L, R);
+            case SyntaxKind::NotEq:   return flt ? builder->CreateFCmpONE(L, R) : builder->CreateICmpNE(L, R);
+            case SyntaxKind::Lt:      return flt ? builder->CreateFCmpOLT(L, R) : (sgn ? builder->CreateICmpSLT(L, R) : builder->CreateICmpULT(L, R));
+            case SyntaxKind::Gt:      return flt ? builder->CreateFCmpOGT(L, R) : (sgn ? builder->CreateICmpSGT(L, R) : builder->CreateICmpUGT(L, R));
+            case SyntaxKind::LtEq:    return flt ? builder->CreateFCmpOLE(L, R) : (sgn ? builder->CreateICmpSLE(L, R) : builder->CreateICmpULE(L, R));
+            case SyntaxKind::GtEq:    return flt ? builder->CreateFCmpOGE(L, R) : (sgn ? builder->CreateICmpSGE(L, R) : builder->CreateICmpUGE(L, R));
+            case SyntaxKind::AmpAmp:
+            case SyntaxKind::Amp:     return builder->CreateAnd(L, R);
+            case SyntaxKind::PipePipe:
+            case SyntaxKind::Pipe:    return builder->CreateOr(L, R);
+            case SyntaxKind::Caret:   return builder->CreateXor(L, R);
+            case SyntaxKind::LtLt:    return builder->CreateShl(L, R);
+            case SyntaxKind::GtGt:    return sgn ? builder->CreateAShr(L, R) : builder->CreateLShr(L, R);
+            case SyntaxKind::GtGtGt:  return builder->CreateLShr(L, R);
             default:
                 error(e.node.startOffset(), "Unsupported binary operator in codegen");
                 return nullptr;

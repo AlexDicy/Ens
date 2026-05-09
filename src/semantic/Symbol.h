@@ -3,7 +3,6 @@
 #include <vector>
 
 class Type;
-class FuncDecl;
 class GreenElement;
 
 enum class SymbolKind { Variable, Parameter, Function };
@@ -19,7 +18,6 @@ public:
 
     std::vector<Type*> paramTypes;
     Type* returnType = nullptr;
-    FuncDecl* funcDecl = nullptr;
     const GreenElement* funcDeclCst = nullptr;
 
     Symbol(SymbolKind k, std::u16string n, Type* t, int l, int c)
