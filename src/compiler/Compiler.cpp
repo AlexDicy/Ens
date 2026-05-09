@@ -1,13 +1,13 @@
 #include "Compiler.h"
+#include "../ast/Declaration.h"
+#include "../codegen/CodeGenerator.h"
 #include "../codegen/Linker.h"
-#include "../cst/CstParser.h"
 #include "../cst/SyntaxNode.h"
-#include "../cst/ast/Declaration.h"
-#include "../cst/codegen/CstCodeGenerator.h"
-#include "../cst/semantic/CstAnalyzer.h"
 #include "../diagnostics/Diagnostic.h"
 #include "../diagnostics/DiagnosticSink.h"
 #include "../diagnostics/SourceFile.h"
+#include "../parser/Parser.h"
+#include "../semantic/Analyzer.h"
 
 #include <algorithm>
 #include <fstream>
@@ -72,7 +72,7 @@ static std::string asAscii16(std::u16string_view s) {
 }
 
 static void dumpTypedOutline(const SyntaxNode& root, std::ostream& os) {
-    auto sf = cst::ast::SourceFile::cast(root);
+    auto sf = ast::SourceFile::cast(root);
     if (!sf) return;
     os << "\n--- Typed outline ---\n";
     for (auto& fn : sf->functions()) {
@@ -134,7 +134,7 @@ bool Compiler::dumpCst(std::istream& source, const std::string& filename) {
     SourceFile sourceFile(filename, std::move(u16code));
 
     DiagnosticSink sink;
-    CstParser parser(sourceFile.getSource(), sink);
+    Parser parser(sourceFile.getSource(), sink);
     auto root = parser.parseSourceFile();
 
     auto rootNode = SyntaxNode::makeRoot(root.get());
@@ -154,11 +154,11 @@ bool Compiler::analyzeCst(std::istream& source, const std::string& filename) {
     SourceFile sourceFile(filename, std::move(u16code));
 
     DiagnosticSink sink;
-    CstParser parser(sourceFile.getSource(), sink);
+    Parser parser(sourceFile.getSource(), sink);
     auto root = parser.parseSourceFile();
     auto rootNode = SyntaxNode::makeRoot(root.get());
 
-    cst::semantic::CstAnalyzer analyzer(sourceFile, sink);
+    Analyzer analyzer(sourceFile, sink);
     analyzer.analyze(*rootNode);
 
     if (!sink.empty()) {
@@ -173,11 +173,11 @@ bool Compiler::compileSingle(std::istream& source, const fs::path& outputFile, c
     SourceFile sourceFile(filename, std::move(u16code));
 
     DiagnosticSink sink;
-    CstParser parser(sourceFile.getSource(), sink);
+    Parser parser(sourceFile.getSource(), sink);
     auto root = parser.parseSourceFile();
     auto rootNode = SyntaxNode::makeRoot(root.get());
 
-    cst::semantic::CstAnalyzer analyzer(sourceFile, sink);
+    Analyzer analyzer(sourceFile, sink);
     analyzer.analyze(*rootNode);
 
     if (sink.hasErrors()) {
@@ -196,7 +196,7 @@ bool Compiler::compileSingle(std::istream& source, const fs::path& outputFile, c
     }
 
     {
-        CstCodeGenerator codegen("ens_module", filename, sourceFile, analyzer.result());
+        CodeGenerator codegen("ens_module", filename, sourceFile, analyzer.result());
         if (!codegen.generate(*rootNode)) {
             for (const auto& d : codegen.getDiagnostics()) d.print(sourceFile, std::cerr);
             return false;

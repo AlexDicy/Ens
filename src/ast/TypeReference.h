@@ -1,9 +1,9 @@
 #pragma once
 #include <optional>
-#include "../SyntaxNode.h"
+#include "../cst/SyntaxNode.h"
 #include "Common.h"
 
-namespace cst::ast {
+namespace ast {
 
 class TypeReference {
 public:
@@ -19,4 +19,4 @@ public:
     bool isOptional() const;
 };
 
-}  // namespace cst::ast
+}  // namespace ast

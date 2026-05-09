@@ -1,10 +1,10 @@
-#include "CstCodeGenerator.h"
+#include "CodeGenerator.h"
 #include "../ast/Declaration.h"
 #include "../ast/Expression.h"
 #include "../ast/Statement.h"
 #include "../ast/TypeReference.h"
-#include "../../semantic/Symbol.h"
-#include "../../semantic/Type.h"
+#include "../semantic/Symbol.h"
+#include "../semantic/Type.h"
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -30,9 +30,6 @@
 #include <optional>
 #include <unordered_map>
 
-namespace ast = cst::ast;
-namespace sema = cst::semantic;
-
 static std::string asAscii(std::u16string_view s) {
     std::string r;
     r.reserve(s.size());
@@ -40,11 +37,11 @@ static std::string asAscii(std::u16string_view s) {
     return r;
 }
 
-struct CstCodeGenerator::Impl {
+struct CodeGenerator::Impl {
     std::string moduleName;
     std::string sourceFilename;
     const SourceFile& sourceFile;
-    const sema::AnalysisResult& analysis;
+    const AnalysisResult& analysis;
 
     llvm::LLVMContext ctx;
     std::unique_ptr<llvm::Module> module;
@@ -63,7 +60,7 @@ struct CstCodeGenerator::Impl {
     bool debugEnabled = true;
     std::vector<Diagnostic> diagnostics;
 
-    Impl(std::string mn, std::string sf, const SourceFile& src, const sema::AnalysisResult& an)
+    Impl(std::string mn, std::string sf, const SourceFile& src, const AnalysisResult& an)
         : moduleName(std::move(mn)), sourceFilename(std::move(sf)),
           sourceFile(src), analysis(an) {
         module = std::make_unique<llvm::Module>(moduleName, ctx);
@@ -1112,16 +1109,16 @@ struct CstCodeGenerator::Impl {
     }
 };
 
-CstCodeGenerator::CstCodeGenerator(std::string moduleName,
+CodeGenerator::CodeGenerator(std::string moduleName,
                                    std::string sourceFilename,
                                    const SourceFile& src,
-                                   const sema::AnalysisResult& analysis)
+                                   const AnalysisResult& analysis)
     : impl(std::make_unique<Impl>(std::move(moduleName), std::move(sourceFilename), src, analysis)) {}
 
-CstCodeGenerator::~CstCodeGenerator() = default;
+CodeGenerator::~CodeGenerator() = default;
 
-bool CstCodeGenerator::generate(const SyntaxNode& root) { return impl->generate(root); }
-void CstCodeGenerator::print(std::ostream& os) const    { impl->print(os); }
-bool CstCodeGenerator::emitObjectFile(const std::string& path) { return impl->emitObjectFile(path); }
-bool CstCodeGenerator::hasErrors() const                { return !impl->diagnostics.empty(); }
-const std::vector<Diagnostic>& CstCodeGenerator::getDiagnostics() const { return impl->diagnostics; }
+bool CodeGenerator::generate(const SyntaxNode& root) { return impl->generate(root); }
+void CodeGenerator::print(std::ostream& os) const    { impl->print(os); }
+bool CodeGenerator::emitObjectFile(const std::string& path) { return impl->emitObjectFile(path); }
+bool CodeGenerator::hasErrors() const                { return !impl->diagnostics.empty(); }
+const std::vector<Diagnostic>& CodeGenerator::getDiagnostics() const { return impl->diagnostics; }

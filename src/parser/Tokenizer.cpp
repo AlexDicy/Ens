@@ -1,4 +1,4 @@
-#include "CstTokenizer.h"
+#include "Tokenizer.h"
 
 #include <utility>
 #include "../diagnostics/Diagnostic.h"
@@ -28,19 +28,19 @@ bool isIdentContinue(char16_t c) {
 
 }  // namespace
 
-CstTokenizer::CstTokenizer(std::u16string_view src, DiagnosticSink& s)
+Tokenizer::Tokenizer(std::u16string_view src, DiagnosticSink& s)
     : source(src), sink(s) {}
 
-bool CstTokenizer::atEnd() const {
+bool Tokenizer::atEnd() const {
     return pos >= source.size();
 }
 
-char16_t CstTokenizer::peek(uint32_t offset) const {
+char16_t Tokenizer::peek(uint32_t offset) const {
     uint32_t idx = pos + offset;
     return idx < source.size() ? source[idx] : u'\0';
 }
 
-void CstTokenizer::advance() {
+void Tokenizer::advance() {
     if (pos >= source.size()) return;
     char16_t c = source[pos];
     pos++;
@@ -56,7 +56,7 @@ void CstTokenizer::advance() {
     }
 }
 
-LexedToken CstTokenizer::makeToken(SyntaxKind kind, uint32_t startPos, int startLine, int startCol) {
+LexedToken Tokenizer::makeToken(SyntaxKind kind, uint32_t startPos, int startLine, int startCol) {
     LexedToken t;
     t.kind = kind;
     t.text = std::u16string(source.substr(startPos, pos - startPos));
@@ -66,7 +66,7 @@ LexedToken CstTokenizer::makeToken(SyntaxKind kind, uint32_t startPos, int start
     return t;
 }
 
-LexedToken CstTokenizer::next() {
+LexedToken Tokenizer::next() {
     if (atEnd()) {
         LexedToken t;
         t.kind = SyntaxKind::EndOfFile;
@@ -108,7 +108,7 @@ LexedToken CstTokenizer::next() {
     return lexOperator(startPos, startLine, startCol);
 }
 
-LexedToken CstTokenizer::lexWhitespace(uint32_t startPos, int startLine, int startCol) {
+LexedToken Tokenizer::lexWhitespace(uint32_t startPos, int startLine, int startCol) {
     while (!atEnd()) {
         char16_t c = peek();
         if (c == u' ' || c == u'\t' || c == u'\f' || c == 0xB) advance();
@@ -117,12 +117,12 @@ LexedToken CstTokenizer::lexWhitespace(uint32_t startPos, int startLine, int sta
     return makeToken(SyntaxKind::Whitespace, startPos, startLine, startCol);
 }
 
-LexedToken CstTokenizer::lexNewline(uint32_t startPos, int startLine, int startCol) {
+LexedToken Tokenizer::lexNewline(uint32_t startPos, int startLine, int startCol) {
     advance();  // consume one line terminator (advance() handles CRLF as a unit)
     return makeToken(SyntaxKind::Newline, startPos, startLine, startCol);
 }
 
-LexedToken CstTokenizer::lexLineComment(uint32_t startPos, int startLine, int startCol) {
+LexedToken Tokenizer::lexLineComment(uint32_t startPos, int startLine, int startCol) {
     advance(); advance();  // //
     while (!atEnd()) {
         char16_t c = peek();
@@ -132,7 +132,7 @@ LexedToken CstTokenizer::lexLineComment(uint32_t startPos, int startLine, int st
     return makeToken(SyntaxKind::LineComment, startPos, startLine, startCol);
 }
 
-LexedToken CstTokenizer::lexBlockComment(uint32_t startPos, int startLine, int startCol) {
+LexedToken Tokenizer::lexBlockComment(uint32_t startPos, int startLine, int startCol) {
     advance(); advance();  // /*
     bool closed = false;
     while (!atEnd()) {
@@ -151,7 +151,7 @@ LexedToken CstTokenizer::lexBlockComment(uint32_t startPos, int startLine, int s
     return makeToken(SyntaxKind::BlockComment, startPos, startLine, startCol);
 }
 
-LexedToken CstTokenizer::lexIdentifierOrKeyword(uint32_t startPos, int startLine, int startCol) {
+LexedToken Tokenizer::lexIdentifierOrKeyword(uint32_t startPos, int startLine, int startCol) {
     while (!atEnd() && isIdentContinue(peek())) advance();
     std::u16string text(source.substr(startPos, pos - startPos));
     SyntaxKind kind = keywordKindFromText(text);
@@ -164,7 +164,7 @@ LexedToken CstTokenizer::lexIdentifierOrKeyword(uint32_t startPos, int startLine
     return t;
 }
 
-LexedToken CstTokenizer::lexNumber(uint32_t startPos, int startLine, int startCol) {
+LexedToken Tokenizer::lexNumber(uint32_t startPos, int startLine, int startCol) {
     bool isFloat = false;
     bool isLong = false;
     bool isFloatSuffix = false;
@@ -214,7 +214,7 @@ LexedToken CstTokenizer::lexNumber(uint32_t startPos, int startLine, int startCo
     return makeToken(kind, startPos, startLine, startCol);
 }
 
-LexedToken CstTokenizer::lexString(uint32_t startPos, int startLine, int startCol) {
+LexedToken Tokenizer::lexString(uint32_t startPos, int startLine, int startCol) {
     advance();  // opening "
     bool closed = false;
     while (!atEnd()) {
@@ -235,7 +235,7 @@ LexedToken CstTokenizer::lexString(uint32_t startPos, int startLine, int startCo
     return makeToken(SyntaxKind::StringLiteral, startPos, startLine, startCol);
 }
 
-LexedToken CstTokenizer::lexChar(uint32_t startPos, int startLine, int startCol) {
+LexedToken Tokenizer::lexChar(uint32_t startPos, int startLine, int startCol) {
     advance();  // opening '
     bool closed = false;
     while (!atEnd()) {
@@ -256,7 +256,7 @@ LexedToken CstTokenizer::lexChar(uint32_t startPos, int startLine, int startCol)
     return makeToken(SyntaxKind::CharLiteral, startPos, startLine, startCol);
 }
 
-LexedToken CstTokenizer::lexOperator(uint32_t startPos, int startLine, int startCol) {
+LexedToken Tokenizer::lexOperator(uint32_t startPos, int startLine, int startCol) {
     char16_t c0 = peek(0);
     char16_t c1 = peek(1);
     char16_t c2 = peek(2);

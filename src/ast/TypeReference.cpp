@@ -1,6 +1,6 @@
 #include "TypeReference.h"
 
-namespace cst::ast {
+namespace ast {
 
 std::optional<SyntaxNode> TypeReference::nameToken() const {
     for (auto& c : node.children()) {
@@ -22,4 +22,4 @@ bool TypeReference::isOptional() const {
     return false;
 }
 
-}  // namespace cst::ast
+}  // namespace ast

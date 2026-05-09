@@ -3,18 +3,18 @@
 #include <ostream>
 #include <string>
 #include <vector>
-#include "../../diagnostics/Diagnostic.h"
-#include "../../diagnostics/SourceFile.h"
-#include "../SyntaxNode.h"
+#include "../diagnostics/Diagnostic.h"
+#include "../diagnostics/SourceFile.h"
+#include "../cst/SyntaxNode.h"
 #include "../semantic/AnalysisResult.h"
 
-class CstCodeGenerator {
+class CodeGenerator {
 public:
-    CstCodeGenerator(std::string moduleName,
-                     std::string sourceFilename,
-                     const SourceFile& sourceFile,
-                     const cst::semantic::AnalysisResult& analysis);
-    ~CstCodeGenerator();
+    CodeGenerator(std::string moduleName,
+                  std::string sourceFilename,
+                  const SourceFile& sourceFile,
+                  const AnalysisResult& analysis);
+    ~CodeGenerator();
 
     bool generate(const SyntaxNode& sourceFileRoot);
     void print(std::ostream& os) const;

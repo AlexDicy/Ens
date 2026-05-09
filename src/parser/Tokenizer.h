@@ -2,7 +2,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
-#include "SyntaxKind.h"
+#include "../cst/SyntaxKind.h"
 
 class DiagnosticSink;
 
@@ -14,9 +14,9 @@ struct LexedToken {
     int column;
 };
 
-class CstTokenizer {
+class Tokenizer {
 public:
-    CstTokenizer(std::u16string_view source, DiagnosticSink& sink);
+    Tokenizer(std::u16string_view source, DiagnosticSink& sink);
 
     LexedToken next();
     bool atEnd() const;

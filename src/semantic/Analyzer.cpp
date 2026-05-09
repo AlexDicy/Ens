@@ -1,10 +1,8 @@
-#include "CstAnalyzer.h"
+#include "Analyzer.h"
 
 #include <algorithm>
-#include "../../diagnostics/Diagnostic.h"
-#include "../../diagnostics/DiagnosticSink.h"
-
-namespace cst::semantic {
+#include "../diagnostics/Diagnostic.h"
+#include "../diagnostics/DiagnosticSink.h"
 
 static std::string asciiOf(std::u16string_view s) {
     std::string r;
@@ -17,7 +15,7 @@ static std::string asciiOf(std::u16string_view s) {
 // Construction / scaffolding
 // =========================================================
 
-CstAnalyzer::CstAnalyzer(const SourceFile& src, DiagnosticSink& s)
+Analyzer::Analyzer(const SourceFile& src, DiagnosticSink& s)
     : source(src), sink(s) {
     auto scope = std::make_unique<Scope>(nullptr);
     globalScope = scope.get();
@@ -26,7 +24,7 @@ CstAnalyzer::CstAnalyzer(const SourceFile& src, DiagnosticSink& s)
     registerBuiltins();
 }
 
-void CstAnalyzer::registerBuiltins() {
+void Analyzer::registerBuiltins() {
     Type* voidTy   = typeCtx.getPrimitive(TypeKind::Void);
     Type* stringTy = typeCtx.getPrimitive(TypeKind::String);
 
@@ -37,7 +35,7 @@ void CstAnalyzer::registerBuiltins() {
     globalScope->define(printSym);
 }
 
-Symbol* CstAnalyzer::makeSymbol(SymbolKind k, std::u16string n, Type* t, uint32_t offset) {
+Symbol* Analyzer::makeSymbol(SymbolKind k, std::u16string n, Type* t, uint32_t offset) {
     auto [line, column] = source.offsetToPosition(offset);
     auto s = std::make_unique<Symbol>(k, std::move(n), t, line, column);
     Symbol* raw = s.get();
@@ -45,7 +43,7 @@ Symbol* CstAnalyzer::makeSymbol(SymbolKind k, std::u16string n, Type* t, uint32_
     return raw;
 }
 
-Scope* CstAnalyzer::pushScope() {
+Scope* Analyzer::pushScope() {
     auto scope = std::make_unique<Scope>(currentScope);
     Scope* raw = scope.get();
     ownedScopes.push_back(std::move(scope));
@@ -53,19 +51,19 @@ Scope* CstAnalyzer::pushScope() {
     return raw;
 }
 
-void CstAnalyzer::popScope() {
+void Analyzer::popScope() {
     if (currentScope && currentScope->parent) currentScope = currentScope->parent;
 }
 
-int CstAnalyzer::lineOf(uint32_t offset) const   { return source.offsetToPosition(offset).first; }
-int CstAnalyzer::columnOf(uint32_t offset) const { return source.offsetToPosition(offset).second; }
+int Analyzer::lineOf(uint32_t offset) const   { return source.offsetToPosition(offset).first; }
+int Analyzer::columnOf(uint32_t offset) const { return source.offsetToPosition(offset).second; }
 
-void CstAnalyzer::error(uint32_t offset, int length, std::string message) {
+void Analyzer::error(uint32_t offset, int length, std::string message) {
     auto [line, column] = source.offsetToPosition(offset);
     sink.error({line, column, length > 0 ? length : 1}, std::move(message));
 }
 
-void CstAnalyzer::errorAtNode(const SyntaxNode& node, std::string message) {
+void Analyzer::errorAtNode(const SyntaxNode& node, std::string message) {
     error(node.startOffset(), static_cast<int>(node.length()), std::move(message));
 }
 
@@ -73,7 +71,7 @@ void CstAnalyzer::errorAtNode(const SyntaxNode& node, std::string message) {
 // Top-level pipeline
 // =========================================================
 
-void CstAnalyzer::analyze(const SyntaxNode& root) {
+void Analyzer::analyze(const SyntaxNode& root) {
     auto sf = ast::SourceFile::cast(root);
     if (!sf) return;
 
@@ -97,7 +95,7 @@ void CstAnalyzer::analyze(const SyntaxNode& root) {
 // Collect phase
 // =========================================================
 
-void CstAnalyzer::collectStructs(const ast::SourceFile& file) {
+void Analyzer::collectStructs(const ast::SourceFile& file) {
     auto structs = file.structs();
 
     for (auto& sd : structs) {
@@ -154,7 +152,7 @@ void CstAnalyzer::collectStructs(const ast::SourceFile& file) {
     }
 }
 
-void CstAnalyzer::collectClasses(const ast::SourceFile& file) {
+void Analyzer::collectClasses(const ast::SourceFile& file) {
     auto classes = file.classes();
 
     for (auto& cd : classes) {
@@ -211,7 +209,7 @@ void CstAnalyzer::collectClasses(const ast::SourceFile& file) {
     }
 }
 
-void CstAnalyzer::collectFunctions(const ast::SourceFile& file) {
+void Analyzer::collectFunctions(const ast::SourceFile& file) {
     for (auto& fn : file.functions()) {
         Type* retType = fn.returnType() && fn.returnType()->typeReference()
             ? resolveTypeReference(*fn.returnType()->typeReference())
@@ -228,7 +226,7 @@ void CstAnalyzer::collectFunctions(const ast::SourceFile& file) {
     }
 }
 
-void CstAnalyzer::resolveMethodParams(const ast::FuncDecl& fn, ::Type* receiverType, Symbol* sym) {
+void Analyzer::resolveMethodParams(const ast::FuncDecl& fn, ::Type* receiverType, Symbol* sym) {
     auto fname = fn.nameText().value_or(std::u16string{});
     bool isCtor = receiverType && receiverType->structInfo && fname == receiverType->structInfo->name;
 
@@ -271,7 +269,7 @@ void CstAnalyzer::resolveMethodParams(const ast::FuncDecl& fn, ::Type* receiverT
     }
 }
 
-void CstAnalyzer::resolveFunctionParams(const ast::FuncDecl& fn, Symbol* sym) {
+void Analyzer::resolveFunctionParams(const ast::FuncDecl& fn, Symbol* sym) {
     if (fn.isShorthand()) {
         errorAtNode(fn.node, "Shorthand declaration ';' is only allowed on a constructor");
     }
@@ -295,7 +293,7 @@ void CstAnalyzer::resolveFunctionParams(const ast::FuncDecl& fn, Symbol* sym) {
     }
 }
 
-void CstAnalyzer::checkParameterDefaults(const ast::FuncDecl& fn) {
+void Analyzer::checkParameterDefaults(const ast::FuncDecl& fn) {
     Symbol* prevFunction = currentFunction;
     Symbol* prevThis = currentThis;
     Scope* prevScope = currentScope;
@@ -332,7 +330,7 @@ void CstAnalyzer::checkParameterDefaults(const ast::FuncDecl& fn) {
 // Type references
 // =========================================================
 
-Type* CstAnalyzer::resolveTypeReference(const ast::TypeReference& tr) {
+Type* Analyzer::resolveTypeReference(const ast::TypeReference& tr) {
     auto name = tr.nameText();
     if (!name) return typeCtx.getError();
     Type* base = typeCtx.fromName(*name);
@@ -354,7 +352,7 @@ Type* CstAnalyzer::resolveTypeReference(const ast::TypeReference& tr) {
 // Function bodies
 // =========================================================
 
-void CstAnalyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
+void Analyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
     auto* info = analysis.find(fn.node.greenNode());
     if (!info || !info->resolvedSymbol) return;
 
@@ -402,7 +400,7 @@ void CstAnalyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
     currentThis = prevThis;
 }
 
-void CstAnalyzer::analyzeImplicitConstructorAssignments(const ast::FuncDecl& fn) {
+void Analyzer::analyzeImplicitConstructorAssignments(const ast::FuncDecl& fn) {
     // For each this.field param, validate `this.field = param` would type-check.
     // We don't need to emit IR or build an AST node — just verify the field
     // exists on the receiver type and the param's type is assignable.
@@ -431,7 +429,7 @@ void CstAnalyzer::analyzeImplicitConstructorAssignments(const ast::FuncDecl& fn)
 // Statements
 // =========================================================
 
-void CstAnalyzer::analyzeStatement(const ast::Statement& stmt) {
+void Analyzer::analyzeStatement(const ast::Statement& stmt) {
     if (auto b = stmt.asBlock())              { analyzeBlock(*b); return; }
     if (auto l = stmt.asLet())                { analyzeLetStmt(*l); return; }
     if (auto v = stmt.asTypedVarDecl())       { analyzeTypedVarDeclStmt(*v); return; }
@@ -441,13 +439,13 @@ void CstAnalyzer::analyzeStatement(const ast::Statement& stmt) {
     if (auto e = stmt.asExpressionStmt())     { analyzeExpressionStmt(*e); return; }
 }
 
-void CstAnalyzer::analyzeBlock(const ast::Block& block) {
+void Analyzer::analyzeBlock(const ast::Block& block) {
     pushScope();
     for (auto& s : block.statements()) analyzeStatement(s);
     popScope();
 }
 
-void CstAnalyzer::analyzeLetStmt(const ast::LetStatement& stmt) {
+void Analyzer::analyzeLetStmt(const ast::LetStatement& stmt) {
     Type* declared = nullptr;
     if (auto tr = stmt.typeAnnotation()) {
         declared = resolveTypeReference(*tr);
@@ -485,7 +483,7 @@ void CstAnalyzer::analyzeLetStmt(const ast::LetStatement& stmt) {
     analysis.setSymbol(stmt.node.greenNode(), sym);
 }
 
-void CstAnalyzer::analyzeTypedVarDeclStmt(const ast::TypedVarDeclStatement& stmt) {
+void Analyzer::analyzeTypedVarDeclStmt(const ast::TypedVarDeclStatement& stmt) {
     Type* declared = stmt.typeReference()
         ? resolveTypeReference(*stmt.typeReference())
         : typeCtx.getError();
@@ -507,7 +505,7 @@ void CstAnalyzer::analyzeTypedVarDeclStmt(const ast::TypedVarDeclStatement& stmt
     analysis.setSymbol(stmt.node.greenNode(), sym);
 }
 
-void CstAnalyzer::analyzeIfStmt(const ast::IfStatement& stmt) {
+void Analyzer::analyzeIfStmt(const ast::IfStatement& stmt) {
     if (auto c = stmt.condition()) {
         Type* ct = analyzeExpr(*c);
         if (!ct->isError() && !ct->isBool()) {
@@ -521,7 +519,7 @@ void CstAnalyzer::analyzeIfStmt(const ast::IfStatement& stmt) {
     }
 }
 
-void CstAnalyzer::analyzeWhileStmt(const ast::WhileStatement& stmt) {
+void Analyzer::analyzeWhileStmt(const ast::WhileStatement& stmt) {
     if (auto c = stmt.condition()) {
         Type* ct = analyzeExpr(*c);
         if (!ct->isError() && !ct->isBool()) {
@@ -531,7 +529,7 @@ void CstAnalyzer::analyzeWhileStmt(const ast::WhileStatement& stmt) {
     if (auto b = stmt.body()) analyzeBlock(*b);
 }
 
-void CstAnalyzer::analyzeReturnStmt(const ast::ReturnStatement& stmt) {
+void Analyzer::analyzeReturnStmt(const ast::ReturnStatement& stmt) {
     if (!currentFunction) {
         errorAtNode(stmt.node, "'return' outside of a function");
         return;
@@ -556,7 +554,7 @@ void CstAnalyzer::analyzeReturnStmt(const ast::ReturnStatement& stmt) {
     }
 }
 
-void CstAnalyzer::analyzeExpressionStmt(const ast::ExpressionStatement& stmt) {
+void Analyzer::analyzeExpressionStmt(const ast::ExpressionStatement& stmt) {
     if (auto e = stmt.expression()) analyzeExpr(*e);
 }
 
@@ -564,7 +562,7 @@ void CstAnalyzer::analyzeExpressionStmt(const ast::ExpressionStatement& stmt) {
 // Expressions
 // =========================================================
 
-Type* CstAnalyzer::analyzeExpr(const ast::Expression& expr) {
+Type* Analyzer::analyzeExpr(const ast::Expression& expr) {
     Type* t = nullptr;
     if (auto lit = expr.asLiteral())    t = analyzeLiteral(*lit);
     else if (auto id = expr.asIdent())  t = analyzeIdent(*id);
@@ -582,7 +580,7 @@ Type* CstAnalyzer::analyzeExpr(const ast::Expression& expr) {
     return t;
 }
 
-Type* CstAnalyzer::analyzeLiteral(const ast::LiteralExpression& expr) {
+Type* Analyzer::analyzeLiteral(const ast::LiteralExpression& expr) {
     switch (expr.literalKind()) {
         case SyntaxKind::IntLiteral:    return typeCtx.getPrimitive(TypeKind::Int);
         case SyntaxKind::LongLiteral:   return typeCtx.getPrimitive(TypeKind::Long);
@@ -597,7 +595,7 @@ Type* CstAnalyzer::analyzeLiteral(const ast::LiteralExpression& expr) {
     }
 }
 
-Type* CstAnalyzer::analyzeIdent(const ast::IdentExpression& expr) {
+Type* Analyzer::analyzeIdent(const ast::IdentExpression& expr) {
     auto name = expr.nameText();
     if (!name) return typeCtx.getError();
     Symbol* sym = currentScope ? currentScope->lookup(*name) : nullptr;
@@ -610,7 +608,7 @@ Type* CstAnalyzer::analyzeIdent(const ast::IdentExpression& expr) {
     return sym->type ? sym->type : typeCtx.getError();
 }
 
-Type* CstAnalyzer::analyzeThis(const ast::ThisExpression& expr) {
+Type* Analyzer::analyzeThis(const ast::ThisExpression& expr) {
     if (!currentThis) {
         errorAtNode(expr.node, "'this' is only valid inside a method");
         return typeCtx.getError();
@@ -619,7 +617,7 @@ Type* CstAnalyzer::analyzeThis(const ast::ThisExpression& expr) {
     return currentThis->type ? currentThis->type : typeCtx.getError();
 }
 
-Type* CstAnalyzer::analyzeBinary(const ast::BinaryExpression& expr) {
+Type* Analyzer::analyzeBinary(const ast::BinaryExpression& expr) {
     auto left = expr.left();
     auto right = expr.right();
     if (!left || !right) return typeCtx.getError();
@@ -691,7 +689,7 @@ Type* CstAnalyzer::analyzeBinary(const ast::BinaryExpression& expr) {
     }
 }
 
-Type* CstAnalyzer::analyzePrefix(const ast::PrefixExpression& expr) {
+Type* Analyzer::analyzePrefix(const ast::PrefixExpression& expr) {
     auto operand = expr.operand();
     if (!operand) return typeCtx.getError();
     Type* t = analyzeExpr(*operand);
@@ -740,7 +738,7 @@ static size_t requiredArgCount(Symbol* sym) {
     return required;
 }
 
-Type* CstAnalyzer::analyzeCall(const ast::CallExpression& expr) {
+Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
     auto callee = expr.callee();
     auto args = expr.arguments();
 
@@ -817,7 +815,7 @@ Type* CstAnalyzer::analyzeCall(const ast::CallExpression& expr) {
     return sym->returnType ? sym->returnType : typeCtx.getError();
 }
 
-Type* CstAnalyzer::analyzeMember(const ast::MemberExpression& expr) {
+Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
     auto obj = expr.object();
     if (!obj) return typeCtx.getError();
     Type* objT = analyzeExpr(*obj);
@@ -842,7 +840,7 @@ Type* CstAnalyzer::analyzeMember(const ast::MemberExpression& expr) {
     return typeCtx.getError();
 }
 
-Type* CstAnalyzer::analyzeAssign(const ast::AssignExpression& expr) {
+Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
     auto target = expr.target();
     auto value = expr.value();
     if (!target || !value) return typeCtx.getError();
@@ -860,7 +858,7 @@ Type* CstAnalyzer::analyzeAssign(const ast::AssignExpression& expr) {
     return targetT;
 }
 
-Type* CstAnalyzer::analyzeTernary(const ast::TernaryExpression& expr) {
+Type* Analyzer::analyzeTernary(const ast::TernaryExpression& expr) {
     auto cond = expr.condition();
     auto thenE = expr.thenBranch();
     auto elseE = expr.elseBranch();
@@ -879,7 +877,7 @@ Type* CstAnalyzer::analyzeTernary(const ast::TernaryExpression& expr) {
     return typeCtx.getError();
 }
 
-Type* CstAnalyzer::analyzeNew(const ast::NewExpression& expr) {
+Type* Analyzer::analyzeNew(const ast::NewExpression& expr) {
     auto typeName = expr.typeNameText();
     if (!typeName) return typeCtx.getError();
     Type* t = typeCtx.lookupClass(*typeName);
@@ -926,15 +924,13 @@ Type* CstAnalyzer::analyzeNew(const ast::NewExpression& expr) {
     return t;
 }
 
-Type* CstAnalyzer::analyzeParen(const ast::ParenExpression& expr) {
+Type* Analyzer::analyzeParen(const ast::ParenExpression& expr) {
     if (auto inner = expr.inner()) return analyzeExpr(*inner);
     return typeCtx.getError();
 }
 
-bool CstAnalyzer::isLValue(const ast::Expression& expr) const {
+bool Analyzer::isLValue(const ast::Expression& expr) const {
     SyntaxKind k = expr.kind();
     return k == SyntaxKind::IdentExpr || k == SyntaxKind::MemberExpr ||
            k == SyntaxKind::SubscriptExpr || k == SyntaxKind::ThisExpr;
 }
-
-}  // namespace cst::semantic

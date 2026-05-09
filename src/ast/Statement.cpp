@@ -1,6 +1,6 @@
 #include "Statement.h"
 
-namespace cst::ast {
+namespace ast {
 
 bool Statement::isStatementKind(SyntaxKind k) {
     switch (k) {
@@ -165,4 +165,4 @@ std::optional<Expression> ExpressionStatement::expression() const {
     return std::nullopt;
 }
 
-}  // namespace cst::ast
+}  // namespace ast

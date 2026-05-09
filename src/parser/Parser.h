@@ -3,16 +3,16 @@
 #include <initializer_list>
 #include <string>
 #include <vector>
-#include "CstTokenizer.h"
-#include "Green.h"
-#include "SyntaxBuilder.h"
-#include "SyntaxKind.h"
+#include "Tokenizer.h"
+#include "../cst/Green.h"
+#include "../cst/SyntaxBuilder.h"
+#include "../cst/SyntaxKind.h"
 
 class DiagnosticSink;
 
-class CstParser {
+class Parser {
 public:
-    CstParser(std::u16string_view source, DiagnosticSink& sink);
+    Parser(std::u16string_view source, DiagnosticSink& sink);
 
     GreenElementPtr parseSourceFile();
 

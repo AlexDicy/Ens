@@ -1,13 +1,13 @@
 #pragma once
 #include <optional>
 #include <vector>
-#include "../SyntaxNode.h"
+#include "../cst/SyntaxNode.h"
 #include "Common.h"
 #include "Expression.h"
 #include "Statement.h"
 #include "TypeReference.h"
 
-namespace cst::ast {
+namespace ast {
 
 enum class Visibility { Public, Private, Protected };
 
@@ -165,4 +165,4 @@ public:
     std::vector<TypedVarDeclStatement> topLevelVarDecls() const;
 };
 
-}  // namespace cst::ast
+}  // namespace ast

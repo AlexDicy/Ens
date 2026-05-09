@@ -1,6 +1,6 @@
 #include "Declaration.h"
 
-namespace cst::ast {
+namespace ast {
 
 // === VisibilityModifier ===
 
@@ -290,4 +290,4 @@ std::vector<TypedVarDeclStatement> SourceFile::topLevelVarDecls() const {
     return out;
 }
 
-}  // namespace cst::ast
+}  // namespace ast

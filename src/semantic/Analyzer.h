@@ -2,12 +2,12 @@
 #include <memory>
 #include <unordered_map>
 #include <vector>
-#include "../../diagnostics/SourceFile.h"
-#include "../../semantic/Scope.h"
-#include "../../semantic/Symbol.h"
-#include "../../semantic/Type.h"
-#include "../../semantic/TypeContext.h"
-#include "../SyntaxNode.h"
+#include "../diagnostics/SourceFile.h"
+#include "Scope.h"
+#include "Symbol.h"
+#include "Type.h"
+#include "TypeContext.h"
+#include "../cst/SyntaxNode.h"
 #include "../ast/Declaration.h"
 #include "../ast/Expression.h"
 #include "../ast/Statement.h"
@@ -16,11 +16,9 @@
 
 class DiagnosticSink;
 
-namespace cst::semantic {
-
-class CstAnalyzer {
+class Analyzer {
 public:
-    CstAnalyzer(const SourceFile& source, DiagnosticSink& sink);
+    Analyzer(const SourceFile& source, DiagnosticSink& sink);
 
     void analyze(const SyntaxNode& sourceFileRoot);
 
@@ -91,5 +89,3 @@ private:
     int lineOf(uint32_t offset) const;
     int columnOf(uint32_t offset) const;
 };
-
-}  // namespace cst::semantic

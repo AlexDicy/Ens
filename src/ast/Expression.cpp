@@ -1,6 +1,6 @@
 #include "Expression.h"
 
-namespace cst::ast {
+namespace ast {
 
 bool Expression::isExpressionKind(SyntaxKind k) {
     switch (k) {
@@ -269,4 +269,4 @@ std::optional<Expression> ParenExpression::inner() const {
     return firstExpressionChild(node);
 }
 
-}  // namespace cst::ast
+}  // namespace ast

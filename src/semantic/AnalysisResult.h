@@ -1,11 +1,9 @@
 #pragma once
 #include <unordered_map>
-#include "../Green.h"
+#include "../cst/Green.h"
 
 class Type;
 class Symbol;
-
-namespace cst::semantic {
 
 struct ResolutionInfo {
     Type* resolvedType = nullptr;
@@ -53,5 +51,3 @@ private:
     std::unordered_map<const GreenElement*, Type*> methodReceivers;
     std::unordered_map<const GreenElement*, Symbol*> thisSymbols;
 };
-
-}  // namespace cst::semantic

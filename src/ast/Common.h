@@ -2,10 +2,10 @@
 #include <optional>
 #include <string>
 #include <vector>
-#include "../SyntaxKind.h"
-#include "../SyntaxNode.h"
+#include "../cst/SyntaxKind.h"
+#include "../cst/SyntaxNode.h"
 
-namespace cst::ast {
+namespace ast {
 
 inline std::optional<SyntaxNode> firstChildNode(const SyntaxNode& parent, SyntaxKind k) {
     for (auto& c : parent.children()) {
@@ -46,4 +46,4 @@ inline bool hasMissingOrError(const SyntaxNode& n) {
     return false;
 }
 
-}  // namespace cst::ast
+}  // namespace ast

@@ -1,12 +1,12 @@
-#include "CstParser.h"
+#include "Parser.h"
 
 #include <algorithm>
 #include "../diagnostics/Diagnostic.h"
 #include "../diagnostics/DiagnosticSink.h"
 
-CstParser::CstParser(std::u16string_view src, DiagnosticSink& s)
+Parser::Parser(std::u16string_view src, DiagnosticSink& s)
     : source(src), sink(s) {
-    CstTokenizer tokenizer(source, sink);
+    Tokenizer tokenizer(source, sink);
     while (true) {
         LexedToken t = tokenizer.next();
         bool eof = (t.kind == SyntaxKind::EndOfFile);
@@ -17,29 +17,29 @@ CstParser::CstParser(std::u16string_view src, DiagnosticSink& s)
     while (current < tokens.size() && isTrivia(tokens[current].kind)) current++;
 }
 
-SyntaxKind CstParser::kindAt() const {
+SyntaxKind Parser::kindAt() const {
     return current < tokens.size() ? tokens[current].kind : SyntaxKind::EndOfFile;
 }
 
-const LexedToken& CstParser::tokenAt() const {
+const LexedToken& Parser::tokenAt() const {
     return tokens[current];
 }
 
-bool CstParser::at(SyntaxKind k) const {
+bool Parser::at(SyntaxKind k) const {
     return kindAt() == k;
 }
 
-bool CstParser::atAny(std::initializer_list<SyntaxKind> kinds) const {
+bool Parser::atAny(std::initializer_list<SyntaxKind> kinds) const {
     SyntaxKind k = kindAt();
     for (auto x : kinds) if (x == k) return true;
     return false;
 }
 
-bool CstParser::atEnd() const {
+bool Parser::atEnd() const {
     return kindAt() == SyntaxKind::EndOfFile;
 }
 
-SyntaxKind CstParser::peekKind(size_t n) const {
+SyntaxKind Parser::peekKind(size_t n) const {
     size_t idx = current;
     while (true) {
         if (idx >= tokens.size()) return SyntaxKind::EndOfFile;
@@ -51,7 +51,7 @@ SyntaxKind CstParser::peekKind(size_t n) const {
     }
 }
 
-void CstParser::bump() {
+void Parser::bump() {
     while (nextToEmit < tokens.size() && nextToEmit < current) {
         const auto& t = tokens[nextToEmit];
         builder.token(t.kind, t.text);
@@ -66,13 +66,13 @@ void CstParser::bump() {
     }
 }
 
-bool CstParser::eat(SyntaxKind k) {
+bool Parser::eat(SyntaxKind k) {
     if (!at(k)) return false;
     bump();
     return true;
 }
 
-void CstParser::expect(SyntaxKind k, const char* what) {
+void Parser::expect(SyntaxKind k, const char* what) {
     if (at(k)) {
         bump();
     } else {
@@ -80,7 +80,7 @@ void CstParser::expect(SyntaxKind k, const char* what) {
     }
 }
 
-void CstParser::emitMissing(SyntaxKind /*expectedKind*/, const char* what) {
+void Parser::emitMissing(SyntaxKind /*expectedKind*/, const char* what) {
     // Flush trivia preceding the current cursor position so the missing-token
     // marker lands at the right offset in the tree.
     while (nextToEmit < tokens.size() && nextToEmit < current) {
@@ -92,7 +92,7 @@ void CstParser::emitMissing(SyntaxKind /*expectedKind*/, const char* what) {
     reportAtCurrent(std::string("Expected ") + what);
 }
 
-void CstParser::reportAtCurrent(std::string message) {
+void Parser::reportAtCurrent(std::string message) {
     int line, column, length;
     if (current < tokens.size()) {
         line = tokens[current].line;
@@ -106,7 +106,7 @@ void CstParser::reportAtCurrent(std::string message) {
     sink.error({line, column, length}, std::move(message));
 }
 
-void CstParser::recoverTo(std::initializer_list<SyntaxKind> syncSet) {
+void Parser::recoverTo(std::initializer_list<SyntaxKind> syncSet) {
     if (atEnd()) return;
     builder.startNode(SyntaxKind::Error);
     bool any = false;
@@ -128,7 +128,7 @@ void CstParser::recoverTo(std::initializer_list<SyntaxKind> syncSet) {
 // Top level
 // =================================================================
 
-GreenElementPtr CstParser::parseSourceFile() {
+GreenElementPtr Parser::parseSourceFile() {
     builder.startNode(SyntaxKind::SourceFile);
     while (!atEnd()) {
         size_t before = current;
@@ -152,7 +152,7 @@ GreenElementPtr CstParser::parseSourceFile() {
     return builder.build();
 }
 
-void CstParser::parseTopLevel() {
+void Parser::parseTopLevel() {
     bool hasVisibility = atAny({SyntaxKind::KwPrivate, SyntaxKind::KwProtected, SyntaxKind::KwPublic});
 
     if (at(SyntaxKind::KwStruct) ||
@@ -181,7 +181,7 @@ void CstParser::parseTopLevel() {
     parseStatement();
 }
 
-void CstParser::parseVisibilityModifier() {
+void Parser::parseVisibilityModifier() {
     if (!atAny({SyntaxKind::KwPrivate, SyntaxKind::KwProtected, SyntaxKind::KwPublic})) return;
     builder.startNode(SyntaxKind::VisibilityModifier);
     bump();
@@ -192,7 +192,7 @@ void CstParser::parseVisibilityModifier() {
 // Function declarations
 // =================================================================
 
-bool CstParser::looksLikeFuncDecl(bool allowShorthand) const {
+bool Parser::looksLikeFuncDecl(bool allowShorthand) const {
     size_t idx = current;
     // Skip an optional visibility modifier.
     if (idx < tokens.size() && (tokens[idx].kind == SyntaxKind::KwPrivate ||
@@ -224,7 +224,7 @@ bool CstParser::looksLikeFuncDecl(bool allowShorthand) const {
     return allowShorthand && after == SyntaxKind::Semi;
 }
 
-void CstParser::parseFuncDecl() {
+void Parser::parseFuncDecl() {
     builder.startNode(SyntaxKind::FuncDecl);
     parseVisibilityModifier();
     expect(SyntaxKind::Identifier, "function name");
@@ -247,7 +247,7 @@ void CstParser::parseFuncDecl() {
     builder.finishNode();
 }
 
-void CstParser::parseParamList() {
+void Parser::parseParamList() {
     builder.startNode(SyntaxKind::ParamList);
     if (!at(SyntaxKind::RParen) && !atEnd()) {
         parseParameter();
@@ -258,7 +258,7 @@ void CstParser::parseParamList() {
     builder.finishNode();
 }
 
-void CstParser::parseParameter() {
+void Parser::parseParameter() {
     builder.startNode(SyntaxKind::Parameter);
     if (eat(SyntaxKind::KwThis)) {
         expect(SyntaxKind::Dot, "'.' after 'this' in parameter");
@@ -275,14 +275,14 @@ void CstParser::parseParameter() {
     builder.finishNode();
 }
 
-void CstParser::parseDefaultValue() {
+void Parser::parseDefaultValue() {
     builder.startNode(SyntaxKind::DefaultValue);
     bump();  // =
     parseExpression();
     builder.finishNode();
 }
 
-void CstParser::parseReturnType() {
+void Parser::parseReturnType() {
     builder.startNode(SyntaxKind::ReturnType);
     expect(SyntaxKind::Arrow, "'->'");
     if (isTypeStart(kindAt())) parseType();
@@ -294,7 +294,7 @@ void CstParser::parseReturnType() {
 // Struct / class declarations
 // =================================================================
 
-void CstParser::parseStructOrClassDecl(SyntaxKind nodeKind, SyntaxKind keywordKind) {
+void Parser::parseStructOrClassDecl(SyntaxKind nodeKind, SyntaxKind keywordKind) {
     builder.startNode(nodeKind);
     parseVisibilityModifier();
     expect(keywordKind, keywordKind == SyntaxKind::KwStruct ? "'struct'" : "'class'");
@@ -316,7 +316,7 @@ void CstParser::parseStructOrClassDecl(SyntaxKind nodeKind, SyntaxKind keywordKi
     builder.finishNode();
 }
 
-void CstParser::parseStructOrClassMember() {
+void Parser::parseStructOrClassMember() {
     if (looksLikeFuncDecl(/*allowShorthand=*/true)) {
         parseFuncDecl();
     } else {
@@ -324,7 +324,7 @@ void CstParser::parseStructOrClassMember() {
     }
 }
 
-void CstParser::parseFieldDecl() {
+void Parser::parseFieldDecl() {
     builder.startNode(SyntaxKind::FieldDecl);
     parseVisibilityModifier();
     if (isTypeStart(kindAt())) parseType();
@@ -338,7 +338,7 @@ void CstParser::parseFieldDecl() {
 // Types
 // =================================================================
 
-bool CstParser::isPrimitiveTypeKw(SyntaxKind k) const {
+bool Parser::isPrimitiveTypeKw(SyntaxKind k) const {
     switch (k) {
         case SyntaxKind::KwBool:
         case SyntaxKind::KwByte:
@@ -360,11 +360,11 @@ bool CstParser::isPrimitiveTypeKw(SyntaxKind k) const {
     }
 }
 
-bool CstParser::isTypeStart(SyntaxKind k) const {
+bool Parser::isTypeStart(SyntaxKind k) const {
     return k == SyntaxKind::Identifier || isPrimitiveTypeKw(k);
 }
 
-void CstParser::parseType() {
+void Parser::parseType() {
     builder.startNode(SyntaxKind::TypeRef);
     if (isTypeStart(kindAt())) bump();
     else emitMissing(SyntaxKind::Identifier, "type name");
@@ -372,7 +372,7 @@ void CstParser::parseType() {
     builder.finishNode();
 }
 
-bool CstParser::looksLikeTypedVarDecl() const {
+bool Parser::looksLikeTypedVarDecl() const {
     SyntaxKind k0 = peekKind(0);
     if (!isTypeStart(k0)) return false;
     SyntaxKind k1 = peekKind(1);
@@ -391,7 +391,7 @@ bool CstParser::looksLikeTypedVarDecl() const {
 // Statements
 // =================================================================
 
-void CstParser::parseStatement() {
+void Parser::parseStatement() {
     SyntaxKind k = kindAt();
     if (k == SyntaxKind::LBrace)        { parseBlock(); return; }
     if (k == SyntaxKind::KwLet)         { parseLetStmt(); return; }
@@ -402,7 +402,7 @@ void CstParser::parseStatement() {
     parseExprStmt();
 }
 
-void CstParser::parseBlock() {
+void Parser::parseBlock() {
     builder.startNode(SyntaxKind::Block);
     expect(SyntaxKind::LBrace, "'{'");
     while (!at(SyntaxKind::RBrace) && !atEnd()) {
@@ -419,7 +419,7 @@ void CstParser::parseBlock() {
     builder.finishNode();
 }
 
-void CstParser::parseLetStmt() {
+void Parser::parseLetStmt() {
     builder.startNode(SyntaxKind::LetStmt);
     expect(SyntaxKind::KwLet, "'let'");
     expect(SyntaxKind::Identifier, "identifier after 'let'");
@@ -432,7 +432,7 @@ void CstParser::parseLetStmt() {
     builder.finishNode();
 }
 
-void CstParser::parseTypedVarDeclStmt() {
+void Parser::parseTypedVarDeclStmt() {
     builder.startNode(SyntaxKind::TypedVarDecl);
     parseType();
     expect(SyntaxKind::Identifier, "identifier after type");
@@ -441,7 +441,7 @@ void CstParser::parseTypedVarDeclStmt() {
     builder.finishNode();
 }
 
-void CstParser::parseIfStmt() {
+void Parser::parseIfStmt() {
     builder.startNode(SyntaxKind::IfStmt);
     expect(SyntaxKind::KwIf, "'if'");
     parseExpression();
@@ -458,7 +458,7 @@ void CstParser::parseIfStmt() {
     builder.finishNode();
 }
 
-void CstParser::parseWhileStmt() {
+void Parser::parseWhileStmt() {
     builder.startNode(SyntaxKind::WhileStmt);
     expect(SyntaxKind::KwWhile, "'while'");
     parseExpression();
@@ -467,7 +467,7 @@ void CstParser::parseWhileStmt() {
     builder.finishNode();
 }
 
-void CstParser::parseReturnStmt() {
+void Parser::parseReturnStmt() {
     builder.startNode(SyntaxKind::ReturnStmt);
     expect(SyntaxKind::KwReturn, "'return'");
     if (!at(SyntaxKind::Semi) && !atEnd()) parseExpression();
@@ -475,7 +475,7 @@ void CstParser::parseReturnStmt() {
     builder.finishNode();
 }
 
-void CstParser::parseExprStmt() {
+void Parser::parseExprStmt() {
     builder.startNode(SyntaxKind::ExprStmt);
     parseExpression();
     expect(SyntaxKind::Semi, "';' after expression");
@@ -486,7 +486,7 @@ void CstParser::parseExprStmt() {
 // Expressions (Pratt)
 // =================================================================
 
-bool CstParser::isAssignmentOp(SyntaxKind k) const {
+bool Parser::isAssignmentOp(SyntaxKind k) const {
     switch (k) {
         case SyntaxKind::Eq:
         case SyntaxKind::PlusEq:
@@ -506,7 +506,7 @@ bool CstParser::isAssignmentOp(SyntaxKind k) const {
     }
 }
 
-int CstParser::infixPrecedence(SyntaxKind k) const {
+int Parser::infixPrecedence(SyntaxKind k) const {
     if (isAssignmentOp(k)) return 1;
     switch (k) {
         case SyntaxKind::Question:   return 2;   // ternary
@@ -536,11 +536,11 @@ int CstParser::infixPrecedence(SyntaxKind k) const {
     }
 }
 
-void CstParser::parseExpression() {
+void Parser::parseExpression() {
     parsePrecedence(1);
 }
 
-void CstParser::parsePrecedence(int minPrec) {
+void Parser::parsePrecedence(int minPrec) {
     size_t cp = builder.checkpoint();
     parsePrefix();
 
@@ -593,7 +593,7 @@ void CstParser::parsePrecedence(int minPrec) {
     }
 }
 
-void CstParser::parsePrefix() {
+void Parser::parsePrefix() {
     SyntaxKind k = kindAt();
     switch (k) {
         case SyntaxKind::IntLiteral:
@@ -652,7 +652,7 @@ void CstParser::parsePrefix() {
     }
 }
 
-void CstParser::parseArgList() {
+void Parser::parseArgList() {
     builder.startNode(SyntaxKind::ArgList);
     expect(SyntaxKind::LParen, "'('");
     if (!at(SyntaxKind::RParen) && !atEnd()) {

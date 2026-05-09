@@ -1,12 +1,12 @@
 #pragma once
 #include <optional>
 #include <vector>
-#include "../SyntaxNode.h"
+#include "../cst/SyntaxNode.h"
 #include "Common.h"
 #include "Expression.h"
 #include "TypeReference.h"
 
-namespace cst::ast {
+namespace ast {
 
 class Block;
 class LetStatement;
@@ -125,4 +125,4 @@ public:
     std::optional<Expression> expression() const;
 };
 
-}  // namespace cst::ast
+}  // namespace ast

@@ -1,10 +1,10 @@
 #pragma once
 #include <optional>
 #include <vector>
-#include "../SyntaxNode.h"
+#include "../cst/SyntaxNode.h"
 #include "Common.h"
 
-namespace cst::ast {
+namespace ast {
 
 class LiteralExpression;
 class IdentExpression;
@@ -202,4 +202,4 @@ public:
     std::optional<Expression> inner() const;
 };
 
-}  // namespace cst::ast
+}  // namespace ast
