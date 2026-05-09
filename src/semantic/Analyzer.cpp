@@ -62,8 +62,11 @@ void Analyzer::analyze(const std::vector<StmtPtr>& program) {
     for (const auto& s : program) {
         if (auto* fn = dynamic_cast<FuncDecl*>(s.get())) {
             analyzeFunctionBody(fn);
-        } else if (dynamic_cast<StructDecl*>(s.get())) {
-            // Already collected; struct bodies are pure declarations
+        } else if (auto* sd = dynamic_cast<StructDecl*>(s.get())) {
+            // Struct fields are already registered. Analyze each method body now.
+            for (auto& m : sd->methods) {
+                analyzeFunctionBody(m.get());
+            }
         } else {
             // Top-level statement that isn't a function — analyze it directly
             analyzeStmt(s.get());
@@ -99,6 +102,31 @@ void Analyzer::collectStructs(const std::vector<StmtPtr>& program) {
             sd->resolvedType->structInfo->fields.push_back(std::move(fi));
         }
     }
+    // Third pass: register method symbols on each struct so cross-method calls
+    // (and forward references) resolve regardless of declaration order.
+    for (const auto& s : program) {
+        auto* sd = dynamic_cast<StructDecl*>(s.get());
+        if (!sd || !sd->resolvedType) continue;
+        for (auto& m : sd->methods) {
+            Type* retType = m->returnType ? resolveTypeNode(m->returnType.get())
+                                          : typeCtx.getPrimitive(TypeKind::Void);
+            Symbol* sym = makeSymbol(SymbolKind::Function, m->name, nullptr,
+                                     m->line, m->column);
+            sym->returnType = retType;
+            for (auto& p : m->parameters) {
+                Type* pt = resolveTypeNode(p.type.get());
+                sym->paramTypes.push_back(pt);
+            }
+            m->resolvedSymbol = sym;
+            m->receiverType = sd->resolvedType;
+
+            MethodInfo mi;
+            mi.name = m->name;
+            mi.symbol = sym;
+            mi.declaration = m.get();
+            sd->resolvedType->structInfo->methods.push_back(std::move(mi));
+        }
+    }
 }
 
 void Analyzer::collectFunctions(const std::vector<StmtPtr>& program) {
@@ -125,9 +153,21 @@ void Analyzer::collectFunctions(const std::vector<StmtPtr>& program) {
 
 void Analyzer::analyzeFunctionBody(FuncDecl* fn) {
     Symbol* prevFunction = currentFunction;
+    Symbol* prevThis = currentThis;
     currentFunction = fn->resolvedSymbol;
 
     pushScope();
+
+    // Methods get an implicit `this` symbol bound to the receiver type.
+    if (fn->receiverType) {
+        Symbol* thisSym = makeSymbol(SymbolKind::Parameter, std::u16string(u"this"),
+                                     fn->receiverType, fn->line, fn->column);
+        currentScope->define(thisSym);
+        currentThis = thisSym;
+    } else {
+        currentThis = nullptr;
+    }
+
     for (size_t i = 0; i < fn->parameters.size(); ++i) {
         auto& p = fn->parameters[i];
         Type* pt = (i < currentFunction->paramTypes.size()) ? currentFunction->paramTypes[i]
@@ -150,6 +190,7 @@ void Analyzer::analyzeFunctionBody(FuncDecl* fn) {
 
     popScope();
     currentFunction = prevFunction;
+    currentThis = prevThis;
 }
 
 Type* Analyzer::resolveTypeNode(TypeNode* node) {
@@ -299,6 +340,7 @@ Type* Analyzer::analyzeExpr(Expr* e) {
     else if (dynamic_cast<BoolLitExpr*>(e))            t = typeCtx.getPrimitive(TypeKind::Bool);
     else if (dynamic_cast<NullLitExpr*>(e))            t = typeCtx.getNull();
     else if (auto* id = dynamic_cast<IdentExpr*>(e))   t = analyzeIdent(id);
+    else if (auto* th = dynamic_cast<ThisExpr*>(e))    t = analyzeThis(th);
     else if (auto* b = dynamic_cast<BinaryExpr*>(e))   t = analyzeBinary(b);
     else if (auto* u = dynamic_cast<UnaryExpr*>(e))    t = analyzeUnary(u);
     else if (auto* c = dynamic_cast<CallExpr*>(e))     t = analyzeCall(c);
@@ -324,6 +366,16 @@ Type* Analyzer::analyzeIdent(IdentExpr* e) {
         return typeCtx.getError();  // not callable as a value yet
     }
     return sym->type ? sym->type : typeCtx.getError();
+}
+
+Type* Analyzer::analyzeThis(ThisExpr* e) {
+    if (!currentThis) {
+        error(e->line, e->column, 4,
+              "'this' is only valid inside a method");
+        return typeCtx.getError();
+    }
+    e->resolvedSymbol = currentThis;
+    return currentThis->type ? currentThis->type : typeCtx.getError();
 }
 
 Type* Analyzer::analyzeBinary(BinaryExpr* e) {
@@ -430,6 +482,35 @@ Type* Analyzer::analyzeUnary(UnaryExpr* e) {
 }
 
 Type* Analyzer::analyzeCall(CallExpr* e) {
+    // `obj.method(args)` — method call on a struct
+    if (auto* member = dynamic_cast<MemberExpr*>(e->callee.get())) {
+        analyzeExpr(e->callee.get());  // resolves field-or-method on member
+        if (member->resolvedMethodSymbol) {
+            Symbol* sym = member->resolvedMethodSymbol;
+            if (e->args.size() != sym->paramTypes.size()) {
+                error(e->line, e->column, 1,
+                      "Method '" + asciiOf(member->member) + "' expects " +
+                      std::to_string(sym->paramTypes.size()) + " argument(s), got " +
+                      std::to_string(e->args.size()));
+            }
+            size_t n = std::min(e->args.size(), sym->paramTypes.size());
+            for (size_t i = 0; i < n; ++i) {
+                Type* argT = analyzeExpr(e->args[i].get());
+                Type* paramT = sym->paramTypes[i];
+                if (!paramT->assignableFrom(argT)) {
+                    error(e->args[i]->line, e->args[i]->column, 1,
+                          "Argument " + std::to_string(i + 1) + ": expected '" +
+                          paramT->toString() + "', got '" + argT->toString() + "'");
+                }
+            }
+            for (size_t i = n; i < e->args.size(); ++i) analyzeExpr(e->args[i].get());
+            return sym->returnType ? sym->returnType : typeCtx.getError();
+        }
+        // analyzeMember already emitted an error if the name didn't resolve.
+        for (auto& a : e->args) analyzeExpr(a.get());
+        return typeCtx.getError();
+    }
+
     auto* idCallee = dynamic_cast<IdentExpr*>(e->callee.get());
     if (!idCallee) {
         error(e->line, e->column, 1, "Only direct function calls are supported");
@@ -483,12 +564,19 @@ Type* Analyzer::analyzeMember(MemberExpr* e) {
         return typeCtx.getError();
     }
     int idx = objT->structInfo->findFieldIndex(e->member);
-    if (idx < 0) {
-        error(e->line, e->column, static_cast<int>(e->member.size()),
-              "No field '" + asciiOf(e->member) + "' on type '" + objT->toString() + "'");
-        return typeCtx.getError();
+    if (idx >= 0) {
+        return objT->structInfo->fields[idx].type;
     }
-    return objT->structInfo->fields[idx].type;
+    int midx = objT->structInfo->findMethodIndex(e->member);
+    if (midx >= 0) {
+        // Method reference: only valid as the callee of a CallExpr. The caller
+        // (analyzeCall) checks resolvedMethodSymbol and handles the call.
+        e->resolvedMethodSymbol = objT->structInfo->methods[midx].symbol;
+        return typeCtx.getError();  // not a value type
+    }
+    error(e->line, e->column, static_cast<int>(e->member.size()),
+          "No field or method '" + asciiOf(e->member) + "' on type '" + objT->toString() + "'");
+    return typeCtx.getError();
 }
 
 Type* Analyzer::analyzeAssign(AssignExpr* e) {

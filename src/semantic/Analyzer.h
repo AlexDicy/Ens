@@ -26,6 +26,7 @@ private:
     Scope* globalScope = nullptr;
     Scope* currentScope = nullptr;
     Symbol* currentFunction = nullptr;
+    Symbol* currentThis = nullptr;
 
     std::vector<Diagnostic> diagnostics;
 
@@ -48,6 +49,7 @@ private:
 
     Type* analyzeExpr(Expr* e);
     Type* analyzeIdent(IdentExpr* e);
+    Type* analyzeThis(ThisExpr* e);
     Type* analyzeBinary(BinaryExpr* e);
     Type* analyzeUnary(UnaryExpr* e);
     Type* analyzeCall(CallExpr* e);

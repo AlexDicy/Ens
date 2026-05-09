@@ -84,6 +84,9 @@ void StructDecl::dump(std::ostream& os, int indent) const {
         os << asciiOf(f.name) << ":\n";
         if (f.type) f.type->dump(os, indent + 2);
     }
+    for (const auto& m : methods) {
+        m->dump(os, indent + 1);
+    }
 }
 
 void FuncDecl::dump(std::ostream& os, int indent) const {

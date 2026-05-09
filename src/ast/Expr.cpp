@@ -41,6 +41,11 @@ void IdentExpr::dump(std::ostream& os, int indent) const {
     os << "Ident(" << asciiOf(name) << ")\n";
 }
 
+void ThisExpr::dump(std::ostream& os, int indent) const {
+    writeIndent(os, indent);
+    os << "This\n";
+}
+
 void BinaryExpr::dump(std::ostream& os, int indent) const {
     writeIndent(os, indent);
     os << "Binary(" << opName(op) << ")\n";

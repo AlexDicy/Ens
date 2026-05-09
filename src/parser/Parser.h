@@ -40,7 +40,7 @@ private:
     StmtPtr parseWhile();
     StmtPtr parseReturn();
     StmtPtr parseExprStmt();
-    StmtPtr parseFuncDecl(Visibility vis);
+    std::unique_ptr<FuncDecl> parseFuncDecl(Visibility vis);
     Parameter parseParameter();
     StmtPtr parseStructDecl(Visibility vis);
 

@@ -55,6 +55,12 @@ public:
     void dump(std::ostream& os, int indent) const override;
 };
 
+class ThisExpr : public Expr {
+public:
+    Symbol* resolvedSymbol = nullptr;  // synthetic `this` parameter symbol
+    void dump(std::ostream& os, int indent) const override;
+};
+
 class BinaryExpr : public Expr {
 public:
     TokenType op;
@@ -86,6 +92,7 @@ class MemberExpr : public Expr {
 public:
     ExprPtr object;
     std::u16string member;
+    Symbol* resolvedMethodSymbol = nullptr;  // set when name resolves to a method, not a field
     MemberExpr(ExprPtr o, std::u16string m)
         : object(std::move(o)), member(std::move(m)) {}
     void dump(std::ostream& os, int indent) const override;

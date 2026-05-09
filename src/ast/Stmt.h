@@ -81,6 +81,11 @@ public:
     std::unique_ptr<BlockStmt> body;
     Symbol* resolvedSymbol = nullptr;
 
+    // Set when this FuncDecl is a method on a struct/class. The owning type's
+    // semantic Type. The synthetic `this` parameter is always the first one
+    // and is added by the analyzer.
+    ::Type* receiverType = nullptr;
+
     void dump(std::ostream& os, int indent) const override;
 };
 
@@ -99,6 +104,7 @@ public:
     Visibility visibility = Visibility::Public;
     std::u16string name;
     std::vector<StructField> fields;
+    std::vector<std::unique_ptr<FuncDecl>> methods;
     ::Type* resolvedType = nullptr;  // canonical semantic type
 
     void dump(std::ostream& os, int indent) const override;

@@ -12,6 +12,7 @@ enum class TypeKind {
 };
 
 class Type;
+class Symbol;
 
 struct FieldInfo {
     std::u16string name;
@@ -20,15 +21,28 @@ struct FieldInfo {
     int column = 0;
 };
 
+struct MethodInfo {
+    std::u16string name;
+    Symbol* symbol = nullptr;       // function symbol with paramTypes/returnType (no `this`)
+    void* declaration = nullptr;    // FuncDecl* (kept void* to avoid AST include cycle)
+};
+
 struct StructInfo {
     std::u16string name;
     std::vector<FieldInfo> fields;
+    std::vector<MethodInfo> methods;
     int line = 0;
     int column = 0;
 
     int findFieldIndex(const std::u16string& fieldName) const {
         for (size_t i = 0; i < fields.size(); ++i) {
             if (fields[i].name == fieldName) return static_cast<int>(i);
+        }
+        return -1;
+    }
+    int findMethodIndex(const std::u16string& methodName) const {
+        for (size_t i = 0; i < methods.size(); ++i) {
+            if (methods[i].name == methodName) return static_cast<int>(i);
         }
         return -1;
     }

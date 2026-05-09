@@ -228,7 +228,7 @@ bool Parser::looksLikeFuncDecl() const {
     return after == TokenType::ARROW || after == TokenType::L_BRACE;
 }
 
-StmtPtr Parser::parseFuncDecl(Visibility vis) {
+std::unique_ptr<FuncDecl> Parser::parseFuncDecl(Visibility vis) {
     const Token& nameTok = expect(TokenType::IDENTIFIER, "function name");
     expect(TokenType::L_PAREN, "'(' after function name");
     auto fn = std::make_unique<FuncDecl>();
@@ -270,13 +270,22 @@ StmtPtr Parser::parseStructDecl(Visibility vis) {
     decl->column = kw.getColumn();
 
     while (!check(TokenType::R_BRACE) && !atEnd()) {
-        Visibility fieldVis = Visibility::Public;
-        if (check(TokenType::PRIVATE))   { consume(); fieldVis = Visibility::Private; }
-        else if (check(TokenType::PROTECTED)) { consume(); fieldVis = Visibility::Protected; }
-        else if (check(TokenType::PUBLIC))    { consume(); fieldVis = Visibility::Public; }
+        Visibility memberVis = Visibility::Public;
+        if (check(TokenType::PRIVATE))   { consume(); memberVis = Visibility::Private; }
+        else if (check(TokenType::PROTECTED)) { consume(); memberVis = Visibility::Protected; }
+        else if (check(TokenType::PUBLIC))    { consume(); memberVis = Visibility::Public; }
+
+        // Method or field?
+        // Method: starts with IDENT and has the func-decl shape (`name(...) [-> T] {`)
+        // Field: starts with a type and an identifier name.
+        if (check(TokenType::IDENTIFIER) && looksLikeFuncDecl()) {
+            auto method = parseFuncDecl(memberVis);
+            decl->methods.push_back(std::move(method));
+            continue;
+        }
 
         StructField field;
-        field.visibility = fieldVis;
+        field.visibility = memberVis;
         field.type = parseType();
         field.line = field.type ? field.type->line : kw.getLine();
         field.column = field.type ? field.type->column : kw.getColumn();
@@ -431,6 +440,13 @@ ExprPtr Parser::parsePrefix() {
         case TokenType::IDENTIFIER: {
             consume();
             auto e = std::make_unique<IdentExpr>(tok.getText());
+            e->line = line;
+            e->column = column;
+            return e;
+        }
+        case TokenType::THIS: {
+            consume();
+            auto e = std::make_unique<ThisExpr>();
             e->line = line;
             e->column = column;
             return e;
