@@ -172,11 +172,24 @@ struct CodeGenerator::Impl {
     }
 
     std::unordered_map<::Type*, llvm::DIType*> diStructTypeCache;
+    std::unordered_map<::Type*, llvm::DIType*> diClassPointerCache;
 
     llvm::DIType* mapDIType(::Type* t) {
         if (!debugEnabled || !diBuilder || !t) return nullptr;
         if (t->kind == TypeKind::Struct) return mapDIStructType(t);
-        if (t->kind == TypeKind::Class)  return nullptr;  // TODO: pointer-to-struct DI
+        if (t->kind == TypeKind::Class) {
+            // A class variable is a pointer to a heap-allocated record. DI
+            // describes that as a `DIDerivedType` with `DW_TAG_pointer_type`
+            // wrapping the struct layout we already build for fields.
+            auto it = diClassPointerCache.find(t);
+            if (it != diClassPointerCache.end()) return it->second;
+            auto* underlying = mapDIStructType(t);
+            if (!underlying) return nullptr;
+            uint64_t ptrBits = module->getDataLayout().getPointerSizeInBits();
+            auto* ptrTy = diBuilder->createPointerType(underlying, ptrBits);
+            diClassPointerCache[t] = ptrTy;
+            return ptrTy;
+        }
         int key = static_cast<int>(t->kind);
         auto it = diTypeCache.find(key);
         if (it != diTypeCache.end()) return it->second;
