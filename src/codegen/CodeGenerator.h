@@ -15,7 +15,6 @@ public:
     void print(std::ostream& os) const;
 
     bool emitObjectFile(const std::string& path);
-    bool linkExecutable(const std::string& objectPath, const std::string& exePath);
 
     bool hasErrors() const;
     const std::vector<Diagnostic>& getDiagnostics() const;

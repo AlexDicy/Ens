@@ -3,11 +3,11 @@
 #include "../parser/Parser.h"
 #include "../semantic/Analyzer.h"
 #include "../codegen/CodeGenerator.h"
+#include "../codegen/Linker.h"
 #include "../diagnostics/Diagnostic.h"
 #include "../diagnostics/SourceFile.h"
 
 #include <algorithm>
-#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -81,60 +81,65 @@ bool Compiler::compileSingle(std::istream& source, const fs::path& outputFile, c
             return false;
         }
 
-        CodeGenerator codegen("ens_module", filename);
-        if (!codegen.generate(stmts)) {
-            for (const auto& d : codegen.getDiagnostics()) {
-                d.print(sourceFile, std::cerr);
-            }
-            return false;
-        }
-
-        // Pick output mode by --output extension; default is IR to stdout.
+        // Pick output mode from --output extension; default is IR to stdout.
         std::string ext = outputFile.extension().string();
         for (auto& c : ext) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+        const bool linkToExe = !outputFile.empty() && (ext == ".exe" || ext.empty());
 
-        if (outputFile.empty()) {
-            std::cout << "--- LLVM IR ---\n";
-            codegen.print(std::cout);
-            return true;
-        }
-        if (ext == ".ll") {
-            std::ofstream out(outputFile);
-            if (!out) {
-                std::cerr << "Could not open '" << outputFile << "' for writing\n";
-                return false;
-            }
-            codegen.print(out);
-            return true;
-        }
-        if (ext == ".obj" || ext == ".o") {
-            if (!codegen.emitObjectFile(outputFile.string())) {
-                for (const auto& d : codegen.getDiagnostics()) d.print(sourceFile, std::cerr);
-                return false;
-            }
-            return true;
-        }
-        if (ext == ".exe" || ext.empty()) {
-            fs::path objPath = outputFile;
+        // For exe output, emit object to a sibling .obj path, then drop codegen
+        // BEFORE invoking the linker.
+        fs::path objPath;
+        if (linkToExe) {
+            objPath = outputFile;
             objPath.replace_extension(".obj");
-            if (!codegen.emitObjectFile(objPath.string())) {
-                for (const auto& d : codegen.getDiagnostics()) d.print(sourceFile, std::cerr);
-                return false;
-            }
-            if (!codegen.linkExecutable(objPath.string(), outputFile.string())) {
-                for (const auto& d : codegen.getDiagnostics()) d.print(sourceFile, std::cerr);
-                return false;
-            }
-            // Workaround: lld::coff::link corrupts heap state on Windows in a way
-            // that crashes subsequent vector destruction in our locals. The .exe
-            // is fully written before this point, so we report success to stdout
-            // and quick-exit, skipping local/static destructors.
-            std::cout << "Compiled successfully to " << outputFile.string() << '\n';
-            std::cout.flush();
-            std::_Exit(0);
         }
-        std::cerr << "Unsupported --output extension: '" << ext << "'\n";
-        return false;
+
+        {
+            CodeGenerator codegen("ens_module", filename);
+            if (!codegen.generate(stmts)) {
+                for (const auto& d : codegen.getDiagnostics()) d.print(sourceFile, std::cerr);
+                return false;
+            }
+
+            if (outputFile.empty()) {
+                std::cout << "--- LLVM IR ---\n";
+                codegen.print(std::cout);
+                return true;
+            }
+            if (ext == ".ll") {
+                std::ofstream out(outputFile);
+                if (!out) {
+                    std::cerr << "Could not open '" << outputFile << "' for writing\n";
+                    return false;
+                }
+                codegen.print(out);
+                return true;
+            }
+            if (ext == ".obj" || ext == ".o") {
+                if (!codegen.emitObjectFile(outputFile.string())) {
+                    for (const auto& d : codegen.getDiagnostics()) d.print(sourceFile, std::cerr);
+                    return false;
+                }
+                return true;
+            }
+            if (linkToExe) {
+                if (!codegen.emitObjectFile(objPath.string())) {
+                    for (const auto& d : codegen.getDiagnostics()) d.print(sourceFile, std::cerr);
+                    return false;
+                }
+            } else {
+                std::cerr << "Unsupported --output extension: '" << ext << "'\n";
+                return false;
+            }
+        }  // codegen LLVM context destroyed
+
+        if (linkToExe) {
+            if (!Linker::link(objPath.string(), outputFile.string(), std::cerr)) {
+                return false;
+            }
+            return true;
+        }
+        return true;
     } catch (const Diagnostic& d) {
         d.print(sourceFile, std::cerr);
         return false;
