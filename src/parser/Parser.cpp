@@ -186,11 +186,15 @@ StmtPtr Parser::parseStatement() {
                                                                  : Visibility::Public;
         consume();
         if (check(TokenType::STRUCT)) return parseStructDecl(vis);
+        if (check(TokenType::CLASS))  return parseClassDecl(vis);
         return parseFuncDecl(vis);
     }
 
     if (tok.getType() == TokenType::STRUCT) {
         return parseStructDecl(Visibility::Public);
+    }
+    if (tok.getType() == TokenType::CLASS) {
+        return parseClassDecl(Visibility::Public);
     }
 
     if (tok.getType() == TokenType::IDENTIFIER && looksLikeFuncDecl()) {
@@ -295,6 +299,43 @@ StmtPtr Parser::parseStructDecl(Visibility vis) {
         decl->fields.push_back(std::move(field));
     }
     expect(TokenType::R_BRACE, "'}' to close struct");
+    return decl;
+}
+
+StmtPtr Parser::parseClassDecl(Visibility vis) {
+    const Token& kw = expect(TokenType::CLASS, "'class'");
+    const Token& nameTok = expect(TokenType::IDENTIFIER, "class name");
+    expect(TokenType::L_BRACE, "'{' after class name");
+
+    auto decl = std::make_unique<ClassDecl>();
+    decl->visibility = vis;
+    decl->name = nameTok.getText();
+    decl->line = kw.getLine();
+    decl->column = kw.getColumn();
+
+    while (!check(TokenType::R_BRACE) && !atEnd()) {
+        Visibility memberVis = Visibility::Public;
+        if (check(TokenType::PRIVATE))   { consume(); memberVis = Visibility::Private; }
+        else if (check(TokenType::PROTECTED)) { consume(); memberVis = Visibility::Protected; }
+        else if (check(TokenType::PUBLIC))    { consume(); memberVis = Visibility::Public; }
+
+        if (check(TokenType::IDENTIFIER) && looksLikeFuncDecl()) {
+            auto method = parseFuncDecl(memberVis);
+            decl->methods.push_back(std::move(method));
+            continue;
+        }
+
+        StructField field;
+        field.visibility = memberVis;
+        field.type = parseType();
+        field.line = field.type ? field.type->line : kw.getLine();
+        field.column = field.type ? field.type->column : kw.getColumn();
+        const Token& fnameTok = expect(TokenType::IDENTIFIER, "field name");
+        field.name = fnameTok.getText();
+        expect(TokenType::SEMI, "';' after field declaration");
+        decl->fields.push_back(std::move(field));
+    }
+    expect(TokenType::R_BRACE, "'}' to close class");
     return decl;
 }
 
@@ -447,6 +488,23 @@ ExprPtr Parser::parsePrefix() {
         case TokenType::THIS: {
             consume();
             auto e = std::make_unique<ThisExpr>();
+            e->line = line;
+            e->column = column;
+            return e;
+        }
+        case TokenType::NEW: {
+            consume();
+            const Token& nameTok = expect(TokenType::IDENTIFIER, "type name after 'new'");
+            expect(TokenType::L_PAREN, "'(' after class name in 'new'");
+            std::vector<ExprPtr> args;
+            if (!check(TokenType::R_PAREN)) {
+                args.push_back(parseExpression());
+                while (match(TokenType::COMMA)) {
+                    args.push_back(parseExpression());
+                }
+            }
+            expect(TokenType::R_PAREN, "')' after constructor arguments");
+            auto e = std::make_unique<NewExpr>(nameTok.getText(), std::move(args));
             e->line = line;
             e->column = column;
             return e;

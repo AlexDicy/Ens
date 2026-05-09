@@ -46,6 +46,16 @@ void ThisExpr::dump(std::ostream& os, int indent) const {
     os << "This\n";
 }
 
+void NewExpr::dump(std::ostream& os, int indent) const {
+    writeIndent(os, indent);
+    os << "New(" << asciiOf(typeName) << ")\n";
+    if (!args.empty()) {
+        writeIndent(os, indent + 1);
+        os << "args:\n";
+        for (const auto& a : args) a->dump(os, indent + 2);
+    }
+}
+
 void BinaryExpr::dump(std::ostream& os, int indent) const {
     writeIndent(os, indent);
     os << "Binary(" << opName(op) << ")\n";

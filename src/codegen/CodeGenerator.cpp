@@ -109,6 +109,10 @@ struct CodeGenerator::Impl {
         }
     }
 
+    bool isReferenceType(::Type* t) {
+        return t && t->kind == TypeKind::Class;
+    }
+
     llvm::Type* mapType(::Type* t) {
         if (!t) return llvm::Type::getVoidTy(ctx);
         switch (t->kind) {
@@ -126,6 +130,7 @@ struct CodeGenerator::Impl {
             case TypeKind::Void:    return llvm::Type::getVoidTy(ctx);
             case TypeKind::String:  return llvm::PointerType::get(ctx, 0);
             case TypeKind::Struct:  return mapStructType(t);
+            case TypeKind::Class:   return llvm::PointerType::get(ctx, 0);
             default:                return nullptr;
         }
     }
@@ -171,6 +176,7 @@ struct CodeGenerator::Impl {
     llvm::DIType* mapDIType(::Type* t) {
         if (!debugEnabled || !diBuilder || !t) return nullptr;
         if (t->kind == TypeKind::Struct) return mapDIStructType(t);
+        if (t->kind == TypeKind::Class)  return nullptr;  // TODO: pointer-to-struct DI
         int key = static_cast<int>(t->kind);
         auto it = diTypeCache.find(key);
         if (it != diTypeCache.end()) return it->second;
@@ -263,6 +269,8 @@ struct CodeGenerator::Impl {
                 declareFunction(fn);
             } else if (auto* sd = dynamic_cast<StructDecl*>(s.get())) {
                 for (auto& m : sd->methods) declareFunction(m.get());
+            } else if (auto* cd = dynamic_cast<ClassDecl*>(s.get())) {
+                for (auto& m : cd->methods) declareFunction(m.get());
             }
         }
         for (auto& s : program) {
@@ -270,6 +278,8 @@ struct CodeGenerator::Impl {
                 emitFunction(fn);
             } else if (auto* sd = dynamic_cast<StructDecl*>(s.get())) {
                 for (auto& m : sd->methods) emitFunction(m.get());
+            } else if (auto* cd = dynamic_cast<ClassDecl*>(s.get())) {
+                for (auto& m : cd->methods) emitFunction(m.get());
             }
         }
         if (debugEnabled && diBuilder) diBuilder->finalize();
@@ -565,6 +575,7 @@ struct CodeGenerator::Impl {
         if (auto* m = dynamic_cast<MemberExpr*>(e)) return emitMember(m);
         if (dynamic_cast<SubscriptExpr*>(e)) { error(e->line, e->column, "subscript codegen not yet supported"); return nullptr; }
         if (auto* tern = dynamic_cast<TernaryExpr*>(e)) return emitTernary(tern);
+        if (auto* nw = dynamic_cast<NewExpr*>(e))       return emitNew(nw);
         return nullptr;
     }
 
@@ -710,6 +721,30 @@ struct CodeGenerator::Impl {
         return llvm::Function::Create(ty, llvm::Function::ExternalLinkage, "puts", module.get());
     }
 
+    llvm::Function* getOrDeclareMalloc() {
+        if (auto* existing = module->getFunction("malloc")) return existing;
+        auto* ty = llvm::FunctionType::get(
+            llvm::PointerType::get(ctx, 0),
+            { llvm::Type::getInt64Ty(ctx) },
+            /*isVarArg*/ false);
+        return llvm::Function::Create(ty, llvm::Function::ExternalLinkage, "malloc", module.get());
+    }
+
+    llvm::Value* emitNew(NewExpr* e) {
+        ::Type* t = e->resolvedClassType;
+        if (!t || !t->structInfo) {
+            error(e->line, e->column, "Internal: 'new' has no resolved class type");
+            return nullptr;
+        }
+        llvm::StructType* layout = mapStructType(t);
+        const llvm::DataLayout& dl = module->getDataLayout();
+        uint64_t sizeBytes = dl.getTypeAllocSize(layout);
+
+        auto* mallocFn = getOrDeclareMalloc();
+        llvm::Value* sizeArg = llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), sizeBytes);
+        return builder->CreateCall(mallocFn, {sizeArg}, "new." + asAscii(t->structInfo->name));
+    }
+
     llvm::Value* emitBuiltinCall(Symbol* sym, CallExpr* e) {
         std::string name = asAscii(sym->name);
         if (name == "print") {
@@ -737,12 +772,17 @@ struct CodeGenerator::Impl {
                     error(e->line, e->column, "Internal: method has no LLVM function");
                     return nullptr;
                 }
-                llvm::Value* receiverAddr = emitLValue(member->object.get());
-                if (!receiverAddr) return nullptr;
+                ::Type* objType = member->object->resolvedType;
+                // For classes the receiver is already a pointer (the object's
+                // value); for structs we take its lvalue address.
+                llvm::Value* receiver = isReferenceType(objType)
+                    ? emitExpr(member->object.get())
+                    : emitLValue(member->object.get());
+                if (!receiver) return nullptr;
 
                 std::vector<llvm::Value*> args;
                 args.reserve(e->args.size() + 1);
-                args.push_back(receiverAddr);
+                args.push_back(receiver);
                 for (auto& a : e->args) {
                     llvm::Value* v = emitExpr(a.get());
                     if (!v) return nullptr;
@@ -808,11 +848,16 @@ struct CodeGenerator::Impl {
         }
         if (auto* m = dynamic_cast<MemberExpr*>(e)) {
             ::Type* objType = m->object->resolvedType;
-            if (!objType || !objType->isStruct() || !objType->structInfo) {
-                error(e->line, e->column, "Cannot take address of member on non-struct");
+            if (!objType || !objType->hasRecordLayout() || !objType->structInfo) {
+                error(e->line, e->column, "Cannot take address of member on non-record type");
                 return nullptr;
             }
-            llvm::Value* objAddr = emitLValue(m->object.get());
+            // For classes (reference types) the object's *value* is the pointer
+            // to the heap allocation — load it. For structs the object's lvalue
+            // address IS the struct's address.
+            llvm::Value* objAddr = isReferenceType(objType)
+                ? emitExpr(m->object.get())
+                : emitLValue(m->object.get());
             if (!objAddr) return nullptr;
             int idx = objType->structInfo->findFieldIndex(m->member);
             if (idx < 0) {

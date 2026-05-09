@@ -126,3 +126,13 @@ public:
         : cond(std::move(c)), thenExpr(std::move(t)), elseExpr(std::move(e)) {}
     void dump(std::ostream& os, int indent) const override;
 };
+
+class NewExpr : public Expr {
+public:
+    std::u16string typeName;
+    std::vector<ExprPtr> args;
+    Type* resolvedClassType = nullptr;
+    NewExpr(std::u16string n, std::vector<ExprPtr> a)
+        : typeName(std::move(n)), args(std::move(a)) {}
+    void dump(std::ostream& os, int indent) const override;
+};

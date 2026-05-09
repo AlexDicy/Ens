@@ -36,6 +36,7 @@ private:
     void registerBuiltins();
 
     void collectStructs(const std::vector<StmtPtr>& program);
+    void collectClasses(const std::vector<StmtPtr>& program);
     void collectFunctions(const std::vector<StmtPtr>& program);
     void analyzeFunctionBody(FuncDecl* fn);
 
@@ -57,6 +58,7 @@ private:
     Type* analyzeAssign(AssignExpr* e);
     Type* analyzeSubscript(SubscriptExpr* e);
     Type* analyzeTernary(TernaryExpr* e);
+    Type* analyzeNew(NewExpr* e);
 
     Type* resolveTypeNode(TypeNode* node);
     bool isLValue(Expr* e);

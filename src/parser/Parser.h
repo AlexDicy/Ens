@@ -43,6 +43,7 @@ private:
     std::unique_ptr<FuncDecl> parseFuncDecl(Visibility vis);
     Parameter parseParameter();
     StmtPtr parseStructDecl(Visibility vis);
+    StmtPtr parseClassDecl(Visibility vis);
 
     [[noreturn]] void error(const Token& t, const std::string& msg) const;
 };

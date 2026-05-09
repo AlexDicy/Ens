@@ -20,12 +20,21 @@ public:
     Type* registerStruct(std::u16string name);
     Type* lookupStruct(const std::u16string& name) const;
 
+    // Class registration: like struct but reference-typed. Field/method layout
+    // shares the same StructInfo machinery.
+    Type* registerClass(std::u16string name);
+    Type* lookupClass(const std::u16string& name) const;
+
+    // Look up either a struct or a class by name (returns whichever is registered).
+    Type* lookupNamedType(const std::u16string& name) const;
+
 private:
     std::vector<std::unique_ptr<Type>> ownedTypes;
     std::vector<std::unique_ptr<StructInfo>> ownedStructs;
     std::unordered_map<int, Type*> primitiveCache;
     std::unordered_map<Type*, Type*> optionalCache;
     std::unordered_map<std::u16string, Type*> structCache;
+    std::unordered_map<std::u16string, Type*> classCache;
     Type* errorType;
     Type* nullType;
 

@@ -46,8 +46,7 @@ Type* TypeContext::fromName(const std::u16string& name) {
     if (name == u"string")  return getPrimitive(TypeKind::String);
     if (name == u"void")    return getPrimitive(TypeKind::Void);
 
-    auto it = structCache.find(name);
-    if (it != structCache.end()) return it->second;
+    if (auto* t = lookupNamedType(name)) return t;
     return nullptr;
 }
 
@@ -66,4 +65,29 @@ Type* TypeContext::registerStruct(std::u16string name) {
 Type* TypeContext::lookupStruct(const std::u16string& name) const {
     auto it = structCache.find(name);
     return it == structCache.end() ? nullptr : it->second;
+}
+
+Type* TypeContext::registerClass(std::u16string name) {
+    auto info = std::make_unique<StructInfo>();
+    info->name = name;
+    StructInfo* infoPtr = info.get();
+    ownedStructs.push_back(std::move(info));
+
+    Type* t = allocate(TypeKind::Class);
+    t->structInfo = infoPtr;
+    classCache[name] = t;
+    return t;
+}
+
+Type* TypeContext::lookupClass(const std::u16string& name) const {
+    auto it = classCache.find(name);
+    return it == classCache.end() ? nullptr : it->second;
+}
+
+Type* TypeContext::lookupNamedType(const std::u16string& name) const {
+    auto sit = structCache.find(name);
+    if (sit != structCache.end()) return sit->second;
+    auto cit = classCache.find(name);
+    if (cit != classCache.end()) return cit->second;
+    return nullptr;
 }

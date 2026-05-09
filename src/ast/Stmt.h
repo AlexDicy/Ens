@@ -110,3 +110,14 @@ public:
 
     void dump(std::ostream& os, int indent) const override;
 };
+
+class ClassDecl : public Stmt {
+public:
+    Visibility visibility = Visibility::Public;
+    std::u16string name;
+    std::vector<StructField> fields;
+    std::vector<std::unique_ptr<FuncDecl>> methods;
+    ::Type* resolvedType = nullptr;    // TypeKind::Class
+
+    void dump(std::ostream& os, int indent) const override;
+};

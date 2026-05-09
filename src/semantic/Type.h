@@ -7,7 +7,8 @@ enum class TypeKind {
     Float, Double, Decimal, Char, String, Void,
     Null,        // type of the `null` literal — assignable to any Optional
     Optional,    // wraps another type
-    Struct,      // user-defined struct
+    Struct,      // user-defined struct (value semantics)
+    Class,       // user-defined class (reference semantics, heap-allocated)
     Error        // sentinel — used to suppress cascading errors
 };
 
@@ -66,6 +67,8 @@ public:
     bool isBool() const { return kind == TypeKind::Bool; }
     bool isNull() const { return kind == TypeKind::Null; }
     bool isStruct() const { return kind == TypeKind::Struct; }
+    bool isClass() const  { return kind == TypeKind::Class; }
+    bool hasRecordLayout() const { return isStruct() || isClass(); }
 
     bool equals(const Type* other) const;
     bool assignableFrom(const Type* source) const;

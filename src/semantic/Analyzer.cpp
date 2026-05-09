@@ -58,15 +58,15 @@ void Analyzer::error(int line, int col, int len, std::string msg) {
 
 void Analyzer::analyze(const std::vector<StmtPtr>& program) {
     collectStructs(program);
+    collectClasses(program);
     collectFunctions(program);
     for (const auto& s : program) {
         if (auto* fn = dynamic_cast<FuncDecl*>(s.get())) {
             analyzeFunctionBody(fn);
         } else if (auto* sd = dynamic_cast<StructDecl*>(s.get())) {
-            // Struct fields are already registered. Analyze each method body now.
-            for (auto& m : sd->methods) {
-                analyzeFunctionBody(m.get());
-            }
+            for (auto& m : sd->methods) analyzeFunctionBody(m.get());
+        } else if (auto* cd = dynamic_cast<ClassDecl*>(s.get())) {
+            for (auto& m : cd->methods) analyzeFunctionBody(m.get());
         } else {
             // Top-level statement that isn't a function — analyze it directly
             analyzeStmt(s.get());
@@ -79,9 +79,9 @@ void Analyzer::collectStructs(const std::vector<StmtPtr>& program) {
     for (const auto& s : program) {
         auto* sd = dynamic_cast<StructDecl*>(s.get());
         if (!sd) continue;
-        if (typeCtx.lookupStruct(sd->name)) {
+        if (typeCtx.lookupNamedType(sd->name)) {
             error(sd->line, sd->column, static_cast<int>(sd->name.size()),
-                  "Duplicate struct '" + asciiOf(sd->name) + "'");
+                  "Duplicate type '" + asciiOf(sd->name) + "'");
             continue;
         }
         sd->resolvedType = typeCtx.registerStruct(sd->name);
@@ -125,6 +125,60 @@ void Analyzer::collectStructs(const std::vector<StmtPtr>& program) {
             mi.symbol = sym;
             mi.declaration = m.get();
             sd->resolvedType->structInfo->methods.push_back(std::move(mi));
+        }
+    }
+}
+
+void Analyzer::collectClasses(const std::vector<StmtPtr>& program) {
+    // Pass 1: register names so classes can reference each other (and structs).
+    for (const auto& s : program) {
+        auto* cd = dynamic_cast<ClassDecl*>(s.get());
+        if (!cd) continue;
+        if (typeCtx.lookupNamedType(cd->name)) {
+            error(cd->line, cd->column, static_cast<int>(cd->name.size()),
+                  "Duplicate type '" + asciiOf(cd->name) + "'");
+            continue;
+        }
+        cd->resolvedType = typeCtx.registerClass(cd->name);
+        cd->resolvedType->structInfo->line = cd->line;
+        cd->resolvedType->structInfo->column = cd->column;
+    }
+    // Pass 2: resolve field types.
+    for (const auto& s : program) {
+        auto* cd = dynamic_cast<ClassDecl*>(s.get());
+        if (!cd || !cd->resolvedType) continue;
+        for (auto& f : cd->fields) {
+            Type* ft = resolveTypeNode(f.type.get());
+            FieldInfo fi;
+            fi.name = f.name;
+            fi.type = ft;
+            fi.line = f.line;
+            fi.column = f.column;
+            cd->resolvedType->structInfo->fields.push_back(std::move(fi));
+        }
+    }
+    // Pass 3: register method symbols.
+    for (const auto& s : program) {
+        auto* cd = dynamic_cast<ClassDecl*>(s.get());
+        if (!cd || !cd->resolvedType) continue;
+        for (auto& m : cd->methods) {
+            Type* retType = m->returnType ? resolveTypeNode(m->returnType.get())
+                                          : typeCtx.getPrimitive(TypeKind::Void);
+            Symbol* sym = makeSymbol(SymbolKind::Function, m->name, nullptr,
+                                     m->line, m->column);
+            sym->returnType = retType;
+            for (auto& p : m->parameters) {
+                Type* pt = resolveTypeNode(p.type.get());
+                sym->paramTypes.push_back(pt);
+            }
+            m->resolvedSymbol = sym;
+            m->receiverType = cd->resolvedType;
+
+            MethodInfo mi;
+            mi.name = m->name;
+            mi.symbol = sym;
+            mi.declaration = m.get();
+            cd->resolvedType->structInfo->methods.push_back(std::move(mi));
         }
     }
 }
@@ -227,6 +281,10 @@ void Analyzer::analyzeStmt(Stmt* s) {
     }
     if (dynamic_cast<StructDecl*>(s)) {
         error(s->line, s->column, 1, "Nested struct declarations are not supported");
+        return;
+    }
+    if (dynamic_cast<ClassDecl*>(s)) {
+        error(s->line, s->column, 1, "Nested class declarations are not supported");
         return;
     }
 }
@@ -349,6 +407,7 @@ Type* Analyzer::analyzeExpr(Expr* e) {
     else if (auto* a = dynamic_cast<AssignExpr*>(e))   t = analyzeAssign(a);
     else if (auto* sub = dynamic_cast<SubscriptExpr*>(e)) t = analyzeSubscript(sub);
     else if (auto* tern = dynamic_cast<TernaryExpr*>(e))  t = analyzeTernary(tern);
+    else if (auto* nw = dynamic_cast<NewExpr*>(e))        t = analyzeNew(nw);
     else                                                t = typeCtx.getError();
     e->resolvedType = t;
     return t;
@@ -559,9 +618,9 @@ Type* Analyzer::analyzeCall(CallExpr* e) {
 Type* Analyzer::analyzeMember(MemberExpr* e) {
     Type* objT = analyzeExpr(e->object.get());
     if (objT->isError()) return typeCtx.getError();
-    if (!objT->isStruct() || !objT->structInfo) {
+    if (!objT->hasRecordLayout() || !objT->structInfo) {
         error(e->line, e->column, 1,
-              "Member access on non-struct type '" + objT->toString() + "'");
+              "Member access on non-record type '" + objT->toString() + "'");
         return typeCtx.getError();
     }
     int idx = objT->structInfo->findFieldIndex(e->member);
@@ -578,6 +637,29 @@ Type* Analyzer::analyzeMember(MemberExpr* e) {
     error(e->line, e->column, static_cast<int>(e->member.size()),
           "No field or method '" + asciiOf(e->member) + "' on type '" + objT->toString() + "'");
     return typeCtx.getError();
+}
+
+Type* Analyzer::analyzeNew(NewExpr* e) {
+    Type* t = typeCtx.lookupClass(e->typeName);
+    if (!t) {
+        if (typeCtx.lookupStruct(e->typeName)) {
+            error(e->line, e->column, static_cast<int>(e->typeName.size()),
+                  "'new' is only valid for classes; '" + asciiOf(e->typeName) + "' is a struct");
+        } else {
+            error(e->line, e->column, static_cast<int>(e->typeName.size()),
+                  "Unknown class '" + asciiOf(e->typeName) + "'");
+        }
+        for (auto& a : e->args) analyzeExpr(a.get());
+        return typeCtx.getError();
+    }
+    e->resolvedClassType = t;
+
+    if (!e->args.empty()) {
+        error(e->line, e->column, 1,
+              "Constructors are not yet implemented; use 'new " + asciiOf(e->typeName) + "()'");
+        for (auto& a : e->args) analyzeExpr(a.get());
+    }
+    return t;
 }
 
 Type* Analyzer::analyzeAssign(AssignExpr* e) {
