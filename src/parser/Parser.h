@@ -27,7 +27,7 @@ private:
     const Token& expect(TokenType type, const char* what);
     bool isPrimitiveType(TokenType t) const;
     bool looksLikeTypedDecl() const;
-    bool looksLikeFuncDecl() const;
+    bool looksLikeFuncDecl(bool allowShorthand = false) const;
 
     ExprPtr parsePrecedence(int minPrec);
     ExprPtr parsePrefix();

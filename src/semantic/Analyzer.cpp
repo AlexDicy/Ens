@@ -60,6 +60,17 @@ void Analyzer::analyze(const std::vector<StmtPtr>& program) {
     collectStructs(program);
     collectClasses(program);
     collectFunctions(program);
+
+    auto synthesizeAndCheck = [&](FuncDecl* fn) {
+        synthesizeShorthandBody(fn);
+        checkParameterDefaults(fn);
+    };
+    for (const auto& s : program) {
+        if (auto* fn = dynamic_cast<FuncDecl*>(s.get())) synthesizeAndCheck(fn);
+        else if (auto* sd = dynamic_cast<StructDecl*>(s.get())) for (auto& m : sd->methods) synthesizeAndCheck(m.get());
+        else if (auto* cd = dynamic_cast<ClassDecl*>(s.get())) for (auto& m : cd->methods) synthesizeAndCheck(m.get());
+    }
+
     for (const auto& s : program) {
         if (auto* fn = dynamic_cast<FuncDecl*>(s.get())) {
             analyzeFunctionBody(fn);
@@ -68,7 +79,6 @@ void Analyzer::analyze(const std::vector<StmtPtr>& program) {
         } else if (auto* cd = dynamic_cast<ClassDecl*>(s.get())) {
             for (auto& m : cd->methods) analyzeFunctionBody(m.get());
         } else {
-            // Top-level statement that isn't a function — analyze it directly
             analyzeStmt(s.get());
         }
     }
@@ -113,12 +123,10 @@ void Analyzer::collectStructs(const std::vector<StmtPtr>& program) {
             Symbol* sym = makeSymbol(SymbolKind::Function, m->name, nullptr,
                                      m->line, m->column);
             sym->returnType = retType;
-            for (auto& p : m->parameters) {
-                Type* pt = resolveTypeNode(p.type.get());
-                sym->paramTypes.push_back(pt);
-            }
+            sym->funcDecl = m.get();
             m->resolvedSymbol = sym;
             m->receiverType = sd->resolvedType;
+            resolveMethodParams(m.get(), sd->resolvedType, sym);
 
             MethodInfo mi;
             mi.name = m->name;
@@ -167,12 +175,10 @@ void Analyzer::collectClasses(const std::vector<StmtPtr>& program) {
             Symbol* sym = makeSymbol(SymbolKind::Function, m->name, nullptr,
                                      m->line, m->column);
             sym->returnType = retType;
-            for (auto& p : m->parameters) {
-                Type* pt = resolveTypeNode(p.type.get());
-                sym->paramTypes.push_back(pt);
-            }
+            sym->funcDecl = m.get();
             m->resolvedSymbol = sym;
             m->receiverType = cd->resolvedType;
+            resolveMethodParams(m.get(), cd->resolvedType, sym);
 
             MethodInfo mi;
             mi.name = m->name;
@@ -193,16 +199,148 @@ void Analyzer::collectFunctions(const std::vector<StmtPtr>& program) {
 
         Symbol* sym = makeSymbol(SymbolKind::Function, fn->name, nullptr, fn->line, fn->column);
         sym->returnType = retType;
-        for (auto& p : fn->parameters) {
-            Type* pt = resolveTypeNode(p.type.get());
-            sym->paramTypes.push_back(pt);
-        }
+        sym->funcDecl = fn;
+        fn->resolvedSymbol = sym;
+        resolveFunctionParams(fn, sym);
         if (!globalScope->define(sym)) {
             error(fn->line, fn->column, static_cast<int>(fn->name.size()),
                   "Duplicate function name '" + asciiOf(fn->name) + "'");
         }
-        fn->resolvedSymbol = sym;
     }
+}
+
+void Analyzer::resolveMethodParams(FuncDecl* fn, ::Type* receiverType, Symbol* sym) {
+    bool isCtor = (receiverType->structInfo && fn->name == receiverType->structInfo->name);
+
+    if (fn->isShorthand && !isCtor) {
+        error(fn->line, fn->column, static_cast<int>(fn->name.size()),
+              "Shorthand declaration ';' is only allowed on a constructor");
+    }
+
+    bool seenDefault = false;
+    for (auto& p : fn->parameters) {
+        Type* pt = nullptr;
+        if (p.isThisField) {
+            if (!isCtor) {
+                error(fn->line, fn->column, static_cast<int>(p.name.size()),
+                      "'this." + asciiOf(p.thisFieldName) + "' parameters are only allowed in a constructor");
+                pt = typeCtx.getError();
+            } else {
+                int idx = receiverType->structInfo->findFieldIndex(p.thisFieldName);
+                if (idx < 0) {
+                    error(fn->line, fn->column, static_cast<int>(p.thisFieldName.size()),
+                          "No field '" + asciiOf(p.thisFieldName) + "' on type '" + receiverType->toString() + "'");
+                    pt = typeCtx.getError();
+                } else {
+                    pt = receiverType->structInfo->fields[idx].type;
+                }
+            }
+        } else {
+            pt = resolveTypeNode(p.type.get());
+        }
+        sym->paramTypes.push_back(pt);
+
+        if (p.defaultValue) {
+            seenDefault = true;
+        } else if (seenDefault) {
+            int line = p.type ? p.type->line : fn->line;
+            int col  = p.type ? p.type->column : fn->column;
+            error(line, col, static_cast<int>(p.name.size()),
+                  "Parameter '" + asciiOf(p.name) + "' has no default but follows a defaulted parameter");
+        }
+    }
+}
+
+void Analyzer::resolveFunctionParams(FuncDecl* fn, Symbol* sym) {
+    if (fn->isShorthand) {
+        error(fn->line, fn->column, static_cast<int>(fn->name.size()),
+              "Shorthand declaration ';' is only allowed on a constructor");
+    }
+    bool seenDefault = false;
+    for (auto& p : fn->parameters) {
+        if (p.isThisField) {
+            error(fn->line, fn->column, static_cast<int>(p.name.size()),
+                  "'this." + asciiOf(p.thisFieldName) + "' parameters are only allowed in a constructor");
+            sym->paramTypes.push_back(typeCtx.getError());
+        } else {
+            sym->paramTypes.push_back(resolveTypeNode(p.type.get()));
+        }
+        if (p.defaultValue) {
+            seenDefault = true;
+        } else if (seenDefault) {
+            int line = p.type ? p.type->line : fn->line;
+            int col  = p.type ? p.type->column : fn->column;
+            error(line, col, static_cast<int>(p.name.size()),
+                  "Parameter '" + asciiOf(p.name) + "' has no default but follows a defaulted parameter");
+        }
+    }
+}
+
+void Analyzer::synthesizeShorthandBody(FuncDecl* fn) {
+    bool hasThisField = false;
+    for (auto& p : fn->parameters) if (p.isThisField) { hasThisField = true; break; }
+    if (!fn->isShorthand && !hasThisField) return;
+
+    std::vector<StmtPtr> synth;
+    for (auto& p : fn->parameters) {
+        if (!p.isThisField) continue;
+        auto thisE = std::make_unique<ThisExpr>();
+        thisE->line = fn->line;
+        thisE->column = fn->column;
+        auto memberE = std::make_unique<MemberExpr>(std::move(thisE), p.thisFieldName);
+        memberE->line = fn->line;
+        memberE->column = fn->column;
+        auto identE = std::make_unique<IdentExpr>(p.name);
+        identE->line = fn->line;
+        identE->column = fn->column;
+        auto assignE = std::make_unique<AssignExpr>(TokenType::EQ, std::move(memberE), std::move(identE));
+        assignE->line = fn->line;
+        assignE->column = fn->column;
+        auto stmt = std::make_unique<ExprStmt>(std::move(assignE));
+        stmt->line = fn->line;
+        stmt->column = fn->column;
+        synth.push_back(std::move(stmt));
+    }
+
+    if (fn->isShorthand) {
+        auto block = std::make_unique<BlockStmt>();
+        block->line = fn->line;
+        block->column = fn->column;
+        for (auto& s : synth) block->statements.push_back(std::move(s));
+        fn->body = std::move(block);
+    } else if (!synth.empty()) {
+        std::vector<StmtPtr> combined;
+        combined.reserve(synth.size() + fn->body->statements.size());
+        for (auto& s : synth) combined.push_back(std::move(s));
+        for (auto& s : fn->body->statements) combined.push_back(std::move(s));
+        fn->body->statements = std::move(combined);
+    }
+}
+
+void Analyzer::checkParameterDefaults(FuncDecl* fn) {
+    Symbol* prevFunction = currentFunction;
+    Symbol* prevThis = currentThis;
+    Scope* prevScope = currentScope;
+    currentFunction = nullptr;
+    currentThis = nullptr;
+    currentScope = globalScope;
+
+    Symbol* sym = fn->resolvedSymbol;
+    for (size_t i = 0; i < fn->parameters.size(); ++i) {
+        auto& p = fn->parameters[i];
+        if (!p.defaultValue) continue;
+        Type* expected = (sym && i < sym->paramTypes.size()) ? sym->paramTypes[i] : typeCtx.getError();
+        Type* actual = analyzeExpr(p.defaultValue.get());
+        if (!expected->isError() && !actual->isError() && !expected->assignableFrom(actual)) {
+            error(p.defaultValue->line, p.defaultValue->column, 1,
+                  "Default value for parameter '" + asciiOf(p.name) + "': expected '" +
+                  expected->toString() + "', got '" + actual->toString() + "'");
+        }
+    }
+
+    currentFunction = prevFunction;
+    currentThis = prevThis;
+    currentScope = prevScope;
 }
 
 void Analyzer::analyzeFunctionBody(FuncDecl* fn) {
@@ -547,11 +685,19 @@ Type* Analyzer::analyzeCall(CallExpr* e) {
         analyzeExpr(e->callee.get());  // resolves field-or-method on member
         if (member->resolvedMethodSymbol) {
             Symbol* sym = member->resolvedMethodSymbol;
-            if (e->args.size() != sym->paramTypes.size()) {
+            size_t requiredCount = sym->paramTypes.size();
+            if (sym->funcDecl) {
+                requiredCount = 0;
+                for (auto& p : sym->funcDecl->parameters) {
+                    if (p.defaultValue) break;
+                    requiredCount++;
+                }
+            }
+            if (e->args.size() < requiredCount || e->args.size() > sym->paramTypes.size()) {
                 error(e->line, e->column, 1,
                       "Method '" + asciiOf(member->member) + "' expects " +
-                      std::to_string(sym->paramTypes.size()) + " argument(s), got " +
-                      std::to_string(e->args.size()));
+                      std::to_string(requiredCount) + (requiredCount == sym->paramTypes.size() ? "" : "-" + std::to_string(sym->paramTypes.size())) +
+                      " argument(s), got " + std::to_string(e->args.size()));
             }
             size_t n = std::min(e->args.size(), sym->paramTypes.size());
             for (size_t i = 0; i < n; ++i) {
@@ -593,11 +739,19 @@ Type* Analyzer::analyzeCall(CallExpr* e) {
     }
     idCallee->resolvedSymbol = sym;
 
-    if (e->args.size() != sym->paramTypes.size()) {
+    size_t requiredCount = sym->paramTypes.size();
+    if (sym->funcDecl) {
+        requiredCount = 0;
+        for (auto& p : sym->funcDecl->parameters) {
+            if (p.defaultValue) break;
+            requiredCount++;
+        }
+    }
+    if (e->args.size() < requiredCount || e->args.size() > sym->paramTypes.size()) {
         error(e->line, e->column, 1,
               "Function '" + asciiOf(idCallee->name) + "' expects " +
-              std::to_string(sym->paramTypes.size()) + " argument(s), got " +
-              std::to_string(e->args.size()));
+              std::to_string(requiredCount) + (requiredCount == sym->paramTypes.size() ? "" : "-" + std::to_string(sym->paramTypes.size())) +
+              " argument(s), got " + std::to_string(e->args.size()));
     }
 
     size_t n = std::min(e->args.size(), sym->paramTypes.size());
@@ -661,11 +815,19 @@ Type* Analyzer::analyzeNew(NewExpr* e) {
     if (ctorIdx >= 0) ctor = t->structInfo->methods[ctorIdx].symbol;
 
     if (ctor) {
-        if (e->args.size() != ctor->paramTypes.size()) {
+        size_t requiredCount = ctor->paramTypes.size();
+        if (ctor->funcDecl) {
+            requiredCount = 0;
+            for (auto& p : ctor->funcDecl->parameters) {
+                if (p.defaultValue) break;
+                requiredCount++;
+            }
+        }
+        if (e->args.size() < requiredCount || e->args.size() > ctor->paramTypes.size()) {
             error(e->line, e->column, 1,
                   "Constructor '" + asciiOf(e->typeName) + "' expects " +
-                  std::to_string(ctor->paramTypes.size()) + " argument(s), got " +
-                  std::to_string(e->args.size()));
+                  std::to_string(requiredCount) + (requiredCount == ctor->paramTypes.size() ? "" : "-" + std::to_string(ctor->paramTypes.size())) +
+                  " argument(s), got " + std::to_string(e->args.size()));
         }
         size_t n = std::min(e->args.size(), ctor->paramTypes.size());
         for (size_t i = 0; i < n; ++i) {

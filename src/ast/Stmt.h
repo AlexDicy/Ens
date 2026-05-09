@@ -16,6 +16,9 @@ enum class Visibility { Public, Private, Protected };
 struct Parameter {
     TypePtr type;
     std::u16string name;
+    bool isThisField = false;
+    std::u16string thisFieldName;
+    ExprPtr defaultValue;
     Symbol* resolvedSymbol = nullptr;
 };
 
@@ -79,6 +82,7 @@ public:
     std::vector<Parameter> parameters;
     TypePtr returnType;
     std::unique_ptr<BlockStmt> body;
+    bool isShorthand = false;
     Symbol* resolvedSymbol = nullptr;
 
     // Set when this FuncDecl is a method on a struct/class. The owning type's

@@ -216,7 +216,7 @@ StmtPtr Parser::parseStatement() {
     }
 }
 
-bool Parser::looksLikeFuncDecl() const {
+bool Parser::looksLikeFuncDecl(bool allowShorthand) const {
     if (pos >= tokens.size() || tokens[pos].getType() != TokenType::IDENTIFIER) return false;
     if (pos + 1 >= tokens.size() || tokens[pos + 1].getType() != TokenType::L_PAREN) return false;
     int depth = 1;
@@ -229,7 +229,8 @@ bool Parser::looksLikeFuncDecl() const {
     }
     if (depth != 0 || j >= tokens.size()) return false;
     TokenType after = tokens[j].getType();
-    return after == TokenType::ARROW || after == TokenType::L_BRACE;
+    if (after == TokenType::ARROW || after == TokenType::L_BRACE) return true;
+    return allowShorthand && after == TokenType::SEMI;
 }
 
 std::unique_ptr<FuncDecl> Parser::parseFuncDecl(Visibility vis) {
@@ -250,15 +251,34 @@ std::unique_ptr<FuncDecl> Parser::parseFuncDecl(Visibility vis) {
     if (match(TokenType::ARROW)) {
         fn->returnType = parseType();
     }
-    fn->body = parseBlock();
+    if (match(TokenType::SEMI)) {
+        fn->isShorthand = true;
+    } else {
+        fn->body = parseBlock();
+    }
     return fn;
 }
 
 Parameter Parser::parseParameter() {
     Parameter p;
+    if (check(TokenType::THIS)) {
+        consume();
+        expect(TokenType::DOT, "'.' after 'this' in parameter");
+        const Token& nameTok = expect(TokenType::IDENTIFIER, "field name after 'this.'");
+        p.isThisField = true;
+        p.thisFieldName = nameTok.getText();
+        p.name = nameTok.getText();
+        if (match(TokenType::EQ)) {
+            p.defaultValue = parseExpression();
+        }
+        return p;
+    }
     p.type = parseType();
     const Token& nameTok = expect(TokenType::IDENTIFIER, "parameter name");
     p.name = nameTok.getText();
+    if (match(TokenType::EQ)) {
+        p.defaultValue = parseExpression();
+    }
     return p;
 }
 
@@ -282,7 +302,7 @@ StmtPtr Parser::parseStructDecl(Visibility vis) {
         // Method or field?
         // Method: starts with IDENT and has the func-decl shape (`name(...) [-> T] {`)
         // Field: starts with a type and an identifier name.
-        if (check(TokenType::IDENTIFIER) && looksLikeFuncDecl()) {
+        if (check(TokenType::IDENTIFIER) && looksLikeFuncDecl(true)) {
             auto method = parseFuncDecl(memberVis);
             decl->methods.push_back(std::move(method));
             continue;
@@ -319,7 +339,7 @@ StmtPtr Parser::parseClassDecl(Visibility vis) {
         else if (check(TokenType::PROTECTED)) { consume(); memberVis = Visibility::Protected; }
         else if (check(TokenType::PUBLIC))    { consume(); memberVis = Visibility::Public; }
 
-        if (check(TokenType::IDENTIFIER) && looksLikeFuncDecl()) {
+        if (check(TokenType::IDENTIFIER) && looksLikeFuncDecl(true)) {
             auto method = parseFuncDecl(memberVis);
             decl->methods.push_back(std::move(method));
             continue;

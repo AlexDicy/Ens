@@ -38,7 +38,11 @@ private:
     void collectStructs(const std::vector<StmtPtr>& program);
     void collectClasses(const std::vector<StmtPtr>& program);
     void collectFunctions(const std::vector<StmtPtr>& program);
+    void resolveMethodParams(FuncDecl* fn, ::Type* receiverType, Symbol* sym);
+    void resolveFunctionParams(FuncDecl* fn, Symbol* sym);
+    void synthesizeShorthandBody(FuncDecl* fn);
     void analyzeFunctionBody(FuncDecl* fn);
+    void checkParameterDefaults(FuncDecl* fn);
 
     void analyzeStmt(Stmt* s);
     void analyzeBlock(BlockStmt* s);

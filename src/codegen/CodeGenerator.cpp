@@ -743,6 +743,23 @@ struct CodeGenerator::Impl {
         return llvm::Function::Create(ty, llvm::Function::ExternalLinkage, "malloc", module.get());
     }
 
+    bool appendCallArgs(Symbol* sym, const std::vector<ExprPtr>& userArgs, std::vector<llvm::Value*>& out) {
+        for (auto& a : userArgs) {
+            llvm::Value* v = emitExpr(a.get());
+            if (!v) return false;
+            out.push_back(v);
+        }
+        if (!sym || !sym->funcDecl) return true;
+        for (size_t i = userArgs.size(); i < sym->funcDecl->parameters.size(); ++i) {
+            auto& p = sym->funcDecl->parameters[i];
+            if (!p.defaultValue) return false;
+            llvm::Value* v = emitExpr(p.defaultValue.get());
+            if (!v) return false;
+            out.push_back(v);
+        }
+        return true;
+    }
+
     llvm::Value* emitNew(NewExpr* e) {
         ::Type* t = e->resolvedClassType;
         if (!t || !t->structInfo) {
@@ -767,11 +784,7 @@ struct CodeGenerator::Impl {
                 std::vector<llvm::Value*> args;
                 args.reserve(e->args.size() + 1);
                 args.push_back(heapPtr);
-                for (auto& a : e->args) {
-                    llvm::Value* v = emitExpr(a.get());
-                    if (!v) return nullptr;
-                    args.push_back(v);
-                }
+                if (!appendCallArgs(ctorSym, e->args, args)) return nullptr;
                 auto* fn = llvm::cast<llvm::Function>(fnIt->second);
                 builder->CreateCall(fn, args);
             }
@@ -817,11 +830,7 @@ struct CodeGenerator::Impl {
                 std::vector<llvm::Value*> args;
                 args.reserve(e->args.size() + 1);
                 args.push_back(receiver);
-                for (auto& a : e->args) {
-                    llvm::Value* v = emitExpr(a.get());
-                    if (!v) return nullptr;
-                    args.push_back(v);
-                }
+                if (!appendCallArgs(methodSym, e->args, args)) return nullptr;
                 auto* fn = llvm::cast<llvm::Function>(fnIt->second);
                 return builder->CreateCall(fn, args);
             }
@@ -843,11 +852,7 @@ struct CodeGenerator::Impl {
         auto* fn = llvm::cast<llvm::Function>(it->second);
         std::vector<llvm::Value*> args;
         args.reserve(e->args.size());
-        for (auto& a : e->args) {
-            llvm::Value* v = emitExpr(a.get());
-            if (!v) return nullptr;
-            args.push_back(v);
-        }
+        if (!appendCallArgs(sym, e->args, args)) return nullptr;
         return builder->CreateCall(fn, args);
     }
 
