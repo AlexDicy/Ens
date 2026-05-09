@@ -261,11 +261,15 @@ struct CodeGenerator::Impl {
         for (auto& s : program) {
             if (auto* fn = dynamic_cast<FuncDecl*>(s.get())) {
                 declareFunction(fn);
+            } else if (auto* sd = dynamic_cast<StructDecl*>(s.get())) {
+                for (auto& m : sd->methods) declareFunction(m.get());
             }
         }
         for (auto& s : program) {
             if (auto* fn = dynamic_cast<FuncDecl*>(s.get())) {
                 emitFunction(fn);
+            } else if (auto* sd = dynamic_cast<StructDecl*>(s.get())) {
+                for (auto& m : sd->methods) emitFunction(m.get());
             }
         }
         if (debugEnabled && diBuilder) diBuilder->finalize();
@@ -290,6 +294,12 @@ struct CodeGenerator::Impl {
         if (!sym) return;
 
         std::vector<llvm::Type*> paramTypes;
+
+        // Methods get an implicit leading `this` pointer parameter.
+        if (fn->receiverType) {
+            paramTypes.push_back(llvm::PointerType::get(ctx, 0));
+        }
+
         for (auto* pt : sym->paramTypes) {
             if (isUnsupportedType(pt)) {
                 error(fn->line, fn->column,
@@ -305,7 +315,13 @@ struct CodeGenerator::Impl {
         }
         llvm::Type* retType = mapType(sym->returnType);
         auto* fnType = llvm::FunctionType::get(retType, paramTypes, false);
-        auto* func = llvm::Function::Create(fnType, llvm::Function::ExternalLinkage, asAscii(fn->name), module.get());
+
+        std::string mangled = asAscii(fn->name);
+        if (fn->receiverType && fn->receiverType->structInfo) {
+            mangled = asAscii(fn->receiverType->structInfo->name) + "_" + mangled;
+        }
+
+        auto* func = llvm::Function::Create(fnType, llvm::Function::ExternalLinkage, mangled, module.get());
         values[sym] = func;
     }
 
@@ -339,14 +355,25 @@ struct CodeGenerator::Impl {
         // verifyModule is happy with !dbg on every instruction.
         setLocation(fn);
 
-        size_t i = 0;
-        for (auto& arg : currentFunction->args()) {
+        auto argIter = currentFunction->args().begin();
+        auto argEnd  = currentFunction->args().end();
+
+        if (fn->receiverType && fn->thisSymbol && argIter != argEnd) {
+            argIter->setName("this");
+            llvm::Type* ptrTy = llvm::PointerType::get(ctx, 0);
+            auto* thisAlloca = createEntryAlloca(currentFunction, ptrTy, "this.addr");
+            builder->CreateStore(&*argIter, thisAlloca);
+            values[fn->thisSymbol] = thisAlloca;
+            ++argIter;
+        }
+
+        for (size_t i = 0; i < fn->parameters.size() && argIter != argEnd; ++i, ++argIter) {
             auto& param = fn->parameters[i];
             std::string pname = asAscii(param.name);
-            arg.setName(pname);
+            argIter->setName(pname);
             llvm::Type* lt = mapType(param.resolvedSymbol->type);
             auto* alloca = createEntryAlloca(currentFunction, lt, pname);
-            builder->CreateStore(&arg, alloca);
+            builder->CreateStore(&*argIter, alloca);
             values[param.resolvedSymbol] = alloca;
 
             if (debugEnabled && diBuilder && sp) {
@@ -365,7 +392,6 @@ struct CodeGenerator::Impl {
                         builder->GetInsertBlock());
                 }
             }
-            i++;
         }
 
         if (fn->body) {
@@ -531,6 +557,7 @@ struct CodeGenerator::Impl {
             return builder->CreateGlobalString(utf8, ".str");
         }
         if (auto* id = dynamic_cast<IdentExpr*>(e))   return emitIdent(id);
+        if (auto* th = dynamic_cast<ThisExpr*>(e))    return emitThis(th);
         if (auto* b = dynamic_cast<BinaryExpr*>(e))   return emitBinary(b);
         if (auto* u = dynamic_cast<UnaryExpr*>(e))    return emitUnary(u);
         if (auto* c = dynamic_cast<CallExpr*>(e))     return emitCall(c);
@@ -586,6 +613,22 @@ struct CodeGenerator::Impl {
             return nullptr;
         }
         return builder->CreateLoad(mapType(sym->type), it->second, asAscii(e->name) + ".load");
+    }
+
+    llvm::Value* emitThis(ThisExpr* e) {
+        Symbol* sym = e->resolvedSymbol;
+        if (!sym) {
+            error(e->line, e->column, "Internal: `this` not bound");
+            return nullptr;
+        }
+        auto it = values.find(sym);
+        if (it == values.end()) {
+            error(e->line, e->column, "Internal: `this` has no LLVM value");
+            return nullptr;
+        }
+        // `this` is stored at an alloca holding a pointer to the receiver. Load
+        // the pointer; member access GEPs from this address directly.
+        return builder->CreateLoad(llvm::PointerType::get(ctx, 0), it->second, "this");
     }
 
     llvm::Value* emitBinary(BinaryExpr* e) {
@@ -685,6 +728,31 @@ struct CodeGenerator::Impl {
     }
 
     llvm::Value* emitCall(CallExpr* e) {
+        // Method call: `obj.method(args)`
+        if (auto* member = dynamic_cast<MemberExpr*>(e->callee.get())) {
+            if (member->resolvedMethodSymbol) {
+                Symbol* methodSym = member->resolvedMethodSymbol;
+                auto fnIt = values.find(methodSym);
+                if (fnIt == values.end()) {
+                    error(e->line, e->column, "Internal: method has no LLVM function");
+                    return nullptr;
+                }
+                llvm::Value* receiverAddr = emitLValue(member->object.get());
+                if (!receiverAddr) return nullptr;
+
+                std::vector<llvm::Value*> args;
+                args.reserve(e->args.size() + 1);
+                args.push_back(receiverAddr);
+                for (auto& a : e->args) {
+                    llvm::Value* v = emitExpr(a.get());
+                    if (!v) return nullptr;
+                    args.push_back(v);
+                }
+                auto* fn = llvm::cast<llvm::Function>(fnIt->second);
+                return builder->CreateCall(fn, args);
+            }
+        }
+
         auto* idCallee = dynamic_cast<IdentExpr*>(e->callee.get());
         if (!idCallee || !idCallee->resolvedSymbol) {
             error(e->line, e->column, "Only direct function calls are supported");
@@ -728,6 +796,15 @@ struct CodeGenerator::Impl {
             if (!sym) return nullptr;
             auto it = values.find(sym);
             return it == values.end() ? nullptr : it->second;
+        }
+        if (auto* th = dynamic_cast<ThisExpr*>(e)) {
+            // `this` already represents the address of the receiver — load the
+            // pointer from its alloca and use it as the lvalue address.
+            Symbol* sym = th->resolvedSymbol;
+            if (!sym) return nullptr;
+            auto it = values.find(sym);
+            if (it == values.end()) return nullptr;
+            return builder->CreateLoad(llvm::PointerType::get(ctx, 0), it->second, "this");
         }
         if (auto* m = dynamic_cast<MemberExpr*>(e)) {
             ::Type* objType = m->object->resolvedType;

@@ -164,6 +164,7 @@ void Analyzer::analyzeFunctionBody(FuncDecl* fn) {
                                      fn->receiverType, fn->line, fn->column);
         currentScope->define(thisSym);
         currentThis = thisSym;
+        fn->thisSymbol = thisSym;
     } else {
         currentThis = nullptr;
     }

@@ -85,6 +85,7 @@ public:
     // semantic Type. The synthetic `this` parameter is always the first one
     // and is added by the analyzer.
     ::Type* receiverType = nullptr;
+    Symbol* thisSymbol = nullptr;  // synthetic `this` parameter symbol for methods
 
     void dump(std::ostream& os, int indent) const override;
 };
