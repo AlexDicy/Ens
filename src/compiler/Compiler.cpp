@@ -7,6 +7,7 @@
 #include "../cst/CstParser.h"
 #include "../cst/SyntaxNode.h"
 #include "../cst/ast/Declaration.h"
+#include "../cst/codegen/CstCodeGenerator.h"
 #include "../cst/semantic/CstAnalyzer.h"
 #include "../diagnostics/Diagnostic.h"
 #include "../diagnostics/DiagnosticSink.h"
@@ -168,6 +169,79 @@ bool Compiler::analyzeCst(std::istream& source, const std::string& filename) {
         sink.printAll(sourceFile, std::cerr);
     }
     return !sink.hasErrors();
+}
+
+bool Compiler::compileViaCst(std::istream& source, const fs::path& outputFile, const std::string& filename) {
+    std::string code((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
+    std::u16string u16code(code.begin(), code.end());
+    SourceFile sourceFile(filename, std::move(u16code));
+
+    DiagnosticSink sink;
+    CstParser parser(sourceFile.getSource(), sink);
+    auto root = parser.parseSourceFile();
+    auto rootNode = SyntaxNode::makeRoot(root.get());
+
+    cst::semantic::CstAnalyzer analyzer(sourceFile, sink);
+    analyzer.analyze(*rootNode);
+
+    if (sink.hasErrors()) {
+        sink.printAll(sourceFile, std::cerr);
+        return false;
+    }
+
+    std::string ext = outputFile.extension().string();
+    for (auto& c : ext) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+    const bool linkToExe = !outputFile.empty() && (ext == ".exe" || ext.empty());
+
+    fs::path objPath;
+    if (linkToExe) {
+        objPath = outputFile;
+        objPath.replace_extension(".obj");
+    }
+
+    {
+        CstCodeGenerator codegen("ens_module", filename, sourceFile, analyzer.result());
+        if (!codegen.generate(*rootNode)) {
+            for (const auto& d : codegen.getDiagnostics()) d.print(sourceFile, std::cerr);
+            return false;
+        }
+        if (outputFile.empty()) {
+            std::cout << "--- LLVM IR ---\n";
+            codegen.print(std::cout);
+            return true;
+        }
+        if (ext == ".ll") {
+            std::ofstream out(outputFile);
+            if (!out) {
+                std::cerr << "Could not open '" << outputFile << "' for writing\n";
+                return false;
+            }
+            codegen.print(out);
+            return true;
+        }
+        if (ext == ".obj" || ext == ".o") {
+            if (!codegen.emitObjectFile(outputFile.string())) {
+                for (const auto& d : codegen.getDiagnostics()) d.print(sourceFile, std::cerr);
+                return false;
+            }
+            return true;
+        }
+        if (linkToExe) {
+            if (!codegen.emitObjectFile(objPath.string())) {
+                for (const auto& d : codegen.getDiagnostics()) d.print(sourceFile, std::cerr);
+                return false;
+            }
+        } else {
+            std::cerr << "Unsupported --output extension: '" << ext << "'\n";
+            return false;
+        }
+    }
+
+    if (linkToExe) {
+        if (!Linker::link(objPath.string(), outputFile.string(), std::cerr)) return false;
+        return true;
+    }
+    return true;
 }
 
 bool Compiler::compileSingle(std::istream& source, const fs::path& outputFile, const std::string& filename) {

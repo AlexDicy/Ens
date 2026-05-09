@@ -144,7 +144,7 @@ void CstAnalyzer::collectStructs(const ast::SourceFile& file) {
             sym->funcDeclCst = m.node.greenNode();
             resolveMethodParams(m, t, sym);
             analysis.setSymbol(m.node.greenNode(), sym);
-            methodReceiver[m.node.greenNode()] = t;
+            analysis.setReceiver(m.node.greenNode(), t);
 
             MethodInfo mi;
             mi.name = mname;
@@ -201,7 +201,7 @@ void CstAnalyzer::collectClasses(const ast::SourceFile& file) {
             sym->funcDeclCst = m.node.greenNode();
             resolveMethodParams(m, t, sym);
             analysis.setSymbol(m.node.greenNode(), sym);
-            methodReceiver[m.node.greenNode()] = t;
+            analysis.setReceiver(m.node.greenNode(), t);
 
             MethodInfo mi;
             mi.name = mname;
@@ -365,17 +365,14 @@ void CstAnalyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
 
     pushScope();
 
-    Type* receiverType = nullptr;
-    if (auto it = methodReceiver.find(fn.node.greenNode()); it != methodReceiver.end()) {
-        receiverType = it->second;
-    }
+    Type* receiverType = analysis.receiverOf(fn.node.greenNode());
 
     if (receiverType) {
         Symbol* thisSym = makeSymbol(SymbolKind::Parameter, std::u16string(u"this"),
                                      receiverType, fn.node.startOffset());
         currentScope->define(thisSym);
         currentThis = thisSym;
-        analysis.setSymbol(fn.node.greenNode(), currentFunction);  // re-anchor sym
+        analysis.setThisSymbol(fn.node.greenNode(), thisSym);
     } else {
         currentThis = nullptr;
     }

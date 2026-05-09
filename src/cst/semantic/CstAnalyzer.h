@@ -41,7 +41,6 @@ private:
     Scope* currentScope = nullptr;
     Symbol* currentFunction = nullptr;
     Symbol* currentThis = nullptr;
-    std::unordered_map<const GreenElement*, Type*> methodReceiver;
 
     Symbol* makeSymbol(SymbolKind k, std::u16string n, Type* t, uint32_t offset);
     Scope* pushScope();

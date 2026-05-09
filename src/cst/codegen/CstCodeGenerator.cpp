@@ -1,0 +1,1153 @@
+#include "CstCodeGenerator.h"
+#include "../ast/Declaration.h"
+#include "../ast/Expression.h"
+#include "../ast/Statement.h"
+#include "../ast/TypeReference.h"
+#include "../../semantic/Symbol.h"
+#include "../../semantic/Type.h"
+#include "../../tokenizer/TokenType.h"
+
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/Verifier.h"
+#include "llvm/IR/DIBuilder.h"
+#include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/BinaryFormat/Dwarf.h"
+#include "llvm/MC/TargetRegistry.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/CodeGen.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Target/TargetOptions.h"
+#include "llvm/TargetParser/Host.h"
+
+#include <filesystem>
+#include <optional>
+#include <unordered_map>
+
+namespace ast = cst::ast;
+namespace sema = cst::semantic;
+
+static std::string asAscii(std::u16string_view s) {
+    std::string r;
+    r.reserve(s.size());
+    for (char16_t c : s) r.push_back(c < 128 ? static_cast<char>(c) : '?');
+    return r;
+}
+
+struct CstCodeGenerator::Impl {
+    std::string moduleName;
+    std::string sourceFilename;
+    const SourceFile& sourceFile;
+    const sema::AnalysisResult& analysis;
+
+    llvm::LLVMContext ctx;
+    std::unique_ptr<llvm::Module> module;
+    std::unique_ptr<llvm::IRBuilder<>> builder;
+    std::unique_ptr<llvm::DIBuilder> diBuilder;
+    std::unique_ptr<llvm::TargetMachine> targetMachine;
+    std::unordered_map<Symbol*, llvm::Value*> values;
+    std::unordered_map<int, llvm::DIType*> diTypeCache;
+    std::unordered_map<::Type*, llvm::StructType*> structTypeCache;
+    std::unordered_map<::Type*, llvm::DIType*> diStructTypeCache;
+    std::unordered_map<::Type*, llvm::DIType*> diClassPointerCache;
+    llvm::Function* currentFunction = nullptr;
+    llvm::DIScope* currentDIScope = nullptr;
+    llvm::DICompileUnit* diCU = nullptr;
+    llvm::DIFile* diFile = nullptr;
+    bool debugEnabled = true;
+    std::vector<Diagnostic> diagnostics;
+
+    Impl(std::string mn, std::string sf, const SourceFile& src, const sema::AnalysisResult& an)
+        : moduleName(std::move(mn)), sourceFilename(std::move(sf)),
+          sourceFile(src), analysis(an) {
+        module = std::make_unique<llvm::Module>(moduleName, ctx);
+        module->setSourceFileName(sourceFilename);
+        builder = std::make_unique<llvm::IRBuilder<>>(ctx);
+
+        if (debugEnabled) {
+            module->addModuleFlag(llvm::Module::Warning, "Debug Info Version", llvm::DEBUG_METADATA_VERSION);
+            module->addModuleFlag(llvm::Module::Warning, "Dwarf Version", 4);
+            diBuilder = std::make_unique<llvm::DIBuilder>(*module);
+            std::filesystem::path p(sourceFilename);
+            std::string fname = p.filename().string();
+            std::string dir   = p.parent_path().string();
+            if (fname.empty()) fname = sourceFilename;
+            diFile = diBuilder->createFile(fname, dir);
+            diCU = diBuilder->createCompileUnit(
+                llvm::dwarf::DW_LANG_C, diFile, "Ens compiler",
+                /*isOptimized*/ false, /*flags*/ "", /*runtimeVersion*/ 0);
+            currentDIScope = diCU;
+        }
+    }
+
+    std::pair<int,int> posOf(uint32_t offset) const {
+        return sourceFile.offsetToPosition(offset);
+    }
+
+    void setLocation(uint32_t offset) {
+        if (!debugEnabled || !currentDIScope) return;
+        auto [line, col] = posOf(offset);
+        builder->SetCurrentDebugLocation(
+            llvm::DILocation::get(ctx, static_cast<unsigned>(line),
+                                  static_cast<unsigned>(col), currentDIScope));
+    }
+
+    void setLocationFromNode(const SyntaxNode& n) { setLocation(n.startOffset()); }
+
+    void error(uint32_t offset, std::string msg) {
+        auto [line, col] = posOf(offset);
+        diagnostics.emplace_back(DiagnosticLevel::Error, SourceSpan{line, col, 1}, std::move(msg));
+    }
+
+    bool isUnsupportedType(::Type* t) {
+        if (!t) return true;
+        switch (t->kind) {
+            case TypeKind::Decimal:
+            case TypeKind::Optional:
+            case TypeKind::Null:
+            case TypeKind::Error:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    bool isReferenceType(::Type* t) { return t && t->kind == TypeKind::Class; }
+
+    llvm::Type* mapType(::Type* t) {
+        if (!t) return llvm::Type::getVoidTy(ctx);
+        switch (t->kind) {
+            case TypeKind::Bool:    return llvm::Type::getInt1Ty(ctx);
+            case TypeKind::Byte:    return llvm::Type::getInt8Ty(ctx);
+            case TypeKind::Short:
+            case TypeKind::UShort:  return llvm::Type::getInt16Ty(ctx);
+            case TypeKind::Int:
+            case TypeKind::UInt:    return llvm::Type::getInt32Ty(ctx);
+            case TypeKind::Long:
+            case TypeKind::ULong:   return llvm::Type::getInt64Ty(ctx);
+            case TypeKind::Char:    return llvm::Type::getInt32Ty(ctx);
+            case TypeKind::Float:   return llvm::Type::getFloatTy(ctx);
+            case TypeKind::Double:  return llvm::Type::getDoubleTy(ctx);
+            case TypeKind::Void:    return llvm::Type::getVoidTy(ctx);
+            case TypeKind::String:  return llvm::PointerType::get(ctx, 0);
+            case TypeKind::Struct:  return mapStructType(t);
+            case TypeKind::Class:   return llvm::PointerType::get(ctx, 0);
+            default:                return nullptr;
+        }
+    }
+
+    llvm::StructType* mapStructType(::Type* t) {
+        auto it = structTypeCache.find(t);
+        if (it != structTypeCache.end()) return it->second;
+        std::string sname = t->structInfo ? asAscii(t->structInfo->name) : "struct.anon";
+        auto* st = llvm::StructType::create(ctx, sname);
+        structTypeCache[t] = st;
+        std::vector<llvm::Type*> fieldTypes;
+        if (t->structInfo) {
+            fieldTypes.reserve(t->structInfo->fields.size());
+            for (const auto& f : t->structInfo->fields) fieldTypes.push_back(mapType(f.type));
+        }
+        st->setBody(fieldTypes);
+        return st;
+    }
+
+    bool isSigned(::Type* t) {
+        if (!t) return false;
+        switch (t->kind) {
+            case TypeKind::Byte:
+            case TypeKind::Short:
+            case TypeKind::Int:
+            case TypeKind::Long:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    llvm::DIType* mapDIType(::Type* t) {
+        if (!debugEnabled || !diBuilder || !t) return nullptr;
+        if (t->kind == TypeKind::Struct) return mapDIStructType(t);
+        if (t->kind == TypeKind::Class) {
+            auto it = diClassPointerCache.find(t);
+            if (it != diClassPointerCache.end()) return it->second;
+            auto* underlying = mapDIStructType(t);
+            if (!underlying) return nullptr;
+            uint64_t ptrBits = module->getDataLayout().getPointerSizeInBits();
+            auto* ptrTy = diBuilder->createPointerType(underlying, ptrBits);
+            diClassPointerCache[t] = ptrTy;
+            return ptrTy;
+        }
+        int key = static_cast<int>(t->kind);
+        auto it = diTypeCache.find(key);
+        if (it != diTypeCache.end()) return it->second;
+        llvm::DIType* result = nullptr;
+        switch (t->kind) {
+            case TypeKind::Bool:   result = diBuilder->createBasicType("bool",   1,  llvm::dwarf::DW_ATE_boolean); break;
+            case TypeKind::Byte:   result = diBuilder->createBasicType("byte",   8,  llvm::dwarf::DW_ATE_signed); break;
+            case TypeKind::Short:  result = diBuilder->createBasicType("short",  16, llvm::dwarf::DW_ATE_signed); break;
+            case TypeKind::UShort: result = diBuilder->createBasicType("ushort", 16, llvm::dwarf::DW_ATE_unsigned); break;
+            case TypeKind::Int:    result = diBuilder->createBasicType("int",    32, llvm::dwarf::DW_ATE_signed); break;
+            case TypeKind::UInt:   result = diBuilder->createBasicType("uint",   32, llvm::dwarf::DW_ATE_unsigned); break;
+            case TypeKind::Long:   result = diBuilder->createBasicType("long",   64, llvm::dwarf::DW_ATE_signed); break;
+            case TypeKind::ULong:  result = diBuilder->createBasicType("ulong",  64, llvm::dwarf::DW_ATE_unsigned); break;
+            case TypeKind::Char:   result = diBuilder->createBasicType("char",   32, llvm::dwarf::DW_ATE_UTF); break;
+            case TypeKind::Float:  result = diBuilder->createBasicType("float",  32, llvm::dwarf::DW_ATE_float); break;
+            case TypeKind::Double: result = diBuilder->createBasicType("double", 64, llvm::dwarf::DW_ATE_float); break;
+            case TypeKind::String: {
+                auto* byteCharTy = diBuilder->createBasicType("char", 8, llvm::dwarf::DW_ATE_signed_char);
+                result = diBuilder->createPointerType(byteCharTy, 64);
+                break;
+            }
+            default: break;
+        }
+        if (result) diTypeCache[key] = result;
+        return result;
+    }
+
+    llvm::DIType* mapDIStructType(::Type* t) {
+        auto it = diStructTypeCache.find(t);
+        if (it != diStructTypeCache.end()) return it->second;
+        if (!t->structInfo) return nullptr;
+        std::string sname = asAscii(t->structInfo->name);
+        auto* st = mapStructType(t);
+        const llvm::DataLayout& dl = module->getDataLayout();
+        const llvm::StructLayout* sl = dl.getStructLayout(st);
+
+        unsigned structLine = static_cast<unsigned>(t->structInfo->line);
+        std::vector<llvm::Metadata*> members;
+        members.reserve(t->structInfo->fields.size());
+        for (size_t i = 0; i < t->structInfo->fields.size(); ++i) {
+            const auto& f = t->structInfo->fields[i];
+            std::string fname = asAscii(f.name);
+            auto* memberType = mapDIType(f.type);
+            uint64_t offsetBits = sl->getElementOffsetInBits(static_cast<unsigned>(i));
+            uint64_t sizeBits = memberType ? memberType->getSizeInBits()
+                                           : dl.getTypeSizeInBits(st->getElementType(static_cast<unsigned>(i)));
+            uint32_t alignBits = static_cast<uint32_t>(
+                dl.getABITypeAlign(st->getElementType(static_cast<unsigned>(i))).value() * 8);
+            members.push_back(diBuilder->createMemberType(
+                diCU, fname, diFile, static_cast<unsigned>(f.line),
+                sizeBits, alignBits, offsetBits,
+                llvm::DINode::FlagZero, memberType));
+        }
+        uint64_t totalBits = dl.getTypeSizeInBits(st);
+        uint32_t structAlignBits = static_cast<uint32_t>(dl.getABITypeAlign(st).value() * 8);
+        auto* finalTy = diBuilder->createStructType(
+            diCU, sname, diFile, structLine,
+            totalBits, structAlignBits,
+            llvm::DINode::FlagZero, /*derivedFrom*/ nullptr,
+            diBuilder->getOrCreateArray(members));
+        diStructTypeCache[t] = finalTy;
+        return finalTy;
+    }
+
+    llvm::DISubroutineType* createDISubroutineType(Symbol* fn) {
+        if (!debugEnabled || !diBuilder) return nullptr;
+        std::vector<llvm::Metadata*> elems;
+        elems.push_back(mapDIType(fn->returnType));
+        for (auto* pt : fn->paramTypes) elems.push_back(mapDIType(pt));
+        return diBuilder->createSubroutineType(diBuilder->getOrCreateTypeArray(elems));
+    }
+
+    Symbol* symbolOf(const SyntaxNode& node) const {
+        const auto* info = analysis.find(node.greenNode());
+        return info ? info->resolvedSymbol : nullptr;
+    }
+
+    Symbol* methodSymbolOf(const SyntaxNode& node) const {
+        const auto* info = analysis.find(node.greenNode());
+        return info ? info->resolvedMethodSymbol : nullptr;
+    }
+
+    ::Type* typeOf(const SyntaxNode& node) const {
+        return analysis.typeOf(node.greenNode());
+    }
+
+    bool initializeNativeTargetOnce() {
+        static const bool ok = []() {
+            llvm::InitializeNativeTarget();
+            llvm::InitializeNativeTargetAsmPrinter();
+            llvm::InitializeNativeTargetAsmParser();
+            return true;
+        }();
+        return ok;
+    }
+
+    bool initializeTargetMachine() {
+        if (targetMachine) return true;
+        initializeNativeTargetOnce();
+        std::string triple = llvm::sys::getDefaultTargetTriple();
+        std::string lookupErr;
+        const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, lookupErr);
+        if (!target) {
+            error(0, "Failed to find target '" + triple + "': " + lookupErr);
+            return false;
+        }
+        llvm::TargetOptions opts;
+        std::optional<llvm::Reloc::Model> rm = llvm::Reloc::PIC_;
+        targetMachine.reset(target->createTargetMachine(
+            llvm::Triple(triple), "generic", "", opts, rm));
+        if (!targetMachine) {
+            error(0, "Failed to create TargetMachine for '" + triple + "'");
+            return false;
+        }
+        module->setDataLayout(targetMachine->createDataLayout());
+        module->setTargetTriple(llvm::Triple(triple));
+        return true;
+    }
+
+    llvm::AllocaInst* createEntryAlloca(llvm::Function* fn, llvm::Type* t, const std::string& name) {
+        llvm::IRBuilder<> tmp(&fn->getEntryBlock(), fn->getEntryBlock().begin());
+        return tmp.CreateAlloca(t, nullptr, name);
+    }
+
+    void declareFunction(const ast::FuncDecl& fn) {
+        Symbol* sym = symbolOf(fn.node);
+        if (!sym) return;
+        ::Type* receiver = analysis.receiverOf(fn.node.greenNode());
+
+        std::vector<llvm::Type*> paramTypes;
+        if (receiver) paramTypes.push_back(llvm::PointerType::get(ctx, 0));
+        auto fname = fn.nameText().value_or(std::u16string{});
+        for (auto* pt : sym->paramTypes) {
+            if (isUnsupportedType(pt)) {
+                error(fn.node.startOffset(),
+                      "Function '" + asAscii(fname) +
+                      "' has unsupported parameter type '" + (pt ? pt->toString() : "<null>") + "'");
+                return;
+            }
+            paramTypes.push_back(mapType(pt));
+        }
+        if (sym->returnType && !sym->returnType->isVoid() && isUnsupportedType(sym->returnType)) {
+            error(fn.node.startOffset(),
+                  "Function '" + asAscii(fname) + "' has unsupported return type '" + sym->returnType->toString() + "'");
+            return;
+        }
+        llvm::Type* retType = mapType(sym->returnType);
+        auto* fnType = llvm::FunctionType::get(retType, paramTypes, false);
+
+        std::string mangled = asAscii(fname);
+        if (receiver && receiver->structInfo) {
+            mangled = asAscii(receiver->structInfo->name) + "_" + mangled;
+        }
+        auto* func = llvm::Function::Create(fnType, llvm::Function::ExternalLinkage, mangled, module.get());
+        values[sym] = func;
+    }
+
+    void emitFunction(const ast::FuncDecl& fn) {
+        Symbol* sym = symbolOf(fn.node);
+        if (!sym) return;
+        auto it = values.find(sym);
+        if (it == values.end()) return;
+
+        currentFunction = llvm::cast<llvm::Function>(it->second);
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", currentFunction);
+        builder->SetInsertPoint(entry);
+
+        llvm::DISubprogram* sp = nullptr;
+        llvm::DIScope* prevScope = currentDIScope;
+        if (debugEnabled && diBuilder) {
+            auto fname = fn.nameText().value_or(std::u16string{});
+            auto [line, col] = posOf(fn.node.startOffset());
+            sp = diBuilder->createFunction(
+                diCU, asAscii(fname), asAscii(fname), diFile,
+                static_cast<unsigned>(line),
+                createDISubroutineType(sym),
+                /*scopeLine*/ static_cast<unsigned>(line),
+                llvm::DINode::FlagPrototyped,
+                llvm::DISubprogram::SPFlagDefinition);
+            currentFunction->setSubprogram(sp);
+            currentDIScope = sp;
+        }
+
+        setLocationFromNode(fn.node);
+
+        ::Type* receiver = analysis.receiverOf(fn.node.greenNode());
+        auto argIter = currentFunction->args().begin();
+        auto argEnd  = currentFunction->args().end();
+
+        // Implicit `this` parameter for methods. The receiver Symbol is bound by
+        // the analyzer onto a synthetic name in the function's local scope; we
+        // can't look it up here, but we don't need to — `this` is referenced
+        // through ThisExpr nodes whose resolvedSymbol is the synthetic one. We
+        // store the alloca under that symbol.
+        Symbol* thisSym = analysis.thisSymbolOf(fn.node.greenNode());
+        if (receiver && argIter != argEnd) {
+            argIter->setName("this");
+            llvm::Type* ptrTy = llvm::PointerType::get(ctx, 0);
+            auto* thisAlloca = createEntryAlloca(currentFunction, ptrTy, "this.addr");
+            builder->CreateStore(&*argIter, thisAlloca);
+            if (thisSym) values[thisSym] = thisAlloca;
+            ++argIter;
+        }
+
+        // Parameters.
+        auto params = fn.parameters();
+        for (size_t i = 0; i < params.size() && argIter != argEnd; ++i, ++argIter) {
+            auto& param = params[i];
+            Symbol* psym = symbolOf(param.node);
+            if (!psym) continue;
+            std::string pname = asAscii(psym->name);
+            argIter->setName(pname);
+            llvm::Type* lt = mapType(psym->type);
+            auto* alloca = createEntryAlloca(currentFunction, lt, pname);
+            builder->CreateStore(&*argIter, alloca);
+            values[psym] = alloca;
+
+            if (debugEnabled && diBuilder && sp) {
+                llvm::DIType* paramDIType = mapDIType(psym->type);
+                if (paramDIType) {
+                    auto [pline, pcol] = posOf(param.node.startOffset());
+                    auto* diVar = diBuilder->createParameterVariable(
+                        sp, pname, static_cast<unsigned>(i + 1), diFile,
+                        static_cast<unsigned>(pline), paramDIType,
+                        /*AlwaysPreserve*/ true);
+                    diBuilder->insertDeclare(
+                        alloca, diVar, diBuilder->createExpression(),
+                        llvm::DILocation::get(ctx, static_cast<unsigned>(pline),
+                                              static_cast<unsigned>(pcol), sp),
+                        builder->GetInsertBlock());
+                }
+            }
+        }
+
+        // Implicit constructor assignments for `this.field` parameters.
+        if (receiver && receiver->structInfo) {
+            for (size_t i = 0; i < params.size(); ++i) {
+                auto& p = params[i];
+                if (!p.isThisField()) continue;
+                auto fname = p.nameText();
+                if (!fname) continue;
+                int idx = receiver->structInfo->findFieldIndex(*fname);
+                if (idx < 0) continue;
+                Symbol* psym = symbolOf(p.node);
+                if (!psym || !thisSym) continue;
+                llvm::Type* ptrTy = llvm::PointerType::get(ctx, 0);
+                llvm::Value* thisVal = builder->CreateLoad(ptrTy, values[thisSym], "this");
+                llvm::StructType* st = mapStructType(receiver);
+                llvm::Value* fieldAddr = builder->CreateStructGEP(st, thisVal, static_cast<unsigned>(idx),
+                                                                  asAscii(*fname) + ".addr");
+                llvm::Value* paramVal = builder->CreateLoad(mapType(psym->type), values[psym]);
+                builder->CreateStore(paramVal, fieldAddr);
+            }
+        }
+
+        // Body.
+        if (auto body = fn.body()) {
+            for (auto& s : body->statements()) {
+                emitStatement(s);
+                if (builder->GetInsertBlock()->getTerminator()) break;
+            }
+        }
+        if (!builder->GetInsertBlock()->getTerminator()) {
+            if (currentFunction->getReturnType()->isVoidTy()) builder->CreateRetVoid();
+            else builder->CreateUnreachable();
+        }
+
+        if (debugEnabled && diBuilder && sp) diBuilder->finalizeSubprogram(sp);
+        currentDIScope = prevScope;
+        currentFunction = nullptr;
+    }
+
+    // ===== Statements =====
+
+    void emitStatement(const ast::Statement& s) {
+        setLocationFromNode(s.node);
+        if (auto b = s.asBlock())              { emitBlock(*b); return; }
+        if (auto l = s.asLet())                { emitLetStmt(*l); return; }
+        if (auto v = s.asTypedVarDecl())       { emitTypedVarDecl(*v); return; }
+        if (auto i = s.asIf())                 { emitIfStmt(*i); return; }
+        if (auto w = s.asWhile())              { emitWhileStmt(*w); return; }
+        if (auto r = s.asReturn())             { emitReturnStmt(*r); return; }
+        if (auto e = s.asExpressionStmt()) {
+            if (auto expr = e->expression()) emitExpr(*expr);
+            return;
+        }
+    }
+
+    void emitBlock(const ast::Block& block) {
+        llvm::DIScope* prev = currentDIScope;
+        if (debugEnabled && diBuilder && currentDIScope) {
+            auto [line, col] = posOf(block.node.startOffset());
+            currentDIScope = diBuilder->createLexicalBlock(
+                currentDIScope, diFile,
+                static_cast<unsigned>(line),
+                static_cast<unsigned>(col));
+        }
+        for (auto& child : block.statements()) {
+            emitStatement(child);
+            if (builder->GetInsertBlock()->getTerminator()) break;
+        }
+        currentDIScope = prev;
+    }
+
+    void emitLetStmt(const ast::LetStatement& s) {
+        Symbol* sym = symbolOf(s.node);
+        if (!sym) return;
+        if (isUnsupportedType(sym->type)) {
+            error(s.node.startOffset(),
+                  "Variable '" + asAscii(sym->name) + "' has unsupported type '" +
+                  (sym->type ? sym->type->toString() : "<null>") + "'");
+            return;
+        }
+        llvm::Type* lt = mapType(sym->type);
+        auto* alloca = createEntryAlloca(currentFunction, lt, asAscii(sym->name));
+        values[sym] = alloca;
+
+        if (debugEnabled && diBuilder && currentDIScope) {
+            llvm::DIType* diVarType = mapDIType(sym->type);
+            if (diVarType) {
+                auto [line, col] = posOf(s.node.startOffset());
+                auto* diVar = diBuilder->createAutoVariable(
+                    currentDIScope, asAscii(sym->name), diFile,
+                    static_cast<unsigned>(line), diVarType);
+                diBuilder->insertDeclare(
+                    alloca, diVar, diBuilder->createExpression(),
+                    llvm::DILocation::get(ctx, static_cast<unsigned>(line),
+                                          static_cast<unsigned>(col), currentDIScope),
+                    builder->GetInsertBlock());
+            }
+        }
+
+        if (auto init = s.initializer()) {
+            setLocationFromNode(s.node);
+            llvm::Value* v = emitExpr(*init);
+            if (v) {
+                setLocationFromNode(s.node);
+                builder->CreateStore(v, alloca);
+            }
+        }
+    }
+
+    void emitTypedVarDecl(const ast::TypedVarDeclStatement& s) {
+        Symbol* sym = symbolOf(s.node);
+        if (!sym) return;
+        if (isUnsupportedType(sym->type)) {
+            error(s.node.startOffset(),
+                  "Variable '" + asAscii(sym->name) + "' has unsupported type '" +
+                  (sym->type ? sym->type->toString() : "<null>") + "'");
+            return;
+        }
+        llvm::Type* lt = mapType(sym->type);
+        auto* alloca = createEntryAlloca(currentFunction, lt, asAscii(sym->name));
+        values[sym] = alloca;
+
+        if (debugEnabled && diBuilder && currentDIScope) {
+            llvm::DIType* diVarType = mapDIType(sym->type);
+            if (diVarType) {
+                auto [line, col] = posOf(s.node.startOffset());
+                auto* diVar = diBuilder->createAutoVariable(
+                    currentDIScope, asAscii(sym->name), diFile,
+                    static_cast<unsigned>(line), diVarType);
+                diBuilder->insertDeclare(
+                    alloca, diVar, diBuilder->createExpression(),
+                    llvm::DILocation::get(ctx, static_cast<unsigned>(line),
+                                          static_cast<unsigned>(col), currentDIScope),
+                    builder->GetInsertBlock());
+            }
+        }
+
+        if (auto init = s.initializer()) {
+            setLocationFromNode(s.node);
+            llvm::Value* v = emitExpr(*init);
+            if (v) builder->CreateStore(v, alloca);
+        }
+    }
+
+    void emitIfStmt(const ast::IfStatement& s) {
+        auto cond = s.condition();
+        if (!cond) return;
+        llvm::Value* condV = emitExpr(*cond);
+        if (!condV) return;
+        bool hasElse = s.elseClause().has_value();
+        auto* thenBB = llvm::BasicBlock::Create(ctx, "if.then", currentFunction);
+        auto* elseBB = hasElse ? llvm::BasicBlock::Create(ctx, "if.else", currentFunction) : nullptr;
+        auto* mergeBB = llvm::BasicBlock::Create(ctx, "if.end", currentFunction);
+
+        builder->CreateCondBr(condV, thenBB, elseBB ? elseBB : mergeBB);
+        builder->SetInsertPoint(thenBB);
+        if (auto b = s.thenBlock()) emitBlock(*b);
+        if (!builder->GetInsertBlock()->getTerminator()) builder->CreateBr(mergeBB);
+
+        if (elseBB) {
+            builder->SetInsertPoint(elseBB);
+            auto ec = *s.elseClause();
+            if (auto innerIf = ec.ifStatement()) emitIfStmt(*innerIf);
+            else if (auto bb = ec.block()) emitBlock(*bb);
+            if (!builder->GetInsertBlock()->getTerminator()) builder->CreateBr(mergeBB);
+        }
+        builder->SetInsertPoint(mergeBB);
+    }
+
+    void emitWhileStmt(const ast::WhileStatement& s) {
+        auto* condBB = llvm::BasicBlock::Create(ctx, "while.cond", currentFunction);
+        auto* bodyBB = llvm::BasicBlock::Create(ctx, "while.body", currentFunction);
+        auto* endBB  = llvm::BasicBlock::Create(ctx, "while.end",  currentFunction);
+
+        builder->CreateBr(condBB);
+        builder->SetInsertPoint(condBB);
+        if (auto cond = s.condition()) {
+            llvm::Value* condV = emitExpr(*cond);
+            if (condV) builder->CreateCondBr(condV, bodyBB, endBB);
+        }
+        builder->SetInsertPoint(bodyBB);
+        if (auto b = s.body()) emitBlock(*b);
+        if (!builder->GetInsertBlock()->getTerminator()) builder->CreateBr(condBB);
+        builder->SetInsertPoint(endBB);
+    }
+
+    void emitReturnStmt(const ast::ReturnStatement& s) {
+        if (auto v = s.value()) {
+            llvm::Value* val = emitExpr(*v);
+            if (val) builder->CreateRet(val);
+            else builder->CreateUnreachable();
+        } else {
+            builder->CreateRetVoid();
+        }
+    }
+
+    // ===== Expressions =====
+
+    llvm::Value* emitExpr(const ast::Expression& e) {
+        setLocationFromNode(e.node);
+        if (auto lit = e.asLiteral())    return emitLiteral(*lit);
+        if (auto id = e.asIdent())       return emitIdent(*id);
+        if (auto th = e.asThis())        return emitThis(*th);
+        if (auto b = e.asBinary())       return emitBinary(*b);
+        if (auto p = e.asPrefix())       return emitPrefix(*p);
+        if (auto c = e.asCall())         return emitCall(*c);
+        if (auto m = e.asMember())       return emitMember(*m);
+        if (auto a = e.asAssign())       return emitAssign(*a);
+        if (auto t = e.asTernary())      return emitTernary(*t);
+        if (auto n = e.asNew())          return emitNew(*n);
+        if (auto pr = e.asParen()) {
+            if (auto inner = pr->inner()) return emitExpr(*inner);
+            return nullptr;
+        }
+        error(e.node.startOffset(), "Unsupported expression in codegen");
+        return nullptr;
+    }
+
+    static long long parseIntText(std::u16string_view text) {
+        std::string s; s.reserve(text.size());
+        for (char16_t c : text) s.push_back(static_cast<char>(c));
+        try {
+            if (s.size() > 2 && s[0] == '0' && (s[1] == 'b' || s[1] == 'B'))
+                return std::stoll(s.substr(2), nullptr, 2);
+            // strip trailing l/L
+            if (!s.empty() && (s.back() == 'l' || s.back() == 'L')) s.pop_back();
+            return std::stoll(s, nullptr, 0);
+        } catch (...) { return 0; }
+    }
+
+    static double parseDoubleText(std::u16string_view text) {
+        std::string s; s.reserve(text.size());
+        for (char16_t c : text) s.push_back(static_cast<char>(c));
+        if (!s.empty() && (s.back() == 'f' || s.back() == 'F' || s.back() == 'd' || s.back() == 'D'))
+            s.pop_back();
+        return std::stod(s);
+    }
+
+    llvm::Value* emitLiteral(const ast::LiteralExpression& e) {
+        ::Type* t = typeOf(e.node);
+        SyntaxKind k = e.literalKind();
+        auto tok = e.token();
+        std::u16string text = tok ? std::u16string(tok->tokenText()) : std::u16string{};
+        switch (k) {
+            case SyntaxKind::IntLiteral:
+            case SyntaxKind::LongLiteral: {
+                llvm::Type* lt = mapType(t);
+                long long v = parseIntText(text);
+                return llvm::ConstantInt::get(lt, static_cast<uint64_t>(v), isSigned(t));
+            }
+            case SyntaxKind::FloatLiteral:
+            case SyntaxKind::DoubleLiteral:
+                return llvm::ConstantFP::get(mapType(t), parseDoubleText(text));
+            case SyntaxKind::KwTrue:  return builder->getInt1(true);
+            case SyntaxKind::KwFalse: return builder->getInt1(false);
+            case SyntaxKind::KwNull:
+                error(e.node.startOffset(), "null codegen not yet supported");
+                return nullptr;
+            case SyntaxKind::StringLiteral: {
+                std::string utf8;
+                // Strip surrounding quotes from the lexed text.
+                size_t start = 0, end = text.size();
+                if (end >= 2 && text.front() == u'"' && text.back() == u'"') { start = 1; end--; }
+                for (size_t i = start; i < end; ++i) {
+                    char16_t c = text[i];
+                    if (c == u'\\' && i + 1 < end) {
+                        char16_t n = text[++i];
+                        switch (n) {
+                            case u'n': utf8.push_back('\n'); break;
+                            case u't': utf8.push_back('\t'); break;
+                            case u'r': utf8.push_back('\r'); break;
+                            case u'\\': utf8.push_back('\\'); break;
+                            case u'"': utf8.push_back('"'); break;
+                            case u'\'': utf8.push_back('\''); break;
+                            default: utf8.push_back(static_cast<char>(n)); break;
+                        }
+                        continue;
+                    }
+                    if (c < 0x80) utf8.push_back(static_cast<char>(c));
+                    else if (c < 0x800) {
+                        utf8.push_back(static_cast<char>(0xC0 | (c >> 6)));
+                        utf8.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+                    } else {
+                        utf8.push_back(static_cast<char>(0xE0 | (c >> 12)));
+                        utf8.push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F)));
+                        utf8.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+                    }
+                }
+                return builder->CreateGlobalString(utf8, ".str");
+            }
+            default:
+                error(e.node.startOffset(), "Unsupported literal");
+                return nullptr;
+        }
+    }
+
+    llvm::Value* emitIdent(const ast::IdentExpression& e) {
+        Symbol* sym = symbolOf(e.node);
+        if (!sym) return nullptr;
+        auto it = values.find(sym);
+        if (it == values.end()) {
+            error(e.node.startOffset(), "Internal: symbol has no LLVM value");
+            return nullptr;
+        }
+        if (sym->kind == SymbolKind::Function) {
+            error(e.node.startOffset(), "Function values are not yet first-class");
+            return nullptr;
+        }
+        return builder->CreateLoad(mapType(sym->type), it->second, asAscii(sym->name) + ".load");
+    }
+
+    llvm::Value* emitThis(const ast::ThisExpression& e) {
+        Symbol* sym = symbolOf(e.node);
+        if (!sym) {
+            error(e.node.startOffset(), "Internal: 'this' not bound");
+            return nullptr;
+        }
+        auto it = values.find(sym);
+        if (it == values.end()) {
+            error(e.node.startOffset(), "Internal: 'this' has no LLVM value");
+            return nullptr;
+        }
+        return builder->CreateLoad(llvm::PointerType::get(ctx, 0), it->second, "this");
+    }
+
+    static TokenType binaryOpFromKind(SyntaxKind k) {
+        switch (k) {
+            case SyntaxKind::Plus:      return TokenType::PLUS;
+            case SyntaxKind::Minus:     return TokenType::SUB;
+            case SyntaxKind::Star:      return TokenType::STAR;
+            case SyntaxKind::Slash:     return TokenType::SLASH;
+            case SyntaxKind::Percent:   return TokenType::PERCENT;
+            case SyntaxKind::EqEq:      return TokenType::EQ_EQ;
+            case SyntaxKind::NotEq:     return TokenType::NOT_EQ;
+            case SyntaxKind::Lt:        return TokenType::LT;
+            case SyntaxKind::Gt:        return TokenType::GT;
+            case SyntaxKind::LtEq:      return TokenType::LT_EQ;
+            case SyntaxKind::GtEq:      return TokenType::GT_EQ;
+            case SyntaxKind::AmpAmp:    return TokenType::AND;
+            case SyntaxKind::PipePipe:  return TokenType::OR;
+            case SyntaxKind::Amp:       return TokenType::BIT_AND;
+            case SyntaxKind::Pipe:      return TokenType::BIT_OR;
+            case SyntaxKind::Caret:     return TokenType::CARET;
+            case SyntaxKind::LtLt:      return TokenType::LT_LT;
+            case SyntaxKind::GtGt:      return TokenType::GT_GT;
+            case SyntaxKind::GtGtGt:    return TokenType::GT_GT_GT;
+            default:                    return TokenType::ERROR;
+        }
+    }
+
+    llvm::Value* emitBinary(const ast::BinaryExpression& e) {
+        auto leftE = e.left();
+        auto rightE = e.right();
+        if (!leftE || !rightE) return nullptr;
+        llvm::Value* L = emitExpr(*leftE);
+        llvm::Value* R = emitExpr(*rightE);
+        if (!L || !R) return nullptr;
+        ::Type* leftType = typeOf(leftE->node);
+        bool flt = leftType && leftType->isFloat();
+        bool sgn = isSigned(leftType);
+        auto opTok = e.operatorToken();
+        TokenType op = opTok ? binaryOpFromKind(opTok->kind()) : TokenType::ERROR;
+        switch (op) {
+            case TokenType::PLUS:    return flt ? builder->CreateFAdd(L, R) : builder->CreateAdd(L, R);
+            case TokenType::SUB:     return flt ? builder->CreateFSub(L, R) : builder->CreateSub(L, R);
+            case TokenType::STAR:    return flt ? builder->CreateFMul(L, R) : builder->CreateMul(L, R);
+            case TokenType::SLASH:   return flt ? builder->CreateFDiv(L, R) : (sgn ? builder->CreateSDiv(L, R) : builder->CreateUDiv(L, R));
+            case TokenType::PERCENT: return flt ? builder->CreateFRem(L, R) : (sgn ? builder->CreateSRem(L, R) : builder->CreateURem(L, R));
+            case TokenType::EQ_EQ:   return flt ? builder->CreateFCmpOEQ(L, R) : builder->CreateICmpEQ(L, R);
+            case TokenType::NOT_EQ:  return flt ? builder->CreateFCmpONE(L, R) : builder->CreateICmpNE(L, R);
+            case TokenType::LT:      return flt ? builder->CreateFCmpOLT(L, R) : (sgn ? builder->CreateICmpSLT(L, R) : builder->CreateICmpULT(L, R));
+            case TokenType::GT:      return flt ? builder->CreateFCmpOGT(L, R) : (sgn ? builder->CreateICmpSGT(L, R) : builder->CreateICmpUGT(L, R));
+            case TokenType::LT_EQ:   return flt ? builder->CreateFCmpOLE(L, R) : (sgn ? builder->CreateICmpSLE(L, R) : builder->CreateICmpULE(L, R));
+            case TokenType::GT_EQ:   return flt ? builder->CreateFCmpOGE(L, R) : (sgn ? builder->CreateICmpSGE(L, R) : builder->CreateICmpUGE(L, R));
+            case TokenType::AND:
+            case TokenType::BIT_AND: return builder->CreateAnd(L, R);
+            case TokenType::OR:
+            case TokenType::BIT_OR:  return builder->CreateOr(L, R);
+            case TokenType::CARET:   return builder->CreateXor(L, R);
+            case TokenType::LT_LT:   return builder->CreateShl(L, R);
+            case TokenType::GT_GT:   return sgn ? builder->CreateAShr(L, R) : builder->CreateLShr(L, R);
+            case TokenType::GT_GT_GT: return builder->CreateLShr(L, R);
+            default:
+                error(e.node.startOffset(), "Unsupported binary operator in codegen");
+                return nullptr;
+        }
+    }
+
+    llvm::Value* emitPrefix(const ast::PrefixExpression& e) {
+        auto operand = e.operand();
+        if (!operand) return nullptr;
+        ::Type* t = typeOf(operand->node);
+        bool flt = t && t->isFloat();
+        auto opTok = e.operatorToken();
+        if (!opTok) return nullptr;
+        switch (opTok->kind()) {
+            case SyntaxKind::Minus: {
+                llvm::Value* v = emitExpr(*operand);
+                if (!v) return nullptr;
+                return flt ? builder->CreateFNeg(v) : builder->CreateNeg(v);
+            }
+            case SyntaxKind::Bang: {
+                llvm::Value* v = emitExpr(*operand);
+                if (!v) return nullptr;
+                return builder->CreateNot(v);
+            }
+            case SyntaxKind::PlusPlus:
+            case SyntaxKind::MinusMinus: {
+                llvm::Value* lv = emitLValue(*operand);
+                if (!lv) return nullptr;
+                llvm::Type* lt = mapType(t);
+                llvm::Value* v = builder->CreateLoad(lt, lv);
+                llvm::Value* one = flt
+                    ? static_cast<llvm::Value*>(llvm::ConstantFP::get(lt, 1.0))
+                    : static_cast<llvm::Value*>(llvm::ConstantInt::get(lt, 1));
+                bool inc = opTok->kind() == SyntaxKind::PlusPlus;
+                llvm::Value* nv = inc
+                    ? (flt ? builder->CreateFAdd(v, one) : builder->CreateAdd(v, one))
+                    : (flt ? builder->CreateFSub(v, one) : builder->CreateSub(v, one));
+                builder->CreateStore(nv, lv);
+                return nv;
+            }
+            default:
+                error(e.node.startOffset(), "Unsupported unary operator in codegen");
+                return nullptr;
+        }
+    }
+
+    llvm::Function* getOrDeclarePuts() {
+        if (auto* existing = module->getFunction("puts")) return existing;
+        auto* ty = llvm::FunctionType::get(
+            llvm::Type::getInt32Ty(ctx),
+            { llvm::PointerType::get(ctx, 0) }, false);
+        return llvm::Function::Create(ty, llvm::Function::ExternalLinkage, "puts", module.get());
+    }
+
+    llvm::Function* getOrDeclareMalloc() {
+        if (auto* existing = module->getFunction("malloc")) return existing;
+        auto* ty = llvm::FunctionType::get(
+            llvm::PointerType::get(ctx, 0),
+            { llvm::Type::getInt64Ty(ctx) }, false);
+        return llvm::Function::Create(ty, llvm::Function::ExternalLinkage, "malloc", module.get());
+    }
+
+    bool appendCallArgs(Symbol* sym, const std::vector<ast::Expression>& userArgs,
+                        std::vector<llvm::Value*>& out) {
+        for (auto& a : userArgs) {
+            llvm::Value* v = emitExpr(a);
+            if (!v) return false;
+            out.push_back(v);
+        }
+        if (!sym || !sym->funcDeclCst) return true;
+        auto rootNode = SyntaxNode::makeRoot(sym->funcDeclCst);
+        auto fn = ast::FuncDecl::cast(*rootNode);
+        if (!fn) return true;
+        auto params = fn->parameters();
+        for (size_t i = userArgs.size(); i < params.size(); ++i) {
+            auto dv = params[i].defaultValue();
+            if (!dv) return false;
+            auto expr = dv->expression();
+            if (!expr) return false;
+            llvm::Value* v = emitExpr(*expr);
+            if (!v) return false;
+            out.push_back(v);
+        }
+        return true;
+    }
+
+    llvm::Value* emitNew(const ast::NewExpression& e) {
+        ::Type* t = typeOf(e.node);
+        if (!t || !t->structInfo) {
+            error(e.node.startOffset(), "Internal: 'new' has no resolved class type");
+            return nullptr;
+        }
+        llvm::StructType* layout = mapStructType(t);
+        const llvm::DataLayout& dl = module->getDataLayout();
+        uint64_t sizeBytes = dl.getTypeAllocSize(layout);
+
+        auto* mallocFn = getOrDeclareMalloc();
+        llvm::Value* sizeArg = llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), sizeBytes);
+        llvm::Value* heapPtr = builder->CreateCall(mallocFn, {sizeArg},
+                                                    "new." + asAscii(t->structInfo->name));
+
+        int ctorIdx = t->structInfo->findMethodIndex(t->structInfo->name);
+        if (ctorIdx >= 0) {
+            Symbol* ctorSym = t->structInfo->methods[ctorIdx].symbol;
+            auto fnIt = values.find(ctorSym);
+            if (fnIt != values.end()) {
+                std::vector<llvm::Value*> args;
+                args.reserve(e.arguments().size() + 1);
+                args.push_back(heapPtr);
+                if (!appendCallArgs(ctorSym, e.arguments(), args)) return nullptr;
+                auto* fn = llvm::cast<llvm::Function>(fnIt->second);
+                builder->CreateCall(fn, args);
+            }
+        }
+        return heapPtr;
+    }
+
+    llvm::Value* emitBuiltinCall(Symbol* sym, const ast::CallExpression& e) {
+        std::string name = asAscii(sym->name);
+        auto args = e.arguments();
+        if (name == "print") {
+            if (args.size() != 1) {
+                error(e.node.startOffset(), "print expects exactly 1 argument");
+                return nullptr;
+            }
+            llvm::Value* arg = emitExpr(args[0]);
+            if (!arg) return nullptr;
+            auto* puts = getOrDeclarePuts();
+            builder->CreateCall(puts, {arg});
+            return nullptr;
+        }
+        error(e.node.startOffset(), "Unknown builtin '" + name + "'");
+        return nullptr;
+    }
+
+    llvm::Value* emitCall(const ast::CallExpression& e) {
+        auto callee = e.callee();
+        if (callee && callee->asMember()) {
+            auto member = *callee->asMember();
+            Symbol* methodSym = methodSymbolOf(member.node);
+            if (methodSym) {
+                auto fnIt = values.find(methodSym);
+                if (fnIt == values.end()) {
+                    error(e.node.startOffset(), "Internal: method has no LLVM function");
+                    return nullptr;
+                }
+                auto obj = member.object();
+                if (!obj) return nullptr;
+                ::Type* objType = typeOf(obj->node);
+                llvm::Value* receiver = isReferenceType(objType)
+                    ? emitExpr(*obj)
+                    : emitLValue(*obj);
+                if (!receiver) return nullptr;
+                std::vector<llvm::Value*> args;
+                args.push_back(receiver);
+                if (!appendCallArgs(methodSym, e.arguments(), args)) return nullptr;
+                auto* fn = llvm::cast<llvm::Function>(fnIt->second);
+                return builder->CreateCall(fn, args);
+            }
+        }
+
+        auto idCallee = callee ? callee->asIdent() : std::nullopt;
+        if (!idCallee) {
+            error(e.node.startOffset(), "Only direct function calls are supported");
+            return nullptr;
+        }
+        Symbol* sym = symbolOf(idCallee->node);
+        if (!sym) {
+            error(e.node.startOffset(), "Internal: callee has no resolved symbol");
+            return nullptr;
+        }
+        if (sym->isBuiltin) return emitBuiltinCall(sym, e);
+        auto it = values.find(sym);
+        if (it == values.end()) {
+            error(e.node.startOffset(), "Internal: callee has no LLVM function");
+            return nullptr;
+        }
+        std::vector<llvm::Value*> args;
+        if (!appendCallArgs(sym, e.arguments(), args)) return nullptr;
+        auto* fn = llvm::cast<llvm::Function>(it->second);
+        return builder->CreateCall(fn, args);
+    }
+
+    llvm::Value* emitAssign(const ast::AssignExpression& e) {
+        auto opTok = e.operatorToken();
+        if (!opTok || opTok->kind() != SyntaxKind::Eq) {
+            error(e.node.startOffset(), "Compound assignment not yet supported in codegen");
+            return nullptr;
+        }
+        auto target = e.target();
+        auto value = e.value();
+        if (!target || !value) return nullptr;
+        llvm::Value* lv = emitLValue(*target);
+        if (!lv) return nullptr;
+        llvm::Value* val = emitExpr(*value);
+        if (!val) return nullptr;
+        builder->CreateStore(val, lv);
+        return val;
+    }
+
+    llvm::Value* emitLValue(const ast::Expression& e) {
+        if (auto id = e.asIdent()) {
+            Symbol* sym = symbolOf(id->node);
+            if (!sym) return nullptr;
+            auto it = values.find(sym);
+            return it == values.end() ? nullptr : it->second;
+        }
+        if (auto th = e.asThis()) {
+            Symbol* sym = symbolOf(th->node);
+            if (!sym) return nullptr;
+            auto it = values.find(sym);
+            if (it == values.end()) return nullptr;
+            return builder->CreateLoad(llvm::PointerType::get(ctx, 0), it->second, "this");
+        }
+        if (auto m = e.asMember()) {
+            auto obj = m->object();
+            if (!obj) return nullptr;
+            ::Type* objType = typeOf(obj->node);
+            if (!objType || !objType->hasRecordLayout() || !objType->structInfo) {
+                error(e.node.startOffset(), "Cannot take address of member on non-record type");
+                return nullptr;
+            }
+            llvm::Value* objAddr = isReferenceType(objType)
+                ? emitExpr(*obj)
+                : emitLValue(*obj);
+            if (!objAddr) return nullptr;
+            auto memberName = m->memberText();
+            if (!memberName) return nullptr;
+            int idx = objType->structInfo->findFieldIndex(*memberName);
+            if (idx < 0) {
+                error(e.node.startOffset(), "Internal: field not found in struct");
+                return nullptr;
+            }
+            llvm::StructType* st = mapStructType(objType);
+            return builder->CreateStructGEP(st, objAddr, static_cast<unsigned>(idx),
+                                            asAscii(*memberName) + ".addr");
+        }
+        error(e.node.startOffset(), "Cannot get address of this expression");
+        return nullptr;
+    }
+
+    llvm::Value* emitMember(const ast::MemberExpression& e) {
+        ast::Expression wrapper{e.node};
+        llvm::Value* addr = emitLValue(wrapper);
+        if (!addr) return nullptr;
+        ::Type* fieldType = typeOf(e.node);
+        auto memberName = e.memberText().value_or(std::u16string{});
+        return builder->CreateLoad(mapType(fieldType), addr, asAscii(memberName) + ".load");
+    }
+
+    llvm::Value* emitTernary(const ast::TernaryExpression& e) {
+        auto cond = e.condition();
+        auto thenE = e.thenBranch();
+        auto elseE = e.elseBranch();
+        if (!cond || !thenE || !elseE) return nullptr;
+        llvm::Value* condV = emitExpr(*cond);
+        if (!condV) return nullptr;
+
+        auto* thenBB  = llvm::BasicBlock::Create(ctx, "tern.then", currentFunction);
+        auto* elseBB  = llvm::BasicBlock::Create(ctx, "tern.else", currentFunction);
+        auto* mergeBB = llvm::BasicBlock::Create(ctx, "tern.end",  currentFunction);
+        builder->CreateCondBr(condV, thenBB, elseBB);
+
+        builder->SetInsertPoint(thenBB);
+        llvm::Value* thenV = emitExpr(*thenE);
+        llvm::BasicBlock* thenEnd = builder->GetInsertBlock();
+        if (thenV && !thenEnd->getTerminator()) builder->CreateBr(mergeBB);
+
+        builder->SetInsertPoint(elseBB);
+        llvm::Value* elseV = emitExpr(*elseE);
+        llvm::BasicBlock* elseEnd = builder->GetInsertBlock();
+        if (elseV && !elseEnd->getTerminator()) builder->CreateBr(mergeBB);
+
+        builder->SetInsertPoint(mergeBB);
+        if (!thenV || !elseV) return nullptr;
+        if (thenV->getType() != elseV->getType()) {
+            error(e.node.startOffset(), "Ternary branches produce different LLVM types");
+            return nullptr;
+        }
+        auto* phi = builder->CreatePHI(thenV->getType(), 2);
+        phi->addIncoming(thenV, thenEnd);
+        phi->addIncoming(elseV, elseEnd);
+        return phi;
+    }
+
+    bool generate(const SyntaxNode& root) {
+        if (!initializeTargetMachine()) return false;
+        auto sf = ast::SourceFile::cast(root);
+        if (!sf) {
+            error(0, "Internal: root is not a SourceFile node");
+            return false;
+        }
+
+        auto eachDecl = [&](auto&& visit) {
+            for (auto& fn : sf->functions()) visit(fn);
+            for (auto& sd : sf->structs())   for (auto& m : sd.methods()) visit(m);
+            for (auto& cd : sf->classes())   for (auto& m : cd.methods()) visit(m);
+        };
+        eachDecl([&](const ast::FuncDecl& fn) { declareFunction(fn); });
+        eachDecl([&](const ast::FuncDecl& fn) { emitFunction(fn); });
+
+        if (debugEnabled && diBuilder) diBuilder->finalize();
+        if (!diagnostics.empty()) return false;
+
+        std::string verifyErr;
+        llvm::raw_string_ostream rso(verifyErr);
+        if (llvm::verifyModule(*module, &rso)) {
+            error(0, "LLVM module verification failed: " + verifyErr);
+            return false;
+        }
+        return true;
+    }
+
+    void print(std::ostream& os) const {
+        std::string text;
+        llvm::raw_string_ostream rso(text);
+        module->print(rso, nullptr);
+        os << text;
+    }
+
+    bool emitObjectFile(const std::string& path) {
+        if (!targetMachine && !initializeTargetMachine()) return false;
+        std::error_code ec;
+        llvm::raw_fd_ostream dest(path, ec, llvm::sys::fs::OF_None);
+        if (ec) {
+            error(0, "Could not open '" + path + "' for writing: " + ec.message());
+            return false;
+        }
+        llvm::legacy::PassManager pass;
+        if (targetMachine->addPassesToEmitFile(pass, dest, nullptr, llvm::CodeGenFileType::ObjectFile)) {
+            error(0, "Target does not support object-file emission");
+            return false;
+        }
+        pass.run(*module);
+        dest.flush();
+        return true;
+    }
+};
+
+CstCodeGenerator::CstCodeGenerator(std::string moduleName,
+                                   std::string sourceFilename,
+                                   const SourceFile& src,
+                                   const sema::AnalysisResult& analysis)
+    : impl(std::make_unique<Impl>(std::move(moduleName), std::move(sourceFilename), src, analysis)) {}
+
+CstCodeGenerator::~CstCodeGenerator() = default;
+
+bool CstCodeGenerator::generate(const SyntaxNode& root) { return impl->generate(root); }
+void CstCodeGenerator::print(std::ostream& os) const    { impl->print(os); }
+bool CstCodeGenerator::emitObjectFile(const std::string& path) { return impl->emitObjectFile(path); }
+bool CstCodeGenerator::hasErrors() const                { return !impl->diagnostics.empty(); }
+const std::vector<Diagnostic>& CstCodeGenerator::getDiagnostics() const { return impl->diagnostics; }
