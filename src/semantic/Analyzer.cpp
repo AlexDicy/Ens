@@ -57,13 +57,39 @@ void Analyzer::error(int line, int col, int len, std::string msg) {
 }
 
 void Analyzer::analyze(const std::vector<StmtPtr>& program) {
+    collectStructs(program);
     collectFunctions(program);
     for (const auto& s : program) {
         if (auto* fn = dynamic_cast<FuncDecl*>(s.get())) {
             analyzeFunctionBody(fn);
+        } else if (dynamic_cast<StructDecl*>(s.get())) {
+            // Already collected; struct bodies are pure declarations
         } else {
             // Top-level statement that isn't a function — analyze it directly
             analyzeStmt(s.get());
+        }
+    }
+}
+
+void Analyzer::collectStructs(const std::vector<StmtPtr>& program) {
+    // First pass: register the names so structs can reference each other.
+    for (const auto& s : program) {
+        auto* sd = dynamic_cast<StructDecl*>(s.get());
+        if (!sd) continue;
+        if (typeCtx.lookupStruct(sd->name)) {
+            error(sd->line, sd->column, static_cast<int>(sd->name.size()),
+                  "Duplicate struct '" + asciiOf(sd->name) + "'");
+            continue;
+        }
+        sd->resolvedType = typeCtx.registerStruct(sd->name);
+    }
+    // Second pass: resolve field types now that all struct names exist.
+    for (const auto& s : program) {
+        auto* sd = dynamic_cast<StructDecl*>(s.get());
+        if (!sd || !sd->resolvedType) continue;
+        for (auto& f : sd->fields) {
+            Type* ft = resolveTypeNode(f.type.get());
+            sd->resolvedType->structInfo->fields.push_back({f.name, ft});
         }
     }
 }
@@ -148,6 +174,10 @@ void Analyzer::analyzeStmt(Stmt* s) {
     if (dynamic_cast<FuncDecl*>(s)) {
         // Nested function declarations not supported yet
         error(s->line, s->column, 1, "Nested function declarations are not supported");
+        return;
+    }
+    if (dynamic_cast<StructDecl*>(s)) {
+        error(s->line, s->column, 1, "Nested struct declarations are not supported");
         return;
     }
 }
@@ -438,9 +468,20 @@ Type* Analyzer::analyzeCall(CallExpr* e) {
 }
 
 Type* Analyzer::analyzeMember(MemberExpr* e) {
-    analyzeExpr(e->object.get());
-    error(e->line, e->column, 1, "Member access is not yet supported (structs not implemented)");
-    return typeCtx.getError();
+    Type* objT = analyzeExpr(e->object.get());
+    if (objT->isError()) return typeCtx.getError();
+    if (!objT->isStruct() || !objT->structInfo) {
+        error(e->line, e->column, 1,
+              "Member access on non-struct type '" + objT->toString() + "'");
+        return typeCtx.getError();
+    }
+    int idx = objT->structInfo->findFieldIndex(e->member);
+    if (idx < 0) {
+        error(e->line, e->column, static_cast<int>(e->member.size()),
+              "No field '" + asciiOf(e->member) + "' on type '" + objT->toString() + "'");
+        return typeCtx.getError();
+    }
+    return objT->structInfo->fields[idx].type;
 }
 
 Type* Analyzer::analyzeAssign(AssignExpr* e) {

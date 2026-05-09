@@ -34,6 +34,7 @@ private:
     void popScope();
     void registerBuiltins();
 
+    void collectStructs(const std::vector<StmtPtr>& program);
     void collectFunctions(const std::vector<StmtPtr>& program);
     void analyzeFunctionBody(FuncDecl* fn);
 

@@ -42,6 +42,7 @@ private:
     StmtPtr parseExprStmt();
     StmtPtr parseFuncDecl(Visibility vis);
     Parameter parseParameter();
+    StmtPtr parseStructDecl(Visibility vis);
 
     [[noreturn]] void error(const Token& t, const std::string& msg) const;
 };

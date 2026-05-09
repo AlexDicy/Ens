@@ -185,7 +185,12 @@ StmtPtr Parser::parseStatement() {
                        : (tok.getType() == TokenType::PROTECTED) ? Visibility::Protected
                                                                  : Visibility::Public;
         consume();
+        if (check(TokenType::STRUCT)) return parseStructDecl(vis);
         return parseFuncDecl(vis);
+    }
+
+    if (tok.getType() == TokenType::STRUCT) {
+        return parseStructDecl(Visibility::Public);
     }
 
     if (tok.getType() == TokenType::IDENTIFIER && looksLikeFuncDecl()) {
@@ -251,6 +256,37 @@ Parameter Parser::parseParameter() {
     const Token& nameTok = expect(TokenType::IDENTIFIER, "parameter name");
     p.name = nameTok.getText();
     return p;
+}
+
+StmtPtr Parser::parseStructDecl(Visibility vis) {
+    const Token& kw = expect(TokenType::STRUCT, "'struct'");
+    const Token& nameTok = expect(TokenType::IDENTIFIER, "struct name");
+    expect(TokenType::L_BRACE, "'{' after struct name");
+
+    auto decl = std::make_unique<StructDecl>();
+    decl->visibility = vis;
+    decl->name = nameTok.getText();
+    decl->line = kw.getLine();
+    decl->column = kw.getColumn();
+
+    while (!check(TokenType::R_BRACE) && !atEnd()) {
+        Visibility fieldVis = Visibility::Public;
+        if (check(TokenType::PRIVATE))   { consume(); fieldVis = Visibility::Private; }
+        else if (check(TokenType::PROTECTED)) { consume(); fieldVis = Visibility::Protected; }
+        else if (check(TokenType::PUBLIC))    { consume(); fieldVis = Visibility::Public; }
+
+        StructField field;
+        field.visibility = fieldVis;
+        field.type = parseType();
+        field.line = field.type ? field.type->line : kw.getLine();
+        field.column = field.type ? field.type->column : kw.getColumn();
+        const Token& fnameTok = expect(TokenType::IDENTIFIER, "field name");
+        field.name = fnameTok.getText();
+        expect(TokenType::SEMI, "';' after field declaration");
+        decl->fields.push_back(std::move(field));
+    }
+    expect(TokenType::R_BRACE, "'}' to close struct");
+    return decl;
 }
 
 bool Parser::looksLikeTypedDecl() const {

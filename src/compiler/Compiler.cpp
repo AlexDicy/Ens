@@ -59,13 +59,6 @@ bool Compiler::compileSingle(const std::optional<fs::path>& root,
         return false;
     }
 
-    // If compiling a single file the file path shouldn't be added to the output path
-    fs::path relativePath = root.has_value() ? source : source.filename();
-    // Add output folder + subfolder + file name
-    fs::path output = outputFolder.filename() / fs::path(relativePath).replace_extension(".cpp");
-    // Print result
-    std::cout << "Compiling " << source << " to " << output << '\n';
-
     return compileSingle(file, outputFolder, filePath.string());
 }
 

@@ -83,3 +83,23 @@ public:
 
     void dump(std::ostream& os, int indent) const override;
 };
+
+struct StructField {
+    TypePtr type;
+    std::u16string name;
+    Visibility visibility = Visibility::Public;
+    int line = 0;
+    int column = 0;
+};
+
+class Type;  // forward — separate from ast::TypeNode
+
+class StructDecl : public Stmt {
+public:
+    Visibility visibility = Visibility::Public;
+    std::u16string name;
+    std::vector<StructField> fields;
+    ::Type* resolvedType = nullptr;  // canonical semantic type
+
+    void dump(std::ostream& os, int indent) const override;
+};

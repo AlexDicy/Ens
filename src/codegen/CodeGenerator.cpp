@@ -52,6 +52,7 @@ struct CodeGenerator::Impl {
     std::unique_ptr<llvm::DIBuilder> diBuilder;
     std::unordered_map<Symbol*, llvm::Value*> values;
     std::unordered_map<int, llvm::DIType*> diTypeCache;  // keyed by TypeKind
+    std::unordered_map<::Type*, llvm::StructType*> structTypeCache;
     llvm::Function* currentFunction = nullptr;
     llvm::DIScope* currentDIScope = nullptr;
     llvm::DICompileUnit* diCU = nullptr;
@@ -130,8 +131,32 @@ struct CodeGenerator::Impl {
             case TypeKind::Double:  return llvm::Type::getDoubleTy(ctx);
             case TypeKind::Void:    return llvm::Type::getVoidTy(ctx);
             case TypeKind::String:  return llvm::PointerType::get(ctx, 0);
+            case TypeKind::Struct:  return mapStructType(t);
             default:                return nullptr;
         }
+    }
+
+    llvm::StructType* mapStructType(::Type* t) {
+        auto it = structTypeCache.find(t);
+        if (it != structTypeCache.end()) return it->second;
+        std::string sname;
+        if (t->structInfo) {
+            for (char16_t c : t->structInfo->name)
+                sname.push_back(c < 128 ? static_cast<char>(c) : '?');
+        } else {
+            sname = "struct.anon";
+        }
+        auto* st = llvm::StructType::create(ctx, sname);  // opaque first
+        structTypeCache[t] = st;  // cache before recursion to handle self-refs
+        std::vector<llvm::Type*> fieldTypes;
+        if (t->structInfo) {
+            fieldTypes.reserve(t->structInfo->fields.size());
+            for (const auto& f : t->structInfo->fields) {
+                fieldTypes.push_back(mapType(f.type));
+            }
+        }
+        st->setBody(fieldTypes);
+        return st;
     }
 
     bool isSigned(::Type* t) {
@@ -147,8 +172,11 @@ struct CodeGenerator::Impl {
         }
     }
 
+    std::unordered_map<::Type*, llvm::DIType*> diStructTypeCache;
+
     llvm::DIType* mapDIType(::Type* t) {
         if (!debugEnabled || !diBuilder || !t) return nullptr;
+        if (t->kind == TypeKind::Struct) return nullptr;  // struct DI temporarily disabled
         int key = static_cast<int>(t->kind);
         auto it = diTypeCache.find(key);
         if (it != diTypeCache.end()) return it->second;
@@ -174,6 +202,41 @@ struct CodeGenerator::Impl {
         }
         if (result) diTypeCache[key] = result;
         return result;
+    }
+
+    llvm::DIType* mapDIStructType(::Type* t) {
+        auto it = diStructTypeCache.find(t);
+        if (it != diStructTypeCache.end()) return it->second;
+        if (!t->structInfo) return nullptr;
+
+        std::string sname;
+        for (char16_t c : t->structInfo->name)
+            sname.push_back(c < 128 ? static_cast<char>(c) : '?');
+
+        // Compute offsets sequentially from field DIType sizes. This ignores
+        // platform alignment padding — fine for first iteration; revisit when
+        // we add real layout/alignment control.
+        std::vector<llvm::Metadata*> members;
+        uint64_t offsetBits = 0;
+        for (const auto& f : t->structInfo->fields) {
+            std::string fname;
+            for (char16_t c : f.name)
+                fname.push_back(c < 128 ? static_cast<char>(c) : '?');
+            auto* memberType = mapDIType(f.type);
+            uint64_t sizeBits = memberType ? memberType->getSizeInBits() : 0;
+            members.push_back(diBuilder->createMemberType(
+                diCU, fname, diFile, /*line*/ 0,
+                sizeBits, /*alignInBits*/ 0, offsetBits,
+                llvm::DINode::FlagZero, memberType));
+            offsetBits += sizeBits;
+        }
+        auto* finalTy = diBuilder->createStructType(
+            diCU, sname, diFile, /*line*/ 0,
+            offsetBits, /*alignInBits*/ 0,
+            llvm::DINode::FlagZero, /*derivedFrom*/ nullptr,
+            diBuilder->getOrCreateArray(members));
+        diStructTypeCache[t] = finalTy;
+        return finalTy;
     }
 
     llvm::DISubroutineType* createDISubroutineType(Symbol* fn) {
@@ -277,18 +340,20 @@ struct CodeGenerator::Impl {
             values[param.resolvedSymbol] = alloca;
 
             if (debugEnabled && diBuilder && sp) {
-                int pline = param.type ? param.type->line : fn->line;
-                int pcol  = param.type ? param.type->column : fn->column;
-                auto* diVar = diBuilder->createParameterVariable(
-                    sp, pname, static_cast<unsigned>(i + 1), diFile,
-                    static_cast<unsigned>(pline),
-                    mapDIType(param.resolvedSymbol->type),
-                    /*AlwaysPreserve*/ true);
-                diBuilder->insertDeclare(
-                    alloca, diVar, diBuilder->createExpression(),
-                    llvm::DILocation::get(ctx, static_cast<unsigned>(pline),
-                                          static_cast<unsigned>(pcol), sp),
-                    builder->GetInsertBlock());
+                llvm::DIType* paramDIType = mapDIType(param.resolvedSymbol->type);
+                if (paramDIType) {
+                    int pline = param.type ? param.type->line : fn->line;
+                    int pcol  = param.type ? param.type->column : fn->column;
+                    auto* diVar = diBuilder->createParameterVariable(
+                        sp, pname, static_cast<unsigned>(i + 1), diFile,
+                        static_cast<unsigned>(pline), paramDIType,
+                        /*AlwaysPreserve*/ true);
+                    diBuilder->insertDeclare(
+                        alloca, diVar, diBuilder->createExpression(),
+                        llvm::DILocation::get(ctx, static_cast<unsigned>(pline),
+                                              static_cast<unsigned>(pcol), sp),
+                        builder->GetInsertBlock());
+                }
             }
             i++;
         }
@@ -350,15 +415,17 @@ struct CodeGenerator::Impl {
         values[sym] = alloca;
 
         if (debugEnabled && diBuilder && currentDIScope) {
-            auto* diVar = diBuilder->createAutoVariable(
-                currentDIScope, asAscii(s->name), diFile,
-                static_cast<unsigned>(s->line),
-                mapDIType(sym->type));
-            diBuilder->insertDeclare(
-                alloca, diVar, diBuilder->createExpression(),
-                llvm::DILocation::get(ctx, static_cast<unsigned>(s->line),
-                                      static_cast<unsigned>(s->column), currentDIScope),
-                builder->GetInsertBlock());
+            llvm::DIType* diVarType = mapDIType(sym->type);
+            if (diVarType) {
+                auto* diVar = diBuilder->createAutoVariable(
+                    currentDIScope, asAscii(s->name), diFile,
+                    static_cast<unsigned>(s->line), diVarType);
+                diBuilder->insertDeclare(
+                    alloca, diVar, diBuilder->createExpression(),
+                    llvm::DILocation::get(ctx, static_cast<unsigned>(s->line),
+                                          static_cast<unsigned>(s->column), currentDIScope),
+                    builder->GetInsertBlock());
+            }
         }
 
         if (s->init) {
@@ -458,7 +525,7 @@ struct CodeGenerator::Impl {
         if (auto* u = dynamic_cast<UnaryExpr*>(e))    return emitUnary(u);
         if (auto* c = dynamic_cast<CallExpr*>(e))     return emitCall(c);
         if (auto* a = dynamic_cast<AssignExpr*>(e))   return emitAssign(a);
-        if (dynamic_cast<MemberExpr*>(e))    { error(e->line, e->column, "member access codegen not yet supported"); return nullptr; }
+        if (auto* m = dynamic_cast<MemberExpr*>(e)) return emitMember(m);
         if (dynamic_cast<SubscriptExpr*>(e)) { error(e->line, e->column, "subscript codegen not yet supported"); return nullptr; }
         if (auto* tern = dynamic_cast<TernaryExpr*>(e)) return emitTernary(tern);
         return nullptr;
@@ -652,8 +719,32 @@ struct CodeGenerator::Impl {
             auto it = values.find(sym);
             return it == values.end() ? nullptr : it->second;
         }
+        if (auto* m = dynamic_cast<MemberExpr*>(e)) {
+            ::Type* objType = m->object->resolvedType;
+            if (!objType || !objType->isStruct() || !objType->structInfo) {
+                error(e->line, e->column, "Cannot take address of member on non-struct");
+                return nullptr;
+            }
+            llvm::Value* objAddr = emitLValue(m->object.get());
+            if (!objAddr) return nullptr;
+            int idx = objType->structInfo->findFieldIndex(m->member);
+            if (idx < 0) {
+                error(e->line, e->column, "Internal: field not found in struct");
+                return nullptr;
+            }
+            llvm::StructType* st = mapStructType(objType);
+            return builder->CreateStructGEP(st, objAddr, static_cast<unsigned>(idx),
+                                            asAscii(m->member) + ".addr");
+        }
         error(e->line, e->column, "Cannot get address of this expression");
         return nullptr;
+    }
+
+    llvm::Value* emitMember(MemberExpr* e) {
+        llvm::Value* addr = emitLValue(e);
+        if (!addr) return nullptr;
+        ::Type* fieldType = e->resolvedType;
+        return builder->CreateLoad(mapType(fieldType), addr, asAscii(e->member) + ".load");
     }
 
     void print(std::ostream& os) const {

@@ -76,6 +76,16 @@ static const char* visName(Visibility v) {
     return "?";
 }
 
+void StructDecl::dump(std::ostream& os, int indent) const {
+    writeIndent(os, indent);
+    os << "StructDecl(" << asciiOf(name) << ")\n";
+    for (const auto& f : fields) {
+        writeIndent(os, indent + 1);
+        os << asciiOf(f.name) << ":\n";
+        if (f.type) f.type->dump(os, indent + 2);
+    }
+}
+
 void FuncDecl::dump(std::ostream& os, int indent) const {
     writeIndent(os, indent);
     os << "FuncDecl(" << visName(visibility) << " " << asciiOf(name) << ")\n";

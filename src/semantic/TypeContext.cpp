@@ -45,5 +45,25 @@ Type* TypeContext::fromName(const std::u16string& name) {
     if (name == u"char")    return getPrimitive(TypeKind::Char);
     if (name == u"string")  return getPrimitive(TypeKind::String);
     if (name == u"void")    return getPrimitive(TypeKind::Void);
+
+    auto it = structCache.find(name);
+    if (it != structCache.end()) return it->second;
     return nullptr;
+}
+
+Type* TypeContext::registerStruct(std::u16string name) {
+    auto info = std::make_unique<StructInfo>();
+    info->name = name;
+    StructInfo* infoPtr = info.get();
+    ownedStructs.push_back(std::move(info));
+
+    Type* t = allocate(TypeKind::Struct);
+    t->structInfo = infoPtr;
+    structCache[name] = t;
+    return t;
+}
+
+Type* TypeContext::lookupStruct(const std::u16string& name) const {
+    auto it = structCache.find(name);
+    return it == structCache.end() ? nullptr : it->second;
 }

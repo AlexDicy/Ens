@@ -38,6 +38,9 @@ bool Type::equals(const Type* other) const {
     if (kind == TypeKind::Optional) {
         return inner && other->inner && inner->equals(other->inner);
     }
+    if (kind == TypeKind::Struct) {
+        return structInfo == other->structInfo;
+    }
     return true;
 }
 
@@ -70,6 +73,16 @@ std::string Type::toString() const {
         case TypeKind::Void:     return "void";
         case TypeKind::Null:     return "null";
         case TypeKind::Optional: return (inner ? inner->toString() : std::string("?")) + "?";
+        case TypeKind::Struct:   {
+            std::string r;
+            if (structInfo) {
+                r.reserve(structInfo->name.size());
+                for (char16_t c : structInfo->name) r.push_back(c < 128 ? static_cast<char>(c) : '?');
+            } else {
+                r = "<struct>";
+            }
+            return r;
+        }
         case TypeKind::Error:    return "<error>";
     }
     return "<unknown>";
