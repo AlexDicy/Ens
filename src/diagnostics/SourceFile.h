@@ -1,6 +1,8 @@
 #pragma once
+#include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 class SourceFile {
@@ -12,6 +14,9 @@ public:
 
     std::u16string_view getLine(int lineNumber) const;
     int getLineCount() const { return static_cast<int>(lineStarts.size()); }
+
+    // Convert a 0-based char16_t offset to a 1-based (line, column) pair.
+    std::pair<int, int> offsetToPosition(uint32_t offset) const;
 
 private:
     std::string filename;

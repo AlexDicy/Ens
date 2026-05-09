@@ -6,6 +6,8 @@
 #include "../codegen/Linker.h"
 #include "../cst/CstParser.h"
 #include "../cst/SyntaxNode.h"
+#include "../cst/ast/Declaration.h"
+#include "../cst/semantic/CstAnalyzer.h"
 #include "../diagnostics/Diagnostic.h"
 #include "../diagnostics/DiagnosticSink.h"
 #include "../diagnostics/SourceFile.h"
@@ -65,6 +67,70 @@ bool Compiler::compileSingle(const std::optional<fs::path>& root,
     return compileSingle(file, outputFolder, filePath.string());
 }
 
+static std::string asAscii16(std::u16string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char16_t c : s) out.push_back(c < 128 ? static_cast<char>(c) : '?');
+    return out;
+}
+
+static void dumpTypedOutline(const SyntaxNode& root, std::ostream& os) {
+    auto sf = cst::ast::SourceFile::cast(root);
+    if (!sf) return;
+    os << "\n--- Typed outline ---\n";
+    for (auto& fn : sf->functions()) {
+        os << "fn " << (fn.nameText() ? asAscii16(*fn.nameText()) : std::string("<missing>")) << "(";
+        bool first = true;
+        for (auto& p : fn.parameters()) {
+            if (!first) os << ", ";
+            first = false;
+            if (p.isThisField()) os << "this.";
+            os << (p.nameText() ? asAscii16(*p.nameText()) : std::string("<?>"));
+            if (auto tr = p.typeReference()) {
+                os << ":" << (tr->nameText() ? asAscii16(*tr->nameText()) : std::string("<?>"));
+                if (tr->isOptional()) os << "?";
+            }
+            if (p.defaultValue()) os << "=...";
+        }
+        os << ")";
+        if (auto rt = fn.returnType()) {
+            if (auto tr = rt->typeReference()) {
+                os << " -> " << (tr->nameText() ? asAscii16(*tr->nameText()) : std::string("<?>"));
+            }
+        }
+        if (fn.isShorthand()) os << " ;";
+        os << "\n";
+    }
+    for (auto& sd : sf->structs()) {
+        os << "struct " << (sd.nameText() ? asAscii16(*sd.nameText()) : std::string("<missing>")) << " {\n";
+        for (auto& f : sd.fields()) {
+            os << "  field " << (f.nameText() ? asAscii16(*f.nameText()) : std::string("<?>"));
+            if (auto tr = f.typeReference()) os << " : " << (tr->nameText() ? asAscii16(*tr->nameText()) : std::string("<?>"));
+            os << "\n";
+        }
+        for (auto& m : sd.methods()) {
+            os << "  method " << (m.nameText() ? asAscii16(*m.nameText()) : std::string("<?>"))
+               << "/" << m.parameters().size() << "\n";
+        }
+        os << "}\n";
+    }
+    for (auto& cd : sf->classes()) {
+        os << "class " << (cd.nameText() ? asAscii16(*cd.nameText()) : std::string("<missing>")) << " {\n";
+        for (auto& f : cd.fields()) {
+            os << "  field " << (f.nameText() ? asAscii16(*f.nameText()) : std::string("<?>"));
+            if (auto tr = f.typeReference()) os << " : " << (tr->nameText() ? asAscii16(*tr->nameText()) : std::string("<?>"));
+            os << "\n";
+        }
+        for (auto& m : cd.methods()) {
+            os << "  method " << (m.nameText() ? asAscii16(*m.nameText()) : std::string("<?>"))
+               << "/" << m.parameters().size();
+            if (m.isShorthand()) os << " (shorthand)";
+            os << "\n";
+        }
+        os << "}\n";
+    }
+}
+
 bool Compiler::dumpCst(std::istream& source, const std::string& filename) {
     std::string code((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
     std::u16string u16code(code.begin(), code.end());
@@ -76,9 +142,29 @@ bool Compiler::dumpCst(std::istream& source, const std::string& filename) {
 
     auto rootNode = SyntaxNode::makeRoot(root.get());
     rootNode->dump(std::cout, 0);
+    dumpTypedOutline(*rootNode, std::cout);
 
     if (!sink.empty()) {
         std::cerr << "\n--- Diagnostics ---\n";
+        sink.printAll(sourceFile, std::cerr);
+    }
+    return !sink.hasErrors();
+}
+
+bool Compiler::analyzeCst(std::istream& source, const std::string& filename) {
+    std::string code((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
+    std::u16string u16code(code.begin(), code.end());
+    SourceFile sourceFile(filename, std::move(u16code));
+
+    DiagnosticSink sink;
+    CstParser parser(sourceFile.getSource(), sink);
+    auto root = parser.parseSourceFile();
+    auto rootNode = SyntaxNode::makeRoot(root.get());
+
+    cst::semantic::CstAnalyzer analyzer(sourceFile, sink);
+    analyzer.analyze(*rootNode);
+
+    if (!sink.empty()) {
         sink.printAll(sourceFile, std::cerr);
     }
     return !sink.hasErrors();

@@ -19,6 +19,7 @@ public:
                               const std::string& filename = "<stdin>");
 
     static bool dumpCst(std::istream& source, const std::string& filename = "<stdin>");
+    static bool analyzeCst(std::istream& source, const std::string& filename = "<stdin>");
 
 private:
     static std::vector<std::filesystem::path> getFileTree(
