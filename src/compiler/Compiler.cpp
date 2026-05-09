@@ -4,7 +4,10 @@
 #include "../semantic/Analyzer.h"
 #include "../codegen/CodeGenerator.h"
 #include "../codegen/Linker.h"
+#include "../cst/CstParser.h"
+#include "../cst/SyntaxNode.h"
 #include "../diagnostics/Diagnostic.h"
+#include "../diagnostics/DiagnosticSink.h"
 #include "../diagnostics/SourceFile.h"
 
 #include <algorithm>
@@ -60,6 +63,25 @@ bool Compiler::compileSingle(const std::optional<fs::path>& root,
     }
 
     return compileSingle(file, outputFolder, filePath.string());
+}
+
+bool Compiler::dumpCst(std::istream& source, const std::string& filename) {
+    std::string code((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
+    std::u16string u16code(code.begin(), code.end());
+    SourceFile sourceFile(filename, std::move(u16code));
+
+    DiagnosticSink sink;
+    CstParser parser(sourceFile.getSource(), sink);
+    auto root = parser.parseSourceFile();
+
+    auto rootNode = SyntaxNode::makeRoot(root.get());
+    rootNode->dump(std::cout, 0);
+
+    if (!sink.empty()) {
+        std::cerr << "\n--- Diagnostics ---\n";
+        sink.printAll(sourceFile, std::cerr);
+    }
+    return !sink.hasErrors();
 }
 
 bool Compiler::compileSingle(std::istream& source, const fs::path& outputFile, const std::string& filename) {

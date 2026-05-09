@@ -1,4 +1,5 @@
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -8,6 +9,19 @@
 namespace fs = std::filesystem;
 
 static bool execute(const std::unordered_map<std::string, std::string>& arguments) {
+    if (arguments.count("--cst-dump")) {
+        if (arguments.count("--source")) {
+            fs::path source = arguments.at("--source");
+            std::ifstream file(source);
+            if (!file) {
+                std::cerr << "ERROR: Couldn't read " << source << '\n';
+                return false;
+            }
+            return Compiler::dumpCst(file, source.string());
+        }
+        return Compiler::dumpCst(std::cin);
+    }
+
     // --output is the output file path. Empty = print LLVM IR to stdout.
     // The extension drives the pipeline: .ll = IR text, .obj/.o = object file,
     // .exe (or no extension) = link to executable.
@@ -25,6 +39,10 @@ static bool execute(const std::unordered_map<std::string, std::string>& argument
     }
 }
 
+static bool isBooleanFlag(const std::string& arg) {
+    return arg == "-h" || arg == "--help" || arg == "--cst-dump";
+}
+
 static std::unordered_map<std::string, std::string> parseArguments(int argc, char* argv[]) {
     std::unordered_map<std::string, std::string> arguments;
 
@@ -33,6 +51,10 @@ static std::unordered_map<std::string, std::string> parseArguments(int argc, cha
         if (arg[0] == '-') {
             if (arg.size() < 2) {
                 throw std::invalid_argument("Not a valid argument: " + arg);
+            }
+            if (isBooleanFlag(arg)) {
+                arguments[arg] = "";
+                continue;
             }
             if (i + 1 >= argc) {
                 throw std::invalid_argument("Expected arg after: " + arg);
@@ -53,7 +75,11 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    if (execute(arguments)) {
+    bool ok = execute(arguments);
+    if (arguments.count("--cst-dump")) {
+        return ok ? 0 : 1;
+    }
+    if (ok) {
         auto it = arguments.find("--output");
         std::cout << "Compiled successfully to "
                   << (it == arguments.end() ? "the current folder" : it->second) << '\n';

@@ -18,6 +18,8 @@ public:
                               const std::filesystem::path& outputFile,
                               const std::string& filename = "<stdin>");
 
+    static bool dumpCst(std::istream& source, const std::string& filename = "<stdin>");
+
 private:
     static std::vector<std::filesystem::path> getFileTree(
         const std::filesystem::path& root,
