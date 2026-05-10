@@ -27,7 +27,7 @@ enum class SyntaxKind : uint16_t {
 
     // === Punctuation ===
     LParen, RParen, LBrace, RBrace, LBracket, RBracket,
-    Semi, Comma, Dot, Ellipsis, Colon, Arrow,
+    Semi, Comma, Dot, Ellipsis, Colon, Arrow, At,
     Plus, Minus, Star, Slash, Percent, Caret,
     Eq, Bang, Question,
     EqEq, NotEq, Lt, Gt, LtEq, GtEq,
@@ -67,6 +67,8 @@ enum class SyntaxKind : uint16_t {
     FieldDecl,
     MemberList,
     VisibilityModifier,
+    ImportDecl,
+    ImportPath,
 
     // === Type expressions ===
     TypeRef,             // identifier (or primitive keyword) optionally followed by ?

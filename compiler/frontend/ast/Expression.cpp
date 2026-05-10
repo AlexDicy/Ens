@@ -237,18 +237,18 @@ std::optional<Expression> TernaryExpression::elseBranch() const {
 
 // === NewExpression ===
 
+std::optional<TypeReference> NewExpression::typeReference() const {
+    if (auto tr = firstChildNode(node, SyntaxKind::TypeRef)) return TypeReference::cast(*tr);
+    return std::nullopt;
+}
+
 std::optional<SyntaxNode> NewExpression::typeName() const {
-    bool seenNewKw = false;
-    for (auto& c : node.children()) {
-        if (isTrivia(c.kind())) continue;
-        if (c.kind() == SyntaxKind::KwNew) { seenNewKw = true; continue; }
-        if (seenNewKw && c.kind() == SyntaxKind::Identifier) return c;
-    }
+    if (auto tr = typeReference()) return tr->nameToken();
     return std::nullopt;
 }
 
 std::optional<std::u16string> NewExpression::typeNameText() const {
-    if (auto t = typeName()) return std::u16string(t->tokenText());
+    if (auto tr = typeReference()) return tr->nameText();
     return std::nullopt;
 }
 

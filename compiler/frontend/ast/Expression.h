@@ -3,6 +3,7 @@
 #include <vector>
 #include "../cst/SyntaxNode.h"
 #include "Common.h"
+#include "TypeReference.h"
 
 namespace ast {
 
@@ -186,6 +187,7 @@ public:
         if (n.kind() != SyntaxKind::NewExpr) return std::nullopt;
         return NewExpression{n};
     }
+    std::optional<TypeReference> typeReference() const;
     std::optional<SyntaxNode> typeName() const;
     std::optional<std::u16string> typeNameText() const;
     std::optional<ArgumentList> argumentList() const;

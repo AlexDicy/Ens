@@ -100,11 +100,11 @@ Allows `new Renderer();`
 
 In both cases, the path is `/src/engine/renderer.ens` and the file contains a public `Renderer` class.
 
-Importing from packages follows the format `@packageorg/packagename/path`.
+Importing from packages follows the format `@packageorg.packagename.path`.
 
 ```ens
-import @std/fs/file; // for external dependency /src/std/fs/file.ens
-import Observable from @alexdicy/reactivity/observable; // for class Observable in external dependency /src/alexdicy/reactivity/observable.ens
+import @std.fs.file; // for external dependency /src/std/fs/file.ens
+import Observable from @alexdicy.reactivity.observable; // for class Observable in external dependency /src/alexdicy/reactivity/observable.ens
 ```
 
 Methods that can throw exceptions are marked with `throws`; any other method can be considered safe. The list of throwable types is computed and not part of the method signature. IDEs will infer and show them on hover.

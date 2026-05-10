@@ -136,7 +136,7 @@ GreenElementPtr Parser::parseSourceFile() {
         if (current == before) {
             // Defensive: if no progress was made, force advance to avoid infinite loop.
             reportAtCurrent("Unexpected token at top level");
-            recoverTo({SyntaxKind::KwStruct, SyntaxKind::KwClass,
+            recoverTo({SyntaxKind::KwImport, SyntaxKind::KwStruct, SyntaxKind::KwClass,
                        SyntaxKind::KwPrivate, SyntaxKind::KwProtected, SyntaxKind::KwPublic,
                        SyntaxKind::Identifier, SyntaxKind::Semi, SyntaxKind::EndOfFile});
             if (current == before && !atEnd()) bump();
@@ -153,6 +153,11 @@ GreenElementPtr Parser::parseSourceFile() {
 }
 
 void Parser::parseTopLevel() {
+    if (at(SyntaxKind::KwImport)) {
+        parseImportDecl();
+        return;
+    }
+
     bool hasVisibility = atAny({SyntaxKind::KwPrivate, SyntaxKind::KwProtected, SyntaxKind::KwPublic});
 
     if (at(SyntaxKind::KwStruct) ||
@@ -185,6 +190,36 @@ void Parser::parseVisibilityModifier() {
     if (!atAny({SyntaxKind::KwPrivate, SyntaxKind::KwProtected, SyntaxKind::KwPublic})) return;
     builder.startNode(SyntaxKind::VisibilityModifier);
     bump();
+    builder.finishNode();
+}
+
+// =================================================================
+// Import declarations
+// =================================================================
+
+void Parser::parseImportDecl() {
+    builder.startNode(SyntaxKind::ImportDecl);
+    expect(SyntaxKind::KwImport, "'import'");
+
+    // Optional alias: `import Identifier from path;`
+    if (peekKind(0) == SyntaxKind::Identifier && peekKind(1) == SyntaxKind::KwFrom) {
+        bump();  // alias identifier
+        bump();  // 'from'
+    }
+
+    parseImportPath();
+    expect(SyntaxKind::Semi, "';' after import");
+    builder.finishNode();
+}
+
+void Parser::parseImportPath() {
+    builder.startNode(SyntaxKind::ImportPath);
+    eat(SyntaxKind::At);  // optional '@' prefix for package imports
+    expect(SyntaxKind::Identifier, "path segment");
+    while (at(SyntaxKind::Dot) && peekKind(1) == SyntaxKind::Identifier) {
+        bump();  // '.'
+        bump();  // identifier
+    }
     builder.finishNode();
 }
 
@@ -366,8 +401,14 @@ bool Parser::isTypeStart(SyntaxKind k) const {
 
 void Parser::parseType() {
     builder.startNode(SyntaxKind::TypeRef);
+    bool wasIdentifier = at(SyntaxKind::Identifier);
     if (isTypeStart(kindAt())) bump();
     else emitMissing(SyntaxKind::Identifier, "type name");
+    // Allow a single namespace qualifier: `ns.Name`. Primitives are not qualifiable.
+    if (wasIdentifier && at(SyntaxKind::Dot) && peekKind(1) == SyntaxKind::Identifier) {
+        bump();  // '.'
+        bump();  // identifier
+    }
     eat(SyntaxKind::Question);
     builder.finishNode();
 }
@@ -375,13 +416,19 @@ void Parser::parseType() {
 bool Parser::looksLikeTypedVarDecl() const {
     SyntaxKind k0 = peekKind(0);
     if (!isTypeStart(k0)) return false;
-    SyntaxKind k1 = peekKind(1);
-    SyntaxKind k2 = peekKind(2);
-    SyntaxKind nameOrAfterQ = k1;
-    SyntaxKind afterName = k2;
-    if (k1 == SyntaxKind::Question) {
-        nameOrAfterQ = peekKind(2);
-        afterName = peekKind(3);
+    // Skip a single optional namespace qualifier: `ns.Name ...`. Primitives can't
+    // be qualified, so this only fires when the leading token is an Identifier.
+    size_t typeEnd = 1;
+    if (k0 == SyntaxKind::Identifier &&
+        peekKind(1) == SyntaxKind::Dot &&
+        peekKind(2) == SyntaxKind::Identifier) {
+        typeEnd = 3;
+    }
+    SyntaxKind nameOrAfterQ = peekKind(typeEnd);
+    SyntaxKind afterName = peekKind(typeEnd + 1);
+    if (nameOrAfterQ == SyntaxKind::Question) {
+        nameOrAfterQ = peekKind(typeEnd + 1);
+        afterName = peekKind(typeEnd + 2);
     }
     if (nameOrAfterQ != SyntaxKind::Identifier) return false;
     return afterName == SyntaxKind::Eq || afterName == SyntaxKind::Semi;
@@ -622,7 +669,8 @@ void Parser::parsePrefix() {
         case SyntaxKind::KwNew: {
             builder.startNode(SyntaxKind::NewExpr);
             bump();
-            expect(SyntaxKind::Identifier, "type name after 'new'");
+            if (at(SyntaxKind::Identifier)) parseType();
+            else emitMissing(SyntaxKind::Identifier, "type name after 'new'");
             if (at(SyntaxKind::LParen)) parseArgList();
             else emitMissing(SyntaxKind::LParen, "'(' after class name in 'new'");
             builder.finishNode();

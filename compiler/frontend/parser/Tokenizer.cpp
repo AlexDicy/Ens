@@ -322,6 +322,7 @@ LexedToken Tokenizer::lexOperator(uint32_t startPos, int startLine, int startCol
         case u'>': return consume(1, SyntaxKind::Gt);
         case u'&': return consume(1, SyntaxKind::Amp);
         case u'|': return consume(1, SyntaxKind::Pipe);
+        case u'@': return consume(1, SyntaxKind::At);
     }
 
     sink.error({startLine, startCol, 1},

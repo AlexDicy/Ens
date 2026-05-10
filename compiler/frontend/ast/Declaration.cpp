@@ -256,7 +256,93 @@ std::vector<FuncDecl> ClassDecl::methods() const {
     return {};
 }
 
+// === ImportPath / ImportDecl ===
+
+bool ImportPath::isPackage() const {
+    for (auto& c : node.children()) {
+        if (isTrivia(c.kind())) continue;
+        if (c.kind() == SyntaxKind::At) return true;
+        break;
+    }
+    return false;
+}
+
+std::vector<SyntaxNode> ImportPath::segmentTokens() const {
+    std::vector<SyntaxNode> out;
+    for (auto& c : node.children()) {
+        if (isTrivia(c.kind()) || !c.isToken()) continue;
+        if (c.kind() == SyntaxKind::Identifier) out.push_back(c);
+    }
+    return out;
+}
+
+std::vector<std::u16string> ImportPath::segments() const {
+    std::vector<std::u16string> out;
+    for (auto& t : segmentTokens()) out.emplace_back(t.tokenText());
+    return out;
+}
+
+std::optional<ImportPath> ImportDecl::importPath() const {
+    if (auto p = firstChildNode(node, SyntaxKind::ImportPath)) return ImportPath::cast(*p);
+    return std::nullopt;
+}
+
+bool ImportDecl::isPackage() const {
+    if (auto p = importPath()) return p->isPackage();
+    return false;
+}
+
+std::optional<SyntaxNode> ImportDecl::aliasToken() const {
+    bool seenImport = false;
+    for (auto& c : node.children()) {
+        if (isTrivia(c.kind())) continue;
+        if (c.kind() == SyntaxKind::KwImport) { seenImport = true; continue; }
+        if (!seenImport) continue;
+        if (c.kind() == SyntaxKind::Identifier) return c;
+        // Anything else after `import` (including `ImportPath`) means this is the
+        // bare-path form with no alias.
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::u16string> ImportDecl::aliasText() const {
+    if (auto t = aliasToken()) return std::u16string(t->tokenText());
+    return std::nullopt;
+}
+
+std::vector<std::u16string> ImportDecl::pathSegments() const {
+    if (auto p = importPath()) return p->segments();
+    return {};
+}
+
+std::optional<std::u16string> ImportDecl::namespaceName() const {
+    if (aliasText()) return std::nullopt;
+    auto segs = pathSegments();
+    if (segs.empty()) return std::nullopt;
+    return segs.back();
+}
+
+std::u16string ImportDecl::modulePath() const {
+    std::u16string out;
+    if (isPackage()) out.push_back(u'@');
+    auto segs = pathSegments();
+    for (size_t i = 0; i < segs.size(); ++i) {
+        if (i > 0) out.push_back(u'.');
+        out += segs[i];
+    }
+    return out;
+}
+
 // === SourceFile ===
+
+std::vector<ImportDecl> SourceFile::imports() const {
+    std::vector<ImportDecl> out;
+    for (auto& c : node.children()) {
+        if (auto i = ImportDecl::cast(c)) out.push_back(*i);
+    }
+    return out;
+}
 
 std::vector<FuncDecl> SourceFile::functions() const {
     std::vector<FuncDecl> out;

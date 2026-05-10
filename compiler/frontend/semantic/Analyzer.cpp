@@ -25,7 +25,22 @@ static std::string asciiOf(std::u16string_view s) {
 // =========================================================
 
 Analyzer::Analyzer(const SourceFile& src, DiagnosticSink& s)
-    : source(src), sink(s) {
+    : source(src), sink(s),
+      ownedTypeCtx(std::make_unique<TypeContext>()),
+      typeCtx(*ownedTypeCtx) {
+    auto scope = std::make_unique<Scope>(nullptr);
+    globalScope = scope.get();
+    currentScope = globalScope;
+    ownedScopes.push_back(std::move(scope));
+    registerBuiltins();
+}
+
+Analyzer::Analyzer(const SourceFile& src, DiagnosticSink& s,
+                   TypeContext& sharedContext, std::u16string mp)
+    : source(src), sink(s),
+      ownedTypeCtx(),
+      typeCtx(sharedContext),
+      modulePath_(std::move(mp)) {
     auto scope = std::make_unique<Scope>(nullptr);
     globalScope = scope.get();
     currentScope = globalScope;
@@ -77,28 +92,95 @@ void Analyzer::errorAtNode(const SyntaxNode& node, std::string message) {
     error(offset, static_cast<int>(length), std::move(message));
 }
 
+Symbol* Analyzer::globalSymbol(const std::u16string& name) const {
+    if (!globalScope) return nullptr;
+    return globalScope->lookupLocal(name);
+}
+
 // =========================================================
 // Top-level pipeline
 // =========================================================
 
 void Analyzer::analyze(const SyntaxNode& root) {
+    collectDeclarations(root);
+    bindImports([](const std::u16string&) -> const Analyzer* { return nullptr; });
+    analyzeBodies();
+}
+
+void Analyzer::collectDeclarations(const SyntaxNode& root) {
     auto sf = ast::SourceFile::cast(root);
     if (!sf) return;
+    astRoot = sf;
 
     collectStructs(*sf);
     collectClasses(*sf);
     collectFunctions(*sf);
+}
+
+void Analyzer::bindImports(const ModuleResolver& resolver) {
+    if (!astRoot) return;
+    for (auto& imp : astRoot->imports()) {
+        if (imp.isPackage()) {
+            errorAtNode(imp.node, "Package imports are not yet supported");
+            continue;
+        }
+        std::u16string targetPath = imp.modulePath();
+        const Analyzer* target = resolver(targetPath);
+        if (!target) {
+            errorAtNode(imp.node, "Cannot resolve import '" + asciiOf(targetPath) + "'");
+            continue;
+        }
+
+        if (auto alias = imp.aliasText()) {
+            // Named import: `import Alias from path;` — bring `Alias` into scope.
+            Type* importedType = typeCtx.lookupNamedType(targetPath, *alias);
+            uint32_t namePos = imp.aliasToken() ? imp.aliasToken()->startOffset() : imp.node.startOffset();
+            if (importedType) {
+                Symbol* sym = makeSymbol(SymbolKind::Variable, *alias, importedType, namePos);
+                if (!globalScope->define(sym)) {
+                    errorAtNode(imp.node, "Imported name '" + asciiOf(*alias) +
+                        "' conflicts with an existing declaration");
+                }
+                continue;
+            }
+            Symbol* fnSym = target->globalSymbol(*alias);
+            if (fnSym && fnSym->kind == SymbolKind::Function) {
+                if (!globalScope->define(fnSym)) {
+                    errorAtNode(imp.node, "Imported name '" + asciiOf(*alias) +
+                        "' conflicts with an existing declaration");
+                }
+                continue;
+            }
+            errorAtNode(imp.node, "Module '" + asciiOf(targetPath) +
+                "' has no exported '" + asciiOf(*alias) + "'");
+        } else {
+            // Namespace import: `import path;` — last path segment becomes the alias.
+            auto nsName = imp.namespaceName();
+            if (!nsName) continue;
+            Symbol* sym = makeSymbol(SymbolKind::Namespace, *nsName, nullptr, imp.node.startOffset());
+            sym->namespaceModulePath = targetPath;
+            if (!globalScope->define(sym)) {
+                errorAtNode(imp.node, "Namespace alias '" + asciiOf(*nsName) +
+                    "' conflicts with an existing declaration");
+            }
+        }
+    }
+}
+
+void Analyzer::analyzeBodies() {
+    if (!astRoot) return;
+    auto& sf = *astRoot;
 
     auto runChecks = [&](const ast::FuncDecl& fn) {
         checkParameterDefaults(fn);
     };
-    for (auto& fn : sf->functions()) runChecks(fn);
-    for (auto& sd : sf->structs()) for (auto& m : sd.methods()) runChecks(m);
-    for (auto& cd : sf->classes()) for (auto& m : cd.methods()) runChecks(m);
+    for (auto& fn : sf.functions()) runChecks(fn);
+    for (auto& sd : sf.structs()) for (auto& m : sd.methods()) runChecks(m);
+    for (auto& cd : sf.classes()) for (auto& m : cd.methods()) runChecks(m);
 
-    for (auto& fn : sf->functions()) analyzeFunctionBody(fn);
-    for (auto& sd : sf->structs())   for (auto& m : sd.methods()) analyzeFunctionBody(m);
-    for (auto& cd : sf->classes())   for (auto& m : cd.methods()) analyzeFunctionBody(m);
+    for (auto& fn : sf.functions()) analyzeFunctionBody(fn);
+    for (auto& sd : sf.structs())   for (auto& m : sd.methods()) analyzeFunctionBody(m);
+    for (auto& cd : sf.classes())   for (auto& m : cd.methods()) analyzeFunctionBody(m);
 }
 
 // =========================================================
@@ -111,11 +193,11 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
     for (auto& sd : structs) {
         auto name = sd.nameText();
         if (!name) continue;
-        if (typeCtx.lookupNamedType(*name)) {
+        if (typeCtx.lookupNamedType(modulePath_, *name)) {
             errorAtNode(sd.node, "Duplicate type '" + asciiOf(*name) + "'");
             continue;
         }
-        Type* t = typeCtx.registerStruct(*name);
+        Type* t = typeCtx.registerStruct(modulePath_, *name);
         auto [line, col] = source.offsetToPosition(sd.node.startOffset());
         t->structInfo->line = line;
         t->structInfo->column = col;
@@ -171,11 +253,11 @@ void Analyzer::collectClasses(const ast::SourceFile& file) {
     for (auto& cd : classes) {
         auto name = cd.nameText();
         if (!name) continue;
-        if (typeCtx.lookupNamedType(*name)) {
+        if (typeCtx.lookupNamedType(modulePath_, *name)) {
             errorAtNode(cd.node, "Duplicate type '" + asciiOf(*name) + "'");
             continue;
         }
-        Type* t = typeCtx.registerClass(*name);
+        Type* t = typeCtx.registerClass(modulePath_, *name);
         auto [line, col] = source.offsetToPosition(cd.node.startOffset());
         t->structInfo->line = line;
         t->structInfo->column = col;
@@ -347,12 +429,41 @@ void Analyzer::checkParameterDefaults(const ast::FuncDecl& fn) {
 // Type references
 // =========================================================
 
+Type* Analyzer::lookupTypeByName(const std::u16string& qualifier,
+                                 const std::u16string& name,
+                                 const SyntaxNode& diagNode) {
+    if (qualifier.empty()) {
+        if (Type* prim = typeCtx.primitiveFromName(name)) return prim;
+        if (Type* t = typeCtx.lookupNamedType(modulePath_, name)) return t;
+        // Fall back to imported aliases stored in the module's globalScope.
+        if (Symbol* sym = globalScope ? globalScope->lookupLocal(name) : nullptr) {
+            if (sym->type && (sym->type->isStruct() || sym->type->isClass())) return sym->type;
+        }
+        errorAtNode(diagNode, "Unknown type '" + asciiOf(name) + "'");
+        return typeCtx.getError();
+    }
+
+    Symbol* nsSym = globalScope ? globalScope->lookupLocal(qualifier) : nullptr;
+    if (!nsSym || nsSym->kind != SymbolKind::Namespace) {
+        errorAtNode(diagNode, "'" + asciiOf(qualifier) + "' is not a namespace alias");
+        return typeCtx.getError();
+    }
+    Type* t = typeCtx.lookupNamedType(nsSym->namespaceModulePath, name);
+    if (!t) {
+        errorAtNode(diagNode, "Module '" + asciiOf(nsSym->namespaceModulePath) +
+            "' has no type '" + asciiOf(name) + "'");
+        return typeCtx.getError();
+    }
+    return t;
+}
+
 Type* Analyzer::resolveTypeReference(const ast::TypeReference& tr) {
     auto name = tr.nameText();
     if (!name) return typeCtx.getError();
-    Type* base = typeCtx.fromName(*name);
-    if (!base) {
-        errorAtNode(tr.node, "Unknown type '" + asciiOf(*name) + "'");
+    auto qualifier = tr.qualifierText().value_or(std::u16string{});
+
+    Type* base = lookupTypeByName(qualifier, *name, tr.node);
+    if (base->isError()) {
         analysis.setType(tr.node.greenNode(), typeCtx.getError());
         return typeCtx.getError();
     }
@@ -423,9 +534,6 @@ void Analyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
 }
 
 void Analyzer::analyzeImplicitConstructorAssignments(const ast::FuncDecl& fn) {
-    // For each this.field param, validate `this.field = param` would type-check.
-    // We don't need to emit IR or build an AST node - just verify the field
-    // exists on the receiver type and the param's type is assignable.
     if (!currentThis) return;
     Type* recvType = currentThis->type;
     if (!recvType || !recvType->structInfo) return;
@@ -629,6 +737,7 @@ Type* Analyzer::analyzeIdent(const ast::IdentExpression& expr) {
     }
     analysis.setSymbol(expr.node.greenNode(), sym);
     if (sym->kind == SymbolKind::Function) return typeCtx.getError();
+    if (sym->kind == SymbolKind::Namespace) return typeCtx.getError();
     return sym->type ? sym->type : typeCtx.getError();
 }
 
@@ -842,6 +951,28 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
 Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
     auto obj = expr.object();
     if (!obj) return typeCtx.getError();
+
+    // Namespace alias on the LHS: `ns.Name` — resolve `Name` against the
+    // imported module's exported symbols rather than complaining about a
+    // non-record type.
+    if (auto idObj = obj->asIdent()) {
+        if (auto idName = idObj->nameText()) {
+            Symbol* nsSym = currentScope ? currentScope->lookup(*idName) : nullptr;
+            if (nsSym && nsSym->kind == SymbolKind::Namespace) {
+                analysis.setSymbol(idObj->node.greenNode(), nsSym);
+                auto memberName = expr.memberText();
+                if (!memberName) return typeCtx.getError();
+                if (Type* t = typeCtx.lookupNamedType(nsSym->namespaceModulePath, *memberName)) {
+                    analysis.setType(expr.node.greenNode(), t);
+                    return t;
+                }
+                errorAtNode(expr.node, "Module '" + asciiOf(nsSym->namespaceModulePath) +
+                    "' has no '" + asciiOf(*memberName) + "'");
+                return typeCtx.getError();
+            }
+        }
+    }
+
     Type* objT = analyzeExpr(*obj);
     if (objT->isError()) return typeCtx.getError();
     if (!objT->hasRecordLayout() || !objT->structInfo) {
@@ -902,15 +1033,25 @@ Type* Analyzer::analyzeTernary(const ast::TernaryExpression& expr) {
 }
 
 Type* Analyzer::analyzeNew(const ast::NewExpression& expr) {
-    auto typeName = expr.typeNameText();
+    auto tr = expr.typeReference();
+    if (!tr) return typeCtx.getError();
+    auto typeName = tr->nameText();
     if (!typeName) return typeCtx.getError();
-    Type* t = typeCtx.lookupClass(*typeName);
-    if (!t) {
-        if (typeCtx.lookupStruct(*typeName)) {
+    if (tr->isOptional()) {
+        errorAtNode(tr->node, "'new' cannot construct an optional type");
+    }
+
+    Type* t = resolveTypeReference(*tr);
+    if (t->isError()) {
+        for (auto& a : expr.arguments()) analyzeExpr(a);
+        return typeCtx.getError();
+    }
+    if (!t->isClass()) {
+        if (t->isStruct()) {
             errorAtNode(expr.node, "'new' is only valid for classes; '" +
                 asciiOf(*typeName) + "' is a struct");
         } else {
-            errorAtNode(expr.node, "Unknown class '" + asciiOf(*typeName) + "'");
+            errorAtNode(expr.node, "'new' requires a class type, got '" + t->toString() + "'");
         }
         for (auto& a : expr.arguments()) analyzeExpr(a);
         return typeCtx.getError();

@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -15,30 +16,66 @@
 #include "AnalysisResult.h"
 
 class DiagnosticSink;
+class Analyzer;
+
+using ModuleResolver = std::function<const Analyzer*(const std::u16string& modulePath)>;
 
 class Analyzer {
 public:
+    // Owning-TypeContext form: used by the LSP and stdin compilation, where
+    // there is exactly one source file and no cross-file resolution.
     Analyzer(const SourceFile& source, DiagnosticSink& sink);
 
+    // Shared-TypeContext form: used by the driver to compile a multi-file
+    // program. `modulePath` is the canonical key (e.g. u"engine.renderer") used
+    // when registering / looking up types in the shared context.
+    Analyzer(const SourceFile& source, DiagnosticSink& sink,
+             TypeContext& sharedContext, std::u16string modulePath);
+
+    // Single-file convenience wrapper: collect → bind imports → analyze bodies,
+    // all in one call.
     void analyze(const SyntaxNode& sourceFileRoot);
+
+    // Multi-file pipeline: each driver step runs once per module before the
+    // next step starts.
+    void collectDeclarations(const SyntaxNode& sourceFileRoot);
+    void bindImports(const ModuleResolver& resolver);
+    void analyzeBodies();
 
     const AnalysisResult& result() const { return analysis; }
     AnalysisResult& result() { return analysis; }
 
     TypeContext& types() { return typeCtx; }
+    const std::u16string& modulePath() const { return modulePath_; }
+
+    // Used by other Analyzers' bindImports to look up an exported symbol in
+    // this module. Returns nullptr if no such symbol exists at the global
+    // scope. Functions live as Symbols; structs/classes are surfaced via a
+    // synthetic Variable-kind symbol whose `type` is the user-defined type.
+    Symbol* globalSymbol(const std::u16string& name) const;
 
 private:
     const SourceFile& source;
     DiagnosticSink& sink;
     AnalysisResult analysis;
 
-    TypeContext typeCtx;
+    // When constructed in single-file mode the analyzer owns its TypeContext
+    // and `typeCtx` aliases it. In shared-context mode `typeCtx` aliases the
+    // driver-owned context and `ownedTypeCtx` stays empty.
+    std::unique_ptr<TypeContext> ownedTypeCtx;
+    TypeContext& typeCtx;
+    std::u16string modulePath_;
+
     std::vector<std::unique_ptr<Symbol>> ownedSymbols;
     std::vector<std::unique_ptr<Scope>> ownedScopes;
     Scope* globalScope = nullptr;
     Scope* currentScope = nullptr;
     Symbol* currentFunction = nullptr;
     Symbol* currentThis = nullptr;
+
+    // Cached AST root after collectDeclarations so analyzeBodies doesn't have
+    // to re-parse the source. Populated by collectDeclarations.
+    std::optional<ast::SourceFile> astRoot;
 
     Symbol* makeSymbol(SymbolKind k, std::u16string n, Type* t, uint32_t offset);
     Scope* pushScope();
@@ -83,6 +120,8 @@ private:
     Type* analyzeParen(const ast::ParenExpression& expr);
 
     Type* resolveTypeReference(const ast::TypeReference& tr);
+    Type* lookupTypeByName(const std::u16string& qualifier, const std::u16string& name,
+                           const SyntaxNode& diagNode);
     bool isLValue(const ast::Expression& expr) const;
 
     // Helpers for CST → location.

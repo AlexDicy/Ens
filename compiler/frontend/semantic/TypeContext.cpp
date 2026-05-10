@@ -30,7 +30,7 @@ Type* TypeContext::getOptional(Type* inner) {
     return t;
 }
 
-Type* TypeContext::fromName(const std::u16string& name) {
+Type* TypeContext::primitiveFromName(const std::u16string& name) {
     if (name == u"bool")    return getPrimitive(TypeKind::Bool);
     if (name == u"byte")    return getPrimitive(TypeKind::Byte);
     if (name == u"short")   return getPrimitive(TypeKind::Short);
@@ -45,12 +45,10 @@ Type* TypeContext::fromName(const std::u16string& name) {
     if (name == u"char")    return getPrimitive(TypeKind::Char);
     if (name == u"string")  return getPrimitive(TypeKind::String);
     if (name == u"void")    return getPrimitive(TypeKind::Void);
-
-    if (auto* t = lookupNamedType(name)) return t;
     return nullptr;
 }
 
-Type* TypeContext::registerStruct(std::u16string name) {
+Type* TypeContext::registerStruct(const std::u16string& modulePath, std::u16string name) {
     auto info = std::make_unique<StructInfo>();
     info->name = name;
     StructInfo* infoPtr = info.get();
@@ -58,16 +56,16 @@ Type* TypeContext::registerStruct(std::u16string name) {
 
     Type* t = allocate(TypeKind::Struct);
     t->structInfo = infoPtr;
-    structCache[name] = t;
+    structCache[Key{modulePath, std::move(name)}] = t;
     return t;
 }
 
-Type* TypeContext::lookupStruct(const std::u16string& name) const {
-    auto it = structCache.find(name);
+Type* TypeContext::lookupStruct(const std::u16string& modulePath, const std::u16string& name) const {
+    auto it = structCache.find(Key{modulePath, name});
     return it == structCache.end() ? nullptr : it->second;
 }
 
-Type* TypeContext::registerClass(std::u16string name) {
+Type* TypeContext::registerClass(const std::u16string& modulePath, std::u16string name) {
     auto info = std::make_unique<StructInfo>();
     info->name = name;
     StructInfo* infoPtr = info.get();
@@ -75,19 +73,16 @@ Type* TypeContext::registerClass(std::u16string name) {
 
     Type* t = allocate(TypeKind::Class);
     t->structInfo = infoPtr;
-    classCache[name] = t;
+    classCache[Key{modulePath, std::move(name)}] = t;
     return t;
 }
 
-Type* TypeContext::lookupClass(const std::u16string& name) const {
-    auto it = classCache.find(name);
+Type* TypeContext::lookupClass(const std::u16string& modulePath, const std::u16string& name) const {
+    auto it = classCache.find(Key{modulePath, name});
     return it == classCache.end() ? nullptr : it->second;
 }
 
-Type* TypeContext::lookupNamedType(const std::u16string& name) const {
-    auto sit = structCache.find(name);
-    if (sit != structCache.end()) return sit->second;
-    auto cit = classCache.find(name);
-    if (cit != classCache.end()) return cit->second;
-    return nullptr;
+Type* TypeContext::lookupNamedType(const std::u16string& modulePath, const std::u16string& name) const {
+    if (Type* t = lookupStruct(modulePath, name)) return t;
+    return lookupClass(modulePath, name);
 }

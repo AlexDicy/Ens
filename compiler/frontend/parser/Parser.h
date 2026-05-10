@@ -57,6 +57,8 @@ private:
     void parseStructOrClassDecl(SyntaxKind nodeKind, SyntaxKind keywordKind);
     void parseStructOrClassMember();
     void parseFieldDecl();
+    void parseImportDecl();
+    void parseImportPath();
 
     // === Type ===
     void parseType();

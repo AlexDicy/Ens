@@ -10,10 +10,6 @@ public:
                         const std::filesystem::path& outputFolder,
                         const std::filesystem::path& sourcePath);
 
-    static bool compileSingle(const std::optional<std::filesystem::path>& root,
-                              const std::filesystem::path& source,
-                              const std::filesystem::path& outputFolder);
-
     static bool compileSingle(std::istream& source,
                               const std::filesystem::path& outputFile,
                               const std::string& filename = "<stdin>");

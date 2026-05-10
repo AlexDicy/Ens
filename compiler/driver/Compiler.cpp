@@ -8,26 +8,292 @@
 #include "diagnostics/SourceFile.h"
 #include "parser/Parser.h"
 #include "semantic/Analyzer.h"
+#include "semantic/TypeContext.h"
 
 #include <algorithm>
+#include <deque>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace fs = std::filesystem;
 
-bool Compiler::compile(const fs::path& source,
-                       const fs::path& outputFolder,
-                       const fs::path& sourcePath) {
-    if (fs::is_directory(source)) {
-        auto files = getFileTree(source, sourcePath);
-        for (const auto& file : files) {
-            compileSingle(source, file, outputFolder);
+namespace {
+
+struct Module {
+    std::u16string modulePath;
+    fs::path absolutePath;
+    fs::path relativePath; // relative to source root
+    std::unique_ptr<SourceFile> source;
+    std::unique_ptr<DiagnosticSink> sink;
+    GreenElementPtr cstRoot;
+    std::unique_ptr<SyntaxNode> rootNode;
+    std::unique_ptr<Analyzer> analyzer;
+};
+
+std::u16string toU16(std::string_view s) {
+    std::u16string out;
+    out.reserve(s.size());
+    for (char c : s) out.push_back(static_cast<unsigned char>(c));
+    return out;
+}
+
+std::string asAscii(std::u16string_view s)
+{
+    std::string r;
+    r.reserve(s.size());
+    for (char16_t c : s) r.push_back(c < 128 ? static_cast<char>(c) : '?');
+    return r;
+}
+
+std::u16string modulePathOfRelative(const fs::path& relative) {
+    fs::path no_ext = relative;
+    no_ext.replace_extension();
+    std::u16string out;
+    bool first = true;
+    for (auto& part : no_ext) {
+        std::string s = part.string();
+        if (s.empty() || s == ".") continue;
+        if (!first) out.push_back(u'.');
+        out += toU16(s);
+        first = false;
+    }
+    return out;
+}
+
+fs::path relativeFromModulePath(const std::u16string& modulePath) {
+    fs::path rel;
+    std::string segment;
+    for (char16_t c : modulePath) {
+        if (c == u'.') {
+            if (!segment.empty()) { rel /= segment; segment.clear(); }
+        } else {
+            segment.push_back(c < 128 ? static_cast<char>(c) : '?');
         }
-    } else {
-        return compileSingle(std::nullopt, source, outputFolder);
+    }
+    if (!segment.empty()) rel /= segment;
+    if (!rel.empty()) rel.replace_extension(".ens");
+    return rel;
+}
+
+std::string sanitizeForFilename(std::u16string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char16_t c : s) {
+        if ((c >= u'a' && c <= u'z') || (c >= u'A' && c <= u'Z') ||
+            (c >= u'0' && c <= u'9') || c == u'_' || c == u'.') {
+            out.push_back(static_cast<char>(c));
+        } else {
+            out.push_back('_');
+        }
+    }
+    if (out.empty()) out = "module";
+    return out;
+}
+
+bool readFileToU16(const fs::path& path, std::u16string& out) {
+    std::ifstream f(path);
+    if (!f) return false;
+    std::string code((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    out.assign(code.begin(), code.end());
+    return true;
+}
+
+std::unique_ptr<Module> loadModule(const fs::path& sourceRoot,
+                                   const fs::path& relativePath,
+                                   const std::u16string& modulePath) {
+    fs::path absolute = sourceRoot / relativePath;
+    std::u16string code;
+    if (!readFileToU16(absolute, code)) {
+        std::cerr << "ERROR: Couldn't read " << absolute << '\n';
+        return nullptr;
+    }
+    auto m = std::make_unique<Module>();
+    m->modulePath = modulePath;
+    m->absolutePath = absolute;
+    m->relativePath = relativePath;
+    m->source = std::make_unique<SourceFile>(absolute.string(), std::move(code));
+    m->sink = std::make_unique<DiagnosticSink>();
+    Parser parser(m->source->getSource(), *m->sink);
+    m->cstRoot = parser.parseSourceFile();
+    m->rootNode = SyntaxNode::makeRoot(m->cstRoot.get());
+    return m;
+}
+
+bool buildModuleGraph(const fs::path& sourceRoot,
+                      std::deque<fs::path>& seedRelatives,
+                      std::vector<std::unique_ptr<Module>>& modulesOut,
+                      std::unordered_map<std::u16string, Module*>& byPath) {
+    std::unordered_set<std::u16string> queued;
+
+    auto enqueue = [&](const fs::path& rel) {
+        std::u16string mp = modulePathOfRelative(rel);
+        if (queued.count(mp)) return;
+        queued.insert(mp);
+        seedRelatives.push_back(rel);
+    };
+
+    {
+        std::deque<fs::path> initial;
+        std::swap(initial, seedRelatives);
+        for (auto& r : initial) enqueue(r);
+    }
+
+    while (!seedRelatives.empty()) {
+        fs::path rel = seedRelatives.front();
+        seedRelatives.pop_front();
+        std::u16string mp = modulePathOfRelative(rel);
+
+        auto module = loadModule(sourceRoot, rel, mp);
+        if (!module) return false;
+
+        Module* raw = module.get();
+        modulesOut.push_back(std::move(module));
+        byPath.emplace(mp, raw);
+
+        auto sf = ast::SourceFile::cast(*raw->rootNode);
+        if (!sf) continue;
+        for (auto& imp : sf->imports()) {
+            if (imp.isPackage()) continue;  // diagnosed later by the analyzer
+            std::u16string targetPath = imp.modulePath();
+            if (queued.count(targetPath)) continue;
+            fs::path targetRel = relativeFromModulePath(targetPath);
+            if (targetRel.empty()) continue;
+            fs::path absolute = sourceRoot / targetRel;
+            if (!fs::exists(absolute)) {
+                auto& sink = *raw->sink;
+                auto [line, col] = raw->source->offsetToPosition(imp.node.startOffset());
+                sink.error({line, col, 1},
+                    "Cannot find module '" + asAscii(targetPath) +
+                    "' (looked for " + absolute.string() + ")");
+                continue;
+            }
+            queued.insert(targetPath);
+            seedRelatives.push_back(targetRel);
+        }
     }
     return true;
+}
+
+bool runMultiModuleAnalysis(std::vector<std::unique_ptr<Module>>& modules,
+                            std::unordered_map<std::u16string, Module*>& byPath,
+                            TypeContext& sharedCtx) {
+    for (auto& m : modules) {
+        m->analyzer = std::make_unique<Analyzer>(*m->source, *m->sink, sharedCtx, m->modulePath);
+        m->analyzer->collectDeclarations(*m->rootNode);
+    }
+
+    ModuleResolver resolver = [&](const std::u16string& path) -> const Analyzer* {
+        auto it = byPath.find(path);
+        if (it == byPath.end()) return nullptr;
+        return it->second->analyzer.get();
+    };
+    for (auto& m : modules) m->analyzer->bindImports(resolver);
+
+    for (auto& m : modules) m->analyzer->analyzeBodies();
+
+    bool ok = true;
+    for (auto& m : modules) {
+        if (m->sink->hasErrors()) {
+            m->sink->printAll(*m->source, std::cerr);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+bool emitModule(Module& module,
+                const std::string& moduleName,
+                const fs::path& objectPath) {
+    CodeGenerator codegen(moduleName, module.source->getFilename(),
+                          *module.source, module.analyzer->result());
+    if (!codegen.generate(*module.rootNode)) {
+        for (const auto& d : codegen.getDiagnostics()) d.print(*module.source, std::cerr);
+        return false;
+    }
+    if (!codegen.emitObjectFile(objectPath.string())) {
+        for (const auto& d : codegen.getDiagnostics()) d.print(*module.source, std::cerr);
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool Compiler::compile(const fs::path& source,
+                       const fs::path& outputFolder,
+                       const fs::path& /*sourcePath*/) {
+    fs::path sourceRoot = fs::is_directory(source) ? source : source.parent_path();
+
+    std::deque<fs::path> seeds;
+    if (fs::is_directory(source)) {
+        auto files = getFileTree(source, sourceRoot);
+        for (auto& f : files) seeds.push_back(f);
+    } else {
+        if (!fs::exists(source)) {
+            std::cerr << "ERROR: " << source << " does not exist\n";
+            return false;
+        }
+        fs::path rel = fs::relative(source, sourceRoot);
+        seeds.push_back(rel);
+    }
+
+    if (seeds.empty()) {
+        std::cerr << "ERROR: no .ens files found in " << sourceRoot << '\n';
+        return false;
+    }
+
+    std::vector<std::unique_ptr<Module>> modules;
+    std::unordered_map<std::u16string, Module*> byPath;
+    if (!buildModuleGraph(sourceRoot, seeds, modules, byPath)) return false;
+
+    TypeContext sharedCtx;
+    if (!runMultiModuleAnalysis(modules, byPath, sharedCtx)) return false;
+
+    std::string ext = outputFolder.extension().string();
+    for (auto& c : ext) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+    const bool linkToExe = !outputFolder.empty() && (ext == ".exe" || ext.empty());
+
+    if (outputFolder.empty()) {
+        for (auto& m : modules) {
+            CodeGenerator codegen("ens_" + sanitizeForFilename(m->modulePath),
+                                  m->source->getFilename(),
+                                  *m->source, m->analyzer->result());
+            if (!codegen.generate(*m->rootNode)) {
+                for (const auto& d : codegen.getDiagnostics()) d.print(*m->source, std::cerr);
+                return false;
+            }
+            std::cout << "--- LLVM IR (" << asAscii(m->modulePath) << ") ---\n";
+            codegen.print(std::cout);
+        }
+        return true;
+    }
+    if (!linkToExe) {
+        std::cerr << "Multi-file compilation only supports linking to an executable; got '"
+                  << ext << "'\n";
+        return false;
+    }
+
+    fs::path outDir = outputFolder.parent_path();
+    if (outDir.empty()) outDir = fs::current_path();
+    std::string baseStem = outputFolder.stem().string();
+    if (baseStem.empty()) baseStem = "ens";
+
+    std::vector<std::string> objectPaths;
+    objectPaths.reserve(modules.size());
+    for (auto& m : modules) {
+        std::string name = baseStem + "." + sanitizeForFilename(m->modulePath) + ".obj";
+        fs::path objPath = outDir / name;
+        if (!emitModule(*m, "ens_" + sanitizeForFilename(m->modulePath), objPath)) return false;
+        objectPaths.push_back(objPath.string());
+    }
+
+    return Linker::link(objectPaths, outputFolder.string(), std::cerr);
 }
 
 std::vector<fs::path> Compiler::getFileTree(const fs::path& root, const fs::path& rootPath) {
@@ -46,22 +312,7 @@ std::vector<fs::path> Compiler::getFileTree(const fs::path& root, const fs::path
         }
     }
 
-    // Make sure subfiles are last
-    std::reverse(files.begin(), files.end());
     return files;
-}
-
-bool Compiler::compileSingle(const std::optional<fs::path>& root,
-                              const fs::path& source,
-                              const fs::path& outputFolder) {
-    fs::path filePath = root.has_value() ? (*root / source) : source;
-    std::ifstream file(filePath);
-    if (!file) {
-        std::cerr << "ERROR: Couldn't read " << source << '\n';
-        return false;
-    }
-
-    return compileSingle(file, outputFolder, filePath.string());
 }
 
 static std::string asAscii16(std::u16string_view s) {

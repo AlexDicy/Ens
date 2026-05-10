@@ -2,12 +2,36 @@
 
 namespace ast {
 
-std::optional<SyntaxNode> TypeReference::nameToken() const {
+std::vector<SyntaxNode> TypeReference::segmentTokens() const {
+    std::vector<SyntaxNode> out;
     for (auto& c : node.children()) {
         if (isTrivia(c.kind()) || !c.isToken()) continue;
-        if (c.kind() == SyntaxKind::Identifier || isKeyword(c.kind())) return c;
+        if (c.kind() == SyntaxKind::Identifier || isKeyword(c.kind())) out.push_back(c);
     }
+    return out;
+}
+
+std::vector<std::u16string> TypeReference::pathSegments() const {
+    std::vector<std::u16string> out;
+    for (auto& t : segmentTokens()) out.emplace_back(t.tokenText());
+    return out;
+}
+
+std::optional<SyntaxNode> TypeReference::qualifierToken() const {
+    auto tokens = segmentTokens();
+    if (tokens.size() < 2) return std::nullopt;
+    return tokens.front();
+}
+
+std::optional<std::u16string> TypeReference::qualifierText() const {
+    if (auto t = qualifierToken()) return std::u16string(t->tokenText());
     return std::nullopt;
+}
+
+std::optional<SyntaxNode> TypeReference::nameToken() const {
+    auto tokens = segmentTokens();
+    if (tokens.empty()) return std::nullopt;
+    return tokens.back();
 }
 
 std::optional<std::u16string> TypeReference::nameText() const {

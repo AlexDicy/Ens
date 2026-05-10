@@ -1,7 +1,8 @@
 #pragma once
 #include <optional>
+#include <string>
+#include <vector>
 #include "../cst/SyntaxNode.h"
-#include "Common.h"
 
 namespace ast {
 
@@ -14,6 +15,10 @@ public:
         return TypeReference{n};
     }
 
+    std::vector<SyntaxNode> segmentTokens() const;
+    std::vector<std::u16string> pathSegments() const;
+    std::optional<SyntaxNode> qualifierToken() const;
+    std::optional<std::u16string> qualifierText() const;
     std::optional<SyntaxNode> nameToken() const;
     std::optional<std::u16string> nameText() const;
     bool isOptional() const;

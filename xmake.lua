@@ -80,9 +80,32 @@ task("test")
         local total, passed = 0, 0
         local failures = {}
 
+        -- list of tests:
+        --   * every tests/*.ens file (single-file mode)
+        --   * every tests/<dir>/main.ens (folder mode)
+        local jobs = {}
         for _, ens_file in ipairs(os.files(path.join(tests_dir, "*.ens"))) do
+            table.insert(jobs, {
+                name = path.basename(ens_file),
+                ens_file = ens_file,
+                source = ens_file,
+            })
+        end
+        for _, sub in ipairs(os.dirs(path.join(tests_dir, "*"))) do
+            local main_ens = path.join(sub, "main.ens")
+            if os.isfile(main_ens) then
+                table.insert(jobs, {
+                    name = path.basename(sub),
+                    ens_file = main_ens,
+                    source = sub,
+                })
+            end
+        end
+
+        for _, job in ipairs(jobs) do
             total = total + 1
-            local name = path.basename(ens_file)
+            local name = job.name
+            local ens_file = job.ens_file
             local exe_file    = path.join(out_dir, name .. ".exe")
             local stdout_file = path.join(out_dir, name .. ".stdout")
             local compile_log = path.join(out_dir, name .. ".compile.log")
@@ -104,7 +127,7 @@ task("test")
             os.tryrm(stdout_file)
 
             local compile_rc = os.execv(ens_exe,
-                {"--source", ens_file, "--output", exe_file},
+                {"--source", job.source, "--output", exe_file},
                 {try = true, stdout = compile_log, stderr = compile_log})
             local compile_log_text = io.readfile(compile_log) or ""
 

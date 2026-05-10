@@ -21,6 +21,8 @@ class FieldDecl;
 class StructDecl;
 class ClassDecl;
 class MemberList;
+class ImportDecl;
+class ImportPath;
 class SourceFile;
 
 class VisibilityModifier {
@@ -152,6 +154,34 @@ public:
     std::vector<FuncDecl> methods() const;
 };
 
+class ImportPath {
+public:
+    SyntaxNode node;
+    static std::optional<ImportPath> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::ImportPath) return std::nullopt;
+        return ImportPath{n};
+    }
+    bool isPackage() const;
+    std::vector<SyntaxNode> segmentTokens() const;
+    std::vector<std::u16string> segments() const;
+};
+
+class ImportDecl {
+public:
+    SyntaxNode node;
+    static std::optional<ImportDecl> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::ImportDecl) return std::nullopt;
+        return ImportDecl{n};
+    }
+    std::optional<ImportPath> importPath() const;
+    bool isPackage() const;
+    std::optional<SyntaxNode> aliasToken() const;
+    std::optional<std::u16string> aliasText() const;
+    std::vector<std::u16string> pathSegments() const;
+    std::optional<std::u16string> namespaceName() const;
+    std::u16string modulePath() const;
+};
+
 class SourceFile {
 public:
     SyntaxNode node;
@@ -159,6 +189,7 @@ public:
         if (n.kind() != SyntaxKind::SourceFile) return std::nullopt;
         return SourceFile{n};
     }
+    std::vector<ImportDecl> imports() const;
     std::vector<FuncDecl> functions() const;
     std::vector<StructDecl> structs() const;
     std::vector<ClassDecl> classes() const;

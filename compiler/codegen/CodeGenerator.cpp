@@ -304,6 +304,37 @@ struct CodeGenerator::Impl {
         return tmp.CreateAlloca(t, nullptr, name);
     }
 
+    llvm::Function* getOrDeclareExternalFunction(Symbol* sym, ::Type* receiver) {
+        auto it = values.find(sym);
+        if (it != values.end()) return llvm::cast<llvm::Function>(it->second);
+        if (!sym) return nullptr;
+
+        std::vector<llvm::Type*> paramTypes;
+        if (receiver) paramTypes.push_back(llvm::PointerType::get(ctx, 0));
+        for (auto* pt : sym->paramTypes) {
+            if (isUnsupportedType(pt)) return nullptr;
+            paramTypes.push_back(mapType(pt));
+        }
+        if (sym->returnType && !sym->returnType->isVoid() && isUnsupportedType(sym->returnType)) {
+            return nullptr;
+        }
+        llvm::Type* retType = mapType(sym->returnType);
+        auto* fnType = llvm::FunctionType::get(retType, paramTypes, false);
+
+        std::string mangled = asAscii(sym->name);
+        if (receiver && receiver->structInfo) {
+            mangled = asAscii(receiver->structInfo->name) + "_" + mangled;
+        }
+
+        if (auto* existing = module->getFunction(mangled)) {
+            values[sym] = existing;
+            return existing;
+        }
+        auto* func = llvm::Function::Create(fnType, llvm::Function::ExternalLinkage, mangled, module.get());
+        values[sym] = func;
+        return func;
+    }
+
     void declareFunction(const ast::FuncDecl& fn) {
         Symbol* sym = symbolOf(fn.node);
         if (!sym) return;
@@ -369,11 +400,7 @@ struct CodeGenerator::Impl {
         auto argIter = currentFunction->args().begin();
         auto argEnd  = currentFunction->args().end();
 
-        // Implicit `this` parameter for methods. The receiver Symbol is bound by
-        // the analyzer onto a synthetic name in the function's local scope; we
-        // can't look it up here, but we don't need to - `this` is referenced
-        // through ThisExpr nodes whose resolvedSymbol is the synthetic one. We
-        // store the alloca under that symbol.
+        // Implicit `this` parameter for methods
         Symbol* thisSym = analysis.thisSymbolOf(fn.node.greenNode());
         if (receiver && argIter != argEnd) {
             argIter->setName("this");
@@ -384,7 +411,6 @@ struct CodeGenerator::Impl {
             ++argIter;
         }
 
-        // Parameters.
         auto params = fn.parameters();
         for (size_t i = 0; i < params.size() && argIter != argEnd; ++i, ++argIter) {
             auto& param = params[i];
@@ -456,15 +482,14 @@ struct CodeGenerator::Impl {
 
     void emitStatement(const ast::Statement& s) {
         setLocationFromNode(s.node);
-        if (auto b = s.asBlock())              { emitBlock(*b); return; }
-        if (auto l = s.asLet())                { emitLetStmt(*l); return; }
-        if (auto v = s.asTypedVarDecl())       { emitTypedVarDecl(*v); return; }
-        if (auto i = s.asIf())                 { emitIfStmt(*i); return; }
-        if (auto w = s.asWhile())              { emitWhileStmt(*w); return; }
-        if (auto r = s.asReturn())             { emitReturnStmt(*r); return; }
-        if (auto e = s.asExpressionStmt()) {
-            if (auto expr = e->expression()) emitExpr(*expr);
-            return;
+        if (const auto b = s.asBlock()) { emitBlock(*b); return; }
+        if (const auto l = s.asLet()) { emitLetStmt(*l); return; }
+        if (const auto v = s.asTypedVarDecl()) { emitTypedVarDecl(*v); return; }
+        if (const auto i = s.asIf()) { emitIfStmt(*i); return; }
+        if (const auto w = s.asWhile()) { emitWhileStmt(*w); return; }
+        if (const auto r = s.asReturn()) { emitReturnStmt(*r); return; }
+        if (const auto e = s.asExpressionStmt()) {
+            if (const auto expr = e->expression()) emitExpr(*expr);
         }
     }
 
@@ -613,16 +638,16 @@ struct CodeGenerator::Impl {
 
     llvm::Value* emitExpr(const ast::Expression& e) {
         setLocationFromNode(e.node);
-        if (auto lit = e.asLiteral())    return emitLiteral(*lit);
-        if (auto id = e.asIdent())       return emitIdent(*id);
-        if (auto th = e.asThis())        return emitThis(*th);
-        if (auto b = e.asBinary())       return emitBinary(*b);
-        if (auto p = e.asPrefix())       return emitPrefix(*p);
-        if (auto c = e.asCall())         return emitCall(*c);
-        if (auto m = e.asMember())       return emitMember(*m);
-        if (auto a = e.asAssign())       return emitAssign(*a);
-        if (auto t = e.asTernary())      return emitTernary(*t);
-        if (auto n = e.asNew())          return emitNew(*n);
+        if (auto lit = e.asLiteral()) return emitLiteral(*lit);
+        if (auto id = e.asIdent()) return emitIdent(*id);
+        if (auto th = e.asThis()) return emitThis(*th);
+        if (auto b = e.asBinary()) return emitBinary(*b);
+        if (auto p = e.asPrefix()) return emitPrefix(*p);
+        if (auto c = e.asCall()) return emitCall(*c);
+        if (auto m = e.asMember()) return emitMember(*m);
+        if (auto a = e.asAssign()) return emitAssign(*a);
+        if (auto t = e.asTernary()) return emitTernary(*t);
+        if (auto n = e.asNew()) return emitNew(*n);
         if (auto pr = e.asParen()) {
             if (auto inner = pr->inner()) return emitExpr(*inner);
             return nullptr;
@@ -874,13 +899,12 @@ struct CodeGenerator::Impl {
         int ctorIdx = t->structInfo->findMethodIndex(t->structInfo->name);
         if (ctorIdx >= 0) {
             Symbol* ctorSym = t->structInfo->methods[ctorIdx].symbol;
-            auto fnIt = values.find(ctorSym);
-            if (fnIt != values.end()) {
+            llvm::Function* fn = getOrDeclareExternalFunction(ctorSym, t);
+            if (fn) {
                 std::vector<llvm::Value*> args;
                 args.reserve(e.arguments().size() + 1);
                 args.push_back(heapPtr);
                 if (!appendCallArgs(ctorSym, e.arguments(), args)) return nullptr;
-                auto* fn = llvm::cast<llvm::Function>(fnIt->second);
                 builder->CreateCall(fn, args);
             }
         }
@@ -911,14 +935,14 @@ struct CodeGenerator::Impl {
             auto member = *callee->asMember();
             Symbol* methodSym = methodSymbolOf(member.node);
             if (methodSym) {
-                auto fnIt = values.find(methodSym);
-                if (fnIt == values.end()) {
-                    error(e.node.startOffset(), "Internal: method has no LLVM function");
-                    return nullptr;
-                }
                 auto obj = member.object();
                 if (!obj) return nullptr;
                 ::Type* objType = typeOf(obj->node);
+                llvm::Function* fn = getOrDeclareExternalFunction(methodSym, objType);
+                if (!fn) {
+                    error(e.node.startOffset(), "Internal: method has no LLVM function");
+                    return nullptr;
+                }
                 llvm::Value* receiver = isReferenceType(objType)
                     ? emitExpr(*obj)
                     : emitLValue(*obj);
@@ -926,7 +950,6 @@ struct CodeGenerator::Impl {
                 std::vector<llvm::Value*> args;
                 args.push_back(receiver);
                 if (!appendCallArgs(methodSym, e.arguments(), args)) return nullptr;
-                auto* fn = llvm::cast<llvm::Function>(fnIt->second);
                 return builder->CreateCall(fn, args);
             }
         }
@@ -942,14 +965,13 @@ struct CodeGenerator::Impl {
             return nullptr;
         }
         if (sym->isBuiltin) return emitBuiltinCall(sym, e);
-        auto it = values.find(sym);
-        if (it == values.end()) {
+        llvm::Function* fn = getOrDeclareExternalFunction(sym, /*receiver*/ nullptr);
+        if (!fn) {
             error(e.node.startOffset(), "Internal: callee has no LLVM function");
             return nullptr;
         }
         std::vector<llvm::Value*> args;
         if (!appendCallArgs(sym, e.arguments(), args)) return nullptr;
-        auto* fn = llvm::cast<llvm::Function>(it->second);
         return builder->CreateCall(fn, args);
     }
 

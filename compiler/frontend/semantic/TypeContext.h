@@ -1,5 +1,6 @@
 #pragma once
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 #include "Type.h"
@@ -13,28 +14,35 @@ public:
     Type* getError() { return errorType; }
     Type* getNull() { return nullType; }
 
-    Type* fromName(const std::u16string& name);
+    Type* primitiveFromName(const std::u16string& name);
 
-    // Struct registration: returns the new struct Type. Fields can be filled in
-    // afterwards via the type's structInfo.
-    Type* registerStruct(std::u16string name);
-    Type* lookupStruct(const std::u16string& name) const;
+    Type* registerStruct(const std::u16string& modulePath, std::u16string name);
+    Type* lookupStruct(const std::u16string& modulePath, const std::u16string& name) const;
 
-    // Class registration: like struct but reference-typed. Field/method layout
-    // shares the same StructInfo machinery.
-    Type* registerClass(std::u16string name);
-    Type* lookupClass(const std::u16string& name) const;
+    Type* registerClass(const std::u16string& modulePath, std::u16string name);
+    Type* lookupClass(const std::u16string& modulePath, const std::u16string& name) const;
 
-    // Look up either a struct or a class by name (returns whichever is registered).
-    Type* lookupNamedType(const std::u16string& name) const;
+    Type* lookupNamedType(const std::u16string& modulePath, const std::u16string& name) const;
 
 private:
+    struct Key {
+        std::u16string modulePath;
+        std::u16string name;
+        bool operator==(const Key& o) const { return modulePath == o.modulePath && name == o.name; }
+    };
+    struct KeyHash {
+        size_t operator()(const Key& k) const noexcept {
+            std::hash<std::u16string> h;
+            return h(k.modulePath) * 1315423911u ^ h(k.name);
+        }
+    };
+
     std::vector<std::unique_ptr<Type>> ownedTypes;
     std::vector<std::unique_ptr<StructInfo>> ownedStructs;
     std::unordered_map<int, Type*> primitiveCache;
     std::unordered_map<Type*, Type*> optionalCache;
-    std::unordered_map<std::u16string, Type*> structCache;
-    std::unordered_map<std::u16string, Type*> classCache;
+    std::unordered_map<Key, Type*, KeyHash> structCache;
+    std::unordered_map<Key, Type*, KeyHash> classCache;
     Type* errorType;
     Type* nullType;
 
