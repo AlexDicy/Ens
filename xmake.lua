@@ -4,6 +4,7 @@ add_rules("plugin.vsxmake.autoupdate")
 add_requires("llvm")
 add_requires("libllvm", { configs = { lld = true } })
 add_requires("libxml2", { configs = { runtimes = "MT" } })
+add_requires("lsp-framework 1.3.1", { configs = { runtimes = "MT" } })
 
 if is_plat("windows") then
     -- libllvm is MT only
@@ -42,10 +43,11 @@ target("ens")
 
 target("ens-lsp")
     set_kind("binary")
-    set_languages("cxx17")
+    set_languages("cxx20")
     add_files("lsp/**.cpp")
     add_headerfiles("lsp/**.h")
     add_deps("ens-frontend")
+    add_packages("lsp-framework")
 
 
 -- compile each tests/*.ens with the ens compiler and verify
