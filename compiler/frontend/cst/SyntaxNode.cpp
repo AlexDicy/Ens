@@ -85,6 +85,28 @@ std::optional<SyntaxNode> SyntaxNode::tokenAtOffset(uint32_t pos) const {
     return std::nullopt;
 }
 
+std::pair<uint32_t, uint32_t> SyntaxNode::contentRange() const {
+    if (isToken()) return {startOffset(), length()};
+    auto kids = children();
+    uint32_t start = startOffset();
+    uint32_t end = endOffset();
+    for (auto& c : kids) {
+        if (!isTrivia(c.kind())) {
+            auto [cs, cl] = c.contentRange();
+            start = cs;
+            break;
+        }
+    }
+    for (auto it = kids.rbegin(); it != kids.rend(); ++it) {
+        if (!isTrivia(it->kind())) {
+            auto [cs, cl] = it->contentRange();
+            end = cs + cl;
+            break;
+        }
+    }
+    return {start, end >= start ? end - start : 0u};
+}
+
 std::optional<SyntaxNode> SyntaxNode::nodeCovering(uint32_t start, uint32_t end) const {
     if (start < offset || end > endOffset()) return std::nullopt;
     for (auto& c : children()) {

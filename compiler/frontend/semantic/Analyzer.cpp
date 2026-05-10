@@ -64,7 +64,8 @@ void Analyzer::error(uint32_t offset, int length, std::string message) {
 }
 
 void Analyzer::errorAtNode(const SyntaxNode& node, std::string message) {
-    error(node.startOffset(), static_cast<int>(node.length()), std::move(message));
+    auto [offset, length] = node.contentRange();
+    error(offset, static_cast<int>(length), std::move(message));
 }
 
 // =========================================================
@@ -136,7 +137,8 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
                 ? resolveTypeReference(*m.returnType()->typeReference())
                 : typeCtx.getPrimitive(TypeKind::Void);
             auto mname = m.nameText().value_or(std::u16string{});
-            Symbol* sym = makeSymbol(SymbolKind::Function, mname, nullptr, m.node.startOffset());
+            uint32_t mPos = m.nameToken() ? m.nameToken()->startOffset() : m.node.startOffset();
+            Symbol* sym = makeSymbol(SymbolKind::Function, mname, nullptr, mPos);
             sym->returnType = retType;
             sym->funcDeclCst = m.node.greenNode();
             resolveMethodParams(m, t, sym);
@@ -193,7 +195,8 @@ void Analyzer::collectClasses(const ast::SourceFile& file) {
                 ? resolveTypeReference(*m.returnType()->typeReference())
                 : typeCtx.getPrimitive(TypeKind::Void);
             auto mname = m.nameText().value_or(std::u16string{});
-            Symbol* sym = makeSymbol(SymbolKind::Function, mname, nullptr, m.node.startOffset());
+            uint32_t mPos = m.nameToken() ? m.nameToken()->startOffset() : m.node.startOffset();
+            Symbol* sym = makeSymbol(SymbolKind::Function, mname, nullptr, mPos);
             sym->returnType = retType;
             sym->funcDeclCst = m.node.greenNode();
             resolveMethodParams(m, t, sym);
@@ -215,7 +218,8 @@ void Analyzer::collectFunctions(const ast::SourceFile& file) {
             ? resolveTypeReference(*fn.returnType()->typeReference())
             : typeCtx.getPrimitive(TypeKind::Void);
         auto fname = fn.nameText().value_or(std::u16string{});
-        Symbol* sym = makeSymbol(SymbolKind::Function, fname, nullptr, fn.node.startOffset());
+        uint32_t fPos = fn.nameToken() ? fn.nameToken()->startOffset() : fn.node.startOffset();
+        Symbol* sym = makeSymbol(SymbolKind::Function, fname, nullptr, fPos);
         sym->returnType = retType;
         sym->funcDeclCst = fn.node.greenNode();
         resolveFunctionParams(fn, sym);
@@ -381,7 +385,8 @@ void Analyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
         Type* pt = (i < currentFunction->paramTypes.size())
             ? currentFunction->paramTypes[i] : typeCtx.getError();
         auto pname = p.nameText().value_or(std::u16string{});
-        Symbol* psym = makeSymbol(SymbolKind::Parameter, pname, pt, p.node.startOffset());
+        uint32_t pPos = p.nameToken() ? p.nameToken()->startOffset() : p.node.startOffset();
+        Symbol* psym = makeSymbol(SymbolKind::Parameter, pname, pt, pPos);
         if (!currentScope->define(psym)) {
             errorAtNode(p.node, "Duplicate parameter name '" + asciiOf(pname) + "'");
         }
@@ -476,7 +481,8 @@ void Analyzer::analyzeLetStmt(const ast::LetStatement& stmt) {
             "' to variable of type '" + declared->toString() + "'");
     }
 
-    Symbol* sym = makeSymbol(SymbolKind::Variable, name, finalType, stmt.node.startOffset());
+    uint32_t namePos = stmt.nameToken() ? stmt.nameToken()->startOffset() : stmt.node.startOffset();
+    Symbol* sym = makeSymbol(SymbolKind::Variable, name, finalType, namePos);
     if (!currentScope->define(sym)) {
         errorAtNode(stmt.node, "Variable '" + asciiOf(name) + "' is already defined in this scope");
     }
@@ -498,7 +504,8 @@ void Analyzer::analyzeTypedVarDeclStmt(const ast::TypedVarDeclStatement& stmt) {
             "' to variable of type '" + declared->toString() + "'");
     }
     auto name = stmt.nameText().value_or(std::u16string{});
-    Symbol* sym = makeSymbol(SymbolKind::Variable, name, declared, stmt.node.startOffset());
+    uint32_t namePos = stmt.nameToken() ? stmt.nameToken()->startOffset() : stmt.node.startOffset();
+    Symbol* sym = makeSymbol(SymbolKind::Variable, name, declared, namePos);
     if (!currentScope->define(sym)) {
         errorAtNode(stmt.node, "Variable '" + asciiOf(name) + "' is already defined in this scope");
     }

@@ -41,6 +41,10 @@ public:
     std::optional<SyntaxNode> tokenAtOffset(uint32_t pos) const;
     std::optional<SyntaxNode> nodeCovering(uint32_t start, uint32_t end) const;
 
+    // The (offset, length) of this node excluding leading and trailing trivia
+    // children. For tokens this is the same as (startOffset, length).
+    std::pair<uint32_t, uint32_t> contentRange() const;
+
 private:
     const GreenElement* green;
     const SyntaxNode* parent;

@@ -1,0 +1,27 @@
+#pragma once
+#include <lsp/messagehandler.h>
+#include <lsp/messages.h>
+
+#include "DocumentStore.h"
+
+class LanguageServer {
+public:
+    explicit LanguageServer(lsp::MessageHandler& mh);
+
+    lsp::InitializeResult onInitialize(lsp::InitializeParams&& params);
+    void onInitialized();
+
+    void onDidOpen(lsp::notifications::TextDocument_DidOpen::Params&& p);
+    void onDidChange(lsp::notifications::TextDocument_DidChange::Params&& p);
+    void onDidClose(lsp::notifications::TextDocument_DidClose::Params&& p);
+
+    lsp::TextDocument_HoverResult onHover(lsp::HoverParams&& p);
+    lsp::TextDocument_DefinitionResult onDefinition(lsp::DefinitionParams&& p);
+    lsp::TextDocument_DocumentSymbolResult onDocumentSymbol(lsp::DocumentSymbolParams&& p);
+
+private:
+    lsp::MessageHandler& messages;
+    DocumentStore documents;
+
+    void publishDiagnostics(const Document& doc);
+};

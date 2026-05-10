@@ -24,6 +24,20 @@ std::u16string_view SourceFile::getLine(int lineNumber) const {
     return std::u16string_view(source.data() + start, end - start);
 }
 
+uint32_t SourceFile::positionToOffset(int line, int column) const {
+    if (line < 1 || lineStarts.empty()) return 0;
+    int idx = line - 1;
+    if (idx >= static_cast<int>(lineStarts.size())) return static_cast<uint32_t>(source.size());
+    int start = lineStarts[idx];
+    int lineEnd = (idx + 1 < static_cast<int>(lineStarts.size()))
+                      ? lineStarts[idx + 1]
+                      : static_cast<int>(source.size());
+    int col0 = column > 0 ? column - 1 : 0;
+    int offset = start + col0;
+    if (offset > lineEnd) offset = lineEnd;
+    return static_cast<uint32_t>(offset);
+}
+
 std::pair<int, int> SourceFile::offsetToPosition(uint32_t offset) const {
     int lo = 0;
     int hi = static_cast<int>(lineStarts.size()) - 1;
