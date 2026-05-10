@@ -4,6 +4,15 @@
 #include "../diagnostics/Diagnostic.h"
 #include "../diagnostics/DiagnosticSink.h"
 
+static Visibility toSemanticVisibility(ast::Visibility v) {
+    switch (v) {
+        case ast::Visibility::Private:   return Visibility::Private;
+        case ast::Visibility::Protected: return Visibility::Protected;
+        case ast::Visibility::Public:    return Visibility::Public;
+    }
+    return Visibility::Public;
+}
+
 static std::string asciiOf(std::u16string_view s) {
     std::string r;
     r.reserve(s.size());
@@ -122,6 +131,7 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             if (fname) fi.name = *fname;
             Type* ft = f.typeReference() ? resolveTypeReference(*f.typeReference()) : typeCtx.getError();
             fi.type = ft;
+            fi.visibility = toSemanticVisibility(f.visibility());
             auto [line, col] = source.offsetToPosition(f.node.startOffset());
             fi.line = line;
             fi.column = col;
@@ -149,6 +159,7 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             mi.name = mname;
             mi.symbol = sym;
             mi.declaration = const_cast<GreenElement*>(m.node.greenNode());
+            mi.visibility = toSemanticVisibility(m.visibility());
             t->structInfo->methods.push_back(std::move(mi));
         }
     }
@@ -180,6 +191,7 @@ void Analyzer::collectClasses(const ast::SourceFile& file) {
             if (fname) fi.name = *fname;
             Type* ft = f.typeReference() ? resolveTypeReference(*f.typeReference()) : typeCtx.getError();
             fi.type = ft;
+            fi.visibility = toSemanticVisibility(f.visibility());
             auto [line, col] = source.offsetToPosition(f.node.startOffset());
             fi.line = line;
             fi.column = col;
@@ -207,6 +219,7 @@ void Analyzer::collectClasses(const ast::SourceFile& file) {
             mi.name = mname;
             mi.symbol = sym;
             mi.declaration = const_cast<GreenElement*>(m.node.greenNode());
+            mi.visibility = toSemanticVisibility(m.visibility());
             t->structInfo->methods.push_back(std::move(mi));
         }
     }

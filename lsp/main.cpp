@@ -51,6 +51,11 @@ int main() {
             return server.onSemanticTokensFull(std::move(p));
         });
 
+    messages.add<lsp::requests::TextDocument_Completion>(
+        [&](lsp::requests::TextDocument_Completion::Params&& p) {
+            return server.onCompletion(std::move(p));
+        });
+
     messages.add<lsp::requests::Shutdown>(
         []() { return lsp::ShutdownResult{}; });
 

@@ -19,6 +19,7 @@ public:
     lsp::TextDocument_DefinitionResult onDefinition(lsp::DefinitionParams&& p);
     lsp::TextDocument_DocumentSymbolResult onDocumentSymbol(lsp::DocumentSymbolParams&& p);
     lsp::TextDocument_SemanticTokens_FullResult onSemanticTokensFull(lsp::SemanticTokensParams&& p);
+    lsp::TextDocument_CompletionResult onCompletion(lsp::CompletionParams&& p);
 
 private:
     lsp::MessageHandler& messages;

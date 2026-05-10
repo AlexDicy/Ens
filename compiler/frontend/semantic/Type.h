@@ -15,9 +15,12 @@ enum class TypeKind {
 class Type;
 class Symbol;
 
+enum class Visibility { Public, Private, Protected };
+
 struct FieldInfo {
     std::u16string name;
     Type* type;
+    Visibility visibility = Visibility::Public;
     int line = 0;
     int column = 0;
 };
@@ -26,6 +29,7 @@ struct MethodInfo {
     std::u16string name;
     Symbol* symbol = nullptr;       // function symbol with paramTypes/returnType (no `this`)
     void* declaration = nullptr;    // FuncDecl* (kept void* to avoid AST include cycle)
+    Visibility visibility = Visibility::Public;
 };
 
 struct StructInfo {

@@ -201,6 +201,10 @@ lsp::InitializeResult LanguageServer::onInitialize(lsp::InitializeParams&&) {
     stOpts.full = true;
     caps.semanticTokensProvider = std::move(stOpts);
 
+    lsp::CompletionOptions cOpts;
+    cOpts.triggerCharacters = std::vector<std::string>{"."};
+    caps.completionProvider = std::move(cOpts);
+
     r.capabilities = std::move(caps);
     return r;
 }
@@ -513,6 +517,92 @@ std::vector<uint32_t> encodeAsLspData(std::vector<SemanticTokenEntry> entries) {
 }
 
 }  // namespace
+
+namespace {
+
+std::string formatMethodSignature(const Symbol& sym) {
+    std::string s = "(";
+    for (size_t i = 0; i < sym.paramTypes.size(); ++i) {
+        if (i) s += ", ";
+        s += sym.paramTypes[i] ? sym.paramTypes[i]->toString() : std::string("?");
+    }
+    s += ") -> ";
+    s += sym.returnType ? sym.returnType->toString() : std::string("void");
+    return s;
+}
+
+struct MemberContext {
+    ::Type* receiverType = nullptr;
+    bool receiverIsThis = false;
+};
+
+MemberContext findMemberContext(const SyntaxNode& root, uint32_t offset,
+                                 const AnalysisResult& analysis) {
+    auto chainAt = [&](uint32_t pos) -> MemberContext {
+        MemberContext ctx;
+        auto chain = ancestorChainAt(root, pos);
+        for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+            if (it->kind() != SyntaxKind::MemberExpr) continue;
+            auto m = ast::MemberExpression::cast(*it);
+            if (!m) continue;
+            auto obj = m->object();
+            if (!obj) continue;
+            ctx.receiverType = analysis.typeOf(obj->node.greenNode());
+            ctx.receiverIsThis = (obj->kind() == SyntaxKind::ThisExpr);
+            return ctx;
+        }
+        return ctx;
+    };
+    auto ctx = chainAt(offset);
+    if (ctx.receiverType) return ctx;
+    if (offset > 0) return chainAt(offset - 1);
+    return ctx;
+}
+
+}  // namespace
+
+lsp::TextDocument_CompletionResult LanguageServer::onCompletion(lsp::CompletionParams&& p) {
+    auto* doc = documents.find(p.textDocument.uri.toString());
+    if (!doc) return nullptr;
+
+    int line1 = p.position.line + 1;
+    int col1 = p.position.character + 1;
+    uint32_t offset = doc->sourceFile().positionToOffset(line1, col1);
+
+    const auto& analysis = doc->analyzer().result();
+    MemberContext mctx = findMemberContext(doc->root(), offset, analysis);
+    if (!mctx.receiverType || mctx.receiverType->isError() || !mctx.receiverType->structInfo) {
+        return nullptr;
+    }
+
+    std::vector<lsp::CompletionItem> items;
+    const auto& info = *mctx.receiverType->structInfo;
+    items.reserve(info.fields.size() + info.methods.size());
+
+    auto isVisible = [&](Visibility v) {
+        if (v == Visibility::Private) return mctx.receiverIsThis;
+        return true;
+    };
+
+    for (const auto& f : info.fields) {
+        if (!isVisible(f.visibility)) continue;
+        lsp::CompletionItem item;
+        item.label = utf16To8(f.name);
+        item.kind = lsp::CompletionItemKindEnum(lsp::CompletionItemKind::Field);
+        if (f.type) item.detail = f.type->toString();
+        items.push_back(std::move(item));
+    }
+    for (const auto& m : info.methods) {
+        if (m.name == info.name) continue;  // constructor - only callable via `new`
+        if (!isVisible(m.visibility)) continue;
+        lsp::CompletionItem item;
+        item.label = utf16To8(m.name);
+        item.kind = lsp::CompletionItemKindEnum(lsp::CompletionItemKind::Method);
+        if (m.symbol) item.detail = formatMethodSignature(*m.symbol);
+        items.push_back(std::move(item));
+    }
+    return std::move(items);
+}
 
 lsp::TextDocument_SemanticTokens_FullResult LanguageServer::onSemanticTokensFull(
         lsp::SemanticTokensParams&& p) {
