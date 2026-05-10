@@ -402,7 +402,7 @@ void Analyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
 
 void Analyzer::analyzeImplicitConstructorAssignments(const ast::FuncDecl& fn) {
     // For each this.field param, validate `this.field = param` would type-check.
-    // We don't need to emit IR or build an AST node — just verify the field
+    // We don't need to emit IR or build an AST node - just verify the field
     // exists on the receiver type and the param's type is assignable.
     if (!currentThis) return;
     Type* recvType = currentThis->type;
@@ -465,7 +465,7 @@ void Analyzer::analyzeLetStmt(const ast::LetStatement& stmt) {
         finalType = typeCtx.getError();
     } else if (!declared) {
         if (initType->isNull()) {
-            errorAtNode(stmt.node, "Cannot infer type from 'null' alone — annotate the type, e.g. 'let " +
+            errorAtNode(stmt.node, "Cannot infer type from 'null' alone - annotate the type, e.g. 'let " +
                 asciiOf(name) + ": T? = null;'");
             finalType = typeCtx.getError();
         } else {
@@ -833,7 +833,7 @@ Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
     int midx = objT->structInfo->findMethodIndex(*memberName);
     if (midx >= 0) {
         analysis.setMethodSymbol(expr.node.greenNode(), objT->structInfo->methods[midx].symbol);
-        return typeCtx.getError();  // callee reference — not a value
+        return typeCtx.getError();  // callee reference - not a value
     }
     errorAtNode(expr.node, "No field or method '" + asciiOf(*memberName) +
         "' on type '" + objT->toString() + "'");

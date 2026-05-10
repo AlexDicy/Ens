@@ -5,11 +5,11 @@
 enum class TypeKind {
     Bool, Byte, Short, UShort, Int, UInt, Long, ULong,
     Float, Double, Decimal, Char, String, Void,
-    Null,        // type of the `null` literal — assignable to any Optional
+    Null,        // type of the `null` literal - assignable to any Optional
     Optional,    // wraps another type
     Struct,      // user-defined struct (value semantics)
     Class,       // user-defined class (reference semantics, heap-allocated)
-    Error        // sentinel — used to suppress cascading errors
+    Error        // sentinel - used to suppress cascading errors
 };
 
 class Type;

@@ -105,7 +105,7 @@ task("test")
                 table.insert(failures, string.format("%s: compile failed (exit %s)\n%s",
                     name, tostring(compile_rc),
                     (io.readfile(compile_log) or ""):gsub("[\r\n]+$", "")))
-                print(string.format("\27[31mFAIL\27[0m %s — compile failed", name))
+                print(string.format("\27[31mFAIL\27[0m %s - compile failed", name))
                 goto continue
             end
 
@@ -131,7 +131,7 @@ task("test")
                 print(string.format("\27[32mPASS\27[0m %s", name))
             else
                 table.insert(failures, string.format("%s: %s", name, table.concat(why, "; ")))
-                print(string.format("\27[31mFAIL\27[0m %s — %s", name, table.concat(why, "; ")))
+                print(string.format("\27[31mFAIL\27[0m %s - %s", name, table.concat(why, "; ")))
             end
             ::continue::
         end

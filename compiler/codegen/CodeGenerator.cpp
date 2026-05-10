@@ -371,7 +371,7 @@ struct CodeGenerator::Impl {
 
         // Implicit `this` parameter for methods. The receiver Symbol is bound by
         // the analyzer onto a synthetic name in the function's local scope; we
-        // can't look it up here, but we don't need to — `this` is referenced
+        // can't look it up here, but we don't need to - `this` is referenced
         // through ThisExpr nodes whose resolvedSymbol is the synthetic one. We
         // store the alloca under that symbol.
         Symbol* thisSym = analysis.thisSymbolOf(fn.node.greenNode());
