@@ -46,6 +46,11 @@ int main() {
             return server.onDocumentSymbol(std::move(p));
         });
 
+    messages.add<lsp::requests::TextDocument_SemanticTokens_Full>(
+        [&](lsp::requests::TextDocument_SemanticTokens_Full::Params&& p) {
+            return server.onSemanticTokensFull(std::move(p));
+        });
+
     messages.add<lsp::requests::Shutdown>(
         []() { return lsp::ShutdownResult{}; });
 

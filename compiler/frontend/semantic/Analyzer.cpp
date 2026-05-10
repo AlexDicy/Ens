@@ -340,16 +340,20 @@ Type* Analyzer::resolveTypeReference(const ast::TypeReference& tr) {
     Type* base = typeCtx.fromName(*name);
     if (!base) {
         errorAtNode(tr.node, "Unknown type '" + asciiOf(*name) + "'");
+        analysis.setType(tr.node.greenNode(), typeCtx.getError());
         return typeCtx.getError();
     }
+    Type* result = base;
     if (tr.isOptional()) {
         if (base->isVoid()) {
             errorAtNode(tr.node, "void cannot be optional");
-            return typeCtx.getError();
+            result = typeCtx.getError();
+        } else {
+            result = typeCtx.getOptional(base);
         }
-        return typeCtx.getOptional(base);
     }
-    return base;
+    analysis.setType(tr.node.greenNode(), result);
+    return result;
 }
 
 // =========================================================

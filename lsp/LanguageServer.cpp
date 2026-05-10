@@ -192,6 +192,15 @@ lsp::InitializeResult LanguageServer::onInitialize(lsp::InitializeParams&&) {
     caps.definitionProvider = true;
     caps.documentSymbolProvider = true;
 
+    lsp::SemanticTokensOptions stOpts;
+    stOpts.legend.tokenTypes = {
+        "function", "method", "parameter", "variable",
+        "property", "class", "struct", "type"
+    };
+    stOpts.legend.tokenModifiers = {};
+    stOpts.full = true;
+    caps.semanticTokensProvider = std::move(stOpts);
+
     r.capabilities = std::move(caps);
     return r;
 }
@@ -278,6 +287,262 @@ lsp::TextDocument_DefinitionResult LanguageServer::onDefinition(lsp::DefinitionP
     loc.uri = lsp::Uri::parse(doc->uri());
     loc.range = zeroWidthRangeAt(target->line, target->column);
     return lsp::Definition{std::move(loc)};
+}
+
+namespace {
+
+// Indices into the SemanticTokensLegend.tokenTypes array declared in onInitialize.
+enum SemanticTokenType : uint32_t {
+    StFunction = 0, StMethod, StParameter, StVariable,
+    StProperty, StClass, StStruct, StType
+};
+
+struct SemanticTokenEntry {
+    uint32_t line;
+    uint32_t startChar;
+    uint32_t length;
+    uint32_t tokenType;
+    uint32_t tokenModifiers;
+};
+
+void emitTokenAt(std::vector<SemanticTokenEntry>& out, const SourceFile& source,
+                 const SyntaxNode& tokenNode, uint32_t tokenType) {
+    if (tokenNode.length() == 0) return;
+    auto [line, col] = source.offsetToPosition(tokenNode.startOffset());
+    SemanticTokenEntry e;
+    e.line = static_cast<uint32_t>(line - 1);
+    e.startChar = static_cast<uint32_t>(col - 1);
+    e.length = tokenNode.length();
+    e.tokenType = tokenType;
+    e.tokenModifiers = 0;
+    out.push_back(e);
+}
+
+uint32_t typeForSymbol(const Symbol& sym, bool isMember) {
+    switch (sym.kind) {
+        case SymbolKind::Function:  return isMember ? StMethod : StFunction;
+        case SymbolKind::Parameter: return StParameter;
+        case SymbolKind::Variable:  return StVariable;
+    }
+    return StVariable;
+}
+
+uint32_t typeForType(const ::Type* t) {
+    if (!t) return StType;
+    if (t->kind == TypeKind::Class)  return StClass;
+    if (t->kind == TypeKind::Struct) return StStruct;
+    return StType;
+}
+
+void collectFromExpression(const SyntaxNode& node, const SourceFile& source,
+                           const AnalysisResult& analysis,
+                           std::vector<SemanticTokenEntry>& out);
+
+void collectFromStatement(const SyntaxNode& node, const SourceFile& source,
+                          const AnalysisResult& analysis,
+                          std::vector<SemanticTokenEntry>& out);
+
+void collectFromExpression(const SyntaxNode& node, const SourceFile& source,
+                           const AnalysisResult& analysis,
+                           std::vector<SemanticTokenEntry>& out) {
+    auto e = ast::Expression::cast(node);
+    if (!e) {
+        for (auto& c : node.children()) collectFromExpression(c, source, analysis, out);
+        return;
+    }
+
+    if (auto id = e->asIdent()) {
+        if (auto* info = analysis.find(id->node.greenNode())) {
+            if (info->resolvedSymbol) {
+                if (auto t = id->identifier()) {
+                    emitTokenAt(out, source, *t, typeForSymbol(*info->resolvedSymbol, false));
+                }
+            }
+        }
+    } else if (auto m = e->asMember()) {
+        if (auto obj = m->object()) {
+            collectFromExpression(obj->node, source, analysis, out);
+        }
+        if (auto* info = analysis.find(m->node.greenNode())) {
+            if (auto nameTok = m->memberName()) {
+                if (info->resolvedMethodSymbol) {
+                    emitTokenAt(out, source, *nameTok, StMethod);
+                } else if (info->resolvedType) {
+                    emitTokenAt(out, source, *nameTok, StProperty);
+                }
+            }
+        }
+    } else if (auto nw = e->asNew()) {
+        if (auto t = nw->typeName()) {
+            ::Type* resolved = analysis.typeOf(nw->node.greenNode());
+            emitTokenAt(out, source, *t, typeForType(resolved));
+        }
+        for (auto& arg : nw->arguments()) {
+            collectFromExpression(arg.node, source, analysis, out);
+        }
+    } else if (auto c = e->asCall()) {
+        if (auto callee = c->callee()) {
+            collectFromExpression(callee->node, source, analysis, out);
+        }
+        for (auto& arg : c->arguments()) {
+            collectFromExpression(arg.node, source, analysis, out);
+        }
+    } else {
+        for (auto& child : node.children()) {
+            collectFromExpression(child, source, analysis, out);
+        }
+    }
+}
+
+void collectFromTypeReference(const ast::TypeReference& tr, const SourceFile& source,
+                              const AnalysisResult& analysis,
+                              std::vector<SemanticTokenEntry>& out) {
+    auto nameTok = tr.nameToken();
+    if (!nameTok) return;
+    if (nameTok->kind() != SyntaxKind::Identifier) return;  // primitive keywords handled by TextMate
+    ::Type* resolved = analysis.typeOf(tr.node.greenNode());
+    emitTokenAt(out, source, *nameTok, typeForType(resolved));
+}
+
+void collectFromParameter(const ast::Parameter& p, const SourceFile& source,
+                          const AnalysisResult& analysis,
+                          std::vector<SemanticTokenEntry>& out) {
+    if (auto tr = p.typeReference()) {
+        collectFromTypeReference(*tr, source, analysis, out);
+    }
+    if (auto nameTok = p.nameToken()) {
+        emitTokenAt(out, source, *nameTok, StParameter);
+    }
+    if (auto dv = p.defaultValue()) {
+        if (auto expr = dv->expression()) collectFromExpression(expr->node, source, analysis, out);
+    }
+}
+
+void collectFromStatement(const SyntaxNode& node, const SourceFile& source,
+                          const AnalysisResult& analysis,
+                          std::vector<SemanticTokenEntry>& out) {
+    auto stmt = ast::Statement::cast(node);
+    if (!stmt) {
+        for (auto& c : node.children()) collectFromStatement(c, source, analysis, out);
+        return;
+    }
+    if (auto b = stmt->asBlock()) {
+        for (auto& s : b->statements()) collectFromStatement(s.node, source, analysis, out);
+        return;
+    }
+    if (auto l = stmt->asLet()) {
+        if (auto tr = l->typeAnnotation()) collectFromTypeReference(*tr, source, analysis, out);
+        if (auto nameTok = l->nameToken()) emitTokenAt(out, source, *nameTok, StVariable);
+        if (auto init = l->initializer()) collectFromExpression(init->node, source, analysis, out);
+        return;
+    }
+    if (auto v = stmt->asTypedVarDecl()) {
+        if (auto tr = v->typeReference()) collectFromTypeReference(*tr, source, analysis, out);
+        if (auto nameTok = v->nameToken()) emitTokenAt(out, source, *nameTok, StVariable);
+        if (auto init = v->initializer()) collectFromExpression(init->node, source, analysis, out);
+        return;
+    }
+    if (auto i = stmt->asIf()) {
+        if (auto cond = i->condition()) collectFromExpression(cond->node, source, analysis, out);
+        if (auto b = i->thenBlock())     collectFromStatement(b->node, source, analysis, out);
+        if (auto ec = i->elseClause()) {
+            if (auto innerIf = ec->ifStatement()) collectFromStatement(innerIf->node, source, analysis, out);
+            else if (auto b = ec->block())        collectFromStatement(b->node, source, analysis, out);
+        }
+        return;
+    }
+    if (auto w = stmt->asWhile()) {
+        if (auto cond = w->condition()) collectFromExpression(cond->node, source, analysis, out);
+        if (auto b = w->body())         collectFromStatement(b->node, source, analysis, out);
+        return;
+    }
+    if (auto r = stmt->asReturn()) {
+        if (auto v = r->value()) collectFromExpression(v->node, source, analysis, out);
+        return;
+    }
+    if (auto e = stmt->asExpressionStmt()) {
+        if (auto x = e->expression()) collectFromExpression(x->node, source, analysis, out);
+        return;
+    }
+}
+
+void collectFromFunction(const ast::FuncDecl& fn, bool isMember, const SourceFile& source,
+                         const AnalysisResult& analysis,
+                         std::vector<SemanticTokenEntry>& out) {
+    if (auto nameTok = fn.nameToken()) {
+        emitTokenAt(out, source, *nameTok, isMember ? StMethod : StFunction);
+    }
+    for (auto& p : fn.parameters()) {
+        collectFromParameter(p, source, analysis, out);
+    }
+    if (auto rt = fn.returnType()) {
+        if (auto tr = rt->typeReference()) collectFromTypeReference(*tr, source, analysis, out);
+    }
+    if (auto body = fn.body()) {
+        collectFromStatement(body->node, source, analysis, out);
+    }
+}
+
+void collectFromField(const ast::FieldDecl& f, const SourceFile& source,
+                      const AnalysisResult& analysis,
+                      std::vector<SemanticTokenEntry>& out) {
+    if (auto tr = f.typeReference()) collectFromTypeReference(*tr, source, analysis, out);
+    if (auto nameTok = f.nameToken()) emitTokenAt(out, source, *nameTok, StProperty);
+}
+
+std::vector<uint32_t> encodeAsLspData(std::vector<SemanticTokenEntry> entries) {
+    std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
+        if (a.line != b.line) return a.line < b.line;
+        return a.startChar < b.startChar;
+    });
+    std::vector<uint32_t> data;
+    data.reserve(entries.size() * 5);
+    uint32_t prevLine = 0, prevChar = 0;
+    for (const auto& e : entries) {
+        uint32_t deltaLine = e.line - prevLine;
+        uint32_t deltaChar = (deltaLine == 0) ? e.startChar - prevChar : e.startChar;
+        data.push_back(deltaLine);
+        data.push_back(deltaChar);
+        data.push_back(e.length);
+        data.push_back(e.tokenType);
+        data.push_back(e.tokenModifiers);
+        prevLine = e.line;
+        prevChar = e.startChar;
+    }
+    return data;
+}
+
+}  // namespace
+
+lsp::TextDocument_SemanticTokens_FullResult LanguageServer::onSemanticTokensFull(
+        lsp::SemanticTokensParams&& p) {
+    auto* doc = documents.find(p.textDocument.uri.toString());
+    if (!doc) return nullptr;
+
+    auto sf = ast::SourceFile::cast(doc->root());
+    if (!sf) return nullptr;
+
+    std::vector<SemanticTokenEntry> entries;
+    const auto& analysis = doc->analyzer().result();
+    const SourceFile& source = doc->sourceFile();
+
+    for (auto& fn : sf->functions()) {
+        collectFromFunction(fn, /*isMember*/ false, source, analysis, entries);
+    }
+    for (auto& sd : sf->structs()) {
+        if (auto t = sd.nameToken()) emitTokenAt(entries, source, *t, StStruct);
+        for (auto& f : sd.fields())  collectFromField(f, source, analysis, entries);
+        for (auto& m : sd.methods()) collectFromFunction(m, /*isMember*/ true, source, analysis, entries);
+    }
+    for (auto& cd : sf->classes()) {
+        if (auto t = cd.nameToken()) emitTokenAt(entries, source, *t, StClass);
+        for (auto& f : cd.fields())  collectFromField(f, source, analysis, entries);
+        for (auto& m : cd.methods()) collectFromFunction(m, /*isMember*/ true, source, analysis, entries);
+    }
+
+    lsp::SemanticTokens result;
+    result.data = encodeAsLspData(std::move(entries));
+    return result;
 }
 
 lsp::TextDocument_DocumentSymbolResult LanguageServer::onDocumentSymbol(
