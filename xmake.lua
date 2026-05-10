@@ -5,19 +5,48 @@ add_requires("llvm")
 add_requires("libllvm", { configs = { lld = true } })
 add_requires("libxml2", { configs = { runtimes = "MT" } })
 
+if is_plat("windows") then
+    -- libllvm is MT only
+    set_runtimes("MT")
+end
+
+
+target("ens-frontend")
+    set_kind("static")
+    set_languages("cxx17")
+    add_files("compiler/frontend/**.cpp")
+    add_headerfiles("compiler/frontend/**.h")
+    add_includedirs("compiler/frontend", { public = true })
+
+
+target("ens-codegen")
+    set_kind("static")
+    set_languages("cxx17")
+    set_toolchains("@llvm")
+    add_files("compiler/codegen/**.cpp")
+    add_headerfiles("compiler/codegen/**.h")
+    add_includedirs("compiler/codegen", { public = true })
+    add_deps("ens-frontend")
+    add_packages("libllvm", "libxml2", { public = true })
+    add_links("LLVMCGData")
+
+
 target("ens")
     set_kind("binary")
     set_languages("cxx17")
     set_toolchains("@llvm")
-    add_files("src/**.cpp")
-    add_headerfiles("src/**.h")
-    add_packages("libllvm", "libxml2")
-    add_links("LLVMCGData")
+    add_files("compiler/driver/**.cpp")
+    add_headerfiles("compiler/driver/**.h")
+    add_deps("ens-frontend", "ens-codegen")
 
-    if is_plat("windows") then
-        -- libllvm is MT only
-        set_runtimes("MT")
-    end
+
+target("ens-lsp")
+    set_kind("binary")
+    set_languages("cxx17")
+    add_files("lsp/**.cpp")
+    add_headerfiles("lsp/**.h")
+    add_deps("ens-frontend")
+
 
 -- compile each tests/*.ens with the ens compiler and verify
 -- the exit code (and stdout) following the test source header:
@@ -54,7 +83,6 @@ task("test")
             local stdout_file = path.join(out_dir, name .. ".stdout")
             local compile_log = path.join(out_dir, name .. ".compile.log")
 
-            -- Parse expectation directives from the test source.
             local expected_exit   = 0
             local expected_stdout = nil
             local content = io.readfile(ens_file) or ""
@@ -68,7 +96,6 @@ task("test")
             os.tryrm(exe_file)
             os.tryrm(stdout_file)
 
-            -- Compile.
             local compile_rc = os.execv(ens_exe,
                 {"--source", ens_file, "--output", exe_file},
                 {try = true, stdout = compile_log, stderr = compile_log})
@@ -80,7 +107,6 @@ task("test")
                 goto continue
             end
 
-            -- Run.
             local run_rc = os.execv(exe_file, {},
                 {try = true, stdout = stdout_file, stderr = stdout_file})
             local actual_stdout = (io.readfile(stdout_file) or ""):gsub("[\r\n]+$", "")

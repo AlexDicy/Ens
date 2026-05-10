@@ -4,7 +4,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
-#include "compiler/Compiler.h"
+#include "Compiler.h"
 
 namespace fs = std::filesystem;
 

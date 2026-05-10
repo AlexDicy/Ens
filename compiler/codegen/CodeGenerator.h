@@ -3,10 +3,10 @@
 #include <ostream>
 #include <string>
 #include <vector>
-#include "../diagnostics/Diagnostic.h"
-#include "../diagnostics/SourceFile.h"
-#include "../cst/SyntaxNode.h"
-#include "../semantic/AnalysisResult.h"
+#include "diagnostics/Diagnostic.h"
+#include "diagnostics/SourceFile.h"
+#include "cst/SyntaxNode.h"
+#include "semantic/AnalysisResult.h"
 
 class CodeGenerator {
 public:

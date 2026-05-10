@@ -1,13 +1,13 @@
 #include "Compiler.h"
-#include "../ast/Declaration.h"
-#include "../codegen/CodeGenerator.h"
-#include "../codegen/Linker.h"
-#include "../cst/SyntaxNode.h"
-#include "../diagnostics/Diagnostic.h"
-#include "../diagnostics/DiagnosticSink.h"
-#include "../diagnostics/SourceFile.h"
-#include "../parser/Parser.h"
-#include "../semantic/Analyzer.h"
+#include "CodeGenerator.h"
+#include "Linker.h"
+#include "ast/Declaration.h"
+#include "cst/SyntaxNode.h"
+#include "diagnostics/Diagnostic.h"
+#include "diagnostics/DiagnosticSink.h"
+#include "diagnostics/SourceFile.h"
+#include "parser/Parser.h"
+#include "semantic/Analyzer.h"
 
 #include <algorithm>
 #include <fstream>
