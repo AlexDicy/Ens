@@ -83,8 +83,8 @@ task("test")
         options = {}
     })
     on_run(function()
-        local mode = is_mode("release") and "release" or "debug"
-        local ens_exe = path.join(os.projectdir(), "build", os.host(), os.arch(), mode, "ens.exe")
+        local mode = get_config("mode") or "release"
+        local ens_exe = path.join(os.projectdir(), "build", os.host(), os.arch(), mode, "ens" .. (is_plat("windows") and ".exe" or ""))
         if not os.isfile(ens_exe) then
             print("Building ens compiler...")
             os.exec("xmake build ens")
