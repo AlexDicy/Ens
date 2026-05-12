@@ -56,7 +56,7 @@ std::u16string modulePathOfRelative(const fs::path& relative) {
     no_ext.replace_extension();
     std::u16string out;
     bool first = true;
-    for (auto& part : no_ext) {
+    for (const auto& part : no_ext) {
         std::string s = part.string();
         if (s.empty() || s == ".") continue;
         if (!first) out.push_back(u'.');
