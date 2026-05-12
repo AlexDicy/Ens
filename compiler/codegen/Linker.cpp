@@ -1,6 +1,9 @@
 #include "Linker.h"
 
+#include "SdkStubs.h"
 #include "lld/Common/Driver.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Host.h"
 
@@ -28,7 +31,39 @@ LinkerFlavor flavorForTriple(const std::string& triple) {
     return LinkerFlavor::Elf;
 }
 
+std::string archFromTriple(const std::string& triple) {
+    const auto dash = triple.find('-');
+    std::string arch = (dash == std::string::npos) ? triple : triple.substr(0, dash);
+    if (arch == "aarch64") return "arm64";
+    return arch;
+}
+
+// extracts the SDK stubs into a temp directory for macOS builds
+const std::string& extractEmbeddedSDK() {
+    static const std::string cached = [] {
+        if (ens::kSdkStubsCount == 0) return std::string();
+        llvm::SmallString<128> dir;
+        if (llvm::sys::fs::createUniqueDirectory("ens-sdk", dir)) return std::string();
+        for (std::size_t i = 0; i < ens::kSdkStubsCount; ++i) {
+            llvm::SmallString<256> full(dir);
+            llvm::sys::path::append(full, ens::kSdkStubs[i].path);
+            llvm::sys::fs::create_directories(llvm::sys::path::parent_path(full));
+            std::error_code ec;
+            llvm::raw_fd_ostream out(full, ec, llvm::sys::fs::OF_None);
+            if (ec) return std::string();
+            out.write(reinterpret_cast<const char*>(ens::kSdkStubs[i].data),
+                      ens::kSdkStubs[i].size);
+        }
+        llvm::SmallString<256> alias(dir);
+        llvm::sys::path::append(alias, "usr/lib/libSystem.tbd");
+        llvm::sys::fs::create_link("libSystem.B.tbd", alias);
+        return std::string(dir.str());
+    }();
+    return cached;
+}
+
 std::vector<std::string> buildArgv(LinkerFlavor flavor,
+                                    const std::string& triple,
                                     const std::vector<std::string>& objs,
                                     const std::string& exe) {
     std::vector<std::string> args;
@@ -43,12 +78,25 @@ std::vector<std::string> buildArgv(LinkerFlavor flavor,
             args.push_back("/defaultlib:libcmt");
             args.push_back("/defaultlib:oldnames");
             return args;
-        case LinkerFlavor::MachO:
+        case LinkerFlavor::MachO: {
             args = {"ld64.lld"};
+            args.push_back("-arch");
+            args.push_back(archFromTriple(triple));
+            args.push_back("-platform_version");
+            args.push_back("macos");
+            args.push_back("11.0");
+            args.push_back("14.0");
+            const std::string& sdk = extractEmbeddedSDK();
+            if (!sdk.empty()) {
+                args.push_back("-syslibroot");
+                args.push_back(sdk);
+            }
             for (auto& o : objs) args.push_back(o);
             args.push_back("-o");
             args.push_back(exe);
+            args.push_back("-lSystem");
             return args;
+        }
         case LinkerFlavor::Elf:
         default:
             args = {"ld.lld"};
@@ -88,7 +136,7 @@ bool Linker::link(const std::vector<std::string>& objectPaths,
     const std::string triple = llvm::sys::getDefaultTargetTriple();
     const LinkerFlavor flavor = flavorForTriple(triple);
 
-    std::vector<std::string> argv = buildArgv(flavor, objectPaths, exePath);
+    std::vector<std::string> argv = buildArgv(flavor, triple, objectPaths, exePath);
     std::vector<const char*> args;
     args.reserve(argv.size());
     for (auto& s : argv) args.push_back(s.c_str());
