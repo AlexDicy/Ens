@@ -109,6 +109,7 @@ public:
     std::optional<TypeReference> typeReference() const;
     std::optional<SyntaxNode> nameToken() const;
     std::optional<std::u16string> nameText() const;
+    std::optional<DefaultValue> defaultValue() const;
 };
 
 class MemberList {

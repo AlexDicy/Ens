@@ -2,6 +2,8 @@
 #include <string>
 #include <vector>
 
+class GreenElement;
+
 enum class TypeKind {
     Bool, Byte, Short, UShort, Int, UInt, Long, ULong,
     Float, Double, Decimal, Char, String, Void,
@@ -23,6 +25,7 @@ struct FieldInfo {
     Visibility visibility = Visibility::Public;
     int line = 0;
     int column = 0;
+    const GreenElement* declaration = nullptr;
 };
 
 struct MethodInfo {

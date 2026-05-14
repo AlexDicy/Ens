@@ -196,6 +196,11 @@ std::optional<std::u16string> FieldDecl::nameText() const {
     return std::nullopt;
 }
 
+std::optional<DefaultValue> FieldDecl::defaultValue() const {
+    if (auto d = firstChildNode(node, SyntaxKind::DefaultValue)) return DefaultValue::cast(*d);
+    return std::nullopt;
+}
+
 // === MemberList ===
 
 std::vector<FieldDecl> MemberList::fields() const {

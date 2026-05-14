@@ -579,6 +579,31 @@ struct CodeGenerator::Impl {
             setLocationFromNode(s.node);
             llvm::Value* v = emitExpr(*init);
             if (v) builder->CreateStore(v, alloca);
+        } else if (sym->type && sym->type->isStruct() && sym->type->structInfo) {
+            setLocationFromNode(s.node);
+            initStructFieldDefaults(sym->type, alloca);
+        }
+    }
+
+    void initStructFieldDefaults(::Type* t, llvm::Value* base) {
+        if (!t || !t->structInfo) return;
+        llvm::StructType* st = mapStructType(t);
+        const auto& fields = t->structInfo->fields;
+        for (size_t i = 0; i < fields.size(); ++i) {
+            const auto& fi = fields[i];
+            if (!fi.declaration) continue;
+            auto fieldNode = SyntaxNode::makeRoot(fi.declaration);
+            auto fd = ast::FieldDecl::cast(*fieldNode);
+            if (!fd) continue;
+            auto dv = fd->defaultValue();
+            if (!dv) continue;
+            auto dvExpr = dv->expression();
+            if (!dvExpr) continue;
+            llvm::Value* v = emitExpr(*dvExpr);
+            if (!v) continue;
+            llvm::Value* fieldAddr = builder->CreateStructGEP(st, base, static_cast<unsigned>(i),
+                                                              asAscii(fi.name) + ".addr");
+            builder->CreateStore(v, fieldAddr);
         }
     }
 

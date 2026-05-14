@@ -365,6 +365,7 @@ void Parser::parseFieldDecl() {
     if (isTypeStart(kindAt())) parseType();
     else emitMissing(SyntaxKind::Identifier, "field type");
     expect(SyntaxKind::Identifier, "field name");
+    if (at(SyntaxKind::Eq)) parseDefaultValue();
     expect(SyntaxKind::Semi, "';' after field declaration");
     builder.finishNode();
 }

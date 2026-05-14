@@ -178,6 +178,9 @@ void Analyzer::analyzeBodies() {
     for (auto& sd : sf.structs()) for (auto& m : sd.methods()) runChecks(m);
     for (auto& cd : sf.classes()) for (auto& m : cd.methods()) runChecks(m);
 
+    for (auto& sd : sf.structs()) checkFieldDefaults(sd);
+    for (auto& cd : sf.classes()) checkFieldDefaults(cd);
+
     for (auto& fn : sf.functions()) analyzeFunctionBody(fn);
     for (auto& sd : sf.structs())   for (auto& m : sd.methods()) analyzeFunctionBody(m);
     for (auto& cd : sf.classes())   for (auto& m : cd.methods()) analyzeFunctionBody(m);
@@ -217,6 +220,7 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             auto [line, col] = source.offsetToPosition(f.node.startOffset());
             fi.line = line;
             fi.column = col;
+            fi.declaration = f.node.greenNode();
             t->structInfo->fields.push_back(std::move(fi));
         }
     }
@@ -277,6 +281,7 @@ void Analyzer::collectClasses(const ast::SourceFile& file) {
             auto [line, col] = source.offsetToPosition(f.node.startOffset());
             fi.line = line;
             fi.column = col;
+            fi.declaration = f.node.greenNode();
             t->structInfo->fields.push_back(std::move(fi));
         }
     }
@@ -390,6 +395,70 @@ void Analyzer::resolveFunctionParams(const ast::FuncDecl& fn, Symbol* sym) {
                 "' has no default but follows a defaulted parameter");
         }
     }
+}
+
+void Analyzer::checkFieldDefaults(const ast::StructDecl& sd) {
+    Type* t = analysis.typeOf(sd.node.greenNode());
+    if (!t || !t->structInfo) return;
+
+    Symbol* prevFunction = currentFunction;
+    Symbol* prevThis = currentThis;
+    Scope* prevScope = currentScope;
+    currentFunction = nullptr;
+    currentThis = nullptr;
+    currentScope = globalScope;
+
+    auto fields = sd.fields();
+    for (size_t i = 0; i < fields.size(); ++i) {
+        auto& f = fields[i];
+        auto dv = f.defaultValue();
+        if (!dv) continue;
+        auto dvExpr = dv->expression();
+        if (!dvExpr) continue;
+        Type* expected = (i < t->structInfo->fields.size()) ? t->structInfo->fields[i].type : typeCtx.getError();
+        Type* actual = analyzeExpr(*dvExpr);
+        if (!expected->isError() && !actual->isError() && !expected->assignableFrom(actual)) {
+            errorAtNode(dvExpr->node, "Default value for field '" +
+                asciiOf(f.nameText().value_or(std::u16string{})) + "': expected '" +
+                expected->toString() + "', got '" + actual->toString() + "'");
+        }
+    }
+
+    currentFunction = prevFunction;
+    currentThis = prevThis;
+    currentScope = prevScope;
+}
+
+void Analyzer::checkFieldDefaults(const ast::ClassDecl& cd) {
+    Type* t = analysis.typeOf(cd.node.greenNode());
+    if (!t || !t->structInfo) return;
+
+    Symbol* prevFunction = currentFunction;
+    Symbol* prevThis = currentThis;
+    Scope* prevScope = currentScope;
+    currentFunction = nullptr;
+    currentThis = nullptr;
+    currentScope = globalScope;
+
+    auto fields = cd.fields();
+    for (size_t i = 0; i < fields.size(); ++i) {
+        auto& f = fields[i];
+        auto dv = f.defaultValue();
+        if (!dv) continue;
+        auto dvExpr = dv->expression();
+        if (!dvExpr) continue;
+        Type* expected = (i < t->structInfo->fields.size()) ? t->structInfo->fields[i].type : typeCtx.getError();
+        Type* actual = analyzeExpr(*dvExpr);
+        if (!expected->isError() && !actual->isError() && !expected->assignableFrom(actual)) {
+            errorAtNode(dvExpr->node, "Default value for field '" +
+                asciiOf(f.nameText().value_or(std::u16string{})) + "': expected '" +
+                expected->toString() + "', got '" + actual->toString() + "'");
+        }
+    }
+
+    currentFunction = prevFunction;
+    currentThis = prevThis;
+    currentScope = prevScope;
 }
 
 void Analyzer::checkParameterDefaults(const ast::FuncDecl& fn) {

@@ -92,6 +92,8 @@ private:
     void resolveMethodParams(const ast::FuncDecl& fn, ::Type* receiverType, Symbol* sym);
     void resolveFunctionParams(const ast::FuncDecl& fn, Symbol* sym);
     void checkParameterDefaults(const ast::FuncDecl& fn);
+    void checkFieldDefaults(const ast::StructDecl& sd);
+    void checkFieldDefaults(const ast::ClassDecl& cd);
 
     // === Body analysis ===
     void analyzeFunctionBody(const ast::FuncDecl& fn);
