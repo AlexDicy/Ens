@@ -882,6 +882,124 @@ struct CodeGenerator::Impl {
         return llvm::Function::Create(ty, llvm::Function::ExternalLinkage, "malloc", module.get());
     }
 
+    llvm::Function* getOrDeclareFree() {
+        if (auto* existing = module->getFunction("free")) return existing;
+        auto* ty = llvm::FunctionType::get(
+            llvm::Type::getVoidTy(ctx),
+            { llvm::PointerType::get(ctx, 0) }, false);
+        return llvm::Function::Create(ty, llvm::Function::ExternalLinkage, "free", module.get());
+    }
+
+    llvm::Function* getOrDefineEnsAlloc() {
+        if (auto* existing = module->getFunction("ens_alloc")) return existing;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(ptrTy, { i64Ty }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "ens_alloc", module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+
+        auto savedIP = builder->saveIP();
+        auto* entry  = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* nullBB = llvm::BasicBlock::Create(ctx, "alloc.null", fn);
+        auto* initBB = llvm::BasicBlock::Create(ctx, "alloc.init", fn);
+
+        builder->SetInsertPoint(entry);
+        llvm::Value* total = builder->CreateAdd(fn->getArg(0), llvm::ConstantInt::get(i64Ty, 8));
+        llvm::Value* header = builder->CreateCall(getOrDeclareMalloc(), { total });
+        llvm::Value* isNull = builder->CreateICmpEQ(header, llvm::ConstantPointerNull::get(ptrTy));
+        builder->CreateCondBr(isNull, nullBB, initBB);
+
+        builder->SetInsertPoint(nullBB);
+        builder->CreateRet(llvm::ConstantPointerNull::get(ptrTy));
+
+        builder->SetInsertPoint(initBB);
+        builder->CreateStore(llvm::ConstantInt::get(i64Ty, 1), header);
+        llvm::Value* payload = builder->CreateGEP(
+            llvm::Type::getInt8Ty(ctx), header, llvm::ConstantInt::get(i64Ty, 8));
+        builder->CreateRet(payload);
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    llvm::Function* getOrDefineEnsRetain() {
+        if (auto* existing = module->getFunction("ens_retain")) return existing;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), { ptrTy }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "ens_retain", module.get());
+        fn->addFnAttr(llvm::Attribute::AlwaysInline);
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+
+        auto savedIP = builder->saveIP();
+        auto* entry  = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* bumpBB = llvm::BasicBlock::Create(ctx, "retain.bump", fn);
+        auto* doneBB = llvm::BasicBlock::Create(ctx, "retain.done", fn);
+
+        builder->SetInsertPoint(entry);
+        llvm::Value* obj = fn->getArg(0);
+        llvm::Value* isNull = builder->CreateICmpEQ(obj, llvm::ConstantPointerNull::get(ptrTy));
+        builder->CreateCondBr(isNull, doneBB, bumpBB);
+
+        builder->SetInsertPoint(bumpBB);
+        llvm::Value* header = builder->CreateGEP(
+            llvm::Type::getInt8Ty(ctx), obj, llvm::ConstantInt::getSigned(i64Ty, -8));
+        builder->CreateAtomicRMW(
+            llvm::AtomicRMWInst::Add, header,
+            llvm::ConstantInt::get(i64Ty, 1),
+            llvm::MaybeAlign(8),
+            llvm::AtomicOrdering::Monotonic);
+        builder->CreateBr(doneBB);
+
+        builder->SetInsertPoint(doneBB);
+        builder->CreateRetVoid();
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    llvm::Function* getOrDefineEnsRelease() {
+        if (auto* existing = module->getFunction("ens_release")) return existing;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), { ptrTy }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "ens_release", module.get());
+        fn->addFnAttr(llvm::Attribute::AlwaysInline);
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+
+        auto savedIP = builder->saveIP();
+        auto* entry  = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* decBB  = llvm::BasicBlock::Create(ctx, "release.dec", fn);
+        auto* freeBB = llvm::BasicBlock::Create(ctx, "release.free", fn);
+        auto* doneBB = llvm::BasicBlock::Create(ctx, "release.done", fn);
+
+        builder->SetInsertPoint(entry);
+        llvm::Value* obj = fn->getArg(0);
+        llvm::Value* isNull = builder->CreateICmpEQ(obj, llvm::ConstantPointerNull::get(ptrTy));
+        builder->CreateCondBr(isNull, doneBB, decBB);
+
+        builder->SetInsertPoint(decBB);
+        llvm::Value* header = builder->CreateGEP(
+            llvm::Type::getInt8Ty(ctx), obj, llvm::ConstantInt::getSigned(i64Ty, -8));
+        llvm::Value* prev = builder->CreateAtomicRMW(
+            llvm::AtomicRMWInst::Sub, header,
+            llvm::ConstantInt::get(i64Ty, 1),
+            llvm::MaybeAlign(8),
+            llvm::AtomicOrdering::AcquireRelease);
+        llvm::Value* isLast = builder->CreateICmpEQ(prev, llvm::ConstantInt::get(i64Ty, 1));
+        builder->CreateCondBr(isLast, freeBB, doneBB);
+
+        builder->SetInsertPoint(freeBB);
+        builder->CreateCall(getOrDeclareFree(), { header });
+        builder->CreateBr(doneBB);
+
+        builder->SetInsertPoint(doneBB);
+        builder->CreateRetVoid();
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
     bool appendCallArgs(Symbol* sym, const std::vector<ast::Expression>& userArgs,
                         std::vector<llvm::Value*>& out) {
         for (auto& a : userArgs) {
@@ -916,9 +1034,9 @@ struct CodeGenerator::Impl {
         const llvm::DataLayout& dl = module->getDataLayout();
         uint64_t sizeBytes = dl.getTypeAllocSize(layout);
 
-        auto* mallocFn = getOrDeclareMalloc();
+        auto* allocFn = getOrDefineEnsAlloc();
         llvm::Value* sizeArg = llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), sizeBytes);
-        llvm::Value* heapPtr = builder->CreateCall(mallocFn, {sizeArg},
+        llvm::Value* heapPtr = builder->CreateCall(allocFn, {sizeArg},
                                                     "new." + asAscii(t->structInfo->name));
 
         int ctorIdx = t->structInfo->findMethodIndex(t->structInfo->name);
