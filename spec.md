@@ -81,6 +81,7 @@ class Animation<S: Shape + Comparable> {
     }
 }
 ```
+---
 
 Imports are based on paths and qualified by default. Imports are file-local.
 
@@ -152,3 +153,30 @@ class TestRepository {
     }
 }
 ```
+---
+
+Memory is managed automatically through Automatic Reference Counting (ARC).
+
+- **Classes** are heap-allocated reference types. Each instance carries a refcount; when the last reference goes out of scope, the instance is freed.
+- **Structs** are value types. They are copied on assignment and passed by value.
+
+Atomics happen only at allocation, at assignment of class-typed fields, and at scope exit.
+
+```ens
+class Texture { /* ... */ }
+
+drawSprite(Texture tex) {
+    // no retain at entry, no release at exit — caller's reference owns +1
+    tex.bind();
+}
+
+renderFrame() {
+    let t = new Texture();   // +1
+    drawSprite(t);           // zero atomics at the call boundary
+    drawSprite(t);           // zero atomics
+}                            // t released here
+```
+
+Reference cycles between class instances are not collected automatically and leak. A class that needs to hold a reference back to its owner should use the `weak` annotation.
+
+The compiler performs **escape analysis** to elide retain/release pairs and large-struct copies when it can prove a value does not escape its scope. The `--explain-arc` flag surfaces what was elided for diagnostics.
