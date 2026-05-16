@@ -136,6 +136,10 @@ void EscapeAnalyzer::scanExpression(const ast::Expression& e) {
     if (auto a = e.asAssign()) { scanAssign(*a); return; }
     if (auto c = e.asCall()) { scanCall(*c); return; }
     if (auto m = e.asMember()) { scanMember(*m); return; }
+    if (auto sm = e.asSafeMember()) {
+        if (auto obj = sm->object()) scanExpression(*obj);
+        return;
+    }
     if (auto bn = e.asBinary()) { scanBinary(*bn); return; }
     if (auto t = e.asTernary()) { scanTernary(*t); return; }
     if (auto p = e.asParen()) { scanParen(*p); return; }
@@ -431,6 +435,8 @@ void EscapeAnalyzer::walkExprForLastUses(const ast::Expression& e) {
         if (auto callee = c->callee()) {
             if (auto m = callee->asMember()) {
                 if (auto obj = m->object()) walkExprForLastUses(*obj);
+            } else if (auto sm = callee->asSafeMember()) {
+                if (auto obj = sm->object()) walkExprForLastUses(*obj);
             }
         }
         for (auto& arg : c->arguments()) walkExprForLastUses(arg);
@@ -438,6 +444,10 @@ void EscapeAnalyzer::walkExprForLastUses(const ast::Expression& e) {
     }
     if (auto m = e.asMember()) {
         if (auto obj = m->object()) walkExprForLastUses(*obj);
+        return;
+    }
+    if (auto sm = e.asSafeMember()) {
+        if (auto obj = sm->object()) walkExprForLastUses(*obj);
         return;
     }
     if (auto bn = e.asBinary()) {

@@ -579,6 +579,7 @@ int Parser::infixPrecedence(SyntaxKind k) const {
         case SyntaxKind::Slash:
         case SyntaxKind::Percent:    return 12;
         case SyntaxKind::Dot:
+        case SyntaxKind::QuestionDot:
         case SyntaxKind::LParen:
         case SyntaxKind::LBracket:   return 14;  // postfix
         default:                     return 0;
@@ -616,6 +617,13 @@ void Parser::parsePrecedence(int minPrec) {
             builder.startNodeAt(cp, SyntaxKind::MemberExpr);
             bump();
             expect(SyntaxKind::Identifier, "identifier after '.'");
+            builder.finishNode();
+            continue;
+        }
+        if (op == SyntaxKind::QuestionDot) {
+            builder.startNodeAt(cp, SyntaxKind::SafeMemberExpr);
+            bump();
+            expect(SyntaxKind::Identifier, "identifier after '?.'");
             builder.finishNode();
             continue;
         }

@@ -296,6 +296,7 @@ LexedToken Tokenizer::lexOperator(uint32_t startPos, int startLine, int startCol
     if (c0 == u'&' && c1 == u'=') return consume(2, SyntaxKind::AmpEq);
     if (c0 == u'|' && c1 == u'=') return consume(2, SyntaxKind::PipeEq);
     if (c0 == u'^' && c1 == u'=') return consume(2, SyntaxKind::CaretEq);
+    if (c0 == u'?' && c1 == u'.') return consume(2, SyntaxKind::QuestionDot);
 
     // 1-char
     switch (c0) {

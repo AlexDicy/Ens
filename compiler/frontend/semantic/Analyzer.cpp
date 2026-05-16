@@ -724,17 +724,69 @@ void Analyzer::analyzeTypedVarDeclStmt(const ast::TypedVarDeclStatement& stmt) {
     analysis.setSymbol(stmt.node.greenNode(), sym);
 }
 
+Analyzer::NullCheckInfo Analyzer::detectNullCheck(const ast::Expression& cond) {
+    NullCheckInfo info;
+    auto bin = cond.asBinary();
+    if (!bin) return info;
+    auto opTok = bin->operatorToken();
+    if (!opTok) return info;
+    SyntaxKind op = opTok->kind();
+    if (op != SyntaxKind::EqEq && op != SyntaxKind::NotEq) return info;
+    auto left = bin->left();
+    auto right = bin->right();
+    if (!left || !right) return info;
+
+    auto isNullLit = [](const ast::Expression& e) {
+        auto lit = e.asLiteral();
+        return lit && lit->literalKind() == SyntaxKind::KwNull;
+    };
+
+    const ast::Expression* identSide = nullptr;
+    if (isNullLit(*right) && !isNullLit(*left)) identSide = &*left;
+    else if (isNullLit(*left) && !isNullLit(*right)) identSide = &*right;
+    else return info;
+
+    auto id = identSide->asIdent();
+    if (!id) return info;
+    auto name = id->nameText();
+    if (!name) return info;
+    Symbol* sym = currentScope ? currentScope->lookup(*name) : nullptr;
+    if (!sym || !sym->type || !sym->type->isOptional() || !sym->type->inner) return info;
+
+    info.key = NarrowingPath{sym, {}};
+    info.narrowedT = sym->type->inner;
+    info.narrowsThen = (op == SyntaxKind::NotEq);
+    info.valid = true;
+    return info;
+}
+
+void Analyzer::analyzeBranchWithNarrowing(const ast::Block& block,
+                                          const NullCheckInfo& info, bool installNarrowing) {
+    pushScope();
+    if (installNarrowing && info.valid) {
+        currentScope->narrowedTypes[info.key] = info.narrowedT;
+    }
+    for (auto& s : block.statements()) analyzeStatement(s);
+    popScope();
+}
+
 void Analyzer::analyzeIfStmt(const ast::IfStatement& stmt) {
+    NullCheckInfo info;
     if (auto c = stmt.condition()) {
         Type* ct = analyzeExpr(*c);
         if (!ct->isError() && !ct->isBool()) {
             errorAtNode(c->node, "If condition must be 'bool', got '" + ct->toString() + "'");
         }
+        info = detectNullCheck(*c);
     }
-    if (auto b = stmt.thenBlock()) analyzeBlock(*b);
+    if (auto b = stmt.thenBlock()) {
+        analyzeBranchWithNarrowing(*b, info, info.valid && info.narrowsThen);
+    }
     if (auto ec = stmt.elseClause()) {
         if (auto inner = ec->ifStatement()) analyzeIfStmt(*inner);
-        else if (auto bb = ec->block()) analyzeBlock(*bb);
+        else if (auto bb = ec->block()) {
+            analyzeBranchWithNarrowing(*bb, info, info.valid && !info.narrowsThen);
+        }
     }
 }
 
@@ -790,6 +842,7 @@ Type* Analyzer::analyzeExpr(const ast::Expression& expr) {
     else if (auto p  = expr.asPrefix()) t = analyzePrefix(*p);
     else if (auto c  = expr.asCall())   t = analyzeCall(*c);
     else if (auto m  = expr.asMember()) t = analyzeMember(*m);
+    else if (auto sm = expr.asSafeMember()) t = analyzeSafeMember(*sm);
     else if (auto a  = expr.asAssign()) t = analyzeAssign(*a);
     else if (auto tn = expr.asTernary())t = analyzeTernary(*tn);
     else if (auto nw = expr.asNew())    t = analyzeNew(*nw);
@@ -825,6 +878,11 @@ Type* Analyzer::analyzeIdent(const ast::IdentExpression& expr) {
     analysis.setSymbol(expr.node.greenNode(), sym);
     if (sym->kind == SymbolKind::Function) return typeCtx.getError();
     if (sym->kind == SymbolKind::Namespace) return typeCtx.getError();
+    if (currentScope) {
+        if (Type* narrowed = currentScope->lookupNarrowedType(NarrowingPath{sym, {}})) {
+            return narrowed;
+        }
+    }
     return sym->type ? sym->type : typeCtx.getError();
 }
 
@@ -993,6 +1051,52 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
         return typeCtx.getError();
     }
 
+    // Safe method call: obj?.method(args)
+    if (callee && callee->asSafeMember()) {
+        auto member = *callee->asSafeMember();
+        analyzeExpr(*callee);  // resolves field-or-method on safe-member
+        auto* memberInfo = analysis.find(member.node.greenNode());
+        Symbol* methodSym = memberInfo ? memberInfo->resolvedMethodSymbol : nullptr;
+        if (methodSym) {
+            auto mname = member.memberText().value_or(std::u16string{});
+            size_t req = requiredArgCount(methodSym);
+            if (args.size() < req || args.size() > methodSym->paramTypes.size()) {
+                errorAtNode(expr.node, "Method '" + asciiOf(mname) + "' expects " +
+                    std::to_string(req) +
+                    (req == methodSym->paramTypes.size() ? "" : "-" + std::to_string(methodSym->paramTypes.size())) +
+                    " argument(s), got " + std::to_string(args.size()));
+            }
+            size_t n = std::min(args.size(), methodSym->paramTypes.size());
+            for (size_t i = 0; i < n; ++i) {
+                Type* argT = analyzeExpr(args[i]);
+                Type* paramT = methodSym->paramTypes[i];
+                if (!paramT->assignableFrom(argT)) {
+                    errorAtNode(args[i].node, "Argument " + std::to_string(i + 1) +
+                        ": expected '" + paramT->toString() + "', got '" + argT->toString() + "'");
+                }
+            }
+            for (size_t i = n; i < args.size(); ++i) analyzeExpr(args[i]);
+            Type* ret = methodSym->returnType;
+            if (!ret || ret->isError()) return typeCtx.getError();
+            if (ret->isVoid()) {
+                errorAtNode(expr.node, "Cannot use '?.' to call '" + asciiOf(mname) +
+                    "' because it does not return a value.");
+                return typeCtx.getError();
+            }
+            bool retIsClassish = ret->isClass() ||
+                (ret->isOptional() && ret->inner && ret->inner->isClass());
+            if (!retIsClassish) {
+                errorAtNode(expr.node, "'?.' on '" + asciiOf(mname) +
+                    "' is not yet supported because it returns '" + ret->toString() +
+                    "'. Only methods that return a class type can be called through '?.' for now.");
+                return typeCtx.getError();
+            }
+            return typeCtx.getOptional(ret);
+        }
+        for (auto& a : args) analyzeExpr(a);
+        return typeCtx.getError();
+    }
+
     // Function call: name(args)
     auto idCallee = callee ? callee->asIdent() : std::nullopt;
     if (!idCallee) {
@@ -1063,7 +1167,13 @@ Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
     Type* objT = analyzeExpr(*obj);
     if (objT->isError()) return typeCtx.getError();
     if (!objT->hasRecordLayout() || !objT->structInfo) {
-        errorAtNode(expr.node, "Member access on non-record type '" + objT->toString() + "'");
+        if (objT->isOptional()) {
+            errorAtNode(expr.node, "Cannot read a member of '" + objT->toString() +
+                "' because it may be null. Use '?.' or check for null first.");
+        } else {
+            errorAtNode(expr.node, "Cannot read a member of '" + objT->toString() +
+                "' because it has no members.");
+        }
         return typeCtx.getError();
     }
     auto memberName = expr.memberText();
@@ -1082,6 +1192,61 @@ Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
     return typeCtx.getError();
 }
 
+Type* Analyzer::analyzeSafeMember(const ast::SafeMemberExpression& expr) {
+    auto obj = expr.object();
+    if (!obj) return typeCtx.getError();
+    Type* objT = analyzeExpr(*obj);
+    if (objT->isError()) return typeCtx.getError();
+
+    if (!objT->isOptional()) {
+        errorAtNode(expr.node, "The value on the left of '?.' has type '" + objT->toString() +
+            "', which can never be null. Use '.' to access its members.");
+        return typeCtx.getError();
+    }
+    Type* inner = objT->inner;
+    if (!inner || !inner->hasRecordLayout() || !inner->structInfo) {
+        std::string innerName = inner ? inner->toString() : std::string("?");
+        errorAtNode(expr.node, "The value on the left of '?.' has type '" + innerName +
+            "?', which has no members to access.");
+        return typeCtx.getError();
+    }
+    if (!inner->isClass()) {
+        errorAtNode(expr.node, "'?.' is not yet supported on '" + inner->toString() +
+            "?'. Only nullable class types can use '?.' for now.");
+        return typeCtx.getError();
+    }
+
+    auto memberName = expr.memberText();
+    if (!memberName) return typeCtx.getError();
+
+    auto isClassOrClassOptional = [](Type* t) {
+        if (!t) return false;
+        if (t->isClass()) return true;
+        if (t->isOptional() && t->inner && t->inner->isClass()) return true;
+        return false;
+    };
+
+    int idx = inner->structInfo->findFieldIndex(*memberName);
+    if (idx >= 0) {
+        Type* fieldT = inner->structInfo->fields[idx].type;
+        if (!isClassOrClassOptional(fieldT)) {
+            errorAtNode(expr.node, "'?.' on '" + asciiOf(*memberName) +
+                "' is not yet supported because the field has type '" + fieldT->toString() +
+                "'. Only class-typed fields can be read through '?.' for now.");
+            return typeCtx.getError();
+        }
+        return typeCtx.getOptional(fieldT);
+    }
+    int midx = inner->structInfo->findMethodIndex(*memberName);
+    if (midx >= 0) {
+        analysis.setMethodSymbol(expr.node.greenNode(), inner->structInfo->methods[midx].symbol);
+        return typeCtx.getError();
+    }
+    errorAtNode(expr.node, "No field or method named '" + asciiOf(*memberName) +
+        "' on '" + inner->toString() + "'.");
+    return typeCtx.getError();
+}
+
 Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
     auto target = expr.target();
     auto value = expr.value();
@@ -1091,11 +1256,29 @@ Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
     }
     Type* targetT = analyzeExpr(*target);
     Type* valueT = analyzeExpr(*value);
-    if (!targetT->isError() && !valueT->isError()) {
-        if (!targetT->assignableFrom(valueT)) {
-            errorAtNode(expr.node, "Cannot assign '" + valueT->toString() +
-                "' to '" + targetT->toString() + "'");
+
+    // For a narrowed identifier the storage keeps its declared (wider) type; the
+    // narrowing only governs reads. Use the symbol's declared type when checking
+    // assignability so that e.g. `x = null` still works inside `if x != null { }`.
+    Type* assignTargetT = targetT;
+    Symbol* targetIdentSym = nullptr;
+    if (auto id = target->asIdent()) {
+        if (auto* targetInfo = analysis.find(id->node.greenNode())) {
+            if (Symbol* sym = targetInfo->resolvedSymbol) {
+                targetIdentSym = sym;
+                if (sym->type) assignTargetT = sym->type;
+            }
         }
+    }
+
+    if (!assignTargetT->isError() && !valueT->isError()) {
+        if (!assignTargetT->assignableFrom(valueT)) {
+            errorAtNode(expr.node, "Cannot assign '" + valueT->toString() +
+                "' to '" + assignTargetT->toString() + "'");
+        }
+    }
+    if (targetIdentSym && currentScope) {
+        currentScope->clearNarrowingsContaining(targetIdentSym, u"");
     }
     return targetT;
 }

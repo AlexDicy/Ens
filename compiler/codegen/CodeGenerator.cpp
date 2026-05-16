@@ -917,6 +917,7 @@ struct CodeGenerator::Impl {
         if (auto p = e.asPrefix()) return emitPrefix(*p);
         if (auto c = e.asCall()) return emitCall(*c);
         if (auto m = e.asMember()) return emitMember(*m);
+        if (auto sm = e.asSafeMember()) return emitSafeMember(*sm);
         if (auto a = e.asAssign()) return emitAssign(*a);
         if (auto t = e.asTernary()) return emitTernary(*t);
         if (auto n = e.asNew()) return emitNew(*n);
@@ -1552,6 +1553,7 @@ struct CodeGenerator::Impl {
 
     bool expressionProducesOwnedRef(const ast::Expression& e) {
         if (e.asNew() || e.asCall()) return true;
+        if (e.asSafeMember()) return true;
         if (auto m = e.asMember()) {
             // Weak field reads return +1 via ens_weak_load's CAS-upgrade.
             const FieldInfo* fi = memberFieldInfo(*m);
@@ -1793,6 +1795,56 @@ struct CodeGenerator::Impl {
             }
         }
 
+        if (callee && callee->asSafeMember()) {
+            auto member = *callee->asSafeMember();
+            Symbol* methodSym = methodSymbolOf(member.node);
+            if (methodSym) {
+                auto obj = member.object();
+                if (!obj) return nullptr;
+                ::Type* recvType = typeOf(obj->node);
+                if (!recvType || !recvType->isOptional() || !recvType->inner) {
+                    error(e.node.startOffset(), "Internal: safe-call receiver type is malformed");
+                    return nullptr;
+                }
+                ::Type* innerType = recvType->inner;
+                llvm::Function* fn = getOrDeclareExternalFunction(methodSym, innerType);
+                if (!fn) {
+                    error(e.node.startOffset(), "Internal: method has no LLVM function");
+                    return nullptr;
+                }
+                llvm::Value* recv = emitExpr(*obj);
+                if (!recv) return nullptr;
+                auto* ptrTy = llvm::PointerType::get(ctx, 0);
+                llvm::Value* isNull = builder->CreateICmpEQ(
+                    recv, llvm::ConstantPointerNull::get(ptrTy), "safecall.isnull");
+
+                auto* nullBB    = llvm::BasicBlock::Create(ctx, "safecall.null",    currentFunction);
+                auto* nonnullBB = llvm::BasicBlock::Create(ctx, "safecall.nonnull", currentFunction);
+                auto* endBB     = llvm::BasicBlock::Create(ctx, "safecall.end",     currentFunction);
+
+                builder->CreateCondBr(isNull, nullBB, nonnullBB);
+
+                builder->SetInsertPoint(nonnullBB);
+                std::vector<llvm::Value*> args;
+                args.push_back(recv);
+                if (!appendCallArgs(methodSym, e.arguments(), args)) return nullptr;
+                llvm::Value* callRes = builder->CreateCall(fn, args);
+                llvm::BasicBlock* nonnullEnd = builder->GetInsertBlock();
+                builder->CreateBr(endBB);
+
+                builder->SetInsertPoint(nullBB);
+                llvm::Value* nullVal = llvm::ConstantPointerNull::get(ptrTy);
+                llvm::BasicBlock* nullEnd = builder->GetInsertBlock();
+                builder->CreateBr(endBB);
+
+                builder->SetInsertPoint(endBB);
+                auto* phi = builder->CreatePHI(ptrTy, 2, "safecall.result");
+                phi->addIncoming(callRes, nonnullEnd);
+                phi->addIncoming(nullVal, nullEnd);
+                return phi;
+            }
+        }
+
         auto idCallee = callee ? callee->asIdent() : std::nullopt;
         if (!idCallee) {
             error(e.node.startOffset(), "Only direct function calls are supported");
@@ -1958,6 +2010,59 @@ struct CodeGenerator::Impl {
         }
         ::Type* fieldType = typeOf(e.node);
         return builder->CreateLoad(mapType(fieldType), addr, asAscii(memberName) + ".load");
+    }
+
+    llvm::Value* emitSafeMember(const ast::SafeMemberExpression& e) {
+        auto obj = e.object();
+        if (!obj) return nullptr;
+        ::Type* recvType = typeOf(obj->node);
+        if (!recvType || !recvType->isOptional() || !recvType->inner ||
+            !recvType->inner->structInfo) {
+            error(e.node.startOffset(), "Internal: safe member receiver type is malformed");
+            return nullptr;
+        }
+        ::Type* innerType = recvType->inner;
+        auto memberName = e.memberText();
+        if (!memberName) return nullptr;
+        int idx = innerType->structInfo->findFieldIndex(*memberName);
+        if (idx < 0) {
+            error(e.node.startOffset(), "Internal: safe member field not found");
+            return nullptr;
+        }
+        ::Type* fieldType = innerType->structInfo->fields[static_cast<size_t>(idx)].type;
+
+        llvm::Value* recv = emitExpr(*obj);
+        if (!recv) return nullptr;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        llvm::Value* isNull = builder->CreateICmpEQ(
+            recv, llvm::ConstantPointerNull::get(ptrTy), "safe.isnull");
+
+        auto* nullBB    = llvm::BasicBlock::Create(ctx, "safe.null",    currentFunction);
+        auto* nonnullBB = llvm::BasicBlock::Create(ctx, "safe.nonnull", currentFunction);
+        auto* endBB     = llvm::BasicBlock::Create(ctx, "safe.end",     currentFunction);
+
+        builder->CreateCondBr(isNull, nullBB, nonnullBB);
+
+        builder->SetInsertPoint(nonnullBB);
+        llvm::StructType* layout = mapStructType(innerType);
+        llvm::Value* fieldAddr = builder->CreateStructGEP(
+            layout, recv, static_cast<unsigned>(idx), asAscii(*memberName) + ".addr");
+        llvm::Value* loaded = builder->CreateLoad(
+            mapType(fieldType), fieldAddr, asAscii(*memberName) + ".load");
+        if (isReferenceType(fieldType)) emitRetain(loaded);
+        llvm::BasicBlock* nonnullEnd = builder->GetInsertBlock();
+        builder->CreateBr(endBB);
+
+        builder->SetInsertPoint(nullBB);
+        llvm::Value* nullVal = llvm::ConstantPointerNull::get(ptrTy);
+        llvm::BasicBlock* nullEnd = builder->GetInsertBlock();
+        builder->CreateBr(endBB);
+
+        builder->SetInsertPoint(endBB);
+        auto* phi = builder->CreatePHI(ptrTy, 2, "safe.result");
+        phi->addIncoming(loaded, nonnullEnd);
+        phi->addIncoming(nullVal, nullEnd);
+        return phi;
     }
 
     llvm::Value* emitTernary(const ast::TernaryExpression& e) {

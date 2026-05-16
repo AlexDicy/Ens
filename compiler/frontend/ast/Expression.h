@@ -15,6 +15,7 @@ class PrefixExpression;
 class PostfixExpression;
 class CallExpression;
 class MemberExpression;
+class SafeMemberExpression;
 class SubscriptExpression;
 class AssignExpression;
 class TernaryExpression;
@@ -39,6 +40,7 @@ public:
     std::optional<PostfixExpression>   asPostfix() const;
     std::optional<CallExpression>      asCall() const;
     std::optional<MemberExpression>    asMember() const;
+    std::optional<SafeMemberExpression> asSafeMember() const;
     std::optional<SubscriptExpression> asSubscript() const;
     std::optional<AssignExpression>    asAssign() const;
     std::optional<TernaryExpression>   asTernary() const;
@@ -139,6 +141,18 @@ public:
     static std::optional<MemberExpression> cast(const SyntaxNode& n) {
         if (n.kind() != SyntaxKind::MemberExpr) return std::nullopt;
         return MemberExpression{n};
+    }
+    std::optional<Expression> object() const;
+    std::optional<SyntaxNode> memberName() const;
+    std::optional<std::u16string> memberText() const;
+};
+
+class SafeMemberExpression {
+public:
+    SyntaxNode node;
+    static std::optional<SafeMemberExpression> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::SafeMemberExpr) return std::nullopt;
+        return SafeMemberExpression{n};
     }
     std::optional<Expression> object() const;
     std::optional<SyntaxNode> memberName() const;

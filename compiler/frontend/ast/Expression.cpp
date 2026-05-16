@@ -13,6 +13,7 @@ bool Expression::isExpressionKind(SyntaxKind k) {
         case SyntaxKind::PostfixExpr:
         case SyntaxKind::CallExpr:
         case SyntaxKind::MemberExpr:
+        case SyntaxKind::SafeMemberExpr:
         case SyntaxKind::SubscriptExpr:
         case SyntaxKind::AssignExpr:
         case SyntaxKind::TernaryExpr:
@@ -52,6 +53,7 @@ std::optional<PrefixExpression>    Expression::asPrefix()    const { return Pref
 std::optional<PostfixExpression>   Expression::asPostfix()   const { return PostfixExpression::cast(node); }
 std::optional<CallExpression>      Expression::asCall()      const { return CallExpression::cast(node); }
 std::optional<MemberExpression>    Expression::asMember()    const { return MemberExpression::cast(node); }
+std::optional<SafeMemberExpression> Expression::asSafeMember() const { return SafeMemberExpression::cast(node); }
 std::optional<SubscriptExpression> Expression::asSubscript() const { return SubscriptExpression::cast(node); }
 std::optional<AssignExpression>    Expression::asAssign()    const { return AssignExpression::cast(node); }
 std::optional<TernaryExpression>   Expression::asTernary()   const { return TernaryExpression::cast(node); }
@@ -176,6 +178,27 @@ std::optional<SyntaxNode> MemberExpression::memberName() const {
 }
 
 std::optional<std::u16string> MemberExpression::memberText() const {
+    if (auto t = memberName()) return std::u16string(t->tokenText());
+    return std::nullopt;
+}
+
+// === SafeMemberExpression ===
+
+std::optional<Expression> SafeMemberExpression::object() const {
+    return firstExpressionChild(node);
+}
+
+std::optional<SyntaxNode> SafeMemberExpression::memberName() const {
+    bool seenOp = false;
+    for (auto& c : node.children()) {
+        if (isTrivia(c.kind())) continue;
+        if (c.kind() == SyntaxKind::QuestionDot) { seenOp = true; continue; }
+        if (seenOp && c.kind() == SyntaxKind::Identifier) return c;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::u16string> SafeMemberExpression::memberText() const {
     if (auto t = memberName()) return std::u16string(t->tokenText());
     return std::nullopt;
 }

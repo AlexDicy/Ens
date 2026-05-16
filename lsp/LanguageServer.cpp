@@ -79,7 +79,7 @@ std::string formatHoverFor(const SyntaxNode& node, const ResolutionInfo& info) {
             return "type: " + info.resolvedType->toString();
         }
     }
-    if (k == SyntaxKind::MemberExpr) {
+    if (k == SyntaxKind::MemberExpr || k == SyntaxKind::SafeMemberExpr) {
         if (info.resolvedMethodSymbol) {
             std::string r = "method " + utf16To8(info.resolvedMethodSymbol->name);
             r += "(";
@@ -542,12 +542,21 @@ MemberContext findMemberContext(const SyntaxNode& root, uint32_t offset,
         MemberContext ctx;
         auto chain = ancestorChainAt(root, pos);
         for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
-            if (it->kind() != SyntaxKind::MemberExpr) continue;
-            auto m = ast::MemberExpression::cast(*it);
-            if (!m) continue;
-            auto obj = m->object();
+            SyntaxKind ck = it->kind();
+            std::optional<ast::Expression> obj;
+            if (ck == SyntaxKind::MemberExpr) {
+                if (auto m = ast::MemberExpression::cast(*it)) obj = m->object();
+            } else if (ck == SyntaxKind::SafeMemberExpr) {
+                if (auto sm = ast::SafeMemberExpression::cast(*it)) obj = sm->object();
+            } else {
+                continue;
+            }
             if (!obj) continue;
-            ctx.receiverType = analysis.typeOf(obj->node.greenNode());
+            ::Type* recvType = analysis.typeOf(obj->node.greenNode());
+            if (ck == SyntaxKind::SafeMemberExpr && recvType && recvType->isOptional()) {
+                recvType = recvType->inner;
+            }
+            ctx.receiverType = recvType;
             ctx.receiverIsThis = (obj->kind() == SyntaxKind::ThisExpr);
             return ctx;
         }

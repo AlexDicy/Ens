@@ -118,10 +118,21 @@ private:
     Type* analyzePrefix(const ast::PrefixExpression& expr);
     Type* analyzeCall(const ast::CallExpression& expr);
     Type* analyzeMember(const ast::MemberExpression& expr);
+    Type* analyzeSafeMember(const ast::SafeMemberExpression& expr);
     Type* analyzeAssign(const ast::AssignExpression& expr);
     Type* analyzeTernary(const ast::TernaryExpression& expr);
     Type* analyzeNew(const ast::NewExpression& expr);
     Type* analyzeParen(const ast::ParenExpression& expr);
+
+    struct NullCheckInfo {
+        NarrowingPath key;
+        Type* narrowedT = nullptr;
+        bool narrowsThen = false;
+        bool valid = false;
+    };
+    NullCheckInfo detectNullCheck(const ast::Expression& cond);
+    void analyzeBranchWithNarrowing(const ast::Block& block,
+                                    const NullCheckInfo& info, bool installNarrowing);
 
     Type* resolveTypeReference(const ast::TypeReference& tr);
     Type* lookupTypeByName(const std::u16string& qualifier, const std::u16string& name,

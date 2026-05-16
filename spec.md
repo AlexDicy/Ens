@@ -155,6 +155,39 @@ class TestRepository {
 ```
 ---
 
+A type written without a `?` always holds a value and can never be `null`. To allow `null`, suffix the type with `?`.
+
+```ens
+class Inner { /* ... */ }
+class Outer {
+    Inner? inner;     // may be null
+    Outer(this.inner = null);
+}
+```
+
+To read through a nullable value, use the safe member operator `?.`. If the value on the left is `null`, the whole expression evaluates to `null` and the right-hand side is not evaluated; otherwise it behaves like `.`.
+
+```ens
+let outer: Outer? = new Outer();
+Inner? maybeInner = outer?.inner;   // either null or the field value
+```
+
+Inside `if x != null { ... }` the `x` is considered as the non-nullable form for the rest of the block, so you can use `.` directly. The same narrowing applies to the `else` branch of `if x == null { ... } else { ... }`. Reassigning `x` inside the block drops the narrowing from that point on.
+
+```ens
+draw(Outer? outer) {
+    if (outer != null) {
+        outer.inner; // outer is treated as non-nullable 'Outer' here
+    }
+
+    if (outer == null) {
+        return;
+    } else {
+        outer.inner; // ok in the else branch too
+    }
+}
+```
+
 Memory is managed automatically through Automatic Reference Counting (ARC).
 
 - **Classes** are heap-allocated reference types. Each instance carries a refcount; when the last reference goes out of scope, the instance is freed.
