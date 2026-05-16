@@ -16,7 +16,10 @@ public:
     bool runOnce();
 
     // Convergent fixpoint for single-module use.
-    void analyze() { while (runOnce()) {} }
+    void analyze() { while (runOnce()) {} finalize(); }
+
+    // Walk function bodies once to record the textually-last read reference for each class-typed local.
+    void finalize();
 
 private:
     const ast::SourceFile& sf;
@@ -25,6 +28,7 @@ private:
     Symbol* currentFn = nullptr;
     std::vector<Symbol*> currentParams;
     bool changedThisIteration = false;
+    int loopDepth = 0;
 
     void analyzeFunction(Symbol* fnSym, const ast::FuncDecl& fn);
     void collectFunctionsOnce();
@@ -61,4 +65,9 @@ private:
     bool isParameterBorrowSource(const ast::Expression& e) const;
     void updateBorrowMode(Symbol* target, const ast::Expression& rhs);
     bool isBorrowModeSymbol(Symbol* sym) const;
+
+    void walkBodyForLastUses(const ast::FuncDecl& fn);
+    void walkStmtForLastUses(const ast::Statement& s);
+    void walkExprForLastUses(const ast::Expression& e);
+    void recordRead(const ast::IdentExpression& id);
 };

@@ -350,6 +350,131 @@ bool EscapeAnalyzer::isBorrowModeSymbol(Symbol* sym) const {
     return true;
 }
 
+void EscapeAnalyzer::finalize() {
+    auto handle = [&](const ast::FuncDecl& fn) {
+        loopDepth = 0;
+        walkBodyForLastUses(fn);
+    };
+    for (auto& fn : sf.functions()) handle(fn);
+    for (auto& sd : sf.structs()) for (auto& m : sd.methods()) handle(m);
+    for (auto& cd : sf.classes()) for (auto& m : cd.methods()) handle(m);
+}
+
+void EscapeAnalyzer::walkBodyForLastUses(const ast::FuncDecl& fn) {
+    if (auto body = fn.body()) {
+        for (auto& s : body->statements()) walkStmtForLastUses(s);
+    }
+}
+
+void EscapeAnalyzer::walkStmtForLastUses(const ast::Statement& s) {
+    if (auto b = s.asBlock()) {
+        for (auto& child : b->statements()) walkStmtForLastUses(child);
+        return;
+    }
+    if (auto l = s.asLet()) {
+        if (auto init = l->initializer()) walkExprForLastUses(*init);
+        return;
+    }
+    if (auto v = s.asTypedVarDecl()) {
+        if (auto init = v->initializer()) walkExprForLastUses(*init);
+        return;
+    }
+    if (auto i = s.asIf()) {
+        if (auto c = i->condition()) walkExprForLastUses(*c);
+        if (auto t = i->thenBlock()) {
+            for (auto& child : t->statements()) walkStmtForLastUses(child);
+        }
+        if (auto ec = i->elseClause()) {
+            if (auto inner = ec->ifStatement()) {
+                // Treat as a statement: wrap in scan
+                ast::Statement asStmt{inner->node};
+                walkStmtForLastUses(asStmt);
+            } else if (auto bb = ec->block()) {
+                for (auto& child : bb->statements()) walkStmtForLastUses(child);
+            }
+        }
+        return;
+    }
+    if (auto w = s.asWhile()) {
+        if (auto c = w->condition()) walkExprForLastUses(*c);
+        loopDepth++;
+        if (auto body = w->body()) {
+            for (auto& child : body->statements()) walkStmtForLastUses(child);
+        }
+        loopDepth--;
+        return;
+    }
+    if (auto r = s.asReturn()) {
+        if (auto v = r->value()) walkExprForLastUses(*v);
+        return;
+    }
+    if (auto e = s.asExpressionStmt()) {
+        if (auto exp = e->expression()) walkExprForLastUses(*exp);
+        return;
+    }
+}
+
+void EscapeAnalyzer::walkExprForLastUses(const ast::Expression& e) {
+    if (auto a = e.asAssign()) {
+        if (auto target = a->target()) {
+            if (auto m = target->asMember()) {
+                if (auto obj = m->object()) walkExprForLastUses(*obj);
+            }
+        }
+        if (auto value = a->value()) walkExprForLastUses(*value);
+        return;
+    }
+    if (auto c = e.asCall()) {
+        if (auto callee = c->callee()) {
+            if (auto m = callee->asMember()) {
+                if (auto obj = m->object()) walkExprForLastUses(*obj);
+            }
+        }
+        for (auto& arg : c->arguments()) walkExprForLastUses(arg);
+        return;
+    }
+    if (auto m = e.asMember()) {
+        if (auto obj = m->object()) walkExprForLastUses(*obj);
+        return;
+    }
+    if (auto bn = e.asBinary()) {
+        if (auto l = bn->left()) walkExprForLastUses(*l);
+        if (auto r = bn->right()) walkExprForLastUses(*r);
+        return;
+    }
+    if (auto t = e.asTernary()) {
+        if (auto cond = t->condition()) walkExprForLastUses(*cond);
+        if (auto th = t->thenBranch()) walkExprForLastUses(*th);
+        if (auto el = t->elseBranch()) walkExprForLastUses(*el);
+        return;
+    }
+    if (auto p = e.asParen()) {
+        if (auto inner = p->inner()) walkExprForLastUses(*inner);
+        return;
+    }
+    if (auto n = e.asNew()) {
+        for (auto& arg : n->arguments()) walkExprForLastUses(arg);
+        return;
+    }
+    if (auto id = e.asIdent()) {
+        recordRead(*id);
+        return;
+    }
+}
+
+void EscapeAnalyzer::recordRead(const ast::IdentExpression& id) {
+    auto* info = analysis.find(id.node.greenNode());
+    Symbol* s = info ? info->resolvedSymbol : nullptr;
+    if (!s) return;
+    if (s->kind != SymbolKind::Variable) return;
+    if (!s->type) return;
+    bool isClassish = (s->type->kind == TypeKind::Class) ||
+        (s->type->kind == TypeKind::Optional && s->type->inner && s->type->inner->isClass());
+    if (!isClassish) return;
+    s->lastUseRef = id.node.greenNode();
+    s->lastUseInLoop = (loopDepth > 0);
+}
+
 void EscapeAnalyzer::markParamMutated(int paramIdx) {
     if (!currentFn || paramIdx < 0) return;
     auto& ei = currentFn->escapeInfo;

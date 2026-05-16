@@ -44,6 +44,9 @@ public:
     // true if every assignment has source = non-reassigned class parameter or `this`
     bool allAssignsFromParam = true;
 
+    const GreenElement* lastUseRef = nullptr;
+    bool lastUseInLoop = false;
+
     Symbol(SymbolKind k, std::u16string n, Type* t, int l, int c)
         : kind(k), name(std::move(n)), type(t), line(l), column(c) {}
 };

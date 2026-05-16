@@ -290,6 +290,7 @@ bool runMultiModuleAnalysis(std::vector<std::unique_ptr<Module>>& modules,
             if (ea.runOnce()) anyChanged = true;
         }
     } while (anyChanged);
+    for (auto& ea : escapeAnalyzers) ea.finalize();
 
     if (explainArc) {
         printEscapeFacts(modules, std::cerr);

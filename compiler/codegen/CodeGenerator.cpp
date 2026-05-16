@@ -607,6 +607,21 @@ struct CodeGenerator::Impl {
         return true;
     }
 
+    Symbol* moveSourceSymbol(const ast::Expression& rhs) {
+        if (auto id = rhs.asIdent()) {
+            Symbol* src = symbolOf(id->node);
+            if (!src || src->kind != SymbolKind::Variable) return nullptr;
+            if (!isReferenceType(src->type)) return nullptr;
+            if (src->lastUseInLoop) return nullptr;
+            if (src->lastUseRef != id->node.greenNode()) return nullptr;
+            return src;
+        }
+        if (auto p = rhs.asParen()) {
+            if (auto inner = p->inner()) return moveSourceSymbol(*inner);
+        }
+        return nullptr;
+    }
+
     void emitLetStmt(const ast::LetStatement& s) {
         Symbol* sym = symbolOf(s.node);
         if (!sym) return;
@@ -649,7 +664,9 @@ struct CodeGenerator::Impl {
         if (auto init = s.initializer()) {
             setLocationFromNode(s.node);
             bool borrowedSource = !expressionProducesOwnedRef(*init);
-            bool needsClassRetain = isReferenceType(sym->type) && borrowedSource && !elideClassRetain;
+            Symbol* moveSrc = !elideClassRetain && isReferenceType(sym->type)
+                ? moveSourceSymbol(*init) : nullptr;
+            bool needsClassRetain = isReferenceType(sym->type) && borrowedSource && !elideClassRetain && !moveSrc;
             bool needsStructRetain = structHasClassFields(sym->type) && borrowedSource;
             llvm::Value* v = emitExpr(*init);
             if (v) {
@@ -658,6 +675,14 @@ struct CodeGenerator::Impl {
                     builder->CreateCall(getOrDefineEnsRetain(), { v });
                 }
                 builder->CreateStore(v, alloca);
+                if (moveSrc) {
+                    auto it = values.find(moveSrc);
+                    if (it != values.end()) {
+                        builder->CreateStore(
+                            llvm::ConstantPointerNull::get(llvm::PointerType::get(ctx, 0)),
+                            it->second);
+                    }
+                }
                 if (needsStructRetain) {
                     emitStructFieldRetain(sym->type, alloca);
                 }
@@ -708,7 +733,9 @@ struct CodeGenerator::Impl {
         if (auto init = s.initializer()) {
             setLocationFromNode(s.node);
             bool borrowedSource = !expressionProducesOwnedRef(*init);
-            bool needsClassRetain = isReferenceType(sym->type) && borrowedSource && !elideClassRetain;
+            Symbol* moveSrc = !elideClassRetain && isReferenceType(sym->type)
+                ? moveSourceSymbol(*init) : nullptr;
+            bool needsClassRetain = isReferenceType(sym->type) && borrowedSource && !elideClassRetain && !moveSrc;
             bool needsStructRetain = structHasClassFields(sym->type) && borrowedSource;
             llvm::Value* v = emitExpr(*init);
             if (v) {
@@ -716,6 +743,14 @@ struct CodeGenerator::Impl {
                     builder->CreateCall(getOrDefineEnsRetain(), { v });
                 }
                 builder->CreateStore(v, alloca);
+                if (moveSrc) {
+                    auto it = values.find(moveSrc);
+                    if (it != values.end()) {
+                        builder->CreateStore(
+                            llvm::ConstantPointerNull::get(llvm::PointerType::get(ctx, 0)),
+                            it->second);
+                    }
+                }
                 if (needsStructRetain) {
                     emitStructFieldRetain(sym->type, alloca);
                 }
@@ -1769,6 +1804,9 @@ struct CodeGenerator::Impl {
         if (auto id = target->asIdent()) targetIdentSym = symbolOf(id->node);
         bool isBorrowModeTarget = isClass && isClassBorrowMode(targetIdentSym);
 
+        Symbol* moveSrc = (isClass && !isBorrowModeTarget && !isWeakField)
+            ? moveSourceSymbol(*value) : nullptr;
+
         llvm::Value* lv = emitLValue(*target);
         if (!lv) return nullptr;
         llvm::Value* val = emitExpr(*value);
@@ -1785,6 +1823,15 @@ struct CodeGenerator::Impl {
                 builder->CreateCall(getOrDefineEnsRelease(), { val });
             }
         } else if (isBorrowModeTarget) {
+            builder->CreateStore(val, lv);
+        } else if (moveSrc) {
+            auto* ptrTy = llvm::PointerType::get(ctx, 0);
+            auto it = values.find(moveSrc);
+            if (it != values.end()) {
+                builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), it->second);
+            }
+            llvm::Value* old = builder->CreateLoad(ptrTy, lv);
+            builder->CreateCall(getOrDefineEnsRelease(), { old });
             builder->CreateStore(val, lv);
         } else if (isClass) {
             if (borrowedSource) {
