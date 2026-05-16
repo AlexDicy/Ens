@@ -518,7 +518,7 @@ struct CodeGenerator::Impl {
                                                                   asAscii(*fname) + ".addr");
                 llvm::Value* paramVal = builder->CreateLoad(mapType(psym->type), values[psym]);
                 if (isReferenceType(psym->type)) {
-                    builder->CreateCall(getOrDefineEnsRetain(), { paramVal });
+                    emitRetain(paramVal);
                 }
                 builder->CreateStore(paramVal, fieldAddr);
                 if (structHasClassFields(psym->type)) {
@@ -582,6 +582,28 @@ struct CodeGenerator::Impl {
         currentDIScope = prev;
     }
 
+    void emitRetain(llvm::Value* val) {
+        if (!val || llvm::isa<llvm::ConstantPointerNull>(val)) return;
+        builder->CreateCall(getOrDefineEnsRetain(), { val });
+    }
+
+    void emitRelease(llvm::Value* val) {
+        if (!val || llvm::isa<llvm::ConstantPointerNull>(val)) return;
+        builder->CreateCall(getOrDefineEnsRelease(), { val });
+    }
+
+    llvm::Value* emitWeakInit(llvm::Value* val) {
+        if (!val || llvm::isa<llvm::ConstantPointerNull>(val)) {
+            return llvm::ConstantPointerNull::get(llvm::PointerType::get(ctx, 0));
+        }
+        return builder->CreateCall(getOrDefineEnsWeakInit(), { val });
+    }
+
+    void emitWeakRelease(llvm::Value* val) {
+        if (!val || llvm::isa<llvm::ConstantPointerNull>(val)) return;
+        builder->CreateCall(getOrDefineEnsWeakRelease(), { val });
+    }
+
     bool classLetCanBorrow(Symbol* lhs, const ast::Expression& init) {
         if (!lhs || !isReferenceType(lhs->type)) return false;
         if (lhs->localEscape != EscapeKind::NoEscape) return false;
@@ -604,6 +626,26 @@ struct CodeGenerator::Impl {
         if (!isReferenceType(sym->type)) return false;
         if (sym->localEscape != EscapeKind::NoEscape) return false;
         if (!sym->allAssignsFromParam) return false;
+        return true;
+    }
+
+    bool isStructBorrowMode(Symbol* sym, const ast::Expression& init) {
+        if (!sym || sym->kind != SymbolKind::Variable) return false;
+        if (!structHasClassFields(sym->type)) return false;
+        if (sym->localEscape != EscapeKind::NoEscape) return false;
+        if (sym->reassigned) return false;
+        if (sym->structFieldsMutated) return false;
+        auto id = init.asIdent();
+        if (!id) {
+            if (auto p = init.asParen()) {
+                if (auto inner = p->inner()) return isStructBorrowMode(sym, *inner);
+            }
+            return false;
+        }
+        Symbol* src = symbolOf(id->node);
+        if (!src) return false;
+        if (!structHasClassFields(src->type)) return false;
+        if (src->reassigned) return false;
         return true;
     }
 
@@ -636,13 +678,15 @@ struct CodeGenerator::Impl {
         values[sym] = alloca;
 
         bool elideClassRetain = false;
+        bool elideStructRetain = false;
         if (auto init = s.initializer()) {
             elideClassRetain = classLetCanBorrow(sym, *init);
+            elideStructRetain = isStructBorrowMode(sym, *init);
         }
         if (!elideClassRetain && isClassBorrowMode(sym)) {
             elideClassRetain = true;
         }
-        if (!elideClassRetain) {
+        if (!elideClassRetain && !elideStructRetain) {
             registerOwnedLocal(alloca, sym->type);
         }
 
@@ -667,12 +711,12 @@ struct CodeGenerator::Impl {
             Symbol* moveSrc = !elideClassRetain && isReferenceType(sym->type)
                 ? moveSourceSymbol(*init) : nullptr;
             bool needsClassRetain = isReferenceType(sym->type) && borrowedSource && !elideClassRetain && !moveSrc;
-            bool needsStructRetain = structHasClassFields(sym->type) && borrowedSource;
+            bool needsStructRetain = structHasClassFields(sym->type) && borrowedSource && !elideStructRetain;
             llvm::Value* v = emitExpr(*init);
             if (v) {
                 setLocationFromNode(s.node);
                 if (needsClassRetain) {
-                    builder->CreateCall(getOrDefineEnsRetain(), { v });
+                    emitRetain(v);
                 }
                 builder->CreateStore(v, alloca);
                 if (moveSrc) {
@@ -708,10 +752,12 @@ struct CodeGenerator::Impl {
         values[sym] = alloca;
 
         bool elideClassRetain = false;
+        bool elideStructRetain = false;
         if (auto init = s.initializer()) {
             elideClassRetain = classLetCanBorrow(sym, *init);
+            elideStructRetain = isStructBorrowMode(sym, *init);
         }
-        if (!elideClassRetain) {
+        if (!elideClassRetain && !elideStructRetain) {
             registerOwnedLocal(alloca, sym->type);
         }
 
@@ -736,11 +782,11 @@ struct CodeGenerator::Impl {
             Symbol* moveSrc = !elideClassRetain && isReferenceType(sym->type)
                 ? moveSourceSymbol(*init) : nullptr;
             bool needsClassRetain = isReferenceType(sym->type) && borrowedSource && !elideClassRetain && !moveSrc;
-            bool needsStructRetain = structHasClassFields(sym->type) && borrowedSource;
+            bool needsStructRetain = structHasClassFields(sym->type) && borrowedSource && !elideStructRetain;
             llvm::Value* v = emitExpr(*init);
             if (v) {
                 if (needsClassRetain) {
-                    builder->CreateCall(getOrDefineEnsRetain(), { v });
+                    emitRetain(v);
                 }
                 builder->CreateStore(v, alloca);
                 if (moveSrc) {
@@ -848,7 +894,7 @@ struct CodeGenerator::Impl {
             if (!val) { builder->CreateUnreachable(); return; }
 
             if (needsClassRetain) {
-                builder->CreateCall(getOrDefineEnsRetain(), { val });
+                emitRetain(val);
             } else if (needsStructRetain) {
                 emitStructFieldRetainOnValue(retType, val);
             }
@@ -1814,13 +1860,13 @@ struct CodeGenerator::Impl {
 
         if (isWeakField) {
             auto* ptrTy = llvm::PointerType::get(ctx, 0);
-            llvm::Value* newSt = builder->CreateCall(getOrDefineEnsWeakInit(), { val });
+            llvm::Value* newSt = emitWeakInit(val);
             llvm::Value* oldSt = builder->CreateLoad(ptrTy, lv);
-            builder->CreateCall(getOrDefineEnsWeakRelease(), { oldSt });
+            emitWeakRelease(oldSt);
             builder->CreateStore(newSt, lv);
             // If RHS produced a fresh +1 (e.g., new T() or a call), release it. Weak doesn't retain strong ownership.
             if (!borrowedSource) {
-                builder->CreateCall(getOrDefineEnsRelease(), { val });
+                emitRelease(val);
             }
         } else if (isBorrowModeTarget) {
             builder->CreateStore(val, lv);
@@ -1831,15 +1877,15 @@ struct CodeGenerator::Impl {
                 builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), it->second);
             }
             llvm::Value* old = builder->CreateLoad(ptrTy, lv);
-            builder->CreateCall(getOrDefineEnsRelease(), { old });
+            emitRelease(old);
             builder->CreateStore(val, lv);
         } else if (isClass) {
             if (borrowedSource) {
-                builder->CreateCall(getOrDefineEnsRetain(), { val });
+                emitRetain(val);
             }
             auto* ptrTy = llvm::PointerType::get(ctx, 0);
             llvm::Value* old = builder->CreateLoad(ptrTy, lv);
-            builder->CreateCall(getOrDefineEnsRelease(), { old });
+            emitRelease(old);
             builder->CreateStore(val, lv);
         } else if (isStructWithClass) {
             emitStructFieldRelease(targetType, lv);

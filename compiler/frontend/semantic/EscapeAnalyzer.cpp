@@ -164,10 +164,13 @@ void EscapeAnalyzer::scanAssign(const ast::AssignExpression& e) {
             if (auto rootId = cursor->asIdent()) {
                 auto* info = analysis.find(rootId->node.greenNode());
                 Symbol* s = info ? info->resolvedSymbol : nullptr;
-                // Mutation propagates through alias chain to any param root.
                 Symbol* root = aliasRoot(s);
                 int idx = paramIndexOfSymbol(root);
                 if (idx >= 0) markParamMutated(idx);
+                if (root && root->kind == SymbolKind::Variable && !root->structFieldsMutated) {
+                    root->structFieldsMutated = true;
+                    changedThisIteration = true;
+                }
             }
         }
         markEscapeIfRef(*value);
