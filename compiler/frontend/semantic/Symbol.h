@@ -7,6 +7,19 @@ class GreenElement;
 
 enum class SymbolKind { Variable, Parameter, Function, Namespace };
 
+enum class EscapeKind : unsigned char {
+    Unknown,
+    NoEscape,
+    Escape,
+};
+
+struct ParamEscapeInfo {
+    std::vector<EscapeKind> params;
+    std::vector<bool> paramMutated;
+    EscapeKind returnEscape = EscapeKind::Unknown;
+    bool analyzed = false;
+};
+
 class Symbol {
 public:
     SymbolKind kind;
@@ -21,6 +34,8 @@ public:
     const GreenElement* funcDeclCst = nullptr;
 
     std::u16string namespaceModulePath;
+
+    ParamEscapeInfo escapeInfo;
 
     Symbol(SymbolKind k, std::u16string n, Type* t, int l, int c)
         : kind(k), name(std::move(n)), type(t), line(l), column(c) {}

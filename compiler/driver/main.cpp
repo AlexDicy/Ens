@@ -42,17 +42,19 @@ static bool execute(const std::unordered_map<std::string, std::string>& argument
         throw std::invalid_argument("The specified output is a directory; please specify a file path");
     }
 
+    bool explainArc = arguments.count("--explain-arc") > 0;
+
     if (arguments.count("--source")) {
         fs::path source = arguments.at("--source");
         fs::path sourcePath = fs::is_directory(source) ? source : source.parent_path();
-        return Compiler::compile(source, outputFile, sourcePath);
+        return Compiler::compile(source, outputFile, sourcePath, explainArc);
     } else {
-        return Compiler::compileSingle(std::cin, outputFile);
+        return Compiler::compileSingle(std::cin, outputFile, "<stdin>", explainArc);
     }
 }
 
 static bool isBooleanFlag(const std::string& arg) {
-    return arg == "-h" || arg == "--help" || arg == "--cst-dump" || arg == "--cst-analyze";
+    return arg == "-h" || arg == "--help" || arg == "--cst-dump" || arg == "--cst-analyze" || arg == "--explain-arc";
 }
 
 static std::unordered_map<std::string, std::string> parseArguments(int argc, char* argv[]) {

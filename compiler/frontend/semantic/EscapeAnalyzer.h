@@ -1,0 +1,57 @@
+#pragma once
+
+#include "../ast/Declaration.h"
+#include "../ast/Expression.h"
+#include "../ast/Statement.h"
+#include "AnalysisResult.h"
+#include "Symbol.h"
+
+class EscapeAnalyzer {
+public:
+    EscapeAnalyzer(const ast::SourceFile& sourceFile, const AnalysisResult& analysis);
+
+    // Single pass over the source file's functions. Returns true if any escape
+    // fact changed. Caller drives the fixpoint (allows cross-module convergence
+    // when multiple modules' facts depend on each other).
+    bool runOnce();
+
+    // Convergent fixpoint for single-module use.
+    void analyze() { while (runOnce()) {} }
+
+private:
+    const ast::SourceFile& sf;
+    const AnalysisResult& analysis;
+
+    Symbol* currentFn = nullptr;
+    std::vector<Symbol*> currentParams;
+    bool changedThisIteration = false;
+
+    void analyzeFunction(Symbol* fnSym, const ast::FuncDecl& fn);
+    void collectFunctionsOnce();
+
+    void scanStatement(const ast::Statement& s);
+    void scanBlock(const ast::Block& b);
+    void scanLetStmt(const ast::LetStatement& s);
+    void scanTypedVarDecl(const ast::TypedVarDeclStatement& s);
+    void scanIf(const ast::IfStatement& s);
+    void scanWhile(const ast::WhileStatement& s);
+    void scanReturn(const ast::ReturnStatement& s);
+    void scanExprStmt(const ast::ExpressionStatement& s);
+
+    void scanExpression(const ast::Expression& e);
+    void scanIdent(const ast::IdentExpression& e);
+    void scanAssign(const ast::AssignExpression& e);
+    void scanCall(const ast::CallExpression& e);
+    void scanMember(const ast::MemberExpression& e);
+    void scanBinary(const ast::BinaryExpression& e);
+    void scanTernary(const ast::TernaryExpression& e);
+    void scanParen(const ast::ParenExpression& e);
+    void scanNew(const ast::NewExpression& e);
+
+    int paramIndexOfSymbol(Symbol* sym) const;
+    void markEscape(int paramIdx);
+    void markMutated(int paramIdx);
+
+    // Mark each parameter referenced by `e` (as an alias source or direct ref) as Escape.
+    void markEscapeIfParamRef(const ast::Expression& e);
+};

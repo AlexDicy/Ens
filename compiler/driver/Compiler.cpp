@@ -8,6 +8,9 @@
 #include "diagnostics/SourceFile.h"
 #include "parser/Parser.h"
 #include "semantic/Analyzer.h"
+#include "semantic/EscapeAnalyzer.h"
+#include "semantic/Symbol.h"
+#include "semantic/Type.h"
 #include "semantic/TypeContext.h"
 
 #include <algorithm>
@@ -180,9 +183,71 @@ bool buildModuleGraph(const fs::path& sourceRoot,
     return true;
 }
 
+std::string escapeKindStr(EscapeKind k) {
+    switch (k) {
+        case EscapeKind::Unknown:  return "Unknown";
+        case EscapeKind::NoEscape: return "NoEscape";
+        case EscapeKind::Escape:   return "Escape";
+    }
+    return "?";
+}
+
+std::string asciiOfU16(const std::u16string& s) {
+    std::string r;
+    r.reserve(s.size());
+    for (char16_t c : s) r.push_back(c < 128 ? static_cast<char>(c) : '?');
+    return r;
+}
+
+void printEscapeFactsForFunction(Symbol* sym, std::ostream& os) {
+    if (!sym || !sym->escapeInfo.analyzed) return;
+    os << asciiOfU16(sym->name) << "(";
+    for (size_t i = 0; i < sym->paramTypes.size(); ++i) {
+        if (i > 0) os << ", ";
+        os << (sym->paramTypes[i] ? sym->paramTypes[i]->toString() : "<?>");
+    }
+    os << ")";
+    const auto& ei = sym->escapeInfo;
+    if (!ei.params.empty()) {
+        os << " — ";
+        for (size_t i = 0; i < ei.params.size(); ++i) {
+            if (i > 0) os << ", ";
+            os << "p" << i << "=" << escapeKindStr(ei.params[i]);
+            if (i < ei.paramMutated.size() && ei.paramMutated[i]) os << "(mut)";
+        }
+    }
+    os << "\n";
+}
+
+void printEscapeFacts(const std::vector<std::unique_ptr<Module>>& modules, std::ostream& os) {
+    os << "=== escape analysis ===\n";
+    for (auto& m : modules) {
+        auto sf = ast::SourceFile::cast(*m->rootNode);
+        if (!sf) continue;
+        const auto& analysis = m->analyzer->result();
+        for (auto& fn : sf->functions()) {
+            auto* info = analysis.find(fn.node.greenNode());
+            if (info && info->resolvedSymbol) printEscapeFactsForFunction(info->resolvedSymbol, os);
+        }
+        for (auto& sd : sf->structs()) {
+            for (auto& mm : sd.methods()) {
+                auto* info = analysis.find(mm.node.greenNode());
+                if (info && info->resolvedSymbol) printEscapeFactsForFunction(info->resolvedSymbol, os);
+            }
+        }
+        for (auto& cd : sf->classes()) {
+            for (auto& mm : cd.methods()) {
+                auto* info = analysis.find(mm.node.greenNode());
+                if (info && info->resolvedSymbol) printEscapeFactsForFunction(info->resolvedSymbol, os);
+            }
+        }
+    }
+}
+
 bool runMultiModuleAnalysis(std::vector<std::unique_ptr<Module>>& modules,
                             std::unordered_map<std::u16string, Module*>& byPath,
-                            TypeContext& sharedCtx) {
+                            TypeContext& sharedCtx,
+                            bool explainArc) {
     for (auto& m : modules) {
         m->analyzer = std::make_unique<Analyzer>(*m->source, *m->sink, sharedCtx, m->modulePath);
         m->analyzer->collectDeclarations(*m->rootNode);
@@ -204,6 +269,32 @@ bool runMultiModuleAnalysis(std::vector<std::unique_ptr<Module>>& modules,
             ok = false;
         }
     }
+    if (!ok) return false;
+
+    // Escape analysis across all modules. Cross-module calls propagate facts
+    // via shared Symbol*; loop until no module's facts changed in a pass.
+    std::vector<std::optional<ast::SourceFile>> moduleSourceFiles;
+    moduleSourceFiles.reserve(modules.size());
+    std::vector<EscapeAnalyzer> escapeAnalyzers;
+    escapeAnalyzers.reserve(modules.size());
+    for (auto& m : modules) {
+        auto sf = ast::SourceFile::cast(*m->rootNode);
+        if (!sf) continue;
+        moduleSourceFiles.push_back(*sf);
+        escapeAnalyzers.emplace_back(*moduleSourceFiles.back(), m->analyzer->result());
+    }
+    bool anyChanged;
+    do {
+        anyChanged = false;
+        for (auto& ea : escapeAnalyzers) {
+            if (ea.runOnce()) anyChanged = true;
+        }
+    } while (anyChanged);
+
+    if (explainArc) {
+        printEscapeFacts(modules, std::cerr);
+    }
+
     return ok;
 }
 
@@ -227,7 +318,8 @@ bool emitModule(Module& module,
 
 bool Compiler::compile(const fs::path& source,
                        const fs::path& outputFolder,
-                       const fs::path& /*sourcePath*/) {
+                       const fs::path& /*sourcePath*/,
+                       bool explainArc) {
     fs::path sourceRoot = fs::is_directory(source) ? source : source.parent_path();
 
     std::deque<fs::path> seeds;
@@ -253,7 +345,7 @@ bool Compiler::compile(const fs::path& source,
     if (!buildModuleGraph(sourceRoot, seeds, modules, byPath)) return false;
 
     TypeContext sharedCtx;
-    if (!runMultiModuleAnalysis(modules, byPath, sharedCtx)) return false;
+    if (!runMultiModuleAnalysis(modules, byPath, sharedCtx, explainArc)) return false;
 
     std::string ext = outputFolder.extension().string();
     for (auto& c : ext) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
@@ -418,7 +510,7 @@ bool Compiler::analyzeCst(std::istream& source, const std::string& filename) {
     return !sink.hasErrors();
 }
 
-bool Compiler::compileSingle(std::istream& source, const fs::path& outputFile, const std::string& filename) {
+bool Compiler::compileSingle(std::istream& source, const fs::path& outputFile, const std::string& filename, bool explainArc) {
     std::string code((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
     std::u16string u16code(code.begin(), code.end());
     SourceFile sourceFile(filename, std::move(u16code));
@@ -434,6 +526,30 @@ bool Compiler::compileSingle(std::istream& source, const fs::path& outputFile, c
     if (sink.hasErrors()) {
         sink.printAll(sourceFile, std::cerr);
         return false;
+    }
+
+    if (auto sf = ast::SourceFile::cast(*rootNode)) {
+        EscapeAnalyzer ea(*sf, analyzer.result());
+        ea.analyze();
+        if (explainArc) {
+            std::cerr << "=== escape analysis ===\n";
+            for (auto& fn : sf->functions()) {
+                auto* info = analyzer.result().find(fn.node.greenNode());
+                if (info && info->resolvedSymbol) printEscapeFactsForFunction(info->resolvedSymbol, std::cerr);
+            }
+            for (auto& sd : sf->structs()) {
+                for (auto& mm : sd.methods()) {
+                    auto* info = analyzer.result().find(mm.node.greenNode());
+                    if (info && info->resolvedSymbol) printEscapeFactsForFunction(info->resolvedSymbol, std::cerr);
+                }
+            }
+            for (auto& cd : sf->classes()) {
+                for (auto& mm : cd.methods()) {
+                    auto* info = analyzer.result().find(mm.node.greenNode());
+                    if (info && info->resolvedSymbol) printEscapeFactsForFunction(info->resolvedSymbol, std::cerr);
+                }
+            }
+        }
     }
 
     std::string ext = outputFile.extension().string();
