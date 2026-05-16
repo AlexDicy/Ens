@@ -125,7 +125,12 @@ struct CodeGenerator::Impl {
         }
     }
 
-    bool isReferenceType(::Type* t) { return t && t->kind == TypeKind::Class; }
+    bool isReferenceType(::Type* t) {
+        if (!t) return false;
+        if (t->kind == TypeKind::Class) return true;
+        if (t->kind == TypeKind::Optional && t->inner && t->inner->isClass()) return true;
+        return false;
+    }
 
     llvm::Type* mapType(::Type* t) {
         if (!t) return llvm::Type::getVoidTy(ctx);
@@ -1417,7 +1422,7 @@ struct CodeGenerator::Impl {
         bool hasOwning = false;
         for (auto& f : t->structInfo->fields) {
             if (!f.type) continue;
-            if (f.isWeak || f.type->isClass() || structHasClassFields(f.type)) {
+            if (f.isWeak || isReferenceType(f.type) || structHasClassFields(f.type)) {
                 hasOwning = true;
                 break;
             }
@@ -1469,7 +1474,7 @@ struct CodeGenerator::Impl {
     bool structHasClassFields(::Type* t) {
         if (!t || !t->isStruct() || !t->structInfo) return false;
         for (auto& f : t->structInfo->fields) {
-            if (f.type && f.type->isClass()) return true;
+            if (isReferenceType(f.type)) return true;
         }
         return false;
     }
@@ -1482,7 +1487,7 @@ struct CodeGenerator::Impl {
         for (size_t i = 0; i < t->structInfo->fields.size(); ++i) {
             auto& f = t->structInfo->fields[i];
             if (!f.type) continue;
-            if (f.type->isClass()) {
+            if (isReferenceType(f.type)) {
                 llvm::Value* fieldAddr = builder->CreateStructGEP(layout, base, static_cast<unsigned>(i),
                                                                   asAscii(f.name) + ".addr");
                 llvm::Value* fieldVal = builder->CreateLoad(ptrTy, fieldAddr);
@@ -1501,7 +1506,7 @@ struct CodeGenerator::Impl {
         for (size_t i = 0; i < t->structInfo->fields.size(); ++i) {
             auto& f = t->structInfo->fields[i];
             if (!f.type) continue;
-            if (f.type->isClass()) {
+            if (isReferenceType(f.type)) {
                 llvm::Value* fieldVal = builder->CreateExtractValue(aggVal, { static_cast<unsigned>(i) });
                 builder->CreateCall(retainFn, { fieldVal });
             } else if (structHasClassFields(f.type)) {
@@ -1525,7 +1530,7 @@ struct CodeGenerator::Impl {
                                                                   asAscii(f.name) + ".addr");
                 llvm::Value* fieldVal = builder->CreateLoad(ptrTy, fieldAddr);
                 builder->CreateCall(weakReleaseFn, { fieldVal });
-            } else if (f.type->isClass()) {
+            } else if (isReferenceType(f.type)) {
                 llvm::Value* fieldAddr = builder->CreateStructGEP(layout, base, static_cast<unsigned>(i),
                                                                   asAscii(f.name) + ".addr");
                 llvm::Value* fieldVal = builder->CreateLoad(ptrTy, fieldAddr);
