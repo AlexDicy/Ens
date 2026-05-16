@@ -112,9 +112,43 @@ void Analyzer::collectDeclarations(const SyntaxNode& root) {
     if (!sf) return;
     astRoot = sf;
 
+    registerStructNames(*sf);
+    registerClassNames(*sf);
     collectStructs(*sf);
     collectClasses(*sf);
     collectFunctions(*sf);
+}
+
+void Analyzer::registerStructNames(const ast::SourceFile& file) {
+    for (auto& sd : file.structs()) {
+        auto name = sd.nameText();
+        if (!name) continue;
+        if (typeCtx.lookupNamedType(modulePath_, *name)) {
+            errorAtNode(sd.node, "Duplicate type '" + asciiOf(*name) + "'");
+            continue;
+        }
+        Type* t = typeCtx.registerStruct(modulePath_, *name);
+        auto [line, col] = source.offsetToPosition(sd.node.startOffset());
+        t->structInfo->line = line;
+        t->structInfo->column = col;
+        analysis.setType(sd.node.greenNode(), t);
+    }
+}
+
+void Analyzer::registerClassNames(const ast::SourceFile& file) {
+    for (auto& cd : file.classes()) {
+        auto name = cd.nameText();
+        if (!name) continue;
+        if (typeCtx.lookupNamedType(modulePath_, *name)) {
+            errorAtNode(cd.node, "Duplicate type '" + asciiOf(*name) + "'");
+            continue;
+        }
+        Type* t = typeCtx.registerClass(modulePath_, *name);
+        auto [line, col] = source.offsetToPosition(cd.node.startOffset());
+        t->structInfo->line = line;
+        t->structInfo->column = col;
+        analysis.setType(cd.node.greenNode(), t);
+    }
 }
 
 void Analyzer::bindImports(const ModuleResolver& resolver) {
@@ -194,20 +228,6 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
     auto structs = file.structs();
 
     for (auto& sd : structs) {
-        auto name = sd.nameText();
-        if (!name) continue;
-        if (typeCtx.lookupNamedType(modulePath_, *name)) {
-            errorAtNode(sd.node, "Duplicate type '" + asciiOf(*name) + "'");
-            continue;
-        }
-        Type* t = typeCtx.registerStruct(modulePath_, *name);
-        auto [line, col] = source.offsetToPosition(sd.node.startOffset());
-        t->structInfo->line = line;
-        t->structInfo->column = col;
-        analysis.setType(sd.node.greenNode(), t);
-    }
-
-    for (auto& sd : structs) {
         Type* t = analysis.typeOf(sd.node.greenNode());
         if (!t) continue;
         for (auto& f : sd.fields()) {
@@ -253,20 +273,6 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
 
 void Analyzer::collectClasses(const ast::SourceFile& file) {
     auto classes = file.classes();
-
-    for (auto& cd : classes) {
-        auto name = cd.nameText();
-        if (!name) continue;
-        if (typeCtx.lookupNamedType(modulePath_, *name)) {
-            errorAtNode(cd.node, "Duplicate type '" + asciiOf(*name) + "'");
-            continue;
-        }
-        Type* t = typeCtx.registerClass(modulePath_, *name);
-        auto [line, col] = source.offsetToPosition(cd.node.startOffset());
-        t->structInfo->line = line;
-        t->structInfo->column = col;
-        analysis.setType(cd.node.greenNode(), t);
-    }
 
     for (auto& cd : classes) {
         Type* t = analysis.typeOf(cd.node.greenNode());

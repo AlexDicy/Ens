@@ -86,6 +86,8 @@ private:
     void errorAtNode(const SyntaxNode& node, std::string message);
 
     // === Collect phase ===
+    void registerStructNames(const ast::SourceFile& file);
+    void registerClassNames(const ast::SourceFile& file);
     void collectStructs(const ast::SourceFile& file);
     void collectClasses(const ast::SourceFile& file);
     void collectFunctions(const ast::SourceFile& file);
