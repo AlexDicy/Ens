@@ -462,6 +462,9 @@ struct CodeGenerator::Impl {
                 llvm::Value* fieldAddr = builder->CreateStructGEP(st, thisVal, static_cast<unsigned>(idx),
                                                                   asAscii(*fname) + ".addr");
                 llvm::Value* paramVal = builder->CreateLoad(mapType(psym->type), values[psym]);
+                if (isReferenceType(psym->type)) {
+                    builder->CreateCall(getOrDefineEnsRetain(), { paramVal });
+                }
                 builder->CreateStore(paramVal, fieldAddr);
             }
         }
@@ -553,9 +556,13 @@ struct CodeGenerator::Impl {
 
         if (auto init = s.initializer()) {
             setLocationFromNode(s.node);
+            bool needsRetain = isReferenceType(sym->type) && !expressionProducesOwnedRef(*init);
             llvm::Value* v = emitExpr(*init);
             if (v) {
                 setLocationFromNode(s.node);
+                if (needsRetain) {
+                    builder->CreateCall(getOrDefineEnsRetain(), { v });
+                }
                 builder->CreateStore(v, alloca);
             }
         } else if (isReferenceType(sym->type)) {
@@ -594,8 +601,14 @@ struct CodeGenerator::Impl {
 
         if (auto init = s.initializer()) {
             setLocationFromNode(s.node);
+            bool needsRetain = isReferenceType(sym->type) && !expressionProducesOwnedRef(*init);
             llvm::Value* v = emitExpr(*init);
-            if (v) builder->CreateStore(v, alloca);
+            if (v) {
+                if (needsRetain) {
+                    builder->CreateCall(getOrDefineEnsRetain(), { v });
+                }
+                builder->CreateStore(v, alloca);
+            }
         } else if (sym->type && sym->type->isStruct() && sym->type->structInfo) {
             setLocationFromNode(s.node);
             initStructFieldDefaults(sym->type, alloca);
@@ -671,7 +684,7 @@ struct CodeGenerator::Impl {
     void emitReturnStmt(const ast::ReturnStatement& s) {
         if (auto v = s.value()) {
             ::Type* retType = typeOf(v->node);
-            bool needsRetain = isReferenceType(retType) && !v->asNew() && !v->asCall();
+            bool needsRetain = isReferenceType(retType) && !expressionProducesOwnedRef(*v);
 
             llvm::Value* val = emitExpr(*v);
             if (!val) { builder->CreateUnreachable(); return; }
@@ -910,6 +923,15 @@ struct CodeGenerator::Impl {
         return llvm::Function::Create(ty, llvm::Function::ExternalLinkage, "malloc", module.get());
     }
 
+    llvm::Function* getOrDeclareCalloc() {
+        if (auto* existing = module->getFunction("calloc")) return existing;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* ty = llvm::FunctionType::get(
+            llvm::PointerType::get(ctx, 0),
+            { i64Ty, i64Ty }, false);
+        return llvm::Function::Create(ty, llvm::Function::ExternalLinkage, "calloc", module.get());
+    }
+
     llvm::Function* getOrDeclareFree() {
         if (auto* existing = module->getFunction("free")) return existing;
         auto* ty = llvm::FunctionType::get(
@@ -933,7 +955,8 @@ struct CodeGenerator::Impl {
 
         builder->SetInsertPoint(entry);
         llvm::Value* total = builder->CreateAdd(fn->getArg(0), llvm::ConstantInt::get(i64Ty, 8));
-        llvm::Value* header = builder->CreateCall(getOrDeclareMalloc(), { total });
+        llvm::Value* header = builder->CreateCall(getOrDeclareCalloc(),
+            { llvm::ConstantInt::get(i64Ty, 1), total });
         llvm::Value* isNull = builder->CreateICmpEQ(header, llvm::ConstantPointerNull::get(ptrTy));
         builder->CreateCondBr(isNull, nullBB, initBB);
 
@@ -1026,6 +1049,14 @@ struct CodeGenerator::Impl {
 
         builder->restoreIP(savedIP);
         return fn;
+    }
+
+    bool expressionProducesOwnedRef(const ast::Expression& e) {
+        if (e.asNew() || e.asCall()) return true;
+        if (auto p = e.asParen()) {
+            if (auto inner = p->inner()) return expressionProducesOwnedRef(*inner);
+        }
+        return false;
     }
 
     void registerOwnedLocal(llvm::Value* alloca, ::Type* type) {
@@ -1177,10 +1208,24 @@ struct CodeGenerator::Impl {
         auto target = e.target();
         auto value = e.value();
         if (!target || !value) return nullptr;
+
+        ::Type* targetType = typeOf(target->node);
+        bool isClass = isReferenceType(targetType);
+        bool needsRetain = isClass && !expressionProducesOwnedRef(*value);
+
         llvm::Value* lv = emitLValue(*target);
         if (!lv) return nullptr;
         llvm::Value* val = emitExpr(*value);
         if (!val) return nullptr;
+
+        if (needsRetain) {
+            builder->CreateCall(getOrDefineEnsRetain(), { val });
+        }
+        if (isClass) {
+            auto* ptrTy = llvm::PointerType::get(ctx, 0);
+            llvm::Value* old = builder->CreateLoad(ptrTy, lv);
+            builder->CreateCall(getOrDefineEnsRelease(), { old });
+        }
         builder->CreateStore(val, lv);
         return val;
     }
