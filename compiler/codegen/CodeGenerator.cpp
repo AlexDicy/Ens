@@ -944,7 +944,7 @@ struct CodeGenerator::Impl {
         if (auto* existing = module->getFunction("ens_alloc")) return existing;
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         auto* i64Ty = llvm::Type::getInt64Ty(ctx);
-        auto* fnTy = llvm::FunctionType::get(ptrTy, { i64Ty }, false);
+        auto* fnTy = llvm::FunctionType::get(ptrTy, { i64Ty, ptrTy }, false);
         auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "ens_alloc", module.get());
         fn->addFnAttr(llvm::Attribute::NoUnwind);
 
@@ -954,7 +954,7 @@ struct CodeGenerator::Impl {
         auto* initBB = llvm::BasicBlock::Create(ctx, "alloc.init", fn);
 
         builder->SetInsertPoint(entry);
-        llvm::Value* total = builder->CreateAdd(fn->getArg(0), llvm::ConstantInt::get(i64Ty, 8));
+        llvm::Value* total = builder->CreateAdd(fn->getArg(0), llvm::ConstantInt::get(i64Ty, 16));
         llvm::Value* header = builder->CreateCall(getOrDeclareCalloc(),
             { llvm::ConstantInt::get(i64Ty, 1), total });
         llvm::Value* isNull = builder->CreateICmpEQ(header, llvm::ConstantPointerNull::get(ptrTy));
@@ -965,8 +965,11 @@ struct CodeGenerator::Impl {
 
         builder->SetInsertPoint(initBB);
         builder->CreateStore(llvm::ConstantInt::get(i64Ty, 1), header);
-        llvm::Value* payload = builder->CreateGEP(
+        llvm::Value* dtorSlot = builder->CreateGEP(
             llvm::Type::getInt8Ty(ctx), header, llvm::ConstantInt::get(i64Ty, 8));
+        builder->CreateStore(fn->getArg(1), dtorSlot);
+        llvm::Value* payload = builder->CreateGEP(
+            llvm::Type::getInt8Ty(ctx), header, llvm::ConstantInt::get(i64Ty, 16));
         builder->CreateRet(payload);
 
         builder->restoreIP(savedIP);
@@ -994,7 +997,7 @@ struct CodeGenerator::Impl {
 
         builder->SetInsertPoint(bumpBB);
         llvm::Value* header = builder->CreateGEP(
-            llvm::Type::getInt8Ty(ctx), obj, llvm::ConstantInt::getSigned(i64Ty, -8));
+            llvm::Type::getInt8Ty(ctx), obj, llvm::ConstantInt::getSigned(i64Ty, -16));
         builder->CreateAtomicRMW(
             llvm::AtomicRMWInst::Add, header,
             llvm::ConstantInt::get(i64Ty, 1),
@@ -1015,12 +1018,13 @@ struct CodeGenerator::Impl {
         auto* i64Ty = llvm::Type::getInt64Ty(ctx);
         auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), { ptrTy }, false);
         auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "ens_release", module.get());
-        fn->addFnAttr(llvm::Attribute::AlwaysInline);
         fn->addFnAttr(llvm::Attribute::NoUnwind);
 
         auto savedIP = builder->saveIP();
         auto* entry  = llvm::BasicBlock::Create(ctx, "entry", fn);
         auto* decBB  = llvm::BasicBlock::Create(ctx, "release.dec", fn);
+        auto* dtorBB = llvm::BasicBlock::Create(ctx, "release.dtor", fn);
+        auto* callBB = llvm::BasicBlock::Create(ctx, "release.dtor.call", fn);
         auto* freeBB = llvm::BasicBlock::Create(ctx, "release.free", fn);
         auto* doneBB = llvm::BasicBlock::Create(ctx, "release.done", fn);
 
@@ -1031,20 +1035,70 @@ struct CodeGenerator::Impl {
 
         builder->SetInsertPoint(decBB);
         llvm::Value* header = builder->CreateGEP(
-            llvm::Type::getInt8Ty(ctx), obj, llvm::ConstantInt::getSigned(i64Ty, -8));
+            llvm::Type::getInt8Ty(ctx), obj, llvm::ConstantInt::getSigned(i64Ty, -16));
         llvm::Value* prev = builder->CreateAtomicRMW(
             llvm::AtomicRMWInst::Sub, header,
             llvm::ConstantInt::get(i64Ty, 1),
             llvm::MaybeAlign(8),
             llvm::AtomicOrdering::AcquireRelease);
         llvm::Value* isLast = builder->CreateICmpEQ(prev, llvm::ConstantInt::get(i64Ty, 1));
-        builder->CreateCondBr(isLast, freeBB, doneBB);
+        builder->CreateCondBr(isLast, dtorBB, doneBB);
+
+        builder->SetInsertPoint(dtorBB);
+        llvm::Value* dtorSlot = builder->CreateGEP(
+            llvm::Type::getInt8Ty(ctx), obj, llvm::ConstantInt::getSigned(i64Ty, -8));
+        llvm::Value* dtorFn = builder->CreateLoad(ptrTy, dtorSlot);
+        llvm::Value* dtorIsNull = builder->CreateICmpEQ(dtorFn, llvm::ConstantPointerNull::get(ptrTy));
+        builder->CreateCondBr(dtorIsNull, freeBB, callBB);
+
+        builder->SetInsertPoint(callBB);
+        auto* dtorTy = llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), { ptrTy }, false);
+        builder->CreateCall(dtorTy, dtorFn, { obj });
+        builder->CreateBr(freeBB);
 
         builder->SetInsertPoint(freeBB);
         builder->CreateCall(getOrDeclareFree(), { header });
         builder->CreateBr(doneBB);
 
         builder->SetInsertPoint(doneBB);
+        builder->CreateRetVoid();
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    llvm::Value* getOrEmitClassDtor(::Type* t) {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        if (!t || !t->structInfo) return llvm::ConstantPointerNull::get(ptrTy);
+
+        bool hasClassField = false;
+        for (auto& f : t->structInfo->fields) {
+            if (f.type && f.type->isClass()) { hasClassField = true; break; }
+        }
+        if (!hasClassField) return llvm::ConstantPointerNull::get(ptrTy);
+
+        std::string name = "_dtor_" + asAscii(t->structInfo->name);
+        if (auto* existing = module->getFunction(name)) return existing;
+
+        auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), { ptrTy }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, name, module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+
+        auto savedIP = builder->saveIP();
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        builder->SetInsertPoint(entry);
+
+        llvm::Value* obj = fn->getArg(0);
+        llvm::StructType* layout = mapStructType(t);
+        auto* releaseFn = getOrDefineEnsRelease();
+        for (size_t i = 0; i < t->structInfo->fields.size(); ++i) {
+            auto& f = t->structInfo->fields[i];
+            if (!f.type || !f.type->isClass()) continue;
+            llvm::Value* fieldAddr = builder->CreateStructGEP(layout, obj, static_cast<unsigned>(i),
+                                                              asAscii(f.name) + ".addr");
+            llvm::Value* fieldVal = builder->CreateLoad(ptrTy, fieldAddr);
+            builder->CreateCall(releaseFn, { fieldVal });
+        }
         builder->CreateRetVoid();
 
         builder->restoreIP(savedIP);
@@ -1117,7 +1171,8 @@ struct CodeGenerator::Impl {
 
         auto* allocFn = getOrDefineEnsAlloc();
         llvm::Value* sizeArg = llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), sizeBytes);
-        llvm::Value* heapPtr = builder->CreateCall(allocFn, {sizeArg},
+        llvm::Value* dtorArg = getOrEmitClassDtor(t);
+        llvm::Value* heapPtr = builder->CreateCall(allocFn, {sizeArg, dtorArg},
                                                     "new." + asAscii(t->structInfo->name));
 
         int ctorIdx = t->structInfo->findMethodIndex(t->structInfo->name);
