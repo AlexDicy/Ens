@@ -62,6 +62,7 @@ struct CodeGenerator::Impl {
 
     struct OwnedLocal {
         llvm::Value* alloca;
+        ::Type* type;
     };
     std::vector<std::vector<OwnedLocal>> cleanupStack;
 
@@ -416,6 +417,8 @@ struct CodeGenerator::Impl {
             ++argIter;
         }
 
+        cleanupStack.emplace_back();
+
         auto params = fn.parameters();
         for (size_t i = 0; i < params.size() && argIter != argEnd; ++i, ++argIter) {
             auto& param = params[i];
@@ -427,6 +430,11 @@ struct CodeGenerator::Impl {
             auto* alloca = createEntryAlloca(currentFunction, lt, pname);
             builder->CreateStore(&*argIter, alloca);
             values[psym] = alloca;
+
+            if (structHasClassFields(psym->type)) {
+                emitStructFieldRetain(psym->type, alloca);
+                cleanupStack.back().push_back({ alloca, psym->type });
+            }
 
             if (debugEnabled && diBuilder && sp) {
                 llvm::DIType* paramDIType = mapDIType(psym->type);
@@ -466,11 +474,13 @@ struct CodeGenerator::Impl {
                     builder->CreateCall(getOrDefineEnsRetain(), { paramVal });
                 }
                 builder->CreateStore(paramVal, fieldAddr);
+                if (structHasClassFields(psym->type)) {
+                    emitStructFieldRetain(psym->type, fieldAddr);
+                }
             }
         }
 
         // Body.
-        cleanupStack.emplace_back();
         if (auto body = fn.body()) {
             for (auto& s : body->statements()) {
                 emitStatement(s);
@@ -556,17 +566,24 @@ struct CodeGenerator::Impl {
 
         if (auto init = s.initializer()) {
             setLocationFromNode(s.node);
-            bool needsRetain = isReferenceType(sym->type) && !expressionProducesOwnedRef(*init);
+            bool borrowedSource = !expressionProducesOwnedRef(*init);
+            bool needsClassRetain = isReferenceType(sym->type) && borrowedSource;
+            bool needsStructRetain = structHasClassFields(sym->type) && borrowedSource;
             llvm::Value* v = emitExpr(*init);
             if (v) {
                 setLocationFromNode(s.node);
-                if (needsRetain) {
+                if (needsClassRetain) {
                     builder->CreateCall(getOrDefineEnsRetain(), { v });
                 }
                 builder->CreateStore(v, alloca);
+                if (needsStructRetain) {
+                    emitStructFieldRetain(sym->type, alloca);
+                }
             }
         } else if (isReferenceType(sym->type)) {
             builder->CreateStore(llvm::ConstantPointerNull::get(llvm::PointerType::get(ctx, 0)), alloca);
+        } else if (structHasClassFields(sym->type)) {
+            initStructFieldDefaults(sym->type, alloca);
         }
     }
 
@@ -601,13 +618,18 @@ struct CodeGenerator::Impl {
 
         if (auto init = s.initializer()) {
             setLocationFromNode(s.node);
-            bool needsRetain = isReferenceType(sym->type) && !expressionProducesOwnedRef(*init);
+            bool borrowedSource = !expressionProducesOwnedRef(*init);
+            bool needsClassRetain = isReferenceType(sym->type) && borrowedSource;
+            bool needsStructRetain = structHasClassFields(sym->type) && borrowedSource;
             llvm::Value* v = emitExpr(*init);
             if (v) {
-                if (needsRetain) {
+                if (needsClassRetain) {
                     builder->CreateCall(getOrDefineEnsRetain(), { v });
                 }
                 builder->CreateStore(v, alloca);
+                if (needsStructRetain) {
+                    emitStructFieldRetain(sym->type, alloca);
+                }
             }
         } else if (sym->type && sym->type->isStruct() && sym->type->structInfo) {
             setLocationFromNode(s.node);
@@ -620,22 +642,32 @@ struct CodeGenerator::Impl {
     void initStructFieldDefaults(::Type* t, llvm::Value* base) {
         if (!t || !t->structInfo) return;
         llvm::StructType* st = mapStructType(t);
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
         const auto& fields = t->structInfo->fields;
         for (size_t i = 0; i < fields.size(); ++i) {
             const auto& fi = fields[i];
-            if (!fi.declaration) continue;
-            auto fieldNode = SyntaxNode::makeRoot(fi.declaration);
-            auto fd = ast::FieldDecl::cast(*fieldNode);
-            if (!fd) continue;
-            auto dv = fd->defaultValue();
-            if (!dv) continue;
-            auto dvExpr = dv->expression();
-            if (!dvExpr) continue;
-            llvm::Value* v = emitExpr(*dvExpr);
-            if (!v) continue;
-            llvm::Value* fieldAddr = builder->CreateStructGEP(st, base, static_cast<unsigned>(i),
-                                                              asAscii(fi.name) + ".addr");
-            builder->CreateStore(v, fieldAddr);
+            bool wrote = false;
+            if (fi.declaration) {
+                auto fieldNode = SyntaxNode::makeRoot(fi.declaration);
+                auto fd = ast::FieldDecl::cast(*fieldNode);
+                if (fd) {
+                    if (auto dv = fd->defaultValue()) {
+                        if (auto dvExpr = dv->expression()) {
+                            if (llvm::Value* v = emitExpr(*dvExpr)) {
+                                llvm::Value* fieldAddr = builder->CreateStructGEP(
+                                    st, base, static_cast<unsigned>(i), asAscii(fi.name) + ".addr");
+                                builder->CreateStore(v, fieldAddr);
+                                wrote = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if (!wrote && fi.type && fi.type->isClass()) {
+                llvm::Value* fieldAddr = builder->CreateStructGEP(
+                    st, base, static_cast<unsigned>(i), asAscii(fi.name) + ".addr");
+                builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), fieldAddr);
+            }
         }
     }
 
@@ -684,13 +716,17 @@ struct CodeGenerator::Impl {
     void emitReturnStmt(const ast::ReturnStatement& s) {
         if (auto v = s.value()) {
             ::Type* retType = typeOf(v->node);
-            bool needsRetain = isReferenceType(retType) && !expressionProducesOwnedRef(*v);
+            bool borrowedSource = !expressionProducesOwnedRef(*v);
+            bool needsClassRetain = isReferenceType(retType) && borrowedSource;
+            bool needsStructRetain = structHasClassFields(retType) && borrowedSource;
 
             llvm::Value* val = emitExpr(*v);
             if (!val) { builder->CreateUnreachable(); return; }
 
-            if (needsRetain) {
+            if (needsClassRetain) {
                 builder->CreateCall(getOrDefineEnsRetain(), { val });
+            } else if (needsStructRetain) {
+                emitStructFieldRetainOnValue(retType, val);
             }
             emitFullCleanup();
             builder->CreateRet(val);
@@ -1071,11 +1107,14 @@ struct CodeGenerator::Impl {
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         if (!t || !t->structInfo) return llvm::ConstantPointerNull::get(ptrTy);
 
-        bool hasClassField = false;
+        bool hasOwning = false;
         for (auto& f : t->structInfo->fields) {
-            if (f.type && f.type->isClass()) { hasClassField = true; break; }
+            if (f.type && (f.type->isClass() || structHasClassFields(f.type))) {
+                hasOwning = true;
+                break;
+            }
         }
-        if (!hasClassField) return llvm::ConstantPointerNull::get(ptrTy);
+        if (!hasOwning) return llvm::ConstantPointerNull::get(ptrTy);
 
         std::string name = "_dtor_" + asAscii(t->structInfo->name);
         if (auto* existing = module->getFunction(name)) return existing;
@@ -1087,18 +1126,7 @@ struct CodeGenerator::Impl {
         auto savedIP = builder->saveIP();
         auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
         builder->SetInsertPoint(entry);
-
-        llvm::Value* obj = fn->getArg(0);
-        llvm::StructType* layout = mapStructType(t);
-        auto* releaseFn = getOrDefineEnsRelease();
-        for (size_t i = 0; i < t->structInfo->fields.size(); ++i) {
-            auto& f = t->structInfo->fields[i];
-            if (!f.type || !f.type->isClass()) continue;
-            llvm::Value* fieldAddr = builder->CreateStructGEP(layout, obj, static_cast<unsigned>(i),
-                                                              asAscii(f.name) + ".addr");
-            llvm::Value* fieldVal = builder->CreateLoad(ptrTy, fieldAddr);
-            builder->CreateCall(releaseFn, { fieldVal });
-        }
+        emitStructFieldRelease(t, fn->getArg(0));
         builder->CreateRetVoid();
 
         builder->restoreIP(savedIP);
@@ -1113,19 +1141,90 @@ struct CodeGenerator::Impl {
         return false;
     }
 
+    bool structHasClassFields(::Type* t) {
+        if (!t || !t->isStruct() || !t->structInfo) return false;
+        for (auto& f : t->structInfo->fields) {
+            if (f.type && f.type->isClass()) return true;
+        }
+        return false;
+    }
+
+    void emitStructFieldRetain(::Type* t, llvm::Value* base) {
+        if (!t || !t->structInfo) return;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        llvm::StructType* layout = mapStructType(t);
+        auto* retainFn = getOrDefineEnsRetain();
+        for (size_t i = 0; i < t->structInfo->fields.size(); ++i) {
+            auto& f = t->structInfo->fields[i];
+            if (!f.type) continue;
+            if (f.type->isClass()) {
+                llvm::Value* fieldAddr = builder->CreateStructGEP(layout, base, static_cast<unsigned>(i),
+                                                                  asAscii(f.name) + ".addr");
+                llvm::Value* fieldVal = builder->CreateLoad(ptrTy, fieldAddr);
+                builder->CreateCall(retainFn, { fieldVal });
+            } else if (structHasClassFields(f.type)) {
+                llvm::Value* fieldAddr = builder->CreateStructGEP(layout, base, static_cast<unsigned>(i),
+                                                                  asAscii(f.name) + ".addr");
+                emitStructFieldRetain(f.type, fieldAddr);
+            }
+        }
+    }
+
+    void emitStructFieldRetainOnValue(::Type* t, llvm::Value* aggVal) {
+        if (!t || !t->structInfo) return;
+        auto* retainFn = getOrDefineEnsRetain();
+        for (size_t i = 0; i < t->structInfo->fields.size(); ++i) {
+            auto& f = t->structInfo->fields[i];
+            if (!f.type) continue;
+            if (f.type->isClass()) {
+                llvm::Value* fieldVal = builder->CreateExtractValue(aggVal, { static_cast<unsigned>(i) });
+                builder->CreateCall(retainFn, { fieldVal });
+            } else if (structHasClassFields(f.type)) {
+                llvm::Value* sub = builder->CreateExtractValue(aggVal, { static_cast<unsigned>(i) });
+                emitStructFieldRetainOnValue(f.type, sub);
+            }
+        }
+    }
+
+    void emitStructFieldRelease(::Type* t, llvm::Value* base) {
+        if (!t || !t->structInfo) return;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        llvm::StructType* layout = mapStructType(t);
+        auto* releaseFn = getOrDefineEnsRelease();
+        for (size_t i = 0; i < t->structInfo->fields.size(); ++i) {
+            auto& f = t->structInfo->fields[i];
+            if (!f.type) continue;
+            if (f.type->isClass()) {
+                llvm::Value* fieldAddr = builder->CreateStructGEP(layout, base, static_cast<unsigned>(i),
+                                                                  asAscii(f.name) + ".addr");
+                llvm::Value* fieldVal = builder->CreateLoad(ptrTy, fieldAddr);
+                builder->CreateCall(releaseFn, { fieldVal });
+            } else if (structHasClassFields(f.type)) {
+                llvm::Value* fieldAddr = builder->CreateStructGEP(layout, base, static_cast<unsigned>(i),
+                                                                  asAscii(f.name) + ".addr");
+                emitStructFieldRelease(f.type, fieldAddr);
+            }
+        }
+    }
+
     void registerOwnedLocal(llvm::Value* alloca, ::Type* type) {
-        if (!isReferenceType(type)) return;
         if (cleanupStack.empty()) return;
-        cleanupStack.back().push_back({ alloca });
+        if (isReferenceType(type) || structHasClassFields(type)) {
+            cleanupStack.back().push_back({ alloca, type });
+        }
     }
 
     void emitFrameCleanup(const std::vector<OwnedLocal>& frame) {
         if (frame.empty()) return;
-        auto* releaseFn = getOrDefineEnsRelease();
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* releaseFn = getOrDefineEnsRelease();
         for (auto it = frame.rbegin(); it != frame.rend(); ++it) {
-            llvm::Value* val = builder->CreateLoad(ptrTy, it->alloca);
-            builder->CreateCall(releaseFn, { val });
+            if (isReferenceType(it->type)) {
+                llvm::Value* val = builder->CreateLoad(ptrTy, it->alloca);
+                builder->CreateCall(releaseFn, { val });
+            } else if (structHasClassFields(it->type)) {
+                emitStructFieldRelease(it->type, it->alloca);
+            }
         }
     }
 
@@ -1266,22 +1365,31 @@ struct CodeGenerator::Impl {
 
         ::Type* targetType = typeOf(target->node);
         bool isClass = isReferenceType(targetType);
-        bool needsRetain = isClass && !expressionProducesOwnedRef(*value);
+        bool isStructWithClass = structHasClassFields(targetType);
+        bool borrowedSource = !expressionProducesOwnedRef(*value);
 
         llvm::Value* lv = emitLValue(*target);
         if (!lv) return nullptr;
         llvm::Value* val = emitExpr(*value);
         if (!val) return nullptr;
 
-        if (needsRetain) {
-            builder->CreateCall(getOrDefineEnsRetain(), { val });
-        }
         if (isClass) {
+            if (borrowedSource) {
+                builder->CreateCall(getOrDefineEnsRetain(), { val });
+            }
             auto* ptrTy = llvm::PointerType::get(ctx, 0);
             llvm::Value* old = builder->CreateLoad(ptrTy, lv);
             builder->CreateCall(getOrDefineEnsRelease(), { old });
+            builder->CreateStore(val, lv);
+        } else if (isStructWithClass) {
+            emitStructFieldRelease(targetType, lv);
+            builder->CreateStore(val, lv);
+            if (borrowedSource) {
+                emitStructFieldRetain(targetType, lv);
+            }
+        } else {
+            builder->CreateStore(val, lv);
         }
-        builder->CreateStore(val, lv);
         return val;
     }
 
