@@ -57,4 +57,8 @@ private:
 
     // Mark the underlying symbol referenced by `e` (alias-aware) as Escape.
     void markEscapeIfRef(const ast::Expression& e);
+
+    bool isParameterBorrowSource(const ast::Expression& e) const;
+    void updateBorrowMode(Symbol* target, const ast::Expression& rhs);
+    bool isBorrowModeSymbol(Symbol* sym) const;
 };

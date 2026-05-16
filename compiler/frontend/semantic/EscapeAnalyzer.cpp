@@ -78,6 +78,7 @@ void EscapeAnalyzer::scanLetStmt(const ast::LetStatement& s) {
                 Symbol* src = iinfo ? iinfo->resolvedSymbol : nullptr;
                 if (src) letSym->aliasOf = src;
             }
+            updateBorrowMode(letSym, *init);
         }
         scanExpression(*init);
     }
@@ -94,8 +95,15 @@ void EscapeAnalyzer::scanTypedVarDecl(const ast::TypedVarDeclStatement& s) {
                 Symbol* src = iinfo ? iinfo->resolvedSymbol : nullptr;
                 if (src) letSym->aliasOf = src;
             }
+            updateBorrowMode(letSym, *init);
         }
         scanExpression(*init);
+    } else if (letSym) {
+        // Initialized to default (zero / null). Not a parameter borrow source.
+        if (letSym->allAssignsFromParam) {
+            letSym->allAssignsFromParam = false;
+            changedThisIteration = true;
+        }
     }
 }
 
@@ -170,9 +178,11 @@ void EscapeAnalyzer::scanAssign(const ast::AssignExpression& e) {
             markSymbolReassigned(targetSym);
             // Reassignment invalidates any previous alias relationship.
             if (targetSym->aliasOf) targetSym->aliasOf = nullptr;
+            updateBorrowMode(targetSym, *value);
         }
-        // RHS escapes (alias creation in long-lived slot).
-        markEscapeIfRef(*value);
+        if (!isBorrowModeSymbol(targetSym)) {
+            markEscapeIfRef(*value);
+        }
     }
 
     scanExpression(*target);
@@ -295,6 +305,49 @@ void EscapeAnalyzer::markSymbolReassigned(Symbol* sym) {
         sym->reassigned = true;
         changedThisIteration = true;
     }
+}
+
+bool EscapeAnalyzer::isParameterBorrowSource(const ast::Expression& e) const {
+    if (auto id = e.asIdent()) {
+        auto* info = analysis.find(id->node.greenNode());
+        Symbol* s = info ? info->resolvedSymbol : nullptr;
+        if (!s) return false;
+        if (s->kind != SymbolKind::Parameter) return false;
+        if (!s->type || s->type->kind != TypeKind::Class) {
+            // Allow Optional<Class> params too.
+            if (!s->type || s->type->kind != TypeKind::Optional ||
+                !s->type->inner || !s->type->inner->isClass()) {
+                return false;
+            }
+        }
+        if (s->reassigned) return false;
+        return true;
+    }
+    if (e.asThis()) return true;
+    if (auto p = e.asParen()) {
+        if (auto inner = p->inner()) return isParameterBorrowSource(*inner);
+    }
+    return false;
+}
+
+void EscapeAnalyzer::updateBorrowMode(Symbol* target, const ast::Expression& rhs) {
+    if (!target) return;
+    if (!target->allAssignsFromParam) return;  // already false; nothing to track
+    if (!isParameterBorrowSource(rhs)) {
+        target->allAssignsFromParam = false;
+        changedThisIteration = true;
+    }
+}
+
+bool EscapeAnalyzer::isBorrowModeSymbol(Symbol* sym) const {
+    if (!sym || sym->kind != SymbolKind::Variable) return false;
+    if (!sym->type) return false;
+    bool isClass = (sym->type->kind == TypeKind::Class) ||
+        (sym->type->kind == TypeKind::Optional && sym->type->inner && sym->type->inner->isClass());
+    if (!isClass) return false;
+    if (sym->localEscape != EscapeKind::NoEscape) return false;
+    if (!sym->allAssignsFromParam) return false;
+    return true;
 }
 
 void EscapeAnalyzer::markParamMutated(int paramIdx) {

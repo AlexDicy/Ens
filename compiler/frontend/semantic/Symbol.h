@@ -41,6 +41,8 @@ public:
     EscapeKind localEscape = EscapeKind::NoEscape;
     bool reassigned = false;
     Symbol* aliasOf = nullptr;
+    // true if every assignment has source = non-reassigned class parameter or `this`
+    bool allAssignsFromParam = true;
 
     Symbol(SymbolKind k, std::u16string n, Type* t, int l, int c)
         : kind(k), name(std::move(n)), type(t), line(l), column(c) {}
