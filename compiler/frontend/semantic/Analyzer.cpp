@@ -724,9 +724,20 @@ void Analyzer::analyzeTypedVarDeclStmt(const ast::TypedVarDeclStatement& stmt) {
     analysis.setSymbol(stmt.node.greenNode(), sym);
 }
 
+static ast::Expression unwrapParens(const ast::Expression& e) {
+    ast::Expression cur = e;
+    while (auto p = cur.asParen()) {
+        auto inner = p->inner();
+        if (!inner) break;
+        cur = *inner;
+    }
+    return cur;
+}
+
 Analyzer::NullCheckInfo Analyzer::detectNullCheck(const ast::Expression& cond) {
     NullCheckInfo info;
-    auto bin = cond.asBinary();
+    ast::Expression condCore = unwrapParens(cond);
+    auto bin = condCore.asBinary();
     if (!bin) return info;
     auto opTok = bin->operatorToken();
     if (!opTok) return info;
@@ -735,6 +746,8 @@ Analyzer::NullCheckInfo Analyzer::detectNullCheck(const ast::Expression& cond) {
     auto left = bin->left();
     auto right = bin->right();
     if (!left || !right) return info;
+    ast::Expression leftCore = unwrapParens(*left);
+    ast::Expression rightCore = unwrapParens(*right);
 
     auto isNullLit = [](const ast::Expression& e) {
         auto lit = e.asLiteral();
@@ -742,8 +755,8 @@ Analyzer::NullCheckInfo Analyzer::detectNullCheck(const ast::Expression& cond) {
     };
 
     const ast::Expression* identSide = nullptr;
-    if (isNullLit(*right) && !isNullLit(*left)) identSide = &*left;
-    else if (isNullLit(*left) && !isNullLit(*right)) identSide = &*right;
+    if (isNullLit(rightCore) && !isNullLit(leftCore)) identSide = &leftCore;
+    else if (isNullLit(leftCore) && !isNullLit(rightCore)) identSide = &rightCore;
     else return info;
 
     auto id = identSide->asIdent();

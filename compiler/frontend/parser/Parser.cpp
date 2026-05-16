@@ -493,7 +493,9 @@ void Parser::parseTypedVarDeclStmt() {
 void Parser::parseIfStmt() {
     builder.startNode(SyntaxKind::IfStmt);
     expect(SyntaxKind::KwIf, "'if'");
+    expect(SyntaxKind::LParen, "'(' around if condition");
     parseExpression();
+    expect(SyntaxKind::RParen, "')' after if condition");
     if (at(SyntaxKind::LBrace)) parseBlock();
     else { emitMissing(SyntaxKind::LBrace, "'{' for if body"); }
     if (at(SyntaxKind::KwElse)) {
@@ -510,7 +512,9 @@ void Parser::parseIfStmt() {
 void Parser::parseWhileStmt() {
     builder.startNode(SyntaxKind::WhileStmt);
     expect(SyntaxKind::KwWhile, "'while'");
+    expect(SyntaxKind::LParen, "'(' around while condition");
     parseExpression();
+    expect(SyntaxKind::RParen, "')' after while condition");
     if (at(SyntaxKind::LBrace)) parseBlock();
     else emitMissing(SyntaxKind::LBrace, "'{' for while body");
     builder.finishNode();
