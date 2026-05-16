@@ -160,6 +160,7 @@ static constexpr std::pair<SyntaxKind, std::string_view> KIND_NAMES[] = {
     {SyntaxKind::KwThrows,          "KwThrows"},
     {SyntaxKind::KwTrue,            "KwTrue"},
     {SyntaxKind::KwTry,             "KwTry"},
+    {SyntaxKind::KwWeak,            "KwWeak"},
     {SyntaxKind::KwWhile,           "KwWhile"},
     {SyntaxKind::SourceFile,        "SourceFile"},
     {SyntaxKind::FuncDecl,          "FuncDecl"},
@@ -263,6 +264,7 @@ static constexpr std::pair<std::u16string_view, SyntaxKind> KEYWORD_TABLE[] = {
     {u"throws",    SyntaxKind::KwThrows},
     {u"true",      SyntaxKind::KwTrue},
     {u"try",       SyntaxKind::KwTry},
+    {u"weak",      SyntaxKind::KwWeak},
     {u"while",     SyntaxKind::KwWhile},
 };
 

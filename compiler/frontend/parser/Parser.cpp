@@ -362,6 +362,7 @@ void Parser::parseStructOrClassMember() {
 void Parser::parseFieldDecl() {
     builder.startNode(SyntaxKind::FieldDecl);
     parseVisibilityModifier();
+    if (at(SyntaxKind::KwWeak)) bump();
     if (isTypeStart(kindAt())) parseType();
     else emitMissing(SyntaxKind::Identifier, "field type");
     expect(SyntaxKind::Identifier, "field name");

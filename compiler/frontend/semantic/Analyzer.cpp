@@ -237,6 +237,10 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             Type* ft = f.typeReference() ? resolveTypeReference(*f.typeReference()) : typeCtx.getError();
             fi.type = ft;
             fi.visibility = toSemanticVisibility(f.visibility());
+            fi.isWeak = f.isWeak();
+            if (fi.isWeak) {
+                errorAtNode(f.node, "'weak' fields are not allowed on structs");
+            }
             auto [line, col] = source.offsetToPosition(f.node.startOffset());
             fi.line = line;
             fi.column = col;
@@ -284,6 +288,14 @@ void Analyzer::collectClasses(const ast::SourceFile& file) {
             Type* ft = f.typeReference() ? resolveTypeReference(*f.typeReference()) : typeCtx.getError();
             fi.type = ft;
             fi.visibility = toSemanticVisibility(f.visibility());
+            fi.isWeak = f.isWeak();
+            if (fi.isWeak) {
+                bool ok = ft && ft->isOptional() && ft->inner && ft->inner->isClass();
+                if (!ok) {
+                    errorAtNode(f.node,
+                        "'weak' fields must be nullable class types (e.g. `weak Foo? f`)");
+                }
+            }
             auto [line, col] = source.offsetToPosition(f.node.startOffset());
             fi.line = line;
             fi.column = col;

@@ -46,7 +46,7 @@ enum class SyntaxKind : uint16_t {
     KwDefault, KwDo, KwElse, KwEnum, KwExtends, KwFalse, KwFinal, KwFinally,
     KwFor, KwFrom, KwGoto, KwIf, KwImport, KwLet, KwNew, KwNull, KwPackage,
     KwPrivate, KwProtected, KwPublic, KwRethrow, KwReturn, KwStatic, KwStruct,
-    KwSuper, KwSwitch, KwThis, KwThrow, KwThrows, KwTrue, KwTry, KwWhile,
+    KwSuper, KwSwitch, KwThis, KwThrow, KwThrows, KwTrue, KwTry, KwWeak, KwWhile,
 
     // ============================================================
     // Marker: everything after this point is a non-terminal node.

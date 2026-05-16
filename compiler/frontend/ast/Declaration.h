@@ -106,6 +106,7 @@ public:
     }
     std::optional<VisibilityModifier> visibilityModifier() const;
     Visibility visibility() const;
+    bool isWeak() const;
     std::optional<TypeReference> typeReference() const;
     std::optional<SyntaxNode> nameToken() const;
     std::optional<std::u16string> nameText() const;

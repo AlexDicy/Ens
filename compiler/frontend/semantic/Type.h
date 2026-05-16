@@ -23,6 +23,7 @@ struct FieldInfo {
     std::u16string name;
     Type* type;
     Visibility visibility = Visibility::Public;
+    bool isWeak = false;
     int line = 0;
     int column = 0;
     const GreenElement* declaration = nullptr;

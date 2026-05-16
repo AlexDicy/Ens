@@ -114,10 +114,12 @@ struct CodeGenerator::Impl {
         if (!t) return true;
         switch (t->kind) {
             case TypeKind::Decimal:
-            case TypeKind::Optional:
             case TypeKind::Null:
             case TypeKind::Error:
                 return true;
+            case TypeKind::Optional:
+                // Nullable class types are supported (represented as a pointer).
+                return !(t->inner && t->inner->isClass());
             default:
                 return false;
         }
@@ -143,6 +145,9 @@ struct CodeGenerator::Impl {
             case TypeKind::String:  return llvm::PointerType::get(ctx, 0);
             case TypeKind::Struct:  return mapStructType(t);
             case TypeKind::Class:   return llvm::PointerType::get(ctx, 0);
+            case TypeKind::Optional:
+                if (t->inner && t->inner->isClass()) return llvm::PointerType::get(ctx, 0);
+                return nullptr;
             default:                return nullptr;
         }
     }
@@ -177,15 +182,26 @@ struct CodeGenerator::Impl {
 
     llvm::DIType* mapDIType(::Type* t) {
         if (!debugEnabled || !diBuilder || !t) return nullptr;
+        if (t->kind == TypeKind::Optional && t->inner && t->inner->isClass()) {
+            return mapDIType(t->inner);
+        }
         if (t->kind == TypeKind::Struct) return mapDIStructType(t);
         if (t->kind == TypeKind::Class) {
             auto it = diClassPointerCache.find(t);
             if (it != diClassPointerCache.end()) return it->second;
-            auto* underlying = mapDIStructType(t);
-            if (!underlying) return nullptr;
+            // Pre-cache a forward-declared pointer to break mutual recursion
+            // when two classes reference each other (e.g. parent<->child).
+            std::string sname = t->structInfo ? asAscii(t->structInfo->name) : "class.anon";
+            auto* fwd = diBuilder->createReplaceableCompositeType(
+                llvm::dwarf::DW_TAG_structure_type,
+                sname, diCU, diFile, 0);
             uint64_t ptrBits = module->getDataLayout().getPointerSizeInBits();
-            auto* ptrTy = diBuilder->createPointerType(underlying, ptrBits);
+            auto* ptrTy = diBuilder->createPointerType(fwd, ptrBits);
             diClassPointerCache[t] = ptrTy;
+            auto* underlying = mapDIStructType(t);
+            if (underlying) {
+                fwd->replaceAllUsesWith(underlying);
+            }
             return ptrTy;
         }
         int key = static_cast<int>(t->kind);
@@ -853,8 +869,7 @@ struct CodeGenerator::Impl {
             case SyntaxKind::KwTrue:  return builder->getInt1(true);
             case SyntaxKind::KwFalse: return builder->getInt1(false);
             case SyntaxKind::KwNull:
-                error(e.node.startOffset(), "null codegen not yet supported");
-                return nullptr;
+                return llvm::ConstantPointerNull::get(llvm::PointerType::get(ctx, 0));
             case SyntaxKind::StringLiteral: {
                 std::string utf8;
                 // Strip surrounding quotes from the lexed text.
@@ -1052,7 +1067,7 @@ struct CodeGenerator::Impl {
         auto* initBB = llvm::BasicBlock::Create(ctx, "alloc.init", fn);
 
         builder->SetInsertPoint(entry);
-        llvm::Value* total = builder->CreateAdd(fn->getArg(0), llvm::ConstantInt::get(i64Ty, 16));
+        llvm::Value* total = builder->CreateAdd(fn->getArg(0), llvm::ConstantInt::get(i64Ty, 24));
         llvm::Value* header = builder->CreateCall(getOrDeclareCalloc(),
             { llvm::ConstantInt::get(i64Ty, 1), total });
         llvm::Value* isNull = builder->CreateICmpEQ(header, llvm::ConstantPointerNull::get(ptrTy));
@@ -1066,8 +1081,9 @@ struct CodeGenerator::Impl {
         llvm::Value* dtorSlot = builder->CreateGEP(
             llvm::Type::getInt8Ty(ctx), header, llvm::ConstantInt::get(i64Ty, 8));
         builder->CreateStore(fn->getArg(1), dtorSlot);
+        // side_table slot at offset 16 stays null (calloc-zeroed); lazily set by ens_weak_init.
         llvm::Value* payload = builder->CreateGEP(
-            llvm::Type::getInt8Ty(ctx), header, llvm::ConstantInt::get(i64Ty, 16));
+            llvm::Type::getInt8Ty(ctx), header, llvm::ConstantInt::get(i64Ty, 24));
         builder->CreateRet(payload);
 
         builder->restoreIP(savedIP);
@@ -1095,7 +1111,7 @@ struct CodeGenerator::Impl {
 
         builder->SetInsertPoint(bumpBB);
         llvm::Value* header = builder->CreateGEP(
-            llvm::Type::getInt8Ty(ctx), obj, llvm::ConstantInt::getSigned(i64Ty, -16));
+            llvm::Type::getInt8Ty(ctx), obj, llvm::ConstantInt::getSigned(i64Ty, -24));
         builder->CreateAtomicRMW(
             llvm::AtomicRMWInst::Add, header,
             llvm::ConstantInt::get(i64Ty, 1),
@@ -1114,17 +1130,21 @@ struct CodeGenerator::Impl {
         if (auto* existing = module->getFunction("ens_release")) return existing;
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8Ty = llvm::Type::getInt8Ty(ctx);
         auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), { ptrTy }, false);
         auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "ens_release", module.get());
         fn->addFnAttr(llvm::Attribute::NoUnwind);
 
         auto savedIP = builder->saveIP();
-        auto* entry  = llvm::BasicBlock::Create(ctx, "entry", fn);
-        auto* decBB  = llvm::BasicBlock::Create(ctx, "release.dec", fn);
-        auto* dtorBB = llvm::BasicBlock::Create(ctx, "release.dtor", fn);
-        auto* callBB = llvm::BasicBlock::Create(ctx, "release.dtor.call", fn);
-        auto* freeBB = llvm::BasicBlock::Create(ctx, "release.free", fn);
-        auto* doneBB = llvm::BasicBlock::Create(ctx, "release.done", fn);
+        auto* entry   = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* decBB   = llvm::BasicBlock::Create(ctx, "release.dec", fn);
+        auto* dtorBB  = llvm::BasicBlock::Create(ctx, "release.dtor", fn);
+        auto* callBB  = llvm::BasicBlock::Create(ctx, "release.dtor.call", fn);
+        auto* stBB    = llvm::BasicBlock::Create(ctx, "release.sidetable", fn);
+        auto* stHasBB = llvm::BasicBlock::Create(ctx, "release.sidetable.has", fn);
+        auto* stFreeBB= llvm::BasicBlock::Create(ctx, "release.sidetable.free", fn);
+        auto* freeBB  = llvm::BasicBlock::Create(ctx, "release.free", fn);
+        auto* doneBB  = llvm::BasicBlock::Create(ctx, "release.done", fn);
 
         builder->SetInsertPoint(entry);
         llvm::Value* obj = fn->getArg(0);
@@ -1132,8 +1152,7 @@ struct CodeGenerator::Impl {
         builder->CreateCondBr(isNull, doneBB, decBB);
 
         builder->SetInsertPoint(decBB);
-        llvm::Value* header = builder->CreateGEP(
-            llvm::Type::getInt8Ty(ctx), obj, llvm::ConstantInt::getSigned(i64Ty, -16));
+        llvm::Value* header = builder->CreateGEP(i8Ty, obj, llvm::ConstantInt::getSigned(i64Ty, -24));
         llvm::Value* prev = builder->CreateAtomicRMW(
             llvm::AtomicRMWInst::Sub, header,
             llvm::ConstantInt::get(i64Ty, 1),
@@ -1143,15 +1162,40 @@ struct CodeGenerator::Impl {
         builder->CreateCondBr(isLast, dtorBB, doneBB);
 
         builder->SetInsertPoint(dtorBB);
-        llvm::Value* dtorSlot = builder->CreateGEP(
-            llvm::Type::getInt8Ty(ctx), obj, llvm::ConstantInt::getSigned(i64Ty, -8));
+        llvm::Value* dtorSlot = builder->CreateGEP(i8Ty, obj, llvm::ConstantInt::getSigned(i64Ty, -16));
         llvm::Value* dtorFn = builder->CreateLoad(ptrTy, dtorSlot);
         llvm::Value* dtorIsNull = builder->CreateICmpEQ(dtorFn, llvm::ConstantPointerNull::get(ptrTy));
-        builder->CreateCondBr(dtorIsNull, freeBB, callBB);
+        builder->CreateCondBr(dtorIsNull, stBB, callBB);
 
         builder->SetInsertPoint(callBB);
         auto* dtorTy = llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), { ptrTy }, false);
         builder->CreateCall(dtorTy, dtorFn, { obj });
+        builder->CreateBr(stBB);
+
+        // Side-table handling: if non-null, null its object_ptr, conditionally free entry.
+        builder->SetInsertPoint(stBB);
+        llvm::Value* stSlot = builder->CreateGEP(i8Ty, obj, llvm::ConstantInt::getSigned(i64Ty, -8));
+        llvm::Value* stPtr = builder->CreateLoad(ptrTy, stSlot);
+        llvm::Value* stIsNull = builder->CreateICmpEQ(stPtr, llvm::ConstantPointerNull::get(ptrTy));
+        builder->CreateCondBr(stIsNull, freeBB, stHasBB);
+
+        builder->SetInsertPoint(stHasBB);
+        // Null the entry's object_ptr (offset 0) with release ordering so weak readers see "dead".
+        builder->CreateAtomicRMW(
+            llvm::AtomicRMWInst::Xchg, stPtr,
+            llvm::ConstantPointerNull::get(ptrTy),
+            llvm::MaybeAlign(8),
+            llvm::AtomicOrdering::Release);
+        // Read entry's weak_count (offset 8). If 0, we own the entry's free.
+        llvm::Value* wcSlot = builder->CreateGEP(i8Ty, stPtr, llvm::ConstantInt::get(i64Ty, 8));
+        llvm::LoadInst* wc = builder->CreateLoad(i64Ty, wcSlot, "weak_count");
+        wc->setAtomic(llvm::AtomicOrdering::Acquire);
+        wc->setAlignment(llvm::Align(8));
+        llvm::Value* wcZero = builder->CreateICmpEQ(wc, llvm::ConstantInt::get(i64Ty, 0));
+        builder->CreateCondBr(wcZero, stFreeBB, freeBB);
+
+        builder->SetInsertPoint(stFreeBB);
+        builder->CreateCall(getOrDeclareFree(), { stPtr });
         builder->CreateBr(freeBB);
 
         builder->SetInsertPoint(freeBB);
@@ -1165,13 +1209,215 @@ struct CodeGenerator::Impl {
         return fn;
     }
 
+    // Side-table entry layout: [obj_ptr (8) | weak_count (8)] = 16 bytes.
+    // Lazily allocated; pointer stored in object header at offset -8 from the payload.
+
+    llvm::Function* getOrDefineEnsWeakInit() {
+        if (auto* existing = module->getFunction("ens_weak_init")) return existing;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(ptrTy, { ptrTy }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "ens_weak_init", module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+
+        auto savedIP = builder->saveIP();
+        auto* entry    = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* nullRet  = llvm::BasicBlock::Create(ctx, "init.null", fn);
+        auto* haveSt   = llvm::BasicBlock::Create(ctx, "init.have", fn);
+        auto* makeSt   = llvm::BasicBlock::Create(ctx, "init.make", fn);
+        auto* afterCAS = llvm::BasicBlock::Create(ctx, "init.after_cas", fn);
+        auto* freeOurs = llvm::BasicBlock::Create(ctx, "init.free_ours", fn);
+        auto* bumpBB   = llvm::BasicBlock::Create(ctx, "init.bump", fn);
+
+        builder->SetInsertPoint(entry);
+        llvm::Value* obj = fn->getArg(0);
+        llvm::Value* isNull = builder->CreateICmpEQ(obj, llvm::ConstantPointerNull::get(ptrTy));
+        builder->CreateCondBr(isNull, nullRet, haveSt);
+
+        builder->SetInsertPoint(nullRet);
+        builder->CreateRet(llvm::ConstantPointerNull::get(ptrTy));
+
+        builder->SetInsertPoint(haveSt);
+        llvm::Value* stSlot = builder->CreateGEP(i8Ty, obj, llvm::ConstantInt::getSigned(i64Ty, -8));
+        llvm::Value* existingSt = builder->CreateLoad(ptrTy, stSlot, "existing_st");
+        llvm::Value* needMake = builder->CreateICmpEQ(existingSt, llvm::ConstantPointerNull::get(ptrTy));
+        builder->CreateCondBr(needMake, makeSt, bumpBB);
+
+        builder->SetInsertPoint(makeSt);
+        llvm::Value* newSt = builder->CreateCall(getOrDeclareCalloc(),
+            { llvm::ConstantInt::get(i64Ty, 1), llvm::ConstantInt::get(i64Ty, 16) }, "new_st");
+        // Initialize object_ptr (offset 0).
+        builder->CreateStore(obj, newSt);
+        // CAS the header's side_table slot from null to newSt.
+        llvm::Value* cas = builder->CreateAtomicCmpXchg(
+            stSlot,
+            llvm::ConstantPointerNull::get(ptrTy),
+            newSt,
+            llvm::MaybeAlign(8),
+            llvm::AtomicOrdering::AcquireRelease,
+            llvm::AtomicOrdering::Acquire);
+        llvm::Value* prev = builder->CreateExtractValue(cas, 0);
+        llvm::Value* success = builder->CreateExtractValue(cas, 1);
+        builder->CreateCondBr(success, bumpBB, freeOurs);
+
+        builder->SetInsertPoint(freeOurs);
+        // Someone else won the race; free our allocation and use theirs.
+        builder->CreateCall(getOrDeclareFree(), { newSt });
+        builder->CreateBr(afterCAS);
+
+        // PHI for the resolved side-table pointer.
+        builder->SetInsertPoint(bumpBB);
+        auto* finalSt = builder->CreatePHI(ptrTy, 2, "st");
+        finalSt->addIncoming(existingSt, haveSt);
+        finalSt->addIncoming(newSt, makeSt);
+        builder->CreateBr(afterCAS);
+
+        builder->SetInsertPoint(afterCAS);
+        auto* finalSt2 = builder->CreatePHI(ptrTy, 2, "st2");
+        finalSt2->addIncoming(prev, freeOurs);
+        finalSt2->addIncoming(finalSt, bumpBB);
+        // Atomic increment weak_count at offset 8.
+        llvm::Value* wcSlot = builder->CreateGEP(i8Ty, finalSt2, llvm::ConstantInt::get(i64Ty, 8));
+        builder->CreateAtomicRMW(
+            llvm::AtomicRMWInst::Add, wcSlot,
+            llvm::ConstantInt::get(i64Ty, 1),
+            llvm::MaybeAlign(8),
+            llvm::AtomicOrdering::Monotonic);
+        builder->CreateRet(finalSt2);
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    llvm::Function* getOrDefineEnsWeakRelease() {
+        if (auto* existing = module->getFunction("ens_weak_release")) return existing;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), { ptrTy }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "ens_weak_release", module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+
+        auto savedIP = builder->saveIP();
+        auto* entry  = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* decBB  = llvm::BasicBlock::Create(ctx, "wrel.dec", fn);
+        auto* lastBB = llvm::BasicBlock::Create(ctx, "wrel.last", fn);
+        auto* freeBB = llvm::BasicBlock::Create(ctx, "wrel.free", fn);
+        auto* doneBB = llvm::BasicBlock::Create(ctx, "wrel.done", fn);
+
+        builder->SetInsertPoint(entry);
+        llvm::Value* st = fn->getArg(0);
+        llvm::Value* isNull = builder->CreateICmpEQ(st, llvm::ConstantPointerNull::get(ptrTy));
+        builder->CreateCondBr(isNull, doneBB, decBB);
+
+        builder->SetInsertPoint(decBB);
+        llvm::Value* wcSlot = builder->CreateGEP(i8Ty, st, llvm::ConstantInt::get(i64Ty, 8));
+        llvm::Value* prev = builder->CreateAtomicRMW(
+            llvm::AtomicRMWInst::Sub, wcSlot,
+            llvm::ConstantInt::get(i64Ty, 1),
+            llvm::MaybeAlign(8),
+            llvm::AtomicOrdering::AcquireRelease);
+        llvm::Value* isLast = builder->CreateICmpEQ(prev, llvm::ConstantInt::get(i64Ty, 1));
+        builder->CreateCondBr(isLast, lastBB, doneBB);
+
+        builder->SetInsertPoint(lastBB);
+        // Load object_ptr; if null, object is dead and we can free the entry.
+        llvm::LoadInst* objPtr = builder->CreateLoad(ptrTy, st, "obj_ptr");
+        objPtr->setAtomic(llvm::AtomicOrdering::Acquire);
+        objPtr->setAlignment(llvm::Align(8));
+        llvm::Value* objNull = builder->CreateICmpEQ(objPtr, llvm::ConstantPointerNull::get(ptrTy));
+        builder->CreateCondBr(objNull, freeBB, doneBB);
+
+        builder->SetInsertPoint(freeBB);
+        builder->CreateCall(getOrDeclareFree(), { st });
+        builder->CreateBr(doneBB);
+
+        builder->SetInsertPoint(doneBB);
+        builder->CreateRetVoid();
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    llvm::Function* getOrDefineEnsWeakLoad() {
+        if (auto* existing = module->getFunction("ens_weak_load")) return existing;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(ptrTy, { ptrTy }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "ens_weak_load", module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+
+        auto savedIP = builder->saveIP();
+        auto* entry    = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* loadObj  = llvm::BasicBlock::Create(ctx, "wload.obj", fn);
+        auto* casLoop  = llvm::BasicBlock::Create(ctx, "wload.loop", fn);
+        auto* casFail  = llvm::BasicBlock::Create(ctx, "wload.fail", fn);
+        auto* retObj   = llvm::BasicBlock::Create(ctx, "wload.success", fn);
+        auto* retNull  = llvm::BasicBlock::Create(ctx, "wload.null", fn);
+
+        builder->SetInsertPoint(entry);
+        llvm::Value* st = fn->getArg(0);
+        llvm::Value* isNull = builder->CreateICmpEQ(st, llvm::ConstantPointerNull::get(ptrTy));
+        builder->CreateCondBr(isNull, retNull, loadObj);
+
+        builder->SetInsertPoint(loadObj);
+        llvm::LoadInst* obj = builder->CreateLoad(ptrTy, st, "obj");
+        obj->setAtomic(llvm::AtomicOrdering::Acquire);
+        obj->setAlignment(llvm::Align(8));
+        llvm::Value* objIsNull = builder->CreateICmpEQ(obj, llvm::ConstantPointerNull::get(ptrTy));
+        auto* preLoop = llvm::BasicBlock::Create(ctx, "wload.preloop", fn);
+        builder->CreateCondBr(objIsNull, retNull, preLoop);
+
+        builder->SetInsertPoint(preLoop);
+        llvm::Value* refSlot = builder->CreateGEP(i8Ty, obj, llvm::ConstantInt::getSigned(i64Ty, -24));
+        llvm::LoadInst* initial = builder->CreateLoad(i64Ty, refSlot, "cur_initial");
+        initial->setAtomic(llvm::AtomicOrdering::Monotonic);
+        initial->setAlignment(llvm::Align(8));
+        builder->CreateBr(casLoop);
+
+        builder->SetInsertPoint(casLoop);
+        auto* curPhi = builder->CreatePHI(i64Ty, 2, "cur");
+        curPhi->addIncoming(initial, preLoop);
+        // If cur == 0, object is being deallocated; return null.
+        llvm::Value* curZero = builder->CreateICmpEQ(curPhi, llvm::ConstantInt::get(i64Ty, 0));
+        auto* tryCAS = llvm::BasicBlock::Create(ctx, "wload.try_cas", fn);
+        builder->CreateCondBr(curZero, retNull, tryCAS);
+
+        builder->SetInsertPoint(tryCAS);
+        llvm::Value* newCount = builder->CreateAdd(curPhi, llvm::ConstantInt::get(i64Ty, 1));
+        llvm::Value* cas = builder->CreateAtomicCmpXchg(
+            refSlot, curPhi, newCount,
+            llvm::MaybeAlign(8),
+            llvm::AtomicOrdering::AcquireRelease,
+            llvm::AtomicOrdering::Monotonic);
+        llvm::Value* prevVal = builder->CreateExtractValue(cas, 0);
+        llvm::Value* success = builder->CreateExtractValue(cas, 1);
+        builder->CreateCondBr(success, retObj, casFail);
+
+        builder->SetInsertPoint(casFail);
+        curPhi->addIncoming(prevVal, casFail);
+        builder->CreateBr(casLoop);
+
+        builder->SetInsertPoint(retObj);
+        builder->CreateRet(obj);
+
+        builder->SetInsertPoint(retNull);
+        builder->CreateRet(llvm::ConstantPointerNull::get(ptrTy));
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
     llvm::Value* getOrEmitClassDtor(::Type* t) {
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         if (!t || !t->structInfo) return llvm::ConstantPointerNull::get(ptrTy);
 
         bool hasOwning = false;
         for (auto& f : t->structInfo->fields) {
-            if (f.type && (f.type->isClass() || structHasClassFields(f.type))) {
+            if (!f.type) continue;
+            if (f.isWeak || f.type->isClass() || structHasClassFields(f.type)) {
                 hasOwning = true;
                 break;
             }
@@ -1195,8 +1441,25 @@ struct CodeGenerator::Impl {
         return fn;
     }
 
+    const FieldInfo* memberFieldInfo(const ast::MemberExpression& m) const {
+        auto obj = m.object();
+        if (!obj) return nullptr;
+        ::Type* objType = typeOf(obj->node);
+        if (!objType || !objType->structInfo) return nullptr;
+        auto name = m.memberText();
+        if (!name) return nullptr;
+        int idx = objType->structInfo->findFieldIndex(*name);
+        if (idx < 0) return nullptr;
+        return &objType->structInfo->fields[static_cast<size_t>(idx)];
+    }
+
     bool expressionProducesOwnedRef(const ast::Expression& e) {
         if (e.asNew() || e.asCall()) return true;
+        if (auto m = e.asMember()) {
+            // Weak field reads return +1 via ens_weak_load's CAS-upgrade.
+            const FieldInfo* fi = memberFieldInfo(*m);
+            return fi && fi->isWeak;
+        }
         if (auto p = e.asParen()) {
             if (auto inner = p->inner()) return expressionProducesOwnedRef(*inner);
         }
@@ -1253,10 +1516,16 @@ struct CodeGenerator::Impl {
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         llvm::StructType* layout = mapStructType(t);
         auto* releaseFn = getOrDefineEnsRelease();
+        auto* weakReleaseFn = getOrDefineEnsWeakRelease();
         for (size_t i = 0; i < t->structInfo->fields.size(); ++i) {
             auto& f = t->structInfo->fields[i];
             if (!f.type) continue;
-            if (f.type->isClass()) {
+            if (f.isWeak) {
+                llvm::Value* fieldAddr = builder->CreateStructGEP(layout, base, static_cast<unsigned>(i),
+                                                                  asAscii(f.name) + ".addr");
+                llvm::Value* fieldVal = builder->CreateLoad(ptrTy, fieldAddr);
+                builder->CreateCall(weakReleaseFn, { fieldVal });
+            } else if (f.type->isClass()) {
                 llvm::Value* fieldAddr = builder->CreateStructGEP(layout, base, static_cast<unsigned>(i),
                                                                   asAscii(f.name) + ".addr");
                 llvm::Value* fieldVal = builder->CreateLoad(ptrTy, fieldAddr);
@@ -1448,6 +1717,20 @@ struct CodeGenerator::Impl {
         return builder->CreateCall(fn, args);
     }
 
+    const FieldInfo* targetFieldInfo(const ast::Expression& target) const {
+        auto m = target.asMember();
+        if (!m) return nullptr;
+        auto obj = m->object();
+        if (!obj) return nullptr;
+        ::Type* objType = typeOf(obj->node);
+        if (!objType || !objType->structInfo) return nullptr;
+        auto memberName = m->memberText();
+        if (!memberName) return nullptr;
+        int idx = objType->structInfo->findFieldIndex(*memberName);
+        if (idx < 0) return nullptr;
+        return &objType->structInfo->fields[static_cast<size_t>(idx)];
+    }
+
     llvm::Value* emitAssign(const ast::AssignExpression& e) {
         auto opTok = e.operatorToken();
         if (!opTok || opTok->kind() != SyntaxKind::Eq) {
@@ -1463,12 +1746,25 @@ struct CodeGenerator::Impl {
         bool isStructWithClass = structHasClassFields(targetType);
         bool borrowedSource = !expressionProducesOwnedRef(*value);
 
+        const FieldInfo* fi = targetFieldInfo(*target);
+        bool isWeakField = fi && fi->isWeak;
+
         llvm::Value* lv = emitLValue(*target);
         if (!lv) return nullptr;
         llvm::Value* val = emitExpr(*value);
         if (!val) return nullptr;
 
-        if (isClass) {
+        if (isWeakField) {
+            auto* ptrTy = llvm::PointerType::get(ctx, 0);
+            llvm::Value* newSt = builder->CreateCall(getOrDefineEnsWeakInit(), { val });
+            llvm::Value* oldSt = builder->CreateLoad(ptrTy, lv);
+            builder->CreateCall(getOrDefineEnsWeakRelease(), { oldSt });
+            builder->CreateStore(newSt, lv);
+            // If RHS produced a fresh +1 (e.g., new T() or a call), release it. Weak doesn't retain strong ownership.
+            if (!borrowedSource) {
+                builder->CreateCall(getOrDefineEnsRelease(), { val });
+            }
+        } else if (isClass) {
             if (borrowedSource) {
                 builder->CreateCall(getOrDefineEnsRetain(), { val });
             }
@@ -1538,8 +1834,14 @@ struct CodeGenerator::Impl {
         ast::Expression wrapper{e.node};
         llvm::Value* addr = emitLValue(wrapper);
         if (!addr) return nullptr;
-        ::Type* fieldType = typeOf(e.node);
+        const FieldInfo* fi = memberFieldInfo(e);
         auto memberName = e.memberText().value_or(std::u16string{});
+        if (fi && fi->isWeak) {
+            auto* ptrTy = llvm::PointerType::get(ctx, 0);
+            llvm::Value* stPtr = builder->CreateLoad(ptrTy, addr, asAscii(memberName) + ".st");
+            return builder->CreateCall(getOrDefineEnsWeakLoad(), { stPtr });
+        }
+        ::Type* fieldType = typeOf(e.node);
         return builder->CreateLoad(mapType(fieldType), addr, asAscii(memberName) + ".load");
     }
 

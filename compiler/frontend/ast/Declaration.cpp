@@ -176,6 +176,14 @@ Visibility FieldDecl::visibility() const {
     return visibilityOfDecl(node);
 }
 
+bool FieldDecl::isWeak() const {
+    for (auto& c : node.children()) {
+        if (c.kind() == SyntaxKind::KwWeak) return true;
+        if (c.kind() == SyntaxKind::TypeRef) break;
+    }
+    return false;
+}
+
 std::optional<TypeReference> FieldDecl::typeReference() const {
     if (auto tr = firstChildNode(node, SyntaxKind::TypeRef)) return TypeReference::cast(*tr);
     return std::nullopt;

@@ -179,4 +179,16 @@ renderFrame() {
 
 Reference cycles between class instances are not collected automatically and leak. A class that needs to hold a reference back to its owner should use the `weak` annotation.
 
+```ens
+class Parent {
+    Child? child;
+}
+
+class Child {
+    weak Parent? parent;
+}
+```
+
+`weak` fields must be nullable class types. They don't contribute to the strong refcount, so they don't keep objects alive. When the referenced object dies, every weak reference to it reads as `null`.
+
 The compiler performs **escape analysis** to elide retain/release pairs and large-struct copies when it can prove a value does not escape its scope. The `--explain-arc` flag surfaces what was elided for diagnostics.
