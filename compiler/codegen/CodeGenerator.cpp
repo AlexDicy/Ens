@@ -561,6 +561,23 @@ struct CodeGenerator::Impl {
         currentDIScope = prev;
     }
 
+    bool classLetCanBorrow(Symbol* lhs, const ast::Expression& init) {
+        if (!lhs || !isReferenceType(lhs->type)) return false;
+        if (lhs->localEscape != EscapeKind::NoEscape) return false;
+        if (lhs->reassigned) return false;
+        auto id = init.asIdent();
+        if (!id) {
+            if (auto p = init.asParen()) {
+                if (auto inner = p->inner()) return classLetCanBorrow(lhs, *inner);
+            }
+            return false;
+        }
+        Symbol* src = symbolOf(id->node);
+        if (!src || !isReferenceType(src->type)) return false;
+        if (src->reassigned) return false;
+        return true;
+    }
+
     void emitLetStmt(const ast::LetStatement& s) {
         Symbol* sym = symbolOf(s.node);
         if (!sym) return;
@@ -573,7 +590,14 @@ struct CodeGenerator::Impl {
         llvm::Type* lt = mapType(sym->type);
         auto* alloca = createEntryAlloca(currentFunction, lt, asAscii(sym->name));
         values[sym] = alloca;
-        registerOwnedLocal(alloca, sym->type);
+
+        bool elideClassRetain = false;
+        if (auto init = s.initializer()) {
+            elideClassRetain = classLetCanBorrow(sym, *init);
+        }
+        if (!elideClassRetain) {
+            registerOwnedLocal(alloca, sym->type);
+        }
 
         if (debugEnabled && diBuilder && currentDIScope) {
             llvm::DIType* diVarType = mapDIType(sym->type);
@@ -593,7 +617,7 @@ struct CodeGenerator::Impl {
         if (auto init = s.initializer()) {
             setLocationFromNode(s.node);
             bool borrowedSource = !expressionProducesOwnedRef(*init);
-            bool needsClassRetain = isReferenceType(sym->type) && borrowedSource;
+            bool needsClassRetain = isReferenceType(sym->type) && borrowedSource && !elideClassRetain;
             bool needsStructRetain = structHasClassFields(sym->type) && borrowedSource;
             llvm::Value* v = emitExpr(*init);
             if (v) {
@@ -625,7 +649,14 @@ struct CodeGenerator::Impl {
         llvm::Type* lt = mapType(sym->type);
         auto* alloca = createEntryAlloca(currentFunction, lt, asAscii(sym->name));
         values[sym] = alloca;
-        registerOwnedLocal(alloca, sym->type);
+
+        bool elideClassRetain = false;
+        if (auto init = s.initializer()) {
+            elideClassRetain = classLetCanBorrow(sym, *init);
+        }
+        if (!elideClassRetain) {
+            registerOwnedLocal(alloca, sym->type);
+        }
 
         if (debugEnabled && diBuilder && currentDIScope) {
             llvm::DIType* diVarType = mapDIType(sym->type);
@@ -645,7 +676,7 @@ struct CodeGenerator::Impl {
         if (auto init = s.initializer()) {
             setLocationFromNode(s.node);
             bool borrowedSource = !expressionProducesOwnedRef(*init);
-            bool needsClassRetain = isReferenceType(sym->type) && borrowedSource;
+            bool needsClassRetain = isReferenceType(sym->type) && borrowedSource && !elideClassRetain;
             bool needsStructRetain = structHasClassFields(sym->type) && borrowedSource;
             llvm::Value* v = emitExpr(*init);
             if (v) {
@@ -873,6 +904,11 @@ struct CodeGenerator::Impl {
         if (sym->kind == SymbolKind::Function) {
             error(e.node.startOffset(), "Function values are not yet first-class");
             return nullptr;
+        }
+        if (byPointerParams.count(sym)) {
+            llvm::Value* ptr = builder->CreateLoad(
+                llvm::PointerType::get(ctx, 0), it->second, asAscii(sym->name) + ".byptr");
+            return builder->CreateLoad(mapType(sym->type), ptr, asAscii(sym->name) + ".load");
         }
         return builder->CreateLoad(mapType(sym->type), it->second, asAscii(sym->name) + ".load");
     }

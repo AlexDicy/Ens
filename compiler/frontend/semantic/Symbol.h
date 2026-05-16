@@ -37,6 +37,11 @@ public:
 
     ParamEscapeInfo escapeInfo;
 
+    // escape/reassignment tracking for variables and parameters.
+    EscapeKind localEscape = EscapeKind::NoEscape;
+    bool reassigned = false;
+    Symbol* aliasOf = nullptr;
+
     Symbol(SymbolKind k, std::u16string n, Type* t, int l, int c)
         : kind(k), name(std::move(n)), type(t), line(l), column(c) {}
 };

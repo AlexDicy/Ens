@@ -68,15 +68,33 @@ void EscapeAnalyzer::scanBlock(const ast::Block& b) {
 }
 
 void EscapeAnalyzer::scanLetStmt(const ast::LetStatement& s) {
+    Symbol* letSym = nullptr;
+    if (auto* info = analysis.find(s.node.greenNode())) letSym = info->resolvedSymbol;
+
     if (auto init = s.initializer()) {
-        markEscapeIfParamRef(*init);
+        if (letSym) {
+            if (auto id = init->asIdent()) {
+                auto* iinfo = analysis.find(id->node.greenNode());
+                Symbol* src = iinfo ? iinfo->resolvedSymbol : nullptr;
+                if (src) letSym->aliasOf = src;
+            }
+        }
         scanExpression(*init);
     }
 }
 
 void EscapeAnalyzer::scanTypedVarDecl(const ast::TypedVarDeclStatement& s) {
+    Symbol* letSym = nullptr;
+    if (auto* info = analysis.find(s.node.greenNode())) letSym = info->resolvedSymbol;
+
     if (auto init = s.initializer()) {
-        markEscapeIfParamRef(*init);
+        if (letSym) {
+            if (auto id = init->asIdent()) {
+                auto* iinfo = analysis.find(id->node.greenNode());
+                Symbol* src = iinfo ? iinfo->resolvedSymbol : nullptr;
+                if (src) letSym->aliasOf = src;
+            }
+        }
         scanExpression(*init);
     }
 }
@@ -97,7 +115,7 @@ void EscapeAnalyzer::scanWhile(const ast::WhileStatement& s) {
 
 void EscapeAnalyzer::scanReturn(const ast::ReturnStatement& s) {
     if (auto v = s.value()) {
-        markEscapeIfParamRef(*v);
+        markEscapeIfRef(*v);
         scanExpression(*v);
     }
 }
@@ -125,7 +143,7 @@ void EscapeAnalyzer::scanAssign(const ast::AssignExpression& e) {
     if (!target || !value) return;
 
     if (auto m = target->asMember()) {
-        // Mutation detection: walk member chain to find the root.
+        // Walk to root of member chain.
         std::optional<ast::Expression> cursor = m->object();
         while (cursor) {
             if (auto innerMem = cursor->asMember()) {
@@ -138,13 +156,23 @@ void EscapeAnalyzer::scanAssign(const ast::AssignExpression& e) {
             if (auto rootId = cursor->asIdent()) {
                 auto* info = analysis.find(rootId->node.greenNode());
                 Symbol* s = info ? info->resolvedSymbol : nullptr;
-                int idx = paramIndexOfSymbol(s);
-                if (idx >= 0) markMutated(idx);
+                // Mutation propagates through alias chain to any param root.
+                Symbol* root = aliasRoot(s);
+                int idx = paramIndexOfSymbol(root);
+                if (idx >= 0) markParamMutated(idx);
             }
         }
-        markEscapeIfParamRef(*value);
-    } else if (target->asIdent()) {
-        markEscapeIfParamRef(*value);
+        markEscapeIfRef(*value);
+    } else if (auto id = target->asIdent()) {
+        auto* info = analysis.find(id->node.greenNode());
+        Symbol* targetSym = info ? info->resolvedSymbol : nullptr;
+        if (targetSym) {
+            markSymbolReassigned(targetSym);
+            // Reassignment invalidates any previous alias relationship.
+            if (targetSym->aliasOf) targetSym->aliasOf = nullptr;
+        }
+        // RHS escapes (alias creation in long-lived slot).
+        markEscapeIfRef(*value);
     }
 
     scanExpression(*target);
@@ -170,15 +198,12 @@ void EscapeAnalyzer::scanCall(const ast::CallExpression& e) {
         if (auto id = args[i].asIdent()) {
             auto* info = analysis.find(id->node.greenNode());
             Symbol* argSym = info ? info->resolvedSymbol : nullptr;
-            int paramIdx = paramIndexOfSymbol(argSym);
-            if (paramIdx >= 0) {
-                bool calleeEscapesParam = true;
-                if (calleeSym && i < calleeSym->escapeInfo.params.size()) {
-                    calleeEscapesParam = (calleeSym->escapeInfo.params[i] == EscapeKind::Escape);
-                }
-                if (calleeEscapesParam) {
-                    markEscape(paramIdx);
-                }
+            bool calleeEscapesParam = true;
+            if (calleeSym && i < calleeSym->escapeInfo.params.size()) {
+                calleeEscapesParam = (calleeSym->escapeInfo.params[i] == EscapeKind::Escape);
+            }
+            if (argSym && calleeEscapesParam) {
+                markSymbolEscape(argSym);
             }
         } else {
             scanExpression(args[i]);
@@ -211,21 +236,20 @@ void EscapeAnalyzer::scanNew(const ast::NewExpression& e) {
     }
 }
 
-void EscapeAnalyzer::markEscapeIfParamRef(const ast::Expression& e) {
+void EscapeAnalyzer::markEscapeIfRef(const ast::Expression& e) {
     if (auto id = e.asIdent()) {
         auto* info = analysis.find(id->node.greenNode());
         Symbol* s = info ? info->resolvedSymbol : nullptr;
-        int idx = paramIndexOfSymbol(s);
-        if (idx >= 0) markEscape(idx);
+        if (s) markSymbolEscape(s);
         return;
     }
     if (auto p = e.asParen()) {
-        if (auto inner = p->inner()) markEscapeIfParamRef(*inner);
+        if (auto inner = p->inner()) markEscapeIfRef(*inner);
         return;
     }
     if (auto t = e.asTernary()) {
-        if (auto th = t->thenBranch()) markEscapeIfParamRef(*th);
-        if (auto el = t->elseBranch()) markEscapeIfParamRef(*el);
+        if (auto th = t->thenBranch()) markEscapeIfRef(*th);
+        if (auto el = t->elseBranch()) markEscapeIfRef(*el);
         return;
     }
 }
@@ -238,17 +262,42 @@ int EscapeAnalyzer::paramIndexOfSymbol(Symbol* sym) const {
     return -1;
 }
 
-void EscapeAnalyzer::markEscape(int paramIdx) {
-    if (!currentFn || paramIdx < 0) return;
-    auto& ei = currentFn->escapeInfo;
-    if (paramIdx >= static_cast<int>(ei.params.size())) return;
-    if (ei.params[paramIdx] != EscapeKind::Escape) {
-        ei.params[paramIdx] = EscapeKind::Escape;
+Symbol* EscapeAnalyzer::aliasRoot(Symbol* sym) const {
+    while (sym && sym->aliasOf) sym = sym->aliasOf;
+    return sym;
+}
+
+void EscapeAnalyzer::markSymbolEscape(Symbol* sym) {
+    // Propagate Escape through the alias chain.
+    Symbol* cur = sym;
+    while (cur) {
+        if (cur->localEscape != EscapeKind::Escape) {
+            cur->localEscape = EscapeKind::Escape;
+            changedThisIteration = true;
+            // Mirror to function-level info if this is a parameter of currentFn.
+            int idx = paramIndexOfSymbol(cur);
+            if (idx >= 0 && currentFn) {
+                auto& ei = currentFn->escapeInfo;
+                if (idx < static_cast<int>(ei.params.size()) && ei.params[idx] != EscapeKind::Escape) {
+                    ei.params[idx] = EscapeKind::Escape;
+                }
+            }
+        } else {
+            break;
+        }
+        cur = cur->aliasOf;
+    }
+}
+
+void EscapeAnalyzer::markSymbolReassigned(Symbol* sym) {
+    if (!sym) return;
+    if (!sym->reassigned) {
+        sym->reassigned = true;
         changedThisIteration = true;
     }
 }
 
-void EscapeAnalyzer::markMutated(int paramIdx) {
+void EscapeAnalyzer::markParamMutated(int paramIdx) {
     if (!currentFn || paramIdx < 0) return;
     auto& ei = currentFn->escapeInfo;
     if (paramIdx >= static_cast<int>(ei.paramMutated.size())) return;

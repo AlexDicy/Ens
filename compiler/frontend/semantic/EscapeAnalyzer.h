@@ -49,9 +49,12 @@ private:
     void scanNew(const ast::NewExpression& e);
 
     int paramIndexOfSymbol(Symbol* sym) const;
-    void markEscape(int paramIdx);
-    void markMutated(int paramIdx);
+    Symbol* aliasRoot(Symbol* sym) const;
 
-    // Mark each parameter referenced by `e` (as an alias source or direct ref) as Escape.
-    void markEscapeIfParamRef(const ast::Expression& e);
+    void markSymbolEscape(Symbol* sym);
+    void markSymbolReassigned(Symbol* sym);
+    void markParamMutated(int paramIdx);
+
+    // Mark the underlying symbol referenced by `e` (alias-aware) as Escape.
+    void markEscapeIfRef(const ast::Expression& e);
 };
