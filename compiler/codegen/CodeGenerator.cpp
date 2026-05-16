@@ -29,6 +29,7 @@
 #include <filesystem>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 
 static std::string asAscii(std::u16string_view s) {
     std::string r;
@@ -65,6 +66,7 @@ struct CodeGenerator::Impl {
         ::Type* type;
     };
     std::vector<std::vector<OwnedLocal>> cleanupStack;
+    std::unordered_set<Symbol*> byPointerParams;
 
     Impl(std::string mn, std::string sf, const SourceFile& src, const AnalysisResult& an)
         : moduleName(std::move(mn)), sourceFilename(std::move(sf)),
@@ -310,6 +312,16 @@ struct CodeGenerator::Impl {
         return tmp.CreateAlloca(t, nullptr, name);
     }
 
+    bool paramIsByPointer(Symbol* sym, size_t i) {
+        if (!sym || i >= sym->paramTypes.size()) return false;
+        if (!structHasClassFields(sym->paramTypes[i])) return false;
+        if (!sym->escapeInfo.analyzed) return false;
+        if (i >= sym->escapeInfo.params.size()) return false;
+        if (sym->escapeInfo.params[i] != EscapeKind::NoEscape) return false;
+        if (i < sym->escapeInfo.paramMutated.size() && sym->escapeInfo.paramMutated[i]) return false;
+        return true;
+    }
+
     llvm::Function* getOrDeclareExternalFunction(Symbol* sym, ::Type* receiver) {
         auto it = values.find(sym);
         if (it != values.end()) return llvm::cast<llvm::Function>(it->second);
@@ -317,9 +329,14 @@ struct CodeGenerator::Impl {
 
         std::vector<llvm::Type*> paramTypes;
         if (receiver) paramTypes.push_back(llvm::PointerType::get(ctx, 0));
-        for (auto* pt : sym->paramTypes) {
+        for (size_t i = 0; i < sym->paramTypes.size(); ++i) {
+            auto* pt = sym->paramTypes[i];
             if (isUnsupportedType(pt)) return nullptr;
-            paramTypes.push_back(mapType(pt));
+            if (paramIsByPointer(sym, i)) {
+                paramTypes.push_back(llvm::PointerType::get(ctx, 0));
+            } else {
+                paramTypes.push_back(mapType(pt));
+            }
         }
         if (sym->returnType && !sym->returnType->isVoid() && isUnsupportedType(sym->returnType)) {
             return nullptr;
@@ -349,14 +366,19 @@ struct CodeGenerator::Impl {
         std::vector<llvm::Type*> paramTypes;
         if (receiver) paramTypes.push_back(llvm::PointerType::get(ctx, 0));
         auto fname = fn.nameText().value_or(std::u16string{});
-        for (auto* pt : sym->paramTypes) {
+        for (size_t i = 0; i < sym->paramTypes.size(); ++i) {
+            auto* pt = sym->paramTypes[i];
             if (isUnsupportedType(pt)) {
                 error(fn.node.startOffset(),
                       "Function '" + asAscii(fname) +
                       "' has unsupported parameter type '" + (pt ? pt->toString() : "<null>") + "'");
                 return;
             }
-            paramTypes.push_back(mapType(pt));
+            if (paramIsByPointer(sym, i)) {
+                paramTypes.push_back(llvm::PointerType::get(ctx, 0));
+            } else {
+                paramTypes.push_back(mapType(pt));
+            }
         }
         if (sym->returnType && !sym->returnType->isVoid() && isUnsupportedType(sym->returnType)) {
             error(fn.node.startOffset(),
@@ -380,6 +402,7 @@ struct CodeGenerator::Impl {
         auto it = values.find(sym);
         if (it == values.end()) return;
 
+        byPointerParams.clear();
         currentFunction = llvm::cast<llvm::Function>(it->second);
         auto* entry = llvm::BasicBlock::Create(ctx, "entry", currentFunction);
         builder->SetInsertPoint(entry);
@@ -426,12 +449,15 @@ struct CodeGenerator::Impl {
             if (!psym) continue;
             std::string pname = asAscii(psym->name);
             argIter->setName(pname);
-            llvm::Type* lt = mapType(psym->type);
+            bool byPointer = paramIsByPointer(sym, i);
+            llvm::Type* lt = byPointer ? llvm::PointerType::get(ctx, 0) : mapType(psym->type);
             auto* alloca = createEntryAlloca(currentFunction, lt, pname);
             builder->CreateStore(&*argIter, alloca);
             values[psym] = alloca;
 
-            if (structHasClassFields(psym->type)) {
+            if (byPointer) {
+                byPointerParams.insert(psym);
+            } else if (structHasClassFields(psym->type)) {
                 emitStructFieldRetain(psym->type, alloca);
                 cleanupStack.back().push_back({ alloca, psym->type });
             }
@@ -1234,12 +1260,39 @@ struct CodeGenerator::Impl {
         }
     }
 
+    llvm::Value* emitAddressForByPointerArg(const ast::Expression& e, ::Type* paramType) {
+        if (e.asIdent() || e.asMember()) {
+            return emitLValue(e);
+        }
+        if (auto p = e.asParen()) {
+            if (auto inner = p->inner()) {
+                return emitAddressForByPointerArg(*inner, paramType);
+            }
+        }
+        llvm::Type* lt = mapType(paramType);
+        auto* temp = createEntryAlloca(currentFunction, lt, "byptr.tmp");
+        llvm::Value* val = emitExpr(e);
+        if (!val) return nullptr;
+        builder->CreateStore(val, temp);
+        if (structHasClassFields(paramType) && !cleanupStack.empty()) {
+            cleanupStack.back().push_back({ temp, paramType });
+        }
+        return temp;
+    }
+
     bool appendCallArgs(Symbol* sym, const std::vector<ast::Expression>& userArgs,
                         std::vector<llvm::Value*>& out) {
-        for (auto& a : userArgs) {
-            llvm::Value* v = emitExpr(a);
-            if (!v) return false;
-            out.push_back(v);
+        for (size_t i = 0; i < userArgs.size(); ++i) {
+            auto& a = userArgs[i];
+            if (sym && paramIsByPointer(sym, i)) {
+                llvm::Value* v = emitAddressForByPointerArg(a, sym->paramTypes[i]);
+                if (!v) return false;
+                out.push_back(v);
+            } else {
+                llvm::Value* v = emitExpr(a);
+                if (!v) return false;
+                out.push_back(v);
+            }
         }
         if (!sym || !sym->funcDeclCst) return true;
         auto rootNode = SyntaxNode::makeRoot(sym->funcDeclCst);
@@ -1251,9 +1304,15 @@ struct CodeGenerator::Impl {
             if (!dv) return false;
             auto expr = dv->expression();
             if (!expr) return false;
-            llvm::Value* v = emitExpr(*expr);
-            if (!v) return false;
-            out.push_back(v);
+            if (sym && paramIsByPointer(sym, i)) {
+                llvm::Value* v = emitAddressForByPointerArg(*expr, sym->paramTypes[i]);
+                if (!v) return false;
+                out.push_back(v);
+            } else {
+                llvm::Value* v = emitExpr(*expr);
+                if (!v) return false;
+                out.push_back(v);
+            }
         }
         return true;
     }
@@ -1398,7 +1457,12 @@ struct CodeGenerator::Impl {
             Symbol* sym = symbolOf(id->node);
             if (!sym) return nullptr;
             auto it = values.find(sym);
-            return it == values.end() ? nullptr : it->second;
+            if (it == values.end()) return nullptr;
+            if (byPointerParams.count(sym)) {
+                return builder->CreateLoad(llvm::PointerType::get(ctx, 0), it->second,
+                                           asAscii(sym->name) + ".byptr");
+            }
+            return it->second;
         }
         if (auto th = e.asThis()) {
             Symbol* sym = symbolOf(th->node);
