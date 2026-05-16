@@ -171,9 +171,16 @@ void EscapeAnalyzer::scanAssign(const ast::AssignExpression& e) {
                 Symbol* root = aliasRoot(s);
                 int idx = paramIndexOfSymbol(root);
                 if (idx >= 0) markParamMutated(idx);
-                if (root && root->kind == SymbolKind::Variable && !root->structFieldsMutated) {
-                    root->structFieldsMutated = true;
-                    changedThisIteration = true;
+                // Mark every Variable in the alias chain as structFieldsMutated so
+                // struct-borrow elision is disabled for any let-var that aliases a
+                // mutated source. Without this, `let y = c; y.b = new Box()` keeps
+                // y as a no-retain borrow of c, releasing c.b through y's mutation
+                // and leaving a dangling pointer for c's eventual cleanup.
+                for (Symbol* cur = s; cur && cur->kind == SymbolKind::Variable; cur = cur->aliasOf) {
+                    if (!cur->structFieldsMutated) {
+                        cur->structFieldsMutated = true;
+                        changedThisIteration = true;
+                    }
                 }
             }
         }
