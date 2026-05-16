@@ -60,6 +60,11 @@ struct CodeGenerator::Impl {
     bool debugEnabled = true;
     std::vector<Diagnostic> diagnostics;
 
+    struct OwnedLocal {
+        llvm::Value* alloca;
+    };
+    std::vector<std::vector<OwnedLocal>> cleanupStack;
+
     Impl(std::string mn, std::string sf, const SourceFile& src, const AnalysisResult& an)
         : moduleName(std::move(mn)), sourceFilename(std::move(sf)),
           sourceFile(src), analysis(an) {
@@ -462,6 +467,7 @@ struct CodeGenerator::Impl {
         }
 
         // Body.
+        cleanupStack.emplace_back();
         if (auto body = fn.body()) {
             for (auto& s : body->statements()) {
                 emitStatement(s);
@@ -469,9 +475,11 @@ struct CodeGenerator::Impl {
             }
         }
         if (!builder->GetInsertBlock()->getTerminator()) {
+            emitFrameCleanup(cleanupStack.back());
             if (currentFunction->getReturnType()->isVoidTy()) builder->CreateRetVoid();
             else builder->CreateUnreachable();
         }
+        cleanupStack.pop_back();
 
         if (debugEnabled && diBuilder && sp) diBuilder->finalizeSubprogram(sp);
         currentDIScope = prevScope;
@@ -502,10 +510,15 @@ struct CodeGenerator::Impl {
                 static_cast<unsigned>(line),
                 static_cast<unsigned>(col));
         }
+        cleanupStack.emplace_back();
         for (auto& child : block.statements()) {
             emitStatement(child);
             if (builder->GetInsertBlock()->getTerminator()) break;
         }
+        if (!builder->GetInsertBlock()->getTerminator()) {
+            emitFrameCleanup(cleanupStack.back());
+        }
+        cleanupStack.pop_back();
         currentDIScope = prev;
     }
 
@@ -521,6 +534,7 @@ struct CodeGenerator::Impl {
         llvm::Type* lt = mapType(sym->type);
         auto* alloca = createEntryAlloca(currentFunction, lt, asAscii(sym->name));
         values[sym] = alloca;
+        registerOwnedLocal(alloca, sym->type);
 
         if (debugEnabled && diBuilder && currentDIScope) {
             llvm::DIType* diVarType = mapDIType(sym->type);
@@ -544,6 +558,8 @@ struct CodeGenerator::Impl {
                 setLocationFromNode(s.node);
                 builder->CreateStore(v, alloca);
             }
+        } else if (isReferenceType(sym->type)) {
+            builder->CreateStore(llvm::ConstantPointerNull::get(llvm::PointerType::get(ctx, 0)), alloca);
         }
     }
 
@@ -559,6 +575,7 @@ struct CodeGenerator::Impl {
         llvm::Type* lt = mapType(sym->type);
         auto* alloca = createEntryAlloca(currentFunction, lt, asAscii(sym->name));
         values[sym] = alloca;
+        registerOwnedLocal(alloca, sym->type);
 
         if (debugEnabled && diBuilder && currentDIScope) {
             llvm::DIType* diVarType = mapDIType(sym->type);
@@ -582,6 +599,8 @@ struct CodeGenerator::Impl {
         } else if (sym->type && sym->type->isStruct() && sym->type->structInfo) {
             setLocationFromNode(s.node);
             initStructFieldDefaults(sym->type, alloca);
+        } else if (isReferenceType(sym->type)) {
+            builder->CreateStore(llvm::ConstantPointerNull::get(llvm::PointerType::get(ctx, 0)), alloca);
         }
     }
 
@@ -651,10 +670,19 @@ struct CodeGenerator::Impl {
 
     void emitReturnStmt(const ast::ReturnStatement& s) {
         if (auto v = s.value()) {
+            ::Type* retType = typeOf(v->node);
+            bool needsRetain = isReferenceType(retType) && !v->asNew() && !v->asCall();
+
             llvm::Value* val = emitExpr(*v);
-            if (val) builder->CreateRet(val);
-            else builder->CreateUnreachable();
+            if (!val) { builder->CreateUnreachable(); return; }
+
+            if (needsRetain) {
+                builder->CreateCall(getOrDefineEnsRetain(), { val });
+            }
+            emitFullCleanup();
+            builder->CreateRet(val);
         } else {
+            emitFullCleanup();
             builder->CreateRetVoid();
         }
     }
@@ -998,6 +1026,28 @@ struct CodeGenerator::Impl {
 
         builder->restoreIP(savedIP);
         return fn;
+    }
+
+    void registerOwnedLocal(llvm::Value* alloca, ::Type* type) {
+        if (!isReferenceType(type)) return;
+        if (cleanupStack.empty()) return;
+        cleanupStack.back().push_back({ alloca });
+    }
+
+    void emitFrameCleanup(const std::vector<OwnedLocal>& frame) {
+        if (frame.empty()) return;
+        auto* releaseFn = getOrDefineEnsRelease();
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        for (auto it = frame.rbegin(); it != frame.rend(); ++it) {
+            llvm::Value* val = builder->CreateLoad(ptrTy, it->alloca);
+            builder->CreateCall(releaseFn, { val });
+        }
+    }
+
+    void emitFullCleanup() {
+        for (auto it = cleanupStack.rbegin(); it != cleanupStack.rend(); ++it) {
+            emitFrameCleanup(*it);
+        }
     }
 
     bool appendCallArgs(Symbol* sym, const std::vector<ast::Expression>& userArgs,
