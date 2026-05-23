@@ -70,6 +70,7 @@ public:
     bool isInteger() const;
     bool isFloat() const;
     bool isNumeric() const;
+    bool isPrimitive() const;
     bool isOptional() const { return kind == TypeKind::Optional; }
     bool isError() const { return kind == TypeKind::Error; }
     bool isVoid() const { return kind == TypeKind::Void; }

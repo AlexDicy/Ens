@@ -31,6 +31,34 @@ bool Type::isNumeric() const {
     return isInteger() || isFloat();
 }
 
+bool Type::isPrimitive() const {
+    switch (kind) {
+        case TypeKind::Bool:
+        case TypeKind::Byte:
+        case TypeKind::Short:
+        case TypeKind::UShort:
+        case TypeKind::Int:
+        case TypeKind::UInt:
+        case TypeKind::Long:
+        case TypeKind::ULong:
+        case TypeKind::Float:
+        case TypeKind::Double:
+        case TypeKind::Char:
+            return true;
+        case TypeKind::Decimal:
+        case TypeKind::String:
+        case TypeKind::Void:
+        case TypeKind::Null:
+        case TypeKind::Optional:
+        case TypeKind::Struct:
+        case TypeKind::Class:
+        case TypeKind::External:
+        case TypeKind::Error:
+            return false;
+    }
+    return false;
+}
+
 bool Type::equals(const Type* other) const {
     if (this == other) return true;
     if (!other) return false;

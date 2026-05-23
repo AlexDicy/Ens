@@ -170,18 +170,7 @@ void Analyzer::collectExternalFunctions(const ast::SourceFile& file) {
                     bool ok = false;
                     if (pt && !pt->isError()) {
                         Type* base = pt->isOptional() ? pt->inner : pt;
-                        ok = base && (base->isExternal() ||
-                                      base->kind == TypeKind::Bool ||
-                                      base->kind == TypeKind::Byte ||
-                                      base->kind == TypeKind::Short ||
-                                      base->kind == TypeKind::UShort ||
-                                      base->kind == TypeKind::Int ||
-                                      base->kind == TypeKind::UInt ||
-                                      base->kind == TypeKind::Long ||
-                                      base->kind == TypeKind::ULong ||
-                                      base->kind == TypeKind::Float ||
-                                      base->kind == TypeKind::Double ||
-                                      base->kind == TypeKind::Char);
+                        ok = base && (base->isPrimitive() || base->isExternal());
                     }
                     if (!ok) {
                         auto pname = p.nameText().value_or(std::u16string{});

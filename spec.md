@@ -2,7 +2,6 @@
 `TODO`: field aliases/getters, for example `Vector4` struct can have `x`, `y`, `z`, `w` and `r`, `g`, `b`, `a`.
 
 Primitive types: `bool (1)`, `byte (1)`, `short (2)`, `ushort (2)`, `int (4)`, `uint (4)`, `long (8)`, `ulong (8)`, `float (4)`, `double (8)`
-Additional primitives if possible: `decimal (16?)`
 
 Public by default. Top-level `private` applies to the file scope. When `private` is used in a class or struct it applies to the class/struct level. `Protected` fields/methods in classes and structs apply to the file scope and subclasses in the case of classes. Top-level `protected` is not allowed as it currently carries no meaning.
 
