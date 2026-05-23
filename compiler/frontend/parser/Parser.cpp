@@ -479,27 +479,21 @@ void Parser::parseType() {
         bump();  // '.'
         bump();  // identifier
     }
-    // Array suffix: zero or more `[]` pairs. Only matched when `[` is followed
-    // immediately by `]`; `[expr]` is left alone for the caller (e.g. `new T[n]`).
-    while (at(SyntaxKind::LBracket) && peekKind(1) == SyntaxKind::RBracket) {
-        bump();  // '['
-        bump();  // ']'
+    // Interleaved suffix chain: any sequence of `?` and `[]` pairs.
+    // Each '[' must be followed immediately by ']' to be a type-position
+    // array suffix; otherwise it's left for the caller (e.g. `new T[n]`).
+    while (true) {
+        if (at(SyntaxKind::Question)) { bump(); continue; }
+        if (at(SyntaxKind::LBracket) && peekKind(1) == SyntaxKind::RBracket) {
+            bump();  // '['
+            bump();  // ']'
+            continue;
+        }
+        break;
     }
-    eat(SyntaxKind::Question);
     builder.finishNode();
 }
 
-void Parser::parseTypeHead() {
-    builder.startNode(SyntaxKind::TypeRef);
-    bool wasIdentifier = at(SyntaxKind::Identifier);
-    if (isTypeStart(kindAt())) bump();
-    else emitMissing(SyntaxKind::Identifier, "type name");
-    if (wasIdentifier && at(SyntaxKind::Dot) && peekKind(1) == SyntaxKind::Identifier) {
-        bump();
-        bump();
-    }
-    builder.finishNode();
-}
 
 bool Parser::looksLikeTypedVarDecl() const {
     SyntaxKind k0 = peekKind(0);
@@ -512,14 +506,15 @@ bool Parser::looksLikeTypedVarDecl() const {
         peekKind(2) == SyntaxKind::Identifier) {
         cursor = 3;
     }
-    // Skip zero or more `[]` array suffixes.
-    while (peekKind(cursor) == SyntaxKind::LBracket &&
-           peekKind(cursor + 1) == SyntaxKind::RBracket) {
-        cursor += 2;
-    }
-    // Skip optional `?`.
-    if (peekKind(cursor) == SyntaxKind::Question) {
-        cursor += 1;
+    // Skip any interleaved sequence of `?` and `[]` type suffixes.
+    while (true) {
+        if (peekKind(cursor) == SyntaxKind::Question) { cursor += 1; continue; }
+        if (peekKind(cursor) == SyntaxKind::LBracket &&
+            peekKind(cursor + 1) == SyntaxKind::RBracket) {
+            cursor += 2;
+            continue;
+        }
+        break;
     }
     SyntaxKind name = peekKind(cursor);
     SyntaxKind afterName = peekKind(cursor + 1);
@@ -774,12 +769,12 @@ void Parser::parsePrefix() {
         case SyntaxKind::KwNew: {
             builder.startNode(SyntaxKind::NewExpr);
             bump();
-            // Element/class type without trailing []/?; that way `new T[n]` and
-            // `new T(args)` disambiguate on the next token rather than on what
-            // parseType() decided to swallow.
-            if (isTypeStart(kindAt())) parseTypeHead();
+            // parseType only consumes `[]` adjacent pairs, so `new T[size]`
+            // leaves the `[` for us to recognise as the array-constructor form.
+            // `new T?[size]` and `new T[]?[size]` work the same way.
+            if (isTypeStart(kindAt())) parseType();
             else emitMissing(SyntaxKind::Identifier, "type name after 'new'");
-            if (at(SyntaxKind::LBracket)) { // Array form: `new T[size]`
+            if (at(SyntaxKind::LBracket)) {
                 bump();  // '['
                 parseExpression();
                 expect(SyntaxKind::RBracket, "']' after array size");

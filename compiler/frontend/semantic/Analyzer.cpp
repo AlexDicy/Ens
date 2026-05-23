@@ -656,20 +656,26 @@ Type* Analyzer::resolveTypeReference(const ast::TypeReference& tr) {
         return typeCtx.getError();
     }
     Type* result = base;
-    int depth = tr.arrayDepth();
-    if (depth > 0 && base->isVoid()) {
-        errorAtNode(tr.node, "void cannot be an array element type");
-        result = typeCtx.getError();
-    } else {
-        for (int i = 0; i < depth; ++i) {
+    auto suffixes = tr.suffixChain();
+    for (auto s : suffixes) {
+        if (result->isError()) break;
+        if (s == ast::TypeReference::Suffix::Array) {
+            if (result->isVoid()) {
+                errorAtNode(tr.node, "void cannot be an array element type");
+                result = typeCtx.getError();
+                break;
+            }
+            if (!validateArrayElement(result, tr.node)) {
+                result = typeCtx.getError();
+                break;
+            }
             result = typeCtx.getArray(result);
-        }
-    }
-    if (tr.isOptional() && !result->isError()) {
-        if (result->isVoid()) {
-            errorAtNode(tr.node, "void cannot be optional");
-            result = typeCtx.getError();
         } else {
+            if (result->isVoid()) {
+                errorAtNode(tr.node, "void cannot be optional");
+                result = typeCtx.getError();
+                break;
+            }
             result = typeCtx.getOptional(result);
         }
     }
@@ -1552,9 +1558,6 @@ Type* Analyzer::analyzeNew(const ast::NewExpression& expr) {
     if (!tr) return typeCtx.getError();
     auto typeName = tr->nameText();
     if (!typeName) return typeCtx.getError();
-    if (tr->isOptional()) {
-        errorAtNode(tr->node, "'new' cannot construct an optional type");
-    }
 
     if (expr.isArrayNew()) {
         Type* elem = resolveTypeReference(*tr);
@@ -1564,6 +1567,10 @@ Type* Analyzer::analyzeNew(const ast::NewExpression& expr) {
         }
         if (elem->isVoid()) {
             errorAtNode(tr->node, "Cannot create an array of void");
+            return typeCtx.getError();
+        }
+        if (!validateArrayElement(elem, tr->node)) {
+            if (auto sz = expr.arraySizeExpression()) analyzeExpr(*sz);
             return typeCtx.getError();
         }
         Type* arrT = typeCtx.getArray(elem);
@@ -1580,6 +1587,10 @@ Type* Analyzer::analyzeNew(const ast::NewExpression& expr) {
         }
         analysis.setType(expr.node.greenNode(), arrT);
         return arrT;
+    }
+
+    if (tr->isOptional()) {
+        errorAtNode(tr->node, "'new' cannot construct an optional type");
     }
 
     Type* t = resolveTypeReference(*tr);
@@ -1639,4 +1650,45 @@ bool Analyzer::isLValue(const ast::Expression& expr) const {
     SyntaxKind k = expr.kind();
     return k == SyntaxKind::IdentExpr || k == SyntaxKind::MemberExpr ||
            k == SyntaxKind::SubscriptExpr || k == SyntaxKind::ThisExpr;
+}
+
+bool Analyzer::zeroBitPatternIsValid(Type* t) const {
+    if (!t) return false;
+    if (t->isPrimitive()) return true;
+    if (t->isOptional()) return true;
+    if (t->isStruct()) {
+        if (!t->structInfo) return false;
+        for (auto& f : t->structInfo->fields) {
+            if (!zeroBitPatternIsValid(f.type)) return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+bool Analyzer::validateArrayElement(Type* elem, const SyntaxNode& diagNode) {
+    if (!elem || elem->isError()) return false;
+    if (zeroBitPatternIsValid(elem)) return true;
+    std::string hint;
+    if (elem->isClass() || elem->isArray() || elem->isExternal() ||
+        elem->kind == TypeKind::String) {
+        hint = " Use '" + elem->toString() + "?[]' so freshly-allocated slots can start as null.";
+    } else if (elem->isStruct() && elem->structInfo) {
+        const FieldInfo* bad = nullptr;
+        for (auto& f : elem->structInfo->fields) {
+            if (!zeroBitPatternIsValid(f.type)) { bad = &f; break; }
+        }
+        if (bad) {
+            std::string fname;
+            fname.reserve(bad->name.size());
+            for (char16_t c : bad->name) fname.push_back(c < 128 ? static_cast<char>(c) : '?');
+            hint = " Field '" + fname + "' of '" + elem->toString() +
+                "' has type '" + (bad->type ? bad->type->toString() : std::string("?")) +
+                "' which cannot start as a default zero value. Make that field nullable.";
+        }
+    }
+    errorAtNode(diagNode, "Cannot use '" + elem->toString() +
+        "' as an array element type because freshly-allocated slots would not be valid values of '" +
+        elem->toString() + "'." + hint);
+    return false;
 }

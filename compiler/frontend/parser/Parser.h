@@ -66,7 +66,6 @@ private:
 
     // === Type ===
     void parseType();
-    void parseTypeHead();  // type without trailing [] or ?, for `new T[...]` / `new T(...)`
     bool isTypeStart(SyntaxKind k) const;
     bool isPrimitiveTypeKw(SyntaxKind k) const;
 

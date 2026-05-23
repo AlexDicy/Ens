@@ -149,6 +149,10 @@ private:
                            const SyntaxNode& diagNode);
     bool isLValue(const ast::Expression& expr) const;
 
+    // If true, non-nullable `T[]` is allowed because T can safely start zero-filled.
+    bool zeroBitPatternIsValid(Type* t) const;
+    bool validateArrayElement(Type* elem, const SyntaxNode& diagNode);
+
     // Helpers for CST → location.
     int lineOf(uint32_t offset) const;
     int columnOf(uint32_t offset) const;

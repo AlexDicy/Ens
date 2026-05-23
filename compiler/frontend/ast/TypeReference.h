@@ -24,6 +24,12 @@ public:
     bool isOptional() const;
     int arrayDepth() const;
     bool isArray() const { return arrayDepth() > 0; }
+
+    // Suffix chain (in source order) wrapping the base type. Each entry is
+    // either SyntaxKind::Question (T?) or SyntaxKind::LBracket (T[]).
+    // `Box?[]` yields [Question, LBracket]; `Box[]?` yields [LBracket, Question].
+    enum class Suffix { Optional, Array };
+    std::vector<Suffix> suffixChain() const;
 };
 
 }  // namespace ast

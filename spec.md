@@ -200,9 +200,10 @@ let n = xs.length;            // long
 ```
 
 - `new T[size]` allocates an array of `size` elements. Primitive and reference slots start zero / `null`. Struct slots get the struct's declared field defaults applied to each slot.
+- The element type must be one whose default value is meaningful. A non-nullable reference type (class, array, external, string) is rejected. Use the nullable form instead: write `Box?[]` rather than `Box[]`. The same rule extends through struct fields: a struct containing a non-nullable reference field cannot be used as an array element.
 - `arr[i]` reads or writes an element. Bounds are checked at every access; an out-of-range index aborts the program.
 - `arr.length` returns the number of elements as a `long`.
-- `T[]?` is the nullable form: an array variable that may be `null`. Indexing or reading `.length` requires narrowing the value first (`if (arr != null) { ... }`).
+- `T?[]` is an array of nullable `T`, each **element** can be `null`. `T[]?` is a nullable array variable. The variable itself may be `null`. The two compose: `T?[]?` is both.
 
 ```ens
 int[]? cache = null;

@@ -54,4 +54,19 @@ int TypeReference::arrayDepth() const {
     return depth;
 }
 
+std::vector<TypeReference::Suffix> TypeReference::suffixChain() const {
+    // Suffix tokens (Question / LBracket) only appear after the name segments
+    // in a well-formed TypeRef, so a single in-order pass is enough.
+    std::vector<Suffix> out;
+    for (auto& c : node.children()) {
+        if (isTrivia(c.kind())) continue;
+        if (c.kind() == SyntaxKind::Question) {
+            out.push_back(Suffix::Optional);
+        } else if (c.kind() == SyntaxKind::LBracket) {
+            out.push_back(Suffix::Array);
+        }
+    }
+    return out;
+}
+
 }  // namespace ast
