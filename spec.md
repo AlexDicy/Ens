@@ -188,6 +188,33 @@ draw(Outer? outer) {
 }
 ```
 
+---
+
+Native libraries can be called from Ens through `external` declarations. They are always written at the top of a source file, alongside `import`s and type declarations.
+
+```ens
+external type HANDLE;
+
+external from "kernel32" {
+    ReadFile(HANDLE h, byte[] buf, uint n, out uint bytesRead, HANDLE? ov) -> int;
+    CloseHandle(HANDLE h) -> int;
+}
+
+read(HANDLE h, byte[] buf) -> uint {
+    let bytesRead: uint = 0;
+    let ok = ReadFile(h, buf, buf.length as uint, out bytesRead, null);
+    if (ok == 0) {
+        panic("read failed");
+    }
+    return bytesRead;
+}
+```
+
+- `external type Name;` declares an opaque foreign handle. The handle is passed around and compared with `null`, but it has no members.
+- `external from "libname" { ... }` groups foreign function signatures. The library name is what the linker will look for (e.g. `"kernel32"` resolves to `kernel32.lib` on Windows; `"c"` is libc on Unix and is auto-linked).
+- The `out` modifier marks a parameter the C function writes back to. At the call site, the caller passes an initialized local variable as `out name`. The variable's type must match the declared parameter type exactly.
+- A `string` argument is converted automatically to a NUL-terminated UTF-8 buffer at the call boundary. The C function must not retain that pointer past the call.
+
 Memory is managed automatically through Automatic Reference Counting (ARC).
 
 - **Classes** are heap-allocated reference types. Each instance carries a refcount; when the last reference goes out of scope, the instance is freed.
