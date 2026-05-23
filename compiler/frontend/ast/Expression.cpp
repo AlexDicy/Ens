@@ -288,6 +288,29 @@ std::vector<Expression> NewExpression::arguments() const {
     return {};
 }
 
+bool NewExpression::isArrayNew() const {
+    for (auto& c : node.children()) {
+        if (isTrivia(c.kind())) continue;
+        if (c.kind() == SyntaxKind::LBracket) return true;
+        if (c.kind() == SyntaxKind::ArgList) return false;
+    }
+    return false;
+}
+
+std::optional<Expression> NewExpression::arraySizeExpression() const {
+    if (!isArrayNew()) return std::nullopt;
+    bool seenBracket = false;
+    for (auto& c : node.children()) {
+        if (isTrivia(c.kind())) continue;
+        if (!seenBracket) {
+            if (c.kind() == SyntaxKind::LBracket) seenBracket = true;
+            continue;
+        }
+        if (auto e = Expression::cast(c)) return e;
+    }
+    return std::nullopt;
+}
+
 // === ParenExpression ===
 
 std::optional<Expression> ParenExpression::inner() const {

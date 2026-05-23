@@ -30,6 +30,16 @@ Type* TypeContext::getOptional(Type* inner) {
     return t;
 }
 
+Type* TypeContext::getArray(Type* element) {
+    if (!element || element->isError()) return errorType;
+    if (element->isVoid()) return errorType;
+    auto it = arrayCache.find(element);
+    if (it != arrayCache.end()) return it->second;
+    Type* t = allocate(TypeKind::Array, element);
+    arrayCache[element] = t;
+    return t;
+}
+
 Type* TypeContext::primitiveFromName(const std::u16string& name) {
     if (name == u"bool")    return getPrimitive(TypeKind::Bool);
     if (name == u"byte")    return getPrimitive(TypeKind::Byte);

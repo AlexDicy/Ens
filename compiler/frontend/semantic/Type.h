@@ -9,6 +9,7 @@ enum class TypeKind {
     Float, Double, Decimal, Char, String, Void,
     Null,        // type of the `null` literal - assignable to any Optional
     Optional,    // wraps another type
+    Array,       // T[]
     Struct,      // user-defined struct (value semantics)
     Class,       // user-defined class (reference semantics, heap-allocated)
     External,    // opaque foreign type declared via `external type Name;`
@@ -76,6 +77,7 @@ public:
     bool isVoid() const { return kind == TypeKind::Void; }
     bool isBool() const { return kind == TypeKind::Bool; }
     bool isNull() const { return kind == TypeKind::Null; }
+    bool isArray() const { return kind == TypeKind::Array; }
     bool isStruct() const { return kind == TypeKind::Struct; }
     bool isClass() const  { return kind == TypeKind::Class; }
     bool isExternal() const { return kind == TypeKind::External; }

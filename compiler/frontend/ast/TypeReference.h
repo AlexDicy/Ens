@@ -22,6 +22,8 @@ public:
     std::optional<SyntaxNode> nameToken() const;
     std::optional<std::u16string> nameText() const;
     bool isOptional() const;
+    int arrayDepth() const;
+    bool isArray() const { return arrayDepth() > 0; }
 };
 
 }  // namespace ast

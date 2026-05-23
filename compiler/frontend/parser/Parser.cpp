@@ -479,7 +479,25 @@ void Parser::parseType() {
         bump();  // '.'
         bump();  // identifier
     }
+    // Array suffix: zero or more `[]` pairs. Only matched when `[` is followed
+    // immediately by `]`; `[expr]` is left alone for the caller (e.g. `new T[n]`).
+    while (at(SyntaxKind::LBracket) && peekKind(1) == SyntaxKind::RBracket) {
+        bump();  // '['
+        bump();  // ']'
+    }
     eat(SyntaxKind::Question);
+    builder.finishNode();
+}
+
+void Parser::parseTypeHead() {
+    builder.startNode(SyntaxKind::TypeRef);
+    bool wasIdentifier = at(SyntaxKind::Identifier);
+    if (isTypeStart(kindAt())) bump();
+    else emitMissing(SyntaxKind::Identifier, "type name");
+    if (wasIdentifier && at(SyntaxKind::Dot) && peekKind(1) == SyntaxKind::Identifier) {
+        bump();
+        bump();
+    }
     builder.finishNode();
 }
 
@@ -488,19 +506,24 @@ bool Parser::looksLikeTypedVarDecl() const {
     if (!isTypeStart(k0)) return false;
     // Skip a single optional namespace qualifier: `ns.Name ...`. Primitives can't
     // be qualified, so this only fires when the leading token is an Identifier.
-    size_t typeEnd = 1;
+    size_t cursor = 1;
     if (k0 == SyntaxKind::Identifier &&
         peekKind(1) == SyntaxKind::Dot &&
         peekKind(2) == SyntaxKind::Identifier) {
-        typeEnd = 3;
+        cursor = 3;
     }
-    SyntaxKind nameOrAfterQ = peekKind(typeEnd);
-    SyntaxKind afterName = peekKind(typeEnd + 1);
-    if (nameOrAfterQ == SyntaxKind::Question) {
-        nameOrAfterQ = peekKind(typeEnd + 1);
-        afterName = peekKind(typeEnd + 2);
+    // Skip zero or more `[]` array suffixes.
+    while (peekKind(cursor) == SyntaxKind::LBracket &&
+           peekKind(cursor + 1) == SyntaxKind::RBracket) {
+        cursor += 2;
     }
-    if (nameOrAfterQ != SyntaxKind::Identifier) return false;
+    // Skip optional `?`.
+    if (peekKind(cursor) == SyntaxKind::Question) {
+        cursor += 1;
+    }
+    SyntaxKind name = peekKind(cursor);
+    SyntaxKind afterName = peekKind(cursor + 1);
+    if (name != SyntaxKind::Identifier) return false;
     return afterName == SyntaxKind::Eq || afterName == SyntaxKind::Semi;
 }
 
@@ -751,10 +774,20 @@ void Parser::parsePrefix() {
         case SyntaxKind::KwNew: {
             builder.startNode(SyntaxKind::NewExpr);
             bump();
-            if (at(SyntaxKind::Identifier)) parseType();
+            // Element/class type without trailing []/?; that way `new T[n]` and
+            // `new T(args)` disambiguate on the next token rather than on what
+            // parseType() decided to swallow.
+            if (isTypeStart(kindAt())) parseTypeHead();
             else emitMissing(SyntaxKind::Identifier, "type name after 'new'");
-            if (at(SyntaxKind::LParen)) parseArgList();
-            else emitMissing(SyntaxKind::LParen, "'(' after class name in 'new'");
+            if (at(SyntaxKind::LBracket)) { // Array form: `new T[size]`
+                bump();  // '['
+                parseExpression();
+                expect(SyntaxKind::RBracket, "']' after array size");
+            } else if (at(SyntaxKind::LParen)) {
+                parseArgList();
+            } else {
+                emitMissing(SyntaxKind::LParen, "'(' or '[' after type in 'new'");
+            }
             builder.finishNode();
             return;
         }

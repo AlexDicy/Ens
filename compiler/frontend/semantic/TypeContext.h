@@ -11,6 +11,7 @@ public:
 
     Type* getPrimitive(TypeKind k);
     Type* getOptional(Type* inner);
+    Type* getArray(Type* element);
     Type* getError() { return errorType; }
     Type* getNull() { return nullType; }
 
@@ -44,6 +45,7 @@ private:
     std::vector<std::unique_ptr<StructInfo>> ownedStructs;
     std::unordered_map<int, Type*> primitiveCache;
     std::unordered_map<Type*, Type*> optionalCache;
+    std::unordered_map<Type*, Type*> arrayCache;
     std::unordered_map<Key, Type*, KeyHash> structCache;
     std::unordered_map<Key, Type*, KeyHash> classCache;
     std::unordered_map<Key, Type*, KeyHash> externalCache;

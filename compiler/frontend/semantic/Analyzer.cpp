@@ -180,6 +180,28 @@ void Analyzer::collectExternalFunctions(const ast::SourceFile& file) {
                             "'. 'out' parameters must be a primitive or an external type.");
                     }
                 }
+                // Array params: only primitive or external element types are valid
+                // at the C ABI boundary (class/struct elements would require the C
+                // side to understand the Ens object header).
+                if (pt && !pt->isError()) {
+                    Type* arrCheck = pt->isOptional() ? pt->inner : pt;
+                    if (arrCheck && arrCheck->isArray()) {
+                        if (isOut) {
+                            auto pname = p.nameText().value_or(std::u16string{});
+                            errorAtNode(p.node, "Out parameter '" + asciiOf(pname) +
+                                "' of '" + asciiOf(fname) + "' has type '" + pt->toString() +
+                                "'. Array 'out' parameters are not supported.");
+                        }
+                        Type* elem = arrCheck->inner;
+                        bool elemOk = elem && (elem->isPrimitive() || elem->isExternal());
+                        if (!elemOk) {
+                            auto pname = p.nameText().value_or(std::u16string{});
+                            errorAtNode(p.node, "External function parameter '" + asciiOf(pname) +
+                                "' of '" + asciiOf(fname) + "' has type '" + pt->toString() +
+                                "'. Array elements passed to C must be a primitive or an external type.");
+                        }
+                    }
+                }
                 if (p.defaultValue()) {
                     errorAtNode(p.node, "External function parameters cannot have default values.");
                 }
@@ -634,12 +656,21 @@ Type* Analyzer::resolveTypeReference(const ast::TypeReference& tr) {
         return typeCtx.getError();
     }
     Type* result = base;
-    if (tr.isOptional()) {
-        if (base->isVoid()) {
+    int depth = tr.arrayDepth();
+    if (depth > 0 && base->isVoid()) {
+        errorAtNode(tr.node, "void cannot be an array element type");
+        result = typeCtx.getError();
+    } else {
+        for (int i = 0; i < depth; ++i) {
+            result = typeCtx.getArray(result);
+        }
+    }
+    if (tr.isOptional() && !result->isError()) {
+        if (result->isVoid()) {
             errorAtNode(tr.node, "void cannot be optional");
             result = typeCtx.getError();
         } else {
-            result = typeCtx.getOptional(base);
+            result = typeCtx.getOptional(result);
         }
     }
     analysis.setType(tr.node.greenNode(), result);
@@ -935,6 +966,7 @@ Type* Analyzer::analyzeExpr(const ast::Expression& expr) {
     else if (auto c  = expr.asCall())   t = analyzeCall(*c);
     else if (auto m  = expr.asMember()) t = analyzeMember(*m);
     else if (auto sm = expr.asSafeMember()) t = analyzeSafeMember(*sm);
+    else if (auto su = expr.asSubscript()) t = analyzeSubscript(*su);
     else if (auto oa = expr.asOutArgument()) {
         errorAtNode(expr.node, "'out' can only be used when calling an external function.");
         t = typeCtx.getError();
@@ -1346,6 +1378,16 @@ Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
 
     Type* objT = analyzeExpr(*obj);
     if (objT->isError()) return typeCtx.getError();
+    if (objT->isArray()) {
+        auto memberName = expr.memberText();
+        if (!memberName) return typeCtx.getError();
+        if (*memberName == u"length") {
+            return typeCtx.getPrimitive(TypeKind::Long);
+        }
+        errorAtNode(expr.node, "Type '" + objT->toString() + "' has no member '" +
+            asciiOf(*memberName) + "'; arrays only have 'length'.");
+        return typeCtx.getError();
+    }
     if (!objT->hasRecordLayout() || !objT->structInfo) {
         if (objT->isOptional()) {
             errorAtNode(expr.node, "Cannot read a member of '" + objT->toString() +
@@ -1427,6 +1469,29 @@ Type* Analyzer::analyzeSafeMember(const ast::SafeMemberExpression& expr) {
     return typeCtx.getError();
 }
 
+Type* Analyzer::analyzeSubscript(const ast::SubscriptExpression& expr) {
+    auto obj = expr.object();
+    auto idx = expr.index();
+    if (!obj || !idx) return typeCtx.getError();
+    Type* objT = analyzeExpr(*obj);
+    Type* idxT = analyzeExpr(*idx);
+    if (objT->isError()) return typeCtx.getError();
+    if (objT->isOptional() && objT->inner && objT->inner->isArray()) {
+        errorAtNode(expr.node, "Cannot index '" + objT->toString() +
+            "' because it may be null. Check for null first.");
+        return typeCtx.getError();
+    }
+    if (!objT->isArray()) {
+        errorAtNode(expr.node, "Cannot index '" + objT->toString() +
+            "'; only arrays support [] indexing.");
+        return typeCtx.getError();
+    }
+    if (!idxT->isError() && !idxT->isInteger()) {
+        errorAtNode(idx->node, "Array index must be an integer, got '" + idxT->toString() + "'");
+    }
+    return objT->inner ? objT->inner : typeCtx.getError();
+}
+
 Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
     auto target = expr.target();
     auto value = expr.value();
@@ -1489,6 +1554,32 @@ Type* Analyzer::analyzeNew(const ast::NewExpression& expr) {
     if (!typeName) return typeCtx.getError();
     if (tr->isOptional()) {
         errorAtNode(tr->node, "'new' cannot construct an optional type");
+    }
+
+    if (expr.isArrayNew()) {
+        Type* elem = resolveTypeReference(*tr);
+        if (elem->isError()) {
+            if (auto sz = expr.arraySizeExpression()) analyzeExpr(*sz);
+            return typeCtx.getError();
+        }
+        if (elem->isVoid()) {
+            errorAtNode(tr->node, "Cannot create an array of void");
+            return typeCtx.getError();
+        }
+        Type* arrT = typeCtx.getArray(elem);
+        auto sz = expr.arraySizeExpression();
+        if (!sz) {
+            errorAtNode(expr.node, "'new " + elem->toString() +
+                "[...]' requires a size expression inside the brackets");
+            analysis.setType(expr.node.greenNode(), arrT);
+            return arrT;
+        }
+        Type* sizeT = analyzeExpr(*sz);
+        if (!sizeT->isError() && !sizeT->isInteger()) {
+            errorAtNode(sz->node, "Array size must be an integer, got '" + sizeT->toString() + "'");
+        }
+        analysis.setType(expr.node.greenNode(), arrT);
+        return arrT;
     }
 
     Type* t = resolveTypeReference(*tr);

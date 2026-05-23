@@ -140,6 +140,7 @@ void EscapeAnalyzer::scanExpression(const ast::Expression& e) {
         if (auto obj = sm->object()) scanExpression(*obj);
         return;
     }
+    if (auto su = e.asSubscript()) { scanSubscript(*su); return; }
     if (e.asOutArgument()) {
         // External calls don't participate in ARC-aware escape analysis; the
         // referenced local is treated as reassigned by the analyzer itself.
@@ -202,10 +203,17 @@ void EscapeAnalyzer::scanAssign(const ast::AssignExpression& e) {
         if (!isBorrowModeSymbol(targetSym)) {
             markEscapeIfRef(*value);
         }
+    } else if (target->asSubscript()) {
+        markEscapeIfRef(*value);
     }
 
     scanExpression(*target);
     scanExpression(*value);
+}
+
+void EscapeAnalyzer::scanSubscript(const ast::SubscriptExpression& e) {
+    if (auto obj = e.object()) scanExpression(*obj);
+    if (auto idx = e.index()) scanExpression(*idx);
 }
 
 void EscapeAnalyzer::scanCall(const ast::CallExpression& e) {
@@ -460,6 +468,11 @@ void EscapeAnalyzer::walkExprForLastUses(const ast::Expression& e) {
     }
     if (auto sm = e.asSafeMember()) {
         if (auto obj = sm->object()) walkExprForLastUses(*obj);
+        return;
+    }
+    if (auto su = e.asSubscript()) {
+        if (auto obj = su->object()) walkExprForLastUses(*obj);
+        if (auto idx = su->index()) walkExprForLastUses(*idx);
         return;
     }
     if (auto bn = e.asBinary()) {

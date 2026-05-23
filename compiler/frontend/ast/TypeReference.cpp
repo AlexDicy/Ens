@@ -46,4 +46,12 @@ bool TypeReference::isOptional() const {
     return false;
 }
 
+int TypeReference::arrayDepth() const {
+    int depth = 0;
+    for (auto& c : node.children()) {
+        if (c.kind() == SyntaxKind::LBracket) depth++;
+    }
+    return depth;
+}
+
 }  // namespace ast

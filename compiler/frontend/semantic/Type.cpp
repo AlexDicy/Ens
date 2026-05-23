@@ -50,6 +50,7 @@ bool Type::isPrimitive() const {
         case TypeKind::Void:
         case TypeKind::Null:
         case TypeKind::Optional:
+        case TypeKind::Array:
         case TypeKind::Struct:
         case TypeKind::Class:
         case TypeKind::External:
@@ -63,7 +64,7 @@ bool Type::equals(const Type* other) const {
     if (this == other) return true;
     if (!other) return false;
     if (kind != other->kind) return false;
-    if (kind == TypeKind::Optional) {
+    if (kind == TypeKind::Optional || kind == TypeKind::Array) {
         return inner && other->inner && inner->equals(other->inner);
     }
     if (kind == TypeKind::Struct || kind == TypeKind::Class ||
@@ -102,6 +103,7 @@ std::string Type::toString() const {
         case TypeKind::Void:     return "void";
         case TypeKind::Null:     return "null";
         case TypeKind::Optional: return (inner ? inner->toString() : std::string("?")) + "?";
+        case TypeKind::Array:    return (inner ? inner->toString() : std::string("?")) + "[]";
         case TypeKind::Struct:
         case TypeKind::Class:    {
             std::string r;

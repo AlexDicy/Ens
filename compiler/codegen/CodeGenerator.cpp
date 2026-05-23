@@ -118,8 +118,12 @@ struct CodeGenerator::Impl {
             case TypeKind::Error:
                 return true;
             case TypeKind::Optional:
-                // Nullable class and external types are supported (pointer-sized).
-                return !(t->inner && (t->inner->isClass() || t->inner->isExternal()));
+                // Nullable class, external, and array types are pointer-sized.
+                if (t->inner && (t->inner->isClass() || t->inner->isExternal())) return false;
+                if (t->inner && t->inner->isArray()) return isUnsupportedType(t->inner);
+                return true;
+            case TypeKind::Array:
+                return isUnsupportedType(t->inner);
             default:
                 return false;
         }
@@ -128,7 +132,9 @@ struct CodeGenerator::Impl {
     bool isReferenceType(::Type* t) {
         if (!t) return false;
         if (t->kind == TypeKind::Class) return true;
-        if (t->kind == TypeKind::Optional && t->inner && t->inner->isClass()) return true;
+        if (t->kind == TypeKind::Array) return true;
+        if (t->kind == TypeKind::Optional && t->inner &&
+            (t->inner->isClass() || t->inner->isArray())) return true;
         return false;
     }
 
@@ -151,9 +157,10 @@ struct CodeGenerator::Impl {
             case TypeKind::Struct:  return mapStructType(t);
             case TypeKind::Class:   return llvm::PointerType::get(ctx, 0);
             case TypeKind::External: return llvm::PointerType::get(ctx, 0);
+            case TypeKind::Array:   return llvm::PointerType::get(ctx, 0);
             case TypeKind::Optional:
-                if (t->inner && t->inner->isClass()) return llvm::PointerType::get(ctx, 0);
-                if (t->inner && t->inner->isExternal()) return llvm::PointerType::get(ctx, 0);
+                if (t->inner && (t->inner->isClass() || t->inner->isExternal() || t->inner->isArray()))
+                    return llvm::PointerType::get(ctx, 0);
                 return nullptr;
             default:                return nullptr;
         }
@@ -191,6 +198,15 @@ struct CodeGenerator::Impl {
         if (!debugEnabled || !diBuilder || !t) return nullptr;
         if (t->kind == TypeKind::Optional && t->inner && t->inner->isClass()) {
             return mapDIType(t->inner);
+        }
+        if (t->kind == TypeKind::Optional && t->inner && t->inner->isArray()) {
+            return mapDIType(t->inner);
+        }
+        if (t->kind == TypeKind::Array) {
+            llvm::DIType* elem = mapDIType(t->inner);
+            if (!elem) return nullptr;
+            uint64_t ptrBits = module->getDataLayout().getPointerSizeInBits();
+            return diBuilder->createPointerType(elem, ptrBits);
         }
         if (t->kind == TypeKind::Struct) return mapDIStructType(t);
         if (t->kind == TypeKind::Class) {
@@ -921,6 +937,7 @@ struct CodeGenerator::Impl {
         if (auto c = e.asCall()) return emitCall(*c);
         if (auto m = e.asMember()) return emitMember(*m);
         if (auto sm = e.asSafeMember()) return emitSafeMember(*sm);
+        if (auto su = e.asSubscript()) return emitSubscript(*su);
         if (auto a = e.asAssign()) return emitAssign(*a);
         if (auto t = e.asTernary()) return emitTernary(*t);
         if (auto n = e.asNew()) return emitNew(*n);
@@ -1542,6 +1559,197 @@ struct CodeGenerator::Impl {
         return fn;
     }
 
+    // ===== Arrays =====
+    //
+    // Layout (offsets from the array pointer, which is the value visible to Ens code):
+    //   payload + 0  : i64 length
+    //   payload + 8  : element data
+
+    llvm::Function* getOrDeclareExit() {
+        if (auto* existing = module->getFunction("exit")) return existing;
+        auto* fnTy = llvm::FunctionType::get(
+            llvm::Type::getVoidTy(ctx),
+            { llvm::Type::getInt32Ty(ctx) }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, "exit", module.get());
+        fn->addFnAttr(llvm::Attribute::NoReturn);
+        return fn;
+    }
+
+    llvm::Constant* makeMessageString(const std::string& text) {
+        return builder->CreateGlobalString(text, ".panicmsg");
+    }
+
+    void emitPanic(const std::string& message, int exitCode) {
+        auto* puts = getOrDeclarePuts();
+        llvm::Value* str = makeMessageString(message);
+        builder->CreateCall(puts, { str });
+        builder->CreateCall(getOrDeclareExit(),
+            { llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), exitCode) });
+        builder->CreateUnreachable();
+    }
+
+    // Builds an LLVM-symbol-safe name from Type::toString() by escaping the
+    // characters toString() may emit that aren't valid in symbol names
+    static std::string mangleTypeForName(::Type* t) {
+        if (!t) return "_";
+        std::string s = t->toString();
+        std::string out;
+        out.reserve(s.size());
+        for (size_t i = 0; i < s.size(); ++i) {
+            char c = s[i];
+            if (c == '?') {
+                out += "_opt";
+            } else if (c == '[' && i + 1 < s.size() && s[i + 1] == ']') {
+                out += "_arr";
+                ++i;
+            } else if (c == '<' || c == '>') {
+                // skip
+            } else {
+                out += c;
+            }
+        }
+        return out;
+    }
+
+    uint64_t elementSizeBytes(::Type* elem) {
+        if (!elem) return 1;
+        llvm::Type* lt = mapType(elem);
+        if (!lt) return 1;
+        return module->getDataLayout().getTypeAllocSize(lt);
+    }
+
+    llvm::Value* arrayLengthAddr(llvm::Value* arrPtr) {
+        return arrPtr; // length lives at payload offset 0.
+    }
+
+    llvm::Value* emitArrayLength(llvm::Value* arrPtr) {
+        return builder->CreateLoad(llvm::Type::getInt64Ty(ctx),
+                                   arrayLengthAddr(arrPtr), "arr.length");
+    }
+
+    llvm::Value* emitArrayDataPtr(llvm::Value* arrPtr) {
+        return builder->CreateGEP(
+            llvm::Type::getInt8Ty(ctx), arrPtr,
+            llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), 8), "arr.data");
+    }
+
+    // Lazily emits `_dtor_<elem>_array` which walks the element data and
+    // releases per-slot ownership where required. Returns null if the element
+    // type needs no per-slot work (primitives / externals / class-free structs).
+    llvm::Value* getOrEmitArrayDtor(::Type* elem) {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        if (!elem) return llvm::ConstantPointerNull::get(ptrTy);
+
+        bool needsWalk = isReferenceType(elem) || structHasClassFields(elem);
+        if (!needsWalk) return llvm::ConstantPointerNull::get(ptrTy);
+
+        std::string name = "_dtor_" + mangleTypeForName(elem) + "_array";
+        if (auto* existing = module->getFunction(name)) return existing;
+
+        auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), { ptrTy }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, name, module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+
+        auto savedIP = builder->saveIP();
+        auto* entry    = llvm::BasicBlock::Create(ctx, "entry",    fn);
+        auto* loopCond = llvm::BasicBlock::Create(ctx, "loop.cond", fn);
+        auto* loopBody = llvm::BasicBlock::Create(ctx, "loop.body", fn);
+        auto* loopEnd  = llvm::BasicBlock::Create(ctx, "loop.end",  fn);
+
+        builder->SetInsertPoint(entry);
+        llvm::Value* arrPtr = fn->getArg(0);
+        llvm::Type* i64 = llvm::Type::getInt64Ty(ctx);
+        llvm::Value* length = builder->CreateLoad(i64, arrPtr, "arr.length");
+        llvm::Value* data = builder->CreateGEP(
+            llvm::Type::getInt8Ty(ctx), arrPtr,
+            llvm::ConstantInt::get(i64, 8), "arr.data");
+        llvm::Value* idxAlloca = builder->CreateAlloca(i64, nullptr, "i");
+        builder->CreateStore(llvm::ConstantInt::get(i64, 0), idxAlloca);
+        builder->CreateBr(loopCond);
+
+        builder->SetInsertPoint(loopCond);
+        llvm::Value* idx = builder->CreateLoad(i64, idxAlloca, "i.load");
+        llvm::Value* cond = builder->CreateICmpSLT(idx, length, "i.lt.len");
+        builder->CreateCondBr(cond, loopBody, loopEnd);
+
+        builder->SetInsertPoint(loopBody);
+        llvm::Type* elemTy = mapType(elem);
+        llvm::Value* slot = builder->CreateGEP(elemTy, data, idx, "slot");
+        if (isReferenceType(elem)) {
+            llvm::Value* val = builder->CreateLoad(ptrTy, slot, "slot.val");
+            builder->CreateCall(getOrDefineEnsRelease(), { val });
+        } else if (structHasClassFields(elem)) {
+            emitStructFieldRelease(elem, slot);
+        }
+        llvm::Value* next = builder->CreateAdd(idx, llvm::ConstantInt::get(i64, 1));
+        builder->CreateStore(next, idxAlloca);
+        builder->CreateBr(loopCond);
+
+        builder->SetInsertPoint(loopEnd);
+        builder->CreateRetVoid();
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    llvm::Value* emitArrayNew(::Type* elem, llvm::Value* sizeI64,
+                              uint32_t diagOffset) {
+        if (!elem) return nullptr;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        llvm::Type* i64 = llvm::Type::getInt64Ty(ctx);
+
+        // Bounds check: size must be non-negative.
+        auto* badBB = llvm::BasicBlock::Create(ctx, "arr.new.neg", currentFunction);
+        auto* okBB  = llvm::BasicBlock::Create(ctx, "arr.new.ok",  currentFunction);
+        llvm::Value* neg = builder->CreateICmpSLT(
+            sizeI64, llvm::ConstantInt::get(i64, 0), "arr.new.neg.cmp");
+        builder->CreateCondBr(neg, badBB, okBB);
+
+        builder->SetInsertPoint(badBB);
+        emitPanic("array size cannot be negative", 134);
+
+        builder->SetInsertPoint(okBB);
+        uint64_t elemBytes = elementSizeBytes(elem);
+        llvm::Value* dataBytes = builder->CreateMul(
+            sizeI64, llvm::ConstantInt::get(i64, static_cast<int64_t>(elemBytes)), "arr.databytes");
+        llvm::Value* payloadBytes = builder->CreateAdd(
+            dataBytes, llvm::ConstantInt::get(i64, 8), "arr.payloadbytes");
+
+        llvm::Value* dtor = getOrEmitArrayDtor(elem);
+        if (!dtor) dtor = llvm::ConstantPointerNull::get(ptrTy);
+        llvm::Value* arrPtr = builder->CreateCall(
+            getOrDefineEnsAlloc(), { payloadBytes, dtor }, "arr.new");
+        builder->CreateStore(sizeI64, arrayLengthAddr(arrPtr));
+        return arrPtr;
+    }
+
+    // Emits a bounds check then returns the address of element `index`.
+    llvm::Value* emitArraySubscriptAddr(llvm::Value* arrPtr, llvm::Value* indexAny,
+                                        ::Type* elem) {
+        llvm::Type* i64 = llvm::Type::getInt64Ty(ctx);
+        llvm::Value* index = indexAny;
+        if (index->getType() != i64) {
+            index = builder->CreateSExtOrTrunc(index, i64, "idx.i64");
+        }
+        llvm::Value* length = emitArrayLength(arrPtr);
+
+        auto* outOfBoundsBB = llvm::BasicBlock::Create(ctx, "arr.oob", currentFunction);
+        auto* okBB          = llvm::BasicBlock::Create(ctx, "arr.idx.ok", currentFunction);
+
+        llvm::Value* tooLow  = builder->CreateICmpSLT(index, llvm::ConstantInt::get(i64, 0), "idx.neg");
+        llvm::Value* tooHigh = builder->CreateICmpSGE(index, length, "idx.ge.len");
+        llvm::Value* oob     = builder->CreateOr(tooLow, tooHigh, "idx.oob");
+        builder->CreateCondBr(oob, outOfBoundsBB, okBB);
+
+        builder->SetInsertPoint(outOfBoundsBB);
+        emitPanic("array index out of bounds", 134);
+
+        builder->SetInsertPoint(okBB);
+        llvm::Value* data = emitArrayDataPtr(arrPtr);
+        llvm::Type* elemTy = mapType(elem);
+        return builder->CreateGEP(elemTy, data, index, "arr.slot");
+    }
+
     const FieldInfo* memberFieldInfo(const ast::MemberExpression& m) const {
         auto obj = m.object();
         if (!obj) return nullptr;
@@ -1726,6 +1934,24 @@ struct CodeGenerator::Impl {
 
     llvm::Value* emitNew(const ast::NewExpression& e) {
         ::Type* t = typeOf(e.node);
+        if (e.isArrayNew()) {
+            if (!t || !t->isArray() || !t->inner) {
+                error(e.node.startOffset(), "Internal: array-'new' has no resolved array type");
+                return nullptr;
+            }
+            auto sz = e.arraySizeExpression();
+            if (!sz) {
+                error(e.node.startOffset(), "Internal: array-'new' missing size expression");
+                return nullptr;
+            }
+            llvm::Value* sizeVal = emitExpr(*sz);
+            if (!sizeVal) return nullptr;
+            llvm::Type* i64 = llvm::Type::getInt64Ty(ctx);
+            if (sizeVal->getType() != i64) {
+                sizeVal = builder->CreateSExtOrTrunc(sizeVal, i64, "arr.size.i64");
+            }
+            return emitArrayNew(t->inner, sizeVal, e.node.startOffset());
+        }
         if (!t || !t->structInfo) {
             error(e.node.startOffset(), "Internal: 'new' has no resolved class type");
             return nullptr;
@@ -1909,6 +2135,11 @@ struct CodeGenerator::Impl {
             } else {
                 llvm::Value* v = emitExpr(userArg);
                 if (!v) return nullptr;
+                ::Type* paramT = sym->paramTypes[i];
+                ::Type* baseT = (paramT && paramT->isOptional()) ? paramT->inner : paramT;
+                if (baseT && baseT->isArray()) {
+                    v = emitArrayDataPtr(v);
+                }
                 args.push_back(v);
             }
         }
@@ -2042,11 +2273,38 @@ struct CodeGenerator::Impl {
             return builder->CreateStructGEP(st, objAddr, static_cast<unsigned>(idx),
                                             asAscii(*memberName) + ".addr");
         }
+        if (auto su = e.asSubscript()) {
+            auto obj = su->object();
+            auto idx = su->index();
+            if (!obj || !idx) return nullptr;
+            ::Type* objType = typeOf(obj->node);
+            if (!objType || !objType->isArray() || !objType->inner) {
+                error(e.node.startOffset(), "Internal: subscript receiver is not an array");
+                return nullptr;
+            }
+            llvm::Value* arrPtr = emitExpr(*obj);
+            llvm::Value* idxVal = emitExpr(*idx);
+            if (!arrPtr || !idxVal) return nullptr;
+            return emitArraySubscriptAddr(arrPtr, idxVal, objType->inner);
+        }
         error(e.node.startOffset(), "Cannot get address of this expression");
         return nullptr;
     }
 
     llvm::Value* emitMember(const ast::MemberExpression& e) {
+        auto obj = e.object();
+        ::Type* objType = obj ? typeOf(obj->node) : nullptr;
+        if (objType && objType->isArray()) {
+            auto memberName = e.memberText().value_or(std::u16string{});
+            if (memberName == u"length") {
+                llvm::Value* arrPtr = emitExpr(*obj);
+                if (!arrPtr) return nullptr;
+                return emitArrayLength(arrPtr);
+            }
+            error(e.node.startOffset(), "Internal: unsupported array member '" +
+                  asAscii(memberName) + "'");
+            return nullptr;
+        }
         ast::Expression wrapper{e.node};
         llvm::Value* addr = emitLValue(wrapper);
         if (!addr) return nullptr;
@@ -2059,6 +2317,22 @@ struct CodeGenerator::Impl {
         }
         ::Type* fieldType = typeOf(e.node);
         return builder->CreateLoad(mapType(fieldType), addr, asAscii(memberName) + ".load");
+    }
+
+    llvm::Value* emitSubscript(const ast::SubscriptExpression& e) {
+        auto obj = e.object();
+        auto idx = e.index();
+        if (!obj || !idx) return nullptr;
+        ::Type* objType = typeOf(obj->node);
+        if (!objType || !objType->isArray() || !objType->inner) {
+            error(e.node.startOffset(), "Internal: subscript receiver is not an array");
+            return nullptr;
+        }
+        llvm::Value* arrPtr = emitExpr(*obj);
+        llvm::Value* idxVal = emitExpr(*idx);
+        if (!arrPtr || !idxVal) return nullptr;
+        llvm::Value* slot = emitArraySubscriptAddr(arrPtr, idxVal, objType->inner);
+        return builder->CreateLoad(mapType(objType->inner), slot, "arr.elem");
     }
 
     llvm::Value* emitSafeMember(const ast::SafeMemberExpression& e) {

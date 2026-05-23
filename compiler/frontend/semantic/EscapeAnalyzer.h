@@ -47,6 +47,7 @@ private:
     void scanAssign(const ast::AssignExpression& e);
     void scanCall(const ast::CallExpression& e);
     void scanMember(const ast::MemberExpression& e);
+    void scanSubscript(const ast::SubscriptExpression& e);
     void scanBinary(const ast::BinaryExpression& e);
     void scanTernary(const ast::TernaryExpression& e);
     void scanParen(const ast::ParenExpression& e);

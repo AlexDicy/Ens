@@ -208,6 +208,8 @@ public:
     std::optional<std::u16string> typeNameText() const;
     std::optional<ArgumentList> argumentList() const;
     std::vector<Expression> arguments() const;
+    bool isArrayNew() const;
+    std::optional<Expression> arraySizeExpression() const;
 };
 
 class ParenExpression {
