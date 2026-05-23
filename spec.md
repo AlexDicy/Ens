@@ -189,6 +189,30 @@ draw(Outer? outer) {
 
 ---
 
+Arrays are written with `T[]` and are reference types: declaring an array variable binds a pointer to a heap allocation, and copying the variable copies the pointer.
+
+```ens
+int[] xs = new int[5];        // 5 ints, zero-initialized
+xs[0] = 10;
+xs[1] = xs[0] * 2;
+
+let n = xs.length;            // long
+```
+
+- `new T[size]` allocates an array of `size` elements. The slots are zero-initialized (`0` for numbers, `null` for class and array references, all-zero bytes for struct fields). Struct field defaults are not applied per slot; assign explicitly if you need anything other than zero.
+- `arr[i]` reads or writes an element. Bounds are checked at every access; an out-of-range index aborts the program.
+- `arr.length` returns the number of elements as a `long`.
+- `T[]?` is the nullable form: an array variable that may be `null`. Indexing or reading `.length` requires narrowing the value first (`if (arr != null) { ... }`).
+
+```ens
+int[]? cache = null;
+if (cache != null) {
+    cache[0] = 1;             // `cache` is `int[]` here
+}
+```
+
+---
+
 Native libraries can be called from Ens through `external` declarations. They are always written at the top of a source file, alongside `import`s and type declarations.
 
 ```ens
@@ -201,7 +225,7 @@ external from "kernel32" {
 
 read(HANDLE h, byte[] buf) -> uint {
     let bytesRead: uint = 0;
-    let ok = ReadFile(h, buf, buf.length as uint, out bytesRead, null);
+    let ok = ReadFile(h, buf, buf.length as uint, out bytesRead, null);  // buf.length is `long`
     if (ok == 0) {
         panic("read failed");
     }
