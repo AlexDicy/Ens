@@ -59,6 +59,10 @@ private:
     void parseFieldDecl();
     void parseImportDecl();
     void parseImportPath();
+    void parseExternalDecl();
+    void parseExternalBlock();
+    void parseExternalTypeDecl();
+    void parseExternalFuncDecl();
 
     // === Type ===
     void parseType();
@@ -80,6 +84,7 @@ private:
     void parsePrecedence(int minPrec);
     void parsePrefix();
     void parseArgList();
+    void parseCallArgument();
 
     int infixPrecedence(SyntaxKind k) const;
     bool isAssignmentOp(SyntaxKind k) const;

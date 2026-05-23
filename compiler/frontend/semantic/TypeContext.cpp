@@ -82,7 +82,25 @@ Type* TypeContext::lookupClass(const std::u16string& modulePath, const std::u16s
     return it == classCache.end() ? nullptr : it->second;
 }
 
+Type* TypeContext::registerExternalType(const std::u16string& modulePath, std::u16string name) {
+    auto info = std::make_unique<StructInfo>();
+    info->name = name;
+    StructInfo* infoPtr = info.get();
+    ownedStructs.push_back(std::move(info));
+
+    Type* t = allocate(TypeKind::External);
+    t->structInfo = infoPtr;
+    externalCache[Key{modulePath, std::move(name)}] = t;
+    return t;
+}
+
+Type* TypeContext::lookupExternalType(const std::u16string& modulePath, const std::u16string& name) const {
+    auto it = externalCache.find(Key{modulePath, name});
+    return it == externalCache.end() ? nullptr : it->second;
+}
+
 Type* TypeContext::lookupNamedType(const std::u16string& modulePath, const std::u16string& name) const {
     if (Type* t = lookupStruct(modulePath, name)) return t;
-    return lookupClass(modulePath, name);
+    if (Type* t = lookupClass(modulePath, name)) return t;
+    return lookupExternalType(modulePath, name);
 }

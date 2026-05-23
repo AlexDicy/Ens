@@ -23,6 +23,9 @@ class ClassDecl;
 class MemberList;
 class ImportDecl;
 class ImportPath;
+class ExternalTypeDecl;
+class ExternalFuncDecl;
+class ExternalBlock;
 class SourceFile;
 
 class VisibilityModifier {
@@ -63,6 +66,7 @@ public:
         return Parameter{n};
     }
     bool isThisField() const;
+    bool isOut() const;
     std::optional<SyntaxNode> nameToken() const;
     std::optional<std::u16string> nameText() const;
     std::optional<TypeReference> typeReference() const;
@@ -184,6 +188,46 @@ public:
     std::u16string modulePath() const;
 };
 
+class ExternalTypeDecl {
+public:
+    SyntaxNode node;
+    static std::optional<ExternalTypeDecl> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::ExternalTypeDecl) return std::nullopt;
+        return ExternalTypeDecl{n};
+    }
+    std::optional<VisibilityModifier> visibilityModifier() const;
+    Visibility visibility() const;
+    std::optional<SyntaxNode> nameToken() const;
+    std::optional<std::u16string> nameText() const;
+};
+
+class ExternalFuncDecl {
+public:
+    SyntaxNode node;
+    static std::optional<ExternalFuncDecl> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::ExternalFuncDecl) return std::nullopt;
+        return ExternalFuncDecl{n};
+    }
+    std::optional<SyntaxNode> nameToken() const;
+    std::optional<std::u16string> nameText() const;
+    std::optional<ParameterList> parameterList() const;
+    std::vector<Parameter> parameters() const;
+    std::optional<ReturnType> returnType() const;
+};
+
+class ExternalBlock {
+public:
+    SyntaxNode node;
+    static std::optional<ExternalBlock> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::ExternalBlock) return std::nullopt;
+        return ExternalBlock{n};
+    }
+    std::optional<VisibilityModifier> visibilityModifier() const;
+    Visibility visibility() const;
+    std::optional<std::u16string> libraryName() const;
+    std::vector<ExternalFuncDecl> declarations() const;
+};
+
 class SourceFile {
 public:
     SyntaxNode node;
@@ -196,6 +240,8 @@ public:
     std::vector<StructDecl> structs() const;
     std::vector<ClassDecl> classes() const;
     std::vector<TypedVarDeclStatement> topLevelVarDecls() const;
+    std::vector<ExternalTypeDecl> externalTypes() const;
+    std::vector<ExternalBlock> externalBlocks() const;
 };
 
 }  // namespace ast

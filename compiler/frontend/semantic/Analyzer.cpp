@@ -114,9 +114,99 @@ void Analyzer::collectDeclarations(const SyntaxNode& root) {
 
     registerStructNames(*sf);
     registerClassNames(*sf);
+    registerExternalTypeNames(*sf);
     collectStructs(*sf);
     collectClasses(*sf);
     collectFunctions(*sf);
+    collectExternalFunctions(*sf);
+}
+
+void Analyzer::registerExternalTypeNames(const ast::SourceFile& file) {
+    for (auto& ed : file.externalTypes()) {
+        auto name = ed.nameText();
+        if (!name) continue;
+        if (typeCtx.lookupNamedType(modulePath_, *name)) {
+            errorAtNode(ed.node, "Duplicate type '" + asciiOf(*name) + "'");
+            continue;
+        }
+        Type* t = typeCtx.registerExternalType(modulePath_, *name);
+        auto [line, col] = source.offsetToPosition(ed.node.startOffset());
+        if (t->structInfo) {
+            t->structInfo->line = line;
+            t->structInfo->column = col;
+        }
+        analysis.setType(ed.node.greenNode(), t);
+    }
+}
+
+void Analyzer::collectExternalFunctions(const ast::SourceFile& file) {
+    for (auto& block : file.externalBlocks()) {
+        auto libName = block.libraryName();
+        if (!libName || libName->empty()) {
+            errorAtNode(block.node, "The library name in 'external from \"\"' cannot be empty.");
+        } else {
+            bool already = false;
+            for (auto& l : linkLibraries_) { if (l == *libName) { already = true; break; } }
+            if (!already) linkLibraries_.push_back(*libName);
+        }
+        for (auto& decl : block.declarations()) {
+            auto fname = decl.nameText().value_or(std::u16string{});
+            uint32_t fPos = decl.nameToken() ? decl.nameToken()->startOffset() : decl.node.startOffset();
+            Type* retType = decl.returnType() && decl.returnType()->typeReference()
+                ? resolveTypeReference(*decl.returnType()->typeReference())
+                : typeCtx.getPrimitive(TypeKind::Void);
+            Symbol* sym = makeSymbol(SymbolKind::Function, fname, nullptr, fPos);
+            sym->returnType = retType;
+            sym->funcDeclCst = decl.node.greenNode();
+            sym->isExternal = true;
+            sym->libraryName = libName ? *libName : std::u16string{};
+
+            for (auto& p : decl.parameters()) {
+                Type* pt = p.typeReference()
+                    ? resolveTypeReference(*p.typeReference())
+                    : typeCtx.getError();
+                bool isOut = p.isOut();
+                if (isOut) {
+                    bool ok = false;
+                    if (pt && !pt->isError()) {
+                        Type* base = pt->isOptional() ? pt->inner : pt;
+                        ok = base && (base->isExternal() ||
+                                      base->kind == TypeKind::Bool ||
+                                      base->kind == TypeKind::Byte ||
+                                      base->kind == TypeKind::Short ||
+                                      base->kind == TypeKind::UShort ||
+                                      base->kind == TypeKind::Int ||
+                                      base->kind == TypeKind::UInt ||
+                                      base->kind == TypeKind::Long ||
+                                      base->kind == TypeKind::ULong ||
+                                      base->kind == TypeKind::Float ||
+                                      base->kind == TypeKind::Double ||
+                                      base->kind == TypeKind::Char);
+                    }
+                    if (!ok) {
+                        auto pname = p.nameText().value_or(std::u16string{});
+                        errorAtNode(p.node, "Out parameter '" + asciiOf(pname) +
+                            "' of '" + asciiOf(fname) + "' has type '" +
+                            (pt ? pt->toString() : std::string("<unknown>")) +
+                            "'. 'out' parameters must be a primitive or an external type.");
+                    }
+                }
+                if (p.defaultValue()) {
+                    errorAtNode(p.node, "External function parameters cannot have default values.");
+                }
+                if (p.isThisField()) {
+                    errorAtNode(p.node, "'this.' parameters are not allowed in external functions.");
+                }
+                sym->paramTypes.push_back(pt);
+                sym->paramIsOut.push_back(isOut);
+            }
+
+            if (!globalScope->define(sym)) {
+                errorAtNode(decl.node, "Duplicate function name '" + asciiOf(fname) + "'");
+            }
+            analysis.setSymbol(decl.node.greenNode(), sym);
+        }
+    }
 }
 
 void Analyzer::registerStructNames(const ast::SourceFile& file) {
@@ -524,7 +614,7 @@ Type* Analyzer::lookupTypeByName(const std::u16string& qualifier,
         if (Type* t = typeCtx.lookupNamedType(modulePath_, name)) return t;
         // Fall back to imported aliases stored in the module's globalScope.
         if (Symbol* sym = globalScope ? globalScope->lookupLocal(name) : nullptr) {
-            if (sym->type && (sym->type->isStruct() || sym->type->isClass())) return sym->type;
+            if (sym->type && (sym->type->isStruct() || sym->type->isClass() || sym->type->isExternal())) return sym->type;
         }
         errorAtNode(diagNode, "Unknown type '" + asciiOf(name) + "'");
         return typeCtx.getError();
@@ -856,6 +946,10 @@ Type* Analyzer::analyzeExpr(const ast::Expression& expr) {
     else if (auto c  = expr.asCall())   t = analyzeCall(*c);
     else if (auto m  = expr.asMember()) t = analyzeMember(*m);
     else if (auto sm = expr.asSafeMember()) t = analyzeSafeMember(*sm);
+    else if (auto oa = expr.asOutArgument()) {
+        errorAtNode(expr.node, "'out' can only be used when calling an external function.");
+        t = typeCtx.getError();
+    }
     else if (auto a  = expr.asAssign()) t = analyzeAssign(*a);
     else if (auto tn = expr.asTernary())t = analyzeTernary(*tn);
     else if (auto nw = expr.asNew())    t = analyzeNew(*nw);
@@ -1132,6 +1226,10 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
     }
     analysis.setSymbol(idCallee->node.greenNode(), sym);
 
+    if (sym->isExternal) {
+        return analyzeExternalCall(expr, sym, *name);
+    }
+
     size_t req = requiredArgCount(sym);
     if (args.size() < req || args.size() > sym->paramTypes.size()) {
         errorAtNode(expr.node, "Function '" + asciiOf(*name) + "' expects " +
@@ -1141,6 +1239,10 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
     }
     size_t n = std::min(args.size(), sym->paramTypes.size());
     for (size_t i = 0; i < n; ++i) {
+        if (args[i].asOutArgument()) {
+            errorAtNode(args[i].node, "'out' can only be used when calling an external function.");
+            continue;
+        }
         Type* argT = analyzeExpr(args[i]);
         Type* paramT = sym->paramTypes[i];
         if (!paramT->assignableFrom(argT)) {
@@ -1148,7 +1250,83 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                 ": expected '" + paramT->toString() + "', got '" + argT->toString() + "'");
         }
     }
-    for (size_t i = n; i < args.size(); ++i) analyzeExpr(args[i]);
+    for (size_t i = n; i < args.size(); ++i) {
+        if (args[i].asOutArgument()) {
+            errorAtNode(args[i].node, "'out' can only be used when calling an external function.");
+        } else {
+            analyzeExpr(args[i]);
+        }
+    }
+    return sym->returnType ? sym->returnType : typeCtx.getError();
+}
+
+Type* Analyzer::analyzeExternalCall(const ast::CallExpression& expr, Symbol* sym,
+                                    const std::u16string& funcName) {
+    auto args = expr.arguments();
+    size_t expected = sym->paramTypes.size();
+    if (args.size() != expected) {
+        errorAtNode(expr.node, "External function '" + asciiOf(funcName) + "' expects " +
+            std::to_string(expected) + " argument(s), got " + std::to_string(args.size()));
+    }
+    size_t n = std::min(args.size(), expected);
+    for (size_t i = 0; i < n; ++i) {
+        Type* paramT = sym->paramTypes[i];
+        bool wantsOut = sym->paramIsOut[i];
+        auto& arg = args[i];
+        auto outArg = arg.asOutArgument();
+        if (wantsOut) {
+            if (!outArg) {
+                errorAtNode(arg.node, "Argument " + std::to_string(i + 1) +
+                    " of '" + asciiOf(funcName) + "' is an 'out' parameter; pass a local variable as 'out <name>'.");
+                continue;
+            }
+            auto identName = outArg->nameText();
+            if (!identName) continue;
+            Symbol* local = currentScope ? currentScope->lookup(*identName) : nullptr;
+            if (!local || (local->kind != SymbolKind::Variable && local->kind != SymbolKind::Parameter)) {
+                errorAtNode(arg.node, "'out " + asciiOf(*identName) +
+                    "' must refer to a local variable or parameter.");
+                continue;
+            }
+            if (auto identTok = outArg->identifier()) {
+                analysis.setSymbol(identTok->greenNode(), local);
+            }
+            if (!local->type || !paramT->equals(local->type)) {
+                std::string localType = local->type ? local->type->toString() : std::string("<unknown>");
+                errorAtNode(arg.node, "Argument " + std::to_string(i + 1) +
+                    " of '" + asciiOf(funcName) + "' expects 'out " + paramT->toString() +
+                    "', got 'out " + localType + "'.");
+                continue;
+            }
+            local->reassigned = true;
+            if (currentScope) currentScope->clearNarrowingsContaining(local, u"");
+        } else {
+            if (outArg) {
+                errorAtNode(arg.node, "Argument " + std::to_string(i + 1) +
+                    " of '" + asciiOf(funcName) + "' is not an 'out' parameter; remove 'out'.");
+                continue;
+            }
+            Type* argT = analyzeExpr(arg);
+            if (!paramT->assignableFrom(argT)) {
+                errorAtNode(arg.node, "Argument " + std::to_string(i + 1) +
+                    ": expected '" + paramT->toString() + "', got '" + argT->toString() + "'");
+            }
+        }
+    }
+    for (size_t i = n; i < args.size(); ++i) {
+        if (auto outArg = args[i].asOutArgument()) {
+            if (auto identName = outArg->nameText()) {
+                Symbol* local = currentScope ? currentScope->lookup(*identName) : nullptr;
+                if (local) {
+                    if (auto identTok = outArg->identifier()) {
+                        analysis.setSymbol(identTok->greenNode(), local);
+                    }
+                }
+            }
+        } else {
+            analyzeExpr(args[i]);
+        }
+    }
     return sym->returnType ? sym->returnType : typeCtx.getError();
 }
 

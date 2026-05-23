@@ -43,10 +43,10 @@ enum class SyntaxKind : uint16_t {
     KwBool, KwByte, KwShort, KwUShort, KwInt, KwUInt, KwLong, KwULong,
     KwFloat, KwDouble, KwDecimal, KwChar, KwString, KwVoid,
     KwAssert, KwBreak, KwCase, KwCatch, KwClass, KwComputed, KwConst, KwContinue,
-    KwDefault, KwDo, KwElse, KwEnum, KwExtends, KwFalse, KwFinal, KwFinally,
-    KwFor, KwFrom, KwGoto, KwIf, KwImport, KwLet, KwNew, KwNull, KwPackage,
+    KwDefault, KwDo, KwElse, KwEnum, KwExtends, KwExternal, KwFalse, KwFinal, KwFinally,
+    KwFor, KwFrom, KwGoto, KwIf, KwImport, KwLet, KwNew, KwNull, KwOut, KwPackage,
     KwPrivate, KwProtected, KwPublic, KwRethrow, KwReturn, KwStatic, KwStruct,
-    KwSuper, KwSwitch, KwThis, KwThrow, KwThrows, KwTrue, KwTry, KwWeak, KwWhile,
+    KwSuper, KwSwitch, KwThis, KwThrow, KwThrows, KwTrue, KwTry, KwType, KwWeak, KwWhile,
 
     // ============================================================
     // Marker: everything after this point is a non-terminal node.
@@ -69,6 +69,10 @@ enum class SyntaxKind : uint16_t {
     VisibilityModifier,
     ImportDecl,
     ImportPath,
+    ExternalTypeDecl,
+    ExternalBlock,
+    LibrarySpec,
+    ExternalFuncDecl,
 
     // === Type expressions ===
     TypeRef,             // identifier (or primitive keyword) optionally followed by ?
@@ -94,6 +98,7 @@ enum class SyntaxKind : uint16_t {
     PostfixExpr,
     CallExpr,
     ArgList,
+    OutArgument,
     MemberExpr,
     SafeMemberExpr,
     SubscriptExpr,

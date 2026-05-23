@@ -65,6 +65,7 @@ const std::string& extractEmbeddedSDK() {
 std::vector<std::string> buildArgv(LinkerFlavor flavor,
                                     const std::string& triple,
                                     const std::vector<std::string>& objs,
+                                    const std::vector<std::string>& libraries,
                                     const std::string& exe) {
     std::vector<std::string> args;
     switch (flavor) {
@@ -77,6 +78,11 @@ std::vector<std::string> buildArgv(LinkerFlavor flavor,
             // arguments API.
             args.push_back("/defaultlib:libcmt");
             args.push_back("/defaultlib:oldnames");
+            for (auto& lib : libraries) {
+                // libc and msvcrt are already covered by the defaultlibs above.
+                if (lib == "c" || lib == "msvcrt" || lib == "libcmt") continue;
+                args.push_back(lib + ".lib");
+            }
             return args;
         case LinkerFlavor::MachO: {
             args = {"ld64.lld"};
@@ -95,6 +101,10 @@ std::vector<std::string> buildArgv(LinkerFlavor flavor,
             args.push_back("-o");
             args.push_back(exe);
             args.push_back("-lSystem");
+            for (auto& lib : libraries) {
+                if (lib == "c" || lib == "System") continue;  // auto-linked
+                args.push_back("-l" + lib);
+            }
             return args;
         }
         case LinkerFlavor::Elf:
@@ -103,6 +113,9 @@ std::vector<std::string> buildArgv(LinkerFlavor flavor,
             for (auto& o : objs) args.push_back(o);
             args.push_back("-o");
             args.push_back(exe);
+            for (auto& lib : libraries) {
+                args.push_back("-l" + lib);
+            }
             return args;
     }
 }
@@ -127,16 +140,23 @@ bool invokeDriver(LinkerFlavor flavor,
 bool Linker::link(const std::string& objectPath,
                    const std::string& exePath,
                    std::ostream& errStream) {
-    return link(std::vector{objectPath}, exePath, errStream);
+    return link(std::vector{objectPath}, {}, exePath, errStream);
 }
 
 bool Linker::link(const std::vector<std::string>& objectPaths,
                    const std::string& exePath,
                    std::ostream& errStream) {
+    return link(objectPaths, {}, exePath, errStream);
+}
+
+bool Linker::link(const std::vector<std::string>& objectPaths,
+                   const std::vector<std::string>& libraries,
+                   const std::string& exePath,
+                   std::ostream& errStream) {
     const std::string triple = llvm::sys::getDefaultTargetTriple();
     const LinkerFlavor flavor = flavorForTriple(triple);
 
-    std::vector<std::string> argv = buildArgv(flavor, triple, objectPaths, exePath);
+    std::vector<std::string> argv = buildArgv(flavor, triple, objectPaths, libraries, exePath);
     std::vector<const char*> args;
     args.reserve(argv.size());
     for (auto& s : argv) args.push_back(s.c_str());

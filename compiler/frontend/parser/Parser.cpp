@@ -160,6 +160,11 @@ void Parser::parseTopLevel() {
 
     bool hasVisibility = atAny({SyntaxKind::KwPrivate, SyntaxKind::KwProtected, SyntaxKind::KwPublic});
 
+    if (at(SyntaxKind::KwExternal) ||
+        peekKind(hasVisibility ? 1 : 0) == SyntaxKind::KwExternal) {
+        parseExternalDecl();
+        return;
+    }
     if (at(SyntaxKind::KwStruct) ||
         peekKind(hasVisibility ? 1 : 0) == SyntaxKind::KwStruct) {
         parseStructOrClassDecl(SyntaxKind::StructDecl, SyntaxKind::KwStruct);
@@ -220,6 +225,68 @@ void Parser::parseImportPath() {
         bump();  // '.'
         bump();  // identifier
     }
+    builder.finishNode();
+}
+
+// =================================================================
+// External (FFI) declarations
+// =================================================================
+
+void Parser::parseExternalDecl() {
+    // Lookahead: 'external' 'type' IDENT ';'     -> ExternalTypeDecl
+    //            'external' 'from' STRING { ... } -> ExternalBlock
+    size_t externalIdx = (kindAt() == SyntaxKind::KwExternal) ? 0 : 1;
+    SyntaxKind afterExternal = peekKind(externalIdx + 1);
+    if (afterExternal == SyntaxKind::KwType) {
+        parseExternalTypeDecl();
+    } else {
+        parseExternalBlock();
+    }
+}
+
+void Parser::parseExternalTypeDecl() {
+    builder.startNode(SyntaxKind::ExternalTypeDecl);
+    parseVisibilityModifier();
+    expect(SyntaxKind::KwExternal, "'external'");
+    expect(SyntaxKind::KwType, "'type'");
+    expect(SyntaxKind::Identifier, "external type name");
+    expect(SyntaxKind::Semi, "';' after external type declaration");
+    builder.finishNode();
+}
+
+void Parser::parseExternalBlock() {
+    builder.startNode(SyntaxKind::ExternalBlock);
+    parseVisibilityModifier();
+    expect(SyntaxKind::KwExternal, "'external'");
+    expect(SyntaxKind::KwFrom, "'from' after 'external'");
+    {
+        builder.startNode(SyntaxKind::LibrarySpec);
+        expect(SyntaxKind::StringLiteral, "library name string");
+        builder.finishNode();
+    }
+    expect(SyntaxKind::LBrace, "'{' to begin external block");
+    while (!at(SyntaxKind::RBrace) && !atEnd()) {
+        size_t before = current;
+        parseExternalFuncDecl();
+        if (current == before) {
+            reportAtCurrent("Unexpected token in external block");
+            recoverTo({SyntaxKind::RBrace, SyntaxKind::Semi, SyntaxKind::EndOfFile});
+            eat(SyntaxKind::Semi);
+            if (current == before && !atEnd()) bump();
+        }
+    }
+    expect(SyntaxKind::RBrace, "'}' to close external block");
+    builder.finishNode();
+}
+
+void Parser::parseExternalFuncDecl() {
+    builder.startNode(SyntaxKind::ExternalFuncDecl);
+    expect(SyntaxKind::Identifier, "external function name");
+    expect(SyntaxKind::LParen, "'(' after external function name");
+    parseParamList();
+    expect(SyntaxKind::RParen, "')' to close parameter list");
+    if (at(SyntaxKind::Arrow)) parseReturnType();
+    expect(SyntaxKind::Semi, "';' after external function declaration");
     builder.finishNode();
 }
 
@@ -299,6 +366,7 @@ void Parser::parseParameter() {
         expect(SyntaxKind::Dot, "'.' after 'this' in parameter");
         expect(SyntaxKind::Identifier, "field name after 'this.'");
     } else {
+        eat(SyntaxKind::KwOut);  // optional 'out' modifier; analyzer enforces context
         if (isTypeStart(kindAt())) {
             parseType();
         } else {
@@ -718,12 +786,27 @@ void Parser::parseArgList() {
     builder.startNode(SyntaxKind::ArgList);
     expect(SyntaxKind::LParen, "'('");
     if (!at(SyntaxKind::RParen) && !atEnd()) {
-        parseExpression();
+        parseCallArgument();
         while (eat(SyntaxKind::Comma)) {
             if (at(SyntaxKind::RParen)) break;
-            parseExpression();
+            parseCallArgument();
         }
     }
     expect(SyntaxKind::RParen, "')'");
     builder.finishNode();
+}
+
+void Parser::parseCallArgument() {
+    if (at(SyntaxKind::KwOut)) {
+        builder.startNode(SyntaxKind::OutArgument);
+        bump();  // 'out'
+        if (at(SyntaxKind::Identifier)) {
+            bump();
+        } else {
+            emitMissing(SyntaxKind::Identifier, "local variable name after 'out'");
+        }
+        builder.finishNode();
+        return;
+    }
+    parseExpression();
 }

@@ -70,6 +70,15 @@ bool Parameter::isThisField() const {
     return false;
 }
 
+bool Parameter::isOut() const {
+    for (auto& c : node.children()) {
+        if (isTrivia(c.kind())) continue;
+        if (c.kind() == SyntaxKind::KwOut) return true;
+        break;
+    }
+    return false;
+}
+
 std::optional<SyntaxNode> Parameter::nameToken() const {
     if (isThisField()) {
         bool seenDot = false;
@@ -83,6 +92,7 @@ std::optional<SyntaxNode> Parameter::nameToken() const {
     bool seenType = false;
     for (auto& c : node.children()) {
         if (isTrivia(c.kind())) continue;
+        if (c.kind() == SyntaxKind::KwOut) continue;
         if (c.kind() == SyntaxKind::TypeRef) { seenType = true; continue; }
         if (seenType && c.kind() == SyntaxKind::Identifier) return c;
     }
@@ -385,6 +395,106 @@ std::vector<TypedVarDeclStatement> SourceFile::topLevelVarDecls() const {
     std::vector<TypedVarDeclStatement> out;
     for (auto& c : node.children()) {
         if (auto v = TypedVarDeclStatement::cast(c)) out.push_back(*v);
+    }
+    return out;
+}
+
+std::vector<ExternalTypeDecl> SourceFile::externalTypes() const {
+    std::vector<ExternalTypeDecl> out;
+    for (auto& c : node.children()) {
+        if (auto e = ExternalTypeDecl::cast(c)) out.push_back(*e);
+    }
+    return out;
+}
+
+std::vector<ExternalBlock> SourceFile::externalBlocks() const {
+    std::vector<ExternalBlock> out;
+    for (auto& c : node.children()) {
+        if (auto e = ExternalBlock::cast(c)) out.push_back(*e);
+    }
+    return out;
+}
+
+// === ExternalTypeDecl ===
+
+std::optional<VisibilityModifier> ExternalTypeDecl::visibilityModifier() const {
+    return visibilityOfDeclNode(node);
+}
+
+Visibility ExternalTypeDecl::visibility() const {
+    return visibilityOfDecl(node);
+}
+
+std::optional<SyntaxNode> ExternalTypeDecl::nameToken() const {
+    return firstIdentAfterKeyword(node, SyntaxKind::KwType);
+}
+
+std::optional<std::u16string> ExternalTypeDecl::nameText() const {
+    if (auto t = nameToken()) return std::u16string(t->tokenText());
+    return std::nullopt;
+}
+
+// === ExternalFuncDecl ===
+
+std::optional<SyntaxNode> ExternalFuncDecl::nameToken() const {
+    for (auto& c : node.children()) {
+        if (isTrivia(c.kind())) continue;
+        if (c.kind() == SyntaxKind::Identifier) return c;
+        break;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::u16string> ExternalFuncDecl::nameText() const {
+    if (auto t = nameToken()) return std::u16string(t->tokenText());
+    return std::nullopt;
+}
+
+std::optional<ParameterList> ExternalFuncDecl::parameterList() const {
+    if (auto p = firstChildNode(node, SyntaxKind::ParamList)) return ParameterList::cast(*p);
+    return std::nullopt;
+}
+
+std::vector<Parameter> ExternalFuncDecl::parameters() const {
+    if (auto pl = parameterList()) return pl->parameters();
+    return {};
+}
+
+std::optional<ReturnType> ExternalFuncDecl::returnType() const {
+    if (auto rt = firstChildNode(node, SyntaxKind::ReturnType)) return ReturnType::cast(*rt);
+    return std::nullopt;
+}
+
+// === ExternalBlock ===
+
+std::optional<VisibilityModifier> ExternalBlock::visibilityModifier() const {
+    return visibilityOfDeclNode(node);
+}
+
+Visibility ExternalBlock::visibility() const {
+    return visibilityOfDecl(node);
+}
+
+std::optional<std::u16string> ExternalBlock::libraryName() const {
+    auto spec = firstChildNode(node, SyntaxKind::LibrarySpec);
+    if (!spec) return std::nullopt;
+    for (auto& c : spec->children()) {
+        if (c.kind() == SyntaxKind::StringLiteral) {
+            std::u16string raw{c.tokenText()};
+            // Strip surrounding quotes.
+            if (raw.size() >= 2 && raw.front() == u'"' && raw.back() == u'"') {
+                return raw.substr(1, raw.size() - 2);
+            }
+            return raw;
+        }
+    }
+    return std::nullopt;
+}
+
+std::vector<ExternalFuncDecl> ExternalBlock::declarations() const {
+    std::vector<ExternalFuncDecl> out;
+    for (auto& c : node.children()) {
+        if (auto e = ExternalFuncDecl::cast(c)) out.push_back(*e);
     }
     return out;
 }

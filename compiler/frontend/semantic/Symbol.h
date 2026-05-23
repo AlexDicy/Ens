@@ -35,6 +35,11 @@ public:
 
     std::u16string namespaceModulePath;
 
+    // FFI metadata (set when this function symbol was declared via `external from "..."`).
+    bool isExternal = false;
+    std::vector<bool> paramIsOut;
+    std::u16string libraryName;
+
     ParamEscapeInfo escapeInfo;
 
     // escape/reassignment tracking for variables and parameters.

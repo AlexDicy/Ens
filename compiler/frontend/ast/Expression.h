@@ -17,6 +17,7 @@ class CallExpression;
 class MemberExpression;
 class SafeMemberExpression;
 class SubscriptExpression;
+class OutArgument;
 class AssignExpression;
 class TernaryExpression;
 class NewExpression;
@@ -42,6 +43,7 @@ public:
     std::optional<MemberExpression>    asMember() const;
     std::optional<SafeMemberExpression> asSafeMember() const;
     std::optional<SubscriptExpression> asSubscript() const;
+    std::optional<OutArgument>         asOutArgument() const;
     std::optional<AssignExpression>    asAssign() const;
     std::optional<TernaryExpression>   asTernary() const;
     std::optional<NewExpression>       asNew() const;
@@ -216,6 +218,17 @@ public:
         return ParenExpression{n};
     }
     std::optional<Expression> inner() const;
+};
+
+class OutArgument {
+public:
+    SyntaxNode node;
+    static std::optional<OutArgument> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::OutArgument) return std::nullopt;
+        return OutArgument{n};
+    }
+    std::optional<SyntaxNode> identifier() const;
+    std::optional<std::u16string> nameText() const;
 };
 
 }  // namespace ast

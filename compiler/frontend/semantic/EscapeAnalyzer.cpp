@@ -140,6 +140,11 @@ void EscapeAnalyzer::scanExpression(const ast::Expression& e) {
         if (auto obj = sm->object()) scanExpression(*obj);
         return;
     }
+    if (e.asOutArgument()) {
+        // External calls don't participate in ARC-aware escape analysis; the
+        // referenced local is treated as reassigned by the analyzer itself.
+        return;
+    }
     if (auto bn = e.asBinary()) { scanBinary(*bn); return; }
     if (auto t = e.asTernary()) { scanTernary(*t); return; }
     if (auto p = e.asParen()) { scanParen(*p); return; }

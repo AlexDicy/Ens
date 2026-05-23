@@ -54,6 +54,10 @@ public:
     // synthetic Variable-kind symbol whose `type` is the user-defined type.
     Symbol* globalSymbol(const std::u16string& name) const;
 
+    // Distinct library names referenced by `external from "..."` blocks in
+    // this module. Order matches first occurrence in source.
+    const std::vector<std::u16string>& linkLibraries() const { return linkLibraries_; }
+
 private:
     const SourceFile& source;
     DiagnosticSink& sink;
@@ -68,6 +72,7 @@ private:
 
     std::vector<std::unique_ptr<Symbol>> ownedSymbols;
     std::vector<std::unique_ptr<Scope>> ownedScopes;
+    std::vector<std::u16string> linkLibraries_;
     Scope* globalScope = nullptr;
     Scope* currentScope = nullptr;
     Symbol* currentFunction = nullptr;
@@ -88,9 +93,11 @@ private:
     // === Collect phase ===
     void registerStructNames(const ast::SourceFile& file);
     void registerClassNames(const ast::SourceFile& file);
+    void registerExternalTypeNames(const ast::SourceFile& file);
     void collectStructs(const ast::SourceFile& file);
     void collectClasses(const ast::SourceFile& file);
     void collectFunctions(const ast::SourceFile& file);
+    void collectExternalFunctions(const ast::SourceFile& file);
     void resolveMethodParams(const ast::FuncDecl& fn, ::Type* receiverType, Symbol* sym);
     void resolveFunctionParams(const ast::FuncDecl& fn, Symbol* sym);
     void checkParameterDefaults(const ast::FuncDecl& fn);
@@ -117,6 +124,8 @@ private:
     Type* analyzeBinary(const ast::BinaryExpression& expr);
     Type* analyzePrefix(const ast::PrefixExpression& expr);
     Type* analyzeCall(const ast::CallExpression& expr);
+    Type* analyzeExternalCall(const ast::CallExpression& expr, Symbol* sym,
+                              const std::u16string& funcName);
     Type* analyzeMember(const ast::MemberExpression& expr);
     Type* analyzeSafeMember(const ast::SafeMemberExpression& expr);
     Type* analyzeAssign(const ast::AssignExpression& expr);

@@ -379,14 +379,21 @@ bool Compiler::compile(const fs::path& source,
 
     std::vector<std::string> objectPaths;
     objectPaths.reserve(modules.size());
+    std::vector<std::string> libraries;
+    auto addLibrary = [&](const std::u16string& lib) {
+        std::string asciiLib = asAscii(lib);
+        for (auto& l : libraries) if (l == asciiLib) return;
+        libraries.push_back(std::move(asciiLib));
+    };
     for (auto& m : modules) {
         std::string name = baseStem + "." + sanitizeForFilename(m->modulePath) + ".obj";
         fs::path objPath = outDir / name;
         if (!emitModule(*m, "ens_" + sanitizeForFilename(m->modulePath), objPath)) return false;
         objectPaths.push_back(objPath.string());
+        for (auto& lib : m->analyzer->linkLibraries()) addLibrary(lib);
     }
 
-    return Linker::link(objectPaths, outputFolder.string(), std::cerr);
+    return Linker::link(objectPaths, libraries, outputFolder.string(), std::cerr);
 }
 
 std::vector<fs::path> Compiler::getFileTree(const fs::path& root, const fs::path& rootPath) {
@@ -602,7 +609,9 @@ bool Compiler::compileSingle(std::istream& source, const fs::path& outputFile, c
     }
 
     if (linkToExe) {
-        if (!Linker::link(objPath.string(), outputFile.string(), std::cerr)) return false;
+        std::vector<std::string> libraries;
+        for (auto& lib : analyzer.linkLibraries()) libraries.push_back(asAscii(lib));
+        if (!Linker::link({objPath.string()}, libraries, outputFile.string(), std::cerr)) return false;
         return true;
     }
     return true;

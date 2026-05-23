@@ -22,6 +22,9 @@ public:
     Type* registerClass(const std::u16string& modulePath, std::u16string name);
     Type* lookupClass(const std::u16string& modulePath, const std::u16string& name) const;
 
+    Type* registerExternalType(const std::u16string& modulePath, std::u16string name);
+    Type* lookupExternalType(const std::u16string& modulePath, const std::u16string& name) const;
+
     Type* lookupNamedType(const std::u16string& modulePath, const std::u16string& name) const;
 
 private:
@@ -43,6 +46,7 @@ private:
     std::unordered_map<Type*, Type*> optionalCache;
     std::unordered_map<Key, Type*, KeyHash> structCache;
     std::unordered_map<Key, Type*, KeyHash> classCache;
+    std::unordered_map<Key, Type*, KeyHash> externalCache;
     Type* errorType;
     Type* nullType;
 

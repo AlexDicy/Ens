@@ -118,8 +118,8 @@ struct CodeGenerator::Impl {
             case TypeKind::Error:
                 return true;
             case TypeKind::Optional:
-                // Nullable class types are supported (represented as a pointer).
-                return !(t->inner && t->inner->isClass());
+                // Nullable class and external types are supported (pointer-sized).
+                return !(t->inner && (t->inner->isClass() || t->inner->isExternal()));
             default:
                 return false;
         }
@@ -150,8 +150,10 @@ struct CodeGenerator::Impl {
             case TypeKind::String:  return llvm::PointerType::get(ctx, 0);
             case TypeKind::Struct:  return mapStructType(t);
             case TypeKind::Class:   return llvm::PointerType::get(ctx, 0);
+            case TypeKind::External: return llvm::PointerType::get(ctx, 0);
             case TypeKind::Optional:
                 if (t->inner && t->inner->isClass()) return llvm::PointerType::get(ctx, 0);
+                if (t->inner && t->inner->isExternal()) return llvm::PointerType::get(ctx, 0);
                 return nullptr;
             default:                return nullptr;
         }
@@ -353,7 +355,8 @@ struct CodeGenerator::Impl {
         for (size_t i = 0; i < sym->paramTypes.size(); ++i) {
             auto* pt = sym->paramTypes[i];
             if (isUnsupportedType(pt)) return nullptr;
-            if (paramIsByPointer(sym, i)) {
+            bool isOut = sym->isExternal && i < sym->paramIsOut.size() && sym->paramIsOut[i];
+            if (isOut || (!sym->isExternal && paramIsByPointer(sym, i))) {
                 paramTypes.push_back(llvm::PointerType::get(ctx, 0));
             } else {
                 paramTypes.push_back(mapType(pt));
@@ -1856,6 +1859,7 @@ struct CodeGenerator::Impl {
             return nullptr;
         }
         if (sym->isBuiltin) return emitBuiltinCall(sym, e);
+        if (sym->isExternal) return emitForeignCall(sym, e);
         llvm::Function* fn = getOrDeclareExternalFunction(sym, /*receiver*/ nullptr);
         if (!fn) {
             error(e.node.startOffset(), "Internal: callee has no LLVM function");
@@ -1863,6 +1867,51 @@ struct CodeGenerator::Impl {
         }
         std::vector<llvm::Value*> args;
         if (!appendCallArgs(sym, e.arguments(), args)) return nullptr;
+        return builder->CreateCall(fn, args);
+    }
+
+    llvm::Value* emitForeignCall(Symbol* sym, const ast::CallExpression& e) {
+        llvm::Function* fn = getOrDeclareExternalFunction(sym, /*receiver*/ nullptr);
+        if (!fn) {
+            error(e.node.startOffset(), "Internal: external callee has no LLVM function");
+            return nullptr;
+        }
+        auto userArgs = e.arguments();
+        std::vector<llvm::Value*> args;
+        args.reserve(userArgs.size());
+        size_t n = std::min(userArgs.size(), sym->paramTypes.size());
+        for (size_t i = 0; i < n; ++i) {
+            bool isOut = i < sym->paramIsOut.size() && sym->paramIsOut[i];
+            auto& userArg = userArgs[i];
+            if (isOut) {
+                auto outArg = userArg.asOutArgument();
+                if (!outArg) {
+                    error(userArg.node.startOffset(), "Internal: expected 'out' argument");
+                    return nullptr;
+                }
+                auto identTok = outArg->identifier();
+                if (!identTok) {
+                    error(userArg.node.startOffset(), "Internal: 'out' argument missing identifier");
+                    return nullptr;
+                }
+                Symbol* local = symbolOf(*identTok);
+                if (!local) {
+                    error(userArg.node.startOffset(), "Internal: 'out' identifier has no symbol");
+                    return nullptr;
+                }
+                auto it = values.find(local);
+                if (it == values.end()) {
+                    error(userArg.node.startOffset(),
+                          "'out' local '" + asAscii(local->name) + "' is not initialized before this call.");
+                    return nullptr;
+                }
+                args.push_back(it->second);
+            } else {
+                llvm::Value* v = emitExpr(userArg);
+                if (!v) return nullptr;
+                args.push_back(v);
+            }
+        }
         return builder->CreateCall(fn, args);
     }
 

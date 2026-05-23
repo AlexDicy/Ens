@@ -14,6 +14,7 @@ bool Expression::isExpressionKind(SyntaxKind k) {
         case SyntaxKind::CallExpr:
         case SyntaxKind::MemberExpr:
         case SyntaxKind::SafeMemberExpr:
+        case SyntaxKind::OutArgument:
         case SyntaxKind::SubscriptExpr:
         case SyntaxKind::AssignExpr:
         case SyntaxKind::TernaryExpr:
@@ -55,6 +56,7 @@ std::optional<CallExpression>      Expression::asCall()      const { return Call
 std::optional<MemberExpression>    Expression::asMember()    const { return MemberExpression::cast(node); }
 std::optional<SafeMemberExpression> Expression::asSafeMember() const { return SafeMemberExpression::cast(node); }
 std::optional<SubscriptExpression> Expression::asSubscript() const { return SubscriptExpression::cast(node); }
+std::optional<OutArgument>         Expression::asOutArgument() const { return OutArgument::cast(node); }
 std::optional<AssignExpression>    Expression::asAssign()    const { return AssignExpression::cast(node); }
 std::optional<TernaryExpression>   Expression::asTernary()   const { return TernaryExpression::cast(node); }
 std::optional<NewExpression>       Expression::asNew()       const { return NewExpression::cast(node); }
@@ -290,6 +292,22 @@ std::vector<Expression> NewExpression::arguments() const {
 
 std::optional<Expression> ParenExpression::inner() const {
     return firstExpressionChild(node);
+}
+
+// === OutArgument ===
+
+std::optional<SyntaxNode> OutArgument::identifier() const {
+    for (auto& c : node.children()) {
+        if (isTrivia(c.kind())) continue;
+        if (c.kind() == SyntaxKind::KwOut) continue;
+        if (c.kind() == SyntaxKind::Identifier) return c;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::u16string> OutArgument::nameText() const {
+    if (auto t = identifier()) return std::u16string(t->tokenText());
+    return std::nullopt;
 }
 
 }  // namespace ast

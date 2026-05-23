@@ -11,6 +11,7 @@ enum class TypeKind {
     Optional,    // wraps another type
     Struct,      // user-defined struct (value semantics)
     Class,       // user-defined class (reference semantics, heap-allocated)
+    External,    // opaque foreign type declared via `external type Name;`
     Error        // sentinel - used to suppress cascading errors
 };
 
@@ -76,6 +77,7 @@ public:
     bool isNull() const { return kind == TypeKind::Null; }
     bool isStruct() const { return kind == TypeKind::Struct; }
     bool isClass() const  { return kind == TypeKind::Class; }
+    bool isExternal() const { return kind == TypeKind::External; }
     bool hasRecordLayout() const { return isStruct() || isClass(); }
 
     bool equals(const Type* other) const;
