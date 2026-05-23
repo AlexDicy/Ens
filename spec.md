@@ -199,7 +199,7 @@ xs[1] = xs[0] * 2;
 let n = xs.length;            // long
 ```
 
-- `new T[size]` allocates an array of `size` elements. The slots are zero-initialized (`0` for numbers, `null` for class and array references, all-zero bytes for struct fields). Struct field defaults are not applied per slot; assign explicitly if you need anything other than zero.
+- `new T[size]` allocates an array of `size` elements. Primitive and reference slots start zero / `null`. Struct slots get the struct's declared field defaults applied to each slot.
 - `arr[i]` reads or writes an element. Bounds are checked at every access; an out-of-range index aborts the program.
 - `arr.length` returns the number of elements as a `long`.
 - `T[]?` is the nullable form: an array variable that may be `null`. Indexing or reading `.length` requires narrowing the value first (`if (arr != null) { ... }`).

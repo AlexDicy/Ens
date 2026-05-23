@@ -1692,6 +1692,17 @@ struct CodeGenerator::Impl {
         return fn;
     }
 
+    bool structHasFieldDefaults(::Type* t) {
+        if (!t || !t->isStruct() || !t->structInfo) return false;
+        for (auto& f : t->structInfo->fields) {
+            if (!f.declaration) continue;
+            auto fieldNode = SyntaxNode::makeRoot(f.declaration);
+            auto fd = ast::FieldDecl::cast(*fieldNode);
+            if (fd && fd->defaultValue()) return true;
+        }
+        return false;
+    }
+
     llvm::Value* emitArrayNew(::Type* elem, llvm::Value* sizeI64,
                               uint32_t diagOffset) {
         if (!elem) return nullptr;
@@ -1720,6 +1731,35 @@ struct CodeGenerator::Impl {
         llvm::Value* arrPtr = builder->CreateCall(
             getOrDefineEnsAlloc(), { payloadBytes, dtor }, "arr.new");
         builder->CreateStore(sizeI64, arrayLengthAddr(arrPtr));
+
+        // Run per-slot struct field defaults when the element type declares
+        // any. (calloc already produced zero-initialized slots, so structs
+        // with only-zero defaults / no defaults at all are already done.)
+        if (structHasFieldDefaults(elem)) {
+            auto* loopCond = llvm::BasicBlock::Create(ctx, "arr.init.cond", currentFunction);
+            auto* loopBody = llvm::BasicBlock::Create(ctx, "arr.init.body", currentFunction);
+            auto* loopEnd  = llvm::BasicBlock::Create(ctx, "arr.init.end",  currentFunction);
+
+            llvm::Value* data = emitArrayDataPtr(arrPtr);
+            llvm::Value* idxAlloca = createEntryAlloca(currentFunction, i64, "arr.init.i");
+            builder->CreateStore(llvm::ConstantInt::get(i64, 0), idxAlloca);
+            builder->CreateBr(loopCond);
+
+            builder->SetInsertPoint(loopCond);
+            llvm::Value* idx = builder->CreateLoad(i64, idxAlloca, "arr.init.i.load");
+            llvm::Value* cond = builder->CreateICmpSLT(idx, sizeI64, "arr.init.i.lt");
+            builder->CreateCondBr(cond, loopBody, loopEnd);
+
+            builder->SetInsertPoint(loopBody);
+            llvm::Type* elemTy = mapType(elem);
+            llvm::Value* slot = builder->CreateGEP(elemTy, data, idx, "arr.init.slot");
+            initStructFieldDefaults(elem, slot);
+            llvm::Value* next = builder->CreateAdd(idx, llvm::ConstantInt::get(i64, 1));
+            builder->CreateStore(next, idxAlloca);
+            builder->CreateBr(loopCond);
+
+            builder->SetInsertPoint(loopEnd);
+        }
         return arrPtr;
     }
 
