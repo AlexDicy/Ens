@@ -103,6 +103,8 @@ private:
     void checkParameterDefaults(const ast::FuncDecl& fn);
     void checkFieldDefaults(const ast::StructDecl& sd);
     void checkFieldDefaults(const ast::ClassDecl& cd);
+    void checkFieldInitialization(const ast::StructDecl& sd);
+    void checkFieldInitialization(const ast::ClassDecl& cd);
 
     // === Body analysis ===
     void analyzeFunctionBody(const ast::FuncDecl& fn);
@@ -149,8 +151,8 @@ private:
                            const SyntaxNode& diagNode);
     bool isLValue(const ast::Expression& expr) const;
 
-    // If true, non-nullable `T[]` is allowed because T can safely start zero-filled.
-    bool zeroBitPatternIsValid(Type* t) const;
+    // True if `t` can be considered non-null without an initializer.
+    bool isDefaultable(Type* t) const;
     bool validateArrayElement(Type* elem, const SyntaxNode& diagNode);
 
     // Helpers for CST → location.

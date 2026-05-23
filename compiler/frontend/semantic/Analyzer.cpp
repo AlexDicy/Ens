@@ -315,6 +315,8 @@ void Analyzer::analyzeBodies() {
 
     for (auto& sd : sf.structs()) checkFieldDefaults(sd);
     for (auto& cd : sf.classes()) checkFieldDefaults(cd);
+    for (auto& sd : sf.structs()) checkFieldInitialization(sd);
+    for (auto& cd : sf.classes()) checkFieldInitialization(cd);
 
     for (auto& fn : sf.functions()) analyzeFunctionBody(fn);
     for (auto& sd : sf.structs())   for (auto& m : sd.methods()) analyzeFunctionBody(m);
@@ -809,6 +811,12 @@ void Analyzer::analyzeLetStmt(const ast::LetStatement& stmt) {
             "' to variable of type '" + declared->toString() + "'");
     }
 
+    if (declared && !initType && !isDefaultable(declared) && !declared->isError()) {
+        errorAtNode(stmt.node, "Variable '" + asciiOf(name) + "' has non-nullable type '" +
+            declared->toString() + "' but no initializer. Provide a value, or make the type nullable ('" +
+            declared->toString() + "?').");
+    }
+
     uint32_t namePos = stmt.nameToken() ? stmt.nameToken()->startOffset() : stmt.node.startOffset();
     Symbol* sym = makeSymbol(SymbolKind::Variable, name, finalType, namePos);
     if (!currentScope->define(sym)) {
@@ -832,6 +840,11 @@ void Analyzer::analyzeTypedVarDeclStmt(const ast::TypedVarDeclStatement& stmt) {
             "' to variable of type '" + declared->toString() + "'");
     }
     auto name = stmt.nameText().value_or(std::u16string{});
+    if (!initType && !isDefaultable(declared) && !declared->isError()) {
+        errorAtNode(stmt.node, "Variable '" + asciiOf(name) + "' has non-nullable type '" +
+            declared->toString() + "' but no initializer. Provide a value, or make the type nullable ('" +
+            declared->toString() + "?').");
+    }
     uint32_t namePos = stmt.nameToken() ? stmt.nameToken()->startOffset() : stmt.node.startOffset();
     Symbol* sym = makeSymbol(SymbolKind::Variable, name, declared, namePos);
     if (!currentScope->define(sym)) {
@@ -1652,23 +1665,118 @@ bool Analyzer::isLValue(const ast::Expression& expr) const {
            k == SyntaxKind::SubscriptExpr || k == SyntaxKind::ThisExpr;
 }
 
-bool Analyzer::zeroBitPatternIsValid(Type* t) const {
+static bool fieldHasDefaultValue(const FieldInfo& f) {
+    if (!f.declaration) return false;
+    auto fieldNode = SyntaxNode::makeRoot(f.declaration);
+    auto fd = ast::FieldDecl::cast(*fieldNode);
+    return fd && fd->defaultValue().has_value();
+}
+
+bool Analyzer::isDefaultable(Type* t) const {
     if (!t) return false;
     if (t->isPrimitive()) return true;
     if (t->isOptional()) return true;
     if (t->isStruct()) {
         if (!t->structInfo) return false;
         for (auto& f : t->structInfo->fields) {
-            if (!zeroBitPatternIsValid(f.type)) return false;
+            if (isDefaultable(f.type)) continue;
+            if (fieldHasDefaultValue(f)) continue;
+            return false;
         }
         return true;
     }
     return false;
 }
 
+static bool ctorHasThisFieldParam(const ast::FuncDecl& ctor, const std::u16string& fieldName) {
+    for (auto& p : ctor.parameters()) {
+        if (!p.isThisField()) continue;
+        if (auto pname = p.nameText(); pname && *pname == fieldName) return true;
+    }
+    return false;
+}
+
+// Returns true if there is at least one top-level assignment in the body.
+// Branches and loops aren't credited as not considered to guarantee initialization.
+static bool ctorBodyAssignsThisField(const ast::FuncDecl& ctor,
+                                     const std::u16string& fieldName) {
+    auto body = ctor.body();
+    if (!body) return false;
+    for (auto& s : body->statements()) {
+        auto e = s.asExpressionStmt();
+        if (!e) continue;
+        auto expr = e->expression();
+        if (!expr) continue;
+        auto a = expr->asAssign();
+        if (!a) continue;
+        auto target = a->target();
+        if (!target) continue;
+        auto m = target->asMember();
+        if (!m) continue;
+        auto obj = m->object();
+        if (!obj || !obj->asThis()) continue;
+        auto mname = m->memberText();
+        if (mname && *mname == fieldName) return true;
+    }
+    return false;
+}
+
+void Analyzer::checkFieldInitialization(const ast::StructDecl& sd) {
+    Type* t = analysis.typeOf(sd.node.greenNode());
+    if (!t || !t->structInfo) return;
+    for (auto& f : t->structInfo->fields) {
+        if (isDefaultable(f.type)) continue;
+        if (fieldHasDefaultValue(f)) continue;
+        std::string fname = asciiOf(f.name);
+        std::string sname = asciiOf(t->structInfo->name);
+        std::string msg = "Field '" + fname + "' of struct '" + sname +
+            "' has non-nullable type '" + f.type->toString() +
+            "' and no default value. Either give it a default (e.g. `" +
+            f.type->toString() + " " + fname + " = ...;`) or make it nullable (`" +
+            f.type->toString() + "? " + fname + ";`).";
+        sink.error({f.line, f.column, static_cast<int>(fname.size())}, std::move(msg));
+    }
+}
+
+void Analyzer::checkFieldInitialization(const ast::ClassDecl& cd) {
+    Type* t = analysis.typeOf(cd.node.greenNode());
+    if (!t || !t->structInfo) return;
+    std::u16string className = t->structInfo->name;
+
+    std::vector<ast::FuncDecl> ctors;
+    for (auto& m : cd.methods()) {
+        if (auto mname = m.nameText(); mname && *mname == className) ctors.push_back(m);
+    }
+
+    for (auto& f : t->structInfo->fields) {
+        if (isDefaultable(f.type)) continue;
+        if (fieldHasDefaultValue(f)) continue;
+
+        bool everyCtorInits = !ctors.empty();
+        for (auto& ctor : ctors) {
+            if (!ctorHasThisFieldParam(ctor, f.name) &&
+                !ctorBodyAssignsThisField(ctor, f.name)) {
+                everyCtorInits = false;
+                break;
+            }
+        }
+        if (everyCtorInits) continue;
+
+        std::string fname = asciiOf(f.name);
+        std::string cname = asciiOf(t->structInfo->name);
+        std::string msg = "Field '" + fname + "' of class '" + cname +
+            "' has non-nullable type '" + f.type->toString() +
+            "' but is never initialized. Give it a default (e.g. `" +
+            f.type->toString() + " " + fname + " = ...;`), make it nullable (`" +
+            f.type->toString() + "? " + fname + ";`), or initialize it in every constructor " +
+            "(via `this." + fname + "` parameter or `this." + fname + " = ...;` in the body).";
+        sink.error({f.line, f.column, static_cast<int>(fname.size())}, std::move(msg));
+    }
+}
+
 bool Analyzer::validateArrayElement(Type* elem, const SyntaxNode& diagNode) {
     if (!elem || elem->isError()) return false;
-    if (zeroBitPatternIsValid(elem)) return true;
+    if (isDefaultable(elem)) return true;
     std::string hint;
     if (elem->isClass() || elem->isArray() || elem->isExternal() ||
         elem->kind == TypeKind::String) {
@@ -1676,7 +1784,7 @@ bool Analyzer::validateArrayElement(Type* elem, const SyntaxNode& diagNode) {
     } else if (elem->isStruct() && elem->structInfo) {
         const FieldInfo* bad = nullptr;
         for (auto& f : elem->structInfo->fields) {
-            if (!zeroBitPatternIsValid(f.type)) { bad = &f; break; }
+            if (!isDefaultable(f.type)) { bad = &f; break; }
         }
         if (bad) {
             std::string fname;
