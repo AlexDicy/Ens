@@ -141,6 +141,10 @@ void EscapeAnalyzer::scanExpression(const ast::Expression& e) {
         return;
     }
     if (auto su = e.asSubscript()) { scanSubscript(*su); return; }
+    if (auto c = e.asCast()) {
+        if (auto src = c->source()) scanExpression(*src);
+        return;
+    }
     if (e.asOutArgument()) {
         // External calls don't participate in ARC-aware escape analysis; the
         // referenced local is treated as reassigned by the analyzer itself.
@@ -473,6 +477,10 @@ void EscapeAnalyzer::walkExprForLastUses(const ast::Expression& e) {
     if (auto su = e.asSubscript()) {
         if (auto obj = su->object()) walkExprForLastUses(*obj);
         if (auto idx = su->index()) walkExprForLastUses(*idx);
+        return;
+    }
+    if (auto c = e.asCast()) {
+        if (auto src = c->source()) walkExprForLastUses(*src);
         return;
     }
     if (auto bn = e.asBinary()) {

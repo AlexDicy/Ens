@@ -17,6 +17,7 @@ class CallExpression;
 class MemberExpression;
 class SafeMemberExpression;
 class SubscriptExpression;
+class CastExpression;
 class OutArgument;
 class AssignExpression;
 class TernaryExpression;
@@ -43,6 +44,7 @@ public:
     std::optional<MemberExpression>    asMember() const;
     std::optional<SafeMemberExpression> asSafeMember() const;
     std::optional<SubscriptExpression> asSubscript() const;
+    std::optional<CastExpression>      asCast() const;
     std::optional<OutArgument>         asOutArgument() const;
     std::optional<AssignExpression>    asAssign() const;
     std::optional<TernaryExpression>   asTernary() const;
@@ -170,6 +172,17 @@ public:
     }
     std::optional<Expression> object() const;
     std::optional<Expression> index() const;
+};
+
+class CastExpression {
+public:
+    SyntaxNode node;
+    static std::optional<CastExpression> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::CastExpr) return std::nullopt;
+        return CastExpression{n};
+    }
+    std::optional<Expression> source() const;
+    std::optional<TypeReference> targetType() const;
 };
 
 class AssignExpression {

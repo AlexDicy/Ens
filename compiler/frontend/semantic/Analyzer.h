@@ -131,6 +131,7 @@ private:
     Type* analyzeMember(const ast::MemberExpression& expr);
     Type* analyzeSafeMember(const ast::SafeMemberExpression& expr);
     Type* analyzeSubscript(const ast::SubscriptExpression& expr);
+    Type* analyzeCast(const ast::CastExpression& expr);
     Type* analyzeAssign(const ast::AssignExpression& expr);
     Type* analyzeTernary(const ast::TernaryExpression& expr);
     Type* analyzeNew(const ast::NewExpression& expr);

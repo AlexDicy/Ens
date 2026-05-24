@@ -189,6 +189,27 @@ draw(Outer? outer) {
 
 ---
 
+Numeric values convert between each other with the `as` operator: `expr as Type`. The source and target must both be numeric. Casts between non-numeric types are a compile error.
+
+```ens
+long n = 300L;
+byte b = n as byte;      // truncating narrow: keeps low 8 bits (44)
+int neg = -1;
+uint u = neg as uint;    // same-width reinterpret: 0xFFFFFFFF
+double d = 3.7;
+int t = d as int;        // float -> int truncates toward zero (3)
+```
+
+`as` binds tightly to the value just before it. It has higher precedence than `*`, `+`, and unary `-`. To cast a whole expression, parenthesize it:
+
+```ens
+int[] arr = new int[4];
+long a = arr.length * 2 as long;  // arr.length * (2 as long)
+long b = (arr.length * 2) as long; // cast applied to the product
+```
+
+---
+
 Arrays are written with `T[]` and are reference types: declaring an array variable binds a pointer to a heap allocation, and copying the variable copies the pointer.
 
 ```ens
@@ -250,7 +271,7 @@ Atomics happen only at allocation, at assignment of class-typed fields, and at s
 class Texture { /* ... */ }
 
 drawSprite(Texture tex) {
-    // no retain at entry, no release at exit — caller's reference owns +1
+    // no retain at entry, no release at exit. Caller's reference owns +1
     tex.bind();
 }
 

@@ -16,6 +16,7 @@ bool Expression::isExpressionKind(SyntaxKind k) {
         case SyntaxKind::SafeMemberExpr:
         case SyntaxKind::OutArgument:
         case SyntaxKind::SubscriptExpr:
+        case SyntaxKind::CastExpr:
         case SyntaxKind::AssignExpr:
         case SyntaxKind::TernaryExpr:
         case SyntaxKind::NewExpr:
@@ -56,6 +57,7 @@ std::optional<CallExpression>      Expression::asCall()      const { return Call
 std::optional<MemberExpression>    Expression::asMember()    const { return MemberExpression::cast(node); }
 std::optional<SafeMemberExpression> Expression::asSafeMember() const { return SafeMemberExpression::cast(node); }
 std::optional<SubscriptExpression> Expression::asSubscript() const { return SubscriptExpression::cast(node); }
+std::optional<CastExpression>      Expression::asCast()      const { return CastExpression::cast(node); }
 std::optional<OutArgument>         Expression::asOutArgument() const { return OutArgument::cast(node); }
 std::optional<AssignExpression>    Expression::asAssign()    const { return AssignExpression::cast(node); }
 std::optional<TernaryExpression>   Expression::asTernary()   const { return TernaryExpression::cast(node); }
@@ -214,6 +216,19 @@ std::optional<Expression> SubscriptExpression::object() const {
 std::optional<Expression> SubscriptExpression::index() const {
     auto exprs = expressionChildren(node);
     if (exprs.size() >= 2) return exprs[1];
+    return std::nullopt;
+}
+
+// === CastExpression ===
+
+std::optional<Expression> CastExpression::source() const {
+    return firstExpressionChild(node);
+}
+
+std::optional<TypeReference> CastExpression::targetType() const {
+    for (auto& c : node.children()) {
+        if (auto tr = TypeReference::cast(c)) return tr;
+    }
     return std::nullopt;
 }
 

@@ -664,6 +664,7 @@ int Parser::infixPrecedence(SyntaxKind k) const {
         case SyntaxKind::Star:
         case SyntaxKind::Slash:
         case SyntaxKind::Percent:    return 12;
+        case SyntaxKind::KwAs:       return 13;  // cast - binds tighter than * and unary
         case SyntaxKind::Dot:
         case SyntaxKind::QuestionDot:
         case SyntaxKind::LParen:
@@ -710,6 +711,14 @@ void Parser::parsePrecedence(int minPrec) {
             builder.startNodeAt(cp, SyntaxKind::SafeMemberExpr);
             bump();
             expect(SyntaxKind::Identifier, "identifier after '?.'");
+            builder.finishNode();
+            continue;
+        }
+        if (op == SyntaxKind::KwAs) {
+            builder.startNodeAt(cp, SyntaxKind::CastExpr);
+            bump();  // 'as'
+            if (isTypeStart(kindAt())) parseType();
+            else emitMissing(SyntaxKind::Identifier, "type after 'as'");
             builder.finishNode();
             continue;
         }

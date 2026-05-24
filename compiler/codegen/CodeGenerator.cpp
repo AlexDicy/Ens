@@ -938,6 +938,7 @@ struct CodeGenerator::Impl {
         if (auto m = e.asMember()) return emitMember(*m);
         if (auto sm = e.asSafeMember()) return emitSafeMember(*sm);
         if (auto su = e.asSubscript()) return emitSubscript(*su);
+        if (auto c = e.asCast()) return emitCast(*c);
         if (auto a = e.asAssign()) return emitAssign(*a);
         if (auto t = e.asTernary()) return emitTernary(*t);
         if (auto n = e.asNew()) return emitNew(*n);
@@ -1136,6 +1137,54 @@ struct CodeGenerator::Impl {
                 error(e.node.startOffset(), "Unsupported unary operator in codegen");
                 return nullptr;
         }
+    }
+
+    llvm::Value* emitNumericConversion(llvm::Value* v, ::Type* srcT, ::Type* dstT) {
+        if (!v || !srcT || !dstT) return v;
+        if (srcT->equals(dstT)) return v;
+
+        llvm::Type* srcLlvm = mapType(srcT);
+        llvm::Type* dstLlvm = mapType(dstT);
+        if (!srcLlvm || !dstLlvm) return v;
+
+        bool srcFloat = srcT->isFloat();
+        bool dstFloat = dstT->isFloat();
+        bool srcSigned = isSigned(srcT);
+        bool dstSigned = isSigned(dstT);
+
+        if (!srcFloat && !dstFloat) {
+            // Integer <-> integer.
+            unsigned srcBits = srcLlvm->getIntegerBitWidth();
+            unsigned dstBits = dstLlvm->getIntegerBitWidth();
+            if (srcBits == dstBits) return v;  // signed/unsigned reinterpret - no IR op
+            if (srcBits > dstBits) return builder->CreateTrunc(v, dstLlvm, "cast.trunc");
+            return srcSigned ? builder->CreateSExt(v, dstLlvm, "cast.sext")
+                             : builder->CreateZExt(v, dstLlvm, "cast.zext");
+        }
+        if (!srcFloat && dstFloat) {
+            return srcSigned ? builder->CreateSIToFP(v, dstLlvm, "cast.sitofp")
+                             : builder->CreateUIToFP(v, dstLlvm, "cast.uitofp");
+        }
+        if (srcFloat && !dstFloat) {
+            return dstSigned ? builder->CreateFPToSI(v, dstLlvm, "cast.fptosi")
+                             : builder->CreateFPToUI(v, dstLlvm, "cast.fptoui");
+        }
+        // float <-> float
+        unsigned srcBits = srcLlvm->getPrimitiveSizeInBits();
+        unsigned dstBits = dstLlvm->getPrimitiveSizeInBits();
+        if (srcBits == dstBits) return v;
+        if (srcBits > dstBits) return builder->CreateFPTrunc(v, dstLlvm, "cast.fptrunc");
+        return builder->CreateFPExt(v, dstLlvm, "cast.fpext");
+    }
+
+    llvm::Value* emitCast(const ast::CastExpression& e) {
+        auto src = e.source();
+        if (!src) return nullptr;
+        ::Type* srcT = typeOf(src->node);
+        ::Type* dstT = typeOf(e.node);
+        llvm::Value* v = emitExpr(*src);
+        if (!v) return nullptr;
+        return emitNumericConversion(v, srcT, dstT);
     }
 
     llvm::Function* getOrDeclarePuts() {

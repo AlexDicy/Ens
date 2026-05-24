@@ -267,7 +267,7 @@ void Analyzer::bindImports(const ModuleResolver& resolver) {
         }
 
         if (auto alias = imp.aliasText()) {
-            // Named import: `import Alias from path;` — bring `Alias` into scope.
+            // Named import: `import Alias from path;`, bring `Alias` into scope.
             Type* importedType = typeCtx.lookupNamedType(targetPath, *alias);
             uint32_t namePos = imp.aliasToken() ? imp.aliasToken()->startOffset() : imp.node.startOffset();
             if (importedType) {
@@ -289,7 +289,7 @@ void Analyzer::bindImports(const ModuleResolver& resolver) {
             errorAtNode(imp.node, "Module '" + asciiOf(targetPath) +
                 "' has no exported '" + asciiOf(*alias) + "'");
         } else {
-            // Namespace import: `import path;` — last path segment becomes the alias.
+            // Namespace import: `import path;`, last path segment becomes the alias.
             auto nsName = imp.namespaceName();
             if (!nsName) continue;
             Symbol* sym = makeSymbol(SymbolKind::Namespace, *nsName, nullptr, imp.node.startOffset());
@@ -966,6 +966,7 @@ Type* Analyzer::analyzeExpr(const ast::Expression& expr) {
     else if (auto m  = expr.asMember()) t = analyzeMember(*m);
     else if (auto sm = expr.asSafeMember()) t = analyzeSafeMember(*sm);
     else if (auto su = expr.asSubscript()) t = analyzeSubscript(*su);
+    else if (auto ca = expr.asCast()) t = analyzeCast(*ca);
     else if (auto oa = expr.asOutArgument()) {
         errorAtNode(expr.node, "'out' can only be used when calling an external function.");
         t = typeCtx.getError();
@@ -1354,7 +1355,7 @@ Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
     auto obj = expr.object();
     if (!obj) return typeCtx.getError();
 
-    // Namespace alias on the LHS: `ns.Name` — resolve `Name` against the
+    // Namespace alias on the LHS: `ns.Name`, resolve `Name` against the
     // imported module's exported symbols rather than complaining about a
     // non-record type.
     if (auto idObj = obj->asIdent()) {
@@ -1466,6 +1467,23 @@ Type* Analyzer::analyzeSafeMember(const ast::SafeMemberExpression& expr) {
     errorAtNode(expr.node, "No field or method named '" + asciiOf(*memberName) +
         "' on '" + inner->toString() + "'.");
     return typeCtx.getError();
+}
+
+Type* Analyzer::analyzeCast(const ast::CastExpression& expr) {
+    auto src = expr.source();
+    auto tr = expr.targetType();
+    if (!src || !tr) return typeCtx.getError();
+    Type* srcT = analyzeExpr(*src);
+    Type* dstT = resolveTypeReference(*tr);
+    if (srcT->isError() || dstT->isError()) return typeCtx.getError();
+
+    auto isNumeric = [](Type* t) { return t && (t->isInteger() || t->isFloat()); };
+    if (!isNumeric(srcT) || !isNumeric(dstT)) {
+        errorAtNode(expr.node, "Cannot cast '" + srcT->toString() + "' to '" +
+            dstT->toString() + "'; 'as' only supports numeric conversions.");
+        return typeCtx.getError();
+    }
+    return dstT;
 }
 
 Type* Analyzer::analyzeSubscript(const ast::SubscriptExpression& expr) {

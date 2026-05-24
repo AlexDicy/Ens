@@ -209,7 +209,7 @@ void printEscapeFactsForFunction(Symbol* sym, std::ostream& os) {
     os << ")";
     const auto& ei = sym->escapeInfo;
     if (!ei.params.empty()) {
-        os << " — ";
+        os << " - ";
         for (size_t i = 0; i < ei.params.size(); ++i) {
             if (i > 0) os << ", ";
             os << "p" << i << "=" << escapeKindStr(ei.params[i]);
