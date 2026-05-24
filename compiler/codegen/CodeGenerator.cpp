@@ -2546,7 +2546,7 @@ struct CodeGenerator::Impl {
         builder->SetInsertPoint(mergeBB);
         if (!thenV || !elseV) return nullptr;
         if (thenV->getType() != elseV->getType()) {
-            error(e.node.startOffset(), "Ternary branches produce different LLVM types");
+            error(e.node.startOffset(), "Internal: ternary branches did not unify to a common type");
             return nullptr;
         }
         auto* phi = builder->CreatePHI(thenV->getType(), 2);
@@ -2577,7 +2577,7 @@ struct CodeGenerator::Impl {
         std::string verifyErr;
         llvm::raw_string_ostream rso(verifyErr);
         if (llvm::verifyModule(*module, &rso)) {
-            error(0, "LLVM module verification failed: " + verifyErr);
+            error(0, "Internal: generated module failed verification: " + verifyErr);
             return false;
         }
         return true;
