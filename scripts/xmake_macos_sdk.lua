@@ -20,7 +20,9 @@ rule("gen-macos-sdk-stubs")
                 if out then sdk_path = out:trim() end
             end
             if not sdk_path or not os.isdir(sdk_path) then
-                print("warning: macOS SDK not found; emitting empty SDK stubs")
+                if is_host("macosx") then
+                    print("warning: macOS SDK not found; emitting empty SDK stubs")
+                end
                 emit_empty()
                 return
             end
