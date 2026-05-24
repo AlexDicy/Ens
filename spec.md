@@ -241,6 +241,7 @@ let n = xs.length;            // long
 - `new T[size]` allocates an array of `size` elements. Primitive and reference slots start zero / `null`. Struct slots get the struct's declared field defaults applied to each slot.
 - The **innermost** element type must be one whose default value is meaningful. A non-nullable reference type (class, array, external, string) is rejected as the element. Use the nullable form: write `Box?[]` rather than `Box[]`. The same rule extends through struct fields: a struct containing a non-nullable reference field cannot be used as an array element.
 - `new T[a][b]` allocates a fully-populated multidimensional grid in one call: an outer array of length `a`, each slot holding a freshly-allocated `T[]` of length `b`. The same shape extends to higher dimensions (`new T[a][b][c]`). Because every intermediate level is allocated, types like `int[][]` are valid here even though no intermediate slot is nullable.
+- `new T[a][]` allocates only the outer array; inner slots stay `null`. The result type is `T[]?[]`, the deepest unallocated level is reflected in the type by adding a `?`. Trailing empty brackets compose: `new T[a][b][]` produces `T[]?[][]`. Sized brackets must come before any empty ones in a single `new` expression.
 - `arr[i]` reads or writes an element. Bounds are checked at every access; an out-of-range index aborts the program.
 - `arr.length` returns the number of elements as a `long`.
 - `T?[]` is an array of nullable `T`, each **element** can be `null`. `T[]?` is a nullable array variable. The variable itself may be `null`. The two compose: `T?[]?` is both. To safely index a nullable array, use `?[i]`: it short-circuits to `null` when the receiver is `null`, otherwise it indexes normally.
@@ -258,7 +259,7 @@ grid[2][3] = 1;
 
 Box?[]?[] sparseGrid = new Box?[]?[3];   // outer allocated, each row left null
 sparseGrid[0] = new Box?[2];             // populate one row by hand
-let cell = sparseGrid[0]?[1];            // Box? — null when the row is null
+let cell = sparseGrid[0]?[1];            // Box?, null when the row is null
 ```
 
 ---

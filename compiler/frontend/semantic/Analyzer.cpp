@@ -1795,6 +1795,7 @@ Type* Analyzer::analyzeNew(const ast::NewExpression& expr) {
 
     if (expr.isArrayNew()) {
         auto sizes = expr.arraySizeExpressions();
+        int unsized = expr.arrayUnsizedTrailingCount();
         Type* elem = resolveTypeReference(*tr);
         if (elem->isError()) {
             for (auto& sz : sizes) analyzeExpr(sz);
@@ -1807,17 +1808,30 @@ Type* Analyzer::analyzeNew(const ast::NewExpression& expr) {
         }
         if (sizes.empty()) {
             errorAtNode(expr.node, "'new " + elem->toString() +
-                "[...]' requires a size expression inside the brackets");
+                "[...]' requires at least one sized dimension. Use 'new " +
+                elem->toString() + "[size]' for a 1-D array, or 'new " +
+                elem->toString() + "[size][]' for a partially-allocated grid.");
             Type* arrT = typeCtx.getArray(elem);
             analysis.setType(expr.node.greenNode(), arrT);
             return arrT;
         }
-        // Only the innermost level's slots are zero-initialized; outer levels
-        // are auto-filled with fresh allocations. So the element-nullability
-        // rule applies just to the element type the user wrote.
-        if (!validateArrayElement(elem, tr->node)) {
-            for (auto& sz : sizes) analyzeExpr(sz);
-            return typeCtx.getError();
+        // When `unsized == 0`, every level is allocated, so the deepest slots
+        // hold values of type T directly. T must therefore satisfy the
+        // element-nullability rule. When `unsized > 0`, the slots at the
+        // deepest allocated level hold nullable inner arrays (which are
+        // defaultable as `null`), so T itself is never zero-initialized and
+        // doesn't need to be defaultable here.
+        Type* slotElem;
+        if (unsized == 0) {
+            if (!validateArrayElement(elem, tr->node)) {
+                for (auto& sz : sizes) analyzeExpr(sz);
+                return typeCtx.getError();
+            }
+            slotElem = elem;
+        } else {
+            Type* innerArr = elem;
+            for (int i = 0; i < unsized; ++i) innerArr = typeCtx.getArray(innerArr);
+            slotElem = typeCtx.getOptional(innerArr);
         }
         for (auto& sz : sizes) {
             Type* sizeT = analyzeExpr(sz);
@@ -1825,8 +1839,9 @@ Type* Analyzer::analyzeNew(const ast::NewExpression& expr) {
                 errorAtNode(sz.node, "Array size must be an integer, got '" + sizeT->toString() + "'");
             }
         }
-        // Result type: Array applied `sizes.size()` times to the element type.
-        Type* arrT = elem;
+        // Result type: Array applied `sizes.size()` times to the deepest slot
+        // type (which already folds in the unsized-tail `?` when applicable).
+        Type* arrT = slotElem;
         for (size_t i = 0; i < sizes.size(); ++i) {
             arrT = typeCtx.getArray(arrT);
         }

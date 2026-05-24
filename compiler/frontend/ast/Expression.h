@@ -236,6 +236,7 @@ public:
     std::vector<Expression> arguments() const;
     bool isArrayNew() const;
     std::vector<Expression> arraySizeExpressions() const;
+    int arrayUnsizedTrailingCount() const;
 };
 
 class ParenExpression {

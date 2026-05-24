@@ -1865,7 +1865,7 @@ struct CodeGenerator::Impl {
     // array. The +1 from each inner `new` is transferred straight into the
     // outer's slot (no retain). Innermost slots stay zero-initialized.
     //
-    // `slotElemType` is the element type for THIS level — i.e. for level 0
+    // `slotElemType` is the element type for THIS level, i.e. for level 0
     // it's the next-deeper array type, and for the deepest level it's the
     // user-written T.
     llvm::Value* emitMultiDimNew(::Type* slotElemType,

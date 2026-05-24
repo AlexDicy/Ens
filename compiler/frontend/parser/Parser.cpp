@@ -494,6 +494,35 @@ void Parser::parseType() {
     builder.finishNode();
 }
 
+void Parser::parseTypeHead() {
+    // Like parseType but leaves dim brackets for the NewExpr to parse.
+    // A `[]` is consumed only when followed by `?` (then it is unambiguously
+    // part of a nullable-array element type like `T[]?`). A standalone `[]`
+    // or `[size]` at this position belongs to the NewExpr's dimension list.
+    // `?` is always consumed so `new Box?[3]` constructs an array of
+    // nullable Box rather than safe-subscripting the result of `new Box[3]`.
+    builder.startNode(SyntaxKind::TypeRef);
+    bool wasIdentifier = at(SyntaxKind::Identifier);
+    if (isTypeStart(kindAt())) bump();
+    else emitMissing(SyntaxKind::Identifier, "type name");
+    if (wasIdentifier && at(SyntaxKind::Dot) && peekKind(1) == SyntaxKind::Identifier) {
+        bump();
+        bump();
+    }
+    while (true) {
+        if (at(SyntaxKind::Question)) { bump(); continue; }
+        if (at(SyntaxKind::LBracket) &&
+            peekKind(1) == SyntaxKind::RBracket &&
+            peekKind(2) == SyntaxKind::Question) {
+            bump();  // '['
+            bump();  // ']'
+            continue;
+        }
+        break;
+    }
+    builder.finishNode();
+}
+
 
 bool Parser::looksLikeTypedVarDecl() const {
     SyntaxKind k0 = peekKind(0);
@@ -790,16 +819,26 @@ void Parser::parsePrefix() {
         case SyntaxKind::KwNew: {
             builder.startNode(SyntaxKind::NewExpr);
             bump();
-            // parseType only consumes `[]` adjacent pairs, so `new T[size]`
-            // leaves the `[` for us to recognise as the array-constructor form.
-            // `new T?[size]` and `new T[]?[size]` work the same way.
-            if (isTypeStart(kindAt())) parseType();
+            // The element type must NOT eat trailing `[]` here, those belong
+            // to the NewExpr's dimension list (`new T[a][]`).
+            if (isTypeStart(kindAt())) parseTypeHead();
             else emitMissing(SyntaxKind::Identifier, "type name after 'new'");
             if (at(SyntaxKind::LBracket)) {
-                // Accept one or more `[expr]` brackets for multi-dim allocation
-                // (`new T[a][b]` builds a fully-allocated grid of T).
+                // Accept one or more `[expr]` brackets for multi-dim allocation,
+                // optionally followed by `[]` brackets for partially-allocated
+                // tails (`new T[a][]` leaves the inner slots null).
+                bool seenEmpty = false;
                 while (at(SyntaxKind::LBracket)) {
                     bump();  // '['
+                    if (at(SyntaxKind::RBracket)) {
+                        bump();  // ']' (empty bracket)
+                        seenEmpty = true;
+                        continue;
+                    }
+                    if (seenEmpty) {
+                        reportAtCurrent(
+                            "Sized dimensions must come before any '[]' dimensions");
+                    }
                     parseExpression();
                     expect(SyntaxKind::RBracket, "']' after array size");
                 }

@@ -66,6 +66,7 @@ private:
 
     // === Type ===
     void parseType();
+    void parseTypeHead();  // base + namespace only, no [] or ? (used in `new`)
     bool isTypeStart(SyntaxKind k) const;
     bool isPrimitiveTypeKw(SyntaxKind k) const;
 

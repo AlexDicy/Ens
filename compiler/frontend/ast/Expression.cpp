@@ -329,14 +329,16 @@ bool NewExpression::isArrayNew() const {
 std::vector<Expression> NewExpression::arraySizeExpressions() const {
     std::vector<Expression> sizes;
     if (!isArrayNew()) return sizes;
-    // Each `[size]` group has a leading LBracket followed by an Expression
-    // (and a closing RBracket). Walk through, capturing the first Expression
-    // after each LBracket.
     bool expectingSize = false;
     for (auto& c : node.children()) {
         if (isTrivia(c.kind())) continue;
         if (c.kind() == SyntaxKind::LBracket) {
             expectingSize = true;
+            continue;
+        }
+        if (c.kind() == SyntaxKind::RBracket) {
+            // Empty `[]`, close without consuming an expression.
+            expectingSize = false;
             continue;
         }
         if (expectingSize) {
@@ -347,6 +349,22 @@ std::vector<Expression> NewExpression::arraySizeExpressions() const {
         }
     }
     return sizes;
+}
+
+int NewExpression::arrayUnsizedTrailingCount() const {
+    if (!isArrayNew()) return 0;
+    // An empty `[]` is a LBracket immediately followed by a RBracket among the
+    // non-trivia children. They only appear at the tail (parser enforces this).
+    int count = 0;
+    SyntaxKind prev = SyntaxKind::Invalid;
+    for (auto& c : node.children()) {
+        if (isTrivia(c.kind())) continue;
+        if (prev == SyntaxKind::LBracket && c.kind() == SyntaxKind::RBracket) {
+            count++;
+        }
+        prev = c.kind();
+    }
+    return count;
 }
 
 // === ParenExpression ===
