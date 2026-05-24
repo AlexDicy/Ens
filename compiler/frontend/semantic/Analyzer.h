@@ -132,6 +132,12 @@ private:
     Type* analyzeSafeMember(const ast::SafeMemberExpression& expr);
     Type* analyzeSubscript(const ast::SubscriptExpression& expr);
     Type* analyzeCast(const ast::CastExpression& expr);
+
+    void tryAdaptIntegerLiteral(const ast::Expression& src, Type* target);
+    Type* numericCommonType(Type* a, Type* b);
+    // analyzeExpr + try to adapt an integer literal to `target` in one step.
+    // Returns the (possibly retyped) expression type.
+    Type* analyzeExprAdapt(const ast::Expression& expr, Type* target);
     Type* analyzeAssign(const ast::AssignExpression& expr);
     Type* analyzeTernary(const ast::TernaryExpression& expr);
     Type* analyzeNew(const ast::NewExpression& expr);

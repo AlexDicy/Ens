@@ -210,6 +210,24 @@ long b = (arr.length * 2) as long; // cast applied to the product
 
 ---
 
+A narrower numeric value automatically converts to a wider one when the conversion preserves every possible value. Narrowing always requires casting with `as`.
+
+```ens
+int x = 5;
+long y = x;              // int -> long, automatic
+int n = arr.length;      // error: long -> int, can be forced with `arr.length as int`
+```
+
+Integer literals without a type suffix adapt to the surrounding type when it's an integer that fits the value. With no context they default to `int`. Values out of range produce a specific error.
+
+```ens
+byte b = 5;              // OK - 5 fits in byte
+long n = 5;              // OK - 5 fits in long
+byte big = 300;          // error: 300 does not fit in 'byte' (range -128..127)
+```
+
+---
+
 Arrays are written with `T[]` and are reference types: declaring an array variable binds a pointer to a heap allocation, and copying the variable copies the pointer.
 
 ```ens

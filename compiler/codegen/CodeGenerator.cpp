@@ -55,6 +55,7 @@ struct CodeGenerator::Impl {
     std::unordered_map<::Type*, llvm::DIType*> diStructTypeCache;
     std::unordered_map<::Type*, llvm::DIType*> diClassPointerCache;
     llvm::Function* currentFunction = nullptr;
+    ::Type* currentReturnType = nullptr;
     llvm::DIScope* currentDIScope = nullptr;
     llvm::DICompileUnit* diCU = nullptr;
     llvm::DIFile* diFile = nullptr;
@@ -444,6 +445,7 @@ struct CodeGenerator::Impl {
 
         byPointerParams.clear();
         currentFunction = llvm::cast<llvm::Function>(it->second);
+        currentReturnType = sym->returnType;
         auto* entry = llvm::BasicBlock::Create(ctx, "entry", currentFunction);
         builder->SetInsertPoint(entry);
 
@@ -563,6 +565,7 @@ struct CodeGenerator::Impl {
         if (debugEnabled && diBuilder && sp) diBuilder->finalizeSubprogram(sp);
         currentDIScope = prevScope;
         currentFunction = nullptr;
+        currentReturnType = nullptr;
     }
 
     // ===== Statements =====
@@ -802,7 +805,7 @@ struct CodeGenerator::Impl {
                 ? moveSourceSymbol(*init) : nullptr;
             bool needsClassRetain = isReferenceType(sym->type) && borrowedSource && !elideClassRetain && !moveSrc;
             bool needsStructRetain = structHasClassFields(sym->type) && borrowedSource && !elideStructRetain;
-            llvm::Value* v = emitExpr(*init);
+            llvm::Value* v = emitExprConverted(*init, sym->type);
             if (v) {
                 if (needsClassRetain) {
                     emitRetain(v);
@@ -909,7 +912,7 @@ struct CodeGenerator::Impl {
             bool needsClassRetain = isReferenceType(retType) && borrowedSource;
             bool needsStructRetain = structHasClassFields(retType) && borrowedSource;
 
-            llvm::Value* val = emitExpr(*v);
+            llvm::Value* val = emitExprConverted(*v, currentReturnType);
             if (!val) { builder->CreateUnreachable(); return; }
 
             if (needsClassRetain) {
@@ -1061,6 +1064,14 @@ struct CodeGenerator::Impl {
         return builder->CreateLoad(llvm::PointerType::get(ctx, 0), it->second, "this");
     }
 
+    ::Type* commonNumericType(::Type* a, ::Type* b) {
+        if (!a || !b) return nullptr;
+        if (a->equals(b)) return a;
+        if (a->widensTo(b)) return b;
+        if (b->widensTo(a)) return a;
+        return nullptr;
+    }
+
     llvm::Value* emitBinary(const ast::BinaryExpression& e) {
         auto leftE = e.left();
         auto rightE = e.right();
@@ -1069,8 +1080,18 @@ struct CodeGenerator::Impl {
         llvm::Value* R = emitExpr(*rightE);
         if (!L || !R) return nullptr;
         ::Type* leftType = typeOf(leftE->node);
-        bool flt = leftType && leftType->isFloat();
-        bool sgn = isSigned(leftType);
+        ::Type* rightType = typeOf(rightE->node);
+
+        ::Type* opType = leftType;
+        if (leftType && rightType && (leftType->isNumeric() || rightType->isNumeric())) {
+            if (::Type* common = commonNumericType(leftType, rightType)) {
+                if (!leftType->equals(common))  L = emitNumericConversion(L, leftType,  common);
+                if (!rightType->equals(common)) R = emitNumericConversion(R, rightType, common);
+                opType = common;
+            }
+        }
+        bool flt = opType && opType->isFloat();
+        bool sgn = isSigned(opType);
         auto opTok = e.operatorToken();
         SyntaxKind op = opTok ? opTok->kind() : SyntaxKind::Invalid;
         switch (op) {
@@ -1137,6 +1158,21 @@ struct CodeGenerator::Impl {
                 error(e.node.startOffset(), "Unsupported unary operator in codegen");
                 return nullptr;
         }
+    }
+
+    // Wrapper that emits an expression and then numerically converts it to the
+    // target type if widening (or any other lossless numeric conversion) was
+    // accepted at the analyzer level. No-op when types already match.
+    llvm::Value* emitExprConverted(const ast::Expression& e, ::Type* target) {
+        llvm::Value* v = emitExpr(e);
+        if (!v) return nullptr;
+        ::Type* srcT = typeOf(e.node);
+        if (!srcT || !target) return v;
+        if (srcT->equals(target)) return v;
+        bool srcNum = srcT->isInteger() || srcT->isFloat();
+        bool dstNum = target->isInteger() || target->isFloat();
+        if (!srcNum || !dstNum) return v;
+        return emitNumericConversion(v, srcT, target);
     }
 
     llvm::Value* emitNumericConversion(llvm::Value* v, ::Type* srcT, ::Type* dstT) {
@@ -1988,12 +2024,13 @@ struct CodeGenerator::Impl {
                         std::vector<llvm::Value*>& out) {
         for (size_t i = 0; i < userArgs.size(); ++i) {
             auto& a = userArgs[i];
+            ::Type* paramT = (sym && i < sym->paramTypes.size()) ? sym->paramTypes[i] : nullptr;
             if (sym && paramIsByPointer(sym, i)) {
-                llvm::Value* v = emitAddressForByPointerArg(a, sym->paramTypes[i]);
+                llvm::Value* v = emitAddressForByPointerArg(a, paramT);
                 if (!v) return false;
                 out.push_back(v);
             } else {
-                llvm::Value* v = emitExpr(a);
+                llvm::Value* v = emitExprConverted(a, paramT);
                 if (!v) return false;
                 out.push_back(v);
             }
@@ -2008,12 +2045,13 @@ struct CodeGenerator::Impl {
             if (!dv) return false;
             auto expr = dv->expression();
             if (!expr) return false;
+            ::Type* paramT = (i < sym->paramTypes.size()) ? sym->paramTypes[i] : nullptr;
             if (sym && paramIsByPointer(sym, i)) {
-                llvm::Value* v = emitAddressForByPointerArg(*expr, sym->paramTypes[i]);
+                llvm::Value* v = emitAddressForByPointerArg(*expr, paramT);
                 if (!v) return false;
                 out.push_back(v);
             } else {
-                llvm::Value* v = emitExpr(*expr);
+                llvm::Value* v = emitExprConverted(*expr, paramT);
                 if (!v) return false;
                 out.push_back(v);
             }
@@ -2222,9 +2260,12 @@ struct CodeGenerator::Impl {
                 }
                 args.push_back(it->second);
             } else {
-                llvm::Value* v = emitExpr(userArg);
-                if (!v) return nullptr;
                 ::Type* paramT = sym->paramTypes[i];
+                ::Type* convertTo = (paramT && (paramT->isInteger() || paramT->isFloat()))
+                    ? paramT : nullptr;
+                llvm::Value* v = convertTo ? emitExprConverted(userArg, convertTo)
+                                           : emitExpr(userArg);
+                if (!v) return nullptr;
                 ::Type* baseT = (paramT && paramT->isOptional()) ? paramT->inner : paramT;
                 if (baseT && baseT->isArray()) {
                     v = emitArrayDataPtr(v);
@@ -2276,7 +2317,7 @@ struct CodeGenerator::Impl {
 
         llvm::Value* lv = emitLValue(*target);
         if (!lv) return nullptr;
-        llvm::Value* val = emitExpr(*value);
+        llvm::Value* val = emitExprConverted(*value, targetType);
         if (!val) return nullptr;
 
         if (isWeakField) {
@@ -2485,18 +2526,20 @@ struct CodeGenerator::Impl {
         llvm::Value* condV = emitExpr(*cond);
         if (!condV) return nullptr;
 
+        ::Type* resultType = typeOf(e.node);
+
         auto* thenBB  = llvm::BasicBlock::Create(ctx, "tern.then", currentFunction);
         auto* elseBB  = llvm::BasicBlock::Create(ctx, "tern.else", currentFunction);
         auto* mergeBB = llvm::BasicBlock::Create(ctx, "tern.end",  currentFunction);
         builder->CreateCondBr(condV, thenBB, elseBB);
 
         builder->SetInsertPoint(thenBB);
-        llvm::Value* thenV = emitExpr(*thenE);
+        llvm::Value* thenV = emitExprConverted(*thenE, resultType);
         llvm::BasicBlock* thenEnd = builder->GetInsertBlock();
         if (thenV && !thenEnd->getTerminator()) builder->CreateBr(mergeBB);
 
         builder->SetInsertPoint(elseBB);
-        llvm::Value* elseV = emitExpr(*elseE);
+        llvm::Value* elseV = emitExprConverted(*elseE, resultType);
         llvm::BasicBlock* elseEnd = builder->GetInsertBlock();
         if (elseV && !elseEnd->getTerminator()) builder->CreateBr(mergeBB);
 

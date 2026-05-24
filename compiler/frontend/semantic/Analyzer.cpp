@@ -1,8 +1,10 @@
 #include "Analyzer.h"
 
 #include <algorithm>
+#include <cassert>
 #include "../diagnostics/Diagnostic.h"
 #include "../diagnostics/DiagnosticSink.h"
+#include "Literals.h"
 
 static Visibility toSemanticVisibility(ast::Visibility v) {
     switch (v) {
@@ -95,6 +97,129 @@ void Analyzer::errorAtNode(const SyntaxNode& node, std::string message) {
 Symbol* Analyzer::globalSymbol(const std::u16string& name) const {
     if (!globalScope) return nullptr;
     return globalScope->lookupLocal(name);
+}
+
+namespace {
+
+const ast::LiteralExpression* asIntLiteralChild(const ast::Expression& e) {
+    if (auto lit = e.asLiteral()) {
+        static thread_local std::optional<ast::LiteralExpression> hold;
+        if (lit->literalKind() != SyntaxKind::IntLiteral) return nullptr;
+        hold = lit;
+        return &*hold;
+    }
+    if (auto pre = e.asPrefix()) {
+        auto op = pre->operatorToken();
+        if (!op) return nullptr;
+        if (op->kind() != SyntaxKind::Plus && op->kind() != SyntaxKind::Minus) return nullptr;
+        auto operand = pre->operand();
+        if (!operand) return nullptr;
+        if (auto lit = operand->asLiteral()) {
+            if (lit->literalKind() != SyntaxKind::IntLiteral) return nullptr;
+            static thread_local std::optional<ast::LiteralExpression> hold;
+            hold = lit;
+            return &*hold;
+        }
+    }
+    return nullptr;
+}
+
+bool literalIsNegative(const ast::Expression& e) {
+    if (auto pre = e.asPrefix()) {
+        if (auto op = pre->operatorToken()) return op->kind() == SyntaxKind::Minus;
+    }
+    return false;
+}
+
+std::string integerRangeString(Type* target) {
+    if (!target) return "";
+    switch (target->kind) {
+        case TypeKind::Byte:   return "-128..127";
+        case TypeKind::Short:  return "-32768..32767";
+        case TypeKind::Int:    return "-2147483648..2147483647";
+        case TypeKind::Long:   return "-9223372036854775808..9223372036854775807";
+        case TypeKind::UShort: return "0..65535";
+        case TypeKind::UInt:   return "0..4294967295";
+        case TypeKind::ULong:  return "0..18446744073709551615";
+        case TypeKind::Char:   return "0..1114111";
+        default:
+            assert(false && "integerRangeString called on non-integer type");
+            return "";
+    }
+}
+
+bool literalFitsTarget(bool negative, uint64_t magnitude, Type* target) {
+    if (!target) return false;
+    switch (target->kind) {
+        case TypeKind::Byte:
+            return negative ? magnitude <= 128u : magnitude <= 127u;
+        case TypeKind::Short:
+            return negative ? magnitude <= 32768u : magnitude <= 32767u;
+        case TypeKind::Int:
+            return negative ? magnitude <= uint64_t(2147483648ull)
+                            : magnitude <= uint64_t(2147483647ull);
+        case TypeKind::Long:
+            return negative ? magnitude <= uint64_t(9223372036854775808ull)
+                            : magnitude <= uint64_t(9223372036854775807ull);
+        case TypeKind::UShort:
+            return !negative && magnitude <= 65535u;
+        case TypeKind::UInt:
+            return !negative && magnitude <= 4294967295u;
+        case TypeKind::ULong:
+            return !negative;  // any magnitude fits ulong
+        case TypeKind::Char:
+            return !negative && magnitude <= 0x10FFFFu;
+        default:
+            assert(false && "literalFitsTarget called on non-integer type");
+            return false;
+    }
+}
+
+}  // namespace
+
+void Analyzer::tryAdaptIntegerLiteral(const ast::Expression& src, Type* target) {
+    if (!target || target->isError()) return;
+    if (!target->isInteger()) return;
+    const ast::LiteralExpression* lit = asIntLiteralChild(src);
+    if (!lit) return;
+
+    auto tok = lit->token();
+    if (!tok) return;
+    std::u16string text(tok->tokenText());
+    uint64_t magnitude = 0;
+    if (!parseIntegerLiteralMagnitude(text, magnitude)) return;
+    bool negative = literalIsNegative(src);
+
+    if (!literalFitsTarget(negative, magnitude, target)) {
+        std::string textAscii = asciiOf(text);
+        std::string num = (negative ? std::string("-") : std::string("")) + textAscii;
+        errorAtNode(src.node, "Literal " + num + " does not fit in '" + target->toString() +
+            "' (range " + integerRangeString(target) + ")");
+        analysis.setType(src.node.greenNode(), typeCtx.getError());
+        return;
+    }
+
+    // In-range: retype the literal-bearing nodes so codegen emits at the
+    // target's width.
+    analysis.setType(src.node.greenNode(), target);
+    analysis.setType(lit->node.greenNode(), target);
+}
+
+Type* Analyzer::numericCommonType(Type* a, Type* b) {
+    if (!a || !b) return nullptr;
+    if (a->isError() || b->isError()) return nullptr;
+    if (a->equals(b)) return a;
+    if (a->widensTo(b)) return b;
+    if (b->widensTo(a)) return a;
+    return nullptr;
+}
+
+Type* Analyzer::analyzeExprAdapt(const ast::Expression& expr, Type* target) {
+    Type* t = analyzeExpr(expr);
+    if (!target || target->isError() || t->isError()) return t;
+    tryAdaptIntegerLiteral(expr, target);
+    Type* updated = analysis.typeOf(expr.node.greenNode());
+    return updated ? updated : t;
 }
 
 // =========================================================
@@ -537,7 +662,7 @@ void Analyzer::checkFieldDefaults(const ast::StructDecl& sd) {
         auto dvExpr = dv->expression();
         if (!dvExpr) continue;
         Type* expected = (i < t->structInfo->fields.size()) ? t->structInfo->fields[i].type : typeCtx.getError();
-        Type* actual = analyzeExpr(*dvExpr);
+        Type* actual = analyzeExprAdapt(*dvExpr, expected);
         if (!expected->isError() && !actual->isError() && !expected->assignableFrom(actual)) {
             errorAtNode(dvExpr->node, "Default value for field '" +
                 asciiOf(f.nameText().value_or(std::u16string{})) + "': expected '" +
@@ -569,7 +694,7 @@ void Analyzer::checkFieldDefaults(const ast::ClassDecl& cd) {
         auto dvExpr = dv->expression();
         if (!dvExpr) continue;
         Type* expected = (i < t->structInfo->fields.size()) ? t->structInfo->fields[i].type : typeCtx.getError();
-        Type* actual = analyzeExpr(*dvExpr);
+        Type* actual = analyzeExprAdapt(*dvExpr, expected);
         if (!expected->isError() && !actual->isError() && !expected->assignableFrom(actual)) {
             errorAtNode(dvExpr->node, "Default value for field '" +
                 asciiOf(f.nameText().value_or(std::u16string{})) + "': expected '" +
@@ -602,7 +727,7 @@ void Analyzer::checkParameterDefaults(const ast::FuncDecl& fn) {
         auto dvExpr = dv->expression();
         if (!dvExpr) continue;
         Type* expected = (sym && i < sym->paramTypes.size()) ? sym->paramTypes[i] : typeCtx.getError();
-        Type* actual = analyzeExpr(*dvExpr);
+        Type* actual = analyzeExprAdapt(*dvExpr, expected);
         if (!expected->isError() && !actual->isError() && !expected->assignableFrom(actual)) {
             errorAtNode(dvExpr->node, "Default value for parameter '" +
                 asciiOf(p.nameText().value_or(std::u16string{})) + "': expected '" +
@@ -814,7 +939,7 @@ void Analyzer::analyzeTypedVarDeclStmt(const ast::TypedVarDeclStatement& stmt) {
         declared = typeCtx.getError();
     }
     Type* initType = nullptr;
-    if (auto init = stmt.initializer()) initType = analyzeExpr(*init);
+    if (auto init = stmt.initializer()) initType = analyzeExprAdapt(*init, declared);
     if (initType && !declared->isError() && !declared->assignableFrom(initType)) {
         errorAtNode(stmt.node, "Cannot assign value of type '" + initType->toString() +
             "' to variable of type '" + declared->toString() + "'");
@@ -936,7 +1061,7 @@ void Analyzer::analyzeReturnStmt(const ast::ReturnStatement& stmt) {
         }
         return;
     }
-    Type* actual = analyzeExpr(*value);
+    Type* actual = analyzeExprAdapt(*value, expected);
     if (expected && !expected->isVoid()) {
         if (!expected->assignableFrom(actual)) {
             errorAtNode(value->node, "Cannot return value of type '" + actual->toString() +
@@ -1034,26 +1159,41 @@ Type* Analyzer::analyzeBinary(const ast::BinaryExpression& expr) {
     auto opTok = expr.operatorToken();
     SyntaxKind op = opTok ? opTok->kind() : SyntaxKind::Invalid;
 
+    // Adapt polymorphic integer literals to the other operand's type when one
+    // side is a non-literal concrete numeric type. Re-read after adaptation.
+    auto tryAdaptOperands = [&]() {
+        tryAdaptIntegerLiteral(*left, r);
+        tryAdaptIntegerLiteral(*right, l);
+        Type* lu = analysis.typeOf(left->node.greenNode());
+        Type* ru = analysis.typeOf(right->node.greenNode());
+        if (lu) l = lu;
+        if (ru) r = ru;
+    };
+
     switch (op) {
         case SyntaxKind::Plus:
         case SyntaxKind::Minus:
         case SyntaxKind::Star:
         case SyntaxKind::Slash:
-        case SyntaxKind::Percent:
+        case SyntaxKind::Percent: {
             if (!l->isNumeric() || !r->isNumeric()) {
                 errorAtNode(expr.node, "Operator requires numeric operands, got '" +
                     l->toString() + "' and '" + r->toString() + "'");
                 return typeCtx.getError();
             }
-            if (!l->equals(r)) {
+            tryAdaptOperands();
+            Type* common = numericCommonType(l, r);
+            if (!common) {
                 errorAtNode(expr.node, "Operands must be the same type, got '" +
                     l->toString() + "' and '" + r->toString() + "'");
                 return typeCtx.getError();
             }
-            return l;
+            return common;
+        }
 
         case SyntaxKind::EqEq:
         case SyntaxKind::NotEq:
+            tryAdaptOperands();
             if (!l->assignableFrom(r) && !r->assignableFrom(l)) {
                 errorAtNode(expr.node, "Cannot compare '" + l->toString() + "' and '" + r->toString() + "'");
             }
@@ -1062,12 +1202,19 @@ Type* Analyzer::analyzeBinary(const ast::BinaryExpression& expr) {
         case SyntaxKind::Lt:
         case SyntaxKind::Gt:
         case SyntaxKind::LtEq:
-        case SyntaxKind::GtEq:
-            if (!l->isNumeric() || !r->isNumeric() || !l->equals(r)) {
+        case SyntaxKind::GtEq: {
+            if (!l->isNumeric() || !r->isNumeric()) {
+                errorAtNode(expr.node, "Comparison requires numeric operands, got '" +
+                    l->toString() + "' and '" + r->toString() + "'");
+                return typeCtx.getPrimitive(TypeKind::Bool);
+            }
+            tryAdaptOperands();
+            if (!numericCommonType(l, r)) {
                 errorAtNode(expr.node, "Comparison requires matching numeric operands, got '" +
                     l->toString() + "' and '" + r->toString() + "'");
             }
             return typeCtx.getPrimitive(TypeKind::Bool);
+        }
 
         case SyntaxKind::AmpAmp:
         case SyntaxKind::PipePipe:
@@ -1165,8 +1312,8 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
             }
             size_t n = std::min(args.size(), methodSym->paramTypes.size());
             for (size_t i = 0; i < n; ++i) {
-                Type* argT = analyzeExpr(args[i]);
                 Type* paramT = methodSym->paramTypes[i];
+                Type* argT = analyzeExprAdapt(args[i], paramT);
                 if (!paramT->assignableFrom(argT)) {
                     errorAtNode(args[i].node, "Argument " + std::to_string(i + 1) +
                         ": expected '" + paramT->toString() + "', got '" + argT->toString() + "'");
@@ -1196,8 +1343,8 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
             }
             size_t n = std::min(args.size(), methodSym->paramTypes.size());
             for (size_t i = 0; i < n; ++i) {
-                Type* argT = analyzeExpr(args[i]);
                 Type* paramT = methodSym->paramTypes[i];
+                Type* argT = analyzeExprAdapt(args[i], paramT);
                 if (!paramT->assignableFrom(argT)) {
                     errorAtNode(args[i].node, "Argument " + std::to_string(i + 1) +
                         ": expected '" + paramT->toString() + "', got '" + argT->toString() + "'");
@@ -1264,8 +1411,8 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
             errorAtNode(args[i].node, "'out' can only be used when calling an external function.");
             continue;
         }
-        Type* argT = analyzeExpr(args[i]);
         Type* paramT = sym->paramTypes[i];
+        Type* argT = analyzeExprAdapt(args[i], paramT);
         if (!paramT->assignableFrom(argT)) {
             errorAtNode(args[i].node, "Argument " + std::to_string(i + 1) +
                 ": expected '" + paramT->toString() + "', got '" + argT->toString() + "'");
@@ -1327,7 +1474,7 @@ Type* Analyzer::analyzeExternalCall(const ast::CallExpression& expr, Symbol* sym
                     " of '" + asciiOf(funcName) + "' is not an 'out' parameter; remove 'out'.");
                 continue;
             }
-            Type* argT = analyzeExpr(arg);
+            Type* argT = analyzeExprAdapt(arg, paramT);
             if (!paramT->assignableFrom(argT)) {
                 errorAtNode(arg.node, "Argument " + std::to_string(i + 1) +
                     ": expected '" + paramT->toString() + "', got '" + argT->toString() + "'");
@@ -1517,7 +1664,6 @@ Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
         errorAtNode(expr.node, "Left side of assignment must be an assignable expression");
     }
     Type* targetT = analyzeExpr(*target);
-    Type* valueT = analyzeExpr(*value);
 
     // For a narrowed identifier the storage keeps its declared (wider) type; the
     // narrowing only governs reads. Use the symbol's declared type when checking
@@ -1532,6 +1678,8 @@ Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
             }
         }
     }
+
+    Type* valueT = analyzeExprAdapt(*value, assignTargetT);
 
     if (!assignTargetT->isError() && !valueT->isError()) {
         if (!assignTargetT->assignableFrom(valueT)) {
@@ -1556,7 +1704,13 @@ Type* Analyzer::analyzeTernary(const ast::TernaryExpression& expr) {
         errorAtNode(cond->node, "Ternary condition must be 'bool', got '" + condT->toString() + "'");
     }
     if (thenT->isError() || elseT->isError()) return typeCtx.getError();
+    // Adapt polymorphic int literal in one branch toward the other branch's type.
+    if (thenE) tryAdaptIntegerLiteral(*thenE, elseT);
+    if (elseE) tryAdaptIntegerLiteral(*elseE, thenT);
+    if (thenE) { Type* upd = analysis.typeOf(thenE->node.greenNode()); if (upd) thenT = upd; }
+    if (elseE) { Type* upd = analysis.typeOf(elseE->node.greenNode()); if (upd) elseT = upd; }
     if (thenT->equals(elseT)) return thenT;
+    if (Type* common = numericCommonType(thenT, elseT)) return common;
     if (thenT->assignableFrom(elseT)) return thenT;
     if (elseT->assignableFrom(thenT)) return elseT;
     errorAtNode(expr.node, "Ternary branches have incompatible types '" + thenT->toString() +
@@ -1636,8 +1790,8 @@ Type* Analyzer::analyzeNew(const ast::NewExpression& expr) {
         }
         size_t n = std::min(args.size(), ctor->paramTypes.size());
         for (size_t i = 0; i < n; ++i) {
-            Type* argT = analyzeExpr(args[i]);
             Type* paramT = ctor->paramTypes[i];
+            Type* argT = analyzeExprAdapt(args[i], paramT);
             if (!paramT->assignableFrom(argT)) {
                 errorAtNode(args[i].node, "Argument " + std::to_string(i + 1) +
                     ": expected '" + paramT->toString() + "', got '" + argT->toString() + "'");

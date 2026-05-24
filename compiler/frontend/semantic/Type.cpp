@@ -77,11 +77,95 @@ bool Type::equals(const Type* other) const {
 bool Type::assignableFrom(const Type* source) const {
     if (!source || source->isError() || isError()) return true;
     if (equals(source)) return true;
+    if (source->widensTo(this)) return true;
     if (isOptional()) {
         if (source->isNull()) return true;
         if (inner && inner->equals(source)) return true;
+        if (inner && source->widensTo(inner)) return true;
         if (source->isOptional() && inner && source->inner && inner->equals(source->inner)) return true;
     }
+    return false;
+}
+
+bool Type::isSignedInteger() const {
+    switch (kind) {
+        case TypeKind::Byte:
+        case TypeKind::Short:
+        case TypeKind::Int:
+        case TypeKind::Long:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool Type::isUnsignedInteger() const {
+    switch (kind) {
+        case TypeKind::UShort:
+        case TypeKind::UInt:
+        case TypeKind::ULong:
+        case TypeKind::Char:
+            return true;
+        default:
+            return false;
+    }
+}
+
+int Type::integerBitWidth() const {
+    switch (kind) {
+        case TypeKind::Byte:                       return 8;
+        case TypeKind::Short:
+        case TypeKind::UShort:                     return 16;
+        case TypeKind::Int:
+        case TypeKind::UInt:
+        case TypeKind::Char:                       return 32;
+        case TypeKind::Long:
+        case TypeKind::ULong:                      return 64;
+        default:                                   return 0;
+    }
+}
+
+int Type::floatBitWidth() const {
+    switch (kind) {
+        case TypeKind::Float:  return 32;
+        case TypeKind::Double: return 64;
+        default:               return 0;
+    }
+}
+
+bool Type::widensTo(const Type* target) const {
+    if (!target || target->isError() || isError()) return false;
+    if (equals(target)) return false;  // identity covered by equals
+
+    // Integer -> integer.
+    if (isInteger() && target->isInteger()) {
+        int srcW = integerBitWidth();
+        int dstW = target->integerBitWidth();
+        if (isSignedInteger() && target->isSignedInteger()) {
+            return dstW > srcW;
+        }
+        if (isUnsignedInteger() && target->isUnsignedInteger()) {
+            return dstW > srcW;
+        }
+        if (isUnsignedInteger() && target->isSignedInteger()) {
+            return dstW > srcW;  // strictly wider signed holds all unsigned bits
+        }
+        // signed -> unsigned: lossless never (negatives don't survive).
+        return false;
+    }
+
+    // Integer -> float.
+    if (isInteger() && target->isFloat()) {
+        int srcW = integerBitWidth();
+        int mantissa = target->floatBitWidth() == 32 ? 24 : 53;
+        return srcW <= mantissa;
+    }
+
+    // float -> float (only float -> double in v1).
+    if (isFloat() && target->isFloat()) {
+        return floatBitWidth() < target->floatBitWidth();
+    }
+
     return false;
 }
 

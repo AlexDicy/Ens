@@ -85,6 +85,11 @@ public:
 
     bool equals(const Type* other) const;
     bool assignableFrom(const Type* source) const;
+    bool widensTo(const Type* target) const;
+    bool isSignedInteger() const;
+    bool isUnsignedInteger() const;
+    int  integerBitWidth() const;
+    int  floatBitWidth() const;
 
     std::string toString() const;
 };
