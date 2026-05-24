@@ -236,6 +236,11 @@ Type* Analyzer::numericCommonType(Type* a, Type* b) {
 }
 
 Type* Analyzer::analyzeExprAdapt(const ast::Expression& expr, Type* target) {
+    if (auto al = expr.asArrayLiteral()) {
+        Type* t = analyzeArrayLiteralAdapt(*al, target);
+        analysis.setType(expr.node.greenNode(), t);
+        return t;
+    }
     Type* t = analyzeExpr(expr);
     if (!target || target->isError() || t->isError()) return t;
     tryAdaptIntegerLiteral(expr, target);
@@ -1125,6 +1130,7 @@ Type* Analyzer::analyzeExpr(const ast::Expression& expr) {
     else if (auto tn = expr.asTernary())t = analyzeTernary(*tn);
     else if (auto nw = expr.asNew())    t = analyzeNew(*nw);
     else if (auto pr = expr.asParen())  t = analyzeParen(*pr);
+    else if (auto al = expr.asArrayLiteral()) t = analyzeArrayLiteral(*al);
     else                                t = typeCtx.getError();
     analysis.setType(expr.node.greenNode(), t);
     return t;
@@ -1904,6 +1910,73 @@ Type* Analyzer::analyzeNew(const ast::NewExpression& expr) {
 Type* Analyzer::analyzeParen(const ast::ParenExpression& expr) {
     if (auto inner = expr.inner()) return analyzeExpr(*inner);
     return typeCtx.getError();
+}
+
+// Array literal `[a, b, c]` with no target type: first-element-wins.
+// The first element's type drives the rest; subsequent elements are adapted
+// against that element type via analyzeExprAdapt so int/char literals narrow.
+Type* Analyzer::analyzeArrayLiteral(const ast::ArrayLiteralExpression& expr) {
+    auto elems = expr.elements();
+    if (elems.empty()) {
+        errorAtNode(expr.node,
+            "Cannot infer element type from an empty array literal; "
+            "annotate the type, e.g. 'int[] xs = [];'.");
+        return typeCtx.getError();
+    }
+    Type* elemT = analyzeExpr(elems[0]);
+    if (elemT->isError()) {
+        for (size_t i = 1; i < elems.size(); ++i) analyzeExpr(elems[i]);
+        return typeCtx.getError();
+    }
+    if (elemT->isNull()) {
+        errorAtNode(elems[0].node,
+            "Cannot infer element type from 'null' alone; "
+            "annotate the array's element type, e.g. 'T?[] xs = [null, ...];'.");
+        for (size_t i = 1; i < elems.size(); ++i) analyzeExpr(elems[i]);
+        return typeCtx.getError();
+    }
+    for (size_t i = 1; i < elems.size(); ++i) {
+        Type* actual = analyzeExprAdapt(elems[i], elemT);
+        if (actual->isError()) continue;
+        if (!elemT->assignableFrom(actual)) {
+            errorAtNode(elems[i].node, "Element " + std::to_string(i + 1) +
+                ": expected '" + elemT->toString() + "', got '" +
+                actual->toString() + "'.");
+        }
+    }
+    return typeCtx.getArray(elemT);
+}
+
+// Array literal with a target type: each element is adapted to the target's
+// element type. The target may be `T[]` or `T[]?` (nullable holder).
+Type* Analyzer::analyzeArrayLiteralAdapt(const ast::ArrayLiteralExpression& expr,
+                                         Type* target) {
+    if (!target || target->isError()) {
+        return analyzeArrayLiteral(expr);
+    }
+    Type* arrayT = target;
+    if (arrayT->isOptional() && arrayT->inner) arrayT = arrayT->inner;
+    if (!arrayT->isArray() || !arrayT->inner) {
+        errorAtNode(expr.node,
+            "Cannot assign array literal to non-array type '" +
+            target->toString() + "'.");
+        for (auto& e : expr.elements()) analyzeExpr(e);
+        return typeCtx.getError();
+    }
+    Type* elemT = arrayT->inner;
+    auto elems = expr.elements();
+    for (size_t i = 0; i < elems.size(); ++i) {
+        Type* actual = analyzeExprAdapt(elems[i], elemT);
+        if (actual->isError()) continue;
+        if (!elemT->assignableFrom(actual)) {
+            errorAtNode(elems[i].node, "Element " + std::to_string(i + 1) +
+                ": expected '" + elemT->toString() + "', got '" +
+                actual->toString() + "'.");
+        }
+    }
+    // Return the non-nullable array form; the optional wrap (if any) is
+    // applied at the use site via the target's declared type.
+    return arrayT;
 }
 
 bool Analyzer::isLValue(const ast::Expression& expr) const {

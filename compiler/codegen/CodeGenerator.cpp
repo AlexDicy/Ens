@@ -937,6 +937,7 @@ struct CodeGenerator::Impl {
             if (auto inner = pr->inner()) return emitExpr(*inner);
             return nullptr;
         }
+        if (auto al = e.asArrayLiteral()) return emitArrayLiteral(*al);
         error(e.node.startOffset(), "Unsupported expression in codegen");
         return nullptr;
     }
@@ -1833,6 +1834,49 @@ struct CodeGenerator::Impl {
         return arrPtr;
     }
 
+    llvm::Value* emitArrayLiteral(const ast::ArrayLiteralExpression& e) {
+        ::Type* arrT = typeOf(e.node);
+        if (!arrT || !arrT->isArray() || !arrT->inner) {
+            error(e.node.startOffset(), "Internal: array literal has no resolved array type");
+            return nullptr;
+        }
+        ::Type* elemT = arrT->inner;
+        auto elems = e.elements();
+        llvm::Type* i64 = llvm::Type::getInt64Ty(ctx);
+        llvm::Value* sizeConst = llvm::ConstantInt::get(i64, static_cast<int64_t>(elems.size()));
+        llvm::Value* arrPtr = emitArrayNew(elemT, sizeConst, e.node.startOffset());
+        if (!arrPtr || elems.empty()) return arrPtr;
+
+        llvm::Value* data = emitArrayDataPtr(arrPtr);
+        llvm::Type* elemTy = mapType(elemT);
+        bool elemIsClass = isReferenceType(elemT);
+        bool elemIsStructWithClass = structHasClassFields(elemT);
+
+        for (size_t i = 0; i < elems.size(); ++i) {
+            const ast::Expression& src = elems[i];
+            bool borrowed = !expressionProducesOwnedRef(src);
+            llvm::Value* v = emitExprConverted(src, elemT);
+            if (!v) return nullptr;
+            llvm::Value* slot = builder->CreateGEP(
+                elemTy, data, llvm::ConstantInt::get(i64, static_cast<int64_t>(i)),
+                "lit.slot");
+            if (elemIsClass) {
+                if (borrowed) emitRetain(v);
+                builder->CreateStore(v, slot);
+            } else if (elemIsStructWithClass) {
+                // Slot may have struct field defaults written by emitArrayNew;
+                // those copies are owning +1 against the source pool, release
+                // them before overwriting with the literal value.
+                if (structHasFieldDefaults(elemT)) emitStructFieldRelease(elemT, slot);
+                builder->CreateStore(v, slot);
+                if (borrowed) emitStructFieldRetain(elemT, slot);
+            } else {
+                builder->CreateStore(v, slot);
+            }
+        }
+        return arrPtr;
+    }
+
     // Emits a bounds check then returns the address of element `index`.
     llvm::Value* emitArraySubscriptAddr(llvm::Value* arrPtr, llvm::Value* indexAny,
                                         ::Type* elem) {
@@ -1926,6 +1970,7 @@ struct CodeGenerator::Impl {
 
     bool expressionProducesOwnedRef(const ast::Expression& e) {
         if (e.asNew() || e.asCall()) return true;
+        if (e.asArrayLiteral()) return true;
         if (e.asSafeMember()) return true;
         if (e.asSafeSubscript()) return true;
         if (auto m = e.asMember()) {

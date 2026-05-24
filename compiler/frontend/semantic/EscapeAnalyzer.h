@@ -52,6 +52,7 @@ private:
     void scanTernary(const ast::TernaryExpression& e);
     void scanParen(const ast::ParenExpression& e);
     void scanNew(const ast::NewExpression& e);
+    void scanArrayLiteral(const ast::ArrayLiteralExpression& e);
 
     int paramIndexOfSymbol(Symbol* sym) const;
     Symbol* aliasRoot(Symbol* sym) const;

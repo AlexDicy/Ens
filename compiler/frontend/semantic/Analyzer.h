@@ -144,6 +144,8 @@ private:
     Type* analyzeTernary(const ast::TernaryExpression& expr);
     Type* analyzeNew(const ast::NewExpression& expr);
     Type* analyzeParen(const ast::ParenExpression& expr);
+    Type* analyzeArrayLiteral(const ast::ArrayLiteralExpression& expr);
+    Type* analyzeArrayLiteralAdapt(const ast::ArrayLiteralExpression& expr, Type* target);
 
     struct NullCheckInfo {
         NarrowingPath key;

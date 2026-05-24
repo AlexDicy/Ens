@@ -108,6 +108,7 @@ enum class SyntaxKind : uint16_t {
     TernaryExpr,
     NewExpr,
     ParenExpr,
+    ArrayLiteralExpr,
 
     // === Recovery ===
     Error,               // wraps unexpected/skipped tokens during recovery

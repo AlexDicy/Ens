@@ -159,6 +159,7 @@ void EscapeAnalyzer::scanExpression(const ast::Expression& e) {
     if (auto t = e.asTernary()) { scanTernary(*t); return; }
     if (auto p = e.asParen()) { scanParen(*p); return; }
     if (auto n = e.asNew()) { scanNew(*n); return; }
+    if (auto al = e.asArrayLiteral()) { scanArrayLiteral(*al); return; }
     if (auto id = e.asIdent()) { scanIdent(*id); return; }
 }
 
@@ -279,6 +280,13 @@ void EscapeAnalyzer::scanParen(const ast::ParenExpression& e) {
 void EscapeAnalyzer::scanNew(const ast::NewExpression& e) {
     for (auto& arg : e.arguments()) {
         scanExpression(arg);
+    }
+}
+
+void EscapeAnalyzer::scanArrayLiteral(const ast::ArrayLiteralExpression& e) {
+    for (auto& el : e.elements()) {
+        markEscapeIfRef(el);
+        scanExpression(el);
     }
 }
 
@@ -510,6 +518,10 @@ void EscapeAnalyzer::walkExprForLastUses(const ast::Expression& e) {
     }
     if (auto n = e.asNew()) {
         for (auto& arg : n->arguments()) walkExprForLastUses(arg);
+        return;
+    }
+    if (auto al = e.asArrayLiteral()) {
+        for (auto& el : al->elements()) walkExprForLastUses(el);
         return;
     }
     if (auto id = e.asIdent()) {

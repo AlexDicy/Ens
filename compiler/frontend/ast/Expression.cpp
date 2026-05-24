@@ -22,6 +22,7 @@ bool Expression::isExpressionKind(SyntaxKind k) {
         case SyntaxKind::TernaryExpr:
         case SyntaxKind::NewExpr:
         case SyntaxKind::ParenExpr:
+        case SyntaxKind::ArrayLiteralExpr:
             return true;
         default:
             return false;
@@ -65,6 +66,7 @@ std::optional<AssignExpression>    Expression::asAssign()    const { return Assi
 std::optional<TernaryExpression>   Expression::asTernary()   const { return TernaryExpression::cast(node); }
 std::optional<NewExpression>       Expression::asNew()       const { return NewExpression::cast(node); }
 std::optional<ParenExpression>     Expression::asParen()     const { return ParenExpression::cast(node); }
+std::optional<ArrayLiteralExpression> Expression::asArrayLiteral() const { return ArrayLiteralExpression::cast(node); }
 
 // === LiteralExpression ===
 
@@ -371,6 +373,12 @@ int NewExpression::arrayUnsizedTrailingCount() const {
 
 std::optional<Expression> ParenExpression::inner() const {
     return firstExpressionChild(node);
+}
+
+// === ArrayLiteralExpression ===
+
+std::vector<Expression> ArrayLiteralExpression::elements() const {
+    return expressionChildren(node);
 }
 
 // === OutArgument ===

@@ -868,6 +868,23 @@ void Parser::parsePrefix() {
             builder.finishNode();
             return;
         }
+        case SyntaxKind::LBracket: {
+            // Array literal: `[ ]`, `[ expr (',' expr)* ','? ]`.
+            // Subscript `arr[i]` does not enter parsePrefix - it is handled as
+            // a postfix in parsePrecedence after a left-hand expression exists.
+            builder.startNode(SyntaxKind::ArrayLiteralExpr);
+            bump();  // '['
+            if (!at(SyntaxKind::RBracket) && !atEnd()) {
+                parseExpression();
+                while (eat(SyntaxKind::Comma)) {
+                    if (at(SyntaxKind::RBracket)) break;  // trailing comma OK
+                    parseExpression();
+                }
+            }
+            expect(SyntaxKind::RBracket, "']' to close array literal");
+            builder.finishNode();
+            return;
+        }
         default:
             emitMissing(SyntaxKind::Identifier, "expression");
             return;

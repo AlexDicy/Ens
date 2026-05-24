@@ -213,6 +213,7 @@ static constexpr std::pair<SyntaxKind, std::string_view> KIND_NAMES[] = {
     {SyntaxKind::TernaryExpr,       "TernaryExpr"},
     {SyntaxKind::NewExpr,           "NewExpr"},
     {SyntaxKind::ParenExpr,         "ParenExpr"},
+    {SyntaxKind::ArrayLiteralExpr,  "ArrayLiteralExpr"},
     {SyntaxKind::Error,             "Error"},
 };
 

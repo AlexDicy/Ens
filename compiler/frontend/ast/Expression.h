@@ -24,6 +24,7 @@ class AssignExpression;
 class TernaryExpression;
 class NewExpression;
 class ParenExpression;
+class ArrayLiteralExpression;
 class ArgumentList;
 
 class Expression {
@@ -52,6 +53,7 @@ public:
     std::optional<TernaryExpression>   asTernary() const;
     std::optional<NewExpression>       asNew() const;
     std::optional<ParenExpression>     asParen() const;
+    std::optional<ArrayLiteralExpression> asArrayLiteral() const;
 };
 
 class LiteralExpression {
@@ -247,6 +249,16 @@ public:
         return ParenExpression{n};
     }
     std::optional<Expression> inner() const;
+};
+
+class ArrayLiteralExpression {
+public:
+    SyntaxNode node;
+    static std::optional<ArrayLiteralExpression> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::ArrayLiteralExpr) return std::nullopt;
+        return ArrayLiteralExpression{n};
+    }
+    std::vector<Expression> elements() const;
 };
 
 class OutArgument {
