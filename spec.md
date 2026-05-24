@@ -262,6 +262,28 @@ sparseGrid[0] = new Box?[2];             // populate one row by hand
 let cell = sparseGrid[0]?[1];            // Box?, null when the row is null
 ```
 
+An **array literal** `[a, b, c]` allocates and fills an array in one expression. The element type comes from context when one is available (variable type, parameter type, return type); when there isn't a target, the type of the **first element** drives inference for the rest, and remaining elements adapt to it just like ordinary assignments do.
+
+```ens
+int[] xs = [10, 20, 30];           // element type from declaration
+byte[] buf = ['H', 'i', 0];        // char/int literals narrow to byte
+long[] ys = [1, 2L, 3];            // 1 and 3 widen to long
+let zs = [1, 2, 3];                // first-wins -> int[]
+let g = [[1, 2], [3, 4]];          // nested literal -> int[][]
+let h = [[1], []];                 // empty inner adopts first inner's type
+```
+
+An empty literal `[]` requires a target type, `let xs = []` is rejected because there is no element to infer from. Write `int[] xs = []` or pass `[]` as an argument where the declared parameter type pins it down.
+
+Literals are the way to construct an array of a non-nullable reference type. `new Box[3]` is rejected because the slots would be left as null; `[new Box(1), new Box(2)]` is fine because every slot is initialized at construction. The resulting type is `Box[]`.
+
+```ens
+let bs = [new Box(1), new Box(2)];     // bs: Box[]
+makeBoxes() -> Box[] {
+    return [new Box(1), new Box(2)];
+}
+```
+
 ---
 
 Native libraries can be called from Ens through `external` declarations. They are always written at the top of a source file, alongside `import`s and type declarations.
