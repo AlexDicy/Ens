@@ -1223,14 +1223,6 @@ struct CodeGenerator::Impl {
         return llvm::Function::Create(ty, llvm::Function::ExternalLinkage, "puts", module.get());
     }
 
-    llvm::Function* getOrDeclareMalloc() {
-        if (auto* existing = module->getFunction("malloc")) return existing;
-        auto* ty = llvm::FunctionType::get(
-            llvm::PointerType::get(ctx, 0),
-            { llvm::Type::getInt64Ty(ctx) }, false);
-        return llvm::Function::Create(ty, llvm::Function::ExternalLinkage, "malloc", module.get());
-    }
-
     llvm::Function* getOrDeclareCalloc() {
         if (auto* existing = module->getFunction("calloc")) return existing;
         auto* i64Ty = llvm::Type::getInt64Ty(ctx);
