@@ -781,40 +781,20 @@ void Analyzer::analyzeBlock(const ast::Block& block) {
 }
 
 void Analyzer::analyzeLetStmt(const ast::LetStatement& stmt) {
-    Type* declared = nullptr;
-    if (auto tr = stmt.typeAnnotation()) {
-        declared = resolveTypeReference(*tr);
-        if (declared->isVoid()) {
-            errorAtNode(tr->node, "Variable cannot have void type");
-            declared = typeCtx.getError();
-        }
-    }
-
     Type* initType = nullptr;
     if (auto init = stmt.initializer()) initType = analyzeExpr(*init);
 
     auto name = stmt.nameText().value_or(std::u16string{});
-    Type* finalType = declared;
-    if (!declared && !initType) {
-        errorAtNode(stmt.node, "Variable '" + asciiOf(name) + "' needs a type or an initializer");
+    Type* finalType;
+    if (!initType) {
+        errorAtNode(stmt.node, "Variable '" + asciiOf(name) + "' needs an initializer");
         finalType = typeCtx.getError();
-    } else if (!declared) {
-        if (initType->isNull()) {
-            errorAtNode(stmt.node, "Cannot infer type from 'null' alone - annotate the type, e.g. 'let " +
-                asciiOf(name) + ": T? = null;'");
-            finalType = typeCtx.getError();
-        } else {
-            finalType = initType;
-        }
-    } else if (initType && !declared->assignableFrom(initType)) {
-        errorAtNode(stmt.node, "Cannot assign value of type '" + initType->toString() +
-            "' to variable of type '" + declared->toString() + "'");
-    }
-
-    if (declared && !initType && !isDefaultable(declared) && !declared->isError()) {
-        errorAtNode(stmt.node, "Variable '" + asciiOf(name) + "' has non-nullable type '" +
-            declared->toString() + "' but no initializer. Provide a value, or make the type nullable ('" +
-            declared->toString() + "?').");
+    } else if (initType->isNull()) {
+        errorAtNode(stmt.node, "Cannot infer type from 'null' alone - declare the variable with an explicit type, e.g. 'T? " +
+            asciiOf(name) + " = null;'");
+        finalType = typeCtx.getError();
+    } else {
+        finalType = initType;
     }
 
     uint32_t namePos = stmt.nameToken() ? stmt.nameToken()->startOffset() : stmt.node.startOffset();

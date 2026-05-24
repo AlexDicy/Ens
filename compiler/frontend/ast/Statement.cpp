@@ -57,13 +57,6 @@ std::optional<std::u16string> LetStatement::nameText() const {
     return std::nullopt;
 }
 
-std::optional<TypeReference> LetStatement::typeAnnotation() const {
-    if (auto tr = firstChildNode(node, SyntaxKind::TypeRef)) {
-        return TypeReference::cast(*tr);
-    }
-    return std::nullopt;
-}
-
 std::optional<Expression> LetStatement::initializer() const {
     for (auto& c : node.children()) {
         if (auto e = Expression::cast(c)) return e;

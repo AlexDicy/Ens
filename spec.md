@@ -167,7 +167,7 @@ class Outer {
 To read through a nullable value, use the safe member operator `?.`. If the value on the left is `null`, the whole expression evaluates to `null` and the right-hand side is not evaluated; otherwise it behaves like `.`.
 
 ```ens
-let outer: Outer? = new Outer();
+Outer? outer = new Outer();
 Inner? maybeInner = outer?.inner;   // either null or the field value
 ```
 
@@ -225,7 +225,7 @@ external from "kernel32" {
 }
 
 read(HANDLE h, byte[] buf) -> uint {
-    let bytesRead: uint = 0;
+    uint bytesRead = 0;
     let ok = ReadFile(h, buf, buf.length as uint, out bytesRead, null);  // buf.length is `long`
     if (ok == 0) {
         panic("read failed");

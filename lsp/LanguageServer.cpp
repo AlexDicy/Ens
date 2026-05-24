@@ -435,7 +435,6 @@ void collectFromStatement(const SyntaxNode& node, const SourceFile& source,
         return;
     }
     if (auto l = stmt->asLet()) {
-        if (auto tr = l->typeAnnotation()) collectFromTypeReference(*tr, source, analysis, out);
         if (auto nameTok = l->nameToken()) emitTokenAt(out, source, *nameTok, StVariable);
         if (auto init = l->initializer()) collectFromExpression(init->node, source, analysis, out);
         return;

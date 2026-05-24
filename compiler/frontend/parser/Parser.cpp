@@ -558,10 +558,6 @@ void Parser::parseLetStmt() {
     builder.startNode(SyntaxKind::LetStmt);
     expect(SyntaxKind::KwLet, "'let'");
     expect(SyntaxKind::Identifier, "identifier after 'let'");
-    if (eat(SyntaxKind::Colon)) {
-        if (isTypeStart(kindAt())) parseType();
-        else emitMissing(SyntaxKind::Identifier, "type after ':'");
-    }
     if (eat(SyntaxKind::Eq)) parseExpression();
     expect(SyntaxKind::Semi, "';' after let declaration");
     builder.finishNode();

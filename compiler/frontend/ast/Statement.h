@@ -54,7 +54,6 @@ public:
     }
     std::optional<SyntaxNode> nameToken() const;
     std::optional<std::u16string> nameText() const;
-    std::optional<TypeReference> typeAnnotation() const;
     std::optional<Expression> initializer() const;
 };
 
