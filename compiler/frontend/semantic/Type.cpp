@@ -89,7 +89,6 @@ bool Type::assignableFrom(const Type* source) const {
 
 bool Type::isSignedInteger() const {
     switch (kind) {
-        case TypeKind::Byte:
         case TypeKind::Short:
         case TypeKind::Int:
         case TypeKind::Long:
@@ -101,6 +100,7 @@ bool Type::isSignedInteger() const {
 
 bool Type::isUnsignedInteger() const {
     switch (kind) {
+        case TypeKind::Byte:
         case TypeKind::UShort:
         case TypeKind::UInt:
         case TypeKind::ULong:

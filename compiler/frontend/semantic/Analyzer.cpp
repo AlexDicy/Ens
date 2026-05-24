@@ -134,7 +134,7 @@ bool literalIsNegative(const ast::Expression& e) {
 std::string integerRangeString(Type* target) {
     if (!target) return "";
     switch (target->kind) {
-        case TypeKind::Byte:   return "-128..127";
+        case TypeKind::Byte:   return "0..255";
         case TypeKind::Short:  return "-32768..32767";
         case TypeKind::Int:    return "-2147483648..2147483647";
         case TypeKind::Long:   return "-9223372036854775808..9223372036854775807";
@@ -152,7 +152,7 @@ bool literalFitsTarget(bool negative, uint64_t magnitude, Type* target) {
     if (!target) return false;
     switch (target->kind) {
         case TypeKind::Byte:
-            return negative ? magnitude <= 128u : magnitude <= 127u;
+            return !negative && magnitude <= 255u;
         case TypeKind::Short:
             return negative ? magnitude <= 32768u : magnitude <= 32767u;
         case TypeKind::Int:

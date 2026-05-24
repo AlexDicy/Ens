@@ -182,19 +182,6 @@ struct CodeGenerator::Impl {
         return st;
     }
 
-    bool isSigned(::Type* t) {
-        if (!t) return false;
-        switch (t->kind) {
-            case TypeKind::Byte:
-            case TypeKind::Short:
-            case TypeKind::Int:
-            case TypeKind::Long:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     llvm::DIType* mapDIType(::Type* t) {
         if (!debugEnabled || !diBuilder || !t) return nullptr;
         if (t->kind == TypeKind::Optional && t->inner && t->inner->isClass()) {
@@ -234,7 +221,7 @@ struct CodeGenerator::Impl {
         llvm::DIType* result = nullptr;
         switch (t->kind) {
             case TypeKind::Bool:   result = diBuilder->createBasicType("bool",   1,  llvm::dwarf::DW_ATE_boolean); break;
-            case TypeKind::Byte:   result = diBuilder->createBasicType("byte",   8,  llvm::dwarf::DW_ATE_signed); break;
+            case TypeKind::Byte:   result = diBuilder->createBasicType("byte",   8,  llvm::dwarf::DW_ATE_unsigned); break;
             case TypeKind::Short:  result = diBuilder->createBasicType("short",  16, llvm::dwarf::DW_ATE_signed); break;
             case TypeKind::UShort: result = diBuilder->createBasicType("ushort", 16, llvm::dwarf::DW_ATE_unsigned); break;
             case TypeKind::Int:    result = diBuilder->createBasicType("int",    32, llvm::dwarf::DW_ATE_signed); break;
@@ -983,12 +970,12 @@ struct CodeGenerator::Impl {
             case SyntaxKind::LongLiteral: {
                 llvm::Type* lt = mapType(t);
                 long long v = parseIntText(text);
-                return llvm::ConstantInt::get(lt, static_cast<uint64_t>(v), isSigned(t));
+                return llvm::ConstantInt::get(lt, static_cast<uint64_t>(v), t && t->isSignedInteger());
             }
             case SyntaxKind::CharLiteral: {
                 llvm::Type* lt = mapType(t);
                 uint32_t cp = parseCharLiteralCodepoint(text);
-                return llvm::ConstantInt::get(lt, cp, isSigned(t));
+                return llvm::ConstantInt::get(lt, cp, t && t->isSignedInteger());
             }
             case SyntaxKind::FloatLiteral:
             case SyntaxKind::DoubleLiteral:
@@ -1096,7 +1083,7 @@ struct CodeGenerator::Impl {
             }
         }
         bool flt = opType && opType->isFloat();
-        bool sgn = isSigned(opType);
+        bool sgn = opType && opType->isSignedInteger();
         auto opTok = e.operatorToken();
         SyntaxKind op = opTok ? opTok->kind() : SyntaxKind::Invalid;
         switch (op) {
@@ -1190,8 +1177,8 @@ struct CodeGenerator::Impl {
 
         bool srcFloat = srcT->isFloat();
         bool dstFloat = dstT->isFloat();
-        bool srcSigned = isSigned(srcT);
-        bool dstSigned = isSigned(dstT);
+        bool srcSigned = srcT->isSignedInteger();
+        bool dstSigned = dstT->isSignedInteger();
 
         if (!srcFloat && !dstFloat) {
             // Integer <-> integer.
