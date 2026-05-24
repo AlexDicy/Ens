@@ -2,7 +2,7 @@
 #include "ast/Declaration.h"
 #include "ast/Expression.h"
 #include "ast/Statement.h"
-#include "ast/TypeReference.h"
+#include "semantic/Literals.h"
 #include "semantic/Symbol.h"
 #include "semantic/Type.h"
 
@@ -984,6 +984,11 @@ struct CodeGenerator::Impl {
                 llvm::Type* lt = mapType(t);
                 long long v = parseIntText(text);
                 return llvm::ConstantInt::get(lt, static_cast<uint64_t>(v), isSigned(t));
+            }
+            case SyntaxKind::CharLiteral: {
+                llvm::Type* lt = mapType(t);
+                uint32_t cp = parseCharLiteralCodepoint(text);
+                return llvm::ConstantInt::get(lt, cp, isSigned(t));
             }
             case SyntaxKind::FloatLiteral:
             case SyntaxKind::DoubleLiteral:

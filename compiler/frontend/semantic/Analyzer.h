@@ -134,6 +134,7 @@ private:
     Type* analyzeCast(const ast::CastExpression& expr);
 
     void tryAdaptIntegerLiteral(const ast::Expression& src, Type* target);
+    void tryAdaptCharLiteral(const ast::Expression& src, Type* target);
     Type* numericCommonType(Type* a, Type* b);
     // analyzeExpr + try to adapt an integer literal to `target` in one step.
     // Returns the (possibly retyped) expression type.

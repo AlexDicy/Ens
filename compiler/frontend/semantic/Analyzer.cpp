@@ -177,6 +177,27 @@ bool literalFitsTarget(bool negative, uint64_t magnitude, Type* target) {
 
 }  // namespace
 
+void Analyzer::tryAdaptCharLiteral(const ast::Expression& src, Type* target) {
+    if (!target || target->isError()) return;
+    if (!target->isInteger()) return;
+    if (target->kind == TypeKind::Char) return;  // already char
+    auto lit = src.asLiteral();
+    if (!lit || lit->literalKind() != SyntaxKind::CharLiteral) return;
+
+    auto tok = lit->token();
+    if (!tok) return;
+    uint32_t cp = parseCharLiteralCodepoint(tok->tokenText());
+
+    if (!literalFitsTarget(/*negative*/ false, cp, target)) {
+        errorAtNode(src.node, "Character literal does not fit in '" + target->toString() +
+            "' (range " + integerRangeString(target) + ")");
+        analysis.setType(src.node.greenNode(), typeCtx.getError());
+        return;
+    }
+    analysis.setType(src.node.greenNode(), target);
+    analysis.setType(lit->node.greenNode(), target);
+}
+
 void Analyzer::tryAdaptIntegerLiteral(const ast::Expression& src, Type* target) {
     if (!target || target->isError()) return;
     if (!target->isInteger()) return;
@@ -218,6 +239,7 @@ Type* Analyzer::analyzeExprAdapt(const ast::Expression& expr, Type* target) {
     Type* t = analyzeExpr(expr);
     if (!target || target->isError() || t->isError()) return t;
     tryAdaptIntegerLiteral(expr, target);
+    tryAdaptCharLiteral(expr, target);
     Type* updated = analysis.typeOf(expr.node.greenNode());
     return updated ? updated : t;
 }
