@@ -102,6 +102,7 @@ enum class SyntaxKind : uint16_t {
     MemberExpr,
     SafeMemberExpr,
     SubscriptExpr,
+    SafeSubscriptExpr,
     CastExpr,
     AssignExpr,
     TernaryExpr,

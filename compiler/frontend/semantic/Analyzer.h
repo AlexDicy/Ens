@@ -131,6 +131,7 @@ private:
     Type* analyzeMember(const ast::MemberExpression& expr);
     Type* analyzeSafeMember(const ast::SafeMemberExpression& expr);
     Type* analyzeSubscript(const ast::SubscriptExpression& expr);
+    Type* analyzeSafeSubscript(const ast::SafeSubscriptExpression& expr);
     Type* analyzeCast(const ast::CastExpression& expr);
 
     void tryAdaptIntegerLiteral(const ast::Expression& src, Type* target);

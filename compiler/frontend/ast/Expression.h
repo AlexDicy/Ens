@@ -17,6 +17,7 @@ class CallExpression;
 class MemberExpression;
 class SafeMemberExpression;
 class SubscriptExpression;
+class SafeSubscriptExpression;
 class CastExpression;
 class OutArgument;
 class AssignExpression;
@@ -44,6 +45,7 @@ public:
     std::optional<MemberExpression>    asMember() const;
     std::optional<SafeMemberExpression> asSafeMember() const;
     std::optional<SubscriptExpression> asSubscript() const;
+    std::optional<SafeSubscriptExpression> asSafeSubscript() const;
     std::optional<CastExpression>      asCast() const;
     std::optional<OutArgument>         asOutArgument() const;
     std::optional<AssignExpression>    asAssign() const;
@@ -174,6 +176,17 @@ public:
     std::optional<Expression> index() const;
 };
 
+class SafeSubscriptExpression {
+public:
+    SyntaxNode node;
+    static std::optional<SafeSubscriptExpression> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::SafeSubscriptExpr) return std::nullopt;
+        return SafeSubscriptExpression{n};
+    }
+    std::optional<Expression> object() const;
+    std::optional<Expression> index() const;
+};
+
 class CastExpression {
 public:
     SyntaxNode node;
@@ -222,7 +235,7 @@ public:
     std::optional<ArgumentList> argumentList() const;
     std::vector<Expression> arguments() const;
     bool isArrayNew() const;
-    std::optional<Expression> arraySizeExpression() const;
+    std::vector<Expression> arraySizeExpressions() const;
 };
 
 class ParenExpression {

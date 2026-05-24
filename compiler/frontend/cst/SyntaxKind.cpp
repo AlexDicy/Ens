@@ -207,6 +207,7 @@ static constexpr std::pair<SyntaxKind, std::string_view> KIND_NAMES[] = {
     {SyntaxKind::MemberExpr,        "MemberExpr"},
     {SyntaxKind::SafeMemberExpr,    "SafeMemberExpr"},
     {SyntaxKind::SubscriptExpr,     "SubscriptExpr"},
+    {SyntaxKind::SafeSubscriptExpr, "SafeSubscriptExpr"},
     {SyntaxKind::CastExpr,          "CastExpr"},
     {SyntaxKind::AssignExpr,        "AssignExpr"},
     {SyntaxKind::TernaryExpr,       "TernaryExpr"},

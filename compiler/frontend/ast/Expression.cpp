@@ -16,6 +16,7 @@ bool Expression::isExpressionKind(SyntaxKind k) {
         case SyntaxKind::SafeMemberExpr:
         case SyntaxKind::OutArgument:
         case SyntaxKind::SubscriptExpr:
+        case SyntaxKind::SafeSubscriptExpr:
         case SyntaxKind::CastExpr:
         case SyntaxKind::AssignExpr:
         case SyntaxKind::TernaryExpr:
@@ -57,6 +58,7 @@ std::optional<CallExpression>      Expression::asCall()      const { return Call
 std::optional<MemberExpression>    Expression::asMember()    const { return MemberExpression::cast(node); }
 std::optional<SafeMemberExpression> Expression::asSafeMember() const { return SafeMemberExpression::cast(node); }
 std::optional<SubscriptExpression> Expression::asSubscript() const { return SubscriptExpression::cast(node); }
+std::optional<SafeSubscriptExpression> Expression::asSafeSubscript() const { return SafeSubscriptExpression::cast(node); }
 std::optional<CastExpression>      Expression::asCast()      const { return CastExpression::cast(node); }
 std::optional<OutArgument>         Expression::asOutArgument() const { return OutArgument::cast(node); }
 std::optional<AssignExpression>    Expression::asAssign()    const { return AssignExpression::cast(node); }
@@ -219,6 +221,18 @@ std::optional<Expression> SubscriptExpression::index() const {
     return std::nullopt;
 }
 
+// === SafeSubscriptExpression ===
+
+std::optional<Expression> SafeSubscriptExpression::object() const {
+    return firstExpressionChild(node);
+}
+
+std::optional<Expression> SafeSubscriptExpression::index() const {
+    auto exprs = expressionChildren(node);
+    if (exprs.size() >= 2) return exprs[1];
+    return std::nullopt;
+}
+
 // === CastExpression ===
 
 std::optional<Expression> CastExpression::source() const {
@@ -312,18 +326,27 @@ bool NewExpression::isArrayNew() const {
     return false;
 }
 
-std::optional<Expression> NewExpression::arraySizeExpression() const {
-    if (!isArrayNew()) return std::nullopt;
-    bool seenBracket = false;
+std::vector<Expression> NewExpression::arraySizeExpressions() const {
+    std::vector<Expression> sizes;
+    if (!isArrayNew()) return sizes;
+    // Each `[size]` group has a leading LBracket followed by an Expression
+    // (and a closing RBracket). Walk through, capturing the first Expression
+    // after each LBracket.
+    bool expectingSize = false;
     for (auto& c : node.children()) {
         if (isTrivia(c.kind())) continue;
-        if (!seenBracket) {
-            if (c.kind() == SyntaxKind::LBracket) seenBracket = true;
+        if (c.kind() == SyntaxKind::LBracket) {
+            expectingSize = true;
             continue;
         }
-        if (auto e = Expression::cast(c)) return e;
+        if (expectingSize) {
+            if (auto e = Expression::cast(c)) {
+                sizes.push_back(*e);
+                expectingSize = false;
+            }
+        }
     }
-    return std::nullopt;
+    return sizes;
 }
 
 // === ParenExpression ===

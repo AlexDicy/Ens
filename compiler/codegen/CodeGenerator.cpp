@@ -928,6 +928,7 @@ struct CodeGenerator::Impl {
         if (auto m = e.asMember()) return emitMember(*m);
         if (auto sm = e.asSafeMember()) return emitSafeMember(*sm);
         if (auto su = e.asSubscript()) return emitSubscript(*su);
+        if (auto ss = e.asSafeSubscript()) return emitSafeSubscript(*ss);
         if (auto c = e.asCast()) return emitCast(*c);
         if (auto a = e.asAssign()) return emitAssign(*a);
         if (auto t = e.asTernary()) return emitTernary(*t);
@@ -1859,6 +1860,58 @@ struct CodeGenerator::Impl {
         return builder->CreateGEP(elemTy, data, index, "arr.slot");
     }
 
+    // Multi-dim `new T[a][b][c]`: allocate one array per level, and for each
+    // non-innermost level fill every slot with a freshly-allocated next-level
+    // array. The +1 from each inner `new` is transferred straight into the
+    // outer's slot (no retain). Innermost slots stay zero-initialized.
+    //
+    // `slotElemType` is the element type for THIS level — i.e. for level 0
+    // it's the next-deeper array type, and for the deepest level it's the
+    // user-written T.
+    llvm::Value* emitMultiDimNew(::Type* slotElemType,
+                                  const std::vector<llvm::Value*>& sizes,
+                                  size_t levelIdx,
+                                  uint32_t diagOffset) {
+        if (levelIdx >= sizes.size()) return nullptr;
+        llvm::Value* arr = emitArrayNew(slotElemType, sizes[levelIdx], diagOffset);
+        if (!arr) return nullptr;
+        if (levelIdx + 1 >= sizes.size()) return arr;
+
+        // We have more sizes to consume; fill each slot with a recursive alloc.
+        ::Type* nextElem = slotElemType->inner;
+        if (!nextElem) {
+            error(diagOffset, "Internal: multi-dim 'new' level has no inner element type");
+            return arr;
+        }
+        llvm::Type* i64 = llvm::Type::getInt64Ty(ctx);
+        auto* loopCond = llvm::BasicBlock::Create(ctx, "mdim.cond", currentFunction);
+        auto* loopBody = llvm::BasicBlock::Create(ctx, "mdim.body", currentFunction);
+        auto* loopEnd  = llvm::BasicBlock::Create(ctx, "mdim.end",  currentFunction);
+
+        llvm::Value* idxAlloca = createEntryAlloca(currentFunction, i64, "mdim.i");
+        builder->CreateStore(llvm::ConstantInt::get(i64, 0), idxAlloca);
+        builder->CreateBr(loopCond);
+
+        builder->SetInsertPoint(loopCond);
+        llvm::Value* idx = builder->CreateLoad(i64, idxAlloca);
+        llvm::Value* cond = builder->CreateICmpSLT(idx, sizes[levelIdx], "mdim.cmp");
+        builder->CreateCondBr(cond, loopBody, loopEnd);
+
+        builder->SetInsertPoint(loopBody);
+        llvm::Value* inner = emitMultiDimNew(nextElem, sizes, levelIdx + 1, diagOffset);
+        if (!inner) return arr;
+        llvm::Value* data = emitArrayDataPtr(arr);
+        llvm::Type* slotTy = mapType(slotElemType);
+        llvm::Value* slot = builder->CreateGEP(slotTy, data, idx, "mdim.slot");
+        builder->CreateStore(inner, slot);
+        llvm::Value* next = builder->CreateAdd(idx, llvm::ConstantInt::get(i64, 1));
+        builder->CreateStore(next, idxAlloca);
+        builder->CreateBr(loopCond);
+
+        builder->SetInsertPoint(loopEnd);
+        return arr;
+    }
+
     const FieldInfo* memberFieldInfo(const ast::MemberExpression& m) const {
         auto obj = m.object();
         if (!obj) return nullptr;
@@ -1874,6 +1927,7 @@ struct CodeGenerator::Impl {
     bool expressionProducesOwnedRef(const ast::Expression& e) {
         if (e.asNew() || e.asCall()) return true;
         if (e.asSafeMember()) return true;
+        if (e.asSafeSubscript()) return true;
         if (auto m = e.asMember()) {
             // Weak field reads return +1 via ens_weak_load's CAS-upgrade.
             const FieldInfo* fi = memberFieldInfo(*m);
@@ -2050,18 +2104,25 @@ struct CodeGenerator::Impl {
                 error(e.node.startOffset(), "Internal: array-'new' has no resolved array type");
                 return nullptr;
             }
-            auto sz = e.arraySizeExpression();
-            if (!sz) {
+            auto sizes = e.arraySizeExpressions();
+            if (sizes.empty()) {
                 error(e.node.startOffset(), "Internal: array-'new' missing size expression");
                 return nullptr;
             }
-            llvm::Value* sizeVal = emitExpr(*sz);
-            if (!sizeVal) return nullptr;
             llvm::Type* i64 = llvm::Type::getInt64Ty(ctx);
-            if (sizeVal->getType() != i64) {
-                sizeVal = builder->CreateSExtOrTrunc(sizeVal, i64, "arr.size.i64");
+            std::vector<llvm::Value*> sizeVals;
+            sizeVals.reserve(sizes.size());
+            for (auto& sz : sizes) {
+                llvm::Value* v = emitExpr(sz);
+                if (!v) return nullptr;
+                if (v->getType() != i64) {
+                    v = builder->CreateSExtOrTrunc(v, i64, "arr.size.i64");
+                }
+                sizeVals.push_back(v);
             }
-            return emitArrayNew(t->inner, sizeVal, e.node.startOffset());
+            // The top-level array type wraps the element once per size bracket.
+            // Each level's slot-element-type is the inner-of-this-level.
+            return emitMultiDimNew(t->inner, sizeVals, 0, e.node.startOffset());
         }
         if (!t || !t->structInfo) {
             error(e.node.startOffset(), "Internal: 'new' has no resolved class type");
@@ -2447,6 +2508,52 @@ struct CodeGenerator::Impl {
         if (!arrPtr || !idxVal) return nullptr;
         llvm::Value* slot = emitArraySubscriptAddr(arrPtr, idxVal, objType->inner);
         return builder->CreateLoad(mapType(objType->inner), slot, "arr.elem");
+    }
+
+    llvm::Value* emitSafeSubscript(const ast::SafeSubscriptExpression& e) {
+        auto obj = e.object();
+        auto idx = e.index();
+        if (!obj || !idx) return nullptr;
+        ::Type* recvType = typeOf(obj->node);
+        if (!recvType || !recvType->isOptional() || !recvType->inner ||
+            !recvType->inner->isArray() || !recvType->inner->inner) {
+            error(e.node.startOffset(), "Internal: safe subscript receiver is not a nullable array");
+            return nullptr;
+        }
+        ::Type* arrType = recvType->inner;
+        ::Type* elemType = arrType->inner;
+
+        llvm::Value* recv = emitExpr(*obj);
+        if (!recv) return nullptr;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        llvm::Value* isNull = builder->CreateICmpEQ(
+            recv, llvm::ConstantPointerNull::get(ptrTy), "safesub.isnull");
+
+        auto* nullBB    = llvm::BasicBlock::Create(ctx, "safesub.null",    currentFunction);
+        auto* nonnullBB = llvm::BasicBlock::Create(ctx, "safesub.nonnull", currentFunction);
+        auto* endBB     = llvm::BasicBlock::Create(ctx, "safesub.end",     currentFunction);
+
+        builder->CreateCondBr(isNull, nullBB, nonnullBB);
+
+        builder->SetInsertPoint(nonnullBB);
+        llvm::Value* idxVal = emitExpr(*idx);
+        if (!idxVal) return nullptr;
+        llvm::Value* slot = emitArraySubscriptAddr(recv, idxVal, elemType);
+        llvm::Value* loaded = builder->CreateLoad(mapType(elemType), slot, "safesub.elem");
+        if (isReferenceType(elemType)) emitRetain(loaded);
+        llvm::BasicBlock* nonnullEnd = builder->GetInsertBlock();
+        builder->CreateBr(endBB);
+
+        builder->SetInsertPoint(nullBB);
+        llvm::Value* nullVal = llvm::ConstantPointerNull::get(ptrTy);
+        llvm::BasicBlock* nullEnd = builder->GetInsertBlock();
+        builder->CreateBr(endBB);
+
+        builder->SetInsertPoint(endBB);
+        auto* phi = builder->CreatePHI(ptrTy, 2, "safesub.result");
+        phi->addIncoming(loaded, nonnullEnd);
+        phi->addIncoming(nullVal, nullEnd);
+        return phi;
     }
 
     llvm::Value* emitSafeMember(const ast::SafeMemberExpression& e) {

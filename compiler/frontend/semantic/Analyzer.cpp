@@ -814,10 +814,12 @@ Type* Analyzer::resolveTypeReference(const ast::TypeReference& tr) {
                 result = typeCtx.getError();
                 break;
             }
-            if (!validateArrayElement(result, tr.node)) {
-                result = typeCtx.getError();
-                break;
-            }
+            // Don't reject types like `int[][]` at name-resolution: multi-dim
+            // `new T[a][b]` fully populates inner slots, so the type is fine
+            // as long as every value of this type is constructed. The
+            // element-nullability rule is enforced where slots actually get
+            // zero-initialised (single-dim `new T[size]` and variable/field
+            // declarations without an initializer).
             result = typeCtx.getArray(result);
         } else {
             if (result->isVoid()) {
@@ -1113,6 +1115,7 @@ Type* Analyzer::analyzeExpr(const ast::Expression& expr) {
     else if (auto m  = expr.asMember()) t = analyzeMember(*m);
     else if (auto sm = expr.asSafeMember()) t = analyzeSafeMember(*sm);
     else if (auto su = expr.asSubscript()) t = analyzeSubscript(*su);
+    else if (auto ss = expr.asSafeSubscript()) t = analyzeSafeSubscript(*ss);
     else if (auto ca = expr.asCast()) t = analyzeCast(*ca);
     else if (auto oa = expr.asOutArgument()) {
         errorAtNode(expr.node, "'out' can only be used when calling an external function.");
@@ -1678,6 +1681,50 @@ Type* Analyzer::analyzeSubscript(const ast::SubscriptExpression& expr) {
     return objT->inner ? objT->inner : typeCtx.getError();
 }
 
+Type* Analyzer::analyzeSafeSubscript(const ast::SafeSubscriptExpression& expr) {
+    auto obj = expr.object();
+    auto idx = expr.index();
+    if (!obj || !idx) return typeCtx.getError();
+    Type* objT = analyzeExpr(*obj);
+    Type* idxT = analyzeExpr(*idx);
+    if (objT->isError()) return typeCtx.getError();
+
+    if (!objT->isOptional()) {
+        errorAtNode(expr.node, "The value on the left of '?[' has type '" + objT->toString() +
+            "', which can never be null. Use '[' to index it.");
+        return typeCtx.getError();
+    }
+    Type* inner = objT->inner;
+    if (!inner || !inner->isArray()) {
+        std::string innerName = inner ? inner->toString() : std::string("?");
+        errorAtNode(expr.node, "The value on the left of '?[' has type '" + objT->toString() +
+            "', which is not a nullable array.");
+        return typeCtx.getError();
+    }
+    Type* elem = inner->inner;
+    if (!elem) return typeCtx.getError();
+    // Element type must be a reference type (class, array, or optional of those)
+    // so that the result `T?` is representable. Primitive optionals are not
+    // currently supported in codegen.
+    auto isReferenceish = [](Type* t) {
+        if (!t) return false;
+        if (t->isClass() || t->isArray()) return true;
+        if (t->isOptional() && t->inner &&
+            (t->inner->isClass() || t->inner->isArray())) return true;
+        return false;
+    };
+    if (!isReferenceish(elem)) {
+        errorAtNode(expr.node, "'?[' on '" + objT->toString() +
+            "' is not supported because its elements have type '" + elem->toString() +
+            "'. Only arrays of class or array elements can be indexed through '?['.");
+        return typeCtx.getError();
+    }
+    if (!idxT->isError() && !idxT->isInteger()) {
+        errorAtNode(idx->node, "Array index must be an integer, got '" + idxT->toString() + "'");
+    }
+    return typeCtx.getOptional(elem);
+}
+
 Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
     auto target = expr.target();
     auto value = expr.value();
@@ -1747,30 +1794,41 @@ Type* Analyzer::analyzeNew(const ast::NewExpression& expr) {
     if (!typeName) return typeCtx.getError();
 
     if (expr.isArrayNew()) {
+        auto sizes = expr.arraySizeExpressions();
         Type* elem = resolveTypeReference(*tr);
         if (elem->isError()) {
-            if (auto sz = expr.arraySizeExpression()) analyzeExpr(*sz);
+            for (auto& sz : sizes) analyzeExpr(sz);
             return typeCtx.getError();
         }
         if (elem->isVoid()) {
             errorAtNode(tr->node, "Cannot create an array of void");
+            for (auto& sz : sizes) analyzeExpr(sz);
             return typeCtx.getError();
         }
-        if (!validateArrayElement(elem, tr->node)) {
-            if (auto sz = expr.arraySizeExpression()) analyzeExpr(*sz);
-            return typeCtx.getError();
-        }
-        Type* arrT = typeCtx.getArray(elem);
-        auto sz = expr.arraySizeExpression();
-        if (!sz) {
+        if (sizes.empty()) {
             errorAtNode(expr.node, "'new " + elem->toString() +
                 "[...]' requires a size expression inside the brackets");
+            Type* arrT = typeCtx.getArray(elem);
             analysis.setType(expr.node.greenNode(), arrT);
             return arrT;
         }
-        Type* sizeT = analyzeExpr(*sz);
-        if (!sizeT->isError() && !sizeT->isInteger()) {
-            errorAtNode(sz->node, "Array size must be an integer, got '" + sizeT->toString() + "'");
+        // Only the innermost level's slots are zero-initialized; outer levels
+        // are auto-filled with fresh allocations. So the element-nullability
+        // rule applies just to the element type the user wrote.
+        if (!validateArrayElement(elem, tr->node)) {
+            for (auto& sz : sizes) analyzeExpr(sz);
+            return typeCtx.getError();
+        }
+        for (auto& sz : sizes) {
+            Type* sizeT = analyzeExpr(sz);
+            if (!sizeT->isError() && !sizeT->isInteger()) {
+                errorAtNode(sz.node, "Array size must be an integer, got '" + sizeT->toString() + "'");
+            }
+        }
+        // Result type: Array applied `sizes.size()` times to the element type.
+        Type* arrT = elem;
+        for (size_t i = 0; i < sizes.size(); ++i) {
+            arrT = typeCtx.getArray(arrT);
         }
         analysis.setType(expr.node.greenNode(), arrT);
         return arrT;

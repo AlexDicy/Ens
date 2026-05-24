@@ -683,8 +683,24 @@ void Parser::parsePrecedence(int minPrec) {
 
     while (true) {
         SyntaxKind op = kindAt();
-        int prec = infixPrecedence(op);
+        // `?[` is a postfix safe-subscript when written adjacent; otherwise `?`
+        // is the loose-binding ternary operator. We disambiguate by lookahead
+        // so the lexer doesn't have to merge `?[`, which would otherwise break
+        // type syntax like `Box?[]?[]`.
+        bool isSafeSubscript = (op == SyntaxKind::Question &&
+                                peekKind(1) == SyntaxKind::LBracket);
+        int prec = isSafeSubscript ? 14 : infixPrecedence(op);
         if (prec < minPrec) break;
+
+        if (isSafeSubscript) {
+            builder.startNodeAt(cp, SyntaxKind::SafeSubscriptExpr);
+            bump();  // '?'
+            bump();  // '['
+            parseExpression();
+            expect(SyntaxKind::RBracket, "']' after safe subscript");
+            builder.finishNode();
+            continue;
+        }
 
         if (op == SyntaxKind::LParen) {
             builder.startNodeAt(cp, SyntaxKind::CallExpr);
@@ -780,9 +796,13 @@ void Parser::parsePrefix() {
             if (isTypeStart(kindAt())) parseType();
             else emitMissing(SyntaxKind::Identifier, "type name after 'new'");
             if (at(SyntaxKind::LBracket)) {
-                bump();  // '['
-                parseExpression();
-                expect(SyntaxKind::RBracket, "']' after array size");
+                // Accept one or more `[expr]` brackets for multi-dim allocation
+                // (`new T[a][b]` builds a fully-allocated grid of T).
+                while (at(SyntaxKind::LBracket)) {
+                    bump();  // '['
+                    parseExpression();
+                    expect(SyntaxKind::RBracket, "']' after array size");
+                }
             } else if (at(SyntaxKind::LParen)) {
                 parseArgList();
             } else {

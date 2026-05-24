@@ -141,6 +141,11 @@ void EscapeAnalyzer::scanExpression(const ast::Expression& e) {
         return;
     }
     if (auto su = e.asSubscript()) { scanSubscript(*su); return; }
+    if (auto ss = e.asSafeSubscript()) {
+        if (auto obj = ss->object()) scanExpression(*obj);
+        if (auto idx = ss->index()) scanExpression(*idx);
+        return;
+    }
     if (auto c = e.asCast()) {
         if (auto src = c->source()) scanExpression(*src);
         return;
@@ -477,6 +482,11 @@ void EscapeAnalyzer::walkExprForLastUses(const ast::Expression& e) {
     if (auto su = e.asSubscript()) {
         if (auto obj = su->object()) walkExprForLastUses(*obj);
         if (auto idx = su->index()) walkExprForLastUses(*idx);
+        return;
+    }
+    if (auto ss = e.asSafeSubscript()) {
+        if (auto obj = ss->object()) walkExprForLastUses(*obj);
+        if (auto idx = ss->index()) walkExprForLastUses(*idx);
         return;
     }
     if (auto c = e.asCast()) {
