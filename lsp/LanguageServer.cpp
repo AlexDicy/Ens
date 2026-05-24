@@ -346,6 +346,10 @@ void collectFromStatement(const SyntaxNode& node, const SourceFile& source,
                           const AnalysisResult& analysis,
                           std::vector<SemanticTokenEntry>& out);
 
+void collectFromTypeReference(const ast::TypeReference& tr, const SourceFile& source,
+                              const AnalysisResult& analysis,
+                              std::vector<SemanticTokenEntry>& out);
+
 void collectFromExpression(const SyntaxNode& node, const SourceFile& source,
                            const AnalysisResult& analysis,
                            std::vector<SemanticTokenEntry>& out) {
@@ -391,6 +395,9 @@ void collectFromExpression(const SyntaxNode& node, const SourceFile& source,
         for (auto& arg : c->arguments()) {
             collectFromExpression(arg.node, source, analysis, out);
         }
+    } else if (auto ca = e->asCast()) {
+        if (auto src = ca->source()) collectFromExpression(src->node, source, analysis, out);
+        if (auto tr = ca->targetType()) collectFromTypeReference(*tr, source, analysis, out);
     } else {
         for (auto& child : node.children()) {
             collectFromExpression(child, source, analysis, out);
