@@ -5,7 +5,7 @@
 class Type;
 class GreenElement;
 
-enum class SymbolKind { Variable, Parameter, Function, Namespace };
+enum class SymbolKind { Variable, Parameter, Function, Namespace, SiblingField };
 
 enum class EscapeKind : unsigned char {
     Unknown,
@@ -54,6 +54,8 @@ public:
     bool structFieldsMutated = false;
 
     bool stackPromoted = false;
+
+    int siblingFieldIndex = -1;
 
     Symbol(SymbolKind k, std::u16string n, Type* t, int l, int c)
         : kind(k), name(std::move(n)), type(t), line(l), column(c) {}

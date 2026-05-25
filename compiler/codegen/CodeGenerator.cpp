@@ -70,6 +70,12 @@ struct CodeGenerator::Impl {
     std::vector<std::vector<OwnedLocal>> cleanupStack;
     std::unordered_set<Symbol*> byPointerParams;
 
+    struct DefaultInitContext {
+        ::Type* structType;
+        llvm::Value* basePtr;
+    };
+    std::vector<DefaultInitContext> defaultInitStack;
+
     Impl(std::string mn, std::string sf, const SourceFile& src, const AnalysisResult& an)
         : moduleName(std::move(mn)), sourceFilename(std::move(sf)),
           sourceFile(src), analysis(an) {
@@ -857,6 +863,7 @@ struct CodeGenerator::Impl {
         llvm::StructType* st = mapStructType(t);
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         const auto& fields = t->structInfo->fields;
+        defaultInitStack.push_back({t, base});
         for (size_t i = 0; i < fields.size(); ++i) {
             const auto& fi = fields[i];
             bool wrote = false;
@@ -869,7 +876,14 @@ struct CodeGenerator::Impl {
                             if (llvm::Value* v = emitExpr(*dvExpr)) {
                                 llvm::Value* fieldAddr = builder->CreateStructGEP(
                                     st, base, static_cast<unsigned>(i), asAscii(fi.name) + ".addr");
+                                bool borrowed = !expressionProducesOwnedRef(*dvExpr);
+                                if (borrowed && isReferenceType(fi.type)) {
+                                    emitRetain(v);
+                                }
                                 builder->CreateStore(v, fieldAddr);
+                                if (borrowed && structHasClassFields(fi.type)) {
+                                    emitStructFieldRetain(fi.type, fieldAddr);
+                                }
                                 wrote = true;
                             }
                         }
@@ -882,6 +896,7 @@ struct CodeGenerator::Impl {
                 builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), fieldAddr);
             }
         }
+        defaultInitStack.pop_back();
     }
 
     void emitIfStmt(const ast::IfStatement& s) {
@@ -1061,6 +1076,21 @@ struct CodeGenerator::Impl {
     llvm::Value* emitIdent(const ast::IdentExpression& e) {
         Symbol* sym = symbolOf(e.node);
         if (!sym) return nullptr;
+        if (sym->kind == SymbolKind::SiblingField) {
+            if (defaultInitStack.empty()) {
+                error(e.node.startOffset(),
+                      "Internal: sibling-field reference outside a default-init context");
+                return nullptr;
+            }
+            auto& ctx = defaultInitStack.back();
+            llvm::StructType* st = mapStructType(ctx.structType);
+            llvm::Value* fieldAddr = builder->CreateStructGEP(
+                st, ctx.basePtr,
+                static_cast<unsigned>(sym->siblingFieldIndex),
+                asAscii(sym->name) + ".sib.addr");
+            return builder->CreateLoad(mapType(sym->type), fieldAddr,
+                                        asAscii(sym->name) + ".sib.load");
+        }
         auto it = values.find(sym);
         if (it == values.end()) {
             error(e.node.startOffset(), "Internal: symbol has no LLVM value");

@@ -680,23 +680,33 @@ void Analyzer::checkFieldDefaults(const ast::StructDecl& sd) {
     currentFunction = nullptr;
     currentThis = nullptr;
     currentScope = globalScope;
+    Scope* fieldScope = pushScope();
 
     auto fields = sd.fields();
     for (size_t i = 0; i < fields.size(); ++i) {
         auto& f = fields[i];
         auto dv = f.defaultValue();
-        if (!dv) continue;
-        auto dvExpr = dv->expression();
-        if (!dvExpr) continue;
         Type* expected = (i < t->structInfo->fields.size()) ? t->structInfo->fields[i].type : typeCtx.getError();
-        Type* actual = analyzeExprAdapt(*dvExpr, expected);
-        if (!expected->isError() && !actual->isError() && !expected->assignableFrom(actual)) {
-            errorAtNode(dvExpr->node, "Default value for field '" +
-                asciiOf(f.nameText().value_or(std::u16string{})) + "': expected '" +
-                expected->toString() + "', got '" + actual->toString() + "'");
+        if (dv) {
+            if (auto dvExpr = dv->expression()) {
+                Type* actual = analyzeExprAdapt(*dvExpr, expected);
+                if (!expected->isError() && !actual->isError() && !expected->assignableFrom(actual)) {
+                    errorAtNode(dvExpr->node, "Default value for field '" +
+                        asciiOf(f.nameText().value_or(std::u16string{})) + "': expected '" +
+                        expected->toString() + "', got '" + actual->toString() + "'");
+                }
+            }
+        }
+        auto fname = f.nameText();
+        if (fname && !fname->empty()) {
+            uint32_t fOffset = f.node.startOffset();
+            Symbol* sib = makeSymbol(SymbolKind::SiblingField, *fname, expected, fOffset);
+            sib->siblingFieldIndex = static_cast<int>(i);
+            fieldScope->define(sib);
         }
     }
 
+    popScope();
     currentFunction = prevFunction;
     currentThis = prevThis;
     currentScope = prevScope;
@@ -712,23 +722,33 @@ void Analyzer::checkFieldDefaults(const ast::ClassDecl& cd) {
     currentFunction = nullptr;
     currentThis = nullptr;
     currentScope = globalScope;
+    Scope* fieldScope = pushScope();
 
     auto fields = cd.fields();
     for (size_t i = 0; i < fields.size(); ++i) {
         auto& f = fields[i];
         auto dv = f.defaultValue();
-        if (!dv) continue;
-        auto dvExpr = dv->expression();
-        if (!dvExpr) continue;
         Type* expected = (i < t->structInfo->fields.size()) ? t->structInfo->fields[i].type : typeCtx.getError();
-        Type* actual = analyzeExprAdapt(*dvExpr, expected);
-        if (!expected->isError() && !actual->isError() && !expected->assignableFrom(actual)) {
-            errorAtNode(dvExpr->node, "Default value for field '" +
-                asciiOf(f.nameText().value_or(std::u16string{})) + "': expected '" +
-                expected->toString() + "', got '" + actual->toString() + "'");
+        if (dv) {
+            if (auto dvExpr = dv->expression()) {
+                Type* actual = analyzeExprAdapt(*dvExpr, expected);
+                if (!expected->isError() && !actual->isError() && !expected->assignableFrom(actual)) {
+                    errorAtNode(dvExpr->node, "Default value for field '" +
+                        asciiOf(f.nameText().value_or(std::u16string{})) + "': expected '" +
+                        expected->toString() + "', got '" + actual->toString() + "'");
+                }
+            }
+        }
+        auto fname = f.nameText();
+        if (fname && !fname->empty()) {
+            uint32_t fOffset = f.node.startOffset();
+            Symbol* sib = makeSymbol(SymbolKind::SiblingField, *fname, expected, fOffset);
+            sib->siblingFieldIndex = static_cast<int>(i);
+            fieldScope->define(sib);
         }
     }
 
+    popScope();
     currentFunction = prevFunction;
     currentThis = prevThis;
     currentScope = prevScope;
