@@ -65,6 +65,7 @@ struct CodeGenerator::Impl {
     struct OwnedLocal {
         llvm::Value* alloca;
         ::Type* type;
+        bool isStackArray = false;
     };
     std::vector<std::vector<OwnedLocal>> cleanupStack;
     std::unordered_set<Symbol*> byPointerParams;
@@ -673,6 +674,21 @@ struct CodeGenerator::Impl {
         return nullptr;
     }
 
+    void emitDebugDeclareForLocal(Symbol* sym, llvm::Value* alloca, uint32_t offset) {
+        if (!debugEnabled || !diBuilder || !currentDIScope) return;
+        llvm::DIType* diVarType = mapDIType(sym->type);
+        if (!diVarType) return;
+        auto [line, col] = posOf(offset);
+        auto* diVar = diBuilder->createAutoVariable(
+            currentDIScope, asAscii(sym->name), diFile,
+            static_cast<unsigned>(line), diVarType);
+        diBuilder->insertDeclare(
+            alloca, diVar, diBuilder->createExpression(),
+            llvm::DILocation::get(ctx, static_cast<unsigned>(line),
+                                  static_cast<unsigned>(col), currentDIScope),
+            builder->GetInsertBlock());
+    }
+
     void emitLetStmt(const ast::LetStatement& s) {
         Symbol* sym = symbolOf(s.node);
         if (!sym) return;
@@ -685,6 +701,15 @@ struct CodeGenerator::Impl {
         llvm::Type* lt = mapType(sym->type);
         auto* alloca = createEntryAlloca(currentFunction, lt, asAscii(sym->name));
         values[sym] = alloca;
+
+        if (sym->stackPromoted) {
+            setLocationFromNode(s.node);
+            emitDebugDeclareForLocal(sym, alloca, s.node.startOffset());
+            if (auto init = s.initializer()) {
+                emitStackArrayInit(sym, sym->type, *init, alloca);
+            }
+            return;
+        }
 
         bool elideClassRetain = false;
         bool elideStructRetain = false;
@@ -759,6 +784,15 @@ struct CodeGenerator::Impl {
         llvm::Type* lt = mapType(sym->type);
         auto* alloca = createEntryAlloca(currentFunction, lt, asAscii(sym->name));
         values[sym] = alloca;
+
+        if (sym->stackPromoted) {
+            setLocationFromNode(s.node);
+            emitDebugDeclareForLocal(sym, alloca, s.node.startOffset());
+            if (auto init = s.initializer()) {
+                emitStackArrayInit(sym, sym->type, *init, alloca);
+            }
+            return;
+        }
 
         bool elideClassRetain = false;
         bool elideStructRetain = false;
@@ -1774,6 +1808,94 @@ struct CodeGenerator::Impl {
         return false;
     }
 
+    // Extract a compile-time integer literal from an array-size or array-literal-element initializer
+    int64_t stackArrayCountFromInit(const ast::Expression& init) {
+        if (auto n = init.asNew()) {
+            auto sizes = n->arraySizeExpressions();
+            if (sizes.size() != 1) return 0;
+            auto lit = sizes[0].asLiteral();
+            if (!lit) return 0;
+            auto tok = lit->token();
+            if (!tok) return 0;
+            return static_cast<int64_t>(parseIntText(tok->tokenText()));
+        }
+        if (auto al = init.asArrayLiteral()) {
+            return static_cast<int64_t>(al->elements().size());
+        }
+        if (auto p = init.asParen()) {
+            if (auto inner = p->inner()) return stackArrayCountFromInit(*inner);
+        }
+        return 0;
+    }
+
+    void emitStackArrayInit(Symbol* sym, ::Type* arrayType,
+                            const ast::Expression& init,
+                            llvm::Value* slotAlloca) {
+        ::Type* elem = arrayType ? arrayType->inner : nullptr;
+        if (!elem) return;
+
+        int64_t count = stackArrayCountFromInit(init);
+        if (count < 0) count = 0;
+        uint64_t elemBytes = elementSizeBytes(elem);
+        uint64_t totalBytes = 8 + static_cast<uint64_t>(count) * elemBytes;
+
+        auto* i8Ty  = llvm::Type::getInt8Ty(ctx);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        // Use a fixed-size i8 array so the alloca claims the exact byte width.
+        auto* storageTy = llvm::ArrayType::get(i8Ty, totalBytes);
+        llvm::Value* arrPtr = createEntryAlloca(currentFunction, storageTy,
+            asAscii(sym->name) + ".stack");
+
+        // make sure to zero out slots for each loop tieration
+        builder->CreateMemSet(arrPtr, llvm::ConstantInt::get(i8Ty, 0),
+                              llvm::ConstantInt::get(i64Ty, totalBytes),
+                              llvm::Align(8));
+
+        builder->CreateStore(llvm::ConstantInt::get(i64Ty, count), arrPtr);
+
+        if (auto al = init.asArrayLiteral()) {
+            llvm::Value* data = builder->CreateGEP(
+                i8Ty, arrPtr, llvm::ConstantInt::get(i64Ty, 8), "arr.data");
+            llvm::Type* elemTy = mapType(elem);
+            bool elemIsClass = isReferenceType(elem);
+            bool elemIsStructWithClass = structHasClassFields(elem);
+            auto elements = al->elements();
+            for (size_t i = 0; i < elements.size(); ++i) {
+                const ast::Expression& src = elements[i];
+                bool borrowed = !expressionProducesOwnedRef(src);
+                llvm::Value* v = emitExprConverted(src, elem);
+                if (!v) return;
+                llvm::Value* slot = builder->CreateGEP(
+                    elemTy, data, llvm::ConstantInt::get(i64Ty, static_cast<int64_t>(i)),
+                    "lit.slot");
+                if (elemIsClass) {
+                    if (borrowed) emitRetain(v);
+                    builder->CreateStore(v, slot);
+                } else if (elemIsStructWithClass) {
+                    builder->CreateStore(v, slot);
+                    if (borrowed) emitStructFieldRetain(elem, slot);
+                } else {
+                    builder->CreateStore(v, slot);
+                }
+            }
+        } else if (init.asNew() && structHasFieldDefaults(elem)) {
+            llvm::Value* data = builder->CreateGEP(
+                i8Ty, arrPtr, llvm::ConstantInt::get(i64Ty, 8), "arr.data");
+            llvm::Type* elemTy = mapType(elem);
+            for (int64_t i = 0; i < count; ++i) {
+                llvm::Value* slot = builder->CreateGEP(
+                    elemTy, data, llvm::ConstantInt::get(i64Ty, i), "arr.init.slot");
+                initStructFieldDefaults(elem, slot);
+            }
+        }
+
+        builder->CreateStore(arrPtr, slotAlloca);
+
+        if ((isReferenceType(elem) || structHasClassFields(elem)) && !cleanupStack.empty()) {
+            cleanupStack.back().push_back({ slotAlloca, arrayType, /*isStackArray*/ true });
+        }
+    }
+
     llvm::Value* emitArrayNew(::Type* elem, llvm::Value* sizeI64,
                               uint32_t diagOffset) {
         if (!elem) return nullptr;
@@ -2068,7 +2190,16 @@ struct CodeGenerator::Impl {
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         auto* releaseFn = getOrDefineEnsRelease();
         for (auto it = frame.rbegin(); it != frame.rend(); ++it) {
-            if (isReferenceType(it->type)) {
+            if (it->isStackArray) {
+                if (!it->type || !it->type->isArray() || !it->type->inner) continue;
+                ::Type* elem = it->type->inner;
+                if (!isReferenceType(elem) && !structHasClassFields(elem)) continue;
+                llvm::Value* arrPtr = builder->CreateLoad(ptrTy, it->alloca);
+                llvm::Value* dtor = getOrEmitArrayDtor(elem);
+                if (auto* dtorFn = llvm::dyn_cast<llvm::Function>(dtor)) {
+                    builder->CreateCall(dtorFn, { arrPtr });
+                }
+            } else if (isReferenceType(it->type)) {
                 llvm::Value* val = builder->CreateLoad(ptrTy, it->alloca);
                 builder->CreateCall(releaseFn, { val });
             } else if (structHasClassFields(it->type)) {

@@ -219,28 +219,80 @@ void printEscapeFactsForFunction(Symbol* sym, std::ostream& os) {
     os << "\n";
 }
 
+static void printPromotionsForStmt(const ast::Statement& s,
+                                   const AnalysisResult& analysis,
+                                   std::ostream& os);
+
+static void printPromotionsForLocal(Symbol* sym, std::ostream& os) {
+    if (!sym || !sym->stackPromoted) return;
+    std::string typeStr = sym->type ? sym->type->toString() : std::string("?");
+    os << "  stack-promoted: " << asciiOfU16(sym->name)
+       << " : " << typeStr << "\n";
+}
+
+static void printPromotionsForStmt(const ast::Statement& s,
+                                   const AnalysisResult& analysis,
+                                   std::ostream& os) {
+    if (auto b = s.asBlock()) {
+        for (auto& child : b->statements()) printPromotionsForStmt(child, analysis, os);
+        return;
+    }
+    if (auto l = s.asLet()) {
+        if (auto* info = analysis.find(l->node.greenNode())) {
+            printPromotionsForLocal(info->resolvedSymbol, os);
+        }
+        return;
+    }
+    if (auto v = s.asTypedVarDecl()) {
+        if (auto* info = analysis.find(v->node.greenNode())) {
+            printPromotionsForLocal(info->resolvedSymbol, os);
+        }
+        return;
+    }
+    if (auto i = s.asIf()) {
+        if (auto t = i->thenBlock()) {
+            for (auto& child : t->statements()) printPromotionsForStmt(child, analysis, os);
+        }
+        if (auto ec = i->elseClause()) {
+            if (auto innerIf = ec->ifStatement()) {
+                ast::Statement asStmt{innerIf->node};
+                printPromotionsForStmt(asStmt, analysis, os);
+            } else if (auto bb = ec->block()) {
+                for (auto& child : bb->statements()) printPromotionsForStmt(child, analysis, os);
+            }
+        }
+        return;
+    }
+    if (auto w = s.asWhile()) {
+        if (auto body = w->body()) {
+            for (auto& child : body->statements()) printPromotionsForStmt(child, analysis, os);
+        }
+        return;
+    }
+}
+
+static void printPromotionsForFunction(const ast::FuncDecl& fn,
+                                       const AnalysisResult& analysis,
+                                       std::ostream& os) {
+    if (auto body = fn.body()) {
+        for (auto& s : body->statements()) printPromotionsForStmt(s, analysis, os);
+    }
+}
+
 void printEscapeFacts(const std::vector<std::unique_ptr<Module>>& modules, std::ostream& os) {
     os << "=== escape analysis ===\n";
     for (auto& m : modules) {
         auto sf = ast::SourceFile::cast(*m->rootNode);
         if (!sf) continue;
         const auto& analysis = m->analyzer->result();
-        for (auto& fn : sf->functions()) {
+        auto emitFn = [&](const ast::FuncDecl& fn) {
             auto* info = analysis.find(fn.node.greenNode());
             if (info && info->resolvedSymbol) printEscapeFactsForFunction(info->resolvedSymbol, os);
-        }
-        for (auto& sd : sf->structs()) {
-            for (auto& mm : sd.methods()) {
-                auto* info = analysis.find(mm.node.greenNode());
-                if (info && info->resolvedSymbol) printEscapeFactsForFunction(info->resolvedSymbol, os);
-            }
-        }
-        for (auto& cd : sf->classes()) {
-            for (auto& mm : cd.methods()) {
-                auto* info = analysis.find(mm.node.greenNode());
-                if (info && info->resolvedSymbol) printEscapeFactsForFunction(info->resolvedSymbol, os);
-            }
-        }
+            printPromotionsForFunction(fn, analysis, os);
+        };
+        for (auto& fn : sf->functions()) emitFn(fn);
+        for (auto& sd : sf->structs()) for (auto& mm : sd.methods()) emitFn(mm);
+        for (auto& cd : sf->classes()) for (auto& mm : cd.methods()) emitFn(mm);
     }
 }
 
@@ -291,6 +343,7 @@ bool runMultiModuleAnalysis(std::vector<std::unique_ptr<Module>>& modules,
         }
     } while (anyChanged);
     for (auto& ea : escapeAnalyzers) ea.finalize();
+    for (auto& ea : escapeAnalyzers) ea.decideStackPromotions();
 
     if (explainArc) {
         printEscapeFacts(modules, std::cerr);
@@ -541,22 +594,14 @@ bool Compiler::compileSingle(std::istream& source, const fs::path& outputFile, c
         ea.analyze();
         if (explainArc) {
             std::cerr << "=== escape analysis ===\n";
-            for (auto& fn : sf->functions()) {
+            auto emitFn = [&](const ast::FuncDecl& fn) {
                 auto* info = analyzer.result().find(fn.node.greenNode());
                 if (info && info->resolvedSymbol) printEscapeFactsForFunction(info->resolvedSymbol, std::cerr);
-            }
-            for (auto& sd : sf->structs()) {
-                for (auto& mm : sd.methods()) {
-                    auto* info = analyzer.result().find(mm.node.greenNode());
-                    if (info && info->resolvedSymbol) printEscapeFactsForFunction(info->resolvedSymbol, std::cerr);
-                }
-            }
-            for (auto& cd : sf->classes()) {
-                for (auto& mm : cd.methods()) {
-                    auto* info = analyzer.result().find(mm.node.greenNode());
-                    if (info && info->resolvedSymbol) printEscapeFactsForFunction(info->resolvedSymbol, std::cerr);
-                }
-            }
+                printPromotionsForFunction(fn, analyzer.result(), std::cerr);
+            };
+            for (auto& fn : sf->functions()) emitFn(fn);
+            for (auto& sd : sf->structs()) for (auto& mm : sd.methods()) emitFn(mm);
+            for (auto& cd : sf->classes()) for (auto& mm : cd.methods()) emitFn(mm);
         }
     }
 

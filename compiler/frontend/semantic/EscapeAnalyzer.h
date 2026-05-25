@@ -16,10 +16,12 @@ public:
     bool runOnce();
 
     // Convergent fixpoint for single-module use.
-    void analyze() { while (runOnce()) {} finalize(); }
+    void analyze() { while (runOnce()) {} finalize(); decideStackPromotions(); }
 
     // Walk function bodies once to record the textually-last read reference for each class-typed local.
     void finalize();
+
+    void decideStackPromotions();
 
 private:
     const ast::SourceFile& sf;
@@ -72,4 +74,9 @@ private:
     void walkStmtForLastUses(const ast::Statement& s);
     void walkExprForLastUses(const ast::Expression& e);
     void recordRead(const ast::IdentExpression& id);
+
+    void walkBodyForPromotion(const ast::FuncDecl& fn);
+    void walkStmtForPromotion(const ast::Statement& s);
+    void considerLocalForPromotion(Symbol* sym, const ast::Expression* init);
+    bool initIsStackPromotable(const ast::Expression& init) const;
 };

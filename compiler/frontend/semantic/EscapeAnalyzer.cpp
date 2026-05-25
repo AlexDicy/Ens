@@ -554,3 +554,90 @@ void EscapeAnalyzer::markParamMutated(int paramIdx) {
 }
 
 void EscapeAnalyzer::collectFunctionsOnce() {}
+
+void EscapeAnalyzer::decideStackPromotions() {
+    auto handle = [&](const ast::FuncDecl& fn) {
+        walkBodyForPromotion(fn);
+    };
+    for (auto& fn : sf.functions()) handle(fn);
+    for (auto& sd : sf.structs()) for (auto& m : sd.methods()) handle(m);
+    for (auto& cd : sf.classes()) for (auto& m : cd.methods()) handle(m);
+}
+
+void EscapeAnalyzer::walkBodyForPromotion(const ast::FuncDecl& fn) {
+    if (auto body = fn.body()) {
+        for (auto& s : body->statements()) walkStmtForPromotion(s);
+    }
+}
+
+void EscapeAnalyzer::walkStmtForPromotion(const ast::Statement& s) {
+    if (auto b = s.asBlock()) {
+        for (auto& child : b->statements()) walkStmtForPromotion(child);
+        return;
+    }
+    if (auto l = s.asLet()) {
+        Symbol* sym = nullptr;
+        if (auto* info = analysis.find(l->node.greenNode())) sym = info->resolvedSymbol;
+        auto init = l->initializer();
+        considerLocalForPromotion(sym, init ? &*init : nullptr);
+        return;
+    }
+    if (auto v = s.asTypedVarDecl()) {
+        Symbol* sym = nullptr;
+        if (auto* info = analysis.find(v->node.greenNode())) sym = info->resolvedSymbol;
+        auto init = v->initializer();
+        considerLocalForPromotion(sym, init ? &*init : nullptr);
+        return;
+    }
+    if (auto i = s.asIf()) {
+        if (auto t = i->thenBlock()) {
+            for (auto& child : t->statements()) walkStmtForPromotion(child);
+        }
+        if (auto ec = i->elseClause()) {
+            if (auto innerIf = ec->ifStatement()) {
+                ast::Statement asStmt{innerIf->node};
+                walkStmtForPromotion(asStmt);
+            } else if (auto bb = ec->block()) {
+                for (auto& child : bb->statements()) walkStmtForPromotion(child);
+            }
+        }
+        return;
+    }
+    if (auto w = s.asWhile()) {
+        if (auto body = w->body()) {
+            for (auto& child : body->statements()) walkStmtForPromotion(child);
+        }
+        return;
+    }
+}
+
+void EscapeAnalyzer::considerLocalForPromotion(Symbol* sym, const ast::Expression* init) {
+    if (!sym) return;
+    if (sym->kind != SymbolKind::Variable) return;
+    if (!sym->type || !sym->type->isArray()) return;
+    if (!sym->type->inner) return;
+    if (sym->localEscape != EscapeKind::NoEscape) return;
+    if (sym->reassigned) return;
+    if (!init) return;
+    if (!initIsStackPromotable(*init)) return;
+    sym->stackPromoted = true;
+}
+
+bool EscapeAnalyzer::initIsStackPromotable(const ast::Expression& init) const {
+    if (auto n = init.asNew()) {
+        if (!n->isArrayNew()) return false;
+        auto sizes = n->arraySizeExpressions();
+        if (sizes.size() != 1) return false;
+        auto lit = sizes[0].asLiteral();
+        if (!lit) return false;
+        SyntaxKind k = lit->literalKind();
+        return k == SyntaxKind::IntLiteral || k == SyntaxKind::LongLiteral;
+    }
+    if (init.asArrayLiteral()) {
+        return true;
+    }
+    if (auto p = init.asParen()) {
+        if (auto inner = p->inner()) return initIsStackPromotable(*inner);
+    }
+    return false;
+}
