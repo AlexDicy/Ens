@@ -171,7 +171,7 @@ Outer? outer = new Outer();
 Inner? maybeInner = outer?.inner;   // either null or the field value
 ```
 
-Inside `if x != null { ... }` the `x` is considered as the non-nullable form for the rest of the block, so you can use `.` directly. The same narrowing applies to the `else` branch of `if x == null { ... } else { ... }`. Reassigning `x` inside the block drops the narrowing from that point on.
+Inside `if (x != null) { ... }` the `x` is considered as the non-nullable form for the rest of the block, so you can use `.` directly. The same narrowing applies to the `else` branch of `if (x == null) { ... } else { ... }`. Reassigning `x` inside the block drops the narrowing from that point on.
 
 ```ens
 draw(Outer? outer) {
@@ -184,6 +184,36 @@ draw(Outer? outer) {
     } else {
         outer.inner; // ok in the else branch too
     }
+}
+```
+
+Narrowing extends to **member chains** (`this.field`, `obj.field`, `a.b.c`) and to **array subscripts** (`arr[K]` for an integer-literal index, `arr[i]` for a plain identifier index, arithmetic and call indices are not narrowed). The same `!= null` / `== null` patterns work; the narrowed form holds for as long as nothing invalidates it.
+
+```ens
+if (this.shape != null) {
+    return this.shape.area;       // this.shape is non-nullable here
+}
+
+if (xs[0] != null) {
+    xs[0].method();               // literal-index subscript narrows
+}
+
+int i = 2;
+if (ys[i] != null) {
+    ys[i].method();               // identifier-index subscript narrows
+}
+```
+
+Narrowing is dropped when the analyzer can't prove the narrowed value is still non-null. Specifically:
+- Writing to the narrowed path or any deeper part of it (`r.door = null`, `xs[0] = null`).
+- Reassigning the root variable or, for subscripts, the index variable.
+- Any function or method call whose receiver or class/array-typed argument could be the narrowed root. Calls that don't touch the relevant root (e.g. `print("hi")`) leave the narrowing intact.
+
+```ens
+if (room.door != null) {
+    room.door.code;        // ok
+    room.door.open();      // call's receiver is rooted at `room`,
+    room.door.code;        // error - narrowing dropped
 }
 ```
 

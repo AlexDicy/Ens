@@ -147,6 +147,15 @@ private:
     Type* analyzeArrayLiteral(const ast::ArrayLiteralExpression& expr);
     Type* analyzeArrayLiteralAdapt(const ast::ArrayLiteralExpression& expr, Type* target);
 
+    // Build a NarrowingPath from a member / subscript chain. Returns nullopt when
+    // any segment is something we can't reliably re-recognize on later reads
+    // (calls, arithmetic indices, etc.).
+    std::optional<NarrowingPath> buildNarrowingPath(
+        const ast::Expression& expr,
+        std::vector<Symbol*>* indexSymbols = nullptr) const;
+
+    void clearNarrowingsForCall(const ast::CallExpression& expr);
+
     struct NullCheckInfo {
         NarrowingPath key;
         Type* narrowedT = nullptr;

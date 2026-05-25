@@ -997,6 +997,123 @@ static ast::Expression unwrapParens(const ast::Expression& e) {
     return cur;
 }
 
+std::optional<NarrowingPath> Analyzer::buildNarrowingPath(
+    const ast::Expression& expr,
+    std::vector<Symbol*>* indexSymbols) const {
+    ast::Expression core = unwrapParens(expr);
+
+    if (auto id = core.asIdent()) {
+        auto* info = analysis.find(id->node.greenNode());
+        Symbol* sym = info ? info->resolvedSymbol : nullptr;
+        if (!sym) return std::nullopt;
+        if (sym->kind != SymbolKind::Variable && sym->kind != SymbolKind::Parameter) {
+            return std::nullopt;
+        }
+        return NarrowingPath{sym, {}};
+    }
+    if (core.asThis()) {
+        if (!currentThis) return std::nullopt;
+        return NarrowingPath{currentThis, {}};
+    }
+    if (auto m = core.asMember()) {
+        auto obj = m->object();
+        auto name = m->memberText();
+        if (!obj || !name) return std::nullopt;
+        auto base = buildNarrowingPath(*obj, indexSymbols);
+        if (!base) return std::nullopt;
+        PathSegment seg;
+        seg.kind = PathSegment::Kind::Field;
+        seg.field = *name;
+        base->chain.push_back(std::move(seg));
+        return base;
+    }
+    if (auto su = core.asSubscript()) {
+        auto obj = su->object();
+        auto idx = su->index();
+        if (!obj || !idx) return std::nullopt;
+        auto base = buildNarrowingPath(*obj, indexSymbols);
+        if (!base) return std::nullopt;
+        ast::Expression idxCore = unwrapParens(*idx);
+        PathSegment seg;
+        // Integer literal index, possibly with unary minus.
+        bool negative = false;
+        ast::Expression idxInner = idxCore;
+        if (auto pre = idxCore.asPrefix()) {
+            if (auto op = pre->operatorToken()) {
+                if (op->kind() == SyntaxKind::Minus || op->kind() == SyntaxKind::Plus) {
+                    if (auto inner = pre->operand()) {
+                        idxInner = *inner;
+                        negative = (op->kind() == SyntaxKind::Minus);
+                    }
+                }
+            }
+        }
+        if (auto lit = idxInner.asLiteral()) {
+            if (lit->literalKind() == SyntaxKind::IntLiteral ||
+                lit->literalKind() == SyntaxKind::LongLiteral) {
+                auto tok = lit->token();
+                if (!tok) return std::nullopt;
+                uint64_t magnitude = 0;
+                if (!parseIntegerLiteralMagnitude(std::u16string(tok->tokenText()), magnitude)) {
+                    return std::nullopt;
+                }
+                seg.kind = PathSegment::Kind::IntIndex;
+                seg.intIndex = negative ? -static_cast<int64_t>(magnitude)
+                                        : static_cast<int64_t>(magnitude);
+                base->chain.push_back(std::move(seg));
+                return base;
+            }
+        }
+        // Plain identifier index. Track the symbol so callers can invalidate
+        // the narrowing if the index variable is reassigned.
+        if (auto idId = idxCore.asIdent()) {
+            auto* info = analysis.find(idId->node.greenNode());
+            Symbol* sym = info ? info->resolvedSymbol : nullptr;
+            if (!sym) return std::nullopt;
+            if (sym->kind != SymbolKind::Variable && sym->kind != SymbolKind::Parameter) {
+                return std::nullopt;
+            }
+            seg.kind = PathSegment::Kind::IdentIndex;
+            seg.identIndexSym = sym;
+            base->chain.push_back(std::move(seg));
+            if (indexSymbols) indexSymbols->push_back(sym);
+            return base;
+        }
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+void Analyzer::clearNarrowingsForCall(const ast::CallExpression& expr) {
+    if (!currentScope) return;
+    auto dropRoot = [&](const ast::Expression& e) {
+        if (auto p = buildNarrowingPath(e)) {
+            currentScope->clearNarrowingsForRoot(p->root);
+        }
+    };
+    // Receiver (method / safe-method call): the call could mutate state
+    // reachable through it.
+    if (auto callee = expr.callee()) {
+        if (auto m = callee->asMember()) {
+            if (auto obj = m->object()) dropRoot(*obj);
+        } else if (auto sm = callee->asSafeMember()) {
+            if (auto obj = sm->object()) dropRoot(*obj);
+        }
+    }
+    // Arguments: only class / array references expose mutable state; struct
+    // and primitive args are passed by value, so the call can't mutate
+    // through them.
+    for (const auto& arg : expr.arguments()) {
+        if (arg.asOutArgument()) continue;
+        Type* t = analysis.typeOf(arg.node.greenNode());
+        if (!t) continue;
+        Type* base = t->isOptional() ? t->inner : t;
+        if (!base) continue;
+        if (!base->isClass() && !base->isArray()) continue;
+        dropRoot(arg);
+    }
+}
+
 Analyzer::NullCheckInfo Analyzer::detectNullCheck(const ast::Expression& cond) {
     NullCheckInfo info;
     ast::Expression condCore = unwrapParens(cond);
@@ -1017,20 +1134,19 @@ Analyzer::NullCheckInfo Analyzer::detectNullCheck(const ast::Expression& cond) {
         return lit && lit->literalKind() == SyntaxKind::KwNull;
     };
 
-    const ast::Expression* identSide = nullptr;
-    if (isNullLit(rightCore) && !isNullLit(leftCore)) identSide = &leftCore;
-    else if (isNullLit(leftCore) && !isNullLit(rightCore)) identSide = &rightCore;
+    const ast::Expression* refSide = nullptr;
+    if (isNullLit(rightCore) && !isNullLit(leftCore)) refSide = &leftCore;
+    else if (isNullLit(leftCore) && !isNullLit(rightCore)) refSide = &rightCore;
     else return info;
 
-    auto id = identSide->asIdent();
-    if (!id) return info;
-    auto name = id->nameText();
-    if (!name) return info;
-    Symbol* sym = currentScope ? currentScope->lookup(*name) : nullptr;
-    if (!sym || !sym->type || !sym->type->isOptional() || !sym->type->inner) return info;
+    Type* refType = analysis.typeOf(refSide->node.greenNode());
+    if (!refType || !refType->isOptional() || !refType->inner) return info;
 
-    info.key = NarrowingPath{sym, {}};
-    info.narrowedT = sym->type->inner;
+    auto path = buildNarrowingPath(*refSide);
+    if (!path) return info;
+
+    info.key = std::move(*path);
+    info.narrowedT = refType->inner;
     info.narrowsThen = (op == SyntaxKind::NotEq);
     info.valid = true;
     return info;
@@ -1323,6 +1439,7 @@ static size_t requiredArgCount(Symbol* sym) {
 }
 
 Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
+    Type* result = [&]() -> Type* {
     auto callee = expr.callee();
     auto args = expr.arguments();
 
@@ -1457,6 +1574,9 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
         }
     }
     return sym->returnType ? sym->returnType : typeCtx.getError();
+    }();
+    clearNarrowingsForCall(expr);
+    return result;
 }
 
 Type* Analyzer::analyzeExternalCall(const ast::CallExpression& expr, Symbol* sym,
@@ -1498,7 +1618,10 @@ Type* Analyzer::analyzeExternalCall(const ast::CallExpression& expr, Symbol* sym
                 continue;
             }
             local->reassigned = true;
-            if (currentScope) currentScope->clearNarrowingsContaining(local, u"");
+            if (currentScope) {
+                currentScope->clearNarrowingsForRoot(local);
+                currentScope->clearNarrowingsForIndexSymbol(local);
+            }
         } else {
             if (outArg) {
                 errorAtNode(arg.node, "Argument " + std::to_string(i + 1) +
@@ -1580,7 +1703,16 @@ Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
     if (!memberName) return typeCtx.getError();
     int idx = objT->structInfo->findFieldIndex(*memberName);
     if (idx >= 0) {
-        return objT->structInfo->fields[idx].type;
+        Type* fieldT = objT->structInfo->fields[idx].type;
+        if (fieldT && fieldT->isOptional() && currentScope) {
+            ast::Expression whole{expr.node};
+            if (auto path = buildNarrowingPath(whole)) {
+                if (Type* narrowed = currentScope->lookupNarrowedType(*path)) {
+                    return narrowed;
+                }
+            }
+        }
+        return fieldT;
     }
     int midx = objT->structInfo->findMethodIndex(*memberName);
     if (midx >= 0) {
@@ -1684,7 +1816,16 @@ Type* Analyzer::analyzeSubscript(const ast::SubscriptExpression& expr) {
     if (!idxT->isError() && !idxT->isInteger()) {
         errorAtNode(idx->node, "Array index must be an integer, got '" + idxT->toString() + "'");
     }
-    return objT->inner ? objT->inner : typeCtx.getError();
+    Type* elemT = objT->inner ? objT->inner : typeCtx.getError();
+    if (elemT && elemT->isOptional() && currentScope) {
+        ast::Expression whole{expr.node};
+        if (auto path = buildNarrowingPath(whole)) {
+            if (Type* narrowed = currentScope->lookupNarrowedType(*path)) {
+                return narrowed;
+            }
+        }
+    }
+    return elemT;
 }
 
 Type* Analyzer::analyzeSafeSubscript(const ast::SafeSubscriptExpression& expr) {
@@ -1763,7 +1904,12 @@ Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
         }
     }
     if (targetIdentSym && currentScope) {
-        currentScope->clearNarrowingsContaining(targetIdentSym, u"");
+        currentScope->clearNarrowingsForRoot(targetIdentSym);
+        currentScope->clearNarrowingsForIndexSymbol(targetIdentSym);
+    } else if (currentScope && (target->asMember() || target->asSubscript())) {
+        if (auto p = buildNarrowingPath(*target)) {
+            currentScope->clearNarrowingsAtOrBelow(*p);
+        }
     }
     return targetT;
 }
