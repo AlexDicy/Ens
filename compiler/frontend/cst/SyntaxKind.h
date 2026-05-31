@@ -42,9 +42,9 @@ enum class SyntaxKind : uint16_t {
     // === Keywords ===
     KwBool, KwByte, KwShort, KwUShort, KwInt, KwUInt, KwLong, KwULong,
     KwFloat, KwDouble, KwDecimal, KwChar, KwString, KwVoid,
-    KwAs, KwAssert, KwBreak, KwCase, KwCatch, KwClass, KwComputed, KwConst, KwContinue,
+    KwAbstract, KwAs, KwAssert, KwBreak, KwCase, KwCatch, KwClass, KwComputed, KwConst, KwContinue,
     KwDefault, KwDo, KwElse, KwEnum, KwExtends, KwExternal, KwFalse, KwFinal, KwFinally,
-    KwFor, KwFrom, KwGoto, KwIf, KwImport, KwLet, KwNew, KwNull, KwOut, KwPackage,
+    KwFor, KwFrom, KwGoto, KwIf, KwImport, KwLet, KwNew, KwNull, KwOut, KwOverride, KwPackage,
     KwPrivate, KwProtected, KwPublic, KwRethrow, KwReturn, KwStatic, KwStruct,
     KwSuper, KwSwitch, KwThis, KwThrow, KwThrows, KwTrue, KwTry, KwType, KwWeak, KwWhile,
 
@@ -92,6 +92,7 @@ enum class SyntaxKind : uint16_t {
     LiteralExpr,         // wraps any literal token
     IdentExpr,
     ThisExpr,
+    SuperExpr,
     BinaryExpr,
     UnaryExpr,
     PrefixExpr,

@@ -7,6 +7,7 @@ bool Expression::isExpressionKind(SyntaxKind k) {
         case SyntaxKind::LiteralExpr:
         case SyntaxKind::IdentExpr:
         case SyntaxKind::ThisExpr:
+        case SyntaxKind::SuperExpr:
         case SyntaxKind::BinaryExpr:
         case SyntaxKind::UnaryExpr:
         case SyntaxKind::PrefixExpr:
@@ -52,6 +53,7 @@ static std::vector<Expression> expressionChildren(const SyntaxNode& parent) {
 std::optional<LiteralExpression>   Expression::asLiteral()   const { return LiteralExpression::cast(node); }
 std::optional<IdentExpression>     Expression::asIdent()     const { return IdentExpression::cast(node); }
 std::optional<ThisExpression>      Expression::asThis()      const { return ThisExpression::cast(node); }
+std::optional<SuperExpression>     Expression::asSuper()     const { return SuperExpression::cast(node); }
 std::optional<BinaryExpression>    Expression::asBinary()    const { return BinaryExpression::cast(node); }
 std::optional<PrefixExpression>    Expression::asPrefix()    const { return PrefixExpression::cast(node); }
 std::optional<PostfixExpression>   Expression::asPostfix()   const { return PostfixExpression::cast(node); }

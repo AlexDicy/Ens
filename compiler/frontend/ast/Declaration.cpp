@@ -43,6 +43,15 @@ static std::optional<SyntaxNode> firstIdentAfterKeyword(const SyntaxNode& decl, 
     return std::nullopt;
 }
 
+// True if the decl node has a direct modifier token of the given kind (e.g. KwAbstract on a
+// class, KwOverride on a method). Only scans immediate token children, so nested bodies are safe.
+static bool hasDirectToken(const SyntaxNode& decl, SyntaxKind kind) {
+    for (auto& c : decl.children()) {
+        if (c.isToken() && c.kind() == kind) return true;
+    }
+    return false;
+}
+
 // === ReturnType ===
 
 std::optional<TypeReference> ReturnType::typeReference() const {
@@ -176,6 +185,10 @@ bool FuncDecl::isShorthand() const {
     return false;
 }
 
+bool FuncDecl::isOverride() const { return hasDirectToken(node, SyntaxKind::KwOverride); }
+bool FuncDecl::isFinal() const    { return hasDirectToken(node, SyntaxKind::KwFinal); }
+bool FuncDecl::isAbstract() const { return hasDirectToken(node, SyntaxKind::KwAbstract); }
+
 // === FieldDecl ===
 
 std::optional<VisibilityModifier> FieldDecl::visibilityModifier() const {
@@ -266,6 +279,15 @@ std::optional<std::u16string> ClassDecl::nameText() const {
     if (auto t = nameToken()) return std::u16string(t->tokenText());
     return std::nullopt;
 }
+std::optional<SyntaxNode> ClassDecl::baseClassToken() const {
+    return firstIdentAfterKeyword(node, SyntaxKind::KwExtends);
+}
+std::optional<std::u16string> ClassDecl::baseClassName() const {
+    if (auto t = baseClassToken()) return std::u16string(t->tokenText());
+    return std::nullopt;
+}
+bool ClassDecl::isAbstract() const { return hasDirectToken(node, SyntaxKind::KwAbstract); }
+bool ClassDecl::isFinal() const    { return hasDirectToken(node, SyntaxKind::KwFinal); }
 std::optional<MemberList> ClassDecl::memberList() const {
     if (auto m = firstChildNode(node, SyntaxKind::MemberList)) return MemberList::cast(*m);
     return std::nullopt;

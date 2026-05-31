@@ -10,6 +10,7 @@ namespace ast {
 class LiteralExpression;
 class IdentExpression;
 class ThisExpression;
+class SuperExpression;
 class BinaryExpression;
 class PrefixExpression;
 class PostfixExpression;
@@ -39,6 +40,7 @@ public:
     std::optional<LiteralExpression>   asLiteral() const;
     std::optional<IdentExpression>     asIdent() const;
     std::optional<ThisExpression>      asThis() const;
+    std::optional<SuperExpression>     asSuper() const;
     std::optional<BinaryExpression>    asBinary() const;
     std::optional<PrefixExpression>    asPrefix() const;
     std::optional<PostfixExpression>   asPostfix() const;
@@ -84,6 +86,15 @@ public:
     static std::optional<ThisExpression> cast(const SyntaxNode& n) {
         if (n.kind() != SyntaxKind::ThisExpr) return std::nullopt;
         return ThisExpression{n};
+    }
+};
+
+class SuperExpression {
+public:
+    SyntaxNode node;
+    static std::optional<SuperExpression> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::SuperExpr) return std::nullopt;
+        return SuperExpression{n};
     }
 };
 

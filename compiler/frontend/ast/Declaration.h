@@ -99,6 +99,9 @@ public:
     std::optional<ReturnType> returnType() const;
     std::optional<Block> body() const;
     bool isShorthand() const;
+    bool isOverride() const;
+    bool isFinal() const;
+    bool isAbstract() const;
 };
 
 class FieldDecl {
@@ -155,6 +158,10 @@ public:
     Visibility visibility() const;
     std::optional<SyntaxNode> nameToken() const;
     std::optional<std::u16string> nameText() const;
+    std::optional<SyntaxNode> baseClassToken() const;
+    std::optional<std::u16string> baseClassName() const;
+    bool isAbstract() const;
+    bool isFinal() const;
     std::optional<MemberList> memberList() const;
     std::vector<FieldDecl> fields() const;
     std::vector<FuncDecl> methods() const;

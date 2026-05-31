@@ -165,13 +165,22 @@ void Parser::parseTopLevel() {
         parseExternalDecl();
         return;
     }
-    if (at(SyntaxKind::KwStruct) ||
-        peekKind(hasVisibility ? 1 : 0) == SyntaxKind::KwStruct) {
+    // Skip leading declaration modifiers (visibility + abstract/final) to classify struct vs class.
+    int declMods = 0;
+    while (true) {
+        SyntaxKind k = peekKind(declMods);
+        if (k == SyntaxKind::KwPrivate || k == SyntaxKind::KwProtected || k == SyntaxKind::KwPublic ||
+            k == SyntaxKind::KwAbstract || k == SyntaxKind::KwFinal) {
+            declMods++;
+            continue;
+        }
+        break;
+    }
+    if (peekKind(declMods) == SyntaxKind::KwStruct) {
         parseStructOrClassDecl(SyntaxKind::StructDecl, SyntaxKind::KwStruct);
         return;
     }
-    if (at(SyntaxKind::KwClass) ||
-        peekKind(hasVisibility ? 1 : 0) == SyntaxKind::KwClass) {
+    if (peekKind(declMods) == SyntaxKind::KwClass) {
         parseStructOrClassDecl(SyntaxKind::ClassDecl, SyntaxKind::KwClass);
         return;
     }
@@ -303,6 +312,13 @@ bool Parser::looksLikeFuncDecl(bool allowShorthand) const {
         idx++;
         while (idx < tokens.size() && isTrivia(tokens[idx].kind)) idx++;
     }
+    // Skip optional method modifiers (override / final / abstract).
+    while (idx < tokens.size() && (tokens[idx].kind == SyntaxKind::KwOverride ||
+                                   tokens[idx].kind == SyntaxKind::KwFinal ||
+                                   tokens[idx].kind == SyntaxKind::KwAbstract)) {
+        idx++;
+        while (idx < tokens.size() && isTrivia(tokens[idx].kind)) idx++;
+    }
     if (idx >= tokens.size() || tokens[idx].kind != SyntaxKind::Identifier) return false;
     idx++;
     while (idx < tokens.size() && isTrivia(tokens[idx].kind)) idx++;
@@ -329,6 +345,9 @@ bool Parser::looksLikeFuncDecl(bool allowShorthand) const {
 void Parser::parseFuncDecl() {
     builder.startNode(SyntaxKind::FuncDecl);
     parseVisibilityModifier();
+    while (at(SyntaxKind::KwOverride) || at(SyntaxKind::KwFinal) || at(SyntaxKind::KwAbstract)) {
+        bump();  // method modifier; analyzer validates context
+    }
     expect(SyntaxKind::Identifier, "function name");
     expect(SyntaxKind::LParen, "'(' after function name");
     parseParamList();
@@ -398,10 +417,20 @@ void Parser::parseReturnType() {
 // =================================================================
 
 void Parser::parseStructOrClassDecl(SyntaxKind nodeKind, SyntaxKind keywordKind) {
+    bool isClass = (keywordKind == SyntaxKind::KwClass);
     builder.startNode(nodeKind);
     parseVisibilityModifier();
+    while (at(SyntaxKind::KwAbstract) || at(SyntaxKind::KwFinal)) {
+        if (!isClass) reportAtCurrent("'abstract' and 'final' are only allowed on classes");
+        bump();
+    }
     expect(keywordKind, keywordKind == SyntaxKind::KwStruct ? "'struct'" : "'class'");
     expect(SyntaxKind::Identifier, "name");
+    if (at(SyntaxKind::KwExtends)) {
+        if (!isClass) reportAtCurrent("Only classes can use 'extends'; structs do not support inheritance");
+        bump();  // 'extends'
+        expect(SyntaxKind::Identifier, "base class name after 'extends'");
+    }
     expect(SyntaxKind::LBrace, "'{'");
     builder.startNode(SyntaxKind::MemberList);
     while (!at(SyntaxKind::RBrace) && !atEnd()) {
@@ -813,6 +842,11 @@ void Parser::parsePrefix() {
             return;
         case SyntaxKind::KwThis:
             builder.startNode(SyntaxKind::ThisExpr);
+            bump();
+            builder.finishNode();
+            return;
+        case SyntaxKind::KwSuper:
+            builder.startNode(SyntaxKind::SuperExpr);
             bump();
             builder.finishNode();
             return;
