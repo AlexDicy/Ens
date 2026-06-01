@@ -2,9 +2,13 @@
 
 #include <algorithm>
 #include <cassert>
+#include <unordered_set>
 #include "../diagnostics/Diagnostic.h"
 #include "../diagnostics/DiagnosticSink.h"
 #include "Literals.h"
+
+// Sentinel for a method known to need a vtable slot before final indices are assigned.
+static constexpr int VTSLOT_PENDING = -2;
 
 static Visibility toSemanticVisibility(ast::Visibility v) {
     switch (v) {
@@ -533,9 +537,74 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
 void Analyzer::collectClasses(const ast::SourceFile& file) {
     auto classes = file.classes();
 
+    // --- Pass A: record class modifiers and resolve base links. ---
     for (auto& cd : classes) {
         Type* t = analysis.typeOf(cd.node.greenNode());
-        if (!t) continue;
+        if (!t || !t->structInfo) continue;
+        StructInfo* si = t->structInfo;
+        si->isAbstract = cd.isAbstract();
+        si->isFinal = cd.isFinal();
+        if (auto baseName = cd.baseClassName()) {
+            SyntaxNode diag = cd.baseClassToken().value_or(cd.node);
+            Type* baseT = typeCtx.lookupNamedType(modulePath_, *baseName);
+            if (!baseT) {
+                errorAtNode(diag, "Unknown base class '" + asciiOf(*baseName) + "'");
+            } else if (!baseT->isClass() || !baseT->structInfo) {
+                errorAtNode(diag, "'" + asciiOf(*baseName) +
+                    "' is not a class; only classes can be extended");
+            } else if (baseT->structInfo == si) {
+                errorAtNode(diag, "Class '" + asciiOf(si->name) + "' cannot extend itself");
+            } else if (baseT->structInfo->isFinal) {
+                errorAtNode(diag, "Cannot extend '" + asciiOf(*baseName) +
+                    "' because it is declared 'final'");
+            } else {
+                si->baseInfo = baseT->structInfo;
+            }
+        }
+    }
+
+    // --- Detect inheritance cycles; break the offending link. ---
+    for (auto& cd : classes) {
+        Type* t = analysis.typeOf(cd.node.greenNode());
+        if (!t || !t->structInfo) continue;
+        StructInfo* si = t->structInfo;
+        std::unordered_set<StructInfo*> seen;
+        for (StructInfo* s = si; s; s = s->baseInfo) {
+            if (!seen.insert(s).second) {
+                errorAtNode(cd.node, "Class '" + asciiOf(si->name) +
+                    "' eventually extends itself through its base classes. "
+                    "A class cannot inherit from itself, directly or indirectly.");
+                si->baseInfo = nullptr;
+                break;
+            }
+        }
+    }
+
+    // --- Topological order: bases before derived (by ancestor depth). ---
+    auto depthOf = [](StructInfo* si) {
+        int d = 0;
+        for (StructInfo* s = si->baseInfo; s; s = s->baseInfo) ++d;
+        return d;
+    };
+    std::vector<ast::ClassDecl> order(classes.begin(), classes.end());
+    std::stable_sort(order.begin(), order.end(),
+        [&](const ast::ClassDecl& a, const ast::ClassDecl& b) {
+            Type* ta = analysis.typeOf(a.node.greenNode());
+            Type* tb = analysis.typeOf(b.node.greenNode());
+            int da = (ta && ta->structInfo) ? depthOf(ta->structInfo) : 0;
+            int db = (tb && tb->structInfo) ? depthOf(tb->structInfo) : 0;
+            return da < db;
+        });
+
+    // --- Fields: flatten inherited fields first, then own fields. ---
+    for (auto& cd : order) {
+        Type* t = analysis.typeOf(cd.node.greenNode());
+        if (!t || !t->structInfo) continue;
+        StructInfo* si = t->structInfo;
+        if (si->baseInfo) {
+            si->fields = si->baseInfo->fields;
+            si->baseFieldCount = static_cast<int>(si->baseInfo->fields.size());
+        }
         for (auto& f : cd.fields()) {
             FieldInfo fi;
             auto fname = f.nameText();
@@ -544,6 +613,7 @@ void Analyzer::collectClasses(const ast::SourceFile& file) {
             fi.type = ft;
             fi.visibility = toSemanticVisibility(f.visibility());
             fi.isWeak = f.isWeak();
+            fi.definingClass = si;
             if (fi.isWeak) {
                 bool ok = ft && ft->isOptional() && ft->inner && ft->inner->isClass();
                 if (!ok) {
@@ -551,17 +621,39 @@ void Analyzer::collectClasses(const ast::SourceFile& file) {
                         "'weak' fields must be nullable class types (e.g. `weak Foo? f`)");
                 }
             }
+            if (!fi.name.empty() && si->findFieldIndex(fi.name) >= 0) {
+                int existing = si->findFieldIndex(fi.name);
+                bool inherited = existing < si->baseFieldCount;
+                errorAtNode(f.node, "Field '" + asciiOf(fi.name) + "' is already declared" +
+                    (inherited ? " in base class '" + asciiOf(si->baseInfo->name) + "'" : " in '" + asciiOf(si->name) + "'"));
+                continue;
+            }
             auto [line, col] = source.offsetToPosition(f.node.startOffset());
             fi.line = line;
             fi.column = col;
             fi.declaration = f.node.greenNode();
-            t->structInfo->fields.push_back(std::move(fi));
+            si->fields.push_back(std::move(fi));
         }
     }
 
-    for (auto& cd : classes) {
+    auto signaturesCompatible = [&](const MethodInfo& base, Symbol* der) -> bool {
+        Symbol* bs = base.symbol;
+        if (!bs || !der) return true;
+        if (bs->paramTypes.size() != der->paramTypes.size()) return false;
+        for (size_t i = 0; i < bs->paramTypes.size(); ++i) {
+            if (!bs->paramTypes[i] || !der->paramTypes[i]) continue;
+            if (!bs->paramTypes[i]->equals(der->paramTypes[i])) return false;
+        }
+        Type* br = bs->returnType ? bs->returnType : typeCtx.getPrimitive(TypeKind::Void);
+        Type* dr = der->returnType ? der->returnType : typeCtx.getPrimitive(TypeKind::Void);
+        return br->assignableFrom(dr);  // covariant return allowed
+    };
+
+    // --- Methods: collect own methods, then validate override/abstract. ---
+    for (auto& cd : order) {
         Type* t = analysis.typeOf(cd.node.greenNode());
-        if (!t) continue;
+        if (!t || !t->structInfo) continue;
+        StructInfo* si = t->structInfo;
         for (auto& m : cd.methods()) {
             Type* retType = m.returnType() && m.returnType()->typeReference()
                 ? resolveTypeReference(*m.returnType()->typeReference())
@@ -580,7 +672,94 @@ void Analyzer::collectClasses(const ast::SourceFile& file) {
             mi.symbol = sym;
             mi.declaration = const_cast<GreenElement*>(m.node.greenNode());
             mi.visibility = toSemanticVisibility(m.visibility());
-            t->structInfo->methods.push_back(std::move(mi));
+            mi.isOverride = m.isOverride();
+            mi.isFinal = m.isFinal();
+            mi.isAbstract = m.isAbstract();
+            mi.definingClass = si;
+            si->methods.push_back(std::move(mi));
+
+            // Validate (base methods already collected via topological order).
+            bool isCtor = (mname == si->name);
+            if (isCtor) {
+                if (m.isOverride() || m.isAbstract())
+                    errorAtNode(m.node, "A constructor cannot be 'override' or 'abstract'");
+                continue;
+            }
+            StructInfo* baseDecl = si->baseInfo ? si->baseInfo->classDeclaringMethod(mname) : nullptr;
+            if (m.isAbstract()) {
+                if (!si->isAbstract)
+                    errorAtNode(m.node, "Abstract method '" + asciiOf(mname) + "' requires class '" +
+                        asciiOf(si->name) + "' to be declared 'abstract'");
+                if (m.body().has_value())
+                    errorAtNode(m.node, "Abstract method '" + asciiOf(mname) + "' cannot have a body");
+            }
+            if (m.isOverride()) {
+                if (!baseDecl) {
+                    errorAtNode(m.node, "Method '" + asciiOf(mname) +
+                        "' is marked 'override' but no base class declares it");
+                } else {
+                    MethodInfo& bm = baseDecl->methods[baseDecl->findMethodIndex(mname)];
+                    if (bm.isFinal)
+                        errorAtNode(m.node, "Cannot override '" + asciiOf(mname) +
+                            "' because it is declared 'final' in '" + asciiOf(baseDecl->name) + "'");
+                    if (!signaturesCompatible(bm, sym))
+                        errorAtNode(m.node, "Override of '" + asciiOf(mname) +
+                            "' does not match the signature declared in '" + asciiOf(baseDecl->name) + "'");
+                }
+            } else if (baseDecl) {
+                errorAtNode(m.node, "Method '" + asciiOf(mname) + "' hides a method inherited from '" +
+                    asciiOf(baseDecl->name) + "'; mark it 'override' to replace it, or rename it");
+            }
+        }
+    }
+
+    // --- A concrete class must implement every inherited abstract method. ---
+    for (auto& cd : order) {
+        Type* t = analysis.typeOf(cd.node.greenNode());
+        if (!t || !t->structInfo) continue;
+        StructInfo* si = t->structInfo;
+        if (si->isAbstract) continue;
+        std::unordered_set<std::u16string> checked;
+        for (StructInfo* s = si; s; s = s->baseInfo) {
+            for (auto& m : s->methods) {
+                if (m.name == s->name) continue;  // constructor
+                if (!checked.insert(m.name).second) continue;
+                StructInfo* decl = si->classDeclaringMethod(m.name);  // most-derived declaration
+                if (decl && decl->methods[decl->findMethodIndex(m.name)].isAbstract) {
+                    errorAtNode(cd.node, "Class '" + asciiOf(si->name) +
+                        "' must override abstract method '" + asciiOf(m.name) +
+                        "', or be declared 'abstract'");
+                }
+            }
+        }
+    }
+
+    // --- Assign vtable slots: a method is virtual only when abstract or overridden somewhere. ---
+    for (auto& cd : order) {  // phase 1: mark
+        Type* t = analysis.typeOf(cd.node.greenNode());
+        if (!t || !t->structInfo) continue;
+        StructInfo* si = t->structInfo;
+        for (auto& mi : si->methods) {
+            if (mi.name == si->name) continue;
+            if (mi.isAbstract) mi.vtableSlot = VTSLOT_PENDING;
+            if (mi.isOverride && si->baseInfo) {
+                if (StructInfo* bc = si->baseInfo->classDeclaringMethod(mi.name)) {
+                    mi.vtableSlot = VTSLOT_PENDING;
+                    bc->methods[bc->findMethodIndex(mi.name)].vtableSlot = VTSLOT_PENDING;
+                }
+            }
+        }
+    }
+    for (auto& cd : order) {  // phase 2: assign indices
+        Type* t = analysis.typeOf(cd.node.greenNode());
+        if (!t || !t->structInfo) continue;
+        StructInfo* si = t->structInfo;
+        si->vtableSize = si->baseInfo ? si->baseInfo->vtableSize : 0;
+        for (auto& mi : si->methods) {
+            if (mi.name == si->name || mi.vtableSlot != VTSLOT_PENDING) continue;
+            StructInfo* bc = si->baseInfo ? si->baseInfo->classDeclaringMethod(mi.name) : nullptr;
+            int inherited = bc ? bc->methods[bc->findMethodIndex(mi.name)].vtableSlot : -1;
+            mi.vtableSlot = (inherited >= 0) ? inherited : si->vtableSize++;
         }
     }
 }
@@ -1250,6 +1429,7 @@ Type* Analyzer::analyzeExpr(const ast::Expression& expr) {
     if (auto lit = expr.asLiteral())    t = analyzeLiteral(*lit);
     else if (auto id = expr.asIdent())  t = analyzeIdent(*id);
     else if (auto th = expr.asThis())   t = analyzeThis(*th);
+    else if (auto su = expr.asSuper())  t = analyzeSuper(*su);
     else if (auto b  = expr.asBinary()) t = analyzeBinary(*b);
     else if (auto p  = expr.asPrefix()) t = analyzePrefix(*p);
     else if (auto c  = expr.asCall())   t = analyzeCall(*c);
@@ -1313,6 +1493,52 @@ Type* Analyzer::analyzeThis(const ast::ThisExpression& expr) {
     }
     analysis.setSymbol(expr.node.greenNode(), currentThis);
     return currentThis->type ? currentThis->type : typeCtx.getError();
+}
+
+Type* Analyzer::analyzeSuper(const ast::SuperExpression& expr) {
+    if (!currentThis || !currentThis->type || !currentThis->type->structInfo) {
+        errorAtNode(expr.node, "'super' is only valid inside a method");
+        return typeCtx.getError();
+    }
+    StructInfo* cls = currentThis->type->structInfo;
+    if (!cls->baseInfo) {
+        errorAtNode(expr.node, "'super' cannot be used in '" + asciiOf(cls->name) +
+            "' because it has no base class");
+        return typeCtx.getError();
+    }
+    Type* baseT = typeCtx.lookupClass(modulePath_, cls->baseInfo->name);
+    return baseT ? baseT : typeCtx.getError();
+}
+
+bool Analyzer::isLocalClass(StructInfo* definingClass) {
+    if (!definingClass) return false;
+    Type* t = typeCtx.lookupClass(modulePath_, definingClass->name);
+    return t && t->structInfo == definingClass;
+}
+
+bool Analyzer::isMemberAccessAllowed(Visibility visibility, StructInfo* definingClass) {
+    if (visibility == Visibility::Public) return true;
+    StructInfo* current = (currentThis && currentThis->type) ? currentThis->type->structInfo : nullptr;
+    if (visibility == Visibility::Private) {
+        return current && current == definingClass;
+    }
+    // Protected: visible in a subclass method, or anywhere in the declaring class's own file.
+    if (current && definingClass && current->isSubclassOf(definingClass)) return true;
+    return isLocalClass(definingClass);
+}
+
+void Analyzer::checkMemberAccess(const SyntaxNode& diagNode, const std::u16string& memberName,
+                                 Visibility visibility, StructInfo* definingClass) {
+    if (isMemberAccessAllowed(visibility, definingClass)) return;
+    std::string owner = definingClass ? asciiOf(definingClass->name) : std::string("its class");
+    if (visibility == Visibility::Private) {
+        errorAtNode(diagNode, "'" + asciiOf(memberName) + "' is private to class '" + owner +
+            "' and can only be accessed from inside '" + owner + "'");
+    } else {
+        errorAtNode(diagNode, "'" + asciiOf(memberName) + "' is protected to class '" + owner +
+            "' and can only be accessed from inside '" + owner +
+            "', a subclass of it, or the file where '" + owner + "' is declared");
+    }
 }
 
 Type* Analyzer::analyzeBinary(const ast::BinaryExpression& expr) {
@@ -1723,7 +1949,9 @@ Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
     if (!memberName) return typeCtx.getError();
     int idx = objT->structInfo->findFieldIndex(*memberName);
     if (idx >= 0) {
-        Type* fieldT = objT->structInfo->fields[idx].type;
+        const FieldInfo& fld = objT->structInfo->fields[idx];
+        checkMemberAccess(expr.node, *memberName, fld.visibility, fld.definingClass);
+        Type* fieldT = fld.type;
         if (fieldT && fieldT->isOptional() && currentScope) {
             ast::Expression whole{expr.node};
             if (auto path = buildNarrowingPath(whole)) {
@@ -1734,9 +1962,10 @@ Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
         }
         return fieldT;
     }
-    int midx = objT->structInfo->findMethodIndex(*memberName);
-    if (midx >= 0) {
-        analysis.setMethodSymbol(expr.node.greenNode(), objT->structInfo->methods[midx].symbol);
+    if (StructInfo* decl = objT->structInfo->classDeclaringMethod(*memberName)) {
+        const MethodInfo& mi = decl->methods[decl->findMethodIndex(*memberName)];
+        checkMemberAccess(expr.node, *memberName, mi.visibility, mi.definingClass);
+        analysis.setMethodSymbol(expr.node.greenNode(), mi.symbol);
         return typeCtx.getError();  // callee reference - not a value
     }
     errorAtNode(expr.node, "No field or method '" + asciiOf(*memberName) +
@@ -1780,7 +2009,9 @@ Type* Analyzer::analyzeSafeMember(const ast::SafeMemberExpression& expr) {
 
     int idx = inner->structInfo->findFieldIndex(*memberName);
     if (idx >= 0) {
-        Type* fieldT = inner->structInfo->fields[idx].type;
+        const FieldInfo& fld = inner->structInfo->fields[idx];
+        checkMemberAccess(expr.node, *memberName, fld.visibility, fld.definingClass);
+        Type* fieldT = fld.type;
         if (!isClassOrClassOptional(fieldT)) {
             errorAtNode(expr.node, "'?.' on '" + asciiOf(*memberName) +
                 "' is not yet supported because the field has type '" + fieldT->toString() +
@@ -1789,9 +2020,10 @@ Type* Analyzer::analyzeSafeMember(const ast::SafeMemberExpression& expr) {
         }
         return typeCtx.getOptional(fieldT);
     }
-    int midx = inner->structInfo->findMethodIndex(*memberName);
-    if (midx >= 0) {
-        analysis.setMethodSymbol(expr.node.greenNode(), inner->structInfo->methods[midx].symbol);
+    if (StructInfo* decl = inner->structInfo->classDeclaringMethod(*memberName)) {
+        const MethodInfo& mi = decl->methods[decl->findMethodIndex(*memberName)];
+        checkMemberAccess(expr.node, *memberName, mi.visibility, mi.definingClass);
+        analysis.setMethodSymbol(expr.node.greenNode(), mi.symbol);
         return typeCtx.getError();
     }
     errorAtNode(expr.node, "No field or method named '" + asciiOf(*memberName) +

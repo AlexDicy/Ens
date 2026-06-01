@@ -78,11 +78,24 @@ bool Type::assignableFrom(const Type* source) const {
     if (!source || source->isError() || isError()) return true;
     if (equals(source)) return true;
     if (source->widensTo(this)) return true;
+    // Class upcast: a derived class is assignable to any of its ancestors.
+    if (isClass() && source->isClass() && structInfo && source->structInfo &&
+        source->structInfo->isSubclassOf(structInfo)) {
+        return true;
+    }
     if (isOptional()) {
         if (source->isNull()) return true;
         if (inner && inner->equals(source)) return true;
         if (inner && source->widensTo(inner)) return true;
         if (source->isOptional() && inner && source->inner && inner->equals(source->inner)) return true;
+        // A nullable class accepts a derived class (or a nullable derived class).
+        if (inner && inner->isClass() && inner->structInfo) {
+            const Type* src = source->isOptional() ? source->inner : source;
+            if (src && src->isClass() && src->structInfo &&
+                src->structInfo->isSubclassOf(inner->structInfo)) {
+                return true;
+            }
+        }
     }
     return false;
 }

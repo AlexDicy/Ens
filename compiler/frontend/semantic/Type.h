@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -29,21 +30,37 @@ struct FieldInfo {
     int line = 0;
     int column = 0;
     const GreenElement* declaration = nullptr;
+    StructInfo* definingClass = nullptr;  // class/struct that declares this field (for visibility)
 };
+
+struct StructInfo;
 
 struct MethodInfo {
     std::u16string name;
     Symbol* symbol = nullptr;       // function symbol with paramTypes/returnType (no `this`)
     void* declaration = nullptr;    // FuncDecl* (kept void* to avoid AST include cycle)
     Visibility visibility = Visibility::Public;
+    bool isOverride = false;
+    bool isFinal = false;
+    bool isAbstract = false;
+    int vtableSlot = -1;            // >= 0 => dispatched virtually through the vtable
+    StructInfo* definingClass = nullptr;  // class that declares this method (for codegen mangling)
 };
 
 struct StructInfo {
     std::u16string name;
-    std::vector<FieldInfo> fields;
-    std::vector<MethodInfo> methods;
+    std::vector<FieldInfo> fields;   // for a class, base fields are flattened in first
+    std::vector<MethodInfo> methods; // methods are NOT flattened; walk baseInfo to inherit
     int line = 0;
     int column = 0;
+
+    // Inheritance (classes only; null for structs / no base).
+    StructInfo* baseInfo = nullptr;
+    int baseFieldCount = 0;          // count of leading `fields` inherited from baseInfo
+    int vtableSize = 0;
+    uint32_t typeId = 0;             // unique per class, for RTTI
+    bool isAbstract = false;
+    bool isFinal = false;
 
     int findFieldIndex(const std::u16string& fieldName) const {
         for (size_t i = 0; i < fields.size(); ++i) {
@@ -56,6 +73,20 @@ struct StructInfo {
             if (methods[i].name == methodName) return static_cast<int>(i);
         }
         return -1;
+    }
+    // True if this class is `other` or descends from it.
+    bool isSubclassOf(const StructInfo* other) const {
+        for (const StructInfo* s = this; s; s = s->baseInfo) {
+            if (s == other) return true;
+        }
+        return false;
+    }
+    // Nearest class in the chain (self first) that declares `methodName`, or null.
+    StructInfo* classDeclaringMethod(const std::u16string& methodName) {
+        for (StructInfo* s = this; s; s = s->baseInfo) {
+            if (s->findMethodIndex(methodName) >= 0) return s;
+        }
+        return nullptr;
     }
 };
 

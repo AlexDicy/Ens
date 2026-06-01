@@ -123,6 +123,7 @@ private:
     Type* analyzeLiteral(const ast::LiteralExpression& expr);
     Type* analyzeIdent(const ast::IdentExpression& expr);
     Type* analyzeThis(const ast::ThisExpression& expr);
+    Type* analyzeSuper(const ast::SuperExpression& expr);
     Type* analyzeBinary(const ast::BinaryExpression& expr);
     Type* analyzePrefix(const ast::PrefixExpression& expr);
     Type* analyzeCall(const ast::CallExpression& expr);
@@ -170,6 +171,11 @@ private:
     Type* lookupTypeByName(const std::u16string& qualifier, const std::u16string& name,
                            const SyntaxNode& diagNode);
     bool isLValue(const ast::Expression& expr) const;
+
+    bool isMemberAccessAllowed(Visibility visibility, StructInfo* definingClass);
+    bool isLocalClass(StructInfo* definingClass);
+    void checkMemberAccess(const SyntaxNode& diagNode, const std::u16string& memberName,
+                           Visibility visibility, StructInfo* definingClass);
 
     // True if `t` can be considered non-null without an initializer.
     bool isDefaultable(Type* t) const;
