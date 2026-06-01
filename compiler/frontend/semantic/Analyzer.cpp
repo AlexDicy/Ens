@@ -10,6 +10,8 @@
 // Sentinel for a method known to need a vtable slot before final indices are assigned.
 static constexpr int VTSLOT_PENDING = -2;
 
+static size_t requiredArgCount(Symbol* sym);
+
 static Visibility toSemanticVisibility(ast::Visibility v) {
     switch (v) {
         case ast::Visibility::Private:   return Visibility::Private;
@@ -1048,7 +1050,9 @@ void Analyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
 
     Symbol* prevFunction = currentFunction;
     Symbol* prevThis = currentThis;
+    bool prevSawSuper = sawSuperConstructorCall;
     currentFunction = info->resolvedSymbol;
+    sawSuperConstructorCall = false;
 
     pushScope();
 
@@ -1086,9 +1090,27 @@ void Analyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
         for (auto& s : body->statements()) analyzeStatement(s);
     }
 
+    // A constructor must chain to its base when the base has no zero-argument constructor.
+    if (receiverType && receiverType->structInfo && !sawSuperConstructorCall) {
+        StructInfo* cls = receiverType->structInfo;
+        bool isCtor = currentFunction && currentFunction->name == cls->name;
+        if (isCtor && cls->baseInfo) {
+            int bidx = cls->baseInfo->findMethodIndex(cls->baseInfo->name);
+            if (bidx >= 0) {
+                Symbol* baseCtor = cls->baseInfo->methods[bidx].symbol;
+                if (baseCtor && requiredArgCount(baseCtor) > 0) {
+                    errorAtNode(fn.node, "Constructor of '" + asciiOf(cls->name) +
+                        "' must call 'super(...)' because base class '" +
+                        asciiOf(cls->baseInfo->name) + "' has no zero-argument constructor");
+                }
+            }
+        }
+    }
+
     popScope();
     currentFunction = prevFunction;
     currentThis = prevThis;
+    sawSuperConstructorCall = prevSawSuper;
 }
 
 void Analyzer::analyzeImplicitConstructorAssignments(const ast::FuncDecl& fn) {
@@ -1766,6 +1788,50 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
         return typeCtx.getError();
     }
 
+    // Base-constructor chaining: super(args)
+    if (callee && callee->asSuper()) {
+        analyzeExpr(*callee);
+        sawSuperConstructorCall = true;
+        StructInfo* cls = (currentThis && currentThis->type) ? currentThis->type->structInfo : nullptr;
+        StructInfo* base = cls ? cls->baseInfo : nullptr;
+        bool inCtor = cls && currentFunction && currentFunction->name == cls->name;
+        if (!inCtor) {
+            errorAtNode(expr.node, "'super(...)' can only be called from a constructor");
+        }
+        if (!base) {
+            for (auto& a : args) analyzeExpr(a);
+            return typeCtx.getPrimitive(TypeKind::Void);
+        }
+        int cidx = base->findMethodIndex(base->name);
+        if (cidx < 0) {
+            if (!args.empty())
+                errorAtNode(expr.node, "Base class '" + asciiOf(base->name) +
+                    "' has no constructor, so 'super(...)' takes no arguments");
+            for (auto& a : args) analyzeExpr(a);
+            return typeCtx.getPrimitive(TypeKind::Void);
+        }
+        Symbol* ctorSym = base->methods[cidx].symbol;
+        analysis.setMethodSymbol(callee->node.greenNode(), ctorSym);
+        size_t req = requiredArgCount(ctorSym);
+        if (args.size() < req || args.size() > ctorSym->paramTypes.size()) {
+            errorAtNode(expr.node, "Base constructor '" + asciiOf(base->name) + "' expects " +
+                std::to_string(req) +
+                (req == ctorSym->paramTypes.size() ? "" : "-" + std::to_string(ctorSym->paramTypes.size())) +
+                " argument(s), got " + std::to_string(args.size()));
+        }
+        size_t n = std::min(args.size(), ctorSym->paramTypes.size());
+        for (size_t i = 0; i < n; ++i) {
+            Type* paramT = ctorSym->paramTypes[i];
+            Type* argT = analyzeExprAdapt(args[i], paramT);
+            if (!paramT->assignableFrom(argT)) {
+                errorAtNode(args[i].node, "Argument " + std::to_string(i + 1) +
+                    ": expected '" + paramT->toString() + "', got '" + argT->toString() + "'");
+            }
+        }
+        for (size_t i = n; i < args.size(); ++i) analyzeExpr(args[i]);
+        return typeCtx.getPrimitive(TypeKind::Void);
+    }
+
     // Function call: name(args)
     auto idCallee = callee ? callee->asIdent() : std::nullopt;
     if (!idCallee) {
@@ -2273,6 +2339,11 @@ Type* Analyzer::analyzeNew(const ast::NewExpression& expr) {
         return typeCtx.getError();
     }
     analysis.setType(expr.node.greenNode(), t);
+
+    if (t->structInfo && t->structInfo->isAbstract) {
+        errorAtNode(expr.node, "Cannot create an instance of abstract class '" +
+            asciiOf(*typeName) + "'; instantiate a concrete subclass instead");
+    }
 
     Symbol* ctor = nullptr;
     int ctorIdx = t->structInfo->findMethodIndex(t->structInfo->name);

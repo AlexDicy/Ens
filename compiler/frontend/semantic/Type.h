@@ -19,6 +19,7 @@ enum class TypeKind {
 
 class Type;
 class Symbol;
+struct StructInfo;
 
 enum class Visibility { Public, Private, Protected };
 
@@ -32,8 +33,6 @@ struct FieldInfo {
     const GreenElement* declaration = nullptr;
     StructInfo* definingClass = nullptr;  // class/struct that declares this field (for visibility)
 };
-
-struct StructInfo;
 
 struct MethodInfo {
     std::u16string name;

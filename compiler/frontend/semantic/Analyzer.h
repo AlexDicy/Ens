@@ -77,6 +77,7 @@ private:
     Scope* currentScope = nullptr;
     Symbol* currentFunction = nullptr;
     Symbol* currentThis = nullptr;
+    bool sawSuperConstructorCall = false;
 
     // Cached AST root after collectDeclarations so analyzeBodies doesn't have
     // to re-parse the source. Populated by collectDeclarations.
