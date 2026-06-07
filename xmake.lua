@@ -48,7 +48,8 @@ target("ens-codegen")
     add_includedirs("compiler/codegen", { public = true })
     add_deps("ens-frontend")
     add_packages("libllvm", "libxml2", { public = true })
-    add_links("LLVMCGData")
+    -- fix to have the flag appear later comapred to add_links(...) for GNU ld
+    add_ldflags("-lLLVMCGData", { public = true, force = true })
 
 
 target("ens")
