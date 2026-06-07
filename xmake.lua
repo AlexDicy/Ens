@@ -15,15 +15,52 @@ includes("scripts/xmake_**.lua")
 
 rule("link-llvm-libs")
     on_config(function (target)
-        if not is_plat("macosx") then return end
-        local tc = target:toolchain("llvm")
-        if not tc then return end
-        local sdkdir = tc:sdkdir()
-        if not sdkdir then return end
-        local libdir = path.join(sdkdir, "lib")
-        if os.isdir(libdir) then
-            target:add("linkdirs", libdir)
-            target:add("rpathdirs", libdir)
+        if is_plat("macosx") then
+            local tc = target:toolchain("llvm")
+            if tc then
+                local sdkdir = tc:sdkdir()
+                if sdkdir then
+                    local libdir = path.join(sdkdir, "lib")
+                    if os.isdir(libdir) then
+                        target:add("linkdirs", libdir)
+                        target:add("rpathdirs", libdir)
+                    end
+                end
+            end
+        end
+
+        -- bundle libllvm libraries skipping non-static dependencies
+        local function find_libllvm(t)
+            for _, pkg in ipairs(t:orderpkgs()) do
+                if pkg:name() == "libllvm" then return pkg end
+            end
+            for _, dep in ipairs(t:orderdeps()) do
+                local pkg = find_libllvm(dep)
+                if pkg then return pkg end
+            end
+        end
+        local pkg = find_libllvm(target)
+        if pkg then
+            local libdirs = table.wrap(pkg:get("linkdirs"))
+            local function shared_only(link)
+                local found_shared = false
+                for _, dir in ipairs(libdirs) do
+                    if os.isfile(path.join(dir, "lib" .. link .. ".a")) then
+                        return false
+                    end
+                    if os.isfile(path.join(dir, "lib" .. link .. ".so")) then
+                        found_shared = true
+                    end
+                end
+                return found_shared
+            end
+            local filtered = {}
+            for _, link in ipairs(table.wrap(pkg:get("links"))) do
+                if not shared_only(link) then
+                    table.insert(filtered, link)
+                end
+            end
+            pkg:set("links", filtered)
         end
     end)
 
