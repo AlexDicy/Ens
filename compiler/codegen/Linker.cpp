@@ -3,7 +3,9 @@
 #include "SdkStubs.h"
 #include "lld/Common/Driver.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/Program.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Host.h"
 
@@ -62,6 +64,51 @@ const std::string& extractEmbeddedSDK() {
     return cached;
 }
 
+std::string queryCCompiler(const llvm::StringRef flag) {
+    static const std::string cc = [] {
+        for (const char* name : {"cc", "clang", "gcc"}) {
+            if (auto path = llvm::sys::findProgramByName(name)) return *path;
+        }
+        return std::string();
+    }();
+    if (cc.empty()) return {};
+
+    llvm::SmallString<128> outFile;
+    if (llvm::sys::fs::createTemporaryFile("ens-cc", "txt", outFile)) {
+        return {};
+    }
+
+    const std::optional<llvm::StringRef> redirects[3] = {
+        std::nullopt, llvm::StringRef(outFile), std::nullopt};
+    const llvm::StringRef args[2] = {cc, flag};
+    const int rc = llvm::sys::ExecuteAndWait(cc, args, /*Env*/ std::nullopt, redirects);
+
+    std::string result;
+    if (rc == 0) {
+        if (auto buf = llvm::MemoryBuffer::getFile(outFile)) {
+            result = (*buf)->getBuffer().trim().str();
+        }
+    }
+    llvm::sys::fs::remove(outFile);
+    return result;
+}
+
+std::string dynamicLinkerFor(const std::string& triple) {
+    const std::string arch = archFromTriple(triple);
+    std::vector<const char*> candidates;
+    if (arch == "arm64" || arch == "aarch64") {
+        candidates = {"/lib/ld-linux-aarch64.so.1"};
+    } else if (arch == "x86_64") {
+        candidates = {"/lib64/ld-linux-x86-64.so.2", "/lib/ld-linux-x86-64.so.2"};
+    } else if (arch == "i386" || arch == "i686") {
+        candidates = {"/lib/ld-linux.so.2"};
+    }
+    for (const char* cand : candidates) {
+        if (llvm::sys::fs::exists(cand)) return cand;
+    }
+    return {};
+}
+
 std::vector<std::string> buildArgv(LinkerFlavor flavor,
                                     const std::string& triple,
                                     const std::vector<std::string>& objs,
@@ -108,15 +155,41 @@ std::vector<std::string> buildArgv(LinkerFlavor flavor,
             return args;
         }
         case LinkerFlavor::Elf:
-        default:
+        default: {
             args = {"ld.lld"};
-            for (auto& o : objs) args.push_back(o);
+
+            const std::string dynLinker = dynamicLinkerFor(triple);
+            if (!dynLinker.empty()) {
+                args.push_back("-dynamic-linker");
+                args.push_back(dynLinker);
+            }
+
             args.push_back("-o");
             args.push_back(exe);
+
+            // Link the C runtime to add an entry point and libc symbols
+            const std::string scrt1 = queryCCompiler("-print-file-name=Scrt1.o");
+            const std::string crti  = queryCCompiler("-print-file-name=crti.o");
+            const std::string crtn  = queryCCompiler("-print-file-name=crtn.o");
+            const bool haveCrt = !scrt1.empty() && scrt1 != "Scrt1.o";
+            if (haveCrt) {
+                args.push_back(scrt1);
+                if (!crti.empty() && crti != "crti.o") args.push_back(crti);
+                args.push_back("-L" + llvm::sys::path::parent_path(scrt1).str());
+            }
+
+            for (auto& o : objs) args.push_back(o);
+
             for (auto& lib : libraries) {
+                if (lib == "c") continue;  // libc is added explicitly below
                 args.push_back("-l" + lib);
             }
+            if (haveCrt) {
+                args.push_back("-lc");
+                if (!crtn.empty() && crtn != "crtn.o") args.push_back(crtn);
+            }
             return args;
+        }
     }
 }
 
