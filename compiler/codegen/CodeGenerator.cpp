@@ -54,6 +54,9 @@ struct CodeGenerator::Impl {
     std::unordered_map<::Type*, llvm::StructType*> structTypeCache;
     std::unordered_map<::Type*, llvm::DIType*> diStructTypeCache;
     std::unordered_map<::Type*, llvm::DIType*> diClassPointerCache;
+    std::unordered_map<StructInfo*, llvm::GlobalVariable*> descriptorCache;
+    llvm::StructType* typeDescriptorTy = nullptr;
+    uint32_t nextTypeId = 1;
     llvm::Function* currentFunction = nullptr;
     ::Type* currentReturnType = nullptr;
     llvm::DIScope* currentDIScope = nullptr;
@@ -431,6 +434,21 @@ struct CodeGenerator::Impl {
         values[sym] = func;
     }
 
+    static bool ctorHasExplicitSuper(const ast::FuncDecl& fn) {
+        auto body = fn.body();
+        if (!body) return false;
+        for (auto& s : body->statements()) {
+            auto es = s.asExpressionStmt();
+            if (!es) continue;
+            auto expr = es->expression();
+            if (expr && expr->asCall()) {
+                if (auto cal = expr->asCall()->callee())
+                    if (cal->asSuper()) return true;
+            }
+        }
+        return false;
+    }
+
     void emitFunction(const ast::FuncDecl& fn) {
         Symbol* sym = symbolOf(fn.node);
         if (!sym) return;
@@ -474,6 +492,24 @@ struct CodeGenerator::Impl {
             builder->CreateStore(&*argIter, thisAlloca);
             if (thisSym) values[thisSym] = thisAlloca;
             ++argIter;
+        }
+
+        // Construct the base subobject first when a constructor omits an explicit super(...)
+        // and the base has a zero-argument constructor.
+        if (receiver && receiver->structInfo && receiver->structInfo->baseInfo && thisSym &&
+            sym->name == receiver->structInfo->name && !ctorHasExplicitSuper(fn)) {
+            StructInfo* base = receiver->structInfo->baseInfo;
+            int bidx = base->findMethodIndex(base->name);
+            if (bidx >= 0) {
+                Symbol* baseCtor = base->methods[bidx].symbol;
+                if (baseCtor && baseCtor->paramTypes.empty()) {
+                    if (llvm::Function* bfn = getOrDeclareExternalFunction(baseCtor, nullptr)) {
+                        llvm::Value* thisVal = builder->CreateLoad(
+                            llvm::PointerType::get(ctx, 0), values[thisSym], "this");
+                        builder->CreateCall(bfn, { thisVal });
+                    }
+                }
+            }
         }
 
         cleanupStack.emplace_back();
@@ -971,6 +1007,7 @@ struct CodeGenerator::Impl {
         if (auto lit = e.asLiteral()) return emitLiteral(*lit);
         if (auto id = e.asIdent()) return emitIdent(*id);
         if (auto th = e.asThis()) return emitThis(*th);
+        if (auto su = e.asSuper()) return emitSuper(*su);
         if (auto b = e.asBinary()) return emitBinary(*b);
         if (auto p = e.asPrefix()) return emitPrefix(*p);
         if (auto c = e.asCall()) return emitCall(*c);
@@ -1120,6 +1157,22 @@ struct CodeGenerator::Impl {
             return nullptr;
         }
         return builder->CreateLoad(llvm::PointerType::get(ctx, 0), it->second, "this");
+    }
+
+    // `super` evaluates to the same object pointer as `this`; the base-vs-derived distinction
+    // is resolved statically at the call site (direct dispatch / base mangling).
+    llvm::Value* emitSuper(const ast::SuperExpression& e) {
+        Symbol* sym = symbolOf(e.node);
+        if (!sym) {
+            error(e.node.startOffset(), "Internal: 'super' not bound");
+            return nullptr;
+        }
+        auto it = values.find(sym);
+        if (it == values.end()) {
+            error(e.node.startOffset(), "Internal: 'super' has no LLVM value");
+            return nullptr;
+        }
+        return builder->CreateLoad(llvm::PointerType::get(ctx, 0), it->second, "super");
     }
 
     ::Type* commonNumericType(::Type* a, ::Type* b) {
@@ -1310,7 +1363,8 @@ struct CodeGenerator::Impl {
         if (auto* existing = module->getFunction("ens_alloc")) return existing;
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         auto* i64Ty = llvm::Type::getInt64Ty(ctx);
-        auto* fnTy = llvm::FunctionType::get(ptrTy, { i64Ty, ptrTy }, false);
+        auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(ptrTy, { i64Ty, ptrTy, ptrTy }, false);
         auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "ens_alloc", module.get());
         fn->addFnAttr(llvm::Attribute::NoUnwind);
 
@@ -1320,7 +1374,7 @@ struct CodeGenerator::Impl {
         auto* initBB = llvm::BasicBlock::Create(ctx, "alloc.init", fn);
 
         builder->SetInsertPoint(entry);
-        llvm::Value* total = builder->CreateAdd(fn->getArg(0), llvm::ConstantInt::get(i64Ty, 24));
+        llvm::Value* total = builder->CreateAdd(fn->getArg(0), llvm::ConstantInt::get(i64Ty, 32));
         llvm::Value* header = builder->CreateCall(getOrDeclareCalloc(),
             { llvm::ConstantInt::get(i64Ty, 1), total });
         llvm::Value* isNull = builder->CreateICmpEQ(header, llvm::ConstantPointerNull::get(ptrTy));
@@ -1330,13 +1384,13 @@ struct CodeGenerator::Impl {
         builder->CreateRet(llvm::ConstantPointerNull::get(ptrTy));
 
         builder->SetInsertPoint(initBB);
-        builder->CreateStore(llvm::ConstantInt::get(i64Ty, 1), header);
-        llvm::Value* dtorSlot = builder->CreateGEP(
-            llvm::Type::getInt8Ty(ctx), header, llvm::ConstantInt::get(i64Ty, 8));
-        builder->CreateStore(fn->getArg(1), dtorSlot);
-        // side_table slot at offset 16 stays null (calloc-zeroed); lazily set by ens_weak_init.
-        llvm::Value* payload = builder->CreateGEP(
-            llvm::Type::getInt8Ty(ctx), header, llvm::ConstantInt::get(i64Ty, 24));
+        builder->CreateStore(fn->getArg(2), header);  // typeDescriptor at offset 0
+        llvm::Value* rcSlot = builder->CreateGEP(i8Ty, header, llvm::ConstantInt::get(i64Ty, 8));
+        builder->CreateStore(llvm::ConstantInt::get(i64Ty, 1), rcSlot);  // refcount at offset 8
+        llvm::Value* dtorSlot = builder->CreateGEP(i8Ty, header, llvm::ConstantInt::get(i64Ty, 16));
+        builder->CreateStore(fn->getArg(1), dtorSlot);  // dtor at offset 16
+        // side_table slot at offset 24 stays null (calloc-zeroed); lazily set by ens_weak_init.
+        llvm::Value* payload = builder->CreateGEP(i8Ty, header, llvm::ConstantInt::get(i64Ty, 32));
         builder->CreateRet(payload);
 
         builder->restoreIP(savedIP);
@@ -1452,7 +1506,8 @@ struct CodeGenerator::Impl {
         builder->CreateBr(freeBB);
 
         builder->SetInsertPoint(freeBB);
-        builder->CreateCall(getOrDeclareFree(), { header });
+        llvm::Value* allocBase = builder->CreateGEP(i8Ty, obj, llvm::ConstantInt::getSigned(i64Ty, -32));
+        builder->CreateCall(getOrDeclareFree(), { allocBase });
         builder->CreateBr(doneBB);
 
         builder->SetInsertPoint(doneBB);
@@ -1661,6 +1716,84 @@ struct CodeGenerator::Impl {
 
         builder->restoreIP(savedIP);
         return fn;
+    }
+
+    // TypeDescriptor { const char* name; TypeDescriptor* parent; uint32_t id; void** vtable; }
+    llvm::StructType* getTypeDescriptorTy() {
+        if (typeDescriptorTy) return typeDescriptorTy;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32 = llvm::Type::getInt32Ty(ctx);
+        typeDescriptorTy = llvm::StructType::create(ctx, { ptrTy, ptrTy, i32, ptrTy }, "TypeDescriptor");
+        return typeDescriptorTy;
+    }
+
+    // The vtable global for a class: slot i holds the most-derived implementation visible to
+    // `si`. Returns null when the class introduces/inherits no virtual slots.
+    llvm::Constant* emitVtable(StructInfo* si) {
+        if (!si || si->vtableSize == 0) return nullptr;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        std::vector<llvm::Constant*> slots(si->vtableSize, llvm::ConstantPointerNull::get(ptrTy));
+        for (int slot = 0; slot < si->vtableSize; ++slot) {
+            for (StructInfo* s = si; s; s = s->baseInfo) {
+                bool found = false;
+                for (auto& mi : s->methods) {
+                    if (mi.vtableSlot != slot) continue;
+                    found = true;
+                    if (!mi.isAbstract && mi.symbol) {
+                        if (llvm::Function* f = getOrDeclareExternalFunction(mi.symbol, nullptr))
+                            slots[slot] = f;
+                    }
+                    break;
+                }
+                if (found) break;  // nearest (most-derived) declaration wins
+            }
+        }
+        auto* arrTy = llvm::ArrayType::get(ptrTy, si->vtableSize);
+        return new llvm::GlobalVariable(*module, arrTy, /*isConstant=*/true,
+            llvm::GlobalValue::InternalLinkage, llvm::ConstantArray::get(arrTy, slots),
+            "_vtable_" + asAscii(si->name));
+    }
+
+    llvm::GlobalVariable* getOrEmitTypeDescriptor(StructInfo* si) {
+        if (!si) return nullptr;
+        auto it = descriptorCache.find(si);
+        if (it != descriptorCache.end()) return it->second;
+
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32 = llvm::Type::getInt32Ty(ctx);
+        auto* descTy = getTypeDescriptorTy();
+        auto* gv = new llvm::GlobalVariable(*module, descTy, /*isConstant=*/true,
+            llvm::GlobalValue::InternalLinkage, nullptr, "_typedesc_" + asAscii(si->name));
+        descriptorCache[si] = gv;  // cache before recursing into parent
+
+        llvm::Constant* nameStr = builder->CreateGlobalString(asAscii(si->name),
+            "_typename_" + asAscii(si->name));
+        llvm::Constant* parent = si->baseInfo
+            ? static_cast<llvm::Constant*>(getOrEmitTypeDescriptor(si->baseInfo))
+            : static_cast<llvm::Constant*>(llvm::ConstantPointerNull::get(ptrTy));
+        if (si->typeId == 0) si->typeId = nextTypeId++;
+        llvm::Constant* vtable = emitVtable(si);
+        if (!vtable) vtable = llvm::ConstantPointerNull::get(ptrTy);
+        gv->setInitializer(llvm::ConstantStruct::get(descTy,
+            { nameStr, parent, llvm::ConstantInt::get(i32, si->typeId), vtable }));
+        return gv;
+    }
+
+    // Load the function pointer for virtual slot `slot` from an object's TypeDescriptor.
+    llvm::Value* loadVtableSlot(llvm::Value* obj, int slot) {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+        auto* i32 = llvm::Type::getInt32Ty(ctx);
+        auto* i64 = llvm::Type::getInt64Ty(ctx);
+        llvm::Value* descSlot = builder->CreateGEP(i8Ty, obj,
+            llvm::ConstantInt::getSigned(i64, -32), "desc.slot");
+        llvm::Value* desc = builder->CreateLoad(ptrTy, descSlot, "desc");
+        llvm::Value* vtSlot = builder->CreateGEP(getTypeDescriptorTy(), desc,
+            { llvm::ConstantInt::get(i32, 0), llvm::ConstantInt::get(i32, 3) }, "vtable.addr");
+        llvm::Value* vtable = builder->CreateLoad(ptrTy, vtSlot, "vtable");
+        llvm::Value* fnSlot = builder->CreateGEP(ptrTy, vtable,
+            llvm::ConstantInt::get(i64, slot), "fn.addr");
+        return builder->CreateLoad(ptrTy, fnSlot, "vfn");
     }
 
     llvm::Value* getOrEmitClassDtor(::Type* t) {
@@ -1951,8 +2084,9 @@ struct CodeGenerator::Impl {
 
         llvm::Value* dtor = getOrEmitArrayDtor(elem);
         if (!dtor) dtor = llvm::ConstantPointerNull::get(ptrTy);
+        // Arrays carry no TypeDescriptor (no RTTI), so pass null.
         llvm::Value* arrPtr = builder->CreateCall(
-            getOrDefineEnsAlloc(), { payloadBytes, dtor }, "arr.new");
+            getOrDefineEnsAlloc(), { payloadBytes, dtor, llvm::ConstantPointerNull::get(ptrTy) }, "arr.new");
         builder->CreateStore(sizeI64, arrayLengthAddr(arrPtr));
 
         // Run per-slot struct field defaults when the element type declares
@@ -2341,7 +2475,8 @@ struct CodeGenerator::Impl {
         auto* allocFn = getOrDefineEnsAlloc();
         llvm::Value* sizeArg = llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), sizeBytes);
         llvm::Value* dtorArg = getOrEmitClassDtor(t);
-        llvm::Value* heapPtr = builder->CreateCall(allocFn, {sizeArg, dtorArg},
+        llvm::Value* descArg = getOrEmitTypeDescriptor(t->structInfo);
+        llvm::Value* heapPtr = builder->CreateCall(allocFn, {sizeArg, dtorArg, descArg},
                                                     "new." + asAscii(t->structInfo->name));
 
         int ctorIdx = t->structInfo->findMethodIndex(t->structInfo->name);
@@ -2354,6 +2489,18 @@ struct CodeGenerator::Impl {
                 args.push_back(heapPtr);
                 if (!appendCallArgs(ctorSym, e.arguments(), args)) return nullptr;
                 builder->CreateCall(fn, args);
+            }
+        } else {
+            // No own constructor: run the nearest inherited zero-argument constructor.
+            for (StructInfo* base = t->structInfo->baseInfo; base; base = base->baseInfo) {
+                int bidx = base->findMethodIndex(base->name);
+                if (bidx < 0) continue;
+                Symbol* baseCtor = base->methods[bidx].symbol;
+                if (baseCtor && baseCtor->paramTypes.empty()) {
+                    if (llvm::Function* bfn = getOrDeclareExternalFunction(baseCtor, nullptr))
+                        builder->CreateCall(bfn, { heapPtr });
+                }
+                break;
             }
         }
         return heapPtr;
@@ -2379,6 +2526,21 @@ struct CodeGenerator::Impl {
 
     llvm::Value* emitCall(const ast::CallExpression& e) {
         auto callee = e.callee();
+
+        // Base-constructor chaining: super(args).
+        if (callee && callee->asSuper()) {
+            Symbol* ctorSym = methodSymbolOf(callee->node);
+            if (!ctorSym) return nullptr;  // base has no constructor: nothing to call
+            llvm::Value* thisPtr = emitSuper(*callee->asSuper());
+            llvm::Function* fn = getOrDeclareExternalFunction(ctorSym, nullptr);
+            if (!thisPtr || !fn) return nullptr;
+            std::vector<llvm::Value*> args;
+            args.push_back(thisPtr);
+            if (!appendCallArgs(ctorSym, e.arguments(), args)) return nullptr;
+            builder->CreateCall(fn, args);
+            return nullptr;
+        }
+
         if (callee && callee->asMember()) {
             auto member = *callee->asMember();
             Symbol* methodSym = methodSymbolOf(member.node);
@@ -2386,6 +2548,14 @@ struct CodeGenerator::Impl {
                 auto obj = member.object();
                 if (!obj) return nullptr;
                 ::Type* objType = typeOf(obj->node);
+                bool isSuper = obj->asSuper().has_value();
+                // A virtual call dispatches through the vtable, except `super.m()` which is
+                // always a direct call to the inherited implementation.
+                int vslot = -1;
+                if (!isSuper && objType && objType->structInfo) {
+                    if (StructInfo* decl = objType->structInfo->classDeclaringMethod(methodSym->name))
+                        vslot = decl->methods[decl->findMethodIndex(methodSym->name)].vtableSlot;
+                }
                 llvm::Function* fn = getOrDeclareExternalFunction(methodSym, objType);
                 if (!fn) {
                     error(e.node.startOffset(), "Internal: method has no LLVM function");
@@ -2398,6 +2568,10 @@ struct CodeGenerator::Impl {
                 std::vector<llvm::Value*> args;
                 args.push_back(receiver);
                 if (!appendCallArgs(methodSym, e.arguments(), args)) return nullptr;
+                if (vslot >= 0) {
+                    llvm::Value* fnPtr = loadVtableSlot(receiver, vslot);
+                    return builder->CreateCall(fn->getFunctionType(), fnPtr, args);
+                }
                 return builder->CreateCall(fn, args);
             }
         }

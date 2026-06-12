@@ -788,7 +788,7 @@ void Analyzer::resolveMethodParams(const ast::FuncDecl& fn, ::Type* receiverType
     auto fname = fn.nameText().value_or(std::u16string{});
     bool isCtor = receiverType && receiverType->structInfo && fname == receiverType->structInfo->name;
 
-    if (fn.isShorthand() && !isCtor) {
+    if (fn.isShorthand() && !isCtor && !fn.isAbstract()) {
         errorAtNode(fn.node, "Shorthand declaration ';' is only allowed on a constructor");
     }
 
@@ -1528,6 +1528,7 @@ Type* Analyzer::analyzeSuper(const ast::SuperExpression& expr) {
             "' because it has no base class");
         return typeCtx.getError();
     }
+    analysis.setSymbol(expr.node.greenNode(), currentThis);
     Type* baseT = typeCtx.lookupClass(modulePath_, cls->baseInfo->name);
     return baseT ? baseT : typeCtx.getError();
 }

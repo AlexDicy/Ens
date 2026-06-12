@@ -146,6 +146,8 @@ Visibility FuncDecl::visibility() const {
 std::optional<SyntaxNode> FuncDecl::nameToken() const {
     for (auto& c : node.children()) {
         if (isTrivia(c.kind()) || c.kind() == SyntaxKind::VisibilityModifier) continue;
+        if (c.kind() == SyntaxKind::KwOverride || c.kind() == SyntaxKind::KwFinal ||
+            c.kind() == SyntaxKind::KwAbstract) continue;  // skip method modifiers
         if (c.kind() == SyntaxKind::Identifier) return c;
         break;
     }

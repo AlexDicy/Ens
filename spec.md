@@ -80,6 +80,32 @@ class Animation<S: Shape + Comparable> {
     }
 }
 ```
+
+A class may extend one other class with `extends`. A subclass inherits the base class's fields and methods, and a value of a subclass may be used wherever the base class, or `Base?`, is expected. Arrays are not covariant: a `Derived[]` is not also a `Base[]`.
+
+```ens
+class Shape {
+    protected int sides;
+    Shape(this.sides = 0);
+    area() -> int { return 0; }
+}
+
+class Square extends Shape {
+    int side;
+    Square(int s) {
+        super(4);          // run the base constructor first
+        this.side = s;
+    }
+    override area() -> int { return this.side * this.side; }
+}
+```
+
+Methods are overridable by default. An override must be marked `override` and must match a method declared in a base class; this catches typos and accidental shadowing. Mark a method or a class `final` to forbid overriding or extending it.
+
+`super.method(...)` calls the base class's implementation, bypassing any override. A constructor may call `super(...)` as its first statement to run the base constructor; if it does not, the base class must be constructible with no arguments. `protected` members (see above) are reachable from subclasses.
+
+An `abstract class` cannot be instantiated. It may declare `abstract` methods (a signature with no body), that every concrete subclass must `override`.
+
 ---
 
 Imports are based on paths and qualified by default. Imports are file-local.
