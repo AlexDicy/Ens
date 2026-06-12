@@ -2588,6 +2588,11 @@ struct CodeGenerator::Impl {
                     return nullptr;
                 }
                 ::Type* innerType = recvType->inner;
+                int vslot = -1;
+                if (innerType && innerType->structInfo) {
+                    if (StructInfo* decl = innerType->structInfo->classDeclaringMethod(methodSym->name))
+                        vslot = decl->methods[decl->findMethodIndex(methodSym->name)].vtableSlot;
+                }
                 llvm::Function* fn = getOrDeclareExternalFunction(methodSym, innerType);
                 if (!fn) {
                     error(e.node.startOffset(), "Internal: method has no LLVM function");
@@ -2609,7 +2614,9 @@ struct CodeGenerator::Impl {
                 std::vector<llvm::Value*> args;
                 args.push_back(recv);
                 if (!appendCallArgs(methodSym, e.arguments(), args)) return nullptr;
-                llvm::Value* callRes = builder->CreateCall(fn, args);
+                llvm::Value* callRes = (vslot >= 0)
+                    ? builder->CreateCall(fn->getFunctionType(), loadVtableSlot(recv, vslot), args)
+                    : builder->CreateCall(fn, args);
                 llvm::BasicBlock* nonnullEnd = builder->GetInsertBlock();
                 builder->CreateBr(endBB);
 
