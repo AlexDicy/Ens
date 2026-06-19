@@ -478,6 +478,9 @@ struct CodeGenerator::Impl {
         if (receiver && receiver->structInfo) {
             mangled = asAscii(receiver->structInfo->name) + "_" + mangled;
         }
+        // A throwing top-level `main` is renamed; a compiler-emitted `main`
+        // wrapper handles the error slot and prints any escaping exception.
+        if (!receiver && sym->abiThrows && mangled == "main") mangled = "ens.main";
         auto* func = llvm::Function::Create(fnType, llvm::Function::ExternalLinkage, mangled, module.get());
         values[sym] = func;
     }
@@ -766,6 +769,50 @@ struct CodeGenerator::Impl {
         builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), currentCatchVarSlot);
         emitFullCleanup();
         emitReturnZero();
+    }
+
+    // Real entry point for a program whose `main` may throw: call the renamed
+    // user main with a root error slot; if an exception escapes, report it on
+    // stderr and exit 1.
+    void emitMainWrapper(Symbol* msym) {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* userMain = llvm::dyn_cast_or_null<llvm::Function>(
+            values.count(msym) ? values[msym] : nullptr);
+        if (!userMain) return;
+        bool retsVoid = !msym->returnType || msym->returnType->isVoid();
+
+        auto* wrapper = llvm::Function::Create(llvm::FunctionType::get(i32Ty, {}, false),
+            llvm::Function::ExternalLinkage, "main", module.get());
+        builder->SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", wrapper));
+        auto* slot = builder->CreateAlloca(ptrTy, nullptr, "err.slot");
+        builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), slot);
+        llvm::Value* r = builder->CreateCall(userMain, { slot });
+        llvm::Value* err = builder->CreateLoad(ptrTy, slot, "err");
+        llvm::Value* thrown = builder->CreateICmpNE(
+            err, llvm::ConstantPointerNull::get(ptrTy), "thrown");
+        auto* okBB = llvm::BasicBlock::Create(ctx, "ok", wrapper);
+        auto* errBB = llvm::BasicBlock::Create(ctx, "uncaught", wrapper);
+        builder->CreateCondBr(thrown, errBB, okBB);
+
+        builder->SetInsertPoint(okBB);
+        builder->CreateRet(retsVoid ? llvm::ConstantInt::get(i32Ty, 0) : r);
+
+        builder->SetInsertPoint(errBB);
+        llvm::Value* stderrF = getStderr();
+        auto* fputs = getOrDeclareFputs();
+        llvm::Value* desc = loadDescriptor(err);
+        llvm::Value* nameAddr = builder->CreateGEP(getTypeDescriptorTy(), desc,
+            { llvm::ConstantInt::get(i32Ty, 0), llvm::ConstantInt::get(i32Ty, 0) }, "name.addr");
+        llvm::Value* typeName = builder->CreateLoad(ptrTy, nameAddr, "type.name");
+        llvm::Value* msg = builder->CreateLoad(ptrTy, err, "exc.message");  // Error.message at offset 0
+        builder->CreateCall(fputs, { builder->CreateGlobalString("Unhandled exception ", ".uex.pfx"), stderrF });
+        builder->CreateCall(fputs, { typeName, stderrF });
+        builder->CreateCall(fputs, { builder->CreateGlobalString(": ", ".uex.sep"), stderrF });
+        builder->CreateCall(fputs, { msg, stderrF });
+        builder->CreateCall(fputs, { builder->CreateGlobalString("\n", ".uex.nl"), stderrF });
+        builder->CreateCall(getOrDefineEnsRelease(), { err });
+        builder->CreateRet(llvm::ConstantInt::get(i32Ty, 1));
     }
 
     // ===== Statements =====
@@ -1518,6 +1565,32 @@ struct CodeGenerator::Impl {
             llvm::Type::getInt32Ty(ctx),
             { llvm::PointerType::get(ctx, 0) }, false);
         return llvm::Function::Create(ty, llvm::Function::ExternalLinkage, "puts", module.get());
+    }
+
+    llvm::Function* getOrDeclareFputs() {
+        if (auto* existing = module->getFunction("fputs")) return existing;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* ty = llvm::FunctionType::get(llvm::Type::getInt32Ty(ctx), { ptrTy, ptrTy }, false);
+        return llvm::Function::Create(ty, llvm::Function::ExternalLinkage, "fputs", module.get());
+    }
+
+    // The platform's stderr FILE*. glibc/ELF exposes `stderr`; macOS `__stderrp`;
+    // Windows routes through __acrt_iob_func(2).
+    llvm::Value* getStderr() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        const llvm::Triple& triple = module->getTargetTriple();
+        if (triple.isOSWindows()) {
+            auto* fnTy = llvm::FunctionType::get(ptrTy, { llvm::Type::getInt32Ty(ctx) }, false);
+            llvm::Function* iob = module->getFunction("__acrt_iob_func");
+            if (!iob) iob = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage,
+                "__acrt_iob_func", module.get());
+            return builder->CreateCall(iob, { llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 2) });
+        }
+        const char* name = triple.isOSDarwin() ? "__stderrp" : "stderr";
+        llvm::GlobalVariable* gv = module->getGlobalVariable(name);
+        if (!gv) gv = new llvm::GlobalVariable(*module, ptrTy, /*isConstant=*/false,
+            llvm::GlobalValue::ExternalLinkage, nullptr, name);
+        return builder->CreateLoad(ptrTy, gv, "stderr");
     }
 
     llvm::Function* getOrDeclareCalloc() {
@@ -3348,6 +3421,14 @@ struct CodeGenerator::Impl {
             if (Type* t = analysis.typeOf(cd.node.greenNode())) {
                 if (t->structInfo) getOrEmitTypeDescriptor(t->structInfo);
             }
+        }
+
+        // A throwing `main` was renamed to `ens.main`; emit the real entry point.
+        for (auto& fn : sf->functions()) {
+            if (fn.nameText().value_or(std::u16string{}) != u"main") continue;
+            Symbol* msym = symbolOf(fn.node);
+            if (msym && msym->abiThrows) emitMainWrapper(msym);
+            break;
         }
 
         if (debugEnabled && diBuilder) diBuilder->finalize();
