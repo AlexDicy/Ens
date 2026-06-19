@@ -39,8 +39,12 @@ public:
     void analyze(const SyntaxNode& sourceFileRoot);
 
     // Multi-file pipeline: each driver step runs once per module before the
-    // next step starts.
+    // next step starts. `collectDeclarations` = registerNames + resolveSignatures;
+    // the driver splits them so imports are bound between the two, letting
+    // signatures, field types, and base classes name imported types.
     void collectDeclarations(const SyntaxNode& sourceFileRoot);
+    void registerNames(const SyntaxNode& sourceFileRoot);
+    void resolveSignatures();
     void bindImports(const ModuleResolver& resolver);
     void analyzeBodies();
 

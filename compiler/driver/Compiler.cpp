@@ -325,16 +325,8 @@ bool runMultiModuleAnalysis(std::vector<std::unique_ptr<Module>>& modules,
         m->analyzer = std::make_unique<Analyzer>(*m->source, *m->sink, sharedCtx, m->modulePath);
     }
 
-    Module* prelude = nullptr;
-    for (auto& m : modules) {
-        if (m->modulePath == std::u16string(kPreludeModulePath)) { prelude = m.get(); break; }
-    }
-    if (prelude) prelude->analyzer->collectDeclarations(*prelude->rootNode);
+    for (auto& m : modules) m->analyzer->registerNames(*m->rootNode);
     for (auto& m : modules) m->analyzer->importPrelude();
-    for (auto& m : modules) {
-        if (m.get() == prelude) continue;
-        m->analyzer->collectDeclarations(*m->rootNode);
-    }
 
     ModuleResolver resolver = [&](const std::u16string& path) -> const Analyzer* {
         auto it = byPath.find(path);
@@ -343,6 +335,7 @@ bool runMultiModuleAnalysis(std::vector<std::unique_ptr<Module>>& modules,
     };
     for (auto& m : modules) m->analyzer->bindImports(resolver);
 
+    for (auto& m : modules) m->analyzer->resolveSignatures();
     for (auto& m : modules) m->analyzer->analyzeBodies();
 
     // Checked-exception throws-set fixpoint (a correctness pass: runs before the

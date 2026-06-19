@@ -312,6 +312,11 @@ void Analyzer::analyze(const SyntaxNode& root) {
 }
 
 void Analyzer::collectDeclarations(const SyntaxNode& root) {
+    registerNames(root);
+    resolveSignatures();
+}
+
+void Analyzer::registerNames(const SyntaxNode& root) {
     auto sf = ast::SourceFile::cast(root);
     if (!sf) return;
     astRoot = sf;
@@ -319,10 +324,16 @@ void Analyzer::collectDeclarations(const SyntaxNode& root) {
     registerStructNames(*sf);
     registerClassNames(*sf);
     registerExternalTypeNames(*sf);
-    collectStructs(*sf);
-    collectClasses(*sf);
-    collectFunctions(*sf);
-    collectExternalFunctions(*sf);
+}
+
+void Analyzer::resolveSignatures() {
+    if (!astRoot) return;
+    auto& sf = *astRoot;
+
+    collectStructs(sf);
+    collectClasses(sf);
+    collectFunctions(sf);
+    collectExternalFunctions(sf);
 }
 
 void Analyzer::registerExternalTypeNames(const ast::SourceFile& file) {
