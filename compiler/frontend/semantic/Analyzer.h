@@ -121,6 +121,8 @@ private:
     void resolveMethodParams(const ast::FuncDecl& fn, ::Type* receiverType, Symbol* sym);
     void resolveFunctionParams(const ast::FuncDecl& fn, Symbol* sym);
     void checkThrowsClausePlacement(const ast::FuncDecl& fn, bool isOverridable, bool isConstructor);
+    void checkFieldMethodCollision(StructInfo* owner, const std::u16string& methodName,
+                                   bool isConstructor, const SyntaxNode& diag);
     void resolveDeclaredThrows(const ast::FuncDecl& fn, Symbol* sym);
     void checkParameterDefaults(const ast::FuncDecl& fn);
     void checkFieldDefaults(const ast::StructDecl& sd);

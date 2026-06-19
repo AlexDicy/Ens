@@ -604,8 +604,9 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             sym->declaredThrows = m.isThrows();
             sym->abiThrows = m.isThrows();  // structs have no inheritance
             sym->methodOwner = t->structInfo;
-            checkThrowsClausePlacement(m, /*isOverridable=*/false,
-                                       /*isConstructor=*/mname == t->structInfo->name);
+            bool isCtor = (mname == t->structInfo->name);
+            checkFieldMethodCollision(t->structInfo, mname, isCtor, m.node);
+            checkThrowsClausePlacement(m, /*isOverridable=*/false, /*isConstructor=*/isCtor);
             resolveMethodParams(m, t, sym);
             analysis.setSymbol(m.node.greenNode(), sym);
             analysis.setReceiver(m.node.greenNode(), t);
@@ -774,6 +775,7 @@ void Analyzer::collectClasses(const ast::SourceFile& file) {
             // Validate (base methods already collected via topological order).
             bool isCtor = (mname == si->name);
             bool overridable = !isCtor && !m.isFinal() && !si->isFinal;
+            checkFieldMethodCollision(si, mname, isCtor, m.node);
             checkThrowsClausePlacement(m, overridable, isCtor);
             if (isCtor) {
                 if (m.isOverride() || m.isAbstract())
@@ -964,6 +966,16 @@ void Analyzer::resolveFunctionParams(const ast::FuncDecl& fn, Symbol* sym) {
                 "' has no default but follows a defaulted parameter");
         }
     }
+}
+
+void Analyzer::checkFieldMethodCollision(StructInfo* owner, const std::u16string& methodName,
+                                         bool isConstructor, const SyntaxNode& diag) {
+    if (isConstructor || !owner) return;
+    int fidx = owner->findFieldIndex(methodName);
+    if (fidx < 0) return;
+    StructInfo* fieldOwner = owner->fields[fidx].definingClass ? owner->fields[fidx].definingClass : owner;
+    errorAtNode(diag, "'" + asciiOf(methodName) + "' is already declared as a field of '" +
+        asciiOf(fieldOwner->name) + "'; a field and a method cannot share a name.");
 }
 
 void Analyzer::checkThrowsClausePlacement(const ast::FuncDecl& fn, bool isOverridable,
