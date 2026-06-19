@@ -603,6 +603,7 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             sym->funcDeclCst = m.node.greenNode();
             sym->declaredThrows = m.isThrows();
             sym->abiThrows = m.isThrows();  // structs have no inheritance
+            sym->methodOwner = t->structInfo;
             checkThrowsClausePlacement(m, /*isOverridable=*/false,
                                        /*isConstructor=*/mname == t->structInfo->name);
             resolveMethodParams(m, t, sym);
@@ -754,6 +755,7 @@ void Analyzer::collectClasses(const ast::SourceFile& file) {
             sym->returnType = retType;
             sym->funcDeclCst = m.node.greenNode();
             sym->declaredThrows = m.isThrows();
+            sym->methodOwner = si;
             resolveMethodParams(m, t, sym);
             analysis.setSymbol(m.node.greenNode(), sym);
             analysis.setReceiver(m.node.greenNode(), t);

@@ -409,7 +409,7 @@ bool emitModule(Module& module,
                 const std::string& moduleName,
                 const fs::path& objectPath) {
     CodeGenerator codegen(moduleName, module.source->getFilename(),
-                          *module.source, module.analyzer->result());
+                          *module.source, module.analyzer->result(), module.modulePath);
     if (!codegen.generate(*module.rootNode)) {
         for (const auto& d : codegen.getDiagnostics()) d.print(*module.source, std::cerr);
         return false;
@@ -469,7 +469,7 @@ bool Compiler::compile(const fs::path& source,
         for (auto& m : modules) {
             CodeGenerator codegen("ens_" + sanitizeForFilename(m->modulePath),
                                   m->source->getFilename(),
-                                  *m->source, m->analyzer->result());
+                                  *m->source, m->analyzer->result(), m->modulePath);
             if (!codegen.generate(*m->rootNode)) {
                 for (const auto& d : codegen.getDiagnostics()) d.print(*m->source, std::cerr);
                 return false;

@@ -13,7 +13,8 @@ public:
     CodeGenerator(std::string moduleName,
                   std::string sourceFilename,
                   const SourceFile& sourceFile,
-                  const AnalysisResult& analysis);
+                  const AnalysisResult& analysis,
+                  std::u16string modulePath = u"");
     ~CodeGenerator();
 
     bool generate(const SyntaxNode& sourceFileRoot);

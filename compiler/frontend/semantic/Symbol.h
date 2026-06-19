@@ -41,6 +41,8 @@ public:
     std::vector<bool> paramIsOut;
     std::u16string libraryName;
 
+    StructInfo* methodOwner = nullptr;
+
     ParamEscapeInfo escapeInfo;
 
     // escape/reassignment tracking for variables and parameters.

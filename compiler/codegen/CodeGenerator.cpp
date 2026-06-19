@@ -38,6 +38,29 @@ static std::string asAscii(std::u16string_view s) {
     return r;
 }
 
+static std::string sanitizeModulePath(std::u16string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char16_t c : s) {
+        bool ok = (c >= u'a' && c <= u'z') || (c >= u'A' && c <= u'Z') ||
+                  (c >= u'0' && c <= u'9') || c == u'_' || c == u'.';
+        out.push_back(ok ? static_cast<char>(c) : '_');
+    }
+    return out;
+}
+
+// Globally-stable descriptor symbol name, qualified by the defining module so a
+// class caught in one module and defined in another resolve to one address.
+static std::string descriptorSymbolName(StructInfo* si) {
+    return "_typedesc_" + sanitizeModulePath(si->modulePath) + "_" + asAscii(si->name);
+}
+
+static uint32_t fnv1a32(const std::string& s) {
+    uint32_t h = 2166136261u;
+    for (unsigned char c : s) { h ^= c; h *= 16777619u; }
+    return h ? h : 1u;
+}
+
 struct CodeGenerator::Impl {
     std::string moduleName;
     std::string sourceFilename;
@@ -73,15 +96,37 @@ struct CodeGenerator::Impl {
     std::vector<std::vector<OwnedLocal>> cleanupStack;
     std::unordered_set<Symbol*> byPointerParams;
 
+    // === Checked-exception lowering state (reset per function) ===
+    // Address of the caller's error slot (trailing param) when this function may throw.
+    llvm::Value* incomingErrorSlot = nullptr;
+    // A function with catch clauses owns a local slot the body writes into; it is
+    // consumed by the catch-dispatch block. Null when the function has no catches.
+    llvm::Value* localErrorSlot = nullptr;
+    llvm::BasicBlock* catchDispatchBB = nullptr;
+    // Prefix of cleanupStack[0] holding param copies; catch clauses see params but
+    // not body locals, so unwinding into dispatch keeps this prefix alive.
+    size_t paramCleanupWatermark = 0;
+    bool currentHasCatch = false;
+    // Where a throw / propagating call writes the error, and whether the error
+    // path branches to catch dispatch (vs. cleanup-and-return to the caller).
+    llvm::Value* throwTargetSlot = nullptr;
+    bool unwindToDispatch = false;
+    // The alloca holding the in-flight exception while emitting a catch body
+    // (used by `rethrow`); null outside catch bodies.
+    llvm::Value* currentCatchVarSlot = nullptr;
+
     struct DefaultInitContext {
         ::Type* structType;
         llvm::Value* basePtr;
     };
     std::vector<DefaultInitContext> defaultInitStack;
 
-    Impl(std::string mn, std::string sf, const SourceFile& src, const AnalysisResult& an)
+    std::u16string modulePath;
+
+    Impl(std::string mn, std::string sf, const SourceFile& src, const AnalysisResult& an,
+         std::u16string mp)
         : moduleName(std::move(mn)), sourceFilename(std::move(sf)),
-          sourceFile(src), analysis(an) {
+          sourceFile(src), analysis(an), modulePath(std::move(mp)) {
         module = std::make_unique<llvm::Module>(moduleName, ctx);
         module->setSourceFileName(sourceFilename);
         builder = std::make_unique<llvm::IRBuilder<>>(ctx);
@@ -359,13 +404,16 @@ struct CodeGenerator::Impl {
         return true;
     }
 
-    llvm::Function* getOrDeclareExternalFunction(Symbol* sym, ::Type* receiver) {
+    llvm::Function* getOrDeclareExternalFunction(Symbol* sym, ::Type* /*receiver*/) {
         auto it = values.find(sym);
         if (it != values.end()) return llvm::cast<llvm::Function>(it->second);
         if (!sym) return nullptr;
 
+        // A method/constructor takes `this` and is mangled by its owning class,
+        // independent of the static receiver, so identity holds across modules.
+        StructInfo* owner = sym->methodOwner;
         std::vector<llvm::Type*> paramTypes;
-        if (receiver) paramTypes.push_back(llvm::PointerType::get(ctx, 0));
+        if (owner) paramTypes.push_back(llvm::PointerType::get(ctx, 0));
         for (size_t i = 0; i < sym->paramTypes.size(); ++i) {
             auto* pt = sym->paramTypes[i];
             if (isUnsupportedType(pt)) return nullptr;
@@ -379,13 +427,12 @@ struct CodeGenerator::Impl {
         if (sym->returnType && !sym->returnType->isVoid() && isUnsupportedType(sym->returnType)) {
             return nullptr;
         }
+        if (sym->abiThrows && !sym->isExternal) paramTypes.push_back(llvm::PointerType::get(ctx, 0));
         llvm::Type* retType = mapType(sym->returnType);
         auto* fnType = llvm::FunctionType::get(retType, paramTypes, false);
 
         std::string mangled = asAscii(sym->name);
-        if (receiver && receiver->structInfo) {
-            mangled = asAscii(receiver->structInfo->name) + "_" + mangled;
-        }
+        if (owner) mangled = asAscii(owner->name) + "_" + mangled;
 
         if (auto* existing = module->getFunction(mangled)) {
             values[sym] = existing;
@@ -423,6 +470,7 @@ struct CodeGenerator::Impl {
                   "Function '" + asAscii(fname) + "' has unsupported return type '" + sym->returnType->toString() + "'");
             return;
         }
+        if (sym->abiThrows && !sym->isExternal) paramTypes.push_back(llvm::PointerType::get(ctx, 0));
         llvm::Type* retType = mapType(sym->returnType);
         auto* fnType = llvm::FunctionType::get(retType, paramTypes, false);
 
@@ -456,6 +504,11 @@ struct CodeGenerator::Impl {
         if (it == values.end()) return;
 
         byPointerParams.clear();
+        incomingErrorSlot = nullptr;
+        localErrorSlot = nullptr;
+        catchDispatchBB = nullptr;
+        currentHasCatch = !fn.catchClauses().empty();
+        paramCleanupWatermark = 0;
         currentFunction = llvm::cast<llvm::Function>(it->second);
         currentReturnType = sym->returnType;
         auto* entry = llvm::BasicBlock::Create(ctx, "entry", currentFunction);
@@ -551,6 +604,26 @@ struct CodeGenerator::Impl {
             }
         }
 
+        // The trailing error-slot parameter, then the watermark separating param
+        // copies (live for catch clauses) from body locals.
+        if (sym->abiThrows && argIter != argEnd) {
+            argIter->setName("err.slot.in");
+            incomingErrorSlot = &*argIter;
+            ++argIter;
+        }
+        paramCleanupWatermark = cleanupStack.back().size();
+        if (currentHasCatch) {
+            auto* ptrTy = llvm::PointerType::get(ctx, 0);
+            localErrorSlot = createEntryAlloca(currentFunction, ptrTy, "err.slot");
+            builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), localErrorSlot);
+            catchDispatchBB = llvm::BasicBlock::Create(ctx, "catch.dispatch", currentFunction);
+            throwTargetSlot = localErrorSlot;
+            unwindToDispatch = true;
+        } else {
+            throwTargetSlot = incomingErrorSlot;
+            unwindToDispatch = false;
+        }
+
         // Implicit constructor assignments for `this.field` parameters.
         if (receiver && receiver->structInfo) {
             for (size_t i = 0; i < params.size(); ++i) {
@@ -588,14 +661,111 @@ struct CodeGenerator::Impl {
         if (!builder->GetInsertBlock()->getTerminator()) {
             emitFrameCleanup(cleanupStack.back());
             if (currentFunction->getReturnType()->isVoidTy()) builder->CreateRetVoid();
+            else if (currentHasCatch) emitReturnZero();
             else builder->CreateUnreachable();
         }
+
+        if (currentHasCatch) emitCatchDispatch(fn);
         cleanupStack.pop_back();
 
         if (debugEnabled && diBuilder && sp) diBuilder->finalizeSubprogram(sp);
         currentDIScope = prevScope;
         currentFunction = nullptr;
         currentReturnType = nullptr;
+    }
+
+    // Walk the thrown object's TypeDescriptor chain against each clause in order;
+    // a match binds the object into an owned catch variable and runs the clause.
+    void emitCatchDispatch(const ast::FuncDecl& fn) {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        builder->SetInsertPoint(catchDispatchBB);
+        // Body locals were released at each unwind edge; drop their stale entries.
+        if (cleanupStack.back().size() > paramCleanupWatermark)
+            cleanupStack.back().resize(paramCleanupWatermark);
+
+        llvm::Value* exc = builder->CreateLoad(ptrTy, localErrorSlot, "exc");
+        builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), localErrorSlot);
+        llvm::Value* desc = loadDescriptor(exc);
+        auto* typeIs = getOrDefineEnsTypeIs();
+
+        auto clauses = fn.catchClauses();
+        for (auto& cc : clauses) {
+            ::Type* ct = cc.typeReference()
+                ? analysis.typeOf(cc.typeReference()->node.greenNode()) : nullptr;
+            StructInfo* csi = (ct && ct->structInfo) ? ct->structInfo : nullptr;
+            auto* bodyBB = llvm::BasicBlock::Create(ctx, "catch.body", currentFunction);
+            auto* nextBB = llvm::BasicBlock::Create(ctx, "catch.next", currentFunction);
+            llvm::Value* match = csi
+                ? static_cast<llvm::Value*>(builder->CreateCall(typeIs,
+                      { desc, getOrEmitTypeDescriptor(csi) }, "match"))
+                : static_cast<llvm::Value*>(llvm::ConstantInt::getFalse(ctx));
+            builder->CreateCondBr(match, bodyBB, nextBB);
+
+            builder->SetInsertPoint(bodyBB);
+            Symbol* var = nullptr;
+            if (auto* info = analysis.find(cc.node.greenNode())) var = info->resolvedSymbol;
+            auto* varSlot = createEntryAlloca(currentFunction, ptrTy, "catch.var");
+            builder->CreateStore(exc, varSlot);
+            if (var) values[var] = varSlot;
+            cleanupStack.emplace_back();
+            cleanupStack.back().push_back({ varSlot, var ? var->type : ct });
+
+            llvm::Value* prevTarget = throwTargetSlot;
+            bool prevDispatch = unwindToDispatch;
+            llvm::Value* prevCatchVar = currentCatchVarSlot;
+            throwTargetSlot = incomingErrorSlot;
+            unwindToDispatch = false;
+            currentCatchVarSlot = varSlot;
+            if (auto cb = cc.body()) {
+                for (auto& s : cb->statements()) {
+                    emitStatement(s);
+                    if (builder->GetInsertBlock()->getTerminator()) break;
+                }
+            }
+            if (!builder->GetInsertBlock()->getTerminator()) {
+                emitFrameCleanup(cleanupStack.back());            // catch variable
+                emitFrameCleanupFrom(cleanupStack.front(), 0);    // parameter copies
+                emitReturnZero();
+            }
+            throwTargetSlot = prevTarget;
+            unwindToDispatch = prevDispatch;
+            currentCatchVarSlot = prevCatchVar;
+            cleanupStack.pop_back();
+
+            builder->SetInsertPoint(nextBB);
+        }
+
+        // No clause matched: propagate if the function may throw, else unreachable.
+        if (incomingErrorSlot) {
+            builder->CreateStore(exc, incomingErrorSlot);
+            emitFullCleanup();
+            emitReturnZero();
+        } else {
+            builder->CreateUnreachable();
+        }
+    }
+
+    void emitThrowStmt(const ast::ThrowStatement& s) {
+        auto value = s.value();
+        if (!value || !throwTargetSlot) return;
+        bool borrowed = !expressionProducesOwnedRef(*value);
+        llvm::Value* v = emitExpr(*value);
+        if (!v) return;
+        if (borrowed) emitRetain(v);
+        builder->CreateStore(v, throwTargetSlot);  // also the future stack-trace hook
+        emitErrorUnwind();
+    }
+
+    void emitRethrowStmt() {
+        if (!currentCatchVarSlot || !incomingErrorSlot) return;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        llvm::Value* obj = builder->CreateLoad(ptrTy, currentCatchVarSlot, "rethrow.obj");
+        builder->CreateStore(obj, incomingErrorSlot);
+        // Null the catch variable so the upcoming cleanup does not release the
+        // object we are re-propagating (ens_release(null) is a no-op).
+        builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), currentCatchVarSlot);
+        emitFullCleanup();
+        emitReturnZero();
     }
 
     // ===== Statements =====
@@ -608,6 +778,8 @@ struct CodeGenerator::Impl {
         if (const auto i = s.asIf()) { emitIfStmt(*i); return; }
         if (const auto w = s.asWhile()) { emitWhileStmt(*w); return; }
         if (const auto r = s.asReturn()) { emitReturnStmt(*r); return; }
+        if (const auto th = s.asThrow()) { emitThrowStmt(*th); return; }
+        if (s.asRethrow()) { emitRethrowStmt(); return; }
         if (const auto e = s.asExpressionStmt()) {
             if (const auto expr = e->expression()) emitExpr(*expr);
         }
@@ -1019,6 +1191,12 @@ struct CodeGenerator::Impl {
         if (auto a = e.asAssign()) return emitAssign(*a);
         if (auto t = e.asTernary()) return emitTernary(*t);
         if (auto n = e.asNew()) return emitNew(*n);
+        if (auto tr = e.asTry()) {
+            // `try` is transparent at runtime; the post-call check is keyed off
+            // the callee's abiThrows, not the marker.
+            if (auto operand = tr->operand()) return emitExpr(*operand);
+            return nullptr;
+        }
         if (auto pr = e.asParen()) {
             if (auto inner = pr->inner()) return emitExpr(*inner);
             return nullptr;
@@ -1762,16 +1940,21 @@ struct CodeGenerator::Impl {
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         auto* i32 = llvm::Type::getInt32Ty(ctx);
         auto* descTy = getTypeDescriptorTy();
+        std::string symName = descriptorSymbolName(si);
+
+        // Each class's descriptor is defined once, in its own module; other
+        // modules reference it as an external so pointer identity holds globally.
         auto* gv = new llvm::GlobalVariable(*module, descTy, /*isConstant=*/true,
-            llvm::GlobalValue::InternalLinkage, nullptr, "_typedesc_" + asAscii(si->name));
+            llvm::GlobalValue::ExternalLinkage, nullptr, symName);
         descriptorCache[si] = gv;  // cache before recursing into parent
+        if (si->modulePath != modulePath) return gv;  // external declaration only
 
         llvm::Constant* nameStr = builder->CreateGlobalString(asAscii(si->name),
-            "_typename_" + asAscii(si->name));
+            "_typename_" + symName);
         llvm::Constant* parent = si->baseInfo
             ? static_cast<llvm::Constant*>(getOrEmitTypeDescriptor(si->baseInfo))
             : static_cast<llvm::Constant*>(llvm::ConstantPointerNull::get(ptrTy));
-        if (si->typeId == 0) si->typeId = nextTypeId++;
+        si->typeId = fnv1a32(symName);
         llvm::Constant* vtable = emitVtable(si);
         if (!vtable) vtable = llvm::ConstantPointerNull::get(ptrTy);
         gv->setInitializer(llvm::ConstantStruct::get(descTy,
@@ -2349,33 +2532,137 @@ struct CodeGenerator::Impl {
         }
     }
 
-    void emitFrameCleanup(const std::vector<OwnedLocal>& frame) {
-        if (frame.empty()) return;
+    // Release frame entries [from, end) in reverse order.
+    void emitFrameCleanupFrom(const std::vector<OwnedLocal>& frame, size_t from) {
+        if (from >= frame.size()) return;
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         auto* releaseFn = getOrDefineEnsRelease();
-        for (auto it = frame.rbegin(); it != frame.rend(); ++it) {
-            if (it->isStackArray) {
-                if (!it->type || !it->type->isArray() || !it->type->inner) continue;
-                ::Type* elem = it->type->inner;
+        for (size_t i = frame.size(); i > from; --i) {
+            const OwnedLocal& ol = frame[i - 1];
+            if (ol.isStackArray) {
+                if (!ol.type || !ol.type->isArray() || !ol.type->inner) continue;
+                ::Type* elem = ol.type->inner;
                 if (!isReferenceType(elem) && !structHasClassFields(elem)) continue;
-                llvm::Value* arrPtr = builder->CreateLoad(ptrTy, it->alloca);
+                llvm::Value* arrPtr = builder->CreateLoad(ptrTy, ol.alloca);
                 llvm::Value* dtor = getOrEmitArrayDtor(elem);
                 if (auto* dtorFn = llvm::dyn_cast<llvm::Function>(dtor)) {
                     builder->CreateCall(dtorFn, { arrPtr });
                 }
-            } else if (isReferenceType(it->type)) {
-                llvm::Value* val = builder->CreateLoad(ptrTy, it->alloca);
+            } else if (isReferenceType(ol.type)) {
+                llvm::Value* val = builder->CreateLoad(ptrTy, ol.alloca);
                 builder->CreateCall(releaseFn, { val });
-            } else if (structHasClassFields(it->type)) {
-                emitStructFieldRelease(it->type, it->alloca);
+            } else if (structHasClassFields(ol.type)) {
+                emitStructFieldRelease(ol.type, ol.alloca);
             }
         }
+    }
+
+    void emitFrameCleanup(const std::vector<OwnedLocal>& frame) {
+        emitFrameCleanupFrom(frame, 0);
     }
 
     void emitFullCleanup() {
         for (auto it = cleanupStack.rbegin(); it != cleanupStack.rend(); ++it) {
             emitFrameCleanup(*it);
         }
+    }
+
+    // Release every owned local live at a throw/propagation site except the
+    // function's parameter copies (kept alive for catch clauses).
+    void emitCleanupToWatermark() {
+        for (size_t fi = cleanupStack.size(); fi > 0; --fi) {
+            const auto& frame = cleanupStack[fi - 1];
+            if (fi == 1) emitFrameCleanupFrom(frame, paramCleanupWatermark);
+            else emitFrameCleanup(frame);
+        }
+    }
+
+    void emitReturnZero() {
+        llvm::Type* rt = currentFunction->getReturnType();
+        if (rt->isVoidTy()) builder->CreateRetVoid();
+        else builder->CreateRet(llvm::Constant::getNullValue(rt));
+    }
+
+    // Emit the error path for the current insert point: either branch to this
+    // function's catch dispatch, or run full cleanup and return zero (propagate).
+    void emitErrorUnwind() {
+        if (unwindToDispatch && catchDispatchBB) {
+            emitCleanupToWatermark();
+            builder->CreateBr(catchDispatchBB);
+        } else {
+            emitFullCleanup();
+            emitReturnZero();
+        }
+    }
+
+    // After a call to a function that may throw (its slot was passed as the
+    // trailing arg), branch to the error path if the slot is now non-null.
+    void emitThrowsCheck(const Symbol* callee) {
+        if (!callee || !callee->abiThrows || !throwTargetSlot) return;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        llvm::Value* err = builder->CreateLoad(ptrTy, throwTargetSlot, "err.check");
+        llvm::Value* thrown = builder->CreateICmpNE(
+            err, llvm::ConstantPointerNull::get(ptrTy), "thrown");
+        auto* unwindBB = llvm::BasicBlock::Create(ctx, "unwind", currentFunction);
+        auto* okBB = llvm::BasicBlock::Create(ctx, "cont", currentFunction);
+        builder->CreateCondBr(thrown, unwindBB, okBB);
+        builder->SetInsertPoint(unwindBB);
+        emitErrorUnwind();
+        builder->SetInsertPoint(okBB);
+    }
+
+    // Internal helper: walk a TypeDescriptor parent chain; true if `desc` is
+    // `target` or descends from it.
+    llvm::Function* getOrDefineEnsTypeIs() {
+        if (auto* existing = module->getFunction("ens_type_is")) return existing;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i1 = llvm::Type::getInt1Ty(ctx);
+        auto* i32 = llvm::Type::getInt32Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(i1, { ptrTy, ptrTy }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "ens_type_is", module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+
+        llvm::IRBuilder<> b(ctx);
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* loop  = llvm::BasicBlock::Create(ctx, "loop", fn);
+        auto* next  = llvm::BasicBlock::Create(ctx, "next", fn);
+        auto* yes   = llvm::BasicBlock::Create(ctx, "yes", fn);
+        auto* no    = llvm::BasicBlock::Create(ctx, "no", fn);
+        llvm::Value* descArg = fn->getArg(0);
+        llvm::Value* target = fn->getArg(1);
+
+        b.SetInsertPoint(entry);
+        b.CreateBr(loop);
+        b.SetInsertPoint(loop);
+        auto* cur = b.CreatePHI(ptrTy, 2, "cur");
+        cur->addIncoming(descArg, entry);
+        llvm::Value* isNull = b.CreateICmpEQ(cur, llvm::ConstantPointerNull::get(ptrTy));
+        auto* body = llvm::BasicBlock::Create(ctx, "body", fn);
+        b.CreateCondBr(isNull, no, body);
+        b.SetInsertPoint(body);
+        llvm::Value* eq = b.CreateICmpEQ(cur, target);
+        b.CreateCondBr(eq, yes, next);
+        b.SetInsertPoint(next);
+        llvm::Value* parentAddr = b.CreateGEP(getTypeDescriptorTy(), cur,
+            { llvm::ConstantInt::get(i32, 0), llvm::ConstantInt::get(i32, 1) }, "parent.addr");
+        llvm::Value* parent = b.CreateLoad(ptrTy, parentAddr, "parent");
+        cur->addIncoming(parent, next);
+        b.CreateBr(loop);
+        b.SetInsertPoint(yes);
+        b.CreateRet(llvm::ConstantInt::getTrue(ctx));
+        b.SetInsertPoint(no);
+        b.CreateRet(llvm::ConstantInt::getFalse(ctx));
+        return fn;
+    }
+
+    // Load the TypeDescriptor pointer from a heap object's header (offset -32).
+    llvm::Value* loadDescriptor(llvm::Value* obj) {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+        auto* i64 = llvm::Type::getInt64Ty(ctx);
+        llvm::Value* slot = builder->CreateGEP(i8Ty, obj,
+            llvm::ConstantInt::getSigned(i64, -32), "desc.slot");
+        return builder->CreateLoad(ptrTy, slot, "desc");
     }
 
     llvm::Value* emitAddressForByPointerArg(const ast::Expression& e, ::Type* paramType) {
@@ -2568,11 +2855,12 @@ struct CodeGenerator::Impl {
                 std::vector<llvm::Value*> args;
                 args.push_back(receiver);
                 if (!appendCallArgs(methodSym, e.arguments(), args)) return nullptr;
-                if (vslot >= 0) {
-                    llvm::Value* fnPtr = loadVtableSlot(receiver, vslot);
-                    return builder->CreateCall(fn->getFunctionType(), fnPtr, args);
-                }
-                return builder->CreateCall(fn, args);
+                if (methodSym->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);
+                llvm::Value* result = (vslot >= 0)
+                    ? builder->CreateCall(fn->getFunctionType(), loadVtableSlot(receiver, vslot), args)
+                    : builder->CreateCall(fn, args);
+                emitThrowsCheck(methodSym);
+                return result;
             }
         }
 
@@ -2614,9 +2902,11 @@ struct CodeGenerator::Impl {
                 std::vector<llvm::Value*> args;
                 args.push_back(recv);
                 if (!appendCallArgs(methodSym, e.arguments(), args)) return nullptr;
+                if (methodSym->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);
                 llvm::Value* callRes = (vslot >= 0)
                     ? builder->CreateCall(fn->getFunctionType(), loadVtableSlot(recv, vslot), args)
                     : builder->CreateCall(fn, args);
+                emitThrowsCheck(methodSym);
                 llvm::BasicBlock* nonnullEnd = builder->GetInsertBlock();
                 builder->CreateBr(endBB);
 
@@ -2652,7 +2942,10 @@ struct CodeGenerator::Impl {
         }
         std::vector<llvm::Value*> args;
         if (!appendCallArgs(sym, e.arguments(), args)) return nullptr;
-        return builder->CreateCall(fn, args);
+        if (sym->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);
+        llvm::Value* result = builder->CreateCall(fn, args);
+        emitThrowsCheck(sym);
+        return result;
     }
 
     llvm::Value* emitForeignCall(Symbol* sym, const ast::CallExpression& e) {
@@ -3049,6 +3342,14 @@ struct CodeGenerator::Impl {
         eachDecl([&](const ast::FuncDecl& fn) { declareFunction(fn); });
         eachDecl([&](const ast::FuncDecl& fn) { emitFunction(fn); });
 
+        // Define a descriptor for every class declared here, even one only ever
+        // thrown or caught (e.g. the prelude's Error), so its definition exists.
+        for (auto& cd : sf->classes()) {
+            if (Type* t = analysis.typeOf(cd.node.greenNode())) {
+                if (t->structInfo) getOrEmitTypeDescriptor(t->structInfo);
+            }
+        }
+
         if (debugEnabled && diBuilder) diBuilder->finalize();
         if (!diagnostics.empty()) return false;
 
@@ -3090,8 +3391,10 @@ struct CodeGenerator::Impl {
 CodeGenerator::CodeGenerator(std::string moduleName,
                                    std::string sourceFilename,
                                    const SourceFile& src,
-                                   const AnalysisResult& analysis)
-    : impl(std::make_unique<Impl>(std::move(moduleName), std::move(sourceFilename), src, analysis)) {}
+                                   const AnalysisResult& analysis,
+                                   std::u16string modulePath)
+    : impl(std::make_unique<Impl>(std::move(moduleName), std::move(sourceFilename), src, analysis,
+                                  std::move(modulePath))) {}
 
 CodeGenerator::~CodeGenerator() = default;
 
