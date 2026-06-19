@@ -2523,6 +2523,9 @@ struct CodeGenerator::Impl {
         if (auto p = e.asParen()) {
             if (auto inner = p->inner()) return expressionProducesOwnedRef(*inner);
         }
+        if (auto tr = e.asTry()) {
+            if (auto operand = tr->operand()) return expressionProducesOwnedRef(*operand);
+        }
         return false;
     }
 
@@ -2601,6 +2604,16 @@ struct CodeGenerator::Impl {
     void registerOwnedLocal(llvm::Value* alloca, ::Type* type) {
         if (cleanupStack.empty()) return;
         if (isReferenceType(type) || structHasClassFields(type)) {
+            // In a function with an error path, an initializer that throws would
+            // unwind before this slot is stored; pre-null so its release no-ops.
+            if (throwTargetSlot) {
+                if (isReferenceType(type)) {
+                    builder->CreateStore(
+                        llvm::ConstantPointerNull::get(llvm::PointerType::get(ctx, 0)), alloca);
+                } else {
+                    builder->CreateStore(llvm::Constant::getNullValue(mapType(type)), alloca);
+                }
+            }
             cleanupStack.back().push_back({ alloca, type });
         }
     }
@@ -2758,6 +2771,17 @@ struct CodeGenerator::Impl {
         return temp;
     }
 
+    // An owned temporary passed by value (a `new`/call result, not bound to a
+    // local) is borrowed by the callee; the caller must release it. Track it so
+    // both normal scope exit and an exception unwind free it exactly once.
+    void trackOwnedArgTemp(llvm::Value* v, const ast::Expression& a, ::Type* paramT) {
+        if (!paramT || !isReferenceType(paramT) || cleanupStack.empty()) return;
+        if (!expressionProducesOwnedRef(a)) return;
+        auto* slot = createEntryAlloca(currentFunction, llvm::PointerType::get(ctx, 0), "arg.tmp");
+        builder->CreateStore(v, slot);
+        cleanupStack.back().push_back({ slot, paramT });
+    }
+
     bool appendCallArgs(Symbol* sym, const std::vector<ast::Expression>& userArgs,
                         std::vector<llvm::Value*>& out) {
         for (size_t i = 0; i < userArgs.size(); ++i) {
@@ -2770,6 +2794,7 @@ struct CodeGenerator::Impl {
             } else {
                 llvm::Value* v = emitExprConverted(a, paramT);
                 if (!v) return false;
+                trackOwnedArgTemp(v, a, paramT);
                 out.push_back(v);
             }
         }
@@ -2925,6 +2950,7 @@ struct CodeGenerator::Impl {
                     ? emitExpr(*obj)
                     : emitLValue(*obj);
                 if (!receiver) return nullptr;
+                trackOwnedArgTemp(receiver, *obj, objType);
                 std::vector<llvm::Value*> args;
                 args.push_back(receiver);
                 if (!appendCallArgs(methodSym, e.arguments(), args)) return nullptr;

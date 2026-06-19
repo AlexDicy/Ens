@@ -45,6 +45,9 @@ void EscapeAnalyzer::analyzeFunction(Symbol* fnSym, const ast::FuncDecl& fn) {
     if (auto body = fn.body()) {
         scanBlock(*body);
     }
+    for (auto& cc : fn.catchClauses()) {
+        if (auto cb = cc.body()) scanBlock(*cb);
+    }
 
     ei.analyzed = true;
     currentFn = nullptr;
@@ -59,6 +62,11 @@ void EscapeAnalyzer::scanStatement(const ast::Statement& s) {
     if (auto w = s.asWhile()) { scanWhile(*w); return; }
     if (auto r = s.asReturn()) { scanReturn(*r); return; }
     if (auto e = s.asExpressionStmt()) { scanExprStmt(*e); return; }
+    if (auto th = s.asThrow()) {
+        if (auto v = th->value()) { markEscapeIfRef(*v); scanExpression(*v); }
+        return;
+    }
+    if (s.asRethrow()) return;
 }
 
 void EscapeAnalyzer::scanBlock(const ast::Block& b) {
@@ -160,6 +168,7 @@ void EscapeAnalyzer::scanExpression(const ast::Expression& e) {
     if (auto p = e.asParen()) { scanParen(*p); return; }
     if (auto n = e.asNew()) { scanNew(*n); return; }
     if (auto al = e.asArrayLiteral()) { scanArrayLiteral(*al); return; }
+    if (auto tr = e.asTry()) { if (auto op = tr->operand()) scanExpression(*op); return; }
     if (auto id = e.asIdent()) { scanIdent(*id); return; }
 }
 
@@ -408,6 +417,11 @@ void EscapeAnalyzer::walkBodyForLastUses(const ast::FuncDecl& fn) {
     if (auto body = fn.body()) {
         for (auto& s : body->statements()) walkStmtForLastUses(s);
     }
+    for (auto& cc : fn.catchClauses()) {
+        if (auto cb = cc.body()) {
+            for (auto& s : cb->statements()) walkStmtForLastUses(s);
+        }
+    }
 }
 
 void EscapeAnalyzer::walkStmtForLastUses(const ast::Statement& s) {
@@ -454,6 +468,10 @@ void EscapeAnalyzer::walkStmtForLastUses(const ast::Statement& s) {
     }
     if (auto e = s.asExpressionStmt()) {
         if (auto exp = e->expression()) walkExprForLastUses(*exp);
+        return;
+    }
+    if (auto th = s.asThrow()) {
+        if (auto v = th->value()) walkExprForLastUses(*v);
         return;
     }
 }
@@ -524,6 +542,10 @@ void EscapeAnalyzer::walkExprForLastUses(const ast::Expression& e) {
         for (auto& el : al->elements()) walkExprForLastUses(el);
         return;
     }
+    if (auto tr = e.asTry()) {
+        if (auto op = tr->operand()) walkExprForLastUses(*op);
+        return;
+    }
     if (auto id = e.asIdent()) {
         recordRead(*id);
         return;
@@ -567,6 +589,11 @@ void EscapeAnalyzer::decideStackPromotions() {
 void EscapeAnalyzer::walkBodyForPromotion(const ast::FuncDecl& fn) {
     if (auto body = fn.body()) {
         for (auto& s : body->statements()) walkStmtForPromotion(s);
+    }
+    for (auto& cc : fn.catchClauses()) {
+        if (auto cb = cc.body()) {
+            for (auto& s : cb->statements()) walkStmtForPromotion(s);
+        }
     }
 }
 
