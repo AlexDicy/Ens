@@ -5,7 +5,9 @@
 #include <unordered_set>
 #include "../diagnostics/Diagnostic.h"
 #include "../diagnostics/DiagnosticSink.h"
+#include "../parser/Parser.h"
 #include "Literals.h"
+#include "Prelude.h"
 
 // Sentinel for a method known to need a vtable slot before final indices are assigned.
 static constexpr int VTSLOT_PENDING = -2;
@@ -32,6 +34,17 @@ static std::string asciiOf(std::u16string_view s) {
 // Construction / scaffolding
 // =========================================================
 
+struct Analyzer::PreludeData {
+    SourceFile source;
+    DiagnosticSink sink;
+    GreenElementPtr cstRoot;
+    std::unique_ptr<SyntaxNode> rootNode;
+    std::unique_ptr<Analyzer> analyzer;
+
+    PreludeData()
+        : source("<prelude>", std::u16string(kPreludeSource)) {}
+};
+
 Analyzer::Analyzer(const SourceFile& src, DiagnosticSink& s)
     : source(src), sink(s),
       ownedTypeCtx(std::make_unique<TypeContext>()),
@@ -41,6 +54,7 @@ Analyzer::Analyzer(const SourceFile& src, DiagnosticSink& s)
     currentScope = globalScope;
     ownedScopes.push_back(std::move(scope));
     registerBuiltins();
+    bootstrapPrelude();
 }
 
 Analyzer::Analyzer(const SourceFile& src, DiagnosticSink& s,
@@ -54,6 +68,32 @@ Analyzer::Analyzer(const SourceFile& src, DiagnosticSink& s,
     currentScope = globalScope;
     ownedScopes.push_back(std::move(scope));
     registerBuiltins();
+}
+
+Analyzer::~Analyzer() = default;
+
+void Analyzer::bootstrapPrelude() {
+    // Compile the prelude into this analyzer's own TypeContext via a nested
+    // shared-context analyzer (which performs no bootstrap, breaking recursion),
+    prelude_ = std::make_unique<PreludeData>();
+    Parser parser(prelude_->source.getSource(), prelude_->sink);
+    prelude_->cstRoot = parser.parseSourceFile();
+    prelude_->rootNode = SyntaxNode::makeRoot(prelude_->cstRoot.get());
+    prelude_->analyzer = std::make_unique<Analyzer>(
+        prelude_->source, prelude_->sink, typeCtx, std::u16string(kPreludeModulePath));
+    prelude_->analyzer->collectDeclarations(*prelude_->rootNode);
+    prelude_->analyzer->analyzeBodies();
+    importPrelude();
+}
+
+void Analyzer::importPrelude() {
+    Type* err = typeCtx.lookupNamedType(std::u16string(kPreludeModulePath), u"Error");
+    if (!err || !err->structInfo) return;
+    errorClassInfo_ = err->structInfo;
+    if (globalScope && !globalScope->lookupLocal(u"Error")) {
+        Symbol* s = makeSymbol(SymbolKind::Variable, std::u16string(u"Error"), err, 0);
+        globalScope->define(s);
+    }
 }
 
 void Analyzer::registerBuiltins() {
@@ -549,6 +589,11 @@ void Analyzer::collectClasses(const ast::SourceFile& file) {
         if (auto baseName = cd.baseClassName()) {
             SyntaxNode diag = cd.baseClassToken().value_or(cd.node);
             Type* baseT = typeCtx.lookupNamedType(modulePath_, *baseName);
+            if (!baseT && globalScope) {
+                if (Symbol* sym = globalScope->lookupLocal(*baseName)) {
+                    if (sym->type && sym->type->isClass()) baseT = sym->type;
+                }
+            }
             if (!baseT) {
                 errorAtNode(diag, "Unknown base class '" + asciiOf(*baseName) + "'");
             } else if (!baseT->isClass() || !baseT->structInfo) {
@@ -2538,7 +2583,10 @@ void Analyzer::checkFieldInitialization(const ast::ClassDecl& cd) {
         if (auto mname = m.nameText(); mname && *mname == className) ctors.push_back(m);
     }
 
-    for (auto& f : t->structInfo->fields) {
+    int baseFieldCount = t->structInfo->baseFieldCount;
+    for (size_t fi = 0; fi < t->structInfo->fields.size(); ++fi) {
+        if (static_cast<int>(fi) < baseFieldCount) continue;
+        auto& f = t->structInfo->fields[fi];
         if (isDefaultable(f.type)) continue;
         if (fieldHasDefaultValue(f)) continue;
 

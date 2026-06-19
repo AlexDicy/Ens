@@ -4,6 +4,7 @@
 
 class Type;
 class GreenElement;
+struct StructInfo;
 
 enum class SymbolKind { Variable, Parameter, Function, Namespace, SiblingField };
 
@@ -56,6 +57,15 @@ public:
     bool stackPromoted = false;
 
     int siblingFieldIndex = -1;
+
+    bool declaredThrows = false;
+    // Empty for a bare `throws` whose set is inferred from the body.
+    std::vector<StructInfo*> declaredThrowsTypes;
+    // Computed outward throw set, sorted by pointer and deduped; keeps both a base and its subclass when both occur.
+    std::vector<StructInfo*> throwsSet;
+    // True if takes an error-slot parameter in the ABI.
+    // For methods this is the root virtual declaration, so it is uniform across a vtable slot.
+    bool abiThrows = false;
 
     Symbol(SymbolKind k, std::u16string n, Type* t, int l, int c)
         : kind(k), name(std::move(n)), type(t), line(l), column(c) {}

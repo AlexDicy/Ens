@@ -9,6 +9,7 @@
 #include "parser/Parser.h"
 #include "semantic/Analyzer.h"
 #include "semantic/EscapeAnalyzer.h"
+#include "semantic/Prelude.h"
 #include "semantic/Symbol.h"
 #include "semantic/Type.h"
 #include "semantic/TypeContext.h"
@@ -121,6 +122,19 @@ std::unique_ptr<Module> loadModule(const fs::path& sourceRoot,
     m->absolutePath = absolute;
     m->relativePath = relativePath;
     m->source = std::make_unique<SourceFile>(absolute.string(), std::move(code));
+    m->sink = std::make_unique<DiagnosticSink>();
+    Parser parser(m->source->getSource(), *m->sink);
+    m->cstRoot = parser.parseSourceFile();
+    m->rootNode = SyntaxNode::makeRoot(m->cstRoot.get());
+    return m;
+}
+
+std::unique_ptr<Module> loadPreludeModule() {
+    auto m = std::make_unique<Module>();
+    m->modulePath = std::u16string(kPreludeModulePath);
+    m->absolutePath = "<prelude>";
+    m->relativePath = "<prelude>";
+    m->source = std::make_unique<SourceFile>("<prelude>", std::u16string(kPreludeSource));
     m->sink = std::make_unique<DiagnosticSink>();
     Parser parser(m->source->getSource(), *m->sink);
     m->cstRoot = parser.parseSourceFile();
@@ -302,6 +316,16 @@ bool runMultiModuleAnalysis(std::vector<std::unique_ptr<Module>>& modules,
                             bool explainArc) {
     for (auto& m : modules) {
         m->analyzer = std::make_unique<Analyzer>(*m->source, *m->sink, sharedCtx, m->modulePath);
+    }
+
+    Module* prelude = nullptr;
+    for (auto& m : modules) {
+        if (m->modulePath == std::u16string(kPreludeModulePath)) { prelude = m.get(); break; }
+    }
+    if (prelude) prelude->analyzer->collectDeclarations(*prelude->rootNode);
+    for (auto& m : modules) m->analyzer->importPrelude();
+    for (auto& m : modules) {
+        if (m.get() == prelude) continue;
         m->analyzer->collectDeclarations(*m->rootNode);
     }
 
@@ -397,6 +421,13 @@ bool Compiler::compile(const fs::path& source,
     std::vector<std::unique_ptr<Module>> modules;
     std::unordered_map<std::u16string, Module*> byPath;
     if (!buildModuleGraph(sourceRoot, seeds, modules, byPath)) return false;
+
+    {
+        auto prelude = loadPreludeModule();
+        Module* raw = prelude.get();
+        modules.insert(modules.begin(), std::move(prelude));
+        byPath.emplace(std::u16string(kPreludeModulePath), raw);
+    }
 
     TypeContext sharedCtx;
     if (!runMultiModuleAnalysis(modules, byPath, sharedCtx, explainArc)) return false;

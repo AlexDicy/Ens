@@ -48,6 +48,7 @@ struct MethodInfo {
 
 struct StructInfo {
     std::u16string name;
+    std::u16string modulePath;       // owning module's canonical path; "" for single-file/stdin
     std::vector<FieldInfo> fields;   // for a class, base fields are flattened in first
     std::vector<MethodInfo> methods; // methods are NOT flattened; walk baseInfo to inherit
     int line = 0;
@@ -86,6 +87,14 @@ struct StructInfo {
             if (s->findMethodIndex(methodName) >= 0) return s;
         }
         return nullptr;
+    }
+    // Topmost class in the chain (deepest ancestor) that declares `methodName`, or null.
+    StructInfo* rootClassDeclaringMethod(const std::u16string& methodName) {
+        StructInfo* found = nullptr;
+        for (StructInfo* s = this; s; s = s->baseInfo) {
+            if (s->findMethodIndex(methodName) >= 0) found = s;
+        }
+        return found;
     }
 };
 

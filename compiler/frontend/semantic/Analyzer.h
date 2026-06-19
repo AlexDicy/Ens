@@ -32,6 +32,8 @@ public:
     Analyzer(const SourceFile& source, DiagnosticSink& sink,
              TypeContext& sharedContext, std::u16string modulePath);
 
+    ~Analyzer();
+
     // Single-file convenience wrapper: collect → bind imports → analyze bodies,
     // all in one call.
     void analyze(const SyntaxNode& sourceFileRoot);
@@ -41,6 +43,10 @@ public:
     void collectDeclarations(const SyntaxNode& sourceFileRoot);
     void bindImports(const ModuleResolver& resolver);
     void analyzeBodies();
+
+    void importPrelude();
+
+    StructInfo* errorClass() const { return errorClassInfo_; }
 
     const AnalysisResult& result() const { return analysis; }
     AnalysisResult& result() { return analysis; }
@@ -82,6 +88,15 @@ private:
     // Cached AST root after collectDeclarations so analyzeBodies doesn't have
     // to re-parse the source. Populated by collectDeclarations.
     std::optional<ast::SourceFile> astRoot;
+
+    StructInfo* errorClassInfo_ = nullptr;
+
+    // In owning-TypeContext (single-file/LSP) mode the analyzer compiles the
+    // prelude into its own context here, so `Error` resolves without a driver.
+    // Empty in shared-context mode (the driver supplies a prelude module).
+    struct PreludeData;
+    std::unique_ptr<PreludeData> prelude_;
+    void bootstrapPrelude();
 
     Symbol* makeSymbol(SymbolKind k, std::u16string n, Type* t, uint32_t offset);
     Scope* pushScope();

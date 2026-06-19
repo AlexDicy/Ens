@@ -61,6 +61,7 @@ Type* TypeContext::primitiveFromName(const std::u16string& name) {
 Type* TypeContext::registerStruct(const std::u16string& modulePath, std::u16string name) {
     auto info = std::make_unique<StructInfo>();
     info->name = name;
+    info->modulePath = modulePath;
     StructInfo* infoPtr = info.get();
     ownedStructs.push_back(std::move(info));
 
@@ -78,6 +79,7 @@ Type* TypeContext::lookupStruct(const std::u16string& modulePath, const std::u16
 Type* TypeContext::registerClass(const std::u16string& modulePath, std::u16string name) {
     auto info = std::make_unique<StructInfo>();
     info->name = name;
+    info->modulePath = modulePath;
     StructInfo* infoPtr = info.get();
     ownedStructs.push_back(std::move(info));
 
@@ -95,6 +97,7 @@ Type* TypeContext::lookupClass(const std::u16string& modulePath, const std::u16s
 Type* TypeContext::registerExternalType(const std::u16string& modulePath, std::u16string name) {
     auto info = std::make_unique<StructInfo>();
     info->name = name;
+    info->modulePath = modulePath;
     StructInfo* infoPtr = info.get();
     ownedStructs.push_back(std::move(info));
 
