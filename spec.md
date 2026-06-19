@@ -133,7 +133,7 @@ import @std.fs.file; // for external dependency /src/std/fs/file.ens
 import Observable from @alexdicy.reactivity.observable; // for class Observable in external dependency /src/alexdicy/reactivity/observable.ens
 ```
 
-Methods that can throw exceptions are marked with `throws`; any other method can be considered safe. The list of throwable types is computed and not part of the method signature. IDEs will infer and show them on hover.
+Methods that can throw exceptions are marked with `throws`; any other method can be considered safe. Every thrown value must be an instance of `Error` or a subclass of it. For most methods the set of throwable types is computed by the compiler and shown by IDEs on hover. A method may also declare its thrown types explicitly — `read() -> bytes throws IOError` or `read() -> bytes throws IOError, ParseError`, which is required for abstract methods and forms a contract: an override may throw those types or their subclasses, never others.
 
 If any exception is not handled and the method is not marked as `throws`, this should result in a compilation error explaining which exceptions were not handled and how to handle them (either with a `catch` block or via the `throws` keyword).
 
@@ -141,17 +141,13 @@ These exceptions are always checked. The user can use `panic()` to stop executio
 
 Methods that throw must be called with `try` as a prefix, even if caught. `Catch` can be added as an additional block of a method.
 
-`Finally` blocks run last and are optional.
-
 ```ens
 class TestRepository {
     getName() -> string? {
         return try queryName();
-    } catch (DatabaseError e) {
+    } catch (DatabaseError e) { // and other catch blocks if multiple exceptions are thrown
         Log.warn("Database error occurred: {e}");
         return null;
-    } finally { // or other catch blocks if multiple exceptions are thrown
-        Log.debug("getName() called");
     }
 
     getNameUnsafe() -> string throws {
