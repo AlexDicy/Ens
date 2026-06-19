@@ -24,6 +24,7 @@ bool Expression::isExpressionKind(SyntaxKind k) {
         case SyntaxKind::NewExpr:
         case SyntaxKind::ParenExpr:
         case SyntaxKind::ArrayLiteralExpr:
+        case SyntaxKind::TryExpr:
             return true;
         default:
             return false;
@@ -69,6 +70,7 @@ std::optional<TernaryExpression>   Expression::asTernary()   const { return Tern
 std::optional<NewExpression>       Expression::asNew()       const { return NewExpression::cast(node); }
 std::optional<ParenExpression>     Expression::asParen()     const { return ParenExpression::cast(node); }
 std::optional<ArrayLiteralExpression> Expression::asArrayLiteral() const { return ArrayLiteralExpression::cast(node); }
+std::optional<TryExpression>       Expression::asTry()       const { return TryExpression::cast(node); }
 
 // === LiteralExpression ===
 
@@ -397,6 +399,12 @@ std::optional<SyntaxNode> OutArgument::identifier() const {
 std::optional<std::u16string> OutArgument::nameText() const {
     if (auto t = identifier()) return std::u16string(t->tokenText());
     return std::nullopt;
+}
+
+// === TryExpression ===
+
+std::optional<Expression> TryExpression::operand() const {
+    return firstExpressionChild(node);
 }
 
 }  // namespace ast

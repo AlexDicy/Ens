@@ -338,7 +338,8 @@ bool Parser::looksLikeFuncDecl(bool allowShorthand) const {
     while (idx < tokens.size() && isTrivia(tokens[idx].kind)) idx++;
     if (idx >= tokens.size()) return false;
     SyntaxKind after = tokens[idx].kind;
-    if (after == SyntaxKind::Arrow || after == SyntaxKind::LBrace) return true;
+    if (after == SyntaxKind::Arrow || after == SyntaxKind::LBrace ||
+        after == SyntaxKind::KwThrows) return true;
     return allowShorthand && after == SyntaxKind::Semi;
 }
 
@@ -353,8 +354,18 @@ void Parser::parseFuncDecl() {
     parseParamList();
     expect(SyntaxKind::RParen, "')' after parameters");
     if (at(SyntaxKind::Arrow)) parseReturnType();
+    if (at(SyntaxKind::KwThrows)) parseThrowsClause();
     if (at(SyntaxKind::LBrace)) {
         parseBlock();
+        while (at(SyntaxKind::KwCatch)) parseCatchClause();
+        if (at(SyntaxKind::KwFinally)) {
+            reportAtCurrent("'finally' is not supported");
+            builder.startNode(SyntaxKind::Error);
+            bump();  // 'finally'
+            if (at(SyntaxKind::LBrace)) parseBlock();
+            builder.finishNode();
+            while (at(SyntaxKind::KwCatch)) parseCatchClause();
+        }
     } else if (eat(SyntaxKind::Semi)) {
         // shorthand body
     } else {
@@ -409,6 +420,39 @@ void Parser::parseReturnType() {
     expect(SyntaxKind::Arrow, "'->'");
     if (isTypeStart(kindAt())) parseType();
     else emitMissing(SyntaxKind::Identifier, "return type");
+    builder.finishNode();
+}
+
+void Parser::parseThrowsClause() {
+    builder.startNode(SyntaxKind::ThrowsClause);
+    expect(SyntaxKind::KwThrows, "'throws'");
+    if (isTypeStart(kindAt())) {
+        parseType();
+        while (eat(SyntaxKind::Comma)) {
+            if (isTypeStart(kindAt())) parseType();
+            else emitMissing(SyntaxKind::Identifier, "exception type after ','");
+        }
+    }
+    builder.finishNode();
+}
+
+void Parser::parseCatchClause() {
+    builder.startNode(SyntaxKind::CatchClause);
+    expect(SyntaxKind::KwCatch, "'catch'");
+    expect(SyntaxKind::LParen, "'(' after 'catch'");
+    if (isTypeStart(kindAt())) parseType();
+    else emitMissing(SyntaxKind::Identifier, "exception type in catch clause");
+    expect(SyntaxKind::Identifier, "exception variable name");
+    expect(SyntaxKind::RParen, "')' after catch variable");
+    if (at(SyntaxKind::LBrace)) {
+        parseBlock();
+    } else {
+        emitMissing(SyntaxKind::LBrace, "'{' for catch body");
+        recoverTo({SyntaxKind::KwCatch, SyntaxKind::KwFinally, SyntaxKind::RBrace,
+                   SyntaxKind::KwStruct, SyntaxKind::KwClass,
+                   SyntaxKind::KwPrivate, SyntaxKind::KwProtected, SyntaxKind::KwPublic,
+                   SyntaxKind::EndOfFile});
+    }
     builder.finishNode();
 }
 
@@ -591,6 +635,20 @@ void Parser::parseStatement() {
     if (k == SyntaxKind::KwIf)          { parseIfStmt(); return; }
     if (k == SyntaxKind::KwWhile)       { parseWhileStmt(); return; }
     if (k == SyntaxKind::KwReturn)      { parseReturnStmt(); return; }
+    if (k == SyntaxKind::KwThrow)       { parseThrowStmt(); return; }
+    if (k == SyntaxKind::KwRethrow)     { parseRethrowStmt(); return; }
+    if (k == SyntaxKind::KwCatch) {
+        reportAtCurrent("'catch' can only appear after a function body's closing '}'");
+        recoverTo({SyntaxKind::Semi, SyntaxKind::RBrace, SyntaxKind::EndOfFile});
+        eat(SyntaxKind::Semi);
+        return;
+    }
+    if (k == SyntaxKind::KwFinally) {
+        reportAtCurrent("'finally' is not supported");
+        recoverTo({SyntaxKind::Semi, SyntaxKind::RBrace, SyntaxKind::EndOfFile});
+        eat(SyntaxKind::Semi);
+        return;
+    }
     if (looksLikeTypedVarDecl())        { parseTypedVarDeclStmt(); return; }
     parseExprStmt();
 }
@@ -665,6 +723,26 @@ void Parser::parseReturnStmt() {
     expect(SyntaxKind::KwReturn, "'return'");
     if (!at(SyntaxKind::Semi) && !atEnd()) parseExpression();
     expect(SyntaxKind::Semi, "';' after return");
+    builder.finishNode();
+}
+
+void Parser::parseThrowStmt() {
+    builder.startNode(SyntaxKind::ThrowStmt);
+    expect(SyntaxKind::KwThrow, "'throw'");
+    if (at(SyntaxKind::Semi)) {
+        reportAtCurrent("'throw' needs an exception value, e.g. 'throw new Error(\"...\");'. "
+                        "To rethrow the current exception inside a catch block, use 'rethrow;'");
+    } else if (!atEnd()) {
+        parseExpression();
+    }
+    expect(SyntaxKind::Semi, "';' after throw");
+    builder.finishNode();
+}
+
+void Parser::parseRethrowStmt() {
+    builder.startNode(SyntaxKind::RethrowStmt);
+    expect(SyntaxKind::KwRethrow, "'rethrow'");
+    expect(SyntaxKind::Semi, "';' after rethrow");
     builder.finishNode();
 }
 
@@ -822,6 +900,16 @@ void Parser::parsePrecedence(int minPrec) {
 void Parser::parsePrefix() {
     SyntaxKind k = kindAt();
     switch (k) {
+        case SyntaxKind::KwTry: {
+            // `try` prefixes exactly one call: one primary plus its postfix chain
+            // (`.`, `?.`, `(...)`, `[...]`), nothing looser. The analyzer requires
+            // the operand to be a call expression.
+            builder.startNode(SyntaxKind::TryExpr);
+            bump();
+            parsePrecedence(14);
+            builder.finishNode();
+            return;
+        }
         case SyntaxKind::IntLiteral:
         case SyntaxKind::LongLiteral:
         case SyntaxKind::FloatLiteral:

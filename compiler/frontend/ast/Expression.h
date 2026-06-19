@@ -26,6 +26,7 @@ class TernaryExpression;
 class NewExpression;
 class ParenExpression;
 class ArrayLiteralExpression;
+class TryExpression;
 class ArgumentList;
 
 class Expression {
@@ -56,6 +57,7 @@ public:
     std::optional<NewExpression>       asNew() const;
     std::optional<ParenExpression>     asParen() const;
     std::optional<ArrayLiteralExpression> asArrayLiteral() const;
+    std::optional<TryExpression>       asTry() const;
 };
 
 class LiteralExpression {
@@ -281,6 +283,16 @@ public:
     }
     std::optional<SyntaxNode> identifier() const;
     std::optional<std::u16string> nameText() const;
+};
+
+class TryExpression {
+public:
+    SyntaxNode node;
+    static std::optional<TryExpression> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::TryExpr) return std::nullopt;
+        return TryExpression{n};
+    }
+    std::optional<Expression> operand() const;
 };
 
 }  // namespace ast

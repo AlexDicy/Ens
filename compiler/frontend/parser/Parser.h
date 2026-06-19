@@ -54,6 +54,8 @@ private:
     void parseParameter();
     void parseDefaultValue();
     void parseReturnType();
+    void parseThrowsClause();
+    void parseCatchClause();
     void parseStructOrClassDecl(SyntaxKind nodeKind, SyntaxKind keywordKind);
     void parseStructOrClassMember();
     void parseFieldDecl();
@@ -78,6 +80,8 @@ private:
     void parseIfStmt();
     void parseWhileStmt();
     void parseReturnStmt();
+    void parseThrowStmt();
+    void parseRethrowStmt();
     void parseExprStmt();
 
     // === Expressions ===

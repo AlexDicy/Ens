@@ -62,6 +62,8 @@ enum class SyntaxKind : uint16_t {
     Parameter,           // includes regular and this-field parameters
     DefaultValue,        // = expr suffix on a parameter
     ReturnType,          // -> Type
+    ThrowsClause,        // throws marker, optionally followed by a declared type list
+    CatchClause,         // catch (Type ident) { ... } after a function body
     StructDecl,
     ClassDecl,
     FieldDecl,
@@ -87,6 +89,8 @@ enum class SyntaxKind : uint16_t {
     WhileStmt,
     ReturnStmt,
     ExprStmt,
+    ThrowStmt,
+    RethrowStmt,
 
     // === Expressions ===
     LiteralExpr,         // wraps any literal token
@@ -110,6 +114,7 @@ enum class SyntaxKind : uint16_t {
     NewExpr,
     ParenExpr,
     ArrayLiteralExpr,
+    TryExpr,             // try <call>: prefixes a single throwing call
 
     // === Recovery ===
     Error,               // wraps unexpected/skipped tokens during recovery

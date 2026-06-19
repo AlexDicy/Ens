@@ -13,6 +13,8 @@ enum class Visibility { Public, Private, Protected };
 
 class VisibilityModifier;
 class ReturnType;
+class ThrowsClause;
+class CatchClause;
 class DefaultValue;
 class Parameter;
 class ParameterList;
@@ -46,6 +48,30 @@ public:
         return ReturnType{n};
     }
     std::optional<TypeReference> typeReference() const;
+};
+
+class ThrowsClause {
+public:
+    SyntaxNode node;
+    static std::optional<ThrowsClause> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::ThrowsClause) return std::nullopt;
+        return ThrowsClause{n};
+    }
+    // declared exception types; empty for an inferred `throws`.
+    std::vector<TypeReference> types() const;
+};
+
+class CatchClause {
+public:
+    SyntaxNode node;
+    static std::optional<CatchClause> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::CatchClause) return std::nullopt;
+        return CatchClause{n};
+    }
+    std::optional<TypeReference> typeReference() const;
+    std::optional<SyntaxNode> nameToken() const;
+    std::optional<std::u16string> nameText() const;
+    std::optional<Block> body() const;
 };
 
 class DefaultValue {
@@ -102,6 +128,11 @@ public:
     bool isOverride() const;
     bool isFinal() const;
     bool isAbstract() const;
+    bool isThrows() const;
+    std::optional<ThrowsClause> throwsClause() const;
+    std::optional<SyntaxNode> throwsToken() const;
+    std::vector<TypeReference> declaredThrowsTypes() const;
+    std::vector<CatchClause> catchClauses() const;
 };
 
 class FieldDecl {

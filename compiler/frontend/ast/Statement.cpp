@@ -11,6 +11,8 @@ bool Statement::isStatementKind(SyntaxKind k) {
         case SyntaxKind::WhileStmt:
         case SyntaxKind::ReturnStmt:
         case SyntaxKind::ExprStmt:
+        case SyntaxKind::ThrowStmt:
+        case SyntaxKind::RethrowStmt:
             return true;
         default:
             return false;
@@ -29,6 +31,8 @@ std::optional<IfStatement>           Statement::asIf()              const { retu
 std::optional<WhileStatement>        Statement::asWhile()           const { return WhileStatement::cast(node); }
 std::optional<ReturnStatement>       Statement::asReturn()          const { return ReturnStatement::cast(node); }
 std::optional<ExpressionStatement>   Statement::asExpressionStmt()  const { return ExpressionStatement::cast(node); }
+std::optional<ThrowStatement>        Statement::asThrow()           const { return ThrowStatement::cast(node); }
+std::optional<RethrowStatement>      Statement::asRethrow()         const { return RethrowStatement::cast(node); }
 
 // === Block ===
 
@@ -152,6 +156,15 @@ std::optional<Expression> ReturnStatement::value() const {
 // === ExpressionStatement ===
 
 std::optional<Expression> ExpressionStatement::expression() const {
+    for (auto& c : node.children()) {
+        if (auto e = Expression::cast(c)) return e;
+    }
+    return std::nullopt;
+}
+
+// === ThrowStatement ===
+
+std::optional<Expression> ThrowStatement::value() const {
     for (auto& c : node.children()) {
         if (auto e = Expression::cast(c)) return e;
     }

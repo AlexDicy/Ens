@@ -175,6 +175,8 @@ static constexpr std::pair<SyntaxKind, std::string_view> KIND_NAMES[] = {
     {SyntaxKind::Parameter,         "Parameter"},
     {SyntaxKind::DefaultValue,      "DefaultValue"},
     {SyntaxKind::ReturnType,        "ReturnType"},
+    {SyntaxKind::ThrowsClause,      "ThrowsClause"},
+    {SyntaxKind::CatchClause,       "CatchClause"},
     {SyntaxKind::StructDecl,        "StructDecl"},
     {SyntaxKind::ClassDecl,         "ClassDecl"},
     {SyntaxKind::FieldDecl,         "FieldDecl"},
@@ -196,6 +198,8 @@ static constexpr std::pair<SyntaxKind, std::string_view> KIND_NAMES[] = {
     {SyntaxKind::WhileStmt,         "WhileStmt"},
     {SyntaxKind::ReturnStmt,        "ReturnStmt"},
     {SyntaxKind::ExprStmt,          "ExprStmt"},
+    {SyntaxKind::ThrowStmt,         "ThrowStmt"},
+    {SyntaxKind::RethrowStmt,       "RethrowStmt"},
     {SyntaxKind::LiteralExpr,       "LiteralExpr"},
     {SyntaxKind::IdentExpr,         "IdentExpr"},
     {SyntaxKind::ThisExpr,          "ThisExpr"},
@@ -217,6 +221,7 @@ static constexpr std::pair<SyntaxKind, std::string_view> KIND_NAMES[] = {
     {SyntaxKind::NewExpr,           "NewExpr"},
     {SyntaxKind::ParenExpr,         "ParenExpr"},
     {SyntaxKind::ArrayLiteralExpr,  "ArrayLiteralExpr"},
+    {SyntaxKind::TryExpr,           "TryExpr"},
     {SyntaxKind::Error,             "Error"},
 };
 

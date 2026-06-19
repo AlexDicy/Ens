@@ -191,6 +191,72 @@ bool FuncDecl::isOverride() const { return hasDirectToken(node, SyntaxKind::KwOv
 bool FuncDecl::isFinal() const    { return hasDirectToken(node, SyntaxKind::KwFinal); }
 bool FuncDecl::isAbstract() const { return hasDirectToken(node, SyntaxKind::KwAbstract); }
 
+std::optional<ThrowsClause> FuncDecl::throwsClause() const {
+    if (auto t = firstChildNode(node, SyntaxKind::ThrowsClause)) return ThrowsClause::cast(*t);
+    return std::nullopt;
+}
+
+bool FuncDecl::isThrows() const { return throwsClause().has_value(); }
+
+std::optional<SyntaxNode> FuncDecl::throwsToken() const {
+    auto tc = throwsClause();
+    if (!tc) return std::nullopt;
+    for (auto& c : tc->node.children()) {
+        if (c.isToken() && c.kind() == SyntaxKind::KwThrows) return c;
+    }
+    return std::nullopt;
+}
+
+std::vector<TypeReference> FuncDecl::declaredThrowsTypes() const {
+    if (auto tc = throwsClause()) return tc->types();
+    return {};
+}
+
+std::vector<CatchClause> FuncDecl::catchClauses() const {
+    std::vector<CatchClause> out;
+    for (auto& c : node.children()) {
+        if (auto cc = CatchClause::cast(c)) out.push_back(*cc);
+    }
+    return out;
+}
+
+// === ThrowsClause ===
+
+std::vector<TypeReference> ThrowsClause::types() const {
+    std::vector<TypeReference> out;
+    for (auto& c : node.children()) {
+        if (auto tr = TypeReference::cast(c)) out.push_back(*tr);
+    }
+    return out;
+}
+
+// === CatchClause ===
+
+std::optional<TypeReference> CatchClause::typeReference() const {
+    if (auto tr = firstChildNode(node, SyntaxKind::TypeRef)) return TypeReference::cast(*tr);
+    return std::nullopt;
+}
+
+std::optional<SyntaxNode> CatchClause::nameToken() const {
+    bool seenType = false;
+    for (auto& c : node.children()) {
+        if (isTrivia(c.kind())) continue;
+        if (c.kind() == SyntaxKind::TypeRef) { seenType = true; continue; }
+        if (seenType && c.kind() == SyntaxKind::Identifier) return c;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::u16string> CatchClause::nameText() const {
+    if (auto t = nameToken()) return std::u16string(t->tokenText());
+    return std::nullopt;
+}
+
+std::optional<Block> CatchClause::body() const {
+    if (auto b = firstChildNode(node, SyntaxKind::Block)) return Block::cast(*b);
+    return std::nullopt;
+}
+
 // === FieldDecl ===
 
 std::optional<VisibilityModifier> FieldDecl::visibilityModifier() const {

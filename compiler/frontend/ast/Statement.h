@@ -16,6 +16,8 @@ class ElseClause;
 class WhileStatement;
 class ReturnStatement;
 class ExpressionStatement;
+class ThrowStatement;
+class RethrowStatement;
 
 class Statement {
 public:
@@ -33,6 +35,8 @@ public:
     std::optional<WhileStatement>        asWhile() const;
     std::optional<ReturnStatement>       asReturn() const;
     std::optional<ExpressionStatement>   asExpressionStmt() const;
+    std::optional<ThrowStatement>        asThrow() const;
+    std::optional<RethrowStatement>      asRethrow() const;
 };
 
 class Block {
@@ -122,6 +126,25 @@ public:
         return ExpressionStatement{n};
     }
     std::optional<Expression> expression() const;
+};
+
+class ThrowStatement {
+public:
+    SyntaxNode node;
+    static std::optional<ThrowStatement> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::ThrowStmt) return std::nullopt;
+        return ThrowStatement{n};
+    }
+    std::optional<Expression> value() const;
+};
+
+class RethrowStatement {
+public:
+    SyntaxNode node;
+    static std::optional<RethrowStatement> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::RethrowStmt) return std::nullopt;
+        return RethrowStatement{n};
+    }
 };
 
 }  // namespace ast
