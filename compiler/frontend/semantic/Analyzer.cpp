@@ -8,6 +8,7 @@
 #include "../parser/Parser.h"
 #include "Literals.h"
 #include "Prelude.h"
+#include "ThrowsAnalyzer.h"
 
 // Sentinel for a method known to need a vtable slot before final indices are assigned.
 static constexpr int VTSLOT_PENDING = -2;
@@ -303,6 +304,11 @@ void Analyzer::analyze(const SyntaxNode& root) {
     collectDeclarations(root);
     bindImports([](const std::u16string&) -> const Analyzer* { return nullptr; });
     analyzeBodies();
+    if (astRoot) {
+        ThrowsAnalyzer throwsAnalyzer(*astRoot, analysis, errorClassInfo_);
+        throwsAnalyzer.analyze();
+        throwsAnalyzer.validate(sink, source);
+    }
 }
 
 void Analyzer::collectDeclarations(const SyntaxNode& root) {
@@ -516,9 +522,42 @@ void Analyzer::analyzeBodies() {
     for (auto& sd : sf.structs()) checkFieldInitialization(sd);
     for (auto& cd : sf.classes()) checkFieldInitialization(cd);
 
+    auto resolveThrows = [&](const ast::FuncDecl& fn) {
+        auto* info = analysis.find(fn.node.greenNode());
+        if (info && info->resolvedSymbol) resolveDeclaredThrows(fn, info->resolvedSymbol);
+    };
+    for (auto& fn : sf.functions()) resolveThrows(fn);
+    for (auto& sd : sf.structs()) for (auto& m : sd.methods()) resolveThrows(m);
+    for (auto& cd : sf.classes()) for (auto& m : cd.methods()) resolveThrows(m);
+
     for (auto& fn : sf.functions()) analyzeFunctionBody(fn);
     for (auto& sd : sf.structs())   for (auto& m : sd.methods()) analyzeFunctionBody(m);
     for (auto& cd : sf.classes())   for (auto& m : cd.methods()) analyzeFunctionBody(m);
+}
+
+void Analyzer::resolveDeclaredThrows(const ast::FuncDecl& fn, Symbol* sym) {
+    for (auto& tr : fn.declaredThrowsTypes()) {
+        Type* t = resolveTypeReference(tr);
+        if (t->isError()) continue;
+        bool isErrorSubclass = t->isClass() && t->structInfo && errorClassInfo_ &&
+            t->structInfo->isSubclassOf(errorClassInfo_);
+        if (!isErrorSubclass) {
+            errorAtNode(tr.node, "A declared throws type must be 'Error' or a subclass; '" +
+                t->toString() + "' is not.");
+            continue;
+        }
+        StructInfo* si = t->structInfo;
+        bool redundant = false;
+        for (StructInfo* existing : sym->declaredThrowsTypes) {
+            if (si == existing || si->isSubclassOf(existing) || existing->isSubclassOf(si)) {
+                errorAtNode(tr.node, "Declared throws type '" + asciiOf(si->name) +
+                    "' overlaps with another type in the list; list each exception once.");
+                redundant = true;
+                break;
+            }
+        }
+        if (!redundant) sym->declaredThrowsTypes.push_back(si);
+    }
 }
 
 // =========================================================

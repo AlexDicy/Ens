@@ -10,6 +10,7 @@
 #include "semantic/Analyzer.h"
 #include "semantic/EscapeAnalyzer.h"
 #include "semantic/Prelude.h"
+#include "semantic/ThrowsAnalyzer.h"
 #include "semantic/Symbol.h"
 #include "semantic/Type.h"
 #include "semantic/TypeContext.h"
@@ -337,6 +338,34 @@ bool runMultiModuleAnalysis(std::vector<std::unique_ptr<Module>>& modules,
     for (auto& m : modules) m->analyzer->bindImports(resolver);
 
     for (auto& m : modules) m->analyzer->analyzeBodies();
+
+    // Checked-exception throws-set fixpoint (a correctness pass: runs before the
+    // error gate). Sets propagate cross-module via shared Symbol*.
+    StructInfo* errorClass = nullptr;
+    for (auto& m : modules) { errorClass = m->analyzer->errorClass(); if (errorClass) break; }
+    std::vector<std::optional<ast::SourceFile>> throwsSourceFiles;
+    std::vector<Module*> throwsModules;
+    throwsSourceFiles.reserve(modules.size());
+    for (auto& m : modules) {
+        auto sf = ast::SourceFile::cast(*m->rootNode);
+        if (!sf) continue;
+        throwsSourceFiles.push_back(*sf);
+        throwsModules.push_back(m.get());
+    }
+    std::vector<ThrowsAnalyzer> throwsAnalyzers;
+    throwsAnalyzers.reserve(throwsSourceFiles.size());
+    for (size_t i = 0; i < throwsSourceFiles.size(); ++i) {
+        throwsAnalyzers.emplace_back(*throwsSourceFiles[i],
+                                     throwsModules[i]->analyzer->result(), errorClass);
+    }
+    bool throwsChanged;
+    do {
+        throwsChanged = false;
+        for (auto& ta : throwsAnalyzers) if (ta.runOnce()) throwsChanged = true;
+    } while (throwsChanged);
+    for (size_t i = 0; i < throwsAnalyzers.size(); ++i) {
+        throwsAnalyzers[i].validate(*throwsModules[i]->sink, *throwsModules[i]->source);
+    }
 
     bool ok = true;
     for (auto& m : modules) {
