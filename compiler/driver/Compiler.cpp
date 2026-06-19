@@ -336,6 +336,35 @@ bool runMultiModuleAnalysis(std::vector<std::unique_ptr<Module>>& modules,
     for (auto& m : modules) m->analyzer->bindImports(resolver);
 
     for (auto& m : modules) m->analyzer->resolveSignatures();
+
+    // Lay out classes whole-program, bases before derived, so a class can extend
+    // a class in another module (inherited fields + virtual slots resolve across
+    // module boundaries). The prelude is modules[0], so it sorts first among roots.
+    {
+        struct ClassItem { Analyzer* owner; ast::ClassDecl decl; StructInfo* info; };
+        std::vector<ClassItem> items;
+        for (auto& m : modules) {
+            auto sf = ast::SourceFile::cast(*m->rootNode);
+            if (!sf) continue;
+            for (auto& cd : sf->classes()) {
+                Type* t = m->analyzer->result().typeOf(cd.node.greenNode());
+                if (t && t->structInfo) items.push_back({ m->analyzer.get(), cd, t->structInfo });
+            }
+        }
+        auto depthOf = [](StructInfo* si) {
+            int d = 0;
+            for (StructInfo* s = si->baseInfo; s; s = s->baseInfo) ++d;
+            return d;
+        };
+        std::stable_sort(items.begin(), items.end(),
+            [&](const ClassItem& a, const ClassItem& b) { return depthOf(a.info) < depthOf(b.info); });
+        for (auto& it : items) it.owner->layoutOneClass(it.decl);
+        std::vector<StructInfo*> infos;
+        infos.reserve(items.size());
+        for (auto& it : items) infos.push_back(it.info);
+        Analyzer::finalizeClassHierarchy(infos);
+    }
+
     for (auto& m : modules) m->analyzer->analyzeBodies();
 
     // Checked-exception throws-set fixpoint (a correctness pass: runs before the

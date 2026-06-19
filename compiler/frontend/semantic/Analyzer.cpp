@@ -314,6 +314,7 @@ void Analyzer::analyze(const SyntaxNode& root) {
 void Analyzer::collectDeclarations(const SyntaxNode& root) {
     registerNames(root);
     resolveSignatures();
+    if (astRoot) layoutDeclaredClasses(*astRoot);
 }
 
 void Analyzer::registerNames(const SyntaxNode& root) {
@@ -331,7 +332,7 @@ void Analyzer::resolveSignatures() {
     auto& sf = *astRoot;
 
     collectStructs(sf);
-    collectClasses(sf);
+    resolveClassBases(sf);
     collectFunctions(sf);
     collectExternalFunctions(sf);
 }
@@ -632,7 +633,13 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
     }
 }
 
-void Analyzer::collectClasses(const ast::SourceFile& file) {
+static int baseDepth(StructInfo* si) {
+    int d = 0;
+    for (StructInfo* s = si->baseInfo; s; s = s->baseInfo) ++d;
+    return d;
+}
+
+void Analyzer::resolveClassBases(const ast::SourceFile& file) {
     auto classes = file.classes();
 
     // --- Pass A: record class modifiers and resolve base links. ---
@@ -682,156 +689,132 @@ void Analyzer::collectClasses(const ast::SourceFile& file) {
             }
         }
     }
+}
 
-    // --- Topological order: bases before derived (by ancestor depth). ---
-    auto depthOf = [](StructInfo* si) {
-        int d = 0;
-        for (StructInfo* s = si->baseInfo; s; s = s->baseInfo) ++d;
-        return d;
-    };
-    std::vector<ast::ClassDecl> order(classes.begin(), classes.end());
-    std::stable_sort(order.begin(), order.end(),
-        [&](const ast::ClassDecl& a, const ast::ClassDecl& b) {
-            Type* ta = analysis.typeOf(a.node.greenNode());
-            Type* tb = analysis.typeOf(b.node.greenNode());
-            int da = (ta && ta->structInfo) ? depthOf(ta->structInfo) : 0;
-            int db = (tb && tb->structInfo) ? depthOf(tb->structInfo) : 0;
-            return da < db;
-        });
+bool Analyzer::overrideSignaturesCompatible(const MethodInfo& base, Symbol* der) {
+    Symbol* bs = base.symbol;
+    if (!bs || !der) return true;
+    if (bs->paramTypes.size() != der->paramTypes.size()) return false;
+    for (size_t i = 0; i < bs->paramTypes.size(); ++i) {
+        if (!bs->paramTypes[i] || !der->paramTypes[i]) continue;
+        if (!bs->paramTypes[i]->equals(der->paramTypes[i])) return false;
+    }
+    Type* br = bs->returnType ? bs->returnType : typeCtx.getPrimitive(TypeKind::Void);
+    Type* dr = der->returnType ? der->returnType : typeCtx.getPrimitive(TypeKind::Void);
+    return br->assignableFrom(dr);  // covariant return allowed
+}
 
-    // --- Fields: flatten inherited fields first, then own fields. ---
-    for (auto& cd : order) {
-        Type* t = analysis.typeOf(cd.node.greenNode());
-        if (!t || !t->structInfo) continue;
-        StructInfo* si = t->structInfo;
-        if (si->baseInfo) {
-            si->fields = si->baseInfo->fields;
-            si->baseFieldCount = static_cast<int>(si->baseInfo->fields.size());
-        }
-        for (auto& f : cd.fields()) {
-            FieldInfo fi;
-            auto fname = f.nameText();
-            if (fname) fi.name = *fname;
-            Type* ft = f.typeReference() ? resolveTypeReference(*f.typeReference()) : typeCtx.getError();
-            fi.type = ft;
-            fi.visibility = toSemanticVisibility(f.visibility());
-            fi.isWeak = f.isWeak();
-            fi.definingClass = si;
-            if (fi.isWeak) {
-                bool ok = ft && ft->isOptional() && ft->inner && ft->inner->isClass();
-                if (!ok) {
-                    errorAtNode(f.node,
-                        "'weak' fields must be nullable class types (e.g. `weak Foo? f`)");
-                }
+void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
+    Type* t = analysis.typeOf(cd.node.greenNode());
+    if (!t || !t->structInfo) return;
+    StructInfo* si = t->structInfo;
+
+    // Fields: flatten inherited fields first (base is already laid out), then own.
+    if (si->baseInfo) {
+        si->fields = si->baseInfo->fields;
+        si->baseFieldCount = static_cast<int>(si->baseInfo->fields.size());
+    }
+    for (auto& f : cd.fields()) {
+        FieldInfo fi;
+        auto fname = f.nameText();
+        if (fname) fi.name = *fname;
+        Type* ft = f.typeReference() ? resolveTypeReference(*f.typeReference()) : typeCtx.getError();
+        fi.type = ft;
+        fi.visibility = toSemanticVisibility(f.visibility());
+        fi.isWeak = f.isWeak();
+        fi.definingClass = si;
+        if (fi.isWeak) {
+            bool ok = ft && ft->isOptional() && ft->inner && ft->inner->isClass();
+            if (!ok) {
+                errorAtNode(f.node,
+                    "'weak' fields must be nullable class types (e.g. `weak Foo? f`)");
             }
-            if (!fi.name.empty() && si->findFieldIndex(fi.name) >= 0) {
-                int existing = si->findFieldIndex(fi.name);
-                bool inherited = existing < si->baseFieldCount;
-                errorAtNode(f.node, "Field '" + asciiOf(fi.name) + "' is already declared" +
-                    (inherited ? " in base class '" + asciiOf(si->baseInfo->name) + "'" : " in '" + asciiOf(si->name) + "'"));
-                continue;
-            }
-            auto [line, col] = source.offsetToPosition(f.node.startOffset());
-            fi.line = line;
-            fi.column = col;
-            fi.declaration = f.node.greenNode();
-            si->fields.push_back(std::move(fi));
         }
+        if (!fi.name.empty() && si->findFieldIndex(fi.name) >= 0) {
+            int existing = si->findFieldIndex(fi.name);
+            bool inherited = existing < si->baseFieldCount;
+            errorAtNode(f.node, "Field '" + asciiOf(fi.name) + "' is already declared" +
+                (inherited ? " in base class '" + asciiOf(si->baseInfo->name) + "'" : " in '" + asciiOf(si->name) + "'"));
+            continue;
+        }
+        auto [line, col] = source.offsetToPosition(f.node.startOffset());
+        fi.line = line;
+        fi.column = col;
+        fi.declaration = f.node.greenNode();
+        si->fields.push_back(std::move(fi));
     }
 
-    auto signaturesCompatible = [&](const MethodInfo& base, Symbol* der) -> bool {
-        Symbol* bs = base.symbol;
-        if (!bs || !der) return true;
-        if (bs->paramTypes.size() != der->paramTypes.size()) return false;
-        for (size_t i = 0; i < bs->paramTypes.size(); ++i) {
-            if (!bs->paramTypes[i] || !der->paramTypes[i]) continue;
-            if (!bs->paramTypes[i]->equals(der->paramTypes[i])) return false;
+    // Methods: collect own methods, then validate override/abstract.
+    for (auto& m : cd.methods()) {
+        Type* retType = m.returnType() && m.returnType()->typeReference()
+            ? resolveTypeReference(*m.returnType()->typeReference())
+            : typeCtx.getPrimitive(TypeKind::Void);
+        auto mname = m.nameText().value_or(std::u16string{});
+        uint32_t mPos = m.nameToken() ? m.nameToken()->startOffset() : m.node.startOffset();
+        Symbol* sym = makeSymbol(SymbolKind::Function, mname, nullptr, mPos);
+        sym->returnType = retType;
+        sym->funcDeclCst = m.node.greenNode();
+        sym->declaredThrows = m.isThrows();
+        sym->methodOwner = si;
+        resolveMethodParams(m, t, sym);
+        analysis.setSymbol(m.node.greenNode(), sym);
+        analysis.setReceiver(m.node.greenNode(), t);
+
+        MethodInfo mi;
+        mi.name = mname;
+        mi.symbol = sym;
+        mi.declaration = const_cast<GreenElement*>(m.node.greenNode());
+        mi.visibility = toSemanticVisibility(m.visibility());
+        mi.isOverride = m.isOverride();
+        mi.isFinal = m.isFinal();
+        mi.isAbstract = m.isAbstract();
+        mi.definingClass = si;
+        si->methods.push_back(std::move(mi));
+
+        // Validate (base methods already collected via base-before-derived order).
+        bool isCtor = (mname == si->name);
+        bool overridable = !isCtor && !m.isFinal() && !si->isFinal;
+        checkFieldMethodCollision(si, mname, isCtor, m.node);
+        checkThrowsClausePlacement(m, overridable, isCtor);
+        if (isCtor) {
+            if (m.isOverride() || m.isAbstract())
+                errorAtNode(m.node, "A constructor cannot be 'override' or 'abstract'");
+            continue;
         }
-        Type* br = bs->returnType ? bs->returnType : typeCtx.getPrimitive(TypeKind::Void);
-        Type* dr = der->returnType ? der->returnType : typeCtx.getPrimitive(TypeKind::Void);
-        return br->assignableFrom(dr);  // covariant return allowed
-    };
-
-    // --- Methods: collect own methods, then validate override/abstract. ---
-    for (auto& cd : order) {
-        Type* t = analysis.typeOf(cd.node.greenNode());
-        if (!t || !t->structInfo) continue;
-        StructInfo* si = t->structInfo;
-        for (auto& m : cd.methods()) {
-            Type* retType = m.returnType() && m.returnType()->typeReference()
-                ? resolveTypeReference(*m.returnType()->typeReference())
-                : typeCtx.getPrimitive(TypeKind::Void);
-            auto mname = m.nameText().value_or(std::u16string{});
-            uint32_t mPos = m.nameToken() ? m.nameToken()->startOffset() : m.node.startOffset();
-            Symbol* sym = makeSymbol(SymbolKind::Function, mname, nullptr, mPos);
-            sym->returnType = retType;
-            sym->funcDeclCst = m.node.greenNode();
-            sym->declaredThrows = m.isThrows();
-            sym->methodOwner = si;
-            resolveMethodParams(m, t, sym);
-            analysis.setSymbol(m.node.greenNode(), sym);
-            analysis.setReceiver(m.node.greenNode(), t);
-
-            MethodInfo mi;
-            mi.name = mname;
-            mi.symbol = sym;
-            mi.declaration = const_cast<GreenElement*>(m.node.greenNode());
-            mi.visibility = toSemanticVisibility(m.visibility());
-            mi.isOverride = m.isOverride();
-            mi.isFinal = m.isFinal();
-            mi.isAbstract = m.isAbstract();
-            mi.definingClass = si;
-            si->methods.push_back(std::move(mi));
-
-            // Validate (base methods already collected via topological order).
-            bool isCtor = (mname == si->name);
-            bool overridable = !isCtor && !m.isFinal() && !si->isFinal;
-            checkFieldMethodCollision(si, mname, isCtor, m.node);
-            checkThrowsClausePlacement(m, overridable, isCtor);
-            if (isCtor) {
-                if (m.isOverride() || m.isAbstract())
-                    errorAtNode(m.node, "A constructor cannot be 'override' or 'abstract'");
-                continue;
+        StructInfo* baseDecl = si->baseInfo ? si->baseInfo->classDeclaringMethod(mname) : nullptr;
+        if (m.isAbstract()) {
+            if (!si->isAbstract)
+                errorAtNode(m.node, "Abstract method '" + asciiOf(mname) + "' requires class '" +
+                    asciiOf(si->name) + "' to be declared 'abstract'");
+            if (m.body().has_value())
+                errorAtNode(m.node, "Abstract method '" + asciiOf(mname) + "' cannot have a body");
+        }
+        if (m.isOverride()) {
+            if (!baseDecl) {
+                errorAtNode(m.node, "Method '" + asciiOf(mname) +
+                    "' is marked 'override' but no base class declares it");
+            } else {
+                MethodInfo& bm = baseDecl->methods[baseDecl->findMethodIndex(mname)];
+                if (bm.isFinal)
+                    errorAtNode(m.node, "Cannot override '" + asciiOf(mname) +
+                        "' because it is declared 'final' in '" + asciiOf(baseDecl->name) + "'");
+                if (!overrideSignaturesCompatible(bm, sym))
+                    errorAtNode(m.node, "Override of '" + asciiOf(mname) +
+                        "' does not match the signature declared in '" + asciiOf(baseDecl->name) + "'");
+                if (m.isThrows() && bm.symbol && !bm.symbol->declaredThrows)
+                    errorAtNode(m.throwsToken().value_or(m.node), "Method '" + asciiOf(mname) +
+                        "' is marked 'throws' but overrides a method of '" + asciiOf(baseDecl->name) +
+                        "' that is not. Mark the base method 'throws' too, or handle the exceptions "
+                        "inside the override.");
             }
-            StructInfo* baseDecl = si->baseInfo ? si->baseInfo->classDeclaringMethod(mname) : nullptr;
-            if (m.isAbstract()) {
-                if (!si->isAbstract)
-                    errorAtNode(m.node, "Abstract method '" + asciiOf(mname) + "' requires class '" +
-                        asciiOf(si->name) + "' to be declared 'abstract'");
-                if (m.body().has_value())
-                    errorAtNode(m.node, "Abstract method '" + asciiOf(mname) + "' cannot have a body");
-            }
-            if (m.isOverride()) {
-                if (!baseDecl) {
-                    errorAtNode(m.node, "Method '" + asciiOf(mname) +
-                        "' is marked 'override' but no base class declares it");
-                } else {
-                    MethodInfo& bm = baseDecl->methods[baseDecl->findMethodIndex(mname)];
-                    if (bm.isFinal)
-                        errorAtNode(m.node, "Cannot override '" + asciiOf(mname) +
-                            "' because it is declared 'final' in '" + asciiOf(baseDecl->name) + "'");
-                    if (!signaturesCompatible(bm, sym))
-                        errorAtNode(m.node, "Override of '" + asciiOf(mname) +
-                            "' does not match the signature declared in '" + asciiOf(baseDecl->name) + "'");
-                    if (m.isThrows() && bm.symbol && !bm.symbol->declaredThrows)
-                        errorAtNode(m.throwsToken().value_or(m.node), "Method '" + asciiOf(mname) +
-                            "' is marked 'throws' but overrides a method of '" + asciiOf(baseDecl->name) +
-                            "' that is not. Mark the base method 'throws' too, or handle the exceptions "
-                            "inside the override.");
-                }
-            } else if (baseDecl) {
-                errorAtNode(m.node, "Method '" + asciiOf(mname) + "' hides a method inherited from '" +
-                    asciiOf(baseDecl->name) + "'; mark it 'override' to replace it, or rename it");
-            }
+        } else if (baseDecl) {
+            errorAtNode(m.node, "Method '" + asciiOf(mname) + "' hides a method inherited from '" +
+                asciiOf(baseDecl->name) + "'; mark it 'override' to replace it, or rename it");
         }
     }
 
     // --- A concrete class must implement every inherited abstract method. ---
-    for (auto& cd : order) {
-        Type* t = analysis.typeOf(cd.node.greenNode());
-        if (!t || !t->structInfo) continue;
-        StructInfo* si = t->structInfo;
-        if (si->isAbstract) continue;
+    if (!si->isAbstract) {
         std::unordered_set<std::u16string> checked;
         for (StructInfo* s = si; s; s = s->baseInfo) {
             for (auto& m : s->methods) {
@@ -846,12 +829,35 @@ void Analyzer::collectClasses(const ast::SourceFile& file) {
             }
         }
     }
+}
+
+void Analyzer::layoutDeclaredClasses(const ast::SourceFile& file) {
+    auto classes = file.classes();
+    std::vector<ast::ClassDecl> order(classes.begin(), classes.end());
+    std::stable_sort(order.begin(), order.end(),
+        [&](const ast::ClassDecl& a, const ast::ClassDecl& b) {
+            Type* ta = analysis.typeOf(a.node.greenNode());
+            Type* tb = analysis.typeOf(b.node.greenNode());
+            int da = (ta && ta->structInfo) ? baseDepth(ta->structInfo) : 0;
+            int db = (tb && tb->structInfo) ? baseDepth(tb->structInfo) : 0;
+            return da < db;
+        });
+    std::vector<StructInfo*> sis;
+    for (auto& cd : order) {
+        layoutOneClass(cd);
+        if (Type* t = analysis.typeOf(cd.node.greenNode()); t && t->structInfo)
+            sis.push_back(t->structInfo);
+    }
+    finalizeClassHierarchy(sis);
+}
+
+void Analyzer::finalizeClassHierarchy(const std::vector<StructInfo*>& classes) {
+    std::vector<StructInfo*> order(classes.begin(), classes.end());
+    std::stable_sort(order.begin(), order.end(),
+        [](StructInfo* a, StructInfo* b) { return baseDepth(a) < baseDepth(b); });
 
     // --- Assign vtable slots: a method is virtual only when abstract or overridden somewhere. ---
-    for (auto& cd : order) {  // phase 1: mark
-        Type* t = analysis.typeOf(cd.node.greenNode());
-        if (!t || !t->structInfo) continue;
-        StructInfo* si = t->structInfo;
+    for (StructInfo* si : order) {  // phase 1: mark
         for (auto& mi : si->methods) {
             if (mi.name == si->name) continue;
             if (mi.isAbstract) mi.vtableSlot = VTSLOT_PENDING;
@@ -863,10 +869,7 @@ void Analyzer::collectClasses(const ast::SourceFile& file) {
             }
         }
     }
-    for (auto& cd : order) {  // phase 2: assign indices
-        Type* t = analysis.typeOf(cd.node.greenNode());
-        if (!t || !t->structInfo) continue;
-        StructInfo* si = t->structInfo;
+    for (StructInfo* si : order) {  // phase 2: assign indices
         si->vtableSize = si->baseInfo ? si->baseInfo->vtableSize : 0;
         for (auto& mi : si->methods) {
             if (mi.name == si->name || mi.vtableSlot != VTSLOT_PENDING) continue;
@@ -877,10 +880,7 @@ void Analyzer::collectClasses(const ast::SourceFile& file) {
     }
 
     // ABI throws-ness is uniform across a vtable slot
-    for (auto& cd : order) {
-        Type* t = analysis.typeOf(cd.node.greenNode());
-        if (!t || !t->structInfo) continue;
-        StructInfo* si = t->structInfo;
+    for (StructInfo* si : order) {
         for (auto& mi : si->methods) {
             if (mi.name == si->name || !mi.symbol) continue;
             StructInfo* root = si->rootClassDeclaringMethod(mi.name);

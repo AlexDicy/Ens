@@ -50,6 +50,9 @@ public:
 
     void importPrelude();
 
+    void layoutOneClass(const ast::ClassDecl& classDecl);
+    static void finalizeClassHierarchy(const std::vector<StructInfo*>& classes);
+
     StructInfo* errorClass() const { return errorClassInfo_; }
 
     const AnalysisResult& result() const { return analysis; }
@@ -119,11 +122,13 @@ private:
     void registerClassNames(const ast::SourceFile& file);
     void registerExternalTypeNames(const ast::SourceFile& file);
     void collectStructs(const ast::SourceFile& file);
-    void collectClasses(const ast::SourceFile& file);
+    void resolveClassBases(const ast::SourceFile& file);
+    void layoutDeclaredClasses(const ast::SourceFile& file);
     void collectFunctions(const ast::SourceFile& file);
     void collectExternalFunctions(const ast::SourceFile& file);
     void resolveMethodParams(const ast::FuncDecl& fn, ::Type* receiverType, Symbol* sym);
     void resolveFunctionParams(const ast::FuncDecl& fn, Symbol* sym);
+    bool overrideSignaturesCompatible(const MethodInfo& base, Symbol* derived);
     void checkThrowsClausePlacement(const ast::FuncDecl& fn, bool isOverridable, bool isConstructor);
     void checkFieldMethodCollision(StructInfo* owner, const std::u16string& methodName,
                                    bool isConstructor, const SyntaxNode& diag);
