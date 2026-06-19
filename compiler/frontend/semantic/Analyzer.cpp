@@ -562,6 +562,10 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             Symbol* sym = makeSymbol(SymbolKind::Function, mname, nullptr, mPos);
             sym->returnType = retType;
             sym->funcDeclCst = m.node.greenNode();
+            sym->declaredThrows = m.isThrows();
+            sym->abiThrows = m.isThrows();  // structs have no inheritance
+            checkThrowsClausePlacement(m, /*isOverridable=*/false,
+                                       /*isConstructor=*/mname == t->structInfo->name);
             resolveMethodParams(m, t, sym);
             analysis.setSymbol(m.node.greenNode(), sym);
             analysis.setReceiver(m.node.greenNode(), t);
@@ -710,6 +714,7 @@ void Analyzer::collectClasses(const ast::SourceFile& file) {
             Symbol* sym = makeSymbol(SymbolKind::Function, mname, nullptr, mPos);
             sym->returnType = retType;
             sym->funcDeclCst = m.node.greenNode();
+            sym->declaredThrows = m.isThrows();
             resolveMethodParams(m, t, sym);
             analysis.setSymbol(m.node.greenNode(), sym);
             analysis.setReceiver(m.node.greenNode(), t);
@@ -727,6 +732,8 @@ void Analyzer::collectClasses(const ast::SourceFile& file) {
 
             // Validate (base methods already collected via topological order).
             bool isCtor = (mname == si->name);
+            bool overridable = !isCtor && !m.isFinal() && !si->isFinal;
+            checkThrowsClausePlacement(m, overridable, isCtor);
             if (isCtor) {
                 if (m.isOverride() || m.isAbstract())
                     errorAtNode(m.node, "A constructor cannot be 'override' or 'abstract'");
@@ -752,6 +759,11 @@ void Analyzer::collectClasses(const ast::SourceFile& file) {
                     if (!signaturesCompatible(bm, sym))
                         errorAtNode(m.node, "Override of '" + asciiOf(mname) +
                             "' does not match the signature declared in '" + asciiOf(baseDecl->name) + "'");
+                    if (m.isThrows() && bm.symbol && !bm.symbol->declaredThrows)
+                        errorAtNode(m.throwsToken().value_or(m.node), "Method '" + asciiOf(mname) +
+                            "' is marked 'throws' but overrides a method of '" + asciiOf(baseDecl->name) +
+                            "' that is not. Mark the base method 'throws' too, or handle the exceptions "
+                            "inside the override.");
                 }
             } else if (baseDecl) {
                 errorAtNode(m.node, "Method '" + asciiOf(mname) + "' hides a method inherited from '" +
@@ -809,6 +821,20 @@ void Analyzer::collectClasses(const ast::SourceFile& file) {
             mi.vtableSlot = (inherited >= 0) ? inherited : si->vtableSize++;
         }
     }
+
+    // ABI throws-ness is uniform across a vtable slot
+    for (auto& cd : order) {
+        Type* t = analysis.typeOf(cd.node.greenNode());
+        if (!t || !t->structInfo) continue;
+        StructInfo* si = t->structInfo;
+        for (auto& mi : si->methods) {
+            if (mi.name == si->name || !mi.symbol) continue;
+            StructInfo* root = si->rootClassDeclaringMethod(mi.name);
+            int ri = root ? root->findMethodIndex(mi.name) : -1;
+            Symbol* rootSym = (ri >= 0) ? root->methods[ri].symbol : nullptr;
+            mi.symbol->abiThrows = rootSym ? rootSym->declaredThrows : mi.symbol->declaredThrows;
+        }
+    }
 }
 
 void Analyzer::collectFunctions(const ast::SourceFile& file) {
@@ -821,6 +847,9 @@ void Analyzer::collectFunctions(const ast::SourceFile& file) {
         Symbol* sym = makeSymbol(SymbolKind::Function, fname, nullptr, fPos);
         sym->returnType = retType;
         sym->funcDeclCst = fn.node.greenNode();
+        sym->declaredThrows = fn.isThrows();
+        sym->abiThrows = fn.isThrows();
+        checkThrowsClausePlacement(fn, /*isOverridable=*/false, /*isConstructor=*/false);
         resolveFunctionParams(fn, sym);
         if (!globalScope->define(sym)) {
             errorAtNode(fn.node, "Duplicate function name '" + asciiOf(fname) + "'");
@@ -893,6 +922,28 @@ void Analyzer::resolveFunctionParams(const ast::FuncDecl& fn, Symbol* sym) {
             errorAtNode(p.node, "Parameter '" + asciiOf(p.nameText().value_or(std::u16string{})) +
                 "' has no default but follows a defaulted parameter");
         }
+    }
+}
+
+void Analyzer::checkThrowsClausePlacement(const ast::FuncDecl& fn, bool isOverridable,
+                                          bool isConstructor) {
+    if (!fn.isThrows()) return;
+    SyntaxNode at = fn.throwsToken().value_or(fn.node);
+    if (isConstructor) {
+        errorAtNode(at, "A constructor cannot be marked 'throws'. Constructors must not let "
+            "exceptions escape; handle them with a 'catch' clause after the constructor body.");
+        return;
+    }
+    bool hasTypes = !fn.declaredThrowsTypes().empty();
+    if (fn.isAbstract()) {
+        if (!hasTypes)
+            errorAtNode(at, "An abstract method marked 'throws' must list its exception types, "
+                "e.g. 'throws IOError'.");
+        return;
+    }
+    if (hasTypes && !isOverridable) {
+        errorAtNode(at, "Explicit 'throws' types are only allowed where the method can be "
+            "overridden; the thrown types here are inferred. Write 'throws' with no type list.");
     }
 }
 
@@ -1096,10 +1147,12 @@ void Analyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
     Symbol* prevFunction = currentFunction;
     Symbol* prevThis = currentThis;
     bool prevSawSuper = sawSuperConstructorCall;
+    Scope* prevParamScope = currentFunctionParamScope;
     currentFunction = info->resolvedSymbol;
     sawSuperConstructorCall = false;
 
-    pushScope();
+    Scope* funcScope = pushScope();
+    currentFunctionParamScope = funcScope;
 
     Type* receiverType = analysis.receiverOf(fn.node.greenNode());
 
@@ -1131,9 +1184,12 @@ void Analyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
     // Synthesize this.field = paramName for each this-field param.
     if (receiverType) analyzeImplicitConstructorAssignments(fn);
 
+    // Body locals live in a child scope so catch clauses (siblings below) can't see them.
+    pushScope();
     if (auto body = fn.body()) {
         for (auto& s : body->statements()) analyzeStatement(s);
     }
+    popScope();
 
     // A constructor must chain to its base when the base has no zero-argument constructor.
     if (receiverType && receiverType->structInfo && !sawSuperConstructorCall) {
@@ -1152,10 +1208,46 @@ void Analyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
         }
     }
 
+    for (auto& cc : fn.catchClauses()) analyzeCatchClause(cc, funcScope);
+
     popScope();
     currentFunction = prevFunction;
     currentThis = prevThis;
     sawSuperConstructorCall = prevSawSuper;
+    currentFunctionParamScope = prevParamScope;
+}
+
+void Analyzer::analyzeCatchClause(const ast::CatchClause& clause, Scope* funcScope) {
+    currentScope = funcScope;
+    pushScope();
+
+    Type* clauseType = clause.typeReference()
+        ? resolveTypeReference(*clause.typeReference()) : typeCtx.getError();
+    if (!clauseType->isError()) {
+        bool isErrorSubclass = clauseType->isClass() && clauseType->structInfo && errorClassInfo_ &&
+            clauseType->structInfo->isSubclassOf(errorClassInfo_);
+        if (!isErrorSubclass) {
+            SyntaxNode diag = clause.typeReference() ? clause.typeReference()->node : clause.node;
+            errorAtNode(diag, "Cannot catch '" + clauseType->toString() +
+                "'; only 'Error' or a subclass of it can be caught.");
+        }
+    }
+
+    if (auto nameTok = clause.nameToken()) {
+        auto cname = clause.nameText().value_or(std::u16string{});
+        Symbol* var = makeSymbol(SymbolKind::Variable, cname, clauseType, nameTok->startOffset());
+        currentScope->define(var);
+        analysis.setSymbol(clause.node.greenNode(), var);
+    }
+
+    bool prevInCatch = inCatchClause;
+    inCatchClause = true;
+    if (auto body = clause.body()) {
+        for (auto& s : body->statements()) analyzeStatement(s);
+    }
+    inCatchClause = prevInCatch;
+
+    popScope();
 }
 
 void Analyzer::analyzeImplicitConstructorAssignments(const ast::FuncDecl& fn) {
@@ -1192,6 +1284,8 @@ void Analyzer::analyzeStatement(const ast::Statement& stmt) {
     if (auto w = stmt.asWhile())              { analyzeWhileStmt(*w); return; }
     if (auto r = stmt.asReturn())             { analyzeReturnStmt(*r); return; }
     if (auto e = stmt.asExpressionStmt())     { analyzeExpressionStmt(*e); return; }
+    if (auto th = stmt.asThrow())             { analyzeThrowStmt(*th); return; }
+    if (auto rt = stmt.asRethrow())           { analyzeRethrowStmt(*rt); return; }
 }
 
 void Analyzer::analyzeBlock(const ast::Block& block) {
@@ -1219,7 +1313,12 @@ void Analyzer::analyzeLetStmt(const ast::LetStatement& stmt) {
 
     uint32_t namePos = stmt.nameToken() ? stmt.nameToken()->startOffset() : stmt.node.startOffset();
     Symbol* sym = makeSymbol(SymbolKind::Variable, name, finalType, namePos);
-    if (!currentScope->define(sym)) {
+    bool collides = !currentScope->define(sym);
+    if (!collides && currentScope->parent == currentFunctionParamScope &&
+        currentFunctionParamScope && currentFunctionParamScope->lookupLocal(name)) {
+        collides = true;
+    }
+    if (collides) {
         errorAtNode(stmt.node, "Variable '" + asciiOf(name) + "' is already defined in this scope");
     }
     analysis.setSymbol(stmt.node.greenNode(), sym);
@@ -1247,7 +1346,12 @@ void Analyzer::analyzeTypedVarDeclStmt(const ast::TypedVarDeclStatement& stmt) {
     }
     uint32_t namePos = stmt.nameToken() ? stmt.nameToken()->startOffset() : stmt.node.startOffset();
     Symbol* sym = makeSymbol(SymbolKind::Variable, name, declared, namePos);
-    if (!currentScope->define(sym)) {
+    bool collides = !currentScope->define(sym);
+    if (!collides && currentScope->parent == currentFunctionParamScope &&
+        currentFunctionParamScope && currentFunctionParamScope->lookupLocal(name)) {
+        collides = true;
+    }
+    if (collides) {
         errorAtNode(stmt.node, "Variable '" + asciiOf(name) + "' is already defined in this scope");
     }
     analysis.setSymbol(stmt.node.greenNode(), sym);
@@ -1512,6 +1616,7 @@ Type* Analyzer::analyzeExpr(const ast::Expression& expr) {
     else if (auto a  = expr.asAssign()) t = analyzeAssign(*a);
     else if (auto tn = expr.asTernary())t = analyzeTernary(*tn);
     else if (auto nw = expr.asNew())    t = analyzeNew(*nw);
+    else if (auto tr = expr.asTry())    t = analyzeTry(*tr);
     else if (auto pr = expr.asParen())  t = analyzeParen(*pr);
     else if (auto al = expr.asArrayLiteral()) t = analyzeArrayLiteral(*al);
     else                                t = typeCtx.getError();
@@ -2425,6 +2530,36 @@ Type* Analyzer::analyzeNew(const ast::NewExpression& expr) {
 Type* Analyzer::analyzeParen(const ast::ParenExpression& expr) {
     if (auto inner = expr.inner()) return analyzeExpr(*inner);
     return typeCtx.getError();
+}
+
+Type* Analyzer::analyzeTry(const ast::TryExpression& expr) {
+    auto operand = expr.operand();
+    if (!operand) return typeCtx.getError();
+    if (operand->node.kind() != SyntaxKind::CallExpr) {
+        errorAtNode(expr.node, "'try' must directly prefix a single call, "
+            "e.g. 'try f(x)' or 'try obj.m()'.");
+        return analyzeExpr(*operand);
+    }
+    return analyzeExpr(*operand);
+}
+
+void Analyzer::analyzeThrowStmt(const ast::ThrowStatement& stmt) {
+    auto value = stmt.value();
+    if (!value) return;
+    Type* t = analyzeExpr(*value);
+    if (t->isError()) return;
+    bool isErrorSubclass = t->isClass() && t->structInfo && errorClassInfo_ &&
+        t->structInfo->isSubclassOf(errorClassInfo_);
+    if (!isErrorSubclass) {
+        errorAtNode(value->node, "Cannot throw a value of type '" + t->toString() +
+            "'; only 'Error' or a subclass of it can be thrown.");
+    }
+}
+
+void Analyzer::analyzeRethrowStmt(const ast::RethrowStatement& stmt) {
+    if (!inCatchClause) {
+        errorAtNode(stmt.node, "'rethrow' can only be used inside a 'catch' block.");
+    }
 }
 
 // Array literal `[a, b, c]` with no target type: first-element-wins.

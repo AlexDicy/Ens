@@ -84,6 +84,10 @@ private:
     Symbol* currentFunction = nullptr;
     Symbol* currentThis = nullptr;
     bool sawSuperConstructorCall = false;
+    // The function's parameter/this scope; catch clauses and the body are children
+    // of it, so catch clauses see params/this but not body locals.
+    Scope* currentFunctionParamScope = nullptr;
+    bool inCatchClause = false;
 
     // Cached AST root after collectDeclarations so analyzeBodies doesn't have
     // to re-parse the source. Populated by collectDeclarations.
@@ -116,6 +120,7 @@ private:
     void collectExternalFunctions(const ast::SourceFile& file);
     void resolveMethodParams(const ast::FuncDecl& fn, ::Type* receiverType, Symbol* sym);
     void resolveFunctionParams(const ast::FuncDecl& fn, Symbol* sym);
+    void checkThrowsClausePlacement(const ast::FuncDecl& fn, bool isOverridable, bool isConstructor);
     void checkParameterDefaults(const ast::FuncDecl& fn);
     void checkFieldDefaults(const ast::StructDecl& sd);
     void checkFieldDefaults(const ast::ClassDecl& cd);
@@ -125,6 +130,7 @@ private:
     // === Body analysis ===
     void analyzeFunctionBody(const ast::FuncDecl& fn);
     void analyzeImplicitConstructorAssignments(const ast::FuncDecl& fn);
+    void analyzeCatchClause(const ast::CatchClause& clause, Scope* funcScope);
 
     void analyzeStatement(const ast::Statement& stmt);
     void analyzeBlock(const ast::Block& block);
@@ -134,6 +140,8 @@ private:
     void analyzeWhileStmt(const ast::WhileStatement& stmt);
     void analyzeReturnStmt(const ast::ReturnStatement& stmt);
     void analyzeExpressionStmt(const ast::ExpressionStatement& stmt);
+    void analyzeThrowStmt(const ast::ThrowStatement& stmt);
+    void analyzeRethrowStmt(const ast::RethrowStatement& stmt);
 
     Type* analyzeExpr(const ast::Expression& expr);
     Type* analyzeLiteral(const ast::LiteralExpression& expr);
@@ -160,6 +168,7 @@ private:
     Type* analyzeAssign(const ast::AssignExpression& expr);
     Type* analyzeTernary(const ast::TernaryExpression& expr);
     Type* analyzeNew(const ast::NewExpression& expr);
+    Type* analyzeTry(const ast::TryExpression& expr);
     Type* analyzeParen(const ast::ParenExpression& expr);
     Type* analyzeArrayLiteral(const ast::ArrayLiteralExpression& expr);
     Type* analyzeArrayLiteralAdapt(const ast::ArrayLiteralExpression& expr, Type* target);
