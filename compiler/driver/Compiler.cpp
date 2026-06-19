@@ -130,17 +130,23 @@ std::unique_ptr<Module> loadModule(const fs::path& sourceRoot,
     return m;
 }
 
-std::unique_ptr<Module> loadPreludeModule() {
+std::unique_ptr<Module> makeInMemoryModule(const std::u16string& modulePath,
+                                           const std::string& filename, std::u16string code) {
     auto m = std::make_unique<Module>();
-    m->modulePath = std::u16string(kPreludeModulePath);
-    m->absolutePath = "<prelude>";
-    m->relativePath = "<prelude>";
-    m->source = std::make_unique<SourceFile>("<prelude>", std::u16string(kPreludeSource));
+    m->modulePath = modulePath;
+    m->absolutePath = filename;
+    m->relativePath = filename;
+    m->source = std::make_unique<SourceFile>(filename, std::move(code));
     m->sink = std::make_unique<DiagnosticSink>();
     Parser parser(m->source->getSource(), *m->sink);
     m->cstRoot = parser.parseSourceFile();
     m->rootNode = SyntaxNode::makeRoot(m->cstRoot.get());
     return m;
+}
+
+std::unique_ptr<Module> loadPreludeModule() {
+    return makeInMemoryModule(std::u16string(kPreludeModulePath), "<prelude>",
+                              std::u16string(kPreludeSource));
 }
 
 bool buildModuleGraph(const fs::path& sourceRoot,
@@ -421,6 +427,31 @@ bool emitModule(Module& module,
     return true;
 }
 
+bool linkModulesToExe(std::vector<std::unique_ptr<Module>>& modules,
+                      const fs::path& outputFile) {
+    fs::path outDir = outputFile.parent_path();
+    if (outDir.empty()) outDir = fs::current_path();
+    std::string baseStem = outputFile.stem().string();
+    if (baseStem.empty()) baseStem = "ens";
+
+    std::vector<std::string> objectPaths;
+    objectPaths.reserve(modules.size());
+    std::vector<std::string> libraries;
+    auto addLibrary = [&](const std::u16string& lib) {
+        std::string asciiLib = asAscii(lib);
+        for (auto& l : libraries) if (l == asciiLib) return;
+        libraries.push_back(std::move(asciiLib));
+    };
+    for (auto& m : modules) {
+        std::string name = baseStem + "." + sanitizeForFilename(m->modulePath) + ".obj";
+        fs::path objPath = outDir / name;
+        if (!emitModule(*m, "ens_" + sanitizeForFilename(m->modulePath), objPath)) return false;
+        objectPaths.push_back(objPath.string());
+        for (auto& lib : m->analyzer->linkLibraries()) addLibrary(lib);
+    }
+    return Linker::link(objectPaths, libraries, outputFile.string(), std::cerr);
+}
+
 }  // namespace
 
 bool Compiler::compile(const fs::path& source,
@@ -485,28 +516,7 @@ bool Compiler::compile(const fs::path& source,
         return false;
     }
 
-    fs::path outDir = outputFolder.parent_path();
-    if (outDir.empty()) outDir = fs::current_path();
-    std::string baseStem = outputFolder.stem().string();
-    if (baseStem.empty()) baseStem = "ens";
-
-    std::vector<std::string> objectPaths;
-    objectPaths.reserve(modules.size());
-    std::vector<std::string> libraries;
-    auto addLibrary = [&](const std::u16string& lib) {
-        std::string asciiLib = asAscii(lib);
-        for (auto& l : libraries) if (l == asciiLib) return;
-        libraries.push_back(std::move(asciiLib));
-    };
-    for (auto& m : modules) {
-        std::string name = baseStem + "." + sanitizeForFilename(m->modulePath) + ".obj";
-        fs::path objPath = outDir / name;
-        if (!emitModule(*m, "ens_" + sanitizeForFilename(m->modulePath), objPath)) return false;
-        objectPaths.push_back(objPath.string());
-        for (auto& lib : m->analyzer->linkLibraries()) addLibrary(lib);
-    }
-
-    return Linker::link(objectPaths, libraries, outputFolder.string(), std::cerr);
+    return linkModulesToExe(modules, outputFolder);
 }
 
 std::vector<fs::path> Compiler::getFileTree(const fs::path& root, const fs::path& rootPath) {
@@ -634,90 +644,57 @@ bool Compiler::analyzeCst(std::istream& source, const std::string& filename) {
 bool Compiler::compileSingle(std::istream& source, const fs::path& outputFile, const std::string& filename, bool explainArc) {
     std::string code((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
     std::u16string u16code(code.begin(), code.end());
-    SourceFile sourceFile(filename, std::move(u16code));
 
-    DiagnosticSink sink;
-    Parser parser(sourceFile.getSource(), sink);
-    auto root = parser.parseSourceFile();
-    auto rootNode = SyntaxNode::makeRoot(root.get());
+    const std::u16string userPath = u"main";
+    std::vector<std::unique_ptr<Module>> modules;
+    std::unordered_map<std::u16string, Module*> byPath;
 
-    Analyzer analyzer(sourceFile, sink);
-    analyzer.analyze(*rootNode);
+    auto prelude = loadPreludeModule();
+    byPath.emplace(std::u16string(kPreludeModulePath), prelude.get());
+    modules.push_back(std::move(prelude));
 
-    if (sink.hasErrors()) {
-        sink.printAll(sourceFile, std::cerr);
-        return false;
-    }
+    auto userModule = makeInMemoryModule(userPath, filename, std::move(u16code));
+    Module* user = userModule.get();
+    byPath.emplace(userPath, user);
+    modules.push_back(std::move(userModule));
 
-    if (auto sf = ast::SourceFile::cast(*rootNode)) {
-        EscapeAnalyzer ea(*sf, analyzer.result());
-        ea.analyze();
-        if (explainArc) {
-            std::cerr << "=== escape analysis ===\n";
-            auto emitFn = [&](const ast::FuncDecl& fn) {
-                auto* info = analyzer.result().find(fn.node.greenNode());
-                if (info && info->resolvedSymbol) printEscapeFactsForFunction(info->resolvedSymbol, std::cerr);
-                printPromotionsForFunction(fn, analyzer.result(), std::cerr);
-            };
-            for (auto& fn : sf->functions()) emitFn(fn);
-            for (auto& sd : sf->structs()) for (auto& mm : sd.methods()) emitFn(mm);
-            for (auto& cd : sf->classes()) for (auto& mm : cd.methods()) emitFn(mm);
-        }
-    }
+    TypeContext sharedCtx;
+    if (!runMultiModuleAnalysis(modules, byPath, sharedCtx, explainArc)) return false;
 
     std::string ext = outputFile.extension().string();
     for (auto& c : ext) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
     const bool linkToExe = !outputFile.empty() && (ext == ".exe" || ext.empty());
 
-    fs::path objPath;
-    if (linkToExe) {
-        objPath = outputFile;
-        objPath.replace_extension(".obj");
-    }
+    if (linkToExe) return linkModulesToExe(modules, outputFile);
 
-    {
-        CodeGenerator codegen("ens_module", filename, sourceFile, analyzer.result());
-        if (!codegen.generate(*rootNode)) {
-            for (const auto& d : codegen.getDiagnostics()) d.print(sourceFile, std::cerr);
-            return false;
-        }
-        if (outputFile.empty()) {
-            std::cout << "--- LLVM IR ---\n";
-            codegen.print(std::cout);
-            return true;
-        }
-        if (ext == ".ll") {
-            std::ofstream out(outputFile);
-            if (!out) {
-                std::cerr << "Could not open '" << outputFile << "' for writing\n";
-                return false;
-            }
-            codegen.print(out);
-            return true;
-        }
-        if (ext == ".obj" || ext == ".o") {
-            if (!codegen.emitObjectFile(outputFile.string())) {
-                for (const auto& d : codegen.getDiagnostics()) d.print(sourceFile, std::cerr);
-                return false;
-            }
-            return true;
-        }
-        if (linkToExe) {
-            if (!codegen.emitObjectFile(objPath.string())) {
-                for (const auto& d : codegen.getDiagnostics()) d.print(sourceFile, std::cerr);
-                return false;
-            }
-        } else {
-            std::cerr << "Unsupported --output extension: '" << ext << "'\n";
-            return false;
-        }
+    CodeGenerator codegen("ens_" + sanitizeForFilename(user->modulePath),
+                          user->source->getFilename(),
+                          *user->source, user->analyzer->result(), user->modulePath);
+    if (!codegen.generate(*user->rootNode)) {
+        for (const auto& d : codegen.getDiagnostics()) d.print(*user->source, std::cerr);
+        return false;
     }
-
-    if (linkToExe) {
-        std::vector<std::string> libraries;
-        for (auto& lib : analyzer.linkLibraries()) libraries.push_back(asAscii(lib));
-        if (!Linker::link({objPath.string()}, libraries, outputFile.string(), std::cerr)) return false;
+    if (outputFile.empty()) {
+        std::cout << "--- LLVM IR ---\n";
+        codegen.print(std::cout);
         return true;
     }
-    return true;
+    if (ext == ".ll") {
+        std::ofstream out(outputFile);
+        if (!out) {
+            std::cerr << "Could not open '" << outputFile << "' for writing\n";
+            return false;
+        }
+        codegen.print(out);
+        return true;
+    }
+    if (ext == ".obj" || ext == ".o") {
+        if (!codegen.emitObjectFile(outputFile.string())) {
+            for (const auto& d : codegen.getDiagnostics()) d.print(*user->source, std::cerr);
+            return false;
+        }
+        return true;
+    }
+    std::cerr << "Unsupported --output extension: '" << ext << "'\n";
+    return false;
 }
