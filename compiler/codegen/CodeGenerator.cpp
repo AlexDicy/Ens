@@ -390,6 +390,7 @@ struct CodeGenerator::Impl {
             return false;
         }
         llvm::TargetOptions opts;
+        opts.UseInitArray = true;   // emit .init_array (run by the loader) not legacy .ctors
         std::optional<llvm::Reloc::Model> rm = llvm::Reloc::PIC_;
         targetMachine.reset(target->createTargetMachine(
             llvm::Triple(triple), "generic", "", opts, rm));
@@ -557,7 +558,9 @@ struct CodeGenerator::Impl {
             if (receiver && receiver->structInfo)
                 display = asAscii(receiver->structInfo->name) + "." + display;
             bool isEntry = !receiver && rawName == u"main";
-            auto [eline, ecol] = posOf(fn.node.startOffset());
+            auto nameTok = fn.nameToken();
+            uint32_t lineOffset = nameTok ? nameTok->startOffset() : fn.node.startOffset();
+            auto [eline, ecol] = posOf(lineOffset);
             recordSymtabEntry(currentFunction, display, static_cast<int>(eline), isEntry);
         }
 
