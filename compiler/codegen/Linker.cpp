@@ -109,6 +109,17 @@ std::string dynamicLinkerFor(const std::string& triple) {
     return {};
 }
 
+void appendUnwinder(std::vector<std::string>& args) {
+    for (const char* name : { "libunwind.a", "libgcc_eh.a" }) {
+        std::string p = queryCCompiler(std::string("-print-file-name=") + name);
+        if (!p.empty() && p != name && llvm::sys::fs::exists(p)) {
+            args.push_back(p);
+            return;
+        }
+    }
+    args.push_back("-lgcc_s");
+}
+
 std::vector<std::string> buildArgv(LinkerFlavor flavor,
                                     const std::string& triple,
                                     const std::vector<std::string>& objs,
@@ -157,6 +168,7 @@ std::vector<std::string> buildArgv(LinkerFlavor flavor,
         case LinkerFlavor::Elf:
         default: {
             args = {"ld.lld"};
+            args.push_back("--eh-frame-hdr");   // so the unwinder finds FDEs under PIE
 
             const std::string dynLinker = dynamicLinkerFor(triple);
             if (!dynLinker.empty()) {
@@ -184,6 +196,7 @@ std::vector<std::string> buildArgv(LinkerFlavor flavor,
                 if (lib == "c") continue;  // libc is added explicitly below
                 args.push_back("-l" + lib);
             }
+            appendUnwinder(args);
             if (haveCrt) {
                 args.push_back("-lc");
                 if (!crtn.empty() && crtn != "crtn.o") args.push_back(crtn);
