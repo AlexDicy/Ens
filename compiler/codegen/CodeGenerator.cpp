@@ -1769,6 +1769,15 @@ struct CodeGenerator::Impl {
             llvm::FunctionType::get(i64, { ptrTy }, false),
             llvm::Function::ExternalLinkage, "_Unwind_GetIP", module.get());
     }
+    // USHORT RtlCaptureStackBackTrace(ULONG skip, ULONG count, PVOID* out, PULONG hash)
+    llvm::Function* getOrDeclareRtlCaptureStackBackTrace() {
+        if (auto* f = module->getFunction("RtlCaptureStackBackTrace")) return f;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32 = llvm::Type::getInt32Ty(ctx);
+        return llvm::Function::Create(
+            llvm::FunctionType::get(llvm::Type::getInt16Ty(ctx), { i32, i32, ptrTy, ptrTy }, false),
+            llvm::Function::ExternalLinkage, "RtlCaptureStackBackTrace", module.get());
+    }
 
     // Single registry head, internal to the prelude module (only prelude-defined
     // runtime functions touch it).
@@ -2003,7 +2012,7 @@ struct CodeGenerator::Impl {
         auto* i32 = llvm::Type::getInt32Ty(ctx);
         auto* i64 = llvm::Type::getInt64Ty(ctx);
         auto* entryTy = getSymEntryTy();
-        auto* stateTy = llvm::StructType::get(ctx, { ptrTy, i32, i32 });
+        bool windows = module->getTargetTriple().isOSWindows();
         fn->addFnAttr(llvm::Attribute::NoUnwind);
         auto saved = builder->saveIP();
         auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
@@ -2016,15 +2025,32 @@ struct CodeGenerator::Impl {
         llvm::Value* mx = fn->getArg(0);
         llvm::Value* mx64 = builder->CreateSExt(mx, i64);
         llvm::Value* buf = builder->CreateAlloca(i64, mx, "buf");
-        llvm::Value* state = builder->CreateAlloca(stateTy, nullptr, "state");
-        builder->CreateStore(buf, builder->CreateStructGEP(stateTy, state, 0));
-        builder->CreateStore(llvm::ConstantInt::get(i32, 0), builder->CreateStructGEP(stateTy, state, 1));
-        builder->CreateStore(mx, builder->CreateStructGEP(stateTy, state, 2));
-        builder->CreateCall(getOrDeclareUnwindBacktrace(),
-            { module->getFunction("ens_unwind_cb"), state });
-        llvm::Value* n = builder->CreateSExt(
-            builder->CreateLoad(i32, builder->CreateStructGEP(stateTy, state, 1)), i64, "n");
-        // long[] sized to maxDepth (over-allocated; length set to the kept count).
+
+        // Platform-specific fill: write up to maxDepth return addresses into buf.
+        // `n` = count; `skip` = leading buf entries to drop (the capture frame).
+        llvm::Value* n;
+        int64_t skip;
+        if (windows) {
+            // RtlCaptureStackBackTrace with skip=1 already drops this frame.
+            llvm::Value* n16 = builder->CreateCall(getOrDeclareRtlCaptureStackBackTrace(),
+                { llvm::ConstantInt::get(i32, 1), mx, buf, llvm::ConstantPointerNull::get(ptrTy) }, "n16");
+            n = builder->CreateZExt(n16, i64, "n");
+            skip = 0;
+        } else {
+            auto* stateTy = llvm::StructType::get(ctx, { ptrTy, i32, i32 });
+            llvm::Value* state = builder->CreateAlloca(stateTy, nullptr, "state");
+            builder->CreateStore(buf, builder->CreateStructGEP(stateTy, state, 0));
+            builder->CreateStore(llvm::ConstantInt::get(i32, 0), builder->CreateStructGEP(stateTy, state, 1));
+            builder->CreateStore(mx, builder->CreateStructGEP(stateTy, state, 2));
+            builder->CreateCall(getOrDeclareUnwindBacktrace(),
+                { module->getFunction("ens_unwind_cb"), state });
+            n = builder->CreateSExt(
+                builder->CreateLoad(i32, builder->CreateStructGEP(stateTy, state, 1)), i64, "n");
+            skip = 1;   // _Unwind_Backtrace reports the capture frame first
+        }
+
+        // Common: over-allocate a long[] of maxDepth, keep resolvable frames, stop at
+        // the program entry, set length to the kept count.
         llvm::Value* bytes = builder->CreateAdd(llvm::ConstantInt::get(i64, 8),
             builder->CreateMul(mx64, llvm::ConstantInt::get(i64, 8)));
         llvm::Value* arr = builder->CreateCall(getOrDefineEnsAlloc(),
@@ -2033,7 +2059,7 @@ struct CodeGenerator::Impl {
             llvm::ConstantInt::get(i64, 8), "trace.data");
         llvm::Value* iA = builder->CreateAlloca(i64, nullptr, "i");
         llvm::Value* jA = builder->CreateAlloca(i64, nullptr, "j");
-        builder->CreateStore(llvm::ConstantInt::get(i64, 1), iA);   // skip the capture frame
+        builder->CreateStore(llvm::ConstantInt::get(i64, skip), iA);
         builder->CreateStore(llvm::ConstantInt::get(i64, 0), jA);
         builder->CreateBr(lpCond);
 
@@ -2251,7 +2277,7 @@ struct CodeGenerator::Impl {
     }
 
     void definePreludeRuntime() {
-        defineUnwindCallback();
+        if (!module->getTargetTriple().isOSWindows()) defineUnwindCallback();
         defineResolveAddr();
         defineResolveLine();
         defineCaptureTrace();

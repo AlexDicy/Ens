@@ -136,6 +136,7 @@ std::vector<std::string> buildArgv(LinkerFlavor flavor,
             // arguments API.
             args.push_back("/defaultlib:libcmt");
             args.push_back("/defaultlib:oldnames");
+            args.push_back("/defaultlib:kernel32");   // RtlCaptureStackBackTrace for stack traces
             for (auto& lib : libraries) {
                 // libc and msvcrt are already covered by the defaultlibs above.
                 if (lib == "c" || lib == "msvcrt" || lib == "libcmt") continue;
