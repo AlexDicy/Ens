@@ -1596,6 +1596,33 @@ void Analyzer::analyzeBranchWithNarrowing(const ast::Block& block,
     popScope();
 }
 
+// True when control can never fall out the bottom of a block (every path returns,
+// throws, or rethrows), so the guard that led there holds for the following code.
+static bool blockAlwaysExits(const ast::Block& block);
+
+static bool ifStatementAlwaysExits(const ast::IfStatement& i) {
+    auto then = i.thenBlock();
+    auto ec = i.elseClause();
+    if (!then || !ec || !blockAlwaysExits(*then)) return false;
+    if (auto inner = ec->ifStatement()) return ifStatementAlwaysExits(*inner);
+    if (auto bb = ec->block()) return blockAlwaysExits(*bb);
+    return false;
+}
+
+static bool statementAlwaysExits(const ast::Statement& s) {
+    if (s.asReturn() || s.asThrow() || s.asRethrow()) return true;
+    if (auto b = s.asBlock()) return blockAlwaysExits(*b);
+    if (auto i = s.asIf()) return ifStatementAlwaysExits(*i);
+    return false;
+}
+
+static bool blockAlwaysExits(const ast::Block& block) {
+    for (auto& s : block.statements()) {
+        if (statementAlwaysExits(s)) return true;
+    }
+    return false;
+}
+
 void Analyzer::analyzeIfStmt(const ast::IfStatement& stmt) {
     NullCheckInfo info;
     if (auto c = stmt.condition()) {
@@ -1605,14 +1632,32 @@ void Analyzer::analyzeIfStmt(const ast::IfStatement& stmt) {
         }
         info = detectNullCheck(*c);
     }
-    if (auto b = stmt.thenBlock()) {
-        analyzeBranchWithNarrowing(*b, info, info.valid && info.narrowsThen);
+    auto thenBlock = stmt.thenBlock();
+    auto elseClause = stmt.elseClause();
+    if (thenBlock) {
+        analyzeBranchWithNarrowing(*thenBlock, info, info.valid && info.narrowsThen);
     }
-    if (auto ec = stmt.elseClause()) {
-        if (auto inner = ec->ifStatement()) analyzeIfStmt(*inner);
-        else if (auto bb = ec->block()) {
+    if (elseClause) {
+        if (auto inner = elseClause->ifStatement()) analyzeIfStmt(*inner);
+        else if (auto bb = elseClause->block()) {
             analyzeBranchWithNarrowing(*bb, info, info.valid && !info.narrowsThen);
         }
+    }
+
+    // When one branch always exits, the opposite case survives into the enclosing
+    // block, so a null check can narrow past the `if` (e.g. `if (x == null) { throw; }`
+    // leaves x non-null below).
+    if (info.valid && currentScope) {
+        bool thenExits = thenBlock && blockAlwaysExits(*thenBlock);
+        bool elseExits = false;
+        if (elseClause) {
+            if (auto inner = elseClause->ifStatement()) elseExits = ifStatementAlwaysExits(*inner);
+            else if (auto bb = elseClause->block()) elseExits = blockAlwaysExits(*bb);
+        }
+        bool narrowsAfter = false;
+        if (thenExits && !elseExits) narrowsAfter = !info.narrowsThen;
+        else if (elseExits && !thenExits && elseClause) narrowsAfter = info.narrowsThen;
+        if (narrowsAfter) currentScope->narrowedTypes[info.key] = info.narrowedT;
     }
 }
 
