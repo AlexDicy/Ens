@@ -16,6 +16,7 @@
 #include "semantic/TypeContext.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <deque>
 #include <fstream>
 #include <iostream>
@@ -149,31 +150,57 @@ std::unique_ptr<Module> loadPreludeModule() {
                               std::u16string(kPreludeSource));
 }
 
+bool isStdlibPath(const std::u16string& modulePath) {
+    static const std::u16string prefix = u"std.";
+    return modulePath == u"std" ||
+           (modulePath.size() >= prefix.size() &&
+            modulePath.compare(0, prefix.size(), prefix) == 0);
+}
+
+// Locate the standard library root (the directory containing `std/`): an explicit
+// ENS_STDLIB override, otherwise the nearest `libs/` walking up from the working
+// directory. Empty if none is found.
+fs::path findStdlibRoot() {
+    std::error_code ec;
+    if (const char* env = std::getenv("ENS_STDLIB")) {
+        fs::path root(env);
+        if (!root.empty() && fs::exists(root, ec)) return root;
+    }
+    fs::path dir = fs::current_path(ec);
+    if (ec) return fs::path();
+    for (fs::path d = dir;; d = d.parent_path()) {
+        fs::path libs = d / "libs";
+        if (fs::exists(libs / "std" / "system.ens", ec)) return libs;
+        if (d == d.parent_path()) break;
+    }
+    return fs::path();
+}
+
 bool buildModuleGraph(const fs::path& sourceRoot,
+                      const fs::path& stdlibRoot,
                       std::deque<fs::path>& seedRelatives,
                       std::vector<std::unique_ptr<Module>>& modulesOut,
                       std::unordered_map<std::u16string, Module*>& byPath) {
+    struct WorkItem { fs::path base; fs::path rel; };
     std::unordered_set<std::u16string> queued;
+    std::deque<WorkItem> work;
 
-    auto enqueue = [&](const fs::path& rel) {
+    auto enqueue = [&](const fs::path& base, const fs::path& rel) {
         std::u16string mp = modulePathOfRelative(rel);
         if (queued.count(mp)) return;
         queued.insert(mp);
-        seedRelatives.push_back(rel);
+        work.push_back({base, rel});
     };
 
-    {
-        std::deque<fs::path> initial;
-        std::swap(initial, seedRelatives);
-        for (auto& r : initial) enqueue(r);
-    }
+    for (auto& r : seedRelatives) enqueue(sourceRoot, r);
+    seedRelatives.clear();
 
-    while (!seedRelatives.empty()) {
-        fs::path rel = seedRelatives.front();
-        seedRelatives.pop_front();
-        std::u16string mp = modulePathOfRelative(rel);
+    while (!work.empty()) {
+        WorkItem item = work.front();
+        work.pop_front();
+        std::u16string mp = modulePathOfRelative(item.rel);
 
-        auto module = loadModule(sourceRoot, rel, mp);
+        auto module = loadModule(item.base, item.rel, mp);
         if (!module) return false;
 
         Module* raw = module.get();
@@ -188,17 +215,24 @@ bool buildModuleGraph(const fs::path& sourceRoot,
             if (queued.count(targetPath)) continue;
             fs::path targetRel = relativeFromModulePath(targetPath);
             if (targetRel.empty()) continue;
-            fs::path absolute = sourceRoot / targetRel;
-            if (!fs::exists(absolute)) {
+            const bool isStd = isStdlibPath(targetPath);
+            const fs::path& base = isStd ? stdlibRoot : sourceRoot;
+            fs::path absolute = base.empty() ? fs::path() : base / targetRel;
+            if (base.empty() || !fs::exists(absolute)) {
                 auto& sink = *raw->sink;
                 auto [line, col] = raw->source->offsetToPosition(imp.node.startOffset());
-                sink.error({line, col, 1},
-                    "Cannot find module '" + asAscii(targetPath) +
-                    "' (looked for " + absolute.string() + ")");
+                if (isStd) {
+                    sink.error({line, col, 1},
+                        "Cannot find standard library module '" + asAscii(targetPath) +
+                        "'. Set ENS_STDLIB to the directory containing 'std/' (normally <repo>/libs).");
+                } else {
+                    sink.error({line, col, 1},
+                        "Cannot find module '" + asAscii(targetPath) +
+                        "' (looked for " + absolute.string() + ")");
+                }
                 continue;
             }
-            queued.insert(targetPath);
-            seedRelatives.push_back(targetRel);
+            enqueue(base, targetRel);
         }
     }
     return true;
@@ -505,7 +539,8 @@ bool Compiler::compile(const fs::path& source,
 
     std::vector<std::unique_ptr<Module>> modules;
     std::unordered_map<std::u16string, Module*> byPath;
-    if (!buildModuleGraph(sourceRoot, seeds, modules, byPath)) return false;
+    fs::path stdlibRoot = findStdlibRoot();
+    if (!buildModuleGraph(sourceRoot, stdlibRoot, seeds, modules, byPath)) return false;
 
     {
         auto prelude = loadPreludeModule();

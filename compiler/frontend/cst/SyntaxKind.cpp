@@ -274,7 +274,6 @@ static constexpr std::pair<std::u16string_view, SyntaxKind> KEYWORD_TABLE[] = {
     {u"let",       SyntaxKind::KwLet},
     {u"new",       SyntaxKind::KwNew},
     {u"null",      SyntaxKind::KwNull},
-    {u"out",       SyntaxKind::KwOut},
     {u"override",  SyntaxKind::KwOverride},
     {u"package",   SyntaxKind::KwPackage},
     {u"private",   SyntaxKind::KwPrivate},

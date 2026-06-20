@@ -51,7 +51,7 @@ SyntaxKind Parser::peekKind(size_t n) const {
     }
 }
 
-void Parser::bump() {
+void Parser::bumpAs(SyntaxKind kind) {
     while (nextToEmit < tokens.size() && nextToEmit < current) {
         const auto& t = tokens[nextToEmit];
         builder.token(t.kind, t.text);
@@ -59,11 +59,19 @@ void Parser::bump() {
     }
     if (current < tokens.size() && !atEnd()) {
         const auto& t = tokens[current];
-        builder.token(t.kind, t.text);
+        builder.token(kind, t.text);
         nextToEmit = current + 1;
         current++;
         while (current < tokens.size() && isTrivia(tokens[current].kind)) current++;
     }
+}
+
+void Parser::bump() { bumpAs(kindAt()); }
+
+// `out` is a contextual keyword: an ordinary identifier everywhere except in the FFI
+// parameter / argument modifier position, recognized at the use sites below.
+bool Parser::atContextualOut() const {
+    return kindAt() == SyntaxKind::Identifier && tokenAt().text == u"out";
 }
 
 bool Parser::eat(SyntaxKind k) {
@@ -396,7 +404,8 @@ void Parser::parseParameter() {
         expect(SyntaxKind::Dot, "'.' after 'this' in parameter");
         expect(SyntaxKind::Identifier, "field name after 'this.'");
     } else {
-        eat(SyntaxKind::KwOut);  // optional 'out' modifier; analyzer enforces context
+        // optional 'out' modifier (followed by the parameter type); analyzer enforces context
+        if (atContextualOut() && isTypeStart(peekKind(1))) bumpAs(SyntaxKind::KwOut);
         if (isTypeStart(kindAt())) {
             parseType();
         } else {
@@ -1028,14 +1037,11 @@ void Parser::parseArgList() {
 }
 
 void Parser::parseCallArgument() {
-    if (at(SyntaxKind::KwOut)) {
+    // `out name`: only when `out` is directly followed by the target identifier.
+    if (atContextualOut() && peekKind(1) == SyntaxKind::Identifier) {
         builder.startNode(SyntaxKind::OutArgument);
-        bump();  // 'out'
-        if (at(SyntaxKind::Identifier)) {
-            bump();
-        } else {
-            emitMissing(SyntaxKind::Identifier, "local variable name after 'out'");
-        }
+        bumpAs(SyntaxKind::KwOut);  // 'out'
+        bump();                     // target identifier
         builder.finishNode();
         return;
     }

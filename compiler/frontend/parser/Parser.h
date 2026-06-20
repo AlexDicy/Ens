@@ -36,7 +36,12 @@ private:
 
     // Emit current token (and any preceding trivia) into the builder, advance.
     void bump();
+    // Like bump(), but record the current token under an overridden kind (for
+    // contextual keywords).
+    void bumpAs(SyntaxKind kind);
     bool eat(SyntaxKind k);
+    // True when positioned on the contextual `out` keyword (an `out` identifier).
+    bool atContextualOut() const;
 
     void expect(SyntaxKind k, const char* what);
     void emitMissing(SyntaxKind expectedKind, const char* what);
