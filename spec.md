@@ -174,6 +174,32 @@ class TestRepository {
     }
 }
 ```
+
+Every `Error` carries a **stack trace** captured at the point it is thrown, recording the throwing call and each caller above it. The trace travels with the exception as it propagates, so a handler always sees where the error originated rather than where it was caught. `panic()` captures a trace the same way.
+
+When an exception is never handled, or the program panics, the trace is printed and the program exits:
+
+```
+Unhandled exception ParseError: bad token
+  at lex (parser.ens:12)
+  at parse (parser.ens:15)
+  at main (parser.ens:18)
+```
+
+A handler can read the trace from a caught error, either preformatted or as structured frames:
+
+```ens
+} catch (ParseError e) {
+    Log.warn(e.stackTrace());                // the trace as a string
+
+    StackFrame[] frames = e.stackFrames();   // or as structured frames
+    StackFrame origin = frames[0];
+    Log.warn("thrown by {origin.function} at {origin.file}:{origin.line}");
+}
+```
+
+`stackTrace() -> string` returns the same text shown for an unhandled exception. `stackFrames() -> StackFrame[]` returns the frames as values, each a `StackFrame` with `function`, `file`, and `line`; `frames[0]` is the throw site.
+
 ---
 
 A type written without a `?` always holds a value and can never be `null`. To allow `null`, suffix the type with `?`.
