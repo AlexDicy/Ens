@@ -190,7 +190,7 @@ A handler can read the trace from a caught error, either preformatted or as stru
 
 ```ens
 } catch (ParseError e) {
-    Log.warn(e.stackTrace());                // the trace as a string
+    Log.warn(e.getStackTrace());                // the trace as a string
 
     StackFrame[] frames = e.stackFrames();   // or as structured frames
     StackFrame origin = frames[0];
@@ -198,7 +198,7 @@ A handler can read the trace from a caught error, either preformatted or as stru
 }
 ```
 
-`stackTrace() -> string` returns the same text shown for an unhandled exception. `stackFrames() -> StackFrame[]` returns the frames as values, each a `StackFrame` with `function`, `file`, and `line`; `frames[0]` is the throw site.
+`getStackTrace() -> string` returns the same text shown for an unhandled exception. `getStackFrames() -> StackFrame[]` returns the frames as values, each a `StackFrame` with `function`, `file`, and `line`; `frames[0]` is the throw site.
 
 ---
 

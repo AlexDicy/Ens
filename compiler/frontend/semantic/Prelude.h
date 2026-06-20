@@ -16,6 +16,6 @@ inline constexpr std::u16string_view kPreludeSource =
     u"    string message;\n"
     u"    long[]? frames;\n"
     u"    Error(this.message);\n"
-    u"    stackTrace() -> string { return \"\"; }\n"
-    u"    stackFrames() -> StackFrame[] { return [new StackFrame(\"\", \"\", 0)]; }\n"
+    u"    getStackTrace() -> string { return \"\"; }\n"
+    u"    getStackFrames() -> StackFrame[] { return [new StackFrame(\"\", \"\", 0)]; }\n"
     u"}\n";

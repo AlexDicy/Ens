@@ -1675,13 +1675,13 @@ struct CodeGenerator::Impl {
 
     bool isPreludeModule() const { return modulePath == kPreludeModulePath; }
 
-    // Error.stackTrace()/stackFrames() are recognized at the call site and lowered
+    // Error.getStackTrace()/getStackFrames() are recognized at the call site and lowered
     // to the runtime; their prelude bodies are placeholders and never emitted.
     bool isInterceptedTraceMethod(Symbol* sym) const {
         if (!sym || !sym->methodOwner) return false;
         if (sym->methodOwner->name != u"Error" ||
             sym->methodOwner->modulePath != kPreludeModulePath) return false;
-        return sym->name == u"stackTrace" || sym->name == u"stackFrames";
+        return sym->name == u"getStackTrace" || sym->name == u"getStackFrames";
     }
 
     // { funcStart, name, file, line, isEntry }
@@ -3729,7 +3729,7 @@ struct CodeGenerator::Impl {
                     builder->CreateGEP(llvm::Type::getInt8Ty(ctx), recv,
                         llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), 8)), "frames");
                 return builder->CreateCall(
-                    methodSym->name == u"stackTrace" ? formatTraceFn() : symbolicateFn(),
+                    methodSym->name == u"getStackTrace" ? formatTraceFn() : symbolicateFn(),
                     { frames }, "trace.result");
             }
             if (methodSym) {
