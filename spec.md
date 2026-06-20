@@ -426,3 +426,21 @@ class Child {
 `weak` fields must be nullable class types. They don't contribute to the strong refcount, so they don't keep objects alive. When the referenced object dies, every weak reference to it reads as `null`.
 
 The compiler performs **escape analysis** to elide retain/release pairs and large-struct copies when it can prove a value does not escape its scope. The `--explain-arc` flag surfaces what was elided for diagnostics.
+
+---
+
+The standard library lives under the `std` namespace and is opt-in: its declarations are visible only after they are imported. The `std.system` module wraps common operating system facilities and reports failures as exceptions. Import the pieces you need by name:
+
+```ens
+import openFile from std.system;
+import File from std.system;
+
+writeGreeting() -> int throws {
+    File file = try openFile("greeting.txt", "w");
+    byte[] bytes = new byte[2];
+    bytes[0] = 'h';
+    bytes[1] = 'i';
+    let written = try file.write(bytes);
+    return file.close();
+}
+```
