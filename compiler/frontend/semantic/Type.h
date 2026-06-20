@@ -120,6 +120,7 @@ public:
     bool isStruct() const { return kind == TypeKind::Struct; }
     bool isClass() const  { return kind == TypeKind::Class; }
     bool isExternal() const { return kind == TypeKind::External; }
+    bool isString() const { return kind == TypeKind::String; }
     bool hasRecordLayout() const { return isStruct() || isClass(); }
 
     bool equals(const Type* other) const;

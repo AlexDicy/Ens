@@ -191,8 +191,8 @@ struct CodeGenerator::Impl {
             case TypeKind::Error:
                 return true;
             case TypeKind::Optional:
-                // Nullable class, external, and array types are pointer-sized.
-                if (t->inner && (t->inner->isClass() || t->inner->isExternal())) return false;
+                // Nullable class, external, string, and array types are pointer-sized.
+                if (t->inner && (t->inner->isClass() || t->inner->isExternal() || t->inner->isString())) return false;
                 if (t->inner && t->inner->isArray()) return isUnsupportedType(t->inner);
                 return true;
             case TypeKind::Array:
@@ -232,7 +232,7 @@ struct CodeGenerator::Impl {
             case TypeKind::External: return llvm::PointerType::get(ctx, 0);
             case TypeKind::Array:   return llvm::PointerType::get(ctx, 0);
             case TypeKind::Optional:
-                if (t->inner && (t->inner->isClass() || t->inner->isExternal() || t->inner->isArray()))
+                if (t->inner && (t->inner->isClass() || t->inner->isExternal() || t->inner->isArray() || t->inner->isString()))
                     return llvm::PointerType::get(ctx, 0);
                 return nullptr;
             default:                return nullptr;
@@ -260,6 +260,9 @@ struct CodeGenerator::Impl {
             return mapDIType(t->inner);
         }
         if (t->kind == TypeKind::Optional && t->inner && t->inner->isArray()) {
+            return mapDIType(t->inner);
+        }
+        if (t->kind == TypeKind::Optional && t->inner && t->inner->isString()) {
             return mapDIType(t->inner);
         }
         if (t->kind == TypeKind::Array) {
