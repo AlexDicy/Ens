@@ -43,13 +43,14 @@ static bool execute(const std::unordered_map<std::string, std::string>& argument
     }
 
     bool explainArc = arguments.count("--explain-arc") > 0;
+    std::string targetTriple = arguments.count("--target") ? arguments.at("--target") : "";
 
     if (arguments.count("--source")) {
         fs::path source = arguments.at("--source");
         fs::path sourcePath = fs::is_directory(source) ? source : source.parent_path();
-        return Compiler::compile(source, outputFile, sourcePath, explainArc);
+        return Compiler::compile(source, outputFile, sourcePath, explainArc, targetTriple);
     } else {
-        return Compiler::compileSingle(std::cin, outputFile, "<stdin>", explainArc);
+        return Compiler::compileSingle(std::cin, outputFile, "<stdin>", explainArc, targetTriple);
     }
 }
 

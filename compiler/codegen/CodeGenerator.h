@@ -14,7 +14,8 @@ public:
                   std::string sourceFilename,
                   const SourceFile& sourceFile,
                   const AnalysisResult& analysis,
-                  std::u16string modulePath = u"");
+                  std::u16string modulePath = u"",
+                  std::string targetTriple = "");
     ~CodeGenerator();
 
     bool generate(const SyntaxNode& sourceFileRoot);

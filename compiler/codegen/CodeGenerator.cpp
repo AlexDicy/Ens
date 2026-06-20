@@ -138,11 +138,12 @@ struct CodeGenerator::Impl {
     std::vector<DefaultInitContext> defaultInitStack;
 
     std::u16string modulePath;
+    std::string targetTriple;   // empty = host default; set by --target for cross-compilation
 
     Impl(std::string mn, std::string sf, const SourceFile& src, const AnalysisResult& an,
-         std::u16string mp)
+         std::u16string mp, std::string triple)
         : moduleName(std::move(mn)), sourceFilename(std::move(sf)),
-          sourceFile(src), analysis(an), modulePath(std::move(mp)) {
+          sourceFile(src), analysis(an), modulePath(std::move(mp)), targetTriple(std::move(triple)) {
         module = std::make_unique<llvm::Module>(moduleName, ctx);
         module->setSourceFileName(sourceFilename);
         builder = std::make_unique<llvm::IRBuilder<>>(ctx);
@@ -372,11 +373,13 @@ struct CodeGenerator::Impl {
         return analysis.typeOf(node.greenNode());
     }
 
-    bool initializeNativeTargetOnce() {
+    bool initializeTargetsOnce() {
         static const bool ok = []() {
-            llvm::InitializeNativeTarget();
-            llvm::InitializeNativeTargetAsmPrinter();
-            llvm::InitializeNativeTargetAsmParser();
+            llvm::InitializeAllTargetInfos();
+            llvm::InitializeAllTargets();
+            llvm::InitializeAllTargetMCs();
+            llvm::InitializeAllAsmPrinters();
+            llvm::InitializeAllAsmParsers();
             return true;
         }();
         return ok;
@@ -384,8 +387,9 @@ struct CodeGenerator::Impl {
 
     bool initializeTargetMachine() {
         if (targetMachine) return true;
-        initializeNativeTargetOnce();
-        std::string triple = llvm::sys::getDefaultTargetTriple();
+        initializeTargetsOnce();
+        std::string triple = targetTriple.empty()
+            ? llvm::sys::getDefaultTargetTriple() : targetTriple;
         std::string lookupErr;
         const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, lookupErr);
         if (!target) {
@@ -4310,9 +4314,10 @@ CodeGenerator::CodeGenerator(std::string moduleName,
                                    std::string sourceFilename,
                                    const SourceFile& src,
                                    const AnalysisResult& analysis,
-                                   std::u16string modulePath)
+                                   std::u16string modulePath,
+                                   std::string targetTriple)
     : impl(std::make_unique<Impl>(std::move(moduleName), std::move(sourceFilename), src, analysis,
-                                  std::move(modulePath))) {}
+                                  std::move(modulePath), std::move(targetTriple))) {}
 
 CodeGenerator::~CodeGenerator() = default;
 

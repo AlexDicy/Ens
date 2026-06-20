@@ -226,21 +226,25 @@ bool invokeDriver(LinkerFlavor flavor,
 
 bool Linker::link(const std::string& objectPath,
                    const std::string& exePath,
-                   std::ostream& errStream) {
-    return link(std::vector{objectPath}, {}, exePath, errStream);
+                   std::ostream& errStream,
+                   const std::string& targetTriple) {
+    return link(std::vector{objectPath}, {}, exePath, errStream, targetTriple);
 }
 
 bool Linker::link(const std::vector<std::string>& objectPaths,
                    const std::string& exePath,
-                   std::ostream& errStream) {
-    return link(objectPaths, {}, exePath, errStream);
+                   std::ostream& errStream,
+                   const std::string& targetTriple) {
+    return link(objectPaths, {}, exePath, errStream, targetTriple);
 }
 
 bool Linker::link(const std::vector<std::string>& objectPaths,
                    const std::vector<std::string>& libraries,
                    const std::string& exePath,
-                   std::ostream& errStream) {
-    const std::string triple = llvm::sys::getDefaultTargetTriple();
+                   std::ostream& errStream,
+                   const std::string& targetTriple) {
+    const std::string triple = targetTriple.empty()
+        ? llvm::sys::getDefaultTargetTriple() : targetTriple;
     const LinkerFlavor flavor = flavorForTriple(triple);
 
     std::vector<std::string> argv = buildArgv(flavor, triple, objectPaths, libraries, exePath);
