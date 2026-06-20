@@ -62,15 +62,21 @@ task("test")
             local stdout_file = path.join(out_dir, name .. ".stdout")
             local compile_log = path.join(out_dir, name .. ".compile.log")
 
-            local expected_exit   = 0
-            local expected_stdout = nil
-            local expected_error  = nil
+            local expected_exit     = 0
+            local expected_stdout   = nil   -- list of lines; joined with "\n" for an exact match
+            local expected_contains = {}    -- substrings that must each appear in stdout
+            local expected_error    = nil
             local content = io.readfile(ens_file) or ""
             for line in content:gmatch("[^\r\n]+") do
                 local exit_str = line:match("^%s*//%s*@exit%s+(%-?%d+)")
                 if exit_str then expected_exit = tonumber(exit_str) end
+                local contains_str = line:match("^%s*//%s*@stdout%-contains%s+(.*)$")
+                if contains_str then table.insert(expected_contains, contains_str) end
                 local stdout_str = line:match("^%s*//%s*@stdout%s+(.*)$")
-                if stdout_str then expected_stdout = stdout_str end
+                if stdout_str then
+                    if expected_stdout == nil then expected_stdout = {} end
+                    table.insert(expected_stdout, stdout_str)
+                end
                 local error_str = line:match("^%s*//%s*@expect%-error%s+(.*)$")
                 if error_str then expected_error = error_str end
             end
@@ -122,10 +128,19 @@ task("test")
                 table.insert(why, string.format("exit=%s expected=%s",
                     tostring(run_rc), tostring(expected_exit)))
             end
-            if expected_stdout ~= nil and actual_stdout ~= expected_stdout then
-                ok = false
-                table.insert(why, string.format("stdout=%q expected=%q",
-                    actual_stdout, expected_stdout))
+            if expected_stdout ~= nil then
+                local joined = table.concat(expected_stdout, "\n")
+                if actual_stdout ~= joined then
+                    ok = false
+                    table.insert(why, string.format("stdout=%q expected=%q",
+                        actual_stdout, joined))
+                end
+            end
+            for _, sub in ipairs(expected_contains) do
+                if not actual_stdout:find(sub, 1, true) then
+                    ok = false
+                    table.insert(why, string.format("stdout missing %q", sub))
+                end
             end
 
             if ok then
