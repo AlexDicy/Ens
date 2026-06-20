@@ -11,6 +11,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Verifier.h"
@@ -83,6 +84,8 @@ struct CodeGenerator::Impl {
     llvm::StructType* typeDescriptorTy = nullptr;
     llvm::StructType* symEntryTy = nullptr;
     llvm::StructType* symChunkTy = nullptr;
+    llvm::StructType* lineEntryTy = nullptr;
+    std::vector<std::pair<llvm::Constant*, int>> lineRecords;
     ::Type* stackFrameType = nullptr;
     struct SymtabRecord {
         llvm::Function* fn;
@@ -1686,13 +1689,21 @@ struct CodeGenerator::Impl {
         return symEntryTy;
     }
 
-    // { next, entries, count }
+    // { next, entries, count, lines, lineCount }
     llvm::StructType* getSymChunkTy() {
         if (symChunkTy) return symChunkTy;
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         auto* i64 = llvm::Type::getInt64Ty(ctx);
-        symChunkTy = llvm::StructType::create(ctx, { ptrTy, ptrTy, i64 }, "EnsSymChunk");
+        symChunkTy = llvm::StructType::create(ctx, { ptrTy, ptrTy, i64, ptrTy, i64 }, "EnsSymChunk");
         return symChunkTy;
+    }
+
+    // { addr, line } : maps a call return address to its precise source line.
+    llvm::StructType* getLineEntryTy() {
+        if (lineEntryTy) return lineEntryTy;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        lineEntryTy = llvm::StructType::create(ctx, { ptrTy, llvm::Type::getInt32Ty(ctx) }, "EnsLineEntry");
+        return lineEntryTy;
     }
 
     llvm::Function* getRuntimeFn(const std::string& name, llvm::FunctionType* ty) {
@@ -1893,6 +1904,96 @@ struct CodeGenerator::Impl {
         builder->restoreIP(saved);
     }
 
+    // i32 ens_resolve_line(i64 addr): precise source line for a return address, via
+    // the greatest call-site marker <= addr, or 0 if none (caller falls back to the
+    // function's declaration line).
+    void defineResolveLine() {
+        if (module->getFunction("ens_resolve_line")) return;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32 = llvm::Type::getInt32Ty(ctx);
+        auto* i64 = llvm::Type::getInt64Ty(ctx);
+        auto* lineTy = getLineEntryTy();
+        auto* chunkTy = getSymChunkTy();
+        auto* fn = llvm::Function::Create(
+            llvm::FunctionType::get(i32, { i64 }, false),
+            llvm::Function::InternalLinkage, "ens_resolve_line", module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+        auto saved = builder->saveIP();
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* ckCond = llvm::BasicBlock::Create(ctx, "chunk.cond", fn);
+        auto* ckBody = llvm::BasicBlock::Create(ctx, "chunk.body", fn);
+        auto* inCond = llvm::BasicBlock::Create(ctx, "inner.cond", fn);
+        auto* inBody = llvm::BasicBlock::Create(ctx, "inner.body", fn);
+        auto* setIt  = llvm::BasicBlock::Create(ctx, "set", fn);
+        auto* inNext = llvm::BasicBlock::Create(ctx, "inner.next", fn);
+        auto* ckNext = llvm::BasicBlock::Create(ctx, "chunk.next", fn);
+        auto* done   = llvm::BasicBlock::Create(ctx, "done", fn);
+        builder->SetInsertPoint(entry);
+        llvm::Value* addr = fn->getArg(0);
+        llvm::Value* bestA = builder->CreateAlloca(i32, nullptr, "bestLine");
+        llvm::Value* bestStartA = builder->CreateAlloca(i64, nullptr, "bestStart");
+        llvm::Value* chunkA = builder->CreateAlloca(ptrTy, nullptr, "chunk");
+        llvm::Value* iA = builder->CreateAlloca(i64, nullptr, "i");
+        builder->CreateStore(llvm::ConstantInt::get(i32, 0), bestA);
+        builder->CreateStore(llvm::ConstantInt::get(i64, 0), bestStartA);
+        builder->CreateStore(builder->CreateLoad(ptrTy, getSymtabHead()), chunkA);
+        builder->CreateBr(ckCond);
+
+        builder->SetInsertPoint(ckCond);
+        llvm::Value* chunk = builder->CreateLoad(ptrTy, chunkA, "chunk.cur");
+        builder->CreateCondBr(
+            builder->CreateICmpEQ(chunk, llvm::ConstantPointerNull::get(ptrTy)), done, ckBody);
+
+        builder->SetInsertPoint(ckBody);
+        llvm::Value* lines = builder->CreateLoad(ptrTy, builder->CreateStructGEP(chunkTy, chunk, 3), "lines");
+        llvm::Value* count = builder->CreateLoad(i64, builder->CreateStructGEP(chunkTy, chunk, 4), "lineCount");
+        builder->CreateStore(llvm::ConstantInt::get(i64, 0), iA);
+        builder->CreateBr(inCond);
+
+        builder->SetInsertPoint(inCond);
+        llvm::Value* i = builder->CreateLoad(i64, iA, "i.cur");
+        builder->CreateCondBr(builder->CreateICmpSLT(i, count), inBody, ckNext);
+
+        builder->SetInsertPoint(inBody);
+        llvm::Value* e = builder->CreateGEP(lineTy, lines, i, "e");
+        llvm::Value* a = builder->CreatePtrToInt(
+            builder->CreateLoad(ptrTy, builder->CreateStructGEP(lineTy, e, 0)), i64, "a");
+        llvm::Value* le = builder->CreateICmpULE(a, addr);
+        llvm::Value* gt = builder->CreateICmpUGT(a, builder->CreateLoad(i64, bestStartA));
+        builder->CreateCondBr(builder->CreateAnd(le, gt), setIt, inNext);
+
+        builder->SetInsertPoint(setIt);
+        builder->CreateStore(
+            builder->CreateLoad(i32, builder->CreateStructGEP(lineTy, e, 1)), bestA);
+        builder->CreateStore(a, bestStartA);
+        builder->CreateBr(inNext);
+
+        builder->SetInsertPoint(inNext);
+        builder->CreateStore(builder->CreateAdd(i, llvm::ConstantInt::get(i64, 1)), iA);
+        builder->CreateBr(inCond);
+
+        builder->SetInsertPoint(ckNext);
+        builder->CreateStore(builder->CreateLoad(ptrTy, builder->CreateStructGEP(chunkTy, chunk, 0)), chunkA);
+        builder->CreateBr(ckCond);
+
+        builder->SetInsertPoint(done);
+        builder->CreateRet(builder->CreateLoad(i32, bestA));
+        builder->restoreIP(saved);
+    }
+
+    // Precise call-site line for a frame address, falling back to the function's
+    // declaration line when no marker covers it.
+    llvm::Value* resolvePreciseLine(llvm::Value* addr, llvm::Value* entryPtr) {
+        auto* i32 = llvm::Type::getInt32Ty(ctx);
+        llvm::Value* declLine = builder->CreateLoad(i32,
+            builder->CreateStructGEP(getSymEntryTy(), entryPtr, 3), "declLine");
+        llvm::Value* precise = builder->CreateCall(
+            module->getFunction("ens_resolve_line"), { addr }, "precise");
+        return builder->CreateSelect(
+            builder->CreateICmpNE(precise, llvm::ConstantInt::get(i32, 0)),
+            precise, declLine, "line");
+    }
+
     // ptr ens_capture_trace(i32 maxDepth): unwind, drop the capture frame and any
     // frames past the program entry, return a long[] of the surviving addresses.
     void defineCaptureTrace() {
@@ -2023,7 +2124,7 @@ struct CodeGenerator::Impl {
         builder->SetInsertPoint(doFmt);
         llvm::Value* name = builder->CreateLoad(ptrTy, builder->CreateStructGEP(entryTy, e, 1), "name");
         llvm::Value* file = builder->CreateLoad(ptrTy, builder->CreateStructGEP(entryTy, e, 2), "file");
-        llvm::Value* line = builder->CreateLoad(i32, builder->CreateStructGEP(entryTy, e, 3), "line");
+        llvm::Value* line = resolvePreciseLine(addr, e);
         llvm::Value* isEntry = builder->CreateLoad(i32, builder->CreateStructGEP(entryTy, e, 4), "isEntry");
         llvm::Value* len = builder->CreateLoad(i64, lenA, "len.cur");
         llvm::Value* cur = builder->CreateGEP(i8, buf, len);
@@ -2132,7 +2233,7 @@ struct CodeGenerator::Impl {
         llvm::Value* e = builder->CreateCall(module->getFunction("ens_resolve_addr"), { addr }, "e");
         llvm::Value* name = builder->CreateLoad(ptrTy, builder->CreateStructGEP(entryTy, e, 1));
         llvm::Value* file = builder->CreateLoad(ptrTy, builder->CreateStructGEP(entryTy, e, 2));
-        llvm::Value* line = builder->CreateLoad(i32, builder->CreateStructGEP(entryTy, e, 3));
+        llvm::Value* line = resolvePreciseLine(addr, e);
         llvm::Value* sf = builder->CreateCall(getOrDefineEnsAlloc(),
             { llvm::ConstantInt::get(i64, sfSize), sfDtor, sfDesc }, "frame");
         builder->CreateStore(name, builder->CreateStructGEP(sfStructTy, sf, 0));
@@ -2152,6 +2253,7 @@ struct CodeGenerator::Impl {
     void definePreludeRuntime() {
         defineUnwindCallback();
         defineResolveAddr();
+        defineResolveLine();
         defineCaptureTrace();
         defineFormatTrace();
         defineSymbolicate();
@@ -2164,6 +2266,44 @@ struct CodeGenerator::Impl {
             llvm::GlobalValue::PrivateLinkage, init, ".trace.s");
         gv->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
         return gv;
+    }
+
+    // A callee that never appears as a user stack frame: our runtime and the libc
+    // helpers we declare. Everything else (Ens functions, including cross-module
+    // external references, and ens_capture_trace) is a frame-producing call.
+    static bool isNonFrameCallee(llvm::StringRef n) {
+        if (n == "ens_capture_trace") return false;
+        if (n.starts_with("ens_") || n.starts_with("_ens") || n.starts_with("_dtor_") ||
+            n.starts_with("_typedesc") || n.starts_with("_Unwind") || n.starts_with("llvm."))
+            return true;
+        static const char* kLibc[] = { "malloc", "calloc", "free", "memcpy", "memset",
+            "snprintf", "puts", "fputs", "exit", "strlen", "__acrt_iob_func" };
+        for (const char* c : kLibc) if (n == c) return true;
+        return false;
+    }
+
+    // Split each frame-producing call into its own block so its start address is a
+    // blockaddress constant, and record (address, call line). A captured return
+    // address then resolves to the greatest marker <= it (its precise call site).
+    void emitCallSiteLineTable() {
+        for (auto& F : *module) {
+            if (F.isDeclaration() || !F.getSubprogram()) continue;
+            std::vector<llvm::CallInst*> calls;
+            for (auto& BB : F)
+                for (auto& I : BB)
+                    if (auto* ci = llvm::dyn_cast<llvm::CallInst>(&I)) {
+                        if (!ci->getDebugLoc() || ci->isInlineAsm()) continue;
+                        llvm::Function* callee = ci->getCalledFunction();
+                        if (!callee || !isNonFrameCallee(callee->getName())) calls.push_back(ci);
+                    }
+            for (auto* ci : calls) {
+                // Always split: a new block starts at the call, so its address is a
+                // legal blockaddress (never the entry block) and is unique per call.
+                llvm::BasicBlock* callBB = ci->getParent()->splitBasicBlock(ci, "call.site");
+                lineRecords.emplace_back(llvm::BlockAddress::get(&F, callBB),
+                    static_cast<int>(ci->getDebugLoc().getLine()));
+            }
+        }
     }
 
     void recordSymtabEntry(llvm::Function* fn, const std::string& display, int line, bool isEntry) {
@@ -2194,9 +2334,21 @@ struct CodeGenerator::Impl {
         auto* arrTy = llvm::ArrayType::get(entryTy, elems.size());
         auto* entriesGV = new llvm::GlobalVariable(*module, arrTy, /*isConstant=*/true,
             llvm::GlobalValue::PrivateLinkage, llvm::ConstantArray::get(arrTy, elems), "_ens_symtab");
+
+        auto* lineTy = getLineEntryTy();
+        std::vector<llvm::Constant*> lineElems;
+        lineElems.reserve(lineRecords.size());
+        for (auto& lr : lineRecords)
+            lineElems.push_back(llvm::ConstantStruct::get(lineTy,
+                { lr.first, llvm::ConstantInt::get(i32, lr.second) }));
+        auto* lineArrTy = llvm::ArrayType::get(lineTy, lineElems.size());
+        auto* linesGV = new llvm::GlobalVariable(*module, lineArrTy, /*isConstant=*/true,
+            llvm::GlobalValue::PrivateLinkage, llvm::ConstantArray::get(lineArrTy, lineElems), "_ens_linetab");
+
         auto* chunkInit = llvm::ConstantStruct::get(chunkTy, {
             llvm::ConstantPointerNull::get(ptrTy), entriesGV,
-            llvm::ConstantInt::get(i64, elems.size()) });
+            llvm::ConstantInt::get(i64, elems.size()),
+            linesGV, llvm::ConstantInt::get(i64, lineElems.size()) });
         auto* chunkGV = new llvm::GlobalVariable(*module, chunkTy, /*isConstant=*/false,
             llvm::GlobalValue::PrivateLinkage, chunkInit, "_ens_symtab_chunk");
 
@@ -4080,6 +4232,8 @@ struct CodeGenerator::Impl {
             break;
         }
 
+        builder->SetCurrentDebugLocation(llvm::DebugLoc());
+        emitCallSiteLineTable();
         if (isPreludeModule()) definePreludeRuntime();
         emitSymtabRegistration();
 
