@@ -6,4 +6,16 @@
 // a real standard library exists this source moves there verbatim.
 inline constexpr std::u16string_view kPreludeModulePath = u"$prelude";
 inline constexpr std::u16string_view kPreludeSource =
-    u"class Error { string message; Error(this.message); }\n";
+    u"class StackFrame {\n"
+    u"    string function;\n"
+    u"    string file;\n"
+    u"    int line;\n"
+    u"    StackFrame(this.function, this.file, this.line);\n"
+    u"}\n"
+    u"class Error {\n"
+    u"    string message;\n"
+    u"    long[]? frames;\n"
+    u"    Error(this.message);\n"
+    u"    stackTrace() -> string { return \"\"; }\n"
+    u"    stackFrames() -> StackFrame[] { return [new StackFrame(\"\", \"\", 0)]; }\n"
+    u"}\n";

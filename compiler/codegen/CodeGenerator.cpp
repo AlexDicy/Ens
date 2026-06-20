@@ -3,6 +3,7 @@
 #include "ast/Expression.h"
 #include "ast/Statement.h"
 #include "semantic/Literals.h"
+#include "semantic/Prelude.h"
 #include "semantic/Symbol.h"
 #include "semantic/Type.h"
 
@@ -16,6 +17,7 @@
 #include "llvm/IR/DIBuilder.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/LegacyPassManager.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/raw_ostream.h"
@@ -79,6 +81,17 @@ struct CodeGenerator::Impl {
     std::unordered_map<::Type*, llvm::DIType*> diClassPointerCache;
     std::unordered_map<StructInfo*, llvm::GlobalVariable*> descriptorCache;
     llvm::StructType* typeDescriptorTy = nullptr;
+    llvm::StructType* symEntryTy = nullptr;
+    llvm::StructType* symChunkTy = nullptr;
+    ::Type* stackFrameType = nullptr;
+    struct SymtabRecord {
+        llvm::Function* fn;
+        std::string name;
+        std::string file;
+        int line;
+        bool isEntry;
+    };
+    std::vector<SymtabRecord> symtabRecords;
     uint32_t nextTypeId = 1;
     llvm::Function* currentFunction = nullptr;
     ::Type* currentReturnType = nullptr;
@@ -503,6 +516,7 @@ struct CodeGenerator::Impl {
     void emitFunction(const ast::FuncDecl& fn) {
         Symbol* sym = symbolOf(fn.node);
         if (!sym) return;
+        if (isInterceptedTraceMethod(sym)) return;
         auto it = values.find(sym);
         if (it == values.end()) return;
 
@@ -536,6 +550,17 @@ struct CodeGenerator::Impl {
         setLocationFromNode(fn.node);
 
         ::Type* receiver = analysis.receiverOf(fn.node.greenNode());
+
+        {
+            auto rawName = fn.nameText().value_or(std::u16string{});
+            std::string display = asAscii(rawName);
+            if (receiver && receiver->structInfo)
+                display = asAscii(receiver->structInfo->name) + "." + display;
+            bool isEntry = !receiver && rawName == u"main";
+            auto [eline, ecol] = posOf(fn.node.startOffset());
+            recordSymtabEntry(currentFunction, display, static_cast<int>(eline), isEntry);
+        }
+
         auto argIter = currentFunction->args().begin();
         auto argEnd  = currentFunction->args().end();
 
@@ -755,8 +780,23 @@ struct CodeGenerator::Impl {
         llvm::Value* v = emitExpr(*value);
         if (!v) return;
         if (borrowed) emitRetain(v);
-        builder->CreateStore(v, throwTargetSlot);  // also the future stack-trace hook
+        builder->CreateStore(v, throwTargetSlot);
+        captureTraceInto(v);
         emitErrorUnwind();
+    }
+
+    // Capture the originating stack onto the thrown Error. Error.frames lives at
+    // payload offset 8 (message occupies offset 0), flattened the same for every
+    // subclass. Releases any prior trace so a re-thrown object does not leak.
+    void captureTraceInto(llvm::Value* errObj) {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64 = llvm::Type::getInt64Ty(ctx);
+        llvm::Value* slot = builder->CreateGEP(llvm::Type::getInt8Ty(ctx), errObj,
+            llvm::ConstantInt::get(i64, 8), "frames.slot");
+        builder->CreateCall(getOrDefineEnsRelease(), { builder->CreateLoad(ptrTy, slot, "frames.old") });
+        llvm::Value* trace = builder->CreateCall(captureTraceFn(),
+            { llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 64) }, "trace");
+        builder->CreateStore(trace, slot);
     }
 
     void emitRethrowStmt() {
@@ -811,6 +851,10 @@ struct CodeGenerator::Impl {
         builder->CreateCall(fputs, { builder->CreateGlobalString(": ", ".uex.sep"), stderrF });
         builder->CreateCall(fputs, { msg, stderrF });
         builder->CreateCall(fputs, { builder->CreateGlobalString("\n", ".uex.nl"), stderrF });
+        llvm::Value* frames = builder->CreateLoad(ptrTy,
+            builder->CreateGEP(llvm::Type::getInt8Ty(ctx), err,
+                llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), 8)), "exc.frames");
+        builder->CreateCall(fputs, { builder->CreateCall(formatTraceFn(), { frames }, "trace.str"), stderrF });
         builder->CreateCall(getOrDefineEnsRelease(), { err });
         builder->CreateRet(llvm::ConstantInt::get(i32Ty, 1));
     }
@@ -1610,6 +1654,561 @@ struct CodeGenerator::Impl {
         return llvm::Function::Create(ty, llvm::Function::ExternalLinkage, "free", module.get());
     }
 
+    // ===== Stack traces =====
+    //
+    // Capture stores raw return addresses on the thrown Error at the throw site
+    // (and at panic); symbolication is lazy, driven by a compiler-emitted side
+    // table. Capture itself is isolated in ens_capture_trace so it can be swapped
+    // per target. The native backend here uses the Itanium unwinder
+    // (_Unwind_Backtrace), which reads .eh_frame and works across glibc, musl,
+    // and macOS, plus dlopen'd modules.
+
+    bool isPreludeModule() const { return modulePath == kPreludeModulePath; }
+
+    // Error.stackTrace()/stackFrames() are recognized at the call site and lowered
+    // to the runtime; their prelude bodies are placeholders and never emitted.
+    bool isInterceptedTraceMethod(Symbol* sym) const {
+        if (!sym || !sym->methodOwner) return false;
+        if (sym->methodOwner->name != u"Error" ||
+            sym->methodOwner->modulePath != kPreludeModulePath) return false;
+        return sym->name == u"stackTrace" || sym->name == u"stackFrames";
+    }
+
+    // { funcStart, name, file, line, isEntry }
+    llvm::StructType* getSymEntryTy() {
+        if (symEntryTy) return symEntryTy;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32 = llvm::Type::getInt32Ty(ctx);
+        symEntryTy = llvm::StructType::create(ctx, { ptrTy, ptrTy, ptrTy, i32, i32 }, "EnsSymEntry");
+        return symEntryTy;
+    }
+
+    // { next, entries, count }
+    llvm::StructType* getSymChunkTy() {
+        if (symChunkTy) return symChunkTy;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64 = llvm::Type::getInt64Ty(ctx);
+        symChunkTy = llvm::StructType::create(ctx, { ptrTy, ptrTy, i64 }, "EnsSymChunk");
+        return symChunkTy;
+    }
+
+    llvm::Function* getRuntimeFn(const std::string& name, llvm::FunctionType* ty) {
+        if (auto* f = module->getFunction(name)) return f;
+        return llvm::Function::Create(ty, llvm::Function::ExternalLinkage, name, module.get());
+    }
+    llvm::Function* captureTraceFn() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        return getRuntimeFn("ens_capture_trace",
+            llvm::FunctionType::get(ptrTy, { llvm::Type::getInt32Ty(ctx) }, false));
+    }
+    llvm::Function* formatTraceFn() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        return getRuntimeFn("ens_format_trace", llvm::FunctionType::get(ptrTy, { ptrTy }, false));
+    }
+    llvm::Function* symbolicateFn() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        return getRuntimeFn("ens_symbolicate", llvm::FunctionType::get(ptrTy, { ptrTy }, false));
+    }
+    llvm::Function* symtabRegisterFn() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        return getRuntimeFn("ens_symtab_register",
+            llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), { ptrTy }, false));
+    }
+
+    llvm::Function* getOrDeclareMalloc() {
+        if (auto* f = module->getFunction("malloc")) return f;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        return llvm::Function::Create(
+            llvm::FunctionType::get(ptrTy, { llvm::Type::getInt64Ty(ctx) }, false),
+            llvm::Function::ExternalLinkage, "malloc", module.get());
+    }
+    llvm::Function* getOrDeclareMemcpy() {
+        if (auto* f = module->getFunction("memcpy")) return f;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64 = llvm::Type::getInt64Ty(ctx);
+        return llvm::Function::Create(
+            llvm::FunctionType::get(ptrTy, { ptrTy, ptrTy, i64 }, false),
+            llvm::Function::ExternalLinkage, "memcpy", module.get());
+    }
+    llvm::Function* getOrDeclareSnprintf() {
+        if (auto* f = module->getFunction("snprintf")) return f;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32 = llvm::Type::getInt32Ty(ctx);
+        auto* i64 = llvm::Type::getInt64Ty(ctx);
+        return llvm::Function::Create(
+            llvm::FunctionType::get(i32, { ptrTy, i64, ptrTy }, /*isVarArg=*/true),
+            llvm::Function::ExternalLinkage, "snprintf", module.get());
+    }
+    llvm::Function* getOrDeclareUnwindBacktrace() {
+        if (auto* f = module->getFunction("_Unwind_Backtrace")) return f;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32 = llvm::Type::getInt32Ty(ctx);
+        return llvm::Function::Create(
+            llvm::FunctionType::get(i32, { ptrTy, ptrTy }, false),
+            llvm::Function::ExternalLinkage, "_Unwind_Backtrace", module.get());
+    }
+    llvm::Function* getOrDeclareUnwindGetIP() {
+        if (auto* f = module->getFunction("_Unwind_GetIP")) return f;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64 = llvm::Type::getInt64Ty(ctx);
+        return llvm::Function::Create(
+            llvm::FunctionType::get(i64, { ptrTy }, false),
+            llvm::Function::ExternalLinkage, "_Unwind_GetIP", module.get());
+    }
+
+    // Single registry head, internal to the prelude module (only prelude-defined
+    // runtime functions touch it).
+    llvm::GlobalVariable* getSymtabHead() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        if (auto* g = module->getNamedGlobal("_ens_symtab_head")) return g;
+        return new llvm::GlobalVariable(*module, ptrTy, /*isConstant=*/false,
+            llvm::GlobalValue::InternalLinkage, llvm::ConstantPointerNull::get(ptrTy),
+            "_ens_symtab_head");
+    }
+
+    void defineSymtabRegister() {
+        auto* fn = symtabRegisterFn();
+        if (!fn->empty()) return;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+        auto saved = builder->saveIP();
+        builder->SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", fn));
+        llvm::Value* chunk = fn->getArg(0);
+        llvm::Value* head = getSymtabHead();
+        llvm::Value* prev = builder->CreateLoad(ptrTy, head, "head");
+        builder->CreateStore(prev, chunk);          // chunk->next = head (field 0)
+        builder->CreateStore(chunk, head);           // head = chunk
+        builder->CreateRetVoid();
+        builder->restoreIP(saved);
+    }
+
+    void defineUnwindCallback() {
+        if (module->getFunction("ens_unwind_cb")) return;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32 = llvm::Type::getInt32Ty(ctx);
+        auto* i64 = llvm::Type::getInt64Ty(ctx);
+        auto* stateTy = llvm::StructType::get(ctx, { ptrTy, i32, i32 });  // buf, idx, max
+        auto* fn = llvm::Function::Create(
+            llvm::FunctionType::get(i32, { ptrTy, ptrTy }, false),
+            llvm::Function::InternalLinkage, "ens_unwind_cb", module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+        auto saved = builder->saveIP();
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* stop  = llvm::BasicBlock::Create(ctx, "full", fn);
+        auto* cont  = llvm::BasicBlock::Create(ctx, "store", fn);
+        builder->SetInsertPoint(entry);
+        llvm::Value* uctx = fn->getArg(0);
+        llvm::Value* state = fn->getArg(1);
+        llvm::Value* idxPtr = builder->CreateStructGEP(stateTy, state, 1);
+        llvm::Value* maxPtr = builder->CreateStructGEP(stateTy, state, 2);
+        llvm::Value* idx = builder->CreateLoad(i32, idxPtr, "idx");
+        llvm::Value* mx = builder->CreateLoad(i32, maxPtr, "max");
+        builder->CreateCondBr(builder->CreateICmpSGE(idx, mx), stop, cont);
+        builder->SetInsertPoint(stop);
+        builder->CreateRet(llvm::ConstantInt::get(i32, 5));   // _URC_END_OF_STACK
+        builder->SetInsertPoint(cont);
+        llvm::Value* ip = builder->CreateCall(getOrDeclareUnwindGetIP(), { uctx }, "ip");
+        llvm::Value* buf = builder->CreateLoad(ptrTy, builder->CreateStructGEP(stateTy, state, 0), "buf");
+        llvm::Value* slot = builder->CreateGEP(i64, buf, builder->CreateSExt(idx, i64), "slot");
+        builder->CreateStore(ip, slot);
+        builder->CreateStore(builder->CreateAdd(idx, llvm::ConstantInt::get(i32, 1)), idxPtr);
+        builder->CreateRet(llvm::ConstantInt::get(i32, 0));   // _URC_NO_REASON
+        builder->restoreIP(saved);
+    }
+
+    // ptr ens_resolve_addr(i64): the entry with the greatest funcStart <= addr,
+    // or null. Linear scan; traces are rare so no index is built.
+    void defineResolveAddr() {
+        if (module->getFunction("ens_resolve_addr")) return;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64 = llvm::Type::getInt64Ty(ctx);
+        auto* entryTy = getSymEntryTy();
+        auto* chunkTy = getSymChunkTy();
+        auto* fn = llvm::Function::Create(
+            llvm::FunctionType::get(ptrTy, { i64 }, false),
+            llvm::Function::InternalLinkage, "ens_resolve_addr", module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+        auto saved = builder->saveIP();
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* ckCond = llvm::BasicBlock::Create(ctx, "chunk.cond", fn);
+        auto* ckBody = llvm::BasicBlock::Create(ctx, "chunk.body", fn);
+        auto* inCond = llvm::BasicBlock::Create(ctx, "inner.cond", fn);
+        auto* inBody = llvm::BasicBlock::Create(ctx, "inner.body", fn);
+        auto* setIt  = llvm::BasicBlock::Create(ctx, "set", fn);
+        auto* inNext = llvm::BasicBlock::Create(ctx, "inner.next", fn);
+        auto* ckNext = llvm::BasicBlock::Create(ctx, "chunk.next", fn);
+        auto* done   = llvm::BasicBlock::Create(ctx, "done", fn);
+        builder->SetInsertPoint(entry);
+        llvm::Value* addr = fn->getArg(0);
+        llvm::Value* bestA = builder->CreateAlloca(ptrTy, nullptr, "best");
+        llvm::Value* bestStartA = builder->CreateAlloca(i64, nullptr, "bestStart");
+        llvm::Value* chunkA = builder->CreateAlloca(ptrTy, nullptr, "chunk");
+        llvm::Value* iA = builder->CreateAlloca(i64, nullptr, "i");
+        builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), bestA);
+        builder->CreateStore(llvm::ConstantInt::get(i64, 0), bestStartA);
+        builder->CreateStore(builder->CreateLoad(ptrTy, getSymtabHead()), chunkA);
+        builder->CreateBr(ckCond);
+
+        builder->SetInsertPoint(ckCond);
+        llvm::Value* chunk = builder->CreateLoad(ptrTy, chunkA, "chunk.cur");
+        builder->CreateCondBr(
+            builder->CreateICmpEQ(chunk, llvm::ConstantPointerNull::get(ptrTy)), done, ckBody);
+
+        builder->SetInsertPoint(ckBody);
+        llvm::Value* entries = builder->CreateLoad(ptrTy, builder->CreateStructGEP(chunkTy, chunk, 1), "entries");
+        llvm::Value* count = builder->CreateLoad(i64, builder->CreateStructGEP(chunkTy, chunk, 2), "count");
+        builder->CreateStore(llvm::ConstantInt::get(i64, 0), iA);
+        builder->CreateBr(inCond);
+
+        builder->SetInsertPoint(inCond);
+        llvm::Value* i = builder->CreateLoad(i64, iA, "i.cur");
+        builder->CreateCondBr(builder->CreateICmpSLT(i, count), inBody, ckNext);
+
+        builder->SetInsertPoint(inBody);
+        llvm::Value* e = builder->CreateGEP(entryTy, entries, i, "e");
+        llvm::Value* fsPtr = builder->CreateLoad(ptrTy, builder->CreateStructGEP(entryTy, e, 0), "fs.ptr");
+        llvm::Value* fs = builder->CreatePtrToInt(fsPtr, i64, "fs");
+        llvm::Value* le = builder->CreateICmpULE(fs, addr);
+        llvm::Value* gt = builder->CreateICmpUGT(fs, builder->CreateLoad(i64, bestStartA));
+        builder->CreateCondBr(builder->CreateAnd(le, gt), setIt, inNext);
+
+        builder->SetInsertPoint(setIt);
+        builder->CreateStore(e, bestA);
+        builder->CreateStore(fs, bestStartA);
+        builder->CreateBr(inNext);
+
+        builder->SetInsertPoint(inNext);
+        builder->CreateStore(builder->CreateAdd(i, llvm::ConstantInt::get(i64, 1)), iA);
+        builder->CreateBr(inCond);
+
+        builder->SetInsertPoint(ckNext);
+        builder->CreateStore(builder->CreateLoad(ptrTy, builder->CreateStructGEP(chunkTy, chunk, 0)), chunkA);
+        builder->CreateBr(ckCond);
+
+        builder->SetInsertPoint(done);
+        builder->CreateRet(builder->CreateLoad(ptrTy, bestA));
+        builder->restoreIP(saved);
+    }
+
+    // ptr ens_capture_trace(i32 maxDepth): unwind, drop the capture frame and any
+    // frames past the program entry, return a long[] of the surviving addresses.
+    void defineCaptureTrace() {
+        auto* fn = captureTraceFn();
+        if (!fn->empty()) return;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32 = llvm::Type::getInt32Ty(ctx);
+        auto* i64 = llvm::Type::getInt64Ty(ctx);
+        auto* entryTy = getSymEntryTy();
+        auto* stateTy = llvm::StructType::get(ctx, { ptrTy, i32, i32 });
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+        auto saved = builder->saveIP();
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* lpCond = llvm::BasicBlock::Create(ctx, "walk.cond", fn);
+        auto* lpBody = llvm::BasicBlock::Create(ctx, "walk.body", fn);
+        auto* keep   = llvm::BasicBlock::Create(ctx, "walk.keep", fn);
+        auto* lpNext = llvm::BasicBlock::Create(ctx, "walk.next", fn);
+        auto* fin    = llvm::BasicBlock::Create(ctx, "walk.done", fn);
+        builder->SetInsertPoint(entry);
+        llvm::Value* mx = fn->getArg(0);
+        llvm::Value* mx64 = builder->CreateSExt(mx, i64);
+        llvm::Value* buf = builder->CreateAlloca(i64, mx, "buf");
+        llvm::Value* state = builder->CreateAlloca(stateTy, nullptr, "state");
+        builder->CreateStore(buf, builder->CreateStructGEP(stateTy, state, 0));
+        builder->CreateStore(llvm::ConstantInt::get(i32, 0), builder->CreateStructGEP(stateTy, state, 1));
+        builder->CreateStore(mx, builder->CreateStructGEP(stateTy, state, 2));
+        builder->CreateCall(getOrDeclareUnwindBacktrace(),
+            { module->getFunction("ens_unwind_cb"), state });
+        llvm::Value* n = builder->CreateSExt(
+            builder->CreateLoad(i32, builder->CreateStructGEP(stateTy, state, 1)), i64, "n");
+        // long[] sized to maxDepth (over-allocated; length set to the kept count).
+        llvm::Value* bytes = builder->CreateAdd(llvm::ConstantInt::get(i64, 8),
+            builder->CreateMul(mx64, llvm::ConstantInt::get(i64, 8)));
+        llvm::Value* arr = builder->CreateCall(getOrDefineEnsAlloc(),
+            { bytes, llvm::ConstantPointerNull::get(ptrTy), llvm::ConstantPointerNull::get(ptrTy) }, "trace");
+        llvm::Value* data = builder->CreateGEP(llvm::Type::getInt8Ty(ctx), arr,
+            llvm::ConstantInt::get(i64, 8), "trace.data");
+        llvm::Value* iA = builder->CreateAlloca(i64, nullptr, "i");
+        llvm::Value* jA = builder->CreateAlloca(i64, nullptr, "j");
+        builder->CreateStore(llvm::ConstantInt::get(i64, 1), iA);   // skip the capture frame
+        builder->CreateStore(llvm::ConstantInt::get(i64, 0), jA);
+        builder->CreateBr(lpCond);
+
+        builder->SetInsertPoint(lpCond);
+        llvm::Value* i = builder->CreateLoad(i64, iA, "i.cur");
+        builder->CreateCondBr(builder->CreateICmpSLT(i, n), lpBody, fin);
+
+        builder->SetInsertPoint(lpBody);
+        llvm::Value* addr = builder->CreateLoad(i64, builder->CreateGEP(i64, buf, i), "addr");
+        llvm::Value* e = builder->CreateCall(module->getFunction("ens_resolve_addr"), { addr }, "e");
+        builder->CreateCondBr(
+            builder->CreateICmpNE(e, llvm::ConstantPointerNull::get(ptrTy)), keep, lpNext);
+
+        builder->SetInsertPoint(keep);
+        llvm::Value* j = builder->CreateLoad(i64, jA, "j.cur");
+        builder->CreateStore(addr, builder->CreateGEP(i64, data, j));
+        builder->CreateStore(builder->CreateAdd(j, llvm::ConstantInt::get(i64, 1)), jA);
+        llvm::Value* isEntry = builder->CreateLoad(i32, builder->CreateStructGEP(entryTy, e, 4), "isEntry");
+        builder->CreateCondBr(
+            builder->CreateICmpNE(isEntry, llvm::ConstantInt::get(i32, 0)), fin, lpNext);
+
+        builder->SetInsertPoint(lpNext);
+        builder->CreateStore(builder->CreateAdd(i, llvm::ConstantInt::get(i64, 1)), iA);
+        builder->CreateBr(lpCond);
+
+        builder->SetInsertPoint(fin);
+        builder->CreateStore(builder->CreateLoad(i64, jA), arr);   // length at +0
+        builder->CreateRet(arr);
+        builder->restoreIP(saved);
+    }
+
+    // ptr ens_format_trace(ptr frames): one "  at <fn> (<file>:<line>)\n" line per
+    // captured frame, into a heap buffer. Capture already dropped non-user frames
+    // and truncated at the program entry, so this iterates every stored frame.
+    void defineFormatTrace() {
+        auto* fn = formatTraceFn();
+        if (!fn->empty()) return;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i8 = llvm::Type::getInt8Ty(ctx);
+        auto* i32 = llvm::Type::getInt32Ty(ctx);
+        auto* i64 = llvm::Type::getInt64Ty(ctx);
+        auto* entryTy = getSymEntryTy();
+        const int64_t BUFSZ = 8192;
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+        auto saved = builder->saveIP();
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* emptyBB = llvm::BasicBlock::Create(ctx, "empty", fn);
+        auto* haveBB = llvm::BasicBlock::Create(ctx, "have", fn);
+        auto* cond = llvm::BasicBlock::Create(ctx, "cond", fn);
+        auto* body = llvm::BasicBlock::Create(ctx, "body", fn);
+        auto* doFmt = llvm::BasicBlock::Create(ctx, "fmt", fn);
+        auto* next = llvm::BasicBlock::Create(ctx, "next", fn);
+        auto* after = llvm::BasicBlock::Create(ctx, "after", fn);
+        auto* trunc = llvm::BasicBlock::Create(ctx, "trunc", fn);
+        auto* retBB = llvm::BasicBlock::Create(ctx, "ret", fn);
+        builder->SetInsertPoint(entry);
+        llvm::Value* frames = fn->getArg(0);
+        builder->CreateCondBr(
+            builder->CreateICmpEQ(frames, llvm::ConstantPointerNull::get(ptrTy)), emptyBB, haveBB);
+
+        builder->SetInsertPoint(emptyBB);
+        builder->CreateRet(builder->CreateGlobalString("", ".trace.empty"));
+
+        builder->SetInsertPoint(haveBB);
+        llvm::Value* n = builder->CreateLoad(i64, frames, "n");
+        llvm::Value* data = builder->CreateGEP(i8, frames, llvm::ConstantInt::get(i64, 8), "data");
+        llvm::Value* buf = builder->CreateCall(getOrDeclareMalloc(), { llvm::ConstantInt::get(i64, BUFSZ) }, "buf");
+        builder->CreateStore(llvm::ConstantInt::get(i8, 0), buf);
+        llvm::Value* lenA = builder->CreateAlloca(i64, nullptr, "len");
+        llvm::Value* iA = builder->CreateAlloca(i64, nullptr, "i");
+        llvm::Value* sawA = builder->CreateAlloca(llvm::Type::getInt1Ty(ctx), nullptr, "sawEntry");
+        builder->CreateStore(llvm::ConstantInt::get(i64, 0), lenA);
+        builder->CreateStore(llvm::ConstantInt::get(i64, 0), iA);
+        builder->CreateStore(llvm::ConstantInt::getFalse(ctx), sawA);
+        llvm::Value* fmt = builder->CreateGlobalString("  at %s (%s:%d)\n", ".trace.fmt");
+        builder->CreateBr(cond);
+
+        builder->SetInsertPoint(cond);
+        llvm::Value* i = builder->CreateLoad(i64, iA, "i.cur");
+        builder->CreateCondBr(builder->CreateICmpSLT(i, n), body, after);
+
+        builder->SetInsertPoint(body);
+        llvm::Value* addr = builder->CreateLoad(i64, builder->CreateGEP(i64, data, i), "addr");
+        llvm::Value* e = builder->CreateCall(module->getFunction("ens_resolve_addr"), { addr }, "e");
+        builder->CreateCondBr(
+            builder->CreateICmpEQ(e, llvm::ConstantPointerNull::get(ptrTy)), next, doFmt);
+
+        builder->SetInsertPoint(doFmt);
+        llvm::Value* name = builder->CreateLoad(ptrTy, builder->CreateStructGEP(entryTy, e, 1), "name");
+        llvm::Value* file = builder->CreateLoad(ptrTy, builder->CreateStructGEP(entryTy, e, 2), "file");
+        llvm::Value* line = builder->CreateLoad(i32, builder->CreateStructGEP(entryTy, e, 3), "line");
+        llvm::Value* isEntry = builder->CreateLoad(i32, builder->CreateStructGEP(entryTy, e, 4), "isEntry");
+        llvm::Value* len = builder->CreateLoad(i64, lenA, "len.cur");
+        llvm::Value* cur = builder->CreateGEP(i8, buf, len);
+        llvm::Value* rem = builder->CreateSub(llvm::ConstantInt::get(i64, BUFSZ), len);
+        llvm::Value* w = builder->CreateCall(getOrDeclareSnprintf(), { cur, rem, fmt, name, file, line }, "w");
+        llvm::Value* newlen = builder->CreateAdd(len, builder->CreateSExt(w, i64));
+        llvm::Value* over = builder->CreateICmpSGT(newlen, llvm::ConstantInt::get(i64, BUFSZ - 1));
+        builder->CreateStore(builder->CreateSelect(over, llvm::ConstantInt::get(i64, BUFSZ - 1), newlen), lenA);
+        builder->CreateStore(
+            builder->CreateOr(builder->CreateLoad(llvm::Type::getInt1Ty(ctx), sawA),
+                              builder->CreateICmpNE(isEntry, llvm::ConstantInt::get(i32, 0))),
+            sawA);
+        builder->CreateBr(next);
+
+        builder->SetInsertPoint(next);
+        builder->CreateStore(builder->CreateAdd(i, llvm::ConstantInt::get(i64, 1)), iA);
+        builder->CreateBr(cond);
+
+        builder->SetInsertPoint(after);
+        llvm::Value* nonEmpty = builder->CreateICmpSGT(n, llvm::ConstantInt::get(i64, 0));
+        llvm::Value* sawEntry = builder->CreateLoad(llvm::Type::getInt1Ty(ctx), sawA);
+        builder->CreateCondBr(builder->CreateAnd(nonEmpty, builder->CreateNot(sawEntry)), trunc, retBB);
+
+        builder->SetInsertPoint(trunc);
+        llvm::Value* tlen = builder->CreateLoad(i64, lenA);
+        builder->CreateCall(getOrDeclareSnprintf(),
+            { builder->CreateGEP(i8, buf, tlen),
+              builder->CreateSub(llvm::ConstantInt::get(i64, BUFSZ), tlen),
+              builder->CreateGlobalString("  ... (trace truncated)\n", ".trace.trunc") });
+        builder->CreateBr(retBB);
+
+        builder->SetInsertPoint(retBB);
+        builder->CreateRet(buf);
+        builder->restoreIP(saved);
+    }
+
+    // ptr ens_symbolicate(ptr frames): build a StackFrame[] from the captured
+    // addresses. Every stored frame resolves (capture kept only resolved ones).
+    void defineSymbolicate() {
+        auto* fn = symbolicateFn();
+        if (!fn->empty()) return;
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+        if (!stackFrameType || !stackFrameType->structInfo) {
+            auto* ptrTy = llvm::PointerType::get(ctx, 0);
+            auto saved = builder->saveIP();
+            builder->SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", fn));
+            builder->CreateRet(llvm::ConstantPointerNull::get(ptrTy));
+            builder->restoreIP(saved);
+            return;
+        }
+        emitSymbolicateBodyFinal(fn);
+    }
+
+    void emitSymbolicateBodyFinal(llvm::Function* fn) {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i8 = llvm::Type::getInt8Ty(ctx);
+        auto* i32 = llvm::Type::getInt32Ty(ctx);
+        auto* i64 = llvm::Type::getInt64Ty(ctx);
+        auto* entryTy = getSymEntryTy();
+        auto* sfStructTy = mapStructType(stackFrameType);
+        uint64_t sfSize = module->getDataLayout().getTypeAllocSize(sfStructTy);
+        llvm::Value* sfDtor = getOrEmitClassDtor(stackFrameType);
+        llvm::Value* sfDesc = getOrEmitTypeDescriptor(stackFrameType->structInfo);
+        llvm::Value* arrDtor = getOrEmitArrayDtor(stackFrameType);
+        if (!arrDtor) arrDtor = llvm::ConstantPointerNull::get(ptrTy);
+        auto saved = builder->saveIP();
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* getN = llvm::BasicBlock::Create(ctx, "getn", fn);
+        auto* zeroN = llvm::BasicBlock::Create(ctx, "zeron", fn);
+        auto* alloc = llvm::BasicBlock::Create(ctx, "alloc", fn);
+        auto* cond = llvm::BasicBlock::Create(ctx, "cond", fn);
+        auto* body = llvm::BasicBlock::Create(ctx, "body", fn);
+        auto* retBB = llvm::BasicBlock::Create(ctx, "ret", fn);
+        builder->SetInsertPoint(entry);
+        llvm::Value* frames = fn->getArg(0);
+        llvm::Value* nA = builder->CreateAlloca(i64, nullptr, "n");
+        llvm::Value* arrA = builder->CreateAlloca(ptrTy, nullptr, "arr");
+        llvm::Value* iA = builder->CreateAlloca(i64, nullptr, "i");
+        builder->CreateCondBr(
+            builder->CreateICmpEQ(frames, llvm::ConstantPointerNull::get(ptrTy)), zeroN, getN);
+        builder->SetInsertPoint(zeroN);
+        builder->CreateStore(llvm::ConstantInt::get(i64, 0), nA);
+        builder->CreateBr(alloc);
+        builder->SetInsertPoint(getN);
+        builder->CreateStore(builder->CreateLoad(i64, frames), nA);
+        builder->CreateBr(alloc);
+
+        builder->SetInsertPoint(alloc);
+        llvm::Value* n = builder->CreateLoad(i64, nA, "n.cur");
+        llvm::Value* bytes = builder->CreateAdd(llvm::ConstantInt::get(i64, 8),
+            builder->CreateMul(n, llvm::ConstantInt::get(i64, 8)));
+        llvm::Value* arr = builder->CreateCall(getOrDefineEnsAlloc(), { bytes, arrDtor,
+            llvm::ConstantPointerNull::get(ptrTy) }, "frames.arr");
+        builder->CreateStore(n, arr);                 // length at +0
+        builder->CreateStore(arr, arrA);
+        builder->CreateStore(llvm::ConstantInt::get(i64, 0), iA);
+        builder->CreateBr(cond);
+
+        builder->SetInsertPoint(cond);
+        llvm::Value* i = builder->CreateLoad(i64, iA, "i.cur");
+        builder->CreateCondBr(builder->CreateICmpSLT(i, n), body, retBB);
+
+        builder->SetInsertPoint(body);
+        llvm::Value* data = builder->CreateGEP(i8, frames, llvm::ConstantInt::get(i64, 8));
+        llvm::Value* addr = builder->CreateLoad(i64, builder->CreateGEP(i64, data, i));
+        llvm::Value* e = builder->CreateCall(module->getFunction("ens_resolve_addr"), { addr }, "e");
+        llvm::Value* name = builder->CreateLoad(ptrTy, builder->CreateStructGEP(entryTy, e, 1));
+        llvm::Value* file = builder->CreateLoad(ptrTy, builder->CreateStructGEP(entryTy, e, 2));
+        llvm::Value* line = builder->CreateLoad(i32, builder->CreateStructGEP(entryTy, e, 3));
+        llvm::Value* sf = builder->CreateCall(getOrDefineEnsAlloc(),
+            { llvm::ConstantInt::get(i64, sfSize), sfDtor, sfDesc }, "frame");
+        builder->CreateStore(name, builder->CreateStructGEP(sfStructTy, sf, 0));
+        builder->CreateStore(file, builder->CreateStructGEP(sfStructTy, sf, 1));
+        builder->CreateStore(line, builder->CreateStructGEP(sfStructTy, sf, 2));
+        llvm::Value* arrData = builder->CreateGEP(i8, builder->CreateLoad(ptrTy, arrA),
+            llvm::ConstantInt::get(i64, 8));
+        builder->CreateStore(sf, builder->CreateGEP(ptrTy, arrData, i));
+        builder->CreateStore(builder->CreateAdd(i, llvm::ConstantInt::get(i64, 1)), iA);
+        builder->CreateBr(cond);
+
+        builder->SetInsertPoint(retBB);
+        builder->CreateRet(builder->CreateLoad(ptrTy, arrA));
+        builder->restoreIP(saved);
+    }
+
+    void definePreludeRuntime() {
+        defineUnwindCallback();
+        defineResolveAddr();
+        defineCaptureTrace();
+        defineFormatTrace();
+        defineSymbolicate();
+        defineSymtabRegister();
+    }
+
+    llvm::Constant* makeCString(const std::string& s) {
+        auto* init = llvm::ConstantDataArray::getString(ctx, s, /*AddNull=*/true);
+        auto* gv = new llvm::GlobalVariable(*module, init->getType(), /*isConstant=*/true,
+            llvm::GlobalValue::PrivateLinkage, init, ".trace.s");
+        gv->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+        return gv;
+    }
+
+    void recordSymtabEntry(llvm::Function* fn, const std::string& display, int line, bool isEntry) {
+        std::string file = std::filesystem::path(sourceFilename).filename().string();
+        if (file.empty()) file = sourceFilename;
+        symtabRecords.push_back({ fn, display, file, line, isEntry });
+    }
+
+    // Emit this module's symbol table as a constant array, then a global ctor that
+    // registers it into the runtime list at load (works for static and dlopen'd
+    // modules alike).
+    void emitSymtabRegistration() {
+        if (symtabRecords.empty()) return;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32 = llvm::Type::getInt32Ty(ctx);
+        auto* i64 = llvm::Type::getInt64Ty(ctx);
+        auto* entryTy = getSymEntryTy();
+        auto* chunkTy = getSymChunkTy();
+
+        std::vector<llvm::Constant*> elems;
+        elems.reserve(symtabRecords.size());
+        for (auto& r : symtabRecords) {
+            elems.push_back(llvm::ConstantStruct::get(entryTy, {
+                r.fn, makeCString(r.name), makeCString(r.file),
+                llvm::ConstantInt::get(i32, r.line),
+                llvm::ConstantInt::get(i32, r.isEntry ? 1 : 0) }));
+        }
+        auto* arrTy = llvm::ArrayType::get(entryTy, elems.size());
+        auto* entriesGV = new llvm::GlobalVariable(*module, arrTy, /*isConstant=*/true,
+            llvm::GlobalValue::PrivateLinkage, llvm::ConstantArray::get(arrTy, elems), "_ens_symtab");
+        auto* chunkInit = llvm::ConstantStruct::get(chunkTy, {
+            llvm::ConstantPointerNull::get(ptrTy), entriesGV,
+            llvm::ConstantInt::get(i64, elems.size()) });
+        auto* chunkGV = new llvm::GlobalVariable(*module, chunkTy, /*isConstant=*/false,
+            llvm::GlobalValue::PrivateLinkage, chunkInit, "_ens_symtab_chunk");
+
+        auto* ctor = llvm::Function::Create(
+            llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), false),
+            llvm::Function::InternalLinkage, "_ens_register_symtab", module.get());
+        ctor->addFnAttr(llvm::Attribute::NoUnwind);
+        auto saved = builder->saveIP();
+        builder->SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", ctor));
+        builder->CreateCall(symtabRegisterFn(), { chunkGV });
+        builder->CreateRetVoid();
+        builder->restoreIP(saved);
+        llvm::appendToGlobalCtors(*module, ctor, 65535);
+    }
+
     llvm::Function* getOrDefineEnsAlloc() {
         if (auto* existing = module->getFunction("ens_alloc")) return existing;
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
@@ -2104,11 +2703,15 @@ struct CodeGenerator::Impl {
     }
 
     void emitPanic(const std::string& message, int exitCode) {
-        auto* puts = getOrDeclarePuts();
-        llvm::Value* str = makeMessageString(message);
-        builder->CreateCall(puts, { str });
-        builder->CreateCall(getOrDeclareExit(),
-            { llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), exitCode) });
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        llvm::Value* stderrF = getStderr();
+        auto* fputs = getOrDeclareFputs();
+        builder->CreateCall(fputs, { builder->CreateGlobalString("panic: ", ".panic.pfx"), stderrF });
+        builder->CreateCall(fputs, { makeMessageString(message), stderrF });
+        builder->CreateCall(fputs, { builder->CreateGlobalString("\n", ".panic.nl"), stderrF });
+        llvm::Value* trace = builder->CreateCall(captureTraceFn(), { llvm::ConstantInt::get(i32Ty, 64) }, "trace");
+        builder->CreateCall(fputs, { builder->CreateCall(formatTraceFn(), { trace }, "trace.str"), stderrF });
+        builder->CreateCall(getOrDeclareExit(), { llvm::ConstantInt::get(i32Ty, exitCode) });
         builder->CreateUnreachable();
     }
 
@@ -2929,6 +3532,21 @@ struct CodeGenerator::Impl {
         if (callee && callee->asMember()) {
             auto member = *callee->asMember();
             Symbol* methodSym = methodSymbolOf(member.node);
+            if (methodSym && isInterceptedTraceMethod(methodSym)) {
+                auto obj = member.object();
+                if (!obj) return nullptr;
+                ::Type* objType = typeOf(obj->node);
+                llvm::Value* recv = isReferenceType(objType) ? emitExpr(*obj) : emitLValue(*obj);
+                if (!recv) return nullptr;
+                trackOwnedArgTemp(recv, *obj, objType);
+                auto* ptrTy = llvm::PointerType::get(ctx, 0);
+                llvm::Value* frames = builder->CreateLoad(ptrTy,
+                    builder->CreateGEP(llvm::Type::getInt8Ty(ctx), recv,
+                        llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), 8)), "frames");
+                return builder->CreateCall(
+                    methodSym->name == u"stackTrace" ? formatTraceFn() : symbolicateFn(),
+                    { frames }, "trace.result");
+            }
             if (methodSym) {
                 auto obj = member.object();
                 if (!obj) return nullptr;
@@ -3446,6 +4064,8 @@ struct CodeGenerator::Impl {
         for (auto& cd : sf->classes()) {
             if (Type* t = analysis.typeOf(cd.node.greenNode())) {
                 if (t->structInfo) getOrEmitTypeDescriptor(t->structInfo);
+                if (t->structInfo && t->structInfo->name == u"StackFrame" && isPreludeModule())
+                    stackFrameType = t;
             }
         }
 
@@ -3456,6 +4076,14 @@ struct CodeGenerator::Impl {
             if (msym && msym->abiThrows) emitMainWrapper(msym);
             break;
         }
+
+        if (isPreludeModule()) definePreludeRuntime();
+        emitSymtabRegistration();
+
+        // The unwinder reads .eh_frame; force it even on the nounwind runtime so a
+        // capture can walk through every frame.
+        for (auto& F : *module)
+            if (!F.isDeclaration()) F.setUWTableKind(llvm::UWTableKind::Async);
 
         if (debugEnabled && diBuilder) diBuilder->finalize();
         if (!diagnostics.empty()) return false;
