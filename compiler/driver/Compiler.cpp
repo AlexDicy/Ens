@@ -367,9 +367,11 @@ bool runMultiModuleAnalysis(std::vector<std::unique_ptr<Module>>& modules,
         if (it == byPath.end()) return nullptr;
         return it->second->analyzer.get();
     };
-    for (auto& m : modules) m->analyzer->bindImports(resolver);
+    for (auto& m : modules) m->analyzer->bindTypeImports(resolver);
 
     for (auto& m : modules) m->analyzer->resolveSignatures();
+
+    for (auto& m : modules) m->analyzer->bindValueImports(resolver);
 
     // Lay out classes whole-program, bases before derived, so a class can extend
     // a class in another module (inherited fields + virtual slots resolve across

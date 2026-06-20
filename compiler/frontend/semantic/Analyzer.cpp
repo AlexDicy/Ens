@@ -469,6 +469,14 @@ void Analyzer::registerClassNames(const ast::SourceFile& file) {
 }
 
 void Analyzer::bindImports(const ModuleResolver& resolver) {
+    bindTypeImports(resolver);
+    bindValueImports(resolver);
+}
+
+// Bind imported types and namespace aliases. Runs before signatures are resolved so
+// a signature can reference an imported type. Named imports that do not resolve to a
+// type are left for bindValueImports (functions are not collected yet).
+void Analyzer::bindTypeImports(const ModuleResolver& resolver) {
     if (!astRoot) return;
     for (auto& imp : astRoot->imports()) {
         if (imp.isPackage()) {
@@ -485,25 +493,14 @@ void Analyzer::bindImports(const ModuleResolver& resolver) {
         if (auto alias = imp.aliasText()) {
             // Named import: `import Alias from path;`, bring `Alias` into scope.
             Type* importedType = typeCtx.lookupNamedType(targetPath, *alias);
-            uint32_t namePos = imp.aliasToken() ? imp.aliasToken()->startOffset() : imp.node.startOffset();
             if (importedType) {
+                uint32_t namePos = imp.aliasToken() ? imp.aliasToken()->startOffset() : imp.node.startOffset();
                 Symbol* sym = makeSymbol(SymbolKind::Variable, *alias, importedType, namePos);
                 if (!globalScope->define(sym)) {
                     errorAtNode(imp.node, "Imported name '" + asciiOf(*alias) +
                         "' conflicts with an existing declaration");
                 }
-                continue;
             }
-            Symbol* fnSym = target->globalSymbol(*alias);
-            if (fnSym && fnSym->kind == SymbolKind::Function) {
-                if (!globalScope->define(fnSym)) {
-                    errorAtNode(imp.node, "Imported name '" + asciiOf(*alias) +
-                        "' conflicts with an existing declaration");
-                }
-                continue;
-            }
-            errorAtNode(imp.node, "Module '" + asciiOf(targetPath) +
-                "' has no exported '" + asciiOf(*alias) + "'");
         } else {
             // Namespace import: `import path;`, last path segment becomes the alias.
             auto nsName = imp.namespaceName();
@@ -515,6 +512,32 @@ void Analyzer::bindImports(const ModuleResolver& resolver) {
                     "' conflicts with an existing declaration");
             }
         }
+    }
+}
+
+// Bind named function imports. Runs after signatures are resolved so the target
+// module's functions exist in its global scope.
+void Analyzer::bindValueImports(const ModuleResolver& resolver) {
+    if (!astRoot) return;
+    for (auto& imp : astRoot->imports()) {
+        if (imp.isPackage()) continue;  // diagnosed in bindTypeImports
+        auto alias = imp.aliasText();
+        if (!alias) continue;            // namespace imports bound in bindTypeImports
+        std::u16string targetPath = imp.modulePath();
+        const Analyzer* target = resolver(targetPath);
+        if (!target) continue;           // diagnosed in bindTypeImports
+        if (typeCtx.lookupNamedType(targetPath, *alias)) continue;  // already bound as a type
+
+        Symbol* fnSym = target->globalSymbol(*alias);
+        if (fnSym && fnSym->kind == SymbolKind::Function) {
+            if (!globalScope->define(fnSym)) {
+                errorAtNode(imp.node, "Imported name '" + asciiOf(*alias) +
+                    "' conflicts with an existing declaration");
+            }
+            continue;
+        }
+        errorAtNode(imp.node, "Module '" + asciiOf(targetPath) +
+            "' has no exported '" + asciiOf(*alias) + "'");
     }
 }
 

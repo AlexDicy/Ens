@@ -46,6 +46,8 @@ public:
     void registerNames(const SyntaxNode& sourceFileRoot);
     void resolveSignatures();
     void bindImports(const ModuleResolver& resolver);
+    void bindTypeImports(const ModuleResolver& resolver);
+    void bindValueImports(const ModuleResolver& resolver);
     void analyzeBodies();
 
     void importPrelude();
