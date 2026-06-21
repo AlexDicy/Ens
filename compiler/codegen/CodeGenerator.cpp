@@ -81,7 +81,13 @@ struct CodeGenerator::Impl {
     std::unordered_map<::Type*, llvm::DIType*> diStructTypeCache;
     std::unordered_map<::Type*, llvm::DIType*> diClassPointerCache;
     std::unordered_map<StructInfo*, llvm::GlobalVariable*> descriptorCache;
+    std::unordered_map<std::string, llvm::Constant*> stringLiteralCache;
     llvm::StructType* typeDescriptorTy = nullptr;
+
+    // Refcount sentinel for immortal objects (string literals). Real refcounts
+    // start at 1 and move by 1, so they never reach this value; ens_retain and
+    // ens_release detect it and leave the object untouched.
+    static constexpr int64_t kImmortalRefcount = INT64_MIN;
     llvm::StructType* symEntryTy = nullptr;
     llvm::StructType* symChunkTy = nullptr;
     llvm::StructType* lineEntryTy = nullptr;
@@ -206,8 +212,9 @@ struct CodeGenerator::Impl {
         if (!t) return false;
         if (t->kind == TypeKind::Class) return true;
         if (t->kind == TypeKind::Array) return true;
+        if (t->kind == TypeKind::String) return true;
         if (t->kind == TypeKind::Optional && t->inner &&
-            (t->inner->isClass() || t->inner->isArray())) return true;
+            (t->inner->isClass() || t->inner->isArray() || t->inner->isString())) return true;
         return false;
     }
 
@@ -862,12 +869,13 @@ struct CodeGenerator::Impl {
         builder->CreateCall(fputs, { builder->CreateGlobalString("Unhandled exception ", ".uex.pfx"), stderrF });
         builder->CreateCall(fputs, { typeName, stderrF });
         builder->CreateCall(fputs, { builder->CreateGlobalString(": ", ".uex.sep"), stderrF });
-        builder->CreateCall(fputs, { msg, stderrF });
+        builder->CreateCall(fputs, { emitStringDataPtr(msg), stderrF });
         builder->CreateCall(fputs, { builder->CreateGlobalString("\n", ".uex.nl"), stderrF });
         llvm::Value* frames = builder->CreateLoad(ptrTy,
             builder->CreateGEP(llvm::Type::getInt8Ty(ctx), err,
                 llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), 8)), "exc.frames");
-        builder->CreateCall(fputs, { builder->CreateCall(formatTraceFn(), { frames }, "trace.str"), stderrF });
+        llvm::Value* traceStr = builder->CreateCall(formatTraceFn(), { frames }, "trace.str");
+        builder->CreateCall(fputs, { emitStringDataPtr(traceStr), stderrF });
         builder->CreateCall(getOrDefineEnsRelease(), { err });
         builder->CreateRet(llvm::ConstantInt::get(i32Ty, 1));
     }
@@ -1370,6 +1378,8 @@ struct CodeGenerator::Impl {
                             case u'\\': utf8.push_back('\\'); break;
                             case u'"': utf8.push_back('"'); break;
                             case u'\'': utf8.push_back('\''); break;
+                            case u'{': utf8.push_back('{'); break;
+                            case u'}': utf8.push_back('}'); break;
                             default: utf8.push_back(static_cast<char>(n)); break;
                         }
                         continue;
@@ -1384,7 +1394,7 @@ struct CodeGenerator::Impl {
                         utf8.push_back(static_cast<char>(0x80 | (c & 0x3F)));
                     }
                 }
-                return builder->CreateGlobalString(utf8, ".str");
+                return emitStringLiteralObject(utf8);
             }
             default:
                 error(e.node.startOffset(), "Unsupported literal");
@@ -1487,6 +1497,11 @@ struct CodeGenerator::Impl {
         bool sgn = opType && opType->isSignedInteger();
         auto opTok = e.operatorToken();
         SyntaxKind op = opTok ? opTok->kind() : SyntaxKind::Invalid;
+        if ((op == SyntaxKind::EqEq || op == SyntaxKind::NotEq) &&
+            (isStringLike(leftType) || isStringLike(rightType))) {
+            llvm::Value* eq = builder->CreateCall(getOrDefineEnsStringEq(), { L, R }, "str.eq");
+            return op == SyntaxKind::NotEq ? builder->CreateNot(eq) : eq;
+        }
         switch (op) {
             case SyntaxKind::Plus:    return flt ? builder->CreateFAdd(L, R) : builder->CreateAdd(L, R);
             case SyntaxKind::Minus:   return flt ? builder->CreateFSub(L, R) : builder->CreateSub(L, R);
@@ -1667,6 +1682,14 @@ struct CodeGenerator::Impl {
         return llvm::Function::Create(ty, llvm::Function::ExternalLinkage, "free", module.get());
     }
 
+    llvm::Function* getOrDeclareStrlen() {
+        if (auto* existing = module->getFunction("strlen")) return existing;
+        auto* ty = llvm::FunctionType::get(
+            llvm::Type::getInt64Ty(ctx),
+            { llvm::PointerType::get(ctx, 0) }, false);
+        return llvm::Function::Create(ty, llvm::Function::ExternalLinkage, "strlen", module.get());
+    }
+
     // ===== Stack traces =====
     //
     // Capture stores raw return addresses on the thrown Error at the throw site
@@ -1750,6 +1773,15 @@ struct CodeGenerator::Impl {
         return llvm::Function::Create(
             llvm::FunctionType::get(ptrTy, { ptrTy, ptrTy, i64 }, false),
             llvm::Function::ExternalLinkage, "memcpy", module.get());
+    }
+    llvm::Function* getOrDeclareMemcmp() {
+        if (auto* f = module->getFunction("memcmp")) return f;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32 = llvm::Type::getInt32Ty(ctx);
+        auto* i64 = llvm::Type::getInt64Ty(ctx);
+        return llvm::Function::Create(
+            llvm::FunctionType::get(i32, { ptrTy, ptrTy, i64 }, false),
+            llvm::Function::ExternalLinkage, "memcmp", module.get());
     }
     llvm::Function* getOrDeclareSnprintf() {
         if (auto* f = module->getFunction("snprintf")) return f;
@@ -2128,7 +2160,7 @@ struct CodeGenerator::Impl {
             builder->CreateICmpEQ(frames, llvm::ConstantPointerNull::get(ptrTy)), emptyBB, haveBB);
 
         builder->SetInsertPoint(emptyBB);
-        builder->CreateRet(builder->CreateGlobalString("", ".trace.empty"));
+        builder->CreateRet(emitStringLiteralObject(""));
 
         builder->SetInsertPoint(haveBB);
         llvm::Value* n = builder->CreateLoad(i64, frames, "n");
@@ -2190,7 +2222,9 @@ struct CodeGenerator::Impl {
         builder->CreateBr(retBB);
 
         builder->SetInsertPoint(retBB);
-        builder->CreateRet(buf);
+        llvm::Value* traceStr = builder->CreateCall(getOrDefineEnsStringFromCStr(), { buf }, "trace.str");
+        builder->CreateCall(getOrDeclareFree(), { buf });
+        builder->CreateRet(traceStr);
         builder->restoreIP(saved);
     }
 
@@ -2267,10 +2301,14 @@ struct CodeGenerator::Impl {
         llvm::Value* name = builder->CreateLoad(ptrTy, builder->CreateStructGEP(entryTy, e, 1));
         llvm::Value* file = builder->CreateLoad(ptrTy, builder->CreateStructGEP(entryTy, e, 2));
         llvm::Value* line = resolvePreciseLine(addr, e);
+        // The symbol table holds raw C strings; the StackFrame fields are Ens
+        // strings, so wrap them into owned objects the frame's dtor can release.
+        llvm::Value* nameStr = builder->CreateCall(getOrDefineEnsStringFromCStr(), { name });
+        llvm::Value* fileStr = builder->CreateCall(getOrDefineEnsStringFromCStr(), { file });
         llvm::Value* sf = builder->CreateCall(getOrDefineEnsAlloc(),
             { llvm::ConstantInt::get(i64, sfSize), sfDtor, sfDesc }, "frame");
-        builder->CreateStore(name, builder->CreateStructGEP(sfStructTy, sf, 0));
-        builder->CreateStore(file, builder->CreateStructGEP(sfStructTy, sf, 1));
+        builder->CreateStore(nameStr, builder->CreateStructGEP(sfStructTy, sf, 0));
+        builder->CreateStore(fileStr, builder->CreateStructGEP(sfStructTy, sf, 1));
         builder->CreateStore(line, builder->CreateStructGEP(sfStructTy, sf, 2));
         llvm::Value* arrData = builder->CreateGEP(i8, builder->CreateLoad(ptrTy, arrA),
             llvm::ConstantInt::get(i64, 8));
@@ -2446,17 +2484,26 @@ struct CodeGenerator::Impl {
 
         auto savedIP = builder->saveIP();
         auto* entry  = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* checkBB = llvm::BasicBlock::Create(ctx, "retain.check", fn);
         auto* bumpBB = llvm::BasicBlock::Create(ctx, "retain.bump", fn);
         auto* doneBB = llvm::BasicBlock::Create(ctx, "retain.done", fn);
 
         builder->SetInsertPoint(entry);
         llvm::Value* obj = fn->getArg(0);
         llvm::Value* isNull = builder->CreateICmpEQ(obj, llvm::ConstantPointerNull::get(ptrTy));
-        builder->CreateCondBr(isNull, doneBB, bumpBB);
+        builder->CreateCondBr(isNull, doneBB, checkBB);
 
-        builder->SetInsertPoint(bumpBB);
+        builder->SetInsertPoint(checkBB);
         llvm::Value* header = builder->CreateGEP(
             llvm::Type::getInt8Ty(ctx), obj, llvm::ConstantInt::getSigned(i64Ty, -24));
+        llvm::LoadInst* rc = builder->CreateLoad(i64Ty, header, "refcount");
+        rc->setAtomic(llvm::AtomicOrdering::Monotonic);
+        rc->setAlignment(llvm::Align(8));
+        llvm::Value* immortal = builder->CreateICmpEQ(
+            rc, llvm::ConstantInt::get(i64Ty, kImmortalRefcount));
+        builder->CreateCondBr(immortal, doneBB, bumpBB);
+
+        builder->SetInsertPoint(bumpBB);
         builder->CreateAtomicRMW(
             llvm::AtomicRMWInst::Add, header,
             llvm::ConstantInt::get(i64Ty, 1),
@@ -2482,6 +2529,7 @@ struct CodeGenerator::Impl {
 
         auto savedIP = builder->saveIP();
         auto* entry   = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* checkBB = llvm::BasicBlock::Create(ctx, "release.check", fn);
         auto* decBB   = llvm::BasicBlock::Create(ctx, "release.dec", fn);
         auto* dtorBB  = llvm::BasicBlock::Create(ctx, "release.dtor", fn);
         auto* callBB  = llvm::BasicBlock::Create(ctx, "release.dtor.call", fn);
@@ -2494,10 +2542,18 @@ struct CodeGenerator::Impl {
         builder->SetInsertPoint(entry);
         llvm::Value* obj = fn->getArg(0);
         llvm::Value* isNull = builder->CreateICmpEQ(obj, llvm::ConstantPointerNull::get(ptrTy));
-        builder->CreateCondBr(isNull, doneBB, decBB);
+        builder->CreateCondBr(isNull, doneBB, checkBB);
+
+        builder->SetInsertPoint(checkBB);
+        llvm::Value* header = builder->CreateGEP(i8Ty, obj, llvm::ConstantInt::getSigned(i64Ty, -24));
+        llvm::LoadInst* rc = builder->CreateLoad(i64Ty, header, "refcount");
+        rc->setAtomic(llvm::AtomicOrdering::Monotonic);
+        rc->setAlignment(llvm::Align(8));
+        llvm::Value* immortal = builder->CreateICmpEQ(
+            rc, llvm::ConstantInt::get(i64Ty, kImmortalRefcount));
+        builder->CreateCondBr(immortal, doneBB, decBB);
 
         builder->SetInsertPoint(decBB);
-        llvm::Value* header = builder->CreateGEP(i8Ty, obj, llvm::ConstantInt::getSigned(i64Ty, -24));
         llvm::Value* prev = builder->CreateAtomicRMW(
             llvm::AtomicRMWInst::Sub, header,
             llvm::ConstantInt::get(i64Ty, 1),
@@ -2898,7 +2954,8 @@ struct CodeGenerator::Impl {
         builder->CreateCall(fputs, { makeMessageString(message), stderrF });
         builder->CreateCall(fputs, { builder->CreateGlobalString("\n", ".panic.nl"), stderrF });
         llvm::Value* trace = builder->CreateCall(captureTraceFn(), { llvm::ConstantInt::get(i32Ty, 64) }, "trace");
-        builder->CreateCall(fputs, { builder->CreateCall(formatTraceFn(), { trace }, "trace.str"), stderrF });
+        llvm::Value* traceStr = builder->CreateCall(formatTraceFn(), { trace }, "trace.str");
+        builder->CreateCall(fputs, { emitStringDataPtr(traceStr), stderrF });
         builder->CreateCall(getOrDeclareExit(), { llvm::ConstantInt::get(i32Ty, exitCode) });
         builder->CreateUnreachable();
     }
@@ -2946,6 +3003,171 @@ struct CodeGenerator::Impl {
         return builder->CreateGEP(
             llvm::Type::getInt8Ty(ctx), arrPtr,
             llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), 8), "arr.data");
+    }
+
+    // Strings share the array payload layout: i64 length at +0, bytes at +8.
+    llvm::Value* emitStringLength(llvm::Value* strPtr) {
+        return builder->CreateLoad(llvm::Type::getInt64Ty(ctx), strPtr, "str.length");
+    }
+
+    llvm::Value* emitStringDataPtr(llvm::Value* strPtr) {
+        return builder->CreateGEP(
+            llvm::Type::getInt8Ty(ctx), strPtr,
+            llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), 8), "str.data");
+    }
+
+    // Emits (and caches) an immortal string object for a literal: a read-only
+    // { typeDesc, refcount, dtor, sidetable, length, [N+1 x i8] } global whose
+    // payload (length onward) matches the array layout, with a trailing NUL for
+    // C interop. The refcount sentinel makes ens_retain/ens_release no-ops, so
+    // the literal is never freed. Returns a constant pointer to the payload.
+    llvm::Constant* emitStringLiteralObject(const std::string& utf8) {
+        auto found = stringLiteralCache.find(utf8);
+        if (found != stringLiteralCache.end()) return found->second;
+
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+
+        size_t len = utf8.size();
+        auto* bytesTy = llvm::ArrayType::get(i8Ty, len + 1);
+        auto* objTy = llvm::StructType::get(ctx, { ptrTy, i64Ty, ptrTy, ptrTy, i64Ty, bytesTy });
+
+        std::vector<llvm::Constant*> bytes;
+        bytes.reserve(len + 1);
+        for (char c : utf8) bytes.push_back(llvm::ConstantInt::get(i8Ty, static_cast<uint8_t>(c)));
+        bytes.push_back(llvm::ConstantInt::get(i8Ty, 0));
+
+        llvm::Constant* init = llvm::ConstantStruct::get(objTy, {
+            llvm::ConstantPointerNull::get(ptrTy),
+            llvm::ConstantInt::get(i64Ty, kImmortalRefcount),
+            llvm::ConstantPointerNull::get(ptrTy),
+            llvm::ConstantPointerNull::get(ptrTy),
+            llvm::ConstantInt::get(i64Ty, static_cast<int64_t>(len)),
+            llvm::ConstantArray::get(bytesTy, bytes),
+        });
+
+        auto* gv = new llvm::GlobalVariable(*module, objTy, /*isConstant=*/true,
+            llvm::GlobalValue::PrivateLinkage, init, ".strobj");
+        gv->setAlignment(llvm::Align(8));
+
+        llvm::Constant* payload = llvm::ConstantExpr::getGetElementPtr(
+            objTy, gv,
+            llvm::ArrayRef<llvm::Constant*>{
+                llvm::ConstantInt::get(i32Ty, 0),
+                llvm::ConstantInt::get(i32Ty, 4) });
+        stringLiteralCache[utf8] = payload;
+        return payload;
+    }
+
+    // Wraps a NUL-terminated C string (possibly null) into a fresh Ens string
+    // object. Returns null for a null input, so it composes with `string?`.
+    llvm::Function* getOrDefineEnsStringFromCStr() {
+        if (auto* existing = module->getFunction("ens_string_from_cstr")) return existing;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(ptrTy, { ptrTy }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+            "ens_string_from_cstr", module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+
+        auto savedIP = builder->saveIP();
+        auto* entry  = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* nullBB = llvm::BasicBlock::Create(ctx, "fromcstr.null", fn);
+        auto* copyBB = llvm::BasicBlock::Create(ctx, "fromcstr.copy", fn);
+
+        builder->SetInsertPoint(entry);
+        llvm::Value* cstr = fn->getArg(0);
+        llvm::Value* isNull = builder->CreateICmpEQ(cstr, llvm::ConstantPointerNull::get(ptrTy));
+        builder->CreateCondBr(isNull, nullBB, copyBB);
+
+        builder->SetInsertPoint(nullBB);
+        builder->CreateRet(llvm::ConstantPointerNull::get(ptrTy));
+
+        builder->SetInsertPoint(copyBB);
+        llvm::Value* len = builder->CreateCall(getOrDeclareStrlen(), { cstr });
+        llvm::Value* obj = emitStringAlloc(len);
+        llvm::Value* data = emitStringDataPtr(obj);
+        builder->CreateMemCpy(data, llvm::MaybeAlign(1), cstr, llvm::MaybeAlign(1), len);
+        builder->CreateRet(obj);
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    // Allocates an uninitialized string object holding `len` bytes plus a NUL.
+    // Stores the length and writes the trailing NUL; the caller fills the bytes.
+    llvm::Value* emitStringAlloc(llvm::Value* len) {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+        llvm::Value* payloadBytes = builder->CreateAdd(
+            len, llvm::ConstantInt::get(i64Ty, 9), "str.payloadbytes");
+        llvm::Value* obj = builder->CreateCall(getOrDefineEnsAlloc(),
+            { payloadBytes, llvm::ConstantPointerNull::get(ptrTy),
+              llvm::ConstantPointerNull::get(ptrTy) }, "str.new");
+        builder->CreateStore(len, obj);
+        llvm::Value* nulSlot = builder->CreateGEP(i8Ty, emitStringDataPtr(obj), len, "str.nul");
+        builder->CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulSlot);
+        return obj;
+    }
+
+    // i1 ens_string_eq(a, b): true when both strings have equal contents. A
+    // pointer-identity check fast-paths shared/interned literals and both-null;
+    // length and memcmp are the source of truth. Null-safe for `string?`.
+    llvm::Function* getOrDefineEnsStringEq() {
+        if (auto* existing = module->getFunction("ens_string_eq")) return existing;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(llvm::Type::getInt1Ty(ctx), { ptrTy, ptrTy }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+            "ens_string_eq", module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+
+        auto savedIP = builder->saveIP();
+        auto* entry   = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* notSame = llvm::BasicBlock::Create(ctx, "streq.notsame", fn);
+        auto* cmpLen  = llvm::BasicBlock::Create(ctx, "streq.cmplen", fn);
+        auto* cmpData = llvm::BasicBlock::Create(ctx, "streq.cmpdata", fn);
+        auto* trueBB  = llvm::BasicBlock::Create(ctx, "streq.true", fn);
+        auto* falseBB = llvm::BasicBlock::Create(ctx, "streq.false", fn);
+
+        builder->SetInsertPoint(entry);
+        llvm::Value* a = fn->getArg(0);
+        llvm::Value* b = fn->getArg(1);
+        builder->CreateCondBr(builder->CreateICmpEQ(a, b), trueBB, notSame);
+
+        builder->SetInsertPoint(notSame);
+        llvm::Value* aNull = builder->CreateICmpEQ(a, llvm::ConstantPointerNull::get(ptrTy));
+        llvm::Value* bNull = builder->CreateICmpEQ(b, llvm::ConstantPointerNull::get(ptrTy));
+        builder->CreateCondBr(builder->CreateOr(aNull, bNull), falseBB, cmpLen);
+
+        builder->SetInsertPoint(cmpLen);
+        llvm::Value* la = emitStringLength(a);
+        llvm::Value* lb = emitStringLength(b);
+        builder->CreateCondBr(builder->CreateICmpEQ(la, lb), cmpData, falseBB);
+
+        builder->SetInsertPoint(cmpData);
+        llvm::Value* cmp = builder->CreateCall(getOrDeclareMemcmp(),
+            { emitStringDataPtr(a), emitStringDataPtr(b), la }, "streq.memcmp");
+        builder->CreateCondBr(
+            builder->CreateICmpEQ(cmp, llvm::ConstantInt::get(i32Ty, 0)), trueBB, falseBB);
+
+        builder->SetInsertPoint(trueBB);
+        builder->CreateRet(llvm::ConstantInt::getTrue(ctx));
+        builder->SetInsertPoint(falseBB);
+        builder->CreateRet(llvm::ConstantInt::getFalse(ctx));
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    static bool isStringLike(::Type* t) {
+        if (!t) return false;
+        if (t->isString()) return true;
+        return t->isOptional() && t->inner && t->inner->isString();
     }
 
     // Lazily emits `_dtor_<elem>_array` which walks the element data and
@@ -3693,7 +3915,7 @@ struct CodeGenerator::Impl {
             llvm::Value* arg = emitExpr(args[0]);
             if (!arg) return nullptr;
             auto* puts = getOrDeclarePuts();
-            builder->CreateCall(puts, {arg});
+            builder->CreateCall(puts, {emitStringDataPtr(arg)});
             return nullptr;
         }
         error(e.node.startOffset(), "Unknown builtin '" + name + "'");
@@ -3919,11 +4141,21 @@ struct CodeGenerator::Impl {
                 ::Type* baseT = (paramT && paramT->isOptional()) ? paramT->inner : paramT;
                 if (baseT && baseT->isArray()) {
                     v = emitArrayDataPtr(v);
+                } else if (baseT && baseT->isString()) {
+                    v = emitStringDataPtr(v);
                 }
                 args.push_back(v);
             }
         }
-        return builder->CreateCall(fn, args);
+        llvm::Value* result = builder->CreateCall(fn, args);
+        // A C function that returns a string hands back a raw char*; wrap it in
+        // an Ens string object so ARC and string operations see a real object.
+        ::Type* retT = sym->returnType;
+        ::Type* retBase = (retT && retT->isOptional()) ? retT->inner : retT;
+        if (retBase && retBase->isString()) {
+            return builder->CreateCall(getOrDefineEnsStringFromCStr(), { result });
+        }
+        return result;
     }
 
     const FieldInfo* targetFieldInfo(const ast::Expression& target) const {
