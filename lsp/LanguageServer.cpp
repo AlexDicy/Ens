@@ -1,7 +1,11 @@
 #include "LanguageServer.h"
 
+#include <filesystem>
+#include <optional>
 #include <utility>
 #include <vector>
+
+#include <lsp/fileuri.h>
 
 #include "DiagnosticBridge.h"
 #include "Encoding.h"
@@ -71,6 +75,9 @@ const ResolutionInfo* lookupResolution(const AnalysisResult& analysis, const Syn
 std::string formatHoverFor(const SyntaxNode& node, const ResolutionInfo& info) {
     SyntaxKind k = node.kind();
     if (k == SyntaxKind::IdentExpr || k == SyntaxKind::ThisExpr) {
+        if (info.resolvedSymbol && info.resolvedSymbol->kind == SymbolKind::Namespace) {
+            return "(namespace) " + utf16To8(info.resolvedSymbol->namespaceModulePath);
+        }
         if (info.resolvedSymbol && info.resolvedSymbol->type) {
             return "(" + std::string(k == SyntaxKind::ThisExpr ? "this" : "value") +
                    ") : " + info.resolvedSymbol->type->toString();
@@ -171,7 +178,23 @@ lsp::DocumentSymbol buildRecordSymbol(const SourceFile& source,
 
 LanguageServer::LanguageServer(lsp::MessageHandler& mh) : messages(mh) {}
 
-lsp::InitializeResult LanguageServer::onInitialize(lsp::InitializeParams&&) {
+lsp::InitializeResult LanguageServer::onInitialize(lsp::InitializeParams&& params) {
+    // Resolve imports relative to the workspace root: prefer a workspace folder, fall
+    // back to the (deprecated) rootUri. Without one, each file uses its own directory.
+    std::optional<std::filesystem::path> root;
+    if (params.workspaceFolders.has_value() && !params.workspaceFolders->isNull()) {
+        const auto& folders = params.workspaceFolders->value();
+        if (!folders.empty()) {
+            auto path = lsp::FileUri(folders.front().uri).path();
+            if (!path.empty()) root = std::filesystem::path(std::string(path));
+        }
+    }
+    if (!root && !params.rootUri.isNull()) {
+        auto path = params.rootUri.value().path();
+        if (!path.empty()) root = std::filesystem::path(std::string(path));
+    }
+    if (root) documents.setWorkspaceRoot(std::move(*root));
+
     lsp::InitializeResult r;
 
     lsp::InitializeResultServerInfo info;
@@ -195,7 +218,7 @@ lsp::InitializeResult LanguageServer::onInitialize(lsp::InitializeParams&&) {
     lsp::SemanticTokensOptions stOpts;
     stOpts.legend.tokenTypes = {
         "function", "method", "parameter", "variable",
-        "property", "class", "struct", "type"
+        "property", "class", "struct", "type", "namespace"
     };
     stOpts.legend.tokenModifiers = {};
     stOpts.full = true;
@@ -278,18 +301,72 @@ lsp::TextDocument_DefinitionResult LanguageServer::onDefinition(lsp::DefinitionP
     auto chain = ancestorChainAt(doc->root(), offset);
 
     const auto& analysis = doc->analyzer().result();
-    Symbol* target = nullptr;
+    const ResolutionInfo* hit = nullptr;
+    const SyntaxNode* hitNode = nullptr;
     for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
         if (auto* info = lookupResolution(analysis, *it)) {
-            if (info->resolvedMethodSymbol) { target = info->resolvedMethodSymbol; break; }
-            if (info->resolvedSymbol)       { target = info->resolvedSymbol; break; }
+            if (info->resolvedMethodSymbol || info->resolvedSymbol ||
+                (info->resolvedType && info->resolvedType->structInfo)) {
+                hit = info;
+                hitNode = &*it;
+                break;
+            }
         }
     }
-    if (!target) return nullptr;
+    if (!hit) return nullptr;
+
+    Symbol* sym = hit->resolvedMethodSymbol ? hit->resolvedMethodSymbol : hit->resolvedSymbol;
+    std::u16string modulePath;  // empty = same file
+    int line = 0, col = 0;
+    bool resolved = false;
+
+    // Namespace-qualified member `ns.X`: jump into the imported module. The receiver
+    // identifier resolves to the Namespace symbol, which names the target module.
+    if (auto member = ast::MemberExpression::cast(*hitNode)) {
+        if (auto obj = member->object()) {
+            if (auto idObj = obj->asIdent()) {
+                if (auto* objInfo = lookupResolution(analysis, idObj->node)) {
+                    Symbol* nsSym = objInfo->resolvedSymbol;
+                    if (nsSym && nsSym->kind == SymbolKind::Namespace) {
+                        modulePath = nsSym->namespaceModulePath;
+                        if (hit->resolvedType && hit->resolvedType->structInfo) {
+                            line = hit->resolvedType->structInfo->line;
+                            col = hit->resolvedType->structInfo->column;
+                        } else if (sym) {
+                            line = sym->line;
+                            col = sym->column;
+                        }
+                        resolved = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!resolved) {
+        if (sym) {
+            line = sym->line;
+            col = sym->column;
+        } else if (hit->resolvedType && hit->resolvedType->structInfo) {
+            // A type reference: jump to the type's declaration (in its own module).
+            StructInfo* si = hit->resolvedType->structInfo;
+            modulePath = si->modulePath;
+            line = si->line;
+            col = si->column;
+        } else {
+            return nullptr;
+        }
+    }
 
     lsp::Location loc;
-    loc.uri = lsp::Uri::parse(doc->uri());
-    loc.range = zeroWidthRangeAt(target->line, target->column);
+    const auto& files = doc->moduleFiles();
+    auto fit = modulePath.empty() ? files.end() : files.find(modulePath);
+    if (fit != files.end()) {
+        loc.uri = lsp::FileUri::fromPath(fit->second.string());
+    } else {
+        loc.uri = lsp::Uri::parse(doc->uri());  // same file
+    }
+    loc.range = zeroWidthRangeAt(line, col);
     return lsp::Definition{std::move(loc)};
 }
 
@@ -298,7 +375,7 @@ namespace {
 // Indices into the SemanticTokensLegend.tokenTypes array declared in onInitialize.
 enum SemanticTokenType : uint32_t {
     StFunction = 0, StMethod, StParameter, StVariable,
-    StProperty, StClass, StStruct, StType
+    StProperty, StClass, StStruct, StType, StNamespace
 };
 
 struct SemanticTokenEntry {
@@ -324,9 +401,11 @@ void emitTokenAt(std::vector<SemanticTokenEntry>& out, const SourceFile& source,
 
 uint32_t typeForSymbol(const Symbol& sym, bool isMember) {
     switch (sym.kind) {
-        case SymbolKind::Function:  return isMember ? StMethod : StFunction;
-        case SymbolKind::Parameter: return StParameter;
-        case SymbolKind::Variable:  return StVariable;
+        case SymbolKind::Function:     return isMember ? StMethod : StFunction;
+        case SymbolKind::Parameter:    return StParameter;
+        case SymbolKind::Variable:     return StVariable;
+        case SymbolKind::Namespace:    return StNamespace;
+        case SymbolKind::SiblingField: return StProperty;
     }
     return StVariable;
 }
