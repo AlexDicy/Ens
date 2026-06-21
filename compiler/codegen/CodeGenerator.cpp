@@ -1314,6 +1314,7 @@ struct CodeGenerator::Impl {
             return nullptr;
         }
         if (auto al = e.asArrayLiteral()) return emitArrayLiteral(*al);
+        if (auto is = e.asInterpString()) return emitInterpString(*is);
         error(e.node.startOffset(), "Unsupported expression in codegen");
         return nullptr;
     }
@@ -1363,38 +1364,10 @@ struct CodeGenerator::Impl {
             case SyntaxKind::KwNull:
                 return llvm::ConstantPointerNull::get(llvm::PointerType::get(ctx, 0));
             case SyntaxKind::StringLiteral: {
-                std::string utf8;
                 // Strip surrounding quotes from the lexed text.
                 size_t start = 0, end = text.size();
                 if (end >= 2 && text.front() == u'"' && text.back() == u'"') { start = 1; end--; }
-                for (size_t i = start; i < end; ++i) {
-                    char16_t c = text[i];
-                    if (c == u'\\' && i + 1 < end) {
-                        char16_t n = text[++i];
-                        switch (n) {
-                            case u'n': utf8.push_back('\n'); break;
-                            case u't': utf8.push_back('\t'); break;
-                            case u'r': utf8.push_back('\r'); break;
-                            case u'\\': utf8.push_back('\\'); break;
-                            case u'"': utf8.push_back('"'); break;
-                            case u'\'': utf8.push_back('\''); break;
-                            case u'{': utf8.push_back('{'); break;
-                            case u'}': utf8.push_back('}'); break;
-                            default: utf8.push_back(static_cast<char>(n)); break;
-                        }
-                        continue;
-                    }
-                    if (c < 0x80) utf8.push_back(static_cast<char>(c));
-                    else if (c < 0x800) {
-                        utf8.push_back(static_cast<char>(0xC0 | (c >> 6)));
-                        utf8.push_back(static_cast<char>(0x80 | (c & 0x3F)));
-                    } else {
-                        utf8.push_back(static_cast<char>(0xE0 | (c >> 12)));
-                        utf8.push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F)));
-                        utf8.push_back(static_cast<char>(0x80 | (c & 0x3F)));
-                    }
-                }
-                return emitStringLiteralObject(utf8);
+                return emitStringLiteralObject(decodeStringSegment(text, start, end));
             }
             default:
                 error(e.node.startOffset(), "Unsupported literal");
@@ -3024,6 +2997,40 @@ struct CodeGenerator::Impl {
             llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), 8), "str.data");
     }
 
+    // Decodes the [start, end) range of a string token's text into UTF-8 bytes,
+    // resolving escape sequences (including \{ and \} for interpolation).
+    std::string decodeStringSegment(const std::u16string& text, size_t start, size_t end) {
+        std::string utf8;
+        for (size_t i = start; i < end; ++i) {
+            char16_t c = text[i];
+            if (c == u'\\' && i + 1 < end) {
+                char16_t n = text[++i];
+                switch (n) {
+                    case u'n': utf8.push_back('\n'); break;
+                    case u't': utf8.push_back('\t'); break;
+                    case u'r': utf8.push_back('\r'); break;
+                    case u'\\': utf8.push_back('\\'); break;
+                    case u'"': utf8.push_back('"'); break;
+                    case u'\'': utf8.push_back('\''); break;
+                    case u'{': utf8.push_back('{'); break;
+                    case u'}': utf8.push_back('}'); break;
+                    default: utf8.push_back(static_cast<char>(n)); break;
+                }
+                continue;
+            }
+            if (c < 0x80) utf8.push_back(static_cast<char>(c));
+            else if (c < 0x800) {
+                utf8.push_back(static_cast<char>(0xC0 | (c >> 6)));
+                utf8.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+            } else {
+                utf8.push_back(static_cast<char>(0xE0 | (c >> 12)));
+                utf8.push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F)));
+                utf8.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+            }
+        }
+        return utf8;
+    }
+
     // Emits (and caches) an immortal string object for a literal: a read-only
     // { typeDesc, refcount, dtor, sidetable, length, [N+1 x i8] } global whose
     // payload (length onward) matches the array layout, with a trailing NUL for
@@ -3518,6 +3525,41 @@ struct CodeGenerator::Impl {
         return arrPtr;
     }
 
+    // Lowers "text {expr} text" to a left-folded concat chain. Literal segments
+    // become immortal strings; holes become their .toString() result. Operands
+    // are released as they are consumed, so only the final owned string survives.
+    llvm::Value* emitInterpString(const ast::InterpStringExpression& e) {
+        auto parts = e.parts();
+        auto holes = e.holes();
+        if (parts.empty()) return emitStringLiteralObject("");
+
+        auto decodePart = [&](const SyntaxNode& part) -> llvm::Constant* {
+            std::u16string txt(part.tokenText());
+            size_t lo = txt.empty() ? 0 : 1;
+            size_t hi = txt.size() <= 1 ? lo : txt.size() - 1;
+            return emitStringLiteralObject(decodeStringSegment(txt, lo, hi));
+        };
+
+        auto* concatFn = getOrDefineEnsStringConcat();
+        auto* releaseFn = getOrDefineEnsRelease();
+        llvm::Value* acc = decodePart(parts[0]);
+        for (size_t i = 0; i < holes.size(); ++i) {
+            llvm::Value* hs = emitToString(holes[i], typeOf(holes[i].node));
+            if (!hs) return nullptr;
+            llvm::Value* joined = builder->CreateCall(concatFn, { acc, hs }, "interp.h");
+            builder->CreateCall(releaseFn, { acc });
+            builder->CreateCall(releaseFn, { hs });
+            acc = joined;
+            if (i + 1 < parts.size()) {
+                llvm::Value* tail = decodePart(parts[i + 1]);
+                llvm::Value* next = builder->CreateCall(concatFn, { acc, tail }, "interp.t");
+                builder->CreateCall(releaseFn, { acc });
+                acc = next;
+            }
+        }
+        return acc;
+    }
+
     llvm::Value* emitArrayLiteral(const ast::ArrayLiteralExpression& e) {
         ::Type* arrT = typeOf(e.node);
         if (!arrT || !arrT->isArray() || !arrT->inner) {
@@ -3655,6 +3697,7 @@ struct CodeGenerator::Impl {
     bool expressionProducesOwnedRef(const ast::Expression& e) {
         if (e.asNew() || e.asCall()) return true;
         if (e.asArrayLiteral()) return true;
+        if (e.asInterpString()) return true;  // builds a fresh concat result
         if (e.asSafeMember()) return true;
         if (e.asSafeSubscript()) return true;
         if (auto m = e.asMember()) {

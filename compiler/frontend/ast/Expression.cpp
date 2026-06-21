@@ -24,6 +24,7 @@ bool Expression::isExpressionKind(SyntaxKind k) {
         case SyntaxKind::NewExpr:
         case SyntaxKind::ParenExpr:
         case SyntaxKind::ArrayLiteralExpr:
+        case SyntaxKind::InterpStringExpr:
         case SyntaxKind::TryExpr:
             return true;
         default:
@@ -70,6 +71,7 @@ std::optional<TernaryExpression>   Expression::asTernary()   const { return Tern
 std::optional<NewExpression>       Expression::asNew()       const { return NewExpression::cast(node); }
 std::optional<ParenExpression>     Expression::asParen()     const { return ParenExpression::cast(node); }
 std::optional<ArrayLiteralExpression> Expression::asArrayLiteral() const { return ArrayLiteralExpression::cast(node); }
+std::optional<InterpStringExpression> Expression::asInterpString() const { return InterpStringExpression::cast(node); }
 std::optional<TryExpression>       Expression::asTry()       const { return TryExpression::cast(node); }
 
 // === LiteralExpression ===
@@ -382,6 +384,24 @@ std::optional<Expression> ParenExpression::inner() const {
 // === ArrayLiteralExpression ===
 
 std::vector<Expression> ArrayLiteralExpression::elements() const {
+    return expressionChildren(node);
+}
+
+// === InterpStringExpression ===
+
+std::vector<SyntaxNode> InterpStringExpression::parts() const {
+    std::vector<SyntaxNode> out;
+    for (auto& c : node.children()) {
+        SyntaxKind k = c.kind();
+        if (k == SyntaxKind::InterpStringStart || k == SyntaxKind::InterpStringMid ||
+            k == SyntaxKind::InterpStringEnd) {
+            out.push_back(c);
+        }
+    }
+    return out;
+}
+
+std::vector<Expression> InterpStringExpression::holes() const {
     return expressionChildren(node);
 }
 

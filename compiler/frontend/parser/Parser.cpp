@@ -932,6 +932,21 @@ void Parser::parsePrefix() {
             bump();
             builder.finishNode();
             return;
+        case SyntaxKind::InterpStringStart: {
+            // "text {expr} text": alternating literal segments and hole
+            // expressions. Each hole is followed by a Mid or End segment.
+            builder.startNode(SyntaxKind::InterpStringExpr);
+            bump();  // leading "...{ segment
+            while (true) {
+                parseExpression();
+                if (eat(SyntaxKind::InterpStringMid)) continue;
+                if (at(SyntaxKind::InterpStringEnd)) { bump(); break; }
+                expect(SyntaxKind::InterpStringEnd, "end of interpolated string");
+                break;
+            }
+            builder.finishNode();
+            return;
+        }
         case SyntaxKind::Identifier:
             builder.startNode(SyntaxKind::IdentExpr);
             bump();

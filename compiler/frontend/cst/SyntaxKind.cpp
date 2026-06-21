@@ -58,6 +58,9 @@ static constexpr std::pair<SyntaxKind, std::string_view> KIND_NAMES[] = {
     {SyntaxKind::DoubleLiteral,     "DoubleLiteral"},
     {SyntaxKind::StringLiteral,     "StringLiteral"},
     {SyntaxKind::CharLiteral,       "CharLiteral"},
+    {SyntaxKind::InterpStringStart, "InterpStringStart"},
+    {SyntaxKind::InterpStringMid,   "InterpStringMid"},
+    {SyntaxKind::InterpStringEnd,   "InterpStringEnd"},
     {SyntaxKind::Identifier,        "Identifier"},
     {SyntaxKind::LParen,            "LParen"},
     {SyntaxKind::RParen,            "RParen"},
@@ -221,6 +224,7 @@ static constexpr std::pair<SyntaxKind, std::string_view> KIND_NAMES[] = {
     {SyntaxKind::NewExpr,           "NewExpr"},
     {SyntaxKind::ParenExpr,         "ParenExpr"},
     {SyntaxKind::ArrayLiteralExpr,  "ArrayLiteralExpr"},
+    {SyntaxKind::InterpStringExpr,  "InterpStringExpr"},
     {SyntaxKind::TryExpr,           "TryExpr"},
     {SyntaxKind::Error,             "Error"},
 };

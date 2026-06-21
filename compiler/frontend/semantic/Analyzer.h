@@ -188,6 +188,7 @@ private:
     Type* analyzeParen(const ast::ParenExpression& expr);
     Type* analyzeArrayLiteral(const ast::ArrayLiteralExpression& expr);
     Type* analyzeArrayLiteralAdapt(const ast::ArrayLiteralExpression& expr, Type* target);
+    Type* analyzeInterpString(const ast::InterpStringExpression& expr);
 
     // Build a NarrowingPath from a member / subscript chain. Returns nullopt when
     // any segment is something we can't reliably re-recognize on later reads

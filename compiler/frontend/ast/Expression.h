@@ -26,6 +26,7 @@ class TernaryExpression;
 class NewExpression;
 class ParenExpression;
 class ArrayLiteralExpression;
+class InterpStringExpression;
 class TryExpression;
 class ArgumentList;
 
@@ -57,6 +58,7 @@ public:
     std::optional<NewExpression>       asNew() const;
     std::optional<ParenExpression>     asParen() const;
     std::optional<ArrayLiteralExpression> asArrayLiteral() const;
+    std::optional<InterpStringExpression> asInterpString() const;
     std::optional<TryExpression>       asTry() const;
 };
 
@@ -272,6 +274,19 @@ public:
         return ArrayLiteralExpression{n};
     }
     std::vector<Expression> elements() const;
+};
+
+class InterpStringExpression {
+public:
+    SyntaxNode node;
+    static std::optional<InterpStringExpression> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::InterpStringExpr) return std::nullopt;
+        return InterpStringExpression{n};
+    }
+    // The literal text segments (Start, Mid..., End tokens), in source order.
+    std::vector<SyntaxNode> parts() const;
+    // The interpolated hole expressions, in source order.
+    std::vector<Expression> holes() const;
 };
 
 class OutArgument {

@@ -1770,9 +1770,23 @@ Type* Analyzer::analyzeExpr(const ast::Expression& expr) {
     else if (auto tr = expr.asTry())    t = analyzeTry(*tr);
     else if (auto pr = expr.asParen())  t = analyzeParen(*pr);
     else if (auto al = expr.asArrayLiteral()) t = analyzeArrayLiteral(*al);
+    else if (auto is = expr.asInterpString()) t = analyzeInterpString(*is);
     else                                t = typeCtx.getError();
     analysis.setType(expr.node.greenNode(), t);
     return t;
+}
+
+Type* Analyzer::analyzeInterpString(const ast::InterpStringExpression& expr) {
+    Type* stringTy = typeCtx.getPrimitive(TypeKind::String);
+    for (auto& hole : expr.holes()) {
+        Type* ht = analyzeExpr(hole);
+        if (ht->isError()) continue;
+        if (!ht->isInteger() && !ht->isBool() && !ht->isString()) {
+            errorAtNode(hole.node, "Cannot interpolate a value of type '" + ht->toString() +
+                "'; only string, integer, and bool values are supported here. Convert it with '.toString()' first.");
+        }
+    }
+    return stringTy;
 }
 
 Type* Analyzer::analyzeLiteral(const ast::LiteralExpression& expr) {

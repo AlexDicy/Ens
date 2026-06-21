@@ -81,6 +81,18 @@ LexedToken Tokenizer::next() {
     int startCol = column;
     char16_t c = peek();
 
+    // Inside an interpolation hole, a `}` at brace depth 0 closes the hole and
+    // resumes string lexing; `{`/`}` at deeper levels are ordinary operators
+    // whose nesting we track so the closing brace is not mistaken for one.
+    if (!interpHoleDepth.empty()) {
+        if (c == u'}' && interpHoleDepth.back() == 0) {
+            advance();  // consume the hole's closing '}'
+            return lexStringBody(startPos, startLine, startCol, /*atStart=*/false);
+        }
+        if (c == u'{') interpHoleDepth.back()++;
+        else if (c == u'}') interpHoleDepth.back()--;
+    }
+
     if (c == u' ' || c == u'\t' || c == u'\f' || c == 0xB) {
         return lexWhitespace(startPos, startLine, startCol);
     }
@@ -216,10 +228,16 @@ LexedToken Tokenizer::lexNumber(uint32_t startPos, int startLine, int startCol) 
 
 LexedToken Tokenizer::lexString(uint32_t startPos, int startLine, int startCol) {
     advance();  // opening "
+    return lexStringBody(startPos, startLine, startCol, /*atStart=*/true);
+}
+
+LexedToken Tokenizer::lexStringBody(uint32_t startPos, int startLine, int startCol, bool atStart) {
     bool closed = false;
+    bool hole = false;
     while (!atEnd()) {
         char16_t c = peek();
         if (c == u'"') { advance(); closed = true; break; }
+        if (c == u'{') { advance(); hole = true; break; }
         if (c == u'\n' || c == u'\r') break;
         if (c == u'\\') {
             advance();
@@ -228,11 +246,18 @@ LexedToken Tokenizer::lexString(uint32_t startPos, int startLine, int startCol) 
         }
         advance();
     }
-    if (!closed) {
+    if (!closed && !hole) {
         sink.error({startLine, startCol, static_cast<int>(pos - startPos)},
                    "Unterminated string literal");
     }
-    return makeToken(SyntaxKind::StringLiteral, startPos, startLine, startCol);
+    if (atStart && !hole) return makeToken(SyntaxKind::StringLiteral, startPos, startLine, startCol);
+    if (atStart) {  // hole
+        interpHoleDepth.push_back(0);
+        return makeToken(SyntaxKind::InterpStringStart, startPos, startLine, startCol);
+    }
+    if (hole) return makeToken(SyntaxKind::InterpStringMid, startPos, startLine, startCol);
+    if (!interpHoleDepth.empty()) interpHoleDepth.pop_back();
+    return makeToken(SyntaxKind::InterpStringEnd, startPos, startLine, startCol);
 }
 
 LexedToken Tokenizer::lexChar(uint32_t startPos, int startLine, int startCol) {

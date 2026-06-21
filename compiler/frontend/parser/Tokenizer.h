@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 #include "../cst/SyntaxKind.h"
 
 class DiagnosticSink;
@@ -27,6 +28,9 @@ private:
     uint32_t pos = 0;
     int line = 1;
     int column = 1;
+    // One entry per open interpolation hole, holding the brace nesting inside
+    // that hole's expression. The current hole closes on a `}` at depth 0.
+    std::vector<int> interpHoleDepth;
 
     char16_t peek(uint32_t offset = 0) const;
     void advance();
@@ -40,6 +44,10 @@ private:
     LexedToken lexIdentifierOrKeyword(uint32_t startPos, int startLine, int startCol);
     LexedToken lexNumber(uint32_t startPos, int startLine, int startCol);
     LexedToken lexString(uint32_t startPos, int startLine, int startCol);
+    // Scans one string segment from the current position to the next unescaped
+    // `{` (a hole opens) or the closing `"`. `atStart` is true just after the
+    // opening quote, false just after a hole's closing `}`.
+    LexedToken lexStringBody(uint32_t startPos, int startLine, int startCol, bool atStart);
     LexedToken lexChar(uint32_t startPos, int startLine, int startCol);
     LexedToken lexOperator(uint32_t startPos, int startLine, int startCol);
 };

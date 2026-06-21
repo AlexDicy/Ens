@@ -21,6 +21,10 @@ enum class SyntaxKind : uint16_t {
     DoubleLiteral,
     StringLiteral,
     CharLiteral,
+    // Interpolated string segments: "a{ -> Start, }b{ -> Mid, }c" -> End.
+    InterpStringStart,
+    InterpStringMid,
+    InterpStringEnd,
 
     // === Identifier ===
     Identifier,
@@ -114,6 +118,7 @@ enum class SyntaxKind : uint16_t {
     NewExpr,
     ParenExpr,
     ArrayLiteralExpr,
+    InterpStringExpr,    // "text {expr} text": alternating literal parts and holes
     TryExpr,             // try <call>: prefixes a single throwing call
 
     // === Recovery ===
