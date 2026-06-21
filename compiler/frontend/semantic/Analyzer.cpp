@@ -2365,6 +2365,16 @@ Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
             asciiOf(*memberName) + "'; arrays only have 'length'.");
         return typeCtx.getError();
     }
+    if (objT->isString()) {
+        auto memberName = expr.memberText();
+        if (!memberName) return typeCtx.getError();
+        if (*memberName == u"length") {
+            return typeCtx.getPrimitive(TypeKind::Long);
+        }
+        errorAtNode(expr.node, "Type 'string' has no member '" +
+            asciiOf(*memberName) + "'.");
+        return typeCtx.getError();
+    }
     if (!objT->hasRecordLayout() || !objT->structInfo) {
         if (objT->isOptional()) {
             errorAtNode(expr.node, "Cannot read a member of '" + objT->toString() +

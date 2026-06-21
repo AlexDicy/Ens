@@ -4317,6 +4317,17 @@ struct CodeGenerator::Impl {
                   asAscii(memberName) + "'");
             return nullptr;
         }
+        if (objType && objType->isString()) {
+            auto memberName = e.memberText().value_or(std::u16string{});
+            if (memberName == u"length") {
+                llvm::Value* strPtr = emitExpr(*obj);
+                if (!strPtr) return nullptr;
+                return emitStringLength(strPtr);
+            }
+            error(e.node.startOffset(), "Internal: unsupported string member '" +
+                  asAscii(memberName) + "'");
+            return nullptr;
+        }
         ast::Expression wrapper{e.node};
         llvm::Value* addr = emitLValue(wrapper);
         if (!addr) return nullptr;
