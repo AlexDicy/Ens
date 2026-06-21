@@ -366,6 +366,35 @@ makeBoxes() -> Box[] {
 
 ---
 
+Strings are immutable text values, written with double quotes (`"hello"`), and are reference types like arrays: a variable binds a reference, and copying it copies the reference. Because strings are immutable, every operation that "changes" a string returns a new one.
+
+- `==` and `!=` compare **contents**, not identity, so `"ab" == "a" + "b"` is true.
+- `s.length` returns the number of UTF-8 **bytes** as a `long`.
+- `+` concatenates two strings. Combining a string with a non-string value is a compile error; convert the other value first with `.toString()`, or use interpolation.
+- `.toString()` produces a string from a value: integer types format as decimal, `bool` as `true` or `false`, and a string returns itself.
+- `s.toBytes()` returns the UTF-8 bytes as a `byte[]`, and `string.fromBytes(bytes)` builds a string from a `byte[]` by interpreting it as UTF-8.
+
+```ens
+let greeting = "Hello, " + name + "!";
+let n = greeting.length;            // long, the byte count
+if (name == "world") { /* ... */ }
+let label = count.toString();       // "0", "42", "-7"
+let raw = greeting.toBytes();       // byte[]
+let back = string.fromBytes(raw);   // string
+```
+
+**Interpolation** embeds expressions in a string with `{ }`. Each hole is converted to text the way `.toString()` would, then the literal parts and holes are joined into one new string. Write `\{` and `\}` for literal braces.
+
+```ens
+let report = "Area: {width * height} for {width}x{height}";   // "Area: 100 for 20x5"
+let status = "done={finished}, items={count}";                // bool and integer holes
+let braces = "use \{these\} verbatim";                        // "use {these} verbatim"
+```
+
+Holes currently accept string, integer, and `bool` values; convert other types explicitly with `.toString()` first.
+
+---
+
 Native libraries can be called from Ens through `external` declarations. They are always written at the top of a source file, alongside `import`s and type declarations.
 
 ```ens
