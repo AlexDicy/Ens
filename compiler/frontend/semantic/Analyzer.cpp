@@ -1893,6 +1893,15 @@ Type* Analyzer::analyzeBinary(const ast::BinaryExpression& expr) {
         case SyntaxKind::Star:
         case SyntaxKind::Slash:
         case SyntaxKind::Percent: {
+            if (op == SyntaxKind::Plus && (l->isString() || r->isString())) {
+                if (l->isString() && r->isString()) {
+                    return typeCtx.getPrimitive(TypeKind::String);
+                }
+                errorAtNode(expr.node, "Cannot use '+' to combine '" + l->toString() +
+                    "' and '" + r->toString() + "'. Convert values to text with '.toString()'" +
+                    " or use string interpolation.");
+                return typeCtx.getError();
+            }
             if (!l->isNumeric() || !r->isNumeric()) {
                 errorAtNode(expr.node, "Operator requires numeric operands, got '" +
                     l->toString() + "' and '" + r->toString() + "'");

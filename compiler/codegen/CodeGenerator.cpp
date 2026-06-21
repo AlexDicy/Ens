@@ -1500,7 +1500,15 @@ struct CodeGenerator::Impl {
         if ((op == SyntaxKind::EqEq || op == SyntaxKind::NotEq) &&
             (isStringLike(leftType) || isStringLike(rightType))) {
             llvm::Value* eq = builder->CreateCall(getOrDefineEnsStringEq(), { L, R }, "str.eq");
+            releaseIfOwnedTemp(L, *leftE);
+            releaseIfOwnedTemp(R, *rightE);
             return op == SyntaxKind::NotEq ? builder->CreateNot(eq) : eq;
+        }
+        if (op == SyntaxKind::Plus && leftType && leftType->isString()) {
+            llvm::Value* result = builder->CreateCall(getOrDefineEnsStringConcat(), { L, R }, "str.concat");
+            releaseIfOwnedTemp(L, *leftE);
+            releaseIfOwnedTemp(R, *rightE);
+            return result;
         }
         switch (op) {
             case SyntaxKind::Plus:    return flt ? builder->CreateFAdd(L, R) : builder->CreateAdd(L, R);
@@ -3170,6 +3178,34 @@ struct CodeGenerator::Impl {
         return t->isOptional() && t->inner && t->inner->isString();
     }
 
+    // string ens_string_concat(a, b): a fresh string holding a's bytes followed
+    // by b's, with a trailing NUL. Owned (+1) by the caller.
+    llvm::Function* getOrDefineEnsStringConcat() {
+        if (auto* existing = module->getFunction("ens_string_concat")) return existing;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(ptrTy, { ptrTy, ptrTy }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+            "ens_string_concat", module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+
+        auto savedIP = builder->saveIP();
+        builder->SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", fn));
+        llvm::Value* a = fn->getArg(0);
+        llvm::Value* b = fn->getArg(1);
+        llvm::Value* la = emitStringLength(a);
+        llvm::Value* lb = emitStringLength(b);
+        llvm::Value* obj = emitStringAlloc(builder->CreateAdd(la, lb));
+        llvm::Value* data = emitStringDataPtr(obj);
+        builder->CreateMemCpy(data, llvm::MaybeAlign(1), emitStringDataPtr(a), llvm::MaybeAlign(1), la);
+        llvm::Value* tail = builder->CreateGEP(i8Ty, data, la, "str.concat.tail");
+        builder->CreateMemCpy(tail, llvm::MaybeAlign(1), emitStringDataPtr(b), llvm::MaybeAlign(1), lb);
+        builder->CreateRet(obj);
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
     // Lazily emits `_dtor_<elem>_array` which walks the element data and
     // releases per-slot ownership where required. Returns null if the element
     // type needs no per-slot work (primitives / externals / class-free structs).
@@ -3539,7 +3575,24 @@ struct CodeGenerator::Impl {
         if (auto tr = e.asTry()) {
             if (auto operand = tr->operand()) return expressionProducesOwnedRef(*operand);
         }
+        if (auto bin = e.asBinary()) {
+            // String concatenation builds a fresh owned string.
+            auto opTok = bin->operatorToken();
+            if (opTok && opTok->kind() == SyntaxKind::Plus) {
+                ::Type* t = typeOf(e.node);
+                if (t && t->isString()) return true;
+            }
+        }
         return false;
+    }
+
+    // Releases a value that an expression produced as a fresh +1 temporary,
+    // once it has been consumed (e.g. a concat operand in a chain). No-op for
+    // borrowed sources (variables, fields) and immortal literals.
+    void releaseIfOwnedTemp(llvm::Value* v, const ast::Expression& e) {
+        if (v && expressionProducesOwnedRef(e)) {
+            builder->CreateCall(getOrDefineEnsRelease(), { v });
+        }
     }
 
     bool structHasClassFields(::Type* t) {
@@ -3916,6 +3969,7 @@ struct CodeGenerator::Impl {
             if (!arg) return nullptr;
             auto* puts = getOrDeclarePuts();
             builder->CreateCall(puts, {emitStringDataPtr(arg)});
+            releaseIfOwnedTemp(arg, args[0]);
             return nullptr;
         }
         error(e.node.startOffset(), "Unknown builtin '" + name + "'");
