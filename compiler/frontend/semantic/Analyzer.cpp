@@ -1908,12 +1908,17 @@ Type* Analyzer::analyzeBinary(const ast::BinaryExpression& expr) {
         case SyntaxKind::Slash:
         case SyntaxKind::Percent: {
             if (op == SyntaxKind::Plus && (l->isString() || r->isString())) {
-                if (l->isString() && r->isString()) {
+                // String concatenation. The non-string operand is converted to
+                // text implicitly, the same way '.toString()' would.
+                auto stringable = [](Type* t) {
+                    return t->isString() || t->isInteger() || t->isBool();
+                };
+                if (stringable(l) && stringable(r)) {
                     return typeCtx.getPrimitive(TypeKind::String);
                 }
-                errorAtNode(expr.node, "Cannot use '+' to combine '" + l->toString() +
-                    "' and '" + r->toString() + "'. Convert values to text with '.toString()'" +
-                    " or use string interpolation.");
+                Type* other = l->isString() ? r : l;
+                errorAtNode(expr.node, "Cannot concatenate a value of type '" + other->toString() +
+                    "' onto a string; only string, integer, and bool values are supported.");
                 return typeCtx.getError();
             }
             if (!l->isNumeric() || !r->isNumeric()) {

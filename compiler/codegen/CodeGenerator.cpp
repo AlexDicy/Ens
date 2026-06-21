@@ -1477,10 +1477,21 @@ struct CodeGenerator::Impl {
             releaseIfOwnedTemp(R, *rightE);
             return op == SyntaxKind::NotEq ? builder->CreateNot(eq) : eq;
         }
-        if (op == SyntaxKind::Plus && leftType && leftType->isString()) {
-            llvm::Value* result = builder->CreateCall(getOrDefineEnsStringConcat(), { L, R }, "str.concat");
-            releaseIfOwnedTemp(L, *leftE);
-            releaseIfOwnedTemp(R, *rightE);
+        if (op == SyntaxKind::Plus && ((leftType && leftType->isString()) ||
+                                       (rightType && rightType->isString()))) {
+            // Concatenation: the non-string operand gets an implicit .toString().
+            auto stringify = [&](llvm::Value* raw, ::Type* t, const ast::Expression& e,
+                                 bool& release) -> llvm::Value* {
+                if (t && t->isString()) { release = expressionProducesOwnedRef(e); return raw; }
+                release = true;  // fresh integer string (owned) or bool literal (immortal no-op)
+                return emitValueToString(raw, t);
+            };
+            bool relL = false, relR = false;
+            llvm::Value* Ls = stringify(L, leftType, *leftE, relL);
+            llvm::Value* Rs = stringify(R, rightType, *rightE, relR);
+            llvm::Value* result = builder->CreateCall(getOrDefineEnsStringConcat(), { Ls, Rs }, "str.concat");
+            if (relL) builder->CreateCall(getOrDefineEnsRelease(), { Ls });
+            if (relR) builder->CreateCall(getOrDefineEnsRelease(), { Rs });
             return result;
         }
         switch (op) {
@@ -3264,6 +3275,19 @@ struct CodeGenerator::Impl {
 
     // Lowers a `.toString()` call on a primitive or string receiver to an owned
     // (+1) string, matching the ownership the call site expects.
+    // Converts an already-emitted non-string primitive value to a string: a
+    // fresh owned string for integers, an immortal literal for bool.
+    llvm::Value* emitValueToString(llvm::Value* v, ::Type* t) {
+        if (t->isBool()) {
+            return builder->CreateSelect(v,
+                emitStringLiteralObject("true"), emitStringLiteralObject("false"), "bool.str");
+        }
+        llvm::Value* asI64 = builder->CreateIntCast(
+            v, llvm::Type::getInt64Ty(ctx), t->isSignedInteger(), "i2s.ext");
+        return builder->CreateCall(getOrDefineEnsIntToString(),
+            { asI64, builder->getInt1(t->isSignedInteger()) }, "i2s");
+    }
+
     llvm::Value* emitToString(const ast::Expression& obj, ::Type* recvT) {
         llvm::Value* v = emitExpr(obj);
         if (!v) return nullptr;
@@ -3272,14 +3296,7 @@ struct CodeGenerator::Impl {
             builder->CreateCall(getOrDefineEnsRetain(), { v });
             return v;
         }
-        if (recvT->isBool()) {
-            return builder->CreateSelect(v,
-                emitStringLiteralObject("true"), emitStringLiteralObject("false"), "bool.str");
-        }
-        llvm::Value* asI64 = builder->CreateIntCast(
-            v, llvm::Type::getInt64Ty(ctx), recvT->isSignedInteger(), "i2s.ext");
-        return builder->CreateCall(getOrDefineEnsIntToString(),
-            { asI64, builder->getInt1(recvT->isSignedInteger()) }, "i2s");
+        return emitValueToString(v, recvT);
     }
 
     // string.toBytes(): a fresh byte[] copy of the UTF-8 bytes (no trailing NUL).
