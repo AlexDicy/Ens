@@ -12,16 +12,29 @@ function resolveServerPath(context) {
 
     const exeName = process.platform === 'win32' ? 'ens-lsp.exe' : 'ens-lsp';
     const repoRoot = path.resolve(context.extensionPath, '..', '..');
-    const candidates = [
-        path.join(repoRoot, 'build', 'windows', 'x64', 'debug', exeName),
-        path.join(repoRoot, 'build', 'windows', 'x64', 'release', exeName),
-        path.join(repoRoot, 'build', 'linux', 'x86_64', 'debug', exeName),
-        path.join(repoRoot, 'build', 'macosx', 'arm64', 'debug', exeName),
-    ];
-    for (const c of candidates) {
-        if (fs.existsSync(c)) return c;
+    const buildRoot = path.join(repoRoot, 'build');
+    const platforms = [['windows', 'x64'], ['linux', 'x86_64'],
+                       ['macosx', 'arm64'], ['macosx', 'x86_64']];
+    const candidates = [];
+    for (const [os, arch] of platforms) {
+        for (const mode of ['release', 'debug']) {
+            candidates.push(path.join(buildRoot, os, arch, mode, exeName));
+        }
+        // xmake may also output directly under the arch dir (no mode subfolder).
+        candidates.push(path.join(buildRoot, os, arch, exeName));
     }
-    return candidates[0];
+
+    // Pick the most recently built binary that exists, so a fresh build in either mode
+    // wins over a stale one left behind in the other.
+    let best = null;
+    let bestMtime = -1;
+    for (const c of candidates) {
+        try {
+            const mtime = fs.statSync(c).mtimeMs;
+            if (mtime > bestMtime) { best = c; bestMtime = mtime; }
+        } catch (_) { /* not built for this platform/mode */ }
+    }
+    return best || candidates[0];
 }
 
 function activate(context) {
