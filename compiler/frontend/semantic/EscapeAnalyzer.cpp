@@ -241,7 +241,11 @@ void EscapeAnalyzer::scanCall(const ast::CallExpression& e) {
     if (callee) {
         if (auto member = callee->asMember()) {
             auto* info = analysis.find(member->node.greenNode());
-            calleeSym = info ? info->resolvedMethodSymbol : nullptr;
+            // Methods use resolvedMethodSymbol; namespace-qualified free-function calls
+            // (ns.func) store the function in resolvedSymbol.
+            calleeSym = info ? (info->resolvedMethodSymbol ? info->resolvedMethodSymbol
+                                                           : info->resolvedSymbol)
+                             : nullptr;
             if (auto obj = member->object()) scanExpression(*obj);
         } else if (auto id = callee->asIdent()) {
             auto* info = analysis.find(id->node.greenNode());

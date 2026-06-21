@@ -438,7 +438,6 @@ std::optional<std::u16string> ImportDecl::namespaceName() const {
 
 std::u16string ImportDecl::modulePath() const {
     std::u16string out;
-    if (isPackage()) out.push_back(u'@');
     auto segs = pathSegments();
     for (size_t i = 0; i < segs.size(); ++i) {
         if (i > 0) out.push_back(u'.');

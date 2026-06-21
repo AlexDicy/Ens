@@ -72,11 +72,15 @@ Symbol* ThrowsAnalyzer::calleeSymbolOf(const ast::CallExpression& call) const {
     }
     if (auto m = callee->asMember()) {
         auto* info = analysis.find(m->node.greenNode());
-        return info ? info->resolvedMethodSymbol : nullptr;
+        if (!info) return nullptr;
+        // Methods resolve to resolvedMethodSymbol; a namespace-qualified free-function
+        // call (ns.func) stores the function in resolvedSymbol instead.
+        return info->resolvedMethodSymbol ? info->resolvedMethodSymbol : info->resolvedSymbol;
     }
     if (auto sm = callee->asSafeMember()) {
         auto* info = analysis.find(sm->node.greenNode());
-        return info ? info->resolvedMethodSymbol : nullptr;
+        if (!info) return nullptr;
+        return info->resolvedMethodSymbol ? info->resolvedMethodSymbol : info->resolvedSymbol;
     }
     // super(...) calls a base constructor, which can never propagate.
     return nullptr;

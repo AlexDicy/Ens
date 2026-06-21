@@ -3767,6 +3767,26 @@ struct CodeGenerator::Impl {
                 emitThrowsCheck(methodSym);
                 return result;
             }
+
+            // Namespace-qualified free-function call: ns.func(args), lowered as a direct
+            // call with no receiver (the namespace symbol carries no runtime value).
+            if (Symbol* fnSym = symbolOf(member.node)) {
+                if (fnSym->kind == SymbolKind::Function) {
+                    if (fnSym->isBuiltin) return emitBuiltinCall(fnSym, e);
+                    if (fnSym->isExternal) return emitForeignCall(fnSym, e);
+                    llvm::Function* fn = getOrDeclareExternalFunction(fnSym, /*receiver*/ nullptr);
+                    if (!fn) {
+                        error(e.node.startOffset(), "Internal: namespace callee has no LLVM function");
+                        return nullptr;
+                    }
+                    std::vector<llvm::Value*> args;
+                    if (!appendCallArgs(fnSym, e.arguments(), args)) return nullptr;
+                    if (fnSym->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);
+                    llvm::Value* result = builder->CreateCall(fn, args);
+                    emitThrowsCheck(fnSym);
+                    return result;
+                }
+            }
         }
 
         if (callee && callee->asSafeMember()) {

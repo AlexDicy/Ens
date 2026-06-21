@@ -4,6 +4,7 @@
 
 class Type;
 class GreenElement;
+class Analyzer;
 struct StructInfo;
 
 enum class SymbolKind { Variable, Parameter, Function, Namespace, SiblingField };
@@ -35,6 +36,11 @@ public:
     const GreenElement* funcDeclCst = nullptr;
 
     std::u16string namespaceModulePath;
+    // For a Namespace symbol: the imported module, used to resolve qualified calls.
+    const Analyzer* namespaceTarget = nullptr;
+
+    // For a top-level function: whether it is reachable from other modules.
+    bool isPublic = true;
 
     // FFI metadata (set when this function symbol was declared via `external from "..."`).
     bool isExternal = false;

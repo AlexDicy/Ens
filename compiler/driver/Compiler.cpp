@@ -210,24 +210,46 @@ bool buildModuleGraph(const fs::path& sourceRoot,
         auto sf = ast::SourceFile::cast(*raw->rootNode);
         if (!sf) continue;
         for (auto& imp : sf->imports()) {
-            if (imp.isPackage()) continue;  // diagnosed later by the analyzer
             std::u16string targetPath = imp.modulePath();
             if (queued.count(targetPath)) continue;
             fs::path targetRel = relativeFromModulePath(targetPath);
             if (targetRel.empty()) continue;
-            const bool isStd = isStdlibPath(targetPath);
-            const fs::path& base = isStd ? stdlibRoot : sourceRoot;
+
+            auto& sink = *raw->sink;
+            auto reportAt = [&](const std::string& message) {
+                auto [line, col] = raw->source->offsetToPosition(imp.node.startOffset());
+                sink.error({line, col, 1}, message);
+            };
+
+            // `@pkg...` selects an external package root; a bare path is local to the
+            // source root. Only the standard library (`@std`) is available as a package.
+            bool isStd = false;
+            fs::path base;
+            if (imp.isPackage()) {
+                auto segs = imp.pathSegments();
+                if (!segs.empty() && segs.front() == u"std") {
+                    isStd = true;
+                    base = stdlibRoot;
+                } else {
+                    reportAt("External package '" + asAscii(targetPath) +
+                        "' is not available yet; only the standard library (@std) is supported.");
+                    continue;
+                }
+            } else if (isStdlibPath(targetPath)) {
+                reportAt("Import the standard library as a package: write '@" +
+                    asAscii(targetPath) + "'.");
+                continue;
+            } else {
+                base = sourceRoot;
+            }
+
             fs::path absolute = base.empty() ? fs::path() : base / targetRel;
             if (base.empty() || !fs::exists(absolute)) {
-                auto& sink = *raw->sink;
-                auto [line, col] = raw->source->offsetToPosition(imp.node.startOffset());
                 if (isStd) {
-                    sink.error({line, col, 1},
-                        "Cannot find standard library module '" + asAscii(targetPath) +
+                    reportAt("Cannot find standard library module '" + asAscii(targetPath) +
                         "'. Set ENS_STDLIB to the directory containing 'std/' (normally <repo>/libs).");
                 } else {
-                    sink.error({line, col, 1},
-                        "Cannot find module '" + asAscii(targetPath) +
+                    reportAt("Cannot find module '" + asAscii(targetPath) +
                         "' (looked for " + absolute.string() + ")");
                 }
                 continue;

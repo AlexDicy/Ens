@@ -49,6 +49,7 @@ struct MethodInfo {
 struct StructInfo {
     std::u16string name;
     std::u16string modulePath;       // owning module's canonical path; "" for single-file/stdin
+    Visibility visibility = Visibility::Public;  // only public types are reachable cross-module
     std::vector<FieldInfo> fields;   // for a class, base fields are flattened in first
     std::vector<MethodInfo> methods; // methods are NOT flattened; walk baseInfo to inherit
     int line = 0;

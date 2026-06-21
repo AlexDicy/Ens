@@ -126,6 +126,8 @@ Allows `new Renderer();`
 
 In both cases, the path is `/src/engine/renderer.ens` and the file contains a public `Renderer` class.
 
+Only `public` declarations are accessible from another module. Types (classes and structs) may be brought into scope by name as above, but free functions are always called through their module namespace, never imported by name: write `import engine.renderer;` then call `renderer.configure()`. Importing a function by name (`import configure from engine.renderer;`) is an error.
+
 Importing from packages follows the format `@packageorg.packagename.path`.
 
 ```ens
@@ -429,14 +431,14 @@ The compiler performs **escape analysis** to elide retain/release pairs and larg
 
 ---
 
-The standard library lives under the `std` namespace and is opt-in: its declarations are visible only after they are imported. The `std.system` module wraps common operating system facilities and reports failures as exceptions. Import the pieces you need by name:
+The standard library is an external package, imported with `@`, and is opt-in: its declarations are visible only after they are imported. The `std.system` module wraps common operating system facilities and reports failures as exceptions. Import the module to call its functions through the `system` namespace, and import any types you use by name:
 
 ```ens
-import openFile from std.system;
-import File from std.system;
+import @std.system;
+import File from @std.system;
 
 writeGreeting() -> int throws {
-    File file = try openFile("greeting.txt", "w");
+    File file = try system.openFile("greeting.txt", "w");
     byte[] bytes = new byte[2];
     bytes[0] = 'h';
     bytes[1] = 'i';

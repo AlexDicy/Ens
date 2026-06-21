@@ -24,6 +24,12 @@ static Visibility toSemanticVisibility(ast::Visibility v) {
     return Visibility::Public;
 }
 
+// A record type may be referenced from another module only when it is public. Primitives
+// and external types (no StructInfo) are always accessible.
+static bool isTypeVisibleAcrossModules(const Type* t) {
+    return !t || !t->structInfo || t->structInfo->visibility == Visibility::Public;
+}
+
 static std::string asciiOf(std::u16string_view s) {
     std::string r;
     r.reserve(s.size());
@@ -479,20 +485,22 @@ void Analyzer::bindImports(const ModuleResolver& resolver) {
 void Analyzer::bindTypeImports(const ModuleResolver& resolver) {
     if (!astRoot) return;
     for (auto& imp : astRoot->imports()) {
-        if (imp.isPackage()) {
-            errorAtNode(imp.node, "Package imports are not yet supported");
-            continue;
-        }
         std::u16string targetPath = imp.modulePath();
         const Analyzer* target = resolver(targetPath);
         if (!target) {
-            errorAtNode(imp.node, "Cannot resolve import '" + asciiOf(targetPath) + "'");
+            // A module that failed to load already produced a clear diagnostic in the
+            // module-graph phase (unknown package, missing file, missing '@'); stay quiet.
             continue;
         }
 
         if (auto alias = imp.aliasText()) {
             // Named import: `import Alias from path;`, bring `Alias` into scope.
             Type* importedType = typeCtx.lookupNamedType(targetPath, *alias);
+            if (importedType && !isTypeVisibleAcrossModules(importedType)) {
+                errorAtNode(imp.node, "Type '" + asciiOf(*alias) + "' is not public in module '" +
+                    asciiOf(targetPath) + "' and cannot be used from another module.");
+                continue;
+            }
             if (importedType) {
                 uint32_t namePos = imp.aliasToken() ? imp.aliasToken()->startOffset() : imp.node.startOffset();
                 Symbol* sym = makeSymbol(SymbolKind::Variable, *alias, importedType, namePos);
@@ -507,6 +515,7 @@ void Analyzer::bindTypeImports(const ModuleResolver& resolver) {
             if (!nsName) continue;
             Symbol* sym = makeSymbol(SymbolKind::Namespace, *nsName, nullptr, imp.node.startOffset());
             sym->namespaceModulePath = targetPath;
+            sym->namespaceTarget = target;
             if (!globalScope->define(sym)) {
                 errorAtNode(imp.node, "Namespace alias '" + asciiOf(*nsName) +
                     "' conflicts with an existing declaration");
@@ -515,25 +524,27 @@ void Analyzer::bindTypeImports(const ModuleResolver& resolver) {
     }
 }
 
-// Bind named function imports. Runs after signatures are resolved so the target
-// module's functions exist in its global scope.
+// Diagnose named imports that resolve to a free function. Runs after signatures are
+// resolved so the target module's functions exist in its global scope. Type imports are
+// already bound in bindTypeImports; functions may only be used namespace-qualified.
 void Analyzer::bindValueImports(const ModuleResolver& resolver) {
     if (!astRoot) return;
     for (auto& imp : astRoot->imports()) {
-        if (imp.isPackage()) continue;  // diagnosed in bindTypeImports
         auto alias = imp.aliasText();
         if (!alias) continue;            // namespace imports bound in bindTypeImports
         std::u16string targetPath = imp.modulePath();
         const Analyzer* target = resolver(targetPath);
-        if (!target) continue;           // diagnosed in bindTypeImports
-        if (typeCtx.lookupNamedType(targetPath, *alias)) continue;  // already bound as a type
+        if (!target) continue;           // unresolved import already diagnosed in the module graph
+        if (typeCtx.lookupNamedType(targetPath, *alias)) continue;  // bound as a type in bindTypeImports
 
         Symbol* fnSym = target->globalSymbol(*alias);
         if (fnSym && fnSym->kind == SymbolKind::Function) {
-            if (!globalScope->define(fnSym)) {
-                errorAtNode(imp.node, "Imported name '" + asciiOf(*alias) +
-                    "' conflicts with an existing declaration");
-            }
+            auto segs = imp.pathSegments();
+            std::u16string ns = segs.empty() ? std::u16string() : segs.back();
+            std::string moduleImport = (imp.isPackage() ? "@" : "") + asciiOf(targetPath);
+            errorAtNode(imp.node, "Function '" + asciiOf(*alias) +
+                "' cannot be imported by name. Import the module instead: 'import " +
+                moduleImport + ";' then call it as '" + asciiOf(ns) + "." + asciiOf(*alias) + "'.");
             continue;
         }
         errorAtNode(imp.node, "Module '" + asciiOf(targetPath) +
@@ -605,6 +616,7 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
     for (auto& sd : structs) {
         Type* t = analysis.typeOf(sd.node.greenNode());
         if (!t) continue;
+        if (t->structInfo) t->structInfo->visibility = toSemanticVisibility(sd.visibility());
         for (auto& f : sd.fields()) {
             FieldInfo fi;
             auto fname = f.nameText();
@@ -672,6 +684,7 @@ void Analyzer::resolveClassBases(const ast::SourceFile& file) {
         StructInfo* si = t->structInfo;
         si->isAbstract = cd.isAbstract();
         si->isFinal = cd.isFinal();
+        si->visibility = toSemanticVisibility(cd.visibility());
         if (auto baseName = cd.baseClassName()) {
             SyntaxNode diag = cd.baseClassToken().value_or(cd.node);
             Type* baseT = typeCtx.lookupNamedType(modulePath_, *baseName);
@@ -924,6 +937,7 @@ void Analyzer::collectFunctions(const ast::SourceFile& file) {
         Symbol* sym = makeSymbol(SymbolKind::Function, fname, nullptr, fPos);
         sym->returnType = retType;
         sym->funcDeclCst = fn.node.greenNode();
+        sym->isPublic = fn.visibility() == ast::Visibility::Public;
         sym->declaredThrows = fn.isThrows();
         sym->abiThrows = fn.isThrows();
         checkThrowsClausePlacement(fn, /*isOverridable=*/false, /*isConstructor=*/false);
@@ -1178,6 +1192,11 @@ Type* Analyzer::lookupTypeByName(const std::u16string& qualifier,
     if (!t) {
         errorAtNode(diagNode, "Module '" + asciiOf(nsSym->namespaceModulePath) +
             "' has no type '" + asciiOf(name) + "'");
+        return typeCtx.getError();
+    }
+    if (!isTypeVisibleAcrossModules(t)) {
+        errorAtNode(diagNode, "Type '" + asciiOf(name) + "' is not public in module '" +
+            asciiOf(nsSym->namespaceModulePath) + "' and cannot be used from another module.");
         return typeCtx.getError();
     }
     return t;
@@ -1997,6 +2016,39 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
     // Method call: obj.method(args)
     if (callee && callee->asMember()) {
         auto member = *callee->asMember();
+
+        // Namespace-qualified free-function call: ns.func(args). Resolve the function in
+        // the imported module before treating the callee as a method (analyzeExpr below
+        // would otherwise complain that the namespace has no such member).
+        if (auto objExpr = member.object()) {
+            if (auto idObj = objExpr->asIdent()) {
+                if (auto idName = idObj->nameText()) {
+                    Symbol* nsSym = currentScope ? currentScope->lookup(*idName) : nullptr;
+                    auto memberName = member.memberText();
+                    if (nsSym && nsSym->kind == SymbolKind::Namespace && memberName &&
+                        nsSym->namespaceTarget) {
+                        Symbol* fnSym = nsSym->namespaceTarget->globalSymbol(*memberName);
+                        if (fnSym && fnSym->kind == SymbolKind::Function) {
+                            analysis.setSymbol(idObj->node.greenNode(), nsSym);
+                            if (!fnSym->isPublic) {
+                                errorAtNode(member.node, "Function '" + asciiOf(*memberName) +
+                                    "' is not public in module '" +
+                                    asciiOf(nsSym->namespaceModulePath) +
+                                    "' and cannot be called from another module.");
+                                for (auto& a : args) analyzeExpr(a);
+                                return typeCtx.getError();
+                            }
+                            analysis.setSymbol(member.node.greenNode(), fnSym);
+                            if (fnSym->isExternal) {
+                                return analyzeExternalCall(expr, fnSym, *memberName);
+                            }
+                            return checkDirectCallArguments(expr, fnSym, *memberName);
+                        }
+                    }
+                }
+            }
+        }
+
         analyzeExpr(*callee);  // resolves field-or-method on member
         auto* memberInfo = analysis.find(member.node.greenNode());
         Symbol* methodSym = memberInfo ? memberInfo->resolvedMethodSymbol : nullptr;
@@ -2028,6 +2080,22 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
     // Safe method call: obj?.method(args)
     if (callee && callee->asSafeMember()) {
         auto member = *callee->asSafeMember();
+
+        // A namespace is never null, so `ns?.func(args)` is meaningless.
+        if (auto objExpr = member.object()) {
+            if (auto idObj = objExpr->asIdent()) {
+                if (auto idName = idObj->nameText()) {
+                    Symbol* nsSym = currentScope ? currentScope->lookup(*idName) : nullptr;
+                    if (nsSym && nsSym->kind == SymbolKind::Namespace) {
+                        errorAtNode(expr.node, "'?.' cannot be used on the module namespace '" +
+                            asciiOf(*idName) + "'; call it directly with '.'.");
+                        for (auto& a : args) analyzeExpr(a);
+                        return typeCtx.getError();
+                    }
+                }
+            }
+        }
+
         analyzeExpr(*callee);  // resolves field-or-method on safe-member
         auto* memberInfo = analysis.find(member.node.greenNode());
         Symbol* methodSym = memberInfo ? memberInfo->resolvedMethodSymbol : nullptr;
@@ -2140,10 +2208,20 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
     if (sym->isExternal) {
         return analyzeExternalCall(expr, sym, *name);
     }
+    return checkDirectCallArguments(expr, sym, *name);
+    }();
+    clearNarrowingsForCall(expr);
+    return result;
+}
 
+// Argument count/type checking shared by plain `name(args)` and namespace-qualified
+// `ns.name(args)` free-function calls. Returns the call's result type.
+Type* Analyzer::checkDirectCallArguments(const ast::CallExpression& expr, Symbol* sym,
+                                         const std::u16string& funcName) {
+    auto args = expr.arguments();
     size_t req = requiredArgCount(sym);
     if (args.size() < req || args.size() > sym->paramTypes.size()) {
-        errorAtNode(expr.node, "Function '" + asciiOf(*name) + "' expects " +
+        errorAtNode(expr.node, "Function '" + asciiOf(funcName) + "' expects " +
             std::to_string(req) +
             (req == sym->paramTypes.size() ? "" : "-" + std::to_string(sym->paramTypes.size())) +
             " argument(s), got " + std::to_string(args.size()));
@@ -2169,9 +2247,6 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
         }
     }
     return sym->returnType ? sym->returnType : typeCtx.getError();
-    }();
-    clearNarrowingsForCall(expr);
-    return result;
 }
 
 Type* Analyzer::analyzeExternalCall(const ast::CallExpression& expr, Symbol* sym,
@@ -2262,6 +2337,12 @@ Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
                 auto memberName = expr.memberText();
                 if (!memberName) return typeCtx.getError();
                 if (Type* t = typeCtx.lookupNamedType(nsSym->namespaceModulePath, *memberName)) {
+                    if (!isTypeVisibleAcrossModules(t)) {
+                        errorAtNode(expr.node, "Type '" + asciiOf(*memberName) +
+                            "' is not public in module '" + asciiOf(nsSym->namespaceModulePath) +
+                            "' and cannot be used from another module.");
+                        return typeCtx.getError();
+                    }
                     analysis.setType(expr.node.greenNode(), t);
                     return t;
                 }
