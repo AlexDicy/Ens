@@ -2026,6 +2026,34 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
     if (callee && callee->asMember()) {
         auto member = *callee->asMember();
 
+        // Static builtin on the `string` type keyword: string.fromBytes(byte[]).
+        if (auto objExpr = member.object()) {
+            if (auto idObj = objExpr->asIdent()) {
+                if (idObj->node.firstToken(SyntaxKind::KwString)) {
+                    auto memberName = member.memberText();
+                    if (memberName && *memberName == u"fromBytes") {
+                        Type* byteArr = typeCtx.getArray(typeCtx.getPrimitive(TypeKind::Byte));
+                        if (args.size() != 1) {
+                            errorAtNode(expr.node, "'string.fromBytes' expects 1 argument (a byte[]), got " +
+                                std::to_string(args.size()) + ".");
+                            for (auto& a : args) analyzeExpr(a);
+                        } else {
+                            Type* argT = analyzeExpr(args[0]);
+                            if (!argT->isError() && !byteArr->assignableFrom(argT)) {
+                                errorAtNode(args[0].node, "'string.fromBytes' expects a byte[], got '" +
+                                    argT->toString() + "'.");
+                            }
+                        }
+                        return typeCtx.getPrimitive(TypeKind::String);
+                    }
+                    errorAtNode(expr.node, "'string' has no static member '" +
+                        asciiOf(member.memberText().value_or(std::u16string{})) + "'.");
+                    for (auto& a : args) analyzeExpr(a);
+                    return typeCtx.getError();
+                }
+            }
+        }
+
         // Namespace-qualified free-function call: ns.func(args). Resolve the function in
         // the imported module before treating the callee as a method (analyzeExpr below
         // would otherwise complain that the namespace has no such member).
@@ -2080,6 +2108,18 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                     return typeCtx.getError();
                 }
                 // Records may declare their own toString: fall through to resolution.
+            }
+            if (memberName && *memberName == u"toBytes") {
+                Type* recvT = analyzeExpr(*objExpr);
+                if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }
+                if (recvT->isString()) {
+                    if (!args.empty()) {
+                        errorAtNode(expr.node, "'toBytes' takes no arguments.");
+                        for (auto& a : args) analyzeExpr(a);
+                    }
+                    return typeCtx.getArray(typeCtx.getPrimitive(TypeKind::Byte));
+                }
+                // Records may declare their own toBytes: fall through to resolution.
             }
         }
 

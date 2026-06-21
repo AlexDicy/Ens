@@ -937,6 +937,13 @@ void Parser::parsePrefix() {
             bump();
             builder.finishNode();
             return;
+        case SyntaxKind::KwString:
+            // The `string` type name as an expression receiver, for static
+            // builtins like `string.fromBytes(bytes)`.
+            builder.startNode(SyntaxKind::IdentExpr);
+            bump();
+            builder.finishNode();
+            return;
         case SyntaxKind::KwThis:
             builder.startNode(SyntaxKind::ThisExpr);
             bump();

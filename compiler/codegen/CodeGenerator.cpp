@@ -3275,6 +3275,30 @@ struct CodeGenerator::Impl {
             { asI64, builder->getInt1(recvT->isSignedInteger()) }, "i2s");
     }
 
+    // string.toBytes(): a fresh byte[] copy of the UTF-8 bytes (no trailing NUL).
+    llvm::Value* emitStringToBytes(const ast::Expression& obj, ::Type* byteArrayT) {
+        llvm::Value* s = emitExpr(obj);
+        if (!s || !byteArrayT || !byteArrayT->inner) return nullptr;
+        llvm::Value* len = emitStringLength(s);
+        llvm::Value* arr = emitArrayNew(byteArrayT->inner, len, obj.node.startOffset());
+        builder->CreateMemCpy(emitArrayDataPtr(arr), llvm::MaybeAlign(1),
+            emitStringDataPtr(s), llvm::MaybeAlign(1), len);
+        releaseIfOwnedTemp(s, obj);
+        return arr;
+    }
+
+    // string.fromBytes(byte[]): a fresh string copy of the bytes plus a NUL.
+    llvm::Value* emitStringFromBytes(const ast::Expression& arg) {
+        llvm::Value* arr = emitExpr(arg);
+        if (!arr) return nullptr;
+        llvm::Value* len = emitArrayLength(arr);
+        llvm::Value* obj = emitStringAlloc(len);
+        builder->CreateMemCpy(emitStringDataPtr(obj), llvm::MaybeAlign(1),
+            emitArrayDataPtr(arr), llvm::MaybeAlign(1), len);
+        releaseIfOwnedTemp(arr, arg);
+        return obj;
+    }
+
     // Lazily emits `_dtor_<elem>_array` which walks the element data and
     // releases per-slot ownership where required. Returns null if the element
     // type needs no per-slot work (primitives / externals / class-free structs).
@@ -4064,6 +4088,16 @@ struct CodeGenerator::Impl {
 
         if (callee && callee->asMember()) {
             auto member = *callee->asMember();
+            // Static builtin on the `string` type keyword: string.fromBytes(byte[]).
+            if (auto objExpr = member.object()) {
+                if (auto idObj = objExpr->asIdent()) {
+                    auto memberName = member.memberText();
+                    if (idObj->node.firstToken(SyntaxKind::KwString) &&
+                        memberName && *memberName == u"fromBytes" && !e.arguments().empty()) {
+                        return emitStringFromBytes(e.arguments()[0]);
+                    }
+                }
+            }
             // Built-in conversion methods (no Symbol; recognized structurally).
             if (auto obj = member.object()) {
                 auto memberName = member.memberText();
@@ -4071,6 +4105,10 @@ struct CodeGenerator::Impl {
                 if (memberName && *memberName == u"toString" && !methodSymbolOf(member.node) &&
                     recvT && (recvT->isInteger() || recvT->isBool() || recvT->isString())) {
                     return emitToString(*obj, recvT);
+                }
+                if (memberName && *memberName == u"toBytes" && !methodSymbolOf(member.node) &&
+                    recvT && recvT->isString()) {
+                    return emitStringToBytes(*obj, typeOf(e.node));
                 }
             }
             Symbol* methodSym = methodSymbolOf(member.node);
