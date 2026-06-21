@@ -2058,6 +2058,31 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
             }
         }
 
+        // Built-in conversion methods on primitive and string receivers. These
+        // have no Symbol; codegen recognizes them structurally. Intercept before
+        // generic member resolution, which would reject a primitive receiver.
+        if (auto objExpr = member.object()) {
+            auto memberName = member.memberText();
+            if (memberName && *memberName == u"toString") {
+                Type* recvT = analyzeExpr(*objExpr);
+                if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }
+                if (recvT->isInteger() || recvT->isBool() || recvT->isString()) {
+                    if (!args.empty()) {
+                        errorAtNode(expr.node, "'toString' takes no arguments.");
+                        for (auto& a : args) analyzeExpr(a);
+                    }
+                    return typeCtx.getPrimitive(TypeKind::String);
+                }
+                if (recvT->isFloat() || recvT->kind == TypeKind::Decimal) {
+                    errorAtNode(expr.node, "'.toString()' is not yet available for type '" +
+                        recvT->toString() + "'.");
+                    for (auto& a : args) analyzeExpr(a);
+                    return typeCtx.getError();
+                }
+                // Records may declare their own toString: fall through to resolution.
+            }
+        }
+
         analyzeExpr(*callee);  // resolves field-or-method on member
         auto* memberInfo = analysis.find(member.node.greenNode());
         Symbol* methodSym = memberInfo ? memberInfo->resolvedMethodSymbol : nullptr;

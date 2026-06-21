@@ -3206,6 +3206,75 @@ struct CodeGenerator::Impl {
         return fn;
     }
 
+    // string ens_int_to_string(i64 value, i1 isSigned): decimal formatting via
+    // snprintf into a fixed buffer, copied into a fresh owned string.
+    llvm::Function* getOrDefineEnsIntToString() {
+        if (auto* existing = module->getFunction("ens_int_to_string")) return existing;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(ptrTy, { i64Ty, llvm::Type::getInt1Ty(ctx) }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+            "ens_int_to_string", module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+
+        auto savedIP = builder->saveIP();
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* signedBB = llvm::BasicBlock::Create(ctx, "i2s.signed", fn);
+        auto* unsignedBB = llvm::BasicBlock::Create(ctx, "i2s.unsigned", fn);
+        auto* fmtBB = llvm::BasicBlock::Create(ctx, "i2s.build", fn);
+
+        builder->SetInsertPoint(entry);
+        llvm::Value* value = fn->getArg(0);
+        // 20 digits for i64 plus sign plus NUL fits in 24 bytes.
+        llvm::Value* buf = builder->CreateAlloca(llvm::ArrayType::get(i8Ty, 24), nullptr, "i2s.buf");
+        builder->CreateCondBr(fn->getArg(1), signedBB, unsignedBB);
+
+        auto* snprintf = getOrDeclareSnprintf();
+        llvm::Value* cap = llvm::ConstantInt::get(i64Ty, 24);
+        builder->SetInsertPoint(signedBB);
+        llvm::Value* wS = builder->CreateCall(snprintf,
+            { buf, cap, builder->CreateGlobalString("%lld", ".fmt.lld"), value }, "i2s.wS");
+        builder->CreateBr(fmtBB);
+        builder->SetInsertPoint(unsignedBB);
+        llvm::Value* wU = builder->CreateCall(snprintf,
+            { buf, cap, builder->CreateGlobalString("%llu", ".fmt.llu"), value }, "i2s.wU");
+        builder->CreateBr(fmtBB);
+
+        builder->SetInsertPoint(fmtBB);
+        llvm::PHINode* w = builder->CreatePHI(i32Ty, 2, "i2s.w");
+        w->addIncoming(wS, signedBB);
+        w->addIncoming(wU, unsignedBB);
+        llvm::Value* len = builder->CreateSExt(w, i64Ty);
+        llvm::Value* obj = emitStringAlloc(len);
+        builder->CreateMemCpy(emitStringDataPtr(obj), llvm::MaybeAlign(1), buf, llvm::MaybeAlign(1), len);
+        builder->CreateRet(obj);
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    // Lowers a `.toString()` call on a primitive or string receiver to an owned
+    // (+1) string, matching the ownership the call site expects.
+    llvm::Value* emitToString(const ast::Expression& obj, ::Type* recvT) {
+        llvm::Value* v = emitExpr(obj);
+        if (!v) return nullptr;
+        if (recvT->isString()) {
+            if (expressionProducesOwnedRef(obj)) return v;  // transfer the temp's +1
+            builder->CreateCall(getOrDefineEnsRetain(), { v });
+            return v;
+        }
+        if (recvT->isBool()) {
+            return builder->CreateSelect(v,
+                emitStringLiteralObject("true"), emitStringLiteralObject("false"), "bool.str");
+        }
+        llvm::Value* asI64 = builder->CreateIntCast(
+            v, llvm::Type::getInt64Ty(ctx), recvT->isSignedInteger(), "i2s.ext");
+        return builder->CreateCall(getOrDefineEnsIntToString(),
+            { asI64, builder->getInt1(recvT->isSignedInteger()) }, "i2s");
+    }
+
     // Lazily emits `_dtor_<elem>_array` which walks the element data and
     // releases per-slot ownership where required. Returns null if the element
     // type needs no per-slot work (primitives / externals / class-free structs).
@@ -3995,6 +4064,15 @@ struct CodeGenerator::Impl {
 
         if (callee && callee->asMember()) {
             auto member = *callee->asMember();
+            // Built-in conversion methods (no Symbol; recognized structurally).
+            if (auto obj = member.object()) {
+                auto memberName = member.memberText();
+                ::Type* recvT = typeOf(obj->node);
+                if (memberName && *memberName == u"toString" && !methodSymbolOf(member.node) &&
+                    recvT && (recvT->isInteger() || recvT->isBool() || recvT->isString())) {
+                    return emitToString(*obj, recvT);
+                }
+            }
             Symbol* methodSym = methodSymbolOf(member.node);
             if (methodSym && isInterceptedTraceMethod(methodSym)) {
                 auto obj = member.object();
