@@ -60,6 +60,9 @@ void EscapeAnalyzer::scanStatement(const ast::Statement& s) {
     if (auto v = s.asTypedVarDecl()) { scanTypedVarDecl(*v); return; }
     if (auto i = s.asIf()) { scanIf(*i); return; }
     if (auto w = s.asWhile()) { scanWhile(*w); return; }
+    if (auto f = s.asFor()) { scanFor(*f); return; }
+    if (auto fe = s.asForEach()) { scanForEach(*fe); return; }
+    if (s.asBreak() || s.asContinue()) return;
     if (auto r = s.asReturn()) { scanReturn(*r); return; }
     if (auto e = s.asExpressionStmt()) { scanExprStmt(*e); return; }
     if (auto th = s.asThrow()) {
@@ -129,6 +132,18 @@ void EscapeAnalyzer::scanWhile(const ast::WhileStatement& s) {
     if (auto body = s.body()) scanBlock(*body);
 }
 
+void EscapeAnalyzer::scanFor(const ast::ForStatement& s) {
+    if (auto init = s.init()) scanStatement(*init);
+    if (auto c = s.condition()) scanExpression(*c);
+    if (auto u = s.update()) scanExpression(*u);
+    if (auto body = s.body()) scanBlock(*body);
+}
+
+void EscapeAnalyzer::scanForEach(const ast::ForEachStatement& s) {
+    if (auto it = s.iterable()) scanExpression(*it);
+    if (auto body = s.body()) scanBlock(*body);
+}
+
 void EscapeAnalyzer::scanReturn(const ast::ReturnStatement& s) {
     if (auto v = s.value()) {
         markEscapeIfRef(*v);
@@ -165,6 +180,11 @@ void EscapeAnalyzer::scanExpression(const ast::Expression& e) {
     }
     if (auto bn = e.asBinary()) { scanBinary(*bn); return; }
     if (auto t = e.asTernary()) { scanTernary(*t); return; }
+    if (auto nc = e.asNullCoalesce()) {
+        if (auto l = nc->left()) scanExpression(*l);
+        if (auto r = nc->right()) scanExpression(*r);
+        return;
+    }
     if (auto p = e.asParen()) { scanParen(*p); return; }
     if (auto n = e.asNew()) { scanNew(*n); return; }
     if (auto al = e.asArrayLiteral()) { scanArrayLiteral(*al); return; }
@@ -466,6 +486,27 @@ void EscapeAnalyzer::walkStmtForLastUses(const ast::Statement& s) {
         loopDepth--;
         return;
     }
+    if (auto f = s.asFor()) {
+        if (auto init = f->init()) walkStmtForLastUses(*init);
+        if (auto c = f->condition()) walkExprForLastUses(*c);
+        loopDepth++;
+        if (auto u = f->update()) walkExprForLastUses(*u);
+        if (auto body = f->body()) {
+            for (auto& child : body->statements()) walkStmtForLastUses(child);
+        }
+        loopDepth--;
+        return;
+    }
+    if (auto fe = s.asForEach()) {
+        if (auto it = fe->iterable()) walkExprForLastUses(*it);
+        loopDepth++;
+        if (auto body = fe->body()) {
+            for (auto& child : body->statements()) walkStmtForLastUses(child);
+        }
+        loopDepth--;
+        return;
+    }
+    if (s.asBreak() || s.asContinue()) return;
     if (auto r = s.asReturn()) {
         if (auto v = r->value()) walkExprForLastUses(*v);
         return;
@@ -532,6 +573,11 @@ void EscapeAnalyzer::walkExprForLastUses(const ast::Expression& e) {
         if (auto cond = t->condition()) walkExprForLastUses(*cond);
         if (auto th = t->thenBranch()) walkExprForLastUses(*th);
         if (auto el = t->elseBranch()) walkExprForLastUses(*el);
+        return;
+    }
+    if (auto nc = e.asNullCoalesce()) {
+        if (auto l = nc->left()) walkExprForLastUses(*l);
+        if (auto r = nc->right()) walkExprForLastUses(*r);
         return;
     }
     if (auto p = e.asParen()) {
@@ -636,6 +682,19 @@ void EscapeAnalyzer::walkStmtForPromotion(const ast::Statement& s) {
     }
     if (auto w = s.asWhile()) {
         if (auto body = w->body()) {
+            for (auto& child : body->statements()) walkStmtForPromotion(child);
+        }
+        return;
+    }
+    if (auto f = s.asFor()) {
+        if (auto init = f->init()) walkStmtForPromotion(*init);
+        if (auto body = f->body()) {
+            for (auto& child : body->statements()) walkStmtForPromotion(child);
+        }
+        return;
+    }
+    if (auto fe = s.asForEach()) {
+        if (auto body = fe->body()) {
             for (auto& child : body->statements()) walkStmtForPromotion(child);
         }
         return;

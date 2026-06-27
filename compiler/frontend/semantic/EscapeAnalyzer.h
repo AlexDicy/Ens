@@ -41,6 +41,8 @@ private:
     void scanTypedVarDecl(const ast::TypedVarDeclStatement& s);
     void scanIf(const ast::IfStatement& s);
     void scanWhile(const ast::WhileStatement& s);
+    void scanFor(const ast::ForStatement& s);
+    void scanForEach(const ast::ForEachStatement& s);
     void scanReturn(const ast::ReturnStatement& s);
     void scanExprStmt(const ast::ExpressionStatement& s);
 
