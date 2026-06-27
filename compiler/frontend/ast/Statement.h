@@ -22,6 +22,7 @@ class ReturnStatement;
 class ExpressionStatement;
 class ThrowStatement;
 class RethrowStatement;
+class SwitchStatement;
 
 class Statement {
 public:
@@ -45,6 +46,7 @@ public:
     std::optional<ExpressionStatement>   asExpressionStmt() const;
     std::optional<ThrowStatement>        asThrow() const;
     std::optional<RethrowStatement>      asRethrow() const;
+    std::optional<SwitchStatement>       asSwitch() const;
 };
 
 class Block {
@@ -202,6 +204,17 @@ public:
         if (n.kind() != SyntaxKind::RethrowStmt) return std::nullopt;
         return RethrowStatement{n};
     }
+};
+
+class SwitchStatement {
+public:
+    SyntaxNode node;
+    static std::optional<SwitchStatement> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::SwitchStmt) return std::nullopt;
+        return SwitchStatement{n};
+    }
+    std::optional<Expression> scrutinee() const;
+    std::vector<SwitchArm> arms() const;
 };
 
 }  // namespace ast

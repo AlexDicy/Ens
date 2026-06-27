@@ -1,4 +1,6 @@
 #pragma once
+#include <cstdint>
+#include <optional>
 #include <unordered_map>
 #include "../cst/Green.h"
 
@@ -46,8 +48,17 @@ public:
     }
     void setThisSymbol(const GreenElement* fnDecl, Symbol* sym) { thisSymbols[fnDecl] = sym; }
 
+    // Resolved value of an enum member reference (a `Color.Red` member access or
+    // a bare enum switch label). Codegen reads this to emit the integer constant.
+    std::optional<int64_t> enumConstantOf(const GreenElement* g) const {
+        auto it = enumConstants.find(g);
+        return it == enumConstants.end() ? std::nullopt : std::optional<int64_t>{it->second};
+    }
+    void setEnumConstant(const GreenElement* g, int64_t v) { enumConstants[g] = v; }
+
 private:
     std::unordered_map<const GreenElement*, ResolutionInfo> info;
     std::unordered_map<const GreenElement*, Type*> methodReceivers;
     std::unordered_map<const GreenElement*, Symbol*> thisSymbols;
+    std::unordered_map<const GreenElement*, int64_t> enumConstants;
 };

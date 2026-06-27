@@ -13,6 +13,7 @@ enum class TypeKind {
     Array,       // T[]
     Struct,      // user-defined struct (value semantics)
     Class,       // user-defined class (reference semantics, heap-allocated)
+    Enum,        // user-defined enum (integer-backed value type)
     External,    // opaque foreign type declared via `external type Name;`
     Error        // sentinel - used to suppress cascading errors
 };
@@ -34,6 +35,11 @@ struct FieldInfo {
     StructInfo* definingClass = nullptr;  // class/struct that declares this field (for visibility)
 };
 
+struct EnumMemberInfo {
+    std::u16string name;
+    int64_t value = 0;
+};
+
 struct MethodInfo {
     std::u16string name;
     Symbol* symbol = nullptr;       // function symbol with paramTypes/returnType (no `this`)
@@ -52,6 +58,7 @@ struct StructInfo {
     Visibility visibility = Visibility::Public;  // only public types are reachable cross-module
     std::vector<FieldInfo> fields;   // for a class, base fields are flattened in first
     std::vector<MethodInfo> methods; // methods are NOT flattened; walk baseInfo to inherit
+    std::vector<EnumMemberInfo> enumMembers;  // for an enum: members in declaration order, values 0..N-1
     int line = 0;
     int column = 0;
 
@@ -120,6 +127,7 @@ public:
     bool isArray() const { return kind == TypeKind::Array; }
     bool isStruct() const { return kind == TypeKind::Struct; }
     bool isClass() const  { return kind == TypeKind::Class; }
+    bool isEnum() const   { return kind == TypeKind::Enum; }
     bool isExternal() const { return kind == TypeKind::External; }
     bool isString() const { return kind == TypeKind::String; }
     bool hasRecordLayout() const { return isStruct() || isClass(); }

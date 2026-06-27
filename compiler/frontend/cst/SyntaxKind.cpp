@@ -192,6 +192,8 @@ static constexpr std::pair<SyntaxKind, std::string_view> KIND_NAMES[] = {
     {SyntaxKind::ExternalBlock,     "ExternalBlock"},
     {SyntaxKind::LibrarySpec,       "LibrarySpec"},
     {SyntaxKind::ExternalFuncDecl,  "ExternalFuncDecl"},
+    {SyntaxKind::EnumDecl,          "EnumDecl"},
+    {SyntaxKind::EnumMember,        "EnumMember"},
     {SyntaxKind::TypeRef,           "TypeRef"},
     {SyntaxKind::OptionalType,      "OptionalType"},
     {SyntaxKind::Block,             "Block"},
@@ -209,6 +211,8 @@ static constexpr std::pair<SyntaxKind, std::string_view> KIND_NAMES[] = {
     {SyntaxKind::ExprStmt,          "ExprStmt"},
     {SyntaxKind::ThrowStmt,         "ThrowStmt"},
     {SyntaxKind::RethrowStmt,       "RethrowStmt"},
+    {SyntaxKind::SwitchStmt,        "SwitchStmt"},
+    {SyntaxKind::SwitchArm,         "SwitchArm"},
     {SyntaxKind::LiteralExpr,       "LiteralExpr"},
     {SyntaxKind::IdentExpr,         "IdentExpr"},
     {SyntaxKind::ThisExpr,          "ThisExpr"},
@@ -233,6 +237,7 @@ static constexpr std::pair<SyntaxKind, std::string_view> KIND_NAMES[] = {
     {SyntaxKind::ArrayLiteralExpr,  "ArrayLiteralExpr"},
     {SyntaxKind::InterpStringExpr,  "InterpStringExpr"},
     {SyntaxKind::TryExpr,           "TryExpr"},
+    {SyntaxKind::SwitchExpr,        "SwitchExpr"},
     {SyntaxKind::Error,             "Error"},
 };
 

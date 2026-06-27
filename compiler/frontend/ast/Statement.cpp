@@ -17,6 +17,7 @@ bool Statement::isStatementKind(SyntaxKind k) {
         case SyntaxKind::ExprStmt:
         case SyntaxKind::ThrowStmt:
         case SyntaxKind::RethrowStmt:
+        case SyntaxKind::SwitchStmt:
             return true;
         default:
             return false;
@@ -41,6 +42,7 @@ std::optional<ReturnStatement>       Statement::asReturn()          const { retu
 std::optional<ExpressionStatement>   Statement::asExpressionStmt()  const { return ExpressionStatement::cast(node); }
 std::optional<ThrowStatement>        Statement::asThrow()           const { return ThrowStatement::cast(node); }
 std::optional<RethrowStatement>      Statement::asRethrow()         const { return RethrowStatement::cast(node); }
+std::optional<SwitchStatement>       Statement::asSwitch()          const { return SwitchStatement::cast(node); }
 
 // === Block ===
 
@@ -255,6 +257,25 @@ std::optional<Expression> ThrowStatement::value() const {
         if (auto e = Expression::cast(c)) return e;
     }
     return std::nullopt;
+}
+
+// === SwitchStatement ===
+
+std::optional<Expression> SwitchStatement::scrutinee() const {
+    // Arms are SwitchArm nodes, so the only direct expression child is the
+    // scrutinee.
+    for (auto& c : node.children()) {
+        if (auto e = Expression::cast(c)) return e;
+    }
+    return std::nullopt;
+}
+
+std::vector<SwitchArm> SwitchStatement::arms() const {
+    std::vector<SwitchArm> out;
+    for (auto& c : node.children()) {
+        if (auto a = SwitchArm::cast(c)) out.push_back(*a);
+    }
+    return out;
 }
 
 }  // namespace ast

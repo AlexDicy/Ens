@@ -28,6 +28,8 @@ class ImportPath;
 class ExternalTypeDecl;
 class ExternalFuncDecl;
 class ExternalBlock;
+class EnumDecl;
+class EnumMember;
 class SourceFile;
 
 class VisibilityModifier {
@@ -266,6 +268,31 @@ public:
     std::vector<ExternalFuncDecl> declarations() const;
 };
 
+class EnumMember {
+public:
+    SyntaxNode node;
+    static std::optional<EnumMember> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::EnumMember) return std::nullopt;
+        return EnumMember{n};
+    }
+    std::optional<SyntaxNode> nameToken() const;
+    std::optional<std::u16string> nameText() const;
+};
+
+class EnumDecl {
+public:
+    SyntaxNode node;
+    static std::optional<EnumDecl> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::EnumDecl) return std::nullopt;
+        return EnumDecl{n};
+    }
+    std::optional<VisibilityModifier> visibilityModifier() const;
+    Visibility visibility() const;
+    std::optional<SyntaxNode> nameToken() const;
+    std::optional<std::u16string> nameText() const;
+    std::vector<EnumMember> members() const;
+};
+
 class SourceFile {
 public:
     SyntaxNode node;
@@ -277,6 +304,7 @@ public:
     std::vector<FuncDecl> functions() const;
     std::vector<StructDecl> structs() const;
     std::vector<ClassDecl> classes() const;
+    std::vector<EnumDecl> enums() const;
     std::vector<TypedVarDeclStatement> topLevelVarDecls() const;
     std::vector<ExternalTypeDecl> externalTypes() const;
     std::vector<ExternalBlock> externalBlocks() const;

@@ -27,6 +27,7 @@ bool Expression::isExpressionKind(SyntaxKind k) {
         case SyntaxKind::ArrayLiteralExpr:
         case SyntaxKind::InterpStringExpr:
         case SyntaxKind::TryExpr:
+        case SyntaxKind::SwitchExpr:
             return true;
         default:
             return false;
@@ -75,6 +76,7 @@ std::optional<ParenExpression>     Expression::asParen()     const { return Pare
 std::optional<ArrayLiteralExpression> Expression::asArrayLiteral() const { return ArrayLiteralExpression::cast(node); }
 std::optional<InterpStringExpression> Expression::asInterpString() const { return InterpStringExpression::cast(node); }
 std::optional<TryExpression>       Expression::asTry()       const { return TryExpression::cast(node); }
+std::optional<SwitchExpression>    Expression::asSwitch()    const { return SwitchExpression::cast(node); }
 
 // === LiteralExpression ===
 
@@ -439,6 +441,57 @@ std::optional<std::u16string> OutArgument::nameText() const {
 
 std::optional<Expression> TryExpression::operand() const {
     return firstExpressionChild(node);
+}
+
+// === SwitchArm ===
+
+bool SwitchArm::isDefault() const {
+    return firstChildNode(node, SyntaxKind::KwDefault).has_value();
+}
+
+std::vector<Expression> SwitchArm::labels() const {
+    std::vector<Expression> out;
+    for (auto& c : node.children()) {
+        if (c.kind() == SyntaxKind::Arrow) break;
+        if (auto e = Expression::cast(c)) out.push_back(*e);
+    }
+    return out;
+}
+
+std::optional<Expression> SwitchArm::bodyExpr() const {
+    bool afterArrow = false;
+    for (auto& c : node.children()) {
+        if (c.kind() == SyntaxKind::Arrow) { afterArrow = true; continue; }
+        if (afterArrow) {
+            if (auto e = Expression::cast(c)) return e;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<SyntaxNode> SwitchArm::bodyBlockNode() const {
+    bool afterArrow = false;
+    for (auto& c : node.children()) {
+        if (c.kind() == SyntaxKind::Arrow) { afterArrow = true; continue; }
+        if (afterArrow && c.kind() == SyntaxKind::Block) return c;
+    }
+    return std::nullopt;
+}
+
+// === SwitchExpression ===
+
+std::optional<Expression> SwitchExpression::scrutinee() const {
+    // The arms are SwitchArm nodes, so the scrutinee is the only direct
+    // expression child.
+    return firstExpressionChild(node);
+}
+
+std::vector<SwitchArm> SwitchExpression::arms() const {
+    std::vector<SwitchArm> out;
+    for (auto& c : node.children()) {
+        if (auto a = SwitchArm::cast(c)) out.push_back(*a);
+    }
+    return out;
 }
 
 }  // namespace ast

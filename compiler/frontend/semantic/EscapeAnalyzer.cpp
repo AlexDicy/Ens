@@ -70,6 +70,7 @@ void EscapeAnalyzer::scanStatement(const ast::Statement& s) {
         return;
     }
     if (s.asRethrow()) return;
+    if (auto sw = s.asSwitch()) { scanSwitchArms(sw->scrutinee(), sw->arms()); return; }
 }
 
 void EscapeAnalyzer::scanBlock(const ast::Block& b) {
@@ -189,7 +190,21 @@ void EscapeAnalyzer::scanExpression(const ast::Expression& e) {
     if (auto n = e.asNew()) { scanNew(*n); return; }
     if (auto al = e.asArrayLiteral()) { scanArrayLiteral(*al); return; }
     if (auto tr = e.asTry()) { if (auto op = tr->operand()) scanExpression(*op); return; }
+    if (auto sw = e.asSwitch()) { scanSwitchArms(sw->scrutinee(), sw->arms()); return; }
     if (auto id = e.asIdent()) { scanIdent(*id); return; }
+}
+
+void EscapeAnalyzer::scanSwitchArms(const std::optional<ast::Expression>& scrutinee,
+                                    const std::vector<ast::SwitchArm>& arms) {
+    if (scrutinee) scanExpression(*scrutinee);
+    for (auto& arm : arms) {
+        // Labels are compile-time constants and own nothing, so they are skipped.
+        if (auto bn = arm.bodyBlockNode()) {
+            if (auto blk = ast::Block::cast(*bn)) scanBlock(*blk);
+        } else if (auto be = arm.bodyExpr()) {
+            scanExpression(*be);
+        }
+    }
 }
 
 void EscapeAnalyzer::scanIdent(const ast::IdentExpression&) {}
@@ -337,6 +352,12 @@ void EscapeAnalyzer::markEscapeIfRef(const ast::Expression& e) {
     if (auto t = e.asTernary()) {
         if (auto th = t->thenBranch()) markEscapeIfRef(*th);
         if (auto el = t->elseBranch()) markEscapeIfRef(*el);
+        return;
+    }
+    if (auto sw = e.asSwitch()) {
+        for (auto& arm : sw->arms()) {
+            if (auto be = arm.bodyExpr()) markEscapeIfRef(*be);
+        }
         return;
     }
 }
@@ -519,6 +540,19 @@ void EscapeAnalyzer::walkStmtForLastUses(const ast::Statement& s) {
         if (auto v = th->value()) walkExprForLastUses(*v);
         return;
     }
+    if (auto sw = s.asSwitch()) {
+        if (auto sc = sw->scrutinee()) walkExprForLastUses(*sc);
+        for (auto& arm : sw->arms()) {
+            if (auto bn = arm.bodyBlockNode()) {
+                if (auto blk = ast::Block::cast(*bn)) {
+                    for (auto& child : blk->statements()) walkStmtForLastUses(child);
+                }
+            } else if (auto be = arm.bodyExpr()) {
+                walkExprForLastUses(*be);
+            }
+        }
+        return;
+    }
 }
 
 void EscapeAnalyzer::walkExprForLastUses(const ast::Expression& e) {
@@ -594,6 +628,13 @@ void EscapeAnalyzer::walkExprForLastUses(const ast::Expression& e) {
     }
     if (auto tr = e.asTry()) {
         if (auto op = tr->operand()) walkExprForLastUses(*op);
+        return;
+    }
+    if (auto sw = e.asSwitch()) {
+        if (auto sc = sw->scrutinee()) walkExprForLastUses(*sc);
+        for (auto& arm : sw->arms()) {
+            if (auto be = arm.bodyExpr()) walkExprForLastUses(*be);
+        }
         return;
     }
     if (auto id = e.asIdent()) {
@@ -696,6 +737,16 @@ void EscapeAnalyzer::walkStmtForPromotion(const ast::Statement& s) {
     if (auto fe = s.asForEach()) {
         if (auto body = fe->body()) {
             for (auto& child : body->statements()) walkStmtForPromotion(child);
+        }
+        return;
+    }
+    if (auto sw = s.asSwitch()) {
+        for (auto& arm : sw->arms()) {
+            if (auto bn = arm.bodyBlockNode()) {
+                if (auto blk = ast::Block::cast(*bn)) {
+                    for (auto& child : blk->statements()) walkStmtForPromotion(child);
+                }
+            }
         }
         return;
     }

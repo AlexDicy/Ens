@@ -29,6 +29,8 @@ class ParenExpression;
 class ArrayLiteralExpression;
 class InterpStringExpression;
 class TryExpression;
+class SwitchArm;
+class SwitchExpression;
 class ArgumentList;
 
 class Expression {
@@ -62,6 +64,7 @@ public:
     std::optional<ArrayLiteralExpression> asArrayLiteral() const;
     std::optional<InterpStringExpression> asInterpString() const;
     std::optional<TryExpression>       asTry() const;
+    std::optional<SwitchExpression>    asSwitch() const;
 };
 
 class LiteralExpression {
@@ -321,6 +324,35 @@ public:
         return TryExpression{n};
     }
     std::optional<Expression> operand() const;
+};
+
+// One arm of a switch: `label[, label...] -> body` or `default -> body`.
+// Shared by SwitchStatement and SwitchExpression. The body is either a block
+// (statement form) or an expression.
+class SwitchArm {
+public:
+    SyntaxNode node;
+    static std::optional<SwitchArm> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::SwitchArm) return std::nullopt;
+        return SwitchArm{n};
+    }
+    bool isDefault() const;
+    // Label expressions before the `->` (empty for the default arm).
+    std::vector<Expression> labels() const;
+    // Body when it is an expression; the block node otherwise.
+    std::optional<Expression> bodyExpr() const;
+    std::optional<SyntaxNode> bodyBlockNode() const;
+};
+
+class SwitchExpression {
+public:
+    SyntaxNode node;
+    static std::optional<SwitchExpression> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::SwitchExpr) return std::nullopt;
+        return SwitchExpression{n};
+    }
+    std::optional<Expression> scrutinee() const;
+    std::vector<SwitchArm> arms() const;
 };
 
 }  // namespace ast

@@ -212,6 +212,10 @@ void Parser::parseTopLevel() {
         parseStructOrClassDecl(SyntaxKind::ClassDecl, SyntaxKind::KwClass);
         return;
     }
+    if (peekKind(declMods) == SyntaxKind::KwEnum) {
+        parseEnumDecl();
+        return;
+    }
 
     // Check function decl first, then typed var decl.
     if (looksLikeFuncDecl(/*allowShorthand=*/false)) {
@@ -541,6 +545,30 @@ void Parser::parseFieldDecl() {
     builder.finishNode();
 }
 
+void Parser::parseEnumDecl() {
+    builder.startNode(SyntaxKind::EnumDecl);
+    parseVisibilityModifier();
+    expect(SyntaxKind::KwEnum, "'enum'");
+    expect(SyntaxKind::Identifier, "enum name");
+    expect(SyntaxKind::LBrace, "'{'");
+    while (!at(SyntaxKind::RBrace) && !atEnd()) {
+        size_t before = current;
+        if (at(SyntaxKind::Identifier)) {
+            builder.startNode(SyntaxKind::EnumMember);
+            bump();
+            builder.finishNode();
+            eat(SyntaxKind::Comma);
+        } else {
+            reportAtCurrent("Expected an enum member name");
+            recoverTo({SyntaxKind::Comma, SyntaxKind::RBrace, SyntaxKind::EndOfFile});
+            eat(SyntaxKind::Comma);
+        }
+        if (current == before && !atEnd()) bump();
+    }
+    expect(SyntaxKind::RBrace, "'}'");
+    builder.finishNode();
+}
+
 // =================================================================
 // Types
 // =================================================================
@@ -669,6 +697,7 @@ void Parser::parseStatement() {
     if (k == SyntaxKind::KwIf)          { parseIfStmt(); return; }
     if (k == SyntaxKind::KwWhile)       { parseWhileStmt(); return; }
     if (k == SyntaxKind::KwFor)         { parseForStmt(); return; }
+    if (k == SyntaxKind::KwSwitch)      { parseSwitchStmt(); return; }
     if (k == SyntaxKind::KwBreak)       { parseBreakStmt(); return; }
     if (k == SyntaxKind::KwContinue)    { parseContinueStmt(); return; }
     if (k == SyntaxKind::KwReturn)      { parseReturnStmt(); return; }
@@ -895,6 +924,57 @@ void Parser::parseExprStmt() {
     builder.finishNode();
 }
 
+void Parser::parseSwitchStmt() {
+    builder.startNode(SyntaxKind::SwitchStmt);
+    expect(SyntaxKind::KwSwitch, "'switch'");
+    parseSwitchHeaderAndArms();
+    builder.finishNode();
+}
+
+void Parser::parseSwitchExpr() {
+    builder.startNode(SyntaxKind::SwitchExpr);
+    expect(SyntaxKind::KwSwitch, "'switch'");
+    parseSwitchHeaderAndArms();
+    builder.finishNode();
+}
+
+void Parser::parseSwitchHeaderAndArms() {
+    expect(SyntaxKind::LParen, "'(' after 'switch'");
+    parseExpression();
+    expect(SyntaxKind::RParen, "')' after the switch value");
+    expect(SyntaxKind::LBrace, "'{' to begin the switch body");
+    while (!at(SyntaxKind::RBrace) && !atEnd()) {
+        size_t before = current;
+        parseSwitchArm();
+        if (current == before) {
+            reportAtCurrent("Unexpected token in switch body");
+            recoverTo({SyntaxKind::Comma, SyntaxKind::RBrace, SyntaxKind::EndOfFile});
+            eat(SyntaxKind::Comma);
+            if (current == before && !atEnd()) bump();
+        }
+    }
+    expect(SyntaxKind::RBrace, "'}' to close the switch body");
+}
+
+void Parser::parseSwitchArm() {
+    builder.startNode(SyntaxKind::SwitchArm);
+    if (at(SyntaxKind::KwDefault)) {
+        bump();
+    } else {
+        // One or more comma-separated labels, ending at the `->`.
+        parseExpression();
+        while (eat(SyntaxKind::Comma)) {
+            if (at(SyntaxKind::Arrow) || at(SyntaxKind::RBrace) || atEnd()) break;
+            parseExpression();
+        }
+    }
+    expect(SyntaxKind::Arrow, "'->' after the switch label");
+    if (at(SyntaxKind::LBrace)) parseBlock();
+    else parseExpression();
+    eat(SyntaxKind::Comma);
+    builder.finishNode();
+}
+
 // =================================================================
 // Expressions (Pratt)
 // =================================================================
@@ -1065,6 +1145,9 @@ void Parser::parsePrefix() {
             builder.finishNode();
             return;
         }
+        case SyntaxKind::KwSwitch:
+            parseSwitchExpr();
+            return;
         case SyntaxKind::IntLiteral:
         case SyntaxKind::LongLiteral:
         case SyntaxKind::FloatLiteral:

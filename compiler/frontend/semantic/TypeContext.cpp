@@ -112,8 +112,27 @@ Type* TypeContext::lookupExternalType(const std::u16string& modulePath, const st
     return it == externalCache.end() ? nullptr : it->second;
 }
 
+Type* TypeContext::registerEnum(const std::u16string& modulePath, std::u16string name) {
+    auto info = std::make_unique<StructInfo>();
+    info->name = name;
+    info->modulePath = modulePath;
+    StructInfo* infoPtr = info.get();
+    ownedStructs.push_back(std::move(info));
+
+    Type* t = allocate(TypeKind::Enum);
+    t->structInfo = infoPtr;
+    enumCache[Key{modulePath, std::move(name)}] = t;
+    return t;
+}
+
+Type* TypeContext::lookupEnum(const std::u16string& modulePath, const std::u16string& name) const {
+    auto it = enumCache.find(Key{modulePath, name});
+    return it == enumCache.end() ? nullptr : it->second;
+}
+
 Type* TypeContext::lookupNamedType(const std::u16string& modulePath, const std::u16string& name) const {
     if (Type* t = lookupStruct(modulePath, name)) return t;
     if (Type* t = lookupClass(modulePath, name)) return t;
+    if (Type* t = lookupEnum(modulePath, name)) return t;
     return lookupExternalType(modulePath, name);
 }

@@ -446,6 +446,34 @@ std::u16string ImportDecl::modulePath() const {
     return out;
 }
 
+// === EnumMember ===
+
+std::optional<SyntaxNode> EnumMember::nameToken() const {
+    return firstChildNode(node, SyntaxKind::Identifier);
+}
+
+std::optional<std::u16string> EnumMember::nameText() const {
+    if (auto t = nameToken()) return std::u16string(t->tokenText());
+    return std::nullopt;
+}
+
+// === EnumDecl ===
+
+std::optional<VisibilityModifier> EnumDecl::visibilityModifier() const { return visibilityOfDeclNode(node); }
+Visibility EnumDecl::visibility() const { return visibilityOfDecl(node); }
+std::optional<SyntaxNode> EnumDecl::nameToken() const { return firstIdentAfterKeyword(node, SyntaxKind::KwEnum); }
+std::optional<std::u16string> EnumDecl::nameText() const {
+    if (auto t = nameToken()) return std::u16string(t->tokenText());
+    return std::nullopt;
+}
+std::vector<EnumMember> EnumDecl::members() const {
+    std::vector<EnumMember> out;
+    for (auto& c : node.children()) {
+        if (auto m = EnumMember::cast(c)) out.push_back(*m);
+    }
+    return out;
+}
+
 // === SourceFile ===
 
 std::vector<ImportDecl> SourceFile::imports() const {
@@ -476,6 +504,14 @@ std::vector<ClassDecl> SourceFile::classes() const {
     std::vector<ClassDecl> out;
     for (auto& c : node.children()) {
         if (auto cl = ClassDecl::cast(c)) out.push_back(*cl);
+    }
+    return out;
+}
+
+std::vector<EnumDecl> SourceFile::enums() const {
+    std::vector<EnumDecl> out;
+    for (auto& c : node.children()) {
+        if (auto e = EnumDecl::cast(c)) out.push_back(*e);
     }
     return out;
 }

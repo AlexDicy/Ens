@@ -54,6 +54,10 @@ public:
     // True for a `const` binding; reassigning it is a compile error.
     bool isConst = false;
 
+    // True when this symbol surfaces an imported type name (not a runtime value),
+    // letting member access tell `EnumType.Member` from `enumValue.member`.
+    bool isTypeName = false;
+
     // escape/reassignment tracking for variables and parameters.
     EscapeKind localEscape = EscapeKind::NoEscape;
     bool reassigned = false;

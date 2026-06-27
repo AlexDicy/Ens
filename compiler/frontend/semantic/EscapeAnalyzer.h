@@ -54,6 +54,8 @@ private:
     void scanSubscript(const ast::SubscriptExpression& e);
     void scanBinary(const ast::BinaryExpression& e);
     void scanTernary(const ast::TernaryExpression& e);
+    void scanSwitchArms(const std::optional<ast::Expression>& scrutinee,
+                        const std::vector<ast::SwitchArm>& arms);
     void scanParen(const ast::ParenExpression& e);
     void scanNew(const ast::NewExpression& e);
     void scanArrayLiteral(const ast::ArrayLiteralExpression& e);

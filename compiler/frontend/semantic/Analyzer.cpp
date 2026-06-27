@@ -330,6 +330,7 @@ void Analyzer::registerNames(const SyntaxNode& root) {
 
     registerStructNames(*sf);
     registerClassNames(*sf);
+    registerEnumNames(*sf);
     registerExternalTypeNames(*sf);
 }
 
@@ -338,6 +339,7 @@ void Analyzer::resolveSignatures() {
     auto& sf = *astRoot;
 
     collectStructs(sf);
+    collectEnums(sf);
     resolveClassBases(sf);
     collectFunctions(sf);
     collectExternalFunctions(sf);
@@ -474,6 +476,51 @@ void Analyzer::registerClassNames(const ast::SourceFile& file) {
     }
 }
 
+void Analyzer::registerEnumNames(const ast::SourceFile& file) {
+    for (auto& ed : file.enums()) {
+        auto name = ed.nameText();
+        if (!name) continue;
+        if (typeCtx.lookupNamedType(modulePath_, *name)) {
+            errorAtNode(ed.node, "Duplicate type '" + asciiOf(*name) + "'");
+            continue;
+        }
+        Type* t = typeCtx.registerEnum(modulePath_, *name);
+        auto [line, col] = source.offsetToPosition(ed.node.startOffset());
+        t->structInfo->line = line;
+        t->structInfo->column = col;
+        analysis.setType(ed.node.greenNode(), t);
+    }
+}
+
+void Analyzer::collectEnums(const ast::SourceFile& file) {
+    for (auto& ed : file.enums()) {
+        Type* t = analysis.typeOf(ed.node.greenNode());
+        if (!t || !t->structInfo) continue;
+        t->structInfo->visibility = toSemanticVisibility(ed.visibility());
+        int64_t next = 0;
+        for (auto& m : ed.members()) {
+            auto mname = m.nameText();
+            if (!mname) continue;
+            bool dup = false;
+            for (auto& existing : t->structInfo->enumMembers) {
+                if (existing.name == *mname) { dup = true; break; }
+            }
+            if (dup) {
+                errorAtNode(m.node, "Duplicate enum member '" + asciiOf(*mname) + "'");
+                continue;
+            }
+            EnumMemberInfo info;
+            info.name = *mname;
+            info.value = next++;
+            t->structInfo->enumMembers.push_back(std::move(info));
+        }
+        if (t->structInfo->enumMembers.empty()) {
+            errorAtNode(ed.node, "Enum '" + asciiOf(t->structInfo->name) +
+                "' must have at least one member.");
+        }
+    }
+}
+
 void Analyzer::bindImports(const ModuleResolver& resolver) {
     bindTypeImports(resolver);
     bindValueImports(resolver);
@@ -504,6 +551,7 @@ void Analyzer::bindTypeImports(const ModuleResolver& resolver) {
             if (importedType) {
                 uint32_t namePos = imp.aliasToken() ? imp.aliasToken()->startOffset() : imp.node.startOffset();
                 Symbol* sym = makeSymbol(SymbolKind::Variable, *alias, importedType, namePos);
+                sym->isTypeName = true;
                 if (!globalScope->define(sym)) {
                     errorAtNode(imp.node, "Imported name '" + asciiOf(*alias) +
                         "' conflicts with an existing declaration");
@@ -1177,7 +1225,8 @@ Type* Analyzer::lookupTypeByName(const std::u16string& qualifier,
         if (Type* t = typeCtx.lookupNamedType(modulePath_, name)) return t;
         // Fall back to imported aliases stored in the module's globalScope.
         if (Symbol* sym = globalScope ? globalScope->lookupLocal(name) : nullptr) {
-            if (sym->type && (sym->type->isStruct() || sym->type->isClass() || sym->type->isExternal())) return sym->type;
+            if (sym->type && (sym->type->isStruct() || sym->type->isClass() ||
+                              sym->type->isEnum() || sym->type->isExternal())) return sym->type;
         }
         errorAtNode(diagNode, "Unknown type '" + asciiOf(name) + "'");
         return typeCtx.getError();
@@ -1399,6 +1448,7 @@ void Analyzer::analyzeStatement(const ast::Statement& stmt) {
     if (auto e = stmt.asExpressionStmt())     { analyzeExpressionStmt(*e); return; }
     if (auto th = stmt.asThrow())             { analyzeThrowStmt(*th); return; }
     if (auto rt = stmt.asRethrow())           { analyzeRethrowStmt(*rt); return; }
+    if (auto sw = stmt.asSwitch())            { analyzeSwitchStmt(*sw); return; }
 }
 
 void Analyzer::analyzeBlock(const ast::Block& block) {
@@ -1652,6 +1702,7 @@ void Analyzer::analyzeBranchWithNarrowing(const ast::Block& block,
 // True when control can never fall out the bottom of a block (every path returns,
 // throws, or rethrows), so the guard that led there holds for the following code.
 static bool blockAlwaysExits(const ast::Block& block);
+static bool switchStatementAlwaysExits(const ast::SwitchStatement& sw);
 
 static bool ifStatementAlwaysExits(const ast::IfStatement& i) {
     auto then = i.thenBlock();
@@ -1666,6 +1717,7 @@ static bool statementAlwaysExits(const ast::Statement& s) {
     if (s.asReturn() || s.asThrow() || s.asRethrow()) return true;
     if (auto b = s.asBlock()) return blockAlwaysExits(*b);
     if (auto i = s.asIf()) return ifStatementAlwaysExits(*i);
+    if (auto sw = s.asSwitch()) return switchStatementAlwaysExits(*sw);
     return false;
 }
 
@@ -1674,6 +1726,22 @@ static bool blockAlwaysExits(const ast::Block& block) {
         if (statementAlwaysExits(s)) return true;
     }
     return false;
+}
+
+// A switch always exits only when it has a `default` arm and every arm body is
+// a block that always exits. This is a deliberate under-approximation: an
+// exhaustive enum switch without a default, or an expression-bodied arm, is not
+// counted, which keeps the narrowing it feeds conservative.
+static bool switchStatementAlwaysExits(const ast::SwitchStatement& sw) {
+    bool hasDefault = false;
+    for (auto& arm : sw.arms()) {
+        if (arm.isDefault()) hasDefault = true;
+        auto bn = arm.bodyBlockNode();
+        if (!bn) return false;
+        auto blk = ast::Block::cast(*bn);
+        if (!blk || !blockAlwaysExits(*blk)) return false;
+    }
+    return hasDefault;
 }
 
 void Analyzer::analyzeIfStmt(const ast::IfStatement& stmt) {
@@ -1844,6 +1912,7 @@ Type* Analyzer::analyzeExpr(const ast::Expression& expr) {
     else if (auto pr = expr.asParen())  t = analyzeParen(*pr);
     else if (auto al = expr.asArrayLiteral()) t = analyzeArrayLiteral(*al);
     else if (auto is = expr.asInterpString()) t = analyzeInterpString(*is);
+    else if (auto sw = expr.asSwitch()) t = analyzeSwitchExpr(*sw);
     else                                t = typeCtx.getError();
     analysis.setType(expr.node.greenNode(), t);
     return t;
@@ -1854,9 +1923,9 @@ Type* Analyzer::analyzeInterpString(const ast::InterpStringExpression& expr) {
     for (auto& hole : expr.holes()) {
         Type* ht = analyzeExpr(hole);
         if (ht->isError()) continue;
-        if (!ht->isInteger() && !ht->isBool() && !ht->isString()) {
+        if (!ht->isInteger() && !ht->isBool() && !ht->isString() && !ht->isEnum()) {
             errorAtNode(hole.node, "Cannot interpolate a value of type '" + ht->toString() +
-                "'; only string, integer, and bool values are supported here. Convert it with '.toString()' first.");
+                "'; only string, integer, bool, and enum values are supported here. Convert it with '.toString()' first.");
         }
     }
     return stringTy;
@@ -2186,7 +2255,7 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
             if (memberName && *memberName == u"toString") {
                 Type* recvT = analyzeExpr(*objExpr);
                 if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }
-                if (recvT->isInteger() || recvT->isBool() || recvT->isString()) {
+                if (recvT->isInteger() || recvT->isBool() || recvT->isString() || recvT->isEnum()) {
                     if (!args.empty()) {
                         errorAtNode(expr.node, "'toString' takes no arguments.");
                         for (auto& a : args) analyzeExpr(a);
@@ -2518,6 +2587,37 @@ Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
                 }
                 errorAtNode(expr.node, "Module '" + asciiOf(nsSym->namespaceModulePath) +
                     "' has no '" + asciiOf(*memberName) + "'");
+                return typeCtx.getError();
+            }
+        }
+    }
+
+    // Enum member access. The object must denote an enum type (a
+    // bare in-module enum name or an imported enum type alias), not a value of
+    // enum type.
+    if (auto idObj = obj->asIdent()) {
+        if (auto idName = idObj->nameText()) {
+            Symbol* valSym = currentScope ? currentScope->lookup(*idName) : nullptr;
+            Type* enumType = nullptr;
+            if (!valSym) {
+                enumType = typeCtx.lookupEnum(modulePath_, *idName);
+            } else if (valSym->isTypeName && valSym->type && valSym->type->isEnum()) {
+                enumType = valSym->type;
+                analysis.setSymbol(idObj->node.greenNode(), valSym);
+            }
+            if (enumType && enumType->structInfo) {
+                analysis.setType(idObj->node.greenNode(), enumType);
+                auto memberName = expr.memberText();
+                if (!memberName) return typeCtx.getError();
+                for (auto& m : enumType->structInfo->enumMembers) {
+                    if (m.name == *memberName) {
+                        analysis.setEnumConstant(expr.node.greenNode(), m.value);
+                        analysis.setType(expr.node.greenNode(), enumType);
+                        return enumType;
+                    }
+                }
+                errorAtNode(expr.node, "'" + asciiOf(*memberName) + "' is not a member of enum '" +
+                    enumType->toString() + "'");
                 return typeCtx.getError();
             }
         }
@@ -2978,6 +3078,211 @@ void Analyzer::analyzeRethrowStmt(const ast::RethrowStatement& stmt) {
     if (!inCatchClause) {
         errorAtNode(stmt.node, "'rethrow' can only be used inside a 'catch' block.");
     }
+}
+
+namespace {
+
+std::optional<int64_t> switchIntLabelValue(const ast::Expression& e) {
+    const ast::LiteralExpression* lit = asIntLiteralChild(e);
+    if (!lit) return std::nullopt;
+    auto tok = lit->token();
+    if (!tok) return std::nullopt;
+    uint64_t mag = 0;
+    if (!parseIntegerLiteralMagnitude(std::u16string(tok->tokenText()), mag)) return std::nullopt;
+    return literalIsNegative(e) ? -static_cast<int64_t>(mag) : static_cast<int64_t>(mag);
+}
+
+bool isNullLabel(const ast::Expression& e) {
+    if (auto lit = e.asLiteral()) return lit->literalKind() == SyntaxKind::KwNull;
+    return false;
+}
+
+bool stringLabelText(const ast::Expression& e, std::u16string& out) {
+    if (auto lit = e.asLiteral()) {
+        if (lit->literalKind() == SyntaxKind::StringLiteral) {
+            if (auto tok = lit->token()) { out = std::u16string(tok->tokenText()); return true; }
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+void Analyzer::analyzeSwitchStmt(const ast::SwitchStatement& stmt) {
+    analyzeSwitchArms(stmt.scrutinee(), stmt.arms(), stmt.node, /*requireValue=*/false);
+}
+
+Type* Analyzer::analyzeSwitchExpr(const ast::SwitchExpression& expr) {
+    return analyzeSwitchArms(expr.scrutinee(), expr.arms(), expr.node, /*requireValue=*/true);
+}
+
+Type* Analyzer::analyzeSwitchArms(const std::optional<ast::Expression>& scrutinee,
+                                  const std::vector<ast::SwitchArm>& arms,
+                                  const SyntaxNode& diagNode, bool requireValue) {
+    Type* scrutType = scrutinee ? analyzeExpr(*scrutinee) : typeCtx.getError();
+    bool nullable = scrutType->isOptional();
+    Type* inner = nullable ? scrutType->inner : scrutType;
+    bool scrutOk = inner && !inner->isError() &&
+                   (inner->isEnum() || inner->isInteger() || inner->isString());
+    if (scrutinee && !scrutType->isError() && !scrutOk) {
+        errorAtNode(scrutinee->node, "Cannot switch on a value of type '" + scrutType->toString() +
+            "'; switch supports enum, integer, and string values.");
+    }
+
+    bool hasDefault = false;
+    bool nullCovered = false;
+    std::vector<int64_t> seenInts;
+    std::vector<std::u16string> seenStrings;
+    std::vector<int64_t> coveredEnum;
+    std::vector<ast::Expression> valueExprs;
+    bool sawValueBlock = false;
+
+    for (auto& arm : arms) {
+        if (arm.isDefault()) {
+            if (hasDefault) errorAtNode(arm.node, "A switch can have only one 'default' arm.");
+            hasDefault = true;
+        } else {
+            for (auto& label : arm.labels()) {
+                if (isNullLabel(label)) {
+                    analysis.setType(label.node.greenNode(), typeCtx.getNull());
+                    if (!nullable) {
+                        errorAtNode(label.node, "'null' is only a valid label when the switch value is nullable.");
+                    } else if (nullCovered) {
+                        errorAtNode(label.node, "Duplicate 'null' label.");
+                    } else {
+                        nullCovered = true;
+                    }
+                    continue;
+                }
+                if (!scrutOk) continue;
+                if (inner->isEnum()) {
+                    std::optional<int64_t> value;
+                    if (auto id = label.asIdent()) {
+                        auto lname = id->nameText();
+                        if (lname && inner->structInfo) {
+                            for (auto& m : inner->structInfo->enumMembers) {
+                                if (m.name == *lname) { value = m.value; break; }
+                            }
+                        }
+                        if (value) {
+                            analysis.setType(label.node.greenNode(), inner);
+                            analysis.setEnumConstant(label.node.greenNode(), *value);
+                        } else {
+                            errorAtNode(label.node, "'" + asciiOf(lname.value_or(std::u16string{})) +
+                                "' is not a member of enum '" + inner->toString() + "'.");
+                        }
+                    } else {
+                        Type* lt = analyzeExpr(label);
+                        if (!lt->isError() && !lt->equals(inner)) {
+                            errorAtNode(label.node, "Switch label of type '" + lt->toString() +
+                                "' does not match the switch value of type '" + inner->toString() + "'.");
+                        }
+                        if (auto ec = analysis.enumConstantOf(label.node.greenNode())) value = *ec;
+                    }
+                    if (value) {
+                        bool dup = false;
+                        for (int64_t v : coveredEnum) if (v == *value) { dup = true; break; }
+                        if (dup) errorAtNode(label.node, "Duplicate switch label.");
+                        else coveredEnum.push_back(*value);
+                    }
+                } else if (inner->isInteger()) {
+                    Type* lt = analyzeExprAdapt(label, inner);
+                    if (!lt->isError() && !inner->assignableFrom(lt) && !lt->assignableFrom(inner)) {
+                        errorAtNode(label.node, "Switch label of type '" + lt->toString() +
+                            "' does not match the switch value of type '" + inner->toString() + "'.");
+                    }
+                    if (auto v = switchIntLabelValue(label)) {
+                        bool dup = false;
+                        for (int64_t s : seenInts) if (s == *v) { dup = true; break; }
+                        if (dup) errorAtNode(label.node, "Duplicate switch label '" + std::to_string(*v) + "'.");
+                        else seenInts.push_back(*v);
+                    } else {
+                        errorAtNode(label.node, "Switch labels for an integer switch must be integer constants.");
+                    }
+                } else {  // string
+                    Type* lt = analyzeExpr(label);
+                    std::u16string text;
+                    if (!lt->isError() && !lt->isString()) {
+                        errorAtNode(label.node, "Switch label of type '" + lt->toString() +
+                            "' does not match the switch value of type 'string'.");
+                    } else if (stringLabelText(label, text)) {
+                        bool dup = false;
+                        for (auto& s : seenStrings) if (s == text) { dup = true; break; }
+                        if (dup) errorAtNode(label.node, "Duplicate switch label.");
+                        else seenStrings.push_back(text);
+                    } else if (!lt->isError()) {
+                        errorAtNode(label.node, "Switch labels for a string switch must be string literals.");
+                    }
+                }
+            }
+        }
+        if (auto bn = arm.bodyBlockNode()) {
+            if (requireValue) {
+                sawValueBlock = true;
+                errorAtNode(*bn, "A switch used as a value must use expression arms, not '{ }' blocks.");
+            }
+            if (auto blk = ast::Block::cast(*bn)) analyzeBlock(*blk);
+        } else if (auto be = arm.bodyExpr()) {
+            analyzeExpr(*be);
+            if (requireValue) valueExprs.push_back(*be);
+        }
+    }
+
+    if (scrutOk && !hasDefault) {
+        if (inner->isEnum() && inner->structInfo) {
+            std::vector<std::u16string> missing;
+            for (auto& m : inner->structInfo->enumMembers) {
+                bool covered = false;
+                for (int64_t v : coveredEnum) if (v == m.value) { covered = true; break; }
+                if (!covered) missing.push_back(m.name);
+            }
+            if (!missing.empty()) {
+                std::string list;
+                for (size_t i = 0; i < missing.size(); ++i) {
+                    if (i) list += ", ";
+                    list += "'" + asciiOf(missing[i]) + "'";
+                }
+                errorAtNode(diagNode, "This switch does not handle enum '" + inner->toString() +
+                    "' member(s) " + list + ". Add them or a 'default' arm.");
+            }
+        } else if (inner->isInteger() || inner->isString()) {
+            errorAtNode(diagNode, "A switch on '" + inner->toString() +
+                "' must have a 'default' arm.");
+        }
+    }
+    if (scrutOk && nullable && !nullCovered && !hasDefault) {
+        errorAtNode(diagNode, "This switch value can be null but no arm handles it. "
+            "Add a 'null ->' arm or a 'default' arm.");
+    }
+
+    if (!requireValue) return typeCtx.getPrimitive(TypeKind::Void);
+
+    if (sawValueBlock) return typeCtx.getError();
+    if (valueExprs.empty()) {
+        errorAtNode(diagNode, "A switch used as a value needs at least one arm.");
+        return typeCtx.getError();
+    }
+    Type* result = nullptr;
+    for (auto& ve : valueExprs) {
+        Type* t = analysis.typeOf(ve.node.greenNode());
+        if (!t || t->isError()) return typeCtx.getError();
+        if (!result) { result = t; continue; }
+        tryAdaptIntegerLiteral(ve, result);
+        if (Type* u = analysis.typeOf(ve.node.greenNode())) t = u;
+        if (t->equals(result)) continue;
+        if (Type* c = numericCommonType(result, t)) { result = c; continue; }
+        if (result->assignableFrom(t)) continue;
+        if (t->assignableFrom(result)) { result = t; continue; }
+        errorAtNode(diagNode, "Switch arms produce incompatible types '" + result->toString() +
+            "' and '" + t->toString() + "'.");
+        return typeCtx.getError();
+    }
+    if (result && result->isVoid()) {
+        errorAtNode(diagNode, "A switch used as a value must produce a value in every arm.");
+        return typeCtx.getError();
+    }
+    for (auto& ve : valueExprs) tryAdaptIntegerLiteral(ve, result);
+    return result ? result : typeCtx.getError();
 }
 
 // Array literal `[a, b, c]` with no target type: first-element-wins.

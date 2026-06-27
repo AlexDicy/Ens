@@ -79,6 +79,8 @@ enum class SyntaxKind : uint16_t {
     ExternalBlock,
     LibrarySpec,
     ExternalFuncDecl,
+    EnumDecl,
+    EnumMember,
 
     // === Type expressions ===
     TypeRef,             // identifier (or primitive keyword) optionally followed by ?
@@ -100,6 +102,8 @@ enum class SyntaxKind : uint16_t {
     ExprStmt,
     ThrowStmt,
     RethrowStmt,
+    SwitchStmt,
+    SwitchArm,           // one `label[, label...] -> body` or `default -> body`; shared by SwitchStmt and SwitchExpr
 
     // === Expressions ===
     LiteralExpr,         // wraps any literal token
@@ -126,6 +130,7 @@ enum class SyntaxKind : uint16_t {
     ArrayLiteralExpr,
     InterpStringExpr,    // "text {expr} text": alternating literal parts and holes
     TryExpr,             // try <call>: prefixes a single throwing call
+    SwitchExpr,          // switch (scrutinee) { arm, arm, ... } used as a value
 
     // === Recovery ===
     Error,               // wraps unexpected/skipped tokens during recovery

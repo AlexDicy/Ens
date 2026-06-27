@@ -124,8 +124,10 @@ private:
     // === Collect phase ===
     void registerStructNames(const ast::SourceFile& file);
     void registerClassNames(const ast::SourceFile& file);
+    void registerEnumNames(const ast::SourceFile& file);
     void registerExternalTypeNames(const ast::SourceFile& file);
     void collectStructs(const ast::SourceFile& file);
+    void collectEnums(const ast::SourceFile& file);
     void resolveClassBases(const ast::SourceFile& file);
     void layoutDeclaredClasses(const ast::SourceFile& file);
     void collectFunctions(const ast::SourceFile& file);
@@ -162,6 +164,11 @@ private:
     void analyzeExpressionStmt(const ast::ExpressionStatement& stmt);
     void analyzeThrowStmt(const ast::ThrowStatement& stmt);
     void analyzeRethrowStmt(const ast::RethrowStatement& stmt);
+    void analyzeSwitchStmt(const ast::SwitchStatement& stmt);
+    Type* analyzeSwitchExpr(const ast::SwitchExpression& expr);
+    Type* analyzeSwitchArms(const std::optional<ast::Expression>& scrutinee,
+                            const std::vector<ast::SwitchArm>& arms,
+                            const SyntaxNode& diagNode, bool requireValue);
 
     Type* analyzeExpr(const ast::Expression& expr);
     Type* analyzeLiteral(const ast::LiteralExpression& expr);

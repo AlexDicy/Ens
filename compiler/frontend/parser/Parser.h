@@ -64,6 +64,7 @@ private:
     void parseStructOrClassDecl(SyntaxKind nodeKind, SyntaxKind keywordKind);
     void parseStructOrClassMember();
     void parseFieldDecl();
+    void parseEnumDecl();
     void parseImportDecl();
     void parseImportPath();
     void parseExternalDecl();
@@ -92,6 +93,9 @@ private:
     void parseThrowStmt();
     void parseRethrowStmt();
     void parseExprStmt();
+    void parseSwitchStmt();
+    void parseSwitchHeaderAndArms();
+    void parseSwitchArm();
 
     bool looksLikeForeachHeader() const;
     bool looksLikeTypedVarDeclFrom(size_t startCursor) const;
@@ -102,6 +106,7 @@ private:
     void parseExpression();
     void parsePrecedence(int minPrec);
     void parsePrefix();
+    void parseSwitchExpr();
     void parseArgList();
     void parseCallArgument();
 
