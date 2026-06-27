@@ -81,6 +81,7 @@ struct CodeGenerator::Impl {
     std::unordered_map<::Type*, llvm::DIType*> diStructTypeCache;
     std::unordered_map<::Type*, llvm::DIType*> diClassPointerCache;
     std::unordered_map<StructInfo*, llvm::GlobalVariable*> descriptorCache;
+    std::unordered_map<StructInfo*, llvm::GlobalVariable*> enumNameTableCache;
     std::unordered_map<std::string, llvm::Constant*> stringLiteralCache;
     llvm::StructType* typeDescriptorTy = nullptr;
 
@@ -257,6 +258,7 @@ struct CodeGenerator::Impl {
             case TypeKind::String:  return llvm::PointerType::get(ctx, 0);
             case TypeKind::Struct:  return mapStructType(t);
             case TypeKind::Class:   return llvm::PointerType::get(ctx, 0);
+            case TypeKind::Enum:    return llvm::Type::getInt32Ty(ctx);
             case TypeKind::External: return llvm::PointerType::get(ctx, 0);
             case TypeKind::Array:   return llvm::PointerType::get(ctx, 0);
             case TypeKind::Optional:
@@ -1040,6 +1042,7 @@ struct CodeGenerator::Impl {
         if (const auto r = s.asReturn()) { emitReturnStmt(*r); return; }
         if (const auto th = s.asThrow()) { emitThrowStmt(*th); return; }
         if (s.asRethrow()) { emitRethrowStmt(); return; }
+        if (const auto sw = s.asSwitch()) { emitSwitch(sw->scrutinee(), sw->arms(), nullptr, false); return; }
         if (const auto e = s.asExpressionStmt()) {
             if (const auto expr = e->expression()) emitExpr(*expr);
         }
@@ -1580,6 +1583,7 @@ struct CodeGenerator::Impl {
         }
         if (auto al = e.asArrayLiteral()) return emitArrayLiteral(*al);
         if (auto is = e.asInterpString()) return emitInterpString(*is);
+        if (auto sw = e.asSwitch()) return emitSwitch(sw->scrutinee(), sw->arms(), typeOf(e.node), true);
         error(e.node.startOffset(), "Unsupported expression in codegen");
         return nullptr;
     }
@@ -3663,6 +3667,23 @@ struct CodeGenerator::Impl {
         return fn;
     }
 
+    // A per-enum `[N x ptr]` table of immortal member-name string objects,
+    // indexed by the member's value (0..N-1).
+    llvm::GlobalVariable* getOrEmitEnumNameTable(StructInfo* si) {
+        auto it = enumNameTableCache.find(si);
+        if (it != enumNameTableCache.end()) return it->second;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        std::vector<llvm::Constant*> entries;
+        entries.reserve(si->enumMembers.size());
+        for (auto& m : si->enumMembers) entries.push_back(emitStringLiteralObject(asAscii(m.name)));
+        auto* arrTy = llvm::ArrayType::get(ptrTy, entries.size());
+        auto* gv = new llvm::GlobalVariable(*module, arrTy, /*isConstant=*/true,
+            llvm::GlobalValue::PrivateLinkage, llvm::ConstantArray::get(arrTy, entries),
+            "_enumnames_" + asAscii(si->name));
+        enumNameTableCache[si] = gv;
+        return gv;
+    }
+
     // Lowers a `.toString()` call on a primitive or string receiver to an owned
     // (+1) string, matching the ownership the call site expects.
     // Converts an already-emitted non-string primitive value to a string: a
@@ -3671,6 +3692,23 @@ struct CodeGenerator::Impl {
         if (t->isBool()) {
             return builder->CreateSelect(v,
                 emitStringLiteralObject("true"), emitStringLiteralObject("false"), "bool.str");
+        }
+        if (t->isEnum() && t->structInfo) {
+            StructInfo* si = t->structInfo;
+            auto* ptrTy = llvm::PointerType::get(ctx, 0);
+            auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+            auto* arrTy = llvm::ArrayType::get(ptrTy, si->enumMembers.size());
+            llvm::Value* idx = builder->CreateSExt(v, i64Ty, "enum.idx");
+            llvm::Value* n = llvm::ConstantInt::get(i64Ty, static_cast<int64_t>(si->enumMembers.size()));
+            llvm::Value* inBounds = builder->CreateAnd(
+                builder->CreateICmpSGE(idx, llvm::ConstantInt::get(i64Ty, 0)),
+                builder->CreateICmpSLT(idx, n), "enum.inb");
+            llvm::Value* safeIdx = builder->CreateSelect(inBounds, idx, llvm::ConstantInt::get(i64Ty, 0));
+            llvm::Value* slot = builder->CreateGEP(arrTy, getOrEmitEnumNameTable(si),
+                { llvm::ConstantInt::get(i64Ty, 0), safeIdx }, "enum.name.addr");
+            llvm::Value* name = builder->CreateLoad(ptrTy, slot, "enum.name");
+            return builder->CreateSelect(inBounds, name,
+                emitStringLiteralObject("<invalid>"), "enum.str");
         }
         llvm::Value* asI64 = builder->CreateIntCast(
             v, llvm::Type::getInt64Ty(ctx), t->isSignedInteger(), "i2s.ext");
@@ -4553,7 +4591,7 @@ struct CodeGenerator::Impl {
                 auto memberName = member.memberText();
                 ::Type* recvT = typeOf(obj->node);
                 if (memberName && *memberName == u"toString" && !methodSymbolOf(member.node) &&
-                    recvT && (recvT->isInteger() || recvT->isBool() || recvT->isString())) {
+                    recvT && (recvT->isInteger() || recvT->isBool() || recvT->isString() || recvT->isEnum())) {
                     return emitToString(*obj, recvT);
                 }
                 if (memberName && *memberName == u"toBytes" && !methodSymbolOf(member.node) &&
@@ -4928,6 +4966,10 @@ struct CodeGenerator::Impl {
     }
 
     llvm::Value* emitMember(const ast::MemberExpression& e) {
+        // the analyzer resolved this to an enum member constant.
+        if (auto ec = analysis.enumConstantOf(e.node.greenNode())) {
+            return llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), *ec, /*isSigned=*/true);
+        }
         auto obj = e.object();
         ::Type* objType = obj ? typeOf(obj->node) : nullptr;
         if (objType && objType->isArray()) {
@@ -5174,6 +5216,121 @@ struct CodeGenerator::Impl {
         auto* phi = builder->CreatePHI(thenV->getType(), 2);
         phi->addIncoming(thenV, thenEnd);
         phi->addIncoming(elseV, elseEnd);
+        return phi;
+    }
+
+    static bool isNullSwitchLabel(const ast::Expression& label) {
+        if (auto lit = label.asLiteral()) return lit->literalKind() == SyntaxKind::KwNull;
+        return false;
+    }
+
+    llvm::Value* emitSwitch(const std::optional<ast::Expression>& scrutOpt,
+                            const std::vector<ast::SwitchArm>& arms,
+                            ::Type* resultType, bool isExpr) {
+        if (!scrutOpt) return nullptr;
+        ::Type* scrutType = typeOf(scrutOpt->node);
+        bool nullable = scrutType && scrutType->isOptional();
+        ::Type* inner = nullable ? scrutType->inner : scrutType;
+        llvm::Value* scrutVal = emitExpr(*scrutOpt);
+        if (!scrutVal) return nullptr;
+
+        auto* mergeBB = llvm::BasicBlock::Create(ctx, "switch.end", currentFunction);
+
+        const ast::SwitchArm* defaultArm = nullptr;
+        llvm::BasicBlock* defaultBodyBB = nullptr;
+        llvm::BasicBlock* nullBodyBB = nullptr;
+        std::vector<std::pair<const ast::SwitchArm*, llvm::BasicBlock*>> labeledArms;
+        for (auto& arm : arms) {
+            if (arm.isDefault()) {
+                defaultArm = &arm;
+                defaultBodyBB = llvm::BasicBlock::Create(ctx, "switch.default", currentFunction);
+                continue;
+            }
+            bool isNullArm = false;
+            for (auto& label : arm.labels()) if (isNullSwitchLabel(label)) { isNullArm = true; break; }
+            auto* bb = llvm::BasicBlock::Create(ctx, isNullArm ? "switch.null" : "switch.case", currentFunction);
+            if (isNullArm) nullBodyBB = bb;
+            labeledArms.push_back({&arm, bb});
+        }
+
+        llvm::BasicBlock* unreachableBB = nullptr;
+        llvm::BasicBlock* valueDefaultBB = defaultBodyBB;
+        if (!valueDefaultBB) {
+            unreachableBB = llvm::BasicBlock::Create(ctx, "switch.unreachable", currentFunction);
+            valueDefaultBB = unreachableBB;
+        }
+
+        if (nullable) {
+            auto* ptrTy = llvm::PointerType::get(ctx, 0);
+            llvm::Value* isNull = builder->CreateICmpEQ(
+                scrutVal, llvm::ConstantPointerNull::get(ptrTy), "switch.isnull");
+            auto* nonNullBB = llvm::BasicBlock::Create(ctx, "switch.nonnull", currentFunction);
+            builder->CreateCondBr(isNull, nullBodyBB ? nullBodyBB : valueDefaultBB, nonNullBB);
+            builder->SetInsertPoint(nonNullBB);
+        }
+
+        if (inner && inner->isString()) {
+            for (auto& [arm, bb] : labeledArms) {
+                for (auto& label : arm->labels()) {
+                    if (isNullSwitchLabel(label)) continue;
+                    llvm::Value* labelStr = emitExpr(label);
+                    if (!labelStr) continue;
+                    llvm::Value* eq = builder->CreateCall(getOrDefineEnsStringEq(),
+                        { scrutVal, labelStr }, "switch.streq");
+                    auto* nextBB = llvm::BasicBlock::Create(ctx, "switch.next", currentFunction);
+                    builder->CreateCondBr(eq, bb, nextBB);
+                    builder->SetInsertPoint(nextBB);
+                }
+            }
+            builder->CreateBr(valueDefaultBB);
+        } else {
+            auto* intTy = llvm::cast<llvm::IntegerType>(mapType(inner));
+            std::vector<std::pair<llvm::ConstantInt*, llvm::BasicBlock*>> cases;
+            for (auto& [arm, bb] : labeledArms) {
+                for (auto& label : arm->labels()) {
+                    if (isNullSwitchLabel(label)) continue;
+                    llvm::ConstantInt* cv = nullptr;
+                    if (auto ec = analysis.enumConstantOf(label.node.greenNode())) {
+                        cv = llvm::ConstantInt::get(intTy, *ec, /*isSigned=*/true);
+                    } else if (auto* c = llvm::dyn_cast_or_null<llvm::ConstantInt>(emitExpr(label))) {
+                        cv = llvm::ConstantInt::get(intTy, c->getSExtValue(), /*isSigned=*/true);
+                    }
+                    if (cv) cases.push_back({cv, bb});
+                }
+            }
+            auto* sw = builder->CreateSwitch(scrutVal, valueDefaultBB,
+                static_cast<unsigned>(cases.size()));
+            for (auto& [cv, bb] : cases) sw->addCase(cv, bb);
+        }
+
+        std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> phiIncomings;
+        auto emitBody = [&](const ast::SwitchArm& arm, llvm::BasicBlock* bb) {
+            builder->SetInsertPoint(bb);
+            if (auto bn = arm.bodyBlockNode()) {
+                if (auto blk = ast::Block::cast(*bn)) emitBlock(*blk);
+            } else if (auto be = arm.bodyExpr()) {
+                if (isExpr) {
+                    llvm::Value* v = emitExprConverted(*be, resultType);
+                    llvm::BasicBlock* endb = builder->GetInsertBlock();
+                    if (v && !endb->getTerminator()) phiIncomings.push_back({v, endb});
+                } else {
+                    emitExpr(*be);
+                }
+            }
+            if (!builder->GetInsertBlock()->getTerminator()) builder->CreateBr(mergeBB);
+        };
+        for (auto& [arm, bb] : labeledArms) emitBody(*arm, bb);
+        if (defaultBodyBB && defaultArm) emitBody(*defaultArm, defaultBodyBB);
+        if (unreachableBB) {
+            builder->SetInsertPoint(unreachableBB);
+            builder->CreateUnreachable();
+        }
+
+        builder->SetInsertPoint(mergeBB);
+        if (!isExpr || phiIncomings.empty()) return nullptr;
+        auto* phi = builder->CreatePHI(phiIncomings[0].first->getType(),
+            static_cast<unsigned>(phiIncomings.size()));
+        for (auto& [v, b] : phiIncomings) phi->addIncoming(v, b);
         return phi;
     }
 
