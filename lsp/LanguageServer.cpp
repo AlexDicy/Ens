@@ -218,7 +218,7 @@ lsp::InitializeResult LanguageServer::onInitialize(lsp::InitializeParams&& param
     lsp::SemanticTokensOptions stOpts;
     stOpts.legend.tokenTypes = {
         "function", "method", "parameter", "variable",
-        "property", "class", "struct", "type", "namespace"
+        "property", "class", "struct", "type", "namespace", "enum"
     };
     stOpts.legend.tokenModifiers = {};
     stOpts.full = true;
@@ -375,7 +375,7 @@ namespace {
 // Indices into the SemanticTokensLegend.tokenTypes array declared in onInitialize.
 enum SemanticTokenType : uint32_t {
     StFunction = 0, StMethod, StParameter, StVariable,
-    StProperty, StClass, StStruct, StType, StNamespace
+    StProperty, StClass, StStruct, StType, StNamespace, StEnum
 };
 
 struct SemanticTokenEntry {
@@ -414,6 +414,7 @@ uint32_t typeForType(const ::Type* t) {
     if (!t) return StType;
     if (t->kind == TypeKind::Class)  return StClass;
     if (t->kind == TypeKind::Struct) return StStruct;
+    if (t->kind == TypeKind::Enum)   return StEnum;
     return StType;
 }
 
@@ -672,6 +673,17 @@ lsp::TextDocument_CompletionResult LanguageServer::onCompletion(lsp::CompletionP
     std::vector<lsp::CompletionItem> items;
     const auto& info = *mctx.receiverType->structInfo;
     items.reserve(info.fields.size() + info.methods.size());
+
+    if (mctx.receiverType->isEnum()) {
+        for (const auto& m : info.enumMembers) {
+            lsp::CompletionItem item;
+            item.label = utf16To8(m.name);
+            item.kind = lsp::CompletionItemKindEnum(lsp::CompletionItemKind::EnumMember);
+            item.detail = mctx.receiverType->toString();
+            items.push_back(std::move(item));
+        }
+        return std::move(items);
+    }
 
     auto isVisible = [&](Visibility v) {
         if (v == Visibility::Private) return mctx.receiverIsThis;
