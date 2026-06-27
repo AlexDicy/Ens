@@ -4,6 +4,7 @@
 --     // @stdout Hello!
 -- use @expect-error instead to assert the compiler reports a specific diagnostic.
 --     // @expect-error Undefined function 'testFunction'
+-- tests run in parallel; set ENS_TEST_JOBS to override the worker count (default: cpu count).
 task("test")
     set_menu({
         usage = "xmake test",
@@ -12,6 +13,7 @@ task("test")
     })
     on_run(function()
         import("core.project.config")
+        import("async.runjobs")
         config.load()
         local mode = config.get("mode") or "release"
         local plat = config.get("plat") or os.host()
@@ -28,9 +30,6 @@ task("test")
         local tests_dir = path.join(os.projectdir(), "tests")
         local out_dir   = path.join(os.projectdir(), "build", "tests")
         os.mkdir(out_dir)
-
-        local total, passed = 0, 0
-        local failures = {}
 
         -- list of tests:
         --   * every tests/*.ens file (single-file mode)
@@ -54,8 +53,9 @@ task("test")
             end
         end
 
-        for _, job in ipairs(jobs) do
-            total = total + 1
+        -- run a single test: compile, optionally run, and compare against the header.
+        -- returns { name = ..., ok = bool, short = <fail reason>, full = <detailed report> }.
+        local function run_one(job)
             local name = job.name
             local ens_file = job.ens_file
             local exe_file    = path.join(out_dir, name .. ".exe")
@@ -98,59 +98,84 @@ task("test")
                     table.insert(why, string.format("error %q not found in stderr", expected_error))
                 end
                 if #why == 0 then
-                    passed = passed + 1
-                    print(string.format("\27[32mPASS\27[0m %s", name))
-                else
-                    table.insert(failures, string.format("%s: %s\n%s", name,
-                        table.concat(why, "; "),
-                        compile_log_text:gsub("[\r\n]+$", "")))
-                    print(string.format("\27[31mFAIL\27[0m %s - %s", name, table.concat(why, "; ")))
+                    return {name = name, ok = true}
                 end
-                goto continue
+                local short = table.concat(why, "; ")
+                return {name = name, ok = false, short = short,
+                    full = string.format("%s: %s\n%s", name, short,
+                        compile_log_text:gsub("[\r\n]+$", ""))}
             end
 
             if not os.isfile(exe_file) then
-                table.insert(failures, string.format("%s: compile failed (exit %s)\n%s",
-                    name, tostring(compile_rc),
-                    compile_log_text:gsub("[\r\n]+$", "")))
-                print(string.format("\27[31mFAIL\27[0m %s - compile failed", name))
-                goto continue
+                return {name = name, ok = false, short = "compile failed",
+                    full = string.format("%s: compile failed (exit %s)\n%s",
+                        name, tostring(compile_rc),
+                        compile_log_text:gsub("[\r\n]+$", ""))}
             end
 
             local run_rc = os.execv(exe_file, {},
                 {try = true, stdout = stdout_file, stderr = stdout_file})
             local actual_stdout = (io.readfile(stdout_file) or ""):gsub("[\r\n]+$", "")
 
-            local ok = true
             local why = {}
             if run_rc ~= expected_exit then
-                ok = false
                 table.insert(why, string.format("exit=%s expected=%s",
                     tostring(run_rc), tostring(expected_exit)))
             end
             if expected_stdout ~= nil then
                 local joined = table.concat(expected_stdout, "\n")
                 if actual_stdout ~= joined then
-                    ok = false
                     table.insert(why, string.format("stdout=%q expected=%q",
                         actual_stdout, joined))
                 end
             end
             for _, sub in ipairs(expected_contains) do
                 if not actual_stdout:find(sub, 1, true) then
-                    ok = false
                     table.insert(why, string.format("stdout missing %q", sub))
                 end
             end
 
-            if ok then
-                passed = passed + 1
-                print(string.format("\27[32mPASS\27[0m %s", name))
-            else
-                table.insert(failures, string.format("%s: %s", name, table.concat(why, "; ")))
-                print(string.format("\27[31mFAIL\27[0m %s - %s", name, table.concat(why, "; ")))
+            if #why == 0 then
+                return {name = name, ok = true}
             end
-            ::continue::
+            local short = table.concat(why, "; ")
+            return {name = name, ok = false, short = short,
+                full = string.format("%s: %s", name, short)}
+        end
+
+        -- worker count: ENS_TEST_JOBS override, else one per cpu, capped at the test count.
+        local njob = tonumber(os.getenv("ENS_TEST_JOBS"))
+        if not njob then
+            local cpuinfo = os.cpuinfo()
+            njob = (type(cpuinfo) == "table" and cpuinfo.ncpu) or 8
+        end
+        njob = math.max(1, math.min(njob, #jobs))
+
+        print(string.format("Running %d tests with %d parallel jobs...", #jobs, njob))
+
+        local results = {}
+        runjobs("run-tests", function (index)
+            local r = run_one(jobs[index])
+            results[index] = r
+            if r.ok then
+                print(string.format("\27[32mPASS\27[0m %s", r.name))
+            else
+                print(string.format("\27[31mFAIL\27[0m %s - %s", r.name, r.short))
+            end
+        end, {total = #jobs, comax = njob})
+
+        -- tally in job order for a stable summary regardless of completion order.
+        local total = #jobs
+        local passed = 0
+        local failures = {}
+        for i = 1, total do
+            local r = results[i]
+            if r and r.ok then
+                passed = passed + 1
+            else
+                table.insert(failures, (r and r.full) or
+                    string.format("%s: no result", jobs[i].name))
+            end
         end
 
         print(string.format("\n%d/%d tests passed", passed, total))
