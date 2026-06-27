@@ -346,6 +346,55 @@ Inner? maybe = outer?.inner;
 Inner chosen = maybe ?? fallback;   // fallback only when maybe is null
 ```
 
+An `enum` declares a fixed set of named constant. Enum values compare with `==` and `!=`, and a value prints (and interpolates) as its member name.
+
+```ens
+enum Command {
+    Initialize,
+    Reload,
+    Submit,
+    Exit,
+}
+
+const Command command = Command.Submit;
+if (command == Command.Submit) {
+    Log.info("running {command}");   // running Submit
+}
+```
+
+`switch` matches a value against a set of arms and runs (or evaluates to) the first matching arm. It works over an enum, an integer, or a string. Each arm is written `label -> body`, or `default -> body` for the catch-all; several labels separated by commas share one arm. There is no fall-through, so exactly one arm runs.
+
+A switch over an enum must be exhaustive: it either covers every member or provides a `default`. A non-exhaustive enum switch is a compile error that names the missing members, so adding a member forces every switch over that enum to be updated. A switch over an integer or a string must provide a `default`.
+
+A switch is also an expression: each arm yields a value, the arms unify to a common type (the same way the branches of `?:` do), and the switch evaluates to the matched arm's value. In statement position an arm's body may be a `{ }` block; used as a value, each arm is a single expression.
+
+When the value is nullable, a `null ->` arm handles the null case and counts toward exhaustiveness alongside the other labels.
+
+```ens
+const number = switch (command) {
+    Initialize -> 17,
+    Reload -> 18,
+    Submit, Exit -> 0,            // one arm shared by two members
+};
+
+return switch (status) {          // over an int, default required
+    200 -> "ok",
+    404 -> "missing",
+    default -> "other",
+};
+
+switch (command) {                // statement form: block or expression arms
+    Initialize -> { Log.info("starting"); },
+    default -> Log.info("ignored"),
+}
+
+let length = switch (name) {      // name is string?, the null case is handled
+    "hi" -> 2,
+    null -> -1,
+    default -> 0,
+};
+```
+
 ---
 
 Arrays are written with `T[]` and are reference types: declaring an array variable binds a pointer to a heap allocation, and copying the variable copies the pointer.
