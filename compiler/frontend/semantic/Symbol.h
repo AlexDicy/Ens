@@ -51,6 +51,9 @@ public:
 
     ParamEscapeInfo escapeInfo;
 
+    // True for a `const` binding; reassigning it is a compile error.
+    bool isConst = false;
+
     // escape/reassignment tracking for variables and parameters.
     EscapeKind localEscape = EscapeKind::NoEscape;
     bool reassigned = false;

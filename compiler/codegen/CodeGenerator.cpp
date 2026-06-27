@@ -123,6 +123,22 @@ struct CodeGenerator::Impl {
     std::vector<std::vector<OwnedLocal>> cleanupStack;
     std::unordered_set<Symbol*> byPointerParams;
 
+    // Break / continue targets of the enclosing loops. cleanupDepth is the number
+    // of cleanup frames live just before the loop body, so an early exit can release
+    // exactly the frames opened inside the body.
+    struct LoopTargets {
+        llvm::BasicBlock* breakBB;
+        llvm::BasicBlock* continueBB;
+        size_t cleanupDepth;
+    };
+    std::vector<LoopTargets> loopStack;
+
+    void emitLoopCleanup(size_t targetDepth) {
+        for (size_t fi = cleanupStack.size(); fi > targetDepth; --fi) {
+            emitFrameCleanup(cleanupStack[fi - 1]);
+        }
+    }
+
     // === Checked-exception lowering state (reset per function) ===
     // Address of the caller's error slot (trailing param) when this function may throw.
     llvm::Value* incomingErrorSlot = nullptr;
@@ -1017,6 +1033,10 @@ struct CodeGenerator::Impl {
         if (const auto v = s.asTypedVarDecl()) { emitTypedVarDecl(*v); return; }
         if (const auto i = s.asIf()) { emitIfStmt(*i); return; }
         if (const auto w = s.asWhile()) { emitWhileStmt(*w); return; }
+        if (const auto f = s.asFor()) { emitForStmt(*f); return; }
+        if (const auto fe = s.asForEach()) { emitForEachStmt(*fe); return; }
+        if (s.asBreak()) { emitBreakStmt(); return; }
+        if (s.asContinue()) { emitContinueStmt(); return; }
         if (const auto r = s.asReturn()) { emitReturnStmt(*r); return; }
         if (const auto th = s.asThrow()) { emitThrowStmt(*th); return; }
         if (s.asRethrow()) { emitRethrowStmt(); return; }
@@ -1384,9 +1404,115 @@ struct CodeGenerator::Impl {
             if (condV) builder->CreateCondBr(condV, bodyBB, endBB);
         }
         builder->SetInsertPoint(bodyBB);
+        loopStack.push_back({endBB, condBB, cleanupStack.size()});
         if (auto b = s.body()) emitBlock(*b);
+        loopStack.pop_back();
         if (!builder->GetInsertBlock()->getTerminator()) builder->CreateBr(condBB);
         builder->SetInsertPoint(endBB);
+    }
+
+    void emitForStmt(const ast::ForStatement& s) {
+        if (auto init = s.init()) emitStatement(*init);
+
+        auto* condBB   = llvm::BasicBlock::Create(ctx, "for.cond",   currentFunction);
+        auto* bodyBB   = llvm::BasicBlock::Create(ctx, "for.body",   currentFunction);
+        auto* updateBB = llvm::BasicBlock::Create(ctx, "for.update", currentFunction);
+        auto* endBB    = llvm::BasicBlock::Create(ctx, "for.end",    currentFunction);
+
+        builder->CreateBr(condBB);
+        builder->SetInsertPoint(condBB);
+        if (auto cond = s.condition()) {
+            llvm::Value* condV = emitExpr(*cond);
+            if (condV) builder->CreateCondBr(condV, bodyBB, endBB);
+            else builder->CreateBr(bodyBB);
+        } else {
+            builder->CreateBr(bodyBB);
+        }
+
+        builder->SetInsertPoint(bodyBB);
+        loopStack.push_back({endBB, updateBB, cleanupStack.size()});
+        if (auto b = s.body()) emitBlock(*b);
+        loopStack.pop_back();
+        if (!builder->GetInsertBlock()->getTerminator()) builder->CreateBr(updateBB);
+
+        builder->SetInsertPoint(updateBB);
+        if (auto u = s.update()) emitExpr(*u);
+        if (!builder->GetInsertBlock()->getTerminator()) builder->CreateBr(condBB);
+
+        builder->SetInsertPoint(endBB);
+    }
+
+    void emitForEachStmt(const ast::ForEachStatement& s) {
+        Symbol* elemSym = symbolOf(s.node);
+        auto it = s.iterable();
+        if (!elemSym || !it) return;
+        if (isUnsupportedType(elemSym->type)) {
+            error(s.node.startOffset(), "Loop variable '" + asAscii(elemSym->name) +
+                  "' has unsupported type");
+            return;
+        }
+
+        llvm::Value* arr = emitExpr(*it);
+        if (!arr) return;
+
+        ::Type* arrType = typeOf(it->node);
+        ::Type* arrElem = arrType ? arrType->inner : elemSym->type;
+        llvm::Type* i64 = llvm::Type::getInt64Ty(ctx);
+        llvm::Value* length = emitArrayLength(arr);
+        llvm::Value* data = emitArrayDataPtr(arr);
+
+        llvm::Value* idxAlloca = createEntryAlloca(currentFunction, i64, "foreach.i");
+        builder->CreateStore(llvm::ConstantInt::get(i64, 0), idxAlloca);
+
+        // The element binding is a per-iteration borrow of the array slot; owning
+        // uses inside the body retain it through the usual store paths.
+        llvm::Type* bindTy = mapType(elemSym->type);
+        llvm::Value* elemAlloca = createEntryAlloca(currentFunction, bindTy, asAscii(elemSym->name));
+        values[elemSym] = elemAlloca;
+
+        auto* condBB = llvm::BasicBlock::Create(ctx, "foreach.cond", currentFunction);
+        auto* bodyBB = llvm::BasicBlock::Create(ctx, "foreach.body", currentFunction);
+        auto* incBB  = llvm::BasicBlock::Create(ctx, "foreach.inc",  currentFunction);
+        auto* endBB  = llvm::BasicBlock::Create(ctx, "foreach.end",  currentFunction);
+
+        builder->CreateBr(condBB);
+        builder->SetInsertPoint(condBB);
+        llvm::Value* idx = builder->CreateLoad(i64, idxAlloca, "foreach.i.load");
+        builder->CreateCondBr(builder->CreateICmpSLT(idx, length, "foreach.cmp"), bodyBB, endBB);
+
+        builder->SetInsertPoint(bodyBB);
+        llvm::Value* curIdx = builder->CreateLoad(i64, idxAlloca, "foreach.i.cur");
+        llvm::Type* slotTy = mapType(arrElem);
+        llvm::Value* slot = builder->CreateGEP(slotTy, data, curIdx, "foreach.slot");
+        llvm::Value* elemVal = builder->CreateLoad(slotTy, slot, "foreach.elem");
+        if (arrElem && elemSym->type && arrElem->isNumeric() && !arrElem->equals(elemSym->type)) {
+            elemVal = emitNumericConversion(elemVal, arrElem, elemSym->type);
+        }
+        builder->CreateStore(elemVal, elemAlloca);
+        loopStack.push_back({endBB, incBB, cleanupStack.size()});
+        if (auto b = s.body()) emitBlock(*b);
+        loopStack.pop_back();
+        if (!builder->GetInsertBlock()->getTerminator()) builder->CreateBr(incBB);
+
+        builder->SetInsertPoint(incBB);
+        llvm::Value* incIdx = builder->CreateLoad(i64, idxAlloca, "foreach.i.inc");
+        builder->CreateStore(builder->CreateAdd(incIdx, llvm::ConstantInt::get(i64, 1)), idxAlloca);
+        builder->CreateBr(condBB);
+
+        builder->SetInsertPoint(endBB);
+        releaseIfOwnedTemp(arr, *it);
+    }
+
+    void emitBreakStmt() {
+        if (loopStack.empty()) return;
+        emitLoopCleanup(loopStack.back().cleanupDepth);
+        builder->CreateBr(loopStack.back().breakBB);
+    }
+
+    void emitContinueStmt() {
+        if (loopStack.empty()) return;
+        emitLoopCleanup(loopStack.back().cleanupDepth);
+        builder->CreateBr(loopStack.back().continueBB);
     }
 
     void emitReturnStmt(const ast::ReturnStatement& s) {
@@ -1430,6 +1556,7 @@ struct CodeGenerator::Impl {
         if (auto c = e.asCast()) return emitCast(*c);
         if (auto a = e.asAssign()) return emitAssign(*a);
         if (auto t = e.asTernary()) return emitTernary(*t);
+        if (auto nc = e.asNullCoalesce()) return emitNullCoalesce(*nc);
         if (auto n = e.asNew()) return emitNew(*n);
         if (auto tr = e.asTry()) {
             // `try` is transparent at runtime; the post-call check is keyed off
@@ -1580,6 +1707,13 @@ struct CodeGenerator::Impl {
         auto leftE = e.left();
         auto rightE = e.right();
         if (!leftE || !rightE) return nullptr;
+        // `&&` / `||` short-circuit, so the right operand must not be evaluated up front.
+        {
+            auto opTok0 = e.operatorToken();
+            SyntaxKind op0 = opTok0 ? opTok0->kind() : SyntaxKind::Invalid;
+            if (op0 == SyntaxKind::AmpAmp || op0 == SyntaxKind::PipePipe)
+                return emitLogicalShortCircuit(e, op0 == SyntaxKind::AmpAmp);
+        }
         llvm::Value* L = emitExpr(*leftE);
         llvm::Value* R = emitExpr(*rightE);
         if (!L || !R) return nullptr;
@@ -1634,9 +1768,7 @@ struct CodeGenerator::Impl {
             case SyntaxKind::Gt:      return flt ? builder->CreateFCmpOGT(L, R) : (sgn ? builder->CreateICmpSGT(L, R) : builder->CreateICmpUGT(L, R));
             case SyntaxKind::LtEq:    return flt ? builder->CreateFCmpOLE(L, R) : (sgn ? builder->CreateICmpSLE(L, R) : builder->CreateICmpULE(L, R));
             case SyntaxKind::GtEq:    return flt ? builder->CreateFCmpOGE(L, R) : (sgn ? builder->CreateICmpSGE(L, R) : builder->CreateICmpUGE(L, R));
-            case SyntaxKind::AmpAmp:
             case SyntaxKind::Amp:     return builder->CreateAnd(L, R);
-            case SyntaxKind::PipePipe:
             case SyntaxKind::Pipe:    return builder->CreateOr(L, R);
             case SyntaxKind::Caret:   return builder->CreateXor(L, R);
             case SyntaxKind::LtLt:    return builder->CreateShl(L, R);
@@ -4936,6 +5068,65 @@ struct CodeGenerator::Impl {
         auto* phi = builder->CreatePHI(ptrTy, 2, "safe.result");
         phi->addIncoming(loaded, nonnullEnd);
         phi->addIncoming(nullVal, nullEnd);
+        return phi;
+    }
+
+    llvm::Value* emitLogicalShortCircuit(const ast::BinaryExpression& e, bool isAnd) {
+        auto leftE = e.left();
+        auto rightE = e.right();
+        if (!leftE || !rightE) return nullptr;
+        llvm::Value* L = emitExpr(*leftE);
+        if (!L) return nullptr;
+
+        llvm::BasicBlock* startBB = builder->GetInsertBlock();
+        auto* rhsBB = llvm::BasicBlock::Create(ctx, isAnd ? "land.rhs" : "lor.rhs", currentFunction);
+        auto* endBB = llvm::BasicBlock::Create(ctx, isAnd ? "land.end" : "lor.end", currentFunction);
+        // `&&` evaluates the right side only when the left is true; `||` only when false.
+        if (isAnd) builder->CreateCondBr(L, rhsBB, endBB);
+        else       builder->CreateCondBr(L, endBB, rhsBB);
+
+        builder->SetInsertPoint(rhsBB);
+        llvm::Value* R = emitExpr(*rightE);
+        if (!R) return nullptr;
+        llvm::BasicBlock* rhsEnd = builder->GetInsertBlock();
+        builder->CreateBr(endBB);
+
+        builder->SetInsertPoint(endBB);
+        auto* i1 = llvm::Type::getInt1Ty(ctx);
+        auto* phi = builder->CreatePHI(i1, 2);
+        // When short-circuited the result is the left value itself: false for &&, true for ||.
+        phi->addIncoming(llvm::ConstantInt::get(i1, isAnd ? 0 : 1), startBB);
+        phi->addIncoming(R, rhsEnd);
+        return phi;
+    }
+
+    llvm::Value* emitNullCoalesce(const ast::NullCoalesceExpression& e) {
+        auto leftE = e.left();
+        auto rightE = e.right();
+        if (!leftE || !rightE) return nullptr;
+        ::Type* resultType = typeOf(e.node);
+
+        llvm::Value* L = emitExpr(*leftE);
+        if (!L) return nullptr;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        llvm::Value* isNull = builder->CreateICmpEQ(
+            L, llvm::ConstantPointerNull::get(ptrTy), "coalesce.isnull");
+
+        llvm::BasicBlock* lhsBB = builder->GetInsertBlock();
+        auto* rhsBB = llvm::BasicBlock::Create(ctx, "coalesce.rhs", currentFunction);
+        auto* endBB = llvm::BasicBlock::Create(ctx, "coalesce.end", currentFunction);
+        builder->CreateCondBr(isNull, rhsBB, endBB);
+
+        builder->SetInsertPoint(rhsBB);
+        llvm::Value* R = emitExprConverted(*rightE, resultType);
+        llvm::BasicBlock* rhsEnd = builder->GetInsertBlock();
+        if (R) builder->CreateBr(endBB);
+
+        builder->SetInsertPoint(endBB);
+        if (!R) return nullptr;
+        auto* phi = builder->CreatePHI(ptrTy, 2, "coalesce.result");
+        phi->addIncoming(L, lhsBB);
+        phi->addIncoming(R, rhsEnd);
         return phi;
     }
 

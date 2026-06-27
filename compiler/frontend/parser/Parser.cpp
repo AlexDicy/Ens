@@ -74,6 +74,26 @@ bool Parser::atContextualOut() const {
     return kindAt() == SyntaxKind::Identifier && tokenAt().text == u"out";
 }
 
+// `in` is a contextual keyword, an ordinary identifier everywhere except between
+// a foreach binding and its iterable.
+bool Parser::atContextualIn() const {
+    return kindAt() == SyntaxKind::Identifier && tokenAt().text == u"in";
+}
+
+bool Parser::peekIsContextualIn(size_t n) const {
+    size_t idx = current;
+    while (true) {
+        if (idx >= tokens.size()) return false;
+        if (!isTrivia(tokens[idx].kind)) {
+            if (n == 0) {
+                return tokens[idx].kind == SyntaxKind::Identifier && tokens[idx].text == u"in";
+            }
+            n--;
+        }
+        idx++;
+    }
+}
+
 bool Parser::eat(SyntaxKind k) {
     if (!at(k)) return false;
     bump();
@@ -607,15 +627,19 @@ void Parser::parseTypeHead() {
 
 
 bool Parser::looksLikeTypedVarDecl() const {
-    SyntaxKind k0 = peekKind(0);
+    return looksLikeTypedVarDeclFrom(0);
+}
+
+bool Parser::looksLikeTypedVarDeclFrom(size_t start) const {
+    SyntaxKind k0 = peekKind(start);
     if (!isTypeStart(k0)) return false;
     // Skip a single optional namespace qualifier: `ns.Name ...`. Primitives can't
     // be qualified, so this only fires when the leading token is an Identifier.
-    size_t cursor = 1;
+    size_t cursor = start + 1;
     if (k0 == SyntaxKind::Identifier &&
-        peekKind(1) == SyntaxKind::Dot &&
-        peekKind(2) == SyntaxKind::Identifier) {
-        cursor = 3;
+        peekKind(start + 1) == SyntaxKind::Dot &&
+        peekKind(start + 2) == SyntaxKind::Identifier) {
+        cursor = start + 3;
     }
     // Skip any interleaved sequence of `?` and `[]` type suffixes.
     while (true) {
@@ -641,8 +665,12 @@ void Parser::parseStatement() {
     SyntaxKind k = kindAt();
     if (k == SyntaxKind::LBrace)        { parseBlock(); return; }
     if (k == SyntaxKind::KwLet)         { parseLetStmt(); return; }
+    if (k == SyntaxKind::KwConst)       { parseConstDecl(); return; }
     if (k == SyntaxKind::KwIf)          { parseIfStmt(); return; }
     if (k == SyntaxKind::KwWhile)       { parseWhileStmt(); return; }
+    if (k == SyntaxKind::KwFor)         { parseForStmt(); return; }
+    if (k == SyntaxKind::KwBreak)       { parseBreakStmt(); return; }
+    if (k == SyntaxKind::KwContinue)    { parseContinueStmt(); return; }
     if (k == SyntaxKind::KwReturn)      { parseReturnStmt(); return; }
     if (k == SyntaxKind::KwThrow)       { parseThrowStmt(); return; }
     if (k == SyntaxKind::KwRethrow)     { parseRethrowStmt(); return; }
@@ -724,6 +752,111 @@ void Parser::parseWhileStmt() {
     expect(SyntaxKind::RParen, "')' after while condition");
     if (at(SyntaxKind::LBrace)) parseBlock();
     else emitMissing(SyntaxKind::LBrace, "'{' for while body");
+    builder.finishNode();
+}
+
+void Parser::parseConstDecl() {
+    // `const T x = expr;` reuses the typed-var-decl shape; `const x = expr;` reuses
+    // the let shape. Both keep the leading `const` token as a child.
+    if (looksLikeTypedVarDeclFrom(1)) {
+        builder.startNode(SyntaxKind::TypedVarDecl);
+        expect(SyntaxKind::KwConst, "'const'");
+        parseType();
+        expect(SyntaxKind::Identifier, "identifier after type");
+        if (eat(SyntaxKind::Eq)) parseExpression();
+        expect(SyntaxKind::Semi, "';' after declaration");
+        builder.finishNode();
+    } else {
+        builder.startNode(SyntaxKind::LetStmt);
+        expect(SyntaxKind::KwConst, "'const'");
+        expect(SyntaxKind::Identifier, "identifier after 'const'");
+        if (eat(SyntaxKind::Eq)) parseExpression();
+        expect(SyntaxKind::Semi, "';' after const declaration");
+        builder.finishNode();
+    }
+}
+
+bool Parser::looksLikeForeachHeader() const {
+    // Positioned at the first token inside the for parentheses.
+    SyntaxKind k0 = peekKind(0);
+    if (k0 == SyntaxKind::KwLet || k0 == SyntaxKind::KwConst) {
+        return peekKind(1) == SyntaxKind::Identifier && peekIsContextualIn(2);
+    }
+    if (!isTypeStart(k0)) return false;
+    size_t cursor = 1;
+    if (k0 == SyntaxKind::Identifier &&
+        peekKind(1) == SyntaxKind::Dot &&
+        peekKind(2) == SyntaxKind::Identifier) {
+        cursor = 3;
+    }
+    while (true) {
+        if (peekKind(cursor) == SyntaxKind::Question) { cursor += 1; continue; }
+        if (peekKind(cursor) == SyntaxKind::LBracket &&
+            peekKind(cursor + 1) == SyntaxKind::RBracket) {
+            cursor += 2;
+            continue;
+        }
+        break;
+    }
+    if (peekKind(cursor) != SyntaxKind::Identifier) return false;
+    return peekIsContextualIn(cursor + 1);
+}
+
+void Parser::parseForStmt() {
+    // The node kind (foreach vs C-style) is known only after `for (`, so open it
+    // retroactively from a checkpoint.
+    size_t cp = builder.checkpoint();
+    expect(SyntaxKind::KwFor, "'for'");
+    expect(SyntaxKind::LParen, "'(' after 'for'");
+
+    if (looksLikeForeachHeader()) {
+        builder.startNodeAt(cp, SyntaxKind::ForEachStmt);
+        if (at(SyntaxKind::KwLet) || at(SyntaxKind::KwConst)) bump();
+        else parseType();
+        expect(SyntaxKind::Identifier, "loop variable name");
+        if (atContextualIn()) bumpAs(SyntaxKind::KwIn);
+        else emitMissing(SyntaxKind::KwIn, "'in' in for-each loop");
+        parseExpression();
+        expect(SyntaxKind::RParen, "')' after for-each header");
+        if (at(SyntaxKind::LBrace)) parseBlock();
+        else emitMissing(SyntaxKind::LBrace, "'{' for loop body");
+        builder.finishNode();
+        return;
+    }
+
+    builder.startNodeAt(cp, SyntaxKind::ForStmt);
+    // init clause (each statement parser consumes its own ';')
+    if (at(SyntaxKind::Semi)) bump();
+    else if (at(SyntaxKind::KwLet)) parseLetStmt();
+    else if (at(SyntaxKind::KwConst)) parseConstDecl();
+    else if (looksLikeTypedVarDecl()) parseTypedVarDeclStmt();
+    else parseExprStmt();
+    // condition clause
+    if (!at(SyntaxKind::Semi)) parseExpression();
+    expect(SyntaxKind::Semi, "';' after for condition");
+    // update clause
+    if (!at(SyntaxKind::RParen)) {
+        builder.startNode(SyntaxKind::ForUpdate);
+        parseExpression();
+        builder.finishNode();
+    }
+    expect(SyntaxKind::RParen, "')' after for clauses");
+    if (at(SyntaxKind::LBrace)) parseBlock();
+    else emitMissing(SyntaxKind::LBrace, "'{' for loop body");
+    builder.finishNode();
+}
+
+void Parser::parseBreakStmt() {
+    builder.startNode(SyntaxKind::BreakStmt);
+    expect(SyntaxKind::KwBreak, "'break'");
+    expect(SyntaxKind::Semi, "';' after break");
+    builder.finishNode();
+}
+
+void Parser::parseContinueStmt() {
+    builder.startNode(SyntaxKind::ContinueStmt);
+    expect(SyntaxKind::KwContinue, "'continue'");
+    expect(SyntaxKind::Semi, "';' after continue");
     builder.finishNode();
 }
 
@@ -834,7 +967,11 @@ void Parser::parsePrecedence(int minPrec) {
         // type syntax like `Box?[]?[]`.
         bool isSafeSubscript = (op == SyntaxKind::Question &&
                                 peekKind(1) == SyntaxKind::LBracket);
-        int prec = isSafeSubscript ? 14 : infixPrecedence(op);
+        // `??` is two adjacent `?` tokens; like `?[` it is disambiguated here rather
+        // than merged in the lexer, so type syntax such as `T??` keeps working.
+        bool isNullCoalesce = (op == SyntaxKind::Question &&
+                               peekKind(1) == SyntaxKind::Question);
+        int prec = isSafeSubscript ? 14 : (isNullCoalesce ? 3 : infixPrecedence(op));
         if (prec < minPrec) break;
 
         if (isSafeSubscript) {
@@ -843,6 +980,15 @@ void Parser::parsePrecedence(int minPrec) {
             bump();  // '['
             parseExpression();
             expect(SyntaxKind::RBracket, "']' after safe subscript");
+            builder.finishNode();
+            continue;
+        }
+
+        if (isNullCoalesce) {
+            builder.startNodeAt(cp, SyntaxKind::NullCoalesceExpr);
+            bump();  // '?'
+            bump();  // '?'
+            parsePrecedence(prec);  // right associative
             builder.finishNode();
             continue;
         }

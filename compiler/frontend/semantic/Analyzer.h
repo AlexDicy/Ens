@@ -97,6 +97,8 @@ private:
     // of it, so catch clauses see params/this but not body locals.
     Scope* currentFunctionParamScope = nullptr;
     bool inCatchClause = false;
+    // Nesting depth of enclosing loops in the current function, for break/continue.
+    int loopDepth = 0;
 
     // Cached AST root after collectDeclarations so analyzeBodies doesn't have
     // to re-parse the source. Populated by collectDeclarations.
@@ -152,6 +154,10 @@ private:
     void analyzeTypedVarDeclStmt(const ast::TypedVarDeclStatement& stmt);
     void analyzeIfStmt(const ast::IfStatement& stmt);
     void analyzeWhileStmt(const ast::WhileStatement& stmt);
+    void analyzeForStmt(const ast::ForStatement& stmt);
+    void analyzeForEachStmt(const ast::ForEachStatement& stmt);
+    void analyzeBreakStmt(const ast::BreakStatement& stmt);
+    void analyzeContinueStmt(const ast::ContinueStatement& stmt);
     void analyzeReturnStmt(const ast::ReturnStatement& stmt);
     void analyzeExpressionStmt(const ast::ExpressionStatement& stmt);
     void analyzeThrowStmt(const ast::ThrowStatement& stmt);
@@ -183,6 +189,7 @@ private:
     Type* analyzeExprAdapt(const ast::Expression& expr, Type* target);
     Type* analyzeAssign(const ast::AssignExpression& expr);
     Type* analyzeTernary(const ast::TernaryExpression& expr);
+    Type* analyzeNullCoalesce(const ast::NullCoalesceExpression& expr);
     Type* analyzeNew(const ast::NewExpression& expr);
     Type* analyzeTry(const ast::TryExpression& expr);
     Type* analyzeParen(const ast::ParenExpression& expr);

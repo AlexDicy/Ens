@@ -21,6 +21,7 @@ bool Expression::isExpressionKind(SyntaxKind k) {
         case SyntaxKind::CastExpr:
         case SyntaxKind::AssignExpr:
         case SyntaxKind::TernaryExpr:
+        case SyntaxKind::NullCoalesceExpr:
         case SyntaxKind::NewExpr:
         case SyntaxKind::ParenExpr:
         case SyntaxKind::ArrayLiteralExpr:
@@ -68,6 +69,7 @@ std::optional<CastExpression>      Expression::asCast()      const { return Cast
 std::optional<OutArgument>         Expression::asOutArgument() const { return OutArgument::cast(node); }
 std::optional<AssignExpression>    Expression::asAssign()    const { return AssignExpression::cast(node); }
 std::optional<TernaryExpression>   Expression::asTernary()   const { return TernaryExpression::cast(node); }
+std::optional<NullCoalesceExpression> Expression::asNullCoalesce() const { return NullCoalesceExpression::cast(node); }
 std::optional<NewExpression>       Expression::asNew()       const { return NewExpression::cast(node); }
 std::optional<ParenExpression>     Expression::asParen()     const { return ParenExpression::cast(node); }
 std::optional<ArrayLiteralExpression> Expression::asArrayLiteral() const { return ArrayLiteralExpression::cast(node); }
@@ -125,6 +127,18 @@ std::optional<SyntaxNode> BinaryExpression::operatorToken() const {
         }
         if (seenLeft && c.isToken()) return c;
     }
+    return std::nullopt;
+}
+
+// === NullCoalesceExpression ===
+
+std::optional<Expression> NullCoalesceExpression::left() const {
+    return firstExpressionChild(node);
+}
+
+std::optional<Expression> NullCoalesceExpression::right() const {
+    auto exprs = expressionChildren(node);
+    if (exprs.size() >= 2) return exprs[1];
     return std::nullopt;
 }
 

@@ -9,6 +9,10 @@ bool Statement::isStatementKind(SyntaxKind k) {
         case SyntaxKind::TypedVarDecl:
         case SyntaxKind::IfStmt:
         case SyntaxKind::WhileStmt:
+        case SyntaxKind::ForStmt:
+        case SyntaxKind::ForEachStmt:
+        case SyntaxKind::BreakStmt:
+        case SyntaxKind::ContinueStmt:
         case SyntaxKind::ReturnStmt:
         case SyntaxKind::ExprStmt:
         case SyntaxKind::ThrowStmt:
@@ -29,6 +33,10 @@ std::optional<LetStatement>          Statement::asLet()             const { retu
 std::optional<TypedVarDeclStatement> Statement::asTypedVarDecl()    const { return TypedVarDeclStatement::cast(node); }
 std::optional<IfStatement>           Statement::asIf()              const { return IfStatement::cast(node); }
 std::optional<WhileStatement>        Statement::asWhile()           const { return WhileStatement::cast(node); }
+std::optional<ForStatement>          Statement::asFor()             const { return ForStatement::cast(node); }
+std::optional<ForEachStatement>      Statement::asForEach()         const { return ForEachStatement::cast(node); }
+std::optional<BreakStatement>        Statement::asBreak()           const { return BreakStatement::cast(node); }
+std::optional<ContinueStatement>     Statement::asContinue()        const { return ContinueStatement::cast(node); }
 std::optional<ReturnStatement>       Statement::asReturn()          const { return ReturnStatement::cast(node); }
 std::optional<ExpressionStatement>   Statement::asExpressionStmt()  const { return ExpressionStatement::cast(node); }
 std::optional<ThrowStatement>        Statement::asThrow()           const { return ThrowStatement::cast(node); }
@@ -47,13 +55,9 @@ std::vector<Statement> Block::statements() const {
 // === LetStatement ===
 
 std::optional<SyntaxNode> LetStatement::nameToken() const {
-    bool seenLet = false;
-    for (auto& c : node.children()) {
-        if (isTrivia(c.kind())) continue;
-        if (c.kind() == SyntaxKind::KwLet) { seenLet = true; continue; }
-        if (seenLet && c.kind() == SyntaxKind::Identifier) return c;
-    }
-    return std::nullopt;
+    // The only bare identifier token child is the variable name; identifiers in
+    // the initializer are nested inside IdentExpr nodes.
+    return firstChildNode(node, SyntaxKind::Identifier);
 }
 
 std::optional<std::u16string> LetStatement::nameText() const {
@@ -66,6 +70,10 @@ std::optional<Expression> LetStatement::initializer() const {
         if (auto e = Expression::cast(c)) return e;
     }
     return std::nullopt;
+}
+
+bool LetStatement::isConst() const {
+    return firstChildNode(node, SyntaxKind::KwConst).has_value();
 }
 
 // === TypedVarDeclStatement ===
@@ -97,6 +105,10 @@ std::optional<Expression> TypedVarDeclStatement::initializer() const {
         if (auto e = Expression::cast(c)) return e;
     }
     return std::nullopt;
+}
+
+bool TypedVarDeclStatement::isConst() const {
+    return firstChildNode(node, SyntaxKind::KwConst).has_value();
 }
 
 // === IfStatement ===
@@ -140,6 +152,80 @@ std::optional<Expression> WhileStatement::condition() const {
 }
 
 std::optional<Block> WhileStatement::body() const {
+    if (auto b = firstChildNode(node, SyntaxKind::Block)) return Block::cast(*b);
+    return std::nullopt;
+}
+
+// === ForStatement ===
+
+std::optional<Statement> ForStatement::init() const {
+    for (auto& c : node.children()) {
+        SyntaxKind k = c.kind();
+        if (k == SyntaxKind::LetStmt || k == SyntaxKind::TypedVarDecl ||
+            k == SyntaxKind::ExprStmt) {
+            return Statement::cast(c);
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<Expression> ForStatement::condition() const {
+    // The init is wrapped in a statement node and the update in a ForUpdate node,
+    // so the only direct expression child is the condition.
+    for (auto& c : node.children()) {
+        if (auto e = Expression::cast(c)) return e;
+    }
+    return std::nullopt;
+}
+
+std::optional<Expression> ForStatement::update() const {
+    if (auto fu = firstChildNode(node, SyntaxKind::ForUpdate)) {
+        for (auto& c : fu->children()) {
+            if (auto e = Expression::cast(c)) return e;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<Block> ForStatement::body() const {
+    if (auto b = firstChildNode(node, SyntaxKind::Block)) return Block::cast(*b);
+    return std::nullopt;
+}
+
+// === ForEachStatement ===
+
+std::optional<TypeReference> ForEachStatement::elementTypeRef() const {
+    if (auto tr = firstChildNode(node, SyntaxKind::TypeRef)) return TypeReference::cast(*tr);
+    return std::nullopt;
+}
+
+bool ForEachStatement::isLet() const {
+    return firstChildNode(node, SyntaxKind::KwLet).has_value();
+}
+
+bool ForEachStatement::isConst() const {
+    return firstChildNode(node, SyntaxKind::KwConst).has_value();
+}
+
+std::optional<SyntaxNode> ForEachStatement::elementNameToken() const {
+    // The type name lives inside the TypeRef node, so the only direct identifier
+    // token child is the element binding name.
+    return firstChildNode(node, SyntaxKind::Identifier);
+}
+
+std::optional<std::u16string> ForEachStatement::elementNameText() const {
+    if (auto t = elementNameToken()) return std::u16string(t->tokenText());
+    return std::nullopt;
+}
+
+std::optional<Expression> ForEachStatement::iterable() const {
+    for (auto& c : node.children()) {
+        if (auto e = Expression::cast(c)) return e;
+    }
+    return std::nullopt;
+}
+
+std::optional<Block> ForEachStatement::body() const {
     if (auto b = firstChildNode(node, SyntaxKind::Block)) return Block::cast(*b);
     return std::nullopt;
 }

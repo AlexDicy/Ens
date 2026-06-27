@@ -308,6 +308,46 @@ byte big = 300;          // error: 300 does not fit in 'byte' (range -128..127)
 
 ---
 
+`let` and a typed declaration both introduce a mutable binding. `const` introduces an immutable one: it must be initialized, and assigning to it again, or passing it as `out`, is a compile error. Like `let`, a `const` may infer its type or state it explicitly.
+
+```ens
+let count = 0;          // mutable, inferred int
+count = count + 1;      // ok
+
+const limit = 10;       // immutable, inferred int
+const int max = 100;    // immutable, explicit type
+limit = 11;             // error: cannot assign to constant 'limit'
+```
+
+`while` repeats its body while the condition holds. A `for` loop comes in two forms. The C-style form has an initializer, a condition, and an update, any of which may be omitted; the initializer is scoped to the loop. The for-each form walks an array element by element.
+
+```ens
+while (i < n) {
+    i = i + 1;
+}
+
+for (int i = 0; i < xs.length; i = i + 1) {
+    total = total + xs[i];
+}
+
+for (int x in xs) {     // x takes each element in turn
+    total = total + x;
+}
+```
+
+`break` exits the nearest enclosing loop; `continue` skips to its next iteration. Using either outside a loop is a compile error.
+
+The logical operators `&&` and `||` require `bool` operands and short-circuit: the right side is evaluated only when it can change the result, so `a != null && a.ready()` is safe.
+
+The null-coalescing operator `??` takes a nullable value on the left. It evaluates to that value when it is not `null`, and otherwise evaluates and returns the right side. The right side is skipped when the left is non-null.
+
+```ens
+Inner? maybe = outer?.inner;
+Inner chosen = maybe ?? fallback;   // fallback only when maybe is null
+```
+
+---
+
 Arrays are written with `T[]` and are reference types: declaring an array variable binds a pointer to a heap allocation, and copying the variable copies the pointer.
 
 ```ens

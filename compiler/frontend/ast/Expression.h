@@ -23,6 +23,7 @@ class CastExpression;
 class OutArgument;
 class AssignExpression;
 class TernaryExpression;
+class NullCoalesceExpression;
 class NewExpression;
 class ParenExpression;
 class ArrayLiteralExpression;
@@ -55,6 +56,7 @@ public:
     std::optional<OutArgument>         asOutArgument() const;
     std::optional<AssignExpression>    asAssign() const;
     std::optional<TernaryExpression>   asTernary() const;
+    std::optional<NullCoalesceExpression> asNullCoalesce() const;
     std::optional<NewExpression>       asNew() const;
     std::optional<ParenExpression>     asParen() const;
     std::optional<ArrayLiteralExpression> asArrayLiteral() const;
@@ -237,6 +239,17 @@ public:
     std::optional<Expression> condition() const;
     std::optional<Expression> thenBranch() const;
     std::optional<Expression> elseBranch() const;
+};
+
+class NullCoalesceExpression {
+public:
+    SyntaxNode node;
+    static std::optional<NullCoalesceExpression> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::NullCoalesceExpr) return std::nullopt;
+        return NullCoalesceExpression{n};
+    }
+    std::optional<Expression> left() const;
+    std::optional<Expression> right() const;
 };
 
 class NewExpression {

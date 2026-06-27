@@ -14,6 +14,10 @@ class TypedVarDeclStatement;
 class IfStatement;
 class ElseClause;
 class WhileStatement;
+class ForStatement;
+class ForEachStatement;
+class BreakStatement;
+class ContinueStatement;
 class ReturnStatement;
 class ExpressionStatement;
 class ThrowStatement;
@@ -33,6 +37,10 @@ public:
     std::optional<TypedVarDeclStatement> asTypedVarDecl() const;
     std::optional<IfStatement>           asIf() const;
     std::optional<WhileStatement>        asWhile() const;
+    std::optional<ForStatement>          asFor() const;
+    std::optional<ForEachStatement>      asForEach() const;
+    std::optional<BreakStatement>        asBreak() const;
+    std::optional<ContinueStatement>     asContinue() const;
     std::optional<ReturnStatement>       asReturn() const;
     std::optional<ExpressionStatement>   asExpressionStmt() const;
     std::optional<ThrowStatement>        asThrow() const;
@@ -59,6 +67,7 @@ public:
     std::optional<SyntaxNode> nameToken() const;
     std::optional<std::u16string> nameText() const;
     std::optional<Expression> initializer() const;
+    bool isConst() const;
 };
 
 class TypedVarDeclStatement {
@@ -72,6 +81,7 @@ public:
     std::optional<SyntaxNode> nameToken() const;
     std::optional<std::u16string> nameText() const;
     std::optional<Expression> initializer() const;
+    bool isConst() const;
 };
 
 class ElseClause {
@@ -106,6 +116,53 @@ public:
     }
     std::optional<Expression> condition() const;
     std::optional<Block> body() const;
+};
+
+class ForStatement {
+public:
+    SyntaxNode node;
+    static std::optional<ForStatement> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::ForStmt) return std::nullopt;
+        return ForStatement{n};
+    }
+    std::optional<Statement> init() const;
+    std::optional<Expression> condition() const;
+    std::optional<Expression> update() const;
+    std::optional<Block> body() const;
+};
+
+class ForEachStatement {
+public:
+    SyntaxNode node;
+    static std::optional<ForEachStatement> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::ForEachStmt) return std::nullopt;
+        return ForEachStatement{n};
+    }
+    std::optional<TypeReference> elementTypeRef() const;
+    bool isLet() const;
+    bool isConst() const;
+    std::optional<SyntaxNode> elementNameToken() const;
+    std::optional<std::u16string> elementNameText() const;
+    std::optional<Expression> iterable() const;
+    std::optional<Block> body() const;
+};
+
+class BreakStatement {
+public:
+    SyntaxNode node;
+    static std::optional<BreakStatement> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::BreakStmt) return std::nullopt;
+        return BreakStatement{n};
+    }
+};
+
+class ContinueStatement {
+public:
+    SyntaxNode node;
+    static std::optional<ContinueStatement> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::ContinueStmt) return std::nullopt;
+        return ContinueStatement{n};
+    }
 };
 
 class ReturnStatement {

@@ -1256,6 +1256,8 @@ void Analyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
     Scope* prevParamScope = currentFunctionParamScope;
     currentFunction = info->resolvedSymbol;
     sawSuperConstructorCall = false;
+    int prevLoopDepth = loopDepth;
+    loopDepth = 0;
 
     Scope* funcScope = pushScope();
     currentFunctionParamScope = funcScope;
@@ -1321,6 +1323,7 @@ void Analyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
     currentThis = prevThis;
     sawSuperConstructorCall = prevSawSuper;
     currentFunctionParamScope = prevParamScope;
+    loopDepth = prevLoopDepth;
 }
 
 void Analyzer::analyzeCatchClause(const ast::CatchClause& clause, Scope* funcScope) {
@@ -1388,6 +1391,10 @@ void Analyzer::analyzeStatement(const ast::Statement& stmt) {
     if (auto v = stmt.asTypedVarDecl())       { analyzeTypedVarDeclStmt(*v); return; }
     if (auto i = stmt.asIf())                 { analyzeIfStmt(*i); return; }
     if (auto w = stmt.asWhile())              { analyzeWhileStmt(*w); return; }
+    if (auto f = stmt.asFor())                { analyzeForStmt(*f); return; }
+    if (auto fe = stmt.asForEach())           { analyzeForEachStmt(*fe); return; }
+    if (auto br = stmt.asBreak())             { analyzeBreakStmt(*br); return; }
+    if (auto co = stmt.asContinue())          { analyzeContinueStmt(*co); return; }
     if (auto r = stmt.asReturn())             { analyzeReturnStmt(*r); return; }
     if (auto e = stmt.asExpressionStmt())     { analyzeExpressionStmt(*e); return; }
     if (auto th = stmt.asThrow())             { analyzeThrowStmt(*th); return; }
@@ -1419,6 +1426,7 @@ void Analyzer::analyzeLetStmt(const ast::LetStatement& stmt) {
 
     uint32_t namePos = stmt.nameToken() ? stmt.nameToken()->startOffset() : stmt.node.startOffset();
     Symbol* sym = makeSymbol(SymbolKind::Variable, name, finalType, namePos);
+    sym->isConst = stmt.isConst();
     bool collides = !currentScope->define(sym);
     if (!collides && currentScope->parent == currentFunctionParamScope &&
         currentFunctionParamScope && currentFunctionParamScope->lookupLocal(name)) {
@@ -1445,13 +1453,16 @@ void Analyzer::analyzeTypedVarDeclStmt(const ast::TypedVarDeclStatement& stmt) {
             "' to variable of type '" + declared->toString() + "'");
     }
     auto name = stmt.nameText().value_or(std::u16string{});
-    if (!initType && !isDefaultable(declared) && !declared->isError()) {
+    if (stmt.isConst() && !initType && !declared->isError()) {
+        errorAtNode(stmt.node, "Constant '" + asciiOf(name) + "' must be initialized");
+    } else if (!initType && !isDefaultable(declared) && !declared->isError()) {
         errorAtNode(stmt.node, "Variable '" + asciiOf(name) + "' has non-nullable type '" +
             declared->toString() + "' but no initializer. Provide a value, or make the type nullable ('" +
             declared->toString() + "?').");
     }
     uint32_t namePos = stmt.nameToken() ? stmt.nameToken()->startOffset() : stmt.node.startOffset();
     Symbol* sym = makeSymbol(SymbolKind::Variable, name, declared, namePos);
+    sym->isConst = stmt.isConst();
     bool collides = !currentScope->define(sym);
     if (!collides && currentScope->parent == currentFunctionParamScope &&
         currentFunctionParamScope && currentFunctionParamScope->lookupLocal(name)) {
@@ -1710,7 +1721,68 @@ void Analyzer::analyzeWhileStmt(const ast::WhileStatement& stmt) {
             errorAtNode(c->node, "While condition must be 'bool', got '" + ct->toString() + "'");
         }
     }
+    loopDepth++;
     if (auto b = stmt.body()) analyzeBlock(*b);
+    loopDepth--;
+}
+
+void Analyzer::analyzeForStmt(const ast::ForStatement& stmt) {
+    pushScope();  // the init binding is scoped to the loop
+    if (auto init = stmt.init()) analyzeStatement(*init);
+    if (auto c = stmt.condition()) {
+        Type* ct = analyzeExpr(*c);
+        if (!ct->isError() && !ct->isBool()) {
+            errorAtNode(c->node, "For condition must be 'bool', got '" + ct->toString() + "'");
+        }
+    }
+    if (auto u = stmt.update()) analyzeExpr(*u);
+    loopDepth++;
+    if (auto b = stmt.body()) analyzeBlock(*b);
+    loopDepth--;
+    popScope();
+}
+
+void Analyzer::analyzeForEachStmt(const ast::ForEachStatement& stmt) {
+    pushScope();
+    Type* iterT = typeCtx.getError();
+    if (auto it = stmt.iterable()) iterT = analyzeExpr(*it);
+    Type* elemT = typeCtx.getError();
+    if (!iterT->isError()) {
+        if (iterT->isArray() && iterT->inner) {
+            elemT = iterT->inner;
+        } else {
+            errorAtNode(stmt.node, "'for (... in ...)' requires an array, got '" +
+                iterT->toString() + "'");
+        }
+    }
+    Type* bindingT = elemT;
+    if (auto tr = stmt.elementTypeRef()) {
+        Type* declared = resolveTypeReference(*tr);
+        if (!declared->isError() && !elemT->isError() && !declared->assignableFrom(elemT)) {
+            errorAtNode(tr->node, "Loop variable of type '" + declared->toString() +
+                "' cannot hold array elements of type '" + elemT->toString() + "'");
+        }
+        bindingT = declared;
+    }
+    auto name = stmt.elementNameText().value_or(std::u16string{});
+    uint32_t namePos = stmt.elementNameToken()
+        ? stmt.elementNameToken()->startOffset() : stmt.node.startOffset();
+    Symbol* sym = makeSymbol(SymbolKind::Variable, name, bindingT, namePos);
+    sym->isConst = stmt.isConst();
+    currentScope->define(sym);
+    analysis.setSymbol(stmt.node.greenNode(), sym);
+    loopDepth++;
+    if (auto b = stmt.body()) analyzeBlock(*b);
+    loopDepth--;
+    popScope();
+}
+
+void Analyzer::analyzeBreakStmt(const ast::BreakStatement& stmt) {
+    if (loopDepth == 0) errorAtNode(stmt.node, "'break' outside of a loop");
+}
+
+void Analyzer::analyzeContinueStmt(const ast::ContinueStatement& stmt) {
+    if (loopDepth == 0) errorAtNode(stmt.node, "'continue' outside of a loop");
 }
 
 void Analyzer::analyzeReturnStmt(const ast::ReturnStatement& stmt) {
@@ -1766,6 +1838,7 @@ Type* Analyzer::analyzeExpr(const ast::Expression& expr) {
     }
     else if (auto a  = expr.asAssign()) t = analyzeAssign(*a);
     else if (auto tn = expr.asTernary())t = analyzeTernary(*tn);
+    else if (auto nc = expr.asNullCoalesce()) t = analyzeNullCoalesce(*nc);
     else if (auto nw = expr.asNew())    t = analyzeNew(*nw);
     else if (auto tr = expr.asTry())    t = analyzeTry(*tr);
     else if (auto pr = expr.asParen())  t = analyzeParen(*pr);
@@ -2370,6 +2443,10 @@ Type* Analyzer::analyzeExternalCall(const ast::CallExpression& expr, Symbol* sym
                     "' must refer to a local variable or parameter.");
                 continue;
             }
+            if (local->isConst) {
+                errorAtNode(arg.node, "Cannot pass '" + asciiOf(*identName) +
+                    "' as 'out' because it is declared as constant");
+            }
             if (auto identTok = outArg->identifier()) {
                 analysis.setSymbol(identTok->greenNode(), local);
             }
@@ -2676,6 +2753,10 @@ Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
             if (Symbol* sym = targetInfo->resolvedSymbol) {
                 targetIdentSym = sym;
                 if (sym->type) assignTargetT = sym->type;
+                if (sym->isConst) {
+                    errorAtNode(expr.node, "Cannot assign a new value to '" + asciiOf(sym->name) +
+                        "' because it is declared as constant");
+                }
             }
         }
     }
@@ -2721,6 +2802,27 @@ Type* Analyzer::analyzeTernary(const ast::TernaryExpression& expr) {
     if (elseT->assignableFrom(thenT)) return elseT;
     errorAtNode(expr.node, "Ternary branches have incompatible types '" + thenT->toString() +
         "' and '" + elseT->toString() + "'");
+    return typeCtx.getError();
+}
+
+Type* Analyzer::analyzeNullCoalesce(const ast::NullCoalesceExpression& expr) {
+    auto left = expr.left();
+    auto right = expr.right();
+    if (!left || !right) return typeCtx.getError();
+    Type* l = analyzeExpr(*left);
+    Type* r = analyzeExpr(*right);
+    if (l->isError() || r->isError()) return typeCtx.getError();
+    if (!l->isOptional() || !l->inner) {
+        errorAtNode(expr.node, "Left of '?\?' must be a nullable value, got '" + l->toString() + "'");
+        return typeCtx.getError();
+    }
+    Type* unwrapped = l->inner;
+    // The result is the non-null type when the right side fits it, and stays
+    // nullable when the right side is itself nullable.
+    if (unwrapped->assignableFrom(r)) return unwrapped;
+    if (l->assignableFrom(r)) return l;
+    errorAtNode(expr.node, "Right of '?\?' has type '" + r->toString() +
+        "' which is not compatible with '" + unwrapped->toString() + "'");
     return typeCtx.getError();
 }
 

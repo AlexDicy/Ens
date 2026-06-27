@@ -82,12 +82,21 @@ private:
     void parseBlock();
     void parseLetStmt();
     void parseTypedVarDeclStmt();
+    void parseConstDecl();
     void parseIfStmt();
     void parseWhileStmt();
+    void parseForStmt();
+    void parseBreakStmt();
+    void parseContinueStmt();
     void parseReturnStmt();
     void parseThrowStmt();
     void parseRethrowStmt();
     void parseExprStmt();
+
+    bool looksLikeForeachHeader() const;
+    bool looksLikeTypedVarDeclFrom(size_t startCursor) const;
+    bool atContextualIn() const;
+    bool peekIsContextualIn(size_t n) const;
 
     // === Expressions ===
     void parseExpression();
