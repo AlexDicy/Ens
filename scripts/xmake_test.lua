@@ -5,14 +5,18 @@
 -- use @expect-error instead to assert the compiler reports a specific diagnostic.
 --     // @expect-error Undefined function 'testFunction'
 -- tests run in parallel; set ENS_TEST_JOBS to override the worker count (default: cpu count).
+-- pass test names to run a subset, e.g. `xmake test arc_basic class_constructor`; runs all if omitted.
 task("test")
     set_menu({
-        usage = "xmake test",
+        usage = "xmake test [tests...]",
         description = "Run all Ens tests in the tests/ folder",
-        options = {}
+        options = {
+            {nil, "tests", "vs", nil, "Names of specific tests to run (runs all if omitted)"}
+        }
     })
     on_run(function()
         import("core.project.config")
+        import("core.base.option")
         import("async.runjobs")
         config.load()
         local mode = config.get("mode") or "release"
@@ -31,25 +35,58 @@ task("test")
         local out_dir   = path.join(os.projectdir(), "build", "tests")
         os.mkdir(out_dir)
 
+        -- optional subset: only run the tests named on the command line.
+        -- names are matched case-sensitively; a trailing ".ens" is accepted and ignored.
+        local wanted = nil
+        local requested = option.get("tests")
+        if requested and #requested > 0 then
+            wanted = {}
+            for _, t in ipairs(requested) do
+                wanted[(t:gsub("%.ens$", ""))] = false
+            end
+        end
+        local function want(name)
+            if wanted == nil then return true end
+            if wanted[name] == nil then return false end
+            wanted[name] = true
+            return true
+        end
+
         -- list of tests:
         --   * every tests/*.ens file (single-file mode)
         --   * every tests/<dir>/main.ens (folder mode)
         local jobs = {}
         for _, ens_file in ipairs(os.files(path.join(tests_dir, "*.ens"))) do
-            table.insert(jobs, {
-                name = path.basename(ens_file),
-                ens_file = ens_file,
-                source = ens_file,
-            })
+            local name = path.basename(ens_file)
+            if want(name) then
+                table.insert(jobs, {
+                    name = name,
+                    ens_file = ens_file,
+                    source = ens_file,
+                })
+            end
         end
         for _, sub in ipairs(os.dirs(path.join(tests_dir, "*"))) do
             local main_ens = path.join(sub, "main.ens")
-            if os.isfile(main_ens) then
+            local name = path.basename(sub)
+            if os.isfile(main_ens) and want(name) then
                 table.insert(jobs, {
-                    name = path.basename(sub),
+                    name = name,
                     ens_file = main_ens,
                     source = sub,
                 })
+            end
+        end
+
+        -- surface any requested names that matched no test, so typos don't pass silently.
+        if wanted ~= nil then
+            local unknown = {}
+            for name, matched in pairs(wanted) do
+                if not matched then table.insert(unknown, name) end
+            end
+            if #unknown > 0 then
+                table.sort(unknown)
+                os.raise("unknown test(s): %s", table.concat(unknown, ", "))
             end
         end
 
