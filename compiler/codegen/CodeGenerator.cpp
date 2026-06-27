@@ -1457,6 +1457,17 @@ struct CodeGenerator::Impl {
 
         ::Type* arrType = typeOf(it->node);
         ::Type* arrElem = arrType ? arrType->inner : elemSym->type;
+
+        // When the iterable is a fresh owned array, keep it alive for the whole loop
+        // through the cleanup stack so every exit path (fall-through, break, return,
+        // throw) releases it exactly once.
+        if (expressionProducesOwnedRef(*it) && isReferenceType(arrType)) {
+            llvm::Value* arrSlot = createEntryAlloca(
+                currentFunction, llvm::PointerType::get(ctx, 0), "foreach.arr");
+            builder->CreateStore(arr, arrSlot);
+            registerOwnedLocal(arrSlot, arrType);
+        }
+
         llvm::Type* i64 = llvm::Type::getInt64Ty(ctx);
         llvm::Value* length = emitArrayLength(arr);
         llvm::Value* data = emitArrayDataPtr(arr);
@@ -1500,7 +1511,6 @@ struct CodeGenerator::Impl {
         builder->CreateBr(condBB);
 
         builder->SetInsertPoint(endBB);
-        releaseIfOwnedTemp(arr, *it);
     }
 
     void emitBreakStmt() {
