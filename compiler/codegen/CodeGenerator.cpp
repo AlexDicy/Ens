@@ -91,7 +91,12 @@ struct CodeGenerator::Impl {
     llvm::StructType* symEntryTy = nullptr;
     llvm::StructType* symChunkTy = nullptr;
     llvm::StructType* lineEntryTy = nullptr;
-    std::vector<std::pair<llvm::Constant*, int>> lineRecords;
+    llvm::StructType* inlineFrameTy = nullptr;
+    struct InlineFrame { std::string name; std::string file; int line; };
+    struct LineRecord { llvm::Constant* addr; std::vector<InlineFrame> chain; };
+    std::vector<LineRecord> lineRecords;
+    // DISubprogram -> (display name, file basename), so inlined frames recover the same names the symbol table uses.
+    std::unordered_map<llvm::DISubprogram*, std::pair<std::string, std::string>> subprogramInfo;
     ::Type* stackFrameType = nullptr;
     struct SymtabRecord {
         llvm::Function* fn;
@@ -579,6 +584,11 @@ struct CodeGenerator::Impl {
             uint32_t lineOffset = nameTok ? nameTok->startOffset() : fn.node.startOffset();
             auto [eline, ecol] = posOf(lineOffset);
             recordSymtabEntry(currentFunction, display, static_cast<int>(eline), isEntry);
+            if (sp) {
+                std::string file = std::filesystem::path(sourceFilename).filename().string();
+                if (file.empty()) file = sourceFilename;
+                subprogramInfo[sp] = { display, file };
+            }
         }
 
         auto argIter = currentFunction->args().begin();
@@ -1720,12 +1730,23 @@ struct CodeGenerator::Impl {
         return symChunkTy;
     }
 
-    // { addr, line } : maps a call return address to its precise source line.
+    // { addr, frames, count } : a call return address -> its inline chain
+    // (innermost frame first; length 1 when nothing was inlined there).
     llvm::StructType* getLineEntryTy() {
         if (lineEntryTy) return lineEntryTy;
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
-        lineEntryTy = llvm::StructType::create(ctx, { ptrTy, llvm::Type::getInt32Ty(ctx) }, "EnsLineEntry");
+        lineEntryTy = llvm::StructType::create(ctx,
+            { ptrTy, ptrTy, llvm::Type::getInt32Ty(ctx) }, "EnsLineEntry");
         return lineEntryTy;
+    }
+
+    // { name, file, line } : one source frame within an inline chain.
+    llvm::StructType* getInlineFrameTy() {
+        if (inlineFrameTy) return inlineFrameTy;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        inlineFrameTy = llvm::StructType::create(ctx,
+            { ptrTy, ptrTy, llvm::Type::getInt32Ty(ctx) }, "EnsInlineFrame");
+        return inlineFrameTy;
     }
 
     llvm::Function* getRuntimeFn(const std::string& name, llvm::FunctionType* ty) {
@@ -1944,19 +1965,17 @@ struct CodeGenerator::Impl {
         builder->restoreIP(saved);
     }
 
-    // i32 ens_resolve_line(i64 addr): precise source line for a return address, via
-    // the greatest call-site marker <= addr, or 0 if none (caller falls back to the
-    // function's declaration line).
-    void defineResolveLine() {
-        if (module->getFunction("ens_resolve_line")) return;
+    // ptr ens_resolve_lineentry(i64 addr): the line entry whose call-site address is
+    // the greatest <= addr, or null (caller falls back to the declaration line).
+    void defineResolveLineEntry() {
+        if (module->getFunction("ens_resolve_lineentry")) return;
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
-        auto* i32 = llvm::Type::getInt32Ty(ctx);
         auto* i64 = llvm::Type::getInt64Ty(ctx);
         auto* lineTy = getLineEntryTy();
         auto* chunkTy = getSymChunkTy();
         auto* fn = llvm::Function::Create(
-            llvm::FunctionType::get(i32, { i64 }, false),
-            llvm::Function::InternalLinkage, "ens_resolve_line", module.get());
+            llvm::FunctionType::get(ptrTy, { i64 }, false),
+            llvm::Function::InternalLinkage, "ens_resolve_lineentry", module.get());
         fn->addFnAttr(llvm::Attribute::NoUnwind);
         auto saved = builder->saveIP();
         auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
@@ -1970,11 +1989,11 @@ struct CodeGenerator::Impl {
         auto* done   = llvm::BasicBlock::Create(ctx, "done", fn);
         builder->SetInsertPoint(entry);
         llvm::Value* addr = fn->getArg(0);
-        llvm::Value* bestA = builder->CreateAlloca(i32, nullptr, "bestLine");
+        llvm::Value* bestA = builder->CreateAlloca(ptrTy, nullptr, "bestEntry");
         llvm::Value* bestStartA = builder->CreateAlloca(i64, nullptr, "bestStart");
         llvm::Value* chunkA = builder->CreateAlloca(ptrTy, nullptr, "chunk");
         llvm::Value* iA = builder->CreateAlloca(i64, nullptr, "i");
-        builder->CreateStore(llvm::ConstantInt::get(i32, 0), bestA);
+        builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), bestA);
         builder->CreateStore(llvm::ConstantInt::get(i64, 0), bestStartA);
         builder->CreateStore(builder->CreateLoad(ptrTy, getSymtabHead()), chunkA);
         builder->CreateBr(ckCond);
@@ -2003,8 +2022,7 @@ struct CodeGenerator::Impl {
         builder->CreateCondBr(builder->CreateAnd(le, gt), setIt, inNext);
 
         builder->SetInsertPoint(setIt);
-        builder->CreateStore(
-            builder->CreateLoad(i32, builder->CreateStructGEP(lineTy, e, 1)), bestA);
+        builder->CreateStore(e, bestA);
         builder->CreateStore(a, bestStartA);
         builder->CreateBr(inNext);
 
@@ -2017,21 +2035,8 @@ struct CodeGenerator::Impl {
         builder->CreateBr(ckCond);
 
         builder->SetInsertPoint(done);
-        builder->CreateRet(builder->CreateLoad(i32, bestA));
+        builder->CreateRet(builder->CreateLoad(ptrTy, bestA));
         builder->restoreIP(saved);
-    }
-
-    // Precise call-site line for a frame address, falling back to the function's
-    // declaration line when no marker covers it.
-    llvm::Value* resolvePreciseLine(llvm::Value* addr, llvm::Value* entryPtr) {
-        auto* i32 = llvm::Type::getInt32Ty(ctx);
-        llvm::Value* declLine = builder->CreateLoad(i32,
-            builder->CreateStructGEP(getSymEntryTy(), entryPtr, 3), "declLine");
-        llvm::Value* precise = builder->CreateCall(
-            module->getFunction("ens_resolve_line"), { addr }, "precise");
-        return builder->CreateSelect(
-            builder->CreateICmpNE(precise, llvm::ConstantInt::get(i32, 0)),
-            precise, declLine, "line");
     }
 
     // ptr ens_capture_trace(i32 maxDepth): unwind, drop the capture frame and any
@@ -2141,11 +2146,17 @@ struct CodeGenerator::Impl {
         auto* haveBB = llvm::BasicBlock::Create(ctx, "have", fn);
         auto* cond = llvm::BasicBlock::Create(ctx, "cond", fn);
         auto* body = llvm::BasicBlock::Create(ctx, "body", fn);
-        auto* doFmt = llvm::BasicBlock::Create(ctx, "fmt", fn);
+        auto* setup = llvm::BasicBlock::Create(ctx, "setup", fn);
+        auto* frInit = llvm::BasicBlock::Create(ctx, "fr.init", fn);
+        auto* frCond = llvm::BasicBlock::Create(ctx, "fr.cond", fn);
+        auto* frBody = llvm::BasicBlock::Create(ctx, "fr.body", fn);
+        auto* fbEmit = llvm::BasicBlock::Create(ctx, "fb.emit", fn);
         auto* next = llvm::BasicBlock::Create(ctx, "next", fn);
         auto* after = llvm::BasicBlock::Create(ctx, "after", fn);
         auto* trunc = llvm::BasicBlock::Create(ctx, "trunc", fn);
         auto* retBB = llvm::BasicBlock::Create(ctx, "ret", fn);
+        auto* lineTy = getLineEntryTy();
+        auto* inlineTy = getInlineFrameTy();
         builder->SetInsertPoint(entry);
         llvm::Value* frames = fn->getArg(0);
         builder->CreateCondBr(
@@ -2161,11 +2172,22 @@ struct CodeGenerator::Impl {
         builder->CreateStore(llvm::ConstantInt::get(i8, 0), buf);
         llvm::Value* lenA = builder->CreateAlloca(i64, nullptr, "len");
         llvm::Value* iA = builder->CreateAlloca(i64, nullptr, "i");
+        llvm::Value* kA = builder->CreateAlloca(i64, nullptr, "k");
         llvm::Value* sawA = builder->CreateAlloca(llvm::Type::getInt1Ty(ctx), nullptr, "sawEntry");
         builder->CreateStore(llvm::ConstantInt::get(i64, 0), lenA);
         builder->CreateStore(llvm::ConstantInt::get(i64, 0), iA);
         builder->CreateStore(llvm::ConstantInt::getFalse(ctx), sawA);
         llvm::Value* fmt = builder->CreateGlobalString("  at %s (%s:%d)\n", ".trace.fmt");
+        // Append "  at name (file:line)\n" to buf at the current insert point.
+        auto emitAppend = [&](llvm::Value* nm, llvm::Value* fl, llvm::Value* ln) {
+            llvm::Value* len = builder->CreateLoad(i64, lenA, "len.cur");
+            llvm::Value* cur = builder->CreateGEP(i8, buf, len);
+            llvm::Value* rem = builder->CreateSub(llvm::ConstantInt::get(i64, BUFSZ), len);
+            llvm::Value* w = builder->CreateCall(getOrDeclareSnprintf(), { cur, rem, fmt, nm, fl, ln }, "w");
+            llvm::Value* newlen = builder->CreateAdd(len, builder->CreateSExt(w, i64));
+            llvm::Value* over = builder->CreateICmpSGT(newlen, llvm::ConstantInt::get(i64, BUFSZ - 1));
+            builder->CreateStore(builder->CreateSelect(over, llvm::ConstantInt::get(i64, BUFSZ - 1), newlen), lenA);
+        };
         builder->CreateBr(cond);
 
         builder->SetInsertPoint(cond);
@@ -2176,24 +2198,44 @@ struct CodeGenerator::Impl {
         llvm::Value* addr = builder->CreateLoad(i64, builder->CreateGEP(i64, data, i), "addr");
         llvm::Value* e = builder->CreateCall(module->getFunction("ens_resolve_addr"), { addr }, "e");
         builder->CreateCondBr(
-            builder->CreateICmpEQ(e, llvm::ConstantPointerNull::get(ptrTy)), next, doFmt);
+            builder->CreateICmpEQ(e, llvm::ConstantPointerNull::get(ptrTy)), next, setup);
 
-        builder->SetInsertPoint(doFmt);
-        llvm::Value* name = builder->CreateLoad(ptrTy, builder->CreateStructGEP(entryTy, e, 1), "name");
-        llvm::Value* file = builder->CreateLoad(ptrTy, builder->CreateStructGEP(entryTy, e, 2), "file");
-        llvm::Value* line = resolvePreciseLine(addr, e);
+        // Mark whether we reached the program-entry frame (controls truncation), then
+        // expand this address's inline chain (innermost first), or fall back to the
+        // function's declaration line if no call-site marker covers it.
+        builder->SetInsertPoint(setup);
         llvm::Value* isEntry = builder->CreateLoad(i32, builder->CreateStructGEP(entryTy, e, 4), "isEntry");
-        llvm::Value* len = builder->CreateLoad(i64, lenA, "len.cur");
-        llvm::Value* cur = builder->CreateGEP(i8, buf, len);
-        llvm::Value* rem = builder->CreateSub(llvm::ConstantInt::get(i64, BUFSZ), len);
-        llvm::Value* w = builder->CreateCall(getOrDeclareSnprintf(), { cur, rem, fmt, name, file, line }, "w");
-        llvm::Value* newlen = builder->CreateAdd(len, builder->CreateSExt(w, i64));
-        llvm::Value* over = builder->CreateICmpSGT(newlen, llvm::ConstantInt::get(i64, BUFSZ - 1));
-        builder->CreateStore(builder->CreateSelect(over, llvm::ConstantInt::get(i64, BUFSZ - 1), newlen), lenA);
         builder->CreateStore(
             builder->CreateOr(builder->CreateLoad(llvm::Type::getInt1Ty(ctx), sawA),
                               builder->CreateICmpNE(isEntry, llvm::ConstantInt::get(i32, 0))),
             sawA);
+        llvm::Value* le = builder->CreateCall(module->getFunction("ens_resolve_lineentry"), { addr }, "le");
+        builder->CreateCondBr(
+            builder->CreateICmpEQ(le, llvm::ConstantPointerNull::get(ptrTy)), fbEmit, frInit);
+
+        builder->SetInsertPoint(frInit);
+        llvm::Value* framesPtr = builder->CreateLoad(ptrTy, builder->CreateStructGEP(lineTy, le, 1), "fr.ptr");
+        llvm::Value* cnt = builder->CreateSExt(
+            builder->CreateLoad(i32, builder->CreateStructGEP(lineTy, le, 2)), i64, "fr.cnt");
+        builder->CreateStore(llvm::ConstantInt::get(i64, 0), kA);
+        builder->CreateBr(frCond);
+
+        builder->SetInsertPoint(frCond);
+        llvm::Value* k = builder->CreateLoad(i64, kA, "k.cur");
+        builder->CreateCondBr(builder->CreateICmpSLT(k, cnt), frBody, next);
+
+        builder->SetInsertPoint(frBody);
+        llvm::Value* f = builder->CreateGEP(inlineTy, framesPtr, k, "f");
+        emitAppend(builder->CreateLoad(ptrTy, builder->CreateStructGEP(inlineTy, f, 0)),
+                   builder->CreateLoad(ptrTy, builder->CreateStructGEP(inlineTy, f, 1)),
+                   builder->CreateLoad(i32, builder->CreateStructGEP(inlineTy, f, 2)));
+        builder->CreateStore(builder->CreateAdd(k, llvm::ConstantInt::get(i64, 1)), kA);
+        builder->CreateBr(frCond);
+
+        builder->SetInsertPoint(fbEmit);
+        emitAppend(builder->CreateLoad(ptrTy, builder->CreateStructGEP(entryTy, e, 1)),
+                   builder->CreateLoad(ptrTy, builder->CreateStructGEP(entryTy, e, 2)),
+                   builder->CreateLoad(i32, builder->CreateStructGEP(entryTy, e, 3)));
         builder->CreateBr(next);
 
         builder->SetInsertPoint(next);
@@ -2249,64 +2291,137 @@ struct CodeGenerator::Impl {
         llvm::Value* sfDesc = getOrEmitTypeDescriptor(stackFrameType->structInfo);
         llvm::Value* arrDtor = getOrEmitArrayDtor(stackFrameType);
         if (!arrDtor) arrDtor = llvm::ConstantPointerNull::get(ptrTy);
+        auto* lineTy = getLineEntryTy();
+        auto* inlineTy = getInlineFrameTy();
         auto saved = builder->saveIP();
-        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
-        auto* getN = llvm::BasicBlock::Create(ctx, "getn", fn);
-        auto* zeroN = llvm::BasicBlock::Create(ctx, "zeron", fn);
-        auto* alloc = llvm::BasicBlock::Create(ctx, "alloc", fn);
-        auto* cond = llvm::BasicBlock::Create(ctx, "cond", fn);
-        auto* body = llvm::BasicBlock::Create(ctx, "body", fn);
-        auto* retBB = llvm::BasicBlock::Create(ctx, "ret", fn);
+        auto* entry   = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* zeroN   = llvm::BasicBlock::Create(ctx, "zeron", fn);
+        auto* getN    = llvm::BasicBlock::Create(ctx, "getn", fn);
+        auto* cStart  = llvm::BasicBlock::Create(ctx, "count.start", fn);
+        auto* cCond   = llvm::BasicBlock::Create(ctx, "count.cond", fn);
+        auto* cBody   = llvm::BasicBlock::Create(ctx, "count.body", fn);
+        auto* cAddOne = llvm::BasicBlock::Create(ctx, "count.one", fn);
+        auto* cAddCnt = llvm::BasicBlock::Create(ctx, "count.cnt", fn);
+        auto* cNext   = llvm::BasicBlock::Create(ctx, "count.next", fn);
+        auto* alloc   = llvm::BasicBlock::Create(ctx, "alloc", fn);
+        auto* fCond   = llvm::BasicBlock::Create(ctx, "fill.cond", fn);
+        auto* fBody   = llvm::BasicBlock::Create(ctx, "fill.body", fn);
+        auto* frInit  = llvm::BasicBlock::Create(ctx, "fr.init", fn);
+        auto* frCond  = llvm::BasicBlock::Create(ctx, "fr.cond", fn);
+        auto* frBody  = llvm::BasicBlock::Create(ctx, "fr.body", fn);
+        auto* fbFill  = llvm::BasicBlock::Create(ctx, "fb.fill", fn);
+        auto* fNext   = llvm::BasicBlock::Create(ctx, "fill.next", fn);
+        auto* retBB   = llvm::BasicBlock::Create(ctx, "ret", fn);
         builder->SetInsertPoint(entry);
         llvm::Value* frames = fn->getArg(0);
         llvm::Value* nA = builder->CreateAlloca(i64, nullptr, "n");
+        llvm::Value* totalA = builder->CreateAlloca(i64, nullptr, "total");
         llvm::Value* arrA = builder->CreateAlloca(ptrTy, nullptr, "arr");
         llvm::Value* iA = builder->CreateAlloca(i64, nullptr, "i");
+        llvm::Value* jA = builder->CreateAlloca(i64, nullptr, "j");
+        llvm::Value* kA = builder->CreateAlloca(i64, nullptr, "k");
+
+        // Build a StackFrame from C strings + line and store it at arr[j++].
+        auto buildFrame = [&](llvm::Value* arrData, llvm::Value* nameC, llvm::Value* fileC, llvm::Value* lineV) {
+            llvm::Value* j = builder->CreateLoad(i64, jA, "j.cur");
+            llvm::Value* nameStr = builder->CreateCall(getOrDefineEnsStringFromCStr(), { nameC });
+            llvm::Value* fileStr = builder->CreateCall(getOrDefineEnsStringFromCStr(), { fileC });
+            llvm::Value* sf = builder->CreateCall(getOrDefineEnsAlloc(),
+                { llvm::ConstantInt::get(i64, sfSize), sfDtor, sfDesc }, "frame");
+            builder->CreateStore(nameStr, builder->CreateStructGEP(sfStructTy, sf, 0));
+            builder->CreateStore(fileStr, builder->CreateStructGEP(sfStructTy, sf, 1));
+            builder->CreateStore(lineV, builder->CreateStructGEP(sfStructTy, sf, 2));
+            builder->CreateStore(sf, builder->CreateGEP(ptrTy, arrData, j));
+            builder->CreateStore(builder->CreateAdd(j, llvm::ConstantInt::get(i64, 1)), jA);
+        };
+
         builder->CreateCondBr(
             builder->CreateICmpEQ(frames, llvm::ConstantPointerNull::get(ptrTy)), zeroN, getN);
         builder->SetInsertPoint(zeroN);
         builder->CreateStore(llvm::ConstantInt::get(i64, 0), nA);
-        builder->CreateBr(alloc);
+        builder->CreateBr(cStart);
         builder->SetInsertPoint(getN);
         builder->CreateStore(builder->CreateLoad(i64, frames), nA);
-        builder->CreateBr(alloc);
+        builder->CreateBr(cStart);
+
+        // Pass 1: total frames = sum of inline-chain lengths (1 per unmarked address).
+        builder->SetInsertPoint(cStart);
+        builder->CreateStore(llvm::ConstantInt::get(i64, 0), totalA);
+        builder->CreateStore(llvm::ConstantInt::get(i64, 0), iA);
+        builder->CreateBr(cCond);
+        builder->SetInsertPoint(cCond);
+        llvm::Value* n = builder->CreateLoad(i64, nA, "n");
+        builder->CreateCondBr(builder->CreateICmpSLT(builder->CreateLoad(i64, iA), n), cBody, alloc);
+        builder->SetInsertPoint(cBody);
+        llvm::Value* cdata = builder->CreateGEP(i8, frames, llvm::ConstantInt::get(i64, 8));
+        llvm::Value* caddr = builder->CreateLoad(i64, builder->CreateGEP(i64, cdata, builder->CreateLoad(i64, iA)));
+        llvm::Value* cle = builder->CreateCall(module->getFunction("ens_resolve_lineentry"), { caddr }, "cle");
+        builder->CreateCondBr(
+            builder->CreateICmpEQ(cle, llvm::ConstantPointerNull::get(ptrTy)), cAddOne, cAddCnt);
+        builder->SetInsertPoint(cAddOne);
+        builder->CreateStore(builder->CreateAdd(builder->CreateLoad(i64, totalA), llvm::ConstantInt::get(i64, 1)), totalA);
+        builder->CreateBr(cNext);
+        builder->SetInsertPoint(cAddCnt);
+        llvm::Value* ccnt = builder->CreateSExt(
+            builder->CreateLoad(i32, builder->CreateStructGEP(lineTy, cle, 2)), i64);
+        builder->CreateStore(builder->CreateAdd(builder->CreateLoad(i64, totalA), ccnt), totalA);
+        builder->CreateBr(cNext);
+        builder->SetInsertPoint(cNext);
+        builder->CreateStore(builder->CreateAdd(builder->CreateLoad(i64, iA), llvm::ConstantInt::get(i64, 1)), iA);
+        builder->CreateBr(cCond);
 
         builder->SetInsertPoint(alloc);
-        llvm::Value* n = builder->CreateLoad(i64, nA, "n.cur");
+        llvm::Value* total = builder->CreateLoad(i64, totalA, "total.cur");
         llvm::Value* bytes = builder->CreateAdd(llvm::ConstantInt::get(i64, 8),
-            builder->CreateMul(n, llvm::ConstantInt::get(i64, 8)));
+            builder->CreateMul(total, llvm::ConstantInt::get(i64, 8)));
         llvm::Value* arr = builder->CreateCall(getOrDefineEnsAlloc(), { bytes, arrDtor,
             llvm::ConstantPointerNull::get(ptrTy) }, "frames.arr");
-        builder->CreateStore(n, arr);                 // length at +0
+        builder->CreateStore(total, arr);             // length at +0
         builder->CreateStore(arr, arrA);
         builder->CreateStore(llvm::ConstantInt::get(i64, 0), iA);
-        builder->CreateBr(cond);
+        builder->CreateStore(llvm::ConstantInt::get(i64, 0), jA);
+        builder->CreateBr(fCond);
 
-        builder->SetInsertPoint(cond);
-        llvm::Value* i = builder->CreateLoad(i64, iA, "i.cur");
-        builder->CreateCondBr(builder->CreateICmpSLT(i, n), body, retBB);
-
-        builder->SetInsertPoint(body);
-        llvm::Value* data = builder->CreateGEP(i8, frames, llvm::ConstantInt::get(i64, 8));
-        llvm::Value* addr = builder->CreateLoad(i64, builder->CreateGEP(i64, data, i));
-        llvm::Value* e = builder->CreateCall(module->getFunction("ens_resolve_addr"), { addr }, "e");
-        llvm::Value* name = builder->CreateLoad(ptrTy, builder->CreateStructGEP(entryTy, e, 1));
-        llvm::Value* file = builder->CreateLoad(ptrTy, builder->CreateStructGEP(entryTy, e, 2));
-        llvm::Value* line = resolvePreciseLine(addr, e);
-        // The symbol table holds raw C strings; the StackFrame fields are Ens
-        // strings, so wrap them into owned objects the frame's dtor can release.
-        llvm::Value* nameStr = builder->CreateCall(getOrDefineEnsStringFromCStr(), { name });
-        llvm::Value* fileStr = builder->CreateCall(getOrDefineEnsStringFromCStr(), { file });
-        llvm::Value* sf = builder->CreateCall(getOrDefineEnsAlloc(),
-            { llvm::ConstantInt::get(i64, sfSize), sfDtor, sfDesc }, "frame");
-        builder->CreateStore(nameStr, builder->CreateStructGEP(sfStructTy, sf, 0));
-        builder->CreateStore(fileStr, builder->CreateStructGEP(sfStructTy, sf, 1));
-        builder->CreateStore(line, builder->CreateStructGEP(sfStructTy, sf, 2));
+        // Pass 2: fill, expanding each address's inline chain.
+        builder->SetInsertPoint(fCond);
+        builder->CreateCondBr(builder->CreateICmpSLT(builder->CreateLoad(i64, iA), n), fBody, retBB);
+        builder->SetInsertPoint(fBody);
+        llvm::Value* fdata = builder->CreateGEP(i8, frames, llvm::ConstantInt::get(i64, 8));
+        llvm::Value* faddr = builder->CreateLoad(i64, builder->CreateGEP(i64, fdata, builder->CreateLoad(i64, iA)));
+        llvm::Value* fe = builder->CreateCall(module->getFunction("ens_resolve_addr"), { faddr }, "fe");
+        llvm::Value* fle = builder->CreateCall(module->getFunction("ens_resolve_lineentry"), { faddr }, "fle");
         llvm::Value* arrData = builder->CreateGEP(i8, builder->CreateLoad(ptrTy, arrA),
             llvm::ConstantInt::get(i64, 8));
-        builder->CreateStore(sf, builder->CreateGEP(ptrTy, arrData, i));
-        builder->CreateStore(builder->CreateAdd(i, llvm::ConstantInt::get(i64, 1)), iA);
-        builder->CreateBr(cond);
+        builder->CreateCondBr(
+            builder->CreateICmpEQ(fle, llvm::ConstantPointerNull::get(ptrTy)), fbFill, frInit);
+
+        builder->SetInsertPoint(frInit);
+        llvm::Value* framesPtr = builder->CreateLoad(ptrTy, builder->CreateStructGEP(lineTy, fle, 1), "fr.ptr");
+        llvm::Value* cnt = builder->CreateSExt(
+            builder->CreateLoad(i32, builder->CreateStructGEP(lineTy, fle, 2)), i64, "fr.cnt");
+        builder->CreateStore(llvm::ConstantInt::get(i64, 0), kA);
+        builder->CreateBr(frCond);
+        builder->SetInsertPoint(frCond);
+        builder->CreateCondBr(builder->CreateICmpSLT(builder->CreateLoad(i64, kA), cnt), frBody, fNext);
+        builder->SetInsertPoint(frBody);
+        llvm::Value* f = builder->CreateGEP(inlineTy, framesPtr, builder->CreateLoad(i64, kA), "f");
+        buildFrame(arrData,
+                   builder->CreateLoad(ptrTy, builder->CreateStructGEP(inlineTy, f, 0)),
+                   builder->CreateLoad(ptrTy, builder->CreateStructGEP(inlineTy, f, 1)),
+                   builder->CreateLoad(i32, builder->CreateStructGEP(inlineTy, f, 2)));
+        builder->CreateStore(builder->CreateAdd(builder->CreateLoad(i64, kA), llvm::ConstantInt::get(i64, 1)), kA);
+        builder->CreateBr(frCond);
+
+        builder->SetInsertPoint(fbFill);
+        buildFrame(arrData,
+                   builder->CreateLoad(ptrTy, builder->CreateStructGEP(entryTy, fe, 1)),
+                   builder->CreateLoad(ptrTy, builder->CreateStructGEP(entryTy, fe, 2)),
+                   builder->CreateLoad(i32, builder->CreateStructGEP(entryTy, fe, 3)));
+        builder->CreateBr(fNext);
+
+        builder->SetInsertPoint(fNext);
+        builder->CreateStore(builder->CreateAdd(builder->CreateLoad(i64, iA), llvm::ConstantInt::get(i64, 1)), iA);
+        builder->CreateBr(fCond);
 
         builder->SetInsertPoint(retBB);
         builder->CreateRet(builder->CreateLoad(ptrTy, arrA));
@@ -2316,7 +2431,7 @@ struct CodeGenerator::Impl {
     void definePreludeRuntime() {
         if (!module->getTargetTriple().isOSWindows()) defineUnwindCallback();
         defineResolveAddr();
-        defineResolveLine();
+        defineResolveLineEntry();
         defineCaptureTrace();
         defineFormatTrace();
         defineSymbolicate();
@@ -2363,8 +2478,22 @@ struct CodeGenerator::Impl {
                 // Always split: a new block starts at the call, so its address is a
                 // legal blockaddress (never the entry block) and is unique per call.
                 llvm::BasicBlock* callBB = ci->getParent()->splitBasicBlock(ci, "call.site");
-                lineRecords.emplace_back(llvm::BlockAddress::get(&F, callBB),
-                    static_cast<int>(ci->getDebugLoc().getLine()));
+                // Walk the inline chain (innermost first). Without an inliner this is
+                // a single frame; under inlining getInlinedAt() yields the callers.
+                std::vector<InlineFrame> chain;
+                for (llvm::DILocation* dl = ci->getDebugLoc().get(); dl; dl = dl->getInlinedAt()) {
+                    llvm::DISubprogram* dsp = dl->getScope() ? dl->getScope()->getSubprogram() : nullptr;
+                    std::string name = "?", file = "?";
+                    auto it = subprogramInfo.find(dsp);
+                    if (it != subprogramInfo.end()) {
+                        name = it->second.first;
+                        file = it->second.second;
+                    } else if (dsp) {
+                        name = dsp->getName().str();
+                    }
+                    chain.push_back({ name, file, static_cast<int>(dl->getLine()) });
+                }
+                lineRecords.push_back({ llvm::BlockAddress::get(&F, callBB), std::move(chain) });
             }
         }
     }
@@ -2398,12 +2527,33 @@ struct CodeGenerator::Impl {
         auto* entriesGV = new llvm::GlobalVariable(*module, arrTy, /*isConstant=*/true,
             llvm::GlobalValue::PrivateLinkage, llvm::ConstantArray::get(arrTy, elems), "_ens_symtab");
 
+        // Flatten every line record's inline chain into one frame table, and point
+        // each line entry at its slice of it.
         auto* lineTy = getLineEntryTy();
+        auto* inlineTy = getInlineFrameTy();
+        std::vector<llvm::Constant*> frameElems;
+        std::vector<size_t> frameOffset;
+        frameOffset.reserve(lineRecords.size());
+        for (auto& lr : lineRecords) {
+            frameOffset.push_back(frameElems.size());
+            for (auto& f : lr.chain)
+                frameElems.push_back(llvm::ConstantStruct::get(inlineTy,
+                    { makeCString(f.name), makeCString(f.file), llvm::ConstantInt::get(i32, f.line) }));
+        }
+        auto* frameArrTy = llvm::ArrayType::get(inlineTy, frameElems.size());
+        auto* framesGV = new llvm::GlobalVariable(*module, frameArrTy, /*isConstant=*/true,
+            llvm::GlobalValue::PrivateLinkage, llvm::ConstantArray::get(frameArrTy, frameElems), "_ens_inlinetab");
+
         std::vector<llvm::Constant*> lineElems;
         lineElems.reserve(lineRecords.size());
-        for (auto& lr : lineRecords)
+        for (size_t k = 0; k < lineRecords.size(); ++k) {
+            llvm::Constant* idx[] = { llvm::ConstantInt::get(i64, 0),
+                                      llvm::ConstantInt::get(i64, frameOffset[k]) };
+            llvm::Constant* framesPtr = llvm::ConstantExpr::getInBoundsGetElementPtr(frameArrTy, framesGV, idx);
             lineElems.push_back(llvm::ConstantStruct::get(lineTy,
-                { lr.first, llvm::ConstantInt::get(i32, lr.second) }));
+                { lineRecords[k].addr, framesPtr,
+                  llvm::ConstantInt::get(i32, static_cast<int>(lineRecords[k].chain.size())) }));
+        }
         auto* lineArrTy = llvm::ArrayType::get(lineTy, lineElems.size());
         auto* linesGV = new llvm::GlobalVariable(*module, lineArrTy, /*isConstant=*/true,
             llvm::GlobalValue::PrivateLinkage, llvm::ConstantArray::get(lineArrTy, lineElems), "_ens_linetab");
