@@ -514,9 +514,10 @@ struct CodeGenerator::Impl {
         if (receiver && receiver->structInfo) {
             mangled = asAscii(receiver->structInfo->name) + "_" + mangled;
         }
-        // A throwing top-level `main` is renamed; a compiler-emitted `main`
-        // wrapper handles the error slot and prints any escaping exception.
-        if (!receiver && sym->abiThrows && mangled == "main") mangled = "ens.main";
+        // A top-level `main` is renamed; a compiler-emitted `main` wrapper
+        // records the process arguments and, when `main` throws, handles the
+        // error slot and prints any escaping exception.
+        if (!receiver && mangled == "main") mangled = "ens.main";
         auto* func = llvm::Function::Create(fnType, llvm::Function::ExternalLinkage, mangled, module.get());
         values[sym] = func;
     }
@@ -841,9 +842,9 @@ struct CodeGenerator::Impl {
         emitReturnZero();
     }
 
-    // Real entry point for a program whose `main` may throw: call the renamed
-    // user main with a root error slot; if an exception escapes, report it on
-    // stderr and exit 1.
+    // The real C entry point. Records the process arguments, then calls the renamed user main.
+    // When `main` may throw it is passed a root error slot; if an exception
+    // escapes, report it on stderr and exit 1.
     void emitMainWrapper(Symbol* msym) {
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         auto* i32Ty = llvm::Type::getInt32Ty(ctx);
@@ -852,9 +853,20 @@ struct CodeGenerator::Impl {
         if (!userMain) return;
         bool retsVoid = !msym->returnType || msym->returnType->isVoid();
 
-        auto* wrapper = llvm::Function::Create(llvm::FunctionType::get(i32Ty, {}, false),
+        auto* wrapper = llvm::Function::Create(
+            llvm::FunctionType::get(i32Ty, { i32Ty, ptrTy }, false),
             llvm::Function::ExternalLinkage, "main", module.get());
         builder->SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", wrapper));
+        builder->CreateStore(wrapper->getArg(0), ensArgcGlobal(/*define=*/true));
+        builder->CreateStore(wrapper->getArg(1), ensArgvGlobal(/*define=*/true));
+
+        // A non-throwing main is the whole program: forward its result directly.
+        if (!msym->abiThrows) {
+            llvm::Value* ret = builder->CreateCall(userMain, {});
+            builder->CreateRet(retsVoid ? llvm::ConstantInt::get(i32Ty, 0) : ret);
+            return;
+        }
+
         auto* slot = builder->CreateAlloca(ptrTy, nullptr, "err.slot");
         builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), slot);
         llvm::Value* r = builder->CreateCall(userMain, { slot });
@@ -888,6 +900,112 @@ struct CodeGenerator::Impl {
         builder->CreateCall(fputs, { emitStringDataPtr(traceStr), stderrF });
         builder->CreateCall(getOrDefineEnsRelease(), { err });
         builder->CreateRet(llvm::ConstantInt::get(i32Ty, 1));
+    }
+
+    // The recorded process arguments. The entry wrapper (in the module that owns
+    // `main`) defines and writes them; ens_arguments(), emitted wherever
+    // std.system.arguments() is compiled, reads them as an external reference.
+    llvm::GlobalVariable* ensArgGlobal(const char* name, llvm::Type* ty,
+                                       llvm::Constant* init, bool define) {
+        auto* g = module->getNamedGlobal(name);
+        if (!g) {
+            g = new llvm::GlobalVariable(*module, ty, /*isConstant=*/false,
+                llvm::GlobalValue::ExternalLinkage, /*init=*/nullptr, name);
+        }
+        if (define && !g->hasInitializer()) g->setInitializer(init);
+        return g;
+    }
+    llvm::GlobalVariable* ensArgcGlobal(bool define) {
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        return ensArgGlobal("ens_argc", i32Ty, llvm::ConstantInt::get(i32Ty, 0), define);
+    }
+    llvm::GlobalVariable* ensArgvGlobal(bool define) {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        return ensArgGlobal("ens_argv", ptrTy, llvm::ConstantPointerNull::get(ptrTy), define);
+    }
+
+    llvm::Function* defineArgsRuntime() {
+        if (auto* existing = module->getFunction("ens_arguments")) return existing;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8Ty  = llvm::Type::getInt8Ty(ctx);
+        auto* voidTy = llvm::Type::getVoidTy(ctx);
+        auto* eight = llvm::ConstantInt::get(i64Ty, 8);
+        auto* one   = llvm::ConstantInt::get(i64Ty, 1);
+
+        auto savedIP = builder->saveIP();
+
+        // void _dtor_args_array(arr): release each string element. Mirrors the
+        // generic reference-element array dtor without needing an element type.
+        auto* dtor = llvm::Function::Create(
+            llvm::FunctionType::get(voidTy, { ptrTy }, false),
+            llvm::Function::InternalLinkage, "_dtor_args_array", module.get());
+        dtor->addFnAttr(llvm::Attribute::NoUnwind);
+        {
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", dtor);
+            auto* cond  = llvm::BasicBlock::Create(ctx, "loop.cond", dtor);
+            auto* body  = llvm::BasicBlock::Create(ctx, "loop.body", dtor);
+            auto* end   = llvm::BasicBlock::Create(ctx, "loop.end", dtor);
+            builder->SetInsertPoint(entry);
+            llvm::Value* arr = dtor->getArg(0);
+            llvm::Value* len = builder->CreateLoad(i64Ty, arr, "len");
+            llvm::Value* data = builder->CreateGEP(i8Ty, arr, eight, "data");
+            llvm::Value* iSlot = builder->CreateAlloca(i64Ty, nullptr, "i");
+            builder->CreateStore(llvm::ConstantInt::get(i64Ty, 0), iSlot);
+            builder->CreateBr(cond);
+            builder->SetInsertPoint(cond);
+            llvm::Value* i = builder->CreateLoad(i64Ty, iSlot, "i.load");
+            builder->CreateCondBr(builder->CreateICmpSLT(i, len), body, end);
+            builder->SetInsertPoint(body);
+            llvm::Value* slot = builder->CreateGEP(ptrTy, data, i, "slot");
+            builder->CreateCall(getOrDefineEnsRelease(), { builder->CreateLoad(ptrTy, slot, "elem") });
+            builder->CreateStore(builder->CreateAdd(i, one), iSlot);
+            builder->CreateBr(cond);
+            builder->SetInsertPoint(end);
+            builder->CreateRetVoid();
+        }
+
+        // string[] ens_arguments(): allocate argc slots and wrap each C string.
+        auto* fn = llvm::Function::Create(
+            llvm::FunctionType::get(ptrTy, {}, false),
+            llvm::Function::ExternalLinkage, "ens_arguments", module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+        {
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* cond  = llvm::BasicBlock::Create(ctx, "loop.cond", fn);
+            auto* body  = llvm::BasicBlock::Create(ctx, "loop.body", fn);
+            auto* end   = llvm::BasicBlock::Create(ctx, "loop.end", fn);
+            builder->SetInsertPoint(entry);
+            llvm::Value* argc = builder->CreateSExt(
+                builder->CreateLoad(i32Ty, ensArgcGlobal(/*define=*/false), "argc"), i64Ty, "argc64");
+            llvm::Value* argv = builder->CreateLoad(ptrTy, ensArgvGlobal(/*define=*/false), "argv");
+            // payload = 8-byte length + one pointer-sized slot per element.
+            llvm::Value* payload = builder->CreateAdd(
+                eight, builder->CreateMul(argc, eight), "payload");
+            llvm::Value* arr = builder->CreateCall(getOrDefineEnsAlloc(),
+                { payload, dtor, llvm::ConstantPointerNull::get(ptrTy) }, "args");
+            builder->CreateStore(argc, arr);  // length at +0
+            llvm::Value* data = builder->CreateGEP(i8Ty, arr, eight, "data");
+            llvm::Value* iSlot = builder->CreateAlloca(i64Ty, nullptr, "i");
+            builder->CreateStore(llvm::ConstantInt::get(i64Ty, 0), iSlot);
+            builder->CreateBr(cond);
+            builder->SetInsertPoint(cond);
+            llvm::Value* i = builder->CreateLoad(i64Ty, iSlot, "i.load");
+            builder->CreateCondBr(builder->CreateICmpSLT(i, argc), body, end);
+            builder->SetInsertPoint(body);
+            llvm::Value* cstr = builder->CreateLoad(ptrTy,
+                builder->CreateGEP(ptrTy, argv, i, "argv.slot"), "argv.i");
+            llvm::Value* str = builder->CreateCall(getOrDefineEnsStringFromCStr(), { cstr }, "arg.str");
+            builder->CreateStore(str, builder->CreateGEP(ptrTy, data, i, "dst"));
+            builder->CreateStore(builder->CreateAdd(i, one), iSlot);
+            builder->CreateBr(cond);
+            builder->SetInsertPoint(end);
+            builder->CreateRet(arr);
+        }
+
+        builder->restoreIP(savedIP);
+        return fn;
     }
 
     // ===== Statements =====
@@ -4476,6 +4594,10 @@ struct CodeGenerator::Impl {
     }
 
     llvm::Value* emitForeignCall(Symbol* sym, const ast::CallExpression& e) {
+        // std.system.arguments() bridges to this compiler-emitted helper rather
+        // than a real C symbol; emit its definition wherever it is referenced.
+        if (sym && sym->name == u"ens_arguments")
+            return builder->CreateCall(defineArgsRuntime(), {});
         llvm::Function* fn = getOrDeclareExternalFunction(sym, /*receiver*/ nullptr);
         if (!fn) {
             error(e.node.startOffset(), "Internal: external callee has no LLVM function");
@@ -4900,11 +5022,12 @@ struct CodeGenerator::Impl {
             }
         }
 
-        // A throwing `main` was renamed to `ens.main`; emit the real entry point.
+        // `main` was renamed to `ens.main`; emit the real entry point, which
+        // records the process arguments and forwards to (or unwinds) ens.main.
         for (auto& fn : sf->functions()) {
             if (fn.nameText().value_or(std::u16string{}) != u"main") continue;
             Symbol* msym = symbolOf(fn.node);
-            if (msym && msym->abiThrows) emitMainWrapper(msym);
+            if (msym) emitMainWrapper(msym);
             break;
         }
 
