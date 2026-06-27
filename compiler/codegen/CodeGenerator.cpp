@@ -882,7 +882,7 @@ struct CodeGenerator::Impl {
 
         builder->SetInsertPoint(errBB);
         llvm::Value* stderrF = getStderr();
-        auto* fputs = getOrDeclareFputs();
+        auto fputs = getOrDeclareFputs();
         llvm::Value* desc = loadDescriptor(err);
         llvm::Value* nameAddr = builder->CreateGEP(getTypeDescriptorTy(), desc,
             { llvm::ConstantInt::get(i32Ty, 0), llvm::ConstantInt::get(i32Ty, 0) }, "name.addr");
@@ -1751,19 +1751,19 @@ struct CodeGenerator::Impl {
         return emitNumericConversion(v, srcT, dstT);
     }
 
-    llvm::Function* getOrDeclarePuts() {
-        if (auto* existing = module->getFunction("puts")) return existing;
-        auto* ty = llvm::FunctionType::get(
-            llvm::Type::getInt32Ty(ctx),
-            { llvm::PointerType::get(ctx, 0) }, false);
-        return llvm::Function::Create(ty, llvm::Function::ExternalLinkage, "puts", module.get());
+    llvm::FunctionCallee libcFn(const char* name, llvm::FunctionType* ty) {
+        return module->getOrInsertFunction(name, ty);
     }
 
-    llvm::Function* getOrDeclareFputs() {
-        if (auto* existing = module->getFunction("fputs")) return existing;
+    llvm::FunctionCallee getOrDeclarePuts() {
+        return libcFn("puts", llvm::FunctionType::get(
+            llvm::Type::getInt32Ty(ctx), { llvm::PointerType::get(ctx, 0) }, false));
+    }
+
+    llvm::FunctionCallee getOrDeclareFputs() {
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
-        auto* ty = llvm::FunctionType::get(llvm::Type::getInt32Ty(ctx), { ptrTy, ptrTy }, false);
-        return llvm::Function::Create(ty, llvm::Function::ExternalLinkage, "fputs", module.get());
+        return libcFn("fputs", llvm::FunctionType::get(
+            llvm::Type::getInt32Ty(ctx), { ptrTy, ptrTy }, false));
     }
 
     // The platform's stderr FILE*. glibc/ELF exposes `stderr`; macOS `__stderrp`;
@@ -1773,10 +1773,8 @@ struct CodeGenerator::Impl {
         const llvm::Triple& triple = module->getTargetTriple();
         if (triple.isOSWindows()) {
             auto* fnTy = llvm::FunctionType::get(ptrTy, { llvm::Type::getInt32Ty(ctx) }, false);
-            llvm::Function* iob = module->getFunction("__acrt_iob_func");
-            if (!iob) iob = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage,
-                "__acrt_iob_func", module.get());
-            return builder->CreateCall(iob, { llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 2) });
+            return builder->CreateCall(libcFn("__acrt_iob_func", fnTy),
+                { llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 2) });
         }
         const char* name = triple.isOSDarwin() ? "__stderrp" : "stderr";
         llvm::GlobalVariable* gv = module->getGlobalVariable(name);
@@ -1785,29 +1783,20 @@ struct CodeGenerator::Impl {
         return builder->CreateLoad(ptrTy, gv, "stderr");
     }
 
-    llvm::Function* getOrDeclareCalloc() {
-        if (auto* existing = module->getFunction("calloc")) return existing;
+    llvm::FunctionCallee getOrDeclareCalloc() {
         auto* i64Ty = llvm::Type::getInt64Ty(ctx);
-        auto* ty = llvm::FunctionType::get(
-            llvm::PointerType::get(ctx, 0),
-            { i64Ty, i64Ty }, false);
-        return llvm::Function::Create(ty, llvm::Function::ExternalLinkage, "calloc", module.get());
+        return libcFn("calloc", llvm::FunctionType::get(
+            llvm::PointerType::get(ctx, 0), { i64Ty, i64Ty }, false));
     }
 
-    llvm::Function* getOrDeclareFree() {
-        if (auto* existing = module->getFunction("free")) return existing;
-        auto* ty = llvm::FunctionType::get(
-            llvm::Type::getVoidTy(ctx),
-            { llvm::PointerType::get(ctx, 0) }, false);
-        return llvm::Function::Create(ty, llvm::Function::ExternalLinkage, "free", module.get());
+    llvm::FunctionCallee getOrDeclareFree() {
+        return libcFn("free", llvm::FunctionType::get(
+            llvm::Type::getVoidTy(ctx), { llvm::PointerType::get(ctx, 0) }, false));
     }
 
-    llvm::Function* getOrDeclareStrlen() {
-        if (auto* existing = module->getFunction("strlen")) return existing;
-        auto* ty = llvm::FunctionType::get(
-            llvm::Type::getInt64Ty(ctx),
-            { llvm::PointerType::get(ctx, 0) }, false);
-        return llvm::Function::Create(ty, llvm::Function::ExternalLinkage, "strlen", module.get());
+    llvm::FunctionCallee getOrDeclareStrlen() {
+        return libcFn("strlen", llvm::FunctionType::get(
+            llvm::Type::getInt64Ty(ctx), { llvm::PointerType::get(ctx, 0) }, false));
     }
 
     // ===== Stack traces =====
@@ -1890,12 +1879,10 @@ struct CodeGenerator::Impl {
             llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), { ptrTy }, false));
     }
 
-    llvm::Function* getOrDeclareMalloc() {
-        if (auto* f = module->getFunction("malloc")) return f;
+    llvm::FunctionCallee getOrDeclareMalloc() {
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
-        return llvm::Function::Create(
-            llvm::FunctionType::get(ptrTy, { llvm::Type::getInt64Ty(ctx) }, false),
-            llvm::Function::ExternalLinkage, "malloc", module.get());
+        return libcFn("malloc",
+            llvm::FunctionType::get(ptrTy, { llvm::Type::getInt64Ty(ctx) }, false));
     }
     llvm::Function* getOrDeclareMemcpy() {
         if (auto* f = module->getFunction("memcpy")) return f;
@@ -1905,23 +1892,18 @@ struct CodeGenerator::Impl {
             llvm::FunctionType::get(ptrTy, { ptrTy, ptrTy, i64 }, false),
             llvm::Function::ExternalLinkage, "memcpy", module.get());
     }
-    llvm::Function* getOrDeclareMemcmp() {
-        if (auto* f = module->getFunction("memcmp")) return f;
+    llvm::FunctionCallee getOrDeclareMemcmp() {
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         auto* i32 = llvm::Type::getInt32Ty(ctx);
         auto* i64 = llvm::Type::getInt64Ty(ctx);
-        return llvm::Function::Create(
-            llvm::FunctionType::get(i32, { ptrTy, ptrTy, i64 }, false),
-            llvm::Function::ExternalLinkage, "memcmp", module.get());
+        return libcFn("memcmp", llvm::FunctionType::get(i32, { ptrTy, ptrTy, i64 }, false));
     }
-    llvm::Function* getOrDeclareSnprintf() {
-        if (auto* f = module->getFunction("snprintf")) return f;
+    llvm::FunctionCallee getOrDeclareSnprintf() {
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         auto* i32 = llvm::Type::getInt32Ty(ctx);
         auto* i64 = llvm::Type::getInt64Ty(ctx);
-        return llvm::Function::Create(
-            llvm::FunctionType::get(i32, { ptrTy, i64, ptrTy }, /*isVarArg=*/true),
-            llvm::Function::ExternalLinkage, "snprintf", module.get());
+        return libcFn("snprintf",
+            llvm::FunctionType::get(i32, { ptrTy, i64, ptrTy }, /*isVarArg=*/true));
     }
     llvm::Function* getOrDeclareUnwindBacktrace() {
         if (auto* f = module->getFunction("_Unwind_Backtrace")) return f;
@@ -3192,14 +3174,12 @@ struct CodeGenerator::Impl {
     //   payload + 0  : i64 length
     //   payload + 8  : element data
 
-    llvm::Function* getOrDeclareExit() {
-        if (auto* existing = module->getFunction("exit")) return existing;
-        auto* fnTy = llvm::FunctionType::get(
-            llvm::Type::getVoidTy(ctx),
-            { llvm::Type::getInt32Ty(ctx) }, false);
-        auto* fn = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, "exit", module.get());
-        fn->addFnAttr(llvm::Attribute::NoReturn);
-        return fn;
+    llvm::FunctionCallee getOrDeclareExit() {
+        auto fc = libcFn("exit", llvm::FunctionType::get(
+            llvm::Type::getVoidTy(ctx), { llvm::Type::getInt32Ty(ctx) }, false));
+        if (auto* fn = llvm::dyn_cast<llvm::Function>(fc.getCallee()))
+            fn->addFnAttr(llvm::Attribute::NoReturn);
+        return fc;
     }
 
     llvm::Constant* makeMessageString(const std::string& text) {
@@ -3209,7 +3189,7 @@ struct CodeGenerator::Impl {
     void emitPanic(const std::string& message, int exitCode) {
         auto* i32Ty = llvm::Type::getInt32Ty(ctx);
         llvm::Value* stderrF = getStderr();
-        auto* fputs = getOrDeclareFputs();
+        auto fputs = getOrDeclareFputs();
         builder->CreateCall(fputs, { builder->CreateGlobalString("panic: ", ".panic.pfx"), stderrF });
         builder->CreateCall(fputs, { makeMessageString(message), stderrF });
         builder->CreateCall(fputs, { builder->CreateGlobalString("\n", ".panic.nl"), stderrF });
@@ -3517,7 +3497,7 @@ struct CodeGenerator::Impl {
         llvm::Value* buf = builder->CreateAlloca(llvm::ArrayType::get(i8Ty, 24), nullptr, "i2s.buf");
         builder->CreateCondBr(fn->getArg(1), signedBB, unsignedBB);
 
-        auto* snprintf = getOrDeclareSnprintf();
+        auto snprintf = getOrDeclareSnprintf();
         llvm::Value* cap = llvm::ConstantInt::get(i64Ty, 24);
         builder->SetInsertPoint(signedBB);
         llvm::Value* wS = builder->CreateCall(snprintf,
@@ -4388,7 +4368,7 @@ struct CodeGenerator::Impl {
             }
             llvm::Value* arg = emitExpr(args[0]);
             if (!arg) return nullptr;
-            auto* puts = getOrDeclarePuts();
+            auto puts = getOrDeclarePuts();
             builder->CreateCall(puts, {emitStringDataPtr(arg)});
             releaseIfOwnedTemp(arg, args[0]);
             return nullptr;
