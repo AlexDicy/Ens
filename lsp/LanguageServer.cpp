@@ -465,6 +465,9 @@ void collectFromExpression(const SyntaxNode& node, const SourceFile& source,
             ::Type* resolved = analysis.typeOf(nw->node.greenNode());
             emitTokenAt(out, source, *t, typeForType(resolved));
         }
+        if (auto tr = nw->typeReference()) {
+            for (auto& arg : tr->typeArguments()) collectFromTypeReference(arg, source, analysis, out);
+        }
         for (auto& arg : nw->arguments()) {
             collectFromExpression(arg.node, source, analysis, out);
         }
@@ -472,6 +475,7 @@ void collectFromExpression(const SyntaxNode& node, const SourceFile& source,
         if (auto callee = c->callee()) {
             collectFromExpression(callee->node, source, analysis, out);
         }
+        for (auto& arg : c->typeArguments()) collectFromTypeReference(arg, source, analysis, out);
         for (auto& arg : c->arguments()) {
             collectFromExpression(arg.node, source, analysis, out);
         }
@@ -493,6 +497,7 @@ void collectFromTypeReference(const ast::TypeReference& tr, const SourceFile& so
     if (nameTok->kind() != SyntaxKind::Identifier) return;  // primitive keywords handled by TextMate
     ::Type* resolved = analysis.typeOf(tr.node.greenNode());
     emitTokenAt(out, source, *nameTok, typeForType(resolved));
+    for (auto& arg : tr.typeArguments()) collectFromTypeReference(arg, source, analysis, out);
 }
 
 void collectFromParameter(const ast::Parameter& p, const SourceFile& source,
