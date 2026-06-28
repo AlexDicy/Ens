@@ -6,6 +6,7 @@
 #include "semantic/Prelude.h"
 #include "semantic/Symbol.h"
 #include "semantic/Type.h"
+#include "semantic/TypeContext.h"
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -52,10 +53,48 @@ static std::string sanitizeModulePath(std::u16string_view s) {
     return out;
 }
 
+static std::string mangledTypeArg(::Type* t);
+
+// A stable, symbol-safe name for a type. For a generic instantiation this folds
+// in the template name and type arguments so each instantiation has a distinct,
+// module-independent symbol (e.g. Vector<int> -> "Vector__int__").
+static std::string mangledTypeName(StructInfo* si) {
+    if (!si) return "_";
+    if (!si->templateOf) return asAscii(si->name);
+    std::string out = asAscii(si->templateOf->name) + "__";
+    for (size_t i = 0; i < si->typeArgs.size(); ++i) {
+        if (i) out += "_";
+        out += mangledTypeArg(si->typeArgs[i]);
+    }
+    out += "__";
+    return out;
+}
+
+static std::string mangledTypeArg(::Type* t) {
+    if (!t) return "_";
+    switch (t->kind) {
+        case TypeKind::Array:    return "arr_" + mangledTypeArg(t->inner);
+        case TypeKind::Optional: return "opt_" + mangledTypeArg(t->inner);
+        case TypeKind::Class:
+        case TypeKind::Struct:
+        case TypeKind::Enum:
+        case TypeKind::External:
+            if (t->structInfo && t->structInfo->templateOf) return mangledTypeName(t->structInfo);
+            if (t->structInfo) {
+                std::string m = sanitizeModulePath(t->structInfo->modulePath);
+                std::string n = asAscii(t->structInfo->name);
+                return m.empty() ? n : m + "_" + n;
+            }
+            return "_";
+        default:
+            return t->toString();  // primitives render to symbol-safe names
+    }
+}
+
 // Globally-stable descriptor symbol name, qualified by the defining module so a
 // class caught in one module and defined in another resolve to one address.
 static std::string descriptorSymbolName(StructInfo* si) {
-    return "_typedesc_" + sanitizeModulePath(si->modulePath) + "_" + asAscii(si->name);
+    return "_typedesc_" + sanitizeModulePath(si->modulePath) + "_" + mangledTypeName(si);
 }
 
 static uint32_t fnv1a32(const std::string& s) {
@@ -69,6 +108,14 @@ struct CodeGenerator::Impl {
     std::string sourceFilename;
     const SourceFile& sourceFile;
     const AnalysisResult& analysis;
+    TypeContext* typeCtx = nullptr;  // shared context, for enumerating instantiations
+
+    // Active monomorphization substitution while emitting a generic instance/function
+    // body. Empty (substOwner == nullptr) when emitting ordinary code.
+    const void* substOwner = nullptr;       // template StructInfo* or function Symbol*
+    StructInfo* substTemplate = nullptr;    // set for class/struct instances
+    ::Type* substInstanceType = nullptr;    // the instance type for `this`
+    std::vector<::Type*> substArgs;
 
     llvm::LLVMContext ctx;
     std::unique_ptr<llvm::Module> module;
@@ -169,9 +216,10 @@ struct CodeGenerator::Impl {
     std::string targetTriple;   // empty = host default; set by --target for cross-compilation
 
     Impl(std::string mn, std::string sf, const SourceFile& src, const AnalysisResult& an,
-         std::u16string mp, std::string triple)
+         std::u16string mp, std::string triple, TypeContext* tc)
         : moduleName(std::move(mn)), sourceFilename(std::move(sf)),
-          sourceFile(src), analysis(an), modulePath(std::move(mp)), targetTriple(std::move(triple)) {
+          sourceFile(src), analysis(an), modulePath(std::move(mp)), targetTriple(std::move(triple)),
+          typeCtx(tc) {
         module = std::make_unique<llvm::Module>(moduleName, ctx);
         module->setSourceFileName(sourceFilename);
         builder = std::make_unique<llvm::IRBuilder<>>(ctx);
@@ -232,6 +280,7 @@ struct CodeGenerator::Impl {
 
     bool isReferenceType(::Type* t) {
         if (!t) return false;
+        t = subst(t);
         if (t->kind == TypeKind::Class) return true;
         if (t->kind == TypeKind::Array) return true;
         if (t->kind == TypeKind::String) return true;
@@ -242,6 +291,7 @@ struct CodeGenerator::Impl {
 
     llvm::Type* mapType(::Type* t) {
         if (!t) return llvm::Type::getVoidTy(ctx);
+        t = subst(t);
         switch (t->kind) {
             case TypeKind::Bool:    return llvm::Type::getInt1Ty(ctx);
             case TypeKind::Byte:    return llvm::Type::getInt8Ty(ctx);
@@ -260,6 +310,9 @@ struct CodeGenerator::Impl {
             case TypeKind::Class:   return llvm::PointerType::get(ctx, 0);
             case TypeKind::Enum:    return llvm::Type::getInt32Ty(ctx);
             case TypeKind::External: return llvm::PointerType::get(ctx, 0);
+            case TypeKind::TypeParam:
+                error(0, "Internal: unsubstituted type parameter '" + t->toString() + "' in codegen");
+                return llvm::PointerType::get(ctx, 0);
             case TypeKind::Array:   return llvm::PointerType::get(ctx, 0);
             case TypeKind::Optional:
                 if (t->inner && (t->inner->isClass() || t->inner->isExternal() || t->inner->isArray() || t->inner->isString()))
@@ -270,6 +323,7 @@ struct CodeGenerator::Impl {
     }
 
     llvm::StructType* mapStructType(::Type* t) {
+        t = subst(t);
         auto it = structTypeCache.find(t);
         if (it != structTypeCache.end()) return it->second;
         std::string sname = t->structInfo ? asAscii(t->structInfo->name) : "struct.anon";
@@ -399,11 +453,38 @@ struct CodeGenerator::Impl {
 
     Symbol* methodSymbolOf(const SyntaxNode& node) const {
         const auto* info = analysis.find(node.greenNode());
-        return info ? info->resolvedMethodSymbol : nullptr;
+        return info ? mapInstanceMethod(info->resolvedMethodSymbol) : nullptr;
     }
 
     ::Type* typeOf(const SyntaxNode& node) const {
-        return analysis.typeOf(node.greenNode());
+        return subst(analysis.typeOf(node.greenNode()));
+    }
+
+    // Apply the active monomorphization substitution to a semantic type. A no-op
+    // unless we are emitting a generic instance/function body.
+    ::Type* subst(::Type* t) const {
+        if (!t || !substOwner || !typeCtx) return t;
+        if (substTemplate && (t->isClass() || t->isStruct()) && t->structInfo == substTemplate) {
+            return substInstanceType;
+        }
+        return typeCtx->substitute(t, substOwner, substArgs);
+    }
+
+    // Inside a template body, a call resolves to the template's own method symbol;
+    // remap it to the concrete instance's cloned method so codegen calls the right
+    // monomorphized function.
+    Symbol* mapInstanceMethod(Symbol* sym) const {
+        if (sym && substTemplate && substInstanceType && substInstanceType->structInfo &&
+            sym->methodOwner == substTemplate) {
+            int idx = substInstanceType->structInfo->findMethodIndex(sym->name);
+            if (idx >= 0) return substInstanceType->structInfo->methods[idx].symbol;
+        }
+        return sym;
+    }
+
+    // Method/owner-qualified mangled function name (e.g. Vector__int___push).
+    std::string mangledMethodName(StructInfo* owner, const std::u16string& name) const {
+        return mangledTypeName(owner) + "_" + asAscii(name);
     }
 
     bool initializeTargetsOnce() {
@@ -486,7 +567,7 @@ struct CodeGenerator::Impl {
         auto* fnType = llvm::FunctionType::get(retType, paramTypes, false);
 
         std::string mangled = asAscii(sym->name);
-        if (owner) mangled = asAscii(owner->name) + "_" + mangled;
+        if (owner) mangled = mangledMethodName(owner, sym->name);
 
         if (auto* existing = module->getFunction(mangled)) {
             values[sym] = existing;
@@ -497,10 +578,11 @@ struct CodeGenerator::Impl {
         return func;
     }
 
-    void declareFunction(const ast::FuncDecl& fn) {
-        Symbol* sym = symbolOf(fn.node);
+    void declareFunction(const ast::FuncDecl& fn, Symbol* symOverride = nullptr,
+                         ::Type* recvOverride = nullptr) {
+        Symbol* sym = symOverride ? symOverride : symbolOf(fn.node);
         if (!sym) return;
-        ::Type* receiver = analysis.receiverOf(fn.node.greenNode());
+        ::Type* receiver = recvOverride ? recvOverride : analysis.receiverOf(fn.node.greenNode());
 
         std::vector<llvm::Type*> paramTypes;
         if (receiver) paramTypes.push_back(llvm::PointerType::get(ctx, 0));
@@ -530,7 +612,7 @@ struct CodeGenerator::Impl {
 
         std::string mangled = asAscii(fname);
         if (receiver && receiver->structInfo) {
-            mangled = asAscii(receiver->structInfo->name) + "_" + mangled;
+            mangled = mangledMethodName(receiver->structInfo, fname);
         }
         // A top-level `main` is renamed; a compiler-emitted `main` wrapper
         // records the process arguments and, when `main` throws, handles the
@@ -555,8 +637,9 @@ struct CodeGenerator::Impl {
         return false;
     }
 
-    void emitFunction(const ast::FuncDecl& fn) {
-        Symbol* sym = symbolOf(fn.node);
+    void emitFunction(const ast::FuncDecl& fn, Symbol* symOverride = nullptr,
+                      ::Type* recvOverride = nullptr) {
+        Symbol* sym = symOverride ? symOverride : symbolOf(fn.node);
         if (!sym) return;
         if (isInterceptedTraceMethod(sym)) return;
         auto it = values.find(sym);
@@ -591,7 +674,7 @@ struct CodeGenerator::Impl {
 
         setLocationFromNode(fn.node);
 
-        ::Type* receiver = analysis.receiverOf(fn.node.greenNode());
+        ::Type* receiver = recvOverride ? recvOverride : analysis.receiverOf(fn.node.greenNode());
 
         {
             auto rawName = fn.nameText().value_or(std::u16string{});
@@ -3297,7 +3380,7 @@ struct CodeGenerator::Impl {
         }
         if (!hasOwning) return llvm::ConstantPointerNull::get(ptrTy);
 
-        std::string name = "_dtor_" + asAscii(t->structInfo->name);
+        std::string name = "_dtor_" + mangledTypeName(t->structInfo);
         if (auto* existing = module->getFunction(name)) return existing;
 
         auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), { ptrTy }, false);
@@ -4433,7 +4516,7 @@ struct CodeGenerator::Impl {
                         std::vector<llvm::Value*>& out) {
         for (size_t i = 0; i < userArgs.size(); ++i) {
             auto& a = userArgs[i];
-            ::Type* paramT = (sym && i < sym->paramTypes.size()) ? sym->paramTypes[i] : nullptr;
+            ::Type* paramT = subst((sym && i < sym->paramTypes.size()) ? sym->paramTypes[i] : nullptr);
             if (sym && paramIsByPointer(sym, i)) {
                 llvm::Value* v = emitAddressForByPointerArg(a, paramT);
                 if (!v) return false;
@@ -4455,7 +4538,7 @@ struct CodeGenerator::Impl {
             if (!dv) return false;
             auto expr = dv->expression();
             if (!expr) return false;
-            ::Type* paramT = (i < sym->paramTypes.size()) ? sym->paramTypes[i] : nullptr;
+            ::Type* paramT = subst((i < sym->paramTypes.size()) ? sym->paramTypes[i] : nullptr);
             if (sym && paramIsByPointer(sym, i)) {
                 llvm::Value* v = emitAddressForByPointerArg(*expr, paramT);
                 if (!v) return false;
@@ -4740,6 +4823,7 @@ struct CodeGenerator::Impl {
         }
         if (sym->isBuiltin) return emitBuiltinCall(sym, e);
         if (sym->isExternal) return emitForeignCall(sym, e);
+        if (sym->isTemplate) return emitGenericCall(sym, e);
         llvm::Function* fn = getOrDeclareExternalFunction(sym, /*receiver*/ nullptr);
         if (!fn) {
             error(e.node.startOffset(), "Internal: callee has no LLVM function");
@@ -4749,6 +4833,37 @@ struct CodeGenerator::Impl {
         if (!appendCallArgs(sym, e.arguments(), args)) return nullptr;
         if (sym->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);
         llvm::Value* result = builder->CreateCall(fn, args);
+        emitThrowsCheck(sym);
+        return result;
+    }
+
+    // A call to a generic free function: declare/reference the monomorphized
+    // instance (mangled by its type args) and call it, with the substitution
+    // active so the signature and argument conversions use concrete types.
+    llvm::Value* emitGenericCall(Symbol* sym, const ast::CallExpression& e) {
+        const std::vector<::Type*>* targs = analysis.callTypeArgsOf(e.node.greenNode());
+        if (!targs) {
+            error(e.node.startOffset(), "Internal: generic call has no resolved type arguments");
+            return nullptr;
+        }
+        const void* savedOwner = substOwner;
+        StructInfo* savedT = substTemplate;
+        ::Type* savedI = substInstanceType;
+        std::vector<::Type*> savedArgs = substArgs;
+        substOwner = sym; substTemplate = nullptr; substInstanceType = nullptr; substArgs = *targs;
+
+        llvm::Function* fn = getOrDeclareGenericFn(sym, mangledGenericFnName(sym, *targs));
+        std::vector<llvm::Value*> args;
+        bool ok = fn && appendCallArgs(sym, e.arguments(), args);
+        llvm::Value* result = nullptr;
+        if (ok) {
+            if (sym->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);
+            result = builder->CreateCall(fn, args);
+        }
+
+        substOwner = savedOwner; substTemplate = savedT; substInstanceType = savedI;
+        substArgs = std::move(savedArgs);
+        if (!ok) return nullptr;
         emitThrowsCheck(sym);
         return result;
     }
@@ -5334,6 +5449,79 @@ struct CodeGenerator::Impl {
         return phi;
     }
 
+    std::string mangledGenericFnName(Symbol* fn, const std::vector<::Type*>& args) {
+        std::string out = asAscii(fn->name) + "__";
+        for (size_t i = 0; i < args.size(); ++i) {
+            if (i) out += "_";
+            out += mangledTypeArg(args[i]);
+        }
+        out += "__";
+        return out;
+    }
+
+    llvm::Function* getOrDeclareGenericFn(Symbol* sym, const std::string& name) {
+        if (auto* ex = module->getFunction(name)) return ex;
+        std::vector<llvm::Type*> ptys;
+        for (size_t i = 0; i < sym->paramTypes.size(); ++i) {
+            if (paramIsByPointer(sym, i)) ptys.push_back(llvm::PointerType::get(ctx, 0));
+            else ptys.push_back(mapType(sym->paramTypes[i]));
+        }
+        if (sym->abiThrows) ptys.push_back(llvm::PointerType::get(ctx, 0));
+        auto* fty = llvm::FunctionType::get(mapType(sym->returnType), ptys, false);
+        return llvm::Function::Create(fty, llvm::Function::ExternalLinkage, name, module.get());
+    }
+
+    void emitClassInstantiation(::Type* instT) {
+        StructInfo* inst = instT->structInfo;
+        StructInfo* templ = inst->templateOf;
+        substOwner = templ; substTemplate = templ; substInstanceType = instT; substArgs = inst->typeArgs;
+        std::vector<std::unique_ptr<SyntaxNode>> roots;
+        for (auto& mi : inst->methods) {
+            if (!mi.symbol || !mi.declaration) continue;
+            roots.push_back(SyntaxNode::makeRoot(static_cast<const GreenElement*>(mi.declaration)));
+            // Reuse any external declaration already created at a call site so the
+            // definition lands on the same symbol instead of an LLVM-renamed copy.
+            getOrDeclareExternalFunction(mi.symbol, instT);
+        }
+        size_t ri = 0;
+        for (auto& mi : inst->methods) {
+            if (!mi.symbol || !mi.declaration) continue;
+            ast::FuncDecl fn{*roots[ri++]};
+            emitFunction(fn, mi.symbol, instT);
+        }
+        getOrEmitTypeDescriptor(inst);
+        substOwner = nullptr; substTemplate = nullptr; substInstanceType = nullptr; substArgs.clear();
+    }
+
+    void emitGenericFunctionInstance(const ast::FuncDecl& fn, Symbol* sym,
+                                     const std::vector<::Type*>& args) {
+        substOwner = sym; substTemplate = nullptr; substInstanceType = nullptr; substArgs = args;
+        llvm::Function* func = getOrDeclareGenericFn(sym, mangledGenericFnName(sym, args));
+        if (func && func->isDeclaration()) {
+            values[sym] = func;
+            emitFunction(fn, sym, nullptr);
+            values.erase(sym);
+        }
+        substOwner = nullptr; substArgs.clear();
+    }
+
+    void emitInstantiations(const ast::SourceFile& sf) {
+        if (!typeCtx) return;
+        for (::Type* instT : typeCtx->classInstantiations()) {
+            if (!instT || !instT->structInfo) continue;
+            StructInfo* templ = instT->structInfo->templateOf;
+            if (!templ || templ->modulePath != modulePath) continue;
+            emitClassInstantiation(instT);
+        }
+        for (auto& fn : sf.functions()) {
+            Symbol* sym = symbolOf(fn.node);
+            if (!sym || !sym->isTemplate) continue;
+            for (auto& fi : typeCtx->functionInstantiations()) {
+                if (fi.function == sym) emitGenericFunctionInstance(fn, sym, fi.args);
+            }
+        }
+    }
+
     bool generate(const SyntaxNode& root) {
         if (!initializeTargetMachine()) return false;
         auto sf = ast::SourceFile::cast(root);
@@ -5342,13 +5530,23 @@ struct CodeGenerator::Impl {
             return false;
         }
 
+        // Skip generic templates here: their concrete instantiations are emitted
+        // separately (a template body references unbound type parameters).
+        auto isTemplateDecl = [&](const ast::FuncDecl& fn) {
+            Symbol* s = symbolOf(fn.node);
+            if (s && s->isTemplate) return true;
+            ::Type* recv = analysis.receiverOf(fn.node.greenNode());
+            return recv && recv->structInfo && recv->structInfo->isTemplate;
+        };
         auto eachDecl = [&](auto&& visit) {
-            for (auto& fn : sf->functions()) visit(fn);
-            for (auto& sd : sf->structs())   for (auto& m : sd.methods()) visit(m);
-            for (auto& cd : sf->classes())   for (auto& m : cd.methods()) visit(m);
+            for (auto& fn : sf->functions()) if (!isTemplateDecl(fn)) visit(fn);
+            for (auto& sd : sf->structs())   for (auto& m : sd.methods()) if (!isTemplateDecl(m)) visit(m);
+            for (auto& cd : sf->classes())   for (auto& m : cd.methods()) if (!isTemplateDecl(m)) visit(m);
         };
         eachDecl([&](const ast::FuncDecl& fn) { declareFunction(fn); });
         eachDecl([&](const ast::FuncDecl& fn) { emitFunction(fn); });
+
+        emitInstantiations(*sf);
 
         // Define a descriptor for every class declared here, even one only ever
         // thrown or caught (e.g. the prelude's Error), so its definition exists.
@@ -5422,9 +5620,10 @@ CodeGenerator::CodeGenerator(std::string moduleName,
                                    const SourceFile& src,
                                    const AnalysisResult& analysis,
                                    std::u16string modulePath,
-                                   std::string targetTriple)
+                                   std::string targetTriple,
+                                   TypeContext* typeContext)
     : impl(std::make_unique<Impl>(std::move(moduleName), std::move(sourceFilename), src, analysis,
-                                  std::move(modulePath), std::move(targetTriple))) {}
+                                  std::move(modulePath), std::move(targetTriple), typeContext)) {}
 
 CodeGenerator::~CodeGenerator() = default;
 

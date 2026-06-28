@@ -8,6 +8,8 @@
 #include "cst/SyntaxNode.h"
 #include "semantic/AnalysisResult.h"
 
+class TypeContext;
+
 class CodeGenerator {
 public:
     CodeGenerator(std::string moduleName,
@@ -15,7 +17,8 @@ public:
                   const SourceFile& sourceFile,
                   const AnalysisResult& analysis,
                   std::u16string modulePath = u"",
-                  std::string targetTriple = "");
+                  std::string targetTriple = "",
+                  TypeContext* typeContext = nullptr);
     ~CodeGenerator();
 
     bool generate(const SyntaxNode& sourceFileRoot);

@@ -195,9 +195,11 @@ bool runDriverAnalysis(std::vector<std::unique_ptr<Module>>& modules,
 bool emitModule(Module& module,
                 const std::string& moduleName,
                 const fs::path& objectPath,
-                const std::string& targetTriple) {
+                const std::string& targetTriple,
+                TypeContext& sharedCtx) {
     CodeGenerator codegen(moduleName, module.source->getFilename(),
-                          *module.source, module.analyzer->result(), module.modulePath, targetTriple);
+                          *module.source, module.analyzer->result(), module.modulePath, targetTriple,
+                          &sharedCtx);
     if (!codegen.generate(*module.rootNode)) {
         for (const auto& d : codegen.getDiagnostics()) d.print(*module.source, std::cerr);
         return false;
@@ -211,7 +213,8 @@ bool emitModule(Module& module,
 
 bool linkModulesToExe(std::vector<std::unique_ptr<Module>>& modules,
                       const fs::path& outputFile,
-                      const std::string& targetTriple) {
+                      const std::string& targetTriple,
+                      TypeContext& sharedCtx) {
     fs::path outDir = outputFile.parent_path();
     if (outDir.empty()) outDir = fs::current_path();
     std::string baseStem = outputFile.stem().string();
@@ -228,7 +231,7 @@ bool linkModulesToExe(std::vector<std::unique_ptr<Module>>& modules,
     for (auto& m : modules) {
         std::string name = baseStem + "." + sanitizeForFilename(m->modulePath) + ".obj";
         fs::path objPath = outDir / name;
-        if (!emitModule(*m, "ens_" + sanitizeForFilename(m->modulePath), objPath, targetTriple)) return false;
+        if (!emitModule(*m, "ens_" + sanitizeForFilename(m->modulePath), objPath, targetTriple, sharedCtx)) return false;
         objectPaths.push_back(objPath.string());
         for (auto& lib : m->analyzer->linkLibraries()) addLibrary(lib);
     }
@@ -280,7 +283,8 @@ bool Compiler::compile(const fs::path& source,
         for (auto& m : modules) {
             CodeGenerator codegen("ens_" + sanitizeForFilename(m->modulePath),
                                   m->source->getFilename(),
-                                  *m->source, m->analyzer->result(), m->modulePath, targetTriple);
+                                  *m->source, m->analyzer->result(), m->modulePath, targetTriple,
+                                  &sharedCtx);
             if (!codegen.generate(*m->rootNode)) {
                 for (const auto& d : codegen.getDiagnostics()) d.print(*m->source, std::cerr);
                 return false;
@@ -296,7 +300,7 @@ bool Compiler::compile(const fs::path& source,
         return false;
     }
 
-    return linkModulesToExe(modules, outputFolder, targetTriple);
+    return linkModulesToExe(modules, outputFolder, targetTriple, sharedCtx);
 }
 
 std::vector<fs::path> Compiler::getFileTree(const fs::path& root, const fs::path& rootPath) {
@@ -445,11 +449,12 @@ bool Compiler::compileSingle(std::istream& source, const fs::path& outputFile, c
     for (auto& c : ext) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
     const bool linkToExe = !outputFile.empty() && (ext == ".exe" || ext.empty());
 
-    if (linkToExe) return linkModulesToExe(modules, outputFile, targetTriple);
+    if (linkToExe) return linkModulesToExe(modules, outputFile, targetTriple, sharedCtx);
 
     CodeGenerator codegen("ens_" + sanitizeForFilename(user->modulePath),
                           user->source->getFilename(),
-                          *user->source, user->analyzer->result(), user->modulePath, targetTriple);
+                          *user->source, user->analyzer->result(), user->modulePath, targetTriple,
+                          &sharedCtx);
     if (!codegen.generate(*user->rootNode)) {
         for (const auto& d : codegen.getDiagnostics()) d.print(*user->source, std::cerr);
         return false;
