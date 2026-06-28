@@ -2855,6 +2855,12 @@ Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
 
     Type* objT = analyzeExpr(*obj);
     if (objT->isError()) return typeCtx.getError();
+    // A bounded type parameter exposes the members of its bound class.
+    if (objT->isTypeParam() && objT->structInfo) {
+        if (Type* bound = typeCtx.lookupClass(objT->structInfo->modulePath, objT->structInfo->name)) {
+            objT = bound;
+        }
+    }
     if (objT->isArray()) {
         auto memberName = expr.memberText();
         if (!memberName) return typeCtx.getError();
