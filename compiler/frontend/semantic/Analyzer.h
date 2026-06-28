@@ -182,6 +182,8 @@ private:
                               const std::u16string& funcName);
     Type* checkDirectCallArguments(const ast::CallExpression& expr, Symbol* sym,
                                    const std::u16string& funcName);
+    Type* analyzeGenericCall(const ast::CallExpression& expr, Symbol* sym,
+                             const std::u16string& funcName);
     Type* analyzeMember(const ast::MemberExpression& expr);
     Type* analyzeSafeMember(const ast::SafeMemberExpression& expr);
     Type* analyzeSubscript(const ast::SubscriptExpression& expr);
@@ -226,6 +228,23 @@ private:
     Type* resolveTypeReference(const ast::TypeReference& tr);
     Type* lookupTypeByName(const std::u16string& qualifier, const std::u16string& name,
                            const SyntaxNode& diagNode);
+
+    // Generics. typeParamScope_ maps type-parameter names visible in the enclosing
+    // template (class/struct/function) to their placeholder types.
+    std::vector<std::pair<std::u16string, Type*>> typeParamScope_;
+    std::vector<StructInfo*> resolveTypeParamBounds(const void* owner,
+                                                    const std::vector<ast::TypeParam>& params);
+    size_t pushTypeParams(const void* owner, const std::vector<std::u16string>& names,
+                          const std::vector<StructInfo*>& bounds);
+    // Resolve a template's bounds (once) from its AST params, then push its scope.
+    size_t enterTemplateScope(StructInfo* si, const std::vector<ast::TypeParam>& astParams);
+    void popTypeParams(size_t count);
+    // Instantiate `templateType` for the type args written on `tr`, checking arity
+    // and bounds; reports against `diag`. Returns the error type on failure.
+    Type* instantiateFromArgs(Type* templateType, const std::vector<ast::TypeReference>& args,
+                              const SyntaxNode& diag);
+    bool checkTypeArgBound(Type* arg, StructInfo* bound, const std::u16string& paramName,
+                           const SyntaxNode& diag);
     bool isLValue(const ast::Expression& expr) const;
 
     bool isMemberAccessAllowed(Visibility visibility, StructInfo* definingClass);

@@ -52,6 +52,38 @@ static bool hasDirectToken(const SyntaxNode& decl, SyntaxKind kind) {
     return false;
 }
 
+static std::optional<TypeParamList> typeParamListOf(const SyntaxNode& decl) {
+    if (auto n = firstChildNode(decl, SyntaxKind::TypeParamList)) return TypeParamList::cast(*n);
+    return std::nullopt;
+}
+
+// === TypeParam / TypeParamList ===
+
+std::optional<SyntaxNode> TypeParam::nameToken() const {
+    for (auto& c : node.children()) {
+        if (!isTrivia(c.kind()) && c.kind() == SyntaxKind::Identifier) return c;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::u16string> TypeParam::nameText() const {
+    if (auto t = nameToken()) return std::u16string(t->tokenText());
+    return std::nullopt;
+}
+
+std::optional<TypeReference> TypeParam::bound() const {
+    if (auto tr = firstChildNode(node, SyntaxKind::TypeRef)) return TypeReference::cast(*tr);
+    return std::nullopt;
+}
+
+std::vector<TypeParam> TypeParamList::params() const {
+    std::vector<TypeParam> out;
+    for (auto& c : node.children()) {
+        if (auto p = TypeParam::cast(c)) out.push_back(*p);
+    }
+    return out;
+}
+
 // === ReturnType ===
 
 std::optional<TypeReference> ReturnType::typeReference() const {
@@ -157,6 +189,12 @@ std::optional<SyntaxNode> FuncDecl::nameToken() const {
 std::optional<std::u16string> FuncDecl::nameText() const {
     if (auto t = nameToken()) return std::u16string(t->tokenText());
     return std::nullopt;
+}
+
+std::optional<TypeParamList> FuncDecl::typeParamList() const { return typeParamListOf(node); }
+std::vector<TypeParam> FuncDecl::typeParams() const {
+    if (auto l = typeParamList()) return l->params();
+    return {};
 }
 
 std::optional<ParameterList> FuncDecl::parameterList() const {
@@ -327,6 +365,11 @@ std::optional<std::u16string> StructDecl::nameText() const {
     if (auto t = nameToken()) return std::u16string(t->tokenText());
     return std::nullopt;
 }
+std::optional<TypeParamList> StructDecl::typeParamList() const { return typeParamListOf(node); }
+std::vector<TypeParam> StructDecl::typeParams() const {
+    if (auto l = typeParamList()) return l->params();
+    return {};
+}
 std::optional<MemberList> StructDecl::memberList() const {
     if (auto m = firstChildNode(node, SyntaxKind::MemberList)) return MemberList::cast(*m);
     return std::nullopt;
@@ -346,6 +389,11 @@ std::optional<SyntaxNode> ClassDecl::nameToken() const { return firstIdentAfterK
 std::optional<std::u16string> ClassDecl::nameText() const {
     if (auto t = nameToken()) return std::u16string(t->tokenText());
     return std::nullopt;
+}
+std::optional<TypeParamList> ClassDecl::typeParamList() const { return typeParamListOf(node); }
+std::vector<TypeParam> ClassDecl::typeParams() const {
+    if (auto l = typeParamList()) return l->params();
+    return {};
 }
 std::optional<SyntaxNode> ClassDecl::baseClassToken() const {
     return firstIdentAfterKeyword(node, SyntaxKind::KwExtends);

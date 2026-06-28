@@ -180,6 +180,18 @@ std::optional<Expression> CallExpression::callee() const {
     return firstExpressionChild(node);
 }
 
+std::vector<TypeReference> CallExpression::typeArguments() const {
+    std::vector<TypeReference> out;
+    for (auto& c : node.children()) {
+        if (c.kind() != SyntaxKind::TypeArgList) continue;
+        for (auto& a : c.children()) {
+            if (auto tr = TypeReference::cast(a)) out.push_back(*tr);
+        }
+        break;
+    }
+    return out;
+}
+
 std::optional<ArgumentList> CallExpression::argumentList() const {
     auto a = firstChildNode(node, SyntaxKind::ArgList);
     if (!a) return std::nullopt;

@@ -65,6 +65,8 @@ private:
     void parseStructOrClassMember();
     void parseFieldDecl();
     void parseEnumDecl();
+    void parseTypeParamList();
+    void parseTypeParam();
     void parseImportDecl();
     void parseImportPath();
     void parseExternalDecl();
@@ -77,6 +79,11 @@ private:
     void parseTypeHead();  // base + namespace only, no [] or ? (used in `new`)
     bool isTypeStart(SyntaxKind k) const;
     bool isPrimitiveTypeKw(SyntaxKind k) const;
+    void parseTypeArgList();
+    void expectClosingGt(const char* what);
+    bool atClosingGt() const;
+    size_t scanTypeArgs(size_t cursor) const;  // peek-index past a type-ish <...>, else 0
+    size_t skipAnglesRaw(size_t idx) const;    // raw-index past <...>, else idx
 
     // === Statements ===
     void parseStatement();

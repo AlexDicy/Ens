@@ -55,6 +55,7 @@ bool Type::isPrimitive() const {
         case TypeKind::Class:
         case TypeKind::Enum:
         case TypeKind::External:
+        case TypeKind::TypeParam:
         case TypeKind::Error:
             return false;
     }
@@ -71,6 +72,9 @@ bool Type::equals(const Type* other) const {
     if (kind == TypeKind::Struct || kind == TypeKind::Class ||
         kind == TypeKind::Enum || kind == TypeKind::External) {
         return structInfo == other->structInfo;
+    }
+    if (kind == TypeKind::TypeParam) {
+        return paramOwner == other->paramOwner && paramIndex == other->paramIndex;
     }
     return true;
 }
@@ -208,6 +212,14 @@ std::string Type::toString() const {
             if (structInfo) {
                 r.reserve(structInfo->name.size());
                 for (char16_t c : structInfo->name) r.push_back(c < 128 ? static_cast<char>(c) : '?');
+                if (structInfo->templateOf && !structInfo->typeArgs.empty()) {
+                    r.push_back('<');
+                    for (size_t i = 0; i < structInfo->typeArgs.size(); ++i) {
+                        if (i) r += ", ";
+                        r += structInfo->typeArgs[i] ? structInfo->typeArgs[i]->toString() : "?";
+                    }
+                    r.push_back('>');
+                }
             } else {
                 r = (kind == TypeKind::Class ? "<class>" : "<struct>");
             }
@@ -232,6 +244,12 @@ std::string Type::toString() const {
                 r = "<external>";
             }
             return r;
+        }
+        case TypeKind::TypeParam: {
+            std::string r;
+            r.reserve(paramName.size());
+            for (char16_t c : paramName) r.push_back(c < 128 ? static_cast<char>(c) : '?');
+            return r.empty() ? "<typeparam>" : r;
         }
         case TypeKind::Error:    return "<error>";
     }

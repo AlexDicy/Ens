@@ -319,6 +319,9 @@ bool analyzeModuleGraph(std::vector<std::unique_ptr<Module>>& modules,
         Analyzer::finalizeClassHierarchy(infos);
     }
 
+    // Fill generic instantiations whose template was laid out after the use site.
+    sharedCtx.materializeInstantiations();
+
     for (auto& m : modules) m->analyzer->analyzeBodies();
 
     // Checked-exception throws-set fixpoint. Sets propagate cross-module via shared Symbol*.

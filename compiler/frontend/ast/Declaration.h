@@ -12,6 +12,8 @@ namespace ast {
 enum class Visibility { Public, Private, Protected };
 
 class VisibilityModifier;
+class TypeParam;
+class TypeParamList;
 class ReturnType;
 class ThrowsClause;
 class CatchClause;
@@ -40,6 +42,28 @@ public:
         return VisibilityModifier{n};
     }
     Visibility visibility() const;
+};
+
+class TypeParam {
+public:
+    SyntaxNode node;
+    static std::optional<TypeParam> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::TypeParam) return std::nullopt;
+        return TypeParam{n};
+    }
+    std::optional<SyntaxNode> nameToken() const;
+    std::optional<std::u16string> nameText() const;
+    std::optional<TypeReference> bound() const;
+};
+
+class TypeParamList {
+public:
+    SyntaxNode node;
+    static std::optional<TypeParamList> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::TypeParamList) return std::nullopt;
+        return TypeParamList{n};
+    }
+    std::vector<TypeParam> params() const;
 };
 
 class ReturnType {
@@ -122,6 +146,8 @@ public:
     Visibility visibility() const;
     std::optional<SyntaxNode> nameToken() const;
     std::optional<std::u16string> nameText() const;
+    std::optional<TypeParamList> typeParamList() const;
+    std::vector<TypeParam> typeParams() const;
     std::optional<ParameterList> parameterList() const;
     std::vector<Parameter> parameters() const;
     std::optional<ReturnType> returnType() const;
@@ -175,6 +201,8 @@ public:
     Visibility visibility() const;
     std::optional<SyntaxNode> nameToken() const;
     std::optional<std::u16string> nameText() const;
+    std::optional<TypeParamList> typeParamList() const;
+    std::vector<TypeParam> typeParams() const;
     std::optional<MemberList> memberList() const;
     std::vector<FieldDecl> fields() const;
     std::vector<FuncDecl> methods() const;
@@ -191,6 +219,8 @@ public:
     Visibility visibility() const;
     std::optional<SyntaxNode> nameToken() const;
     std::optional<std::u16string> nameText() const;
+    std::optional<TypeParamList> typeParamList() const;
+    std::vector<TypeParam> typeParams() const;
     std::optional<SyntaxNode> baseClassToken() const;
     std::optional<std::u16string> baseClassName() const;
     bool isAbstract() const;

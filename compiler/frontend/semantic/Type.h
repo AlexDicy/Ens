@@ -15,6 +15,7 @@ enum class TypeKind {
     Class,       // user-defined class (reference semantics, heap-allocated)
     Enum,        // user-defined enum (integer-backed value type)
     External,    // opaque foreign type declared via `external type Name;`
+    TypeParam,   // a generic type-parameter placeholder before instantiation
     Error        // sentinel - used to suppress cascading errors
 };
 
@@ -70,6 +71,15 @@ struct StructInfo {
     bool isAbstract = false;
     bool isFinal = false;
 
+    // Generics. A template carries its type-parameter names and optional bounds;
+    // an instantiation points back at its template and records the concrete args.
+    bool isTemplate = false;
+    bool membersCollected = false;              // template: fields/methods resolved
+    std::vector<std::u16string> typeParamNames;
+    std::vector<StructInfo*> typeParamBounds;   // parallel to names; null = unbounded
+    StructInfo* templateOf = nullptr;           // instantiation -> its template
+    std::vector<Type*> typeArgs;                // instantiation -> concrete type args
+
     int findFieldIndex(const std::u16string& fieldName) const {
         for (size_t i = 0; i < fields.size(); ++i) {
             if (fields[i].name == fieldName) return static_cast<int>(i);
@@ -112,6 +122,12 @@ public:
     Type* inner = nullptr;
     StructInfo* structInfo = nullptr;
 
+    // Type-parameter placeholder (kind == TypeParam): identity is (paramOwner,
+    // paramIndex); `structInfo` holds the optional bound; paramName is for display.
+    const void* paramOwner = nullptr;
+    int paramIndex = -1;
+    std::u16string paramName;
+
     explicit Type(TypeKind k) : kind(k) {}
     Type(TypeKind k, Type* i) : kind(k), inner(i) {}
 
@@ -129,6 +145,7 @@ public:
     bool isClass() const  { return kind == TypeKind::Class; }
     bool isEnum() const   { return kind == TypeKind::Enum; }
     bool isExternal() const { return kind == TypeKind::External; }
+    bool isTypeParam() const { return kind == TypeKind::TypeParam; }
     bool isString() const { return kind == TypeKind::String; }
     bool hasRecordLayout() const { return isStruct() || isClass(); }
 

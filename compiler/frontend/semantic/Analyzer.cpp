@@ -321,6 +321,7 @@ void Analyzer::collectDeclarations(const SyntaxNode& root) {
     registerNames(root);
     resolveSignatures();
     if (astRoot) layoutDeclaredClasses(*astRoot);
+    typeCtx.materializeInstantiations();
 }
 
 void Analyzer::registerNames(const SyntaxNode& root) {
@@ -456,6 +457,10 @@ void Analyzer::registerStructNames(const ast::SourceFile& file) {
         auto [line, col] = source.offsetToPosition(sd.node.startOffset());
         t->structInfo->line = line;
         t->structInfo->column = col;
+        for (auto& tp : sd.typeParams()) {
+            t->structInfo->isTemplate = true;
+            t->structInfo->typeParamNames.push_back(tp.nameText().value_or(std::u16string{}));
+        }
         analysis.setType(sd.node.greenNode(), t);
     }
 }
@@ -472,6 +477,10 @@ void Analyzer::registerClassNames(const ast::SourceFile& file) {
         auto [line, col] = source.offsetToPosition(cd.node.startOffset());
         t->structInfo->line = line;
         t->structInfo->column = col;
+        for (auto& tp : cd.typeParams()) {
+            t->structInfo->isTemplate = true;
+            t->structInfo->typeParamNames.push_back(tp.nameText().value_or(std::u16string{}));
+        }
         analysis.setType(cd.node.greenNode(), t);
     }
 }
@@ -665,6 +674,7 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
         Type* t = analysis.typeOf(sd.node.greenNode());
         if (!t) continue;
         if (t->structInfo) t->structInfo->visibility = toSemanticVisibility(sd.visibility());
+        size_t tpCount = t->structInfo ? enterTemplateScope(t->structInfo, sd.typeParams()) : 0;
         for (auto& f : sd.fields()) {
             FieldInfo fi;
             auto fname = f.nameText();
@@ -682,11 +692,13 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             fi.declaration = f.node.greenNode();
             t->structInfo->fields.push_back(std::move(fi));
         }
+        popTypeParams(tpCount);
     }
 
     for (auto& sd : structs) {
         Type* t = analysis.typeOf(sd.node.greenNode());
         if (!t) continue;
+        size_t tpCount = t->structInfo ? enterTemplateScope(t->structInfo, sd.typeParams()) : 0;
         for (auto& m : sd.methods()) {
             Type* retType = m.returnType() && m.returnType()->typeReference()
                 ? resolveTypeReference(*m.returnType()->typeReference())
@@ -713,6 +725,8 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             mi.visibility = toSemanticVisibility(m.visibility());
             t->structInfo->methods.push_back(std::move(mi));
         }
+        t->structInfo->membersCollected = true;
+        popTypeParams(tpCount);
     }
 }
 
@@ -733,6 +747,11 @@ void Analyzer::resolveClassBases(const ast::SourceFile& file) {
         si->isAbstract = cd.isAbstract();
         si->isFinal = cd.isFinal();
         si->visibility = toSemanticVisibility(cd.visibility());
+        if (si->isTemplate && cd.baseClassName()) {
+            errorAtNode(cd.baseClassToken().value_or(cd.node),
+                "A generic class cannot extend a base class yet");
+            continue;
+        }
         if (auto baseName = cd.baseClassName()) {
             SyntaxNode diag = cd.baseClassToken().value_or(cd.node);
             Type* baseT = typeCtx.lookupNamedType(modulePath_, *baseName);
@@ -792,6 +811,7 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
     Type* t = analysis.typeOf(cd.node.greenNode());
     if (!t || !t->structInfo) return;
     StructInfo* si = t->structInfo;
+    size_t tpCount = enterTemplateScope(si, cd.typeParams());
 
     // Fields: flatten inherited fields first (base is already laid out), then own.
     if (si->baseInfo) {
@@ -913,6 +933,8 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
             }
         }
     }
+    si->membersCollected = true;
+    popTypeParams(tpCount);
 }
 
 void Analyzer::layoutDeclaredClasses(const ast::SourceFile& file) {
@@ -977,19 +999,29 @@ void Analyzer::finalizeClassHierarchy(const std::vector<StructInfo*>& classes) {
 
 void Analyzer::collectFunctions(const ast::SourceFile& file) {
     for (auto& fn : file.functions()) {
-        Type* retType = fn.returnType() && fn.returnType()->typeReference()
-            ? resolveTypeReference(*fn.returnType()->typeReference())
-            : typeCtx.getPrimitive(TypeKind::Void);
         auto fname = fn.nameText().value_or(std::u16string{});
         uint32_t fPos = fn.nameToken() ? fn.nameToken()->startOffset() : fn.node.startOffset();
         Symbol* sym = makeSymbol(SymbolKind::Function, fname, nullptr, fPos);
-        sym->returnType = retType;
         sym->funcDeclCst = fn.node.greenNode();
         sym->isPublic = fn.visibility() == ast::Visibility::Public;
         sym->declaredThrows = fn.isThrows();
         sym->abiThrows = fn.isThrows();
+
+        auto tparams = fn.typeParams();
+        size_t tpCount = 0;
+        if (!tparams.empty()) {
+            sym->isTemplate = true;
+            for (auto& tp : tparams) sym->typeParamNames.push_back(tp.nameText().value_or(std::u16string{}));
+            sym->typeParamBounds = resolveTypeParamBounds(sym, tparams);
+            tpCount = pushTypeParams(sym, sym->typeParamNames, sym->typeParamBounds);
+        }
+        sym->returnType = fn.returnType() && fn.returnType()->typeReference()
+            ? resolveTypeReference(*fn.returnType()->typeReference())
+            : typeCtx.getPrimitive(TypeKind::Void);
         checkThrowsClausePlacement(fn, /*isOverridable=*/false, /*isConstructor=*/false);
         resolveFunctionParams(fn, sym);
+        popTypeParams(tpCount);
+
         if (!globalScope->define(sym)) {
             errorAtNode(fn.node, "Duplicate function name '" + asciiOf(fname) + "'");
         }
@@ -1217,11 +1249,94 @@ void Analyzer::checkParameterDefaults(const ast::FuncDecl& fn) {
 // Type references
 // =========================================================
 
+std::vector<StructInfo*> Analyzer::resolveTypeParamBounds(
+        const void* /*owner*/, const std::vector<ast::TypeParam>& params) {
+    std::vector<StructInfo*> bounds;
+    bounds.reserve(params.size());
+    for (auto& tp : params) {
+        StructInfo* b = nullptr;
+        if (auto br = tp.bound()) {
+            Type* bt = resolveTypeReference(*br);
+            if (bt && bt->isClass() && bt->structInfo && !bt->structInfo->isTemplate) {
+                b = bt->structInfo;
+            } else if (bt && !bt->isError()) {
+                errorAtNode(br->node, "A type-parameter bound must be a non-generic class; '" +
+                    bt->toString() + "' is not");
+            }
+        }
+        bounds.push_back(b);
+    }
+    return bounds;
+}
+
+size_t Analyzer::pushTypeParams(const void* owner, const std::vector<std::u16string>& names,
+                                const std::vector<StructInfo*>& bounds) {
+    for (size_t i = 0; i < names.size(); ++i) {
+        StructInfo* b = i < bounds.size() ? bounds[i] : nullptr;
+        Type* ph = typeCtx.getTypeParam(owner, static_cast<int>(i), names[i], b);
+        typeParamScope_.push_back({names[i], ph});
+    }
+    return names.size();
+}
+
+size_t Analyzer::enterTemplateScope(StructInfo* si, const std::vector<ast::TypeParam>& astParams) {
+    if (!si || !si->isTemplate) return 0;
+    if (si->typeParamBounds.empty() && !astParams.empty()) {
+        si->typeParamBounds = resolveTypeParamBounds(si, astParams);
+    }
+    return pushTypeParams(si, si->typeParamNames, si->typeParamBounds);
+}
+
+void Analyzer::popTypeParams(size_t count) {
+    while (count-- > 0 && !typeParamScope_.empty()) typeParamScope_.pop_back();
+}
+
+bool Analyzer::checkTypeArgBound(Type* arg, StructInfo* bound, const std::u16string& paramName,
+                                 const SyntaxNode& diag) {
+    if (!bound) return true;
+    if (arg && arg->isClass() && arg->structInfo && arg->structInfo->isSubclassOf(bound)) {
+        return true;
+    }
+    errorAtNode(diag, "Type argument '" + (arg ? arg->toString() : std::string("?")) +
+        "' for type parameter '" + asciiOf(paramName) + "' must be '" + asciiOf(bound->name) +
+        "' or a subclass of it");
+    return false;
+}
+
+Type* Analyzer::instantiateFromArgs(Type* templateType,
+                                    const std::vector<ast::TypeReference>& args,
+                                    const SyntaxNode& diag) {
+    StructInfo* tmpl = templateType->structInfo;
+    size_t arity = tmpl->typeParamNames.size();
+    if (args.size() != arity) {
+        errorAtNode(diag, "Generic type '" + asciiOf(tmpl->name) + "' expects " +
+            std::to_string(arity) + (arity == 1 ? " type argument" : " type arguments") +
+            ", but " + std::to_string(args.size()) + (args.size() == 1 ? " was given" : " were given"));
+        return typeCtx.getError();
+    }
+    std::vector<Type*> argTypes;
+    argTypes.reserve(args.size());
+    bool ok = true;
+    for (size_t i = 0; i < args.size(); ++i) {
+        Type* at = resolveTypeReference(args[i]);
+        if (!at || at->isError()) { ok = false; argTypes.push_back(typeCtx.getError()); continue; }
+        argTypes.push_back(at);
+        StructInfo* bound = i < tmpl->typeParamBounds.size() ? tmpl->typeParamBounds[i] : nullptr;
+        std::u16string pname = i < tmpl->typeParamNames.size() ? tmpl->typeParamNames[i] : std::u16string{};
+        if (!checkTypeArgBound(at, bound, pname, args[i].node)) ok = false;
+    }
+    if (!ok) return typeCtx.getError();
+    return typeCtx.instantiate(templateType, argTypes);
+}
+
 Type* Analyzer::lookupTypeByName(const std::u16string& qualifier,
                                  const std::u16string& name,
                                  const SyntaxNode& diagNode) {
     if (qualifier.empty()) {
         if (Type* prim = typeCtx.primitiveFromName(name)) return prim;
+        for (auto it = typeParamScope_.rbegin(); it != typeParamScope_.rend(); ++it) {
+            if (it->first == name) return it->second;
+        }
         if (Type* t = typeCtx.lookupNamedType(modulePath_, name)) return t;
         // Fall back to imported aliases stored in the module's globalScope.
         if (Symbol* sym = globalScope ? globalScope->lookupLocal(name) : nullptr) {
@@ -1258,6 +1373,27 @@ Type* Analyzer::resolveTypeReference(const ast::TypeReference& tr) {
 
     Type* base = lookupTypeByName(qualifier, *name, tr.node);
     if (base->isError()) {
+        analysis.setType(tr.node.greenNode(), typeCtx.getError());
+        return typeCtx.getError();
+    }
+    auto typeArgs = tr.typeArguments();
+    bool baseIsTemplate = base->structInfo && base->structInfo->isTemplate &&
+                          (base->isClass() || base->isStruct());
+    if (baseIsTemplate) {
+        if (typeArgs.empty()) {
+            errorAtNode(tr.node, "Generic type '" + asciiOf(base->structInfo->name) +
+                "' requires type arguments (for example '" + asciiOf(base->structInfo->name) + "<int>')");
+            analysis.setType(tr.node.greenNode(), typeCtx.getError());
+            return typeCtx.getError();
+        }
+        base = instantiateFromArgs(base, typeArgs, tr.node);
+        if (base->isError()) {
+            analysis.setType(tr.node.greenNode(), typeCtx.getError());
+            return typeCtx.getError();
+        }
+    } else if (!typeArgs.empty()) {
+        errorAtNode(tr.node, "Type '" + base->toString() +
+            "' is not generic and takes no type arguments");
         analysis.setType(tr.node.greenNode(), typeCtx.getError());
         return typeCtx.getError();
     }
@@ -1312,6 +1448,16 @@ void Analyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
     currentFunctionParamScope = funcScope;
 
     Type* receiverType = analysis.receiverOf(fn.node.greenNode());
+
+    size_t tpCount = 0;
+    if (currentFunction->isTemplate) {
+        tpCount += pushTypeParams(currentFunction, currentFunction->typeParamNames,
+                                  currentFunction->typeParamBounds);
+    }
+    if (receiverType && receiverType->structInfo && receiverType->structInfo->isTemplate) {
+        StructInfo* owner = receiverType->structInfo;
+        tpCount += pushTypeParams(owner, owner->typeParamNames, owner->typeParamBounds);
+    }
 
     if (receiverType) {
         Symbol* thisSym = makeSymbol(SymbolKind::Parameter, std::u16string(u"this"),
@@ -1368,6 +1514,7 @@ void Analyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
     for (auto& cc : fn.catchClauses()) analyzeCatchClause(cc, funcScope);
 
     popScope();
+    popTypeParams(tpCount);
     currentFunction = prevFunction;
     currentThis = prevThis;
     sawSuperConstructorCall = prevSawSuper;
@@ -2443,10 +2590,93 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
     if (sym->isExternal) {
         return analyzeExternalCall(expr, sym, *name);
     }
+    if (sym->isTemplate) {
+        return analyzeGenericCall(expr, sym, *name);
+    }
     return checkDirectCallArguments(expr, sym, *name);
     }();
     clearNarrowingsForCall(expr);
     return result;
+}
+
+Type* Analyzer::analyzeGenericCall(const ast::CallExpression& expr, Symbol* sym,
+                                   const std::u16string& funcName) {
+    auto args = expr.arguments();
+    auto explicitArgs = expr.typeArguments();
+    size_t arity = sym->typeParamNames.size();
+
+    std::vector<Type*> typeArgs(arity, nullptr);
+    if (!explicitArgs.empty()) {
+        if (explicitArgs.size() != arity) {
+            errorAtNode(expr.node, "Generic function '" + asciiOf(funcName) + "' expects " +
+                std::to_string(arity) + (arity == 1 ? " type argument" : " type arguments") +
+                ", but " + std::to_string(explicitArgs.size()) +
+                (explicitArgs.size() == 1 ? " was given" : " were given"));
+            for (auto& a : args) analyzeExpr(a);
+            return typeCtx.getError();
+        }
+        for (size_t i = 0; i < arity; ++i) typeArgs[i] = resolveTypeReference(explicitArgs[i]);
+    }
+
+    std::vector<Type*> argTypes;
+    argTypes.reserve(args.size());
+    for (auto& a : args) argTypes.push_back(analyzeExpr(a));
+
+    // Infer unspecified type args from arguments whose parameter is exactly a
+    // type-parameter placeholder of this function (single-level inference).
+    if (explicitArgs.empty()) {
+        for (size_t i = 0; i < std::min(args.size(), sym->paramTypes.size()); ++i) {
+            Type* pt = sym->paramTypes[i];
+            if (pt && pt->isTypeParam() && pt->paramOwner == sym &&
+                pt->paramIndex >= 0 && pt->paramIndex < static_cast<int>(arity) &&
+                !typeArgs[pt->paramIndex] && argTypes[i] && !argTypes[i]->isError()) {
+                typeArgs[pt->paramIndex] = argTypes[i];
+            }
+        }
+    }
+
+    for (size_t i = 0; i < arity; ++i) {
+        if (!typeArgs[i]) {
+            errorAtNode(expr.node, "Cannot infer type argument '" + asciiOf(sym->typeParamNames[i]) +
+                "' for '" + asciiOf(funcName) + "'; pass it explicitly, e.g. '" +
+                asciiOf(funcName) + "<int>(...)'");
+            return typeCtx.getError();
+        }
+    }
+
+    bool ok = true;
+    for (size_t i = 0; i < arity; ++i) {
+        StructInfo* bound = i < sym->typeParamBounds.size() ? sym->typeParamBounds[i] : nullptr;
+        SyntaxNode diag = (i < explicitArgs.size()) ? explicitArgs[i].node : expr.node;
+        if (!checkTypeArgBound(typeArgs[i], bound, sym->typeParamNames[i], diag)) ok = false;
+    }
+
+    size_t req = requiredArgCount(sym);
+    if (args.size() < req || args.size() > sym->paramTypes.size()) {
+        errorAtNode(expr.node, "Function '" + asciiOf(funcName) + "' expects " +
+            std::to_string(req) +
+            (req == sym->paramTypes.size() ? "" : "-" + std::to_string(sym->paramTypes.size())) +
+            " argument(s), got " + std::to_string(args.size()));
+        ok = false;
+    }
+    size_t n = std::min(args.size(), sym->paramTypes.size());
+    for (size_t i = 0; i < n; ++i) {
+        Type* paramT = typeCtx.substitute(sym->paramTypes[i], sym, typeArgs);
+        tryAdaptIntegerLiteral(args[i], paramT);
+        Type* argT = argTypes[i];
+        if (paramT && argT && !paramT->isError() && !argT->isError() &&
+            !paramT->assignableFrom(argT)) {
+            errorAtNode(args[i].node, "Argument " + std::to_string(i + 1) +
+                ": expected '" + paramT->toString() + "', got '" + argT->toString() + "'");
+        }
+    }
+
+    if (ok) {
+        analysis.setCallTypeArgs(expr.node.greenNode(), typeArgs);
+        typeCtx.recordFunctionInstantiation(sym, typeArgs);
+    }
+    Type* ret = typeCtx.substitute(sym->returnType, sym, typeArgs);
+    return ret ? ret : typeCtx.getError();
 }
 
 // Argument count/type checking shared by plain `name(args)` and namespace-qualified
@@ -3473,6 +3703,10 @@ void Analyzer::checkFieldInitialization(const ast::ClassDecl& cd) {
 bool Analyzer::validateArrayElement(Type* elem, const SyntaxNode& diagNode) {
     if (!elem || elem->isError()) return false;
     if (isDefaultable(elem)) return true;
+    // A type-parameter backing store (`new T[n]`) is allowed: the slots start as
+    // the substituted type's zero value and the generic container only reads the
+    // ones it has filled.
+    if (elem->isTypeParam()) return true;
     std::string hint;
     if (elem->isClass() || elem->isArray() || elem->isExternal() ||
         elem->kind == TypeKind::String) {

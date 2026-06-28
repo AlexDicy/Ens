@@ -1,8 +1,11 @@
 #pragma once
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
+#include "Symbol.h"
 #include "Type.h"
 
 class TypeContext {
@@ -31,7 +34,52 @@ public:
 
     Type* lookupNamedType(const std::u16string& modulePath, const std::u16string& name) const;
 
+    // Generics.
+    Type* getTypeParam(const void* owner, int index, std::u16string name, StructInfo* bound);
+    Type* instantiate(Type* templateType, const std::vector<Type*>& args);
+    Type* substitute(Type* t, const void* owner, const std::vector<Type*>& args);
+    // Fill any instantiations whose template was not yet collected when first
+    // requested. Returns true if any work was done (loop to a fixpoint).
+    bool materializeInstantiations();
+
+    // All class/struct instantiations created so far (for monomorphized codegen).
+    const std::vector<Type*>& classInstantiations() const { return instantiationList_; }
+
+    // Generic free-function instantiations, recorded at call sites.
+    struct FunctionInstantiation {
+        Symbol* function;
+        std::vector<Type*> args;
+    };
+    void recordFunctionInstantiation(Symbol* fn, std::vector<Type*> args);
+    const std::vector<FunctionInstantiation>& functionInstantiations() const {
+        return functionInstantiations_;
+    }
+
 private:
+    Type* instantiateInternal(StructInfo* templ, TypeKind kind, const std::vector<Type*>& args);
+    void fillInstantiation(StructInfo* inst, StructInfo* templ, const std::vector<Type*>& args);
+
+    struct PendingInstantiation {
+        StructInfo* inst;
+        StructInfo* templ;
+        std::vector<Type*> args;
+    };
+    std::vector<PendingInstantiation> pendingInstantiations_;
+
+    struct InstantiationKey {
+        StructInfo* templ;
+        std::vector<Type*> args;
+        bool operator==(const InstantiationKey& o) const {
+            return templ == o.templ && args == o.args;
+        }
+    };
+    struct InstantiationKeyHash {
+        size_t operator()(const InstantiationKey& k) const noexcept {
+            size_t h = std::hash<const void*>{}(k.templ);
+            for (Type* a : k.args) h = h * 1315423911u ^ std::hash<const void*>{}(a);
+            return h;
+        }
+    };
     struct Key {
         std::u16string modulePath;
         std::u16string name;
@@ -53,6 +101,11 @@ private:
     std::unordered_map<Key, Type*, KeyHash> classCache;
     std::unordered_map<Key, Type*, KeyHash> externalCache;
     std::unordered_map<Key, Type*, KeyHash> enumCache;
+    std::map<std::pair<const void*, int>, Type*> typeParamCache;
+    std::unordered_map<InstantiationKey, Type*, InstantiationKeyHash> instantiationCache;
+    std::vector<Type*> instantiationList_;
+    std::vector<FunctionInstantiation> functionInstantiations_;
+    std::vector<std::unique_ptr<Symbol>> ownedSymbols;
     Type* errorType;
     Type* nullType;
 

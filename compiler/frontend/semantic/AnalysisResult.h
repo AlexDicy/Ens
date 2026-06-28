@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <optional>
 #include <unordered_map>
+#include <vector>
 #include "../cst/Green.h"
 
 class Type;
@@ -56,9 +57,20 @@ public:
     }
     void setEnumConstant(const GreenElement* g, int64_t v) { enumConstants[g] = v; }
 
+    // Concrete type arguments of a generic function call, for codegen to
+    // monomorphize. Empty/absent for non-generic calls.
+    const std::vector<Type*>* callTypeArgsOf(const GreenElement* g) const {
+        auto it = callTypeArgs.find(g);
+        return it == callTypeArgs.end() ? nullptr : &it->second;
+    }
+    void setCallTypeArgs(const GreenElement* g, std::vector<Type*> args) {
+        callTypeArgs[g] = std::move(args);
+    }
+
 private:
     std::unordered_map<const GreenElement*, ResolutionInfo> info;
     std::unordered_map<const GreenElement*, Type*> methodReceivers;
     std::unordered_map<const GreenElement*, Symbol*> thisSymbols;
     std::unordered_map<const GreenElement*, int64_t> enumConstants;
+    std::unordered_map<const GreenElement*, std::vector<Type*>> callTypeArgs;
 };

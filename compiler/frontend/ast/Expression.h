@@ -159,6 +159,7 @@ public:
         return CallExpression{n};
     }
     std::optional<Expression> callee() const;
+    std::vector<TypeReference> typeArguments() const;
     std::optional<ArgumentList> argumentList() const;
     std::vector<Expression> arguments() const;
 };

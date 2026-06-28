@@ -39,6 +39,18 @@ std::optional<std::u16string> TypeReference::nameText() const {
     return std::nullopt;
 }
 
+std::vector<TypeReference> TypeReference::typeArguments() const {
+    std::vector<TypeReference> out;
+    for (auto& c : node.children()) {
+        if (c.kind() != SyntaxKind::TypeArgList) continue;
+        for (auto& a : c.children()) {
+            if (auto tr = TypeReference::cast(a)) out.push_back(*tr);
+        }
+        break;
+    }
+    return out;
+}
+
 bool TypeReference::isOptional() const {
     for (auto& c : node.children()) {
         if (c.kind() == SyntaxKind::Question) return true;

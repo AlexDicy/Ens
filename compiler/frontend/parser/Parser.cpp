@@ -354,6 +354,8 @@ bool Parser::looksLikeFuncDecl(bool allowShorthand) const {
     if (idx >= tokens.size() || tokens[idx].kind != SyntaxKind::Identifier) return false;
     idx++;
     while (idx < tokens.size() && isTrivia(tokens[idx].kind)) idx++;
+    idx = skipAnglesRaw(idx);
+    while (idx < tokens.size() && isTrivia(tokens[idx].kind)) idx++;
     if (idx >= tokens.size() || tokens[idx].kind != SyntaxKind::LParen) return false;
 
     // Walk balanced parens.
@@ -382,6 +384,7 @@ void Parser::parseFuncDecl() {
         bump();  // method modifier; analyzer validates context
     }
     expect(SyntaxKind::Identifier, "function name");
+    if (at(SyntaxKind::Lt)) parseTypeParamList();
     expect(SyntaxKind::LParen, "'(' after function name");
     parseParamList();
     expect(SyntaxKind::RParen, "')' after parameters");
@@ -503,10 +506,15 @@ void Parser::parseStructOrClassDecl(SyntaxKind nodeKind, SyntaxKind keywordKind)
     }
     expect(keywordKind, keywordKind == SyntaxKind::KwStruct ? "'struct'" : "'class'");
     expect(SyntaxKind::Identifier, "name");
+    if (at(SyntaxKind::Lt)) parseTypeParamList();
     if (at(SyntaxKind::KwExtends)) {
         if (!isClass) reportAtCurrent("Only classes can use 'extends'; structs do not support inheritance");
         bump();  // 'extends'
         expect(SyntaxKind::Identifier, "base class name after 'extends'");
+        if (at(SyntaxKind::Lt)) {
+            reportAtCurrent("Generic base classes are not yet supported");
+            parseTypeArgList();
+        }
     }
     expect(SyntaxKind::LBrace, "'{'");
     builder.startNode(SyntaxKind::MemberList);
@@ -609,6 +617,7 @@ void Parser::parseType() {
         bump();  // '.'
         bump();  // identifier
     }
+    if (at(SyntaxKind::Lt) && scanTypeArgs(0) != 0) parseTypeArgList();
     // Interleaved suffix chain: any sequence of `?` and `[]` pairs.
     // Each '[' must be followed immediately by ']' to be a type-position
     // array suffix; otherwise it's left for the caller (e.g. `new T[n]`).
@@ -639,6 +648,7 @@ void Parser::parseTypeHead() {
         bump();
         bump();
     }
+    if (at(SyntaxKind::Lt) && scanTypeArgs(0) != 0) parseTypeArgList();
     while (true) {
         if (at(SyntaxKind::Question)) { bump(); continue; }
         if (at(SyntaxKind::LBracket) &&
@@ -651,6 +661,119 @@ void Parser::parseTypeHead() {
         break;
     }
     builder.finishNode();
+}
+
+void Parser::parseTypeParamList() {
+    builder.startNode(SyntaxKind::TypeParamList);
+    expect(SyntaxKind::Lt, "'<'");
+    if (!atClosingGt() && !atEnd()) {
+        parseTypeParam();
+        while (eat(SyntaxKind::Comma)) {
+            if (atClosingGt()) break;
+            parseTypeParam();
+        }
+    }
+    expectClosingGt("'>' after type parameters");
+    builder.finishNode();
+}
+
+void Parser::parseTypeParam() {
+    builder.startNode(SyntaxKind::TypeParam);
+    expect(SyntaxKind::Identifier, "type parameter name");
+    if (eat(SyntaxKind::Colon)) {
+        if (isTypeStart(kindAt())) parseType();
+        else emitMissing(SyntaxKind::Identifier, "bound type after ':'");
+    }
+    builder.finishNode();
+}
+
+void Parser::parseTypeArgList() {
+    builder.startNode(SyntaxKind::TypeArgList);
+    expect(SyntaxKind::Lt, "'<'");
+    if (!atClosingGt() && !atEnd()) {
+        parseType();
+        while (eat(SyntaxKind::Comma)) {
+            if (atClosingGt()) break;
+            parseType();
+        }
+    }
+    expectClosingGt("'>' after type arguments");
+    builder.finishNode();
+}
+
+bool Parser::atClosingGt() const {
+    SyntaxKind k = kindAt();
+    return k == SyntaxKind::Gt || k == SyntaxKind::GtGt || k == SyntaxKind::GtGtGt;
+}
+
+void Parser::expectClosingGt(const char* what) {
+    SyntaxKind k = kindAt();
+    if (k == SyntaxKind::Gt) { bump(); return; }
+    if (k == SyntaxKind::GtGt || k == SyntaxKind::GtGtGt) {
+        // A merged '>>'/'>>>' closes nested generics: emit one '>', keep the rest.
+        while (nextToEmit < tokens.size() && nextToEmit < current) {
+            const auto& t = tokens[nextToEmit];
+            builder.token(t.kind, t.text);
+            nextToEmit++;
+        }
+        builder.token(SyntaxKind::Gt, u">");
+        LexedToken& tok = tokens[current];
+        tok.kind = (k == SyntaxKind::GtGt) ? SyntaxKind::Gt : SyntaxKind::GtGt;
+        tok.text = tok.text.substr(1);
+        tok.offset += 1;
+        tok.column += 1;
+        nextToEmit = current;
+        return;
+    }
+    emitMissing(SyntaxKind::Gt, what);
+}
+
+size_t Parser::scanTypeArgs(size_t cursor) const {
+    if (peekKind(cursor) != SyntaxKind::Lt) return 0;
+    int depth = 0;
+    size_t c = cursor;
+    for (int guard = 0; guard < 256; ++guard) {
+        SyntaxKind k = peekKind(c);
+        switch (k) {
+            case SyntaxKind::Lt:     depth += 1; break;
+            case SyntaxKind::LtLt:   depth += 2; break;
+            case SyntaxKind::Gt:     depth -= 1; break;
+            case SyntaxKind::GtGt:   depth -= 2; break;
+            case SyntaxKind::GtGtGt: depth -= 3; break;
+            case SyntaxKind::Identifier:
+            case SyntaxKind::Comma:
+            case SyntaxKind::Dot:
+            case SyntaxKind::Question:
+            case SyntaxKind::LBracket:
+            case SyntaxKind::RBracket:
+                break;
+            default:
+                if (!isPrimitiveTypeKw(k)) return 0;
+        }
+        c++;
+        if (depth <= 0) return c;
+    }
+    return 0;
+}
+
+size_t Parser::skipAnglesRaw(size_t idx) const {
+    if (idx >= tokens.size() || tokens[idx].kind != SyntaxKind::Lt) return idx;
+    int depth = 0;
+    size_t i = idx;
+    for (int guard = 0; guard < 256 && i < tokens.size(); ++guard) {
+        SyntaxKind k = tokens[i].kind;
+        if (k == SyntaxKind::Lt)          depth += 1;
+        else if (k == SyntaxKind::LtLt)   depth += 2;
+        else if (k == SyntaxKind::Gt)     depth -= 1;
+        else if (k == SyntaxKind::GtGt)   depth -= 2;
+        else if (k == SyntaxKind::GtGtGt) depth -= 3;
+        else if (k == SyntaxKind::EndOfFile || k == SyntaxKind::LBrace ||
+                 k == SyntaxKind::Semi || k == SyntaxKind::LParen ||
+                 k == SyntaxKind::RParen) return idx;
+        i++;
+        if (depth <= 0) return i;
+    }
+    return idx;
 }
 
 
@@ -669,6 +792,7 @@ bool Parser::looksLikeTypedVarDeclFrom(size_t start) const {
         peekKind(start + 2) == SyntaxKind::Identifier) {
         cursor = start + 3;
     }
+    if (size_t a = scanTypeArgs(cursor)) cursor = a;
     // Skip any interleaved sequence of `?` and `[]` type suffixes.
     while (true) {
         if (peekKind(cursor) == SyntaxKind::Question) { cursor += 1; continue; }
@@ -1041,6 +1165,18 @@ void Parser::parsePrecedence(int minPrec) {
 
     while (true) {
         SyntaxKind op = kindAt();
+        // Generic call `callee<TypeArgs>(args)`: a balanced type-ish `<...>`
+        // immediately followed by `(`. Otherwise `<` is a comparison operator.
+        if (op == SyntaxKind::Lt) {
+            size_t after = scanTypeArgs(0);
+            if (after != 0 && peekKind(after) == SyntaxKind::LParen) {
+                builder.startNodeAt(cp, SyntaxKind::CallExpr);
+                parseTypeArgList();
+                parseArgList();
+                builder.finishNode();
+                continue;
+            }
+        }
         // `?[` is a postfix safe-subscript when written adjacent; otherwise `?`
         // is the loose-binding ternary operator. We disambiguate by lookahead
         // so the lexer doesn't have to merge `?[`, which would otherwise break

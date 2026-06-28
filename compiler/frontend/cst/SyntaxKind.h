@@ -81,10 +81,13 @@ enum class SyntaxKind : uint16_t {
     ExternalFuncDecl,
     EnumDecl,
     EnumMember,
+    TypeParamList,       // <T, U> in a generic declaration head
+    TypeParam,           // one type parameter, optionally `T: Base`
 
     // === Type expressions ===
     TypeRef,             // identifier (or primitive keyword) optionally followed by ?
     OptionalType,        // wraps TypeRef with trailing ?
+    TypeArgList,         // <int, string> applied to a type or call
 
     // === Statements ===
     Block,

@@ -136,3 +136,135 @@ Type* TypeContext::lookupNamedType(const std::u16string& modulePath, const std::
     if (Type* t = lookupEnum(modulePath, name)) return t;
     return lookupExternalType(modulePath, name);
 }
+
+Type* TypeContext::getTypeParam(const void* owner, int index, std::u16string name, StructInfo* bound) {
+    auto key = std::make_pair(owner, index);
+    auto it = typeParamCache.find(key);
+    if (it != typeParamCache.end()) {
+        if (bound && !it->second->structInfo) it->second->structInfo = bound;
+        return it->second;
+    }
+    Type* t = allocate(TypeKind::TypeParam);
+    t->paramOwner = owner;
+    t->paramIndex = index;
+    t->paramName = std::move(name);
+    t->structInfo = bound;
+    typeParamCache[key] = t;
+    return t;
+}
+
+Type* TypeContext::substitute(Type* t, const void* owner, const std::vector<Type*>& args) {
+    if (!t) return t;
+    switch (t->kind) {
+        case TypeKind::TypeParam:
+            if (t->paramOwner == owner && t->paramIndex >= 0 &&
+                t->paramIndex < static_cast<int>(args.size())) {
+                return args[t->paramIndex];
+            }
+            return t;
+        case TypeKind::Array:
+            return getArray(substitute(t->inner, owner, args));
+        case TypeKind::Optional:
+            return getOptional(substitute(t->inner, owner, args));
+        case TypeKind::Struct:
+        case TypeKind::Class:
+            if (t->structInfo && t->structInfo->templateOf) {
+                std::vector<Type*> newArgs;
+                newArgs.reserve(t->structInfo->typeArgs.size());
+                bool changed = false;
+                for (Type* a : t->structInfo->typeArgs) {
+                    Type* s = substitute(a, owner, args);
+                    changed |= (s != a);
+                    newArgs.push_back(s);
+                }
+                if (!changed) return t;
+                return instantiateInternal(t->structInfo->templateOf, t->kind, newArgs);
+            }
+            return t;
+        default:
+            return t;
+    }
+}
+
+Type* TypeContext::instantiate(Type* templateType, const std::vector<Type*>& args) {
+    if (!templateType || !templateType->structInfo) return errorType;
+    return instantiateInternal(templateType->structInfo, templateType->kind, args);
+}
+
+Type* TypeContext::instantiateInternal(StructInfo* templ, TypeKind kind,
+                                       const std::vector<Type*>& args) {
+    InstantiationKey key{templ, args};
+    auto it = instantiationCache.find(key);
+    if (it != instantiationCache.end()) return it->second;
+
+    auto info = std::make_unique<StructInfo>();
+    info->name = templ->name;
+    info->modulePath = templ->modulePath;
+    info->visibility = templ->visibility;
+    info->isAbstract = templ->isAbstract;
+    info->isFinal = templ->isFinal;
+    info->templateOf = templ;
+    info->typeArgs = args;
+    info->baseInfo = templ->baseInfo;
+    info->baseFieldCount = templ->baseFieldCount;
+    StructInfo* inst = info.get();
+    ownedStructs.push_back(std::move(info));
+
+    // Register the shell before filling, so a self-referential field
+    // (e.g. `Node<T>? next`) resolves back to this same instantiation.
+    Type* t = allocate(kind);
+    t->structInfo = inst;
+    instantiationCache[key] = t;
+    instantiationList_.push_back(t);
+
+    // Fill now if the template's members are already resolved; otherwise defer
+    // (the template is laid out later, then materializeInstantiations fills it).
+    if (templ->membersCollected) {
+        fillInstantiation(inst, templ, args);
+    } else {
+        pendingInstantiations_.push_back({inst, templ, args});
+    }
+    return t;
+}
+
+void TypeContext::fillInstantiation(StructInfo* inst, StructInfo* templ,
+                                    const std::vector<Type*>& args) {
+    const void* owner = static_cast<const void*>(templ);
+    for (const auto& f : templ->fields) {
+        FieldInfo nf = f;
+        nf.type = substitute(f.type, owner, args);
+        nf.definingClass = inst;
+        inst->fields.push_back(nf);
+    }
+    for (const auto& m : templ->methods) {
+        MethodInfo nm = m;
+        nm.definingClass = inst;
+        if (m.symbol) {
+            auto sym = std::make_unique<Symbol>(*m.symbol);
+            sym->methodOwner = inst;
+            for (auto& pt : sym->paramTypes) pt = substitute(pt, owner, args);
+            sym->returnType = substitute(sym->returnType, owner, args);
+            nm.symbol = sym.get();
+            ownedSymbols.push_back(std::move(sym));
+        }
+        inst->methods.push_back(nm);
+    }
+}
+
+void TypeContext::recordFunctionInstantiation(Symbol* fn, std::vector<Type*> args) {
+    for (auto& fi : functionInstantiations_) {
+        if (fi.function == fn && fi.args == args) return;
+    }
+    functionInstantiations_.push_back({fn, std::move(args)});
+}
+
+bool TypeContext::materializeInstantiations() {
+    bool did = false;
+    while (!pendingInstantiations_.empty()) {
+        PendingInstantiation p = pendingInstantiations_.back();
+        pendingInstantiations_.pop_back();
+        fillInstantiation(p.inst, p.templ, p.args);  // may enqueue nested instances
+        did = true;
+    }
+    return did;
+}

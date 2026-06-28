@@ -49,6 +49,11 @@ public:
 
     StructInfo* methodOwner = nullptr;
 
+    // Generic function template: the type-parameter names and optional bounds.
+    bool isTemplate = false;
+    std::vector<std::u16string> typeParamNames;
+    std::vector<StructInfo*> typeParamBounds;   // parallel to names; null = unbounded
+
     ParamEscapeInfo escapeInfo;
 
     // True for a `const` binding; reassigning it is a compile error.
