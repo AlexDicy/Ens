@@ -2387,6 +2387,9 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                             if (fnSym->isExternal) {
                                 return analyzeExternalCall(expr, fnSym, *memberName);
                             }
+                            if (fnSym->isTemplate) {
+                                return analyzeGenericCall(expr, fnSym, *memberName);
+                            }
                             return checkDirectCallArguments(expr, fnSym, *memberName);
                         }
                     }
@@ -3655,6 +3658,9 @@ void Analyzer::checkFieldInitialization(const ast::StructDecl& sd) {
     if (!t || !t->structInfo) return;
     for (auto& f : t->structInfo->fields) {
         if (isDefaultable(f.type)) continue;
+        // A type-parameter field's defaultability depends on the type argument;
+        // it is checked per instantiation where the struct is actually used.
+        if (f.type && f.type->isTypeParam()) continue;
         if (fieldHasDefaultValue(f)) continue;
         std::string fname = asciiOf(f.name);
         std::string sname = asciiOf(t->structInfo->name);

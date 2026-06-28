@@ -4737,6 +4737,7 @@ struct CodeGenerator::Impl {
                 if (fnSym->kind == SymbolKind::Function) {
                     if (fnSym->isBuiltin) return emitBuiltinCall(fnSym, e);
                     if (fnSym->isExternal) return emitForeignCall(fnSym, e);
+                    if (fnSym->isTemplate) return emitGenericCall(fnSym, e);
                     llvm::Function* fn = getOrDeclareExternalFunction(fnSym, /*receiver*/ nullptr);
                     if (!fn) {
                         error(e.node.startOffset(), "Internal: namespace callee has no LLVM function");
