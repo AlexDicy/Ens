@@ -108,6 +108,52 @@ An `abstract class` cannot be instantiated. It may declare `abstract` methods (a
 
 ---
 
+Classes, structs, functions, and methods may be generic: they declare type parameters in angle brackets and work uniformly over any type argument. A type parameter can be used as a field type, a parameter or return type, a local type, and as the element type of an array.
+
+```ens
+class Vector<T> {
+    private T[] items;
+    private long count;
+
+    Vector() { this.items = new T[4]; this.count = 0; }
+
+    push(T value) { /* ... grow if full ... */ }
+    get(long index) -> T { return this.items[index]; }
+    length() -> long { return this.count; }
+}
+
+swap<T>(T a, T b) -> T { return b; }
+```
+
+A type argument is written in angle brackets wherever the type is used, including at construction:
+
+```ens
+let numbers = new Vector<int>();
+numbers.push(5);
+let names = new Vector<string>();
+```
+
+A generic type is specialized for each set of type arguments, so a `Vector<int>` stores its integers directly (no boxing) while a `Vector<Shape>` stores and reference counts `Shape` objects. Using a generic type without its arguments (just `Vector`) is an error.
+
+For a generic function, the type arguments can be passed explicitly or, where each one appears directly as a parameter type, inferred from the call:
+
+```ens
+swap<int>(1, 2);   // explicit
+swap(1, 2);        // T inferred as int
+```
+
+A type parameter may declare a single base-class bound with `T: Base`, requiring every type argument to be `Base` or a subclass; the body may then use the members of `Base` on a value of that parameter.
+
+```ens
+class Drawer<T: Shape> {
+    private T shape;
+    Drawer(T s) { this.shape = s; }
+    area() -> int { return this.shape.area(); }
+}
+```
+
+---
+
 Imports are based on paths and qualified by default. Imports are file-local.
 
 ```ens
