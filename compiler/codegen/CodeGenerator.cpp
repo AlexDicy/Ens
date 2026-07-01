@@ -1859,8 +1859,15 @@ struct CodeGenerator::Impl {
             case SyntaxKind::Star:    return flt ? builder->CreateFMul(L, R) : builder->CreateMul(L, R);
             case SyntaxKind::Slash:   return flt ? builder->CreateFDiv(L, R) : (sgn ? builder->CreateSDiv(L, R) : builder->CreateUDiv(L, R));
             case SyntaxKind::Percent: return flt ? builder->CreateFRem(L, R) : (sgn ? builder->CreateSRem(L, R) : builder->CreateURem(L, R));
-            case SyntaxKind::EqEq:    return flt ? builder->CreateFCmpOEQ(L, R) : builder->CreateICmpEQ(L, R);
-            case SyntaxKind::NotEq:   return flt ? builder->CreateFCmpONE(L, R) : builder->CreateICmpNE(L, R);
+            case SyntaxKind::EqEq:
+            case SyntaxKind::NotEq: {
+                llvm::Value* cmp = op == SyntaxKind::EqEq
+                    ? (flt ? builder->CreateFCmpOEQ(L, R) : builder->CreateICmpEQ(L, R))
+                    : (flt ? builder->CreateFCmpONE(L, R) : builder->CreateICmpNE(L, R));
+                if (isReferenceType(leftType))  releaseIfOwnedTemp(L, *leftE);
+                if (isReferenceType(rightType)) releaseIfOwnedTemp(R, *rightE);
+                return cmp;
+            }
             case SyntaxKind::Lt:      return flt ? builder->CreateFCmpOLT(L, R) : (sgn ? builder->CreateICmpSLT(L, R) : builder->CreateICmpULT(L, R));
             case SyntaxKind::Gt:      return flt ? builder->CreateFCmpOGT(L, R) : (sgn ? builder->CreateICmpSGT(L, R) : builder->CreateICmpUGT(L, R));
             case SyntaxKind::LtEq:    return flt ? builder->CreateFCmpOLE(L, R) : (sgn ? builder->CreateICmpSLE(L, R) : builder->CreateICmpULE(L, R));
