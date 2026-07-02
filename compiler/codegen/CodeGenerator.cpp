@@ -1498,15 +1498,16 @@ struct CodeGenerator::Impl {
                     }
                 }
             }
-            if (!wrote && fi.type && fi.type->isClass()) {
+            ::Type* fieldType = fi.type ? subst(fi.type) : nullptr;
+            if (!wrote && fieldType && isReferenceType(fieldType)) {
                 llvm::Value* fieldAddr = builder->CreateStructGEP(
                     st, base, static_cast<unsigned>(i), asAscii(fi.name) + ".addr");
                 builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), fieldAddr);
             }
-            if (!wrote && isValueTypeOptional(fi.type)) {
+            if (!wrote && isValueTypeOptional(fieldType)) {
                 llvm::Value* fieldAddr = builder->CreateStructGEP(
                     st, base, static_cast<unsigned>(i), asAscii(fi.name) + ".addr");
-                builder->CreateStore(llvm::ConstantAggregateZero::get(mapType(fi.type)), fieldAddr);
+                builder->CreateStore(llvm::ConstantAggregateZero::get(mapType(fieldType)), fieldAddr);
             }
         }
         defaultInitStack.pop_back();
