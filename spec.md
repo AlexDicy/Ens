@@ -152,6 +152,23 @@ class Drawer<T: Shape> {
 }
 ```
 
+A generic class may extend another generic class by naming the base with full type arguments; the arguments may use the subclass's own type parameters. Overrides and virtual dispatch work as with ordinary inheritance, per specialization.
+
+```ens
+abstract class Source<T> {
+    abstract read() -> T;
+}
+
+class Constant<T> extends Source<T> {
+    private T value;
+    Constant(this.value);
+    override read() -> T { return this.value; }
+}
+
+Source<int> source = new Constant<int>(5);
+source.read();
+```
+
 ---
 
 Imports are based on paths and qualified by default. Imports are file-local.
@@ -260,6 +277,19 @@ class Outer {
 }
 ```
 
+Any type can be made nullable, including value types: `int?`, `bool?`, an enum, or a struct. A nullable value type carries its own presence, so no value of the underlying type is sacrificed as a marker; `0` and `null` are distinct `int?` values. Comparison with `null`, narrowing, and `??` work the same as for nullable classes.
+
+```ens
+findIndex(int[] xs, int wanted) -> long? {
+    for (int i = 0; i < xs.length; i = i + 1) {
+        if (xs[i] == wanted) { return i; }
+    }
+    return null;
+}
+
+long position = findIndex(numbers, 7) ?? -1;
+```
+
 To read through a nullable value, use the safe member operator `?.`. If the value on the left is `null`, the whole expression evaluates to `null` and the right-hand side is not evaluated; otherwise it behaves like `.`.
 
 ```ens
@@ -365,7 +395,7 @@ const int max = 100;    // immutable, explicit type
 limit = 11;             // error: cannot assign to constant 'limit'
 ```
 
-`while` repeats its body while the condition holds. A `for` loop comes in two forms. The C-style form has an initializer, a condition, and an update, any of which may be omitted; the initializer is scoped to the loop. The for-each form walks an array element by element.
+`while` repeats its body while the condition holds. A `for` loop comes in two forms. The C-style form has an initializer, a condition, and an update, any of which may be omitted; the initializer is scoped to the loop. The for-each form walks an array element by element, or any iterable object value by value.
 
 ```ens
 while (i < n) {
@@ -378,6 +408,23 @@ for (int i = 0; i < xs.length; i = i + 1) {
 
 for (int x in xs) {     // x takes each element in turn
     total = total + x;
+}
+```
+
+A class is iterable when it has a `makeIterator()` method returning an iterator: a class with `hasNext() -> bool` and `next() -> T` methods, conventionally a subclass of `Iterator<T>` from `@std.iterator`. The loop calls `makeIterator()` once, then draws values with `next()` while `hasNext()` is true.
+
+```ens
+import Iterator from @std.iterator;
+
+class Range {
+    private int low;
+    private int high;
+    Range(this.low, this.high);
+    makeIterator() -> Iterator<int> { return new RangeIterator(this.low, this.high); }
+}
+
+for (let n in new Range(1, 10)) {
+    total = total + n;
 }
 ```
 
@@ -610,3 +657,31 @@ writeGreeting() -> int throws {
     return file.close();
 }
 ```
+
+---
+
+Every value has a `hash()` method returning a `long`. Value types (primitives, enums, strings, structs) hash by their contents, so equal values hash equally; classes and arrays hash by identity, matching how `==` compares them. A class can declare its own `hash() -> long` to control its hashing; a method named `hash` must have exactly that signature. The `Hashable` class from `@std.hash` names this contract for generic bounds, and every type satisfies it.
+
+The collection modules build on hashing and iteration:
+
+- `Vector<T>` from `@std.vector` is a growable array: `push(value)`, `get(index)`, `set(index, value)`, and `length()`.
+- `Map<K, V>` from `@std.map` maps keys to values: `set(key, value)` inserts or overwrites, `get(key)` returns `V?` (`null` when absent), plus `contains(key)`, `remove(key)`, `length()`, and `keys()` / `values()` snapshots. Iterating a map yields `Pair<K, V>` entries (from `@std.pair`) with `key` and `value` fields.
+- `Set<T>` from `@std.set` stores each value once: `add(value)` returns whether the value was new, plus `contains(value)`, `remove(value)`, `length()`, and `items()`. Iterating a set yields its values.
+
+```ens
+import Map from @std.map;
+import Set from @std.set;
+
+let ages = new Map<string, int>();
+ages.set("ada", 36);
+int age = ages.get("ada") ?? 0;
+
+let seen = new Set<string>();
+seen.add("ada");
+
+for (let entry in ages) {
+    print(entry.key + " is " + entry.value);
+}
+```
+
+Keys are matched with `==`: strings by contents, value types by value, and classes by identity unless the key class defines its own `hash()` (identity comparison still applies). Struct keys are not supported yet because structs cannot be compared with `==`.
