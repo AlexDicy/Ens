@@ -138,6 +138,7 @@ private:
     void checkThrowsClausePlacement(const ast::FuncDecl& fn, bool isOverridable, bool isConstructor);
     void checkFieldMethodCollision(StructInfo* owner, const std::u16string& methodName,
                                    bool isConstructor, const SyntaxNode& diag);
+    void checkHashMethodSignature(const ast::FuncDecl& fn, Symbol* sym, bool isConstructor);
     void resolveDeclaredThrows(const ast::FuncDecl& fn, Symbol* sym);
     void checkParameterDefaults(const ast::FuncDecl& fn);
     void checkFieldDefaults(const ast::StructDecl& sd);

@@ -1902,6 +1902,11 @@ struct CodeGenerator::Impl {
             case SyntaxKind::Percent: return flt ? builder->CreateFRem(L, R) : (sgn ? builder->CreateSRem(L, R) : builder->CreateURem(L, R));
             case SyntaxKind::EqEq:
             case SyntaxKind::NotEq: {
+                if ((leftType && subst(leftType)->isStruct()) ||
+                    (rightType && subst(rightType)->isStruct())) {
+                    error(e.node.startOffset(), "Comparing struct values with '==' is not supported yet");
+                    return nullptr;
+                }
                 llvm::Value* cmp = op == SyntaxKind::EqEq
                     ? (flt ? builder->CreateFCmpOEQ(L, R) : builder->CreateICmpEQ(L, R))
                     : (flt ? builder->CreateFCmpONE(L, R) : builder->CreateICmpNE(L, R));
@@ -2066,6 +2071,123 @@ struct CodeGenerator::Impl {
                                          plainV, subst(inner));
         if (!valEq) return nullptr;
         return builder->CreateAnd(present, valEq, "opt.eq");
+    }
+
+    // The abstract hash() contract from std.hash; calls resolved through it
+    // are rebound per concrete receiver at monomorphization.
+    static bool isHashableOwner(const StructInfo* si) {
+        return si && si->name == u"Hashable" && si->modulePath == u"std.hash";
+    }
+
+    static bool isHashableHashMethod(const Symbol* sym) {
+        return sym && sym->name == u"hash" && isHashableOwner(sym->methodOwner);
+    }
+
+    // The receiver type's own conforming `hash() -> long`, or null when the
+    // compiler should synthesize the hash inline.
+    Symbol* declaredConformingHash(::Type* t) {
+        if (!t) return nullptr;
+        t = subst(t);
+        if (!t->hasRecordLayout() || !t->structInfo) return nullptr;
+        StructInfo* decl = nullptr;
+        if (t->isClass()) {
+            decl = t->structInfo->classDeclaringMethod(u"hash");
+        } else if (t->structInfo->findMethodIndex(u"hash") >= 0) {
+            decl = t->structInfo;
+        }
+        if (!decl || isHashableOwner(decl)) return nullptr;
+        Symbol* sym = decl->methods[decl->findMethodIndex(u"hash")].symbol;
+        if (!sym || !sym->paramTypes.empty() || !sym->returnType ||
+            sym->returnType->kind != TypeKind::Long) return nullptr;
+        return sym;
+    }
+
+    // Synthesized hash of a value: identity for reference types, contents for
+    // value types (FNV-1a fold for structs and string bytes).
+    llvm::Value* emitBuiltinHashOf(llvm::Value* v, ::Type* t, uint32_t offset) {
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        if (!v || !t) return llvm::ConstantInt::get(i64Ty, 0);
+        t = subst(t);
+        switch (t->kind) {
+            case TypeKind::Bool:
+            case TypeKind::UShort:
+            case TypeKind::UInt:
+            case TypeKind::ULong:
+            case TypeKind::Char:
+                return builder->CreateZExtOrTrunc(v, i64Ty, "hash.bits");
+            case TypeKind::Byte:
+            case TypeKind::Short:
+            case TypeKind::Int:
+            case TypeKind::Long:
+                return builder->CreateSExtOrTrunc(v, i64Ty, "hash.bits");
+            case TypeKind::Enum:
+                return builder->CreateSExtOrTrunc(v, i64Ty, "hash.bits");
+            case TypeKind::Float:
+                return builder->CreateZExt(
+                    builder->CreateBitCast(v, llvm::Type::getInt32Ty(ctx), "hash.fbits"),
+                    i64Ty, "hash.bits");
+            case TypeKind::Double:
+                return builder->CreateBitCast(v, i64Ty, "hash.bits");
+            case TypeKind::String:
+                return builder->CreateCall(getOrDefineEnsHashString(), { v }, "hash.str");
+            case TypeKind::Class: {
+                if (Symbol* sym = declaredConformingHash(t)) {
+                    int vslot = -1;
+                    if (StructInfo* decl = t->structInfo->classDeclaringMethod(u"hash"))
+                        vslot = decl->methods[decl->findMethodIndex(u"hash")].vtableSlot;
+                    llvm::Function* fn = getOrDeclareExternalFunction(sym, t);
+                    if (!fn) return llvm::ConstantInt::get(i64Ty, 0);
+                    std::vector<llvm::Value*> args{ v };
+                    if (sym->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);
+                    llvm::Value* result = (vslot >= 0)
+                        ? builder->CreateCall(fn->getFunctionType(), loadVtableSlot(v, vslot), args)
+                        : builder->CreateCall(fn, args);
+                    emitThrowsCheck(sym);
+                    return result;
+                }
+                return builder->CreatePtrToInt(v, i64Ty, "hash.identity");
+            }
+            case TypeKind::Array:
+            case TypeKind::External:
+                return builder->CreatePtrToInt(v, i64Ty, "hash.identity");
+            case TypeKind::Struct: {
+                if (Symbol* sym = declaredConformingHash(t)) {
+                    auto* slot = createEntryAlloca(currentFunction, mapType(t), "hash.recv");
+                    builder->CreateStore(v, slot);
+                    llvm::Function* fn = getOrDeclareExternalFunction(sym, t);
+                    if (!fn) return llvm::ConstantInt::get(i64Ty, 0);
+                    std::vector<llvm::Value*> args{ slot };
+                    if (sym->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);
+                    llvm::Value* result = builder->CreateCall(fn, args);
+                    emitThrowsCheck(sym);
+                    return result;
+                }
+                if (!t->structInfo) return llvm::ConstantInt::get(i64Ty, 0);
+                llvm::Value* hash = llvm::ConstantInt::get(i64Ty, 0xcbf29ce484222325ULL);
+                auto* prime = llvm::ConstantInt::get(i64Ty, 0x100000001b3ULL);
+                const auto& fields = t->structInfo->fields;
+                for (size_t i = 0; i < fields.size(); ++i) {
+                    llvm::Value* fieldVal = builder->CreateExtractValue(
+                        v, {static_cast<unsigned>(i)}, "hash.field");
+                    llvm::Value* fieldHash = emitBuiltinHashOf(fieldVal, fields[i].type, offset);
+                    hash = builder->CreateMul(builder->CreateXor(hash, fieldHash), prime, "hash.fold");
+                }
+                return hash;
+            }
+            case TypeKind::Optional: {
+                if (!isValueTypeOptional(t)) {
+                    return builder->CreatePtrToInt(v, i64Ty, "hash.identity");
+                }
+                llvm::Value* present = builder->CreateExtractValue(v, {0}, "hash.present");
+                llvm::Value* innerHash = emitBuiltinHashOf(
+                    builder->CreateExtractValue(v, {1}, "hash.val"), t->inner, offset);
+                return builder->CreateSelect(present, innerHash,
+                    llvm::ConstantInt::get(i64Ty, -1), "hash.opt");
+            }
+            default:
+                error(offset, "Internal: cannot synthesize hash for type '" + t->toString() + "'");
+                return llvm::ConstantInt::get(i64Ty, 0);
+        }
     }
 
     llvm::Value* emitNumericConversion(llvm::Value* v, ::Type* srcT, ::Type* dstT) {
@@ -3809,6 +3931,64 @@ struct CodeGenerator::Impl {
         return t->isOptional() && t->inner && t->inner->isString();
     }
 
+    // i64 ens_hash_string(string s): FNV-1a over the string's bytes. Null
+    // (an absent optional's zeroed payload) hashes to 0.
+    llvm::Function* getOrDefineEnsHashString() {
+        if (auto* existing = module->getFunction("ens_hash_string")) return existing;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(i64Ty, { ptrTy }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+            "ens_hash_string", module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+
+        auto savedIP = builder->saveIP();
+        auto* entry  = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* init   = llvm::BasicBlock::Create(ctx, "hash.init", fn);
+        auto* cond   = llvm::BasicBlock::Create(ctx, "hash.cond", fn);
+        auto* body   = llvm::BasicBlock::Create(ctx, "hash.body", fn);
+        auto* done   = llvm::BasicBlock::Create(ctx, "hash.done", fn);
+        auto* isNull = llvm::BasicBlock::Create(ctx, "hash.null", fn);
+
+        builder->SetInsertPoint(entry);
+        llvm::Value* s = fn->getArg(0);
+        builder->CreateCondBr(
+            builder->CreateICmpEQ(s, llvm::ConstantPointerNull::get(ptrTy)), isNull, init);
+
+        builder->SetInsertPoint(isNull);
+        builder->CreateRet(llvm::ConstantInt::get(i64Ty, 0));
+
+        builder->SetInsertPoint(init);
+        llvm::Value* len = emitStringLength(s);
+        llvm::Value* data = emitStringDataPtr(s);
+        builder->CreateBr(cond);
+
+        builder->SetInsertPoint(cond);
+        auto* i = builder->CreatePHI(i64Ty, 2, "hash.i");
+        auto* h = builder->CreatePHI(i64Ty, 2, "hash.h");
+        i->addIncoming(llvm::ConstantInt::get(i64Ty, 0), init);
+        h->addIncoming(llvm::ConstantInt::get(i64Ty, 0xcbf29ce484222325ULL), init);
+        builder->CreateCondBr(builder->CreateICmpSLT(i, len), body, done);
+
+        builder->SetInsertPoint(body);
+        llvm::Value* byteVal = builder->CreateLoad(i8Ty,
+            builder->CreateGEP(i8Ty, data, i, "hash.byte.addr"), "hash.byte");
+        llvm::Value* mixed = builder->CreateMul(
+            builder->CreateXor(h, builder->CreateZExt(byteVal, i64Ty)),
+            llvm::ConstantInt::get(i64Ty, 0x100000001b3ULL), "hash.mix");
+        llvm::Value* next = builder->CreateAdd(i, llvm::ConstantInt::get(i64Ty, 1));
+        i->addIncoming(next, body);
+        h->addIncoming(mixed, body);
+        builder->CreateBr(cond);
+
+        builder->SetInsertPoint(done);
+        builder->CreateRet(h);
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
     // string ens_string_concat(a, b): a fresh string holding a's bytes followed
     // by b's, with a trailing NUL. Owned (+1) by the caller.
     llvm::Function* getOrDefineEnsStringConcat() {
@@ -4817,8 +4997,32 @@ struct CodeGenerator::Impl {
                     recvT && recvT->isString()) {
                     return emitStringToBytes(*obj, typeOf(e.node));
                 }
+                if (memberName && *memberName == u"hash" && !methodSymbolOf(member.node) &&
+                    recvT && !recvT->isError()) {
+                    llvm::Value* recv = emitExpr(*obj);
+                    if (!recv) return nullptr;
+                    llvm::Value* h = emitBuiltinHashOf(recv, recvT, e.node.startOffset());
+                    if (isReferenceType(recvT)) releaseIfOwnedTemp(recv, *obj);
+                    return h;
+                }
             }
             Symbol* methodSym = methodSymbolOf(member.node);
+            if (methodSym && isHashableHashMethod(methodSym)) {
+                // hash() resolved through the Hashable bound: bind to the
+                // concrete receiver's own hash() or synthesize one inline.
+                auto obj = member.object();
+                if (!obj) return nullptr;
+                ::Type* objType = typeOf(obj->node);
+                if (Symbol* declared = declaredConformingHash(objType)) {
+                    methodSym = declared;
+                } else {
+                    llvm::Value* recv = emitExpr(*obj);
+                    if (!recv) return nullptr;
+                    llvm::Value* h = emitBuiltinHashOf(recv, objType, e.node.startOffset());
+                    if (isReferenceType(objType)) releaseIfOwnedTemp(recv, *obj);
+                    return h;
+                }
+            }
             if (methodSym && isInterceptedTraceMethod(methodSym)) {
                 auto obj = member.object();
                 if (!obj) return nullptr;

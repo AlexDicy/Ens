@@ -715,6 +715,7 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             checkFieldMethodCollision(t->structInfo, mname, isCtor, m.node);
             checkThrowsClausePlacement(m, /*isOverridable=*/false, /*isConstructor=*/isCtor);
             resolveMethodParams(m, t, sym);
+            checkHashMethodSignature(m, sym, isCtor);
             analysis.setSymbol(m.node.greenNode(), sym);
             analysis.setReceiver(m.node.greenNode(), t);
 
@@ -880,6 +881,7 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
         bool overridable = !isCtor && !m.isFinal() && !si->isFinal;
         checkFieldMethodCollision(si, mname, isCtor, m.node);
         checkThrowsClausePlacement(m, overridable, isCtor);
+        checkHashMethodSignature(m, sym, isCtor);
         if (isCtor) {
             if (m.isOverride() || m.isAbstract())
                 errorAtNode(m.node, "A constructor cannot be 'override' or 'abstract'");
@@ -1106,6 +1108,18 @@ void Analyzer::checkFieldMethodCollision(StructInfo* owner, const std::u16string
         asciiOf(fieldOwner->name) + "'; a field and a method cannot share a name.");
 }
 
+// `hash` is a reserved method name with compiler support: any declaration must
+// match the synthesized contract so the type stays usable as a hashed key.
+void Analyzer::checkHashMethodSignature(const ast::FuncDecl& fn, Symbol* sym, bool isConstructor) {
+    if (isConstructor || !sym || sym->name != u"hash") return;
+    bool conforming = sym->paramTypes.empty() && sym->returnType &&
+        sym->returnType->kind == TypeKind::Long;
+    if (!conforming) {
+        errorAtNode(fn.node, "A method named 'hash' must have the signature 'hash() -> long'; "
+            "it defines how values of this type hash when used as keys (for example in a Map or Set).");
+    }
+}
+
 void Analyzer::checkThrowsClausePlacement(const ast::FuncDecl& fn, bool isOverridable,
                                           bool isConstructor) {
     if (!fn.isThrows()) return;
@@ -1291,9 +1305,16 @@ void Analyzer::popTypeParams(size_t count) {
     while (count-- > 0 && !typeParamScope_.empty()) typeParamScope_.pop_back();
 }
 
+// The compiler-known hashing contract from the standard library. Every type
+// satisfies it: hash() is synthesized for types that do not declare their own.
+static bool isHashableClass(const StructInfo* si) {
+    return si && si->name == u"Hashable" && si->modulePath == u"std.hash";
+}
+
 bool Analyzer::checkTypeArgBound(Type* arg, StructInfo* bound, const std::u16string& paramName,
                                  const SyntaxNode& diag) {
     if (!bound) return true;
+    if (isHashableClass(bound)) return true;
     if (arg && arg->isClass() && arg->structInfo && arg->structInfo->isSubclassOf(bound)) {
         return true;
     }
@@ -2431,6 +2452,40 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                     return typeCtx.getArray(typeCtx.getPrimitive(TypeKind::Byte));
                 }
                 // Records may declare their own toBytes: fall through to resolution.
+            }
+            // Every type is hashable: hash() resolves to a declared
+            // `hash() -> long` when the receiver (or its bound) has one, and is
+            // synthesized by codegen otherwise.
+            if (memberName && *memberName == u"hash") {
+                Type* recvT = analyzeExpr(*objExpr);
+                if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }
+                if (recvT->isVoid()) {
+                    errorAtNode(expr.node, "Cannot call 'hash' on a void expression.");
+                    for (auto& a : args) analyzeExpr(a);
+                    return typeCtx.getError();
+                }
+                Type* lookupT = recvT;
+                if (recvT->isTypeParam()) {
+                    lookupT = nullptr;
+                    if (recvT->structInfo) {
+                        lookupT = typeCtx.lookupClass(recvT->structInfo->modulePath,
+                                                      recvT->structInfo->name);
+                    }
+                }
+                bool declaresHash = false;
+                if (lookupT && lookupT->hasRecordLayout() && lookupT->structInfo) {
+                    declaresHash = lookupT->isClass()
+                        ? lookupT->structInfo->classDeclaringMethod(u"hash") != nullptr
+                        : lookupT->structInfo->findMethodIndex(u"hash") >= 0;
+                }
+                if (!declaresHash) {
+                    if (!args.empty()) {
+                        errorAtNode(expr.node, "'hash' takes no arguments.");
+                        for (auto& a : args) analyzeExpr(a);
+                    }
+                    return typeCtx.getPrimitive(TypeKind::Long);
+                }
+                // The receiver declares its own hash(): fall through to resolution.
             }
         }
 
