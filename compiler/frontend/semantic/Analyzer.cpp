@@ -731,9 +731,17 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
     }
 }
 
+// Chain depth for base-before-derived ordering. A base that is a generic
+// instantiation may not be filled yet, so its chain continues through the
+// template. The seen set guards against not-yet-reported inheritance cycles.
 static int baseDepth(StructInfo* si) {
     int d = 0;
-    for (StructInfo* s = si->baseInfo; s; s = s->baseInfo) ++d;
+    std::unordered_set<StructInfo*> seen;
+    for (StructInfo* s = si->baseInfo; s && seen.insert(s).second; ) {
+        ++d;
+        StructInfo* authority = s->templateOf ? s->templateOf : s;
+        s = authority->baseInfo;
+    }
     return d;
 }
 
@@ -748,11 +756,6 @@ void Analyzer::resolveClassBases(const ast::SourceFile& file) {
         si->isAbstract = cd.isAbstract();
         si->isFinal = cd.isFinal();
         si->visibility = toSemanticVisibility(cd.visibility());
-        if (si->isTemplate && cd.baseClassName()) {
-            errorAtNode(cd.baseClassToken().value_or(cd.node),
-                "A generic class cannot extend a base class yet");
-            continue;
-        }
         if (auto baseName = cd.baseClassName()) {
             SyntaxNode diag = cd.baseClassToken().value_or(cd.node);
             Type* baseT = typeCtx.lookupNamedType(modulePath_, *baseName);
@@ -763,17 +766,62 @@ void Analyzer::resolveClassBases(const ast::SourceFile& file) {
             }
             if (!baseT) {
                 errorAtNode(diag, "Unknown base class '" + asciiOf(*baseName) + "'");
-            } else if (!baseT->isClass() || !baseT->structInfo) {
+                continue;
+            }
+            if (!baseT->isClass() || !baseT->structInfo) {
                 errorAtNode(diag, "'" + asciiOf(*baseName) +
                     "' is not a class; only classes can be extended");
-            } else if (baseT->structInfo == si) {
+                continue;
+            }
+            if (baseT->structInfo == si) {
                 errorAtNode(diag, "Class '" + asciiOf(si->name) + "' cannot extend itself");
-            } else if (baseT->structInfo->isFinal) {
+                continue;
+            }
+            auto baseArgs = cd.baseTypeArguments();
+            if (baseT->structInfo->isTemplate) {
+                // A generic base must be extended as a full instantiation whose
+                // type arguments may use the subclass's own type parameters.
+                size_t arity = baseT->structInfo->typeParamNames.size();
+                if (baseArgs.size() != arity) {
+                    errorAtNode(diag, "Generic base class '" + asciiOf(*baseName) + "' expects " +
+                        std::to_string(arity) + (arity == 1 ? " type argument" : " type arguments") +
+                        ", but " + std::to_string(baseArgs.size()) +
+                        (baseArgs.size() == 1 ? " was given" : " were given"));
+                    continue;
+                }
+                size_t tpCount = enterTemplateScope(si, cd.typeParams());
+                std::vector<Type*> argTypes;
+                bool ok = true;
+                for (size_t i = 0; i < baseArgs.size(); ++i) {
+                    Type* at = resolveTypeReference(baseArgs[i]);
+                    if (at->isError()) ok = false;
+                    StructInfo* bound = i < baseT->structInfo->typeParamBounds.size()
+                        ? baseT->structInfo->typeParamBounds[i] : nullptr;
+                    std::u16string pname = i < baseT->structInfo->typeParamNames.size()
+                        ? baseT->structInfo->typeParamNames[i] : std::u16string{};
+                    if (ok && !checkTypeArgBound(at, bound, pname, baseArgs[i].node)) ok = false;
+                    argTypes.push_back(at);
+                }
+                popTypeParams(tpCount);
+                if (!ok) continue;
+                Type* baseInst = typeCtx.instantiate(baseT, argTypes);
+                if (baseInst->isError() || !baseInst->structInfo) continue;
+                baseT = baseInst;
+            } else if (!baseArgs.empty()) {
+                errorAtNode(diag, "'" + asciiOf(*baseName) +
+                    "' is not generic and takes no type arguments");
+                continue;
+            }
+            if (baseT->structInfo->templateOf == si) {
+                errorAtNode(diag, "Class '" + asciiOf(si->name) + "' cannot extend itself");
+                continue;
+            }
+            if (baseT->structInfo->isFinal) {
                 errorAtNode(diag, "Cannot extend '" + asciiOf(*baseName) +
                     "' because it is declared 'final'");
-            } else {
-                si->baseInfo = baseT->structInfo;
+                continue;
             }
+            si->baseInfo = baseT->structInfo;
         }
     }
 
@@ -783,14 +831,22 @@ void Analyzer::resolveClassBases(const ast::SourceFile& file) {
         if (!t || !t->structInfo) continue;
         StructInfo* si = t->structInfo;
         std::unordered_set<StructInfo*> seen;
-        for (StructInfo* s = si; s; s = s->baseInfo) {
-            if (!seen.insert(s).second) {
-                errorAtNode(cd.node, "Class '" + asciiOf(si->name) +
-                    "' eventually extends itself through its base classes. "
-                    "A class cannot inherit from itself, directly or indirectly.");
-                si->baseInfo = nullptr;
-                break;
+        bool cycle = false;
+        for (StructInfo* s = si; s && !cycle; ) {
+            cycle = !seen.insert(s).second;
+            if (cycle) break;
+            StructInfo* authority = s->templateOf ? s->templateOf : s;
+            if (authority != s) {
+                cycle = !seen.insert(authority).second;
+                if (cycle) break;
             }
+            s = authority->baseInfo;
+        }
+        if (cycle) {
+            errorAtNode(cd.node, "Class '" + asciiOf(si->name) +
+                "' eventually extends itself through its base classes. "
+                "A class cannot inherit from itself, directly or indirectly.");
+            si->baseInfo = nullptr;
         }
     }
 }
@@ -813,6 +869,12 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
     if (!t || !t->structInfo) return;
     StructInfo* si = t->structInfo;
     size_t tpCount = enterTemplateScope(si, cd.typeParams());
+
+    // A generic base is an instantiation created during base resolution; its
+    // fill may have been deferred until the base template was laid out.
+    if (si->baseInfo && si->baseInfo->templateOf) {
+        typeCtx.ensureFilled(si->baseInfo);
+    }
 
     // Fields: flatten inherited fields first (base is already laid out), then own.
     if (si->baseInfo) {
@@ -965,6 +1027,12 @@ void Analyzer::finalizeClassHierarchy(const std::vector<StructInfo*>& classes) {
         [](StructInfo* a, StructInfo* b) { return baseDepth(a) < baseDepth(b); });
 
     // --- Assign vtable slots: a method is virtual only when abstract or overridden somewhere. ---
+    // A base that is a generic instantiation defers slot state to its template
+    // (the template is finalized in its own module; the instance copies slots
+    // when it fills).
+    auto slotAuthority = [](StructInfo* s) -> StructInfo* {
+        return (s && s->templateOf) ? s->templateOf : s;
+    };
     for (StructInfo* si : order) {  // phase 1: mark
         for (auto& mi : si->methods) {
             if (mi.name == si->name) continue;
@@ -972,17 +1040,21 @@ void Analyzer::finalizeClassHierarchy(const std::vector<StructInfo*>& classes) {
             if (mi.isOverride && si->baseInfo) {
                 if (StructInfo* bc = si->baseInfo->classDeclaringMethod(mi.name)) {
                     mi.vtableSlot = VTSLOT_PENDING;
-                    bc->methods[bc->findMethodIndex(mi.name)].vtableSlot = VTSLOT_PENDING;
+                    StructInfo* auth = slotAuthority(bc);
+                    auto& baseMethod = auth->methods[auth->findMethodIndex(mi.name)];
+                    if (baseMethod.vtableSlot == -1) baseMethod.vtableSlot = VTSLOT_PENDING;
                 }
             }
         }
     }
     for (StructInfo* si : order) {  // phase 2: assign indices
-        si->vtableSize = si->baseInfo ? si->baseInfo->vtableSize : 0;
+        StructInfo* baseAuth = slotAuthority(si->baseInfo);
+        si->vtableSize = baseAuth ? baseAuth->vtableSize : 0;
         for (auto& mi : si->methods) {
             if (mi.name == si->name || mi.vtableSlot != VTSLOT_PENDING) continue;
             StructInfo* bc = si->baseInfo ? si->baseInfo->classDeclaringMethod(mi.name) : nullptr;
-            int inherited = bc ? bc->methods[bc->findMethodIndex(mi.name)].vtableSlot : -1;
+            StructInfo* bcAuth = slotAuthority(bc);
+            int inherited = bcAuth ? bcAuth->methods[bcAuth->findMethodIndex(mi.name)].vtableSlot : -1;
             mi.vtableSlot = (inherited >= 0) ? inherited : si->vtableSize++;
         }
     }
@@ -1673,7 +1745,10 @@ void Analyzer::analyzeTypedVarDeclStmt(const ast::TypedVarDeclStatement& stmt) {
     auto name = stmt.nameText().value_or(std::u16string{});
     if (stmt.isConst() && !initType && !declared->isError()) {
         errorAtNode(stmt.node, "Constant '" + asciiOf(name) + "' must be initialized");
-    } else if (!initType && !isDefaultable(declared) && !declared->isError()) {
+    } else if (!initType && !isDefaultable(declared) && !declared->isError() &&
+               !TypeContext::containsTypeParam(declared)) {
+        // A type mentioning a type parameter defers its defaultability to the
+        // instantiation, like a type-parameter field.
         errorAtNode(stmt.node, "Variable '" + asciiOf(name) + "' has non-nullable type '" +
             declared->toString() + "' but no initializer. Provide a value, or make the type nullable ('" +
             declared->toString() + "?').");

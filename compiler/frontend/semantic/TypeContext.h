@@ -41,9 +41,22 @@ public:
     // Fill any instantiations whose template was not yet collected when first
     // requested. Returns true if any work was done (loop to a fixpoint).
     bool materializeInstantiations();
+    // Fill one deferred instantiation now if its template is ready (used when a
+    // class's generic base must be complete before the class is laid out).
+    void ensureFilled(StructInfo* inst);
 
     // All class/struct instantiations created so far (for monomorphized codegen).
     const std::vector<Type*>& classInstantiations() const { return instantiationList_; }
+
+    // The Type that owns an instantiation's StructInfo.
+    Type* typeForInstance(StructInfo* inst) const {
+        auto it = instanceTypes_.find(inst);
+        return it == instanceTypes_.end() ? nullptr : it->second;
+    }
+
+    // True if the type mentions any unsubstituted type parameter (an "open"
+    // type, e.g. a generic base recorded on a template).
+    static bool containsTypeParam(const Type* t);
 
     // Generic free-function instantiations, recorded at call sites.
     struct FunctionInstantiation {
@@ -104,6 +117,7 @@ private:
     std::map<std::pair<const void*, int>, Type*> typeParamCache;
     std::unordered_map<InstantiationKey, Type*, InstantiationKeyHash> instantiationCache;
     std::vector<Type*> instantiationList_;
+    std::unordered_map<StructInfo*, Type*> instanceTypes_;
     std::vector<FunctionInstantiation> functionInstantiations_;
     std::vector<std::unique_ptr<Symbol>> ownedSymbols;
     Type* errorType;

@@ -223,6 +223,7 @@ public:
     std::vector<TypeParam> typeParams() const;
     std::optional<SyntaxNode> baseClassToken() const;
     std::optional<std::u16string> baseClassName() const;
+    std::vector<TypeReference> baseTypeArguments() const;
     bool isAbstract() const;
     bool isFinal() const;
     std::optional<MemberList> memberList() const;

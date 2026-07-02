@@ -511,10 +511,7 @@ void Parser::parseStructOrClassDecl(SyntaxKind nodeKind, SyntaxKind keywordKind)
         if (!isClass) reportAtCurrent("Only classes can use 'extends'; structs do not support inheritance");
         bump();  // 'extends'
         expect(SyntaxKind::Identifier, "base class name after 'extends'");
-        if (at(SyntaxKind::Lt)) {
-            reportAtCurrent("Generic base classes are not yet supported");
-            parseTypeArgList();
-        }
+        if (at(SyntaxKind::Lt)) parseTypeArgList();
     }
     expect(SyntaxKind::LBrace, "'{'");
     builder.startNode(SyntaxKind::MemberList);

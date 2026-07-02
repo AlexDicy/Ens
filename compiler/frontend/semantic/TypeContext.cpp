@@ -216,6 +216,7 @@ Type* TypeContext::instantiateInternal(StructInfo* templ, TypeKind kind,
     t->structInfo = inst;
     instantiationCache[key] = t;
     instantiationList_.push_back(t);
+    instanceTypes_[inst] = t;
 
     // Fill now if the template's members are already resolved; otherwise defer
     // (the template is laid out later, then materializeInstantiations fills it).
@@ -230,6 +231,23 @@ Type* TypeContext::instantiateInternal(StructInfo* templ, TypeKind kind,
 void TypeContext::fillInstantiation(StructInfo* inst, StructInfo* templ,
                                     const std::vector<Type*>& args) {
     const void* owner = static_cast<const void*>(templ);
+    // Base layout is settled by fill time; refresh what the shell copied at
+    // creation, and rebind a generic base to its concrete instantiation.
+    inst->baseInfo = templ->baseInfo;
+    inst->baseFieldCount = templ->baseFieldCount;
+    inst->vtableSize = templ->vtableSize;
+    if (templ->baseInfo && templ->baseInfo->templateOf) {
+        std::vector<Type*> baseArgs;
+        baseArgs.reserve(templ->baseInfo->typeArgs.size());
+        for (Type* a : templ->baseInfo->typeArgs) {
+            baseArgs.push_back(substitute(a, owner, args));
+        }
+        Type* concreteBase = instantiateInternal(templ->baseInfo->templateOf,
+                                                 TypeKind::Class, baseArgs);
+        if (concreteBase && concreteBase->structInfo) {
+            inst->baseInfo = concreteBase->structInfo;
+        }
+    }
     for (const auto& f : templ->fields) {
         FieldInfo nf = f;
         nf.type = substitute(f.type, owner, args);
@@ -267,4 +285,37 @@ bool TypeContext::materializeInstantiations() {
         did = true;
     }
     return did;
+}
+
+void TypeContext::ensureFilled(StructInfo* inst) {
+    for (size_t i = 0; i < pendingInstantiations_.size(); ++i) {
+        if (pendingInstantiations_[i].inst != inst) continue;
+        if (!pendingInstantiations_[i].templ->membersCollected) return;
+        PendingInstantiation p = std::move(pendingInstantiations_[i]);
+        pendingInstantiations_.erase(pendingInstantiations_.begin() +
+                                     static_cast<ptrdiff_t>(i));
+        fillInstantiation(p.inst, p.templ, p.args);
+        return;
+    }
+}
+
+bool TypeContext::containsTypeParam(const Type* t) {
+    if (!t) return false;
+    switch (t->kind) {
+        case TypeKind::TypeParam:
+            return true;
+        case TypeKind::Array:
+        case TypeKind::Optional:
+            return containsTypeParam(t->inner);
+        case TypeKind::Struct:
+        case TypeKind::Class:
+            if (t->structInfo && t->structInfo->templateOf) {
+                for (const Type* a : t->structInfo->typeArgs) {
+                    if (containsTypeParam(a)) return true;
+                }
+            }
+            return false;
+        default:
+            return false;
+    }
 }

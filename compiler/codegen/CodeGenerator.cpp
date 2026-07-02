@@ -362,6 +362,8 @@ struct CodeGenerator::Impl {
 
     llvm::DIType* mapDIType(::Type* t) {
         if (!debugEnabled || !diBuilder || !t) return nullptr;
+        t = subst(t);
+        if (t->isTypeParam()) return nullptr;
         if (t->kind == TypeKind::Optional && t->inner && t->inner->isClass()) {
             return mapDIType(t->inner);
         }
@@ -386,7 +388,7 @@ struct CodeGenerator::Impl {
             if (it != diClassPointerCache.end()) return it->second;
             // Pre-cache a forward-declared pointer to break mutual recursion
             // when two classes reference each other (e.g. parent<->child).
-            std::string sname = t->structInfo ? asAscii(t->structInfo->name) : "class.anon";
+            std::string sname = diTypeName(t);
             auto* fwd = diBuilder->createReplaceableCompositeType(
                 llvm::dwarf::DW_TAG_structure_type,
                 sname, diCU, diFile, 0);
@@ -426,11 +428,21 @@ struct CodeGenerator::Impl {
         return result;
     }
 
+    // Instances of the same template share a display name; distinct DI names
+    // keep their otherwise-identical debug nodes from being uniqued together
+    // (a merged node would dangle the cached pointer type).
+    std::string diTypeName(::Type* t) {
+        if (!t || !t->structInfo) return "class.anon";
+        if (t->structInfo->templateOf) return mangledTypeName(t->structInfo);
+        return asAscii(t->structInfo->name);
+    }
+
     llvm::DIType* mapDIStructType(::Type* t) {
+        t = subst(t);
         auto it = diStructTypeCache.find(t);
         if (it != diStructTypeCache.end()) return it->second;
         if (!t->structInfo) return nullptr;
-        std::string sname = asAscii(t->structInfo->name);
+        std::string sname = diTypeName(t);
         auto* st = mapStructType(t);
         const llvm::DataLayout& dl = module->getDataLayout();
         const llvm::StructLayout* sl = dl.getStructLayout(st);
@@ -503,6 +515,21 @@ struct CodeGenerator::Impl {
             sym->methodOwner == substTemplate) {
             int idx = substInstanceType->structInfo->findMethodIndex(sym->name);
             if (idx >= 0) return substInstanceType->structInfo->methods[idx].symbol;
+        }
+        // A call may also resolve to a method of an open instance (an
+        // instantiation whose args mention the enclosing template's type
+        // parameters); rebind it to the concrete instance's clone.
+        if (sym && sym->methodOwner && sym->methodOwner->templateOf && substOwner && typeCtx) {
+            if (::Type* ownerT = typeCtx->typeForInstance(sym->methodOwner)) {
+                if (TypeContext::containsTypeParam(ownerT)) {
+                    ::Type* concreteT = typeCtx->substitute(ownerT, substOwner, substArgs);
+                    if (concreteT && concreteT->structInfo &&
+                        concreteT->structInfo != sym->methodOwner) {
+                        int idx = concreteT->structInfo->findMethodIndex(sym->name);
+                        if (idx >= 0) return concreteT->structInfo->methods[idx].symbol;
+                    }
+                }
+            }
         }
         return sym;
     }
@@ -5859,7 +5886,7 @@ struct CodeGenerator::Impl {
         substOwner = templ; substTemplate = templ; substInstanceType = instT; substArgs = inst->typeArgs;
         std::vector<std::unique_ptr<SyntaxNode>> roots;
         for (auto& mi : inst->methods) {
-            if (!mi.symbol || !mi.declaration) continue;
+            if (!mi.symbol || !mi.declaration || mi.isAbstract) continue;
             roots.push_back(SyntaxNode::makeRoot(static_cast<const GreenElement*>(mi.declaration)));
             // Reuse any external declaration already created at a call site so the
             // definition lands on the same symbol instead of an LLVM-renamed copy.
@@ -5867,7 +5894,7 @@ struct CodeGenerator::Impl {
         }
         size_t ri = 0;
         for (auto& mi : inst->methods) {
-            if (!mi.symbol || !mi.declaration) continue;
+            if (!mi.symbol || !mi.declaration || mi.isAbstract) continue;
             ast::FuncDecl fn{*roots[ri++]};
             emitFunction(fn, mi.symbol, instT);
         }
@@ -5889,10 +5916,21 @@ struct CodeGenerator::Impl {
 
     void emitInstantiations(const ast::SourceFile& sf) {
         if (!typeCtx) return;
-        for (::Type* instT : typeCtx->classInstantiations()) {
+        // Emitting one instantiation can create further ones (a method body may
+        // instantiate other generics with this instance's type args), so index
+        // through the growing list rather than iterating it.
+        for (size_t i = 0; i < typeCtx->classInstantiations().size(); ++i) {
+            ::Type* instT = typeCtx->classInstantiations()[i];
             if (!instT || !instT->structInfo) continue;
             StructInfo* templ = instT->structInfo->templateOf;
             if (!templ || templ->modulePath != modulePath) continue;
+            // An open instance (type args still mention a type parameter, e.g.
+            // a template's generic base) has no runtime identity of its own.
+            bool open = false;
+            for (::Type* a : instT->structInfo->typeArgs) {
+                if (TypeContext::containsTypeParam(a)) { open = true; break; }
+            }
+            if (open) continue;
             emitClassInstantiation(instT);
         }
         for (auto& fn : sf.functions()) {
@@ -5932,9 +5970,10 @@ struct CodeGenerator::Impl {
 
         // Define a descriptor for every class declared here, even one only ever
         // thrown or caught (e.g. the prelude's Error), so its definition exists.
+        // Templates have no runtime identity; their instantiations emit their own.
         for (auto& cd : sf->classes()) {
             if (Type* t = analysis.typeOf(cd.node.greenNode())) {
-                if (t->structInfo) getOrEmitTypeDescriptor(t->structInfo);
+                if (t->structInfo && !t->structInfo->isTemplate) getOrEmitTypeDescriptor(t->structInfo);
                 if (t->structInfo && t->structInfo->name == u"StackFrame" && isPreludeModule())
                     stackFrameType = t;
             }

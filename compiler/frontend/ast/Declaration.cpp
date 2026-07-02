@@ -402,6 +402,19 @@ std::optional<std::u16string> ClassDecl::baseClassName() const {
     if (auto t = baseClassToken()) return std::u16string(t->tokenText());
     return std::nullopt;
 }
+std::vector<TypeReference> ClassDecl::baseTypeArguments() const {
+    std::vector<TypeReference> out;
+    bool afterExtends = false;
+    for (auto& c : node.children()) {
+        if (c.kind() == SyntaxKind::KwExtends) { afterExtends = true; continue; }
+        if (!afterExtends || c.kind() != SyntaxKind::TypeArgList) continue;
+        for (auto& a : c.children()) {
+            if (auto tr = TypeReference::cast(a)) out.push_back(*tr);
+        }
+        break;
+    }
+    return out;
+}
 bool ClassDecl::isAbstract() const { return hasDirectToken(node, SyntaxKind::KwAbstract); }
 bool ClassDecl::isFinal() const    { return hasDirectToken(node, SyntaxKind::KwFinal); }
 std::optional<MemberList> ClassDecl::memberList() const {
