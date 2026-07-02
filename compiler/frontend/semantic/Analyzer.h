@@ -159,6 +159,7 @@ private:
     void analyzeWhileStmt(const ast::WhileStatement& stmt);
     void analyzeForStmt(const ast::ForStatement& stmt);
     void analyzeForEachStmt(const ast::ForEachStatement& stmt);
+    ::Type* resolveIterableElement(::Type* iterT, const SyntaxNode& diag);
     void analyzeBreakStmt(const ast::BreakStatement& stmt);
     void analyzeContinueStmt(const ast::ContinueStatement& stmt);
     void analyzeReturnStmt(const ast::ReturnStatement& stmt);

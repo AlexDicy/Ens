@@ -1597,6 +1597,12 @@ struct CodeGenerator::Impl {
             return;
         }
 
+        ::Type* iterableType = typeOf(it->node);
+        if (iterableType && iterableType->isClass()) {
+            emitIteratorForEach(s, elemSym, *it, iterableType);
+            return;
+        }
+
         llvm::Value* arr = emitExpr(*it);
         if (!arr) return;
 
@@ -1653,6 +1659,114 @@ struct CodeGenerator::Impl {
         builder->SetInsertPoint(incBB);
         llvm::Value* incIdx = builder->CreateLoad(i64, idxAlloca, "foreach.i.inc");
         builder->CreateStore(builder->CreateAdd(incIdx, llvm::ConstantInt::get(i64, 1)), idxAlloca);
+        builder->CreateBr(condBB);
+
+        builder->SetInsertPoint(endBB);
+    }
+
+    // Resolve a zero-argument method on a class along its base chain, together
+    // with its vtable slot for dynamic dispatch.
+    struct ResolvedMethod {
+        Symbol* symbol = nullptr;
+        int vtableSlot = -1;
+    };
+    ResolvedMethod resolveClassMethod(::Type* classT, const std::u16string& name) {
+        ResolvedMethod out;
+        if (!classT || !classT->structInfo) return out;
+        StructInfo* decl = classT->structInfo->classDeclaringMethod(name);
+        if (!decl) return out;
+        const MethodInfo& mi = decl->methods[decl->findMethodIndex(name)];
+        out.symbol = mi.symbol;
+        out.vtableSlot = mi.vtableSlot;
+        return out;
+    }
+
+    llvm::Value* emitResolvedCall(const ResolvedMethod& m, ::Type* receiverT,
+                                  llvm::Value* receiver) {
+        llvm::Function* fn = getOrDeclareExternalFunction(m.symbol, receiverT);
+        if (!fn) return nullptr;
+        std::vector<llvm::Value*> args{ receiver };
+        if (m.symbol->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);
+        llvm::Value* result = (m.vtableSlot >= 0)
+            ? builder->CreateCall(fn->getFunctionType(), loadVtableSlot(receiver, m.vtableSlot), args)
+            : builder->CreateCall(fn, args);
+        emitThrowsCheck(m.symbol);
+        return result;
+    }
+
+    // for (item in obj) over a class with makeIterator(): drive the returned
+    // iterator's hasNext()/next(). The iterator is owned for the loop's
+    // duration; each next() result is owned by the element binding, released
+    // when the next value overwrites it and finally by frame cleanup.
+    void emitIteratorForEach(const ast::ForEachStatement& s, Symbol* elemSym,
+                             const ast::Expression& iterableE, ::Type* iterableT) {
+        ResolvedMethod makeIterator = resolveClassMethod(iterableT, u"makeIterator");
+        if (!makeIterator.symbol) {
+            error(s.node.startOffset(), "Internal: iterable lost its makeIterator method in codegen");
+            return;
+        }
+        ::Type* iteratorT = subst(makeIterator.symbol->returnType);
+        ResolvedMethod hasNext = resolveClassMethod(iteratorT, u"hasNext");
+        ResolvedMethod next = resolveClassMethod(iteratorT, u"next");
+        if (!hasNext.symbol || !next.symbol) {
+            error(s.node.startOffset(), "Internal: iterator type lost hasNext/next in codegen");
+            return;
+        }
+
+        llvm::Value* iterable = emitExpr(iterableE);
+        if (!iterable) return;
+        llvm::Value* iterator = emitResolvedCall(makeIterator, iterableT, iterable);
+        if (!iterator) return;
+        releaseIfOwnedTemp(iterable, iterableE);
+
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        llvm::Value* iteratorSlot = createEntryAlloca(currentFunction, ptrTy, "foreach.iter");
+        builder->CreateStore(iterator, iteratorSlot);
+        if (!cleanupStack.empty()) cleanupStack.back().push_back({ iteratorSlot, iteratorT });
+
+        ::Type* nextRetT = subst(next.symbol->returnType);
+        llvm::Type* bindTy = mapType(elemSym->type);
+        llvm::Value* elemAlloca = createEntryAlloca(currentFunction, bindTy, asAscii(elemSym->name));
+        values[elemSym] = elemAlloca;
+        bool elemOwned = isReferenceType(elemSym->type) || structHasClassFields(elemSym->type);
+        if (elemOwned) {
+            builder->CreateStore(llvm::Constant::getNullValue(bindTy), elemAlloca);
+            if (!cleanupStack.empty()) cleanupStack.back().push_back({ elemAlloca, elemSym->type });
+        }
+
+        auto* condBB = llvm::BasicBlock::Create(ctx, "foreach.cond", currentFunction);
+        auto* bodyBB = llvm::BasicBlock::Create(ctx, "foreach.body", currentFunction);
+        auto* incBB  = llvm::BasicBlock::Create(ctx, "foreach.inc",  currentFunction);
+        auto* endBB  = llvm::BasicBlock::Create(ctx, "foreach.end",  currentFunction);
+
+        builder->CreateBr(condBB);
+        builder->SetInsertPoint(condBB);
+        llvm::Value* iterForCond = builder->CreateLoad(ptrTy, iteratorSlot, "foreach.iter.load");
+        llvm::Value* more = emitResolvedCall(hasNext, iteratorT, iterForCond);
+        if (!more) return;
+        builder->CreateCondBr(more, bodyBB, endBB);
+
+        builder->SetInsertPoint(bodyBB);
+        llvm::Value* iterForNext = builder->CreateLoad(ptrTy, iteratorSlot, "foreach.iter.load");
+        llvm::Value* elemVal = emitResolvedCall(next, iteratorT, iterForNext);
+        if (!elemVal) return;
+        if (nextRetT && elemSym->type && nextRetT->isNumeric() &&
+            !nextRetT->equals(elemSym->type)) {
+            elemVal = emitNumericConversion(elemVal, nextRetT, elemSym->type);
+        }
+        if (isReferenceType(elemSym->type)) {
+            llvm::Value* previous = builder->CreateLoad(ptrTy, elemAlloca, "foreach.elem.old");
+            emitRelease(previous);
+        } else if (structHasClassFields(elemSym->type)) {
+            emitStructFieldRelease(elemSym->type, elemAlloca);
+        }
+        builder->CreateStore(elemVal, elemAlloca);
+        loopStack.push_back({endBB, incBB, cleanupStack.size()});
+        if (auto b = s.body()) emitBlock(*b);
+        loopStack.pop_back();
+        if (!builder->GetInsertBlock()->getTerminator()) builder->CreateBr(incBB);
+
+        builder->SetInsertPoint(incBB);
         builder->CreateBr(condBB);
 
         builder->SetInsertPoint(endBB);
@@ -3621,7 +3735,12 @@ struct CodeGenerator::Impl {
         descriptorCache[si] = gv;  // cache before recursing into parent
         if (si->modulePath != modulePath) return gv;  // external declaration only
 
-        llvm::Constant* nameStr = builder->CreateGlobalString(asAscii(si->name),
+        // Not CreateGlobalString: this can run before any function gave the
+        // builder an insertion point (e.g. a module holding only an abstract
+        // generic class).
+        auto* nameData = llvm::ConstantDataArray::getString(ctx, asAscii(si->name), true);
+        llvm::Constant* nameStr = new llvm::GlobalVariable(*module, nameData->getType(),
+            /*isConstant=*/true, llvm::GlobalValue::PrivateLinkage, nameData,
             "_typename_" + symName);
         llvm::Constant* parent = si->baseInfo
             ? static_cast<llvm::Constant*>(getOrEmitTypeDescriptor(si->baseInfo))

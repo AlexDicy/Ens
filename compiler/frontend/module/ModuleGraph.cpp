@@ -307,7 +307,14 @@ bool analyzeModuleGraph(std::vector<std::unique_ptr<Module>>& modules,
         }
         auto depthOf = [](StructInfo* si) {
             int d = 0;
-            for (StructInfo* s = si->baseInfo; s; s = s->baseInfo) ++d;
+            std::unordered_set<StructInfo*> seen;
+            // A generic base may be an unfilled instantiation; its chain
+            // continues through the template.
+            for (StructInfo* s = si->baseInfo; s && seen.insert(s).second; ) {
+                ++d;
+                StructInfo* authority = s->templateOf ? s->templateOf : s;
+                s = authority->baseInfo;
+            }
             return d;
         };
         std::stable_sort(items.begin(), items.end(),
@@ -321,6 +328,7 @@ bool analyzeModuleGraph(std::vector<std::unique_ptr<Module>>& modules,
 
     // Fill generic instantiations whose template was laid out after the use site.
     sharedCtx.materializeInstantiations();
+    sharedCtx.refreshInstantiationInheritance();
 
     for (auto& m : modules) m->analyzer->analyzeBodies();
 

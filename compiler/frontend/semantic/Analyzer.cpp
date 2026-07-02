@@ -1019,6 +1019,7 @@ void Analyzer::layoutDeclaredClasses(const ast::SourceFile& file) {
             sis.push_back(t->structInfo);
     }
     finalizeClassHierarchy(sis);
+    typeCtx.refreshInstantiationInheritance();
 }
 
 void Analyzer::finalizeClassHierarchy(const std::vector<StructInfo*>& classes) {
@@ -2053,6 +2054,48 @@ void Analyzer::analyzeForStmt(const ast::ForStatement& stmt) {
     popScope();
 }
 
+// The element type a class yields in a for-in loop: the return type of next()
+// on whatever makeIterator() returns. Reports a specific diagnostic and
+// returns the error type when the protocol is incomplete.
+Type* Analyzer::resolveIterableElement(Type* iterT, const SyntaxNode& diag) {
+    StructInfo* declaring = iterT->structInfo->classDeclaringMethod(u"makeIterator");
+    Symbol* makeSym = declaring
+        ? declaring->methods[declaring->findMethodIndex(u"makeIterator")].symbol : nullptr;
+    if (!makeSym) {
+        errorAtNode(diag, "'" + iterT->toString() + "' is not iterable: it has no "
+            "'makeIterator()' method. Add one returning an Iterator to use it in a "
+            "for-in loop.");
+        return typeCtx.getError();
+    }
+    if (!makeSym->paramTypes.empty()) {
+        errorAtNode(diag, "'makeIterator()' on '" + iterT->toString() +
+            "' must take no arguments to be used in a for-in loop.");
+        return typeCtx.getError();
+    }
+    Type* iteratorT = makeSym->returnType;
+    if (!iteratorT || !iteratorT->isClass() || !iteratorT->structInfo) {
+        errorAtNode(diag, "'makeIterator()' on '" + iterT->toString() + "' must return "
+            "an iterator class with 'hasNext() -> bool' and 'next() -> T' methods.");
+        return typeCtx.getError();
+    }
+    StructInfo* hasNextDecl = iteratorT->structInfo->classDeclaringMethod(u"hasNext");
+    StructInfo* nextDecl = iteratorT->structInfo->classDeclaringMethod(u"next");
+    Symbol* hasNextSym = hasNextDecl
+        ? hasNextDecl->methods[hasNextDecl->findMethodIndex(u"hasNext")].symbol : nullptr;
+    Symbol* nextSym = nextDecl
+        ? nextDecl->methods[nextDecl->findMethodIndex(u"next")].symbol : nullptr;
+    bool hasNextOk = hasNextSym && hasNextSym->paramTypes.empty() &&
+        hasNextSym->returnType && hasNextSym->returnType->isBool();
+    bool nextOk = nextSym && nextSym->paramTypes.empty() &&
+        nextSym->returnType && !nextSym->returnType->isVoid();
+    if (!hasNextOk || !nextOk) {
+        errorAtNode(diag, "The iterator type '" + iteratorT->toString() + "' returned by "
+            "'makeIterator()' must have 'hasNext() -> bool' and 'next() -> T' methods.");
+        return typeCtx.getError();
+    }
+    return nextSym->returnType;
+}
+
 void Analyzer::analyzeForEachStmt(const ast::ForEachStatement& stmt) {
     pushScope();
     Type* iterT = typeCtx.getError();
@@ -2061,9 +2104,12 @@ void Analyzer::analyzeForEachStmt(const ast::ForEachStatement& stmt) {
     if (!iterT->isError()) {
         if (iterT->isArray() && iterT->inner) {
             elemT = iterT->inner;
+        } else if (iterT->isClass() && iterT->structInfo) {
+            elemT = resolveIterableElement(iterT, stmt.node);
         } else {
-            errorAtNode(stmt.node, "'for (... in ...)' requires an array, got '" +
-                iterT->toString() + "'");
+            errorAtNode(stmt.node, "'for (... in ...)' requires an array or an iterable "
+                "object, got '" + iterT->toString() + "'. A class is iterable when it has "
+                "a 'makeIterator() -> Iterator<T>' method.");
         }
     }
     Type* bindingT = elemT;

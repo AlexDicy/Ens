@@ -44,6 +44,10 @@ public:
     // Fill one deferred instantiation now if its template is ready (used when a
     // class's generic base must be complete before the class is laid out).
     void ensureFilled(StructInfo* inst);
+    // Re-copy vtable slots, vtable size, and slot ABI throws-ness from each
+    // template onto its instances. Instances filled during class layout copy
+    // that state before final vtable assignment runs, so it is refreshed after.
+    void refreshInstantiationInheritance();
 
     // All class/struct instantiations created so far (for monomorphized codegen).
     const std::vector<Type*>& classInstantiations() const { return instantiationList_; }

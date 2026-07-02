@@ -287,6 +287,22 @@ bool TypeContext::materializeInstantiations() {
     return did;
 }
 
+void TypeContext::refreshInstantiationInheritance() {
+    for (Type* t : instantiationList_) {
+        StructInfo* inst = t ? t->structInfo : nullptr;
+        if (!inst || !inst->templateOf) continue;
+        StructInfo* templ = inst->templateOf;
+        inst->vtableSize = templ->vtableSize;
+        size_t n = std::min(inst->methods.size(), templ->methods.size());
+        for (size_t i = 0; i < n; ++i) {
+            inst->methods[i].vtableSlot = templ->methods[i].vtableSlot;
+            if (inst->methods[i].symbol && templ->methods[i].symbol) {
+                inst->methods[i].symbol->abiThrows = templ->methods[i].symbol->abiThrows;
+            }
+        }
+    }
+}
+
 void TypeContext::ensureFilled(StructInfo* inst) {
     for (size_t i = 0; i < pendingInstantiations_.size(); ++i) {
         if (pendingInstantiations_[i].inst != inst) continue;
