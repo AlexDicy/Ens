@@ -270,6 +270,8 @@ struct CodeGenerator::Impl {
                 // Nullable class, external, string, and array types are pointer-sized.
                 if (t->inner && (t->inner->isClass() || t->inner->isExternal() || t->inner->isString())) return false;
                 if (t->inner && t->inner->isArray()) return isUnsupportedType(t->inner);
+                // Value-type inners use the tagged {i1 present, T value} form.
+                if (t->inner) return isUnsupportedType(t->inner);
                 return true;
             case TypeKind::Array:
                 return isUnsupportedType(t->inner);
@@ -287,6 +289,18 @@ struct CodeGenerator::Impl {
         if (t->kind == TypeKind::Optional && t->inner &&
             (t->inner->isClass() || t->inner->isArray() || t->inner->isString())) return true;
         return false;
+    }
+
+    // An Optional whose inner is a value type (primitive, enum, struct). These
+    // lower to a tagged {i1 present, T value} struct instead of a null-pointer
+    // sentinel, and are never ARC-managed.
+    bool isValueTypeOptional(::Type* t) {
+        if (!t) return false;
+        t = subst(t);
+        if (!t->isOptional() || !t->inner) return false;
+        ::Type* inner = subst(t->inner);
+        return !inner->isClass() && !inner->isArray() &&
+               !inner->isString() && !inner->isExternal();
     }
 
     llvm::Type* mapType(::Type* t) {
@@ -317,6 +331,14 @@ struct CodeGenerator::Impl {
             case TypeKind::Optional:
                 if (t->inner && (t->inner->isClass() || t->inner->isExternal() || t->inner->isArray() || t->inner->isString()))
                     return llvm::PointerType::get(ctx, 0);
+                if (t->inner) {
+                    std::string name = "opt." + mangledTypeArg(subst(t->inner));
+                    if (auto* existing = llvm::StructType::getTypeByName(ctx, name))
+                        return existing;
+                    auto* st = llvm::StructType::create(ctx, name);
+                    st->setBody({ llvm::Type::getInt1Ty(ctx), mapType(t->inner) });
+                    return st;
+                }
                 return nullptr;
             default:                return nullptr;
         }
@@ -347,6 +369,9 @@ struct CodeGenerator::Impl {
             return mapDIType(t->inner);
         }
         if (t->kind == TypeKind::Optional && t->inner && t->inner->isString()) {
+            return mapDIType(t->inner);
+        }
+        if (t->kind == TypeKind::Optional && t->inner) {
             return mapDIType(t->inner);
         }
         if (t->kind == TypeKind::Array) {
@@ -1409,6 +1434,8 @@ struct CodeGenerator::Impl {
             initStructFieldDefaults(sym->type, alloca);
         } else if (isReferenceType(sym->type)) {
             builder->CreateStore(llvm::ConstantPointerNull::get(llvm::PointerType::get(ctx, 0)), alloca);
+        } else if (isValueTypeOptional(sym->type)) {
+            builder->CreateStore(llvm::ConstantAggregateZero::get(mapType(sym->type)), alloca);
         }
     }
 
@@ -1427,7 +1454,7 @@ struct CodeGenerator::Impl {
                 if (fd) {
                     if (auto dv = fd->defaultValue()) {
                         if (auto dvExpr = dv->expression()) {
-                            if (llvm::Value* v = emitExpr(*dvExpr)) {
+                            if (llvm::Value* v = emitExprConverted(*dvExpr, fi.type)) {
                                 llvm::Value* fieldAddr = builder->CreateStructGEP(
                                     st, base, static_cast<unsigned>(i), asAscii(fi.name) + ".addr");
                                 bool borrowed = !expressionProducesOwnedRef(*dvExpr);
@@ -1448,6 +1475,11 @@ struct CodeGenerator::Impl {
                 llvm::Value* fieldAddr = builder->CreateStructGEP(
                     st, base, static_cast<unsigned>(i), asAscii(fi.name) + ".addr");
                 builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), fieldAddr);
+            }
+            if (!wrote && isValueTypeOptional(fi.type)) {
+                llvm::Value* fieldAddr = builder->CreateStructGEP(
+                    st, base, static_cast<unsigned>(i), asAscii(fi.name) + ".addr");
+                builder->CreateStore(llvm::ConstantAggregateZero::get(mapType(fi.type)), fieldAddr);
             }
         }
         defaultInitStack.pop_back();
@@ -1757,9 +1789,11 @@ struct CodeGenerator::Impl {
         if (byPointerParams.count(sym)) {
             llvm::Value* ptr = builder->CreateLoad(
                 llvm::PointerType::get(ctx, 0), it->second, asAscii(sym->name) + ".byptr");
-            return builder->CreateLoad(mapType(sym->type), ptr, asAscii(sym->name) + ".load");
+            llvm::Value* v = builder->CreateLoad(mapType(sym->type), ptr, asAscii(sym->name) + ".load");
+            return unwrapIfNarrowedValueOptional(v, sym->type, e.node);
         }
-        return builder->CreateLoad(mapType(sym->type), it->second, asAscii(sym->name) + ".load");
+        llvm::Value* v = builder->CreateLoad(mapType(sym->type), it->second, asAscii(sym->name) + ".load");
+        return unwrapIfNarrowedValueOptional(v, sym->type, e.node);
     }
 
     llvm::Value* emitThis(const ast::ThisExpression& e) {
@@ -1835,6 +1869,13 @@ struct CodeGenerator::Impl {
             releaseIfOwnedTemp(L, *leftE);
             releaseIfOwnedTemp(R, *rightE);
             return op == SyntaxKind::NotEq ? builder->CreateNot(eq) : eq;
+        }
+        if ((op == SyntaxKind::EqEq || op == SyntaxKind::NotEq) &&
+            (isValueTypeOptional(leftType) || isValueTypeOptional(rightType))) {
+            llvm::Value* eq = emitValueOptionalEquality(L, leftType, R, rightType,
+                                                        e.node.startOffset());
+            if (!eq) return nullptr;
+            return op == SyntaxKind::NotEq ? builder->CreateNot(eq, "opt.ne") : eq;
         }
         if (op == SyntaxKind::Plus && ((leftType && leftType->isString()) ||
                                        (rightType && rightType->isString()))) {
@@ -1933,10 +1974,98 @@ struct CodeGenerator::Impl {
         ::Type* srcT = typeOf(e.node);
         if (!srcT || !target) return v;
         if (srcT->equals(target)) return v;
+        if (isValueTypeOptional(target) && !srcT->isOptional()) {
+            return emitWrapInValueOptional(v, srcT, target);
+        }
         bool srcNum = srcT->isInteger() || srcT->isFloat();
         bool dstNum = target->isInteger() || target->isFloat();
         if (!srcNum || !dstNum) return v;
         return emitNumericConversion(v, srcT, target);
+    }
+
+    // Build the tagged {i1 present, T value} form of a value-type Optional from
+    // either the null literal (absent) or a plain inner value (present).
+    llvm::Value* emitWrapInValueOptional(llvm::Value* v, ::Type* srcT, ::Type* optTarget) {
+        llvm::Type* optTy = mapType(optTarget);
+        if (!optTy) return v;
+        if (srcT->isNull()) {
+            return llvm::ConstantAggregateZero::get(optTy);
+        }
+        ::Type* inner = subst(optTarget)->inner;
+        if (inner && !srcT->equals(inner) &&
+            (srcT->isInteger() || srcT->isFloat()) &&
+            (inner->isInteger() || inner->isFloat())) {
+            v = emitNumericConversion(v, srcT, inner);
+        }
+        llvm::Value* result = llvm::UndefValue::get(optTy);
+        result = builder->CreateInsertValue(result, llvm::ConstantInt::getTrue(ctx), {0}, "opt.wrap");
+        result = builder->CreateInsertValue(result, v, {1}, "opt.wrap");
+        return result;
+    }
+
+    // Loads through a slot whose declared type is a value-type Optional yield
+    // the whole tagged struct; when flow narrowing typed the expression as the
+    // bare inner, unwrap to the value component.
+    llvm::Value* unwrapIfNarrowedValueOptional(llvm::Value* v, ::Type* physicalT,
+                                               const SyntaxNode& node) {
+        if (!v || !isValueTypeOptional(physicalT)) return v;
+        ::Type* exprT = typeOf(node);
+        if (exprT && !exprT->isOptional() && !exprT->isError()) {
+            return builder->CreateExtractValue(v, {1}, "opt.narrowed");
+        }
+        return v;
+    }
+
+    // `==` over tagged value-type Optionals. Returns the equality bit; the
+    // caller negates for `!=`. Covers optional-vs-null, optional-vs-optional,
+    // and optional-vs-plain-value.
+    llvm::Value* emitValueOptionalEquality(llvm::Value* L, ::Type* leftType,
+                                           llvm::Value* R, ::Type* rightType,
+                                           uint32_t offset) {
+        auto innerEquals = [&](llvm::Value* a, llvm::Value* b, ::Type* inner) -> llvm::Value* {
+            if (inner && inner->isFloat()) return builder->CreateFCmpOEQ(a, b, "opt.val.eq");
+            if (a->getType()->isIntegerTy()) return builder->CreateICmpEQ(a, b, "opt.val.eq");
+            error(offset, "Comparing optional values of type '" +
+                (inner ? inner->toString() : "?") + "' is not supported yet");
+            return nullptr;
+        };
+        bool leftOpt = isValueTypeOptional(leftType);
+        bool rightOpt = isValueTypeOptional(rightType);
+        if (leftOpt && rightType && rightType->isNull()) {
+            llvm::Value* present = builder->CreateExtractValue(L, {0}, "opt.present");
+            return builder->CreateNot(present, "opt.isnull");
+        }
+        if (rightOpt && leftType && leftType->isNull()) {
+            llvm::Value* present = builder->CreateExtractValue(R, {0}, "opt.present");
+            return builder->CreateNot(present, "opt.isnull");
+        }
+        if (leftOpt && rightOpt) {
+            ::Type* inner = subst(leftType)->inner;
+            llvm::Value* presL = builder->CreateExtractValue(L, {0}, "opt.l.present");
+            llvm::Value* presR = builder->CreateExtractValue(R, {0}, "opt.r.present");
+            llvm::Value* valEq = innerEquals(builder->CreateExtractValue(L, {1}),
+                                             builder->CreateExtractValue(R, {1}), subst(inner));
+            if (!valEq) return nullptr;
+            llvm::Value* samePresence = builder->CreateICmpEQ(presL, presR, "opt.same.presence");
+            llvm::Value* absentOrEqual = builder->CreateOr(
+                builder->CreateNot(presL), valEq, "opt.absent.or.eq");
+            return builder->CreateAnd(samePresence, absentOrEqual, "opt.eq");
+        }
+        ::Type* optT = leftOpt ? leftType : rightType;
+        ::Type* plainT = leftOpt ? rightType : leftType;
+        llvm::Value* optV = leftOpt ? L : R;
+        llvm::Value* plainV = leftOpt ? R : L;
+        ::Type* inner = subst(optT)->inner;
+        if (inner && plainT && !plainT->equals(inner) &&
+            (plainT->isInteger() || plainT->isFloat()) &&
+            (inner->isInteger() || inner->isFloat())) {
+            plainV = emitNumericConversion(plainV, plainT, inner);
+        }
+        llvm::Value* present = builder->CreateExtractValue(optV, {0}, "opt.present");
+        llvm::Value* valEq = innerEquals(builder->CreateExtractValue(optV, {1}),
+                                         plainV, subst(inner));
+        if (!valEq) return nullptr;
+        return builder->CreateAnd(present, valEq, "opt.eq");
     }
 
     llvm::Value* emitNumericConversion(llvm::Value* v, ::Type* srcT, ::Type* dstT) {
@@ -5127,8 +5256,10 @@ struct CodeGenerator::Impl {
             llvm::Value* stPtr = builder->CreateLoad(ptrTy, addr, asAscii(memberName) + ".st");
             return builder->CreateCall(getOrDefineEnsWeakLoad(), { stPtr });
         }
-        ::Type* fieldType = typeOf(e.node);
-        return builder->CreateLoad(mapType(fieldType), addr, asAscii(memberName) + ".load");
+        ::Type* physicalType = fi ? fi->type : typeOf(e.node);
+        llvm::Value* v = builder->CreateLoad(mapType(physicalType), addr,
+                                             asAscii(memberName) + ".load");
+        return unwrapIfNarrowedValueOptional(v, physicalType, e.node);
     }
 
     llvm::Value* emitSubscript(const ast::SubscriptExpression& e) {
@@ -5144,7 +5275,8 @@ struct CodeGenerator::Impl {
         llvm::Value* idxVal = emitExpr(*idx);
         if (!arrPtr || !idxVal) return nullptr;
         llvm::Value* slot = emitArraySubscriptAddr(arrPtr, idxVal, objType->inner);
-        return builder->CreateLoad(mapType(objType->inner), slot, "arr.elem");
+        llvm::Value* v = builder->CreateLoad(mapType(objType->inner), slot, "arr.elem");
+        return unwrapIfNarrowedValueOptional(v, objType->inner, e.node);
     }
 
     llvm::Value* emitSafeSubscript(const ast::SafeSubscriptExpression& e) {
@@ -5283,6 +5415,10 @@ struct CodeGenerator::Impl {
 
         llvm::Value* L = emitExpr(*leftE);
         if (!L) return nullptr;
+        ::Type* leftType = typeOf(leftE->node);
+        if (isValueTypeOptional(leftType)) {
+            return emitValueOptionalCoalesce(L, leftType, *rightE, resultType);
+        }
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         llvm::Value* isNull = builder->CreateICmpEQ(
             L, llvm::ConstantPointerNull::get(ptrTy), "coalesce.isnull");
@@ -5301,6 +5437,34 @@ struct CodeGenerator::Impl {
         if (!R) return nullptr;
         auto* phi = builder->CreatePHI(ptrTy, 2, "coalesce.result");
         phi->addIncoming(L, lhsBB);
+        phi->addIncoming(R, rhsEnd);
+        return phi;
+    }
+
+    // `??` over a tagged value-type Optional. The result is either the bare
+    // inner (right side is plain) or the same optional (right side nullable).
+    llvm::Value* emitValueOptionalCoalesce(llvm::Value* L, ::Type* leftType,
+                                           const ast::Expression& rightE,
+                                           ::Type* resultType) {
+        bool resultIsOptional = resultType && resultType->isOptional();
+        llvm::Value* present = builder->CreateExtractValue(L, {0}, "coalesce.present");
+        llvm::Value* lhsVal = resultIsOptional
+            ? L : builder->CreateExtractValue(L, {1}, "coalesce.val");
+
+        llvm::BasicBlock* lhsBB = builder->GetInsertBlock();
+        auto* rhsBB = llvm::BasicBlock::Create(ctx, "coalesce.rhs", currentFunction);
+        auto* endBB = llvm::BasicBlock::Create(ctx, "coalesce.end", currentFunction);
+        builder->CreateCondBr(present, endBB, rhsBB);
+
+        builder->SetInsertPoint(rhsBB);
+        llvm::Value* R = emitExprConverted(rightE, resultType);
+        llvm::BasicBlock* rhsEnd = builder->GetInsertBlock();
+        if (R) builder->CreateBr(endBB);
+
+        builder->SetInsertPoint(endBB);
+        if (!R) return nullptr;
+        auto* phi = builder->CreatePHI(lhsVal->getType(), 2, "coalesce.result");
+        phi->addIncoming(lhsVal, lhsBB);
         phi->addIncoming(R, rhsEnd);
         return phi;
     }
@@ -5383,7 +5547,13 @@ struct CodeGenerator::Impl {
             valueDefaultBB = unreachableBB;
         }
 
-        if (nullable) {
+        if (nullable && isValueTypeOptional(scrutType)) {
+            llvm::Value* present = builder->CreateExtractValue(scrutVal, {0}, "switch.present");
+            auto* nonNullBB = llvm::BasicBlock::Create(ctx, "switch.nonnull", currentFunction);
+            builder->CreateCondBr(present, nonNullBB, nullBodyBB ? nullBodyBB : valueDefaultBB);
+            builder->SetInsertPoint(nonNullBB);
+            scrutVal = builder->CreateExtractValue(scrutVal, {1}, "switch.val");
+        } else if (nullable) {
             auto* ptrTy = llvm::PointerType::get(ctx, 0);
             llvm::Value* isNull = builder->CreateICmpEQ(
                 scrutVal, llvm::ConstantPointerNull::get(ptrTy), "switch.isnull");
