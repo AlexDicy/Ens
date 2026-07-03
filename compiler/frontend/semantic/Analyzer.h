@@ -224,8 +224,13 @@ private:
         bool valid = false;
     };
     NullCheckInfo detectNullCheck(const ast::Expression& cond);
+    // All null checks the condition establishes when it evaluates to
+    // `conditionHolds`: descends `&&` when the condition holds and `||` when it
+    // does not, so every conjunct's narrowing is collected.
+    void collectNarrowings(const ast::Expression& cond, bool conditionHolds,
+                           std::vector<NullCheckInfo>& out);
     void analyzeBranchWithNarrowing(const ast::Block& block,
-                                    const NullCheckInfo& info, bool installNarrowing);
+                                    const std::vector<NullCheckInfo>& narrowings);
 
     Type* resolveTypeReference(const ast::TypeReference& tr);
     Type* lookupTypeByName(const std::u16string& qualifier, const std::u16string& name,

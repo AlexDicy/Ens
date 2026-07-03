@@ -1933,10 +1933,28 @@ Analyzer::NullCheckInfo Analyzer::detectNullCheck(const ast::Expression& cond) {
     return info;
 }
 
+void Analyzer::collectNarrowings(const ast::Expression& cond, bool conditionHolds,
+                                 std::vector<NullCheckInfo>& out) {
+    ast::Expression core = unwrapParens(cond);
+    if (auto bin = core.asBinary()) {
+        auto opTok = bin->operatorToken();
+        SyntaxKind op = opTok ? opTok->kind() : SyntaxKind::Invalid;
+        bool descend = (conditionHolds && op == SyntaxKind::AmpAmp) ||
+                       (!conditionHolds && op == SyntaxKind::PipePipe);
+        if (descend) {
+            if (auto l = bin->left()) collectNarrowings(*l, conditionHolds, out);
+            if (auto r = bin->right()) collectNarrowings(*r, conditionHolds, out);
+            return;
+        }
+    }
+    NullCheckInfo info = detectNullCheck(core);
+    if (info.valid && info.narrowsThen == conditionHolds) out.push_back(std::move(info));
+}
+
 void Analyzer::analyzeBranchWithNarrowing(const ast::Block& block,
-                                          const NullCheckInfo& info, bool installNarrowing) {
+                                          const std::vector<NullCheckInfo>& narrowings) {
     pushScope();
-    if (installNarrowing && info.valid) {
+    for (const auto& info : narrowings) {
         currentScope->narrowedTypes[info.key] = info.narrowedT;
     }
     for (auto& s : block.statements()) analyzeStatement(s);
@@ -1989,69 +2007,89 @@ static bool switchStatementAlwaysExits(const ast::SwitchStatement& sw) {
 }
 
 void Analyzer::analyzeIfStmt(const ast::IfStatement& stmt) {
-    NullCheckInfo info;
+    std::vector<NullCheckInfo> whenTrue;
+    std::vector<NullCheckInfo> whenFalse;
     if (auto c = stmt.condition()) {
         Type* ct = analyzeExpr(*c);
         if (!ct->isError() && !ct->isBool()) {
             errorAtNode(c->node, "If condition must be 'bool', got '" + ct->toString() + "'");
         }
-        info = detectNullCheck(*c);
+        collectNarrowings(*c, /*conditionHolds=*/true, whenTrue);
+        collectNarrowings(*c, /*conditionHolds=*/false, whenFalse);
     }
     auto thenBlock = stmt.thenBlock();
     auto elseClause = stmt.elseClause();
     if (thenBlock) {
-        analyzeBranchWithNarrowing(*thenBlock, info, info.valid && info.narrowsThen);
+        analyzeBranchWithNarrowing(*thenBlock, whenTrue);
     }
     if (elseClause) {
         if (auto inner = elseClause->ifStatement()) analyzeIfStmt(*inner);
         else if (auto bb = elseClause->block()) {
-            analyzeBranchWithNarrowing(*bb, info, info.valid && !info.narrowsThen);
+            analyzeBranchWithNarrowing(*bb, whenFalse);
         }
     }
 
     // When one branch always exits, the opposite case survives into the enclosing
     // block, so a null check can narrow past the `if` (e.g. `if (x == null) { throw; }`
     // leaves x non-null below).
-    if (info.valid && currentScope) {
+    if (currentScope) {
         bool thenExits = thenBlock && blockAlwaysExits(*thenBlock);
         bool elseExits = false;
         if (elseClause) {
             if (auto inner = elseClause->ifStatement()) elseExits = ifStatementAlwaysExits(*inner);
             else if (auto bb = elseClause->block()) elseExits = blockAlwaysExits(*bb);
         }
-        bool narrowsAfter = false;
-        if (thenExits && !elseExits) narrowsAfter = !info.narrowsThen;
-        else if (elseExits && !thenExits && elseClause) narrowsAfter = info.narrowsThen;
-        if (narrowsAfter) currentScope->narrowedTypes[info.key] = info.narrowedT;
+        const std::vector<NullCheckInfo>* survives = nullptr;
+        if (thenExits && !elseExits) survives = &whenFalse;
+        else if (elseExits && !thenExits && elseClause) survives = &whenTrue;
+        if (survives) {
+            for (const auto& info : *survives) {
+                currentScope->narrowedTypes[info.key] = info.narrowedT;
+            }
+        }
     }
 }
 
 void Analyzer::analyzeWhileStmt(const ast::WhileStatement& stmt) {
+    // The condition is rechecked every iteration and writes inside the body
+    // drop narrowing at that point, so condition narrowing is safe in the body.
+    std::vector<NullCheckInfo> narrowings;
     if (auto c = stmt.condition()) {
         Type* ct = analyzeExpr(*c);
         if (!ct->isError() && !ct->isBool()) {
             errorAtNode(c->node, "While condition must be 'bool', got '" + ct->toString() + "'");
         }
+        collectNarrowings(*c, /*conditionHolds=*/true, narrowings);
     }
     loopDepth++;
-    if (auto b = stmt.body()) analyzeBlock(*b);
+    if (auto b = stmt.body()) analyzeBranchWithNarrowing(*b, narrowings);
     loopDepth--;
 }
 
 void Analyzer::analyzeForStmt(const ast::ForStatement& stmt) {
     pushScope();  // the init binding is scoped to the loop
     if (auto init = stmt.init()) analyzeStatement(*init);
+    std::vector<NullCheckInfo> narrowings;
     if (auto c = stmt.condition()) {
         Type* ct = analyzeExpr(*c);
         if (!ct->isError() && !ct->isBool()) {
             errorAtNode(c->node, "For condition must be 'bool', got '" + ct->toString() + "'");
         }
+        collectNarrowings(*c, /*conditionHolds=*/true, narrowings);
+    }
+    // The update runs after each iteration, so it is analyzed after the body
+    // under the same narrowing; a body write drops the narrowing first.
+    loopDepth++;
+    pushScope();
+    for (const auto& info : narrowings) {
+        currentScope->narrowedTypes[info.key] = info.narrowedT;
+    }
+    if (auto b = stmt.body()) {
+        for (auto& s : b->statements()) analyzeStatement(s);
     }
     if (auto u = stmt.update()) analyzeExpr(*u);
-    loopDepth++;
-    if (auto b = stmt.body()) analyzeBlock(*b);
-    loopDepth--;
     popScope();
+    loopDepth--;
 }
 
 // The element type a class yields in a for-in loop: the return type of next()
@@ -2314,12 +2352,34 @@ Type* Analyzer::analyzeBinary(const ast::BinaryExpression& expr) {
     auto left = expr.left();
     auto right = expr.right();
     if (!left || !right) return typeCtx.getError();
-    Type* l = analyzeExpr(*left);
-    Type* r = analyzeExpr(*right);
-    if (l->isError() || r->isError()) return typeCtx.getError();
 
     auto opTok = expr.operatorToken();
     SyntaxKind op = opTok ? opTok->kind() : SyntaxKind::Invalid;
+
+    // `&&` and `||` evaluate the right side only when the left side did not
+    // already decide the result, so a null check on the left narrows the right:
+    // `x != null && x.ready()` and `x == null || x.ready()` are both safe.
+    if (op == SyntaxKind::AmpAmp || op == SyntaxKind::PipePipe) {
+        Type* l = analyzeExpr(*left);
+        std::vector<NullCheckInfo> narrowings;
+        collectNarrowings(*left, /*conditionHolds=*/op == SyntaxKind::AmpAmp, narrowings);
+        pushScope();
+        for (const auto& info : narrowings) {
+            currentScope->narrowedTypes[info.key] = info.narrowedT;
+        }
+        Type* r = analyzeExpr(*right);
+        popScope();
+        if (l->isError() || r->isError()) return typeCtx.getError();
+        if (!l->isBool() || !r->isBool()) {
+            errorAtNode(expr.node, "Logical operator requires bool operands, got '" +
+                l->toString() + "' and '" + r->toString() + "'");
+        }
+        return typeCtx.getPrimitive(TypeKind::Bool);
+    }
+
+    Type* l = analyzeExpr(*left);
+    Type* r = analyzeExpr(*right);
+    if (l->isError() || r->isError()) return typeCtx.getError();
 
     // Adapt polymorphic integer literals to the other operand's type when one
     // side is a non-literal concrete numeric type. Re-read after adaptation.
@@ -2391,14 +2451,6 @@ Type* Analyzer::analyzeBinary(const ast::BinaryExpression& expr) {
             }
             return typeCtx.getPrimitive(TypeKind::Bool);
         }
-
-        case SyntaxKind::AmpAmp:
-        case SyntaxKind::PipePipe:
-            if (!l->isBool() || !r->isBool()) {
-                errorAtNode(expr.node, "Logical operator requires bool operands, got '" +
-                    l->toString() + "' and '" + r->toString() + "'");
-            }
-            return typeCtx.getPrimitive(TypeKind::Bool);
 
         case SyntaxKind::Amp:
         case SyntaxKind::Pipe:
@@ -3300,8 +3352,19 @@ Type* Analyzer::analyzeTernary(const ast::TernaryExpression& expr) {
     auto thenE = expr.thenBranch();
     auto elseE = expr.elseBranch();
     Type* condT = cond ? analyzeExpr(*cond) : typeCtx.getError();
-    Type* thenT = thenE ? analyzeExpr(*thenE) : typeCtx.getError();
-    Type* elseT = elseE ? analyzeExpr(*elseE) : typeCtx.getError();
+    auto analyzeBranch = [&](const ast::Expression& branch, bool conditionHolds) {
+        std::vector<NullCheckInfo> narrowings;
+        if (cond) collectNarrowings(*cond, conditionHolds, narrowings);
+        pushScope();
+        for (const auto& info : narrowings) {
+            currentScope->narrowedTypes[info.key] = info.narrowedT;
+        }
+        Type* t = analyzeExpr(branch);
+        popScope();
+        return t;
+    };
+    Type* thenT = thenE ? analyzeBranch(*thenE, true) : typeCtx.getError();
+    Type* elseT = elseE ? analyzeBranch(*elseE, false) : typeCtx.getError();
     if (cond && !condT->isError() && !condT->isBool()) {
         errorAtNode(cond->node, "Ternary condition must be 'bool', got '" + condT->toString() + "'");
     }
