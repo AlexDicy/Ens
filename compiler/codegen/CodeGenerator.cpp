@@ -855,6 +855,11 @@ struct CodeGenerator::Impl {
                 llvm::Value* paramVal = builder->CreateLoad(mapType(psym->type), values[psym]);
                 if (isReferenceType(psym->type)) {
                     emitRetain(paramVal);
+                    // A field default may already occupy the slot.
+                    llvm::Value* previous = builder->CreateLoad(ptrTy, fieldAddr, asAscii(*fname) + ".old");
+                    emitRelease(previous);
+                } else if (structHasClassFields(psym->type)) {
+                    emitStructFieldRelease(psym->type, fieldAddr);
                 }
                 builder->CreateStore(paramVal, fieldAddr);
                 if (structHasClassFields(psym->type)) {
@@ -4358,7 +4363,12 @@ struct CodeGenerator::Impl {
 
     bool structHasFieldDefaults(::Type* t) {
         if (!t || !t->isStruct() || !t->structInfo) return false;
-        for (auto& f : t->structInfo->fields) {
+        return recordHasFieldDefaults(t->structInfo);
+    }
+
+    bool recordHasFieldDefaults(StructInfo* si) {
+        if (!si) return false;
+        for (auto& f : si->fields) {
             if (!f.declaration) continue;
             auto fieldNode = SyntaxNode::makeRoot(f.declaration);
             auto fd = ast::FieldDecl::cast(*fieldNode);
@@ -5056,6 +5066,24 @@ struct CodeGenerator::Impl {
         llvm::Value* descArg = getOrEmitTypeDescriptor(t->structInfo);
         llvm::Value* heapPtr = builder->CreateCall(allocFn, {sizeArg, dtorArg, descArg},
                                                     "new." + asAscii(t->structInfo->name));
+
+        // Field defaults run before the constructor, so constructor assignments
+        // overwrite them. A generic instance's default expressions come from its
+        // template and emit under that instance's substitution.
+        if (recordHasFieldDefaults(t->structInfo)) {
+            StructInfo* templ = t->structInfo->templateOf;
+            auto savedOwner = substOwner; auto savedTemplate = substTemplate;
+            auto savedInstance = substInstanceType; auto savedArgs = substArgs;
+            if (templ) {
+                substOwner = templ; substTemplate = templ;
+                substInstanceType = t; substArgs = t->structInfo->typeArgs;
+            }
+            initStructFieldDefaults(t, heapPtr);
+            if (templ) {
+                substOwner = savedOwner; substTemplate = savedTemplate;
+                substInstanceType = savedInstance; substArgs = savedArgs;
+            }
+        }
 
         int ctorIdx = t->structInfo->findMethodIndex(t->structInfo->name);
         if (ctorIdx >= 0) {
