@@ -104,6 +104,8 @@ Methods are overridable by default. An override must be marked `override` and mu
 
 `super.method(...)` calls the base class's implementation, bypassing any override. A constructor may call `super(...)` as its first statement to run the base constructor; if it does not, the base class must be constructible with no arguments. `protected` members (see above) are reachable from subclasses.
 
+Class fields may declare default values just like struct fields. Defaults are applied when an instance is created, in declaration order and before the constructor body runs, so constructor assignments overwrite them.
+
 An `abstract class` cannot be instantiated. It may declare `abstract` methods (a signature with no body), that every concrete subclass must `override`.
 
 ---
@@ -295,9 +297,25 @@ To read through a nullable value, use the safe member operator `?.`. If the valu
 ```ens
 Outer? outer = new Outer();
 Inner? maybeInner = outer?.inner;   // either null or the field value
+int? wheels = car?.wheels;          // value-typed members work too
+long size = name?.length ?? 0;
+listener?.notify();                 // runs only when listener is present
 ```
 
 Inside `if (x != null) { ... }` the `x` is considered as the non-nullable form for the rest of the block, so you can use `.` directly. The same narrowing applies to the `else` branch of `if (x == null) { ... } else { ... }`. Reassigning `x` inside the block drops the narrowing from that point on.
+
+Narrowing also follows the short-circuit operators and conditions: `x != null && x.ready()` narrows `x` on the right of `&&`, `x == null || x.ready()` narrows on the right of `||`, a conjunction of checks narrows the whole `if` branch or ternary branch, and a loop condition narrows the loop body.
+
+```ens
+if (a != null && a.b != null) {
+    a.b.use();                    // both links narrowed by the condition
+}
+
+while (cursor != null) {
+    total = total + cursor.size;  // narrowed by the loop condition
+    cursor = cursor.next;
+}
+```
 
 ```ens
 draw(Outer? outer) {

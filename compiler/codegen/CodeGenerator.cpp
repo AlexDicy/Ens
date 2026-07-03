@@ -5279,7 +5279,10 @@ struct CodeGenerator::Impl {
                     error(e.node.startOffset(), "Internal: safe-call receiver type is malformed");
                     return nullptr;
                 }
-                ::Type* innerType = recvType->inner;
+                ::Type* innerType = subst(recvType->inner);
+                ::Type* returnType = subst(methodSym->returnType);
+                ::Type* resultType = typeOf(e.node);
+                bool isVoid = returnType && returnType->isVoid();
                 int vslot = -1;
                 if (innerType && innerType->structInfo) {
                     if (StructInfo* decl = innerType->structInfo->classDeclaringMethod(methodSym->name))
@@ -5292,36 +5295,46 @@ struct CodeGenerator::Impl {
                 }
                 llvm::Value* recv = emitExpr(*obj);
                 if (!recv) return nullptr;
-                auto* ptrTy = llvm::PointerType::get(ctx, 0);
-                llvm::Value* isNull = builder->CreateICmpEQ(
-                    recv, llvm::ConstantPointerNull::get(ptrTy), "safecall.isnull");
+                llvm::Value* present = emitOptionalPresence(recv, recvType, "safecall.present");
 
                 auto* nullBB    = llvm::BasicBlock::Create(ctx, "safecall.null",    currentFunction);
                 auto* nonnullBB = llvm::BasicBlock::Create(ctx, "safecall.nonnull", currentFunction);
                 auto* endBB     = llvm::BasicBlock::Create(ctx, "safecall.end",     currentFunction);
 
-                builder->CreateCondBr(isNull, nullBB, nonnullBB);
+                builder->CreateCondBr(present, nonnullBB, nullBB);
 
                 builder->SetInsertPoint(nonnullBB);
+                llvm::Value* receiver = recv;
+                if (isValueTypeOptional(recvType)) {
+                    // Struct methods take their receiver by pointer; unwrap the
+                    // tagged optional into a slot and pass its address.
+                    llvm::Value* innerVal = builder->CreateExtractValue(recv, {1}, "safecall.recv.val");
+                    auto* slot = createEntryAlloca(currentFunction, mapType(innerType), "safecall.recv");
+                    builder->CreateStore(innerVal, slot);
+                    receiver = slot;
+                }
                 std::vector<llvm::Value*> args;
-                args.push_back(recv);
+                args.push_back(receiver);
                 if (!appendCallArgs(methodSym, e.arguments(), args)) return nullptr;
                 if (methodSym->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);
                 llvm::Value* callRes = (vslot >= 0)
-                    ? builder->CreateCall(fn->getFunctionType(), loadVtableSlot(recv, vslot), args)
+                    ? builder->CreateCall(fn->getFunctionType(), loadVtableSlot(receiver, vslot), args)
                     : builder->CreateCall(fn, args);
                 emitThrowsCheck(methodSym);
+                llvm::Value* presentVal = isVoid
+                    ? nullptr : presentOptionalValue(callRes, returnType, resultType);
                 llvm::BasicBlock* nonnullEnd = builder->GetInsertBlock();
                 builder->CreateBr(endBB);
 
                 builder->SetInsertPoint(nullBB);
-                llvm::Value* nullVal = llvm::ConstantPointerNull::get(ptrTy);
+                llvm::Value* nullVal = isVoid ? nullptr : absentOptionalValue(resultType);
                 llvm::BasicBlock* nullEnd = builder->GetInsertBlock();
                 builder->CreateBr(endBB);
 
                 builder->SetInsertPoint(endBB);
-                auto* phi = builder->CreatePHI(ptrTy, 2, "safecall.result");
-                phi->addIncoming(callRes, nonnullEnd);
+                if (isVoid) return nullptr;
+                auto* phi = builder->CreatePHI(presentVal->getType(), 2, "safecall.result");
+                phi->addIncoming(presentVal, nonnullEnd);
                 phi->addIncoming(nullVal, nullEnd);
                 return phi;
             }
@@ -5658,6 +5671,35 @@ struct CodeGenerator::Impl {
         return unwrapIfNarrowedValueOptional(v, objType->inner, e.node);
     }
 
+    // Presence of a nullable receiver: the tag for value-type optionals, a
+    // null-pointer test otherwise.
+    llvm::Value* emitOptionalPresence(llvm::Value* recv, ::Type* recvType, const char* name) {
+        if (isValueTypeOptional(recvType)) {
+            return builder->CreateExtractValue(recv, {0}, name);
+        }
+        return builder->CreateICmpNE(recv,
+            llvm::ConstantPointerNull::get(llvm::PointerType::get(ctx, 0)), name);
+    }
+
+    // The value the skipped path of `?.`/`?[` produces.
+    llvm::Value* absentOptionalValue(::Type* resultType) {
+        if (isValueTypeOptional(resultType)) {
+            return llvm::ConstantAggregateZero::get(mapType(resultType));
+        }
+        return llvm::ConstantPointerNull::get(llvm::PointerType::get(ctx, 0));
+    }
+
+    // Adapt a raw member/element/call value to the merged optional result. A
+    // value already carrying its own nullability passes through unchanged.
+    llvm::Value* presentOptionalValue(llvm::Value* raw, ::Type* rawType, ::Type* resultType) {
+        if (!isValueTypeOptional(resultType)) return raw;
+        if (rawType && subst(rawType)->isOptional()) return raw;
+        llvm::Value* wrapped = llvm::UndefValue::get(mapType(resultType));
+        wrapped = builder->CreateInsertValue(wrapped, llvm::ConstantInt::getTrue(ctx), {0}, "safe.wrap");
+        wrapped = builder->CreateInsertValue(wrapped, raw, {1}, "safe.wrap");
+        return wrapped;
+    }
+
     llvm::Value* emitSafeSubscript(const ast::SafeSubscriptExpression& e) {
         auto obj = e.object();
         auto idx = e.index();
@@ -5668,20 +5710,18 @@ struct CodeGenerator::Impl {
             error(e.node.startOffset(), "Internal: safe subscript receiver is not a nullable array");
             return nullptr;
         }
-        ::Type* arrType = recvType->inner;
-        ::Type* elemType = arrType->inner;
+        ::Type* elemType = subst(recvType->inner->inner);
+        ::Type* resultType = typeOf(e.node);
 
         llvm::Value* recv = emitExpr(*obj);
         if (!recv) return nullptr;
-        auto* ptrTy = llvm::PointerType::get(ctx, 0);
-        llvm::Value* isNull = builder->CreateICmpEQ(
-            recv, llvm::ConstantPointerNull::get(ptrTy), "safesub.isnull");
+        llvm::Value* present = emitOptionalPresence(recv, recvType, "safesub.present");
 
         auto* nullBB    = llvm::BasicBlock::Create(ctx, "safesub.null",    currentFunction);
         auto* nonnullBB = llvm::BasicBlock::Create(ctx, "safesub.nonnull", currentFunction);
         auto* endBB     = llvm::BasicBlock::Create(ctx, "safesub.end",     currentFunction);
 
-        builder->CreateCondBr(isNull, nullBB, nonnullBB);
+        builder->CreateCondBr(present, nonnullBB, nullBB);
 
         builder->SetInsertPoint(nonnullBB);
         llvm::Value* idxVal = emitExpr(*idx);
@@ -5689,17 +5729,18 @@ struct CodeGenerator::Impl {
         llvm::Value* slot = emitArraySubscriptAddr(recv, idxVal, elemType);
         llvm::Value* loaded = builder->CreateLoad(mapType(elemType), slot, "safesub.elem");
         if (isReferenceType(elemType)) emitRetain(loaded);
+        llvm::Value* presentVal = presentOptionalValue(loaded, elemType, resultType);
         llvm::BasicBlock* nonnullEnd = builder->GetInsertBlock();
         builder->CreateBr(endBB);
 
         builder->SetInsertPoint(nullBB);
-        llvm::Value* nullVal = llvm::ConstantPointerNull::get(ptrTy);
+        llvm::Value* nullVal = absentOptionalValue(resultType);
         llvm::BasicBlock* nullEnd = builder->GetInsertBlock();
         builder->CreateBr(endBB);
 
         builder->SetInsertPoint(endBB);
-        auto* phi = builder->CreatePHI(ptrTy, 2, "safesub.result");
-        phi->addIncoming(loaded, nonnullEnd);
+        auto* phi = builder->CreatePHI(presentVal->getType(), 2, "safesub.result");
+        phi->addIncoming(presentVal, nonnullEnd);
         phi->addIncoming(nullVal, nullEnd);
         return phi;
     }
@@ -5708,51 +5749,76 @@ struct CodeGenerator::Impl {
         auto obj = e.object();
         if (!obj) return nullptr;
         ::Type* recvType = typeOf(obj->node);
-        if (!recvType || !recvType->isOptional() || !recvType->inner ||
-            !recvType->inner->structInfo) {
+        if (!recvType || !recvType->isOptional() || !recvType->inner) {
             error(e.node.startOffset(), "Internal: safe member receiver type is malformed");
             return nullptr;
         }
-        ::Type* innerType = recvType->inner;
+        ::Type* innerType = subst(recvType->inner);
+        ::Type* resultType = typeOf(e.node);
         auto memberName = e.memberText();
         if (!memberName) return nullptr;
-        int idx = innerType->structInfo->findFieldIndex(*memberName);
-        if (idx < 0) {
-            error(e.node.startOffset(), "Internal: safe member field not found");
-            return nullptr;
-        }
-        ::Type* fieldType = innerType->structInfo->fields[static_cast<size_t>(idx)].type;
 
         llvm::Value* recv = emitExpr(*obj);
         if (!recv) return nullptr;
-        auto* ptrTy = llvm::PointerType::get(ctx, 0);
-        llvm::Value* isNull = builder->CreateICmpEQ(
-            recv, llvm::ConstantPointerNull::get(ptrTy), "safe.isnull");
+        llvm::Value* present = emitOptionalPresence(recv, recvType, "safe.present");
 
         auto* nullBB    = llvm::BasicBlock::Create(ctx, "safe.null",    currentFunction);
         auto* nonnullBB = llvm::BasicBlock::Create(ctx, "safe.nonnull", currentFunction);
         auto* endBB     = llvm::BasicBlock::Create(ctx, "safe.end",     currentFunction);
 
-        builder->CreateCondBr(isNull, nullBB, nonnullBB);
+        builder->CreateCondBr(present, nonnullBB, nullBB);
 
         builder->SetInsertPoint(nonnullBB);
-        llvm::StructType* layout = mapStructType(innerType);
-        llvm::Value* fieldAddr = builder->CreateStructGEP(
-            layout, recv, static_cast<unsigned>(idx), asAscii(*memberName) + ".addr");
-        llvm::Value* loaded = builder->CreateLoad(
-            mapType(fieldType), fieldAddr, asAscii(*memberName) + ".load");
-        if (isReferenceType(fieldType)) emitRetain(loaded);
+        llvm::Value* raw = nullptr;
+        ::Type* memberType = nullptr;
+        if ((innerType->isString() || innerType->isArray()) && *memberName == u"length") {
+            raw = innerType->isString() ? emitStringLength(recv) : emitArrayLength(recv);
+            memberType = typeCtx ? typeCtx->getPrimitive(TypeKind::Long) : nullptr;
+        } else if (innerType->structInfo) {
+            int idx = innerType->structInfo->findFieldIndex(*memberName);
+            if (idx < 0) {
+                error(e.node.startOffset(), "Internal: safe member field not found");
+                return nullptr;
+            }
+            const FieldInfo& field = innerType->structInfo->fields[static_cast<size_t>(idx)];
+            memberType = subst(field.type);
+            if (isValueTypeOptional(recvType)) {
+                // The receiver is a tagged optional struct; read the field out
+                // of its value component.
+                llvm::Value* innerVal = builder->CreateExtractValue(recv, {1}, "safe.recv.val");
+                raw = builder->CreateExtractValue(
+                    innerVal, {static_cast<unsigned>(idx)}, asAscii(*memberName) + ".load");
+            } else {
+                llvm::StructType* layout = mapStructType(innerType);
+                llvm::Value* fieldAddr = builder->CreateStructGEP(
+                    layout, recv, static_cast<unsigned>(idx), asAscii(*memberName) + ".addr");
+                if (field.isWeak) {
+                    auto* ptrTy = llvm::PointerType::get(ctx, 0);
+                    llvm::Value* sideTable = builder->CreateLoad(ptrTy, fieldAddr,
+                                                                 asAscii(*memberName) + ".st");
+                    raw = builder->CreateCall(getOrDefineEnsWeakLoad(), { sideTable });
+                } else {
+                    raw = builder->CreateLoad(mapType(memberType), fieldAddr,
+                                              asAscii(*memberName) + ".load");
+                    if (isReferenceType(memberType)) emitRetain(raw);
+                }
+            }
+        } else {
+            error(e.node.startOffset(), "Internal: safe member receiver has no members");
+            return nullptr;
+        }
+        llvm::Value* presentVal = presentOptionalValue(raw, memberType, resultType);
         llvm::BasicBlock* nonnullEnd = builder->GetInsertBlock();
         builder->CreateBr(endBB);
 
         builder->SetInsertPoint(nullBB);
-        llvm::Value* nullVal = llvm::ConstantPointerNull::get(ptrTy);
+        llvm::Value* nullVal = absentOptionalValue(resultType);
         llvm::BasicBlock* nullEnd = builder->GetInsertBlock();
         builder->CreateBr(endBB);
 
         builder->SetInsertPoint(endBB);
-        auto* phi = builder->CreatePHI(ptrTy, 2, "safe.result");
-        phi->addIncoming(loaded, nonnullEnd);
+        auto* phi = builder->CreatePHI(presentVal->getType(), 2, "safe.result");
+        phi->addIncoming(presentVal, nonnullEnd);
         phi->addIncoming(nullVal, nullEnd);
         return phi;
     }

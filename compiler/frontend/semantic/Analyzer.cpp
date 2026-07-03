@@ -2733,19 +2733,9 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
             for (size_t i = n; i < args.size(); ++i) analyzeExpr(args[i]);
             Type* ret = methodSym->returnType;
             if (!ret || ret->isError()) return typeCtx.getError();
-            if (ret->isVoid()) {
-                errorAtNode(expr.node, "Cannot use '?.' to call '" + asciiOf(mname) +
-                    "' because it does not return a value.");
-                return typeCtx.getError();
-            }
-            bool retIsClassish = ret->isClass() ||
-                (ret->isOptional() && ret->inner && ret->inner->isClass());
-            if (!retIsClassish) {
-                errorAtNode(expr.node, "'?.' on '" + asciiOf(mname) +
-                    "' is not yet supported because it returns '" + ret->toString() +
-                    "'. Only methods that return a class type can be called through '?.' for now.");
-                return typeCtx.getError();
-            }
+            // A void safe call is a statement: it runs only when the receiver
+            // is non-null and produces no value.
+            if (ret->isVoid()) return ret;
             return typeCtx.getOptional(ret);
         }
         for (auto& a : args) analyzeExpr(a);
@@ -3162,40 +3152,23 @@ Type* Analyzer::analyzeSafeMember(const ast::SafeMemberExpression& expr) {
         return typeCtx.getError();
     }
     Type* inner = objT->inner;
+    auto memberName = expr.memberText();
+    if (!memberName) return typeCtx.getError();
+    if (inner && (inner->isString() || inner->isArray()) && *memberName == u"length") {
+        return typeCtx.getOptional(typeCtx.getPrimitive(TypeKind::Long));
+    }
     if (!inner || !inner->hasRecordLayout() || !inner->structInfo) {
         std::string innerName = inner ? inner->toString() : std::string("?");
         errorAtNode(expr.node, "The value on the left of '?.' has type '" + innerName +
             "?', which has no members to access.");
         return typeCtx.getError();
     }
-    if (!inner->isClass()) {
-        errorAtNode(expr.node, "'?.' is not yet supported on '" + inner->toString() +
-            "?'. Only nullable class types can use '?.' for now.");
-        return typeCtx.getError();
-    }
-
-    auto memberName = expr.memberText();
-    if (!memberName) return typeCtx.getError();
-
-    auto isClassOrClassOptional = [](Type* t) {
-        if (!t) return false;
-        if (t->isClass()) return true;
-        if (t->isOptional() && t->inner && t->inner->isClass()) return true;
-        return false;
-    };
 
     int idx = inner->structInfo->findFieldIndex(*memberName);
     if (idx >= 0) {
         const FieldInfo& fld = inner->structInfo->fields[idx];
         checkMemberAccess(expr.node, *memberName, fld.visibility, fld.definingClass);
-        Type* fieldT = fld.type;
-        if (!isClassOrClassOptional(fieldT)) {
-            errorAtNode(expr.node, "'?.' on '" + asciiOf(*memberName) +
-                "' is not yet supported because the field has type '" + fieldT->toString() +
-                "'. Only class-typed fields can be read through '?.' for now.");
-            return typeCtx.getError();
-        }
-        return typeCtx.getOptional(fieldT);
+        return typeCtx.getOptional(fld.type);
     }
     if (StructInfo* decl = inner->structInfo->classDeclaringMethod(*memberName)) {
         const MethodInfo& mi = decl->methods[decl->findMethodIndex(*memberName)];
@@ -3279,22 +3252,6 @@ Type* Analyzer::analyzeSafeSubscript(const ast::SafeSubscriptExpression& expr) {
     }
     Type* elem = inner->inner;
     if (!elem) return typeCtx.getError();
-    // Element type must be a reference type (class, array, or optional of those)
-    // so that the result `T?` is representable. Primitive optionals are not
-    // currently supported in codegen.
-    auto isReferenceish = [](Type* t) {
-        if (!t) return false;
-        if (t->isClass() || t->isArray()) return true;
-        if (t->isOptional() && t->inner &&
-            (t->inner->isClass() || t->inner->isArray())) return true;
-        return false;
-    };
-    if (!isReferenceish(elem)) {
-        errorAtNode(expr.node, "'?[' on '" + objT->toString() +
-            "' is not supported because its elements have type '" + elem->toString() +
-            "'. Only arrays of class or array elements can be indexed through '?['.");
-        return typeCtx.getError();
-    }
     if (!idxT->isError() && !idxT->isInteger()) {
         errorAtNode(idx->node, "Array index must be an integer, got '" + idxT->toString() + "'");
     }
