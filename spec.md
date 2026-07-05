@@ -269,6 +269,59 @@ A handler can read the trace from a caught error, either preformatted or as stru
 
 ---
 
+Tests are declared with the `test` keyword, a description string, and a body.
+Test declarations live in files ending `_test.ens`, next to the code they cover; everything else in a test file (helpers, classes, imports) is ordinary Ens.
+Regular builds skip `_test.ens` files entirely, so tests never ship with the program; `ens test` compiles and runs them.
+
+```ens
+import @std.testing;
+import Calculator from lib.calculator;
+
+test "addition adds small integers" {
+    let calculator = new Calculator();
+    try testing.assertEqual(calculator.add(2, 3), 5);
+}
+```
+
+A test body may call throwing functions with `try` without declaring anything: a test is allowed to throw any `Error`.
+A test fails by throwing.
+The runner catches the error, reports it, and moves on, so one failure never stops the run.
+A `panic()` or a crash still aborts the whole run; tests are not isolated in separate processes yet.
+
+The `@std.testing` module provides `TestFailure`, an `Error` subclass, and assertion helpers that throw it:
+
+- `testing.assertEqual(actual, expected)` and `testing.assertNotEqual(actual, expected)` compare two values of the same type with `==`; the failure message shows both values.
+- `testing.assertTrue(condition, message)` and `testing.assertFalse(condition, message)` check a condition; the message is optional, and interpolation at the call site can add context (`"sum was {sum}"`).
+- `testing.fail(message)` fails unconditionally.
+
+To assert that some code throws, write a helper whose catch clause swallows the expected type, and fail after the call:
+
+```ens
+expectParseFailure(string input) throws {
+    let unused = try parse(input);
+    try testing.fail("expected a ParseError for '{input}'");
+} catch (ParseError expected) {
+    return;
+}
+```
+
+`ens test [--source <folder>] [--filter <substring>]` discovers every `_test.ens` file under the folder (the current one by default) and runs the tests in a deterministic order: files by path, tests in source order.
+Each test prints one line, a failing test also prints its message and the stack trace of the failure, and the run ends with a summary:
+
+```
+PASS addition adds small integers
+FAIL subtraction fails on purpose: expected 1, got -1
+  at assertEqual (testing.ens:7)
+  at "subtraction fails on purpose" (math_test.ens:11)
+2/3 tests passed
+```
+
+`--filter` runs only the tests whose description contains the substring.
+The exit code is `0` when every test passes, `1` when any test fails, and `2` when the tests do not compile.
+Test files must have unique file names, and neither a test file nor anything it imports may define `main()`.
+
+---
+
 A type written without a `?` always holds a value and can never be `null`. To allow `null`, suffix the type with `?`.
 
 ```ens
@@ -573,6 +626,8 @@ Strings are immutable text values, written with double quotes (`"hello"`), and a
 - `+` concatenates strings. When one side is a string, an integer or `bool` on the other side is converted to text implicitly (the same way `.toString()` would). Types without a string conversion yet are still rejected.
 - `.toString()` produces a string from a value explicitly: integer types format as decimal, `bool` as `true` or `false`, and a string returns itself. It can be written directly on a literal, as in `42.toString()`.
 - `s.toBytes()` returns the UTF-8 bytes as a `byte[]`, and `string.fromBytes(bytes)` builds a string from a `byte[]` by interpreting it as UTF-8.
+- `s.contains(needle)` reports whether `needle` occurs in `s`.
+  `s.indexOf(needle)` returns the byte offset of the first occurrence as a `long`, or `-1` when absent; an empty needle is found at offset `0`.
 
 ```ens
 let greeting = "Hello, " + name + "!";
@@ -581,6 +636,8 @@ if (name == "world") { /* ... */ }
 let label = count.toString();       // "0", "42", "-7"
 let raw = greeting.toBytes();       // byte[]
 let back = string.fromBytes(raw);   // string
+let at = greeting.indexOf("llo");   // 2
+let has = greeting.contains("!");   // true
 ```
 
 **Interpolation** embeds expressions in a string with `{ }`. Each hole is converted to text the way `.toString()` would, then the literal parts and holes are joined into one new string. Write `\{` and `\}` for literal braces.
@@ -591,7 +648,8 @@ let status = "done={finished}, items={count}";                // bool and intege
 let braces = "use \{these\} verbatim";                        // "use {these} verbatim"
 ```
 
-Holes currently accept string, integer, and `bool` values; convert other types explicitly with `.toString()` first.
+Holes currently accept string, integer, `bool`, and enum values; convert other types explicitly with `.toString()` first.
+Inside a generic body a hole may hold a value of a type-parameter type; the requirement is then checked against the concrete type of each instantiation.
 
 ---
 
