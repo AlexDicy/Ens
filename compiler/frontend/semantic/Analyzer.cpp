@@ -2250,6 +2250,8 @@ Type* Analyzer::analyzeInterpString(const ast::InterpStringExpression& expr) {
     for (auto& hole : expr.holes()) {
         Type* ht = analyzeExpr(hole);
         if (ht->isError()) continue;
+        // A type-parameter hole is checked per instantiation during code generation.
+        if (ht->isTypeParam()) continue;
         if (!ht->isInteger() && !ht->isBool() && !ht->isString() && !ht->isEnum()) {
             errorAtNode(hole.node, "Cannot interpolate a value of type '" + ht->toString() +
                 "'; only string, integer, bool, and enum values are supported here. Convert it with '.toString()' first.");

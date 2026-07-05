@@ -4545,7 +4545,15 @@ struct CodeGenerator::Impl {
         auto* releaseFn = getOrDefineEnsRelease();
         llvm::Value* acc = decodePart(parts[0]);
         for (size_t i = 0; i < holes.size(); ++i) {
-            llvm::Value* hs = emitToString(holes[i], typeOf(holes[i].node));
+            ::Type* holeType = typeOf(holes[i].node);
+            if (holeType && !holeType->isError() && !holeType->isInteger() &&
+                !holeType->isBool() && !holeType->isString() && !holeType->isEnum()) {
+                error(holes[i].node.startOffset(),
+                    "Cannot interpolate a value of type '" + holeType->toString() +
+                    "'; only string, integer, bool, and enum values are supported here.");
+                return nullptr;
+            }
+            llvm::Value* hs = emitToString(holes[i], holeType);
             if (!hs) return nullptr;
             llvm::Value* joined = builder->CreateCall(concatFn, { acc, hs }, "interp.h");
             builder->CreateCall(releaseFn, { acc });
