@@ -2628,6 +2628,28 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                 }
                 // Records may declare their own toBytes: fall through to resolution.
             }
+            // String search builtins: indexOf(string) -> long, contains(string) -> bool.
+            if (memberName && (*memberName == u"indexOf" || *memberName == u"contains")) {
+                Type* recvT = analyzeExpr(*objExpr);
+                if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }
+                if (recvT->isString()) {
+                    bool isIndexOf = *memberName == u"indexOf";
+                    std::string name = isIndexOf ? "indexOf" : "contains";
+                    if (args.size() != 1) {
+                        errorAtNode(expr.node, "'" + name + "' expects 1 argument (a string), got " +
+                            std::to_string(args.size()) + ".");
+                        for (auto& a : args) analyzeExpr(a);
+                    } else {
+                        Type* argT = analyzeExpr(args[0]);
+                        if (!argT->isError() && !argT->isString()) {
+                            errorAtNode(args[0].node, "'" + name + "' expects a string argument, got '" +
+                                argT->toString() + "'.");
+                        }
+                    }
+                    return typeCtx.getPrimitive(isIndexOf ? TypeKind::Long : TypeKind::Bool);
+                }
+                // Records may declare their own indexOf/contains: fall through to resolution.
+            }
             // Every type is hashable: hash() resolves to a declared
             // `hash() -> long` when the receiver (or its bound) has one, and is
             // synthesized by codegen otherwise.

@@ -4077,6 +4077,73 @@ struct CodeGenerator::Impl {
         return fn;
     }
 
+    // i64 ens_string_index_of(haystack, needle): byte offset of the first
+    // occurrence of needle in haystack, -1 when absent. An empty needle
+    // matches at offset 0.
+    llvm::Function* getOrDefineEnsStringIndexOf() {
+        if (auto* existing = module->getFunction("ens_string_index_of")) return existing;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(i64Ty, { ptrTy, ptrTy }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+            "ens_string_index_of", module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+
+        auto savedIP = builder->saveIP();
+        auto* entry    = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* foundNow = llvm::BasicBlock::Create(ctx, "strfind.empty", fn);
+        auto* fitCheck = llvm::BasicBlock::Create(ctx, "strfind.fit", fn);
+        auto* scan     = llvm::BasicBlock::Create(ctx, "strfind.scan", fn);
+        auto* body     = llvm::BasicBlock::Create(ctx, "strfind.body", fn);
+        auto* next     = llvm::BasicBlock::Create(ctx, "strfind.next", fn);
+        auto* foundBB  = llvm::BasicBlock::Create(ctx, "strfind.found", fn);
+        auto* missBB   = llvm::BasicBlock::Create(ctx, "strfind.miss", fn);
+
+        builder->SetInsertPoint(entry);
+        llvm::Value* hay = fn->getArg(0);
+        llvm::Value* needle = fn->getArg(1);
+        llvm::Value* hayLen = emitStringLength(hay);
+        llvm::Value* needleLen = emitStringLength(needle);
+        llvm::Value* hayData = emitStringDataPtr(hay);
+        llvm::Value* needleData = emitStringDataPtr(needle);
+        llvm::Value* zero = llvm::ConstantInt::get(i64Ty, 0);
+        builder->CreateCondBr(builder->CreateICmpEQ(needleLen, zero), foundNow, fitCheck);
+
+        builder->SetInsertPoint(foundNow);
+        builder->CreateRet(zero);
+
+        builder->SetInsertPoint(fitCheck);
+        llvm::Value* last = builder->CreateSub(hayLen, needleLen, "strfind.last");
+        builder->CreateCondBr(builder->CreateICmpSLE(needleLen, hayLen), scan, missBB);
+
+        builder->SetInsertPoint(scan);
+        llvm::PHINode* index = builder->CreatePHI(i64Ty, 2, "strfind.i");
+        index->addIncoming(zero, fitCheck);
+        builder->CreateCondBr(builder->CreateICmpSGT(index, last), missBB, body);
+
+        builder->SetInsertPoint(body);
+        llvm::Value* at = builder->CreateGEP(i8Ty, hayData, index, "strfind.at");
+        llvm::Value* cmp = builder->CreateCall(getOrDeclareMemcmp(),
+            { at, needleData, needleLen }, "strfind.memcmp");
+        builder->CreateCondBr(
+            builder->CreateICmpEQ(cmp, llvm::ConstantInt::get(i32Ty, 0)), foundBB, next);
+
+        builder->SetInsertPoint(next);
+        llvm::Value* increment = builder->CreateAdd(index, llvm::ConstantInt::get(i64Ty, 1));
+        index->addIncoming(increment, next);
+        builder->CreateBr(scan);
+
+        builder->SetInsertPoint(foundBB);
+        builder->CreateRet(index);
+        builder->SetInsertPoint(missBB);
+        builder->CreateRet(llvm::ConstantInt::get(i64Ty, -1));
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
     static bool isStringLike(::Type* t) {
         if (!t) return false;
         if (t->isString()) return true;
@@ -4288,6 +4355,24 @@ struct CodeGenerator::Impl {
             emitStringDataPtr(s), llvm::MaybeAlign(1), len);
         releaseIfOwnedTemp(s, obj);
         return arr;
+    }
+
+    // string.indexOf(needle) -> long and string.contains(needle) -> bool.
+    llvm::Value* emitStringSearch(const ast::Expression& obj, const ast::Expression& needleArg,
+                                  bool asContains) {
+        llvm::Value* hay = emitExpr(obj);
+        if (!hay) return nullptr;
+        llvm::Value* needle = emitExpr(needleArg);
+        if (!needle) return nullptr;
+        llvm::Value* index = builder->CreateCall(getOrDefineEnsStringIndexOf(),
+            { hay, needle }, "str.indexof");
+        releaseIfOwnedTemp(hay, obj);
+        releaseIfOwnedTemp(needle, needleArg);
+        if (asContains) {
+            return builder->CreateICmpSGE(index,
+                llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), 0), "str.contains");
+        }
+        return index;
     }
 
     // string.fromBytes(byte[]): a fresh string copy of the bytes plus a NUL.
@@ -5179,6 +5264,11 @@ struct CodeGenerator::Impl {
                 if (memberName && *memberName == u"toBytes" && !methodSymbolOf(member.node) &&
                     recvT && recvT->isString()) {
                     return emitStringToBytes(*obj, typeOf(e.node));
+                }
+                if (memberName && (*memberName == u"indexOf" || *memberName == u"contains") &&
+                    !methodSymbolOf(member.node) && recvT && recvT->isString() &&
+                    e.arguments().size() == 1) {
+                    return emitStringSearch(*obj, e.arguments()[0], *memberName == u"contains");
                 }
                 if (memberName && *memberName == u"hash" && !methodSymbolOf(member.node) &&
                     recvT && !recvT->isError()) {
