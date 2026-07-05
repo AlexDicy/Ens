@@ -178,6 +178,13 @@ void printEscapeFacts(const std::vector<std::unique_ptr<Module>>& modules, std::
         for (auto& fn : sf->functions()) emitFn(fn);
         for (auto& sd : sf->structs()) for (auto& mm : sd.methods()) emitFn(mm);
         for (auto& cd : sf->classes()) for (auto& mm : cd.methods()) emitFn(mm);
+        for (auto& td : sf->tests()) {
+            auto* info = analysis.find(td.node.greenNode());
+            if (info && info->resolvedSymbol) printEscapeFactsForFunction(info->resolvedSymbol, os);
+            if (auto body = td.body()) {
+                for (auto& s : body->statements()) printPromotionsForStmt(s, analysis, os);
+            }
+        }
     }
 }
 

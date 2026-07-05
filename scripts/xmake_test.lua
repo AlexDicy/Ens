@@ -4,6 +4,9 @@
 --     // @stdout Hello!
 -- use @expect-error instead to assert the compiler reports a specific diagnostic.
 --     // @expect-error Undefined function 'testFunction'
+-- a folder test's main.ens may use @ens-test (optionally with extra arguments) to run
+-- `ens test --source <folder> ...` instead of compile+run, asserting on its output.
+--     // @ens-test --filter needle
 -- tests run in parallel; set ENS_TEST_JOBS to override the worker count (default: cpu count).
 -- pass test names to run a subset, e.g. `xmake test arc_basic class_constructor`; runs all if omitted.
 task("test")
@@ -103,6 +106,7 @@ task("test")
             local expected_stdout   = nil   -- list of lines; joined with "\n" for an exact match
             local expected_contains = {}    -- substrings that must each appear in stdout
             local expected_error    = nil
+            local ens_test_args     = nil   -- @ens-test: run `ens test` on the folder instead
             local content = io.readfile(ens_file) or ""
             for line in content:gmatch("[^\r\n]+") do
                 local exit_str = line:match("^%s*//%s*@exit%s+(%-?%d+)")
@@ -116,6 +120,52 @@ task("test")
                 end
                 local error_str = line:match("^%s*//%s*@expect%-error%s+(.*)$")
                 if error_str then expected_error = error_str end
+                local enstest_str = line:match("^%s*//%s*@ens%-test%s*(.*)$")
+                if enstest_str then
+                    ens_test_args = {}
+                    for token in enstest_str:gmatch("%S+") do
+                        table.insert(ens_test_args, token)
+                    end
+                end
+            end
+
+            -- compare a process result against the @exit/@stdout/@stdout-contains directives.
+            local function compareRun(run_rc, actual_stdout)
+                local why = {}
+                if run_rc ~= expected_exit then
+                    table.insert(why, string.format("exit=%s expected=%s",
+                        tostring(run_rc), tostring(expected_exit)))
+                end
+                if expected_stdout ~= nil then
+                    local joined = table.concat(expected_stdout, "\n")
+                    if actual_stdout ~= joined then
+                        table.insert(why, string.format("stdout=%q expected=%q",
+                            actual_stdout, joined))
+                    end
+                end
+                for _, sub in ipairs(expected_contains) do
+                    if not actual_stdout:find(sub, 1, true) then
+                        table.insert(why, string.format("stdout missing %q", sub))
+                    end
+                end
+                return why
+            end
+
+            -- @ens-test: invoke `ens test` on the folder and assert on its combined output.
+            if ens_test_args ~= nil then
+                os.tryrm(stdout_file)
+                local argv = {"test", "--source", job.source}
+                for _, a in ipairs(ens_test_args) do table.insert(argv, a) end
+                local run_rc = os.execv(ens_exe, argv,
+                    {try = true, stdout = stdout_file, stderr = stdout_file})
+                local actual_stdout = (io.readfile(stdout_file) or ""):gsub("[\r\n]+$", "")
+                local why = compareRun(run_rc, actual_stdout)
+                if #why == 0 then
+                    return {name = name, ok = true}
+                end
+                local short = table.concat(why, "; ")
+                return {name = name, ok = false, short = short,
+                    full = string.format("%s: %s\n%s", name, short, actual_stdout)}
             end
 
             os.tryrm(exe_file)
@@ -154,23 +204,7 @@ task("test")
                 {try = true, stdout = stdout_file, stderr = stdout_file})
             local actual_stdout = (io.readfile(stdout_file) or ""):gsub("[\r\n]+$", "")
 
-            local why = {}
-            if run_rc ~= expected_exit then
-                table.insert(why, string.format("exit=%s expected=%s",
-                    tostring(run_rc), tostring(expected_exit)))
-            end
-            if expected_stdout ~= nil then
-                local joined = table.concat(expected_stdout, "\n")
-                if actual_stdout ~= joined then
-                    table.insert(why, string.format("stdout=%q expected=%q",
-                        actual_stdout, joined))
-                end
-            end
-            for _, sub in ipairs(expected_contains) do
-                if not actual_stdout:find(sub, 1, true) then
-                    table.insert(why, string.format("stdout missing %q", sub))
-                end
-            end
+            local why = compareRun(run_rc, actual_stdout)
 
             if #why == 0 then
                 return {name = name, ok = true}
