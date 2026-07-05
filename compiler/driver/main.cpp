@@ -81,12 +81,38 @@ static std::unordered_map<std::string, std::string> parseArguments(int argc, cha
     return arguments;
 }
 
+// `ens test [--source <folder>] [--filter <substring>] [--explain-arc]`:
+// discover tests, build and run them, and return the runner's exit code.
+static int runTestCommand(int argc, char* argv[]) {
+    std::unordered_map<std::string, std::string> arguments;
+    try {
+        arguments = parseArguments(argc - 1, argv + 1);
+    } catch (const std::exception& e) {
+        std::cerr << "ERROR: " << e.what() << '\n';
+        return 2;
+    }
+    for (const auto& [key, value] : arguments) {
+        if (key != "--source" && key != "--filter" && key != "--explain-arc") {
+            std::cerr << "ERROR: unknown option '" << key << "' for 'ens test'\n";
+            return 2;
+        }
+    }
+    fs::path source = arguments.count("--source") ? fs::path(arguments.at("--source")) : fs::path(".");
+    std::string filter = arguments.count("--filter") ? arguments.at("--filter") : "";
+    return Compiler::test(source, filter, arguments.count("--explain-arc") > 0);
+}
+
 int main(int argc, char* argv[]) {
+    if (argc >= 2 && std::string(argv[1]) == "test") {
+        return runTestCommand(argc, argv);
+    }
+
     auto arguments = parseArguments(argc, argv);
 
     if (arguments.count("-h") || arguments.count("--help")) {
         std::cout << "Use --source to specify the input file or folder to compile, otherwise use stdin\n";
         std::cout << "Use --output to specify the output folder\n";
+        std::cout << "Use 'ens test [--source <folder>] [--filter <substring>]' to run the folder's tests\n";
         return 0;
     }
 

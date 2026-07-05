@@ -28,11 +28,45 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "llvm/ADT/SmallString.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/Program.h"
+
 namespace fs = std::filesystem;
 
 namespace {
 
 using namespace ens::modules;
+
+bool isTestFile(const fs::path& relativePath) {
+    static const std::string suffix = "_test";
+    std::string stem = relativePath.stem().string();
+    return stem.size() >= suffix.size() &&
+           stem.compare(stem.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+std::string utf8OfU16(const std::u16string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char16_t c : s) {
+        if (c < 0x80) {
+            out.push_back(static_cast<char>(c));
+        } else if (c < 0x800) {
+            out.push_back(static_cast<char>(0xC0 | (c >> 6)));
+            out.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+        } else {
+            out.push_back(static_cast<char>(0xE0 | (c >> 12)));
+            out.push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+        }
+    }
+    return out;
+}
+
+void appendAscii(std::u16string& out, std::string_view ascii) {
+    for (char c : ascii) out.push_back(static_cast<char16_t>(c));
+}
 
 std::string escapeKindStr(EscapeKind k) {
     switch (k) {
@@ -249,8 +283,11 @@ bool Compiler::compile(const fs::path& source,
 
     std::deque<fs::path> seeds;
     if (fs::is_directory(source)) {
+        // *_test.ens files hold test declarations; they are compiled by `ens test`.
         auto files = getFileTree(source, sourceRoot);
-        for (auto& f : files) seeds.push_back(f);
+        for (auto& f : files) {
+            if (!isTestFile(f)) seeds.push_back(f);
+        }
     } else {
         if (!fs::exists(source)) {
             std::cerr << "ERROR: " << source << " does not exist\n";
@@ -301,6 +338,223 @@ bool Compiler::compile(const fs::path& source,
     }
 
     return linkModulesToExe(modules, outputFolder, targetTriple, sharedCtx);
+}
+
+namespace {
+
+struct DiscoveredTest {
+    std::u16string modulePath;
+    int index = 0;                 // source order within the module: $test<index>
+    std::u16string rawLiteral;     // the description literal exactly as written
+    std::string description;       // decoded, UTF-8; used for --filter and messages
+    bool selected = true;
+};
+
+// The runner is ordinary Ens source: it imports each test module, wraps each
+// test in a bool-returning function whose catch (Error) prints the failure,
+// and counts passes in main(). Descriptions are spliced as their original
+// string literals, so no re-escaping is needed. Failure traces are printed
+// frame by frame and stop at the runner's own frames, which are internal.
+std::u16string buildRunnerSource(const std::vector<DiscoveredTest>& tests) {
+    std::u16string out;
+    std::u16string lastImported;
+    for (auto& t : tests) {
+        if (!t.selected || t.modulePath == lastImported) continue;
+        lastImported = t.modulePath;
+        appendAscii(out, "import ");
+        out += t.modulePath;
+        appendAscii(out, ";\n");
+    }
+    appendAscii(out, "\n");
+
+    std::u16string alias;
+    auto aliasOf = [](const std::u16string& modulePath) {
+        auto dot = modulePath.rfind(u'.');
+        return dot == std::u16string::npos ? modulePath : modulePath.substr(dot + 1);
+    };
+
+    int runIndex = 0;
+    for (auto& t : tests) {
+        if (!t.selected) continue;
+        std::string run = "$run" + std::to_string(runIndex++);
+        std::string target = "$test" + std::to_string(t.index);
+        appendAscii(out, run + "() -> bool {\n    try ");
+        out += aliasOf(t.modulePath);
+        appendAscii(out, "." + target + "();\n    print(\"PASS \" + ");
+        out += t.rawLiteral;
+        appendAscii(out, ");\n    return true;\n} catch (Error e) {\n    print(\"FAIL \" + ");
+        out += t.rawLiteral;
+        appendAscii(out, " + \": \" + e.message);\n"
+                         "    for (let frame in e.getStackFrames()) {\n"
+                         "        if (frame.file == \"$ens_test_runner.ens\") { break; }\n"
+                         "        print(\"  at \" + frame.function + \" (\" + frame.file + \":\" + frame.line + \")\");\n"
+                         "    }\n"
+                         "    return false;\n}\n\n");
+    }
+
+    std::string total = std::to_string(runIndex);
+    appendAscii(out, "main() -> int {\n    int passed = 0;\n");
+    for (int i = 0; i < runIndex; ++i) {
+        appendAscii(out, "    if ($run" + std::to_string(i) + "()) { passed = passed + 1; }\n");
+    }
+    appendAscii(out, "    print(\"{passed}/" + total + " tests passed\");\n"
+                     "    if (passed == " + total + ") { return 0; }\n"
+                     "    return 1;\n}\n");
+    return out;
+}
+
+}  // namespace
+
+int Compiler::test(const fs::path& sourceDir, const std::string& filter, bool explainArc) {
+    std::error_code ec;
+    if (!fs::is_directory(sourceDir, ec)) {
+        std::cerr << "ERROR: '" << sourceDir.string() << "' is not a folder\n";
+        return 2;
+    }
+    const fs::path& sourceRoot = sourceDir;
+
+    std::vector<fs::path> testFiles;
+    for (auto& rel : getFileTree(sourceRoot, sourceRoot)) {
+        if (isTestFile(rel)) testFiles.push_back(rel);
+    }
+    std::sort(testFiles.begin(), testFiles.end(), [](const fs::path& a, const fs::path& b) {
+        return a.generic_string() < b.generic_string();
+    });
+    if (testFiles.empty()) {
+        std::cout << "no tests found under " << sourceRoot.string()
+                  << " (tests live in files ending '_test.ens')\n";
+        return 0;
+    }
+
+    // Two test files with the same name would collide on the runner's imports.
+    std::unordered_map<std::string, fs::path> byStem;
+    for (auto& rel : testFiles) {
+        auto [existing, inserted] = byStem.emplace(rel.stem().string(), rel);
+        if (!inserted) {
+            std::cerr << "ERROR: test files must have unique names: '"
+                      << existing->second.generic_string() << "' and '" << rel.generic_string()
+                      << "' would both be imported as '" << existing->first << "'\n";
+            return 2;
+        }
+    }
+
+    // Discovery parses each test file; real diagnostics surface in the graph build below.
+    std::vector<DiscoveredTest> tests;
+    for (auto& rel : testFiles) {
+        std::u16string modulePath = modulePathOfRelative(rel);
+        auto module = loadModule(sourceRoot, rel, modulePath);
+        if (!module || !module->rootNode) return 2;
+        auto sf = ast::SourceFile::cast(*module->rootNode);
+        if (!sf) continue;
+        for (auto& fn : sf->functions()) {
+            if (fn.nameText().value_or(std::u16string{}) == u"main") {
+                std::cerr << "ERROR: '" << rel.generic_string()
+                          << "' defines main(); a test file cannot define the program entry point\n";
+                return 2;
+            }
+        }
+        int index = 0;
+        for (auto& td : sf->tests()) {
+            DiscoveredTest t;
+            t.modulePath = modulePath;
+            t.index = index++;
+            t.rawLiteral = td.rawDescriptionLiteral().value_or(u"\"\"");
+            t.description = utf8OfU16(td.descriptionText().value_or(std::u16string{}));
+            tests.push_back(std::move(t));
+        }
+    }
+    if (tests.empty()) {
+        std::cout << "no tests found under " << sourceRoot.string() << "\n";
+        return 0;
+    }
+
+    size_t selectedCount = tests.size();
+    if (!filter.empty()) {
+        selectedCount = 0;
+        for (auto& t : tests) {
+            t.selected = t.description.find(filter) != std::string::npos;
+            if (t.selected) selectedCount++;
+        }
+        if (selectedCount == 0) {
+            std::cout << "no tests matched filter '" << filter << "'\n";
+            return 0;
+        }
+    }
+
+    // The runner enters the graph as a virtual seed via a source override.
+    const fs::path runnerRelative = "$ens_test_runner.ens";
+    SourceOverrides overrides;
+    overrides[overrideKey(sourceRoot / runnerRelative)] = buildRunnerSource(tests);
+    const std::u16string runnerModulePath = modulePathOfRelative(runnerRelative);
+
+    std::deque<fs::path> seeds;
+    for (auto& rel : testFiles) seeds.push_back(rel);
+    seeds.push_back(runnerRelative);
+
+    std::vector<std::unique_ptr<Module>> modules;
+    std::unordered_map<std::u16string, Module*> byPath;
+    if (!buildModuleGraph(sourceRoot, findStdlibRoot(), seeds, modules, byPath, &overrides)) {
+        return 2;
+    }
+
+    // Only the runner may define main(): a second entry point cannot be linked.
+    for (auto& m : modules) {
+        if (m->modulePath == runnerModulePath) continue;
+        auto sf = ast::SourceFile::cast(*m->rootNode);
+        if (!sf) continue;
+        for (auto& fn : sf->functions()) {
+            if (fn.nameText().value_or(std::u16string{}) == u"main") {
+                std::cerr << "ERROR: module '" << asciiOfU16(m->modulePath)
+                          << "' defines main(); it cannot be linked into a test binary. "
+                             "Keep program entry points out of modules that tests import.\n";
+                return 2;
+            }
+        }
+    }
+
+    insertPreludeModule(modules, byPath);
+
+    TypeContext sharedCtx;
+    if (!runDriverAnalysis(modules, byPath, sharedCtx, explainArc)) {
+        std::cerr << "ens test: the test build failed to compile\n";
+        return 2;
+    }
+
+    llvm::SmallString<128> tempDir;
+    if (llvm::sys::fs::createUniqueDirectory("ens-test", tempDir)) {
+        std::cerr << "ERROR: could not create a temporary folder for the test binary\n";
+        return 2;
+    }
+#ifdef _WIN32
+    fs::path exePath = fs::path(tempDir.str().str()) / "runner.exe";
+#else
+    fs::path exePath = fs::path(tempDir.str().str()) / "runner";
+#endif
+    if (!linkModulesToExe(modules, exePath, /*targetTriple*/ "", sharedCtx)) {
+        fs::remove_all(fs::path(tempDir.str().str()), ec);
+        return 2;
+    }
+
+    std::string exeString = exePath.string();
+    std::string errorMessage;
+    bool executionFailed = false;
+    llvm::StringRef argv[1] = { exeString };
+    int exitCode = llvm::sys::ExecuteAndWait(exeString, argv, /*Env*/ std::nullopt,
+                                             /*Redirects*/ {}, /*SecondsToWait*/ 0,
+                                             /*MemoryLimit*/ 0, &errorMessage, &executionFailed);
+    fs::remove_all(fs::path(tempDir.str().str()), ec);
+
+    if (executionFailed || exitCode < 0) {
+        std::cerr << "ERROR: could not run the test binary"
+                  << (errorMessage.empty() ? "" : ": " + errorMessage) << "\n";
+        return 2;
+    }
+    if (exitCode == 0) return 0;
+    if (exitCode != 1) {
+        std::cerr << "ens test: the test binary exited with code " << exitCode
+                  << " (a crash or panic aborts the whole run)\n";
+    }
+    return 1;
 }
 
 std::vector<fs::path> Compiler::getFileTree(const fs::path& root, const fs::path& rootPath) {
