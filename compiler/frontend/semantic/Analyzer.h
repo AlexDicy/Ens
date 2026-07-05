@@ -131,6 +131,7 @@ private:
     void resolveClassBases(const ast::SourceFile& file);
     void layoutDeclaredClasses(const ast::SourceFile& file);
     void collectFunctions(const ast::SourceFile& file);
+    void collectTests(const ast::SourceFile& file);
     void collectExternalFunctions(const ast::SourceFile& file);
     void resolveMethodParams(const ast::FuncDecl& fn, ::Type* receiverType, Symbol* sym);
     void resolveFunctionParams(const ast::FuncDecl& fn, Symbol* sym);
@@ -148,6 +149,7 @@ private:
 
     // === Body analysis ===
     void analyzeFunctionBody(const ast::FuncDecl& fn);
+    void analyzeTestBody(const ast::TestDecl& test);
     void analyzeImplicitConstructorAssignments(const ast::FuncDecl& fn);
     void analyzeCatchClause(const ast::CatchClause& clause, Scope* funcScope);
 

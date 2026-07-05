@@ -32,6 +32,7 @@ class ExternalFuncDecl;
 class ExternalBlock;
 class EnumDecl;
 class EnumMember;
+class TestDecl;
 class SourceFile;
 
 class VisibilityModifier {
@@ -324,6 +325,21 @@ public:
     std::vector<EnumMember> members() const;
 };
 
+class TestDecl {
+public:
+    SyntaxNode node;
+    static std::optional<TestDecl> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::TestDecl) return std::nullopt;
+        return TestDecl{n};
+    }
+    std::optional<SyntaxNode> descriptionToken() const;
+    // The description with quotes stripped and escape sequences decoded.
+    std::optional<std::u16string> descriptionText() const;
+    // The description literal exactly as written, including the quotes.
+    std::optional<std::u16string> rawDescriptionLiteral() const;
+    std::optional<Block> body() const;
+};
+
 class SourceFile {
 public:
     SyntaxNode node;
@@ -336,6 +352,7 @@ public:
     std::vector<StructDecl> structs() const;
     std::vector<ClassDecl> classes() const;
     std::vector<EnumDecl> enums() const;
+    std::vector<TestDecl> tests() const;
     std::vector<TypedVarDeclStatement> topLevelVarDecls() const;
     std::vector<ExternalTypeDecl> externalTypes() const;
     std::vector<ExternalBlock> externalBlocks() const;

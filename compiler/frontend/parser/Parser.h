@@ -42,6 +42,8 @@ private:
     bool eat(SyntaxKind k);
     // True when positioned on the contextual `out` keyword (an `out` identifier).
     bool atContextualOut() const;
+    // True when positioned on the contextual `test` keyword (a `test` identifier).
+    bool atContextualTest() const;
 
     void expect(SyntaxKind k, const char* what);
     void emitMissing(SyntaxKind expectedKind, const char* what);
@@ -55,6 +57,7 @@ private:
     bool looksLikeFuncDecl(bool allowShorthand) const;
     bool looksLikeTypedVarDecl() const;
     void parseFuncDecl();
+    void parseTestDecl();
     void parseParamList();
     void parseParameter();
     void parseDefaultValue();

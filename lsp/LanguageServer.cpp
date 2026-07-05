@@ -730,6 +730,11 @@ lsp::TextDocument_SemanticTokens_FullResult LanguageServer::onSemanticTokensFull
     for (auto& fn : sf->functions()) {
         collectFromFunction(fn, /*isMember*/ false, source, analysis, entries);
     }
+    for (auto& td : sf->tests()) {
+        if (auto body = td.body()) {
+            collectFromStatement(body->node, source, analysis, entries);
+        }
+    }
     for (auto& sd : sf->structs()) {
         if (auto t = sd.nameToken()) emitTokenAt(entries, source, *t, StStruct);
         for (auto& f : sd.fields())  collectFromField(f, source, analysis, entries);
@@ -757,6 +762,19 @@ lsp::TextDocument_DocumentSymbolResult LanguageServer::onDocumentSymbol(
     std::vector<lsp::DocumentSymbol> symbols;
     for (const auto& fn : sf->functions()) {
         symbols.push_back(buildFunctionSymbol(doc->sourceFile(), fn));
+    }
+    for (const auto& td : sf->tests()) {
+        lsp::DocumentSymbol sym;
+        auto desc = td.descriptionText();
+        sym.name = "test \"" + (desc ? utf16To8(*desc) : std::string("<missing>")) + "\"";
+        sym.kind = lsp::SymbolKindEnum(lsp::SymbolKind::Function);
+        sym.range = toLspRange(doc->sourceFile(), td.node);
+        if (auto t = td.descriptionToken()) {
+            sym.selectionRange = toLspRange(doc->sourceFile(), *t);
+        } else {
+            sym.selectionRange = sym.range;
+        }
+        symbols.push_back(std::move(sym));
     }
     for (const auto& sd : sf->structs()) {
         symbols.push_back(buildRecordSymbol(doc->sourceFile(),

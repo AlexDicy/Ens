@@ -618,7 +618,7 @@ struct CodeGenerator::Impl {
         llvm::Type* retType = mapType(sym->returnType);
         auto* fnType = llvm::FunctionType::get(retType, paramTypes, false);
 
-        std::string mangled = asAscii(sym->name);
+        std::string mangled = sym->linkName.empty() ? asAscii(sym->name) : asAscii(sym->linkName);
         if (owner) mangled = mangledMethodName(owner, sym->name);
 
         if (auto* existing = module->getFunction(mangled)) {
@@ -883,6 +883,96 @@ struct CodeGenerator::Impl {
         }
 
         if (currentHasCatch) emitCatchDispatch(fn);
+        cleanupStack.pop_back();
+
+        if (debugEnabled && diBuilder && sp) diBuilder->finalizeSubprogram(sp);
+        currentDIScope = prevScope;
+        currentFunction = nullptr;
+        currentReturnType = nullptr;
+    }
+
+    // A test declaration compiles like a public, zero-parameter, void function
+    // with an error-slot parameter; its link name is module-qualified because
+    // the scope names ($test0, $test1, ...) repeat across modules.
+    void declareTest(const ast::TestDecl& td) {
+        Symbol* sym = symbolOf(td.node);
+        if (!sym) return;
+        std::vector<llvm::Type*> paramTypes;
+        paramTypes.push_back(llvm::PointerType::get(ctx, 0));  // error slot
+        auto* fnType = llvm::FunctionType::get(mapType(sym->returnType), paramTypes, false);
+        std::string mangled = sym->linkName.empty() ? asAscii(sym->name) : asAscii(sym->linkName);
+        auto* func = llvm::Function::Create(fnType, llvm::Function::ExternalLinkage, mangled, module.get());
+        values[sym] = func;
+    }
+
+    void emitTest(const ast::TestDecl& td) {
+        Symbol* sym = symbolOf(td.node);
+        if (!sym) return;
+        auto it = values.find(sym);
+        if (it == values.end()) return;
+
+        byPointerParams.clear();
+        incomingErrorSlot = nullptr;
+        localErrorSlot = nullptr;
+        catchDispatchBB = nullptr;
+        currentHasCatch = false;
+        paramCleanupWatermark = 0;
+        currentFunction = llvm::cast<llvm::Function>(it->second);
+        currentReturnType = sym->returnType;
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", currentFunction);
+        builder->SetInsertPoint(entry);
+
+        // Stack traces show the quoted description, not the internal name.
+        std::string display = "\"" + asAscii(td.descriptionText().value_or(std::u16string{})) + "\"";
+
+        llvm::DISubprogram* sp = nullptr;
+        llvm::DIScope* prevScope = currentDIScope;
+        if (debugEnabled && diBuilder) {
+            auto [line, col] = posOf(td.node.startOffset());
+            sp = diBuilder->createFunction(
+                diCU, display, display, diFile,
+                static_cast<unsigned>(line),
+                createDISubroutineType(sym),
+                /*scopeLine*/ static_cast<unsigned>(line),
+                llvm::DINode::FlagPrototyped,
+                llvm::DISubprogram::SPFlagDefinition);
+            currentFunction->setSubprogram(sp);
+            currentDIScope = sp;
+        }
+
+        setLocationFromNode(td.node);
+
+        {
+            auto descTok = td.descriptionToken();
+            uint32_t lineOffset = descTok ? descTok->startOffset() : td.node.startOffset();
+            auto [eline, ecol] = posOf(lineOffset);
+            recordSymtabEntry(currentFunction, display, static_cast<int>(eline), /*isEntry=*/false);
+            if (sp) {
+                std::string file = std::filesystem::path(sourceFilename).filename().string();
+                if (file.empty()) file = sourceFilename;
+                subprogramInfo[sp] = { display, file };
+            }
+        }
+
+        auto argIter = currentFunction->args().begin();
+        if (argIter != currentFunction->args().end()) {
+            argIter->setName("err.slot.in");
+            incomingErrorSlot = &*argIter;
+        }
+        throwTargetSlot = incomingErrorSlot;
+        unwindToDispatch = false;
+
+        cleanupStack.emplace_back();
+        if (auto body = td.body()) {
+            for (auto& s : body->statements()) {
+                emitStatement(s);
+                if (builder->GetInsertBlock()->getTerminator()) break;
+            }
+        }
+        if (!builder->GetInsertBlock()->getTerminator()) {
+            emitFrameCleanup(cleanupStack.back());
+            builder->CreateRetVoid();
+        }
         cleanupStack.pop_back();
 
         if (debugEnabled && diBuilder && sp) diBuilder->finalizeSubprogram(sp);
@@ -6276,7 +6366,9 @@ struct CodeGenerator::Impl {
             for (auto& cd : sf->classes())   for (auto& m : cd.methods()) if (!isTemplateDecl(m)) visit(m);
         };
         eachDecl([&](const ast::FuncDecl& fn) { declareFunction(fn); });
+        for (auto& td : sf->tests()) declareTest(td);
         eachDecl([&](const ast::FuncDecl& fn) { emitFunction(fn); });
+        for (auto& td : sf->tests()) emitTest(td);
 
         emitInstantiations(*sf);
 

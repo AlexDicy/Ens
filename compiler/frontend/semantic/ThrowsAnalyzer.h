@@ -55,6 +55,7 @@ private:
     TypeSet bodySetOf(const ast::FuncDecl& fn) const;
 
     void runOnceForFunction(Symbol* sym, const ast::FuncDecl& fn);
+    void runOnceForTest(Symbol* sym, const ast::TestDecl& td);
 
     // === validation ===
     DiagnosticSink* sink_ = nullptr;

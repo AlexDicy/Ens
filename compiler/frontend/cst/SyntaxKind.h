@@ -50,7 +50,7 @@ enum class SyntaxKind : uint16_t {
     KwDefault, KwDo, KwElse, KwEnum, KwExtends, KwExternal, KwFalse, KwFinal, KwFinally,
     KwFor, KwFrom, KwGoto, KwIf, KwImport, KwIn, KwLet, KwNew, KwNull, KwOut, KwOverride, KwPackage,
     KwPrivate, KwProtected, KwPublic, KwRethrow, KwReturn, KwStatic, KwStruct,
-    KwSuper, KwSwitch, KwThis, KwThrow, KwThrows, KwTrue, KwTry, KwType, KwWeak, KwWhile,
+    KwSuper, KwSwitch, KwTest, KwThis, KwThrow, KwThrows, KwTrue, KwTry, KwType, KwWeak, KwWhile,
 
     // ============================================================
     // Marker: everything after this point is a non-terminal node.
@@ -83,6 +83,7 @@ enum class SyntaxKind : uint16_t {
     EnumMember,
     TypeParamList,       // <T, U> in a generic declaration head
     TypeParam,           // one type parameter, optionally `T: Base`
+    TestDecl,            // test "description" { ... }
 
     // === Type expressions ===
     TypeRef,             // identifier (or primitive keyword) optionally followed by ?

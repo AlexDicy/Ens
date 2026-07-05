@@ -74,6 +74,12 @@ bool Parser::atContextualOut() const {
     return kindAt() == SyntaxKind::Identifier && tokenAt().text == u"out";
 }
 
+// `test` is a contextual keyword: an ordinary identifier everywhere except at
+// the top level when followed by a string literal, which starts a test declaration.
+bool Parser::atContextualTest() const {
+    return kindAt() == SyntaxKind::Identifier && tokenAt().text == u"test";
+}
+
 // `in` is a contextual keyword, an ordinary identifier everywhere except between
 // a foreach binding and its iterable.
 bool Parser::atContextualIn() const {
@@ -214,6 +220,12 @@ void Parser::parseTopLevel() {
     }
     if (peekKind(declMods) == SyntaxKind::KwEnum) {
         parseEnumDecl();
+        return;
+    }
+
+    if (atContextualTest() &&
+        (peekKind(1) == SyntaxKind::StringLiteral || peekKind(1) == SyntaxKind::InterpStringStart)) {
+        parseTestDecl();
         return;
     }
 
@@ -405,6 +417,32 @@ void Parser::parseFuncDecl() {
         // shorthand body
     } else {
         emitMissing(SyntaxKind::LBrace, "'{' or ';' for function body");
+        recoverTo({SyntaxKind::RBrace, SyntaxKind::Semi,
+                   SyntaxKind::KwStruct, SyntaxKind::KwClass,
+                   SyntaxKind::KwPrivate, SyntaxKind::KwProtected, SyntaxKind::KwPublic,
+                   SyntaxKind::EndOfFile});
+        eat(SyntaxKind::Semi);
+    }
+    builder.finishNode();
+}
+
+void Parser::parseTestDecl() {
+    builder.startNode(SyntaxKind::TestDecl);
+    bumpAs(SyntaxKind::KwTest);
+    if (at(SyntaxKind::StringLiteral)) {
+        bump();
+    } else if (at(SyntaxKind::InterpStringStart)) {
+        reportAtCurrent("A test description must be a plain string without interpolation");
+        builder.startNode(SyntaxKind::Error);
+        while (!at(SyntaxKind::LBrace) && !atEnd()) bump();
+        builder.finishNode();
+    } else {
+        emitMissing(SyntaxKind::StringLiteral, "test description string");
+    }
+    if (at(SyntaxKind::LBrace)) {
+        parseBlock();
+    } else {
+        emitMissing(SyntaxKind::LBrace, "'{' for the test body");
         recoverTo({SyntaxKind::RBrace, SyntaxKind::Semi,
                    SyntaxKind::KwStruct, SyntaxKind::KwClass,
                    SyntaxKind::KwPrivate, SyntaxKind::KwProtected, SyntaxKind::KwPublic,

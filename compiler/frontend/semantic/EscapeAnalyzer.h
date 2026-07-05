@@ -33,6 +33,7 @@ private:
     int loopDepth = 0;
 
     void analyzeFunction(Symbol* fnSym, const ast::FuncDecl& fn);
+    void analyzeTest(Symbol* fnSym, const ast::TestDecl& td);
     void collectFunctionsOnce();
 
     void scanStatement(const ast::Statement& s);

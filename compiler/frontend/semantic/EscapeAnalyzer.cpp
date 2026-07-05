@@ -23,7 +23,25 @@ bool EscapeAnalyzer::runOnce() {
             if (info && info->resolvedSymbol) analyzeFunction(info->resolvedSymbol, m);
         }
     }
+    for (auto& td : sf.tests()) {
+        auto* info = analysis.find(td.node.greenNode());
+        if (info && info->resolvedSymbol) analyzeTest(info->resolvedSymbol, td);
+    }
     return changedThisIteration;
+}
+
+void EscapeAnalyzer::analyzeTest(Symbol* fnSym, const ast::TestDecl& td) {
+    currentFn = fnSym;
+    currentParams.clear();
+
+    auto& ei = fnSym->escapeInfo;
+    ei.params.clear();
+    ei.paramMutated.clear();
+
+    if (auto body = td.body()) scanBlock(*body);
+
+    ei.analyzed = true;
+    currentFn = nullptr;
 }
 
 void EscapeAnalyzer::analyzeFunction(Symbol* fnSym, const ast::FuncDecl& fn) {
@@ -456,6 +474,12 @@ void EscapeAnalyzer::finalize() {
     for (auto& fn : sf.functions()) handle(fn);
     for (auto& sd : sf.structs()) for (auto& m : sd.methods()) handle(m);
     for (auto& cd : sf.classes()) for (auto& m : cd.methods()) handle(m);
+    for (auto& td : sf.tests()) {
+        loopDepth = 0;
+        if (auto body = td.body()) {
+            for (auto& s : body->statements()) walkStmtForLastUses(s);
+        }
+    }
 }
 
 void EscapeAnalyzer::walkBodyForLastUses(const ast::FuncDecl& fn) {
@@ -675,6 +699,11 @@ void EscapeAnalyzer::decideStackPromotions() {
     for (auto& fn : sf.functions()) handle(fn);
     for (auto& sd : sf.structs()) for (auto& m : sd.methods()) handle(m);
     for (auto& cd : sf.classes()) for (auto& m : cd.methods()) handle(m);
+    for (auto& td : sf.tests()) {
+        if (auto body = td.body()) {
+            for (auto& s : body->statements()) walkStmtForPromotion(s);
+        }
+    }
 }
 
 void EscapeAnalyzer::walkBodyForPromotion(const ast::FuncDecl& fn) {

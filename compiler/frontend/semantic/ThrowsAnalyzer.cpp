@@ -166,11 +166,25 @@ void ThrowsAnalyzer::runOnceForFunction(Symbol* sym, const ast::FuncDecl& fn) {
     }
 }
 
+// A test body has no catch clauses; everything it throws goes outward, and the
+// implicit declared contract (`throws Error`) covers all of it.
+void ThrowsAnalyzer::runOnceForTest(Symbol* sym, const ast::TestDecl& td) {
+    TypeSet outward;
+    if (auto b = td.body()) collectBlockThrows(b->node, outward);
+    for (StructInfo* m : outward) {
+        if (addType(sym->throwsSet, m)) changed = true;
+    }
+}
+
 bool ThrowsAnalyzer::runOnce() {
     changed = false;
     for (auto& fn : sf.functions()) {
         auto* info = analysis.find(fn.node.greenNode());
         if (info && info->resolvedSymbol) runOnceForFunction(info->resolvedSymbol, fn);
+    }
+    for (auto& td : sf.tests()) {
+        auto* info = analysis.find(td.node.greenNode());
+        if (info && info->resolvedSymbol) runOnceForTest(info->resolvedSymbol, td);
     }
     for (auto& sd : sf.structs()) {
         for (auto& m : sd.methods()) {
@@ -365,6 +379,13 @@ void ThrowsAnalyzer::validate(DiagnosticSink& sink, const SourceFile& source) {
     for (auto& fn : sf.functions()) {
         auto* info = analysis.find(fn.node.greenNode());
         if (info && info->resolvedSymbol) validateFunction(info->resolvedSymbol, fn, false, nullptr);
+    }
+    // Test bodies get the same try-usage checks; their declared contract
+    // (`throws Error`) covers any computed set, so no contract check is needed.
+    for (auto& td : sf.tests()) {
+        auto* info = analysis.find(td.node.greenNode());
+        if (!info || !info->resolvedSymbol) continue;
+        if (auto b = td.body()) validateTryUsage(b->node, false);
     }
     auto eachMethod = [&](const ast::FuncDecl& m) {
         auto* info = analysis.find(m.node.greenNode());

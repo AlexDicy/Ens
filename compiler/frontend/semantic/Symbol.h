@@ -42,6 +42,10 @@ public:
     // For a top-level function: whether it is reachable from other modules.
     bool isPublic = true;
 
+    // Overrides the linker-level name when non-empty. Used by test declarations,
+    // whose scope names ($test0, $test1, ...) repeat across modules.
+    std::u16string linkName;
+
     // FFI metadata (set when this function symbol was declared via `external from "..."`).
     bool isExternal = false;
     std::vector<bool> paramIsOut;

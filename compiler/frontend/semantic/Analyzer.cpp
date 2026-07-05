@@ -343,6 +343,7 @@ void Analyzer::resolveSignatures() {
     collectEnums(sf);
     resolveClassBases(sf);
     collectFunctions(sf);
+    collectTests(sf);
     collectExternalFunctions(sf);
 }
 
@@ -633,9 +634,19 @@ void Analyzer::analyzeBodies() {
     for (auto& sd : sf.structs()) for (auto& m : sd.methods()) resolveThrows(m);
     for (auto& cd : sf.classes()) for (auto& m : cd.methods()) resolveThrows(m);
 
+    // A test's implicit declared contract is `throws Error`.
+    for (auto& td : sf.tests()) {
+        auto* info = analysis.find(td.node.greenNode());
+        if (info && info->resolvedSymbol && errorClassInfo_ &&
+            info->resolvedSymbol->declaredThrowsTypes.empty()) {
+            info->resolvedSymbol->declaredThrowsTypes.push_back(errorClassInfo_);
+        }
+    }
+
     for (auto& fn : sf.functions()) analyzeFunctionBody(fn);
     for (auto& sd : sf.structs())   for (auto& m : sd.methods()) analyzeFunctionBody(m);
     for (auto& cd : sf.classes())   for (auto& m : cd.methods()) analyzeFunctionBody(m);
+    for (auto& td : sf.tests())     analyzeTestBody(td);
 }
 
 void Analyzer::resolveDeclaredThrows(const ast::FuncDecl& fn, Symbol* sym) {
@@ -1101,6 +1112,49 @@ void Analyzer::collectFunctions(const ast::SourceFile& file) {
             errorAtNode(fn.node, "Duplicate function name '" + asciiOf(fname) + "'");
         }
         analysis.setSymbol(fn.node.greenNode(), sym);
+    }
+}
+
+// Each test declaration becomes a public, zero-parameter, void function whose
+// scope name is $test<N> (N = source order). The name repeats across modules,
+// so the link-level name is qualified with the module path. Tests carry an
+// implicit declared contract of `throws Error`, letting a body throw anything
+// (or nothing) while callers handle failures with a single catch (Error).
+void Analyzer::collectTests(const ast::SourceFile& file) {
+    auto tests = file.tests();
+    if (tests.empty()) return;
+
+    const std::string& filename = source.getFilename();
+    static const std::string kSuffix = "_test.ens";
+    bool inTestFile = filename.size() >= kSuffix.size() &&
+        filename.compare(filename.size() - kSuffix.size(), kSuffix.size(), kSuffix) == 0;
+
+    int index = 0;
+    for (auto& td : tests) {
+        if (!inTestFile) {
+            errorAtNode(td.node, "Test declarations are only allowed in files ending '_test.ens'.");
+        }
+        if (auto description = td.descriptionText()) {
+            if (description->empty()) {
+                errorAtNode(td.node, "A test description cannot be empty.");
+            } else if (description->find(u'\n') != std::u16string::npos ||
+                       description->find(u'\r') != std::u16string::npos) {
+                errorAtNode(td.node, "A test description cannot contain a line break.");
+            }
+        }
+
+        std::u16string name = u"$test";
+        for (char c : std::to_string(index)) name.push_back(static_cast<char16_t>(c));
+        Symbol* sym = makeSymbol(SymbolKind::Function, name, nullptr, td.node.startOffset());
+        sym->funcDeclCst = td.node.greenNode();
+        sym->isPublic = true;
+        sym->declaredThrows = true;
+        sym->abiThrows = true;
+        sym->linkName = modulePath_.empty() ? name : modulePath_ + u"." + name;
+        sym->returnType = typeCtx.getPrimitive(TypeKind::Void);
+        globalScope->define(sym);
+        analysis.setSymbol(td.node.greenNode(), sym);
+        index++;
     }
 }
 
@@ -1612,6 +1666,33 @@ void Analyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
     currentFunction = prevFunction;
     currentThis = prevThis;
     sawSuperConstructorCall = prevSawSuper;
+    currentFunctionParamScope = prevParamScope;
+    loopDepth = prevLoopDepth;
+}
+
+void Analyzer::analyzeTestBody(const ast::TestDecl& test) {
+    auto* info = analysis.find(test.node.greenNode());
+    if (!info || !info->resolvedSymbol) return;
+
+    Symbol* prevFunction = currentFunction;
+    Symbol* prevThis = currentThis;
+    Scope* prevParamScope = currentFunctionParamScope;
+    int prevLoopDepth = loopDepth;
+    currentFunction = info->resolvedSymbol;
+    currentThis = nullptr;
+    loopDepth = 0;
+
+    Scope* funcScope = pushScope();
+    currentFunctionParamScope = funcScope;
+    pushScope();
+    if (auto body = test.body()) {
+        for (auto& s : body->statements()) analyzeStatement(s);
+    }
+    popScope();
+    popScope();
+
+    currentFunction = prevFunction;
+    currentThis = prevThis;
     currentFunctionParamScope = prevParamScope;
     loopDepth = prevLoopDepth;
 }

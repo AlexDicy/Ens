@@ -356,6 +356,10 @@ static void dumpTypedOutline(const SyntaxNode& root, std::ostream& os) {
         if (fn.isShorthand()) os << " ;";
         os << "\n";
     }
+    for (auto& td : sf->tests()) {
+        os << "test \"" << (td.descriptionText() ? asAscii16(*td.descriptionText()) : std::string("<missing>"))
+           << "\"\n";
+    }
     for (auto& sd : sf->structs()) {
         os << "struct " << (sd.nameText() ? asAscii16(*sd.nameText()) : std::string("<missing>")) << " {\n";
         for (auto& f : sd.fields()) {

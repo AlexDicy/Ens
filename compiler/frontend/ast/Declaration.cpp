@@ -545,10 +545,60 @@ std::vector<ImportDecl> SourceFile::imports() const {
     return out;
 }
 
+// === TestDecl ===
+
+std::optional<SyntaxNode> TestDecl::descriptionToken() const {
+    for (auto& c : node.children()) {
+        if (!isTrivia(c.kind()) && c.kind() == SyntaxKind::StringLiteral) return c;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::u16string> TestDecl::rawDescriptionLiteral() const {
+    if (auto t = descriptionToken()) return std::u16string(t->tokenText());
+    return std::nullopt;
+}
+
+std::optional<std::u16string> TestDecl::descriptionText() const {
+    auto raw = rawDescriptionLiteral();
+    if (!raw) return std::nullopt;
+    size_t lo = !raw->empty() && (*raw)[0] == u'"' ? 1 : 0;
+    size_t hi = raw->size() > lo && raw->back() == u'"' ? raw->size() - 1 : raw->size();
+    std::u16string out;
+    for (size_t i = lo; i < hi; ++i) {
+        char16_t c = (*raw)[i];
+        if (c == u'\\' && i + 1 < hi) {
+            char16_t escaped = (*raw)[++i];
+            switch (escaped) {
+                case u'n': out.push_back(u'\n'); break;
+                case u't': out.push_back(u'\t'); break;
+                case u'r': out.push_back(u'\r'); break;
+                default:   out.push_back(escaped); break;
+            }
+            continue;
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+
+std::optional<Block> TestDecl::body() const {
+    if (auto b = firstChildNode(node, SyntaxKind::Block)) return Block::cast(*b);
+    return std::nullopt;
+}
+
 std::vector<FuncDecl> SourceFile::functions() const {
     std::vector<FuncDecl> out;
     for (auto& c : node.children()) {
         if (auto f = FuncDecl::cast(c)) out.push_back(*f);
+    }
+    return out;
+}
+
+std::vector<TestDecl> SourceFile::tests() const {
+    std::vector<TestDecl> out;
+    for (auto& c : node.children()) {
+        if (auto t = TestDecl::cast(c)) out.push_back(*t);
     }
     return out;
 }
