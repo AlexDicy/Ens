@@ -122,6 +122,43 @@ Because the compiler sees the whole hierarchy, a `switch` over a sealed class ca
 
 ---
 
+An `interface` declares a named contract: a set of method signatures with no bodies.
+Interfaces are declared at the top level and follow the same `public`/`private` visibility rules as classes; they may be generic, specialized per type-argument set like generic classes.
+An interface body contains only method signatures, each ended with `;`.
+An interface cannot declare fields, constructors, or method bodies, and it cannot extend or implement anything.
+A throwing interface method must list its thrown types explicitly (`load(string path) -> string throws IOError;`), the same rule as abstract methods.
+
+```ens
+interface Speaker {
+    speak() -> string;
+}
+
+interface Source<T> {
+    take() -> T;
+}
+```
+
+A class names the interfaces it implements in an `implements` clause after the optional `extends`, separated by commas: `class Dog extends Animal implements Speaker, Source<string> { ... }`.
+The class must provide every method of every listed interface with the exact signature, either declared in the class or inherited from a base class; a missing or mismatched method is a compile error naming the interface and the signature.
+Interface satisfaction uses no marker: `override` stays reserved for base-class overrides.
+An abstract class may declare an interface method `abstract` and leave the body to its concrete subclasses.
+A method satisfying a throwing interface method may throw the declared types or their subclasses, never others; satisfying a non-throwing interface method means not throwing at all.
+Structs cannot implement interfaces.
+
+An interface name is a reference type usable wherever a class type is: variables, parameters, returns, fields, generic type arguments, `I?`, and arrays under the same element rules as classes.
+A value of an implementing class converts implicitly to each interface it implements (and to `I?`); there are no implicit conversions between unrelated interfaces.
+A call through an interface-typed value dispatches on the value's runtime type, so a subclass override runs even when the call happens through the interface.
+`==` and `!=` on interface-typed values compare identity, exactly like class references.
+An interface cannot be instantiated with `new`, and a `weak` field cannot have an interface type; weak references stay class-only.
+
+```ens
+Speaker s = new Dog();     // implicit conversion to the interface
+print(s.speak());          // runs the implementing class's method
+Speaker? quiet = null;     // nullable interface reference
+```
+
+---
+
 Classes, structs, functions, and methods may be generic: they declare type parameters in angle brackets and work uniformly over any type argument. A type parameter can be used as a field type, a parameter or return type, a local type, and as the element type of an array.
 
 ```ens
@@ -156,13 +193,20 @@ swap<int>(1, 2);   // explicit
 swap(1, 2);        // T inferred as int
 ```
 
-A type parameter may declare a single base-class bound with `T: Base`, requiring every type argument to be `Base` or a subclass; the body may then use the members of `Base` on a value of that parameter.
+A type parameter may declare bounds with `T: Base + Comparable`, joined by `+`: at most one bound may be a class (conventionally written first) and every other bound must be an interface, and listing the same bound twice is an error.
+Every type argument must satisfy all bounds, being the class or a subclass of it and implementing each interface; a violation is a compile error naming the failing bound.
+The body may use the members of every bound on a value of that parameter.
+The `Animation<S: Shape + Comparable>` example above uses exactly this form.
 
 ```ens
 class Drawer<T: Shape> {
     private T shape;
     Drawer(T s) { this.shape = s; }
     area() -> int { return this.shape.area(); }
+}
+
+summarize<S: Shape + Comparable>(S value) -> string {
+    return value.describe() + " / " + value.compareTo(9);
 }
 ```
 
@@ -465,9 +509,11 @@ Circle? c = s as? Circle;              // the circle, or null
 int r = (s as? Circle)?.radius ?? 0;
 ```
 
-The target must be a class; testing against a struct, primitive, enum, array, or string is a compile error, and so is a nullable target like `as? Circle?`, whose result would already be nullable.
-The scrutinee must be a class or nullable class, and the target must be related to it: a test that could never succeed (unrelated classes) and a test the static type already satisfies (always true) are both compile errors.
+The target must be a class or an interface; testing against a struct, primitive, enum, array, or string is a compile error, and so is a nullable target like `as? Circle?`, whose result would already be nullable.
+The scrutinee must be a class, an interface, or a nullable form of either, and the target must be related to it: a test that could never succeed (unrelated classes) and a test the static type already satisfies (always true) are both compile errors.
 A nullable scrutinee tested against a type it already satisfies is the exception: for `Base? x`, the test `x is Base` is a combined null-plus-type check and is allowed.
+An interface target over a class scrutinee is an error only in the impossible case, a `final` class that does not implement it (any other class could have an implementing subclass), or the always-true case where the static class already implements it.
+An interface scrutinee may be tested against any class or interface target; the outcome is decided by the value's runtime type.
 
 `if (x is Derived)` narrows `x` to `Derived` inside the branch, following the same rules as null narrowing above: the same paths narrow (locals, member chains, subscripts), `x is Derived && x.derivedMethod()` narrows the right side of `&&`, conjunctions narrow the branch, a loop condition narrows the body, and the same writes and calls drop the narrowing.
 Failing the test proves nothing about the value's type, so nothing narrows in the else branch.
@@ -523,12 +569,15 @@ for (int x in xs) {     // x takes each element in turn
 }
 ```
 
-A class is iterable when it has a `makeIterator()` method returning an iterator: a class with `hasNext() -> bool` and `next() -> T` methods, conventionally a subclass of `Iterator<T>` from `@std.iterator`. The loop calls `makeIterator()` once, then draws values with `next()` while `hasNext()` is true.
+A class is iterable when it implements the `Iterable<T>` interface from `@std.iterator`, whose single method `makeIterator() -> Iterator<T>` returns an `Iterator<T>` (an interface with `hasNext() -> bool` and `next() -> T`).
+The loop calls `makeIterator()` once, then draws values with `next()` while `hasNext()` is true.
+A value whose static type is `Iterable<T>` itself can also be iterated.
 
 ```ens
+import Iterable from @std.iterator;
 import Iterator from @std.iterator;
 
-class Range {
+class Range implements Iterable<int> {
     private int low;
     private int high;
     Range(this.low, this.high);
@@ -600,9 +649,10 @@ let length = switch (name) {      // name is string?, the null case is handled
 };
 ```
 
-A switch over a class value matches on the runtime type instead of on labels.
+A switch over a class or interface value matches on the runtime type instead of on labels.
 A type arm is written `is Type binding -> body`; the binding is an arm-scoped constant of type `Type`, and it may be omitted when the value is not needed.
-Arm types follow the same rules as the `is` operator, and each must be a strict subclass of the switch value's class: an unrelated type could never match, and an arm of the value's own type would match everything, which is what `default` is for.
+Arm types follow the same rules as the `is` operator: an arm that could never match and an arm the static type already satisfies (which would match everything, `default`'s job) are both compile errors.
+An arm may name an interface, and a switch over an interface value may test both classes and interfaces.
 Arms are tested in source order, and an arm whose type is already covered by an earlier arm is a compile error, just like a `catch` clause shadowed by a broader one.
 Value labels cannot be mixed with type arms; `default` is allowed alongside them, and for a nullable value a `null ->` arm handles the null case exactly as it does elsewhere.
 
@@ -610,6 +660,7 @@ When the value's class is sealed and abstract, the switch may omit `default` by 
 A non-exhaustive switch over a sealed hierarchy is a compile error that names the missing subclasses, so adding a subclass forces every such switch to be updated.
 A concrete sealed class still needs `default`, because the value may be an instance of the root class itself, which no subclass arm can match.
 When the class is not sealed, `default` is required, just like an integer or string switch, and a nullable value additionally needs its `null ->` arm (or `default`).
+A switch over an interface value always requires `default`: interfaces are open, so any class anywhere may implement one.
 Type arms work in both the statement and the expression forms.
 
 ```ens
@@ -816,7 +867,7 @@ writeGreeting() -> int throws {
 
 ---
 
-Every value has a `hash()` method returning a `long`. Value types (primitives, enums, strings, structs) hash by their contents, so equal values hash equally; classes and arrays hash by identity, matching how `==` compares them. A class can declare its own `hash() -> long` to control its hashing; a method named `hash` must have exactly that signature. The `Hashable` class from `@std.hash` names this contract for generic bounds, and every type satisfies it.
+Every value has a `hash()` method returning a `long`. Value types (primitives, enums, strings, structs) hash by their contents, so equal values hash equally; classes and arrays hash by identity, matching how `==` compares them. A class can declare its own `hash() -> long` to control its hashing; a method named `hash` must have exactly that signature. The `Hashable` interface from `@std.hash` names this contract for generic bounds, and every type satisfies it.
 
 The collection modules build on hashing and iteration:
 
