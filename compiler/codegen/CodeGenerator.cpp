@@ -740,6 +740,33 @@ struct CodeGenerator::Impl {
         return false;
     }
 
+    // Mirrors the analyzer's implicit-super rule: a constructor is callable
+    // with no arguments when every parameter has a default.
+    static size_t requiredParamCount(Symbol* sym) {
+        if (!sym->funcDeclCst) return sym->paramTypes.size();
+        auto fnNode = SyntaxNode::makeRoot(sym->funcDeclCst);
+        auto fn = ast::FuncDecl::cast(*fnNode);
+        if (!fn) return sym->paramTypes.size();
+        size_t required = 0;
+        for (auto& p : fn->parameters()) {
+            if (p.defaultValue()) break;
+            required++;
+        }
+        return required;
+    }
+
+    // The base constructor an implicit super call binds to: the zero-parameter
+    // one when declared, otherwise one whose parameters all have defaults.
+    static Symbol* implicitBaseCtor(StructInfo* base) {
+        Symbol* fallback = nullptr;
+        for (auto& m : base->methods) {
+            if (m.name != base->name || !m.symbol) continue;
+            if (m.symbol->paramTypes.empty()) return m.symbol;
+            if (!fallback && requiredParamCount(m.symbol) == 0) fallback = m.symbol;
+        }
+        return fallback;
+    }
+
     void emitFunction(const ast::FuncDecl& fn, Symbol* symOverride = nullptr,
                       ::Type* recvOverride = nullptr) {
         Symbol* sym = symOverride ? symOverride : symbolOf(fn.node);
@@ -811,17 +838,17 @@ struct CodeGenerator::Impl {
         }
 
         // Construct the base subobject first when a constructor omits an explicit super(...)
-        // and the base has a zero-argument constructor.
+        // and the base has a constructor callable with no arguments.
         if (receiver && receiver->structInfo && receiver->structInfo->baseInfo && thisSym &&
             sym->name == receiver->structInfo->name && !ctorHasExplicitSuper(fn)) {
             StructInfo* base = receiver->structInfo->baseInfo;
-            int bidx = base->findZeroArgMethodIndex(base->name);
-            if (bidx >= 0) {
-                Symbol* baseCtor = base->methods[bidx].symbol;
+            if (Symbol* baseCtor = implicitBaseCtor(base)) {
                 if (llvm::Function* bfn = getOrDeclareExternalFunction(baseCtor, nullptr)) {
                     llvm::Value* thisVal = builder->CreateLoad(
                         llvm::PointerType::get(ctx, 0), values[thisSym], "this");
-                    builder->CreateCall(bfn, { thisVal });
+                    std::vector<llvm::Value*> callArgs{ thisVal };
+                    if (appendCallArgs(baseCtor, {}, nullptr, callArgs))
+                        builder->CreateCall(bfn, callArgs);
                 }
             }
         }
@@ -5504,14 +5531,16 @@ struct CodeGenerator::Impl {
                 builder->CreateCall(fn, args);
             }
         } else {
-            // No own constructor: run the nearest inherited zero-argument constructor.
+            // No own constructor: run the nearest inherited constructor that is
+            // callable with no arguments.
             for (StructInfo* base = t->structInfo->baseInfo; base; base = base->baseInfo) {
                 if (base->findMethodIndex(base->name) < 0) continue;
-                int bidx = base->findZeroArgMethodIndex(base->name);
-                if (bidx >= 0) {
-                    Symbol* baseCtor = base->methods[bidx].symbol;
-                    if (llvm::Function* bfn = getOrDeclareExternalFunction(baseCtor, nullptr))
-                        builder->CreateCall(bfn, { heapPtr });
+                if (Symbol* baseCtor = implicitBaseCtor(base)) {
+                    if (llvm::Function* bfn = getOrDeclareExternalFunction(baseCtor, nullptr)) {
+                        std::vector<llvm::Value*> callArgs{ heapPtr };
+                        if (appendCallArgs(baseCtor, {}, nullptr, callArgs))
+                            builder->CreateCall(bfn, callArgs);
+                    }
                 }
                 break;
             }
