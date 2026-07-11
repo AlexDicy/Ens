@@ -577,6 +577,9 @@ let n = xs.length;            // long
 - `new T[a][]` allocates only the outer array; inner slots stay `null`. The result type is `T[]?[]`, the deepest unallocated level is reflected in the type by adding a `?`. Trailing empty brackets compose: `new T[a][b][]` produces `T[]?[][]`. Sized brackets must come before any empty ones in a single `new` expression.
 - `arr[i]` reads or writes an element. Bounds are checked at every access; an out-of-range index aborts the program.
 - `arr.length` returns the number of elements as a `long`.
+- `arr.slice(start, end)` returns a new array holding the elements in the half-open range `[start, end)`.
+  An invalid range aborts the program.
+  Elements are copied the way ordinary assignment copies them, so class elements are shared by reference.
 - `T?[]` is an array of nullable `T`, each **element** can be `null`. `T[]?` is a nullable array variable. The variable itself may be `null`. The two compose: `T?[]?` is both. To safely index a nullable array, use `?[i]`: it short-circuits to `null` when the receiver is `null`, otherwise it indexes normally.
 
 ```ens
@@ -628,6 +631,9 @@ Strings are immutable text values, written with double quotes (`"hello"`), and a
 - `s.toBytes()` returns the UTF-8 bytes as a `byte[]`, and `string.fromBytes(bytes)` builds a string from a `byte[]` by interpreting it as UTF-8.
 - `s.contains(needle)` reports whether `needle` occurs in `s`.
   `s.indexOf(needle)` returns the byte offset of the first occurrence as a `long`, or `-1` when absent; an empty needle is found at offset `0`.
+- `s.substring(start, end)` returns the bytes in the half-open range `[start, end)` as a new string.
+  Offsets are byte offsets, like `length` and `indexOf`.
+  An invalid range (a negative start, a start past the end, or an end past the length) aborts the program.
 
 ```ens
 let greeting = "Hello, " + name + "!";
@@ -638,6 +644,7 @@ let raw = greeting.toBytes();       // byte[]
 let back = string.fromBytes(raw);   // string
 let at = greeting.indexOf("llo");   // 2
 let has = greeting.contains("!");   // true
+let word = greeting.substring(0, 5); // "Hello"
 ```
 
 **Interpolation** embeds expressions in a string with `{ }`. Each hole is converted to text the way `.toString()` would, then the literal parts and holes are joined into one new string. Write `\{` and `\}` for literal braces.
