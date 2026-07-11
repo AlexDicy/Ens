@@ -20,6 +20,8 @@ class SafeMemberExpression;
 class SubscriptExpression;
 class SafeSubscriptExpression;
 class CastExpression;
+class CheckedCastExpression;
+class TypeTestExpression;
 class OutArgument;
 class NamedArgument;
 class AssignExpression;
@@ -56,6 +58,8 @@ public:
     std::optional<SubscriptExpression> asSubscript() const;
     std::optional<SafeSubscriptExpression> asSafeSubscript() const;
     std::optional<CastExpression>      asCast() const;
+    std::optional<CheckedCastExpression> asCheckedCast() const;
+    std::optional<TypeTestExpression>  asTypeTest() const;
     std::optional<OutArgument>         asOutArgument() const;
     std::optional<NamedArgument>       asNamedArgument() const;
     std::optional<AssignExpression>    asAssign() const;
@@ -220,6 +224,31 @@ public:
         return CastExpression{n};
     }
     std::optional<Expression> source() const;
+    std::optional<TypeReference> targetType() const;
+};
+
+// A checked cast `value as? Type`: the value when the runtime type test
+// succeeds, null when the value is null or not an instance of the target.
+class CheckedCastExpression {
+public:
+    SyntaxNode node;
+    static std::optional<CheckedCastExpression> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::CheckedCastExpr) return std::nullopt;
+        return CheckedCastExpression{n};
+    }
+    std::optional<Expression> source() const;
+    std::optional<TypeReference> targetType() const;
+};
+
+// A type test `value is Type`, evaluating to bool.
+class TypeTestExpression {
+public:
+    SyntaxNode node;
+    static std::optional<TypeTestExpression> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::TypeTestExpr) return std::nullopt;
+        return TypeTestExpression{n};
+    }
+    std::optional<Expression> operand() const;
     std::optional<TypeReference> targetType() const;
 };
 

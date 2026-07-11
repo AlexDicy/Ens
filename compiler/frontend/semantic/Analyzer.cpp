@@ -2148,9 +2148,35 @@ Analyzer::NullCheckInfo Analyzer::detectNullCheck(const ast::Expression& cond) {
     return info;
 }
 
+// A type test narrows its operand to the target class while the condition
+// holds. There is no negative counterpart: failing the test proves nothing
+// about the operand's type, so nothing narrows in the else branch.
+Analyzer::NullCheckInfo Analyzer::detectTypeTest(const ast::TypeTestExpression& test) {
+    NullCheckInfo info;
+    auto operand = test.operand();
+    auto tr = test.targetType();
+    if (!operand || !tr) return info;
+    Type* testT = analysis.typeOf(test.node.greenNode());
+    if (!testT || !testT->isBool()) return info;  // the test itself did not analyze cleanly
+    Type* targetT = analysis.typeOf(tr->node.greenNode());
+    if (!targetT || !targetT->isClass()) return info;
+    auto path = buildNarrowingPath(*operand);
+    if (!path) return info;
+    info.key = std::move(*path);
+    info.narrowedT = targetT;
+    info.narrowsThen = true;
+    info.valid = true;
+    return info;
+}
+
 void Analyzer::collectNarrowings(const ast::Expression& cond, bool conditionHolds,
                                  std::vector<NullCheckInfo>& out) {
     ast::Expression core = unwrapParens(cond);
+    if (auto tt = core.asTypeTest()) {
+        NullCheckInfo info = detectTypeTest(*tt);
+        if (info.valid && conditionHolds) out.push_back(std::move(info));
+        return;
+    }
     if (auto bin = core.asBinary()) {
         auto opTok = bin->operatorToken();
         SyntaxKind op = opTok ? opTok->kind() : SyntaxKind::Invalid;
@@ -2452,6 +2478,8 @@ Type* Analyzer::analyzeExpr(const ast::Expression& expr) {
     else if (auto su = expr.asSubscript()) t = analyzeSubscript(*su);
     else if (auto ss = expr.asSafeSubscript()) t = analyzeSafeSubscript(*ss);
     else if (auto ca = expr.asCast()) t = analyzeCast(*ca);
+    else if (auto cc = expr.asCheckedCast()) t = analyzeCheckedCast(*cc);
+    else if (auto tt = expr.asTypeTest()) t = analyzeTypeTest(*tt);
     else if (auto oa = expr.asOutArgument()) {
         errorAtNode(expr.node, "'out' can only be used when calling an external function.");
         t = typeCtx.getError();
@@ -3851,7 +3879,9 @@ Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
         const FieldInfo& fld = objT->structInfo->fields[idx];
         checkMemberAccess(expr.node, *memberName, fld.visibility, fld.definingClass);
         Type* fieldT = fld.type;
-        if (fieldT && fieldT->isOptional() && currentScope) {
+        // A nullable field can be null-narrowed; a class field can be
+        // is-narrowed to a subclass.
+        if (fieldT && (fieldT->isOptional() || fieldT->isClass()) && currentScope) {
             ast::Expression whole{expr.node};
             if (auto path = buildNarrowingPath(whole)) {
                 if (Type* narrowed = currentScope->lookupNarrowedType(*path)) {
@@ -3936,6 +3966,88 @@ Type* Analyzer::analyzeCast(const ast::CastExpression& expr) {
     return dstT;
 }
 
+bool Analyzer::checkClassTypeTest(Type* srcT, Type* dstT, bool isCast,
+                                  const SyntaxNode& diagNode) {
+    std::string op = isCast ? "as?" : "is";
+    if (dstT->isOptional()) {
+        std::string inner = dstT->inner ? dstT->inner->toString() : std::string("?");
+        if (isCast) {
+            errorAtNode(diagNode, "The target of 'as?' cannot be nullable; 'as? " + inner +
+                "' already produces '" + inner + "?'. Drop the '?' on the target.");
+        } else {
+            errorAtNode(diagNode, "The target of 'is' cannot be nullable; 'is' is never true "
+                "for null. Test against '" + inner + "' instead.");
+        }
+        return false;
+    }
+    if (dstT->isTypeParam()) {
+        errorAtNode(diagNode, "The target of '" + op + "' must be a concrete class; '" +
+            dstT->toString() + "' is a type parameter.");
+        return false;
+    }
+    if (!dstT->isClass() || !dstT->structInfo) {
+        errorAtNode(diagNode, "The target of '" + op + "' must be a class, got '" +
+            dstT->toString() + "'.");
+        return false;
+    }
+    Type* srcCore = srcT->isOptional() ? srcT->inner : srcT;
+    if (!srcCore) return false;
+    // A scrutinee mentioning a type parameter is checked per instantiation
+    // during code generation, like interpolation holes.
+    if (TypeContext::containsTypeParam(srcT) || TypeContext::containsTypeParam(dstT)) {
+        return true;
+    }
+    if (!srcCore->isClass() || !srcCore->structInfo) {
+        errorAtNode(diagNode, "Cannot use '" + op + "' on a value of type '" + srcT->toString() +
+            "'; only class values can be " + (isCast ? "cast." : "tested."));
+        return false;
+    }
+    if (srcCore->structInfo->isSubclassOf(dstT->structInfo)) {
+        // A nullable scrutinee still gains information from 'is': the test
+        // also proves the value is not null.
+        if (!isCast && srcT->isOptional()) return true;
+        if (isCast) {
+            errorAtNode(diagNode, "'as? " + dstT->toString() + "' is not needed here: a value "
+                "of type '" + srcT->toString() + "' always converts to '" + dstT->toString() +
+                "?'. Use the value directly.");
+        } else {
+            errorAtNode(diagNode, "A value of type '" + srcT->toString() + "' is always a '" +
+                dstT->toString() + "'; this 'is' test would always be true. Remove it.");
+        }
+        return false;
+    }
+    if (!dstT->structInfo->isSubclassOf(srcCore->structInfo)) {
+        errorAtNode(diagNode, "A value of type '" + srcT->toString() + "' can never be a '" +
+            dstT->toString() + "'; " + (isCast ? "this 'as?' cast would always be null."
+                                               : "this 'is' test would always be false.") +
+            " Remove it.");
+        return false;
+    }
+    return true;
+}
+
+Type* Analyzer::analyzeTypeTest(const ast::TypeTestExpression& expr) {
+    auto operand = expr.operand();
+    auto tr = expr.targetType();
+    if (!operand || !tr) return typeCtx.getError();
+    Type* srcT = analyzeExpr(*operand);
+    Type* dstT = resolveTypeReference(*tr);
+    if (srcT->isError() || dstT->isError()) return typeCtx.getError();
+    if (!checkClassTypeTest(srcT, dstT, /*isCast=*/false, expr.node)) return typeCtx.getError();
+    return typeCtx.getPrimitive(TypeKind::Bool);
+}
+
+Type* Analyzer::analyzeCheckedCast(const ast::CheckedCastExpression& expr) {
+    auto src = expr.source();
+    auto tr = expr.targetType();
+    if (!src || !tr) return typeCtx.getError();
+    Type* srcT = analyzeExpr(*src);
+    Type* dstT = resolveTypeReference(*tr);
+    if (srcT->isError() || dstT->isError()) return typeCtx.getError();
+    if (!checkClassTypeTest(srcT, dstT, /*isCast=*/true, expr.node)) return typeCtx.getError();
+    return typeCtx.getOptional(dstT);
+}
+
 Type* Analyzer::analyzeSubscript(const ast::SubscriptExpression& expr) {
     auto obj = expr.object();
     auto idx = expr.index();
@@ -3957,7 +4069,7 @@ Type* Analyzer::analyzeSubscript(const ast::SubscriptExpression& expr) {
         errorAtNode(idx->node, "Array index must be an integer, got '" + idxT->toString() + "'");
     }
     Type* elemT = objT->inner ? objT->inner : typeCtx.getError();
-    if (elemT && elemT->isOptional() && currentScope) {
+    if (elemT && (elemT->isOptional() || elemT->isClass()) && currentScope) {
         ast::Expression whole{expr.node};
         if (auto path = buildNarrowingPath(whole)) {
             if (Type* narrowed = currentScope->lookupNarrowedType(*path)) {

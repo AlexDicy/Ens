@@ -231,6 +231,12 @@ private:
     Type* analyzeSubscript(const ast::SubscriptExpression& expr);
     Type* analyzeSafeSubscript(const ast::SafeSubscriptExpression& expr);
     Type* analyzeCast(const ast::CastExpression& expr);
+    Type* analyzeCheckedCast(const ast::CheckedCastExpression& expr);
+    Type* analyzeTypeTest(const ast::TypeTestExpression& expr);
+    // Shared checks for 'is' and 'as?': class-only target, class or nullable
+    // class scrutinee, related hierarchies. Returns false after reporting.
+    bool checkClassTypeTest(Type* srcT, Type* dstT, bool isCast,
+                            const SyntaxNode& diagNode);
 
     void tryAdaptIntegerLiteral(const ast::Expression& src, Type* target);
     void tryAdaptCharLiteral(const ast::Expression& src, Type* target);
@@ -264,6 +270,7 @@ private:
         bool valid = false;
     };
     NullCheckInfo detectNullCheck(const ast::Expression& cond);
+    NullCheckInfo detectTypeTest(const ast::TypeTestExpression& test);
     // All null checks the condition establishes when it evaluates to
     // `conditionHolds`: descends `&&` when the condition holds and `||` when it
     // does not, so every conjunct's narrowing is collected.

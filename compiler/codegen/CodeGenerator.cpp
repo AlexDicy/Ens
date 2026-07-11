@@ -1996,6 +1996,8 @@ struct CodeGenerator::Impl {
         if (auto su = e.asSubscript()) return emitSubscript(*su);
         if (auto ss = e.asSafeSubscript()) return emitSafeSubscript(*ss);
         if (auto c = e.asCast()) return emitCast(*c);
+        if (auto cc = e.asCheckedCast()) return emitCheckedCast(*cc);
+        if (auto tt = e.asTypeTest()) return emitTypeTest(*tt);
         if (auto a = e.asAssign()) return emitAssign(*a);
         if (auto t = e.asTernary()) return emitTernary(*t);
         if (auto nc = e.asNullCoalesce()) return emitNullCoalesce(*nc);
@@ -2550,6 +2552,114 @@ struct CodeGenerator::Impl {
         llvm::Value* v = emitExpr(*src);
         if (!v) return nullptr;
         return emitNumericConversion(v, srcT, dstT);
+    }
+
+    // Validates the operand and target of an 'is' test or 'as?' cast at emit
+    // time. The analyzer defers anything that mentions a type parameter, so
+    // inside a generic instance these rules run against the substituted types,
+    // the same way interpolation holes are checked per instantiation.
+    bool checkClassTypeTest(::Type* srcT, ::Type* dstT, bool isCast, uint32_t offset) {
+        std::string op = isCast ? "as?" : "is";
+        if (!srcT || !dstT) return false;
+        if (!dstT->isClass() || !dstT->structInfo) {
+            error(offset, "The target of '" + op + "' must be a class, got '" +
+                dstT->toString() + "'.");
+            return false;
+        }
+        ::Type* srcCore = srcT->isOptional() ? srcT->inner : srcT;
+        if (!srcCore || !srcCore->isClass() || !srcCore->structInfo) {
+            error(offset, "Cannot use '" + op + "' on a value of type '" + srcT->toString() +
+                "'; only class values can be " + (isCast ? "cast." : "tested."));
+            return false;
+        }
+        if (srcCore->structInfo->isSubclassOf(dstT->structInfo)) {
+            if (!isCast && srcT->isOptional()) return true;
+            if (isCast) {
+                error(offset, "'as? " + dstT->toString() + "' is not needed here: a value "
+                    "of type '" + srcT->toString() + "' always converts to '" +
+                    dstT->toString() + "?'. Use the value directly.");
+            } else {
+                error(offset, "A value of type '" + srcT->toString() + "' is always a '" +
+                    dstT->toString() + "'; this 'is' test would always be true. Remove it.");
+            }
+            return false;
+        }
+        if (!dstT->structInfo->isSubclassOf(srcCore->structInfo)) {
+            error(offset, "A value of type '" + srcT->toString() + "' can never be a '" +
+                dstT->toString() + "'; " + (isCast ? "this 'as?' cast would always be null."
+                                                   : "this 'is' test would always be false.") +
+                " Remove it.");
+            return false;
+        }
+        return true;
+    }
+
+    llvm::Value* emitTypeTest(const ast::TypeTestExpression& e) {
+        auto operand = e.operand();
+        auto tr = e.targetType();
+        if (!operand || !tr) return nullptr;
+        ::Type* srcT = typeOf(operand->node);
+        ::Type* dstT = typeOf(tr->node);
+        if (!checkClassTypeTest(srcT, dstT, /*isCast=*/false, e.node.startOffset())) return nullptr;
+        llvm::Value* v = emitExpr(*operand);
+        if (!v) return nullptr;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        llvm::Value* isNull = builder->CreateICmpEQ(
+            v, llvm::ConstantPointerNull::get(ptrTy), "is.nullcheck");
+        llvm::BasicBlock* fromBB = builder->GetInsertBlock();
+        auto* testBB = llvm::BasicBlock::Create(ctx, "is.test", currentFunction);
+        auto* endBB = llvm::BasicBlock::Create(ctx, "is.end", currentFunction);
+        builder->CreateCondBr(isNull, endBB, testBB);
+
+        builder->SetInsertPoint(testBB);
+        llvm::Value* match = builder->CreateCall(getOrDefineEnsTypeIs(),
+            { loadDescriptor(v), getOrEmitTypeDescriptor(dstT->structInfo) }, "is.match");
+        builder->CreateBr(endBB);
+
+        builder->SetInsertPoint(endBB);
+        auto* phi = builder->CreatePHI(llvm::Type::getInt1Ty(ctx), 2, "is.result");
+        phi->addIncoming(llvm::ConstantInt::getFalse(ctx), fromBB);
+        phi->addIncoming(match, testBB);
+        releaseIfOwnedTemp(v, *operand);
+        return phi;
+    }
+
+    llvm::Value* emitCheckedCast(const ast::CheckedCastExpression& e) {
+        auto src = e.source();
+        auto tr = e.targetType();
+        if (!src || !tr) return nullptr;
+        ::Type* srcT = typeOf(src->node);
+        ::Type* dstT = typeOf(tr->node);
+        if (!checkClassTypeTest(srcT, dstT, /*isCast=*/true, e.node.startOffset())) return nullptr;
+        llvm::Value* v = emitExpr(*src);
+        if (!v) return nullptr;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        llvm::Value* isNull = builder->CreateICmpEQ(
+            v, llvm::ConstantPointerNull::get(ptrTy), "cast.nullcheck");
+        llvm::BasicBlock* fromBB = builder->GetInsertBlock();
+        auto* testBB = llvm::BasicBlock::Create(ctx, "cast.test", currentFunction);
+        auto* failBB = llvm::BasicBlock::Create(ctx, "cast.fail", currentFunction);
+        auto* endBB = llvm::BasicBlock::Create(ctx, "cast.end", currentFunction);
+        builder->CreateCondBr(isNull, endBB, testBB);
+
+        builder->SetInsertPoint(testBB);
+        llvm::Value* match = builder->CreateCall(getOrDefineEnsTypeIs(),
+            { loadDescriptor(v), getOrEmitTypeDescriptor(dstT->structInfo) }, "cast.match");
+        builder->CreateCondBr(match, endBB, failBB);
+
+        // A failed cast consumes an owned source; nothing else will release it.
+        builder->SetInsertPoint(failBB);
+        releaseIfOwnedTemp(v, *src);
+        builder->CreateBr(endBB);
+
+        // The result is the same object with the source's ownership passed
+        // through, so expressionProducesOwnedRef mirrors the source.
+        builder->SetInsertPoint(endBB);
+        auto* phi = builder->CreatePHI(ptrTy, 3, "cast.result");
+        phi->addIncoming(v, fromBB);  // a null source flows through as null
+        phi->addIncoming(v, testBB);
+        phi->addIncoming(llvm::ConstantPointerNull::get(ptrTy), failBB);
+        return phi;
     }
 
     llvm::FunctionCallee libcFn(const char* name, llvm::FunctionType* ty) {
@@ -5082,6 +5192,11 @@ struct CodeGenerator::Impl {
         }
         if (auto p = e.asParen()) {
             if (auto inner = p->inner()) return expressionProducesOwnedRef(*inner);
+        }
+        if (auto cc = e.asCheckedCast()) {
+            // The cast passes its source through (or drops it, releasing an
+            // owned one), so ownership of the result mirrors the source.
+            if (auto src = cc->source()) return expressionProducesOwnedRef(*src);
         }
         if (auto tr = e.asTry()) {
             if (auto operand = tr->operand()) return expressionProducesOwnedRef(*operand);

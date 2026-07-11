@@ -1172,7 +1172,8 @@ int Parser::infixPrecedence(SyntaxKind k) const {
         case SyntaxKind::Lt:
         case SyntaxKind::Gt:
         case SyntaxKind::LtEq:
-        case SyntaxKind::GtEq:       return 9;
+        case SyntaxKind::GtEq:
+        case SyntaxKind::KwIs:       return 9;  // type test - comparison level
         case SyntaxKind::LtLt:
         case SyntaxKind::GtGt:
         case SyntaxKind::GtGtGt:     return 10;
@@ -1273,10 +1274,21 @@ void Parser::parsePrecedence(int minPrec) {
             continue;
         }
         if (op == SyntaxKind::KwAs) {
-            builder.startNodeAt(cp, SyntaxKind::CastExpr);
+            // A '?' directly after 'as' selects the checked cast `as? Type`.
+            bool checked = peekKind(1) == SyntaxKind::Question;
+            builder.startNodeAt(cp, checked ? SyntaxKind::CheckedCastExpr : SyntaxKind::CastExpr);
             bump();  // 'as'
+            if (checked) bump();  // '?'
             if (isTypeStart(kindAt())) parseType();
-            else emitMissing(SyntaxKind::Identifier, "type after 'as'");
+            else emitMissing(SyntaxKind::Identifier, checked ? "type after 'as?'" : "type after 'as'");
+            builder.finishNode();
+            continue;
+        }
+        if (op == SyntaxKind::KwIs) {
+            builder.startNodeAt(cp, SyntaxKind::TypeTestExpr);
+            bump();  // 'is'
+            if (isTypeStart(kindAt())) parseType();
+            else emitMissing(SyntaxKind::Identifier, "type after 'is'");
             builder.finishNode();
             continue;
         }

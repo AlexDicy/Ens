@@ -20,6 +20,8 @@ bool Expression::isExpressionKind(SyntaxKind k) {
         case SyntaxKind::SubscriptExpr:
         case SyntaxKind::SafeSubscriptExpr:
         case SyntaxKind::CastExpr:
+        case SyntaxKind::CheckedCastExpr:
+        case SyntaxKind::TypeTestExpr:
         case SyntaxKind::AssignExpr:
         case SyntaxKind::TernaryExpr:
         case SyntaxKind::NullCoalesceExpr:
@@ -68,6 +70,8 @@ std::optional<SafeMemberExpression> Expression::asSafeMember() const { return Sa
 std::optional<SubscriptExpression> Expression::asSubscript() const { return SubscriptExpression::cast(node); }
 std::optional<SafeSubscriptExpression> Expression::asSafeSubscript() const { return SafeSubscriptExpression::cast(node); }
 std::optional<CastExpression>      Expression::asCast()      const { return CastExpression::cast(node); }
+std::optional<CheckedCastExpression> Expression::asCheckedCast() const { return CheckedCastExpression::cast(node); }
+std::optional<TypeTestExpression>  Expression::asTypeTest()  const { return TypeTestExpression::cast(node); }
 std::optional<OutArgument>         Expression::asOutArgument() const { return OutArgument::cast(node); }
 std::optional<NamedArgument>       Expression::asNamedArgument() const { return NamedArgument::cast(node); }
 std::optional<AssignExpression>    Expression::asAssign()    const { return AssignExpression::cast(node); }
@@ -278,6 +282,32 @@ std::optional<Expression> CastExpression::source() const {
 }
 
 std::optional<TypeReference> CastExpression::targetType() const {
+    for (auto& c : node.children()) {
+        if (auto tr = TypeReference::cast(c)) return tr;
+    }
+    return std::nullopt;
+}
+
+// === CheckedCastExpression ===
+
+std::optional<Expression> CheckedCastExpression::source() const {
+    return firstExpressionChild(node);
+}
+
+std::optional<TypeReference> CheckedCastExpression::targetType() const {
+    for (auto& c : node.children()) {
+        if (auto tr = TypeReference::cast(c)) return tr;
+    }
+    return std::nullopt;
+}
+
+// === TypeTestExpression ===
+
+std::optional<Expression> TypeTestExpression::operand() const {
+    return firstExpressionChild(node);
+}
+
+std::optional<TypeReference> TypeTestExpression::targetType() const {
     for (auto& c : node.children()) {
         if (auto tr = TypeReference::cast(c)) return tr;
     }

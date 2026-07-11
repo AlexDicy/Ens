@@ -192,6 +192,14 @@ void EscapeAnalyzer::scanExpression(const ast::Expression& e) {
         if (auto src = c->source()) scanExpression(*src);
         return;
     }
+    if (auto cc = e.asCheckedCast()) {
+        if (auto src = cc->source()) scanExpression(*src);
+        return;
+    }
+    if (auto tt = e.asTypeTest()) {
+        if (auto op = tt->operand()) scanExpression(*op);
+        return;
+    }
     if (e.asOutArgument()) {
         // External calls don't participate in ARC-aware escape analysis; the
         // referenced local is treated as reassigned by the analyzer itself.
@@ -378,6 +386,11 @@ void EscapeAnalyzer::markEscapeIfRef(const ast::Expression& e) {
     }
     if (auto p = e.asParen()) {
         if (auto inner = p->inner()) markEscapeIfRef(*inner);
+        return;
+    }
+    // A checked cast passes its source reference through unchanged.
+    if (auto cc = e.asCheckedCast()) {
+        if (auto src = cc->source()) markEscapeIfRef(*src);
         return;
     }
     if (auto t = e.asTernary()) {
@@ -633,6 +646,14 @@ void EscapeAnalyzer::walkExprForLastUses(const ast::Expression& e) {
     }
     if (auto c = e.asCast()) {
         if (auto src = c->source()) walkExprForLastUses(*src);
+        return;
+    }
+    if (auto cc = e.asCheckedCast()) {
+        if (auto src = cc->source()) walkExprForLastUses(*src);
+        return;
+    }
+    if (auto tt = e.asTypeTest()) {
+        if (auto op = tt->operand()) walkExprForLastUses(*op);
         return;
     }
     if (auto bn = e.asBinary()) {
