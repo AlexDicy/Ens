@@ -6526,9 +6526,10 @@ struct CodeGenerator::Impl {
         }
         llvm::Value* scrutVal = emitExpr(*scrutOpt);
         if (!scrutVal) return nullptr;
-        if (typeSwitch && expressionProducesOwnedRef(*scrutOpt)) {
-            // Park the owned scrutinee in the enclosing cleanup frame so every
-            // exit path releases it exactly once; arm bindings borrow it.
+        if (expressionProducesOwnedRef(*scrutOpt)) {
+            // Park the owned scrutinee (a string temp or a type-switch ref) in
+            // the enclosing cleanup frame so every exit path releases it
+            // exactly once; arm bindings borrow it.
             auto* slot = createEntryAlloca(currentFunction,
                 llvm::PointerType::get(ctx, 0), "switch.scrut");
             registerOwnedLocal(slot, scrutType);
