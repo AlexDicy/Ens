@@ -92,6 +92,11 @@ struct StructInfo {
         }
         return -1;
     }
+    // Overload-aware lookups (defined in Type.cpp; they need Symbol's parameter list).
+    int findMethodIndexBySignature(const std::u16string& methodName, const Symbol* like) const;
+    StructInfo* classDeclaringMethodBySignature(const std::u16string& methodName, const Symbol* like);
+    int findZeroArgMethodIndex(const std::u16string& methodName) const;
+    StructInfo* classDeclaringZeroArgMethod(const std::u16string& methodName);
     // True if this class is `other` or descends from it.
     bool isSubclassOf(const StructInfo* other) const {
         for (const StructInfo* s = this; s; s = s->baseInfo) {
@@ -106,15 +111,10 @@ struct StructInfo {
         }
         return nullptr;
     }
-    // Topmost class in the chain (deepest ancestor) that declares `methodName`, or null.
-    StructInfo* rootClassDeclaringMethod(const std::u16string& methodName) {
-        StructInfo* found = nullptr;
-        for (StructInfo* s = this; s; s = s->baseInfo) {
-            if (s->findMethodIndex(methodName) >= 0) found = s;
-        }
-        return found;
-    }
 };
+
+// True when the two function symbols take exactly the same parameter types.
+bool sameParameterTypes(const Symbol* a, const Symbol* b);
 
 class Type {
 public:

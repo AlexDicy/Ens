@@ -121,6 +121,7 @@ enum class SyntaxKind : uint16_t {
     CallExpr,
     ArgList,
     OutArgument,
+    NamedArgument,       // `name: expr` call argument
     MemberExpr,
     SafeMemberExpr,
     SubscriptExpr,

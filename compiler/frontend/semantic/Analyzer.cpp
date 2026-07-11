@@ -439,7 +439,13 @@ void Analyzer::collectExternalFunctions(const ast::SourceFile& file) {
             }
 
             if (!globalScope->define(sym)) {
-                errorAtNode(decl.node, "Duplicate function name '" + asciiOf(fname) + "'");
+                Symbol* existing = globalScope->lookupLocal(fname);
+                if (existing && existing->kind == SymbolKind::Function) {
+                    errorAtNode(decl.node, "External function '" + asciiOf(fname) +
+                        "' cannot share its name with another function; C symbols cannot be overloaded.");
+                } else {
+                    errorAtNode(decl.node, "Duplicate function name '" + asciiOf(fname) + "'");
+                }
             }
             analysis.setSymbol(decl.node.greenNode(), sym);
         }
@@ -678,6 +684,60 @@ void Analyzer::resolveDeclaredThrows(const ast::FuncDecl& fn, Symbol* sym) {
 // Collect phase
 // =========================================================
 
+// Flag every method whose name is declared more than once in the same owner so
+// codegen mangles each overload distinctly.
+static void markOverloadedMethods(StructInfo* si) {
+    if (!si) return;
+    for (auto& mi : si->methods) {
+        if (!mi.symbol) continue;
+        for (auto& other : si->methods) {
+            if (&other != &mi && other.name == mi.name) {
+                mi.symbol->isOverloaded = true;
+                break;
+            }
+        }
+    }
+}
+
+// Same-name methods callable on `si`, most-derived first. A base declaration
+// with the same signature as a more derived one is shadowed (an overridden or
+// hidden method) and is not a separate candidate. Two same-signature methods in
+// one class (overloads collapsed by a generic instantiation) both stay, so a
+// call to them is reported as ambiguous.
+static std::vector<const MethodInfo*> collectMethodCandidates(StructInfo* si,
+                                                              const std::u16string& name) {
+    std::vector<const MethodInfo*> out;
+    for (StructInfo* s = si; s; s = s->baseInfo) {
+        size_t derivedCount = out.size();
+        for (const auto& mi : s->methods) {
+            if (mi.name != name || !mi.symbol) continue;
+            bool shadowed = false;
+            for (size_t i = 0; i < derivedCount; ++i) {
+                if (sameParameterTypes(out[i]->symbol, mi.symbol)) { shadowed = true; break; }
+            }
+            if (!shadowed) out.push_back(&mi);
+        }
+    }
+    return out;
+}
+
+static bool callUsesNamedArguments(const std::vector<ast::Expression>& args) {
+    for (auto& a : args) {
+        if (a.asNamedArgument()) return true;
+    }
+    return false;
+}
+
+static std::string signatureOf(Symbol* sym) {
+    std::string sig = asciiOf(sym->name) + "(";
+    for (size_t i = 0; i < sym->paramTypes.size(); ++i) {
+        if (i) sig += ", ";
+        sig += sym->paramTypes[i] ? sym->paramTypes[i]->toString() : "?";
+    }
+    sig += ")";
+    return sig;
+}
+
 void Analyzer::collectStructs(const ast::SourceFile& file) {
     auto structs = file.structs();
 
@@ -730,6 +790,13 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             analysis.setSymbol(m.node.greenNode(), sym);
             analysis.setReceiver(m.node.greenNode(), t);
 
+            if (t->structInfo->findMethodIndexBySignature(mname, sym) >= 0) {
+                errorAtNode(m.node, "Method '" + asciiOf(mname) + "' of '" +
+                    asciiOf(t->structInfo->name) + "' is already declared with the same "
+                    "parameter types; overloads must differ in parameter count or types.");
+                continue;
+            }
+
             MethodInfo mi;
             mi.name = mname;
             mi.symbol = sym;
@@ -737,6 +804,7 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             mi.visibility = toSemanticVisibility(m.visibility());
             t->structInfo->methods.push_back(std::move(mi));
         }
+        markOverloadedMethods(t->structInfo);
         t->structInfo->membersCollected = true;
         popTypeParams(tpCount);
     }
@@ -938,6 +1006,13 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
         analysis.setSymbol(m.node.greenNode(), sym);
         analysis.setReceiver(m.node.greenNode(), t);
 
+        if (si->findMethodIndexBySignature(mname, sym) >= 0) {
+            errorAtNode(m.node, "Method '" + asciiOf(mname) + "' of '" + asciiOf(si->name) +
+                "' is already declared with the same parameter types; overloads must "
+                "differ in parameter count or types.");
+            continue;
+        }
+
         MethodInfo mi;
         mi.name = mname;
         mi.symbol = sym;
@@ -960,7 +1035,9 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
                 errorAtNode(m.node, "A constructor cannot be 'override' or 'abstract'");
             continue;
         }
-        StructInfo* baseDecl = si->baseInfo ? si->baseInfo->classDeclaringMethod(mname) : nullptr;
+        StructInfo* baseByName = si->baseInfo ? si->baseInfo->classDeclaringMethod(mname) : nullptr;
+        StructInfo* baseBySig = si->baseInfo
+            ? si->baseInfo->classDeclaringMethodBySignature(mname, sym) : nullptr;
         if (m.isAbstract()) {
             if (!si->isAbstract)
                 errorAtNode(m.node, "Abstract method '" + asciiOf(mname) + "' requires class '" +
@@ -969,38 +1046,49 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
                 errorAtNode(m.node, "Abstract method '" + asciiOf(mname) + "' cannot have a body");
         }
         if (m.isOverride()) {
-            if (!baseDecl) {
+            if (!baseByName) {
                 errorAtNode(m.node, "Method '" + asciiOf(mname) +
                     "' is marked 'override' but no base class declares it");
+            } else if (!baseBySig) {
+                errorAtNode(m.node, "Override of '" + asciiOf(mname) +
+                    "' does not match the signature declared in '" + asciiOf(baseByName->name) + "'");
             } else {
-                MethodInfo& bm = baseDecl->methods[baseDecl->findMethodIndex(mname)];
+                MethodInfo& bm = baseBySig->methods[baseBySig->findMethodIndexBySignature(mname, sym)];
                 if (bm.isFinal)
                     errorAtNode(m.node, "Cannot override '" + asciiOf(mname) +
-                        "' because it is declared 'final' in '" + asciiOf(baseDecl->name) + "'");
+                        "' because it is declared 'final' in '" + asciiOf(baseBySig->name) + "'");
                 if (!overrideSignaturesCompatible(bm, sym))
                     errorAtNode(m.node, "Override of '" + asciiOf(mname) +
-                        "' does not match the signature declared in '" + asciiOf(baseDecl->name) + "'");
+                        "' does not match the signature declared in '" + asciiOf(baseBySig->name) + "'");
                 if (m.isThrows() && bm.symbol && !bm.symbol->declaredThrows)
                     errorAtNode(m.throwsToken().value_or(m.node), "Method '" + asciiOf(mname) +
-                        "' is marked 'throws' but overrides a method of '" + asciiOf(baseDecl->name) +
+                        "' is marked 'throws' but overrides a method of '" + asciiOf(baseBySig->name) +
                         "' that is not. Mark the base method 'throws' too, or handle the exceptions "
                         "inside the override.");
             }
-        } else if (baseDecl) {
+        } else if (baseBySig) {
+            // A subclass may add a new overload of an inherited name; only a
+            // same-signature redeclaration hides the base method.
             errorAtNode(m.node, "Method '" + asciiOf(mname) + "' hides a method inherited from '" +
-                asciiOf(baseDecl->name) + "'; mark it 'override' to replace it, or rename it");
+                asciiOf(baseBySig->name) + "'; mark it 'override' to replace it, or rename it");
         }
     }
+    markOverloadedMethods(si);
 
     // --- A concrete class must implement every inherited abstract method. ---
     if (!si->isAbstract) {
-        std::unordered_set<std::u16string> checked;
+        std::vector<const Symbol*> checked;
         for (StructInfo* s = si; s; s = s->baseInfo) {
             for (auto& m : s->methods) {
-                if (m.name == s->name) continue;  // constructor
-                if (!checked.insert(m.name).second) continue;
-                StructInfo* decl = si->classDeclaringMethod(m.name);  // most-derived declaration
-                if (decl && decl->methods[decl->findMethodIndex(m.name)].isAbstract) {
+                if (m.name == s->name || !m.symbol) continue;  // constructor
+                bool seen = false;
+                for (const Symbol* c : checked) {
+                    if (c->name == m.name && sameParameterTypes(c, m.symbol)) { seen = true; break; }
+                }
+                if (seen) continue;
+                checked.push_back(m.symbol);
+                StructInfo* decl = si->classDeclaringMethodBySignature(m.name, m.symbol);
+                if (decl && decl->methods[decl->findMethodIndexBySignature(m.name, m.symbol)].isAbstract) {
                     errorAtNode(cd.node, "Class '" + asciiOf(si->name) +
                         "' must override abstract method '" + asciiOf(m.name) +
                         "', or be declared 'abstract'");
@@ -1050,11 +1138,14 @@ void Analyzer::finalizeClassHierarchy(const std::vector<StructInfo*>& classes) {
             if (mi.name == si->name) continue;
             if (mi.isAbstract) mi.vtableSlot = VTSLOT_PENDING;
             if (mi.isOverride && si->baseInfo) {
-                if (StructInfo* bc = si->baseInfo->classDeclaringMethod(mi.name)) {
+                if (StructInfo* bc = si->baseInfo->classDeclaringMethodBySignature(mi.name, mi.symbol)) {
                     mi.vtableSlot = VTSLOT_PENDING;
+                    int bi = bc->findMethodIndexBySignature(mi.name, mi.symbol);
                     StructInfo* auth = slotAuthority(bc);
-                    auto& baseMethod = auth->methods[auth->findMethodIndex(mi.name)];
-                    if (baseMethod.vtableSlot == -1) baseMethod.vtableSlot = VTSLOT_PENDING;
+                    if (bi >= 0 && bi < static_cast<int>(auth->methods.size())) {
+                        auto& baseMethod = auth->methods[bi];
+                        if (baseMethod.vtableSlot == -1) baseMethod.vtableSlot = VTSLOT_PENDING;
+                    }
                 }
             }
         }
@@ -1064,9 +1155,12 @@ void Analyzer::finalizeClassHierarchy(const std::vector<StructInfo*>& classes) {
         si->vtableSize = baseAuth ? baseAuth->vtableSize : 0;
         for (auto& mi : si->methods) {
             if (mi.name == si->name || mi.vtableSlot != VTSLOT_PENDING) continue;
-            StructInfo* bc = si->baseInfo ? si->baseInfo->classDeclaringMethod(mi.name) : nullptr;
+            StructInfo* bc = si->baseInfo
+                ? si->baseInfo->classDeclaringMethodBySignature(mi.name, mi.symbol) : nullptr;
+            int bi = bc ? bc->findMethodIndexBySignature(mi.name, mi.symbol) : -1;
             StructInfo* bcAuth = slotAuthority(bc);
-            int inherited = bcAuth ? bcAuth->methods[bcAuth->findMethodIndex(mi.name)].vtableSlot : -1;
+            int inherited = (bcAuth && bi >= 0 && bi < static_cast<int>(bcAuth->methods.size()))
+                ? bcAuth->methods[bi].vtableSlot : -1;
             mi.vtableSlot = (inherited >= 0) ? inherited : si->vtableSize++;
         }
     }
@@ -1075,9 +1169,13 @@ void Analyzer::finalizeClassHierarchy(const std::vector<StructInfo*>& classes) {
     for (StructInfo* si : order) {
         for (auto& mi : si->methods) {
             if (mi.name == si->name || !mi.symbol) continue;
-            StructInfo* root = si->rootClassDeclaringMethod(mi.name);
-            int ri = root ? root->findMethodIndex(mi.name) : -1;
-            Symbol* rootSym = (ri >= 0) ? root->methods[ri].symbol : nullptr;
+            StructInfo* root = nullptr;
+            int ri = -1;
+            for (StructInfo* s = si; s; s = s->baseInfo) {
+                int i = s->findMethodIndexBySignature(mi.name, mi.symbol);
+                if (i >= 0) { root = s; ri = i; }
+            }
+            Symbol* rootSym = (root && ri >= 0) ? root->methods[ri].symbol : nullptr;
             mi.symbol->abiThrows = rootSym ? rootSym->declaredThrows : mi.symbol->declaredThrows;
         }
     }
@@ -1109,7 +1207,34 @@ void Analyzer::collectFunctions(const ast::SourceFile& file) {
         popTypeParams(tpCount);
 
         if (!globalScope->define(sym)) {
-            errorAtNode(fn.node, "Duplicate function name '" + asciiOf(fname) + "'");
+            Symbol* existing = globalScope->lookupLocal(fname);
+            if (!existing || existing->kind != SymbolKind::Function) {
+                errorAtNode(fn.node, "Duplicate function name '" + asciiOf(fname) + "'");
+            } else if (existing->isExternal) {
+                errorAtNode(fn.node, "Function '" + asciiOf(fname) +
+                    "' cannot share its name with an external function; C symbols cannot be overloaded.");
+            } else if (fname == u"main") {
+                errorAtNode(fn.node, "Function 'main' cannot be overloaded; it is the program entry point.");
+            } else if (existing->isTemplate || sym->isTemplate) {
+                errorAtNode(fn.node, "Function '" + asciiOf(fname) +
+                    "' cannot be overloaded because one of its declarations is generic; "
+                    "generic functions do not support overloading.");
+            } else {
+                Symbol* last = existing;
+                bool duplicate = false;
+                for (Symbol* o = existing; o; o = o->nextOverload) {
+                    last = o;
+                    if (sameParameterTypes(o, sym)) { duplicate = true; break; }
+                }
+                if (duplicate) {
+                    errorAtNode(fn.node, "Function '" + asciiOf(fname) +
+                        "' is already declared with the same parameter types; "
+                        "overloads must differ in parameter count or types.");
+                } else {
+                    last->nextOverload = sym;
+                    for (Symbol* o = existing; o; o = o->nextOverload) o->isOverloaded = true;
+                }
+            }
         }
         analysis.setSymbol(fn.node.greenNode(), sym);
     }
@@ -1647,14 +1772,17 @@ void Analyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
         StructInfo* cls = receiverType->structInfo;
         bool isCtor = currentFunction && currentFunction->name == cls->name;
         if (isCtor && cls->baseInfo) {
-            int bidx = cls->baseInfo->findMethodIndex(cls->baseInfo->name);
-            if (bidx >= 0) {
-                Symbol* baseCtor = cls->baseInfo->methods[bidx].symbol;
-                if (baseCtor && requiredArgCount(baseCtor) > 0) {
-                    errorAtNode(fn.node, "Constructor of '" + asciiOf(cls->name) +
-                        "' must call 'super(...)' because base class '" +
-                        asciiOf(cls->baseInfo->name) + "' has no zero-argument constructor");
-                }
+            bool anyCtor = false;
+            bool anyCallableWithoutArgs = false;
+            for (auto& m : cls->baseInfo->methods) {
+                if (m.name != cls->baseInfo->name || !m.symbol) continue;
+                anyCtor = true;
+                if (requiredArgCount(m.symbol) == 0) anyCallableWithoutArgs = true;
+            }
+            if (anyCtor && !anyCallableWithoutArgs) {
+                errorAtNode(fn.node, "Constructor of '" + asciiOf(cls->name) +
+                    "' must call 'super(...)' because base class '" +
+                    asciiOf(cls->baseInfo->name) + "' has no zero-argument constructor");
             }
         }
     }
@@ -1967,12 +2095,18 @@ void Analyzer::clearNarrowingsForCall(const ast::CallExpression& expr) {
     // through them.
     for (const auto& arg : expr.arguments()) {
         if (arg.asOutArgument()) continue;
-        Type* t = analysis.typeOf(arg.node.greenNode());
+        ast::Expression target = arg;
+        if (auto na = arg.asNamedArgument()) {
+            auto value = na->value();
+            if (!value) continue;
+            target = *value;
+        }
+        Type* t = analysis.typeOf(target.node.greenNode());
         if (!t) continue;
         Type* base = t->isOptional() ? t->inner : t;
         if (!base) continue;
         if (!base->isClass() && !base->isArray()) continue;
-        dropRoot(arg);
+        dropRoot(target);
     }
 }
 
@@ -2177,9 +2311,13 @@ void Analyzer::analyzeForStmt(const ast::ForStatement& stmt) {
 // on whatever makeIterator() returns. Reports a specific diagnostic and
 // returns the error type when the protocol is incomplete.
 Type* Analyzer::resolveIterableElement(Type* iterT, const SyntaxNode& diag) {
-    StructInfo* declaring = iterT->structInfo->classDeclaringMethod(u"makeIterator");
-    Symbol* makeSym = declaring
-        ? declaring->methods[declaring->findMethodIndex(u"makeIterator")].symbol : nullptr;
+    StructInfo* declaring = iterT->structInfo->classDeclaringZeroArgMethod(u"makeIterator");
+    int makeIdx = declaring ? declaring->findZeroArgMethodIndex(u"makeIterator") : -1;
+    if (!declaring) {
+        declaring = iterT->structInfo->classDeclaringMethod(u"makeIterator");
+        makeIdx = declaring ? declaring->findMethodIndex(u"makeIterator") : -1;
+    }
+    Symbol* makeSym = (declaring && makeIdx >= 0) ? declaring->methods[makeIdx].symbol : nullptr;
     if (!makeSym) {
         errorAtNode(diag, "'" + iterT->toString() + "' is not iterable: it has no "
             "'makeIterator()' method. Add one returning an Iterator to use it in a "
@@ -2197,12 +2335,18 @@ Type* Analyzer::resolveIterableElement(Type* iterT, const SyntaxNode& diag) {
             "an iterator class with 'hasNext() -> bool' and 'next() -> T' methods.");
         return typeCtx.getError();
     }
-    StructInfo* hasNextDecl = iteratorT->structInfo->classDeclaringMethod(u"hasNext");
-    StructInfo* nextDecl = iteratorT->structInfo->classDeclaringMethod(u"next");
-    Symbol* hasNextSym = hasNextDecl
-        ? hasNextDecl->methods[hasNextDecl->findMethodIndex(u"hasNext")].symbol : nullptr;
-    Symbol* nextSym = nextDecl
-        ? nextDecl->methods[nextDecl->findMethodIndex(u"next")].symbol : nullptr;
+    StructInfo* hasNextDecl = iteratorT->structInfo->classDeclaringZeroArgMethod(u"hasNext");
+    if (!hasNextDecl) hasNextDecl = iteratorT->structInfo->classDeclaringMethod(u"hasNext");
+    StructInfo* nextDecl = iteratorT->structInfo->classDeclaringZeroArgMethod(u"next");
+    if (!nextDecl) nextDecl = iteratorT->structInfo->classDeclaringMethod(u"next");
+    auto protocolSymbol = [](StructInfo* decl, const char16_t* name) -> Symbol* {
+        if (!decl) return nullptr;
+        int idx = decl->findZeroArgMethodIndex(name);
+        if (idx < 0) idx = decl->findMethodIndex(name);
+        return idx >= 0 ? decl->methods[idx].symbol : nullptr;
+    };
+    Symbol* hasNextSym = protocolSymbol(hasNextDecl, u"hasNext");
+    Symbol* nextSym = protocolSymbol(nextDecl, u"next");
     bool hasNextOk = hasNextSym && hasNextSym->paramTypes.empty() &&
         hasNextSym->returnType && hasNextSym->returnType->isBool();
     bool nextOk = nextSym && nextSym->paramTypes.empty() &&
@@ -2310,6 +2454,11 @@ Type* Analyzer::analyzeExpr(const ast::Expression& expr) {
     else if (auto ca = expr.asCast()) t = analyzeCast(*ca);
     else if (auto oa = expr.asOutArgument()) {
         errorAtNode(expr.node, "'out' can only be used when calling an external function.");
+        t = typeCtx.getError();
+    }
+    else if (expr.asNamedArgument()) {
+        errorAtNode(expr.node, "Named arguments can only be used when calling a function, "
+            "method, or constructor.");
         t = typeCtx.getError();
     }
     else if (auto a  = expr.asAssign()) t = analyzeAssign(*a);
@@ -2602,6 +2751,328 @@ static size_t requiredArgCount(Symbol* sym) {
     return required;
 }
 
+// =========================================================
+// Overload resolution
+// =========================================================
+
+namespace {
+
+constexpr int kRankNone = 0;
+constexpr int kRankLiteral = 1;   // viable only because the literal's value fits
+constexpr int kRankConvert = 2;   // numeric widening or another implicit conversion
+constexpr int kRankExact = 3;
+
+std::vector<Symbol*> overloadChainOf(Symbol* head) {
+    std::vector<Symbol*> chain;
+    for (Symbol* s = head; s; s = s->nextOverload) chain.push_back(s);
+    return chain;
+}
+
+// How well an argument fits a parameter. Untyped integer and char literals
+// adapt to any integer type their value fits, as they do for assignments.
+int conversionRank(const ast::Expression& arg, Type* argT, Type* paramT) {
+    if (!argT || !paramT) return kRankNone;
+    if (argT->isError() || paramT->isError()) return kRankExact;
+    if (argT->equals(paramT)) return kRankExact;
+    if (paramT->isInteger()) {
+        if (const ast::LiteralExpression* lit = asIntLiteralChild(arg)) {
+            auto tok = lit->token();
+            uint64_t magnitude = 0;
+            if (tok && parseIntegerLiteralMagnitude(std::u16string(tok->tokenText()), magnitude) &&
+                literalFitsTarget(literalIsNegative(arg), magnitude, paramT)) {
+                return argT->widensTo(paramT) ? kRankConvert : kRankLiteral;
+            }
+        }
+        if (auto lit = arg.asLiteral(); lit && lit->literalKind() == SyntaxKind::CharLiteral) {
+            if (auto tok = lit->token()) {
+                uint32_t cp = parseCharLiteralCodepoint(tok->tokenText());
+                if (literalFitsTarget(/*negative*/ false, cp, paramT)) {
+                    return argT->widensTo(paramT) ? kRankConvert : kRankLiteral;
+                }
+            }
+        }
+    }
+    if (paramT->assignableFrom(argT)) return kRankConvert;
+    return kRankNone;
+}
+
+// Parameter names and default-value presence, read from the declaration CST.
+void parameterInfoOf(Symbol* sym, std::vector<std::u16string>& names, std::vector<bool>& defaults) {
+    names.clear();
+    defaults.clear();
+    if (!sym->funcDeclCst) return;
+    auto fnNode = SyntaxNode::makeRoot(sym->funcDeclCst);
+    auto fn = ast::FuncDecl::cast(*fnNode);
+    if (!fn) return;
+    for (auto& p : fn->parameters()) {
+        names.push_back(p.nameText().value_or(std::u16string{}));
+        defaults.push_back(p.defaultValue().has_value());
+    }
+}
+
+}  // namespace
+
+Analyzer::CallShape Analyzer::analyzeCallShape(const std::vector<ast::Expression>& args) {
+    CallShape shape;
+    for (auto& a : args) {
+        if (auto na = a.asNamedArgument()) {
+            auto argName = na->nameText();
+            auto value = na->value();
+            if (!argName || !value) {
+                shape.malformed = true;
+                shape.hasErrorArg = true;
+                continue;
+            }
+            for (auto& prev : shape.named) {
+                if (prev.name == *argName) {
+                    errorAtNode(a.node, "Duplicate named argument '" + asciiOf(*argName) + "'.");
+                    shape.malformed = true;
+                    break;
+                }
+            }
+            Type* t = analyzeExpr(*value);
+            analysis.setType(a.node.greenNode(), t);
+            if (t->isError()) shape.hasErrorArg = true;
+            shape.named.push_back({*argName, *value, a.node, t});
+        } else {
+            if (!shape.named.empty() && !shape.malformed) {
+                errorAtNode(a.node, "Positional arguments must come before named arguments.");
+                shape.malformed = true;
+            }
+            Type* t = analyzeExpr(a);
+            if (t->isError()) shape.hasErrorArg = true;
+            shape.positional.push_back(a);
+            shape.positionalTypes.push_back(t);
+        }
+    }
+    return shape;
+}
+
+// Binds every source-order argument to a parameter index. False when the shape
+// cannot call `sym`; `failure` then explains why for single-candidate reporting.
+bool Analyzer::mapCallArguments(Symbol* sym, const CallShape& shape, std::vector<int>& mapping,
+                                int& defaultedCount, std::string& failure,
+                                const std::string& kindWord, const std::string& displayName) {
+    size_t nParams = sym->paramTypes.size();
+    size_t nPos = shape.positional.size();
+    size_t total = nPos + shape.named.size();
+    size_t req = requiredArgCount(sym);
+    if (nPos > nParams) {
+        failure = kindWord + " '" + displayName + "' expects " + std::to_string(req) +
+            (req == nParams ? "" : "-" + std::to_string(nParams)) +
+            " argument(s), got " + std::to_string(total);
+        return false;
+    }
+
+    std::vector<std::u16string> names;
+    std::vector<bool> defaults;
+    parameterInfoOf(sym, names, defaults);
+
+    std::vector<bool> bound(nParams, false);
+    mapping.clear();
+    mapping.reserve(total);
+    for (size_t i = 0; i < nPos; ++i) {
+        bound[i] = true;
+        mapping.push_back(static_cast<int>(i));
+    }
+    for (auto& na : shape.named) {
+        int idx = -1;
+        for (size_t j = 0; j < names.size(); ++j) {
+            if (names[j] == na.name) { idx = static_cast<int>(j); break; }
+        }
+        if (idx < 0 || idx >= static_cast<int>(nParams)) {
+            failure = kindWord + " '" + displayName + "' has no parameter named '" +
+                asciiOf(na.name) + "'";
+            return false;
+        }
+        if (bound[idx]) {
+            failure = kindWord + " '" + displayName + "': parameter '" + asciiOf(na.name) +
+                "' is already bound by a positional argument";
+            return false;
+        }
+        bound[idx] = true;
+        mapping.push_back(idx);
+    }
+    defaultedCount = 0;
+    for (size_t j = 0; j < nParams; ++j) {
+        if (bound[j]) continue;
+        if (j < defaults.size() && defaults[j]) { defaultedCount++; continue; }
+        std::string pname = (j < names.size() && !names[j].empty())
+            ? "'" + asciiOf(names[j]) + "'" : std::to_string(j + 1);
+        failure = kindWord + " '" + displayName + "' is missing an argument for parameter " + pname;
+        return false;
+    }
+    return true;
+}
+
+// Picks the best candidate: filter by argument shape and viability, rank
+// argument matches (exact beats widening beats literal fitting), prefer
+// accessible candidates, and report no-match/ambiguity errors here.
+Analyzer::OverloadChoice Analyzer::resolveOverloadedCall(
+        const std::vector<OverloadCandidate>& candidates, const CallShape& shape,
+        const SyntaxNode& diagNode, const std::string& displayName,
+        const std::string& kindWord) {
+    OverloadChoice out;
+    if (shape.malformed) {
+        out.failed = true;
+        return out;
+    }
+
+    struct Viable {
+        const OverloadCandidate* cand;
+        std::vector<int> mapping;
+        std::vector<int> ranks;
+        int defaulted = 0;
+    };
+    std::vector<Viable> viable;
+    std::string singleFailure;
+    size_t sourceCount = shape.positional.size() + shape.named.size();
+    for (auto& c : candidates) {
+        std::vector<int> mapping;
+        int defaulted = 0;
+        std::string failure;
+        if (!mapCallArguments(c.symbol, shape, mapping, defaulted, failure, kindWord, displayName)) {
+            if (candidates.size() == 1) singleFailure = failure;
+            continue;
+        }
+        std::vector<int> ranks;
+        ranks.reserve(sourceCount);
+        bool ok = true;
+        for (size_t i = 0; i < sourceCount && ok; ++i) {
+            const ast::Expression& e = i < shape.positional.size()
+                ? shape.positional[i] : shape.named[i - shape.positional.size()].value;
+            Type* argT = i < shape.positional.size()
+                ? shape.positionalTypes[i] : shape.named[i - shape.positional.size()].type;
+            Type* paramT = c.symbol->paramTypes[mapping[i]];
+            int rank = conversionRank(e, argT, paramT);
+            // A single candidate is checked argument by argument afterwards,
+            // in the same style as a non-overloaded call.
+            if (rank == kRankNone && candidates.size() > 1 && !shape.hasErrorArg) ok = false;
+            ranks.push_back(rank);
+        }
+        if (!ok) continue;
+        viable.push_back({&c, std::move(mapping), std::move(ranks), defaulted});
+    }
+
+    if (viable.empty()) {
+        if (candidates.size() == 1 && !singleFailure.empty()) {
+            errorAtNode(diagNode, singleFailure);
+        } else {
+            std::string list;
+            for (size_t i = 0; i < candidates.size(); ++i) {
+                if (i) list += ", ";
+                list += "'" + signatureOf(candidates[i].symbol) + "'";
+            }
+            errorAtNode(diagNode, "No overload of '" + displayName +
+                "' matches this call. Candidates: " + list + ".");
+        }
+        out.failed = true;
+        return out;
+    }
+
+    // Inaccessible candidates lose to accessible ones; they only win (and then
+    // report a visibility error at the call site) when nothing accessible matches.
+    bool anyAccessible = false;
+    for (auto& v : viable) anyAccessible = anyAccessible || v.cand->accessible;
+    std::vector<const Viable*> pool;
+    for (auto& v : viable) {
+        if (v.cand->accessible == anyAccessible) pool.push_back(&v);
+    }
+
+    auto betterThan = [](const Viable& a, const Viable& b) {
+        bool atLeastAsGood = true;
+        bool strictlyBetter = false;
+        for (size_t i = 0; i < a.ranks.size(); ++i) {
+            if (a.ranks[i] < b.ranks[i]) atLeastAsGood = false;
+            if (a.ranks[i] > b.ranks[i]) strictlyBetter = true;
+        }
+        if (!atLeastAsGood) return false;
+        if (strictlyBetter) return true;
+        return a.defaulted < b.defaulted;  // equal ranks: fewer defaulted parameters wins
+    };
+    std::vector<const Viable*> best;
+    for (const Viable* v : pool) {
+        bool dominated = false;
+        for (const Viable* o : pool) {
+            if (o != v && betterThan(*o, *v)) { dominated = true; break; }
+        }
+        if (!dominated) best.push_back(v);
+    }
+    if (best.empty()) best.push_back(pool.front());
+    if (best.size() > 1 && !shape.hasErrorArg) {
+        std::string list;
+        for (size_t i = 0; i < best.size(); ++i) {
+            if (i) list += ", ";
+            list += "'" + signatureOf(best[i]->cand->symbol) + "'";
+        }
+        errorAtNode(diagNode, "Call to '" + displayName +
+            "' is ambiguous. Candidates: " + list + ".");
+        out.failed = true;
+        return out;
+    }
+
+    const Viable* winner = best.front();
+    out.symbol = winner->cand->symbol;
+    out.method = winner->cand->method;
+    out.argParamIndex = winner->mapping;
+    out.accessible = winner->cand->accessible;
+    return out;
+}
+
+// Final argument checking against the chosen overload: adapt literals to the
+// parameter types and verify assignability, mirroring the non-overloaded path.
+Type* Analyzer::checkResolvedCallArguments(const CallShape& shape, const OverloadChoice& choice,
+                                           const GreenElement* callNode) {
+    Symbol* sym = choice.symbol;
+    auto checkOne = [&](const ast::Expression& valueExpr, Type* argT, int paramIdx,
+                        const std::string& argLabel, const SyntaxNode& diagNode) {
+        if (paramIdx < 0 || paramIdx >= static_cast<int>(sym->paramTypes.size())) return;
+        Type* paramT = sym->paramTypes[paramIdx];
+        if (!paramT || paramT->isError() || !argT || argT->isError()) return;
+        tryAdaptIntegerLiteral(valueExpr, paramT);
+        tryAdaptCharLiteral(valueExpr, paramT);
+        Type* updated = analysis.typeOf(valueExpr.node.greenNode());
+        Type* finalT = updated ? updated : argT;
+        if (!paramT->assignableFrom(finalT)) {
+            errorAtNode(diagNode, "Argument " + argLabel + ": expected '" +
+                paramT->toString() + "', got '" + finalT->toString() + "'");
+        }
+    };
+    for (size_t i = 0; i < shape.positional.size() && i < choice.argParamIndex.size(); ++i) {
+        checkOne(shape.positional[i], shape.positionalTypes[i], choice.argParamIndex[i],
+                 std::to_string(i + 1), shape.positional[i].node);
+    }
+    for (size_t k = 0; k < shape.named.size(); ++k) {
+        size_t i = shape.positional.size() + k;
+        if (i >= choice.argParamIndex.size()) break;
+        checkOne(shape.named[k].value, shape.named[k].type, choice.argParamIndex[i],
+                 "'" + asciiOf(shape.named[k].name) + "'", shape.named[k].node);
+    }
+    if (!shape.named.empty() && callNode) {
+        analysis.setCallArgOrder(callNode, choice.argParamIndex);
+    }
+    return sym->returnType ? sym->returnType : typeCtx.getError();
+}
+
+// The record type whose methods a call receiver exposes: unwraps `T?` for safe
+// calls and maps a bounded type parameter to its bound class.
+StructInfo* Analyzer::receiverStructInfo(const std::optional<ast::Expression>& obj,
+                                         bool unwrapOptional) {
+    if (!obj) return nullptr;
+    Type* t = analysis.typeOf(obj->node.greenNode());
+    if (!t) return nullptr;
+    if (unwrapOptional) {
+        if (!t->isOptional() || !t->inner) return nullptr;
+        t = t->inner;
+    }
+    if (t->isTypeParam() && t->structInfo) {
+        if (Type* bound = typeCtx.lookupClass(t->structInfo->modulePath, t->structInfo->name)) {
+            t = bound;
+        }
+    }
+    return (t->hasRecordLayout() && t->structInfo) ? t->structInfo : nullptr;
+}
+
 Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
     Type* result = [&]() -> Type* {
     auto callee = expr.callee();
@@ -2652,6 +3123,27 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                         Symbol* fnSym = nsSym->namespaceTarget->globalSymbol(*memberName);
                         if (fnSym && fnSym->kind == SymbolKind::Function) {
                             analysis.setSymbol(idObj->node.greenNode(), nsSym);
+                            std::vector<Symbol*> chain = overloadChainOf(fnSym);
+                            if (chain.size() > 1 || callUsesNamedArguments(args)) {
+                                analysis.setSymbol(member.node.greenNode(), fnSym);
+                                CallShape shape = analyzeCallShape(args);
+                                std::vector<OverloadCandidate> candidates;
+                                for (Symbol* s : chain) {
+                                    candidates.push_back({s, nullptr, s->isPublic});
+                                }
+                                OverloadChoice choice = resolveOverloadedCall(
+                                    candidates, shape, expr.node, asciiOf(*memberName), "Function");
+                                if (choice.failed) return typeCtx.getError();
+                                analysis.setSymbol(member.node.greenNode(), choice.symbol);
+                                if (!choice.accessible) {
+                                    errorAtNode(member.node, "Function '" + asciiOf(*memberName) +
+                                        "' is not public in module '" +
+                                        asciiOf(nsSym->namespaceModulePath) +
+                                        "' and cannot be called from another module.");
+                                    return typeCtx.getError();
+                                }
+                                return checkResolvedCallArguments(shape, choice, expr.node.greenNode());
+                            }
                             if (!fnSym->isPublic) {
                                 errorAtNode(member.node, "Function '" + asciiOf(*memberName) +
                                     "' is not public in module '" +
@@ -2812,9 +3304,30 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
         auto* memberInfo = analysis.find(member.node.greenNode());
         Symbol* methodSym = memberInfo ? memberInfo->resolvedMethodSymbol : nullptr;
         if (methodSym) {
+            auto mname = member.memberText().value_or(std::u16string{});
+            StructInfo* recvInfo = receiverStructInfo(member.object(), /*unwrapOptional=*/false);
+            std::vector<const MethodInfo*> cands = recvInfo
+                ? collectMethodCandidates(recvInfo, mname) : std::vector<const MethodInfo*>{};
+            if (cands.size() > 1 || callUsesNamedArguments(args)) {
+                CallShape shape = analyzeCallShape(args);
+                std::vector<OverloadCandidate> candidates;
+                for (const MethodInfo* mi : cands) {
+                    candidates.push_back({mi->symbol, mi,
+                        isMemberAccessAllowed(mi->visibility, mi->definingClass)});
+                }
+                if (candidates.empty()) candidates.push_back({methodSym, nullptr, true});
+                OverloadChoice choice = resolveOverloadedCall(
+                    candidates, shape, expr.node, asciiOf(mname), "Method");
+                if (choice.failed) return typeCtx.getError();
+                if (!choice.accessible && choice.method) {
+                    checkMemberAccess(member.node, mname, choice.method->visibility,
+                                      choice.method->definingClass);
+                }
+                analysis.setMethodSymbol(member.node.greenNode(), choice.symbol);
+                return checkResolvedCallArguments(shape, choice, expr.node.greenNode());
+            }
             size_t req = requiredArgCount(methodSym);
             if (args.size() < req || args.size() > methodSym->paramTypes.size()) {
-                auto mname = member.memberText().value_or(std::u16string{});
                 errorAtNode(expr.node, "Method '" + asciiOf(mname) + "' expects " +
                     std::to_string(req) +
                     (req == methodSym->paramTypes.size() ? "" : "-" + std::to_string(methodSym->paramTypes.size())) +
@@ -2860,6 +3373,30 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
         Symbol* methodSym = memberInfo ? memberInfo->resolvedMethodSymbol : nullptr;
         if (methodSym) {
             auto mname = member.memberText().value_or(std::u16string{});
+            StructInfo* recvInfo = receiverStructInfo(member.object(), /*unwrapOptional=*/true);
+            std::vector<const MethodInfo*> cands = recvInfo
+                ? collectMethodCandidates(recvInfo, mname) : std::vector<const MethodInfo*>{};
+            if (cands.size() > 1 || callUsesNamedArguments(args)) {
+                CallShape shape = analyzeCallShape(args);
+                std::vector<OverloadCandidate> candidates;
+                for (const MethodInfo* mi : cands) {
+                    candidates.push_back({mi->symbol, mi,
+                        isMemberAccessAllowed(mi->visibility, mi->definingClass)});
+                }
+                if (candidates.empty()) candidates.push_back({methodSym, nullptr, true});
+                OverloadChoice choice = resolveOverloadedCall(
+                    candidates, shape, expr.node, asciiOf(mname), "Method");
+                if (choice.failed) return typeCtx.getError();
+                if (!choice.accessible && choice.method) {
+                    checkMemberAccess(member.node, mname, choice.method->visibility,
+                                      choice.method->definingClass);
+                }
+                analysis.setMethodSymbol(member.node.greenNode(), choice.symbol);
+                Type* ret = checkResolvedCallArguments(shape, choice, expr.node.greenNode());
+                if (!ret || ret->isError()) return typeCtx.getError();
+                if (ret->isVoid()) return ret;
+                return typeCtx.getOptional(ret);
+            }
             size_t req = requiredArgCount(methodSym);
             if (args.size() < req || args.size() > methodSym->paramTypes.size()) {
                 errorAtNode(expr.node, "Method '" + asciiOf(mname) + "' expects " +
@@ -2902,15 +3439,29 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
             for (auto& a : args) analyzeExpr(a);
             return typeCtx.getPrimitive(TypeKind::Void);
         }
-        int cidx = base->findMethodIndex(base->name);
-        if (cidx < 0) {
+        std::vector<const MethodInfo*> ctorCands;
+        for (const auto& m : base->methods) {
+            if (m.name == base->name && m.symbol) ctorCands.push_back(&m);
+        }
+        if (ctorCands.empty()) {
             if (!args.empty())
                 errorAtNode(expr.node, "Base class '" + asciiOf(base->name) +
                     "' has no constructor, so 'super(...)' takes no arguments");
             for (auto& a : args) analyzeExpr(a);
             return typeCtx.getPrimitive(TypeKind::Void);
         }
-        Symbol* ctorSym = base->methods[cidx].symbol;
+        if (ctorCands.size() > 1 || callUsesNamedArguments(args)) {
+            CallShape shape = analyzeCallShape(args);
+            std::vector<OverloadCandidate> candidates;
+            for (const MethodInfo* mi : ctorCands) candidates.push_back({mi->symbol, mi, true});
+            OverloadChoice choice = resolveOverloadedCall(
+                candidates, shape, expr.node, asciiOf(base->name), "Base constructor");
+            if (choice.failed) return typeCtx.getPrimitive(TypeKind::Void);
+            analysis.setMethodSymbol(callee->node.greenNode(), choice.symbol);
+            checkResolvedCallArguments(shape, choice, expr.node.greenNode());
+            return typeCtx.getPrimitive(TypeKind::Void);
+        }
+        Symbol* ctorSym = ctorCands.front()->symbol;
         analysis.setMethodSymbol(callee->node.greenNode(), ctorSym);
         size_t req = requiredArgCount(ctorSym);
         if (args.size() < req || args.size() > ctorSym->paramTypes.size()) {
@@ -2960,6 +3511,17 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
     if (sym->isTemplate) {
         return analyzeGenericCall(expr, sym, *name);
     }
+    std::vector<Symbol*> chain = overloadChainOf(sym);
+    if (chain.size() > 1 || callUsesNamedArguments(args)) {
+        CallShape shape = analyzeCallShape(args);
+        std::vector<OverloadCandidate> candidates;
+        for (Symbol* s : chain) candidates.push_back({s, nullptr, true});
+        OverloadChoice choice = resolveOverloadedCall(
+            candidates, shape, expr.node, asciiOf(*name), "Function");
+        if (choice.failed) return typeCtx.getError();
+        analysis.setSymbol(idCallee->node.greenNode(), choice.symbol);
+        return checkResolvedCallArguments(shape, choice, expr.node.greenNode());
+    }
     return checkDirectCallArguments(expr, sym, *name);
     }();
     clearNarrowingsForCall(expr);
@@ -2969,6 +3531,18 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
 Type* Analyzer::analyzeGenericCall(const ast::CallExpression& expr, Symbol* sym,
                                    const std::u16string& funcName) {
     auto args = expr.arguments();
+    if (callUsesNamedArguments(args)) {
+        errorAtNode(expr.node, "Generic function '" + asciiOf(funcName) +
+            "' does not support named arguments; pass the arguments in order.");
+        for (auto& a : args) {
+            if (auto na = a.asNamedArgument()) {
+                if (auto value = na->value()) analyzeExpr(*value);
+            } else {
+                analyzeExpr(a);
+            }
+        }
+        return typeCtx.getError();
+    }
     auto explicitArgs = expr.typeArguments();
     size_t arity = sym->typeParamNames.size();
 
@@ -3084,6 +3658,18 @@ Type* Analyzer::checkDirectCallArguments(const ast::CallExpression& expr, Symbol
 Type* Analyzer::analyzeExternalCall(const ast::CallExpression& expr, Symbol* sym,
                                     const std::u16string& funcName) {
     auto args = expr.arguments();
+    if (callUsesNamedArguments(args)) {
+        errorAtNode(expr.node, "External function '" + asciiOf(funcName) +
+            "' does not support named arguments; pass the arguments in order.");
+        for (auto& a : args) {
+            if (auto na = a.asNamedArgument()) {
+                if (auto value = na->value()) analyzeExpr(*value);
+            } else if (!a.asOutArgument()) {
+                analyzeExpr(a);
+            }
+        }
+        return sym->returnType ? sym->returnType : typeCtx.getError();
+    }
     size_t expected = sym->paramTypes.size();
     if (args.size() != expected) {
         errorAtNode(expr.node, "External function '" + asciiOf(funcName) + "' expects " +
@@ -3277,7 +3863,11 @@ Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
     }
     if (StructInfo* decl = objT->structInfo->classDeclaringMethod(*memberName)) {
         const MethodInfo& mi = decl->methods[decl->findMethodIndex(*memberName)];
-        checkMemberAccess(expr.node, *memberName, mi.visibility, mi.definingClass);
+        // An overloaded name defers visibility checking to call resolution,
+        // where the chosen overload is known.
+        if (collectMethodCandidates(objT->structInfo, *memberName).size() <= 1) {
+            checkMemberAccess(expr.node, *memberName, mi.visibility, mi.definingClass);
+        }
         analysis.setMethodSymbol(expr.node.greenNode(), mi.symbol);
         return typeCtx.getError();  // callee reference - not a value
     }
@@ -3318,7 +3908,9 @@ Type* Analyzer::analyzeSafeMember(const ast::SafeMemberExpression& expr) {
     }
     if (StructInfo* decl = inner->structInfo->classDeclaringMethod(*memberName)) {
         const MethodInfo& mi = decl->methods[decl->findMethodIndex(*memberName)];
-        checkMemberAccess(expr.node, *memberName, mi.visibility, mi.definingClass);
+        if (collectMethodCandidates(inner->structInfo, *memberName).size() <= 1) {
+            checkMemberAccess(expr.node, *memberName, mi.visibility, mi.definingClass);
+        }
         analysis.setMethodSymbol(expr.node.greenNode(), mi.symbol);
         return typeCtx.getError();
     }
@@ -3595,12 +4187,25 @@ Type* Analyzer::analyzeNew(const ast::NewExpression& expr) {
             asciiOf(*typeName) + "'; instantiate a concrete subclass instead");
     }
 
-    Symbol* ctor = nullptr;
-    int ctorIdx = t->structInfo->findMethodIndex(t->structInfo->name);
-    if (ctorIdx >= 0) ctor = t->structInfo->methods[ctorIdx].symbol;
+    std::vector<const MethodInfo*> ctorCands;
+    for (const auto& m : t->structInfo->methods) {
+        if (m.name == t->structInfo->name && m.symbol) ctorCands.push_back(&m);
+    }
 
     auto args = expr.arguments();
-    if (ctor) {
+    if (ctorCands.size() > 1 || (!ctorCands.empty() && callUsesNamedArguments(args))) {
+        CallShape shape = analyzeCallShape(args);
+        std::vector<OverloadCandidate> candidates;
+        for (const MethodInfo* mi : ctorCands) candidates.push_back({mi->symbol, mi, true});
+        OverloadChoice choice = resolveOverloadedCall(
+            candidates, shape, expr.node, asciiOf(*typeName), "Constructor");
+        if (!choice.failed) {
+            analysis.setMethodSymbol(expr.node.greenNode(), choice.symbol);
+            checkResolvedCallArguments(shape, choice, expr.node.greenNode());
+        }
+    } else if (!ctorCands.empty()) {
+        Symbol* ctor = ctorCands.front()->symbol;
+        analysis.setMethodSymbol(expr.node.greenNode(), ctor);
         size_t req = requiredArgCount(ctor);
         if (args.size() < req || args.size() > ctor->paramTypes.size()) {
             errorAtNode(expr.node, "Constructor '" + asciiOf(*typeName) + "' expects " +

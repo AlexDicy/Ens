@@ -507,14 +507,26 @@ struct CodeGenerator::Impl {
         return typeCtx->substitute(t, substOwner, substArgs);
     }
 
+    // A method's position in its owner's method table; clones keep the
+    // template's order, so the index maps a method across instantiations.
+    static int methodIndexOfSymbol(StructInfo* owner, Symbol* sym) {
+        if (!owner || !sym) return -1;
+        for (size_t i = 0; i < owner->methods.size(); ++i) {
+            if (owner->methods[i].symbol == sym) return static_cast<int>(i);
+        }
+        return -1;
+    }
+
     // Inside a template body, a call resolves to the template's own method symbol;
     // remap it to the concrete instance's cloned method so codegen calls the right
-    // monomorphized function.
+    // monomorphized function. Mapping is by method-table index so overloads keep
+    // their identity.
     Symbol* mapInstanceMethod(Symbol* sym) const {
         if (sym && substTemplate && substInstanceType && substInstanceType->structInfo &&
             sym->methodOwner == substTemplate) {
-            int idx = substInstanceType->structInfo->findMethodIndex(sym->name);
-            if (idx >= 0) return substInstanceType->structInfo->methods[idx].symbol;
+            int idx = methodIndexOfSymbol(substTemplate, sym);
+            auto& methods = substInstanceType->structInfo->methods;
+            if (idx >= 0 && idx < static_cast<int>(methods.size())) return methods[idx].symbol;
         }
         // A call may also resolve to a method of an open instance (an
         // instantiation whose args mention the enclosing template's type
@@ -525,8 +537,11 @@ struct CodeGenerator::Impl {
                     ::Type* concreteT = typeCtx->substitute(ownerT, substOwner, substArgs);
                     if (concreteT && concreteT->structInfo &&
                         concreteT->structInfo != sym->methodOwner) {
-                        int idx = concreteT->structInfo->findMethodIndex(sym->name);
-                        if (idx >= 0) return concreteT->structInfo->methods[idx].symbol;
+                        int idx = methodIndexOfSymbol(sym->methodOwner, sym);
+                        auto& methods = concreteT->structInfo->methods;
+                        if (idx >= 0 && idx < static_cast<int>(methods.size())) {
+                            return methods[idx].symbol;
+                        }
                     }
                 }
             }
@@ -534,9 +549,44 @@ struct CodeGenerator::Impl {
         return sym;
     }
 
+    // The vtable slot of the exact method declaration a call resolved to, found
+    // along the receiver's base chain. -1 when the method is not virtual.
+    int vtableSlotForMethodSymbol(::Type* recvT, Symbol* methodSym) const {
+        if (!recvT || !recvT->structInfo || !methodSym) return -1;
+        for (StructInfo* s = recvT->structInfo; s; s = s->baseInfo) {
+            for (const auto& mi : s->methods) {
+                if (mi.symbol == methodSym) return mi.vtableSlot;
+            }
+        }
+        return -1;
+    }
+
+    // Suffix distinguishing overloads at the symbol level. A generic instance's
+    // methods use the template's parameter spellings so overloads that collapse
+    // to one type after substitution still get distinct symbols.
+    std::string overloadSuffix(Symbol* sym) const {
+        if (!sym || !sym->isOverloaded) return "";
+        const std::vector<::Type*>* params = &sym->paramTypes;
+        if (sym->methodOwner && sym->methodOwner->templateOf) {
+            StructInfo* tmpl = sym->methodOwner->templateOf;
+            int idx = methodIndexOfSymbol(sym->methodOwner, sym);
+            if (idx >= 0 && idx < static_cast<int>(tmpl->methods.size()) &&
+                tmpl->methods[idx].symbol) {
+                params = &tmpl->methods[idx].symbol->paramTypes;
+            }
+        }
+        if (params->empty()) return "$void";
+        std::string s = "$";
+        for (size_t i = 0; i < params->size(); ++i) {
+            if (i) s += "_";
+            s += mangleTypeForName((*params)[i]);
+        }
+        return s;
+    }
+
     // Method/owner-qualified mangled function name (e.g. Vector__int___push).
-    std::string mangledMethodName(StructInfo* owner, const std::u16string& name) const {
-        return mangledTypeName(owner) + "_" + asAscii(name);
+    std::string mangledMethodName(StructInfo* owner, Symbol* sym) const {
+        return mangledTypeName(owner) + "_" + asAscii(sym->name) + overloadSuffix(sym);
     }
 
     bool initializeTargetsOnce() {
@@ -618,8 +668,9 @@ struct CodeGenerator::Impl {
         llvm::Type* retType = mapType(sym->returnType);
         auto* fnType = llvm::FunctionType::get(retType, paramTypes, false);
 
-        std::string mangled = sym->linkName.empty() ? asAscii(sym->name) : asAscii(sym->linkName);
-        if (owner) mangled = mangledMethodName(owner, sym->name);
+        std::string mangled = sym->linkName.empty()
+            ? asAscii(sym->name) + overloadSuffix(sym) : asAscii(sym->linkName);
+        if (owner) mangled = mangledMethodName(owner, sym);
 
         if (auto* existing = module->getFunction(mangled)) {
             values[sym] = existing;
@@ -662,9 +713,9 @@ struct CodeGenerator::Impl {
         llvm::Type* retType = mapType(sym->returnType);
         auto* fnType = llvm::FunctionType::get(retType, paramTypes, false);
 
-        std::string mangled = asAscii(fname);
+        std::string mangled = asAscii(fname) + overloadSuffix(sym);
         if (receiver && receiver->structInfo) {
-            mangled = mangledMethodName(receiver->structInfo, fname);
+            mangled = mangledMethodName(receiver->structInfo, sym);
         }
         // A top-level `main` is renamed; a compiler-emitted `main` wrapper
         // records the process arguments and, when `main` throws, handles the
@@ -764,15 +815,13 @@ struct CodeGenerator::Impl {
         if (receiver && receiver->structInfo && receiver->structInfo->baseInfo && thisSym &&
             sym->name == receiver->structInfo->name && !ctorHasExplicitSuper(fn)) {
             StructInfo* base = receiver->structInfo->baseInfo;
-            int bidx = base->findMethodIndex(base->name);
+            int bidx = base->findZeroArgMethodIndex(base->name);
             if (bidx >= 0) {
                 Symbol* baseCtor = base->methods[bidx].symbol;
-                if (baseCtor && baseCtor->paramTypes.empty()) {
-                    if (llvm::Function* bfn = getOrDeclareExternalFunction(baseCtor, nullptr)) {
-                        llvm::Value* thisVal = builder->CreateLoad(
-                            llvm::PointerType::get(ctx, 0), values[thisSym], "this");
-                        builder->CreateCall(bfn, { thisVal });
-                    }
+                if (llvm::Function* bfn = getOrDeclareExternalFunction(baseCtor, nullptr)) {
+                    llvm::Value* thisVal = builder->CreateLoad(
+                        llvm::PointerType::get(ctx, 0), values[thisSym], "this");
+                    builder->CreateCall(bfn, { thisVal });
                 }
             }
         }
@@ -1769,9 +1818,10 @@ struct CodeGenerator::Impl {
     ResolvedMethod resolveClassMethod(::Type* classT, const std::u16string& name) {
         ResolvedMethod out;
         if (!classT || !classT->structInfo) return out;
-        StructInfo* decl = classT->structInfo->classDeclaringMethod(name);
+        // Protocol methods take no parameters; skip unrelated overloads.
+        StructInfo* decl = classT->structInfo->classDeclaringZeroArgMethod(name);
         if (!decl) return out;
-        const MethodInfo& mi = decl->methods[decl->findMethodIndex(name)];
+        const MethodInfo& mi = decl->methods[decl->findZeroArgMethodIndex(name)];
         out.symbol = mi.symbol;
         out.vtableSlot = mi.vtableSlot;
         return out;
@@ -5283,7 +5333,9 @@ struct CodeGenerator::Impl {
     }
 
     bool appendCallArgs(Symbol* sym, const std::vector<ast::Expression>& userArgs,
-                        std::vector<llvm::Value*>& out) {
+                        const GreenElement* callNode, std::vector<llvm::Value*>& out) {
+        const std::vector<int>* order = callNode ? analysis.callArgOrderOf(callNode) : nullptr;
+        if (order && sym) return appendMappedCallArgs(sym, userArgs, *order, out);
         for (size_t i = 0; i < userArgs.size(); ++i) {
             auto& a = userArgs[i];
             ::Type* paramT = subst((sym && i < sym->paramTypes.size()) ? sym->paramTypes[i] : nullptr);
@@ -5318,6 +5370,61 @@ struct CodeGenerator::Impl {
                 if (!v) return false;
                 out.push_back(v);
             }
+        }
+        return true;
+    }
+
+    // Named-argument form: arguments evaluate in source order and are passed in
+    // parameter order; parameters left unbound take their declared defaults.
+    bool appendMappedCallArgs(Symbol* sym, const std::vector<ast::Expression>& userArgs,
+                              const std::vector<int>& order, std::vector<llvm::Value*>& out) {
+        size_t nParams = sym->paramTypes.size();
+        std::vector<llvm::Value*> slots(nParams, nullptr);
+        std::vector<bool> filled(nParams, false);
+        for (size_t i = 0; i < userArgs.size() && i < order.size(); ++i) {
+            int j = order[i];
+            if (j < 0 || j >= static_cast<int>(nParams)) return false;
+            ast::Expression value = userArgs[i];
+            if (auto na = userArgs[i].asNamedArgument()) {
+                auto inner = na->value();
+                if (!inner) return false;
+                value = *inner;
+            }
+            ::Type* paramT = subst(sym->paramTypes[j]);
+            llvm::Value* v;
+            if (paramIsByPointer(sym, static_cast<size_t>(j))) {
+                v = emitAddressForByPointerArg(value, paramT);
+            } else {
+                v = emitExprConverted(value, paramT);
+                if (v) trackOwnedArgTemp(v, value, paramT);
+            }
+            if (!v) return false;
+            slots[j] = v;
+            filled[j] = true;
+        }
+        if (sym->funcDeclCst) {
+            auto rootNode = SyntaxNode::makeRoot(sym->funcDeclCst);
+            if (auto fn = ast::FuncDecl::cast(*rootNode)) {
+                auto params = fn->parameters();
+                for (size_t j = 0; j < nParams && j < params.size(); ++j) {
+                    if (filled[j]) continue;
+                    auto dv = params[j].defaultValue();
+                    if (!dv) return false;
+                    auto expr = dv->expression();
+                    if (!expr) return false;
+                    ::Type* paramT = subst(sym->paramTypes[j]);
+                    llvm::Value* v = paramIsByPointer(sym, j)
+                        ? emitAddressForByPointerArg(*expr, paramT)
+                        : emitExprConverted(*expr, paramT);
+                    if (!v) return false;
+                    slots[j] = v;
+                    filled[j] = true;
+                }
+            }
+        }
+        for (size_t j = 0; j < nParams; ++j) {
+            if (!filled[j]) return false;
+            out.push_back(slots[j]);
         }
         return true;
     }
@@ -5382,24 +5489,27 @@ struct CodeGenerator::Impl {
             }
         }
 
-        int ctorIdx = t->structInfo->findMethodIndex(t->structInfo->name);
-        if (ctorIdx >= 0) {
-            Symbol* ctorSym = t->structInfo->methods[ctorIdx].symbol;
+        Symbol* ctorSym = methodSymbolOf(e.node);
+        if (!ctorSym) {
+            int ctorIdx = t->structInfo->findMethodIndex(t->structInfo->name);
+            if (ctorIdx >= 0) ctorSym = t->structInfo->methods[ctorIdx].symbol;
+        }
+        if (ctorSym) {
             llvm::Function* fn = getOrDeclareExternalFunction(ctorSym, t);
             if (fn) {
                 std::vector<llvm::Value*> args;
                 args.reserve(e.arguments().size() + 1);
                 args.push_back(heapPtr);
-                if (!appendCallArgs(ctorSym, e.arguments(), args)) return nullptr;
+                if (!appendCallArgs(ctorSym, e.arguments(), e.node.greenNode(), args)) return nullptr;
                 builder->CreateCall(fn, args);
             }
         } else {
             // No own constructor: run the nearest inherited zero-argument constructor.
             for (StructInfo* base = t->structInfo->baseInfo; base; base = base->baseInfo) {
-                int bidx = base->findMethodIndex(base->name);
-                if (bidx < 0) continue;
-                Symbol* baseCtor = base->methods[bidx].symbol;
-                if (baseCtor && baseCtor->paramTypes.empty()) {
+                if (base->findMethodIndex(base->name) < 0) continue;
+                int bidx = base->findZeroArgMethodIndex(base->name);
+                if (bidx >= 0) {
+                    Symbol* baseCtor = base->methods[bidx].symbol;
                     if (llvm::Function* bfn = getOrDeclareExternalFunction(baseCtor, nullptr))
                         builder->CreateCall(bfn, { heapPtr });
                 }
@@ -5440,7 +5550,7 @@ struct CodeGenerator::Impl {
             if (!thisPtr || !fn) return nullptr;
             std::vector<llvm::Value*> args;
             args.push_back(thisPtr);
-            if (!appendCallArgs(ctorSym, e.arguments(), args)) return nullptr;
+            if (!appendCallArgs(ctorSym, e.arguments(), e.node.greenNode(), args)) return nullptr;
             builder->CreateCall(fn, args);
             return nullptr;
         }
@@ -5530,11 +5640,7 @@ struct CodeGenerator::Impl {
                 bool isSuper = obj->asSuper().has_value();
                 // A virtual call dispatches through the vtable, except `super.m()` which is
                 // always a direct call to the inherited implementation.
-                int vslot = -1;
-                if (!isSuper && objType && objType->structInfo) {
-                    if (StructInfo* decl = objType->structInfo->classDeclaringMethod(methodSym->name))
-                        vslot = decl->methods[decl->findMethodIndex(methodSym->name)].vtableSlot;
-                }
+                int vslot = isSuper ? -1 : vtableSlotForMethodSymbol(objType, methodSym);
                 llvm::Function* fn = getOrDeclareExternalFunction(methodSym, objType);
                 if (!fn) {
                     error(e.node.startOffset(), "Internal: method has no LLVM function");
@@ -5547,7 +5653,7 @@ struct CodeGenerator::Impl {
                 trackOwnedArgTemp(receiver, *obj, objType);
                 std::vector<llvm::Value*> args;
                 args.push_back(receiver);
-                if (!appendCallArgs(methodSym, e.arguments(), args)) return nullptr;
+                if (!appendCallArgs(methodSym, e.arguments(), e.node.greenNode(), args)) return nullptr;
                 if (methodSym->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);
                 llvm::Value* result = (vslot >= 0)
                     ? builder->CreateCall(fn->getFunctionType(), loadVtableSlot(receiver, vslot), args)
@@ -5569,7 +5675,7 @@ struct CodeGenerator::Impl {
                         return nullptr;
                     }
                     std::vector<llvm::Value*> args;
-                    if (!appendCallArgs(fnSym, e.arguments(), args)) return nullptr;
+                    if (!appendCallArgs(fnSym, e.arguments(), e.node.greenNode(), args)) return nullptr;
                     if (fnSym->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);
                     llvm::Value* result = builder->CreateCall(fn, args);
                     emitThrowsCheck(fnSym);
@@ -5593,11 +5699,7 @@ struct CodeGenerator::Impl {
                 ::Type* returnType = subst(methodSym->returnType);
                 ::Type* resultType = typeOf(e.node);
                 bool isVoid = returnType && returnType->isVoid();
-                int vslot = -1;
-                if (innerType && innerType->structInfo) {
-                    if (StructInfo* decl = innerType->structInfo->classDeclaringMethod(methodSym->name))
-                        vslot = decl->methods[decl->findMethodIndex(methodSym->name)].vtableSlot;
-                }
+                int vslot = vtableSlotForMethodSymbol(innerType, methodSym);
                 llvm::Function* fn = getOrDeclareExternalFunction(methodSym, innerType);
                 if (!fn) {
                     error(e.node.startOffset(), "Internal: method has no LLVM function");
@@ -5625,7 +5727,7 @@ struct CodeGenerator::Impl {
                 }
                 std::vector<llvm::Value*> args;
                 args.push_back(receiver);
-                if (!appendCallArgs(methodSym, e.arguments(), args)) return nullptr;
+                if (!appendCallArgs(methodSym, e.arguments(), e.node.greenNode(), args)) return nullptr;
                 if (methodSym->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);
                 llvm::Value* callRes = (vslot >= 0)
                     ? builder->CreateCall(fn->getFunctionType(), loadVtableSlot(receiver, vslot), args)
@@ -5669,7 +5771,7 @@ struct CodeGenerator::Impl {
             return nullptr;
         }
         std::vector<llvm::Value*> args;
-        if (!appendCallArgs(sym, e.arguments(), args)) return nullptr;
+        if (!appendCallArgs(sym, e.arguments(), e.node.greenNode(), args)) return nullptr;
         if (sym->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);
         llvm::Value* result = builder->CreateCall(fn, args);
         emitThrowsCheck(sym);
@@ -5693,7 +5795,7 @@ struct CodeGenerator::Impl {
 
         llvm::Function* fn = getOrDeclareGenericFn(sym, mangledGenericFnName(sym, *targs));
         std::vector<llvm::Value*> args;
-        bool ok = fn && appendCallArgs(sym, e.arguments(), args);
+        bool ok = fn && appendCallArgs(sym, e.arguments(), e.node.greenNode(), args);
         llvm::Value* result = nullptr;
         if (ok) {
             if (sym->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);

@@ -1,5 +1,51 @@
 #include "Type.h"
 
+#include "Symbol.h"
+
+bool sameParameterTypes(const Symbol* a, const Symbol* b) {
+    if (!a || !b) return false;
+    if (a->paramTypes.size() != b->paramTypes.size()) return false;
+    for (size_t i = 0; i < a->paramTypes.size(); ++i) {
+        Type* pa = a->paramTypes[i];
+        Type* pb = b->paramTypes[i];
+        if (!pa || !pb) return false;
+        if (!pa->equals(pb)) return false;
+    }
+    return true;
+}
+
+int StructInfo::findMethodIndexBySignature(const std::u16string& methodName,
+                                           const Symbol* like) const {
+    for (size_t i = 0; i < methods.size(); ++i) {
+        if (methods[i].name != methodName) continue;
+        if (sameParameterTypes(methods[i].symbol, like)) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+StructInfo* StructInfo::classDeclaringMethodBySignature(const std::u16string& methodName,
+                                                        const Symbol* like) {
+    for (StructInfo* s = this; s; s = s->baseInfo) {
+        if (s->findMethodIndexBySignature(methodName, like) >= 0) return s;
+    }
+    return nullptr;
+}
+
+int StructInfo::findZeroArgMethodIndex(const std::u16string& methodName) const {
+    for (size_t i = 0; i < methods.size(); ++i) {
+        if (methods[i].name != methodName) continue;
+        if (methods[i].symbol && methods[i].symbol->paramTypes.empty()) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+StructInfo* StructInfo::classDeclaringZeroArgMethod(const std::u16string& methodName) {
+    for (StructInfo* s = this; s; s = s->baseInfo) {
+        if (s->findZeroArgMethodIndex(methodName) >= 0) return s;
+    }
+    return nullptr;
+}
+
 bool Type::isInteger() const {
     switch (kind) {
         case TypeKind::Byte:

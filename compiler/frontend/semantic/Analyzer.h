@@ -174,6 +174,44 @@ private:
                             const std::vector<ast::SwitchArm>& arms,
                             const SyntaxNode& diagNode, bool requireValue);
 
+    // === Overload resolution ===
+    struct NamedArgInfo {
+        std::u16string name;
+        ast::Expression value;
+        SyntaxNode node;        // the NamedArgument node, for diagnostics
+        Type* type = nullptr;
+    };
+    struct CallShape {
+        std::vector<ast::Expression> positional;
+        std::vector<Type*> positionalTypes;
+        std::vector<NamedArgInfo> named;
+        bool malformed = false;   // bad named-argument usage, already reported
+        bool hasErrorArg = false; // an argument failed to type; suppress selection noise
+    };
+    struct OverloadCandidate {
+        Symbol* symbol = nullptr;
+        const MethodInfo* method = nullptr;  // null for free functions
+        bool accessible = true;
+    };
+    struct OverloadChoice {
+        Symbol* symbol = nullptr;
+        const MethodInfo* method = nullptr;
+        std::vector<int> argParamIndex;      // source-order argument -> parameter index
+        bool accessible = true;
+        bool failed = false;                 // resolution error already reported
+    };
+    CallShape analyzeCallShape(const std::vector<ast::Expression>& args);
+    bool mapCallArguments(Symbol* sym, const CallShape& shape, std::vector<int>& mapping,
+                          int& defaultedCount, std::string& failure,
+                          const std::string& kindWord, const std::string& displayName);
+    OverloadChoice resolveOverloadedCall(const std::vector<OverloadCandidate>& candidates,
+                                         const CallShape& shape, const SyntaxNode& diagNode,
+                                         const std::string& displayName,
+                                         const std::string& kindWord);
+    Type* checkResolvedCallArguments(const CallShape& shape, const OverloadChoice& choice,
+                                     const GreenElement* callNode);
+    StructInfo* receiverStructInfo(const std::optional<ast::Expression>& obj, bool unwrapOptional);
+
     Type* analyzeExpr(const ast::Expression& expr);
     Type* analyzeLiteral(const ast::LiteralExpression& expr);
     Type* analyzeIdent(const ast::IdentExpression& expr);

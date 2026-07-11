@@ -314,9 +314,9 @@ void ThrowsAnalyzer::validateFunction(Symbol* sym, const ast::FuncDecl& fn, bool
 
     // Overrides may only narrow the overridden method's contract.
     if (receiver && receiver->baseInfo && !isConstructor) {
-        StructInfo* baseDecl = receiver->baseInfo->classDeclaringMethod(sym->name);
+        StructInfo* baseDecl = receiver->baseInfo->classDeclaringMethodBySignature(sym->name, sym);
         if (baseDecl) {
-            int bi = baseDecl->findMethodIndex(sym->name);
+            int bi = baseDecl->findMethodIndexBySignature(sym->name, sym);
             Symbol* baseSym = bi >= 0 ? baseDecl->methods[bi].symbol : nullptr;
             if (baseSym) {
                 const TypeSet& mine = contractOf(sym);

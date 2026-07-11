@@ -46,6 +46,13 @@ public:
     // whose scope names ($test0, $test1, ...) repeat across modules.
     std::u16string linkName;
 
+    // Next same-name overload declared in the same scope (free functions only;
+    // methods keep their overloads side by side in StructInfo::methods).
+    Symbol* nextOverload = nullptr;
+    // True when this name has more than one declaration in its scope or owner;
+    // codegen then folds the parameter types into the linker-level name.
+    bool isOverloaded = false;
+
     // FFI metadata (set when this function symbol was declared via `external from "..."`).
     bool isExternal = false;
     std::vector<bool> paramIsOut;

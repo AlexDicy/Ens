@@ -67,10 +67,21 @@ public:
         callTypeArgs[g] = std::move(args);
     }
 
+    // Parameter index of each source-order argument, recorded (keyed by the
+    // call/new node) only when the call uses named arguments.
+    const std::vector<int>* callArgOrderOf(const GreenElement* g) const {
+        auto it = callArgOrder.find(g);
+        return it == callArgOrder.end() ? nullptr : &it->second;
+    }
+    void setCallArgOrder(const GreenElement* g, std::vector<int> order) {
+        callArgOrder[g] = std::move(order);
+    }
+
 private:
     std::unordered_map<const GreenElement*, ResolutionInfo> info;
     std::unordered_map<const GreenElement*, Type*> methodReceivers;
     std::unordered_map<const GreenElement*, Symbol*> thisSymbols;
     std::unordered_map<const GreenElement*, int64_t> enumConstants;
     std::unordered_map<const GreenElement*, std::vector<Type*>> callTypeArgs;
+    std::unordered_map<const GreenElement*, std::vector<int>> callArgOrder;
 };

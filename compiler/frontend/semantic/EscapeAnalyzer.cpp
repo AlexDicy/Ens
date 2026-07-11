@@ -307,19 +307,28 @@ void EscapeAnalyzer::scanCall(const ast::CallExpression& e) {
     }
 
     auto args = e.arguments();
+    const std::vector<int>* order = analysis.callArgOrderOf(e.node.greenNode());
     for (size_t i = 0; i < args.size(); ++i) {
-        if (auto id = args[i].asIdent()) {
+        ast::Expression arg = args[i];
+        if (auto na = arg.asNamedArgument()) {
+            auto value = na->value();
+            if (!value) continue;
+            arg = *value;
+        }
+        size_t paramIndex = (order && i < order->size() && (*order)[i] >= 0)
+            ? static_cast<size_t>((*order)[i]) : i;
+        if (auto id = arg.asIdent()) {
             auto* info = analysis.find(id->node.greenNode());
             Symbol* argSym = info ? info->resolvedSymbol : nullptr;
             bool calleeEscapesParam = true;
-            if (calleeSym && i < calleeSym->escapeInfo.params.size()) {
-                calleeEscapesParam = (calleeSym->escapeInfo.params[i] == EscapeKind::Escape);
+            if (calleeSym && paramIndex < calleeSym->escapeInfo.params.size()) {
+                calleeEscapesParam = (calleeSym->escapeInfo.params[paramIndex] == EscapeKind::Escape);
             }
             if (argSym && calleeEscapesParam) {
                 markSymbolEscape(argSym);
             }
         } else {
-            scanExpression(args[i]);
+            scanExpression(arg);
         }
     }
 }
@@ -345,6 +354,10 @@ void EscapeAnalyzer::scanParen(const ast::ParenExpression& e) {
 
 void EscapeAnalyzer::scanNew(const ast::NewExpression& e) {
     for (auto& arg : e.arguments()) {
+        if (auto na = arg.asNamedArgument()) {
+            if (auto value = na->value()) scanExpression(*value);
+            continue;
+        }
         scanExpression(arg);
     }
 }

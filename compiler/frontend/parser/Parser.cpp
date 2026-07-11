@@ -1467,5 +1467,15 @@ void Parser::parseCallArgument() {
         builder.finishNode();
         return;
     }
+    // `name: expr`: a named argument. Unambiguous at argument start because no
+    // expression begins with an identifier directly followed by ':'.
+    if (at(SyntaxKind::Identifier) && peekKind(1) == SyntaxKind::Colon) {
+        builder.startNode(SyntaxKind::NamedArgument);
+        bump();  // parameter name
+        bump();  // ':'
+        parseExpression();
+        builder.finishNode();
+        return;
+    }
     parseExpression();
 }

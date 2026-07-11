@@ -21,6 +21,7 @@ class SubscriptExpression;
 class SafeSubscriptExpression;
 class CastExpression;
 class OutArgument;
+class NamedArgument;
 class AssignExpression;
 class TernaryExpression;
 class NullCoalesceExpression;
@@ -56,6 +57,7 @@ public:
     std::optional<SafeSubscriptExpression> asSafeSubscript() const;
     std::optional<CastExpression>      asCast() const;
     std::optional<OutArgument>         asOutArgument() const;
+    std::optional<NamedArgument>       asNamedArgument() const;
     std::optional<AssignExpression>    asAssign() const;
     std::optional<TernaryExpression>   asTernary() const;
     std::optional<NullCoalesceExpression> asNullCoalesce() const;
@@ -315,6 +317,19 @@ public:
     }
     std::optional<SyntaxNode> identifier() const;
     std::optional<std::u16string> nameText() const;
+};
+
+// A `name: expr` call argument binding a parameter by name.
+class NamedArgument {
+public:
+    SyntaxNode node;
+    static std::optional<NamedArgument> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::NamedArgument) return std::nullopt;
+        return NamedArgument{n};
+    }
+    std::optional<SyntaxNode> identifier() const;
+    std::optional<std::u16string> nameText() const;
+    std::optional<Expression> value() const;
 };
 
 class TryExpression {
