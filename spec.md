@@ -115,6 +115,11 @@ Class fields may declare default values just like struct fields. Defaults are ap
 
 An `abstract class` cannot be instantiated. It may declare `abstract` methods (a signature with no body), that every concrete subclass must `override`.
 
+A `sealed class` closes its hierarchy: every direct subclass must be declared in the same module as the sealed class, and extending it from another module is a compile error.
+A sealed class may be abstract or concrete (`sealed abstract class Expr { ... }`), but it cannot also be `final`, which already forbids subclasses.
+Sealing does not constrain the subclasses themselves: they may in turn be sealed, final, abstract, or left open.
+Because the compiler sees the whole hierarchy, a `switch` over a sealed class can be checked for exhaustiveness (see the switch section).
+
 ---
 
 Classes, structs, functions, and methods may be generic: they declare type parameters in angle brackets and work uniformly over any type argument. A type parameter can be used as a field type, a parameter or return type, a local type, and as the element type of an array.
@@ -562,7 +567,7 @@ if (command == Command.Submit) {
 }
 ```
 
-`switch` matches a value against a set of arms and runs (or evaluates to) the first matching arm. It works over an enum, an integer, or a string. Each arm is written `label -> body`, or `default -> body` for the catch-all; several labels separated by commas share one arm. There is no fall-through, so exactly one arm runs.
+`switch` matches a value against a set of arms and runs (or evaluates to) the first matching arm. It works over an enum, an integer, a string, or a class value. Each arm is written `label -> body`, or `default -> body` for the catch-all; several labels separated by commas share one arm. There is no fall-through, so exactly one arm runs.
 
 A switch over an enum must be exhaustive: it either covers every member or provides a `default`. A non-exhaustive enum switch is a compile error that names the missing members, so adding a member forces every switch over that enum to be updated. A switch over an integer or a string must provide a `default`.
 
@@ -593,6 +598,38 @@ let length = switch (name) {      // name is string?, the null case is handled
     null -> -1,
     default -> 0,
 };
+```
+
+A switch over a class value matches on the runtime type instead of on labels.
+A type arm is written `is Type binding -> body`; the binding is an arm-scoped constant of type `Type`, and it may be omitted when the value is not needed.
+Arm types follow the same rules as the `is` operator, and each must be a strict subclass of the switch value's class: an unrelated type could never match, and an arm of the value's own type would match everything, which is what `default` is for.
+Arms are tested in source order, and an arm whose type is already covered by an earlier arm is a compile error, just like a `catch` clause shadowed by a broader one.
+Value labels cannot be mixed with type arms; `default` is allowed alongside them, and for a nullable value a `null ->` arm handles the null case exactly as it does elsewhere.
+
+When the value's class is sealed and abstract, the switch may omit `default` by covering every direct subclass; an arm for a subclass also covers all of that subclass's descendants.
+A non-exhaustive switch over a sealed hierarchy is a compile error that names the missing subclasses, so adding a subclass forces every such switch to be updated.
+A concrete sealed class still needs `default`, because the value may be an instance of the root class itself, which no subclass arm can match.
+When the class is not sealed, `default` is required, just like an integer or string switch, and a nullable value additionally needs its `null ->` arm (or `default`).
+Type arms work in both the statement and the expression forms.
+
+```ens
+sealed abstract class Expr { ... }
+class Num extends Expr { int value; ... }
+class Neg extends Expr { Expr inner; ... }
+class Add extends Expr { Expr left; Expr right; ... }
+
+eval(Expr e) -> int {
+    return switch (e) {           // exhaustive: every subclass has an arm
+        is Num n -> n.value,
+        is Neg n -> 0 - eval(n.inner),
+        is Add a -> eval(a.left) + eval(a.right),
+    };
+}
+
+switch (shape) {                  // an open hierarchy needs default
+    is Circle c -> { render(c); },
+    default -> { },
+}
 ```
 
 ---
