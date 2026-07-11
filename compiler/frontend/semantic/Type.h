@@ -70,6 +70,8 @@ struct StructInfo {
     uint32_t typeId = 0;             // unique per class, for RTTI
     bool isAbstract = false;
     bool isFinal = false;
+    bool isSealed = false;           // direct subclasses restricted to the declaring module
+    std::vector<StructInfo*> directSubclasses;  // classes extending this one directly
 
     // Generics. A template carries its type-parameter names and optional bounds;
     // an instantiation points back at its template and records the concrete args.

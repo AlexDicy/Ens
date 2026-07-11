@@ -203,6 +203,7 @@ Type* TypeContext::instantiateInternal(StructInfo* templ, TypeKind kind,
     info->visibility = templ->visibility;
     info->isAbstract = templ->isAbstract;
     info->isFinal = templ->isFinal;
+    info->isSealed = templ->isSealed;
     info->templateOf = templ;
     info->typeArgs = args;
     info->baseInfo = templ->baseInfo;

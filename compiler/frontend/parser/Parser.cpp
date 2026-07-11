@@ -199,12 +199,12 @@ void Parser::parseTopLevel() {
         parseExternalDecl();
         return;
     }
-    // Skip leading declaration modifiers (visibility + abstract/final) to classify struct vs class.
+    // Skip leading declaration modifiers (visibility + abstract/final/sealed) to classify struct vs class.
     int declMods = 0;
     while (true) {
         SyntaxKind k = peekKind(declMods);
         if (k == SyntaxKind::KwPrivate || k == SyntaxKind::KwProtected || k == SyntaxKind::KwPublic ||
-            k == SyntaxKind::KwAbstract || k == SyntaxKind::KwFinal) {
+            k == SyntaxKind::KwAbstract || k == SyntaxKind::KwFinal || k == SyntaxKind::KwSealed) {
             declMods++;
             continue;
         }
@@ -538,8 +538,8 @@ void Parser::parseStructOrClassDecl(SyntaxKind nodeKind, SyntaxKind keywordKind)
     bool isClass = (keywordKind == SyntaxKind::KwClass);
     builder.startNode(nodeKind);
     parseVisibilityModifier();
-    while (at(SyntaxKind::KwAbstract) || at(SyntaxKind::KwFinal)) {
-        if (!isClass) reportAtCurrent("'abstract' and 'final' are only allowed on classes");
+    while (at(SyntaxKind::KwAbstract) || at(SyntaxKind::KwFinal) || at(SyntaxKind::KwSealed)) {
+        if (!isClass) reportAtCurrent("'abstract', 'final', and 'sealed' are only allowed on classes");
         bump();
     }
     expect(keywordKind, keywordKind == SyntaxKind::KwStruct ? "'struct'" : "'class'");
@@ -1119,6 +1119,13 @@ void Parser::parseSwitchArm() {
     builder.startNode(SyntaxKind::SwitchArm);
     if (at(SyntaxKind::KwDefault)) {
         bump();
+    } else if (at(SyntaxKind::KwIs)) {
+        // Type arm: `is Type [binding] -> body`. A bare `is Type` is not an
+        // expression, so this form gets its own path.
+        bump();  // 'is'
+        if (isTypeStart(kindAt())) parseType();
+        else emitMissing(SyntaxKind::Identifier, "type after 'is'");
+        eat(SyntaxKind::Identifier);  // optional binding name
     } else {
         // One or more comma-separated labels, ending at the `->`.
         parseExpression();

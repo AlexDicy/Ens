@@ -70,6 +70,10 @@ public:
     // True for a `const` binding; reassigning it is a compile error.
     bool isConst = false;
 
+    // A switch-arm binding: it borrows the scrutinee for the arm's duration,
+    // so reads must never transfer ownership away from it.
+    bool isBorrowedBinding = false;
+
     // True when this symbol surfaces an imported type name (not a runtime value),
     // letting member access tell `EnumType.Member` from `enumValue.member`.
     bool isTypeName = false;

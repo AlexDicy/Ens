@@ -417,6 +417,7 @@ std::vector<TypeReference> ClassDecl::baseTypeArguments() const {
 }
 bool ClassDecl::isAbstract() const { return hasDirectToken(node, SyntaxKind::KwAbstract); }
 bool ClassDecl::isFinal() const    { return hasDirectToken(node, SyntaxKind::KwFinal); }
+bool ClassDecl::isSealed() const   { return hasDirectToken(node, SyntaxKind::KwSealed); }
 std::optional<MemberList> ClassDecl::memberList() const {
     if (auto m = firstChildNode(node, SyntaxKind::MemberList)) return MemberList::cast(*m);
     return std::nullopt;

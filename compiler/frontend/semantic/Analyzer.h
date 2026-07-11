@@ -237,6 +237,11 @@ private:
     // class scrutinee, related hierarchies. Returns false after reporting.
     bool checkClassTypeTest(Type* srcT, Type* dstT, bool isCast,
                             const SyntaxNode& diagNode);
+    // The target of a switch type arm must be a class and a strict subclass of
+    // the scrutinee's class `inner`. Returns its StructInfo, or null after
+    // reporting.
+    StructInfo* checkTypeArmTarget(Type* scrutType, Type* inner, Type* armT,
+                                   const SyntaxNode& diagNode);
 
     void tryAdaptIntegerLiteral(const ast::Expression& src, Type* target);
     void tryAdaptCharLiteral(const ast::Expression& src, Type* target);

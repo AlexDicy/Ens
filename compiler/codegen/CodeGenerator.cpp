@@ -1446,6 +1446,7 @@ struct CodeGenerator::Impl {
         if (auto id = rhs.asIdent()) {
             Symbol* src = symbolOf(id->node);
             if (!src || src->kind != SymbolKind::Variable) return nullptr;
+            if (src->isBorrowedBinding) return nullptr;  // it owns no reference to steal
             if (!isReferenceType(src->type)) return nullptr;
             if (src->lastUseInLoop) return nullptr;
             if (src->lastUseRef != id->node.greenNode()) return nullptr;
@@ -6519,8 +6520,20 @@ struct CodeGenerator::Impl {
         ::Type* scrutType = typeOf(scrutOpt->node);
         bool nullable = scrutType && scrutType->isOptional();
         ::Type* inner = nullable ? scrutType->inner : scrutType;
+        bool typeSwitch = false;
+        for (auto& arm : arms) {
+            if (arm.isTypeArm()) { typeSwitch = true; break; }
+        }
         llvm::Value* scrutVal = emitExpr(*scrutOpt);
         if (!scrutVal) return nullptr;
+        if (typeSwitch && expressionProducesOwnedRef(*scrutOpt)) {
+            // Park the owned scrutinee in the enclosing cleanup frame so every
+            // exit path releases it exactly once; arm bindings borrow it.
+            auto* slot = createEntryAlloca(currentFunction,
+                llvm::PointerType::get(ctx, 0), "switch.scrut");
+            registerOwnedLocal(slot, scrutType);
+            builder->CreateStore(scrutVal, slot);
+        }
 
         auto* mergeBB = llvm::BasicBlock::Create(ctx, "switch.end", currentFunction);
 
@@ -6563,7 +6576,22 @@ struct CodeGenerator::Impl {
             builder->SetInsertPoint(nonNullBB);
         }
 
-        if (inner && inner->isString()) {
+        if (typeSwitch) {
+            // Ordered chain of runtime type tests, one per arm, in source order.
+            llvm::Value* desc = loadDescriptor(scrutVal);
+            for (auto& [arm, bb] : labeledArms) {
+                if (!arm->isTypeArm()) continue;  // a null arm was routed above
+                auto tr = arm->typeReference();
+                ::Type* armT = tr ? typeOf(tr->node) : nullptr;
+                if (!armT || !armT->structInfo) continue;
+                llvm::Value* match = builder->CreateCall(getOrDefineEnsTypeIs(),
+                    { desc, getOrEmitTypeDescriptor(armT->structInfo) }, "switch.is");
+                auto* nextBB = llvm::BasicBlock::Create(ctx, "switch.next", currentFunction);
+                builder->CreateCondBr(match, bb, nextBB);
+                builder->SetInsertPoint(nextBB);
+            }
+            builder->CreateBr(valueDefaultBB);
+        } else if (inner && inner->isString()) {
             for (auto& [arm, bb] : labeledArms) {
                 for (auto& label : arm->labels()) {
                     if (isNullSwitchLabel(label)) continue;
@@ -6600,6 +6628,13 @@ struct CodeGenerator::Impl {
         std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> phiIncomings;
         auto emitBody = [&](const ast::SwitchArm& arm, llvm::BasicBlock* bb) {
             builder->SetInsertPoint(bb);
+            if (Symbol* binding = symbolOf(arm.node)) {
+                // The arm binding borrows the scrutinee pointer for the arm.
+                auto* slot = createEntryAlloca(currentFunction,
+                    llvm::PointerType::get(ctx, 0), asAscii(binding->name));
+                builder->CreateStore(scrutVal, slot);
+                values[binding] = slot;
+            }
             if (auto bn = arm.bodyBlockNode()) {
                 if (auto blk = ast::Block::cast(*bn)) emitBlock(*blk);
             } else if (auto be = arm.bodyExpr()) {

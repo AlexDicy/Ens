@@ -512,6 +512,35 @@ bool SwitchArm::isDefault() const {
     return firstChildNode(node, SyntaxKind::KwDefault).has_value();
 }
 
+bool SwitchArm::isTypeArm() const {
+    for (auto& c : node.children()) {
+        if (c.kind() == SyntaxKind::Arrow) break;
+        if (c.kind() == SyntaxKind::KwIs) return true;
+    }
+    return false;
+}
+
+std::optional<TypeReference> SwitchArm::typeReference() const {
+    for (auto& c : node.children()) {
+        if (c.kind() == SyntaxKind::Arrow) break;
+        if (auto tr = TypeReference::cast(c)) return tr;
+    }
+    return std::nullopt;
+}
+
+std::optional<SyntaxNode> SwitchArm::bindingNameToken() const {
+    for (auto& c : node.children()) {
+        if (c.kind() == SyntaxKind::Arrow) break;
+        if (c.kind() == SyntaxKind::Identifier) return c;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::u16string> SwitchArm::bindingNameText() const {
+    if (auto t = bindingNameToken()) return std::u16string(t->tokenText());
+    return std::nullopt;
+}
+
 std::vector<Expression> SwitchArm::labels() const {
     std::vector<Expression> out;
     for (auto& c : node.children()) {

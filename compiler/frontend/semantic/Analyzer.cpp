@@ -824,6 +824,12 @@ static int baseDepth(StructInfo* si) {
     return d;
 }
 
+// Direct subclasses are recorded on the declared class: extending an
+// instantiation of a generic base records the subclass on its template.
+static StructInfo* baseSubclassAuthority(StructInfo* base) {
+    return base->templateOf ? base->templateOf : base;
+}
+
 void Analyzer::resolveClassBases(const ast::SourceFile& file) {
     auto classes = file.classes();
 
@@ -834,7 +840,12 @@ void Analyzer::resolveClassBases(const ast::SourceFile& file) {
         StructInfo* si = t->structInfo;
         si->isAbstract = cd.isAbstract();
         si->isFinal = cd.isFinal();
+        si->isSealed = cd.isSealed();
         si->visibility = toSemanticVisibility(cd.visibility());
+        if (si->isSealed && si->isFinal) {
+            errorAtNode(cd.node, "Class '" + asciiOf(si->name) + "' cannot be both 'sealed' and "
+                "'final'; 'final' already forbids subclasses, so there is nothing to seal.");
+        }
         if (auto baseName = cd.baseClassName()) {
             SyntaxNode diag = cd.baseClassToken().value_or(cd.node);
             Type* baseT = typeCtx.lookupNamedType(modulePath_, *baseName);
@@ -900,7 +911,14 @@ void Analyzer::resolveClassBases(const ast::SourceFile& file) {
                     "' because it is declared 'final'");
                 continue;
             }
+            if (baseT->structInfo->isSealed && baseT->structInfo->modulePath != modulePath_) {
+                errorAtNode(diag, "Cannot extend '" + asciiOf(*baseName) + "' because it is "
+                    "declared 'sealed'; every subclass of a sealed class must be declared in "
+                    "the module that declares it.");
+                continue;
+            }
             si->baseInfo = baseT->structInfo;
+            baseSubclassAuthority(si->baseInfo)->directSubclasses.push_back(si);
         }
     }
 
@@ -925,6 +943,8 @@ void Analyzer::resolveClassBases(const ast::SourceFile& file) {
             errorAtNode(cd.node, "Class '" + asciiOf(si->name) +
                 "' eventually extends itself through its base classes. "
                 "A class cannot inherit from itself, directly or indirectly.");
+            auto& siblings = baseSubclassAuthority(si->baseInfo)->directSubclasses;
+            siblings.erase(std::remove(siblings.begin(), siblings.end(), si), siblings.end());
             si->baseInfo = nullptr;
         }
     }
@@ -4026,6 +4046,42 @@ bool Analyzer::checkClassTypeTest(Type* srcT, Type* dstT, bool isCast,
     return true;
 }
 
+StructInfo* Analyzer::checkTypeArmTarget(Type* scrutType, Type* inner, Type* armT,
+                                         const SyntaxNode& diagNode) {
+    if (armT->isOptional()) {
+        std::string name = armT->inner ? armT->inner->toString() : std::string("?");
+        errorAtNode(diagNode, "The type of an 'is' arm cannot be nullable; 'is' never matches "
+            "null. Test against '" + name + "' and handle null with a 'null ->' arm.");
+        return nullptr;
+    }
+    if (armT->isTypeParam()) {
+        errorAtNode(diagNode, "The type of an 'is' arm must be a concrete class; '" +
+            armT->toString() + "' is a type parameter.");
+        return nullptr;
+    }
+    if (!armT->isClass() || !armT->structInfo) {
+        errorAtNode(diagNode, "The type of an 'is' arm must be a class, got '" +
+            armT->toString() + "'.");
+        return nullptr;
+    }
+    if (armT->structInfo == inner->structInfo) {
+        errorAtNode(diagNode, "'is " + armT->toString() + "' matches every value of this switch "
+            "over '" + scrutType->toString() + "'; use a 'default' arm instead.");
+        return nullptr;
+    }
+    if (inner->structInfo->isSubclassOf(armT->structInfo)) {
+        errorAtNode(diagNode, "A value of type '" + inner->toString() + "' is always a '" +
+            armT->toString() + "'; this arm would match every value. Use a 'default' arm instead.");
+        return nullptr;
+    }
+    if (!armT->structInfo->isSubclassOf(inner->structInfo)) {
+        errorAtNode(diagNode, "A value of type '" + inner->toString() + "' can never be a '" +
+            armT->toString() + "'; this arm would never match. Remove it.");
+        return nullptr;
+    }
+    return armT->structInfo;
+}
+
 Type* Analyzer::analyzeTypeTest(const ast::TypeTestExpression& expr) {
     auto operand = expr.operand();
     auto tr = expr.targetType();
@@ -4420,11 +4476,24 @@ Type* Analyzer::analyzeSwitchArms(const std::optional<ast::Expression>& scrutine
     Type* scrutType = scrutinee ? analyzeExpr(*scrutinee) : typeCtx.getError();
     bool nullable = scrutType->isOptional();
     Type* inner = nullable ? scrutType->inner : scrutType;
+
+    bool hasTypeArm = false;
+    for (auto& arm : arms) {
+        if (arm.isTypeArm()) { hasTypeArm = true; break; }
+    }
+
+    bool classScrut = inner && !inner->isError() && inner->isClass() && inner->structInfo;
     bool scrutOk = inner && !inner->isError() &&
                    (inner->isEnum() || inner->isInteger() || inner->isString());
-    if (scrutinee && !scrutType->isError() && !scrutOk) {
-        errorAtNode(scrutinee->node, "Cannot switch on a value of type '" + scrutType->toString() +
-            "'; switch supports enum, integer, and string values.");
+    bool typeSwitch = hasTypeArm && classScrut;
+    if (scrutinee && !scrutType->isError()) {
+        if (classScrut && !hasTypeArm) {
+            errorAtNode(scrutinee->node, "A switch over a class value needs at least one "
+                "'is Type ->' arm.");
+        } else if (!classScrut && !scrutOk) {
+            errorAtNode(scrutinee->node, "Cannot switch on a value of type '" + scrutType->toString() +
+                "'; switch supports enum, integer, string, and class values.");
+        }
     }
 
     bool hasDefault = false;
@@ -4432,14 +4501,67 @@ Type* Analyzer::analyzeSwitchArms(const std::optional<ast::Expression>& scrutine
     std::vector<int64_t> seenInts;
     std::vector<std::u16string> seenStrings;
     std::vector<int64_t> coveredEnum;
+    std::vector<StructInfo*> armClasses;
     std::vector<ast::Expression> valueExprs;
     bool sawValueBlock = false;
+
+    auto analyzeArmBody = [&](const ast::SwitchArm& arm) {
+        if (auto bn = arm.bodyBlockNode()) {
+            if (requireValue) {
+                sawValueBlock = true;
+                errorAtNode(*bn, "A switch used as a value must use expression arms, not '{ }' blocks.");
+            }
+            if (auto blk = ast::Block::cast(*bn)) analyzeBlock(*blk);
+        } else if (auto be = arm.bodyExpr()) {
+            analyzeExpr(*be);
+            if (requireValue) valueExprs.push_back(*be);
+        }
+    };
 
     for (auto& arm : arms) {
         if (arm.isDefault()) {
             if (hasDefault) errorAtNode(arm.node, "A switch can have only one 'default' arm.");
             hasDefault = true;
+        } else if (arm.isTypeArm()) {
+            auto tr = arm.typeReference();
+            Type* armT = tr ? resolveTypeReference(*tr) : typeCtx.getError();
+            SyntaxNode diag = tr ? tr->node : arm.node;
+            StructInfo* armClass = nullptr;
+            if (!classScrut) {
+                if (scrutOk) {
+                    errorAtNode(diag, "An 'is' arm needs a class switch value, but this switch "
+                        "is over '" + scrutType->toString() + "'.");
+                }
+            } else if (!armT->isError()) {
+                armClass = checkTypeArmTarget(scrutType, inner, armT, diag);
+            }
+            if (armClass) {
+                for (StructInfo* prev : armClasses) {
+                    if (armClass->isSubclassOf(prev)) {
+                        errorAtNode(diag, "This 'is " + asciiOf(armClass->name) + "' arm is "
+                            "unreachable: the earlier 'is " + asciiOf(prev->name) + "' arm "
+                            "already matches every '" + asciiOf(armClass->name) + "'. Move it "
+                            "before the broader arm, or remove it.");
+                        break;
+                    }
+                }
+                armClasses.push_back(armClass);
+            }
+            pushScope();
+            if (auto bindTok = arm.bindingNameToken()) {
+                Type* bindT = armClass ? armT : typeCtx.getError();
+                Symbol* binding = makeSymbol(SymbolKind::Variable,
+                    arm.bindingNameText().value_or(std::u16string{}), bindT, bindTok->startOffset());
+                binding->isConst = true;
+                binding->isBorrowedBinding = true;
+                currentScope->define(binding);
+                analysis.setSymbol(arm.node.greenNode(), binding);
+            }
+            analyzeArmBody(arm);
+            popScope();
+            continue;
         } else {
+            bool mixReported = false;
             for (auto& label : arm.labels()) {
                 if (isNullLabel(label)) {
                     analysis.setType(label.node.greenNode(), typeCtx.getNull());
@@ -4449,6 +4571,14 @@ Type* Analyzer::analyzeSwitchArms(const std::optional<ast::Expression>& scrutine
                         errorAtNode(label.node, "Duplicate 'null' label.");
                     } else {
                         nullCovered = true;
+                    }
+                    continue;
+                }
+                if (typeSwitch) {
+                    if (!mixReported) {
+                        errorAtNode(label.node, "Cannot mix value labels with 'is' arms in the "
+                            "same switch.");
+                        mixReported = true;
                     }
                     continue;
                 }
@@ -4514,16 +4644,7 @@ Type* Analyzer::analyzeSwitchArms(const std::optional<ast::Expression>& scrutine
                 }
             }
         }
-        if (auto bn = arm.bodyBlockNode()) {
-            if (requireValue) {
-                sawValueBlock = true;
-                errorAtNode(*bn, "A switch used as a value must use expression arms, not '{ }' blocks.");
-            }
-            if (auto blk = ast::Block::cast(*bn)) analyzeBlock(*blk);
-        } else if (auto be = arm.bodyExpr()) {
-            analyzeExpr(*be);
-            if (requireValue) valueExprs.push_back(*be);
-        }
+        analyzeArmBody(arm);
     }
 
     if (scrutOk && !hasDefault) {
@@ -4548,7 +4669,37 @@ Type* Analyzer::analyzeSwitchArms(const std::optional<ast::Expression>& scrutine
                 "' must have a 'default' arm.");
         }
     }
-    if (scrutOk && nullable && !nullCovered && !hasDefault) {
+    if (typeSwitch && !hasDefault) {
+        StructInfo* root = inner->structInfo;
+        std::string rootName = inner->toString();
+        if (!root->isSealed) {
+            errorAtNode(diagNode, "A switch over '" + rootName + "' must have a 'default' arm "
+                "because '" + rootName + "' is not sealed.");
+        } else if (!root->isAbstract) {
+            errorAtNode(diagNode, "A switch over '" + rootName + "' must have a 'default' arm: '" +
+                rootName + "' is concrete, so a value may be a plain '" + rootName +
+                "' that no subclass arm matches.");
+        } else {
+            std::vector<std::u16string> missing;
+            for (StructInfo* sub : root->directSubclasses) {
+                bool covered = false;
+                for (StructInfo* a : armClasses) {
+                    if (sub->isSubclassOf(a)) { covered = true; break; }
+                }
+                if (!covered) missing.push_back(sub->name);
+            }
+            if (!missing.empty()) {
+                std::string list;
+                for (size_t i = 0; i < missing.size(); ++i) {
+                    if (i) list += ", ";
+                    list += "'" + asciiOf(missing[i]) + "'";
+                }
+                errorAtNode(diagNode, "This switch does not handle subclass(es) " + list +
+                    " of sealed class '" + rootName + "'. Add arms for them or a 'default' arm.");
+            }
+        }
+    }
+    if ((scrutOk || typeSwitch) && nullable && !nullCovered && !hasDefault) {
         errorAtNode(diagNode, "This switch value can be null but no arm handles it. "
             "Add a 'null ->' arm or a 'default' arm.");
     }

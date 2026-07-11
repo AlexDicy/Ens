@@ -227,6 +227,7 @@ public:
     std::vector<TypeReference> baseTypeArguments() const;
     bool isAbstract() const;
     bool isFinal() const;
+    bool isSealed() const;
     std::optional<MemberList> memberList() const;
     std::vector<FieldDecl> fields() const;
     std::vector<FuncDecl> methods() const;

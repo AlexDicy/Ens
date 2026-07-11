@@ -371,9 +371,9 @@ public:
     std::optional<Expression> operand() const;
 };
 
-// One arm of a switch: `label[, label...] -> body` or `default -> body`.
-// Shared by SwitchStatement and SwitchExpression. The body is either a block
-// (statement form) or an expression.
+// One arm of a switch: `label[, label...] -> body`, `is Type [binding] -> body`,
+// or `default -> body`. Shared by SwitchStatement and SwitchExpression. The
+// body is either a block (statement form) or an expression.
 class SwitchArm {
 public:
     SyntaxNode node;
@@ -382,6 +382,13 @@ public:
         return SwitchArm{n};
     }
     bool isDefault() const;
+    // A type arm `is Type [binding] -> body`.
+    bool isTypeArm() const;
+    // The tested type of a type arm.
+    std::optional<TypeReference> typeReference() const;
+    // The optional binding name of a type arm.
+    std::optional<SyntaxNode> bindingNameToken() const;
+    std::optional<std::u16string> bindingNameText() const;
     // Label expressions before the `->` (empty for the default arm).
     std::vector<Expression> labels() const;
     // Body when it is an expression; the block node otherwise.
