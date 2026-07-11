@@ -2731,6 +2731,47 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                 }
                 // Records may declare their own indexOf/contains: fall through to resolution.
             }
+            // Range builtins: string.substring(start, end) -> string and
+            // array slice(start, end) -> T[], both half-open ranges.
+            auto checkRangeArguments = [&](const std::string& name) {
+                if (args.size() != 2) {
+                    errorAtNode(expr.node, "'" + name + "' expects 2 arguments (start and end), got " +
+                        std::to_string(args.size()) + ".");
+                    for (auto& a : args) analyzeExpr(a);
+                    return;
+                }
+                for (auto& a : args) {
+                    Type* argT = analyzeExpr(a);
+                    if (!argT->isError() && !argT->isInteger()) {
+                        errorAtNode(a.node, "'" + name + "' expects an integer index, got '" +
+                            argT->toString() + "'.");
+                    }
+                }
+            };
+            if (memberName && *memberName == u"substring") {
+                Type* recvT = analyzeExpr(*objExpr);
+                if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }
+                if (recvT->isString()) {
+                    checkRangeArguments("substring");
+                    return typeCtx.getPrimitive(TypeKind::String);
+                }
+                // Records may declare their own substring: fall through to resolution.
+            }
+            if (memberName && *memberName == u"slice") {
+                Type* recvT = analyzeExpr(*objExpr);
+                if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }
+                if (recvT->isOptional() && recvT->inner && recvT->inner->isArray()) {
+                    errorAtNode(expr.node, "Cannot call 'slice' on '" + recvT->toString() +
+                        "' because it may be null. Check for null first.");
+                    for (auto& a : args) analyzeExpr(a);
+                    return typeCtx.getError();
+                }
+                if (recvT->isArray()) {
+                    checkRangeArguments("slice");
+                    return recvT;
+                }
+                // Records may declare their own slice: fall through to resolution.
+            }
             // Every type is hashable: hash() resolves to a declared
             // `hash() -> long` when the receiver (or its bound) has one, and is
             // synthesized by codegen otherwise.

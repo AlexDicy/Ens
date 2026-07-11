@@ -4477,6 +4477,120 @@ struct CodeGenerator::Impl {
         return obj;
     }
 
+    // Loads an index expression and widens it to i64.
+    llvm::Value* emitIndexAsI64(const ast::Expression& e) {
+        llvm::Value* v = emitExpr(e);
+        if (!v) return nullptr;
+        llvm::Type* i64 = llvm::Type::getInt64Ty(ctx);
+        if (v->getType() != i64) v = builder->CreateSExtOrTrunc(v, i64, "range.idx");
+        return v;
+    }
+
+    // Panics unless 0 <= start <= end <= length.
+    void emitRangeCheck(llvm::Value* start, llvm::Value* end, llvm::Value* length,
+                        const std::string& message) {
+        llvm::Type* i64 = llvm::Type::getInt64Ty(ctx);
+        auto* badBB = llvm::BasicBlock::Create(ctx, "range.bad", currentFunction);
+        auto* okBB  = llvm::BasicBlock::Create(ctx, "range.ok",  currentFunction);
+        llvm::Value* negStart = builder->CreateICmpSLT(start, llvm::ConstantInt::get(i64, 0), "range.neg");
+        llvm::Value* inverted = builder->CreateICmpSGT(start, end, "range.inv");
+        llvm::Value* tooFar   = builder->CreateICmpSGT(end, length, "range.far");
+        llvm::Value* bad = builder->CreateOr(builder->CreateOr(negStart, inverted), tooFar, "range.oob");
+        builder->CreateCondBr(bad, badBB, okBB);
+        builder->SetInsertPoint(badBB);
+        emitPanic(message, 134);
+        builder->SetInsertPoint(okBB);
+    }
+
+    // string.substring(start, end) -> string: a fresh copy of the half-open
+    // byte range. Panics when the range is invalid.
+    llvm::Value* emitStringSubstring(const ast::Expression& obj,
+                                     const ast::Expression& startArg,
+                                     const ast::Expression& endArg) {
+        llvm::Value* s = emitExpr(obj);
+        if (!s) return nullptr;
+        llvm::Value* start = emitIndexAsI64(startArg);
+        if (!start) return nullptr;
+        llvm::Value* end = emitIndexAsI64(endArg);
+        if (!end) return nullptr;
+        llvm::Value* length = emitStringLength(s);
+        emitRangeCheck(start, end, length, "substring range out of bounds");
+        llvm::Value* count = builder->CreateSub(end, start, "substr.len");
+        llvm::Value* result = emitStringAlloc(count);
+        builder->CreateMemCpy(emitStringDataPtr(result), llvm::MaybeAlign(1),
+            builder->CreateGEP(llvm::Type::getInt8Ty(ctx), emitStringDataPtr(s), start, "substr.src"),
+            llvm::MaybeAlign(1), count);
+        releaseIfOwnedTemp(s, obj);
+        return result;
+    }
+
+    // arr.slice(start, end) -> T[]: a fresh array holding the half-open element
+    // range. Class slots are retained; struct slots retain their class fields.
+    llvm::Value* emitArraySlice(const ast::Expression& obj, ::Type* arrT,
+                                const ast::Expression& startArg,
+                                const ast::Expression& endArg) {
+        ::Type* elem = arrT ? arrT->inner : nullptr;
+        if (!elem) return nullptr;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        llvm::Type* i64 = llvm::Type::getInt64Ty(ctx);
+
+        llvm::Value* arr = emitExpr(obj);
+        if (!arr) return nullptr;
+        llvm::Value* start = emitIndexAsI64(startArg);
+        if (!start) return nullptr;
+        llvm::Value* end = emitIndexAsI64(endArg);
+        if (!end) return nullptr;
+
+        llvm::Value* length = emitArrayLength(arr);
+        emitRangeCheck(start, end, length, "slice range out of bounds");
+        llvm::Value* count = builder->CreateSub(end, start, "slice.len");
+
+        uint64_t elemBytes = elementSizeBytes(elem);
+        llvm::Value* dataBytes = builder->CreateMul(
+            count, llvm::ConstantInt::get(i64, static_cast<int64_t>(elemBytes)), "slice.databytes");
+        llvm::Value* payloadBytes = builder->CreateAdd(
+            dataBytes, llvm::ConstantInt::get(i64, 8), "slice.payloadbytes");
+        llvm::Value* dtor = getOrEmitArrayDtor(elem);
+        llvm::Value* result = builder->CreateCall(
+            getOrDefineEnsAlloc(), { payloadBytes, dtor, llvm::ConstantPointerNull::get(ptrTy) },
+            "slice.new");
+        builder->CreateStore(count, arrayLengthAddr(result));
+
+        llvm::Type* elemTy = mapType(elem);
+        llvm::Value* dstData = emitArrayDataPtr(result);
+        builder->CreateMemCpy(dstData, llvm::MaybeAlign(1),
+            builder->CreateGEP(elemTy, emitArrayDataPtr(arr), start, "slice.src"),
+            llvm::MaybeAlign(1), dataBytes);
+
+        bool slotIsClass = isReferenceType(elem);
+        if (slotIsClass || structHasClassFields(elem)) {
+            auto* loopCond = llvm::BasicBlock::Create(ctx, "slice.retain.cond", currentFunction);
+            auto* loopBody = llvm::BasicBlock::Create(ctx, "slice.retain.body", currentFunction);
+            auto* loopEnd  = llvm::BasicBlock::Create(ctx, "slice.retain.end",  currentFunction);
+            llvm::Value* idxAlloca = createEntryAlloca(currentFunction, i64, "slice.retain.i");
+            builder->CreateStore(llvm::ConstantInt::get(i64, 0), idxAlloca);
+            builder->CreateBr(loopCond);
+
+            builder->SetInsertPoint(loopCond);
+            llvm::Value* idx = builder->CreateLoad(i64, idxAlloca, "slice.retain.i.load");
+            builder->CreateCondBr(builder->CreateICmpSLT(idx, count, "slice.retain.lt"), loopBody, loopEnd);
+
+            builder->SetInsertPoint(loopBody);
+            llvm::Value* slot = builder->CreateGEP(elemTy, dstData, idx, "slice.retain.slot");
+            if (slotIsClass) {
+                emitRetain(builder->CreateLoad(ptrTy, slot, "slice.retain.val"));
+            } else {
+                emitStructFieldRetain(elem, slot);
+            }
+            builder->CreateStore(builder->CreateAdd(idx, llvm::ConstantInt::get(i64, 1)), idxAlloca);
+            builder->CreateBr(loopCond);
+
+            builder->SetInsertPoint(loopEnd);
+        }
+        releaseIfOwnedTemp(arr, obj);
+        return result;
+    }
+
     // Lazily emits `_dtor_<elem>_array` which walks the element data and
     // releases per-slot ownership where required. Returns null if the element
     // type needs no per-slot work (primitives / externals / class-free structs).
@@ -5359,6 +5473,14 @@ struct CodeGenerator::Impl {
                     !methodSymbolOf(member.node) && recvT && recvT->isString() &&
                     e.arguments().size() == 1) {
                     return emitStringSearch(*obj, e.arguments()[0], *memberName == u"contains");
+                }
+                if (memberName && *memberName == u"substring" && !methodSymbolOf(member.node) &&
+                    recvT && recvT->isString() && e.arguments().size() == 2) {
+                    return emitStringSubstring(*obj, e.arguments()[0], e.arguments()[1]);
+                }
+                if (memberName && *memberName == u"slice" && !methodSymbolOf(member.node) &&
+                    recvT && recvT->isArray() && e.arguments().size() == 2) {
+                    return emitArraySlice(*obj, recvT, e.arguments()[0], e.arguments()[1]);
                 }
                 if (memberName && *memberName == u"hash" && !methodSymbolOf(member.node) &&
                     recvT && !recvT->isError()) {
