@@ -421,6 +421,8 @@ if (room.door != null) {
 }
 ```
 
+The `is` type test (described with `as?` further below) narrows by exactly the same rules, including these invalidation points.
+
 ---
 
 Numeric values convert between each other with the `as` operator: `expr as Type`. The source and target must both be numeric. Casts between non-numeric types are a compile error.
@@ -441,6 +443,33 @@ int[] arr = new int[4];
 long a = arr.length * 2 as long;  // arr.length * (2 as long)
 long b = (arr.length * 2) as long; // cast applied to the product
 ```
+
+---
+
+Class values support runtime type tests with `is` and checked casts with `as?`.
+`expr is Type` evaluates to `bool`: true when the value is a non-null instance of `Type` or one of its subclasses.
+`expr as? Type` evaluates to `Type?`: the value itself when the test would succeed, and `null` when the value is null or not an instance.
+
+```ens
+Shape s = pickShape();
+if (s is Circle) {
+    s.radius;                          // s is treated as 'Circle' here
+}
+
+Circle? c = s as? Circle;              // the circle, or null
+int r = (s as? Circle)?.radius ?? 0;
+```
+
+The target must be a class; testing against a struct, primitive, enum, array, or string is a compile error, and so is a nullable target like `as? Circle?`, whose result would already be nullable.
+The scrutinee must be a class or nullable class, and the target must be related to it: a test that could never succeed (unrelated classes) and a test the static type already satisfies (always true) are both compile errors.
+A nullable scrutinee tested against a type it already satisfies is the exception: for `Base? x`, the test `x is Base` is a combined null-plus-type check and is allowed.
+
+`if (x is Derived)` narrows `x` to `Derived` inside the branch, following the same rules as null narrowing above: the same paths narrow (locals, member chains, subscripts), `x is Derived && x.derivedMethod()` narrows the right side of `&&`, conjunctions narrow the branch, a loop condition narrows the body, and the same writes and calls drop the narrowing.
+Failing the test proves nothing about the value's type, so nothing narrows in the else branch.
+
+`is` sits at the comparison precedence level, so `a is Circle && b is Square` reads as `(a is Circle) && (b is Square)`.
+`as?` binds tightly to the value just before it, like `as`.
+Inside a generic body the scrutinee may have a type-parameter type; the requirements are then checked against the concrete type of each instantiation.
 
 ---
 
