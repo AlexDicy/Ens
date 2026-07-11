@@ -37,6 +37,13 @@ struct Rectangle {
 ```
 
 Overloading is allowed, best match arguments first, then visibility.
+Two declarations of the same name must differ in parameter count or parameter types.
+A call picks the overload whose parameter types match the arguments exactly; when there is no exact match, an overload reachable through implicit widening is chosen.
+When two overloads match equally well, the call is a compile error that lists the candidates.
+Overloads that are not visible from the call site lose to visible ones; visibility is only an error when no visible overload matches.
+Named arguments participate in selection: an overload is only considered when every named argument names one of its parameters.
+A subclass may add a new overload of an inherited method name; `override` still requires the exact signature of the method it replaces.
+External functions and generic functions cannot be overloaded.
 
 ```ens
 calculateArea(Rectangle rectangle) -> uint {
