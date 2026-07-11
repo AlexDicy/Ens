@@ -775,3 +775,17 @@ for (let entry in ages) {
 ```
 
 Keys are matched with `==`: strings by contents, value types by value, and classes by identity unless the key class defines its own `hash()` (identity comparison still applies). Struct keys are not supported yet because structs cannot be compared with `==`.
+
+`StringBuilder` from `@std.stringbuilder` accumulates text in a growable buffer, so building a string piece by piece stays linear where repeated `+` on immutable strings would re-copy the whole prefix.
+`append(value)` accepts a string, an integer, or a `bool`; `length()` returns the number of bytes written so far; `toString()` returns the accumulated text and leaves the builder usable.
+
+```ens
+import StringBuilder from @std.stringbuilder;
+
+let report = new StringBuilder();
+report.append("processed ");
+report.append(count);
+report.append(", ok: ");
+report.append(allPassed);
+print(report.toString());
+```
