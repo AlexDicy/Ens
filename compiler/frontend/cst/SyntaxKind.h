@@ -48,7 +48,7 @@ enum class SyntaxKind : uint16_t {
     KwFloat, KwDouble, KwDecimal, KwChar, KwString, KwVoid,
     KwAbstract, KwAs, KwAssert, KwBreak, KwCase, KwCatch, KwClass, KwComputed, KwConst, KwContinue,
     KwDefault, KwDo, KwElse, KwEnum, KwExtends, KwExternal, KwFalse, KwFinal, KwFinally,
-    KwFor, KwFrom, KwGoto, KwIf, KwImport, KwIn, KwIs, KwLet, KwNew, KwNull, KwOut, KwOverride, KwPackage,
+    KwFor, KwFrom, KwGoto, KwIf, KwImplements, KwImport, KwIn, KwInterface, KwIs, KwLet, KwNew, KwNull, KwOut, KwOverride, KwPackage,
     KwPrivate, KwProtected, KwPublic, KwRethrow, KwReturn, KwSealed, KwStatic, KwStruct,
     KwSuper, KwSwitch, KwTest, KwThis, KwThrow, KwThrows, KwTrue, KwTry, KwType, KwWeak, KwWhile,
 
@@ -70,6 +70,8 @@ enum class SyntaxKind : uint16_t {
     CatchClause,         // catch (Type ident) { ... } after a function body
     StructDecl,
     ClassDecl,
+    InterfaceDecl,
+    ImplementsClause,    // implements I, J<int> on a class
     FieldDecl,
     MemberList,
     VisibilityModifier,

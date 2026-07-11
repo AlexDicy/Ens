@@ -131,6 +131,7 @@ struct CodeGenerator::Impl {
     std::unordered_map<StructInfo*, llvm::GlobalVariable*> enumNameTableCache;
     std::unordered_map<std::string, llvm::Constant*> stringLiteralCache;
     llvm::StructType* typeDescriptorTy = nullptr;
+    llvm::StructType* interfaceEntryTy = nullptr;
 
     // Refcount sentinel for immortal objects (string literals). Real refcounts
     // start at 1 and move by 1, so they never reach this value; ens_retain and
@@ -1837,11 +1838,13 @@ struct CodeGenerator::Impl {
         builder->SetInsertPoint(endBB);
     }
 
-    // Resolve a zero-argument method on a class along its base chain, together
-    // with its vtable slot for dynamic dispatch.
+    // Resolve a zero-argument method on a class or interface along its base
+    // chain, together with its dispatch slot (vtable or itable).
     struct ResolvedMethod {
         Symbol* symbol = nullptr;
         int vtableSlot = -1;
+        StructInfo* iface = nullptr;  // set when the method is an interface signature
+        int itableSlot = -1;
     };
     ResolvedMethod resolveClassMethod(::Type* classT, const std::u16string& name) {
         ResolvedMethod out;
@@ -1851,7 +1854,12 @@ struct CodeGenerator::Impl {
         if (!decl) return out;
         const MethodInfo& mi = decl->methods[decl->findZeroArgMethodIndex(name)];
         out.symbol = mi.symbol;
-        out.vtableSlot = mi.vtableSlot;
+        if (decl->isInterface) {
+            out.iface = decl;
+            out.itableSlot = mi.itableSlot;
+        } else {
+            out.vtableSlot = mi.vtableSlot;
+        }
         return out;
     }
 
@@ -1861,9 +1869,16 @@ struct CodeGenerator::Impl {
         if (!fn) return nullptr;
         std::vector<llvm::Value*> args{ receiver };
         if (m.symbol->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);
-        llvm::Value* result = (m.vtableSlot >= 0)
-            ? builder->CreateCall(fn->getFunctionType(), loadVtableSlot(receiver, m.vtableSlot), args)
-            : builder->CreateCall(fn, args);
+        llvm::Value* result;
+        if (m.iface && m.itableSlot >= 0) {
+            result = builder->CreateCall(fn->getFunctionType(),
+                loadItableSlot(receiver, m.iface, m.itableSlot), args);
+        } else if (m.vtableSlot >= 0) {
+            result = builder->CreateCall(fn->getFunctionType(),
+                loadVtableSlot(receiver, m.vtableSlot), args);
+        } else {
+            result = builder->CreateCall(fn, args);
+        }
         emitThrowsCheck(m.symbol);
         return result;
     }
@@ -2563,7 +2578,7 @@ struct CodeGenerator::Impl {
         std::string op = isCast ? "as?" : "is";
         if (!srcT || !dstT) return false;
         if (!dstT->isClass() || !dstT->structInfo) {
-            error(offset, "The target of '" + op + "' must be a class, got '" +
+            error(offset, "The target of '" + op + "' must be a class or an interface, got '" +
                 dstT->toString() + "'.");
             return false;
         }
@@ -2573,7 +2588,7 @@ struct CodeGenerator::Impl {
                 "'; only class values can be " + (isCast ? "cast." : "tested."));
             return false;
         }
-        if (srcCore->structInfo->isSubclassOf(dstT->structInfo)) {
+        if (srcCore->structInfo->isSubclassOrConforms(dstT->structInfo)) {
             if (!isCast && srcT->isOptional()) return true;
             if (isCast) {
                 error(offset, "'as? " + dstT->toString() + "' is not needed here: a value "
@@ -2584,6 +2599,20 @@ struct CodeGenerator::Impl {
                     dstT->toString() + "'; this 'is' test would always be true. Remove it.");
             }
             return false;
+        }
+        // An interface scrutinee (or an interface target over a non-final class)
+        // is decided at runtime.
+        if (srcCore->isInterface()) return true;
+        if (dstT->isInterface()) {
+            if (srcCore->structInfo->isFinal) {
+                error(offset, "A value of type '" + srcT->toString() + "' can never be a '" +
+                    dstT->toString() + "': '" + srcCore->toString() + "' is 'final' and does "
+                    "not implement it. " + (isCast ? "This 'as?' cast would always be null."
+                                                   : "This 'is' test would always be false.") +
+                    " Remove it.");
+                return false;
+            }
+            return true;
         }
         if (!dstT->structInfo->isSubclassOf(srcCore->structInfo)) {
             error(offset, "A value of type '" + srcT->toString() + "' can never be a '" +
@@ -2613,8 +2642,7 @@ struct CodeGenerator::Impl {
         builder->CreateCondBr(isNull, endBB, testBB);
 
         builder->SetInsertPoint(testBB);
-        llvm::Value* match = builder->CreateCall(getOrDefineEnsTypeIs(),
-            { loadDescriptor(v), getOrEmitTypeDescriptor(dstT->structInfo) }, "is.match");
+        llvm::Value* match = emitRuntimeTypeMatch(loadDescriptor(v), dstT->structInfo, "is.match");
         builder->CreateBr(endBB);
 
         builder->SetInsertPoint(endBB);
@@ -2644,8 +2672,7 @@ struct CodeGenerator::Impl {
         builder->CreateCondBr(isNull, endBB, testBB);
 
         builder->SetInsertPoint(testBB);
-        llvm::Value* match = builder->CreateCall(getOrDefineEnsTypeIs(),
-            { loadDescriptor(v), getOrEmitTypeDescriptor(dstT->structInfo) }, "cast.match");
+        llvm::Value* match = emitRuntimeTypeMatch(loadDescriptor(v), dstT->structInfo, "cast.match");
         builder->CreateCondBr(match, endBB, failBB);
 
         // A failed cast consumes an owned source; nothing else will release it.
@@ -3966,13 +3993,24 @@ struct CodeGenerator::Impl {
         return fn;
     }
 
-    // TypeDescriptor { const char* name; TypeDescriptor* parent; uint32_t id; void** vtable; }
+    // TypeDescriptor { const char* name; TypeDescriptor* parent; uint32_t id;
+    //                  void** vtable; InterfaceEntry* itables; }
     llvm::StructType* getTypeDescriptorTy() {
         if (typeDescriptorTy) return typeDescriptorTy;
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         auto* i32 = llvm::Type::getInt32Ty(ctx);
-        typeDescriptorTy = llvm::StructType::create(ctx, { ptrTy, ptrTy, i32, ptrTy }, "TypeDescriptor");
+        typeDescriptorTy = llvm::StructType::create(ctx, { ptrTy, ptrTy, i32, ptrTy, ptrTy }, "TypeDescriptor");
         return typeDescriptorTy;
+    }
+
+    // One conformance record: the implemented interface's descriptor plus the
+    // class's method table for it. A class's `itables` array ends with a null
+    // interface pointer.
+    llvm::StructType* getInterfaceEntryTy() {
+        if (interfaceEntryTy) return interfaceEntryTy;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        interfaceEntryTy = llvm::StructType::create(ctx, { ptrTy, ptrTy }, "InterfaceEntry");
+        return interfaceEntryTy;
     }
 
     // The vtable global for a class: slot i holds the most-derived implementation visible to
@@ -4032,9 +4070,58 @@ struct CodeGenerator::Impl {
         si->typeId = fnv1a32(symName);
         llvm::Constant* vtable = emitVtable(si);
         if (!vtable) vtable = llvm::ConstantPointerNull::get(ptrTy);
+        llvm::Constant* itables = emitConformanceTable(si, symName);
         gv->setInitializer(llvm::ConstantStruct::get(descTy,
-            { nameStr, parent, llvm::ConstantInt::get(i32, si->typeId), vtable }));
+            { nameStr, parent, llvm::ConstantInt::get(i32, si->typeId), vtable, itables }));
         return gv;
+    }
+
+    // The method table a class exposes for one implemented interface: slot i
+    // holds the implementation of the interface's method with itableSlot i,
+    // resolved to the most-derived override visible from `si`.
+    llvm::Constant* emitItable(StructInfo* si, StructInfo* iface, const std::string& ownerSym) {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        std::vector<llvm::Constant*> slots(iface->methods.size(),
+                                           llvm::ConstantPointerNull::get(ptrTy));
+        for (const auto& im : iface->methods) {
+            if (im.itableSlot < 0 || im.itableSlot >= static_cast<int>(slots.size()) || !im.symbol) continue;
+            StructInfo* decl = si->classDeclaringMethodBySignature(im.name, im.symbol);
+            if (!decl) continue;  // missing implementation already diagnosed
+            const MethodInfo& cm = decl->methods[decl->findMethodIndexBySignature(im.name, im.symbol)];
+            if (cm.isAbstract || !cm.symbol) continue;  // abstract classes leave the slot null
+            if (llvm::Function* f = getOrDeclareExternalFunction(cm.symbol, nullptr)) {
+                slots[im.itableSlot] = f;
+            }
+        }
+        auto* arrTy = llvm::ArrayType::get(ptrTy, slots.size());
+        return new llvm::GlobalVariable(*module, arrTy, /*isConstant=*/true,
+            llvm::GlobalValue::InternalLinkage, llvm::ConstantArray::get(arrTy, slots),
+            "_itable_" + mangledTypeName(iface) + "_" + ownerSym);
+    }
+
+    // The class's flattened conformance table: one entry per interface it
+    // implements directly or via a base class, terminated by a null entry.
+    // Null (no table) for interfaces and classes without conformances.
+    llvm::Constant* emitConformanceTable(StructInfo* si, const std::string& symName) {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* entryTy = getInterfaceEntryTy();
+        std::vector<llvm::Constant*> entries;
+        std::unordered_set<StructInfo*> seen;
+        for (StructInfo* s = si; s; s = s->baseInfo) {
+            for (::Type* ifT : s->implementedInterfaces) {
+                StructInfo* iface = (ifT && ifT->structInfo) ? ifT->structInfo : nullptr;
+                if (!iface || !seen.insert(iface).second) continue;
+                entries.push_back(llvm::ConstantStruct::get(entryTy,
+                    { getOrEmitTypeDescriptor(iface), emitItable(si, iface, symName) }));
+            }
+        }
+        if (entries.empty()) return llvm::ConstantPointerNull::get(ptrTy);
+        entries.push_back(llvm::ConstantStruct::get(entryTy,
+            { llvm::ConstantPointerNull::get(ptrTy), llvm::ConstantPointerNull::get(ptrTy) }));
+        auto* arrTy = llvm::ArrayType::get(entryTy, entries.size());
+        return new llvm::GlobalVariable(*module, arrTy, /*isConstant=*/true,
+            llvm::GlobalValue::InternalLinkage, llvm::ConstantArray::get(arrTy, entries),
+            "_itables_" + symName);
     }
 
     // Load the function pointer for virtual slot `slot` from an object's TypeDescriptor.
@@ -5434,6 +5521,116 @@ struct CodeGenerator::Impl {
         return fn;
     }
 
+    // Internal helper: scan a descriptor's conformance table for `target`;
+    // returns the interface's method table, or null when the type does not
+    // conform. Tables are flattened per class, so no parent walk is needed.
+    llvm::Function* getOrDefineEnsItableLookup() {
+        if (auto* existing = module->getFunction("ens_itable_lookup")) return existing;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32 = llvm::Type::getInt32Ty(ctx);
+        auto* i64 = llvm::Type::getInt64Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(ptrTy, { ptrTy, ptrTy }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                          "ens_itable_lookup", module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+
+        llvm::IRBuilder<> b(ctx);
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* loop  = llvm::BasicBlock::Create(ctx, "loop", fn);
+        auto* body  = llvm::BasicBlock::Create(ctx, "body", fn);
+        auto* yes   = llvm::BasicBlock::Create(ctx, "yes", fn);
+        auto* next  = llvm::BasicBlock::Create(ctx, "next", fn);
+        auto* no    = llvm::BasicBlock::Create(ctx, "no", fn);
+        llvm::Value* desc = fn->getArg(0);
+        llvm::Value* target = fn->getArg(1);
+        auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy);
+
+        b.SetInsertPoint(entry);
+        llvm::Value* tblAddr = b.CreateGEP(getTypeDescriptorTy(), desc,
+            { llvm::ConstantInt::get(i32, 0), llvm::ConstantInt::get(i32, 4) }, "itables.addr");
+        llvm::Value* first = b.CreateLoad(ptrTy, tblAddr, "itables");
+        b.CreateCondBr(b.CreateICmpEQ(first, nullPtr), no, loop);
+
+        b.SetInsertPoint(loop);
+        auto* cur = b.CreatePHI(ptrTy, 2, "cur");
+        cur->addIncoming(first, entry);
+        llvm::Value* ifaceAddr = b.CreateGEP(getInterfaceEntryTy(), cur,
+            { llvm::ConstantInt::get(i32, 0), llvm::ConstantInt::get(i32, 0) }, "iface.addr");
+        llvm::Value* iface = b.CreateLoad(ptrTy, ifaceAddr, "iface");
+        b.CreateCondBr(b.CreateICmpEQ(iface, nullPtr), no, body);
+
+        b.SetInsertPoint(body);
+        b.CreateCondBr(b.CreateICmpEQ(iface, target), yes, next);
+
+        b.SetInsertPoint(yes);
+        llvm::Value* methodsAddr = b.CreateGEP(getInterfaceEntryTy(), cur,
+            { llvm::ConstantInt::get(i32, 0), llvm::ConstantInt::get(i32, 1) }, "methods.addr");
+        b.CreateRet(b.CreateLoad(ptrTy, methodsAddr, "methods"));
+
+        b.SetInsertPoint(next);
+        llvm::Value* nextEntry = b.CreateGEP(getInterfaceEntryTy(), cur,
+            llvm::ConstantInt::get(i64, 1), "next.entry");
+        cur->addIncoming(nextEntry, next);
+        b.CreateBr(loop);
+
+        b.SetInsertPoint(no);
+        b.CreateRet(nullPtr);
+        return fn;
+    }
+
+    // Dynamic type test against `target`: a parent-chain walk for a class, a
+    // conformance-table lookup for an interface.
+    llvm::Value* emitRuntimeTypeMatch(llvm::Value* desc, StructInfo* target, const char* name) {
+        if (target->isInterface) {
+            llvm::Value* itable = builder->CreateCall(getOrDefineEnsItableLookup(),
+                { desc, getOrEmitTypeDescriptor(target) }, "conf.itable");
+            auto* ptrTy = llvm::PointerType::get(ctx, 0);
+            return builder->CreateICmpNE(itable, llvm::ConstantPointerNull::get(ptrTy), name);
+        }
+        return builder->CreateCall(getOrDefineEnsTypeIs(),
+            { desc, getOrEmitTypeDescriptor(target) }, name);
+    }
+
+    // Load the implementation of interface method slot `slot` for the object's
+    // dynamic type. The object pointer itself never adjusts.
+    llvm::Value* loadItableSlot(llvm::Value* obj, StructInfo* iface, int slot) {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64 = llvm::Type::getInt64Ty(ctx);
+        llvm::Value* itable = builder->CreateCall(getOrDefineEnsItableLookup(),
+            { loadDescriptor(obj), getOrEmitTypeDescriptor(iface) }, "itable");
+        llvm::Value* fnSlot = builder->CreateGEP(ptrTy, itable,
+            llvm::ConstantInt::get(i64, slot), "ifn.addr");
+        return builder->CreateLoad(ptrTy, fnSlot, "ifn");
+    }
+
+    // The interface that declares `sym`, or null for a class/struct method.
+    static StructInfo* interfaceOwnerOf(Symbol* sym) {
+        return (sym && sym->methodOwner && sym->methodOwner->isInterface)
+            ? sym->methodOwner : nullptr;
+    }
+
+    static int itableSlotOf(Symbol* sym) {
+        StructInfo* owner = sym ? sym->methodOwner : nullptr;
+        if (!owner) return -1;
+        for (const auto& mi : owner->methods) {
+            if (mi.symbol == sym) return mi.itableSlot;
+        }
+        return -1;
+    }
+
+    // When an interface method is called on a receiver whose static type is a
+    // concrete class, rebind to the class's implementing method so the call
+    // keeps the direct/vtable paths (itables serve interface-typed receivers).
+    Symbol* devirtualizeInterfaceMethod(::Type* recvT, Symbol* methodSym) {
+        if (!interfaceOwnerOf(methodSym) || !recvT) return methodSym;
+        ::Type* t = subst(recvT);
+        if (!t || !t->isClass() || t->isInterface() || !t->structInfo) return methodSym;
+        StructInfo* decl = t->structInfo->classDeclaringMethodBySignature(methodSym->name, methodSym);
+        if (!decl) return methodSym;
+        Symbol* impl = decl->methods[decl->findMethodIndexBySignature(methodSym->name, methodSym)].symbol;
+        return impl ? impl : methodSym;
+    }
+
     // Load the TypeDescriptor pointer from a heap object's header (offset -32).
     llvm::Value* loadDescriptor(llvm::Value* obj) {
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
@@ -5749,18 +5946,21 @@ struct CodeGenerator::Impl {
             Symbol* methodSym = methodSymbolOf(member.node);
             if (methodSym && isHashableHashMethod(methodSym)) {
                 // hash() resolved through the Hashable bound: bind to the
-                // concrete receiver's own hash() or synthesize one inline.
+                // concrete receiver's own hash() or synthesize one inline. An
+                // interface-typed receiver dispatches through its itable below.
                 auto obj = member.object();
                 if (!obj) return nullptr;
                 ::Type* objType = typeOf(obj->node);
-                if (Symbol* declared = declaredConformingHash(objType)) {
-                    methodSym = declared;
-                } else {
-                    llvm::Value* recv = emitExpr(*obj);
-                    if (!recv) return nullptr;
-                    llvm::Value* h = emitBuiltinHashOf(recv, objType, e.node.startOffset());
-                    if (isReferenceType(objType)) releaseIfOwnedTemp(recv, *obj);
-                    return h;
+                if (!objType || !objType->isInterface()) {
+                    if (Symbol* declared = declaredConformingHash(objType)) {
+                        methodSym = declared;
+                    } else {
+                        llvm::Value* recv = emitExpr(*obj);
+                        if (!recv) return nullptr;
+                        llvm::Value* h = emitBuiltinHashOf(recv, objType, e.node.startOffset());
+                        if (isReferenceType(objType)) releaseIfOwnedTemp(recv, *obj);
+                        return h;
+                    }
                 }
             }
             if (methodSym && isInterceptedTraceMethod(methodSym)) {
@@ -5783,9 +5983,14 @@ struct CodeGenerator::Impl {
                 if (!obj) return nullptr;
                 ::Type* objType = typeOf(obj->node);
                 bool isSuper = obj->asSuper().has_value();
+                // A concrete-class receiver keeps the direct/vtable paths even
+                // when the call resolved to an interface method.
+                methodSym = devirtualizeInterfaceMethod(objType, methodSym);
+                StructInfo* iface = interfaceOwnerOf(methodSym);
+                int islot = iface ? itableSlotOf(methodSym) : -1;
                 // A virtual call dispatches through the vtable, except `super.m()` which is
                 // always a direct call to the inherited implementation.
-                int vslot = isSuper ? -1 : vtableSlotForMethodSymbol(objType, methodSym);
+                int vslot = (isSuper || iface) ? -1 : vtableSlotForMethodSymbol(objType, methodSym);
                 llvm::Function* fn = getOrDeclareExternalFunction(methodSym, objType);
                 if (!fn) {
                     error(e.node.startOffset(), "Internal: method has no LLVM function");
@@ -5800,9 +6005,16 @@ struct CodeGenerator::Impl {
                 args.push_back(receiver);
                 if (!appendCallArgs(methodSym, e.arguments(), e.node.greenNode(), args)) return nullptr;
                 if (methodSym->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);
-                llvm::Value* result = (vslot >= 0)
-                    ? builder->CreateCall(fn->getFunctionType(), loadVtableSlot(receiver, vslot), args)
-                    : builder->CreateCall(fn, args);
+                llvm::Value* result;
+                if (iface && islot >= 0) {
+                    result = builder->CreateCall(fn->getFunctionType(),
+                        loadItableSlot(receiver, iface, islot), args);
+                } else if (vslot >= 0) {
+                    result = builder->CreateCall(fn->getFunctionType(),
+                        loadVtableSlot(receiver, vslot), args);
+                } else {
+                    result = builder->CreateCall(fn, args);
+                }
                 emitThrowsCheck(methodSym);
                 return result;
             }
@@ -5841,10 +6053,13 @@ struct CodeGenerator::Impl {
                     return nullptr;
                 }
                 ::Type* innerType = subst(recvType->inner);
+                methodSym = devirtualizeInterfaceMethod(innerType, methodSym);
+                StructInfo* iface = interfaceOwnerOf(methodSym);
+                int islot = iface ? itableSlotOf(methodSym) : -1;
                 ::Type* returnType = subst(methodSym->returnType);
                 ::Type* resultType = typeOf(e.node);
                 bool isVoid = returnType && returnType->isVoid();
-                int vslot = vtableSlotForMethodSymbol(innerType, methodSym);
+                int vslot = iface ? -1 : vtableSlotForMethodSymbol(innerType, methodSym);
                 llvm::Function* fn = getOrDeclareExternalFunction(methodSym, innerType);
                 if (!fn) {
                     error(e.node.startOffset(), "Internal: method has no LLVM function");
@@ -5874,9 +6089,16 @@ struct CodeGenerator::Impl {
                 args.push_back(receiver);
                 if (!appendCallArgs(methodSym, e.arguments(), e.node.greenNode(), args)) return nullptr;
                 if (methodSym->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);
-                llvm::Value* callRes = (vslot >= 0)
-                    ? builder->CreateCall(fn->getFunctionType(), loadVtableSlot(receiver, vslot), args)
-                    : builder->CreateCall(fn, args);
+                llvm::Value* callRes;
+                if (iface && islot >= 0) {
+                    callRes = builder->CreateCall(fn->getFunctionType(),
+                        loadItableSlot(receiver, iface, islot), args);
+                } else if (vslot >= 0) {
+                    callRes = builder->CreateCall(fn->getFunctionType(),
+                        loadVtableSlot(receiver, vslot), args);
+                } else {
+                    callRes = builder->CreateCall(fn, args);
+                }
                 emitThrowsCheck(methodSym);
                 llvm::Value* presentVal = isVoid
                     ? nullptr : presentOptionalValue(callRes, returnType, resultType);
@@ -6585,8 +6807,7 @@ struct CodeGenerator::Impl {
                 auto tr = arm->typeReference();
                 ::Type* armT = tr ? typeOf(tr->node) : nullptr;
                 if (!armT || !armT->structInfo) continue;
-                llvm::Value* match = builder->CreateCall(getOrDefineEnsTypeIs(),
-                    { desc, getOrEmitTypeDescriptor(armT->structInfo) }, "switch.is");
+                llvm::Value* match = emitRuntimeTypeMatch(desc, armT->structInfo, "switch.is");
                 auto* nextBB = llvm::BasicBlock::Create(ctx, "switch.next", currentFunction);
                 builder->CreateCondBr(match, bb, nextBB);
                 builder->SetInsertPoint(nextBB);
@@ -6688,6 +6909,12 @@ struct CodeGenerator::Impl {
 
     void emitClassInstantiation(::Type* instT) {
         StructInfo* inst = instT->structInfo;
+        if (inst->isInterface) {
+            // Interfaces have no method bodies; the specialization only needs
+            // its runtime identity.
+            getOrEmitTypeDescriptor(inst);
+            return;
+        }
         StructInfo* templ = inst->templateOf;
         substOwner = templ; substTemplate = templ; substInstanceType = instT; substArgs = inst->typeArgs;
         std::vector<std::unique_ptr<SyntaxNode>> roots;
@@ -6784,6 +7011,12 @@ struct CodeGenerator::Impl {
                 if (t->structInfo && !t->structInfo->isTemplate) getOrEmitTypeDescriptor(t->structInfo);
                 if (t->structInfo && t->structInfo->name == u"StackFrame" && isPreludeModule())
                     stackFrameType = t;
+            }
+        }
+        // Interfaces likewise own their runtime identity in their defining module.
+        for (auto& id : sf->interfaces()) {
+            if (Type* t = analysis.typeOf(id.node.greenNode())) {
+                if (t->structInfo && !t->structInfo->isTemplate) getOrEmitTypeDescriptor(t->structInfo);
             }
         }
 

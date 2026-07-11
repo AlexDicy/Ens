@@ -46,6 +46,16 @@ StructInfo* StructInfo::classDeclaringZeroArgMethod(const std::u16string& method
     return nullptr;
 }
 
+bool StructInfo::conformsToInterface(const StructInfo* iface) const {
+    if (this == iface) return true;
+    for (const StructInfo* s = this; s; s = s->baseInfo) {
+        for (const Type* t : s->implementedInterfaces) {
+            if (t && t->structInfo == iface) return true;
+        }
+    }
+    return false;
+}
+
 bool Type::isInteger() const {
     switch (kind) {
         case TypeKind::Byte:
@@ -129,9 +139,10 @@ bool Type::assignableFrom(const Type* source) const {
     if (!source || source->isError() || isError()) return true;
     if (equals(source)) return true;
     if (source->widensTo(this)) return true;
-    // Class upcast: a derived class is assignable to any of its ancestors.
+    // Class upcast: a derived class is assignable to any of its ancestors, and
+    // a class converts implicitly to each interface it implements.
     if (isClass() && source->isClass() && structInfo && source->structInfo &&
-        source->structInfo->isSubclassOf(structInfo)) {
+        source->structInfo->isSubclassOrConforms(structInfo)) {
         return true;
     }
     if (isOptional()) {
@@ -139,11 +150,11 @@ bool Type::assignableFrom(const Type* source) const {
         if (inner && inner->equals(source)) return true;
         if (inner && source->widensTo(inner)) return true;
         if (source->isOptional() && inner && source->inner && inner->equals(source->inner)) return true;
-        // A nullable class accepts a derived class (or a nullable derived class).
+        // A nullable class accepts a derived or conforming class (nullable or not).
         if (inner && inner->isClass() && inner->structInfo) {
             const Type* src = source->isOptional() ? source->inner : source;
             if (src && src->isClass() && src->structInfo &&
-                src->structInfo->isSubclassOf(inner->structInfo)) {
+                src->structInfo->isSubclassOrConforms(inner->structInfo)) {
                 return true;
             }
         }

@@ -26,6 +26,10 @@ public:
     Type* registerClass(const std::u16string& modulePath, std::u16string name);
     Type* lookupClass(const std::u16string& modulePath, const std::u16string& name) const;
 
+    // An interface is a class-kind type flagged isInterface; it shares the
+    // class namespace so name lookups treat the two uniformly.
+    Type* registerInterface(const std::u16string& modulePath, std::u16string name);
+
     Type* registerExternalType(const std::u16string& modulePath, std::u16string name);
     Type* lookupExternalType(const std::u16string& modulePath, const std::u16string& name) const;
 
@@ -35,7 +39,8 @@ public:
     Type* lookupNamedType(const std::u16string& modulePath, const std::u16string& name) const;
 
     // Generics.
-    Type* getTypeParam(const void* owner, int index, std::u16string name, StructInfo* bound);
+    Type* getTypeParam(const void* owner, int index, std::u16string name,
+                       const std::vector<StructInfo*>& bounds);
     Type* instantiate(Type* templateType, const std::vector<Type*>& args);
     Type* substitute(Type* t, const void* owner, const std::vector<Type*>& args);
     // Fill any instantiations whose template was not yet collected when first

@@ -63,7 +63,7 @@ public:
     // Generic function template: the type-parameter names and optional bounds.
     bool isTemplate = false;
     std::vector<std::u16string> typeParamNames;
-    std::vector<StructInfo*> typeParamBounds;   // parallel to names; null = unbounded
+    std::vector<std::vector<StructInfo*>> typeParamBounds;  // parallel to names; empty = unbounded
 
     ParamEscapeInfo escapeInfo;
 

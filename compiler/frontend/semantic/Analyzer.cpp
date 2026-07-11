@@ -331,6 +331,7 @@ void Analyzer::registerNames(const SyntaxNode& root) {
 
     registerStructNames(*sf);
     registerClassNames(*sf);
+    registerInterfaceNames(*sf);
     registerEnumNames(*sf);
     registerExternalTypeNames(*sf);
 }
@@ -340,6 +341,7 @@ void Analyzer::resolveSignatures() {
     auto& sf = *astRoot;
 
     collectStructs(sf);
+    collectInterfaces(sf);
     collectEnums(sf);
     resolveClassBases(sf);
     collectFunctions(sf);
@@ -492,6 +494,26 @@ void Analyzer::registerClassNames(const ast::SourceFile& file) {
     }
 }
 
+void Analyzer::registerInterfaceNames(const ast::SourceFile& file) {
+    for (auto& id : file.interfaces()) {
+        auto name = id.nameText();
+        if (!name) continue;
+        if (typeCtx.lookupNamedType(modulePath_, *name)) {
+            errorAtNode(id.node, "Duplicate type '" + asciiOf(*name) + "'");
+            continue;
+        }
+        Type* t = typeCtx.registerInterface(modulePath_, *name);
+        auto [line, col] = source.offsetToPosition(id.node.startOffset());
+        t->structInfo->line = line;
+        t->structInfo->column = col;
+        for (auto& tp : id.typeParams()) {
+            t->structInfo->isTemplate = true;
+            t->structInfo->typeParamNames.push_back(tp.nameText().value_or(std::u16string{}));
+        }
+        analysis.setType(id.node.greenNode(), t);
+    }
+}
+
 void Analyzer::registerEnumNames(const ast::SourceFile& file) {
     for (auto& ed : file.enums()) {
         auto name = ed.nameText();
@@ -639,6 +661,7 @@ void Analyzer::analyzeBodies() {
     for (auto& fn : sf.functions()) resolveThrows(fn);
     for (auto& sd : sf.structs()) for (auto& m : sd.methods()) resolveThrows(m);
     for (auto& cd : sf.classes()) for (auto& m : cd.methods()) resolveThrows(m);
+    for (auto& id : sf.interfaces()) for (auto& m : id.methods()) resolveThrows(m);
 
     // A test's implicit declared contract is `throws Error`.
     for (auto& td : sf.tests()) {
@@ -738,6 +761,15 @@ static std::string signatureOf(Symbol* sym) {
     return sig;
 }
 
+// Full display signature of an interface method, including the return type.
+static std::string interfaceMethodSignature(const MethodInfo& mi) {
+    std::string sig = signatureOf(mi.symbol);
+    if (mi.symbol && mi.symbol->returnType && !mi.symbol->returnType->isVoid()) {
+        sig += " -> " + mi.symbol->returnType->toString();
+    }
+    return sig;
+}
+
 void Analyzer::collectStructs(const ast::SourceFile& file) {
     auto structs = file.structs();
 
@@ -810,6 +842,79 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
     }
 }
 
+void Analyzer::collectInterfaces(const ast::SourceFile& file) {
+    for (auto& id : file.interfaces()) {
+        Type* t = analysis.typeOf(id.node.greenNode());
+        if (!t || !t->structInfo) continue;
+        StructInfo* si = t->structInfo;
+        si->visibility = toSemanticVisibility(id.visibility());
+        size_t tpCount = enterTemplateScope(si, id.typeParams());
+
+        for (auto& f : id.fields()) {
+            errorAtNode(f.node, "An interface cannot declare fields; its body lists only "
+                "method signatures.");
+        }
+
+        for (auto& m : id.methods()) {
+            auto mname = m.nameText().value_or(std::u16string{});
+            if (m.visibilityModifier()) {
+                errorAtNode(m.node, "Interface methods are always public; remove the "
+                    "visibility modifier from '" + asciiOf(mname) + "'.");
+            }
+            if (m.isOverride() || m.isFinal() || m.isAbstract()) {
+                errorAtNode(m.node, "Interface methods are plain signatures; 'abstract', "
+                    "'override', and 'final' are not allowed on '" + asciiOf(mname) + "'.");
+            }
+            if (mname == si->name) {
+                errorAtNode(m.node, "An interface cannot declare a constructor; '" +
+                    asciiOf(si->name) + "' has no instances of its own.");
+                continue;
+            }
+            if (m.body().has_value()) {
+                errorAtNode(m.node, "Interface method '" + asciiOf(mname) + "' cannot have a "
+                    "body; end the signature with ';'. Implementing classes provide the body.");
+            }
+            if (m.isThrows() && m.declaredThrowsTypes().empty()) {
+                errorAtNode(m.throwsToken().value_or(m.node), "An interface method marked "
+                    "'throws' must list its exception types, e.g. 'throws IOError'.");
+            }
+
+            Type* retType = m.returnType() && m.returnType()->typeReference()
+                ? resolveTypeReference(*m.returnType()->typeReference())
+                : typeCtx.getPrimitive(TypeKind::Void);
+            uint32_t mPos = m.nameToken() ? m.nameToken()->startOffset() : m.node.startOffset();
+            Symbol* sym = makeSymbol(SymbolKind::Function, mname, nullptr, mPos);
+            sym->returnType = retType;
+            sym->funcDeclCst = m.node.greenNode();
+            sym->declaredThrows = m.isThrows();
+            sym->abiThrows = m.isThrows();
+            sym->methodOwner = si;
+            resolveMethodParams(m, t, sym, /*isInterfaceMethod=*/true);
+            checkHashMethodSignature(m, sym, /*isConstructor=*/false);
+            analysis.setSymbol(m.node.greenNode(), sym);
+
+            if (si->findMethodIndexBySignature(mname, sym) >= 0) {
+                errorAtNode(m.node, "Method '" + asciiOf(mname) + "' of '" + asciiOf(si->name) +
+                    "' is already declared with the same parameter types; overloads must "
+                    "differ in parameter count or types.");
+                continue;
+            }
+
+            MethodInfo mi;
+            mi.name = mname;
+            mi.symbol = sym;
+            mi.declaration = const_cast<GreenElement*>(m.node.greenNode());
+            mi.isAbstract = true;  // no body; never emitted as a function
+            mi.itableSlot = static_cast<int>(si->methods.size());
+            mi.definingClass = si;
+            si->methods.push_back(std::move(mi));
+        }
+        markOverloadedMethods(si);
+        si->membersCollected = true;
+        popTypeParams(tpCount);
+    }
+}
+
 // Chain depth for base-before-derived ordering. A base that is a generic
 // instantiation may not be filled yet, so its chain continues through the
 // template. The seen set guards against not-yet-reported inheritance cycles.
@@ -863,6 +968,12 @@ void Analyzer::resolveClassBases(const ast::SourceFile& file) {
                     "' is not a class; only classes can be extended");
                 continue;
             }
+            if (baseT->structInfo->isInterface) {
+                errorAtNode(diag, "Cannot extend interface '" + asciiOf(*baseName) +
+                    "'; a class implements an interface with 'implements " +
+                    asciiOf(*baseName) + "'.");
+                continue;
+            }
             if (baseT->structInfo == si) {
                 errorAtNode(diag, "Class '" + asciiOf(si->name) + "' cannot extend itself");
                 continue;
@@ -882,14 +993,16 @@ void Analyzer::resolveClassBases(const ast::SourceFile& file) {
                 size_t tpCount = enterTemplateScope(si, cd.typeParams());
                 std::vector<Type*> argTypes;
                 bool ok = true;
+                static const std::vector<StructInfo*> kNoBounds;
                 for (size_t i = 0; i < baseArgs.size(); ++i) {
                     Type* at = resolveTypeReference(baseArgs[i]);
                     if (at->isError()) ok = false;
-                    StructInfo* bound = i < baseT->structInfo->typeParamBounds.size()
-                        ? baseT->structInfo->typeParamBounds[i] : nullptr;
+                    const std::vector<StructInfo*>& bounds =
+                        i < baseT->structInfo->typeParamBounds.size()
+                            ? baseT->structInfo->typeParamBounds[i] : kNoBounds;
                     std::u16string pname = i < baseT->structInfo->typeParamNames.size()
                         ? baseT->structInfo->typeParamNames[i] : std::u16string{};
-                    if (ok && !checkTypeArgBound(at, bound, pname, baseArgs[i].node)) ok = false;
+                    if (ok && !checkTypeArgBound(at, bounds, pname, baseArgs[i].node)) ok = false;
                     argTypes.push_back(at);
                 }
                 popTypeParams(tpCount);
@@ -919,6 +1032,42 @@ void Analyzer::resolveClassBases(const ast::SourceFile& file) {
             }
             si->baseInfo = baseT->structInfo;
             baseSubclassAuthority(si->baseInfo)->directSubclasses.push_back(si);
+        }
+
+        // --- Resolve the implements clause. ---
+        auto ifaceRefs = cd.implementedInterfaceRefs();
+        if (!ifaceRefs.empty()) {
+            size_t tpCount = enterTemplateScope(si, cd.typeParams());
+            for (auto& tr : ifaceRefs) {
+                Type* it = resolveTypeReference(tr);
+                if (it->isError()) continue;
+                if (it->isOptional() || it->isArray()) {
+                    errorAtNode(tr.node, "'implements' takes plain interface names; '" +
+                        it->toString() + "' is not an interface type.");
+                    continue;
+                }
+                if (!it->isInterface()) {
+                    if (it->isClass()) {
+                        errorAtNode(tr.node, "'" + it->toString() + "' is a class, not an "
+                            "interface; use 'extends " + it->toString() + "' for a base class.");
+                    } else {
+                        errorAtNode(tr.node, "'" + it->toString() + "' is not an interface; "
+                            "'implements' takes interfaces only.");
+                    }
+                    continue;
+                }
+                bool dup = false;
+                for (Type* prev : si->implementedInterfaces) {
+                    if (prev == it) { dup = true; break; }
+                }
+                if (dup) {
+                    errorAtNode(tr.node, "Interface '" + it->toString() +
+                        "' is listed more than once in the 'implements' clause.");
+                    continue;
+                }
+                si->implementedInterfaces.push_back(it);
+            }
+            popTypeParams(tpCount);
         }
     }
 
@@ -991,7 +1140,10 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
         fi.definingClass = si;
         if (fi.isWeak) {
             bool ok = ft && ft->isOptional() && ft->inner && ft->inner->isClass();
-            if (!ok) {
+            if (ok && ft->inner->isInterface()) {
+                errorAtNode(f.node, "'weak' fields must reference a class; interface-typed "
+                    "weak fields are not supported. Use the implementing class's type instead.");
+            } else if (!ok) {
                 errorAtNode(f.node,
                     "'weak' fields must be nullable class types (e.g. `weak Foo? f`)");
             }
@@ -1094,6 +1246,31 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
         }
     }
     markOverloadedMethods(si);
+
+    // --- The class must provide every method of every interface it implements,
+    // either declared here (abstract counts) or inherited from a base class. ---
+    for (Type* ifaceT : si->implementedInterfaces) {
+        if (!ifaceT || !ifaceT->structInfo) continue;
+        StructInfo* iface = ifaceT->structInfo;
+        if (iface->templateOf) typeCtx.ensureFilled(iface);
+        for (auto& im : iface->methods) {
+            if (!im.symbol) continue;
+            StructInfo* decl = si->classDeclaringMethodBySignature(im.name, im.symbol);
+            if (!decl) {
+                errorAtNode(cd.node, "Class '" + asciiOf(si->name) + "' implements '" +
+                    ifaceT->toString() + "' but does not provide '" +
+                    interfaceMethodSignature(im) + "'. Declare the method, or inherit it "
+                    "from a base class.");
+                continue;
+            }
+            const MethodInfo& cm = decl->methods[decl->findMethodIndexBySignature(im.name, im.symbol)];
+            if (!overrideSignaturesCompatible(im, cm.symbol)) {
+                errorAtNode(cd.node, "Method '" + asciiOf(im.name) + "' of '" +
+                    asciiOf(si->name) + "' does not match '" + interfaceMethodSignature(im) +
+                    "' declared in interface '" + ifaceT->toString() + "'.");
+            }
+        }
+    }
 
     // --- A concrete class must implement every inherited abstract method. ---
     if (!si->isAbstract) {
@@ -1303,17 +1480,22 @@ void Analyzer::collectTests(const ast::SourceFile& file) {
     }
 }
 
-void Analyzer::resolveMethodParams(const ast::FuncDecl& fn, ::Type* receiverType, Symbol* sym) {
+void Analyzer::resolveMethodParams(const ast::FuncDecl& fn, ::Type* receiverType, Symbol* sym,
+                                   bool isInterfaceMethod) {
     auto fname = fn.nameText().value_or(std::u16string{});
     bool isCtor = receiverType && receiverType->structInfo && fname == receiverType->structInfo->name;
 
-    if (fn.isShorthand() && !isCtor && !fn.isAbstract()) {
+    if (fn.isShorthand() && !isCtor && !fn.isAbstract() && !isInterfaceMethod) {
         errorAtNode(fn.node, "Shorthand declaration ';' is only allowed on a constructor");
     }
 
     bool seenDefault = false;
     for (auto& p : fn.parameters()) {
         Type* pt = nullptr;
+        if (isInterfaceMethod && p.defaultValue()) {
+            errorAtNode(p.node, "Interface method parameters cannot have default values; "
+                "implementing classes choose their own defaults.");
+        }
         if (p.isThisField()) {
             if (!isCtor) {
                 errorAtNode(p.node, "'this." + asciiOf(p.nameText().value_or(std::u16string{})) +
@@ -1535,30 +1717,57 @@ void Analyzer::checkParameterDefaults(const ast::FuncDecl& fn) {
 // Type references
 // =========================================================
 
-std::vector<StructInfo*> Analyzer::resolveTypeParamBounds(
+std::vector<std::vector<StructInfo*>> Analyzer::resolveTypeParamBounds(
         const void* /*owner*/, const std::vector<ast::TypeParam>& params) {
-    std::vector<StructInfo*> bounds;
-    bounds.reserve(params.size());
+    std::vector<std::vector<StructInfo*>> all;
+    all.reserve(params.size());
     for (auto& tp : params) {
-        StructInfo* b = nullptr;
-        if (auto br = tp.bound()) {
-            Type* bt = resolveTypeReference(*br);
-            if (bt && bt->isClass() && bt->structInfo && !bt->structInfo->isTemplate) {
+        std::vector<StructInfo*> bounds;
+        StructInfo* classBound = nullptr;
+        std::string pname = asciiOf(tp.nameText().value_or(std::u16string{}));
+        for (auto& br : tp.bounds()) {
+            Type* bt = resolveTypeReference(br);
+            if (!bt || bt->isError()) continue;
+            StructInfo* b = nullptr;
+            if (bt->isInterface()) {
                 b = bt->structInfo;
-            } else if (bt && !bt->isError()) {
-                errorAtNode(br->node, "A type-parameter bound must be a non-generic class; '" +
-                    bt->toString() + "' is not");
+            } else if (bt->isClass() && bt->structInfo && !bt->structInfo->isTemplate) {
+                b = bt->structInfo;
+            } else {
+                errorAtNode(br.node, "A type-parameter bound must be a non-generic class or "
+                    "an interface; '" + bt->toString() + "' is not");
+                continue;
             }
+            bool dup = false;
+            for (StructInfo* prev : bounds) {
+                if (prev == b) { dup = true; break; }
+            }
+            if (dup) {
+                errorAtNode(br.node, "Duplicate bound '" + bt->toString() +
+                    "' on type parameter '" + pname + "'; list each bound once.");
+                continue;
+            }
+            if (!b->isInterface) {
+                if (classBound) {
+                    errorAtNode(br.node, "Type parameter '" + pname + "' already has the class "
+                        "bound '" + asciiOf(classBound->name) + "'; at most one bound can be a "
+                        "class, every other bound must be an interface.");
+                    continue;
+                }
+                classBound = b;
+            }
+            bounds.push_back(b);
         }
-        bounds.push_back(b);
+        all.push_back(std::move(bounds));
     }
-    return bounds;
+    return all;
 }
 
 size_t Analyzer::pushTypeParams(const void* owner, const std::vector<std::u16string>& names,
-                                const std::vector<StructInfo*>& bounds) {
+                                const std::vector<std::vector<StructInfo*>>& bounds) {
+    static const std::vector<StructInfo*> kNoBounds;
     for (size_t i = 0; i < names.size(); ++i) {
-        StructInfo* b = i < bounds.size() ? bounds[i] : nullptr;
+        const std::vector<StructInfo*>& b = i < bounds.size() ? bounds[i] : kNoBounds;
         Type* ph = typeCtx.getTypeParam(owner, static_cast<int>(i), names[i], b);
         typeParamScope_.push_back({names[i], ph});
     }
@@ -1583,17 +1792,44 @@ static bool isHashableClass(const StructInfo* si) {
     return si && si->name == u"Hashable" && si->modulePath == u"std.hash";
 }
 
-bool Analyzer::checkTypeArgBound(Type* arg, StructInfo* bound, const std::u16string& paramName,
-                                 const SyntaxNode& diag) {
-    if (!bound) return true;
-    if (isHashableClass(bound)) return true;
-    if (arg && arg->isClass() && arg->structInfo && arg->structInfo->isSubclassOf(bound)) {
-        return true;
+// All bounds of a type-parameter placeholder. Falls back to the primary bound
+// for placeholders created before multi-bound support populated paramBounds.
+static std::vector<StructInfo*> boundsOfTypeParam(const Type* t) {
+    if (!t) return {};
+    if (!t->paramBounds.empty()) return t->paramBounds;
+    if (t->structInfo) return {t->structInfo};
+    return {};
+}
+
+bool Analyzer::checkTypeArgBound(Type* arg, const std::vector<StructInfo*>& bounds,
+                                 const std::u16string& paramName, const SyntaxNode& diag) {
+    bool ok = true;
+    for (StructInfo* bound : bounds) {
+        if (!bound) continue;
+        // Every type satisfies the compiler-known hashing contract.
+        if (isHashableClass(bound)) continue;
+        bool satisfied = false;
+        if (arg && arg->isClass() && arg->structInfo) {
+            satisfied = arg->structInfo->isSubclassOrConforms(bound);
+        } else if (arg && arg->isTypeParam()) {
+            // A type-parameter argument satisfies a bound its own bounds imply.
+            for (StructInfo* own : arg->paramBounds) {
+                if (own && own->isSubclassOrConforms(bound)) { satisfied = true; break; }
+            }
+        }
+        if (satisfied) continue;
+        if (bound->isInterface) {
+            errorAtNode(diag, "Type argument '" + (arg ? arg->toString() : std::string("?")) +
+                "' for type parameter '" + asciiOf(paramName) + "' must implement interface '" +
+                asciiOf(bound->name) + "'");
+        } else {
+            errorAtNode(diag, "Type argument '" + (arg ? arg->toString() : std::string("?")) +
+                "' for type parameter '" + asciiOf(paramName) + "' must be '" + asciiOf(bound->name) +
+                "' or a subclass of it");
+        }
+        ok = false;
     }
-    errorAtNode(diag, "Type argument '" + (arg ? arg->toString() : std::string("?")) +
-        "' for type parameter '" + asciiOf(paramName) + "' must be '" + asciiOf(bound->name) +
-        "' or a subclass of it");
-    return false;
+    return ok;
 }
 
 Type* Analyzer::instantiateFromArgs(Type* templateType,
@@ -1610,13 +1846,15 @@ Type* Analyzer::instantiateFromArgs(Type* templateType,
     std::vector<Type*> argTypes;
     argTypes.reserve(args.size());
     bool ok = true;
+    static const std::vector<StructInfo*> kNoBounds;
     for (size_t i = 0; i < args.size(); ++i) {
         Type* at = resolveTypeReference(args[i]);
         if (!at || at->isError()) { ok = false; argTypes.push_back(typeCtx.getError()); continue; }
         argTypes.push_back(at);
-        StructInfo* bound = i < tmpl->typeParamBounds.size() ? tmpl->typeParamBounds[i] : nullptr;
+        const std::vector<StructInfo*>& bounds =
+            i < tmpl->typeParamBounds.size() ? tmpl->typeParamBounds[i] : kNoBounds;
         std::u16string pname = i < tmpl->typeParamNames.size() ? tmpl->typeParamNames[i] : std::u16string{};
-        if (!checkTypeArgBound(at, bound, pname, args[i].node)) ok = false;
+        if (!checkTypeArgBound(at, bounds, pname, args[i].node)) ok = false;
     }
     if (!ok) return typeCtx.getError();
     return typeCtx.instantiate(templateType, argTypes);
@@ -2353,56 +2591,43 @@ void Analyzer::analyzeForStmt(const ast::ForStatement& stmt) {
     loopDepth--;
 }
 
-// The element type a class yields in a for-in loop: the return type of next()
-// on whatever makeIterator() returns. Reports a specific diagnostic and
-// returns the error type when the protocol is incomplete.
+// True when `si` is the std.iterator Iterable interface (or an instantiation of it).
+static bool isIterableInterface(const StructInfo* si) {
+    if (!si || !si->isInterface) return false;
+    const StructInfo* authority = si->templateOf ? si->templateOf : si;
+    return authority->name == u"Iterable" && authority->modulePath == u"std.iterator";
+}
+
+// The element type a class yields in a for-in loop. Iteration is nominal: the
+// class (or a base class) must implement 'Iterable<T>' from @std.iterator, and
+// the element type is that instantiation's type argument. An 'Iterable<T>'
+// value itself is iterable too. Reports and returns the error type otherwise.
 Type* Analyzer::resolveIterableElement(Type* iterT, const SyntaxNode& diag) {
-    StructInfo* declaring = iterT->structInfo->classDeclaringZeroArgMethod(u"makeIterator");
-    int makeIdx = declaring ? declaring->findZeroArgMethodIndex(u"makeIterator") : -1;
-    if (!declaring) {
-        declaring = iterT->structInfo->classDeclaringMethod(u"makeIterator");
-        makeIdx = declaring ? declaring->findMethodIndex(u"makeIterator") : -1;
+    StructInfo* si = iterT->structInfo;
+    StructInfo* iterableInst = nullptr;
+    if (isIterableInterface(si)) {
+        iterableInst = si;
+    } else {
+        for (StructInfo* s = si; s && !iterableInst; s = s->baseInfo) {
+            for (Type* it : s->implementedInterfaces) {
+                if (it && isIterableInterface(it->structInfo)) {
+                    iterableInst = it->structInfo;
+                    break;
+                }
+            }
+        }
     }
-    Symbol* makeSym = (declaring && makeIdx >= 0) ? declaring->methods[makeIdx].symbol : nullptr;
-    if (!makeSym) {
-        errorAtNode(diag, "'" + iterT->toString() + "' is not iterable: it has no "
-            "'makeIterator()' method. Add one returning an Iterator to use it in a "
-            "for-in loop.");
+    if (!iterableInst) {
+        errorAtNode(diag, "'" + iterT->toString() + "' is not iterable: it does not implement "
+            "'Iterable' from '@std.iterator'. Declare 'implements Iterable<T>' and provide "
+            "'makeIterator() -> Iterator<T>' to use it in a for-in loop.");
         return typeCtx.getError();
     }
-    if (!makeSym->paramTypes.empty()) {
-        errorAtNode(diag, "'makeIterator()' on '" + iterT->toString() +
-            "' must take no arguments to be used in a for-in loop.");
+    if (iterableInst->typeArgs.empty() || !iterableInst->typeArgs[0]) {
+        errorAtNode(diag, "Internal: 'Iterable' lost its element type argument");
         return typeCtx.getError();
     }
-    Type* iteratorT = makeSym->returnType;
-    if (!iteratorT || !iteratorT->isClass() || !iteratorT->structInfo) {
-        errorAtNode(diag, "'makeIterator()' on '" + iterT->toString() + "' must return "
-            "an iterator class with 'hasNext() -> bool' and 'next() -> T' methods.");
-        return typeCtx.getError();
-    }
-    StructInfo* hasNextDecl = iteratorT->structInfo->classDeclaringZeroArgMethod(u"hasNext");
-    if (!hasNextDecl) hasNextDecl = iteratorT->structInfo->classDeclaringMethod(u"hasNext");
-    StructInfo* nextDecl = iteratorT->structInfo->classDeclaringZeroArgMethod(u"next");
-    if (!nextDecl) nextDecl = iteratorT->structInfo->classDeclaringMethod(u"next");
-    auto protocolSymbol = [](StructInfo* decl, const char16_t* name) -> Symbol* {
-        if (!decl) return nullptr;
-        int idx = decl->findZeroArgMethodIndex(name);
-        if (idx < 0) idx = decl->findMethodIndex(name);
-        return idx >= 0 ? decl->methods[idx].symbol : nullptr;
-    };
-    Symbol* hasNextSym = protocolSymbol(hasNextDecl, u"hasNext");
-    Symbol* nextSym = protocolSymbol(nextDecl, u"next");
-    bool hasNextOk = hasNextSym && hasNextSym->paramTypes.empty() &&
-        hasNextSym->returnType && hasNextSym->returnType->isBool();
-    bool nextOk = nextSym && nextSym->paramTypes.empty() &&
-        nextSym->returnType && !nextSym->returnType->isVoid();
-    if (!hasNextOk || !nextOk) {
-        errorAtNode(diag, "The iterator type '" + iteratorT->toString() + "' returned by "
-            "'makeIterator()' must have 'hasNext() -> bool' and 'next() -> T' methods.");
-        return typeCtx.getError();
-    }
-    return nextSym->returnType;
+    return iterableInst->typeArgs[0];
 }
 
 void Analyzer::analyzeForEachStmt(const ast::ForEachStatement& stmt) {
@@ -2417,8 +2642,8 @@ void Analyzer::analyzeForEachStmt(const ast::ForEachStatement& stmt) {
             elemT = resolveIterableElement(iterT, stmt.node);
         } else {
             errorAtNode(stmt.node, "'for (... in ...)' requires an array or an iterable "
-                "object, got '" + iterT->toString() + "'. A class is iterable when it has "
-                "a 'makeIterator() -> Iterator<T>' method.");
+                "object, got '" + iterT->toString() + "'. A class is iterable when it "
+                "implements 'Iterable<T>' from '@std.iterator'.");
         }
     }
     Type* bindingT = elemT;
@@ -3113,10 +3338,8 @@ StructInfo* Analyzer::receiverStructInfo(const std::optional<ast::Expression>& o
         if (!t->isOptional() || !t->inner) return nullptr;
         t = t->inner;
     }
-    if (t->isTypeParam() && t->structInfo) {
-        if (Type* bound = typeCtx.lookupClass(t->structInfo->modulePath, t->structInfo->name)) {
-            t = bound;
-        }
+    if (t->isTypeParam()) {
+        return t->structInfo;  // primary bound (or null when unbounded)
     }
     return (t->hasRecordLayout() && t->structInfo) ? t->structInfo : nullptr;
 }
@@ -3323,19 +3546,15 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                     for (auto& a : args) analyzeExpr(a);
                     return typeCtx.getError();
                 }
-                Type* lookupT = recvT;
-                if (recvT->isTypeParam()) {
-                    lookupT = nullptr;
-                    if (recvT->structInfo) {
-                        lookupT = typeCtx.lookupClass(recvT->structInfo->modulePath,
-                                                      recvT->structInfo->name);
-                    }
-                }
                 bool declaresHash = false;
-                if (lookupT && lookupT->hasRecordLayout() && lookupT->structInfo) {
-                    declaresHash = lookupT->isClass()
-                        ? lookupT->structInfo->classDeclaringMethod(u"hash") != nullptr
-                        : lookupT->structInfo->findMethodIndex(u"hash") >= 0;
+                if (recvT->isTypeParam()) {
+                    for (StructInfo* b : boundsOfTypeParam(recvT)) {
+                        if (b && b->classDeclaringMethod(u"hash")) { declaresHash = true; break; }
+                    }
+                } else if (recvT->hasRecordLayout() && recvT->structInfo) {
+                    declaresHash = recvT->isClass()
+                        ? recvT->structInfo->classDeclaringMethod(u"hash") != nullptr
+                        : recvT->structInfo->findMethodIndex(u"hash") >= 0;
                 }
                 if (!declaresHash) {
                     if (!args.empty()) {
@@ -3634,10 +3853,12 @@ Type* Analyzer::analyzeGenericCall(const ast::CallExpression& expr, Symbol* sym,
     }
 
     bool ok = true;
+    static const std::vector<StructInfo*> kNoBounds;
     for (size_t i = 0; i < arity; ++i) {
-        StructInfo* bound = i < sym->typeParamBounds.size() ? sym->typeParamBounds[i] : nullptr;
+        const std::vector<StructInfo*>& bounds =
+            i < sym->typeParamBounds.size() ? sym->typeParamBounds[i] : kNoBounds;
         SyntaxNode diag = (i < explicitArgs.size()) ? explicitArgs[i].node : expr.node;
-        if (!checkTypeArgBound(typeArgs[i], bound, sym->typeParamNames[i], diag)) ok = false;
+        if (!checkTypeArgBound(typeArgs[i], bounds, sym->typeParamNames[i], diag)) ok = false;
     }
 
     size_t req = requiredArgCount(sym);
@@ -3856,11 +4077,24 @@ Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
 
     Type* objT = analyzeExpr(*obj);
     if (objT->isError()) return typeCtx.getError();
-    // A bounded type parameter exposes the members of its bound class.
-    if (objT->isTypeParam() && objT->structInfo) {
-        if (Type* bound = typeCtx.lookupClass(objT->structInfo->modulePath, objT->structInfo->name)) {
-            objT = bound;
+    // A bounded type parameter exposes the members of every one of its bounds;
+    // the first bound declaring the member wins.
+    if (objT->isTypeParam()) {
+        auto wanted = expr.memberText();
+        Type* rebound = nullptr;
+        for (StructInfo* b : boundsOfTypeParam(objT)) {
+            if (!b) continue;
+            Type* bt = b->templateOf ? typeCtx.typeForInstance(b)
+                                     : typeCtx.lookupNamedType(b->modulePath, b->name);
+            if (!bt || !bt->structInfo) continue;
+            if (!rebound) rebound = bt;
+            if (wanted && (bt->structInfo->findFieldIndex(*wanted) >= 0 ||
+                           bt->structInfo->classDeclaringMethod(*wanted))) {
+                rebound = bt;
+                break;
+            }
         }
+        if (rebound) objT = rebound;
     }
     if (objT->isArray()) {
         auto memberName = expr.memberText();
@@ -4006,7 +4240,7 @@ bool Analyzer::checkClassTypeTest(Type* srcT, Type* dstT, bool isCast,
         return false;
     }
     if (!dstT->isClass() || !dstT->structInfo) {
-        errorAtNode(diagNode, "The target of '" + op + "' must be a class, got '" +
+        errorAtNode(diagNode, "The target of '" + op + "' must be a class or an interface, got '" +
             dstT->toString() + "'.");
         return false;
     }
@@ -4022,7 +4256,7 @@ bool Analyzer::checkClassTypeTest(Type* srcT, Type* dstT, bool isCast,
             "'; only class values can be " + (isCast ? "cast." : "tested."));
         return false;
     }
-    if (srcCore->structInfo->isSubclassOf(dstT->structInfo)) {
+    if (srcCore->structInfo->isSubclassOrConforms(dstT->structInfo)) {
         // A nullable scrutinee still gains information from 'is': the test
         // also proves the value is not null.
         if (!isCast && srcT->isOptional()) return true;
@@ -4035,6 +4269,22 @@ bool Analyzer::checkClassTypeTest(Type* srcT, Type* dstT, bool isCast,
                 dstT->toString() + "'; this 'is' test would always be true. Remove it.");
         }
         return false;
+    }
+    // An interface scrutinee leaves everything to the runtime: any class or
+    // interface target may match depending on the value's dynamic type.
+    if (srcCore->isInterface()) return true;
+    if (dstT->isInterface()) {
+        // Class scrutinee against an interface target: a subclass may implement
+        // it, unless the class is final (no subclasses can exist).
+        if (srcCore->structInfo->isFinal) {
+            errorAtNode(diagNode, "A value of type '" + srcT->toString() + "' can never be a '" +
+                dstT->toString() + "': '" + srcCore->toString() + "' is 'final' and does not "
+                "implement it. " + (isCast ? "This 'as?' cast would always be null."
+                                           : "This 'is' test would always be false.") +
+                " Remove it.");
+            return false;
+        }
+        return true;
     }
     if (!dstT->structInfo->isSubclassOf(srcCore->structInfo)) {
         errorAtNode(diagNode, "A value of type '" + srcT->toString() + "' can never be a '" +
@@ -4060,7 +4310,7 @@ StructInfo* Analyzer::checkTypeArmTarget(Type* scrutType, Type* inner, Type* arm
         return nullptr;
     }
     if (!armT->isClass() || !armT->structInfo) {
-        errorAtNode(diagNode, "The type of an 'is' arm must be a class, got '" +
+        errorAtNode(diagNode, "The type of an 'is' arm must be a class or an interface, got '" +
             armT->toString() + "'.");
         return nullptr;
     }
@@ -4069,10 +4319,22 @@ StructInfo* Analyzer::checkTypeArmTarget(Type* scrutType, Type* inner, Type* arm
             "over '" + scrutType->toString() + "'; use a 'default' arm instead.");
         return nullptr;
     }
-    if (inner->structInfo->isSubclassOf(armT->structInfo)) {
+    if (inner->structInfo->isSubclassOrConforms(armT->structInfo)) {
         errorAtNode(diagNode, "A value of type '" + inner->toString() + "' is always a '" +
             armT->toString() + "'; this arm would match every value. Use a 'default' arm instead.");
         return nullptr;
+    }
+    // An interface scrutinee (or an interface arm over a non-final class) is
+    // decided at runtime; only the impossible combinations are rejected.
+    if (inner->isInterface()) return armT->structInfo;
+    if (armT->isInterface()) {
+        if (inner->structInfo->isFinal) {
+            errorAtNode(diagNode, "A value of type '" + inner->toString() + "' can never be a '" +
+                armT->toString() + "': '" + inner->toString() + "' is 'final' and does not "
+                "implement it. This arm would never match. Remove it.");
+            return nullptr;
+        }
+        return armT->structInfo;
     }
     if (!armT->structInfo->isSubclassOf(inner->structInfo)) {
         errorAtNode(diagNode, "A value of type '" + inner->toString() + "' can never be a '" +
@@ -4350,7 +4612,10 @@ Type* Analyzer::analyzeNew(const ast::NewExpression& expr) {
     }
     analysis.setType(expr.node.greenNode(), t);
 
-    if (t->structInfo && t->structInfo->isAbstract) {
+    if (t->structInfo && t->structInfo->isInterface) {
+        errorAtNode(expr.node, "Cannot create an instance of interface '" + asciiOf(*typeName) +
+            "'; instantiate a class that implements it instead");
+    } else if (t->structInfo && t->structInfo->isAbstract) {
         errorAtNode(expr.node, "Cannot create an instance of abstract class '" +
             asciiOf(*typeName) + "'; instantiate a concrete subclass instead");
     }
@@ -4537,7 +4802,7 @@ Type* Analyzer::analyzeSwitchArms(const std::optional<ast::Expression>& scrutine
             }
             if (armClass) {
                 for (StructInfo* prev : armClasses) {
-                    if (armClass->isSubclassOf(prev)) {
+                    if (armClass->isSubclassOrConforms(prev)) {
                         errorAtNode(diag, "This 'is " + asciiOf(armClass->name) + "' arm is "
                             "unreachable: the earlier 'is " + asciiOf(prev->name) + "' arm "
                             "already matches every '" + asciiOf(armClass->name) + "'. Move it "
@@ -4672,7 +4937,10 @@ Type* Analyzer::analyzeSwitchArms(const std::optional<ast::Expression>& scrutine
     if (typeSwitch && !hasDefault) {
         StructInfo* root = inner->structInfo;
         std::string rootName = inner->toString();
-        if (!root->isSealed) {
+        if (root->isInterface) {
+            errorAtNode(diagNode, "A switch over '" + rootName + "' must have a 'default' arm: "
+                "interfaces are open, so any class anywhere may implement '" + rootName + "'.");
+        } else if (!root->isSealed) {
             errorAtNode(diagNode, "A switch over '" + rootName + "' must have a 'default' arm "
                 "because '" + rootName + "' is not sealed.");
         } else if (!root->isAbstract) {
@@ -4684,7 +4952,7 @@ Type* Analyzer::analyzeSwitchArms(const std::optional<ast::Expression>& scrutine
             for (StructInfo* sub : root->directSubclasses) {
                 bool covered = false;
                 for (StructInfo* a : armClasses) {
-                    if (sub->isSubclassOf(a)) { covered = true; break; }
+                    if (sub->isSubclassOrConforms(a)) { covered = true; break; }
                 }
                 if (!covered) missing.push_back(sub->name);
             }

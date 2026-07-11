@@ -50,6 +50,7 @@ struct MethodInfo {
     bool isFinal = false;
     bool isAbstract = false;
     int vtableSlot = -1;            // >= 0 => dispatched virtually through the vtable
+    int itableSlot = -1;            // interface methods: index in the interface's method table
     StructInfo* definingClass = nullptr;  // class that declares this method (for codegen mangling)
 };
 
@@ -73,12 +74,19 @@ struct StructInfo {
     bool isSealed = false;           // direct subclasses restricted to the declaring module
     std::vector<StructInfo*> directSubclasses;  // classes extending this one directly
 
+    // Interfaces. An interface reuses the class type kind (reference semantics)
+    // with this flag set; its `methods` are bodiless signatures with itable slots.
+    // On a class, `implementedInterfaces` lists the interface types named in its
+    // own `implements` clause (base classes contribute theirs via the chain).
+    bool isInterface = false;
+    std::vector<Type*> implementedInterfaces;
+
     // Generics. A template carries its type-parameter names and optional bounds;
     // an instantiation points back at its template and records the concrete args.
     bool isTemplate = false;
     bool membersCollected = false;              // template: fields/methods resolved
     std::vector<std::u16string> typeParamNames;
-    std::vector<StructInfo*> typeParamBounds;   // parallel to names; null = unbounded
+    std::vector<std::vector<StructInfo*>> typeParamBounds;  // parallel to names; empty = unbounded
     StructInfo* templateOf = nullptr;           // instantiation -> its template
     std::vector<Type*> typeArgs;                // instantiation -> concrete type args
 
@@ -106,6 +114,14 @@ struct StructInfo {
         }
         return false;
     }
+    // True if this class (or a base class) implements `iface`, or is `iface` itself.
+    bool conformsToInterface(const StructInfo* iface) const;
+    // Combined subtyping test: subclass for a class target, conformance for an
+    // interface target. The single primitive behind implicit reference conversions.
+    bool isSubclassOrConforms(const StructInfo* other) const {
+        if (!other) return false;
+        return other->isInterface ? conformsToInterface(other) : isSubclassOf(other);
+    }
     // Nearest class in the chain (self first) that declares `methodName`, or null.
     StructInfo* classDeclaringMethod(const std::u16string& methodName) {
         for (StructInfo* s = this; s; s = s->baseInfo) {
@@ -125,10 +141,12 @@ public:
     StructInfo* structInfo = nullptr;
 
     // Type-parameter placeholder (kind == TypeParam): identity is (paramOwner,
-    // paramIndex); `structInfo` holds the optional bound; paramName is for display.
+    // paramIndex); `structInfo` holds the primary bound (the class bound when one
+    // exists) and `paramBounds` all bounds; paramName is for display.
     const void* paramOwner = nullptr;
     int paramIndex = -1;
     std::u16string paramName;
+    std::vector<StructInfo*> paramBounds;
 
     explicit Type(TypeKind k) : kind(k) {}
     Type(TypeKind k, Type* i) : kind(k), inner(i) {}
@@ -145,6 +163,8 @@ public:
     bool isArray() const { return kind == TypeKind::Array; }
     bool isStruct() const { return kind == TypeKind::Struct; }
     bool isClass() const  { return kind == TypeKind::Class; }
+    // Interfaces share the class type kind; this narrows to them.
+    bool isInterface() const { return kind == TypeKind::Class && structInfo && structInfo->isInterface; }
     bool isEnum() const   { return kind == TypeKind::Enum; }
     bool isExternal() const { return kind == TypeKind::External; }
     bool isTypeParam() const { return kind == TypeKind::TypeParam; }

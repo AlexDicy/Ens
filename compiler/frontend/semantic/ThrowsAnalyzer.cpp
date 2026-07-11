@@ -90,6 +90,19 @@ const ThrowsAnalyzer::TypeSet& ThrowsAnalyzer::contractOf(const Symbol* sym) con
     static const TypeSet kEmpty;
     if (!sym) return kEmpty;
     if (!sym->declaredThrowsTypes.empty()) return sym->declaredThrowsTypes;
+    // A generic instance's method clone may have been copied before the template
+    // resolved its declared list; the template's list is authoritative (declared
+    // throws types never mention type parameters).
+    if (sym->declaredThrows && sym->methodOwner && sym->methodOwner->templateOf) {
+        StructInfo* owner = sym->methodOwner;
+        StructInfo* templ = owner->templateOf;
+        for (size_t i = 0; i < owner->methods.size() && i < templ->methods.size(); ++i) {
+            if (owner->methods[i].symbol != sym) continue;
+            Symbol* ts = templ->methods[i].symbol;
+            if (ts && !ts->declaredThrowsTypes.empty()) return ts->declaredThrowsTypes;
+            break;
+        }
+    }
     return sym->throwsSet;
 }
 
@@ -397,6 +410,36 @@ void ThrowsAnalyzer::validate(DiagnosticSink& sink, const SourceFile& source) {
     };
     for (auto& sd : sf.structs()) for (auto& m : sd.methods()) eachMethod(m);
     for (auto& cd : sf.classes()) for (auto& m : cd.methods()) eachMethod(m);
+
+    // A method satisfying an interface may only throw what the interface method
+    // declares (subclasses of a declared type included).
+    for (auto& cd : sf.classes()) {
+        Type* t = analysis.typeOf(cd.node.greenNode());
+        StructInfo* si = (t && t->isClass()) ? t->structInfo : nullptr;
+        if (!si) continue;
+        for (Type* ifaceT : si->implementedInterfaces) {
+            StructInfo* iface = (ifaceT && ifaceT->isClass()) ? ifaceT->structInfo : nullptr;
+            if (!iface) continue;
+            for (auto& im : iface->methods) {
+                if (!im.symbol) continue;
+                StructInfo* decl = si->classDeclaringMethodBySignature(im.name, im.symbol);
+                if (!decl) continue;  // missing method reported during class layout
+                int idx = decl->findMethodIndexBySignature(im.name, im.symbol);
+                Symbol* implSym = idx >= 0 ? decl->methods[idx].symbol : nullptr;
+                if (!implSym || implSym == im.symbol) continue;
+                const TypeSet& mine = contractOf(implSym);
+                const TypeSet& allowed = contractOf(im.symbol);
+                TypeSet stray;
+                for (StructInfo* m : mine) if (!covers(allowed, m)) addType(stray, m);
+                if (!stray.empty()) {
+                    errorAt(cd.node, "Method '" + asciiOf(im.name) + "' of '" +
+                        asciiOf(si->name) + "' can throw " + nameList(stray) +
+                        ", which interface '" + ifaceT->toString() + "' does not allow. An "
+                        "implementing method may only throw types the interface method declares.");
+                }
+            }
+        }
+    }
 
     // Field defaults must not throw.
     auto checkFieldDefaults = [&](auto fields) {

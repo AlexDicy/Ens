@@ -124,16 +124,19 @@ private:
     // === Collect phase ===
     void registerStructNames(const ast::SourceFile& file);
     void registerClassNames(const ast::SourceFile& file);
+    void registerInterfaceNames(const ast::SourceFile& file);
     void registerEnumNames(const ast::SourceFile& file);
     void registerExternalTypeNames(const ast::SourceFile& file);
     void collectStructs(const ast::SourceFile& file);
+    void collectInterfaces(const ast::SourceFile& file);
     void collectEnums(const ast::SourceFile& file);
     void resolveClassBases(const ast::SourceFile& file);
     void layoutDeclaredClasses(const ast::SourceFile& file);
     void collectFunctions(const ast::SourceFile& file);
     void collectTests(const ast::SourceFile& file);
     void collectExternalFunctions(const ast::SourceFile& file);
-    void resolveMethodParams(const ast::FuncDecl& fn, ::Type* receiverType, Symbol* sym);
+    void resolveMethodParams(const ast::FuncDecl& fn, ::Type* receiverType, Symbol* sym,
+                             bool isInterfaceMethod = false);
     void resolveFunctionParams(const ast::FuncDecl& fn, Symbol* sym);
     bool overrideSignaturesCompatible(const MethodInfo& base, Symbol* derived);
     void checkThrowsClausePlacement(const ast::FuncDecl& fn, bool isOverridable, bool isConstructor);
@@ -291,10 +294,10 @@ private:
     // Generics. typeParamScope_ maps type-parameter names visible in the enclosing
     // template (class/struct/function) to their placeholder types.
     std::vector<std::pair<std::u16string, Type*>> typeParamScope_;
-    std::vector<StructInfo*> resolveTypeParamBounds(const void* owner,
-                                                    const std::vector<ast::TypeParam>& params);
+    std::vector<std::vector<StructInfo*>> resolveTypeParamBounds(
+        const void* owner, const std::vector<ast::TypeParam>& params);
     size_t pushTypeParams(const void* owner, const std::vector<std::u16string>& names,
-                          const std::vector<StructInfo*>& bounds);
+                          const std::vector<std::vector<StructInfo*>>& bounds);
     // Resolve a template's bounds (once) from its AST params, then push its scope.
     size_t enterTemplateScope(StructInfo* si, const std::vector<ast::TypeParam>& astParams);
     void popTypeParams(size_t count);
@@ -302,8 +305,8 @@ private:
     // and bounds; reports against `diag`. Returns the error type on failure.
     Type* instantiateFromArgs(Type* templateType, const std::vector<ast::TypeReference>& args,
                               const SyntaxNode& diag);
-    bool checkTypeArgBound(Type* arg, StructInfo* bound, const std::u16string& paramName,
-                           const SyntaxNode& diag);
+    bool checkTypeArgBound(Type* arg, const std::vector<StructInfo*>& bounds,
+                           const std::u16string& paramName, const SyntaxNode& diag);
     bool isLValue(const ast::Expression& expr) const;
 
     bool isMemberAccessAllowed(Visibility visibility, StructInfo* definingClass);

@@ -94,6 +94,13 @@ Type* TypeContext::lookupClass(const std::u16string& modulePath, const std::u16s
     return it == classCache.end() ? nullptr : it->second;
 }
 
+Type* TypeContext::registerInterface(const std::u16string& modulePath, std::u16string name) {
+    Type* t = registerClass(modulePath, std::move(name));
+    t->structInfo->isInterface = true;
+    t->structInfo->isAbstract = true;  // never instantiable
+    return t;
+}
+
 Type* TypeContext::registerExternalType(const std::u16string& modulePath, std::u16string name) {
     auto info = std::make_unique<StructInfo>();
     info->name = name;
@@ -137,18 +144,29 @@ Type* TypeContext::lookupNamedType(const std::u16string& modulePath, const std::
     return lookupExternalType(modulePath, name);
 }
 
-Type* TypeContext::getTypeParam(const void* owner, int index, std::u16string name, StructInfo* bound) {
+Type* TypeContext::getTypeParam(const void* owner, int index, std::u16string name,
+                                const std::vector<StructInfo*>& bounds) {
+    // The primary bound drives single-bound lookups: the class bound when one
+    // exists, otherwise the first interface bound.
+    StructInfo* primary = nullptr;
+    for (StructInfo* b : bounds) {
+        if (b && !b->isInterface) { primary = b; break; }
+    }
+    if (!primary && !bounds.empty()) primary = bounds.front();
+
     auto key = std::make_pair(owner, index);
     auto it = typeParamCache.find(key);
     if (it != typeParamCache.end()) {
-        if (bound && !it->second->structInfo) it->second->structInfo = bound;
+        if (primary && !it->second->structInfo) it->second->structInfo = primary;
+        if (!bounds.empty() && it->second->paramBounds.empty()) it->second->paramBounds = bounds;
         return it->second;
     }
     Type* t = allocate(TypeKind::TypeParam);
     t->paramOwner = owner;
     t->paramIndex = index;
     t->paramName = std::move(name);
-    t->structInfo = bound;
+    t->structInfo = primary;
+    t->paramBounds = bounds;
     typeParamCache[key] = t;
     return t;
 }
@@ -204,6 +222,7 @@ Type* TypeContext::instantiateInternal(StructInfo* templ, TypeKind kind,
     info->isAbstract = templ->isAbstract;
     info->isFinal = templ->isFinal;
     info->isSealed = templ->isSealed;
+    info->isInterface = templ->isInterface;
     info->templateOf = templ;
     info->typeArgs = args;
     info->baseInfo = templ->baseInfo;
@@ -248,6 +267,10 @@ void TypeContext::fillInstantiation(StructInfo* inst, StructInfo* templ,
         if (concreteBase && concreteBase->structInfo) {
             inst->baseInfo = concreteBase->structInfo;
         }
+    }
+    inst->implementedInterfaces.clear();
+    for (Type* ifaceT : templ->implementedInterfaces) {
+        inst->implementedInterfaces.push_back(substitute(ifaceT, owner, args));
     }
     for (const auto& f : templ->fields) {
         FieldInfo nf = f;

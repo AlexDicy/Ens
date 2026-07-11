@@ -76,6 +76,14 @@ std::optional<TypeReference> TypeParam::bound() const {
     return std::nullopt;
 }
 
+std::vector<TypeReference> TypeParam::bounds() const {
+    std::vector<TypeReference> out;
+    for (auto& c : node.children()) {
+        if (auto tr = TypeReference::cast(c)) out.push_back(*tr);
+    }
+    return out;
+}
+
 std::vector<TypeParam> TypeParamList::params() const {
     std::vector<TypeParam> out;
     for (auto& c : node.children()) {
@@ -415,9 +423,56 @@ std::vector<TypeReference> ClassDecl::baseTypeArguments() const {
     }
     return out;
 }
+std::optional<ImplementsClause> ClassDecl::implementsClause() const {
+    if (auto n = firstChildNode(node, SyntaxKind::ImplementsClause)) return ImplementsClause::cast(*n);
+    return std::nullopt;
+}
+std::vector<TypeReference> ClassDecl::implementedInterfaceRefs() const {
+    if (auto ic = implementsClause()) return ic->types();
+    return {};
+}
 bool ClassDecl::isAbstract() const { return hasDirectToken(node, SyntaxKind::KwAbstract); }
 bool ClassDecl::isFinal() const    { return hasDirectToken(node, SyntaxKind::KwFinal); }
 bool ClassDecl::isSealed() const   { return hasDirectToken(node, SyntaxKind::KwSealed); }
+
+// === ImplementsClause ===
+
+std::vector<TypeReference> ImplementsClause::types() const {
+    std::vector<TypeReference> out;
+    for (auto& c : node.children()) {
+        if (auto tr = TypeReference::cast(c)) out.push_back(*tr);
+    }
+    return out;
+}
+
+// === InterfaceDecl ===
+
+std::optional<VisibilityModifier> InterfaceDecl::visibilityModifier() const { return visibilityOfDeclNode(node); }
+Visibility InterfaceDecl::visibility() const { return visibilityOfDecl(node); }
+std::optional<SyntaxNode> InterfaceDecl::nameToken() const {
+    return firstIdentAfterKeyword(node, SyntaxKind::KwInterface);
+}
+std::optional<std::u16string> InterfaceDecl::nameText() const {
+    if (auto t = nameToken()) return std::u16string(t->tokenText());
+    return std::nullopt;
+}
+std::optional<TypeParamList> InterfaceDecl::typeParamList() const { return typeParamListOf(node); }
+std::vector<TypeParam> InterfaceDecl::typeParams() const {
+    if (auto l = typeParamList()) return l->params();
+    return {};
+}
+std::optional<MemberList> InterfaceDecl::memberList() const {
+    if (auto m = firstChildNode(node, SyntaxKind::MemberList)) return MemberList::cast(*m);
+    return std::nullopt;
+}
+std::vector<FieldDecl> InterfaceDecl::fields() const {
+    if (auto ml = memberList()) return ml->fields();
+    return {};
+}
+std::vector<FuncDecl> InterfaceDecl::methods() const {
+    if (auto ml = memberList()) return ml->methods();
+    return {};
+}
 std::optional<MemberList> ClassDecl::memberList() const {
     if (auto m = firstChildNode(node, SyntaxKind::MemberList)) return MemberList::cast(*m);
     return std::nullopt;
@@ -616,6 +671,14 @@ std::vector<ClassDecl> SourceFile::classes() const {
     std::vector<ClassDecl> out;
     for (auto& c : node.children()) {
         if (auto cl = ClassDecl::cast(c)) out.push_back(*cl);
+    }
+    return out;
+}
+
+std::vector<InterfaceDecl> SourceFile::interfaces() const {
+    std::vector<InterfaceDecl> out;
+    for (auto& c : node.children()) {
+        if (auto i = InterfaceDecl::cast(c)) out.push_back(*i);
     }
     return out;
 }

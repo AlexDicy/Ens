@@ -171,6 +171,7 @@ GreenElementPtr Parser::parseSourceFile() {
             // Defensive: if no progress was made, force advance to avoid infinite loop.
             reportAtCurrent("Unexpected token at top level");
             recoverTo({SyntaxKind::KwImport, SyntaxKind::KwStruct, SyntaxKind::KwClass,
+                       SyntaxKind::KwInterface,
                        SyntaxKind::KwPrivate, SyntaxKind::KwProtected, SyntaxKind::KwPublic,
                        SyntaxKind::Identifier, SyntaxKind::Semi, SyntaxKind::EndOfFile});
             if (current == before && !atEnd()) bump();
@@ -216,6 +217,10 @@ void Parser::parseTopLevel() {
     }
     if (peekKind(declMods) == SyntaxKind::KwClass) {
         parseStructOrClassDecl(SyntaxKind::ClassDecl, SyntaxKind::KwClass);
+        return;
+    }
+    if (peekKind(declMods) == SyntaxKind::KwInterface) {
+        parseInterfaceDecl();
         return;
     }
     if (peekKind(declMods) == SyntaxKind::KwEnum) {
@@ -551,6 +556,10 @@ void Parser::parseStructOrClassDecl(SyntaxKind nodeKind, SyntaxKind keywordKind)
         expect(SyntaxKind::Identifier, "base class name after 'extends'");
         if (at(SyntaxKind::Lt)) parseTypeArgList();
     }
+    if (at(SyntaxKind::KwImplements)) {
+        if (!isClass) reportAtCurrent("Structs cannot implement interfaces; only classes can use 'implements'");
+        parseImplementsClause();
+    }
     expect(SyntaxKind::LBrace, "'{'");
     builder.startNode(SyntaxKind::MemberList);
     while (!at(SyntaxKind::RBrace) && !atEnd()) {
@@ -558,6 +567,52 @@ void Parser::parseStructOrClassDecl(SyntaxKind nodeKind, SyntaxKind keywordKind)
         parseStructOrClassMember();
         if (current == before) {
             reportAtCurrent("Unexpected token in member list");
+            recoverTo({SyntaxKind::RBrace, SyntaxKind::Semi, SyntaxKind::EndOfFile});
+            eat(SyntaxKind::Semi);
+            if (current == before && !atEnd()) bump();
+        }
+    }
+    builder.finishNode();
+    expect(SyntaxKind::RBrace, "'}'");
+    builder.finishNode();
+}
+
+void Parser::parseImplementsClause() {
+    builder.startNode(SyntaxKind::ImplementsClause);
+    expect(SyntaxKind::KwImplements, "'implements'");
+    if (isTypeStart(kindAt())) parseType();
+    else emitMissing(SyntaxKind::Identifier, "interface name after 'implements'");
+    while (eat(SyntaxKind::Comma)) {
+        if (isTypeStart(kindAt())) parseType();
+        else emitMissing(SyntaxKind::Identifier, "interface name after ','");
+    }
+    builder.finishNode();
+}
+
+void Parser::parseInterfaceDecl() {
+    builder.startNode(SyntaxKind::InterfaceDecl);
+    parseVisibilityModifier();
+    while (at(SyntaxKind::KwAbstract) || at(SyntaxKind::KwFinal) || at(SyntaxKind::KwSealed)) {
+        reportAtCurrent("'abstract', 'final', and 'sealed' are not allowed on an interface");
+        bump();
+    }
+    expect(SyntaxKind::KwInterface, "'interface'");
+    expect(SyntaxKind::Identifier, "interface name");
+    if (at(SyntaxKind::Lt)) parseTypeParamList();
+    if (at(SyntaxKind::KwExtends) || at(SyntaxKind::KwImplements)) {
+        reportAtCurrent("An interface cannot extend or implement anything; its body lists "
+                        "only method signatures");
+        builder.startNode(SyntaxKind::Error);
+        while (!at(SyntaxKind::LBrace) && !atEnd()) bump();
+        builder.finishNode();
+    }
+    expect(SyntaxKind::LBrace, "'{'");
+    builder.startNode(SyntaxKind::MemberList);
+    while (!at(SyntaxKind::RBrace) && !atEnd()) {
+        size_t before = current;
+        parseStructOrClassMember();
+        if (current == before) {
+            reportAtCurrent("Unexpected token in interface body");
             recoverTo({SyntaxKind::RBrace, SyntaxKind::Semi, SyntaxKind::EndOfFile});
             eat(SyntaxKind::Semi);
             if (current == before && !atEnd()) bump();
@@ -716,8 +771,13 @@ void Parser::parseTypeParam() {
     builder.startNode(SyntaxKind::TypeParam);
     expect(SyntaxKind::Identifier, "type parameter name");
     if (eat(SyntaxKind::Colon)) {
+        // One or more bounds separated by '+': `T: Base + Comparable`.
         if (isTypeStart(kindAt())) parseType();
         else emitMissing(SyntaxKind::Identifier, "bound type after ':'");
+        while (eat(SyntaxKind::Plus)) {
+            if (isTypeStart(kindAt())) parseType();
+            else emitMissing(SyntaxKind::Identifier, "bound type after '+'");
+        }
     }
     builder.finishNode();
 }

@@ -24,6 +24,8 @@ class FuncDecl;
 class FieldDecl;
 class StructDecl;
 class ClassDecl;
+class InterfaceDecl;
+class ImplementsClause;
 class MemberList;
 class ImportDecl;
 class ImportPath;
@@ -55,6 +57,8 @@ public:
     std::optional<SyntaxNode> nameToken() const;
     std::optional<std::u16string> nameText() const;
     std::optional<TypeReference> bound() const;
+    // All bounds in source order: `T: Base + Comparable` yields both.
+    std::vector<TypeReference> bounds() const;
 };
 
 class TypeParamList {
@@ -209,6 +213,16 @@ public:
     std::vector<FuncDecl> methods() const;
 };
 
+class ImplementsClause {
+public:
+    SyntaxNode node;
+    static std::optional<ImplementsClause> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::ImplementsClause) return std::nullopt;
+        return ImplementsClause{n};
+    }
+    std::vector<TypeReference> types() const;
+};
+
 class ClassDecl {
 public:
     SyntaxNode node;
@@ -225,9 +239,29 @@ public:
     std::optional<SyntaxNode> baseClassToken() const;
     std::optional<std::u16string> baseClassName() const;
     std::vector<TypeReference> baseTypeArguments() const;
+    std::optional<ImplementsClause> implementsClause() const;
+    std::vector<TypeReference> implementedInterfaceRefs() const;
     bool isAbstract() const;
     bool isFinal() const;
     bool isSealed() const;
+    std::optional<MemberList> memberList() const;
+    std::vector<FieldDecl> fields() const;
+    std::vector<FuncDecl> methods() const;
+};
+
+class InterfaceDecl {
+public:
+    SyntaxNode node;
+    static std::optional<InterfaceDecl> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::InterfaceDecl) return std::nullopt;
+        return InterfaceDecl{n};
+    }
+    std::optional<VisibilityModifier> visibilityModifier() const;
+    Visibility visibility() const;
+    std::optional<SyntaxNode> nameToken() const;
+    std::optional<std::u16string> nameText() const;
+    std::optional<TypeParamList> typeParamList() const;
+    std::vector<TypeParam> typeParams() const;
     std::optional<MemberList> memberList() const;
     std::vector<FieldDecl> fields() const;
     std::vector<FuncDecl> methods() const;
@@ -352,6 +386,7 @@ public:
     std::vector<FuncDecl> functions() const;
     std::vector<StructDecl> structs() const;
     std::vector<ClassDecl> classes() const;
+    std::vector<InterfaceDecl> interfaces() const;
     std::vector<EnumDecl> enums() const;
     std::vector<TestDecl> tests() const;
     std::vector<TypedVarDeclStatement> topLevelVarDecls() const;

@@ -65,6 +65,8 @@ private:
     void parseThrowsClause();
     void parseCatchClause();
     void parseStructOrClassDecl(SyntaxKind nodeKind, SyntaxKind keywordKind);
+    void parseInterfaceDecl();
+    void parseImplementsClause();
     void parseStructOrClassMember();
     void parseFieldDecl();
     void parseEnumDecl();
