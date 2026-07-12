@@ -1,0 +1,317 @@
+// syntax.grammar - single source of truth for the self-hosted front end's tree.
+//
+// The syntaxgen tool reads this file and emits, as checked-in .ens sources: the SyntaxKind enum, kind predicates,
+// the typed red node classes, the red factory, and the tree dump.
+//
+// DSL, in brief:
+//   tokens { Name = 'spelling' ... }     fixed-spelling tokens and keywords
+//   tokens { Name ... }                  variable-text tokens (Identifier, literals)
+//   Name = 'spelling' contextual         lexed as Identifier; the parser re-tags the token only where the grammar
+//                                        expects it, so the spelling stays a valid identifier everywhere else
+//   Category = NodeA | NodeB | ...       a sealed abstract class; nodes extend it, so type switches are exhaustive
+//   union Name = NodeA | NodeB | ...     a marker interface for ad hoc unions; a node may implement several
+//   Node = slot: Type ...                a node rule with fixed slots, in order
+//     'if'                               anonymous token slot (accessor name derived)
+//     name: Identifier                   named token slot
+//     condition: Expression              named node slot (category, union, or node)
+//     x: Thing?                          optional slot (accessor returns Thing?)
+//     xs: Thing* sep ','                 list slot, optionally with a separator
+//     operator: ('+' | '-')              token-set slot
+//
+// Tree-wide rules (not expressed per node):
+//   - Trivia (whitespace, comments) is attached to tokens: leading trivia plus same-line trailing trivia.
+//     Tree children are only meaningful nodes and tokens.
+//   - The parser never leaves a structural slot empty: an absent required token becomes a Missing token, and an
+//     unparsable region becomes the Error node of the right category (ErrorExpression is an Expression, and so
+//     on), so accessors are nullable only where this file says '?'.
+//   - Offsets are UTF-8 byte offsets; line/column come from a LineIndex.
+
+// ============================================================ tokens
+
+tokens {
+    // trivia (attached to tokens, never tree children)
+    Whitespace
+    Newline
+    LineComment
+    BlockComment
+
+    // special
+    EndOfFile
+    Invalid          // tokenizer-level lex error
+    Missing          // parser-inserted placeholder for an expected token
+
+    // literals
+    IntLiteral
+    LongLiteral
+    FloatLiteral
+    DoubleLiteral
+    StringLiteral
+    CharLiteral
+    InterpolatedStringStart    // "a{
+    InterpolatedStringMiddle   // }b{
+    InterpolatedStringEnd      // }c"
+
+    Identifier
+
+    // punctuation
+    OpenParenthesis = '('      CloseParenthesis = ')'    OpenBrace = '{'      CloseBrace = '}'
+    OpenBracket = '['          CloseBracket = ']'        Semicolon = ';'      Comma = ','
+    Dot = '.'                  Ellipsis = '...'          Colon = ':'          Arrow = '->'
+    At = '@'                   Plus = '+'                Minus = '-'          Star = '*'
+    Slash = '/'                Percent = '%'             Caret = '^'          Equals = '='
+    Exclamation = '!'          Question = '?'            QuestionDot = '?.'   QuestionQuestion = '??'
+    EqualsEquals = '=='        NotEquals = '!='          Less = '<'           Greater = '>'
+    LessEquals = '<='          GreaterEquals = '>='      AmpersandAmpersand = '&&'
+    PipePipe = '||'            Ampersand = '&'           Pipe = '|'
+    PlusPlus = '++'            MinusMinus = '--'
+    LessLess = '<<'            GreaterGreater = '>>'     GreaterGreaterGreater = '>>>'
+    PlusEquals = '+='          MinusEquals = '-='        StarEquals = '*='    SlashEquals = '/='
+    PercentEquals = '%='       AmpersandEquals = '&='    PipeEquals = '|='    CaretEquals = '^='
+    LessLessEquals = '<<='     GreaterGreaterEquals = '>>='                   GreaterGreaterGreaterEquals = '>>>='
+
+    // primitive type keywords
+    BoolKeyword = 'bool'       ByteKeyword = 'byte'      ShortKeyword = 'short'     UShortKeyword = 'ushort'
+    IntKeyword = 'int'         UIntKeyword = 'uint'      LongKeyword = 'long'       ULongKeyword = 'ulong'
+    FloatKeyword = 'float'     DoubleKeyword = 'double'  DecimalKeyword = 'decimal' CharKeyword = 'char'
+    StringKeyword = 'string'   VoidKeyword = 'void'
+
+    // reserved keywords
+    AbstractKeyword = 'abstract'     AsKeyword = 'as'                 BreakKeyword = 'break'
+    CatchKeyword = 'catch'           ClassKeyword = 'class'           ConstKeyword = 'const'
+    ContinueKeyword = 'continue'     DefaultKeyword = 'default'       ElseKeyword = 'else'
+    EnumKeyword = 'enum'             ExtendsKeyword = 'extends'       ExternalKeyword = 'external'
+    FalseKeyword = 'false'           FinalKeyword = 'final'           ForKeyword = 'for'
+    FromKeyword = 'from'             IfKeyword = 'if'                 ImplementsKeyword = 'implements'
+    ImportKeyword = 'import'         InterfaceKeyword = 'interface'   IsKeyword = 'is'
+    LetKeyword = 'let'               NewKeyword = 'new'               NullKeyword = 'null'
+    OverrideKeyword = 'override'     PrivateKeyword = 'private'       ProtectedKeyword = 'protected'
+    PublicKeyword = 'public'         RethrowKeyword = 'rethrow'       ReturnKeyword = 'return'
+    SealedKeyword = 'sealed'         StructKeyword = 'struct'         SuperKeyword = 'super'
+    SwitchKeyword = 'switch'         ThisKeyword = 'this'             ThrowKeyword = 'throw'
+    ThrowsKeyword = 'throws'         TrueKeyword = 'true'             TryKeyword = 'try'
+    TypeKeyword = 'type'             WeakKeyword = 'weak'             WhileKeyword = 'while'
+
+    // reserved for future use
+    AssertKeyword = 'assert'         CaseKeyword = 'case'             ComputedKeyword = 'computed'
+    DoKeyword = 'do'                 FinallyKeyword = 'finally'       GotoKeyword = 'goto'
+    PackageKeyword = 'package'       StaticKeyword = 'static'
+
+    // contextual keywords: valid identifiers everywhere except the one grammatical position that expects them
+    OutKeyword = 'out' contextual
+    InKeyword = 'in' contextual
+    TestKeyword = 'test' contextual
+}
+
+// Declaration modifiers are a token list slot, validated semantically per declaration form rather than encoded
+// as per-kind slots.
+tokenset Modifier = 'public' | 'private' | 'protected' | 'abstract' | 'override' | 'final' | 'sealed' | 'weak' | 'const'
+
+// ============================================================ categories
+
+Declaration = FunctionDeclaration | FieldDeclaration | StructDeclaration | ClassDeclaration | InterfaceDeclaration
+            | EnumDeclaration | EnumMember | ImportDeclaration | ExternalTypeDeclaration | ExternalBlock
+            | ExternalFunctionDeclaration | TestDeclaration | ErrorDeclaration
+
+Statement = Block | VariableDeclaration | IfStatement | WhileStatement | ForStatement | ForEachStatement
+          | BreakStatement | ContinueStatement | ReturnStatement | ExpressionStatement | ThrowStatement
+          | RethrowStatement | SwitchStatement | ErrorStatement
+
+Expression = LiteralExpression | IdentifierExpression | ThisExpression | SuperExpression | BinaryExpression
+           | PrefixExpression | PostfixExpression | CallExpression | MemberExpression | SafeMemberExpression
+           | SubscriptExpression | SafeSubscriptExpression | CastExpression | CheckedCastExpression
+           | TypeTestExpression | AssignmentExpression | TernaryExpression | NullCoalesceExpression
+           | NewExpression | ParenthesizedExpression | ArrayLiteralExpression | InterpolatedStringExpression
+           | TryExpression | SwitchExpression | ErrorExpression
+
+Type = NamedType | ArrayType | OptionalType | ErrorType
+
+SwitchArm = ValueArm | TypeArm | DefaultArm
+
+// Ad hoc unions (marker interfaces).
+union TopLevelItem = ImportDeclaration | ExternalTypeDeclaration | ExternalBlock | FunctionDeclaration
+                   | StructDeclaration | ClassDeclaration | InterfaceDeclaration | EnumDeclaration
+                   | TestDeclaration | ErrorDeclaration
+union Member = FieldDeclaration | FunctionDeclaration | ErrorDeclaration
+union Argument = Expression | OutArgument | NamedArgument
+union ArmBody = Block | Expression
+union ElseBody = Block | IfStatement
+union ForInitializer = VariableDeclaration | ExpressionStatement
+
+// ============================================================ top level
+
+SourceFile = items: TopLevelItem*
+
+// ============================================================ declarations
+
+FunctionDeclaration =
+    modifiers: Modifier*
+    name: Identifier
+    typeParameters: TypeParameterList?
+    parameters: ParameterList
+    returnType: ReturnTypeClause?
+    throwsClause: ThrowsClause?
+    // Exactly one of body/';' is present: bodiless forms (abstract methods, interface method
+    // signatures, and shorthand constructors like `Animation(this.shape = null);`) end with ';'.
+    body: Block?
+    ';'?
+    catchClauses: CatchClause*
+
+ParameterList = '(' parameters: Parameter* sep ',' ')'
+
+// Covers `int width`, `out uint bytesRead`, and the `this.field` shorthand.
+Parameter = outKeyword: 'out'? declaredType: Type? thisPrefix: ThisPrefix? name: Identifier default: Initializer?
+
+ThisPrefix = 'this' '.'
+Initializer = '=' value: Expression
+ReturnTypeClause = '->' type: Type
+ThrowsClause = 'throws' types: NamedType* sep ','     // list may be empty
+CatchClause = 'catch' '(' type: NamedType name: Identifier ')' body: Block
+
+// Structs parse the same clauses as classes so that `struct S extends T` and `struct S implements I`
+// get precise semantic diagnostics ("structs cannot extend/implement") instead of parse errors.
+StructDeclaration =
+    modifiers: Modifier*
+    'struct' name: Identifier
+    typeParameters: TypeParameterList?
+    extendsClause: ExtendsClause?
+    implementsClause: ImplementsClause?
+    body: MemberList
+
+ClassDeclaration =
+    modifiers: Modifier*
+    'class' name: Identifier
+    typeParameters: TypeParameterList?
+    extendsClause: ExtendsClause?
+    implementsClause: ImplementsClause?
+    body: MemberList
+
+InterfaceDeclaration =
+    modifiers: Modifier*
+    'interface' name: Identifier
+    typeParameters: TypeParameterList?
+    body: MemberList
+
+ExtendsClause = 'extends' base: NamedType
+ImplementsClause = 'implements' interfaces: NamedType* sep ','
+MemberList = '{' members: Member* '}'
+
+FieldDeclaration = modifiers: Modifier* type: Type name: Identifier default: Initializer? ';'
+
+EnumDeclaration = modifiers: Modifier* 'enum' name: Identifier '{' members: EnumMember* sep ',' '}'
+EnumMember = name: Identifier
+
+// `import engine.renderer;` and `import Renderer from engine.renderer;`
+ImportDeclaration = 'import' binding: ImportBinding? path: ImportPath ';'
+ImportBinding = name: Identifier 'from'
+ImportPath = at: '@'? segments: Identifier* sep '.'
+
+ExternalTypeDeclaration = 'external' 'type' name: Identifier ';'
+ExternalBlock = 'external' 'from' library: StringLiteral '{' functions: ExternalFunctionDeclaration* '}'
+ExternalFunctionDeclaration = name: Identifier parameters: ParameterList returnType: ReturnTypeClause? ';'
+
+TestDeclaration = 'test' description: (StringLiteral | InterpolatedStringExpression) body: Block
+
+TypeParameterList = '<' parameters: TypeParameter* sep ',' '>'
+TypeParameter = name: Identifier bounds: BoundsClause?
+BoundsClause = ':' bounds: NamedType* sep '+'
+
+// ============================================================ types
+
+NamedType = qualifier: TypeQualifier?
+            name: (Identifier | 'bool' | 'byte' | 'short' | 'ushort' | 'int' | 'uint' | 'long' | 'ulong'
+                 | 'float' | 'double' | 'decimal' | 'char' | 'string' | 'void')
+            typeArguments: TypeArgumentList?
+TypeQualifier = module: Identifier '.'
+ArrayType = element: Type '[' ']'
+OptionalType = inner: Type '?'
+TypeArgumentList = '<' arguments: Type* sep ',' '>'
+
+// ============================================================ statements
+
+Block = '{' statements: Statement* '}'
+
+// Unifies `let x = e;`, `const x = e;`, `const int x = e;`, and `int x = e;`.
+// At least one of modifier/declaredType is present (checked semantically).
+VariableDeclaration = modifier: ('let' | 'const')? declaredType: Type? name: Identifier initializer: Initializer? ';'
+
+IfStatement = 'if' '(' condition: Expression ')' thenBranch: Block elseClause: ElseClause?
+ElseClause = 'else' body: ElseBody
+
+WhileStatement = 'while' '(' condition: Expression ')' body: Block
+
+// The initializer owns its own ';'; the condition's ';' is a direct token.
+ForStatement = 'for' '(' initializer: ForInitializer? condition: Expression? ';' update: Expression? ')' body: Block
+
+ForEachStatement = 'for' '(' letKeyword: 'let'? declaredType: Type? name: Identifier 'in' iterable: Expression ')' body: Block
+
+BreakStatement = 'break' ';'
+ContinueStatement = 'continue' ';'
+ReturnStatement = 'return' value: Expression? ';'
+ExpressionStatement = expression: Expression ';'
+ThrowStatement = 'throw' value: Expression ';'
+RethrowStatement = 'rethrow' ';'
+
+SwitchStatement = 'switch' '(' scrutinee: Expression ')' '{' arms: SwitchArm* sep ',' '}'
+
+ValueArm = labels: Expression* sep ',' '->' body: ArmBody
+TypeArm = 'is' type: NamedType binding: Identifier? '->' body: ArmBody
+DefaultArm = 'default' '->' body: ArmBody
+
+// ============================================================ expressions
+
+LiteralExpression = value: (IntLiteral | LongLiteral | FloatLiteral | DoubleLiteral | StringLiteral | CharLiteral
+                          | 'true' | 'false' | 'null')
+IdentifierExpression = name: Identifier
+ThisExpression = 'this'
+SuperExpression = 'super'
+
+BinaryExpression = left: Expression
+                   operator: ('+' | '-' | '*' | '/' | '%' | '==' | '!=' | '<' | '>' | '<=' | '>='
+                            | '&&' | '||' | '&' | '|' | '^' | '<<' | '>>' | '>>>')
+                   right: Expression
+
+PrefixExpression = operator: ('-' | '+' | '!' | '++' | '--') operand: Expression
+PostfixExpression = operand: Expression operator: ('++' | '--')
+
+CallExpression = callee: Expression typeArguments: TypeArgumentList? arguments: ArgumentList
+ArgumentList = '(' arguments: Argument* sep ',' ')'
+OutArgument = 'out' name: Identifier
+NamedArgument = name: Identifier ':' value: Expression
+
+MemberExpression = object: Expression '.' member: Identifier
+SafeMemberExpression = object: Expression '?.' member: Identifier
+SubscriptExpression = object: Expression '[' index: Expression ']'
+SafeSubscriptExpression = object: Expression '?' '[' index: Expression ']'
+
+CastExpression = value: Expression 'as' target: Type
+CheckedCastExpression = value: Expression 'as' '?' target: Type
+TypeTestExpression = value: Expression 'is' target: NamedType
+
+AssignmentExpression = target: Expression
+                       operator: ('=' | '+=' | '-=' | '*=' | '/=' | '%=' | '&=' | '|=' | '^=' | '<<=' | '>>=' | '>>>=')
+                       value: Expression
+
+TernaryExpression = condition: Expression '?' thenValue: Expression ':' elseValue: Expression
+NullCoalesceExpression = left: Expression '??' right: Expression
+
+// `new T(...)`, `new T[a][b]`, `new T[a][]`; empty dimensions have no size.
+NewExpression = 'new' type: NamedType arguments: ArgumentList? dimensions: ArrayDimension*
+ArrayDimension = '[' size: Expression? ']'
+
+ParenthesizedExpression = '(' inner: Expression ')'
+ArrayLiteralExpression = '[' elements: Expression* sep ',' ']'
+
+// Literal segments and holes interleave in source order; the two lists reconstruct it by position
+// (parts[0], holes[0], parts[1], holes[1], ...).
+InterpolatedStringExpression = parts: (InterpolatedStringStart | InterpolatedStringMiddle | InterpolatedStringEnd)*
+                               holes: Expression*
+
+TryExpression = 'try' operand: Expression
+SwitchExpression = 'switch' '(' scrutinee: Expression ')' '{' arms: SwitchArm* sep ',' '}'
+
+// ============================================================ recovery
+
+ErrorDeclaration = skipped: token*
+ErrorStatement = skipped: token*
+ErrorExpression = skipped: token*
+ErrorType = skipped: token*
