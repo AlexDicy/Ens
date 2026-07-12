@@ -4461,9 +4461,10 @@ Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
     }
     Type* targetT = analyzeExpr(*target);
 
-    // For a narrowed identifier the storage keeps its declared (wider) type; the
-    // narrowing only governs reads. Use the symbol's declared type when checking
-    // assignability so that e.g. `x = null` still works inside `if x != null { }`.
+    // Narrowing only governs reads; the storage keeps its declared (wider)
+    // type. Check assignability against the declared symbol, field, or element
+    // type so that e.g. `x = null` and `x.f = null` still work inside
+    // `if x != null { }`.
     Type* assignTargetT = targetT;
     Symbol* targetIdentSym = nullptr;
     if (auto id = target->asIdent()) {
@@ -4477,6 +4478,22 @@ Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
                 }
             }
         }
+    } else if (auto mem = target->asMember()) {
+        auto obj = mem->object();
+        auto name = mem->memberText();
+        Type* objT = obj ? analysis.typeOf(obj->node.greenNode()) : nullptr;
+        if (name && objT && objT->structInfo) {
+            int idx = objT->structInfo->findFieldIndex(*name);
+            if (idx >= 0 && objT->structInfo->fields[idx].type) {
+                assignTargetT = objT->structInfo->fields[idx].type;
+            }
+        }
+    } else if (auto sub = target->asSubscript()) {
+        auto obj = sub->object();
+        Type* objT = obj ? analysis.typeOf(obj->node.greenNode()) : nullptr;
+        if (objT && objT->isArray() && objT->inner) {
+            assignTargetT = objT->inner;
+        }
     }
 
     Type* valueT = analyzeExprAdapt(*value, assignTargetT);
@@ -4487,6 +4504,12 @@ Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
                 "' to '" + assignTargetT->toString() + "'");
         }
     }
+    // The store lands in the declared slot: retype the target so codegen
+    // converts the value to the declared type, and drop the narrowing on the
+    // written path.
+    if (assignTargetT != targetT) {
+        analysis.setType(target->node.greenNode(), assignTargetT);
+    }
     if (targetIdentSym && currentScope) {
         currentScope->clearNarrowingsForRoot(targetIdentSym);
         currentScope->clearNarrowingsForIndexSymbol(targetIdentSym);
@@ -4495,7 +4518,7 @@ Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
             currentScope->clearNarrowingsAtOrBelow(*p);
         }
     }
-    return targetT;
+    return assignTargetT;
 }
 
 Type* Analyzer::analyzeTernary(const ast::TernaryExpression& expr) {
