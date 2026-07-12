@@ -712,7 +712,9 @@ let n = xs.length;            // long
 ```
 
 - `new T[size]` allocates an array of `size` elements. Primitive and reference slots start zero / `null`. Struct slots get the struct's declared field defaults applied to each slot.
-- The **innermost** element type must be one whose default value is meaningful. A non-nullable reference type (class, array, external, string) is rejected as the element. Use the nullable form: write `Box?[]` rather than `Box[]`. The same rule extends through struct fields: a struct containing a non-nullable reference field cannot be used as an array element.
+- The **innermost** element type must be one whose default value is meaningful, unless the array is filled as it is created (see the fill loop below).
+  A non-nullable reference type (class, array, external, string) is otherwise rejected as the element; use the nullable form, `Box?[]` rather than `Box[]`.
+  The same rule extends through struct fields: a struct containing a non-nullable reference field cannot be used as an array element.
 - `new T[a][b]` allocates a fully-populated multidimensional grid in one call: an outer array of length `a`, each slot holding a freshly-allocated `T[]` of length `b`. The same shape extends to higher dimensions (`new T[a][b][c]`). Because every intermediate level is allocated, types like `int[][]` are valid here even though no intermediate slot is nullable.
 - `new T[a][]` allocates only the outer array; inner slots stay `null`. The result type is `T[]?[]`, the deepest unallocated level is reflected in the type by adding a `?`. Trailing empty brackets compose: `new T[a][b][]` produces `T[]?[][]`. Sized brackets must come before any empty ones in a single `new` expression.
 - `arr[i]` reads or writes an element. Bounds are checked at every access; an out-of-range index aborts the program.
@@ -751,7 +753,7 @@ let h = [[1], []];                 // empty inner adopts first inner's type
 
 An empty literal `[]` requires a target type, `let xs = []` is rejected because there is no element to infer from. Write `int[] xs = []` or pass `[]` as an argument where the declared parameter type pins it down.
 
-Literals are the way to construct an array of a non-nullable reference type. `new Box[3]` is rejected because the slots would be left as null; `[new Box(1), new Box(2)]` is fine because every slot is initialized at construction. The resulting type is `Box[]`.
+An array literal is one way to construct an array of a non-nullable reference type: `[new Box(1), new Box(2)]` initializes every slot at construction, and the resulting type is `Box[]`.
 
 ```ens
 let bs = [new Box(1), new Box(2)];     // bs: Box[]
@@ -759,6 +761,25 @@ makeBoxes() -> Box[] {
     return [new Box(1), new Box(2)];
 }
 ```
+
+When the size is not known until run time, `new Box[n]` is legal in exactly one shape: declare a new variable with the allocation, and make the very next statement a loop that fills every slot.
+The loop must count from `0` to the array's own `.length`, stepping by one, and its body must be a single assignment to the current slot.
+The fill expression must not mention the array being filled.
+A zero-length allocation is fine, the loop simply runs zero times.
+After the loop the array is fully initialized and behaves like any other array variable.
+Anything else, such as a statement between the declaration and the loop, a different loop condition, or a fill expression that reads the array, keeps the allocation an error.
+
+```ens
+makeLabels(long n) -> string[] {
+    string[] labels = new string[n];
+    for (long i = 0; i < labels.length; i = i + 1) {
+        labels[i] = "item " + i;
+    }
+    return labels;
+}
+```
+
+The element type may itself be an array: `new string[][n]` allocates an outer array whose slots the loop fills with `string[]` values.
 
 ---
 
@@ -887,7 +908,7 @@ Every value has a `hash()` method returning a `long`. Value types (primitives, e
 
 The collection modules build on hashing and iteration:
 
-- `Vector<T>` from `@std.vector` is a growable array: `push(value)`, `get(index)`, `set(index, value)`, and `length()`.
+- `Vector<T>` from `@std.vector` is a growable array: `push(value)`, `get(index)`, `set(index, value)`, and `length()`, plus `toArray()` returning a fresh right-sized `T[]` holding the current contents.
 - `Map<K, V>` from `@std.map` maps keys to values: `set(key, value)` inserts or overwrites, `get(key)` returns `V?` (`null` when absent), plus `contains(key)`, `remove(key)`, `length()`, and `keys()` / `values()` snapshots. Iterating a map yields `Pair<K, V>` entries (from `@std.pair`) with `key` and `value` fields.
 - `Set<T>` from `@std.set` stores each value once: `add(value)` returns whether the value was new, plus `contains(value)`, `remove(value)`, `length()`, and `items()`. Iterating a set yields its values.
 
