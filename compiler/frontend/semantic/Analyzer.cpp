@@ -794,7 +794,8 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             if (fi.isWeak) {
                 errorAtNode(f.node, "'weak' fields are not allowed on structs");
             }
-            auto [line, col] = source.offsetToPosition(f.node.startOffset());
+            auto [line, col] = source.offsetToPosition(
+                f.nameToken() ? f.nameToken()->startOffset() : f.node.startOffset());
             fi.line = line;
             fi.column = col;
             fi.declaration = f.node.greenNode();
@@ -982,6 +983,9 @@ void Analyzer::resolveClassBases(const ast::SourceFile& file) {
             if (baseT->structInfo == si) {
                 errorAtNode(diag, "Class '" + asciiOf(si->name) + "' cannot extend itself");
                 continue;
+            }
+            if (auto baseTok = cd.baseClassToken()) {
+                analysis.setType(baseTok->greenNode(), baseT);
             }
             auto baseArgs = cd.baseTypeArguments();
             if (baseT->structInfo->isTemplate) {
@@ -1657,7 +1661,7 @@ void Analyzer::checkFieldDefaults(const ast::StructDecl& sd) {
         }
         auto fname = f.nameText();
         if (fname && !fname->empty()) {
-            uint32_t fOffset = f.node.startOffset();
+            uint32_t fOffset = f.nameToken() ? f.nameToken()->startOffset() : f.node.startOffset();
             Symbol* sib = makeSymbol(SymbolKind::SiblingField, *fname, expected, fOffset);
             sib->siblingFieldIndex = static_cast<int>(i);
             fieldScope->define(sib);
@@ -1699,7 +1703,7 @@ void Analyzer::checkFieldDefaults(const ast::ClassDecl& cd) {
         }
         auto fname = f.nameText();
         if (fname && !fname->empty()) {
-            uint32_t fOffset = f.node.startOffset();
+            uint32_t fOffset = f.nameToken() ? f.nameToken()->startOffset() : f.node.startOffset();
             Symbol* sib = makeSymbol(SymbolKind::SiblingField, *fname, expected, fOffset);
             sib->siblingFieldIndex = static_cast<int>(i);
             fieldScope->define(sib);

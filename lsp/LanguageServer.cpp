@@ -78,8 +78,9 @@ const ResolutionInfo* lookupResolution(const AnalysisResult& analysis, const Syn
 // misattribute the enclosing statement or declaration to the cursor position.
 bool isReferenceKind(SyntaxKind k) {
     return k == SyntaxKind::IdentExpr || k == SyntaxKind::ThisExpr ||
-           k == SyntaxKind::MemberExpr || k == SyntaxKind::SafeMemberExpr ||
-           k == SyntaxKind::TypeRef || k == SyntaxKind::NewExpr;
+           k == SyntaxKind::SuperExpr || k == SyntaxKind::MemberExpr ||
+           k == SyntaxKind::SafeMemberExpr || k == SyntaxKind::TypeRef ||
+           k == SyntaxKind::NewExpr;
 }
 
 StructInfo* structInfoOf(Type* t) {
@@ -253,6 +254,19 @@ std::optional<DefinitionTarget> resolveDefinitionTarget(const AnalysisResult& an
     }
 
     if (!info) return std::nullopt;
+
+    // `this` and `super` resolve to the synthetic this-symbol; the useful
+    // definition is the class (respectively base class) declaration instead.
+    if (k == SyntaxKind::ThisExpr || k == SyntaxKind::SuperExpr) {
+        if (StructInfo* si = structInfoOf(info->resolvedType)) {
+            DefinitionTarget t;
+            t.modulePath = si->modulePath;
+            t.line = si->line;
+            t.column = si->column;
+            return t;
+        }
+    }
+
     if (info->resolvedMethodSymbol) return targetForSymbol(*info->resolvedMethodSymbol);
     if (info->resolvedSymbol) {
         const Symbol& s = *info->resolvedSymbol;
@@ -273,6 +287,29 @@ std::optional<DefinitionTarget> resolveDefinitionTarget(const AnalysisResult& an
     return std::nullopt;
 }
 
+// lsp::FileUri::fromPath normalizes to native separators, which produces
+// percent-encoded backslashes on Windows; build the URI from the generic
+// (forward-slash) form instead.
+lsp::DocumentUri uriForFilePath(const std::filesystem::path& path) {
+    auto generic = path.generic_u8string();
+    static const char* hex = "0123456789ABCDEF";
+    std::string encoded = "file:///";
+    for (char8_t unit : generic) {
+        auto c = static_cast<unsigned char>(unit);
+        bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                          (c >= '0' && c <= '9') || c == '-' || c == '.' ||
+                          c == '_' || c == '~' || c == '/';
+        if (unreserved) {
+            encoded += static_cast<char>(c);
+        } else {
+            encoded += '%';
+            encoded += hex[c >> 4];
+            encoded += hex[c & 0xF];
+        }
+    }
+    return lsp::Uri::parse(encoded);
+}
+
 lsp::DocumentUri definitionUri(const Document& doc, const std::u16string& modulePath) {
     if (!modulePath.empty()) {
         const auto& files = doc.moduleFiles();
@@ -281,7 +318,7 @@ lsp::DocumentUri definitionUri(const Document& doc, const std::u16string& module
             std::error_code ec;
             bool sameFile = it->second == doc.path() ||
                             std::filesystem::equivalent(it->second, doc.path(), ec);
-            if (!sameFile) return lsp::FileUri::fromPath(it->second.generic_string());
+            if (!sameFile) return uriForFilePath(it->second);
         }
     }
     return lsp::Uri::parse(doc.uri());
