@@ -1,6 +1,7 @@
 # Ens VS Code extension (development)
 
 Tiny extension that registers `.ens` files and spawns `ens-lsp` as the language server.
+The TextMate grammar and language configuration are copied from `tools/grammar/` by `npm install` (or `npm run sync-grammar`); edit them there, not here.
 
 ## One-time setup
 
