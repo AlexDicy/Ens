@@ -25,6 +25,7 @@ public:
     int version() const { return version_; }
     const std::u16string& text() const { return text_; }
     std::filesystem::path path() const;
+    static std::filesystem::path pathForUri(const std::string& uri);
 
     const SourceFile& sourceFile() const { return *openModule_->source; }
     const SyntaxNode& root() const { return *openModule_->rootNode; }
@@ -80,8 +81,14 @@ public:
     // In-memory text for every open buffer, keyed for SourceOverrides.
     ens::modules::SourceOverrides collectOverrides() const;
 
+    // Post-edit contents the server itself produced (rename edits): analysis sees
+    // them immediately, until the client's buffer or the disk catches up.
+    void setTransientOverride(const std::filesystem::path& absolute, std::u16string text);
+    void clearTransientOverride(const std::filesystem::path& absolute);
+
 private:
     std::unordered_map<std::string, std::unique_ptr<Document>> docs;
+    std::unordered_map<std::string, std::u16string> transientOverrides_;
     std::optional<std::filesystem::path> workspaceRoot_;
     std::filesystem::path stdlibRoot_ = ens::modules::findStdlibRoot();
 };

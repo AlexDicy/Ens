@@ -16,8 +16,12 @@ void Document::setText(std::u16string text, int version) {
 }
 
 fs::path Document::path() const {
-    if (uri_.empty()) return {};
-    lsp::Uri parsed = lsp::Uri::parse(uri_);
+    return pathForUri(uri_);
+}
+
+fs::path Document::pathForUri(const std::string& uri) {
+    if (uri.empty()) return {};
+    lsp::Uri parsed = lsp::Uri::parse(uri);
     if (parsed.scheme() != "file") return {};
     lsp::FileUri fileUri(parsed);
     auto p = fileUri.path();
@@ -114,5 +118,16 @@ ens::modules::SourceOverrides DocumentStore::collectOverrides() const {
         if (p.empty()) continue;
         overrides[ens::modules::overrideKey(p)] = doc->text();
     }
+    for (const auto& [key, text] : transientOverrides_) {
+        overrides[key] = text;
+    }
     return overrides;
+}
+
+void DocumentStore::setTransientOverride(const fs::path& absolute, std::u16string text) {
+    transientOverrides_[ens::modules::overrideKey(absolute)] = std::move(text);
+}
+
+void DocumentStore::clearTransientOverride(const fs::path& absolute) {
+    transientOverrides_.erase(ens::modules::overrideKey(absolute));
 }

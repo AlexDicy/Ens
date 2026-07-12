@@ -30,5 +30,6 @@ private:
     DocumentStore documents;
 
     void publishDiagnostics(const Document& doc);
-    void refreshOtherDocuments(const Document* changed);
+    void refreshDocumentsDependingOn(const std::vector<std::filesystem::path>& changedPaths,
+                                     const Document* skip);
 };

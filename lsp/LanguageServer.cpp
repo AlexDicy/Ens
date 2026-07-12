@@ -780,44 +780,70 @@ void LanguageServer::onInitialized() {
 }
 
 // Every open document analyzes its own module graph, so a change to one file can
-// invalidate the diagnostics of any other open document that imports it.
-void LanguageServer::refreshOtherDocuments(const Document* changed) {
+// invalidate the diagnostics of any open document whose graph includes it.
+void LanguageServer::refreshDocumentsDependingOn(
+        const std::vector<std::filesystem::path>& changedPaths, const Document* skip) {
+    std::vector<std::string> changedKeys;
+    changedKeys.reserve(changedPaths.size());
+    for (const auto& path : changedPaths) changedKeys.push_back(ens::modules::overrideKey(path));
     documents.forEachDocument([&](Document& doc) {
-        if (&doc == changed) return;
+        if (&doc == skip) return;
+        // Documents without a module graph (fallback analysis) are cheap; refresh them too.
+        bool depends = doc.moduleFiles().empty();
+        for (const auto& [modulePath, file] : doc.moduleFiles()) {
+            if (depends) break;
+            std::string key = ens::modules::overrideKey(file);
+            depends = std::find(changedKeys.begin(), changedKeys.end(), key) != changedKeys.end();
+        }
+        if (!depends) return;
         doc.analyze();
         publishDiagnostics(doc);
     });
 }
 
 void LanguageServer::onDidOpen(lsp::notifications::TextDocument_DidOpen::Params&& p) {
-    auto& doc = documents.upsert(p.textDocument.uri.toString(),
+    std::string uri = p.textDocument.uri.toString();
+    documents.clearTransientOverride(Document::pathForUri(uri));
+    auto& doc = documents.upsert(std::move(uri),
                                   utf8To16(p.textDocument.text),
                                   p.textDocument.version);
     publishDiagnostics(doc);
-    refreshOtherDocuments(&doc);
+    refreshDocumentsDependingOn({doc.path()}, &doc);
 }
 
 void LanguageServer::onDidChange(lsp::notifications::TextDocument_DidChange::Params&& p) {
     if (p.contentChanges.empty()) return;
     const auto& last = p.contentChanges.back();
     if (auto* full = std::get_if<lsp::TextDocumentContentChangeEvent_Text>(&last)) {
-        auto& doc = documents.upsert(p.textDocument.uri.toString(),
+        std::string uri = p.textDocument.uri.toString();
+        documents.clearTransientOverride(Document::pathForUri(uri));
+        auto& doc = documents.upsert(std::move(uri),
                                       utf8To16(full->text),
                                       p.textDocument.version);
         publishDiagnostics(doc);
-        refreshOtherDocuments(&doc);
+        refreshDocumentsDependingOn({doc.path()}, &doc);
     }
 }
 
 void LanguageServer::onDidClose(lsp::notifications::TextDocument_DidClose::Params&& p) {
-    documents.erase(p.textDocument.uri.toString());
-    refreshOtherDocuments(nullptr);
+    std::string uri = p.textDocument.uri.toString();
+    std::filesystem::path closedPath = Document::pathForUri(uri);
+    documents.erase(uri);
+    refreshDocumentsDependingOn({closedPath}, nullptr);
 }
 
 void LanguageServer::onDidChangeWatchedFiles(
         lsp::notifications::Workspace_DidChangeWatchedFiles::Params&& p) {
     if (p.changes.empty()) return;
-    refreshOtherDocuments(nullptr);
+    std::vector<std::filesystem::path> changedPaths;
+    changedPaths.reserve(p.changes.size());
+    for (const auto& change : p.changes) {
+        std::filesystem::path path = Document::pathForUri(change.uri.toString());
+        if (path.empty()) continue;
+        documents.clearTransientOverride(path);
+        changedPaths.push_back(std::move(path));
+    }
+    if (!changedPaths.empty()) refreshDocumentsDependingOn(changedPaths, nullptr);
 }
 
 void LanguageServer::publishDiagnostics(const Document& doc) {
@@ -952,12 +978,40 @@ lsp::TextDocument_RenameResult LanguageServer::onRename(lsp::RenameParams&& p) {
     if (occurrences.empty()) return nullptr;
 
     lsp::Map<lsp::DocumentUri, lsp::Array<lsp::TextEdit>> changes;
+    std::unordered_map<const ens::modules::Module*, std::vector<const Occurrence*>> occurrencesByModule;
     for (const auto& occurrence : occurrences) {
         lsp::TextEdit edit;
         edit.range = occurrence.range;
         edit.newText = p.newName;
         changes[definitionUri(*doc, occurrence.module->modulePath)].push_back(std::move(edit));
+        occurrencesByModule[occurrence.module].push_back(&occurrence);
     }
+
+    // The client applies the edit asynchronously and may keep the results in
+    // unsaved buffers; install the post-edit contents as transient overrides so
+    // analysis never sees a half-renamed module graph. The overrides drop out as
+    // the client's buffers and the disk catch up.
+    std::vector<std::filesystem::path> editedPaths;
+    for (const auto& [module, moduleOccurrences] : occurrencesByModule) {
+        const SourceFile& source = *module->source;
+        std::vector<std::pair<uint32_t, uint32_t>> spans;
+        spans.reserve(moduleOccurrences.size());
+        for (const Occurrence* occurrence : moduleOccurrences) {
+            const lsp::Range& r = occurrence->range;
+            spans.emplace_back(source.positionToOffset(r.start.line + 1, r.start.character + 1),
+                               source.positionToOffset(r.end.line + 1, r.end.character + 1));
+        }
+        std::sort(spans.begin(), spans.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::u16string text = source.getSource();
+        for (const auto& [start, end] : spans) {
+            text.replace(start, end - start, newName);
+        }
+        documents.setTransientOverride(module->absolutePath, std::move(text));
+        editedPaths.push_back(module->absolutePath);
+    }
+    refreshDocumentsDependingOn(editedPaths, doc);
+
     lsp::WorkspaceEdit edit;
     edit.changes = std::move(changes);
     return edit;
