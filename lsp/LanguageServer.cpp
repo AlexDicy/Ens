@@ -41,11 +41,12 @@ lsp::Range toLspRange(const SourceFile& source, const SyntaxNode& node) {
     return toLspRange(source, start, start + length);
 }
 
-lsp::Range zeroWidthRangeAt(int line1, int col1) {
+lsp::Range nameRangeAt(int line1, int col1, size_t nameLength) {
     lsp::Range r;
     r.start.line = line1 > 0 ? line1 - 1 : 0;
     r.start.character = col1 > 0 ? col1 - 1 : 0;
-    r.end = r.start;
+    r.end.line = r.start.line;
+    r.end.character = r.start.character + static_cast<int>(nameLength);
     return r;
 }
 
@@ -171,6 +172,7 @@ struct DefinitionTarget {
     std::u16string modulePath;  // empty = the open document's own module
     int line = 0;               // 1-based; 0 = start of the target file
     int column = 0;
+    size_t nameLength = 0;      // UTF-16 length of the declared name at (line, column)
 };
 
 DefinitionTarget targetForSymbol(const Symbol& s) {
@@ -178,6 +180,7 @@ DefinitionTarget targetForSymbol(const Symbol& s) {
     if (s.methodOwner) t.modulePath = s.methodOwner->modulePath;
     t.line = s.line;
     t.column = s.column;
+    t.nameLength = s.name.size();
     return t;
 }
 
@@ -192,6 +195,7 @@ std::optional<DefinitionTarget> memberTarget(StructInfo* si, const std::u16strin
         t.modulePath = f.definingClass ? f.definingClass->modulePath : si->modulePath;
         t.line = f.line;
         t.column = f.column;
+        t.nameLength = f.name.size();
         return t;
     }
     if (StructInfo* declaring = si->classDeclaringMethod(name)) {
@@ -202,6 +206,7 @@ std::optional<DefinitionTarget> memberTarget(StructInfo* si, const std::u16strin
             t.line = m.symbol->line;
             t.column = m.symbol->column;
         }
+        t.nameLength = m.name.size();
         return t;
     }
     return std::nullopt;
@@ -237,9 +242,11 @@ std::optional<DefinitionTarget> resolveDefinitionTarget(const AnalysisResult& an
                             if (s) {
                                 t.line = s->line;
                                 t.column = s->column;
+                                t.nameLength = s->name.size();
                             } else if (si) {
                                 t.line = si->line;
                                 t.column = si->column;
+                                t.nameLength = si->name.size();
                             }
                         }
                         return t;
@@ -263,6 +270,7 @@ std::optional<DefinitionTarget> resolveDefinitionTarget(const AnalysisResult& an
             t.modulePath = si->modulePath;
             t.line = si->line;
             t.column = si->column;
+            t.nameLength = si->name.size();
             return t;
         }
     }
@@ -282,6 +290,7 @@ std::optional<DefinitionTarget> resolveDefinitionTarget(const AnalysisResult& an
         t.modulePath = si->modulePath;
         t.line = si->line;
         t.column = si->column;
+        t.nameLength = si->name.size();
         return t;
     }
     return std::nullopt;
@@ -487,6 +496,8 @@ lsp::TextDocument_HoverResult LanguageServer::onHover(lsp::HoverParams&& p) {
     uint32_t offset = doc->sourceFile().positionToOffset(line1, col1);
     auto chain = ancestorChainAt(doc->root(), offset);
 
+    if (!chain.empty() && chain.back().isToken() && isTrivia(chain.back().kind())) return nullptr;
+
     const auto& analysis = doc->analyzer().result();
     auto makeHover = [&](std::string text, const SyntaxNode& node) {
         lsp::Hover h;
@@ -519,13 +530,15 @@ lsp::TextDocument_DefinitionResult LanguageServer::onDefinition(lsp::DefinitionP
     uint32_t offset = doc->sourceFile().positionToOffset(line1, col1);
     auto chain = ancestorChainAt(doc->root(), offset);
 
+    if (!chain.empty() && chain.back().isToken() && isTrivia(chain.back().kind())) return nullptr;
+
     const auto& analysis = doc->analyzer().result();
     for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
         if (!it->isToken() && !isReferenceKind(it->kind())) break;
         if (auto target = resolveDefinitionTarget(analysis, *it)) {
             lsp::Location loc;
             loc.uri = definitionUri(*doc, target->modulePath);
-            loc.range = zeroWidthRangeAt(target->line, target->column);
+            loc.range = nameRangeAt(target->line, target->column, target->nameLength);
             return lsp::Definition{std::move(loc)};
         }
     }
