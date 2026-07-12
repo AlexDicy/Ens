@@ -1162,6 +1162,21 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
         si->fields.push_back(std::move(fi));
     }
 
+    // Interface methods a locally-declared method may implement; used to
+    // validate 'override' markers the same way base-class methods are.
+    auto interfaceDeclaring = [&](const std::u16string& name, Symbol* sym,
+                                  bool bySignature) -> Type* {
+        for (Type* ifaceT : si->implementedInterfaces) {
+            if (!ifaceT || !ifaceT->structInfo) continue;
+            StructInfo* iface = ifaceT->structInfo;
+            if (iface->templateOf) typeCtx.ensureFilled(iface);
+            int idx = bySignature ? iface->findMethodIndexBySignature(name, sym)
+                                  : iface->findMethodIndex(name);
+            if (idx >= 0) return ifaceT;
+        }
+        return nullptr;
+    };
+
     // Methods: collect own methods, then validate override/abstract.
     for (auto& m : cd.methods()) {
         Type* retType = m.returnType() && m.returnType()->typeReference()
@@ -1218,13 +1233,7 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
                 errorAtNode(m.node, "Abstract method '" + asciiOf(mname) + "' cannot have a body");
         }
         if (m.isOverride()) {
-            if (!baseByName) {
-                errorAtNode(m.node, "Method '" + asciiOf(mname) +
-                    "' is marked 'override' but no base class declares it");
-            } else if (!baseBySig) {
-                errorAtNode(m.node, "Override of '" + asciiOf(mname) +
-                    "' does not match the signature declared in '" + asciiOf(baseByName->name) + "'");
-            } else {
+            if (baseBySig) {
                 MethodInfo& bm = baseBySig->methods[baseBySig->findMethodIndexBySignature(mname, sym)];
                 if (bm.isFinal)
                     errorAtNode(m.node, "Cannot override '" + asciiOf(mname) +
@@ -1237,12 +1246,29 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
                         "' is marked 'throws' but overrides a method of '" + asciiOf(baseBySig->name) +
                         "' that is not. Mark the base method 'throws' too, or handle the exceptions "
                         "inside the override.");
+            } else if (interfaceDeclaring(mname, sym, /*bySignature=*/true)) {
+                // Implements an interface method; the implements clause check
+                // below validates the return type and throws conformance.
+            } else if (baseByName) {
+                errorAtNode(m.node, "Override of '" + asciiOf(mname) +
+                    "' does not match the signature declared in '" + asciiOf(baseByName->name) + "'");
+            } else if (Type* ifaceByName = interfaceDeclaring(mname, sym, /*bySignature=*/false)) {
+                errorAtNode(m.node, "Override of '" + asciiOf(mname) +
+                    "' does not match the signature declared in interface '" +
+                    ifaceByName->toString() + "'");
+            } else {
+                errorAtNode(m.node, "Method '" + asciiOf(mname) +
+                    "' is marked 'override' but no base class or implemented interface declares it");
             }
         } else if (baseBySig) {
             // A subclass may add a new overload of an inherited name; only a
             // same-signature redeclaration hides the base method.
             errorAtNode(m.node, "Method '" + asciiOf(mname) + "' hides a method inherited from '" +
                 asciiOf(baseBySig->name) + "'; mark it 'override' to replace it, or rename it");
+        } else if (Type* ifaceT = interfaceDeclaring(mname, sym, /*bySignature=*/true)) {
+            errorAtNode(m.node, "Method '" + asciiOf(mname) + "' of '" + asciiOf(si->name) +
+                "' implements a method declared in interface '" + ifaceT->toString() +
+                "'; mark it 'override'");
         }
     }
     markOverloadedMethods(si);
