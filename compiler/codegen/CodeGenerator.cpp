@@ -5647,6 +5647,27 @@ struct CodeGenerator::Impl {
         return builder->CreateLoad(ptrTy, slot, "desc");
     }
 
+    // The address of a record-typed member-access object or method receiver:
+    // its lvalue slot when it has one, else the value materialized into a
+    // fresh stack slot (e.g. a struct returned by a call). An owned temp with
+    // reference fields joins the enclosing cleanup frame.
+    llvm::Value* emitRecordAddress(const ast::Expression& e, ::Type* type) {
+        if (e.asIdent() || e.asThis() || e.asMember() || e.asSubscript()) {
+            return emitLValue(e);
+        }
+        if (auto p = e.asParen()) {
+            if (auto inner = p->inner()) return emitRecordAddress(*inner, type);
+        }
+        llvm::Value* val = emitExpr(e);
+        if (!val || !type) return nullptr;
+        auto* temp = createEntryAlloca(currentFunction, mapType(type), "record.tmp");
+        builder->CreateStore(val, temp);
+        if (structHasClassFields(type) && expressionProducesOwnedRef(e) && !cleanupStack.empty()) {
+            cleanupStack.back().push_back({ temp, type });
+        }
+        return temp;
+    }
+
     llvm::Value* emitAddressForByPointerArg(const ast::Expression& e, ::Type* paramType) {
         if (e.asIdent() || e.asMember()) {
             return emitLValue(e);
@@ -6014,7 +6035,7 @@ struct CodeGenerator::Impl {
                 }
                 llvm::Value* receiver = isReferenceType(objType)
                     ? emitExpr(*obj)
-                    : emitLValue(*obj);
+                    : emitRecordAddress(*obj, objType);
                 if (!receiver) return nullptr;
                 trackOwnedArgTemp(receiver, *obj, objType);
                 std::vector<llvm::Value*> args;
@@ -6373,7 +6394,7 @@ struct CodeGenerator::Impl {
             }
             llvm::Value* objAddr = isReferenceType(objType)
                 ? emitExpr(*obj)
-                : emitLValue(*obj);
+                : emitRecordAddress(*obj, objType);
             if (!objAddr) return nullptr;
             auto memberName = m->memberText();
             if (!memberName) return nullptr;

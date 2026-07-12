@@ -4768,10 +4768,10 @@ Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
     auto target = expr.target();
     auto value = expr.value();
     if (!target || !value) return typeCtx.getError();
+    Type* targetT = analyzeExpr(*target);
     if (!isLValue(*target)) {
         errorAtNode(expr.node, "Left side of assignment must be an assignable expression");
     }
-    Type* targetT = analyzeExpr(*target);
 
     // Narrowing only governs reads; the storage keeps its declared (wider)
     // type. Check assignability against the declared symbol, field, or element
@@ -5455,8 +5455,20 @@ Type* Analyzer::analyzeArrayLiteralAdapt(const ast::ArrayLiteralExpression& expr
 
 bool Analyzer::isLValue(const ast::Expression& expr) const {
     SyntaxKind k = expr.kind();
-    return k == SyntaxKind::IdentExpr || k == SyntaxKind::MemberExpr ||
-           k == SyntaxKind::SubscriptExpr || k == SyntaxKind::ThisExpr;
+    if (k == SyntaxKind::IdentExpr || k == SyntaxKind::SubscriptExpr ||
+        k == SyntaxKind::ThisExpr) {
+        return true;
+    }
+    if (k != SyntaxKind::MemberExpr) return false;
+    // A member write through a class reference mutates the heap object, so any
+    // object expression works. A struct member write needs an addressable
+    // struct, so the object must itself be an lvalue.
+    auto member = expr.asMember();
+    auto obj = member ? member->object() : std::nullopt;
+    if (!obj) return false;
+    Type* objT = analysis.typeOf(obj->node.greenNode());
+    if (objT && objT->isStruct()) return isLValue(*obj);
+    return true;
 }
 
 static bool fieldHasDefaultValue(const FieldInfo& f) {
