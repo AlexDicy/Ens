@@ -37,7 +37,8 @@ lsp::Range toLspRange(const SourceFile& source, uint32_t startOffset, uint32_t e
 }
 
 lsp::Range toLspRange(const SourceFile& source, const SyntaxNode& node) {
-    return toLspRange(source, node.startOffset(), node.endOffset());
+    auto [start, length] = node.contentRange();
+    return toLspRange(source, start, start + length);
 }
 
 lsp::Range zeroWidthRangeAt(int line1, int col1) {
@@ -72,42 +73,218 @@ const ResolutionInfo* lookupResolution(const AnalysisResult& analysis, const Syn
     return analysis.find(node.greenNode());
 }
 
+// Node kinds that name or evaluate to something with a declaration. Hover and
+// go-to-definition only act on these; walking further up the chain would
+// misattribute the enclosing statement or declaration to the cursor position.
+bool isReferenceKind(SyntaxKind k) {
+    return k == SyntaxKind::IdentExpr || k == SyntaxKind::ThisExpr ||
+           k == SyntaxKind::MemberExpr || k == SyntaxKind::SafeMemberExpr ||
+           k == SyntaxKind::TypeRef || k == SyntaxKind::NewExpr;
+}
+
+StructInfo* structInfoOf(Type* t) {
+    if (!t) return nullptr;
+    if (t->isOptional() && t->inner) t = t->inner;
+    return t->structInfo;
+}
+
+std::string formatFunctionSignature(const Symbol& s) {
+    std::string r = (s.methodOwner ? "method " : "function ") + utf16To8(s.name) + "(";
+    for (size_t i = 0; i < s.paramTypes.size(); ++i) {
+        if (i) r += ", ";
+        r += s.paramTypes[i]->toString();
+    }
+    r += ") -> ";
+    r += s.returnType ? s.returnType->toString() : "void";
+    return r;
+}
+
 std::string formatHoverFor(const SyntaxNode& node, const ResolutionInfo& info) {
     SyntaxKind k = node.kind();
-    if (k == SyntaxKind::IdentExpr || k == SyntaxKind::ThisExpr) {
-        if (info.resolvedSymbol && info.resolvedSymbol->kind == SymbolKind::Namespace) {
-            return "(namespace) " + utf16To8(info.resolvedSymbol->namespaceModulePath);
+    bool identLike = k == SyntaxKind::IdentExpr || k == SyntaxKind::ThisExpr || node.isToken();
+    if (identLike && info.resolvedSymbol) {
+        const Symbol& s = *info.resolvedSymbol;
+        if (s.kind == SymbolKind::Namespace) {
+            return "(namespace) " + utf16To8(s.namespaceModulePath);
         }
-        if (info.resolvedSymbol && info.resolvedSymbol->type) {
-            return "(" + std::string(k == SyntaxKind::ThisExpr ? "this" : "value") +
-                   ") : " + info.resolvedSymbol->type->toString();
+        if (s.kind == SymbolKind::Function) {
+            return formatFunctionSignature(s);
         }
-        if (info.resolvedType) {
-            return "type: " + info.resolvedType->toString();
-        }
-    }
-    if (k == SyntaxKind::MemberExpr || k == SyntaxKind::SafeMemberExpr) {
-        if (info.resolvedMethodSymbol) {
-            std::string r = "method " + utf16To8(info.resolvedMethodSymbol->name);
-            r += "(";
-            for (size_t i = 0; i < info.resolvedMethodSymbol->paramTypes.size(); ++i) {
-                if (i) r += ", ";
-                r += info.resolvedMethodSymbol->paramTypes[i]->toString();
-            }
-            r += ") -> ";
-            r += info.resolvedMethodSymbol->returnType
-                     ? info.resolvedMethodSymbol->returnType->toString()
-                     : "void";
-            return r;
-        }
-        if (info.resolvedType) {
-            return "type: " + info.resolvedType->toString();
+        if (s.type) {
+            const char* label = k == SyntaxKind::ThisExpr ? "this"
+                : s.kind == SymbolKind::Parameter ? "parameter" : "value";
+            return "(" + std::string(label) + ") : " + s.type->toString();
         }
     }
-    if (info.resolvedType) {
+    if ((k == SyntaxKind::MemberExpr || k == SyntaxKind::SafeMemberExpr) &&
+        info.resolvedMethodSymbol) {
+        return formatFunctionSignature(*info.resolvedMethodSymbol);
+    }
+    if (info.resolvedType && !info.resolvedType->isError()) {
         return "type: " + info.resolvedType->toString();
     }
     return {};
+}
+
+// Hover on the name inside a declaration: the declaration node carries the
+// symbol (or type) it introduces, keyed by matching the token text.
+std::string declarationHoverText(const AnalysisResult& analysis,
+                                 const std::vector<SyntaxNode>& chain) {
+    if (chain.empty() || !chain.back().isToken()) return {};
+    std::u16string_view name = chain.back().tokenText();
+    if (name.empty()) return {};
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+        if (it->isToken()) continue;
+        const ResolutionInfo* info = lookupResolution(analysis, *it);
+        if (info && info->resolvedSymbol && info->resolvedSymbol->name == name) {
+            const Symbol& s = *info->resolvedSymbol;
+            if (s.kind == SymbolKind::Function) return formatFunctionSignature(s);
+            if (s.type) {
+                const char* label = s.kind == SymbolKind::Parameter ? "parameter" : "value";
+                return "(" + std::string(label) + ") : " + s.type->toString();
+            }
+        }
+        if (it->kind() == SyntaxKind::FieldDecl) {
+            for (auto up = it; up != chain.rend(); ++up) {
+                const ResolutionInfo* ownerInfo = lookupResolution(analysis, *up);
+                StructInfo* si = ownerInfo ? structInfoOf(ownerInfo->resolvedType) : nullptr;
+                if (!si) continue;
+                int fieldIndex = si->findFieldIndex(std::u16string(name));
+                if (fieldIndex >= 0 && si->fields[fieldIndex].type) {
+                    return "(field) : " + si->fields[fieldIndex].type->toString();
+                }
+                break;
+            }
+        }
+        if (info && info->resolvedType) {
+            StructInfo* si = structInfoOf(info->resolvedType);
+            if (si && si->name == name) {
+                return "type: " + info->resolvedType->toString();
+            }
+        }
+    }
+    return {};
+}
+
+struct DefinitionTarget {
+    std::u16string modulePath;  // empty = the open document's own module
+    int line = 0;               // 1-based; 0 = start of the target file
+    int column = 0;
+};
+
+DefinitionTarget targetForSymbol(const Symbol& s) {
+    DefinitionTarget t;
+    if (s.methodOwner) t.modulePath = s.methodOwner->modulePath;
+    t.line = s.line;
+    t.column = s.column;
+    return t;
+}
+
+// Field or method declaration position, searched by member name on the
+// receiver's type (base fields are flattened in; methods walk the base chain).
+std::optional<DefinitionTarget> memberTarget(StructInfo* si, const std::u16string& name) {
+    if (!si) return std::nullopt;
+    int fieldIndex = si->findFieldIndex(name);
+    if (fieldIndex >= 0) {
+        const FieldInfo& f = si->fields[fieldIndex];
+        DefinitionTarget t;
+        t.modulePath = f.definingClass ? f.definingClass->modulePath : si->modulePath;
+        t.line = f.line;
+        t.column = f.column;
+        return t;
+    }
+    if (StructInfo* declaring = si->classDeclaringMethod(name)) {
+        const MethodInfo& m = declaring->methods[declaring->findMethodIndex(name)];
+        DefinitionTarget t;
+        t.modulePath = m.definingClass ? m.definingClass->modulePath : declaring->modulePath;
+        if (m.symbol) {
+            t.line = m.symbol->line;
+            t.column = m.symbol->column;
+        }
+        return t;
+    }
+    return std::nullopt;
+}
+
+std::optional<DefinitionTarget> resolveDefinitionTarget(const AnalysisResult& analysis,
+                                                        const SyntaxNode& node) {
+    const ResolutionInfo* info = lookupResolution(analysis, node);
+    SyntaxKind k = node.kind();
+
+    if (k == SyntaxKind::MemberExpr || k == SyntaxKind::SafeMemberExpr) {
+        std::optional<ast::Expression> object;
+        std::optional<std::u16string> memberName;
+        if (auto member = ast::MemberExpression::cast(node)) {
+            object = member->object();
+            memberName = member->memberText();
+        } else if (auto safeMember = ast::SafeMemberExpression::cast(node)) {
+            object = safeMember->object();
+            memberName = safeMember->memberText();
+        }
+        if (object) {
+            // Namespace-qualified member `ns.X`: jump into the imported module.
+            if (auto idObj = object->asIdent()) {
+                if (auto* objInfo = lookupResolution(analysis, idObj->node)) {
+                    Symbol* nsSym = objInfo->resolvedSymbol;
+                    if (nsSym && nsSym->kind == SymbolKind::Namespace) {
+                        DefinitionTarget t;
+                        t.modulePath = nsSym->namespaceModulePath;
+                        if (info) {
+                            Symbol* s = info->resolvedMethodSymbol ? info->resolvedMethodSymbol
+                                                                   : info->resolvedSymbol;
+                            StructInfo* si = info->resolvedType ? structInfoOf(info->resolvedType) : nullptr;
+                            if (s) {
+                                t.line = s->line;
+                                t.column = s->column;
+                            } else if (si) {
+                                t.line = si->line;
+                                t.column = si->column;
+                            }
+                        }
+                        return t;
+                    }
+                }
+            }
+            if (memberName) {
+                StructInfo* receiver = structInfoOf(analysis.typeOf(object->node.greenNode()));
+                if (auto t = memberTarget(receiver, *memberName)) return t;
+            }
+        }
+    }
+
+    if (!info) return std::nullopt;
+    if (info->resolvedMethodSymbol) return targetForSymbol(*info->resolvedMethodSymbol);
+    if (info->resolvedSymbol) {
+        const Symbol& s = *info->resolvedSymbol;
+        if (s.kind == SymbolKind::Namespace) {
+            DefinitionTarget t;
+            t.modulePath = s.namespaceModulePath;
+            return t;
+        }
+        return targetForSymbol(s);
+    }
+    if (StructInfo* si = structInfoOf(info->resolvedType)) {
+        DefinitionTarget t;
+        t.modulePath = si->modulePath;
+        t.line = si->line;
+        t.column = si->column;
+        return t;
+    }
+    return std::nullopt;
+}
+
+lsp::DocumentUri definitionUri(const Document& doc, const std::u16string& modulePath) {
+    if (!modulePath.empty()) {
+        const auto& files = doc.moduleFiles();
+        auto it = files.find(modulePath);
+        if (it != files.end()) {
+            std::error_code ec;
+            bool sameFile = it->second == doc.path() ||
+                            std::filesystem::equivalent(it->second, doc.path(), ec);
+            if (!sameFile) return lsp::FileUri::fromPath(it->second.generic_string());
+        }
+    }
+    return lsp::Uri::parse(doc.uri());
 }
 
 lsp::SymbolKind kindForFunction(bool isConstructor) {
@@ -274,20 +451,25 @@ lsp::TextDocument_HoverResult LanguageServer::onHover(lsp::HoverParams&& p) {
     auto chain = ancestorChainAt(doc->root(), offset);
 
     const auto& analysis = doc->analyzer().result();
+    auto makeHover = [&](std::string text, const SyntaxNode& node) {
+        lsp::Hover h;
+        lsp::MarkupContent mc;
+        mc.kind = lsp::MarkupKindEnum(lsp::MarkupKind::PlainText);
+        mc.value = std::move(text);
+        h.contents = std::move(mc);
+        h.range = toLspRange(doc->sourceFile(), node);
+        return h;
+    };
+
     for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+        if (!it->isToken() && !isReferenceKind(it->kind())) break;
         if (auto* info = lookupResolution(analysis, *it)) {
             std::string text = formatHoverFor(*it, *info);
-            if (!text.empty()) {
-                lsp::Hover h;
-                lsp::MarkupContent mc;
-                mc.kind = lsp::MarkupKindEnum(lsp::MarkupKind::PlainText);
-                mc.value = std::move(text);
-                h.contents = std::move(mc);
-                h.range = toLspRange(doc->sourceFile(), *it);
-                return h;
-            }
+            if (!text.empty()) return makeHover(std::move(text), *it);
         }
     }
+    std::string declText = declarationHoverText(analysis, chain);
+    if (!declText.empty()) return makeHover(std::move(declText), chain.back());
     return nullptr;
 }
 
@@ -301,73 +483,16 @@ lsp::TextDocument_DefinitionResult LanguageServer::onDefinition(lsp::DefinitionP
     auto chain = ancestorChainAt(doc->root(), offset);
 
     const auto& analysis = doc->analyzer().result();
-    const ResolutionInfo* hit = nullptr;
-    const SyntaxNode* hitNode = nullptr;
     for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
-        if (auto* info = lookupResolution(analysis, *it)) {
-            if (info->resolvedMethodSymbol || info->resolvedSymbol ||
-                (info->resolvedType && info->resolvedType->structInfo)) {
-                hit = info;
-                hitNode = &*it;
-                break;
-            }
+        if (!it->isToken() && !isReferenceKind(it->kind())) break;
+        if (auto target = resolveDefinitionTarget(analysis, *it)) {
+            lsp::Location loc;
+            loc.uri = definitionUri(*doc, target->modulePath);
+            loc.range = zeroWidthRangeAt(target->line, target->column);
+            return lsp::Definition{std::move(loc)};
         }
     }
-    if (!hit) return nullptr;
-
-    Symbol* sym = hit->resolvedMethodSymbol ? hit->resolvedMethodSymbol : hit->resolvedSymbol;
-    std::u16string modulePath;  // empty = same file
-    int line = 0, col = 0;
-    bool resolved = false;
-
-    // Namespace-qualified member `ns.X`: jump into the imported module. The receiver
-    // identifier resolves to the Namespace symbol, which names the target module.
-    if (auto member = ast::MemberExpression::cast(*hitNode)) {
-        if (auto obj = member->object()) {
-            if (auto idObj = obj->asIdent()) {
-                if (auto* objInfo = lookupResolution(analysis, idObj->node)) {
-                    Symbol* nsSym = objInfo->resolvedSymbol;
-                    if (nsSym && nsSym->kind == SymbolKind::Namespace) {
-                        modulePath = nsSym->namespaceModulePath;
-                        if (hit->resolvedType && hit->resolvedType->structInfo) {
-                            line = hit->resolvedType->structInfo->line;
-                            col = hit->resolvedType->structInfo->column;
-                        } else if (sym) {
-                            line = sym->line;
-                            col = sym->column;
-                        }
-                        resolved = true;
-                    }
-                }
-            }
-        }
-    }
-
-    if (!resolved) {
-        if (sym) {
-            line = sym->line;
-            col = sym->column;
-        } else if (hit->resolvedType && hit->resolvedType->structInfo) {
-            // A type reference: jump to the type's declaration (in its own module).
-            StructInfo* si = hit->resolvedType->structInfo;
-            modulePath = si->modulePath;
-            line = si->line;
-            col = si->column;
-        } else {
-            return nullptr;
-        }
-    }
-
-    lsp::Location loc;
-    const auto& files = doc->moduleFiles();
-    auto fit = modulePath.empty() ? files.end() : files.find(modulePath);
-    if (fit != files.end()) {
-        loc.uri = lsp::FileUri::fromPath(fit->second.string());
-    } else {
-        loc.uri = lsp::Uri::parse(doc->uri());  // same file
-    }
-    loc.range = zeroWidthRangeAt(line, col);
-    return lsp::Definition{std::move(loc)};
+    return nullptr;
 }
 
 namespace {

@@ -358,7 +358,8 @@ void Analyzer::registerExternalTypeNames(const ast::SourceFile& file) {
             continue;
         }
         Type* t = typeCtx.registerExternalType(modulePath_, *name);
-        auto [line, col] = source.offsetToPosition(ed.node.startOffset());
+        auto [line, col] = source.offsetToPosition(
+            ed.nameToken() ? ed.nameToken()->startOffset() : ed.node.startOffset());
         if (t->structInfo) {
             t->structInfo->line = line;
             t->structInfo->column = col;
@@ -463,7 +464,8 @@ void Analyzer::registerStructNames(const ast::SourceFile& file) {
             continue;
         }
         Type* t = typeCtx.registerStruct(modulePath_, *name);
-        auto [line, col] = source.offsetToPosition(sd.node.startOffset());
+        auto [line, col] = source.offsetToPosition(
+            sd.nameToken() ? sd.nameToken()->startOffset() : sd.node.startOffset());
         t->structInfo->line = line;
         t->structInfo->column = col;
         for (auto& tp : sd.typeParams()) {
@@ -483,7 +485,8 @@ void Analyzer::registerClassNames(const ast::SourceFile& file) {
             continue;
         }
         Type* t = typeCtx.registerClass(modulePath_, *name);
-        auto [line, col] = source.offsetToPosition(cd.node.startOffset());
+        auto [line, col] = source.offsetToPosition(
+            cd.nameToken() ? cd.nameToken()->startOffset() : cd.node.startOffset());
         t->structInfo->line = line;
         t->structInfo->column = col;
         for (auto& tp : cd.typeParams()) {
@@ -503,7 +506,8 @@ void Analyzer::registerInterfaceNames(const ast::SourceFile& file) {
             continue;
         }
         Type* t = typeCtx.registerInterface(modulePath_, *name);
-        auto [line, col] = source.offsetToPosition(id.node.startOffset());
+        auto [line, col] = source.offsetToPosition(
+            id.nameToken() ? id.nameToken()->startOffset() : id.node.startOffset());
         t->structInfo->line = line;
         t->structInfo->column = col;
         for (auto& tp : id.typeParams()) {
@@ -523,7 +527,8 @@ void Analyzer::registerEnumNames(const ast::SourceFile& file) {
             continue;
         }
         Type* t = typeCtx.registerEnum(modulePath_, *name);
-        auto [line, col] = source.offsetToPosition(ed.node.startOffset());
+        auto [line, col] = source.offsetToPosition(
+            ed.nameToken() ? ed.nameToken()->startOffset() : ed.node.startOffset());
         t->structInfo->line = line;
         t->structInfo->column = col;
         analysis.setType(ed.node.greenNode(), t);
@@ -1155,7 +1160,8 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
                 (inherited ? " in base class '" + asciiOf(si->baseInfo->name) + "'" : " in '" + asciiOf(si->name) + "'"));
             continue;
         }
-        auto [line, col] = source.offsetToPosition(f.node.startOffset());
+        auto [line, col] = source.offsetToPosition(
+            f.nameToken() ? f.nameToken()->startOffset() : f.node.startOffset());
         fi.line = line;
         fi.column = col;
         fi.declaration = f.node.greenNode();
