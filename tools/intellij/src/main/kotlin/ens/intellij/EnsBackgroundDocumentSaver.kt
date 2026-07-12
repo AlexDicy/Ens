@@ -33,7 +33,6 @@ private object EnsBackgroundSaveListener : CommandListener, ApplicationListener 
         val application = ApplicationManager.getApplication()
         application.messageBus.connect().subscribe(CommandListener.TOPIC, this)
         application.addApplicationListener(this, application)
-        log.info("Ens background saver registered")
     }
 
     override fun commandFinished(event: CommandEvent) = scheduleScan()
@@ -61,7 +60,7 @@ private object EnsBackgroundSaveListener : CommandListener, ApplicationListener 
             val file = manager.getFile(document) ?: continue
             if (!file.isInLocalFileSystem || file.extension != "ens") continue
             manager.saveDocument(document)
-            log.info("Ens background saver: saved ${file.path}")
+            log.debug("Saved unfocused Ens document ${file.path}")
         }
     }
 }

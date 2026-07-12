@@ -22,7 +22,6 @@ class EnsFileWatchForwarder : ProjectActivity {
     private val log = logger<EnsFileWatchForwarder>()
 
     override suspend fun execute(project: Project) {
-        log.info("Ens file watch forwarder registered for ${project.name}")
         project.messageBus.connect().subscribe(VirtualFileManager.VFS_CHANGES, object : BulkFileListener {
             override fun after(events: List<VFileEvent>) {
                 if (project.isDisposed) return
@@ -38,12 +37,10 @@ class EnsFileWatchForwarder : ProjectActivity {
                 }
                 if (changes.isEmpty()) return
                 val manager = LanguageServerManager.getInstance(project)
-                val status = manager.getServerStatus("ens")
-                log.info("Ens file watch forwarder: ${changes.size} change(s), server status $status: ${changes.joinToString { it.uri }}")
-                if (status != ServerStatus.started) return
+                if (manager.getServerStatus("ens") != ServerStatus.started) return
                 manager.getLanguageServer("ens").thenAccept { item ->
                     item?.server?.workspaceService?.didChangeWatchedFiles(DidChangeWatchedFilesParams(changes))
-                    log.info("Ens file watch forwarder: forwarded ${changes.size} change(s)")
+                    log.debug("Forwarded ${changes.size} Ens file change(s)")
                 }
             }
         })
