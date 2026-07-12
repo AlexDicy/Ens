@@ -112,6 +112,12 @@ void Analyzer::registerBuiltins() {
     printSym->paramTypes = {stringTy};
     printSym->isBuiltin = true;
     globalScope->define(printSym);
+
+    Symbol* panicSym = makeSymbol(SymbolKind::Function, std::u16string(u"panic"), nullptr, 0);
+    panicSym->returnType = voidTy;
+    panicSym->paramTypes = {stringTy};
+    panicSym->isBuiltin = true;
+    globalScope->define(panicSym);
 }
 
 Symbol* Analyzer::makeSymbol(SymbolKind k, std::u16string n, Type* t, uint32_t offset) {

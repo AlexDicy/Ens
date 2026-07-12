@@ -4191,11 +4191,17 @@ struct CodeGenerator::Impl {
     }
 
     void emitPanic(const std::string& message, int exitCode) {
+        emitPanicMessagePtr(makeMessageString(message), exitCode);
+    }
+
+    // Prints "panic: <message>" with a stack trace captured at the panic point,
+    // then exits. `messageData` is a NUL-terminated char pointer.
+    void emitPanicMessagePtr(llvm::Value* messageData, int exitCode) {
         auto* i32Ty = llvm::Type::getInt32Ty(ctx);
         llvm::Value* stderrF = getStderr();
         auto fputs = getOrDeclareFputs();
         builder->CreateCall(fputs, { builder->CreateGlobalString("panic: ", ".panic.pfx"), stderrF });
-        builder->CreateCall(fputs, { makeMessageString(message), stderrF });
+        builder->CreateCall(fputs, { messageData, stderrF });
         builder->CreateCall(fputs, { builder->CreateGlobalString("\n", ".panic.nl"), stderrF });
         llvm::Value* trace = builder->CreateCall(captureTraceFn(), { llvm::ConstantInt::get(i32Ty, 64) }, "trace");
         llvm::Value* traceStr = builder->CreateCall(formatTraceFn(), { trace }, "trace.str");
@@ -5874,6 +5880,16 @@ struct CodeGenerator::Impl {
             auto puts = getOrDeclarePuts();
             builder->CreateCall(puts, {emitStringDataPtr(arg)});
             releaseIfOwnedTemp(arg, args[0]);
+            return nullptr;
+        }
+        if (name == "panic") {
+            if (args.size() != 1) {
+                error(e.node.startOffset(), "panic expects exactly 1 argument");
+                return nullptr;
+            }
+            llvm::Value* arg = emitExpr(args[0]);
+            if (!arg) return nullptr;
+            emitPanicMessagePtr(emitStringDataPtr(arg), 134);
             return nullptr;
         }
         error(e.node.startOffset(), "Unknown builtin '" + name + "'");
