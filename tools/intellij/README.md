@@ -3,7 +3,7 @@
 Plugin for IntelliJ-based IDEs (including Community Edition) that highlights `.ens` files and spawns `ens-lsp` as the language server.
 Syntax highlighting uses the canonical TextMate grammar and language configuration from `tools/grammar/`.
 Both files are copied into the plugin resources at build time by `processResources` and are never committed under this folder.
-Language features (diagnostics, hover, completion, go to definition, structure view, semantic tokens) come from `ens-lsp` through the [LSP4IJ](https://plugins.jetbrains.com/plugin/23257-lsp4ij) plugin.
+Language features (diagnostics, hover, completion, go to definition, find references, rename, structure view, semantic tokens) come from `ens-lsp` through the [LSP4IJ](https://plugins.jetbrains.com/plugin/23257-lsp4ij) plugin.
 
 ## One-time setup
 

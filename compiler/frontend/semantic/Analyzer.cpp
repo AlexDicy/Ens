@@ -117,6 +117,7 @@ void Analyzer::registerBuiltins() {
 Symbol* Analyzer::makeSymbol(SymbolKind k, std::u16string n, Type* t, uint32_t offset) {
     auto [line, column] = source.offsetToPosition(offset);
     auto s = std::make_unique<Symbol>(k, std::move(n), t, line, column);
+    s->modulePath = modulePath_;
     Symbol* raw = s.get();
     ownedSymbols.push_back(std::move(s));
     return raw;
@@ -595,6 +596,7 @@ void Analyzer::bindTypeImports(const ModuleResolver& resolver) {
                 uint32_t namePos = imp.aliasToken() ? imp.aliasToken()->startOffset() : imp.node.startOffset();
                 Symbol* sym = makeSymbol(SymbolKind::Variable, *alias, importedType, namePos);
                 sym->isTypeName = true;
+                analysis.setSymbol(imp.node.greenNode(), sym);
                 if (!globalScope->define(sym)) {
                     errorAtNode(imp.node, "Imported name '" + asciiOf(*alias) +
                         "' conflicts with an existing declaration");
@@ -2045,6 +2047,7 @@ void Analyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
         auto pname = p.nameText().value_or(std::u16string{});
         uint32_t pPos = p.nameToken() ? p.nameToken()->startOffset() : p.node.startOffset();
         Symbol* psym = makeSymbol(SymbolKind::Parameter, pname, pt, pPos);
+        if (p.isThisField() && receiverType) psym->thisFieldOwner = receiverType->structInfo;
         if (!currentScope->define(psym)) {
             errorAtNode(p.node, "Duplicate parameter name '" + asciiOf(pname) + "'");
         }

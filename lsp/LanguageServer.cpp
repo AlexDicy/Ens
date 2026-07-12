@@ -341,18 +341,21 @@ std::optional<DefinitionTarget> resolveDeclarationTarget(const AnalysisResult& a
         const ResolutionInfo* info = lookupResolution(analysis, *it);
         SyntaxKind k = it->kind();
         if (info && info->resolvedSymbol && info->resolvedSymbol->name == name) {
-            if (k == SyntaxKind::Parameter) {
-                auto param = ast::Parameter::cast(*it);
-                if (param && param->isThisField()) {
-                    for (auto up = it; up != chain.rend(); ++up) {
-                        if (up->kind() != SyntaxKind::FuncDecl) continue;
-                        StructInfo* si = structInfoOf(analysis.receiverOf(up->greenNode()));
-                        if (auto t = memberTarget(si, std::u16string(name))) return t;
-                        break;
-                    }
+            const Symbol& s = *info->resolvedSymbol;
+            if (s.thisFieldOwner) {
+                if (auto t = memberTarget(s.thisFieldOwner, std::u16string(name))) return t;
+            }
+            if (s.isTypeName) {
+                if (StructInfo* si = structInfoOf(s.type)) {
+                    DefinitionTarget t;
+                    t.modulePath = si->modulePath;
+                    t.line = si->line;
+                    t.column = si->column;
+                    t.nameLength = si->name.size();
+                    return t;
                 }
             }
-            return targetForSymbol(*info->resolvedSymbol);
+            return targetForSymbol(s);
         }
         if (k == SyntaxKind::FieldDecl) {
             for (auto up = it; up != chain.rend(); ++up) {
@@ -390,6 +393,246 @@ lsp::DocumentUri definitionUri(const Document& doc, const std::u16string& module
         }
     }
     return lsp::Uri::parse(doc.uri());
+}
+
+// ===== References and rename =====
+//
+// A reference search resolves the position to the declared entity (a symbol, a
+// type, or a field), then finds every identifier in the module graph whose own
+// resolution reaches the same entity.
+
+struct Entity {
+    Symbol* symbol = nullptr;
+    StructInfo* type = nullptr;
+    StructInfo* fieldOwner = nullptr;
+    std::u16string fieldName;
+
+    bool valid() const { return symbol || type || fieldOwner; }
+    bool operator==(const Entity& other) const {
+        return symbol == other.symbol && type == other.type &&
+               fieldOwner == other.fieldOwner && fieldName == other.fieldName;
+    }
+};
+
+Entity typeEntity(StructInfo* si) {
+    Entity e;
+    e.type = si && si->templateOf ? si->templateOf : si;
+    return e;
+}
+
+std::optional<Entity> memberEntity(StructInfo* si, const std::u16string& name);
+
+// An override chain is one entity: root a method symbol at the base-most class
+// (or interface) declaration with the same signature, so renaming any link
+// renames them all.
+Symbol* baseMostMethodSymbol(Symbol* s) {
+    StructInfo* owner = s->methodOwner;
+    if (!owner) return s;
+    for (StructInfo* base = owner->baseInfo; base; base = base->baseInfo) {
+        if (base->findMethodIndexBySignature(s->name, s) >= 0) owner = base;
+    }
+    for (StructInfo* c = owner; c; c = c->baseInfo) {
+        for (::Type* interfaceType : c->implementedInterfaces) {
+            StructInfo* interfaceInfo = interfaceType ? interfaceType->structInfo : nullptr;
+            if (!interfaceInfo) continue;
+            int index = interfaceInfo->findMethodIndexBySignature(s->name, s);
+            if (index >= 0 && interfaceInfo->methods[index].symbol) {
+                return interfaceInfo->methods[index].symbol;
+            }
+        }
+    }
+    int index = owner->findMethodIndexBySignature(s->name, s);
+    if (index >= 0 && owner->methods[index].symbol) return owner->methods[index].symbol;
+    return s;
+}
+
+// Constructors, imported type aliases, this-field parameters, and overrides all
+// stand for another declaration; fold them so every spelling matches the same entity.
+Entity entityForSymbol(Symbol* s) {
+    if (!s) return {};
+    if (s->isTypeName) {
+        if (StructInfo* si = structInfoOf(s->type)) return typeEntity(si);
+    }
+    if (s->kind == SymbolKind::Function && s->methodOwner) {
+        if (s->name == s->methodOwner->name) return typeEntity(s->methodOwner);
+        s = baseMostMethodSymbol(s);
+    }
+    if (s->thisFieldOwner) {
+        if (auto e = memberEntity(s->thisFieldOwner, s->name)) return *e;
+    }
+    Entity e;
+    e.symbol = s;
+    return e;
+}
+
+std::optional<Entity> memberEntity(StructInfo* si, const std::u16string& name) {
+    if (!si) return std::nullopt;
+    int fieldIndex = si->findFieldIndex(name);
+    if (fieldIndex >= 0) {
+        const FieldInfo& f = si->fields[fieldIndex];
+        Entity e;
+        e.fieldOwner = f.definingClass ? f.definingClass : si;
+        e.fieldName = name;
+        return e;
+    }
+    if (StructInfo* declaring = si->classDeclaringMethod(name)) {
+        const MethodInfo& m = declaring->methods[declaring->findMethodIndex(name)];
+        if (m.symbol) return entityForSymbol(m.symbol);
+    }
+    return std::nullopt;
+}
+
+Entity entityForNode(const AnalysisResult& analysis, const SyntaxNode& node) {
+    const ResolutionInfo* info = lookupResolution(analysis, node);
+    SyntaxKind k = node.kind();
+
+    if (k == SyntaxKind::MemberExpr || k == SyntaxKind::SafeMemberExpr) {
+        std::optional<ast::Expression> object;
+        std::optional<std::u16string> memberName;
+        if (auto member = ast::MemberExpression::cast(node)) {
+            object = member->object();
+            memberName = member->memberText();
+        } else if (auto safeMember = ast::SafeMemberExpression::cast(node)) {
+            object = safeMember->object();
+            memberName = safeMember->memberText();
+        }
+        if (object) {
+            if (auto idObj = object->asIdent()) {
+                if (auto* objInfo = lookupResolution(analysis, idObj->node)) {
+                    Symbol* nsSym = objInfo->resolvedSymbol;
+                    if (nsSym && nsSym->kind == SymbolKind::Namespace) {
+                        if (info) {
+                            Symbol* s = info->resolvedMethodSymbol ? info->resolvedMethodSymbol
+                                                                   : info->resolvedSymbol;
+                            if (s) return entityForSymbol(s);
+                            if (StructInfo* si = structInfoOf(info->resolvedType)) return typeEntity(si);
+                        }
+                        return {};
+                    }
+                }
+            }
+            if (memberName) {
+                StructInfo* receiver = structInfoOf(analysis.typeOf(object->node.greenNode()));
+                if (auto e = memberEntity(receiver, *memberName)) return *e;
+            }
+        }
+    }
+
+    if (!info) return {};
+    if (info->resolvedMethodSymbol) return entityForSymbol(info->resolvedMethodSymbol);
+    if (info->resolvedSymbol) return entityForSymbol(info->resolvedSymbol);
+    // Bare tokens cover resolutions attached directly to name tokens (extends bases).
+    if (node.isToken() || k == SyntaxKind::IdentExpr || k == SyntaxKind::TypeRef ||
+        k == SyntaxKind::NewExpr) {
+        if (StructInfo* si = structInfoOf(info->resolvedType)) return typeEntity(si);
+    }
+    return {};
+}
+
+Entity declarationEntityAt(const AnalysisResult& analysis, const std::vector<SyntaxNode>& chain) {
+    if (chain.empty() || !chain.back().isToken()) return {};
+    std::u16string_view name = chain.back().tokenText();
+    if (name.empty()) return {};
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+        if (it->isToken()) continue;
+        const ResolutionInfo* info = lookupResolution(analysis, *it);
+        if (info && info->resolvedSymbol && info->resolvedSymbol->name == name) {
+            return entityForSymbol(info->resolvedSymbol);
+        }
+        if (it->kind() == SyntaxKind::FieldDecl) {
+            for (auto up = it; up != chain.rend(); ++up) {
+                const ResolutionInfo* ownerInfo = lookupResolution(analysis, *up);
+                StructInfo* si = ownerInfo ? structInfoOf(ownerInfo->resolvedType) : nullptr;
+                if (!si) continue;
+                if (auto e = memberEntity(si, std::u16string(name))) return *e;
+                break;
+            }
+        }
+        if (info && info->resolvedType) {
+            StructInfo* si = structInfoOf(info->resolvedType);
+            if (si && si->name == name) return typeEntity(si);
+        }
+    }
+    return {};
+}
+
+struct EntityAtResult {
+    Entity entity;
+    bool atDeclaration = false;
+};
+
+EntityAtResult entityAt(const SyntaxNode& root, const AnalysisResult& analysis, uint32_t offset) {
+    auto chain = ancestorChainAt(root, offset);
+    if (chain.empty() || !chain.back().isToken() || isTrivia(chain.back().kind())) return {};
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+        if (!it->isToken() && !isReferenceKind(it->kind())) break;
+        Entity e = entityForNode(analysis, *it);
+        if (e.valid()) return {e, false};
+    }
+    Entity declared = declarationEntityAt(analysis, chain);
+    return {declared, declared.valid()};
+}
+
+std::u16string entityName(const Entity& e) {
+    if (e.symbol) return e.symbol->name;
+    if (e.type) return e.type->name;
+    return e.fieldName;
+}
+
+void collectIdentifierTokens(const SyntaxNode& node, std::u16string_view name,
+                             std::vector<SyntaxNode>& out) {
+    if (node.isToken()) {
+        if (node.kind() == SyntaxKind::Identifier && node.tokenText() == name) out.push_back(node);
+        return;
+    }
+    for (auto& c : node.children()) collectIdentifierTokens(c, name, out);
+}
+
+struct Occurrence {
+    const ens::modules::Module* module = nullptr;
+    lsp::Range range;
+    bool atDeclaration = false;
+};
+
+std::vector<Occurrence> findOccurrences(const Document& doc, const Entity& target) {
+    std::vector<Occurrence> out;
+    std::u16string name = entityName(target);
+    if (name.empty()) return out;
+    for (const auto& modulePtr : doc.moduleList()) {
+        const ens::modules::Module& m = *modulePtr;
+        if (!m.rootNode || !m.analyzer || !m.source) continue;
+        const AnalysisResult& analysis = m.analyzer->result();
+        std::vector<SyntaxNode> tokens;
+        collectIdentifierTokens(*m.rootNode, name, tokens);
+        for (const auto& token : tokens) {
+            auto resolved = entityAt(*m.rootNode, analysis, token.startOffset());
+            if (resolved.entity == target) {
+                out.push_back({&m, toLspRange(*m.source, token), resolved.atDeclaration});
+            }
+        }
+    }
+    return out;
+}
+
+bool isRenameableEntity(const Entity& e) {
+    if (!e.valid()) return false;
+    if (e.symbol) {
+        const Symbol& s = *e.symbol;
+        if (s.isBuiltin || s.isExternal || s.kind == SymbolKind::Namespace) return false;
+    }
+    return true;
+}
+
+bool isValidIdentifierName(const std::u16string& name) {
+    auto isNameStart = [](char16_t c) {
+        return (c >= u'a' && c <= u'z') || (c >= u'A' && c <= u'Z') || c == u'_' || c == u'$';
+    };
+    auto isDigit = [](char16_t c) { return c >= u'0' && c <= u'9'; };
+    if (name.empty() || !isNameStart(name.front())) return false;
+    for (char16_t c : name) {
+        if (!isNameStart(c) && !isDigit(c)) return false;
+    }
+    return keywordKindFromText(name) == SyntaxKind::Identifier;
 }
 
 lsp::SymbolKind kindForFunction(bool isConstructor) {
@@ -510,6 +753,11 @@ lsp::InitializeResult LanguageServer::onInitialize(lsp::InitializeParams&& param
     cOpts.triggerCharacters = std::vector<std::string>{"."};
     caps.completionProvider = std::move(cOpts);
 
+    caps.referencesProvider = true;
+    lsp::RenameOptions renameOptions;
+    renameOptions.prepareProvider = true;
+    caps.renameProvider = std::move(renameOptions);
+
     r.capabilities = std::move(caps);
     return r;
 }
@@ -607,6 +855,78 @@ lsp::TextDocument_DefinitionResult LanguageServer::onDefinition(lsp::DefinitionP
     }
     if (auto target = resolveDeclarationTarget(analysis, chain)) return makeLocation(*target);
     return nullptr;
+}
+
+lsp::TextDocument_ReferencesResult LanguageServer::onReferences(lsp::ReferenceParams&& p) {
+    auto* doc = documents.find(p.textDocument.uri.toString());
+    if (!doc) return nullptr;
+
+    int line1 = p.position.line + 1;
+    int col1 = p.position.character + 1;
+    uint32_t offset = preferIdentifierToTheLeft(
+        doc->root(), doc->sourceFile().positionToOffset(line1, col1));
+    Entity target = entityAt(doc->root(), doc->analyzer().result(), offset).entity;
+    if (!target.valid()) return nullptr;
+
+    lsp::Array<lsp::Location> locations;
+    for (const auto& occurrence : findOccurrences(*doc, target)) {
+        if (!p.context.includeDeclaration && occurrence.atDeclaration) continue;
+        lsp::Location loc;
+        loc.uri = definitionUri(*doc, occurrence.module->modulePath);
+        loc.range = occurrence.range;
+        locations.push_back(std::move(loc));
+    }
+    return locations;
+}
+
+lsp::TextDocument_PrepareRenameResult LanguageServer::onPrepareRename(lsp::PrepareRenameParams&& p) {
+    auto* doc = documents.find(p.textDocument.uri.toString());
+    if (!doc) return nullptr;
+
+    int line1 = p.position.line + 1;
+    int col1 = p.position.character + 1;
+    uint32_t offset = preferIdentifierToTheLeft(
+        doc->root(), doc->sourceFile().positionToOffset(line1, col1));
+    auto token = doc->root().tokenAtOffset(offset);
+    if (!token || token->kind() != SyntaxKind::Identifier) return nullptr;
+    Entity target = entityAt(doc->root(), doc->analyzer().result(), offset).entity;
+    if (!isRenameableEntity(target)) return nullptr;
+
+    lsp::PrepareRenameResult_Range_Placeholder result;
+    result.range = toLspRange(doc->sourceFile(), *token);
+    result.placeholder = utf16To8(std::u16string(token->tokenText()));
+    return lsp::PrepareRenameResult(std::move(result));
+}
+
+lsp::TextDocument_RenameResult LanguageServer::onRename(lsp::RenameParams&& p) {
+    auto* doc = documents.find(p.textDocument.uri.toString());
+    if (!doc) return nullptr;
+
+    std::u16string newName = utf8To16(p.newName);
+    if (!isValidIdentifierName(newName)) {
+        throw lsp::RequestError(-32602, "'" + p.newName + "' is not a valid Ens identifier");
+    }
+
+    int line1 = p.position.line + 1;
+    int col1 = p.position.character + 1;
+    uint32_t offset = preferIdentifierToTheLeft(
+        doc->root(), doc->sourceFile().positionToOffset(line1, col1));
+    Entity target = entityAt(doc->root(), doc->analyzer().result(), offset).entity;
+    if (!isRenameableEntity(target)) return nullptr;
+
+    auto occurrences = findOccurrences(*doc, target);
+    if (occurrences.empty()) return nullptr;
+
+    lsp::Map<lsp::DocumentUri, lsp::Array<lsp::TextEdit>> changes;
+    for (const auto& occurrence : occurrences) {
+        lsp::TextEdit edit;
+        edit.range = occurrence.range;
+        edit.newText = p.newName;
+        changes[definitionUri(*doc, occurrence.module->modulePath)].push_back(std::move(edit));
+    }
+    lsp::WorkspaceEdit edit;
+    edit.changes = std::move(changes);
+    return edit;
 }
 
 namespace {

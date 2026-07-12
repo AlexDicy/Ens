@@ -29,6 +29,7 @@ public:
     Type* type = nullptr;
     int line = 0;
     int column = 0;
+    std::u16string modulePath;  // module that declares this symbol
     bool isBuiltin = false;
 
     std::vector<Type*> paramTypes;
@@ -59,6 +60,9 @@ public:
     std::u16string libraryName;
 
     StructInfo* methodOwner = nullptr;
+
+    // For a this-field constructor parameter: the class whose field it initializes.
+    StructInfo* thisFieldOwner = nullptr;
 
     // Generic function template: the type-parameter names and optional bounds.
     bool isTemplate = false;

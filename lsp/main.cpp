@@ -56,6 +56,21 @@ int main() {
             return server.onCompletion(std::move(p));
         });
 
+    messages.add<lsp::requests::TextDocument_References>(
+        [&](lsp::requests::TextDocument_References::Params&& p) {
+            return server.onReferences(std::move(p));
+        });
+
+    messages.add<lsp::requests::TextDocument_PrepareRename>(
+        [&](lsp::requests::TextDocument_PrepareRename::Params&& p) {
+            return server.onPrepareRename(std::move(p));
+        });
+
+    messages.add<lsp::requests::TextDocument_Rename>(
+        [&](lsp::requests::TextDocument_Rename::Params&& p) {
+            return server.onRename(std::move(p));
+        });
+
     messages.add<lsp::requests::Shutdown>(
         []() { return lsp::ShutdownResult{}; });
 

@@ -38,6 +38,11 @@ public:
         return moduleFiles_;
     }
 
+    // Every module in the graph, for graph-wide searches (references, rename).
+    const std::vector<std::unique_ptr<ens::modules::Module>>& moduleList() const {
+        return modules_;
+    }
+
 private:
     DocumentStore& store_;
     std::string uri_;

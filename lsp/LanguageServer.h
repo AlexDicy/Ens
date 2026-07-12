@@ -20,6 +20,9 @@ public:
     lsp::TextDocument_DocumentSymbolResult onDocumentSymbol(lsp::DocumentSymbolParams&& p);
     lsp::TextDocument_SemanticTokens_FullResult onSemanticTokensFull(lsp::SemanticTokensParams&& p);
     lsp::TextDocument_CompletionResult onCompletion(lsp::CompletionParams&& p);
+    lsp::TextDocument_ReferencesResult onReferences(lsp::ReferenceParams&& p);
+    lsp::TextDocument_PrepareRenameResult onPrepareRename(lsp::PrepareRenameParams&& p);
+    lsp::TextDocument_RenameResult onRename(lsp::RenameParams&& p);
 
 private:
     lsp::MessageHandler& messages;
