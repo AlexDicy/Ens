@@ -462,6 +462,9 @@ Narrowing is dropped when the analyzer can't prove the narrowed value is still n
 - Reassigning the root variable or, for subscripts, the index variable.
 - Any function or method call whose receiver or class/array-typed argument could be the narrowed root. Calls that don't touch the relevant root (e.g. `print("hi")`) leave the narrowing intact.
 
+A write through a narrowed path is checked against the declared field or element type, not the narrowed one.
+Nulling out a just-checked field (`r.door = null`) or storing a base value over an `is`-narrowed one (`c.shape = new Shape()`) is therefore allowed; the write drops the narrowing, and reading the path again requires a new check.
+
 ```ens
 if (room.door != null) {
     room.door.code;        // ok
@@ -621,6 +624,18 @@ if (command == Command.Submit) {
 A switch over an enum must be exhaustive: it either covers every member or provides a `default`. A non-exhaustive enum switch is a compile error that names the missing members, so adding a member forces every switch over that enum to be updated. A switch over an integer or a string must provide a `default`.
 
 A switch is also an expression: each arm yields a value, the arms unify to a common type (the same way the branches of `?:` do), and the switch evaluates to the matched arm's value. In statement position an arm's body may be a `{ }` block; used as a value, each arm is a single expression.
+
+Unification treats `null` as the absent case of a nullable type: a `null` branch or arm beside a `T` one yields `T?`, and a `T` one beside a `T?` one yields `T?`.
+Unrelated types still do not unify, and branches that are all `null` give the expression no type of its own, so it can appear only where a plain `null` could.
+
+```ens
+string? label = hasLabel ? readLabel() : null;   // string beside null -> string?
+int? bonus = switch (rank) {
+    1 -> 100,
+    2 -> 50,
+    default -> null,                             // int beside null -> int?
+};
+```
 
 When the value is nullable, a `null ->` arm handles the null case and counts toward exhaustiveness alongside the other labels.
 
