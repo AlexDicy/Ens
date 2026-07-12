@@ -35,6 +35,20 @@ void Scope::clearNarrowingsForRoot(Symbol* root) {
     }
 }
 
+// Erases the narrowings that pass through `root` but keeps the narrowing of
+// the binding itself.
+void Scope::clearNarrowingsForRootMembers(Symbol* root) {
+    for (Scope* s = this; s; s = s->parent) {
+        for (auto it = s->narrowedTypes.begin(); it != s->narrowedTypes.end();) {
+            if (it->first.root == root && !it->first.chain.empty()) {
+                it = s->narrowedTypes.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+}
+
 static bool startsWith(const std::vector<PathSegment>& chain,
                        const std::vector<PathSegment>& prefix) {
     if (chain.size() < prefix.size()) return false;

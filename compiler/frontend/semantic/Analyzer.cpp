@@ -2545,12 +2545,26 @@ void Analyzer::clearNarrowingsForCall(const ast::CallExpression& expr) {
         }
     };
     // Receiver (method / safe-method call): the call could mutate state
-    // reachable through it.
+    // reachable through it, which drops every narrowing that passes through
+    // the receiver's root. A plain local (or parameter) receiver keeps the
+    // narrowing of the binding itself: no callee can reassign the caller's
+    // binding.
+    auto dropReceiver = [&](const ast::Expression& e) {
+        auto p = buildNarrowingPath(e);
+        if (!p) return;
+        if (p->chain.empty() && p->root &&
+            (p->root->kind == SymbolKind::Variable ||
+             p->root->kind == SymbolKind::Parameter)) {
+            currentScope->clearNarrowingsForRootMembers(p->root);
+        } else {
+            currentScope->clearNarrowingsForRoot(p->root);
+        }
+    };
     if (auto callee = expr.callee()) {
         if (auto m = callee->asMember()) {
-            if (auto obj = m->object()) dropRoot(*obj);
+            if (auto obj = m->object()) dropReceiver(*obj);
         } else if (auto sm = callee->asSafeMember()) {
-            if (auto obj = sm->object()) dropRoot(*obj);
+            if (auto obj = sm->object()) dropReceiver(*obj);
         }
     }
     // Arguments: only class / array references expose mutable state; struct

@@ -79,6 +79,7 @@ public:
     Type* lookupNarrowedType(const NarrowingPath& key) const;
 
     void clearNarrowingsForRoot(Symbol* root);
+    void clearNarrowingsForRootMembers(Symbol* root);
     void clearNarrowingsAtOrBelow(const NarrowingPath& prefix);
     void clearNarrowingsForIndexSymbol(Symbol* sym);
 };
