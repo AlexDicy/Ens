@@ -846,6 +846,21 @@ void LanguageServer::onDidChangeWatchedFiles(
     if (!changedPaths.empty()) refreshDocumentsDependingOn(changedPaths, nullptr);
 }
 
+// A companion editor plugin can report edits the IDE applied to documents that are
+// not open in the LSP sense (rename workspace edits, undo in files without a tab);
+// the content stays a transient override until a real buffer or the disk takes over.
+void LanguageServer::onBackgroundDocumentChanged(lsp::json::Value&& params) {
+    if (!params.isObject()) return;
+    const lsp::json::Value* uri = params.object().find("uri");
+    const lsp::json::Value* text = params.object().find("text");
+    if (!uri || !uri->isString() || !text || !text->isString()) return;
+    if (documents.find(uri->string())) return;  // open buffers are authoritative
+    std::filesystem::path path = Document::pathForUri(uri->string());
+    if (path.empty()) return;
+    documents.setTransientOverride(path, utf8To16(text->string()));
+    refreshDocumentsDependingOn({path}, nullptr);
+}
+
 void LanguageServer::publishDiagnostics(const Document& doc) {
     lsp::notifications::TextDocument_PublishDiagnostics::Params p;
     p.uri = lsp::Uri::parse(doc.uri());

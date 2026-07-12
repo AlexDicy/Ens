@@ -38,6 +38,12 @@ int main() {
             server.onDidChangeWatchedFiles(std::move(p));
         });
 
+    messages.add("ens/didChangeBackground",
+        [&](lsp::json::Value&& params) -> lsp::json::Value {
+            server.onBackgroundDocumentChanged(std::move(params));
+            return nullptr;
+        });
+
     messages.add<lsp::requests::TextDocument_Hover>(
         [&](lsp::requests::TextDocument_Hover::Params&& p) { return server.onHover(std::move(p)); });
 
