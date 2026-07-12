@@ -39,6 +39,10 @@ tasks.runIde {
     jvmArgs("-Didea.trust.all.projects=true", "-Djb.consents.confirmation.enabled=false")
 }
 
+tasks.prepareSandbox {
+    disabledPlugins.add("com.intellij.gradle")
+}
+
 tasks.processResources {
     from("../grammar/ens.tmLanguage.json") { into("textmate/ens/syntaxes") }
     from("../grammar/language-configuration.json") { into("textmate/ens") }
