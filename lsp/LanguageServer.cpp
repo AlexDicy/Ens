@@ -50,6 +50,16 @@ lsp::Range nameRangeAt(int line1, int col1, size_t nameLength) {
     return r;
 }
 
+// A caret sitting immediately after an identifier (before `;`, `)`, a space, ...)
+// should resolve that identifier, matching how editors treat word boundaries.
+uint32_t preferIdentifierToTheLeft(const SyntaxNode& root, uint32_t offset) {
+    auto at = root.tokenAtOffset(offset);
+    if ((at && at->kind() == SyntaxKind::Identifier) || offset == 0) return offset;
+    auto left = root.tokenAtOffset(offset - 1);
+    if (left && left->kind() == SyntaxKind::Identifier) return offset - 1;
+    return offset;
+}
+
 // Walks from `root` down to the deepest descendant whose extent contains `offset`.
 // Returns root → ... → deepest. Empty if offset is outside root.
 std::vector<SyntaxNode> ancestorChainAt(const SyntaxNode& root, uint32_t offset) {
@@ -319,6 +329,55 @@ lsp::DocumentUri uriForFilePath(const std::filesystem::path& path) {
     return lsp::Uri::parse(encoded);
 }
 
+// Definition invoked on the name inside a declaration: a this-field parameter
+// navigates to the field it initializes; other declarations resolve to themselves.
+std::optional<DefinitionTarget> resolveDeclarationTarget(const AnalysisResult& analysis,
+                                                         const std::vector<SyntaxNode>& chain) {
+    if (chain.empty() || !chain.back().isToken()) return std::nullopt;
+    std::u16string_view name = chain.back().tokenText();
+    if (name.empty()) return std::nullopt;
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+        if (it->isToken()) continue;
+        const ResolutionInfo* info = lookupResolution(analysis, *it);
+        SyntaxKind k = it->kind();
+        if (info && info->resolvedSymbol && info->resolvedSymbol->name == name) {
+            if (k == SyntaxKind::Parameter) {
+                auto param = ast::Parameter::cast(*it);
+                if (param && param->isThisField()) {
+                    for (auto up = it; up != chain.rend(); ++up) {
+                        if (up->kind() != SyntaxKind::FuncDecl) continue;
+                        StructInfo* si = structInfoOf(analysis.receiverOf(up->greenNode()));
+                        if (auto t = memberTarget(si, std::u16string(name))) return t;
+                        break;
+                    }
+                }
+            }
+            return targetForSymbol(*info->resolvedSymbol);
+        }
+        if (k == SyntaxKind::FieldDecl) {
+            for (auto up = it; up != chain.rend(); ++up) {
+                const ResolutionInfo* ownerInfo = lookupResolution(analysis, *up);
+                StructInfo* si = ownerInfo ? structInfoOf(ownerInfo->resolvedType) : nullptr;
+                if (!si) continue;
+                if (auto t = memberTarget(si, std::u16string(name))) return t;
+                break;
+            }
+        }
+        if (info && info->resolvedType) {
+            StructInfo* si = structInfoOf(info->resolvedType);
+            if (si && si->name == name) {
+                DefinitionTarget t;
+                t.modulePath = si->modulePath;
+                t.line = si->line;
+                t.column = si->column;
+                t.nameLength = si->name.size();
+                return t;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
 lsp::DocumentUri definitionUri(const Document& doc, const std::u16string& modulePath) {
     if (!modulePath.empty()) {
         const auto& files = doc.moduleFiles();
@@ -443,7 +502,7 @@ lsp::InitializeResult LanguageServer::onInitialize(lsp::InitializeParams&& param
         "function", "method", "parameter", "variable",
         "property", "class", "struct", "type", "namespace", "enum"
     };
-    stOpts.legend.tokenModifiers = {};
+    stOpts.legend.tokenModifiers = {"declaration"};
     stOpts.full = true;
     caps.semanticTokensProvider = std::move(stOpts);
 
@@ -493,7 +552,8 @@ lsp::TextDocument_HoverResult LanguageServer::onHover(lsp::HoverParams&& p) {
 
     int line1 = p.position.line + 1;
     int col1 = p.position.character + 1;
-    uint32_t offset = doc->sourceFile().positionToOffset(line1, col1);
+    uint32_t offset = preferIdentifierToTheLeft(
+        doc->root(), doc->sourceFile().positionToOffset(line1, col1));
     auto chain = ancestorChainAt(doc->root(), offset);
 
     if (!chain.empty() && chain.back().isToken() && isTrivia(chain.back().kind())) return nullptr;
@@ -527,21 +587,25 @@ lsp::TextDocument_DefinitionResult LanguageServer::onDefinition(lsp::DefinitionP
 
     int line1 = p.position.line + 1;
     int col1 = p.position.character + 1;
-    uint32_t offset = doc->sourceFile().positionToOffset(line1, col1);
+    uint32_t offset = preferIdentifierToTheLeft(
+        doc->root(), doc->sourceFile().positionToOffset(line1, col1));
     auto chain = ancestorChainAt(doc->root(), offset);
 
     if (!chain.empty() && chain.back().isToken() && isTrivia(chain.back().kind())) return nullptr;
 
     const auto& analysis = doc->analyzer().result();
+    auto makeLocation = [&](const DefinitionTarget& target) {
+        lsp::Location loc;
+        loc.uri = definitionUri(*doc, target.modulePath);
+        loc.range = nameRangeAt(target.line, target.column, target.nameLength);
+        return lsp::Definition{std::move(loc)};
+    };
+
     for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
         if (!it->isToken() && !isReferenceKind(it->kind())) break;
-        if (auto target = resolveDefinitionTarget(analysis, *it)) {
-            lsp::Location loc;
-            loc.uri = definitionUri(*doc, target->modulePath);
-            loc.range = nameRangeAt(target->line, target->column, target->nameLength);
-            return lsp::Definition{std::move(loc)};
-        }
+        if (auto target = resolveDefinitionTarget(analysis, *it)) return makeLocation(*target);
     }
+    if (auto target = resolveDeclarationTarget(analysis, chain)) return makeLocation(*target);
     return nullptr;
 }
 
@@ -561,8 +625,11 @@ struct SemanticTokenEntry {
     uint32_t tokenModifiers;
 };
 
+// Indices into the SemanticTokensLegend.tokenModifiers array declared in onInitialize.
+constexpr uint32_t StModifierDeclaration = 1u << 0;
+
 void emitTokenAt(std::vector<SemanticTokenEntry>& out, const SourceFile& source,
-                 const SyntaxNode& tokenNode, uint32_t tokenType) {
+                 const SyntaxNode& tokenNode, uint32_t tokenType, uint32_t tokenModifiers = 0) {
     if (tokenNode.length() == 0) return;
     auto [line, col] = source.offsetToPosition(tokenNode.startOffset());
     SemanticTokenEntry e;
@@ -570,7 +637,7 @@ void emitTokenAt(std::vector<SemanticTokenEntry>& out, const SourceFile& source,
     e.startChar = static_cast<uint32_t>(col - 1);
     e.length = tokenNode.length();
     e.tokenType = tokenType;
-    e.tokenModifiers = 0;
+    e.tokenModifiers = tokenModifiers;
     out.push_back(e);
 }
 
@@ -682,7 +749,7 @@ void collectFromParameter(const ast::Parameter& p, const SourceFile& source,
         collectFromTypeReference(*tr, source, analysis, out);
     }
     if (auto nameTok = p.nameToken()) {
-        emitTokenAt(out, source, *nameTok, StParameter);
+        emitTokenAt(out, source, *nameTok, StParameter, StModifierDeclaration);
     }
     if (auto dv = p.defaultValue()) {
         if (auto expr = dv->expression()) collectFromExpression(expr->node, source, analysis, out);
@@ -702,13 +769,13 @@ void collectFromStatement(const SyntaxNode& node, const SourceFile& source,
         return;
     }
     if (auto l = stmt->asLet()) {
-        if (auto nameTok = l->nameToken()) emitTokenAt(out, source, *nameTok, StVariable);
+        if (auto nameTok = l->nameToken()) emitTokenAt(out, source, *nameTok, StVariable, StModifierDeclaration);
         if (auto init = l->initializer()) collectFromExpression(init->node, source, analysis, out);
         return;
     }
     if (auto v = stmt->asTypedVarDecl()) {
         if (auto tr = v->typeReference()) collectFromTypeReference(*tr, source, analysis, out);
-        if (auto nameTok = v->nameToken()) emitTokenAt(out, source, *nameTok, StVariable);
+        if (auto nameTok = v->nameToken()) emitTokenAt(out, source, *nameTok, StVariable, StModifierDeclaration);
         if (auto init = v->initializer()) collectFromExpression(init->node, source, analysis, out);
         return;
     }
@@ -740,7 +807,7 @@ void collectFromFunction(const ast::FuncDecl& fn, bool isMember, const SourceFil
                          const AnalysisResult& analysis,
                          std::vector<SemanticTokenEntry>& out) {
     if (auto nameTok = fn.nameToken()) {
-        emitTokenAt(out, source, *nameTok, isMember ? StMethod : StFunction);
+        emitTokenAt(out, source, *nameTok, isMember ? StMethod : StFunction, StModifierDeclaration);
     }
     for (auto& p : fn.parameters()) {
         collectFromParameter(p, source, analysis, out);
@@ -757,7 +824,7 @@ void collectFromField(const ast::FieldDecl& f, const SourceFile& source,
                       const AnalysisResult& analysis,
                       std::vector<SemanticTokenEntry>& out) {
     if (auto tr = f.typeReference()) collectFromTypeReference(*tr, source, analysis, out);
-    if (auto nameTok = f.nameToken()) emitTokenAt(out, source, *nameTok, StProperty);
+    if (auto nameTok = f.nameToken()) emitTokenAt(out, source, *nameTok, StProperty, StModifierDeclaration);
 }
 
 std::vector<uint32_t> encodeAsLspData(std::vector<SemanticTokenEntry> entries) {
@@ -911,12 +978,12 @@ lsp::TextDocument_SemanticTokens_FullResult LanguageServer::onSemanticTokensFull
         }
     }
     for (auto& sd : sf->structs()) {
-        if (auto t = sd.nameToken()) emitTokenAt(entries, source, *t, StStruct);
+        if (auto t = sd.nameToken()) emitTokenAt(entries, source, *t, StStruct, StModifierDeclaration);
         for (auto& f : sd.fields())  collectFromField(f, source, analysis, entries);
         for (auto& m : sd.methods()) collectFromFunction(m, /*isMember*/ true, source, analysis, entries);
     }
     for (auto& cd : sf->classes()) {
-        if (auto t = cd.nameToken()) emitTokenAt(entries, source, *t, StClass);
+        if (auto t = cd.nameToken()) emitTokenAt(entries, source, *t, StClass, StModifierDeclaration);
         for (auto& f : cd.fields())  collectFromField(f, source, analysis, entries);
         for (auto& m : cd.methods()) collectFromFunction(m, /*isMember*/ true, source, analysis, entries);
     }
