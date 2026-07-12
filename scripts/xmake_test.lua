@@ -86,8 +86,8 @@ task("test")
         if want("selfhost_frontend") then
             table.insert(jobs, {
                 name = "selfhost_frontend",
-                source = path.join(os.projectdir(), "selfhost", "frontend"),
-                ens_test_args = {},
+                source = path.join(os.projectdir(), "selfhost", "frontend", "src"),
+                ens_test_args = {"--tests", path.join(os.projectdir(), "selfhost", "frontend", "tests")},
             })
         end
 
