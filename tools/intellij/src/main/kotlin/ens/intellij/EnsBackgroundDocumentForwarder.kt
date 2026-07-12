@@ -1,39 +1,31 @@
 package ens.intellij
 
+import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.components.Service
 import com.intellij.openapi.editor.Document
 import com.intellij.openapi.editor.EditorFactory
 import com.intellij.openapi.editor.event.DocumentEvent
 import com.intellij.openapi.editor.event.DocumentListener
 import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.fileEditor.FileEditorManager
-import com.intellij.openapi.project.Project
 import com.intellij.openapi.project.ProjectManager
-import com.intellij.openapi.startup.ProjectActivity
 import com.redhat.devtools.lsp4ij.LSPIJUtils
 import com.redhat.devtools.lsp4ij.LanguageServerManager
 import com.redhat.devtools.lsp4ij.ServerStatus
 import org.eclipse.lsp4j.jsonrpc.Endpoint
-import java.util.concurrent.atomic.AtomicBoolean
 
 // The IDE modifies Ens documents that are not open in the LSP sense (rename
 // workspace edits, undo in files without a tab). Those edits produce neither
 // didChange nor a save, so forward the document text to the server directly;
-// the server ignores reports for documents it already has open.
-class EnsBackgroundDocumentForwarder : ProjectActivity {
-    override suspend fun execute(project: Project) {
-        EnsBackgroundChangeListener.ensureRegistered()
-    }
-}
-
-private object EnsBackgroundChangeListener : DocumentListener {
-    private val registered = AtomicBoolean(false)
+// the server ignores reports for documents it already has open. A disposable
+// service, so dynamic plugin unload detaches the listener.
+@Service(Service.Level.APP)
+class EnsBackgroundDocumentForwarder : DocumentListener, Disposable {
     private val pending = mutableSetOf<Document>()
 
-    fun ensureRegistered() {
-        if (!registered.compareAndSet(false, true)) return
-        EditorFactory.getInstance().eventMulticaster
-            .addDocumentListener(this, ApplicationManager.getApplication())
+    init {
+        EditorFactory.getInstance().eventMulticaster.addDocumentListener(this, this)
     }
 
     override fun documentChanged(event: DocumentEvent) {
@@ -73,4 +65,6 @@ private object EnsBackgroundChangeListener : DocumentListener {
             }
         }
     }
+
+    override fun dispose() {}
 }

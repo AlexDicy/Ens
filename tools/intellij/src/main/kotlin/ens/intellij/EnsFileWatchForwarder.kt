@@ -1,8 +1,9 @@
 package ens.intellij
 
+import com.intellij.openapi.Disposable
+import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.project.Project
-import com.intellij.openapi.startup.ProjectActivity
 import com.intellij.openapi.vfs.VirtualFileManager
 import com.intellij.openapi.vfs.newvfs.BulkFileListener
 import com.intellij.openapi.vfs.newvfs.events.VFileCreateEvent
@@ -16,13 +17,15 @@ import org.eclipse.lsp4j.FileChangeType
 import org.eclipse.lsp4j.FileEvent
 
 // The server registers a watcher for *.ens files so it can refresh diagnostics when
-// imported files change on disk (rename edits in closed files). Client-side watcher
-// delivery is not dependable, so forward the IDE's own VFS events directly.
-class EnsFileWatchForwarder : ProjectActivity {
+// imported files change on disk (rename edits in closed files, external tools).
+// Client-side watcher delivery is not dependable, so forward the IDE's own VFS
+// events directly. A disposable service, so dynamic plugin unload detaches it.
+@Service(Service.Level.PROJECT)
+class EnsFileWatchForwarder(private val project: Project) : Disposable {
     private val log = logger<EnsFileWatchForwarder>()
 
-    override suspend fun execute(project: Project) {
-        project.messageBus.connect().subscribe(VirtualFileManager.VFS_CHANGES, object : BulkFileListener {
+    init {
+        project.messageBus.connect(this).subscribe(VirtualFileManager.VFS_CHANGES, object : BulkFileListener {
             override fun after(events: List<VFileEvent>) {
                 if (project.isDisposed) return
                 val changes = events.mapNotNull { event ->
@@ -45,4 +48,6 @@ class EnsFileWatchForwarder : ProjectActivity {
             }
         })
     }
+
+    override fun dispose() {}
 }
