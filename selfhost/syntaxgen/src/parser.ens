@@ -1,0 +1,472 @@
+// Lexer and parser for the syntax.grammar DSL. Parsing never throws: the
+// result carries the grammar plus any errors, each prefixed with its line.
+import Vector from @std.vector;
+import Grammar from model;
+import TokenDeclaration from model;
+import TokenSetDeclaration from model;
+import CategoryDeclaration from model;
+import UnionDeclaration from model;
+import SlotReference from model;
+import SlotDeclaration from model;
+import NodeRuleDeclaration from model;
+
+public enum DslTokenKind {
+    Identifier,
+    Spelling,
+    Equals,
+    Pipe,
+    Colon,
+    Question,
+    Star,
+    OpenParenthesis,
+    CloseParenthesis,
+    OpenBrace,
+    CloseBrace,
+    EndOfInput,
+}
+
+public class DslToken {
+    DslTokenKind kind;
+    string text;
+    long line;
+
+    DslToken(this.kind, this.text, this.line);
+}
+
+public class ParseResult {
+    Grammar grammar;
+    Vector<string> errors;
+
+    ParseResult(this.grammar, this.errors);
+}
+
+public parseGrammar(string text) -> ParseResult {
+    let errors = new Vector<string>();
+    let tokens = lex(text, errors);
+    let grammar = new Grammar();
+    if (errors.length() == 0) {
+        let state = new ParserState(tokens, grammar, errors);
+        state.parseTopLevel();
+    }
+    return new ParseResult(grammar, errors);
+}
+
+private isIdentifierStart(byte value) -> bool {
+    if (value >= 'a' && value <= 'z') {
+        return true;
+    }
+    if (value >= 'A' && value <= 'Z') {
+        return true;
+    }
+    return value == '_';
+}
+
+private isIdentifierPart(byte value) -> bool {
+    if (isIdentifierStart(value)) {
+        return true;
+    }
+    return value >= '0' && value <= '9';
+}
+
+private lex(string text, Vector<string> errors) -> Vector<DslToken> {
+    let tokens = new Vector<DslToken>();
+    byte[] bytes = text.toBytes();
+    long line = 1;
+    long i = 0;
+    while (i < bytes.length) {
+        byte value = bytes[i];
+        if (value == '\n') {
+            line = line + 1;
+            i = i + 1;
+        } else if (value == ' ' || value == '\t' || value == '\r') {
+            i = i + 1;
+        } else if (value == '/' && i + 1 < bytes.length && bytes[i + 1] == '/') {
+            while (i < bytes.length && bytes[i] != '\n') {
+                i = i + 1;
+            }
+        } else if (isIdentifierStart(value)) {
+            long start = i;
+            while (i < bytes.length && isIdentifierPart(bytes[i])) {
+                i = i + 1;
+            }
+            tokens.push(new DslToken(DslTokenKind.Identifier, text.substring(start, i), line));
+        } else if (value == '\'') {
+            long start = i + 1;
+            i = i + 1;
+            while (i < bytes.length && bytes[i] != '\'' && bytes[i] != '\n') {
+                i = i + 1;
+            }
+            if (i < bytes.length && bytes[i] == '\'') {
+                tokens.push(new DslToken(DslTokenKind.Spelling, text.substring(start, i), line));
+                i = i + 1;
+            } else {
+                errors.push("line {line}: unterminated spelling");
+            }
+        } else if (value == '=') {
+            tokens.push(new DslToken(DslTokenKind.Equals, "=", line));
+            i = i + 1;
+        } else if (value == '|') {
+            tokens.push(new DslToken(DslTokenKind.Pipe, "|", line));
+            i = i + 1;
+        } else if (value == ':') {
+            tokens.push(new DslToken(DslTokenKind.Colon, ":", line));
+            i = i + 1;
+        } else if (value == '?') {
+            tokens.push(new DslToken(DslTokenKind.Question, "?", line));
+            i = i + 1;
+        } else if (value == '*') {
+            tokens.push(new DslToken(DslTokenKind.Star, "*", line));
+            i = i + 1;
+        } else if (value == '(') {
+            tokens.push(new DslToken(DslTokenKind.OpenParenthesis, "(", line));
+            i = i + 1;
+        } else if (value == ')') {
+            tokens.push(new DslToken(DslTokenKind.CloseParenthesis, ")", line));
+            i = i + 1;
+        } else if (value == '{') {
+            tokens.push(new DslToken(DslTokenKind.OpenBrace, "\{", line));
+            i = i + 1;
+        } else if (value == '}') {
+            tokens.push(new DslToken(DslTokenKind.CloseBrace, "\}", line));
+            i = i + 1;
+        } else {
+            let shown = text.substring(i, i + 1);
+            errors.push("line {line}: unexpected character '{shown}'");
+            i = i + 1;
+        }
+    }
+    tokens.push(new DslToken(DslTokenKind.EndOfInput, "", line));
+    return tokens;
+}
+
+class ParserState {
+    Vector<DslToken> tokens;
+    Grammar grammar;
+    Vector<string> errors;
+    long position;
+
+    ParserState(this.tokens, this.grammar, this.errors) {
+        this.position = 0;
+    }
+
+    current() -> DslToken {
+        return this.tokens.get(this.position);
+    }
+
+    peek(long offset) -> DslToken {
+        long target = this.position + offset;
+        if (target >= this.tokens.length()) {
+            return this.tokens.get(this.tokens.length() - 1);
+        }
+        return this.tokens.get(target);
+    }
+
+    advance() {
+        if (this.position < this.tokens.length() - 1) {
+            this.position = this.position + 1;
+        }
+    }
+
+    atEnd() -> bool {
+        return this.current().kind == DslTokenKind.EndOfInput;
+    }
+
+    // Records the error and jumps to the end so every parse loop stops.
+    fail(string message) {
+        let token = this.current();
+        this.errors.push("line {token.line}: {message}");
+        this.position = this.tokens.length() - 1;
+    }
+
+    parseTopLevel() {
+        while (!this.atEnd() && this.errors.length() == 0) {
+            let token = this.current();
+            if (token.kind != DslTokenKind.Identifier) {
+                this.fail("expected a declaration");
+            } else if (token.text == "tokens" && this.peek(1).kind == DslTokenKind.OpenBrace) {
+                this.parseTokensBlock();
+            } else if (token.text == "tokenset") {
+                this.parseTokenSet();
+            } else if (token.text == "union") {
+                this.parseUnion();
+            } else if (this.peek(1).kind == DslTokenKind.Equals) {
+                this.parseCategoryOrRule();
+            } else {
+                this.fail("expected '=' after '{token.text}'");
+            }
+        }
+    }
+
+    parseTokensBlock() {
+        this.advance();
+        this.advance();
+        while (this.current().kind == DslTokenKind.Identifier) {
+            let name = this.current();
+            this.advance();
+            string? spelling = null;
+            if (this.current().kind == DslTokenKind.Equals) {
+                this.advance();
+                if (this.current().kind != DslTokenKind.Spelling) {
+                    this.fail("expected a spelling after '=' for token '{name.text}'");
+                    return;
+                }
+                spelling = this.current().text;
+                this.advance();
+            }
+            bool isContextual = false;
+            bool isTrivia = false;
+            bool scanning = true;
+            while (scanning) {
+                let modifier = this.current();
+                if (modifier.kind == DslTokenKind.Identifier && modifier.text == "contextual") {
+                    isContextual = true;
+                    this.advance();
+                } else if (modifier.kind == DslTokenKind.Identifier && modifier.text == "trivia") {
+                    isTrivia = true;
+                    this.advance();
+                } else {
+                    scanning = false;
+                }
+            }
+            this.grammar.tokens.push(new TokenDeclaration(name.text, spelling, isContextual, isTrivia));
+        }
+        if (this.current().kind != DslTokenKind.CloseBrace) {
+            this.fail("expected '\}' to close the tokens block");
+            return;
+        }
+        this.advance();
+    }
+
+    parseTokenSet() {
+        this.advance();
+        if (this.current().kind != DslTokenKind.Identifier) {
+            this.fail("expected a name after 'tokenset'");
+            return;
+        }
+        let name = this.current();
+        this.advance();
+        if (this.current().kind != DslTokenKind.Equals) {
+            this.fail("expected '=' after 'tokenset {name.text}'");
+            return;
+        }
+        this.advance();
+        let members = new Vector<SlotReference>();
+        bool expectMember = true;
+        while (expectMember) {
+            let member = this.current();
+            if (member.kind == DslTokenKind.Spelling) {
+                members.push(new SlotReference(member.text, true));
+                this.advance();
+            } else if (member.kind == DslTokenKind.Identifier) {
+                members.push(new SlotReference(member.text, false));
+                this.advance();
+            } else {
+                this.fail("expected a member in token set '{name.text}'");
+                return;
+            }
+            if (this.current().kind == DslTokenKind.Pipe) {
+                this.advance();
+            } else {
+                expectMember = false;
+            }
+        }
+        this.grammar.tokenSets.push(new TokenSetDeclaration(name.text, members));
+    }
+
+    parseUnion() {
+        this.advance();
+        if (this.current().kind != DslTokenKind.Identifier) {
+            this.fail("expected a name after 'union'");
+            return;
+        }
+        let name = this.current();
+        this.advance();
+        if (this.current().kind != DslTokenKind.Equals) {
+            this.fail("expected '=' after 'union {name.text}'");
+            return;
+        }
+        this.advance();
+        let members = new Vector<string>();
+        bool expectMember = true;
+        while (expectMember) {
+            if (this.current().kind != DslTokenKind.Identifier) {
+                this.fail("expected a member in union '{name.text}'");
+                return;
+            }
+            members.push(this.current().text);
+            this.advance();
+            if (this.current().kind == DslTokenKind.Pipe) {
+                this.advance();
+            } else {
+                expectMember = false;
+            }
+        }
+        this.grammar.unions.push(new UnionDeclaration(name.text, members));
+    }
+
+    parseCategoryOrRule() {
+        let name = this.current();
+        this.advance();
+        this.advance();
+        if (this.current().kind == DslTokenKind.Identifier && this.peek(1).kind == DslTokenKind.Pipe) {
+            this.parseCategory(name.text);
+        } else {
+            this.parseRule(name.text);
+        }
+    }
+
+    parseCategory(string name) {
+        let members = new Vector<string>();
+        bool expectMember = true;
+        while (expectMember) {
+            if (this.current().kind != DslTokenKind.Identifier) {
+                this.fail("expected a member in category '{name}'");
+                return;
+            }
+            members.push(this.current().text);
+            this.advance();
+            if (this.current().kind == DslTokenKind.Pipe) {
+                this.advance();
+            } else {
+                expectMember = false;
+            }
+        }
+        this.grammar.categories.push(new CategoryDeclaration(name, members));
+    }
+
+    parseRule(string name) {
+        let slots = new Vector<SlotDeclaration>();
+        while (this.errors.length() == 0 && !this.atRuleBoundary()) {
+            this.parseSlot(name, slots);
+        }
+        this.grammar.rules.push(new NodeRuleDeclaration(name, slots));
+    }
+
+    // The next declaration starts at `Name =`, at `tokens {`, or at a
+    // `tokenset`/`union` keyword followed by `Name =`.
+    atRuleBoundary() -> bool {
+        let token = this.current();
+        if (token.kind == DslTokenKind.EndOfInput) {
+            return true;
+        }
+        if (token.kind != DslTokenKind.Identifier) {
+            return false;
+        }
+        if (this.peek(1).kind == DslTokenKind.Equals) {
+            return true;
+        }
+        if (token.text == "tokens" && this.peek(1).kind == DslTokenKind.OpenBrace) {
+            return true;
+        }
+        if (token.text == "tokenset" || token.text == "union") {
+            return this.peek(1).kind == DslTokenKind.Identifier && this.peek(2).kind == DslTokenKind.Equals;
+        }
+        return false;
+    }
+
+    parseSlot(string ruleName, Vector<SlotDeclaration> slots) {
+        let token = this.current();
+        string? slotName = null;
+        let references = new Vector<SlotReference>();
+        if (token.kind == DslTokenKind.Identifier) {
+            slotName = token.text;
+            this.advance();
+            if (this.current().kind != DslTokenKind.Colon) {
+                this.fail("expected ':' after slot name '{token.text}' in rule '{ruleName}'");
+                return;
+            }
+            this.advance();
+            if (!this.parseSlotType(ruleName, references)) {
+                return;
+            }
+        } else if (token.kind == DslTokenKind.Spelling) {
+            references.push(new SlotReference(token.text, true));
+            this.advance();
+        } else {
+            this.fail("expected a slot in rule '{ruleName}'");
+            return;
+        }
+        bool isOptional = false;
+        bool isList = false;
+        SlotReference? separator = null;
+        if (this.current().kind == DslTokenKind.Question) {
+            isOptional = true;
+            this.advance();
+        } else if (this.current().kind == DslTokenKind.Star) {
+            isList = true;
+            this.advance();
+            if (this.atSeparatorKeyword()) {
+                this.advance();
+                let separatorToken = this.current();
+                if (separatorToken.kind == DslTokenKind.Spelling) {
+                    separator = new SlotReference(separatorToken.text, true);
+                } else {
+                    separator = new SlotReference(separatorToken.text, false);
+                }
+                this.advance();
+            }
+        }
+        slots.push(new SlotDeclaration(slotName, references, isOptional, isList, separator));
+    }
+
+    // `sep` introduces a separator unless it reads as the next slot or rule.
+    atSeparatorKeyword() -> bool {
+        let token = this.current();
+        if (token.kind != DslTokenKind.Identifier || token.text != "sep") {
+            return false;
+        }
+        let next = this.peek(1);
+        if (next.kind == DslTokenKind.Spelling) {
+            return true;
+        }
+        if (next.kind == DslTokenKind.Identifier) {
+            let after = this.peek(2);
+            return after.kind != DslTokenKind.Colon && after.kind != DslTokenKind.Equals;
+        }
+        return false;
+    }
+
+    parseSlotType(string ruleName, Vector<SlotReference> references) -> bool {
+        let token = this.current();
+        if (token.kind == DslTokenKind.Spelling) {
+            references.push(new SlotReference(token.text, true));
+            this.advance();
+            return true;
+        }
+        if (token.kind == DslTokenKind.Identifier) {
+            references.push(new SlotReference(token.text, false));
+            this.advance();
+            return true;
+        }
+        if (token.kind == DslTokenKind.OpenParenthesis) {
+            this.advance();
+            bool expectMember = true;
+            while (expectMember) {
+                let member = this.current();
+                if (member.kind == DslTokenKind.Spelling) {
+                    references.push(new SlotReference(member.text, true));
+                    this.advance();
+                } else if (member.kind == DslTokenKind.Identifier) {
+                    references.push(new SlotReference(member.text, false));
+                    this.advance();
+                } else {
+                    this.fail("expected a token or node name in a group in rule '{ruleName}'");
+                    return false;
+                }
+                if (this.current().kind == DslTokenKind.Pipe) {
+                    this.advance();
+                } else {
+                    expectMember = false;
+                }
+            }
+            if (this.current().kind != DslTokenKind.CloseParenthesis) {
+                this.fail("expected ')' to close a group in rule '{ruleName}'");
+                return false;
+            }
+            this.advance();
+            return true;
+        }
+        this.fail("expected a slot type in rule '{ruleName}'");
+        return false;
+    }
+}

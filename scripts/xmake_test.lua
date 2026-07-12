@@ -91,6 +91,15 @@ task("test")
             })
         end
 
+        -- the syntax.grammar to Ens code generator's tests run the same way.
+        if want("selfhost_syntaxgen") then
+            table.insert(jobs, {
+                name = "selfhost_syntaxgen",
+                source = path.join(os.projectdir(), "selfhost", "syntaxgen", "src"),
+                ens_test_args = {"--tests", path.join(os.projectdir(), "selfhost", "syntaxgen", "tests")},
+            })
+        end
+
         -- surface any requested names that matched no test, so typos don't pass silently.
         if wanted ~= nil then
             local unknown = {}

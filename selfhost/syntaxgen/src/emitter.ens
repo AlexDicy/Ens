@@ -1,0 +1,641 @@
+// Turns a validated grammar into the generated .ens modules. Emission is
+// deterministic: iteration follows grammar declaration order and the output
+// contains nothing environment-dependent.
+import Vector from @std.vector;
+import StringBuilder from @std.stringbuilder;
+import model;
+import Grammar from model;
+import GrammarIndex from model;
+import TokenDeclaration from model;
+import NodeRuleDeclaration from model;
+import SlotDeclaration from model;
+import SlotReference from model;
+
+enum SlotShapeKind {
+    TokenSlot,
+    NodeSlot,
+    MixedSlot,
+}
+
+class SlotShape {
+    long slotIndex;
+    string accessorName;
+    SlotShapeKind shape;
+    string nodeTypeName;
+    bool isOptional;
+    bool isList;
+    bool isSeparated;
+
+    SlotShape(this.slotIndex, this.accessorName, this.shape, this.nodeTypeName,
+              this.isOptional, this.isList, this.isSeparated);
+}
+
+public emitKindModule(Grammar grammar) -> string {
+    let builder = new StringBuilder();
+    line(builder, header());
+    line(builder, "");
+    line(builder, "public enum SyntaxKind \{");
+    for (long i = 0; i < grammar.tokens.length(); i = i + 1) {
+        let name = grammar.tokens.get(i).name;
+        line(builder, "    {name},");
+    }
+    for (long i = 0; i < grammar.rules.length(); i = i + 1) {
+        let name = grammar.rules.get(i).name;
+        line(builder, "    {name},");
+    }
+    line(builder, "    List,");
+    line(builder, "\}");
+    emitKindPredicate(builder, "isTrivia", triviaKinds(grammar));
+    emitKindPredicate(builder, "isToken", tokenKinds(grammar));
+    emitKindPredicate(builder, "isKeyword", keywordKinds(grammar));
+    emitKindPredicate(builder, "isNode", nodeKinds(grammar));
+    for (long i = 0; i < grammar.categories.length(); i = i + 1) {
+        let category = grammar.categories.get(i);
+        emitKindPredicate(builder, "is{category.name}Kind", category.members);
+    }
+    emitTextLookup(builder, "keywordFromText", grammar, false);
+    emitTextLookup(builder, "contextualKeywordFromText", grammar, true);
+    emitKindName(builder, grammar);
+    return builder.toString();
+}
+
+public emitNodesModule(Grammar grammar) -> string {
+    let builder = new StringBuilder();
+    let index = model.buildIndex(grammar);
+    line(builder, header());
+    line(builder, "import GreenNode from syntax.green;");
+    line(builder, "import NodeFactory from syntax.node;");
+    line(builder, "import SyntaxNode from syntax.node;");
+    line(builder, "import SyntaxToken from syntax.node;");
+    line(builder, "import internal;");
+    for (long i = 0; i < grammar.unions.length(); i = i + 1) {
+        let union = grammar.unions.get(i);
+        line(builder, "");
+        line(builder, "public interface {union.name} \{ \}");
+    }
+    for (long i = 0; i < grammar.categories.length(); i = i + 1) {
+        let category = grammar.categories.get(i);
+        let suffix = implementsSuffix(category.name, index);
+        line(builder, "");
+        line(builder, "public sealed abstract class {category.name} extends SyntaxNode{suffix} \{");
+        emitConstructor(builder, category.name);
+        line(builder, "\}");
+    }
+    emitListNode(builder);
+    for (long i = 0; i < grammar.rules.length(); i = i + 1) {
+        emitNodeClass(builder, grammar.rules.get(i), index);
+    }
+    return builder.toString();
+}
+
+public emitFactoryModule(Grammar grammar) -> string {
+    let builder = new StringBuilder();
+    line(builder, header());
+    line(builder, "import SyntaxKind from syntax.kind;");
+    line(builder, "import GreenNode from syntax.green;");
+    line(builder, "import NodeFactory from syntax.node;");
+    line(builder, "import SyntaxNode from syntax.node;");
+    line(builder, "import internal;");
+    for (long i = 0; i < grammar.rules.length(); i = i + 1) {
+        let name = grammar.rules.get(i).name;
+        line(builder, "import {name}Node from syntax.nodes;");
+    }
+    line(builder, "import ListNode from syntax.nodes;");
+    line(builder, "");
+    line(builder, "public class SyntaxNodeFactory implements NodeFactory \{");
+    line(builder, "    SyntaxNodeFactory();");
+    line(builder, "");
+    line(builder, "    override create(GreenNode green, long fullStart, SyntaxNode? parent) -> SyntaxNode \{");
+    line(builder, "        switch (green.kind()) \{");
+    for (long i = 0; i < grammar.rules.length(); i = i + 1) {
+        let name = grammar.rules.get(i).name;
+        line(builder, "            {name} -> \{ return new {name}Node(green, fullStart, parent, this); \},");
+    }
+    line(builder, "            List -> \{ return new ListNode(green, fullStart, parent, this); \},");
+    line(builder, "            default -> \{ \},");
+    line(builder, "        \}");
+    line(builder, "        internal.fatal(\"no typed node is registered for kind \{green.kind()\}\");");
+    line(builder, "        while (true) \{ \}");
+    line(builder, "    \}");
+    line(builder, "\}");
+    line(builder, "");
+    line(builder, "// Builds the typed red root for a green tree.");
+    line(builder, "public createRoot(GreenNode green) -> SyntaxNode \{");
+    line(builder, "    return new SyntaxNodeFactory().create(green, 0, null);");
+    line(builder, "\}");
+    return builder.toString();
+}
+
+public emitDumpModule() -> string {
+    let builder = new StringBuilder();
+    line(builder, header());
+    line(builder, "// Kind-agnostic printer for red trees: one element per line with its kind,");
+    line(builder, "// span, and token text. Emitted verbatim, so it is stable across grammar");
+    line(builder, "// changes.");
+    line(builder, "import syntax.kind;");
+    line(builder, "import GreenToken from syntax.green;");
+    line(builder, "import GreenNode from syntax.green;");
+    line(builder, "import NodeFactory from syntax.node;");
+    line(builder, "import SyntaxNode from syntax.node;");
+    line(builder, "import SyntaxNodeFactory from syntax.factory;");
+    line(builder, "import StringBuilder from @std.stringbuilder;");
+    line(builder, "");
+    line(builder, "public dumpTree(SyntaxNode root) -> string \{");
+    line(builder, "    let builder = new StringBuilder();");
+    line(builder, "    writeNode(root, new SyntaxNodeFactory(), builder, 0);");
+    line(builder, "    return builder.toString();");
+    line(builder, "\}");
+    line(builder, "");
+    line(builder, "private writeNode(SyntaxNode node, NodeFactory factory, StringBuilder builder, long depth) \{");
+    line(builder, "    writeIndent(builder, depth);");
+    line(builder, "    let span = node.span();");
+    line(builder, "    builder.append(kind.kindName(node.kind()));");
+    line(builder, "    builder.append(\" [\");");
+    line(builder, "    builder.append(span.start);");
+    line(builder, "    builder.append(\"..\");");
+    line(builder, "    builder.append(span.end());");
+    line(builder, "    builder.append(\")\\n\");");
+    line(builder, "    let green = node.green();");
+    line(builder, "    let fullSpan = node.fullSpan();");
+    line(builder, "    long offset = fullSpan.start;");
+    line(builder, "    for (long i = 0; i < green.slotCount(); i = i + 1) \{");
+    line(builder, "        let child = green.slot(i);");
+    line(builder, "        if (child != null) \{");
+    line(builder, "            long width = child.fullLength();");
+    line(builder, "            if (child is GreenToken) \{");
+    line(builder, "                writeToken(child, offset, builder, depth + 1);");
+    line(builder, "            \}");
+    line(builder, "            if (child is GreenNode) \{");
+    line(builder, "                writeNode(factory.create(child, offset, node), factory, builder, depth + 1);");
+    line(builder, "            \}");
+    line(builder, "            offset = offset + width;");
+    line(builder, "        \}");
+    line(builder, "    \}");
+    line(builder, "\}");
+    line(builder, "");
+    line(builder, "private writeToken(GreenToken token, long offset, StringBuilder builder, long depth) \{");
+    line(builder, "    writeIndent(builder, depth);");
+    line(builder, "    long start = offset + token.leadingLength();");
+    line(builder, "    builder.append(kind.kindName(token.kind()));");
+    line(builder, "    builder.append(\" \\\"\");");
+    line(builder, "    builder.append(escapeText(token.text()));");
+    line(builder, "    builder.append(\"\\\" [\");");
+    line(builder, "    builder.append(start);");
+    line(builder, "    builder.append(\"..\");");
+    line(builder, "    builder.append(start + token.contentLength());");
+    line(builder, "    builder.append(\")\\n\");");
+    line(builder, "\}");
+    line(builder, "");
+    line(builder, "private writeIndent(StringBuilder builder, long depth) \{");
+    line(builder, "    for (long i = 0; i < depth; i = i + 1) \{");
+    line(builder, "        builder.append(\"  \");");
+    line(builder, "    \}");
+    line(builder, "\}");
+    line(builder, "");
+    line(builder, "private escapeText(string text) -> string \{");
+    line(builder, "    let builder = new StringBuilder();");
+    line(builder, "    byte[] bytes = text.toBytes();");
+    line(builder, "    for (long i = 0; i < bytes.length; i = i + 1) \{");
+    line(builder, "        byte value = bytes[i];");
+    line(builder, "        if (value == '\\n') \{");
+    line(builder, "            builder.append(\"\\\\n\");");
+    line(builder, "        \} else if (value == '\\r') \{");
+    line(builder, "            builder.append(\"\\\\r\");");
+    line(builder, "        \} else if (value == '\\t') \{");
+    line(builder, "            builder.append(\"\\\\t\");");
+    line(builder, "        \} else if (value == '\"') \{");
+    line(builder, "            builder.append(\"\\\\\\\"\");");
+    line(builder, "        \} else if (value == '\\\\') \{");
+    line(builder, "            builder.append(\"\\\\\\\\\");");
+    line(builder, "        \} else \{");
+    line(builder, "            byte[] single = [value];");
+    line(builder, "            builder.append(string.fromBytes(single));");
+    line(builder, "        \}");
+    line(builder, "    \}");
+    line(builder, "    return builder.toString();");
+    line(builder, "\}");
+    return builder.toString();
+}
+
+private header() -> string {
+    return "// Generated by syntaxgen from selfhost/syntax.grammar. Do not edit.";
+}
+
+private line(StringBuilder builder, string text) {
+    builder.append(text);
+    builder.append("\n");
+}
+
+private triviaKinds(Grammar grammar) -> Vector<string> {
+    let names = new Vector<string>();
+    for (long i = 0; i < grammar.tokens.length(); i = i + 1) {
+        let token = grammar.tokens.get(i);
+        if (token.isTrivia) {
+            names.push(token.name);
+        }
+    }
+    return names;
+}
+
+private tokenKinds(Grammar grammar) -> Vector<string> {
+    let names = new Vector<string>();
+    for (long i = 0; i < grammar.tokens.length(); i = i + 1) {
+        let token = grammar.tokens.get(i);
+        if (!token.isTrivia) {
+            names.push(token.name);
+        }
+    }
+    return names;
+}
+
+private keywordKinds(Grammar grammar) -> Vector<string> {
+    let names = new Vector<string>();
+    for (long i = 0; i < grammar.tokens.length(); i = i + 1) {
+        let token = grammar.tokens.get(i);
+        let spelling = token.spelling;
+        if (spelling != null && isKeywordSpelling(spelling)) {
+            names.push(token.name);
+        }
+    }
+    return names;
+}
+
+private nodeKinds(Grammar grammar) -> Vector<string> {
+    let names = new Vector<string>();
+    for (long i = 0; i < grammar.rules.length(); i = i + 1) {
+        names.push(grammar.rules.get(i).name);
+    }
+    names.push("List");
+    return names;
+}
+
+private isKeywordSpelling(string spelling) -> bool {
+    byte[] bytes = spelling.toBytes();
+    if (bytes.length == 0) {
+        return false;
+    }
+    for (long i = 0; i < bytes.length; i = i + 1) {
+        if (bytes[i] < 'a' || bytes[i] > 'z') {
+            return false;
+        }
+    }
+    return true;
+}
+
+private emitKindPredicate(StringBuilder builder, string name, Vector<string> members) {
+    line(builder, "");
+    line(builder, "public {name}(SyntaxKind kind) -> bool \{");
+    if (members.length() == 0) {
+        line(builder, "    return false;");
+        line(builder, "\}");
+        return;
+    }
+    line(builder, "    return switch (kind) \{");
+    emitWrappedLabels(builder, members, "true");
+    line(builder, "        default -> false,");
+    line(builder, "    \};");
+    line(builder, "\}");
+}
+
+private emitWrappedLabels(StringBuilder builder, Vector<string> labels, string result) {
+    string current = "        ";
+    for (long i = 0; i < labels.length(); i = i + 1) {
+        string piece = labels.get(i);
+        if (i == labels.length() - 1) {
+            piece = piece + " -> " + result + ",";
+        } else {
+            piece = piece + ",";
+        }
+        if (current.length > 8) {
+            if (current.length + piece.length + 1 > 100) {
+                line(builder, current);
+                current = "        ";
+            } else {
+                current = current + " ";
+            }
+        }
+        current = current + piece;
+    }
+    line(builder, current);
+}
+
+private emitTextLookup(StringBuilder builder, string name, Grammar grammar, bool contextual) {
+    let entries = new Vector<TokenDeclaration>();
+    for (long i = 0; i < grammar.tokens.length(); i = i + 1) {
+        let token = grammar.tokens.get(i);
+        let spelling = token.spelling;
+        if (spelling != null && isKeywordSpelling(spelling) && token.isContextual == contextual) {
+            entries.push(token);
+        }
+    }
+    line(builder, "");
+    line(builder, "public {name}(string text) -> SyntaxKind? \{");
+    if (entries.length() == 0) {
+        line(builder, "    return null;");
+        line(builder, "\}");
+        return;
+    }
+    line(builder, "    return switch (text) \{");
+    for (long i = 0; i < entries.length(); i = i + 1) {
+        let token = entries.get(i);
+        let spelling = token.spelling ?? "";
+        line(builder, "        \"{spelling}\" -> SyntaxKind.{token.name},");
+    }
+    line(builder, "        default -> null,");
+    line(builder, "    \};");
+    line(builder, "\}");
+}
+
+private emitKindName(StringBuilder builder, Grammar grammar) {
+    line(builder, "");
+    line(builder, "public kindName(SyntaxKind kind) -> string \{");
+    line(builder, "    return switch (kind) \{");
+    for (long i = 0; i < grammar.tokens.length(); i = i + 1) {
+        let name = grammar.tokens.get(i).name;
+        line(builder, "        {name} -> \"{name}\",");
+    }
+    for (long i = 0; i < grammar.rules.length(); i = i + 1) {
+        let name = grammar.rules.get(i).name;
+        line(builder, "        {name} -> \"{name}\",");
+    }
+    line(builder, "        List -> \"List\",");
+    line(builder, "    \};");
+    line(builder, "\}");
+}
+
+private implementsSuffix(string name, GrammarIndex index) -> string {
+    let found = index.unionsByMember.get(name);
+    if (found == null) {
+        return "";
+    }
+    Vector<string> unions = found;
+    string suffix = " implements ";
+    for (long i = 0; i < unions.length(); i = i + 1) {
+        if (i > 0) {
+            suffix = suffix + ", ";
+        }
+        suffix = suffix + unions.get(i);
+    }
+    return suffix;
+}
+
+private emitConstructor(StringBuilder builder, string className) {
+    line(builder, "    {className}(GreenNode green, long fullStart, SyntaxNode? parent, NodeFactory factory) \{");
+    line(builder, "        super(green, fullStart, parent, factory);");
+    line(builder, "    \}");
+}
+
+private emitListNode(StringBuilder builder) {
+    line(builder, "");
+    line(builder, "// Container for list slots: its children are the list elements, with the");
+    line(builder, "// separator tokens interleaved at the odd indices for separated lists.");
+    line(builder, "public class ListNode extends SyntaxNode \{");
+    emitConstructor(builder, "ListNode");
+    line(builder, "");
+    line(builder, "    childCount() -> long \{");
+    line(builder, "        return this.slotCount();");
+    line(builder, "    \}");
+    line(builder, "");
+    line(builder, "    childNodeAt(long index) -> SyntaxNode \{");
+    line(builder, "        return this.nodeAt(index);");
+    line(builder, "    \}");
+    line(builder, "");
+    line(builder, "    childTokenAt(long index) -> SyntaxToken \{");
+    line(builder, "        return this.tokenAt(index);");
+    line(builder, "    \}");
+    line(builder, "\}");
+}
+
+private emitNodeClass(StringBuilder builder, NodeRuleDeclaration rule, GrammarIndex index) {
+    let className = rule.name + "Node";
+    let base = index.categoryByRule.get(rule.name) ?? "SyntaxNode";
+    let suffix = implementsSuffix(rule.name, index);
+    line(builder, "");
+    line(builder, "public class {className} extends {base}{suffix} \{");
+    emitConstructor(builder, className);
+    let shapes = computeShapes(rule, index);
+    for (long i = 0; i < shapes.length(); i = i + 1) {
+        emitSlotAccessors(builder, shapes.get(i));
+    }
+    line(builder, "\}");
+}
+
+private computeShapes(NodeRuleDeclaration rule, GrammarIndex index) -> Vector<SlotShape> {
+    let shapes = new Vector<SlotShape>();
+    let usedNames = new Vector<string>();
+    for (long i = 0; i < rule.slots.length(); i = i + 1) {
+        let slot = rule.slots.get(i);
+        bool hasToken = false;
+        let nodeTypeNames = new Vector<string>();
+        for (long j = 0; j < slot.references.length(); j = j + 1) {
+            let reference = slot.references.get(j);
+            if (isTokenReference(reference, index)) {
+                hasToken = true;
+            } else if (index.rulesByName.contains(reference.text)) {
+                nodeTypeNames.push(reference.text + "Node");
+            } else {
+                nodeTypeNames.push(reference.text);
+            }
+        }
+        SlotShapeKind shape = SlotShapeKind.TokenSlot;
+        if (nodeTypeNames.length() > 0) {
+            if (hasToken) {
+                shape = SlotShapeKind.MixedSlot;
+            } else {
+                shape = SlotShapeKind.NodeSlot;
+            }
+        }
+        string nodeTypeName = "";
+        if (nodeTypeNames.length() == 1) {
+            nodeTypeName = nodeTypeNames.get(0);
+        } else if (nodeTypeNames.length() > 1) {
+            nodeTypeName = "SyntaxNode";
+        }
+        let accessorName = accessorBaseName(slot, index, usedNames);
+        usedNames.push(accessorName);
+        shapes.push(new SlotShape(i, accessorName, shape, nodeTypeName,
+                                  slot.isOptional, slot.isList, slot.separator != null));
+    }
+    return shapes;
+}
+
+private isTokenReference(SlotReference reference, GrammarIndex index) -> bool {
+    if (reference.isSpelling) {
+        return true;
+    }
+    if (reference.text == "token") {
+        return true;
+    }
+    if (index.tokensByName.contains(reference.text)) {
+        return true;
+    }
+    return index.tokenSetsByName.contains(reference.text);
+}
+
+// Named slots keep their name; anonymous token slots take the token kind name
+// with a lowercase first letter, suffixed with 2, 3, ... on repeats.
+private accessorBaseName(SlotDeclaration slot, GrammarIndex index, Vector<string> usedNames) -> string {
+    let slotName = slot.name;
+    if (slotName != null) {
+        return slotName;
+    }
+    string base = "token";
+    if (slot.references.length() > 0) {
+        let reference = slot.references.get(0);
+        let token = index.tokensBySpelling.get(reference.text);
+        if (token != null) {
+            base = lowerFirst(token.name);
+        }
+    }
+    if (!containsName(usedNames, base)) {
+        return base;
+    }
+    long suffix = 2;
+    while (containsName(usedNames, "{base}{suffix}")) {
+        suffix = suffix + 1;
+    }
+    return "{base}{suffix}";
+}
+
+private lowerFirst(string name) -> string {
+    byte[] bytes = name.toBytes();
+    if (bytes.length == 0) {
+        return name;
+    }
+    if (bytes[0] >= 'A' && bytes[0] <= 'Z') {
+        bytes[0] = (bytes[0] + 32) as byte;
+    }
+    return string.fromBytes(bytes);
+}
+
+private containsName(Vector<string> names, string name) -> bool {
+    for (long i = 0; i < names.length(); i = i + 1) {
+        if (names.get(i) == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+private emitSlotAccessors(StringBuilder builder, SlotShape shape) {
+    if (shape.isList) {
+        emitListAccessors(builder, shape);
+        return;
+    }
+    if (shape.shape == SlotShapeKind.TokenSlot) {
+        line(builder, "");
+        if (shape.isOptional) {
+            line(builder, "    {shape.accessorName}() -> SyntaxToken? \{");
+            line(builder, "        return this.tokenAtOrNull({shape.slotIndex});");
+        } else {
+            line(builder, "    {shape.accessorName}() -> SyntaxToken \{");
+            line(builder, "        return this.tokenAt({shape.slotIndex});");
+        }
+        line(builder, "    \}");
+        return;
+    }
+    if (shape.shape == SlotShapeKind.NodeSlot) {
+        if (shape.isOptional) {
+            emitOptionalNodeAccessor(builder, shape.accessorName, shape.nodeTypeName, shape.slotIndex);
+        } else {
+            emitRequiredNodeAccessor(builder, shape.accessorName, shape.nodeTypeName, shape.slotIndex);
+        }
+        return;
+    }
+    line(builder, "");
+    line(builder, "    // This slot holds either a token or a node; exactly one accessor is non-null.");
+    line(builder, "    {shape.accessorName}Token() -> SyntaxToken? \{");
+    line(builder, "        return this.tokenAtOrNull({shape.slotIndex});");
+    line(builder, "    \}");
+    emitOptionalNodeAccessor(builder, "{shape.accessorName}Node", shape.nodeTypeName, shape.slotIndex);
+}
+
+private emitRequiredNodeAccessor(StringBuilder builder, string name, string typeName, long slotIndex) {
+    line(builder, "");
+    if (typeName == "SyntaxNode") {
+        line(builder, "    {name}() -> SyntaxNode \{");
+        line(builder, "        return this.nodeAt({slotIndex});");
+        line(builder, "    \}");
+        return;
+    }
+    line(builder, "    {name}() -> {typeName} \{");
+    line(builder, "        let node = this.nodeAt({slotIndex});");
+    line(builder, "        if (node is {typeName}) \{");
+    line(builder, "            return node;");
+    line(builder, "        \}");
+    line(builder, "        internal.fatal(\"expected {typeName} in slot {slotIndex} of a \{this.kind()\} node\");");
+    line(builder, "        while (true) \{ \}");
+    line(builder, "    \}");
+}
+
+private emitOptionalNodeAccessor(StringBuilder builder, string name, string typeName, long slotIndex) {
+    line(builder, "");
+    if (typeName == "SyntaxNode") {
+        line(builder, "    {name}() -> SyntaxNode? \{");
+        line(builder, "        return this.nodeAtOrNull({slotIndex});");
+        line(builder, "    \}");
+        return;
+    }
+    line(builder, "    {name}() -> {typeName}? \{");
+    line(builder, "        let node = this.nodeAtOrNull({slotIndex});");
+    line(builder, "        return node as? {typeName};");
+    line(builder, "    \}");
+}
+
+private emitListAccessors(StringBuilder builder, SlotShape shape) {
+    let name = shape.accessorName;
+    long slotIndex = shape.slotIndex;
+    line(builder, "");
+    line(builder, "    {name}Count() -> long \{");
+    line(builder, "        let list = this.nodeAt({slotIndex});");
+    line(builder, "        if (list is ListNode) \{");
+    if (shape.isSeparated) {
+        line(builder, "            return (list.childCount() + 1) / 2;");
+    } else {
+        line(builder, "            return list.childCount();");
+    }
+    line(builder, "        \}");
+    emitExpectedListFatal(builder, slotIndex);
+    line(builder, "    \}");
+    string childIndex = "index";
+    if (shape.isSeparated) {
+        childIndex = "index * 2";
+    }
+    line(builder, "");
+    if (shape.shape == SlotShapeKind.NodeSlot && shape.nodeTypeName != "SyntaxNode") {
+        line(builder, "    {name}(long index) -> {shape.nodeTypeName} \{");
+        line(builder, "        let list = this.nodeAt({slotIndex});");
+        line(builder, "        if (list is ListNode) \{");
+        line(builder, "            let node = list.childNodeAt({childIndex});");
+        line(builder, "            if (node is {shape.nodeTypeName}) \{");
+        line(builder, "                return node;");
+        line(builder, "            \}");
+        line(builder, "        \}");
+        line(builder, "        internal.fatal(\"expected {shape.nodeTypeName} in the list at slot {slotIndex} of a \{this.kind()\} node\");");
+        line(builder, "        while (true) \{ \}");
+        line(builder, "    \}");
+        return;
+    }
+    if (shape.shape == SlotShapeKind.NodeSlot) {
+        line(builder, "    {name}(long index) -> SyntaxNode \{");
+        line(builder, "        let list = this.nodeAt({slotIndex});");
+        line(builder, "        if (list is ListNode) \{");
+        line(builder, "            return list.childNodeAt({childIndex});");
+        line(builder, "        \}");
+        emitExpectedListFatal(builder, slotIndex);
+        line(builder, "    \}");
+        return;
+    }
+    line(builder, "    {name}(long index) -> SyntaxToken \{");
+    line(builder, "        let list = this.nodeAt({slotIndex});");
+    line(builder, "        if (list is ListNode) \{");
+    line(builder, "            return list.childTokenAt({childIndex});");
+    line(builder, "        \}");
+    emitExpectedListFatal(builder, slotIndex);
+    line(builder, "    \}");
+}
+
+private emitExpectedListFatal(StringBuilder builder, long slotIndex) {
+    line(builder, "        internal.fatal(\"expected a List in slot {slotIndex} of a \{this.kind()\} node\");");
+    line(builder, "        while (true) \{ \}");
+}
