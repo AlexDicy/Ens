@@ -11,6 +11,15 @@
 
 class DocumentStore;
 
+// A module graph seeded with every Ens file under the workspace root, so files
+// that import a given document (reverse dependencies) are part of the graph.
+// Used by workspace-scoped features: references and rename.
+struct WorkspaceModules {
+    std::vector<std::unique_ptr<ens::modules::Module>> modules;
+    std::unordered_map<std::u16string, ens::modules::Module*> byPath;
+    std::unique_ptr<TypeContext> typeCtx;
+};
+
 // One open editor buffer. Analysis builds a module graph rooted at the document's source
 // root (with all open buffers overlaid), so imports, the standard library, and
 // namespace-qualified calls resolve. The public accessors expose the open file's module.
@@ -85,6 +94,9 @@ public:
     // them immediately, until the client's buffer or the disk catches up.
     void setTransientOverride(const std::filesystem::path& absolute, std::u16string text);
     void clearTransientOverride(const std::filesystem::path& absolute);
+
+    // Empty modules when there is no workspace root or the graph cannot be built.
+    WorkspaceModules buildWorkspaceModules() const;
 
 private:
     std::unordered_map<std::string, std::unique_ptr<Document>> docs;

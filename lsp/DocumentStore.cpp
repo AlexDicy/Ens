@@ -128,6 +128,40 @@ void DocumentStore::setTransientOverride(const fs::path& absolute, std::u16strin
     transientOverrides_[ens::modules::overrideKey(absolute)] = std::move(text);
 }
 
+WorkspaceModules DocumentStore::buildWorkspaceModules() const {
+    WorkspaceModules workspace;
+    if (!workspaceRoot_) return workspace;
+
+    std::deque<fs::path> seeds;
+    std::error_code ec;
+    auto iterator = fs::recursive_directory_iterator(
+        *workspaceRoot_, fs::directory_options::skip_permission_denied, ec);
+    if (ec) return workspace;
+    for (auto it = fs::begin(iterator); it != fs::end(iterator); it.increment(ec)) {
+        if (ec) break;
+        const fs::directory_entry& entry = *it;
+        std::string name = entry.path().filename().string();
+        if (entry.is_directory(ec)) {
+            if (!name.empty() && name.front() == '.') it.disable_recursion_pending();
+            continue;
+        }
+        if (entry.path().extension() != ".ens") continue;
+        fs::path rel = fs::relative(entry.path(), *workspaceRoot_, ec);
+        if (!ec && !rel.empty()) seeds.push_back(std::move(rel));
+    }
+    if (seeds.empty()) return workspace;
+
+    workspace.typeCtx = std::make_unique<TypeContext>();
+    ens::modules::SourceOverrides overrides = collectOverrides();
+    bool ok = ens::modules::buildModuleGraph(*workspaceRoot_, stdlibRoot_, seeds,
+                                             workspace.modules, workspace.byPath, &overrides);
+    if (!ok) return WorkspaceModules{};
+
+    ens::modules::insertPreludeModule(workspace.modules, workspace.byPath);
+    ens::modules::analyzeModuleGraph(workspace.modules, workspace.byPath, *workspace.typeCtx);
+    return workspace;
+}
+
 void DocumentStore::clearTransientOverride(const fs::path& absolute) {
     transientOverrides_.erase(ens::modules::overrideKey(absolute));
 }

@@ -381,6 +381,15 @@ std::optional<DefinitionTarget> resolveDeclarationTarget(const AnalysisResult& a
     return std::nullopt;
 }
 
+lsp::DocumentUri uriForModuleFile(const Document& doc, const std::filesystem::path& absolute) {
+    if (absolute.empty()) return lsp::Uri::parse(doc.uri());
+    std::error_code ec;
+    bool sameFile = absolute == doc.path() ||
+                    std::filesystem::equivalent(absolute, doc.path(), ec);
+    if (sameFile) return lsp::Uri::parse(doc.uri());
+    return uriForFilePath(absolute);
+}
+
 lsp::DocumentUri definitionUri(const Document& doc, const std::u16string& modulePath) {
     if (!modulePath.empty()) {
         const auto& files = doc.moduleFiles();
@@ -594,11 +603,12 @@ struct Occurrence {
     bool atDeclaration = false;
 };
 
-std::vector<Occurrence> findOccurrences(const Document& doc, const Entity& target) {
+std::vector<Occurrence> findOccurrencesInModules(
+        const std::vector<std::unique_ptr<ens::modules::Module>>& modules, const Entity& target) {
     std::vector<Occurrence> out;
     std::u16string name = entityName(target);
     if (name.empty()) return out;
-    for (const auto& modulePtr : doc.moduleList()) {
+    for (const auto& modulePtr : modules) {
         const ens::modules::Module& m = *modulePtr;
         if (!m.rootNode || !m.analyzer || !m.source) continue;
         const AnalysisResult& analysis = m.analyzer->result();
@@ -612,6 +622,20 @@ std::vector<Occurrence> findOccurrences(const Document& doc, const Entity& targe
         }
     }
     return out;
+}
+
+const ens::modules::Module* moduleForPath(
+        const std::vector<std::unique_ptr<ens::modules::Module>>& modules,
+        const std::filesystem::path& path) {
+    if (path.empty()) return nullptr;
+    std::string key = ens::modules::overrideKey(path);
+    for (const auto& m : modules) {
+        if (m->rootNode && m->analyzer && m->source && !m->absolutePath.empty() &&
+            ens::modules::overrideKey(m->absolutePath) == key) {
+            return m.get();
+        }
+    }
+    return nullptr;
 }
 
 bool isRenameableEntity(const Entity& e) {
@@ -947,14 +971,29 @@ lsp::TextDocument_ReferencesResult LanguageServer::onReferences(lsp::ReferencePa
     int col1 = p.position.character + 1;
     uint32_t offset = preferIdentifierToTheLeft(
         doc->root(), doc->sourceFile().positionToOffset(line1, col1));
-    Entity target = entityAt(doc->root(), doc->analyzer().result(), offset).entity;
-    if (!target.valid()) return nullptr;
+
+    // Search the whole workspace so reverse dependencies (files importing this
+    // one) are covered; the document's own forward graph is the fallback.
+    WorkspaceModules workspace = documents.buildWorkspaceModules();
+    const ens::modules::Module* requestModule = moduleForPath(workspace.modules, doc->path());
+
+    Entity target;
+    std::vector<Occurrence> occurrences;
+    if (requestModule) {
+        target = entityAt(*requestModule->rootNode, requestModule->analyzer->result(), offset).entity;
+        if (!target.valid()) return nullptr;
+        occurrences = findOccurrencesInModules(workspace.modules, target);
+    } else {
+        target = entityAt(doc->root(), doc->analyzer().result(), offset).entity;
+        if (!target.valid()) return nullptr;
+        occurrences = findOccurrencesInModules(doc->moduleList(), target);
+    }
 
     lsp::Array<lsp::Location> locations;
-    for (const auto& occurrence : findOccurrences(*doc, target)) {
+    for (const auto& occurrence : occurrences) {
         if (!p.context.includeDeclaration && occurrence.atDeclaration) continue;
         lsp::Location loc;
-        loc.uri = definitionUri(*doc, occurrence.module->modulePath);
+        loc.uri = uriForModuleFile(*doc, occurrence.module->absolutePath);
         loc.range = occurrence.range;
         locations.push_back(std::move(loc));
     }
@@ -993,10 +1032,21 @@ lsp::TextDocument_RenameResult LanguageServer::onRename(lsp::RenameParams&& p) {
     int col1 = p.position.character + 1;
     uint32_t offset = preferIdentifierToTheLeft(
         doc->root(), doc->sourceFile().positionToOffset(line1, col1));
-    Entity target = entityAt(doc->root(), doc->analyzer().result(), offset).entity;
-    if (!isRenameableEntity(target)) return nullptr;
 
-    auto occurrences = findOccurrences(*doc, target);
+    WorkspaceModules workspace = documents.buildWorkspaceModules();
+    const ens::modules::Module* requestModule = moduleForPath(workspace.modules, doc->path());
+
+    Entity target;
+    std::vector<Occurrence> occurrences;
+    if (requestModule) {
+        target = entityAt(*requestModule->rootNode, requestModule->analyzer->result(), offset).entity;
+        if (!isRenameableEntity(target)) return nullptr;
+        occurrences = findOccurrencesInModules(workspace.modules, target);
+    } else {
+        target = entityAt(doc->root(), doc->analyzer().result(), offset).entity;
+        if (!isRenameableEntity(target)) return nullptr;
+        occurrences = findOccurrencesInModules(doc->moduleList(), target);
+    }
     if (occurrences.empty()) return nullptr;
 
     lsp::Map<lsp::DocumentUri, lsp::Array<lsp::TextEdit>> changes;
@@ -1005,7 +1055,7 @@ lsp::TextDocument_RenameResult LanguageServer::onRename(lsp::RenameParams&& p) {
         lsp::TextEdit edit;
         edit.range = occurrence.range;
         edit.newText = p.newName;
-        changes[definitionUri(*doc, occurrence.module->modulePath)].push_back(std::move(edit));
+        changes[uriForModuleFile(*doc, occurrence.module->absolutePath)].push_back(std::move(edit));
         occurrencesByModule[occurrence.module].push_back(&occurrence);
     }
 
@@ -1015,6 +1065,7 @@ lsp::TextDocument_RenameResult LanguageServer::onRename(lsp::RenameParams&& p) {
     // the client's buffers and the disk catch up.
     std::vector<std::filesystem::path> editedPaths;
     for (const auto& [module, moduleOccurrences] : occurrencesByModule) {
+        if (module->absolutePath.empty()) continue;
         const SourceFile& source = *module->source;
         std::vector<std::pair<uint32_t, uint32_t>> spans;
         spans.reserve(moduleOccurrences.size());
