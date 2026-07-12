@@ -5,10 +5,12 @@ import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.command.CommandEvent
 import com.intellij.openapi.command.CommandListener
 import com.intellij.openapi.diagnostic.logger
-import com.intellij.openapi.editor.EditorFactory
 import com.intellij.openapi.fileEditor.FileDocumentManager
+import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.project.ProjectManager
 import com.intellij.openapi.startup.ProjectActivity
+import com.intellij.openapi.vfs.VirtualFile
 import java.util.concurrent.atomic.AtomicBoolean
 
 // Workspace edits from the language server (rename) can land in files without an
@@ -49,15 +51,21 @@ private object EnsBackgroundSaveListener : CommandListener, ApplicationListener 
 
     private fun saveEditorlessEnsDocuments() {
         val manager = FileDocumentManager.getInstance()
-        val editorFactory = EditorFactory.getInstance()
-        val pending = manager.unsavedDocuments.filter { document ->
-            val file = manager.getFile(document)
-            file != null && file.isInLocalFileSystem && file.extension == "ens" &&
-                editorFactory.getEditors(document).isEmpty()
-        }
-        for (document in pending) {
+        for (document in manager.unsavedDocuments) {
+            val file = manager.getFile(document) ?: continue
+            if (!file.isInLocalFileSystem || file.extension != "ens") continue
+            if (isOpenInAnyEditorTab(file)) {
+                log.info("Ens background saver: skipping ${file.path}, open in an editor tab")
+                continue
+            }
             manager.saveDocument(document)
-            log.info("Ens background saver: saved ${manager.getFile(document)?.path}")
+            log.info("Ens background saver: saved ${file.path}")
+        }
+    }
+
+    private fun isOpenInAnyEditorTab(file: VirtualFile): Boolean {
+        return ProjectManager.getInstance().openProjects.any { project ->
+            !project.isDisposed && FileEditorManager.getInstance(project).isFileOpen(file)
         }
     }
 }
