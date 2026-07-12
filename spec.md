@@ -913,7 +913,7 @@ Every value has a `hash()` method returning a `long`. Value types (primitives, e
 
 The collection modules build on hashing and iteration:
 
-- `Vector<T>` from `@std.vector` is a growable array: `push(value)`, `get(index)`, `set(index, value)`, and `length()`, plus `toArray()` returning a fresh right-sized `T[]` holding the current contents.
+- `Vector<T>` from `@std.vector` is a growable array: `push(value)`, `get(index)`, `set(index, value)`, and `length()`, plus `toArray()` returning a fresh right-sized `T[]` holding the current contents. Iterating a vector yields its values in insertion order.
 - `Map<K, V>` from `@std.map` maps keys to values: `set(key, value)` inserts or overwrites, `get(key)` returns `V?` (`null` when absent), plus `contains(key)`, `remove(key)`, `length()`, and `keys()` / `values()` snapshots. Iterating a map yields `Pair<K, V>` entries (from `@std.pair`) with `key` and `value` fields.
 - `Set<T>` from `@std.set` stores each value once: `add(value)` returns whether the value was new, plus `contains(value)`, `remove(value)`, `length()`, and `items()`. Iterating a set yields its values.
 
@@ -937,6 +937,7 @@ Keys are matched with `==`: strings by contents, value types by value, and class
 
 `StringBuilder` from `@std.stringbuilder` accumulates text in a growable buffer, so building a string piece by piece stays linear where repeated `+` on immutable strings would re-copy the whole prefix.
 `append(value)` accepts a string, an integer, or a `bool`; `length()` returns the number of bytes written so far; `toString()` returns the accumulated text and leaves the builder usable.
+`appendByte(value)` appends one raw byte to the buffer, where `append` on the same value would format it as decimal text.
 
 ```ens
 import StringBuilder from @std.stringbuilder;
