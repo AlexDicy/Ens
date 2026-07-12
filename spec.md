@@ -20,6 +20,9 @@ printArea() { // no need to specify -> void
 }
 ```
 
+A function with a non-void return type must return a value on every path through its body: the compiler rejects a function that can reach the end of its body without hitting a `return`, `throw`, `rethrow`, or `panic()`.
+An `if`/`else` where every branch exits counts as exiting, as does a `switch` whose arms all exit and a `while (true)` loop with no `break`.
+
 Everything public by default.
 
 Structs automatically implement `copy()` and are `(de)serializable` by default, which also allows printing them as JSON strings. Private and protected fields are included in the serialization.

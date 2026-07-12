@@ -154,6 +154,13 @@ private:
     // === Body analysis ===
     void analyzeFunctionBody(const ast::FuncDecl& fn);
     void analyzeTestBody(const ast::TestDecl& test);
+    void checkFunctionReturnPaths(const ast::FuncDecl& fn);
+    bool statementTerminates(const ast::Statement& stmt) const;
+    bool blockTerminates(const ast::Block& block) const;
+    bool ifStatementTerminates(const ast::IfStatement& stmt) const;
+    bool switchStatementTerminates(const ast::SwitchStatement& stmt) const;
+    bool whileStatementTerminates(const ast::WhileStatement& stmt) const;
+    bool isPanicCall(const ast::Expression& expr) const;
     void analyzeImplicitConstructorAssignments(const ast::FuncDecl& fn);
     void analyzeCatchClause(const ast::CatchClause& clause, Scope* funcScope);
 

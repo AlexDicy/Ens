@@ -2092,6 +2092,8 @@ void Analyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
 
     for (auto& cc : fn.catchClauses()) analyzeCatchClause(cc, funcScope);
 
+    checkFunctionReturnPaths(fn);
+
     popScope();
     popTypeParams(tpCount);
     currentFunction = prevFunction;
@@ -2706,6 +2708,139 @@ static bool switchStatementAlwaysExits(const ast::SwitchStatement& sw) {
         if (!blk || !blockAlwaysExits(*blk)) return false;
     }
     return hasDefault;
+}
+
+// =========================================================
+// Missing-return analysis
+// =========================================================
+//
+// Conservative reachability for functions with a non-void return type: every
+// path through the body must end in return, throw, rethrow, or panic(). Loops
+// are not proven infinite, except `while (true)` with no break out of it.
+
+static bool statementContainsLoopBreak(const ast::Statement& s);
+
+static bool blockContainsLoopBreak(const ast::Block& block) {
+    for (auto& child : block.statements()) {
+        if (statementContainsLoopBreak(child)) return true;
+    }
+    return false;
+}
+
+// True when the statement contains a `break` that binds to the enclosing loop.
+// Nested loops are not entered: a break inside them binds to that inner loop.
+static bool statementContainsLoopBreak(const ast::Statement& s) {
+    if (s.asBreak()) return true;
+    if (auto b = s.asBlock()) return blockContainsLoopBreak(*b);
+    if (auto i = s.asIf()) {
+        if (auto then = i->thenBlock()) {
+            if (blockContainsLoopBreak(*then)) return true;
+        }
+        if (auto ec = i->elseClause()) {
+            if (auto inner = ec->ifStatement()) {
+                return statementContainsLoopBreak(ast::Statement{inner->node});
+            }
+            if (auto bb = ec->block()) return blockContainsLoopBreak(*bb);
+        }
+        return false;
+    }
+    if (auto sw = s.asSwitch()) {
+        for (auto& arm : sw->arms()) {
+            auto bn = arm.bodyBlockNode();
+            if (!bn) continue;
+            auto blk = ast::Block::cast(*bn);
+            if (blk && blockContainsLoopBreak(*blk)) return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+bool Analyzer::isPanicCall(const ast::Expression& expr) const {
+    ast::Expression core = unwrapParens(expr);
+    auto call = core.asCall();
+    if (!call) return false;
+    auto callee = call->callee();
+    if (!callee) return false;
+    auto id = callee->asIdent();
+    if (!id) return false;
+    const auto* info = analysis.find(id->node.greenNode());
+    Symbol* sym = info ? info->resolvedSymbol : nullptr;
+    return sym && sym->isBuiltin && sym->name == u"panic";
+}
+
+bool Analyzer::blockTerminates(const ast::Block& block) const {
+    for (auto& s : block.statements()) {
+        if (statementTerminates(s)) return true;
+    }
+    return false;
+}
+
+bool Analyzer::ifStatementTerminates(const ast::IfStatement& stmt) const {
+    auto then = stmt.thenBlock();
+    auto ec = stmt.elseClause();
+    if (!then || !ec || !blockTerminates(*then)) return false;
+    if (auto inner = ec->ifStatement()) return ifStatementTerminates(*inner);
+    if (auto bb = ec->block()) return blockTerminates(*bb);
+    return false;
+}
+
+// The analyzer separately rejects a non-exhaustive switch statement (an enum
+// switch must cover every member or have a default, an int/string switch must
+// have a default, and a sealed type switch must cover every subclass), so a
+// switch terminates when every arm body is a block that terminates.
+bool Analyzer::switchStatementTerminates(const ast::SwitchStatement& stmt) const {
+    auto arms = stmt.arms();
+    if (arms.empty()) return false;
+    for (auto& arm : arms) {
+        auto bn = arm.bodyBlockNode();
+        if (!bn) return false;
+        auto blk = ast::Block::cast(*bn);
+        if (!blk || !blockTerminates(*blk)) return false;
+    }
+    return true;
+}
+
+bool Analyzer::whileStatementTerminates(const ast::WhileStatement& stmt) const {
+    auto cond = stmt.condition();
+    if (!cond) return false;
+    auto lit = unwrapParens(*cond).asLiteral();
+    if (!lit || lit->literalKind() != SyntaxKind::KwTrue) return false;
+    auto body = stmt.body();
+    return !body || !blockContainsLoopBreak(*body);
+}
+
+bool Analyzer::statementTerminates(const ast::Statement& s) const {
+    if (s.asReturn() || s.asThrow() || s.asRethrow()) return true;
+    if (auto b = s.asBlock()) return blockTerminates(*b);
+    if (auto i = s.asIf()) return ifStatementTerminates(*i);
+    if (auto sw = s.asSwitch()) return switchStatementTerminates(*sw);
+    if (auto w = s.asWhile()) return whileStatementTerminates(*w);
+    if (auto e = s.asExpressionStmt()) {
+        auto expr = e->expression();
+        return expr && isPanicCall(*expr);
+    }
+    return false;
+}
+
+void Analyzer::checkFunctionReturnPaths(const ast::FuncDecl& fn) {
+    Type* ret = currentFunction ? currentFunction->returnType : nullptr;
+    if (!ret || ret->isVoid() || ret->isError()) return;
+    auto body = fn.body();
+    if (!body) return;
+    std::string name = asciiOf(currentFunction->name);
+    if (!blockTerminates(*body)) {
+        errorAtNode(fn.nameToken() ? *fn.nameToken() : fn.node, "Function '" + name +
+            "' can reach the end of its body without returning a value");
+        return;
+    }
+    for (auto& cc : fn.catchClauses()) {
+        auto cb = cc.body();
+        if (cb && !blockTerminates(*cb)) {
+            errorAtNode(cc.node, "Function '" + name +
+                "' can reach the end of its body without returning a value");
+        }
+    }
 }
 
 void Analyzer::analyzeIfStmt(const ast::IfStatement& stmt) {
