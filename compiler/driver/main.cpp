@@ -14,7 +14,7 @@ static bool execute(const std::unordered_map<std::string, std::string>& argument
             fs::path source = arguments.at("--source");
             std::ifstream file(source);
             if (!file) {
-                std::cerr << "ERROR: Couldn't read " << source << '\n';
+                std::cerr << "ERROR: Couldn't read " << fs::absolute(source).string() << '\n';
                 return false;
             }
             return Compiler::dumpCst(file, source.string());
@@ -26,7 +26,7 @@ static bool execute(const std::unordered_map<std::string, std::string>& argument
             fs::path source = arguments.at("--source");
             std::ifstream file(source);
             if (!file) {
-                std::cerr << "ERROR: Couldn't read " << source << '\n';
+                std::cerr << "ERROR: Couldn't read " << fs::absolute(source).string() << '\n';
                 return false;
             }
             return Compiler::analyzeCst(file, source.string());
@@ -108,7 +108,13 @@ int main(int argc, char* argv[]) {
         return runTestCommand(argc, argv);
     }
 
-    auto arguments = parseArguments(argc, argv);
+    std::unordered_map<std::string, std::string> arguments;
+    try {
+        arguments = parseArguments(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << "ERROR: " << e.what() << '\n';
+        return 2;
+    }
 
     if (arguments.count("-h") || arguments.count("--help")) {
         std::cout << "Use --source to specify the input file or folder to compile, otherwise use stdin\n";
@@ -117,7 +123,13 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    bool ok = execute(arguments);
+    bool ok = false;
+    try {
+        ok = execute(arguments);
+    } catch (const std::exception& e) {
+        std::cerr << "ERROR: " << e.what() << '\n';
+        return 2;
+    }
     if (arguments.count("--cst-dump") || arguments.count("--cst-analyze")) {
         return ok ? 0 : 1;
     }
@@ -127,6 +139,7 @@ int main(int argc, char* argv[]) {
                   << (it == arguments.end() ? "the current folder" : it->second) << '\n';
     } else {
         std::cerr << "Please check the errors and retry.\n";
+        return 1;
     }
     return 0;
 }

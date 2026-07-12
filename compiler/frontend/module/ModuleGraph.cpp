@@ -101,7 +101,7 @@ std::unique_ptr<Module> loadModule(const fs::path& sourceRoot,
     fs::path absolute = sourceRoot / relativePath;
     std::u16string code;
     if (!readFileToU16(absolute, code)) {
-        std::cerr << "ERROR: Couldn't read " << absolute << '\n';
+        std::cerr << "ERROR: Couldn't read " << absolute.string() << '\n';
         return nullptr;
     }
     auto m = std::make_unique<Module>();

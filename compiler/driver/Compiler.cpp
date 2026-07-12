@@ -287,6 +287,9 @@ bool Compiler::compile(const fs::path& source,
                        bool explainArc,
                        const std::string& targetTriple) {
     fs::path sourceRoot = fs::is_directory(source) ? source : source.parent_path();
+    // A bare file name has an empty parent; resolve it against the current
+    // folder so the module paths below stay non-empty.
+    if (sourceRoot.empty()) sourceRoot = ".";
 
     std::deque<fs::path> seeds;
     if (fs::is_directory(source)) {
@@ -297,7 +300,7 @@ bool Compiler::compile(const fs::path& source,
         }
     } else {
         if (!fs::exists(source)) {
-            std::cerr << "ERROR: " << source << " does not exist\n";
+            std::cerr << "ERROR: " << fs::absolute(source).string() << " does not exist\n";
             return false;
         }
         fs::path rel = fs::relative(source, sourceRoot);
