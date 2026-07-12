@@ -2,6 +2,7 @@
 #include <functional>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include "../diagnostics/SourceFile.h"
 #include "Scope.h"
@@ -157,6 +158,10 @@ private:
     void analyzeCatchClause(const ast::CatchClause& clause, Scope* funcScope);
 
     void analyzeStatement(const ast::Statement& stmt);
+    // Analyzes a statement list in order, first recognizing the array fill-loop
+    // idiom across consecutive statements (declaration + immediate fill loop).
+    void analyzeStatements(const std::vector<ast::Statement>& stmts);
+    void noteArrayFillLoop(const std::vector<ast::Statement>& stmts, size_t index);
     void analyzeBlock(const ast::Block& block);
     void analyzeLetStmt(const ast::LetStatement& stmt);
     void analyzeTypedVarDeclStmt(const ast::TypedVarDeclStatement& stmt);
@@ -316,7 +321,18 @@ private:
 
     // True if `t` can be considered non-null without an initializer.
     bool isDefaultable(Type* t) const;
-    bool validateArrayElement(Type* elem, const SyntaxNode& diagNode);
+    // `fillExampleName`, when set, marks the single-dimension `new T[n]` form
+    // where the fill-loop idiom applies; the diagnostic then teaches the idiom
+    // using that variable name.
+    bool validateArrayElement(Type* elem, const SyntaxNode& diagNode,
+                              const std::optional<std::u16string>& fillExampleName = std::nullopt);
+
+    // `new T[n]` allocations proven fully written by the fill loop immediately
+    // following their declaration, keyed by the NewExpr green node.
+    std::unordered_set<const GreenElement*> fillLoopProvenNews_;
+    // Declared variable names of single-dimension array-new initializers, used
+    // to word the fill-loop diagnostic with the user's own variable name.
+    std::unordered_map<const GreenElement*, std::u16string> arrayNewDeclNames_;
 
     // Helpers for CST → location.
     int lineOf(uint32_t offset) const;

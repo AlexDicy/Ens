@@ -2060,7 +2060,7 @@ void Analyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
     // Body locals live in a child scope so catch clauses (siblings below) can't see them.
     pushScope();
     if (auto body = fn.body()) {
-        for (auto& s : body->statements()) analyzeStatement(s);
+        analyzeStatements(body->statements());
     }
     popScope();
 
@@ -2111,7 +2111,7 @@ void Analyzer::analyzeTestBody(const ast::TestDecl& test) {
     currentFunctionParamScope = funcScope;
     pushScope();
     if (auto body = test.body()) {
-        for (auto& s : body->statements()) analyzeStatement(s);
+        analyzeStatements(body->statements());
     }
     popScope();
     popScope();
@@ -2148,7 +2148,7 @@ void Analyzer::analyzeCatchClause(const ast::CatchClause& clause, Scope* funcSco
     bool prevInCatch = inCatchClause;
     inCatchClause = true;
     if (auto body = clause.body()) {
-        for (auto& s : body->statements()) analyzeStatement(s);
+        analyzeStatements(body->statements());
     }
     inCatchClause = prevInCatch;
 
@@ -2181,6 +2181,164 @@ void Analyzer::analyzeImplicitConstructorAssignments(const ast::FuncDecl& fn) {
 // Statements
 // =========================================================
 
+// `new T[n]` with a non-nullable reference element type is accepted only when
+// the allocation is the entire initializer of a fresh local and the next
+// statement in the same block is the canonical fill loop:
+//     T[] name = new T[n];
+//     for (long i = 0; i < name.length; i = i + 1) { name[i] = expr; }
+// The loop writes every slot before any read, so the zeroed slots are never
+// observed. The shape is matched purely syntactically below.
+
+static std::optional<std::u16string> identExprName(const ast::Expression& e) {
+    auto id = e.asIdent();
+    if (!id) return std::nullopt;
+    return id->nameText();
+}
+
+static bool isIntegerLiteralToken(const ast::Expression& e, std::u16string_view text) {
+    auto lit = e.asLiteral();
+    if (!lit) return false;
+    SyntaxKind k = lit->literalKind();
+    if (k != SyntaxKind::IntLiteral && k != SyntaxKind::LongLiteral) return false;
+    auto tok = lit->token();
+    return tok && tok->tokenText() == text;
+}
+
+// Any identifier token spelling `name` counts as a mention. Deliberately
+// conservative: the fill expression must provably never read the array.
+static bool mentionsIdentifier(const SyntaxNode& n, const std::u16string& name) {
+    if (n.isToken()) {
+        return n.kind() == SyntaxKind::Identifier && n.tokenText() == name;
+    }
+    for (auto& child : n.children()) {
+        if (mentionsIdentifier(child, name)) return true;
+    }
+    return false;
+}
+
+static bool isPlainIndexType(const ast::TypeReference& tr) {
+    auto name = tr.nameText();
+    if (!name || (*name != u"long" && *name != u"int")) return false;
+    return !tr.qualifierText() && tr.typeArguments().empty() && tr.suffixChain().empty();
+}
+
+// Matches `for (long i = 0; i < name.length; i = i + 1) { name[i] = expr; }`
+// with a fresh `long`/`int` index of any name and `expr` never mentioning `name`.
+static bool isArrayFillLoop(const ast::ForStatement& loop, const std::u16string& arrayName) {
+    std::u16string indexName;
+    auto init = loop.init();
+    if (!init) return false;
+    if (auto let = init->asLet()) {
+        auto n = let->nameText();
+        auto iv = let->initializer();
+        if (!n || !iv || !isIntegerLiteralToken(*iv, u"0")) return false;
+        indexName = *n;
+    } else if (auto typed = init->asTypedVarDecl()) {
+        auto tr = typed->typeReference();
+        auto n = typed->nameText();
+        auto iv = typed->initializer();
+        if (!tr || !isPlainIndexType(*tr)) return false;
+        if (!n || !iv || !isIntegerLiteralToken(*iv, u"0")) return false;
+        indexName = *n;
+    } else {
+        return false;
+    }
+    if (indexName.empty() || indexName == arrayName) return false;
+
+    auto cond = loop.condition();
+    if (!cond) return false;
+    auto compare = cond->asBinary();
+    if (!compare) return false;
+    auto compareOp = compare->operatorToken();
+    if (!compareOp || compareOp->kind() != SyntaxKind::Lt) return false;
+    auto compareLeft = compare->left();
+    if (!compareLeft || identExprName(*compareLeft) != indexName) return false;
+    auto compareRight = compare->right();
+    if (!compareRight) return false;
+    auto lengthAccess = compareRight->asMember();
+    if (!lengthAccess) return false;
+    auto lengthObject = lengthAccess->object();
+    if (!lengthObject || identExprName(*lengthObject) != arrayName) return false;
+    auto lengthName = lengthAccess->memberText();
+    if (!lengthName || *lengthName != u"length") return false;
+
+    auto update = loop.update();
+    if (!update) return false;
+    auto step = update->asAssign();
+    if (!step) return false;
+    auto stepOp = step->operatorToken();
+    if (!stepOp || stepOp->kind() != SyntaxKind::Eq) return false;
+    auto stepTarget = step->target();
+    if (!stepTarget || identExprName(*stepTarget) != indexName) return false;
+    auto stepValue = step->value();
+    if (!stepValue) return false;
+    auto increment = stepValue->asBinary();
+    if (!increment) return false;
+    auto incrementOp = increment->operatorToken();
+    if (!incrementOp || incrementOp->kind() != SyntaxKind::Plus) return false;
+    auto incrementLeft = increment->left();
+    if (!incrementLeft || identExprName(*incrementLeft) != indexName) return false;
+    auto incrementRight = increment->right();
+    if (!incrementRight || !isIntegerLiteralToken(*incrementRight, u"1")) return false;
+
+    auto body = loop.body();
+    if (!body) return false;
+    auto statements = body->statements();
+    if (statements.size() != 1) return false;
+    auto exprStmt = statements[0].asExpressionStmt();
+    if (!exprStmt) return false;
+    auto bodyExpr = exprStmt->expression();
+    if (!bodyExpr) return false;
+    auto slotAssign = bodyExpr->asAssign();
+    if (!slotAssign) return false;
+    auto slotOp = slotAssign->operatorToken();
+    if (!slotOp || slotOp->kind() != SyntaxKind::Eq) return false;
+    auto slotTarget = slotAssign->target();
+    if (!slotTarget) return false;
+    auto subscript = slotTarget->asSubscript();
+    if (!subscript) return false;
+    auto subscriptObject = subscript->object();
+    if (!subscriptObject || identExprName(*subscriptObject) != arrayName) return false;
+    auto subscriptIndex = subscript->index();
+    if (!subscriptIndex || identExprName(*subscriptIndex) != indexName) return false;
+    auto filledValue = slotAssign->value();
+    if (!filledValue) return false;
+    return !mentionsIdentifier(filledValue->node, arrayName);
+}
+
+// Records single-dimension array-new declaration initializers (for diagnostic
+// wording) and proves the ones immediately followed by their fill loop.
+void Analyzer::noteArrayFillLoop(const std::vector<ast::Statement>& stmts, size_t index) {
+    const ast::Statement& stmt = stmts[index];
+    std::optional<ast::Expression> init;
+    std::optional<std::u16string> name;
+    if (auto let = stmt.asLet()) {
+        init = let->initializer();
+        name = let->nameText();
+    } else if (auto typed = stmt.asTypedVarDecl()) {
+        init = typed->initializer();
+        name = typed->nameText();
+    }
+    if (!init || !name || name->empty()) return;
+    auto arrayNew = init->asNew();
+    if (!arrayNew || !arrayNew->isArrayNew()) return;
+    if (arrayNew->arraySizeExpressions().size() != 1 ||
+        arrayNew->arrayUnsizedTrailingCount() != 0) return;
+    arrayNewDeclNames_[arrayNew->node.greenNode()] = *name;
+    if (index + 1 >= stmts.size()) return;
+    auto loop = stmts[index + 1].asFor();
+    if (loop && isArrayFillLoop(*loop, *name)) {
+        fillLoopProvenNews_.insert(arrayNew->node.greenNode());
+    }
+}
+
+void Analyzer::analyzeStatements(const std::vector<ast::Statement>& stmts) {
+    for (size_t i = 0; i < stmts.size(); ++i) {
+        noteArrayFillLoop(stmts, i);
+        analyzeStatement(stmts[i]);
+    }
+}
+
 void Analyzer::analyzeStatement(const ast::Statement& stmt) {
     if (auto b = stmt.asBlock())              { analyzeBlock(*b); return; }
     if (auto l = stmt.asLet())                { analyzeLetStmt(*l); return; }
@@ -2200,7 +2358,7 @@ void Analyzer::analyzeStatement(const ast::Statement& stmt) {
 
 void Analyzer::analyzeBlock(const ast::Block& block) {
     pushScope();
-    for (auto& s : block.statements()) analyzeStatement(s);
+    analyzeStatements(block.statements());
     popScope();
 }
 
@@ -2495,7 +2653,7 @@ void Analyzer::analyzeBranchWithNarrowing(const ast::Block& block,
     for (const auto& info : narrowings) {
         currentScope->narrowedTypes[info.key] = info.narrowedT;
     }
-    for (auto& s : block.statements()) analyzeStatement(s);
+    analyzeStatements(block.statements());
     popScope();
 }
 
@@ -2623,7 +2781,7 @@ void Analyzer::analyzeForStmt(const ast::ForStatement& stmt) {
         currentScope->narrowedTypes[info.key] = info.narrowedT;
     }
     if (auto b = stmt.body()) {
-        for (auto& s : b->statements()) analyzeStatement(s);
+        analyzeStatements(b->statements());
     }
     if (auto u = stmt.update()) analyzeExpr(*u);
     popScope();
@@ -4626,13 +4784,26 @@ Type* Analyzer::analyzeNew(const ast::NewExpression& expr) {
         }
         // When `unsized == 0`, every level is allocated, so the deepest slots
         // hold values of type T directly. T must therefore satisfy the
-        // element-nullability rule. When `unsized > 0`, the slots at the
-        // deepest allocated level hold nullable inner arrays (which are
-        // defaultable as `null`), so T itself is never zero-initialized and
-        // doesn't need to be defaultable here.
+        // element-nullability rule, unless a fill loop right after the
+        // declaration proves every slot is written before any read. When
+        // `unsized > 0`, the slots at the deepest allocated level hold
+        // nullable inner arrays (which are defaultable as `null`), so T
+        // itself is never zero-initialized and doesn't need to be defaultable
+        // here.
         Type* slotElem;
         if (unsized == 0) {
-            if (!validateArrayElement(elem, tr->node)) {
+            bool singleDim = sizes.size() == 1;
+            bool referenceElem = elem->isClass() || elem->isArray() ||
+                                 elem->isString() || elem->isExternal();
+            bool provenFilled = singleDim && referenceElem &&
+                fillLoopProvenNews_.count(expr.node.greenNode()) > 0;
+            std::optional<std::u16string> fillExampleName;
+            if (singleDim) {
+                auto named = arrayNewDeclNames_.find(expr.node.greenNode());
+                fillExampleName = named != arrayNewDeclNames_.end()
+                    ? named->second : std::u16string(u"items");
+            }
+            if (!provenFilled && !validateArrayElement(elem, tr->node, fillExampleName)) {
                 for (auto& sz : sizes) analyzeExpr(sz);
                 return typeCtx.getError();
             }
@@ -5262,7 +5433,8 @@ void Analyzer::checkFieldInitialization(const ast::ClassDecl& cd) {
     }
 }
 
-bool Analyzer::validateArrayElement(Type* elem, const SyntaxNode& diagNode) {
+bool Analyzer::validateArrayElement(Type* elem, const SyntaxNode& diagNode,
+                                    const std::optional<std::u16string>& fillExampleName) {
     if (!elem || elem->isError()) return false;
     if (isDefaultable(elem)) return true;
     // A type-parameter backing store (`new T[n]`) is allowed: the slots start as
@@ -5272,6 +5444,15 @@ bool Analyzer::validateArrayElement(Type* elem, const SyntaxNode& diagNode) {
     std::string hint;
     if (elem->isClass() || elem->isArray() || elem->isExternal() ||
         elem->kind == TypeKind::String) {
+        if (fillExampleName) {
+            std::string name = asciiOf(*fillExampleName);
+            errorAtNode(diagNode, "An array of non-nullable '" + elem->toString() +
+                "' must be filled as it is created: assign it to a new variable and "
+                "follow the declaration with `for (long i = 0; i < " + name +
+                ".length; i = i + 1) { " + name + "[i] = ...; }`. Alternatively use '" +
+                elem->toString() + "?[]' so slots can start as null.");
+            return false;
+        }
         hint = " Use '" + elem->toString() + "?[]' so freshly-allocated slots can start as null.";
     } else if (elem->isStruct() && elem->structInfo) {
         const FieldInfo* bad = nullptr;

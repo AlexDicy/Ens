@@ -725,9 +725,10 @@ void Parser::parseType() {
 
 void Parser::parseTypeHead() {
     // Like parseType but leaves dim brackets for the NewExpr to parse.
-    // A `[]` is consumed only when followed by `?` (then it is unambiguously
-    // part of a nullable-array element type like `T[]?`). A standalone `[]`
-    // or `[size]` at this position belongs to the NewExpr's dimension list.
+    // A `[]` is consumed only when followed by `?` or another `[` (then it is
+    // unambiguously part of an array element type like `T[]?` or `T[][n]`).
+    // A standalone `[]` or `[size]` at this position belongs to the NewExpr's
+    // dimension list.
     // `?` is always consumed so `new Box?[3]` constructs an array of
     // nullable Box rather than safe-subscripting the result of `new Box[3]`.
     builder.startNode(SyntaxKind::TypeRef);
@@ -743,7 +744,8 @@ void Parser::parseTypeHead() {
         if (at(SyntaxKind::Question)) { bump(); continue; }
         if (at(SyntaxKind::LBracket) &&
             peekKind(1) == SyntaxKind::RBracket &&
-            peekKind(2) == SyntaxKind::Question) {
+            (peekKind(2) == SyntaxKind::Question ||
+             peekKind(2) == SyntaxKind::LBracket)) {
             bump();  // '['
             bump();  // ']'
             continue;
