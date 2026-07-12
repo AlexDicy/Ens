@@ -854,9 +854,16 @@ void LanguageServer::onBackgroundDocumentChanged(lsp::json::Value&& params) {
     const lsp::json::Value* uri = params.object().find("uri");
     const lsp::json::Value* text = params.object().find("text");
     if (!uri || !uri->isString() || !text || !text->isString()) return;
-    if (documents.find(uri->string())) return;  // open buffers are authoritative
     std::filesystem::path path = Document::pathForUri(uri->string());
     if (path.empty()) return;
+    // Open buffers are authoritative; compare by path identity because the
+    // reporting plugin and the LSP client may spell the same URI differently.
+    std::string key = ens::modules::overrideKey(path);
+    bool isOpenDocument = false;
+    documents.forEachDocument([&](Document& doc) {
+        if (!isOpenDocument && ens::modules::overrideKey(doc.path()) == key) isOpenDocument = true;
+    });
+    if (isOpenDocument) return;
     documents.setTransientOverride(path, utf8To16(text->string()));
     refreshDocumentsDependingOn({path}, nullptr);
 }

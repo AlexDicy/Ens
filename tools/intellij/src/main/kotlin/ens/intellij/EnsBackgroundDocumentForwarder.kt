@@ -6,6 +6,7 @@ import com.intellij.openapi.editor.EditorFactory
 import com.intellij.openapi.editor.event.DocumentEvent
 import com.intellij.openapi.editor.event.DocumentListener
 import com.intellij.openapi.fileEditor.FileDocumentManager
+import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.project.ProjectManager
 import com.intellij.openapi.startup.ProjectActivity
@@ -38,9 +39,19 @@ private object EnsBackgroundChangeListener : DocumentListener {
     override fun documentChanged(event: DocumentEvent) {
         val file = FileDocumentManager.getInstance().getFile(event.document) ?: return
         if (!file.isInLocalFileSystem || file.extension != "ens") return
+        if (isFocusedDocument(event.document)) return
         val firstPending = pending.isEmpty()
         pending.add(event.document)
         if (firstPending) ApplicationManager.getApplication().invokeLater { flushPending() }
+    }
+
+    // The focused editor's document is always open in the LSP sense; its didChange
+    // is authoritative and forwarding it would only race that channel.
+    private fun isFocusedDocument(document: Document): Boolean {
+        return ProjectManager.getInstance().openProjects.any { project ->
+            !project.isDisposed &&
+                FileEditorManager.getInstance(project).selectedTextEditor?.document == document
+        }
     }
 
     private fun flushPending() {
