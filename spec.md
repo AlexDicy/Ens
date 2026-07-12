@@ -140,8 +140,8 @@ interface Source<T> {
 
 A class names the interfaces it implements in an `implements` clause after the optional `extends`, separated by commas: `class Dog extends Animal implements Speaker, Source<string> { ... }`.
 The class must provide every method of every listed interface with the exact signature, either declared in the class or inherited from a base class; a missing or mismatched method is a compile error naming the interface and the signature.
-Interface satisfaction uses no marker: `override` stays reserved for base-class overrides.
-An abstract class may declare an interface method `abstract` and leave the body to its concrete subclasses.
+A method declared in the implementing class that provides an interface method must be marked `override`, exactly like the override of an abstract base method; a satisfying method inherited from a base class needs no marker.
+An abstract class may declare an interface method `abstract override` and leave the body to its concrete subclasses.
 A method satisfying a throwing interface method may throw the declared types or their subclasses, never others; satisfying a non-throwing interface method means not throwing at all.
 Structs cannot implement interfaces.
 
@@ -581,7 +581,7 @@ class Range implements Iterable<int> {
     private int low;
     private int high;
     Range(this.low, this.high);
-    makeIterator() -> Iterator<int> { return new RangeIterator(this.low, this.high); }
+    override makeIterator() -> Iterator<int> { return new RangeIterator(this.low, this.high); }
 }
 
 for (let n in new Range(1, 10)) {
