@@ -10,7 +10,6 @@ import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.project.ProjectManager
 import com.intellij.openapi.startup.ProjectActivity
-import com.intellij.openapi.vfs.VirtualFile
 import java.util.concurrent.atomic.AtomicBoolean
 
 // Workspace edits from the language server (rename) can land in files without an
@@ -49,23 +48,20 @@ private object EnsBackgroundSaveListener : CommandListener, ApplicationListener 
         }
     }
 
+    // Save every unsaved Ens document except the one being typed in (the focused
+    // editor). Rename targets live in unfocused or invisible editors, so open-state
+    // checks cannot tell them apart from the user's own editing.
     private fun saveEditorlessEnsDocuments() {
         val manager = FileDocumentManager.getInstance()
+        val focusedDocuments = ProjectManager.getInstance().openProjects
+            .filter { !it.isDisposed }
+            .mapNotNull { FileEditorManager.getInstance(it).selectedTextEditor?.document }
         for (document in manager.unsavedDocuments) {
+            if (document in focusedDocuments) continue
             val file = manager.getFile(document) ?: continue
             if (!file.isInLocalFileSystem || file.extension != "ens") continue
-            if (isOpenInAnyEditorTab(file)) {
-                log.info("Ens background saver: skipping ${file.path}, open in an editor tab")
-                continue
-            }
             manager.saveDocument(document)
             log.info("Ens background saver: saved ${file.path}")
-        }
-    }
-
-    private fun isOpenInAnyEditorTab(file: VirtualFile): Boolean {
-        return ProjectManager.getInstance().openProjects.any { project ->
-            !project.isDisposed && FileEditorManager.getInstance(project).isFileOpen(file)
         }
     }
 }
