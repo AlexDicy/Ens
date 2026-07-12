@@ -1,5 +1,6 @@
 package ens.intellij
 
+import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.startup.ProjectActivity
 import com.intellij.openapi.vfs.VirtualFileManager
@@ -18,7 +19,10 @@ import org.eclipse.lsp4j.FileEvent
 // imported files change on disk (rename edits in closed files). Client-side watcher
 // delivery is not dependable, so forward the IDE's own VFS events directly.
 class EnsFileWatchForwarder : ProjectActivity {
+    private val log = logger<EnsFileWatchForwarder>()
+
     override suspend fun execute(project: Project) {
+        log.info("Ens file watch forwarder registered for ${project.name}")
         project.messageBus.connect().subscribe(VirtualFileManager.VFS_CHANGES, object : BulkFileListener {
             override fun after(events: List<VFileEvent>) {
                 if (project.isDisposed) return
@@ -34,9 +38,12 @@ class EnsFileWatchForwarder : ProjectActivity {
                 }
                 if (changes.isEmpty()) return
                 val manager = LanguageServerManager.getInstance(project)
-                if (manager.getServerStatus("ens") != ServerStatus.started) return
+                val status = manager.getServerStatus("ens")
+                log.info("Ens file watch forwarder: ${changes.size} change(s), server status $status: ${changes.joinToString { it.uri }}")
+                if (status != ServerStatus.started) return
                 manager.getLanguageServer("ens").thenAccept { item ->
                     item?.server?.workspaceService?.didChangeWatchedFiles(DidChangeWatchedFilesParams(changes))
+                    log.info("Ens file watch forwarder: forwarded ${changes.size} change(s)")
                 }
             }
         })
