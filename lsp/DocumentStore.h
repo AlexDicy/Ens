@@ -65,6 +65,11 @@ public:
     Document* find(const std::string& uri);
     const Document* find(const std::string& uri) const;
 
+    template <typename F>
+    void forEachDocument(F&& f) {
+        for (auto& [uri, doc] : docs) f(*doc);
+    }
+
     void setWorkspaceRoot(std::filesystem::path root) { workspaceRoot_ = std::move(root); }
     const std::filesystem::path& stdlibRoot() const { return stdlibRoot_; }
 

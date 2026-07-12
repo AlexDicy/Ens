@@ -33,6 +33,11 @@ int main() {
             server.onDidClose(std::move(p));
         });
 
+    messages.add<lsp::notifications::Workspace_DidChangeWatchedFiles>(
+        [&](lsp::notifications::Workspace_DidChangeWatchedFiles::Params&& p) {
+            server.onDidChangeWatchedFiles(std::move(p));
+        });
+
     messages.add<lsp::requests::TextDocument_Hover>(
         [&](lsp::requests::TextDocument_Hover::Params&& p) { return server.onHover(std::move(p)); });
 

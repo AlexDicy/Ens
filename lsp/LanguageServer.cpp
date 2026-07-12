@@ -762,13 +762,39 @@ lsp::InitializeResult LanguageServer::onInitialize(lsp::InitializeParams&& param
     return r;
 }
 
-void LanguageServer::onInitialized() {}
+void LanguageServer::onInitialized() {
+    // Watch the workspace's Ens files so edits that land on disk without an open
+    // buffer (rename edits in closed files, external tools) refresh diagnostics.
+    lsp::FileSystemWatcher watcher;
+    watcher.globPattern = std::string("**/*.ens");
+    lsp::DidChangeWatchedFilesRegistrationOptions watchOptions;
+    watchOptions.watchers = {std::move(watcher)};
+    lsp::Registration registration;
+    registration.id = "ens-watched-files";
+    registration.method = "workspace/didChangeWatchedFiles";
+    registration.registerOptions = lsp::toJson(std::move(watchOptions));
+    lsp::RegistrationParams params;
+    params.registrations = {std::move(registration)};
+    messages.sendRequest<lsp::requests::Client_RegisterCapability>(
+        std::move(params), [](auto&&...) {}, [](const lsp::ResponseError&) {});
+}
+
+// Every open document analyzes its own module graph, so a change to one file can
+// invalidate the diagnostics of any other open document that imports it.
+void LanguageServer::refreshOtherDocuments(const Document* changed) {
+    documents.forEachDocument([&](Document& doc) {
+        if (&doc == changed) return;
+        doc.analyze();
+        publishDiagnostics(doc);
+    });
+}
 
 void LanguageServer::onDidOpen(lsp::notifications::TextDocument_DidOpen::Params&& p) {
     auto& doc = documents.upsert(p.textDocument.uri.toString(),
                                   utf8To16(p.textDocument.text),
                                   p.textDocument.version);
     publishDiagnostics(doc);
+    refreshOtherDocuments(&doc);
 }
 
 void LanguageServer::onDidChange(lsp::notifications::TextDocument_DidChange::Params&& p) {
@@ -779,11 +805,19 @@ void LanguageServer::onDidChange(lsp::notifications::TextDocument_DidChange::Par
                                       utf8To16(full->text),
                                       p.textDocument.version);
         publishDiagnostics(doc);
+        refreshOtherDocuments(&doc);
     }
 }
 
 void LanguageServer::onDidClose(lsp::notifications::TextDocument_DidClose::Params&& p) {
     documents.erase(p.textDocument.uri.toString());
+    refreshOtherDocuments(nullptr);
+}
+
+void LanguageServer::onDidChangeWatchedFiles(
+        lsp::notifications::Workspace_DidChangeWatchedFiles::Params&& p) {
+    if (p.changes.empty()) return;
+    refreshOtherDocuments(nullptr);
 }
 
 void LanguageServer::publishDiagnostics(const Document& doc) {

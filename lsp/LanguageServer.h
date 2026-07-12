@@ -14,6 +14,7 @@ public:
     void onDidOpen(lsp::notifications::TextDocument_DidOpen::Params&& p);
     void onDidChange(lsp::notifications::TextDocument_DidChange::Params&& p);
     void onDidClose(lsp::notifications::TextDocument_DidClose::Params&& p);
+    void onDidChangeWatchedFiles(lsp::notifications::Workspace_DidChangeWatchedFiles::Params&& p);
 
     lsp::TextDocument_HoverResult onHover(lsp::HoverParams&& p);
     lsp::TextDocument_DefinitionResult onDefinition(lsp::DefinitionParams&& p);
@@ -29,4 +30,5 @@ private:
     DocumentStore documents;
 
     void publishDiagnostics(const Document& doc);
+    void refreshOtherDocuments(const Document* changed);
 };
