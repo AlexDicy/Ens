@@ -400,7 +400,14 @@ void Parser::parseFuncDecl() {
     while (at(SyntaxKind::KwOverride) || at(SyntaxKind::KwFinal) || at(SyntaxKind::KwAbstract)) {
         bump();  // method modifier; analyzer validates context
     }
-    expect(SyntaxKind::Identifier, "function name");
+    if (isKeyword(kindAt())) {
+        std::string word;
+        for (char16_t c : tokenAt().text) word.push_back(c < 128 ? static_cast<char>(c) : '?');
+        reportAtCurrent("'" + word + "' is a keyword and cannot be used as a method name");
+        bumpAs(SyntaxKind::Identifier);
+    } else {
+        expect(SyntaxKind::Identifier, "function name");
+    }
     if (at(SyntaxKind::Lt)) parseTypeParamList();
     expect(SyntaxKind::LParen, "'(' after function name");
     parseParamList();
@@ -624,11 +631,38 @@ void Parser::parseInterfaceDecl() {
 }
 
 void Parser::parseStructOrClassMember() {
-    if (looksLikeFuncDecl(/*allowShorthand=*/true)) {
+    if (looksLikeFuncDecl(/*allowShorthand=*/true) || looksLikeKeywordNamedMethod()) {
         parseFuncDecl();
     } else {
         parseFieldDecl();
     }
+}
+
+// A reserved word sitting where a member name is expected (`type() -> ...`):
+// the shape of a method declaration whose name slot holds a keyword. Parsing
+// it as a method keeps one bad name from cascading through the member list;
+// parseFuncDecl reports the name.
+bool Parser::looksLikeKeywordNamedMethod() const {
+    size_t idx = current;
+    auto skipTrivia = [&] {
+        while (idx < tokens.size() && isTrivia(tokens[idx].kind)) idx++;
+    };
+    if (idx < tokens.size() && (tokens[idx].kind == SyntaxKind::KwPrivate ||
+                                tokens[idx].kind == SyntaxKind::KwProtected ||
+                                tokens[idx].kind == SyntaxKind::KwPublic)) {
+        idx++;
+        skipTrivia();
+    }
+    while (idx < tokens.size() && (tokens[idx].kind == SyntaxKind::KwOverride ||
+                                   tokens[idx].kind == SyntaxKind::KwFinal ||
+                                   tokens[idx].kind == SyntaxKind::KwAbstract)) {
+        idx++;
+        skipTrivia();
+    }
+    if (idx >= tokens.size() || !isKeyword(tokens[idx].kind)) return false;
+    idx++;
+    skipTrivia();
+    return idx < tokens.size() && tokens[idx].kind == SyntaxKind::LParen;
 }
 
 void Parser::parseFieldDecl() {

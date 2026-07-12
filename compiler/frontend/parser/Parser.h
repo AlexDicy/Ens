@@ -68,6 +68,7 @@ private:
     void parseInterfaceDecl();
     void parseImplementsClause();
     void parseStructOrClassMember();
+    bool looksLikeKeywordNamedMethod() const;
     void parseFieldDecl();
     void parseEnumDecl();
     void parseTypeParamList();
