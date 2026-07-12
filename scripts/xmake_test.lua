@@ -81,6 +81,15 @@ task("test")
             end
         end
 
+        -- the self-hosted front end's own tests run as one `ens test` job.
+        if want("selfhost_frontend") then
+            table.insert(jobs, {
+                name = "selfhost_frontend",
+                source = path.join(os.projectdir(), "selfhost", "frontend"),
+                ens_test_args = {},
+            })
+        end
+
         -- surface any requested names that matched no test, so typos don't pass silently.
         if wanted ~= nil then
             local unknown = {}
@@ -106,8 +115,8 @@ task("test")
             local expected_stdout   = nil   -- list of lines; joined with "\n" for an exact match
             local expected_contains = {}    -- substrings that must each appear in stdout
             local expected_error    = nil
-            local ens_test_args     = nil   -- @ens-test: run `ens test` on the folder instead
-            local content = io.readfile(ens_file) or ""
+            local ens_test_args     = job.ens_test_args   -- @ens-test: run `ens test` on the folder instead
+            local content = (ens_file and io.readfile(ens_file)) or ""
             for line in content:gmatch("[^\r\n]+") do
                 local exit_str = line:match("^%s*//%s*@exit%s+(%-?%d+)")
                 if exit_str then expected_exit = tonumber(exit_str) end
