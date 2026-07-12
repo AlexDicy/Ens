@@ -180,7 +180,8 @@ bool buildModuleGraph(const fs::path& sourceRoot,
                       std::deque<fs::path>& seedRelatives,
                       std::vector<std::unique_ptr<Module>>& modulesOut,
                       std::unordered_map<std::u16string, Module*>& byPath,
-                      const SourceOverrides* overrides) {
+                      const SourceOverrides* overrides,
+                      const fs::path& testsRoot) {
     struct WorkItem { fs::path base; fs::path rel; };
     std::unordered_set<std::u16string> queued;
     std::deque<WorkItem> work;
@@ -192,7 +193,8 @@ bool buildModuleGraph(const fs::path& sourceRoot,
         work.push_back({base, rel});
     };
 
-    for (auto& r : seedRelatives) enqueue(sourceRoot, r);
+    const fs::path& seedBase = testsRoot.empty() ? sourceRoot : testsRoot;
+    for (auto& r : seedRelatives) enqueue(seedBase, r);
     seedRelatives.clear();
 
     while (!work.empty()) {
@@ -241,6 +243,21 @@ bool buildModuleGraph(const fs::path& sourceRoot,
                 continue;
             } else {
                 base = sourceRoot;
+                if (!testsRoot.empty()) {
+                    auto present = [&](const fs::path& root) {
+                        fs::path candidate = root / targetRel;
+                        return fs::exists(candidate) ||
+                            (overrides && overrides->count(overrideKey(candidate)) > 0);
+                    };
+                    bool underSource = present(sourceRoot);
+                    bool underTests = present(testsRoot);
+                    if (underSource && underTests) {
+                        reportAt("Module '" + asAscii(targetPath) +
+                            "' exists under both the source folder and the tests folder; rename one of the files.");
+                        continue;
+                    }
+                    if (underTests) base = testsRoot;
+                }
             }
 
             fs::path absolute = base.empty() ? fs::path() : base / targetRel;
@@ -251,8 +268,12 @@ bool buildModuleGraph(const fs::path& sourceRoot,
                     reportAt("Cannot find standard library module '" + asAscii(targetPath) +
                         "'. Set ENS_STDLIB to the directory containing 'std/' (normally <repo>/libs).");
                 } else {
+                    std::string lookedFor = absolute.string();
+                    if (!testsRoot.empty()) {
+                        lookedFor += " and " + (testsRoot / targetRel).string();
+                    }
                     reportAt("Cannot find module '" + asAscii(targetPath) +
-                        "' (looked for " + absolute.string() + ")");
+                        "' (looked for " + lookedFor + ")");
                 }
                 continue;
             }

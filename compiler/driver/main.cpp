@@ -81,7 +81,7 @@ static std::unordered_map<std::string, std::string> parseArguments(int argc, cha
     return arguments;
 }
 
-// `ens test [--source <folder>] [--filter <substring>] [--explain-arc]`:
+// `ens test [--source <folder>] [--tests <folder>] [--filter <substring>] [--explain-arc]`:
 // discover tests, build and run them, and return the runner's exit code.
 static int runTestCommand(int argc, char* argv[]) {
     std::unordered_map<std::string, std::string> arguments;
@@ -92,14 +92,15 @@ static int runTestCommand(int argc, char* argv[]) {
         return 2;
     }
     for (const auto& [key, value] : arguments) {
-        if (key != "--source" && key != "--filter" && key != "--explain-arc") {
+        if (key != "--source" && key != "--tests" && key != "--filter" && key != "--explain-arc") {
             std::cerr << "ERROR: unknown option '" << key << "' for 'ens test'\n";
             return 2;
         }
     }
     fs::path source = arguments.count("--source") ? fs::path(arguments.at("--source")) : fs::path(".");
+    fs::path tests = arguments.count("--tests") ? fs::path(arguments.at("--tests")) : fs::path();
     std::string filter = arguments.count("--filter") ? arguments.at("--filter") : "";
-    return Compiler::test(source, filter, arguments.count("--explain-arc") > 0);
+    return Compiler::test(source, tests, filter, arguments.count("--explain-arc") > 0);
 }
 
 int main(int argc, char* argv[]) {

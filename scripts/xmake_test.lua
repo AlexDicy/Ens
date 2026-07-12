@@ -6,6 +6,7 @@
 --     // @expect-error Undefined function 'testFunction'
 -- a folder test's main.ens may use @ens-test (optionally with extra arguments) to run
 -- `ens test --source <folder> ...` instead of compile+run, asserting on its output.
+-- the token {dir} in the extra arguments expands to the folder's absolute path.
 --     // @ens-test --filter needle
 -- tests run in parallel; set ENS_TEST_JOBS to override the worker count (default: cpu count).
 -- pass test names to run a subset, e.g. `xmake test arc_basic class_constructor`; runs all if omitted.
@@ -164,7 +165,9 @@ task("test")
             if ens_test_args ~= nil then
                 os.tryrm(stdout_file)
                 local argv = {"test", "--source", job.source}
-                for _, a in ipairs(ens_test_args) do table.insert(argv, a) end
+                for _, a in ipairs(ens_test_args) do
+                    table.insert(argv, (a:gsub("{dir}", (job.source:gsub("\\", "/")))))
+                end
                 local run_rc = os.execv(ens_exe, argv,
                     {try = true, stdout = stdout_file, stderr = stdout_file})
                 local actual_stdout = (io.readfile(stdout_file) or ""):gsub("[\r\n]+$", "")

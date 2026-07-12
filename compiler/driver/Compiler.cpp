@@ -412,23 +412,31 @@ std::u16string buildRunnerSource(const std::vector<DiscoveredTest>& tests) {
 
 }  // namespace
 
-int Compiler::test(const fs::path& sourceDir, const std::string& filter, bool explainArc) {
+int Compiler::test(const fs::path& sourceDir, const fs::path& testsDir,
+                   const std::string& filter, bool explainArc) {
     std::error_code ec;
     if (!fs::is_directory(sourceDir, ec)) {
         std::cerr << "ERROR: '" << sourceDir.string() << "' is not a folder\n";
         return 2;
     }
     const fs::path& sourceRoot = sourceDir;
+    if (!testsDir.empty() && !fs::is_directory(testsDir, ec)) {
+        std::cerr << "ERROR: '" << testsDir.string() << "' is not a folder\n";
+        return 2;
+    }
+    // Tests are discovered under (and their module paths are relative to) the
+    // tests folder when one is given, otherwise the source folder.
+    const fs::path discoveryRoot = testsDir.empty() ? sourceRoot : testsDir;
 
     std::vector<fs::path> testFiles;
-    for (auto& rel : getFileTree(sourceRoot, sourceRoot)) {
+    for (auto& rel : getFileTree(discoveryRoot, discoveryRoot)) {
         if (isTestFile(rel)) testFiles.push_back(rel);
     }
     std::sort(testFiles.begin(), testFiles.end(), [](const fs::path& a, const fs::path& b) {
         return a.generic_string() < b.generic_string();
     });
     if (testFiles.empty()) {
-        std::cout << "no tests found under " << sourceRoot.string()
+        std::cout << "no tests found under " << discoveryRoot.string()
                   << " (tests live in files ending '_test.ens')\n";
         return 0;
     }
@@ -449,7 +457,7 @@ int Compiler::test(const fs::path& sourceDir, const std::string& filter, bool ex
     std::vector<DiscoveredTest> tests;
     for (auto& rel : testFiles) {
         std::u16string modulePath = modulePathOfRelative(rel);
-        auto module = loadModule(sourceRoot, rel, modulePath);
+        auto module = loadModule(discoveryRoot, rel, modulePath);
         if (!module || !module->rootNode) return 2;
         auto sf = ast::SourceFile::cast(*module->rootNode);
         if (!sf) continue;
@@ -471,7 +479,7 @@ int Compiler::test(const fs::path& sourceDir, const std::string& filter, bool ex
         }
     }
     if (tests.empty()) {
-        std::cout << "no tests found under " << sourceRoot.string() << "\n";
+        std::cout << "no tests found under " << discoveryRoot.string() << "\n";
         return 0;
     }
 
@@ -491,7 +499,7 @@ int Compiler::test(const fs::path& sourceDir, const std::string& filter, bool ex
     // The runner enters the graph as a virtual seed via a source override.
     const fs::path runnerRelative = "$ens_test_runner.ens";
     SourceOverrides overrides;
-    overrides[overrideKey(sourceRoot / runnerRelative)] = buildRunnerSource(tests);
+    overrides[overrideKey(discoveryRoot / runnerRelative)] = buildRunnerSource(tests);
     const std::u16string runnerModulePath = modulePathOfRelative(runnerRelative);
 
     std::deque<fs::path> seeds;
@@ -500,7 +508,8 @@ int Compiler::test(const fs::path& sourceDir, const std::string& filter, bool ex
 
     std::vector<std::unique_ptr<Module>> modules;
     std::unordered_map<std::u16string, Module*> byPath;
-    if (!buildModuleGraph(sourceRoot, findStdlibRoot(), seeds, modules, byPath, &overrides)) {
+    if (!buildModuleGraph(sourceRoot, findStdlibRoot(), seeds, modules, byPath, &overrides,
+                          testsDir.empty() ? fs::path() : discoveryRoot)) {
         return 2;
     }
 

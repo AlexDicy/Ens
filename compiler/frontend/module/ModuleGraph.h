@@ -60,12 +60,15 @@ using SourceOverrides = std::unordered_map<std::string, std::u16string>;
 
 // Load the seed files and everything they transitively import (following `@std` to the
 // stdlib root and bare paths to the source root). Returns false if a file cannot be read.
+// When testsRoot is non-empty, seeds resolve against it and bare imports fall back to it
+// after the source root (`ens test --tests`); a module under both roots is an error.
 bool buildModuleGraph(const fs::path& sourceRoot,
                       const fs::path& stdlibRoot,
                       std::deque<fs::path>& seedRelatives,
                       std::vector<std::unique_ptr<Module>>& modulesOut,
                       std::unordered_map<std::u16string, Module*>& byPath,
-                      const SourceOverrides* overrides = nullptr);
+                      const SourceOverrides* overrides = nullptr,
+                      const fs::path& testsRoot = {});
 
 // Insert the prelude as modules[0] / byPath[$prelude].
 void insertPreludeModule(std::vector<std::unique_ptr<Module>>& modules,

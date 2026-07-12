@@ -22,10 +22,13 @@ public:
     static bool dumpCst(std::istream& source, const std::string& filename = "<stdin>");
     static bool analyzeCst(std::istream& source, const std::string& filename = "<stdin>");
 
-    // Discovers test declarations in *_test.ens files under sourceDir, compiles
-    // them with a synthesized runner, executes it, and streams the report.
+    // Discovers test declarations in *_test.ens files under testsDir (or under
+    // sourceDir when testsDir is empty), compiles them with a synthesized
+    // runner, executes it, and streams the report. Test imports resolve against
+    // sourceDir first, then testsDir.
     // Returns the process exit code: 0 all pass, 1 test failures, 2 errors.
     static int test(const std::filesystem::path& sourceDir,
+                    const std::filesystem::path& testsDir,
                     const std::string& filter,
                     bool explainArc = false);
 
