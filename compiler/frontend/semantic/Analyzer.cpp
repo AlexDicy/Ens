@@ -4552,6 +4552,11 @@ Type* Analyzer::analyzeTernary(const ast::TernaryExpression& expr) {
     if (Type* common = numericCommonType(thenT, elseT)) return common;
     if (thenT->assignableFrom(elseT)) return thenT;
     if (elseT->assignableFrom(thenT)) return elseT;
+    // A 'null' branch beside a typed branch yields the nullable of that type.
+    if (thenT->isNull() != elseT->isNull()) {
+        Type* typed = thenT->isNull() ? elseT : thenT;
+        if (!typed->isVoid()) return typeCtx.getOptional(typed);
+    }
     errorAtNode(expr.node, "Ternary branches have incompatible types '" + thenT->toString() +
         "' and '" + elseT->toString() + "'");
     return typeCtx.getError();
@@ -5039,6 +5044,11 @@ Type* Analyzer::analyzeSwitchArms(const std::optional<ast::Expression>& scrutine
         if (Type* c = numericCommonType(result, t)) { result = c; continue; }
         if (result->assignableFrom(t)) continue;
         if (t->assignableFrom(result)) { result = t; continue; }
+        // A 'null' arm beside a typed arm yields the nullable of that type.
+        if (t->isNull() != result->isNull()) {
+            Type* typed = t->isNull() ? result : t;
+            if (!typed->isVoid()) { result = typeCtx.getOptional(typed); continue; }
+        }
         errorAtNode(diagNode, "Switch arms produce incompatible types '" + result->toString() +
             "' and '" + t->toString() + "'.");
         return typeCtx.getError();
