@@ -234,6 +234,16 @@ private:
     Type* analyzeSuper(const ast::SuperExpression& expr);
     Type* analyzeBinary(const ast::BinaryExpression& expr);
     Type* analyzePrefix(const ast::PrefixExpression& expr);
+    Type* analyzePostfix(const ast::PostfixExpression& expr);
+    // Shared checks for prefix and postfix `++`/`--`: the operand must be an
+    // assignable numeric lvalue, and a successful form invalidates narrowings on
+    // the mutated target exactly as an assignment to it would. Returns the
+    // operand type (the result type for both forms).
+    Type* analyzeIncDec(const SyntaxNode& exprNode, const ast::Expression& operand,
+                        Type* operandT, bool isIncrement, bool isPrefix);
+    // Drops any narrowings recorded for the storage written by `target`, mirroring
+    // the invalidation an assignment to `target` performs.
+    void invalidateNarrowingsForWrite(const ast::Expression& target);
     Type* analyzeCall(const ast::CallExpression& expr);
     Type* analyzeExternalCall(const ast::CallExpression& expr, Symbol* sym,
                               const std::u16string& funcName);

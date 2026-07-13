@@ -504,6 +504,20 @@ long b = (arr.length * 2) as long; // cast applied to the product
 
 ---
 
+The `++` and `--` operators add or subtract one from a numeric value in place.
+Each works in prefix position (`++x`) and in postfix position (`x++`), and both forms change the operand the same way.
+The difference is the value the expression produces: a prefix form evaluates to the new value, and a postfix form evaluates to the value from before the change.
+The operand must be an assignable numeric location, such as a variable, a parameter, a field, or an array element, of an integer or floating-point type.
+Applying either operator to a literal, a computed expression, a `const` binding, or a non-numeric value is a compile error.
+
+```ens
+int i = 0;
+int a = i++;      // a is 0, then i becomes 1
+int b = ++i;      // i becomes 2, then b is 2
+```
+
+---
+
 Class values support runtime type tests with `is` and checked casts with `as?`.
 `expr is Type` evaluates to `bool`: true when the value is a non-null instance of `Type` or one of its subclasses.
 `expr as? Type` evaluates to `Type?`: the value itself when the test would succeed, and `null` when the value is null or not an instance.

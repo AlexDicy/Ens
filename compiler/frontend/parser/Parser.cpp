@@ -1300,7 +1300,9 @@ int Parser::infixPrecedence(SyntaxKind k) const {
         case SyntaxKind::Dot:
         case SyntaxKind::QuestionDot:
         case SyntaxKind::LParen:
-        case SyntaxKind::LBracket:   return 14;  // postfix
+        case SyntaxKind::LBracket:
+        case SyntaxKind::PlusPlus:
+        case SyntaxKind::MinusMinus: return 14;  // postfix
         default:                     return 0;
     }
 }
@@ -1370,6 +1372,14 @@ void Parser::parsePrecedence(int minPrec) {
             bump();
             parseExpression();
             expect(SyntaxKind::RBracket, "']' after subscript");
+            builder.finishNode();
+            continue;
+        }
+        if (op == SyntaxKind::PlusPlus || op == SyntaxKind::MinusMinus) {
+            // Postfix `++`/`--` wraps the operand parsed so far; it takes no
+            // right operand and binds as tightly as the other postfix forms.
+            builder.startNodeAt(cp, SyntaxKind::PostfixExpr);
+            bump();
             builder.finishNode();
             continue;
         }

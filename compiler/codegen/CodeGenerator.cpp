@@ -2076,6 +2076,7 @@ struct CodeGenerator::Impl {
         if (auto su = e.asSuper()) return emitSuper(*su);
         if (auto b = e.asBinary()) return emitBinary(*b);
         if (auto p = e.asPrefix()) return emitPrefix(*p);
+        if (auto po = e.asPostfix()) return emitPostfix(*po);
         if (auto c = e.asCall()) return emitCall(*c);
         if (auto m = e.asMember()) return emitMember(*m);
         if (auto sm = e.asSafeMember()) return emitSafeMember(*sm);
@@ -2370,6 +2371,31 @@ struct CodeGenerator::Impl {
                 error(e.node.startOffset(), "Unsupported unary operator in codegen");
                 return nullptr;
         }
+    }
+
+    // Postfix `++`/`--`: load through the operand's address (evaluated once, so
+    // an index like `arr[f()]` runs its side effects a single time), store the
+    // adjusted value, and yield the OLD value.
+    llvm::Value* emitPostfix(const ast::PostfixExpression& e) {
+        auto operand = e.operand();
+        if (!operand) return nullptr;
+        ::Type* t = typeOf(operand->node);
+        bool flt = t && t->isFloat();
+        auto opTok = e.operatorToken();
+        if (!opTok) return nullptr;
+        llvm::Value* lv = emitLValue(*operand);
+        if (!lv) return nullptr;
+        llvm::Type* lt = mapType(t);
+        llvm::Value* old = builder->CreateLoad(lt, lv);
+        llvm::Value* one = flt
+            ? static_cast<llvm::Value*>(llvm::ConstantFP::get(lt, 1.0))
+            : static_cast<llvm::Value*>(llvm::ConstantInt::get(lt, 1));
+        bool inc = opTok->kind() == SyntaxKind::PlusPlus;
+        llvm::Value* nv = inc
+            ? (flt ? builder->CreateFAdd(old, one) : builder->CreateAdd(old, one))
+            : (flt ? builder->CreateFSub(old, one) : builder->CreateSub(old, one));
+        builder->CreateStore(nv, lv);
+        return old;
     }
 
     // Wrapper that emits an expression and then numerically converts it to the

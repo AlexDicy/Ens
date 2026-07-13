@@ -3069,6 +3069,7 @@ Type* Analyzer::analyzeExpr(const ast::Expression& expr) {
     else if (auto su = expr.asSuper())  t = analyzeSuper(*su);
     else if (auto b  = expr.asBinary()) t = analyzeBinary(*b);
     else if (auto p  = expr.asPrefix()) t = analyzePrefix(*p);
+    else if (auto po = expr.asPostfix()) t = analyzePostfix(*po);
     else if (auto c  = expr.asCall())   t = analyzeCall(*c);
     else if (auto m  = expr.asMember()) t = analyzeMember(*m);
     else if (auto sm = expr.asSafeMember()) t = analyzeSafeMember(*sm);
@@ -3349,18 +3350,53 @@ Type* Analyzer::analyzePrefix(const ast::PrefixExpression& expr) {
             return t;
         case SyntaxKind::PlusPlus:
         case SyntaxKind::MinusMinus:
-            if (!t->isNumeric()) {
-                errorAtNode(expr.node, "Increment/decrement requires numeric, got '" + t->toString() + "'");
-                return typeCtx.getError();
-            }
-            if (!isLValue(*operand)) {
-                errorAtNode(expr.node, "Cannot increment/decrement a non-assignable expression");
-            }
-            return t;
+            return analyzeIncDec(expr.node, *operand, t,
+                                 opTok->kind() == SyntaxKind::PlusPlus, /*isPrefix=*/true);
         default:
             errorAtNode(expr.node, "Unsupported unary operator");
             return typeCtx.getError();
     }
+}
+
+Type* Analyzer::analyzePostfix(const ast::PostfixExpression& expr) {
+    auto operand = expr.operand();
+    if (!operand) return typeCtx.getError();
+    Type* t = analyzeExpr(*operand);
+    if (t->isError()) return typeCtx.getError();
+    auto opTok = expr.operatorToken();
+    if (!opTok) return typeCtx.getError();
+    return analyzeIncDec(expr.node, *operand, t,
+                         opTok->kind() == SyntaxKind::PlusPlus, /*isPrefix=*/false);
+}
+
+Type* Analyzer::analyzeIncDec(const SyntaxNode& exprNode, const ast::Expression& operand,
+                              Type* operandT, bool isIncrement, bool isPrefix) {
+    const char* op = isIncrement ? "++" : "--";
+    std::string example = isPrefix ? std::string(op) + "count" : std::string("count") + op;
+    if (!operandT->isNumeric()) {
+        errorAtNode(exprNode, std::string("The '") + op + "' operator works only on numbers, so it "
+            "cannot be applied to a value of type '" + operandT->toString() + "'; use it on an "
+            "integer or floating-point variable, for example '" + example + "'.");
+        return operandT;
+    }
+    if (!isLValue(operand)) {
+        errorAtNode(exprNode, std::string("The '") + op + "' operator needs a variable to change, "
+            "for example '" + example + "'; it cannot be applied to something that is not a "
+            "variable, field, or array element.");
+        return operandT;
+    }
+    if (auto id = operand.asIdent()) {
+        if (auto* info = analysis.find(id->node.greenNode())) {
+            if (Symbol* sym = info->resolvedSymbol; sym && sym->isConst) {
+                errorAtNode(exprNode, std::string("The '") + op + "' operator cannot change '" +
+                    asciiOf(sym->name) + "' because it is declared as constant; use 'let' instead "
+                    "of 'const' if it needs to change.");
+                return operandT;
+            }
+        }
+    }
+    invalidateNarrowingsForWrite(operand);
+    return operandT;
 }
 
 static size_t requiredArgCount(Symbol* sym) {
@@ -4778,6 +4814,24 @@ Type* Analyzer::analyzeSafeSubscript(const ast::SafeSubscriptExpression& expr) {
     return typeCtx.getOptional(elem);
 }
 
+void Analyzer::invalidateNarrowingsForWrite(const ast::Expression& target) {
+    if (!currentScope) return;
+    if (auto id = target.asIdent()) {
+        if (auto* info = analysis.find(id->node.greenNode())) {
+            if (Symbol* sym = info->resolvedSymbol) {
+                currentScope->clearNarrowingsForRoot(sym);
+                currentScope->clearNarrowingsForIndexSymbol(sym);
+                return;
+            }
+        }
+    }
+    if (target.asMember() || target.asSubscript()) {
+        if (auto p = buildNarrowingPath(target)) {
+            currentScope->clearNarrowingsAtOrBelow(*p);
+        }
+    }
+}
+
 Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
     auto target = expr.target();
     auto value = expr.value();
@@ -4792,11 +4846,9 @@ Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
     // type so that e.g. `x = null` and `x.f = null` still work inside
     // `if x != null { }`.
     Type* assignTargetT = targetT;
-    Symbol* targetIdentSym = nullptr;
     if (auto id = target->asIdent()) {
         if (auto* targetInfo = analysis.find(id->node.greenNode())) {
             if (Symbol* sym = targetInfo->resolvedSymbol) {
-                targetIdentSym = sym;
                 if (sym->type) assignTargetT = sym->type;
                 if (sym->isConst) {
                     errorAtNode(expr.node, "Cannot assign a new value to '" + asciiOf(sym->name) +
@@ -4836,14 +4888,7 @@ Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
     if (assignTargetT != targetT) {
         analysis.setType(target->node.greenNode(), assignTargetT);
     }
-    if (targetIdentSym && currentScope) {
-        currentScope->clearNarrowingsForRoot(targetIdentSym);
-        currentScope->clearNarrowingsForIndexSymbol(targetIdentSym);
-    } else if (currentScope && (target->asMember() || target->asSubscript())) {
-        if (auto p = buildNarrowingPath(*target)) {
-            currentScope->clearNarrowingsAtOrBelow(*p);
-        }
-    }
+    invalidateNarrowingsForWrite(*target);
     return assignTargetT;
 }
 
