@@ -36,23 +36,55 @@ bool parseIntegerLiteralMagnitude(std::u16string_view text, uint64_t& out) {
     return true;
 }
 
+static int hexDigitValue(char16_t c) {
+    if (c >= u'0' && c <= u'9') return static_cast<int>(c - u'0');
+    if (c >= u'a' && c <= u'f') return static_cast<int>(c - u'a') + 10;
+    if (c >= u'A' && c <= u'F') return static_cast<int>(c - u'A') + 10;
+    return -1;
+}
+
+uint32_t decodeEscapeSequence(std::u16string_view text, size_t backslashIndex,
+                              size_t end, size_t& next) {
+    char16_t n = text[backslashIndex + 1];
+    next = backslashIndex + 2;
+    switch (n) {
+        case u'n':  return 0x0A;
+        case u't':  return 0x09;
+        case u'r':  return 0x0D;
+        case u'b':  return 0x08;
+        case u'f':  return 0x0C;
+        case u'0':  return 0x00;
+        case u'\\': return 0x5C;
+        case u'\'': return 0x27;
+        case u'"':  return 0x22;
+        case u'u': {
+            // \uXXXX names a BMP scalar with exactly four hex digits. A malformed
+            // sequence falls back to the letter 'u', matching the reference
+            // tokenizer, which does not special-case it.
+            if (backslashIndex + 6 <= end) {
+                int h0 = hexDigitValue(text[backslashIndex + 2]);
+                int h1 = hexDigitValue(text[backslashIndex + 3]);
+                int h2 = hexDigitValue(text[backslashIndex + 4]);
+                int h3 = hexDigitValue(text[backslashIndex + 5]);
+                if (h0 >= 0 && h1 >= 0 && h2 >= 0 && h3 >= 0) {
+                    next = backslashIndex + 6;
+                    return static_cast<uint32_t>((h0 << 12) | (h1 << 8) | (h2 << 4) | h3);
+                }
+            }
+            return static_cast<uint32_t>(n);
+        }
+        default: return static_cast<uint32_t>(n);
+    }
+}
+
 uint32_t parseCharLiteralCodepoint(std::u16string_view text) {
     size_t start = 0, end = text.size();
     if (end >= 2 && text.front() == u'\'' && text.back() == u'\'') { start = 1; end--; }
     if (start >= end) return 0;
     char16_t c = text[start];
     if (c == u'\\' && start + 1 < end) {
-        char16_t n = text[start + 1];
-        switch (n) {
-            case u'n':  return 0x0A;
-            case u't':  return 0x09;
-            case u'r':  return 0x0D;
-            case u'0':  return 0x00;
-            case u'\\': return 0x5C;
-            case u'\'': return 0x27;
-            case u'"':  return 0x22;
-            default:    return static_cast<uint32_t>(n);
-        }
+        size_t next;
+        return decodeEscapeSequence(text, start, end, next);
     }
     // UTF-16 surrogate pair: codepoints above U+FFFF arrive as two char16_t
     // units (high in D800..DBFF, low in DC00..DFFF) which we recombine here.

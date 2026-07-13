@@ -1,5 +1,7 @@
 #include "Declaration.h"
 
+#include "semantic/Literals.h"
+
 namespace ast {
 
 // === VisibilityModifier ===
@@ -623,17 +625,19 @@ std::optional<std::u16string> TestDecl::descriptionText() const {
     std::u16string out;
     for (size_t i = lo; i < hi; ++i) {
         char16_t c = (*raw)[i];
+        uint32_t scalar = c;
         if (c == u'\\' && i + 1 < hi) {
-            char16_t escaped = (*raw)[++i];
-            switch (escaped) {
-                case u'n': out.push_back(u'\n'); break;
-                case u't': out.push_back(u'\t'); break;
-                case u'r': out.push_back(u'\r'); break;
-                default:   out.push_back(escaped); break;
-            }
-            continue;
+            size_t next;
+            scalar = decodeEscapeSequence(*raw, i, hi, next);
+            i = next - 1;
         }
-        out.push_back(c);
+        if (scalar <= 0xFFFF) {
+            out.push_back(static_cast<char16_t>(scalar));
+        } else {
+            uint32_t v = scalar - 0x10000;
+            out.push_back(static_cast<char16_t>(0xD800 + (v >> 10)));
+            out.push_back(static_cast<char16_t>(0xDC00 + (v & 0x3FF)));
+        }
     }
     return out;
 }

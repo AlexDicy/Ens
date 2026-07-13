@@ -4333,29 +4333,25 @@ struct CodeGenerator::Impl {
         std::string utf8;
         for (size_t i = start; i < end; ++i) {
             char16_t c = text[i];
+            uint32_t scalar = c;
             if (c == u'\\' && i + 1 < end) {
-                char16_t n = text[++i];
-                switch (n) {
-                    case u'n': utf8.push_back('\n'); break;
-                    case u't': utf8.push_back('\t'); break;
-                    case u'r': utf8.push_back('\r'); break;
-                    case u'\\': utf8.push_back('\\'); break;
-                    case u'"': utf8.push_back('"'); break;
-                    case u'\'': utf8.push_back('\''); break;
-                    case u'{': utf8.push_back('{'); break;
-                    case u'}': utf8.push_back('}'); break;
-                    default: utf8.push_back(static_cast<char>(n)); break;
-                }
-                continue;
+                size_t next;
+                scalar = decodeEscapeSequence(text, i, end, next);
+                i = next - 1;
             }
-            if (c < 0x80) utf8.push_back(static_cast<char>(c));
-            else if (c < 0x800) {
-                utf8.push_back(static_cast<char>(0xC0 | (c >> 6)));
-                utf8.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+            if (scalar < 0x80) utf8.push_back(static_cast<char>(scalar));
+            else if (scalar < 0x800) {
+                utf8.push_back(static_cast<char>(0xC0 | (scalar >> 6)));
+                utf8.push_back(static_cast<char>(0x80 | (scalar & 0x3F)));
+            } else if (scalar < 0x10000) {
+                utf8.push_back(static_cast<char>(0xE0 | (scalar >> 12)));
+                utf8.push_back(static_cast<char>(0x80 | ((scalar >> 6) & 0x3F)));
+                utf8.push_back(static_cast<char>(0x80 | (scalar & 0x3F)));
             } else {
-                utf8.push_back(static_cast<char>(0xE0 | (c >> 12)));
-                utf8.push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F)));
-                utf8.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+                utf8.push_back(static_cast<char>(0xF0 | (scalar >> 18)));
+                utf8.push_back(static_cast<char>(0x80 | ((scalar >> 12) & 0x3F)));
+                utf8.push_back(static_cast<char>(0x80 | ((scalar >> 6) & 0x3F)));
+                utf8.push_back(static_cast<char>(0x80 | (scalar & 0x3F)));
             }
         }
         return utf8;
