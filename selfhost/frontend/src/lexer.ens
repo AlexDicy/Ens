@@ -1,0 +1,799 @@
+// The lexer: a pure per-file function from source bytes to a flat stream of
+// span pieces, the significant-token stream with attached trivia, and the
+// diagnostics found along the way. Each call owns its output; there is no
+// shared state, no sink passed in, and no cache that outlives the call.
+//
+// Lexical rules mirror the reference tokenizer over UTF-8 bytes, with two
+// deliberate additions: `??` is one QuestionQuestion token, and invalid escape
+// sequences are reported. Keyword recognition goes through keywordFromText, so
+// the contextual keywords out/in/test stay Identifier for the parser to re-tag.
+import Source from source;
+import source;
+import SyntaxKind from syntax.kind;
+import syntax.kind;
+import Diagnostic from diagnostics;
+import RawToken from token;
+import LexedToken from token;
+import Vector from @std.vector;
+
+// Everything one lex call produces. The flat piece stream tiles the file
+// exactly: concatenating the pieces in order reproduces every source byte once.
+public class LexResult {
+    private RawToken[] rawPieces;
+
+    private LexedToken[] significantTokens;
+
+    private Diagnostic[] lexDiagnostics;
+
+    LexResult(RawToken[] pieces, LexedToken[] tokens, Diagnostic[] diagnostics) {
+        this.rawPieces = pieces;
+        this.significantTokens = tokens;
+        this.lexDiagnostics = diagnostics;
+    }
+
+    // The raw stream: every token and every trivia piece, ending with EndOfFile.
+    pieces() -> RawToken[] {
+        return this.rawPieces;
+    }
+
+    // The parser's stream: significant tokens each carrying leading and trailing
+    // trivia, ending with the EndOfFile token.
+    tokens() -> LexedToken[] {
+        return this.significantTokens;
+    }
+
+    diagnostics() -> Diagnostic[] {
+        return this.lexDiagnostics;
+    }
+}
+
+public lex(Source input) -> LexResult {
+    let lexer = new Lexer(input);
+    lexer.scanAll();
+    let pieces = lexer.collectedPieces();
+    let diagnostics = lexer.collectedDiagnostics();
+    let tokens = attachTrivia(pieces);
+    return new LexResult(pieces, tokens, diagnostics);
+}
+
+class Lexer {
+    private Source lexerSource;
+
+    private string sourceText;
+
+    private long sourceLength;
+
+    private long position;
+
+    private Vector<RawToken> pieces;
+
+    private Vector<Diagnostic> diagnostics;
+
+    // A stack of per-hole brace depths so nested braces and nested interpolated
+    // strings inside a hole lex correctly. holeDepthCount is the logical size,
+    // letting the backing vector grow without a pop operation.
+    private Vector<long> holeDepthStack;
+
+    private long holeDepthCount;
+
+    Lexer(Source input) {
+        this.lexerSource = input;
+        this.sourceText = input.text();
+        this.sourceLength = input.length();
+        this.position = 0;
+        this.pieces = new Vector<RawToken>();
+        this.diagnostics = new Vector<Diagnostic>();
+        this.holeDepthStack = new Vector<long>();
+        this.holeDepthCount = 0;
+    }
+
+    scanAll() {
+        while (!this.atEnd()) {
+            this.scanPiece();
+        }
+        this.emit(SyntaxKind.EndOfFile, this.position);
+    }
+
+    collectedPieces() -> RawToken[] {
+        return this.pieces.toArray();
+    }
+
+    collectedDiagnostics() -> Diagnostic[] {
+        return this.diagnostics.toArray();
+    }
+
+    private atEnd() -> bool {
+        return this.position >= this.sourceLength;
+    }
+
+    // The byte at position + offset, or 0 past the end. 0 is a safe sentinel:
+    // callers guard real work with atEnd, and a literal NUL byte in the source
+    // is not part of any token form and falls through to the invalid path.
+    private peek(long offset) -> byte {
+        let index = this.position + offset;
+        if (index < this.sourceLength) {
+            return this.lexerSource.byteAt(index);
+        }
+        return 0;
+    }
+
+    private advance() {
+        if (this.position < this.sourceLength) {
+            this.position = this.position + 1;
+        }
+    }
+
+    private emit(SyntaxKind pieceKind, long startPosition) {
+        RawToken piece;
+        piece.kind = pieceKind;
+        piece.offset = startPosition;
+        piece.length = this.position - startPosition;
+        this.pieces.push(piece);
+    }
+
+    private report(string message, long startPosition, long endPosition) {
+        let span = source.makeSpan(startPosition, endPosition - startPosition);
+        this.diagnostics.push(new Diagnostic(message, span));
+    }
+
+    private holeStackEmpty() -> bool {
+        return this.holeDepthCount == 0;
+    }
+
+    private holeTop() -> long {
+        return this.holeDepthStack.get(this.holeDepthCount - 1);
+    }
+
+    private setHoleTop(long value) {
+        this.holeDepthStack.set(this.holeDepthCount - 1, value);
+    }
+
+    private pushHole(long value) {
+        if (this.holeDepthCount == this.holeDepthStack.length()) {
+            this.holeDepthStack.push(value);
+        } else {
+            this.holeDepthStack.set(this.holeDepthCount, value);
+        }
+        this.holeDepthCount = this.holeDepthCount + 1;
+    }
+
+    private popHole() {
+        this.holeDepthCount = this.holeDepthCount - 1;
+    }
+
+    // Produce one piece, mirroring the reference tokenizer's per-call dispatch.
+    private scanPiece() {
+        let startPosition = this.position;
+        let c = this.peek(0);
+
+        // Inside an interpolation hole a `}` at brace depth 0 closes the hole and
+        // resumes string lexing; deeper `{`/`}` are ordinary braces whose nesting
+        // we track so the closing brace is not mistaken for one.
+        if (!this.holeStackEmpty()) {
+            let depth = this.holeTop();
+            if (c == '}' && depth == 0) {
+                this.advance();
+                this.lexStringBody(startPosition, false);
+                return;
+            }
+            if (c == '{') {
+                this.setHoleTop(depth + 1);
+            } else if (c == '}') {
+                this.setHoleTop(depth - 1);
+            }
+        }
+
+        if (c == ' ' || c == '\t' || c == 0x0C || c == 0x0B) {
+            this.lexWhitespace(startPosition);
+            return;
+        }
+        if (c == '\n' || c == '\r') {
+            this.lexNewline(startPosition);
+            return;
+        }
+        if (c == '/') {
+            let following = this.peek(1);
+            if (following == '/') {
+                this.lexLineComment(startPosition);
+                return;
+            }
+            if (following == '*') {
+                this.lexBlockComment(startPosition);
+                return;
+            }
+            this.lexOperator(startPosition);
+            return;
+        }
+        if (isDigit(c)) {
+            this.lexNumber(startPosition);
+            return;
+        }
+        if (isIdentifierStart(c)) {
+            this.lexIdentifierOrKeyword(startPosition);
+            return;
+        }
+        if (c == '"') {
+            this.lexString(startPosition);
+            return;
+        }
+        if (c == '\'') {
+            this.lexCharacter(startPosition);
+            return;
+        }
+        this.lexOperator(startPosition);
+    }
+
+    private lexWhitespace(long startPosition) {
+        while (!this.atEnd()) {
+            let c = this.peek(0);
+            if (c == ' ' || c == '\t' || c == 0x0C || c == 0x0B) {
+                this.advance();
+            } else {
+                break;
+            }
+        }
+        this.emit(SyntaxKind.Whitespace, startPosition);
+    }
+
+    // One line terminator per piece; "\r\n" counts as a single Newline.
+    private lexNewline(long startPosition) {
+        let c = this.peek(0);
+        this.advance();
+        if (c == '\r' && this.peek(0) == '\n') {
+            this.advance();
+        }
+        this.emit(SyntaxKind.Newline, startPosition);
+    }
+
+    // The terminating newline is left for a separate Newline piece.
+    private lexLineComment(long startPosition) {
+        this.advance();
+        this.advance();
+        while (!this.atEnd()) {
+            let c = this.peek(0);
+            if (c == '\n' || c == '\r') {
+                break;
+            }
+            this.advance();
+        }
+        this.emit(SyntaxKind.LineComment, startPosition);
+    }
+
+    // Block comments do not nest, matching the reference: the first `*/` closes.
+    private lexBlockComment(long startPosition) {
+        this.advance();
+        this.advance();
+        bool closed = false;
+        while (!this.atEnd()) {
+            let c = this.peek(0);
+            if (c == '*' && this.peek(1) == '/') {
+                this.advance();
+                this.advance();
+                closed = true;
+                break;
+            }
+            this.advance();
+        }
+        if (!closed) {
+            this.report("Unterminated block comment", startPosition, this.position);
+        }
+        this.emit(SyntaxKind.BlockComment, startPosition);
+    }
+
+    private lexIdentifierOrKeyword(long startPosition) {
+        while (!this.atEnd() && isIdentifierContinue(this.peek(0))) {
+            this.advance();
+        }
+        let text = this.sourceText.substring(startPosition, this.position);
+        let keyword = kind.keywordFromText(text);
+        if (keyword == null) {
+            this.emit(SyntaxKind.Identifier, startPosition);
+        } else {
+            this.emit(keyword, startPosition);
+        }
+    }
+
+    // Decimal, hex, and binary literals with underscores and an optional suffix.
+    // The suffix and the presence of a fraction or exponent pick the literal
+    // kind, matching the reference classification exactly.
+    private lexNumber(long startPosition) {
+        bool isFloat = false;
+        bool isLong = false;
+        bool isFloatSuffix = false;
+
+        if (this.peek(0) == '0' && (this.peek(1) == 'x' || this.peek(1) == 'X')) {
+            this.advance();
+            this.advance();
+            bool anyDigit = false;
+            while (!this.atEnd() && (isHexDigit(this.peek(0)) || this.peek(0) == '_')) {
+                anyDigit = true;
+                this.advance();
+            }
+            if (!anyDigit) {
+                this.report("Invalid hex number", startPosition, this.position);
+            }
+        } else if (this.peek(0) == '0' && (this.peek(1) == 'b' || this.peek(1) == 'B')) {
+            this.advance();
+            this.advance();
+            bool anyDigit = false;
+            while (!this.atEnd() && (this.peek(0) == '0' || this.peek(0) == '1' || this.peek(0) == '_')) {
+                anyDigit = true;
+                this.advance();
+            }
+            if (!anyDigit) {
+                this.report("Invalid binary number", startPosition, this.position);
+            }
+        } else {
+            while (!this.atEnd() && (isDigit(this.peek(0)) || this.peek(0) == '_')) {
+                this.advance();
+            }
+            if (this.peek(0) == '.' && isDigit(this.peek(1))) {
+                isFloat = true;
+                this.advance();
+                while (!this.atEnd() && (isDigit(this.peek(0)) || this.peek(0) == '_')) {
+                    this.advance();
+                }
+            }
+            if (this.peek(0) == 'e' || this.peek(0) == 'E') {
+                isFloat = true;
+                this.advance();
+                if (this.peek(0) == '+' || this.peek(0) == '-') {
+                    this.advance();
+                }
+                while (!this.atEnd() && isDigit(this.peek(0))) {
+                    this.advance();
+                }
+            }
+        }
+
+        if (this.peek(0) == 'f' || this.peek(0) == 'F') {
+            isFloat = true;
+            isFloatSuffix = true;
+            this.advance();
+        } else if (this.peek(0) == 'd' || this.peek(0) == 'D') {
+            isFloat = true;
+            this.advance();
+        } else if (this.peek(0) == 'l' || this.peek(0) == 'L') {
+            isLong = true;
+            this.advance();
+        }
+
+        if (isFloatSuffix) {
+            this.emit(SyntaxKind.FloatLiteral, startPosition);
+        } else if (isFloat) {
+            this.emit(SyntaxKind.DoubleLiteral, startPosition);
+        } else if (isLong) {
+            this.emit(SyntaxKind.LongLiteral, startPosition);
+        } else {
+            this.emit(SyntaxKind.IntLiteral, startPosition);
+        }
+    }
+
+    private lexString(long startPosition) {
+        this.advance();
+        this.lexStringBody(startPosition, true);
+    }
+
+    // Scans string content up to a closing quote, an interpolation hole opener,
+    // or a line break. atStart marks the opening `"...`; otherwise this resumes
+    // after a hole's `}`. The four resulting kinds are: a plain StringLiteral,
+    // the InterpolatedString Start / Middle / End around holes.
+    private lexStringBody(long startPosition, bool atStart) {
+        bool closed = false;
+        bool hole = false;
+        while (!this.atEnd()) {
+            let c = this.peek(0);
+            if (c == '"') {
+                this.advance();
+                closed = true;
+                break;
+            }
+            if (c == '{') {
+                this.advance();
+                hole = true;
+                break;
+            }
+            if (c == '\n' || c == '\r') {
+                break;
+            }
+            if (c == '\\') {
+                this.consumeEscape();
+                continue;
+            }
+            this.advance();
+        }
+        if (!closed && !hole) {
+            this.report("Unterminated string literal", startPosition, this.position);
+        }
+        if (atStart && !hole) {
+            this.emit(SyntaxKind.StringLiteral, startPosition);
+            return;
+        }
+        if (atStart) {
+            this.pushHole(0);
+            this.emit(SyntaxKind.InterpolatedStringStart, startPosition);
+            return;
+        }
+        if (hole) {
+            this.emit(SyntaxKind.InterpolatedStringMiddle, startPosition);
+            return;
+        }
+        if (!this.holeStackEmpty()) {
+            this.popHole();
+        }
+        this.emit(SyntaxKind.InterpolatedStringEnd, startPosition);
+    }
+
+    private lexCharacter(long startPosition) {
+        this.advance();
+        bool closed = false;
+        while (!this.atEnd()) {
+            let c = this.peek(0);
+            if (c == '\'') {
+                this.advance();
+                closed = true;
+                break;
+            }
+            if (c == '\n' || c == '\r') {
+                break;
+            }
+            if (c == '\\') {
+                this.consumeEscape();
+                continue;
+            }
+            this.advance();
+        }
+        if (!closed) {
+            this.report("Unterminated character literal", startPosition, this.position);
+        }
+        this.emit(SyntaxKind.CharLiteral, startPosition);
+    }
+
+    // Consumes a backslash escape, matching the reference's two-character step
+    // (backslash plus the next byte) and additionally validating the sequence.
+    // A valid \uXXXX consumes its four hex digits too; the token span is the
+    // same either way since those bytes are string content regardless.
+    private consumeEscape() {
+        let escapeStart = this.position;
+        this.advance();
+        if (this.atEnd()) {
+            return;
+        }
+        let escaped = this.peek(0);
+        if (isSimpleEscape(escaped)) {
+            this.advance();
+            return;
+        }
+        if (escaped == 'u') {
+            this.advance();
+            if (isHexDigit(this.peek(0)) && isHexDigit(this.peek(1))
+                && isHexDigit(this.peek(2)) && isHexDigit(this.peek(3))) {
+                this.advance();
+                this.advance();
+                this.advance();
+                this.advance();
+                return;
+            }
+            let sequence = this.sourceText.substring(escapeStart, this.position);
+            this.report("Invalid Unicode escape sequence '{sequence}': expected four hex digits", escapeStart, this.position);
+            return;
+        }
+        this.advance();
+        let sequence = this.sourceText.substring(escapeStart, this.position);
+        this.report("Invalid escape sequence '{sequence}'", escapeStart, this.position);
+    }
+
+    // Maximal-munch operators from the grammar's token list. `??` is one token
+    // (a deliberate divergence); `?[` stays Question then OpenBracket because no
+    // two-character rule matches it.
+    private lexOperator(long startPosition) {
+        let c0 = this.peek(0);
+        let c1 = this.peek(1);
+        let c2 = this.peek(2);
+        let c3 = this.peek(3);
+
+        if (c0 == '>' && c1 == '>' && c2 == '>' && c3 == '=') {
+            this.consumeOperator(4, SyntaxKind.GreaterGreaterGreaterEquals, startPosition);
+            return;
+        }
+        if (c0 == '>' && c1 == '>' && c2 == '>') {
+            this.consumeOperator(3, SyntaxKind.GreaterGreaterGreater, startPosition);
+            return;
+        }
+        if (c0 == '>' && c1 == '>' && c2 == '=') {
+            this.consumeOperator(3, SyntaxKind.GreaterGreaterEquals, startPosition);
+            return;
+        }
+        if (c0 == '<' && c1 == '<' && c2 == '=') {
+            this.consumeOperator(3, SyntaxKind.LessLessEquals, startPosition);
+            return;
+        }
+        if (c0 == '.' && c1 == '.' && c2 == '.') {
+            this.consumeOperator(3, SyntaxKind.Ellipsis, startPosition);
+            return;
+        }
+        if (c0 == '=' && c1 == '=') {
+            this.consumeOperator(2, SyntaxKind.EqualsEquals, startPosition);
+            return;
+        }
+        if (c0 == '!' && c1 == '=') {
+            this.consumeOperator(2, SyntaxKind.NotEquals, startPosition);
+            return;
+        }
+        if (c0 == '<' && c1 == '=') {
+            this.consumeOperator(2, SyntaxKind.LessEquals, startPosition);
+            return;
+        }
+        if (c0 == '>' && c1 == '=') {
+            this.consumeOperator(2, SyntaxKind.GreaterEquals, startPosition);
+            return;
+        }
+        if (c0 == '-' && c1 == '>') {
+            this.consumeOperator(2, SyntaxKind.Arrow, startPosition);
+            return;
+        }
+        if (c0 == '&' && c1 == '&') {
+            this.consumeOperator(2, SyntaxKind.AmpersandAmpersand, startPosition);
+            return;
+        }
+        if (c0 == '|' && c1 == '|') {
+            this.consumeOperator(2, SyntaxKind.PipePipe, startPosition);
+            return;
+        }
+        if (c0 == '+' && c1 == '+') {
+            this.consumeOperator(2, SyntaxKind.PlusPlus, startPosition);
+            return;
+        }
+        if (c0 == '-' && c1 == '-') {
+            this.consumeOperator(2, SyntaxKind.MinusMinus, startPosition);
+            return;
+        }
+        if (c0 == '<' && c1 == '<') {
+            this.consumeOperator(2, SyntaxKind.LessLess, startPosition);
+            return;
+        }
+        if (c0 == '>' && c1 == '>') {
+            this.consumeOperator(2, SyntaxKind.GreaterGreater, startPosition);
+            return;
+        }
+        if (c0 == '+' && c1 == '=') {
+            this.consumeOperator(2, SyntaxKind.PlusEquals, startPosition);
+            return;
+        }
+        if (c0 == '-' && c1 == '=') {
+            this.consumeOperator(2, SyntaxKind.MinusEquals, startPosition);
+            return;
+        }
+        if (c0 == '*' && c1 == '=') {
+            this.consumeOperator(2, SyntaxKind.StarEquals, startPosition);
+            return;
+        }
+        if (c0 == '/' && c1 == '=') {
+            this.consumeOperator(2, SyntaxKind.SlashEquals, startPosition);
+            return;
+        }
+        if (c0 == '%' && c1 == '=') {
+            this.consumeOperator(2, SyntaxKind.PercentEquals, startPosition);
+            return;
+        }
+        if (c0 == '&' && c1 == '=') {
+            this.consumeOperator(2, SyntaxKind.AmpersandEquals, startPosition);
+            return;
+        }
+        if (c0 == '|' && c1 == '=') {
+            this.consumeOperator(2, SyntaxKind.PipeEquals, startPosition);
+            return;
+        }
+        if (c0 == '^' && c1 == '=') {
+            this.consumeOperator(2, SyntaxKind.CaretEquals, startPosition);
+            return;
+        }
+        if (c0 == '?' && c1 == '.') {
+            this.consumeOperator(2, SyntaxKind.QuestionDot, startPosition);
+            return;
+        }
+        if (c0 == '?' && c1 == '?') {
+            this.consumeOperator(2, SyntaxKind.QuestionQuestion, startPosition);
+            return;
+        }
+
+        let single = singleCharacterKind(c0);
+        if (single != null) {
+            this.consumeOperator(1, single, startPosition);
+            return;
+        }
+        this.lexInvalidCharacter(startPosition, c0);
+    }
+
+    private consumeOperator(long count, SyntaxKind operatorKind, long startPosition) {
+        for (long i = 0; i < count; i = i + 1) {
+            this.advance();
+        }
+        this.emit(operatorKind, startPosition);
+    }
+
+    // A byte that begins no token form: emit an Invalid token spanning the whole
+    // offending character (a full UTF-8 codepoint when the lead byte is one) and
+    // report it, then carry on so one bad byte does not derail the rest.
+    private lexInvalidCharacter(long startPosition, byte lead) {
+        this.advance();
+        let trailing = utf8SequenceLength(lead) - 1;
+        long consumed = 0;
+        while (consumed < trailing && !this.atEnd() && isContinuationByte(this.peek(0))) {
+            this.advance();
+            consumed = consumed + 1;
+        }
+        let sequence = this.sourceText.substring(startPosition, this.position);
+        this.report("Unexpected character '{sequence}'", startPosition, this.position);
+        this.emit(SyntaxKind.Invalid, startPosition);
+    }
+}
+
+// Splits the flat stream into significant tokens carrying their trivia. A
+// token's trailing trivia runs from just after it up to and including the first
+// newline (or end of file); the rest becomes the next token's leading. The
+// EndOfFile token, always last, owns the file's remaining tail as leading.
+private attachTrivia(RawToken[] pieces) -> LexedToken[] {
+    let tokens = new Vector<LexedToken>();
+    let count = pieces.length;
+    long index = 0;
+    while (index < count) {
+        let leadingStart = index;
+        while (index < count && kind.isTrivia(pieces[index].kind)) {
+            index = index + 1;
+        }
+        let tokenIndex = index;
+        let tokenPiece = pieces[index];
+        index = index + 1;
+        let trailingStart = index;
+        while (index < count && kind.isTrivia(pieces[index].kind)) {
+            let triviaKind = pieces[index].kind;
+            index = index + 1;
+            if (triviaKind == SyntaxKind.Newline) {
+                break;
+            }
+        }
+        LexedToken lexed;
+        lexed.kind = tokenPiece.kind;
+        lexed.offset = tokenPiece.offset;
+        lexed.length = tokenPiece.length;
+        lexed.leading = sliceRawTokens(pieces, leadingStart, tokenIndex);
+        lexed.trailing = sliceRawTokens(pieces, trailingStart, index);
+        tokens.push(lexed);
+        if (tokenPiece.kind == SyntaxKind.EndOfFile) {
+            break;
+        }
+    }
+    return tokens.toArray();
+}
+
+private sliceRawTokens(RawToken[] pieces, long startIndex, long endIndex) -> RawToken[] {
+    RawToken[] result = new RawToken[endIndex - startIndex];
+    for (long i = 0; i < result.length; i = i + 1) {
+        result[i] = pieces[startIndex + i];
+    }
+    return result;
+}
+
+private isAsciiLetter(byte c) -> bool {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+private isDigit(byte c) -> bool {
+    return c >= '0' && c <= '9';
+}
+
+private isHexDigit(byte c) -> bool {
+    return isDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+private isIdentifierStart(byte c) -> bool {
+    return isAsciiLetter(c) || c == '_' || c == '$';
+}
+
+private isIdentifierContinue(byte c) -> bool {
+    return isIdentifierStart(c) || isDigit(c);
+}
+
+private isSimpleEscape(byte c) -> bool {
+    return c == '\\' || c == '"' || c == '\'' || c == 'n' || c == 'r'
+        || c == 't' || c == 'b' || c == 'f' || c == '0' || c == '{' || c == '}';
+}
+
+private isContinuationByte(byte c) -> bool {
+    return c >= 0x80 && c <= 0xBF;
+}
+
+// Byte length of a UTF-8 codepoint from its lead byte; 1 for ASCII or a byte
+// that is not a valid lead, so a stray byte spans just itself.
+private utf8SequenceLength(byte lead) -> long {
+    if (lead < 0x80) {
+        return 1;
+    }
+    if (lead >= 0xF0 && lead <= 0xF7) {
+        return 4;
+    }
+    if (lead >= 0xE0 && lead <= 0xEF) {
+        return 3;
+    }
+    if (lead >= 0xC0 && lead <= 0xDF) {
+        return 2;
+    }
+    return 1;
+}
+
+private singleCharacterKind(byte c) -> SyntaxKind? {
+    if (c == '(') {
+        return SyntaxKind.OpenParenthesis;
+    }
+    if (c == ')') {
+        return SyntaxKind.CloseParenthesis;
+    }
+    if (c == '{') {
+        return SyntaxKind.OpenBrace;
+    }
+    if (c == '}') {
+        return SyntaxKind.CloseBrace;
+    }
+    if (c == '[') {
+        return SyntaxKind.OpenBracket;
+    }
+    if (c == ']') {
+        return SyntaxKind.CloseBracket;
+    }
+    if (c == ';') {
+        return SyntaxKind.Semicolon;
+    }
+    if (c == ',') {
+        return SyntaxKind.Comma;
+    }
+    if (c == '.') {
+        return SyntaxKind.Dot;
+    }
+    if (c == ':') {
+        return SyntaxKind.Colon;
+    }
+    if (c == '+') {
+        return SyntaxKind.Plus;
+    }
+    if (c == '-') {
+        return SyntaxKind.Minus;
+    }
+    if (c == '*') {
+        return SyntaxKind.Star;
+    }
+    if (c == '/') {
+        return SyntaxKind.Slash;
+    }
+    if (c == '%') {
+        return SyntaxKind.Percent;
+    }
+    if (c == '^') {
+        return SyntaxKind.Caret;
+    }
+    if (c == '=') {
+        return SyntaxKind.Equals;
+    }
+    if (c == '!') {
+        return SyntaxKind.Exclamation;
+    }
+    if (c == '?') {
+        return SyntaxKind.Question;
+    }
+    if (c == '<') {
+        return SyntaxKind.Less;
+    }
+    if (c == '>') {
+        return SyntaxKind.Greater;
+    }
+    if (c == '&') {
+        return SyntaxKind.Ampersand;
+    }
+    if (c == '|') {
+        return SyntaxKind.Pipe;
+    }
+    if (c == '@') {
+        return SyntaxKind.At;
+    }
+    return null;
+}
