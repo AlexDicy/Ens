@@ -233,20 +233,40 @@ bool runDriverAnalysis(std::vector<std::unique_ptr<Module>>& modules,
     return true;
 }
 
+// A resolver that maps any module path in the compilation to its analysis and
+// source, so codegen can emit a node against the module that owns it (e.g. a
+// struct's field defaults reached through a generic instantiation in another
+// module). The pointers stay valid for the lifetime of `modules`.
+CodeGenerator::ModuleResolver makeModuleResolver(
+        const std::vector<std::unique_ptr<Module>>& modules) {
+    auto table = std::make_shared<
+        std::unordered_map<std::u16string, CodeGenerator::ModuleAnalysis>>();
+    for (const auto& m : modules) {
+        if (!m || !m->source) continue;
+        (*table)[m->modulePath] =
+            CodeGenerator::ModuleAnalysis{&m->analyzer->result(), m->source.get()};
+    }
+    return [table](const std::u16string& path) -> CodeGenerator::ModuleAnalysis {
+        auto it = table->find(path);
+        return it == table->end() ? CodeGenerator::ModuleAnalysis{} : it->second;
+    };
+}
+
 bool emitModule(Module& module,
                 const std::string& moduleName,
                 const fs::path& objectPath,
                 const std::string& targetTriple,
-                TypeContext& sharedCtx) {
+                TypeContext& sharedCtx,
+                const CodeGenerator::ModuleResolver& resolver) {
     CodeGenerator codegen(moduleName, module.source->getFilename(),
                           *module.source, module.analyzer->result(), module.modulePath, targetTriple,
-                          &sharedCtx);
+                          &sharedCtx, resolver);
     if (!codegen.generate(*module.rootNode)) {
-        for (const auto& d : codegen.getDiagnostics()) d.print(*module.source, std::cerr);
+        codegen.printDiagnostics(std::cerr);
         return false;
     }
     if (!codegen.emitObjectFile(objectPath.string())) {
-        for (const auto& d : codegen.getDiagnostics()) d.print(*module.source, std::cerr);
+        codegen.printDiagnostics(std::cerr);
         return false;
     }
     return true;
@@ -269,10 +289,11 @@ bool linkModulesToExe(std::vector<std::unique_ptr<Module>>& modules,
         for (auto& l : libraries) if (l == asciiLib) return;
         libraries.push_back(std::move(asciiLib));
     };
+    CodeGenerator::ModuleResolver resolver = makeModuleResolver(modules);
     for (auto& m : modules) {
         std::string name = baseStem + "." + sanitizeForFilename(m->modulePath) + ".obj";
         fs::path objPath = outDir / name;
-        if (!emitModule(*m, "ens_" + sanitizeForFilename(m->modulePath), objPath, targetTriple, sharedCtx)) return false;
+        if (!emitModule(*m, "ens_" + sanitizeForFilename(m->modulePath), objPath, targetTriple, sharedCtx, resolver)) return false;
         objectPaths.push_back(objPath.string());
         for (auto& lib : m->analyzer->linkLibraries()) addLibrary(lib);
     }
@@ -327,13 +348,14 @@ bool Compiler::compile(const fs::path& source,
     const bool linkToExe = !outputFolder.empty() && (ext == ".exe" || ext.empty());
 
     if (outputFolder.empty()) {
+        CodeGenerator::ModuleResolver resolver = makeModuleResolver(modules);
         for (auto& m : modules) {
             CodeGenerator codegen("ens_" + sanitizeForFilename(m->modulePath),
                                   m->source->getFilename(),
                                   *m->source, m->analyzer->result(), m->modulePath, targetTriple,
-                                  &sharedCtx);
+                                  &sharedCtx, resolver);
             if (!codegen.generate(*m->rootNode)) {
-                for (const auto& d : codegen.getDiagnostics()) d.print(*m->source, std::cerr);
+                codegen.printDiagnostics(std::cerr);
                 return false;
             }
             std::cout << "--- LLVM IR (" << asciiOfU16(m->modulePath) << ") ---\n";
@@ -731,9 +753,9 @@ bool Compiler::compileSingle(std::istream& source, const fs::path& outputFile, c
     CodeGenerator codegen("ens_" + sanitizeForFilename(user->modulePath),
                           user->source->getFilename(),
                           *user->source, user->analyzer->result(), user->modulePath, targetTriple,
-                          &sharedCtx);
+                          &sharedCtx, makeModuleResolver(modules));
     if (!codegen.generate(*user->rootNode)) {
-        for (const auto& d : codegen.getDiagnostics()) d.print(*user->source, std::cerr);
+        codegen.printDiagnostics(std::cerr);
         return false;
     }
     if (outputFile.empty()) {
@@ -752,7 +774,7 @@ bool Compiler::compileSingle(std::istream& source, const fs::path& outputFile, c
     }
     if (ext == ".obj" || ext == ".o") {
         if (!codegen.emitObjectFile(outputFile.string())) {
-            for (const auto& d : codegen.getDiagnostics()) d.print(*user->source, std::cerr);
+            codegen.printDiagnostics(std::cerr);
             return false;
         }
         return true;

@@ -106,8 +106,14 @@ static uint32_t fnv1a32(const std::string& s) {
 struct CodeGenerator::Impl {
     std::string moduleName;
     std::string sourceFilename;
-    const SourceFile& sourceFile;
-    const AnalysisResult& analysis;
+    // Source and analysis of the module whose nodes are currently being emitted.
+    // Normally the module being generated; temporarily rebound (ScopedModuleBinding)
+    // to a foreign module while emitting nodes that module owns.
+    const SourceFile* sourceFile;
+    const AnalysisResult* analysis;
+    // Looks up any module's analysis/source by path, so a foreign node can be
+    // resolved against its owning module. Null in single-module callers.
+    CodeGenerator::ModuleResolver moduleResolver;
     TypeContext* typeCtx = nullptr;  // shared context, for enumerating instantiations
 
     // Active monomorphization substitution while emitting a generic instance/function
@@ -163,6 +169,13 @@ struct CodeGenerator::Impl {
     llvm::DIFile* diFile = nullptr;
     bool debugEnabled = true;
     std::vector<Diagnostic> diagnostics;
+    // The source each diagnostic was raised against (parallel to diagnostics),
+    // so foreign-node diagnostics render against the file that owns the node.
+    std::vector<const SourceFile*> diagnosticSources;
+    // While emitting a field-default expression, the node offsets are relative to
+    // the field declaration (it is re-rooted), not the file. This holds the field
+    // declaration's absolute offset so any diagnostic points at that field.
+    std::optional<uint32_t> diagnosticOffsetOverride;
 
     struct OwnedLocal {
         llvm::Value* alloca;
@@ -213,13 +226,40 @@ struct CodeGenerator::Impl {
     };
     std::vector<DefaultInitContext> defaultInitStack;
 
+    // Rebinds analysis + source to a foreign module while emitting nodes that
+    // module owns, restoring the previous binding on scope exit. A null analysis
+    // leaves the current binding untouched (the single-module fallback).
+    struct ScopedModuleBinding {
+        Impl& impl;
+        const AnalysisResult* savedAnalysis;
+        const SourceFile* savedSource;
+        bool active;
+        ScopedModuleBinding(Impl& i, const AnalysisResult* a, const SourceFile* s)
+            : impl(i), savedAnalysis(i.analysis), savedSource(i.sourceFile), active(a != nullptr) {
+            if (active) {
+                impl.analysis = a;
+                if (s) impl.sourceFile = s;
+            }
+        }
+        ~ScopedModuleBinding() {
+            if (active) {
+                impl.analysis = savedAnalysis;
+                impl.sourceFile = savedSource;
+            }
+        }
+        ScopedModuleBinding(const ScopedModuleBinding&) = delete;
+        ScopedModuleBinding& operator=(const ScopedModuleBinding&) = delete;
+    };
+
     std::u16string modulePath;
     std::string targetTriple;   // empty = host default; set by --target for cross-compilation
 
     Impl(std::string mn, std::string sf, const SourceFile& src, const AnalysisResult& an,
-         std::u16string mp, std::string triple, TypeContext* tc)
+         std::u16string mp, std::string triple, TypeContext* tc,
+         CodeGenerator::ModuleResolver resolver)
         : moduleName(std::move(mn)), sourceFilename(std::move(sf)),
-          sourceFile(src), analysis(an), modulePath(std::move(mp)), targetTriple(std::move(triple)),
+          sourceFile(&src), analysis(&an), moduleResolver(std::move(resolver)),
+          modulePath(std::move(mp)), targetTriple(std::move(triple)),
           typeCtx(tc) {
         module = std::make_unique<llvm::Module>(moduleName, ctx);
         module->setSourceFileName(sourceFilename);
@@ -242,7 +282,7 @@ struct CodeGenerator::Impl {
     }
 
     std::pair<int,int> posOf(uint32_t offset) const {
-        return sourceFile.offsetToPosition(offset);
+        return sourceFile->offsetToPosition(offset);
     }
 
     void setLocation(uint32_t offset) {
@@ -256,8 +296,9 @@ struct CodeGenerator::Impl {
     void setLocationFromNode(const SyntaxNode& n) { setLocation(n.startOffset()); }
 
     void error(uint32_t offset, std::string msg) {
-        auto [line, col] = posOf(offset);
+        auto [line, col] = posOf(diagnosticOffsetOverride.value_or(offset));
         diagnostics.emplace_back(DiagnosticLevel::Error, SourceSpan{line, col, 1}, std::move(msg));
+        diagnosticSources.push_back(sourceFile);
     }
 
     bool isUnsupportedType(::Type* t) {
@@ -485,17 +526,17 @@ struct CodeGenerator::Impl {
     }
 
     Symbol* symbolOf(const SyntaxNode& node) const {
-        const auto* info = analysis.find(node.greenNode());
+        const auto* info = analysis->find(node.greenNode());
         return info ? info->resolvedSymbol : nullptr;
     }
 
     Symbol* methodSymbolOf(const SyntaxNode& node) const {
-        const auto* info = analysis.find(node.greenNode());
+        const auto* info = analysis->find(node.greenNode());
         return info ? mapInstanceMethod(info->resolvedMethodSymbol) : nullptr;
     }
 
     ::Type* typeOf(const SyntaxNode& node) const {
-        return subst(analysis.typeOf(node.greenNode()));
+        return subst(analysis->typeOf(node.greenNode()));
     }
 
     // Apply the active monomorphization substitution to a semantic type. A no-op
@@ -686,7 +727,7 @@ struct CodeGenerator::Impl {
                          ::Type* recvOverride = nullptr) {
         Symbol* sym = symOverride ? symOverride : symbolOf(fn.node);
         if (!sym) return;
-        ::Type* receiver = recvOverride ? recvOverride : analysis.receiverOf(fn.node.greenNode());
+        ::Type* receiver = recvOverride ? recvOverride : analysis->receiverOf(fn.node.greenNode());
 
         std::vector<llvm::Type*> paramTypes;
         if (receiver) paramTypes.push_back(llvm::PointerType::get(ctx, 0));
@@ -805,7 +846,7 @@ struct CodeGenerator::Impl {
 
         setLocationFromNode(fn.node);
 
-        ::Type* receiver = recvOverride ? recvOverride : analysis.receiverOf(fn.node.greenNode());
+        ::Type* receiver = recvOverride ? recvOverride : analysis->receiverOf(fn.node.greenNode());
 
         {
             auto rawName = fn.nameText().value_or(std::u16string{});
@@ -828,7 +869,7 @@ struct CodeGenerator::Impl {
         auto argEnd  = currentFunction->args().end();
 
         // Implicit `this` parameter for methods
-        Symbol* thisSym = analysis.thisSymbolOf(fn.node.greenNode());
+        Symbol* thisSym = analysis->thisSymbolOf(fn.node.greenNode());
         if (receiver && argIter != argEnd) {
             argIter->setName("this");
             llvm::Type* ptrTy = llvm::PointerType::get(ctx, 0);
@@ -1075,7 +1116,7 @@ struct CodeGenerator::Impl {
         auto clauses = fn.catchClauses();
         for (auto& cc : clauses) {
             ::Type* ct = cc.typeReference()
-                ? analysis.typeOf(cc.typeReference()->node.greenNode()) : nullptr;
+                ? analysis->typeOf(cc.typeReference()->node.greenNode()) : nullptr;
             StructInfo* csi = (ct && ct->structInfo) ? ct->structInfo : nullptr;
             auto* bodyBB = llvm::BasicBlock::Create(ctx, "catch.body", currentFunction);
             auto* nextBB = llvm::BasicBlock::Create(ctx, "catch.next", currentFunction);
@@ -1087,7 +1128,7 @@ struct CodeGenerator::Impl {
 
             builder->SetInsertPoint(bodyBB);
             Symbol* var = nullptr;
-            if (auto* info = analysis.find(cc.node.greenNode())) var = info->resolvedSymbol;
+            if (auto* info = analysis->find(cc.node.greenNode())) var = info->resolvedSymbol;
             auto* varSlot = createEntryAlloca(currentFunction, ptrTy, "catch.var");
             builder->CreateStore(exc, varSlot);
             if (var) values[var] = varSlot;
@@ -1641,6 +1682,19 @@ struct CodeGenerator::Impl {
 
     void initStructFieldDefaults(::Type* t, llvm::Value* base) {
         if (!t || !t->structInfo) return;
+        // A struct's field-default expressions are green nodes owned by the module
+        // that declares the struct (the template's module for a generic instance).
+        // Their analysis facts (enum constants, sibling-field bindings, resolved
+        // calls) live in that module's AnalysisResult, so bind to it while emitting
+        // them. Recursing into a nested struct's defaults rebinds to its own module.
+        const AnalysisResult* declAnalysis = nullptr;
+        const SourceFile* declSource = nullptr;
+        if (moduleResolver) {
+            CodeGenerator::ModuleAnalysis owner = moduleResolver(t->structInfo->modulePath);
+            declAnalysis = owner.analysis;
+            declSource = owner.source;
+        }
+        ScopedModuleBinding bind(*this, declAnalysis, declSource);
         llvm::StructType* st = mapStructType(t);
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         const auto& fields = t->structInfo->fields;
@@ -1654,7 +1708,14 @@ struct CodeGenerator::Impl {
                 if (fd) {
                     if (auto dv = fd->defaultValue()) {
                         if (auto dvExpr = dv->expression()) {
-                            if (llvm::Value* v = emitExprConverted(*dvExpr, fi.type)) {
+                            std::optional<uint32_t> savedOverride = diagnosticOffsetOverride;
+                            if (fi.line > 0) {
+                                diagnosticOffsetOverride =
+                                    sourceFile->positionToOffset(fi.line, fi.column);
+                            }
+                            llvm::Value* v = emitExprConverted(*dvExpr, fi.type);
+                            diagnosticOffsetOverride = savedOverride;
+                            if (v) {
                                 llvm::Value* fieldAddr = builder->CreateStructGEP(
                                     st, base, static_cast<unsigned>(i), asAscii(fi.name) + ".addr");
                                 bool borrowed = !expressionProducesOwnedRef(*dvExpr);
@@ -5701,7 +5762,7 @@ struct CodeGenerator::Impl {
 
     bool appendCallArgs(Symbol* sym, const std::vector<ast::Expression>& userArgs,
                         const GreenElement* callNode, std::vector<llvm::Value*>& out) {
-        const std::vector<int>* order = callNode ? analysis.callArgOrderOf(callNode) : nullptr;
+        const std::vector<int>* order = callNode ? analysis->callArgOrderOf(callNode) : nullptr;
         if (order && sym) return appendMappedCallArgs(sym, userArgs, *order, out);
         for (size_t i = 0; i < userArgs.size(); ++i) {
             auto& a = userArgs[i];
@@ -6186,7 +6247,7 @@ struct CodeGenerator::Impl {
     // instance (mangled by its type args) and call it, with the substitution
     // active so the signature and argument conversions use concrete types.
     llvm::Value* emitGenericCall(Symbol* sym, const ast::CallExpression& e) {
-        const std::vector<::Type*>* targs = analysis.callTypeArgsOf(e.node.greenNode());
+        const std::vector<::Type*>* targs = analysis->callTypeArgsOf(e.node.greenNode());
         if (!targs) {
             error(e.node.startOffset(), "Internal: generic call has no resolved type arguments");
             return nullptr;
@@ -6427,7 +6488,7 @@ struct CodeGenerator::Impl {
 
     llvm::Value* emitMember(const ast::MemberExpression& e) {
         // the analyzer resolved this to an enum member constant.
-        if (auto ec = analysis.enumConstantOf(e.node.greenNode())) {
+        if (auto ec = analysis->enumConstantOf(e.node.greenNode())) {
             return llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), *ec, /*isSigned=*/true);
         }
         auto obj = e.object();
@@ -6871,7 +6932,7 @@ struct CodeGenerator::Impl {
                 for (auto& label : arm->labels()) {
                     if (isNullSwitchLabel(label)) continue;
                     llvm::ConstantInt* cv = nullptr;
-                    if (auto ec = analysis.enumConstantOf(label.node.greenNode())) {
+                    if (auto ec = analysis->enumConstantOf(label.node.greenNode())) {
                         cv = llvm::ConstantInt::get(intTy, *ec, /*isSigned=*/true);
                     } else if (auto* c = llvm::dyn_cast_or_null<llvm::ConstantInt>(emitExpr(label))) {
                         cv = llvm::ConstantInt::get(intTy, c->getSExtValue(), /*isSigned=*/true);
@@ -7025,7 +7086,7 @@ struct CodeGenerator::Impl {
         auto isTemplateDecl = [&](const ast::FuncDecl& fn) {
             Symbol* s = symbolOf(fn.node);
             if (s && s->isTemplate) return true;
-            ::Type* recv = analysis.receiverOf(fn.node.greenNode());
+            ::Type* recv = analysis->receiverOf(fn.node.greenNode());
             return recv && recv->structInfo && recv->structInfo->isTemplate;
         };
         auto eachDecl = [&](auto&& visit) {
@@ -7044,7 +7105,7 @@ struct CodeGenerator::Impl {
         // thrown or caught (e.g. the prelude's Error), so its definition exists.
         // Templates have no runtime identity; their instantiations emit their own.
         for (auto& cd : sf->classes()) {
-            if (Type* t = analysis.typeOf(cd.node.greenNode())) {
+            if (Type* t = analysis->typeOf(cd.node.greenNode())) {
                 if (t->structInfo && !t->structInfo->isTemplate) getOrEmitTypeDescriptor(t->structInfo);
                 if (t->structInfo && t->structInfo->name == u"StackFrame" && isPreludeModule())
                     stackFrameType = t;
@@ -7052,7 +7113,7 @@ struct CodeGenerator::Impl {
         }
         // Interfaces likewise own their runtime identity in their defining module.
         for (auto& id : sf->interfaces()) {
-            if (Type* t = analysis.typeOf(id.node.greenNode())) {
+            if (Type* t = analysis->typeOf(id.node.greenNode())) {
                 if (t->structInfo && !t->structInfo->isTemplate) getOrEmitTypeDescriptor(t->structInfo);
             }
         }
@@ -7120,9 +7181,11 @@ CodeGenerator::CodeGenerator(std::string moduleName,
                                    const AnalysisResult& analysis,
                                    std::u16string modulePath,
                                    std::string targetTriple,
-                                   TypeContext* typeContext)
+                                   TypeContext* typeContext,
+                                   ModuleResolver moduleResolver)
     : impl(std::make_unique<Impl>(std::move(moduleName), std::move(sourceFilename), src, analysis,
-                                  std::move(modulePath), std::move(targetTriple), typeContext)) {}
+                                  std::move(modulePath), std::move(targetTriple), typeContext,
+                                  std::move(moduleResolver))) {}
 
 CodeGenerator::~CodeGenerator() = default;
 
@@ -7131,3 +7194,12 @@ void CodeGenerator::print(std::ostream& os) const    { impl->print(os); }
 bool CodeGenerator::emitObjectFile(const std::string& path) { return impl->emitObjectFile(path); }
 bool CodeGenerator::hasErrors() const                { return !impl->diagnostics.empty(); }
 const std::vector<Diagnostic>& CodeGenerator::getDiagnostics() const { return impl->diagnostics; }
+
+void CodeGenerator::printDiagnostics(std::ostream& os) const {
+    for (size_t i = 0; i < impl->diagnostics.size(); ++i) {
+        const SourceFile* src = i < impl->diagnosticSources.size()
+            ? impl->diagnosticSources[i] : nullptr;
+        if (!src) src = impl->sourceFile;
+        impl->diagnostics[i].print(*src, os);
+    }
+}
