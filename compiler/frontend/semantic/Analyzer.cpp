@@ -5095,6 +5095,15 @@ void Analyzer::analyzeRethrowStmt(const ast::RethrowStatement& stmt) {
 namespace {
 
 std::optional<int64_t> switchIntLabelValue(const ast::Expression& e) {
+    // A char literal is an integer constant: its value is its codepoint. This
+    // lets `'A'` and `65` name the same label, so mixing them is a duplicate.
+    if (auto lit = e.asLiteral()) {
+        if (lit->literalKind() == SyntaxKind::CharLiteral) {
+            if (auto tok = lit->token())
+                return static_cast<int64_t>(parseCharLiteralCodepoint(tok->tokenText()));
+            return std::nullopt;
+        }
+    }
     const ast::LiteralExpression* lit = asIntLiteralChild(e);
     if (!lit) return std::nullopt;
     auto tok = lit->token();
