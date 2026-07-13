@@ -488,7 +488,18 @@ void Parser::parseParameter() {
         } else {
             emitMissing(SyntaxKind::Identifier, "parameter type");
         }
-        expect(SyntaxKind::Identifier, "parameter name");
+        // A keyword in the name slot (e.g. `string from`) would otherwise cascade
+        // into a stream of unrelated errors; report it once and recover by taking
+        // the keyword as the name, mirroring keyword-named method recovery.
+        if (isKeyword(kindAt())) {
+            std::string word;
+            for (char16_t c : tokenAt().text) word.push_back(c < 128 ? static_cast<char>(c) : '?');
+            reportAtCurrent("'" + word + "' is a keyword and cannot be used as a parameter name; "
+                "choose a different name such as 'source'");
+            bumpAs(SyntaxKind::Identifier);
+        } else {
+            expect(SyntaxKind::Identifier, "parameter name");
+        }
     }
     if (at(SyntaxKind::Eq)) parseDefaultValue();
     builder.finishNode();
