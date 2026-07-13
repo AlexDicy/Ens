@@ -763,7 +763,16 @@ struct CodeGenerator::Impl {
         // records the process arguments and, when `main` throws, handles the
         // error slot and prints any escaping exception.
         if (!receiver && mangled == "main") mangled = "ens.main";
-        auto* func = llvm::Function::Create(fnType, llvm::Function::ExternalLinkage, mangled, module.get());
+        // A top-level `private` free function is only ever called from inside its
+        // own module (the analyzer rejects cross-module private calls), so it gets
+        // internal linkage under its unmangled name. Without this, two modules that
+        // each declare a same-named private function would collide at link time.
+        // Public functions keep external linkage, and methods are mangled by their
+        // owning class so they never collide across modules.
+        auto linkage = (!receiver && !sym->isPublic)
+            ? llvm::Function::InternalLinkage
+            : llvm::Function::ExternalLinkage;
+        auto* func = llvm::Function::Create(fnType, linkage, mangled, module.get());
         values[sym] = func;
     }
 
