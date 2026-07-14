@@ -1,0 +1,119 @@
+// The corpus round-trip harness: a standalone driver that runs the self-hosted front end over
+// every .ens file in the repository's real source trees and asserts two invariants.
+//
+//   1. Round-trip: the green tree's full text reproduces the source byte for byte, on every file
+//      including the parse-error fixtures.
+//   2. Clean parse: a file parses with zero diagnostics unless it is an intentional parse-error
+//      fixture. A file is allowed to carry parse diagnostics only when it contains an
+//      "@expect-error" directive; a file without that directive must parse with no diagnostics.
+//
+// The build system enumerates the corpus (the standard library has no directory walk) and writes a
+// manifest of absolute paths, one per line. The harness takes the manifest path as its single
+// argument, reads it, and processes each file. It exits 0 only when every file passes; otherwise it
+// prints every failure and exits nonzero so a regression is diagnosable.
+import @std.system;
+import SystemError from @std.system;
+import Vector from @std.vector;
+import Source from source;
+import parser;
+
+main() -> int {
+    string[] arguments = system.arguments();
+    if (arguments.length < 2) {
+        print("corpus: usage: corpus <manifest-path>");
+        return 2;
+    }
+    string manifestText = try system.readAllText(arguments[1]);
+    string[] paths = splitLines(manifestText);
+
+    long total = 0;
+    let roundTripFailures = new Vector<string>();
+    let diagnosticFailures = new Vector<string>();
+
+    for (long i = 0; i < paths.length; i++) {
+        string path = paths[i];
+        if (path.length == 0) {
+            continue;
+        }
+        total++;
+        string text = try system.readAllText(path);
+        let result = parser.parse(new Source(path, text));
+
+        string produced = result.root().fullText();
+        if (produced != text) {
+            long offset = firstDifference(text, produced);
+            roundTripFailures.push("{path}: round-trip differs at byte {offset} "
+                + "(source {text.length} bytes, produced {produced.length} bytes)");
+        }
+
+        if (!text.contains("@expect-error")) {
+            let diagnostics = result.diagnostics();
+            if (diagnostics.length != 0) {
+                let span = diagnostics[0].span();
+                diagnosticFailures.push("{path}: {diagnostics.length} unexpected parse "
+                    + "diagnostic(s); first at byte {span.start} length {span.length}: "
+                    + diagnostics[0].message());
+            }
+        }
+    }
+
+    print("corpus: processed {total} file(s)");
+    print("corpus: {roundTripFailures.length()} round-trip failure(s), "
+        + "{diagnosticFailures.length()} unexpected-diagnostic file(s)");
+    for (long i = 0; i < roundTripFailures.length(); i++) {
+        print("  round-trip: {roundTripFailures.get(i)}");
+    }
+    for (long i = 0; i < diagnosticFailures.length(); i++) {
+        print("  diagnostic: {diagnosticFailures.get(i)}");
+    }
+
+    if (roundTripFailures.length() == 0 && diagnosticFailures.length() == 0) {
+        print("corpus: all files round-trip and parse cleanly");
+        return 0;
+    }
+    return 1;
+} catch (SystemError e) {
+    print("corpus: {e.message}");
+    return 2;
+}
+
+// Splits the manifest into lines on '\n', dropping a trailing '\r' so a manifest written with
+// Windows line endings still yields clean paths. Empty lines are kept and skipped by the caller.
+private splitLines(string text) -> string[] {
+    let lines = new Vector<string>();
+    string rest = text;
+    while (true) {
+        long newline = rest.indexOf("\n");
+        if (newline < 0) {
+            lines.push(stripCarriageReturn(rest));
+            break;
+        }
+        lines.push(stripCarriageReturn(rest.substring(0, newline)));
+        rest = rest.substring(newline + 1, rest.length);
+    }
+    return lines.toArray();
+}
+
+private stripCarriageReturn(string line) -> string {
+    if (line.length > 0 && line.substring(line.length - 1, line.length) == "\r") {
+        return line.substring(0, line.length - 1);
+    }
+    return line;
+}
+
+// The first byte offset at which two strings differ, or the shorter length when one is a prefix of
+// the other. Used only to make a round-trip failure report actionable.
+private firstDifference(string expected, string actual) -> long {
+    byte[] expectedBytes = expected.toBytes();
+    byte[] actualBytes = actual.toBytes();
+    long limit = expectedBytes.length;
+    if (actualBytes.length < limit) {
+        limit = actualBytes.length;
+    }
+    for (long i = 0; i < limit; i++) {
+        if (expectedBytes[i] != actualBytes[i]) {
+            return i;
+        }
+    }
+    return limit;
+}
