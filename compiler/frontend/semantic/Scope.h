@@ -12,9 +12,11 @@ class Type;
 // distinguish by index kind so we can compare and invalidate precisely:
 //   * `IntIndex`   - integer-literal index (e.g. xs[0])
 //   * `IdentIndex` - plain identifier index (e.g. xs[i])
-// Other index forms (arithmetic, calls, member reads) are NOT narrowable.
+//   * `AnyIndex`   - any other index form (e.g. xs[i + 1]); such elements are
+//                    NOT narrowable, so this kind only appears in the written
+//                    path of an invalidation query, never in a stored key.
 struct PathSegment {
-    enum class Kind { Field, IntIndex, IdentIndex };
+    enum class Kind { Field, IntIndex, IdentIndex, AnyIndex };
     Kind kind = Kind::Field;
     std::u16string field;            // when Kind == Field
     int64_t intIndex = 0;            // when Kind == IntIndex
@@ -26,6 +28,7 @@ struct PathSegment {
             case Kind::Field:      return field == o.field;
             case Kind::IntIndex:   return intIndex == o.intIndex;
             case Kind::IdentIndex: return identIndexSym == o.identIndexSym;
+            case Kind::AnyIndex:   return true;
         }
         return false;
     }
@@ -57,6 +60,8 @@ struct NarrowingPathHash {
                 case PathSegment::Kind::IdentIndex:
                     segH ^= std::hash<Symbol*>{}(s.identIndexSym) * 0x9E3779B9u;
                     break;
+                case PathSegment::Kind::AnyIndex:
+                    break;
             }
             h = h * 1315423911u ^ segH;
         }
@@ -80,6 +85,9 @@ public:
 
     void clearNarrowingsForRoot(Symbol* root);
     void clearNarrowingsForRootMembers(Symbol* root);
-    void clearNarrowingsAtOrBelow(const NarrowingPath& prefix);
+    // Erases every narrowing whose storage a write through `written` could reach:
+    // segments must match, except that a subscript write may alias any subscript
+    // narrowing unless both indices are distinct integer literals.
+    void clearNarrowingsThatMayAlias(const NarrowingPath& written);
     void clearNarrowingsForIndexSymbol(Symbol* sym);
 };

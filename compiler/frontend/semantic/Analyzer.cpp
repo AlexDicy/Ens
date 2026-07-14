@@ -2453,7 +2453,8 @@ static ast::Expression unwrapParens(const ast::Expression& e) {
 
 std::optional<NarrowingPath> Analyzer::buildNarrowingPath(
     const ast::Expression& expr,
-    std::vector<Symbol*>* indexSymbols) const {
+    std::vector<Symbol*>* indexSymbols,
+    bool allowAnyIndex) const {
     ast::Expression core = unwrapParens(expr);
 
     if (auto id = core.asIdent()) {
@@ -2473,7 +2474,7 @@ std::optional<NarrowingPath> Analyzer::buildNarrowingPath(
         auto obj = m->object();
         auto name = m->memberText();
         if (!obj || !name) return std::nullopt;
-        auto base = buildNarrowingPath(*obj, indexSymbols);
+        auto base = buildNarrowingPath(*obj, indexSymbols, allowAnyIndex);
         if (!base) return std::nullopt;
         PathSegment seg;
         seg.kind = PathSegment::Kind::Field;
@@ -2485,10 +2486,20 @@ std::optional<NarrowingPath> Analyzer::buildNarrowingPath(
         auto obj = su->object();
         auto idx = su->index();
         if (!obj || !idx) return std::nullopt;
-        auto base = buildNarrowingPath(*obj, indexSymbols);
+        auto base = buildNarrowingPath(*obj, indexSymbols, allowAnyIndex);
         if (!base) return std::nullopt;
         ast::Expression idxCore = unwrapParens(*idx);
         PathSegment seg;
+        // An index that is neither an integer literal nor a plain identifier
+        // cannot be re-recognized on later reads; for write invalidation it
+        // still names some element, so it may alias every one.
+        auto unrecognizedIndex = [&]() -> std::optional<NarrowingPath> {
+            if (!allowAnyIndex) return std::nullopt;
+            PathSegment any;
+            any.kind = PathSegment::Kind::AnyIndex;
+            base->chain.push_back(std::move(any));
+            return base;
+        };
         // Integer literal index, possibly with unary minus.
         bool negative = false;
         ast::Expression idxInner = idxCore;
@@ -2506,10 +2517,10 @@ std::optional<NarrowingPath> Analyzer::buildNarrowingPath(
             if (lit->literalKind() == SyntaxKind::IntLiteral ||
                 lit->literalKind() == SyntaxKind::LongLiteral) {
                 auto tok = lit->token();
-                if (!tok) return std::nullopt;
+                if (!tok) return unrecognizedIndex();
                 uint64_t magnitude = 0;
                 if (!parseIntegerLiteralMagnitude(std::u16string(tok->tokenText()), magnitude)) {
-                    return std::nullopt;
+                    return unrecognizedIndex();
                 }
                 seg.kind = PathSegment::Kind::IntIndex;
                 seg.intIndex = negative ? -static_cast<int64_t>(magnitude)
@@ -2523,9 +2534,9 @@ std::optional<NarrowingPath> Analyzer::buildNarrowingPath(
         if (auto idId = idxCore.asIdent()) {
             auto* info = analysis.find(idId->node.greenNode());
             Symbol* sym = info ? info->resolvedSymbol : nullptr;
-            if (!sym) return std::nullopt;
+            if (!sym) return unrecognizedIndex();
             if (sym->kind != SymbolKind::Variable && sym->kind != SymbolKind::Parameter) {
-                return std::nullopt;
+                return unrecognizedIndex();
             }
             seg.kind = PathSegment::Kind::IdentIndex;
             seg.identIndexSym = sym;
@@ -2533,7 +2544,7 @@ std::optional<NarrowingPath> Analyzer::buildNarrowingPath(
             if (indexSymbols) indexSymbols->push_back(sym);
             return base;
         }
-        return std::nullopt;
+        return unrecognizedIndex();
     }
     return std::nullopt;
 }
@@ -4827,8 +4838,8 @@ void Analyzer::invalidateNarrowingsForWrite(const ast::Expression& target) {
         }
     }
     if (target.asMember() || target.asSubscript()) {
-        if (auto p = buildNarrowingPath(target)) {
-            currentScope->clearNarrowingsAtOrBelow(*p);
+        if (auto p = buildNarrowingPath(target, nullptr, /*allowAnyIndex=*/true)) {
+            currentScope->clearNarrowingsThatMayAlias(*p);
         }
     }
 }

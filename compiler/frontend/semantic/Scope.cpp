@@ -49,20 +49,36 @@ void Scope::clearNarrowingsForRootMembers(Symbol* root) {
     }
 }
 
-static bool startsWith(const std::vector<PathSegment>& chain,
-                       const std::vector<PathSegment>& prefix) {
-    if (chain.size() < prefix.size()) return false;
-    for (size_t i = 0; i < prefix.size(); ++i) {
-        if (!(chain[i] == prefix[i])) return false;
+// Whether a write through `written` could land in the storage `narrowed` names.
+// Fields alias only themselves. Subscripts with distinct integer-literal indices
+// never collide; every other index pairing might, since a variable or computed
+// index can hold any value at runtime.
+static bool segmentsMayAlias(const PathSegment& narrowed, const PathSegment& written) {
+    if (narrowed.kind == PathSegment::Kind::Field ||
+        written.kind == PathSegment::Kind::Field) {
+        return narrowed.kind == written.kind && narrowed.field == written.field;
+    }
+    if (narrowed.kind == PathSegment::Kind::IntIndex &&
+        written.kind == PathSegment::Kind::IntIndex) {
+        return narrowed.intIndex == written.intIndex;
     }
     return true;
 }
 
-void Scope::clearNarrowingsAtOrBelow(const NarrowingPath& prefix) {
+static bool mayAliasPrefix(const std::vector<PathSegment>& chain,
+                           const std::vector<PathSegment>& written) {
+    if (chain.size() < written.size()) return false;
+    for (size_t i = 0; i < written.size(); ++i) {
+        if (!segmentsMayAlias(chain[i], written[i])) return false;
+    }
+    return true;
+}
+
+void Scope::clearNarrowingsThatMayAlias(const NarrowingPath& written) {
     for (Scope* s = this; s; s = s->parent) {
         for (auto it = s->narrowedTypes.begin(); it != s->narrowedTypes.end();) {
             const NarrowingPath& key = it->first;
-            if (key.root == prefix.root && startsWith(key.chain, prefix.chain)) {
+            if (key.root == written.root && mayAliasPrefix(key.chain, written.chain)) {
                 it = s->narrowedTypes.erase(it);
             } else {
                 ++it;

@@ -465,6 +465,8 @@ if (ys[i] != null) {
 
 Narrowing is dropped when the analyzer can't prove the narrowed value is still non-null. Specifically:
 - Writing to the narrowed path or any deeper part of it (`r.door = null`, `xs[0] = null`).
+  Writing through a subscript also drops the narrowing of any element it could alias: `xs[j] = null` drops `xs[0]` because `j` could be `0`, and `xs[0] = null` drops `xs[i]`.
+  Elements narrowed at a different literal index are kept: `xs[2] = null` leaves `xs[0]` and `xs[1]` narrowed.
 - Reassigning the root variable or, for subscripts, the index variable.
 - Any function or method call whose receiver path or class/array-typed argument could touch the narrowed root. Calls that don't touch the relevant root (e.g. `print("hi")`) leave the narrowing intact.
   One exception: when the narrowed path is a plain local variable (or parameter), calling a method on it (`xs.length()`) keeps the binding's narrowing, because no callee can reassign the caller's binding.

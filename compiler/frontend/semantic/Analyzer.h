@@ -290,10 +290,13 @@ private:
 
     // Build a NarrowingPath from a member / subscript chain. Returns nullopt when
     // any segment is something we can't reliably re-recognize on later reads
-    // (calls, arithmetic indices, etc.).
+    // (calls, arithmetic indices, etc.). With `allowAnyIndex`, such an index
+    // becomes an AnyIndex segment instead, so write invalidation can treat it
+    // as potentially aliasing every element.
     std::optional<NarrowingPath> buildNarrowingPath(
         const ast::Expression& expr,
-        std::vector<Symbol*>* indexSymbols = nullptr) const;
+        std::vector<Symbol*>* indexSymbols = nullptr,
+        bool allowAnyIndex = false) const;
 
     void clearNarrowingsForCall(const ast::CallExpression& expr);
 
