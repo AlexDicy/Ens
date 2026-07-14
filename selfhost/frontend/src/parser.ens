@@ -61,6 +61,14 @@ public parseExpressionOnly(Source input) -> ParseResult {
     return finishParse(input, lexed, parser);
 }
 
+// Testing entry: parses one statement, wrapped the same way as parseExpressionOnly.
+public parseStatementOnly(Source input) -> ParseResult {
+    let lexed = lexer.lex(input);
+    let parser = new Parser(input, lexed.tokens());
+    parser.parseStandaloneStatement();
+    return finishParse(input, lexed, parser);
+}
+
 private finishParse(Source input, LexResult lexed, Parser parser) -> ParseResult {
     let root = treebuilder.buildTree(input, lexed.tokens(), parser.finishedEvents());
     let diagnostics = mergeDiagnostics(lexed.diagnostics(), parser.collectedDiagnostics());
@@ -191,6 +199,16 @@ class Parser {
     parseStandaloneExpression() {
         let marker = this.start();
         this.parseExpression();
+        while (!this.atEnd()) {
+            this.bump();
+        }
+        this.emitEndOfFile();
+        this.complete(marker, SyntaxKind.List);
+    }
+
+    parseStandaloneStatement() {
+        let marker = this.start();
+        this.parseStatement();
         while (!this.atEnd()) {
             this.bump();
         }
@@ -473,6 +491,425 @@ class Parser {
         }
     }
 
+    // ============================================================ statements
+
+    private parseStatement() {
+        switch (this.currentKind()) {
+            OpenBrace -> this.parseBlock(),
+            LetKeyword, ConstKeyword -> this.parseVariableDeclaration(),
+            IfKeyword -> this.parseIfStatement(),
+            WhileKeyword -> this.parseWhileStatement(),
+            ForKeyword -> this.parseForStatement(),
+            SwitchKeyword -> this.parseSwitchStatement(),
+            BreakKeyword -> this.parseKeywordStatement(SyntaxKind.BreakStatement,
+                "Expected ';' after 'break'"),
+            ContinueKeyword -> this.parseKeywordStatement(SyntaxKind.ContinueStatement,
+                "Expected ';' after 'continue'"),
+            RethrowKeyword -> this.parseKeywordStatement(SyntaxKind.RethrowStatement,
+                "Expected ';' after 'rethrow'"),
+            ReturnKeyword -> this.parseReturnStatement(),
+            ThrowKeyword -> this.parseThrowStatement(),
+            CatchKeyword -> this.parseStatementError(
+                "A 'catch' block can only follow a function body's closing '}'"),
+            default -> {
+                if (this.atTypedVariableDeclaration()) {
+                    this.parseVariableDeclaration();
+                } else if (canStartExpression(this.currentKind())) {
+                    this.parseExpressionStatement();
+                } else {
+                    this.parseStatementError("Expected a statement, for example an assignment, "
+                        + "a call, or a declaration like 'let count = 0;'");
+                }
+            },
+        }
+    }
+
+    private parseBlock() {
+        let marker = this.start();
+        this.expect(SyntaxKind.OpenBrace, "Expected '\{' to begin the block");
+        let statements = this.start();
+        while (!this.at(SyntaxKind.CloseBrace) && !this.atEnd()) {
+            this.parseStatement();
+        }
+        this.complete(statements, SyntaxKind.List);
+        this.expect(SyntaxKind.CloseBrace, "Expected '\}' to close the block");
+        this.complete(marker, SyntaxKind.Block);
+    }
+
+    // For a required Block slot when no '{' is present: an empty Block with missing braces keeps
+    // the typed accessors total, and the single diagnostic explains what was expected.
+    private parseBlockOrMissing(string message) {
+        if (this.at(SyntaxKind.OpenBrace)) {
+            this.parseBlock();
+            return;
+        }
+        this.report(message, source.makeSpan(this.lastContentEnd, 0));
+        let marker = this.start();
+        this.pushMissingToken();
+        let statements = this.start();
+        this.complete(statements, SyntaxKind.List);
+        this.pushMissingToken();
+        this.complete(marker, SyntaxKind.Block);
+    }
+
+    // Recovery inside blocks: wraps the junk in an ErrorStatement; a ';' ends the junk and is
+    // consumed into it, and a '}' ends it unconsumed so the enclosing block can close.
+    private parseStatementError(string message) {
+        this.reportAtCurrent(message);
+        let marker = this.start();
+        let skipped = this.start();
+        while (!this.atEnd()) {
+            let kind = this.currentKind();
+            if (kind == SyntaxKind.CloseBrace) {
+                break;
+            }
+            if (kind == SyntaxKind.Semicolon) {
+                this.bump();
+                break;
+            }
+            this.bump();
+        }
+        this.complete(skipped, SyntaxKind.List);
+        this.complete(marker, SyntaxKind.ErrorStatement);
+    }
+
+    // True at `Type name = ...` or `Type name;`, the typed variable-declaration shape. The type
+    // is parsed speculatively and always rewound; the caller re-parses it for real.
+    private atTypedVariableDeclaration() -> bool {
+        if (!isTypeStart(this.currentKind())) {
+            return false;
+        }
+        let restore = this.mark();
+        this.parseType("");
+        bool result = this.clean(restore) && this.at(SyntaxKind.Identifier);
+        if (result) {
+            let after = this.peekKind(1);
+            result = after == SyntaxKind.Equals || after == SyntaxKind.Semicolon;
+        }
+        this.rewind(restore);
+        return result;
+    }
+
+    // VariableDeclaration = modifier? declaredType? name initializer? ';'. Whether at least one
+    // of modifier and declared type is present is checked semantically, not here.
+    private parseVariableDeclaration() {
+        let marker = this.start();
+        if (this.at(SyntaxKind.LetKeyword) || this.at(SyntaxKind.ConstKeyword)) {
+            this.bump();
+        } else {
+            this.nullSlot();
+        }
+        bool bareName = this.at(SyntaxKind.Identifier)
+            && (this.peekKind(1) == SyntaxKind.Equals || this.peekKind(1) == SyntaxKind.Semicolon);
+        if (bareName) {
+            this.nullSlot();
+            this.bump();
+        } else if (isTypeStart(this.currentKind())) {
+            this.parseType("Expected the variable's type");
+            this.expect(SyntaxKind.Identifier,
+                "Expected the variable's name after its type, for example 'int count = 0;'");
+        } else {
+            this.nullSlot();
+            this.missing("Expected the variable's name, for example 'let count = 0;'");
+        }
+        if (this.at(SyntaxKind.Equals)) {
+            this.parseInitializer();
+        } else {
+            this.nullSlot();
+        }
+        this.expect(SyntaxKind.Semicolon,
+            "Expected ';' after the variable declaration, for example 'let count = 0;'");
+        this.complete(marker, SyntaxKind.VariableDeclaration);
+    }
+
+    private parseInitializer() {
+        let marker = this.start();
+        this.bump();
+        this.parseExpression();
+        this.complete(marker, SyntaxKind.Initializer);
+    }
+
+    private parseIfStatement() {
+        let marker = this.start();
+        this.bump();
+        this.expect(SyntaxKind.OpenParenthesis, "Expected '(' before the if condition, for "
+            + "example 'if (ready) \{ ... \}'");
+        this.parseExpression();
+        this.expect(SyntaxKind.CloseParenthesis, "Expected ')' after the if condition");
+        this.parseBlockOrMissing("Expected '\{' for the if body; the branches of 'if' are always "
+            + "blocks, for example 'if (ready) \{ start(); \}'");
+        if (this.at(SyntaxKind.ElseKeyword)) {
+            let elseMarker = this.start();
+            this.bump();
+            if (this.at(SyntaxKind.IfKeyword)) {
+                this.parseIfStatement();
+            } else {
+                this.parseBlockOrMissing("Expected '\{' or another 'if' after 'else'");
+            }
+            this.complete(elseMarker, SyntaxKind.ElseClause);
+        } else {
+            this.nullSlot();
+        }
+        this.complete(marker, SyntaxKind.IfStatement);
+    }
+
+    private parseWhileStatement() {
+        let marker = this.start();
+        this.bump();
+        this.expect(SyntaxKind.OpenParenthesis, "Expected '(' before the while condition, for "
+            + "example 'while (running) \{ ... \}'");
+        this.parseExpression();
+        this.expect(SyntaxKind.CloseParenthesis, "Expected ')' after the while condition");
+        this.parseBlockOrMissing("Expected '\{' for the loop body");
+        this.complete(marker, SyntaxKind.WhileStatement);
+    }
+
+    private parseForStatement() {
+        let marker = this.start();
+        this.bump();
+        this.expect(SyntaxKind.OpenParenthesis, "Expected '(' after 'for'");
+        if (this.atForEachHeader()) {
+            if (this.at(SyntaxKind.LetKeyword) || this.at(SyntaxKind.ConstKeyword)) {
+                this.bump();
+            } else {
+                this.nullSlot();
+            }
+            if (this.at(SyntaxKind.Identifier) && this.peekIsContextualIn(1)) {
+                this.nullSlot();
+                this.bump();
+            } else {
+                this.parseType("Expected the loop variable's type or 'let'");
+                this.expect(SyntaxKind.Identifier, "Expected the loop variable's name");
+            }
+            if (this.atContextual("in")) {
+                this.bumpAs(SyntaxKind.InKeyword);
+            } else {
+                this.missing("Expected 'in' between the loop variable and the values, for "
+                    + "example 'for (let item in items)'");
+            }
+            this.parseExpression();
+            this.expect(SyntaxKind.CloseParenthesis, "Expected ')' after the for-each header");
+            this.parseBlockOrMissing("Expected '\{' for the loop body");
+            this.complete(marker, SyntaxKind.ForEachStatement);
+            return;
+        }
+        if (this.at(SyntaxKind.Semicolon)) {
+            this.nullSlot();
+            this.bump();
+        } else {
+            if (this.at(SyntaxKind.LetKeyword) || this.at(SyntaxKind.ConstKeyword)
+                    || this.atTypedVariableDeclaration()) {
+                this.parseVariableDeclaration();
+            } else {
+                this.parseExpressionStatement();
+            }
+            this.nullSlot();
+        }
+        if (this.at(SyntaxKind.Semicolon) || !canStartExpression(this.currentKind())) {
+            this.nullSlot();
+        } else {
+            this.parseExpression();
+        }
+        this.expect(SyntaxKind.Semicolon, "Expected ';' after the for condition");
+        if (this.at(SyntaxKind.CloseParenthesis) || !canStartExpression(this.currentKind())) {
+            this.nullSlot();
+        } else {
+            this.parseExpression();
+        }
+        this.expect(SyntaxKind.CloseParenthesis, "Expected ')' after the for clauses");
+        this.parseBlockOrMissing("Expected '\{' for the loop body");
+        this.complete(marker, SyntaxKind.ForStatement);
+    }
+
+    // At the first token inside the for parentheses: true for `[let|const]? [Type]? name in`.
+    // Purely speculative; everything is rewound.
+    private atForEachHeader() -> bool {
+        let restore = this.mark();
+        if (this.at(SyntaxKind.LetKeyword) || this.at(SyntaxKind.ConstKeyword)) {
+            this.bump();
+        }
+        bool result;
+        if (this.at(SyntaxKind.Identifier) && this.peekIsContextualIn(1)) {
+            result = true;
+        } else if (isTypeStart(this.currentKind())) {
+            this.parseType("");
+            result = this.clean(restore) && this.at(SyntaxKind.Identifier)
+                && this.peekIsContextualIn(1);
+        } else {
+            result = false;
+        }
+        this.rewind(restore);
+        return result;
+    }
+
+    private parseKeywordStatement(SyntaxKind statementKind, string semicolonMessage) {
+        let marker = this.start();
+        this.bump();
+        this.expect(SyntaxKind.Semicolon, semicolonMessage);
+        this.complete(marker, statementKind);
+    }
+
+    private parseReturnStatement() {
+        let marker = this.start();
+        this.bump();
+        if (this.at(SyntaxKind.Semicolon) || !canStartExpression(this.currentKind())) {
+            this.nullSlot();
+        } else {
+            this.parseExpression();
+        }
+        this.expect(SyntaxKind.Semicolon,
+            "Expected ';' after the return statement, for example 'return value;'");
+        this.complete(marker, SyntaxKind.ReturnStatement);
+    }
+
+    private parseThrowStatement() {
+        let marker = this.start();
+        this.bump();
+        if (this.at(SyntaxKind.Semicolon)) {
+            this.report("'throw' needs an error value, for example 'throw new "
+                + "ParseError(\"bad input\");'. To rethrow the current error inside a catch "
+                + "block, use 'rethrow;'", source.makeSpan(this.lastContentEnd, 0));
+            let empty = this.start();
+            let skipped = this.start();
+            this.complete(skipped, SyntaxKind.List);
+            this.complete(empty, SyntaxKind.ErrorExpression);
+        } else {
+            this.parseExpression();
+        }
+        this.expect(SyntaxKind.Semicolon, "Expected ';' after the throw statement");
+        this.complete(marker, SyntaxKind.ThrowStatement);
+    }
+
+    private parseExpressionStatement() {
+        let marker = this.start();
+        this.parseExpression();
+        this.expect(SyntaxKind.Semicolon,
+            "Expected ';' after the expression, for example 'total = total + 1;'");
+        this.complete(marker, SyntaxKind.ExpressionStatement);
+    }
+
+    // ============================================================ switch
+
+    private parseSwitchStatement() {
+        let marker = this.start();
+        this.parseSwitchParts();
+        this.complete(marker, SyntaxKind.SwitchStatement);
+    }
+
+    private parseSwitchExpression() -> long {
+        let marker = this.start();
+        this.parseSwitchParts();
+        return this.complete(marker, SyntaxKind.SwitchExpression);
+    }
+
+    private parseSwitchParts() {
+        this.bump();
+        this.expect(SyntaxKind.OpenParenthesis, "Expected '(' after 'switch'");
+        this.parseExpression();
+        this.expect(SyntaxKind.CloseParenthesis, "Expected ')' after the switch value");
+        this.expect(SyntaxKind.OpenBrace, "Expected '\{' to begin the switch arms");
+        let arms = this.start();
+        bool needSeparator = false;
+        while (!this.at(SyntaxKind.CloseBrace) && !this.atEnd()) {
+            if (needSeparator) {
+                if (this.at(SyntaxKind.Comma)) {
+                    this.bump();
+                } else {
+                    this.missing("Expected ',' after the switch arm");
+                }
+                if (this.at(SyntaxKind.CloseBrace)) {
+                    break;
+                }
+            }
+            let kind = this.currentKind();
+            if (kind == SyntaxKind.DefaultKeyword || kind == SyntaxKind.IsKeyword
+                    || canStartExpression(kind)) {
+                this.parseSwitchArm();
+                needSeparator = true;
+            } else {
+                this.parseSwitchArmError();
+                needSeparator = false;
+            }
+        }
+        this.complete(arms, SyntaxKind.List);
+        this.expect(SyntaxKind.CloseBrace, "Expected '\}' to close the switch");
+    }
+
+    private parseSwitchArm() {
+        switch (this.currentKind()) {
+            DefaultKeyword -> {
+                let marker = this.start();
+                this.bump();
+                this.expect(SyntaxKind.Arrow, "Expected '->' after 'default'");
+                this.parseArmBody();
+                this.complete(marker, SyntaxKind.DefaultArm);
+            },
+            IsKeyword -> {
+                let marker = this.start();
+                this.bump();
+                this.parseNamedType("Expected a type after 'is', for example 'is Circle c -> "
+                    + "c.radius'");
+                if (this.at(SyntaxKind.Identifier)) {
+                    this.bump();
+                } else {
+                    this.nullSlot();
+                }
+                this.expect(SyntaxKind.Arrow, "Expected '->' after the type arm");
+                this.parseArmBody();
+                this.complete(marker, SyntaxKind.TypeArm);
+            },
+            default -> {
+                let marker = this.start();
+                let labels = this.start();
+                this.parseExpression();
+                while (this.at(SyntaxKind.Comma)) {
+                    this.bump();
+                    if (this.at(SyntaxKind.Arrow) || this.at(SyntaxKind.CloseBrace)
+                            || this.atEnd()) {
+                        break;
+                    }
+                    this.parseExpression();
+                }
+                this.complete(labels, SyntaxKind.List);
+                this.expect(SyntaxKind.Arrow, "Expected '->' after the switch labels, for "
+                    + "example '1 -> handleOne()'");
+                this.parseArmBody();
+                this.complete(marker, SyntaxKind.ValueArm);
+            },
+        }
+    }
+
+    private parseArmBody() {
+        if (this.at(SyntaxKind.OpenBrace)) {
+            this.parseBlock();
+        } else {
+            this.parseExpression();
+        }
+    }
+
+    // Junk between switch arms; stops before the ',' or '}' so the arm loop stays in charge.
+    private parseSwitchArmError() {
+        this.reportAtCurrent("Expected a switch arm, for example '1 -> handleOne()'");
+        let marker = this.start();
+        let skipped = this.start();
+        bool first = true;
+        while (!this.atEnd()) {
+            let kind = this.currentKind();
+            if (kind == SyntaxKind.CloseBrace) {
+                break;
+            }
+            bool armBoundary = kind == SyntaxKind.Comma || kind == SyntaxKind.DefaultKeyword
+                || kind == SyntaxKind.IsKeyword || canStartExpression(kind);
+            if (!first && armBoundary) {
+                break;
+            }
+            this.bump();
+            first = false;
+        }
+        this.complete(skipped, SyntaxKind.List);
+        this.complete(marker, SyntaxKind.ErrorStatement);
+    }
+
     // ============================================================ types
 
     // Type = NamedType with any chain of '?' and '[]' suffixes; returns the completed marker.
@@ -727,6 +1164,9 @@ class Parser {
                 this.bump();
                 this.parsePrecedence(14);
                 return this.complete(marker, SyntaxKind.TryExpression);
+            },
+            SwitchKeyword -> {
+                return this.parseSwitchExpression();
             },
             default -> {
                 this.report("Expected an expression, for example a value like '42', a variable "

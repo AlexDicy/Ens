@@ -1,0 +1,341 @@
+// Statement parsing: every form of the statement grammar through the typed accessors, plus
+// statement-level recovery. Every parse asserts the byte-for-byte round trip.
+import @std.testing;
+import parser_support;
+import SyntaxKind from syntax.kind;
+import SyntaxNode from syntax.node;
+import Expression from syntax.nodes;
+import BlockNode from syntax.nodes;
+import VariableDeclarationNode from syntax.nodes;
+import IfStatementNode from syntax.nodes;
+import ElseClauseNode from syntax.nodes;
+import WhileStatementNode from syntax.nodes;
+import ForStatementNode from syntax.nodes;
+import ForEachStatementNode from syntax.nodes;
+import ReturnStatementNode from syntax.nodes;
+import ThrowStatementNode from syntax.nodes;
+import ExpressionStatementNode from syntax.nodes;
+import SwitchStatementNode from syntax.nodes;
+import ValueArmNode from syntax.nodes;
+import TypeArmNode from syntax.nodes;
+import DefaultArmNode from syntax.nodes;
+import ErrorStatementNode from syntax.nodes;
+import InitializerNode from syntax.nodes;
+
+test "variable declarations cover the let, const, and typed forms" {
+    let inferred = try parser_support.statementNode("let count = 0;");
+    if (inferred is VariableDeclarationNode) {
+        try testing.assertTrue(inferred.modifier()?.kind() == SyntaxKind.LetKeyword,
+            "the modifier is 'let'");
+        try testing.assertTrue(inferred.declaredType() == null, "no declared type");
+        try testing.assertEqual(inferred.name().text(), "count");
+        try testing.assertTrue(inferred.initializer() != null, "the initializer is present");
+    } else {
+        try testing.fail("'let count = 0;' should be a variable declaration");
+    }
+
+    let constant = try parser_support.statementNode("const int max = 100;");
+    if (constant is VariableDeclarationNode) {
+        try testing.assertTrue(constant.modifier()?.kind() == SyntaxKind.ConstKeyword,
+            "the modifier is 'const'");
+        try testing.assertTrue(constant.declaredType() != null, "the type is declared");
+    } else {
+        try testing.fail("'const int max = 100;' should be a variable declaration");
+    }
+
+    let typed = try parser_support.statementNode("Vector<int>? items = null;");
+    if (typed is VariableDeclarationNode) {
+        try testing.assertTrue(typed.modifier() == null, "no modifier");
+        try testing.assertTrue(typed.declaredType()?.kind() == SyntaxKind.OptionalType,
+            "the declared type keeps its suffixes");
+        try testing.assertEqual(typed.name().text(), "items");
+    } else {
+        try testing.fail("'Vector<int>? items = null;' should be a variable declaration");
+    }
+
+    let bare = try parser_support.statementNode("let x;");
+    if (bare is VariableDeclarationNode) {
+        try testing.assertTrue(bare.initializer() == null, "no initializer");
+    } else {
+        try testing.fail("'let x;' should be a variable declaration");
+    }
+}
+
+test "if chains nest through else clauses" {
+    let node = try parser_support.statementNode(
+        "if (a) \{ one(); \} else if (b) \{ two(); \} else \{ three(); \}");
+    if (node is IfStatementNode) {
+        try testing.assertEqual(node.thenBranch().statementsCount(), 1L);
+        let elseClause = node.elseClause();
+        if (elseClause == null) {
+            try testing.fail("the first else clause should be present");
+        } else {
+            let body = elseClause.body();
+            if (body is IfStatementNode) {
+                try testing.assertTrue(body.elseClause() != null, "the inner if has an else");
+            } else {
+                try testing.fail("'else if' should nest an if statement");
+            }
+        }
+    } else {
+        try testing.fail("the root should be an if statement");
+    }
+}
+
+test "while loops parse their condition and body" {
+    let node = try parser_support.statementNode("while (i < n) \{ i++; \}");
+    if (node is WhileStatementNode) {
+        try testing.assertEqual(node.condition().kind(), SyntaxKind.BinaryExpression);
+        try testing.assertEqual(node.body().statementsCount(), 1L);
+    } else {
+        try testing.fail("the root should be a while statement");
+    }
+}
+
+test "c-style for loops fill every clause combination" {
+    let full = try parser_support.statementNode("for (long i = 0; i < n; i++) \{ use(i); \}");
+    if (full is ForStatementNode) {
+        try testing.assertTrue(full.initializer() != null, "the initializer is present");
+        try testing.assertTrue(full.initializerSemicolon() == null,
+            "a present initializer owns its semicolon");
+        try testing.assertTrue(full.condition() != null, "the condition is present");
+        try testing.assertTrue(full.update() != null, "the update is present");
+    } else {
+        try testing.fail("the root should be a for statement");
+    }
+
+    let empty = try parser_support.statementNode("for (;;) \{ \}");
+    if (empty is ForStatementNode) {
+        try testing.assertTrue(empty.initializer() == null, "no initializer");
+        try testing.assertTrue(empty.initializerSemicolon() != null,
+            "the bare first ';' sits in its own slot");
+        try testing.assertTrue(empty.condition() == null, "no condition");
+        try testing.assertTrue(empty.update() == null, "no update");
+    } else {
+        try testing.fail("'for (;;)' should be a for statement");
+    }
+
+    let walker = try parser_support.statementNode(
+        "for (; cursor != null; cursor = cursor.next) \{ total = total + cursor.size; \}");
+    if (walker is ForStatementNode) {
+        try testing.assertTrue(walker.initializer() == null, "no initializer");
+        try testing.assertTrue(walker.condition() != null, "the condition is present");
+    } else {
+        try testing.fail("the walker loop should be a for statement");
+    }
+
+    let exprInit = try parser_support.statementNode("for (i = 0; i < n;) \{ i++; \}");
+    if (exprInit is ForStatementNode) {
+        let initializer = exprInit.initializer();
+        try testing.assertTrue(initializer is ExpressionStatementNode,
+            "an assignment initializer is an expression statement");
+        try testing.assertTrue(exprInit.update() == null, "no update");
+    } else {
+        try testing.fail("the assignment-initialized loop should be a for statement");
+    }
+}
+
+test "for-each loops re-tag the contextual in keyword" {
+    let inferred = try parser_support.statementNode("for (let item in items) \{ use(item); \}");
+    if (inferred is ForEachStatementNode) {
+        try testing.assertTrue(inferred.letKeyword()?.kind() == SyntaxKind.LetKeyword,
+            "the binding uses let");
+        try testing.assertTrue(inferred.declaredType() == null, "no declared type");
+        try testing.assertEqual(inferred.name().text(), "item");
+        try testing.assertEqual(inferred.inKeyword().kind(), SyntaxKind.InKeyword);
+        try testing.assertEqual(inferred.inKeyword().text(), "in");
+    } else {
+        try testing.fail("the root should be a for-each statement");
+    }
+
+    let typed = try parser_support.statementNode("for (int x in xs) \{ total = total + x; \}");
+    if (typed is ForEachStatementNode) {
+        try testing.assertTrue(typed.letKeyword() == null, "no let keyword");
+        try testing.assertTrue(typed.declaredType() != null, "the type is declared");
+    } else {
+        try testing.fail("the typed loop should be a for-each statement");
+    }
+
+    let generic = try parser_support.statementNode("for (Pair<K, V> entry in map) \{ \}");
+    try testing.assertEqual(generic.kind(), SyntaxKind.ForEachStatement);
+
+    let inAsName = try parser_support.statementNode("in = in + 1;");
+    try testing.assertEqual(inAsName.kind(), SyntaxKind.ExpressionStatement);
+}
+
+test "jump statements parse with and without values" {
+    let breakNode = try parser_support.statementNode("break;");
+    try testing.assertEqual(breakNode.kind(), SyntaxKind.BreakStatement);
+    let continueNode = try parser_support.statementNode("continue;");
+    try testing.assertEqual(continueNode.kind(), SyntaxKind.ContinueStatement);
+    let rethrowNode = try parser_support.statementNode("rethrow;");
+    try testing.assertEqual(rethrowNode.kind(), SyntaxKind.RethrowStatement);
+
+    let bareReturn = try parser_support.statementNode("return;");
+    if (bareReturn is ReturnStatementNode) {
+        try testing.assertTrue(bareReturn.value() == null, "no return value");
+    } else {
+        try testing.fail("'return;' should be a return statement");
+    }
+    let valueReturn = try parser_support.statementNode("return total + 1;");
+    if (valueReturn is ReturnStatementNode) {
+        try testing.assertTrue(valueReturn.value() != null, "the return value is present");
+    } else {
+        try testing.fail("'return total + 1;' should be a return statement");
+    }
+    let throwNode = try parser_support.statementNode("throw new ParseError(\"bad\");");
+    if (throwNode is ThrowStatementNode) {
+        try testing.assertEqual(throwNode.value().kind(), SyntaxKind.NewExpression);
+    } else {
+        try testing.fail("the root should be a throw statement");
+    }
+}
+
+test "switch statements parse value, type, and default arms" {
+    let text = "switch (shape) \{\n"
+        + "    1, 2 -> handleSmall(),\n"
+        + "    is Circle c -> \{ render(c); \},\n"
+        + "    is Square -> renderSquare(),\n"
+        + "    default -> \{ \},\n"
+        + "\}";
+    let node = try parser_support.statementNode(text);
+    if (node is SwitchStatementNode) {
+        try testing.assertEqual(node.armsCount(), 4L);
+        let first = node.arms(0);
+        if (first is ValueArmNode) {
+            try testing.assertEqual(first.labelsCount(), 2L);
+            try testing.assertTrue(first.body() is Expression, "the first arm body is a value");
+        } else {
+            try testing.fail("the first arm should be a value arm");
+        }
+        let second = node.arms(1);
+        if (second is TypeArmNode) {
+            try testing.assertEqual(second.target().name().text(), "Circle");
+            try testing.assertTrue(second.binding()?.text() == "c", "the binding is named c");
+            try testing.assertTrue(second.body() is BlockNode, "the second arm body is a block");
+        } else {
+            try testing.fail("the second arm should be a type arm");
+        }
+        let third = node.arms(2);
+        if (third is TypeArmNode) {
+            try testing.assertTrue(third.binding() == null, "no binding on the third arm");
+        } else {
+            try testing.fail("the third arm should be a type arm");
+        }
+        try testing.assertTrue(node.arms(3) is DefaultArmNode, "the last arm is default");
+    } else {
+        try testing.fail("the root should be a switch statement");
+    }
+}
+
+test "a switch expression can initialize a variable" {
+    let node = try parser_support.statementNode(
+        "let label = switch (code) \{ 200 -> \"ok\", default -> \"other\", \};");
+    if (node is VariableDeclarationNode) {
+        let initializer = node.initializer();
+        if (initializer == null) {
+            try testing.fail("the initializer should be present");
+        } else {
+            try testing.assertEqual(initializer.value().kind(), SyntaxKind.SwitchExpression);
+        }
+    } else {
+        try testing.fail("the root should be a variable declaration");
+    }
+}
+
+test "blocks nest and empty blocks parse" {
+    let node = try parser_support.statementNode("\{ let a = 1; \{ use(a); \} \}");
+    if (node is BlockNode) {
+        try testing.assertEqual(node.statementsCount(), 2L);
+        try testing.assertEqual(node.statements(1).kind(), SyntaxKind.Block);
+    } else {
+        try testing.fail("the root should be a block");
+    }
+    let empty = try parser_support.statementNode("\{ \}");
+    try testing.assertEqual(empty.kind(), SyntaxKind.Block);
+}
+
+test "a missing semicolon anchors at the statement end" {
+    let text = "\{ let a = 1\n    use(a); \}";
+    let result = parser_support.parseStatementText(text);
+    try parser_support.assertRoundTrip(text, result);
+    try parser_support.assertDiagnosticCount(result, 1);
+    let span = result.diagnostics()[0].span();
+    try testing.assertEqual(span.start, 11L);
+    try testing.assertEqual(span.length, 0L);
+}
+
+test "junk inside a block becomes an error statement and the block survives" {
+    let text = "\{ let a = 1; ??? %%% ; use(a); \}";
+    let result = parser_support.parseStatementText(text);
+    try parser_support.assertRoundTrip(text, result);
+    try testing.assertTrue(result.diagnostics().length > 0, "the junk is reported");
+    let node = parser_support.standaloneNode(result);
+    if (node is BlockNode) {
+        try testing.assertEqual(node.statementsCount(), 3L);
+        try testing.assertTrue(node.statements(1) is ErrorStatementNode,
+            "the junk is wrapped in an error statement");
+        try testing.assertEqual(node.statements(2).kind(), SyntaxKind.ExpressionStatement);
+    } else {
+        try testing.fail("the root should still be a block");
+    }
+}
+
+test "an unclosed block reports the missing brace and round trips" {
+    let text = "\{ start();";
+    let result = parser_support.parseStatementText(text);
+    try parser_support.assertRoundTrip(text, result);
+    try parser_support.assertDiagnosticCount(result, 1);
+}
+
+test "a stray catch statement gets a tailored message" {
+    let text = "catch (Error e) \{ \}";
+    let result = parser_support.parseStatementText(text);
+    try parser_support.assertRoundTrip(text, result);
+    try testing.assertTrue(result.diagnostics().length > 0, "the stray catch is reported");
+    try testing.assertEqual(result.diagnostics()[0].message(),
+        "A 'catch' block can only follow a function body's closing '\}'");
+}
+
+test "switch bodies recover from junk and missing commas" {
+    let missingComma = "switch (x) \{ 1 -> a() 2 -> b() \}";
+    let result = parser_support.parseStatementText(missingComma);
+    try parser_support.assertRoundTrip(missingComma, result);
+    try testing.assertTrue(result.diagnostics().length > 0, "the missing comma is reported");
+    let node = parser_support.standaloneNode(result);
+    if (node is SwitchStatementNode) {
+        try testing.assertEqual(node.armsCount(), 2L);
+    } else {
+        try testing.fail("the root should be a switch statement");
+    }
+
+    let junk = "switch (x) \{ ??? ,, 1 -> a() \}";
+    let junkResult = parser_support.parseStatementText(junk);
+    try parser_support.assertRoundTrip(junk, junkResult);
+    try testing.assertTrue(junkResult.diagnostics().length > 0, "the junk is reported");
+
+    let malformed = "switch \{ \}";
+    let malformedResult = parser_support.parseStatementText(malformed);
+    try parser_support.assertRoundTrip(malformed, malformedResult);
+    try testing.assertTrue(malformedResult.diagnostics().length > 0,
+        "the missing header is reported");
+}
+
+test "malformed statements still round trip byte for byte" {
+    let samples = [
+        "if a \{ \}",
+        "while () do();",
+        "for (let in items) \{ \}",
+        "let = 5;",
+        "int x",
+        "return",
+        "throw ;",
+        "\{ \{ \{",
+    ];
+    for (let text in samples) {
+        let result = parser_support.parseStatementText(text);
+        try parser_support.assertRoundTrip(text, result);
+        try testing.assertTrue(result.diagnostics().length > 0,
+            "'{text}' should report at least one diagnostic");
+    }
+}
