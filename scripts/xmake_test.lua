@@ -100,6 +100,15 @@ task("test")
             })
         end
 
+        -- the corpus round-trip harness parses every .ens file in the real source trees and
+        -- asserts the front end is lossless and clean over all of them.
+        if want("corpus_roundtrip") then
+            table.insert(jobs, {
+                name = "corpus_roundtrip",
+                corpus = true,
+            })
+        end
+
         -- surface any requested names that matched no test, so typos don't pass silently.
         if wanted ~= nil then
             local unknown = {}
@@ -112,9 +121,60 @@ task("test")
             end
         end
 
+        -- the corpus round-trip harness: stage the front end and the harness into one source root,
+        -- build the driver exe fresh, enumerate every .ens file in the real source trees into a
+        -- manifest, and run the driver over it. the front end imports its siblings by bare name, so
+        -- it only compiles with its own folder as the source root; staging lets the harness live in
+        -- its own folder yet compile against the front end.
+        local function run_corpus(job)
+            local name = job.name
+            local corpus_dir  = path.join(os.projectdir(), "build", "corpus")
+            local stage       = path.join(corpus_dir, "stage")
+            local exe_file    = path.join(corpus_dir, "corpus.exe")
+            local manifest    = path.join(corpus_dir, "manifest.txt")
+            local log         = path.join(out_dir, name .. ".log")
+            local frontend_src = path.join(os.projectdir(), "selfhost", "frontend", "src")
+            local corpus_src   = path.join(os.projectdir(), "selfhost", "corpus", "src")
+
+            os.tryrm(stage)
+            os.mkdir(stage)
+            os.cp(path.join(frontend_src, "**"), stage, {rootdir = frontend_src})
+            os.cp(path.join(corpus_src, "**"), stage, {rootdir = corpus_src})
+
+            os.tryrm(exe_file)
+            local compile_rc = os.execv(ens_exe, {"--source", stage, "--output", exe_file},
+                {try = true, stdout = log, stderr = log})
+            if not os.isfile(exe_file) then
+                return {name = name, ok = false, short = "harness build failed",
+                    full = string.format("%s: harness build failed (exit %s)\n%s",
+                        name, tostring(compile_rc), (io.readfile(log) or ""):gsub("[\r\n]+$", ""))}
+            end
+
+            -- enumerate the corpus; the staged copies live under build/ and are not matched here.
+            local files = {}
+            for _, root in ipairs({"selfhost", "libs", "tests"}) do
+                for _, f in ipairs(os.files(path.join(os.projectdir(), root, "**.ens"))) do
+                    table.insert(files, (f:gsub("\\", "/")))
+                end
+            end
+            table.sort(files)
+            io.writefile(manifest, table.concat(files, "\n") .. "\n")
+
+            local run_rc = os.execv(exe_file, {manifest},
+                {try = true, stdout = log, stderr = log})
+            local out = (io.readfile(log) or ""):gsub("[\r\n]+$", "")
+            if run_rc == 0 then
+                return {name = name, ok = true}
+            end
+            return {name = name, ok = false,
+                short = string.format("harness exit %s", tostring(run_rc)),
+                full = string.format("%s:\n%s", name, out)}
+        end
+
         -- run a single test: compile, optionally run, and compare against the header.
         -- returns { name = ..., ok = bool, short = <fail reason>, full = <detailed report> }.
         local function run_one(job)
+            if job.corpus then return run_corpus(job) end
             local name = job.name
             local ens_file = job.ens_file
             local exe_file    = path.join(out_dir, name .. ".exe")
