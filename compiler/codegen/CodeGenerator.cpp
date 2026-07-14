@@ -1602,7 +1602,8 @@ struct CodeGenerator::Impl {
             }
         } else if (isReferenceType(sym->type)) {
             builder->CreateStore(llvm::ConstantPointerNull::get(llvm::PointerType::get(ctx, 0)), alloca);
-        } else if (structHasClassFields(sym->type)) {
+        } else if (sym->type && sym->type->isStruct() && sym->type->structInfo) {
+            builder->CreateStore(llvm::ConstantAggregateZero::get(mapType(sym->type)), alloca);
             initStructFieldDefaults(sym->type, alloca);
         }
     }
@@ -1681,6 +1682,7 @@ struct CodeGenerator::Impl {
             }
         } else if (sym->type && sym->type->isStruct() && sym->type->structInfo) {
             setLocationFromNode(s.node);
+            builder->CreateStore(llvm::ConstantAggregateZero::get(mapType(sym->type)), alloca);
             initStructFieldDefaults(sym->type, alloca);
         } else if (isReferenceType(sym->type)) {
             builder->CreateStore(llvm::ConstantPointerNull::get(llvm::PointerType::get(ctx, 0)), alloca);
@@ -1751,6 +1753,14 @@ struct CodeGenerator::Impl {
                 llvm::Value* fieldAddr = builder->CreateStructGEP(
                     st, base, static_cast<unsigned>(i), asAscii(fi.name) + ".addr");
                 builder->CreateStore(llvm::ConstantAggregateZero::get(mapType(fieldType)), fieldAddr);
+            }
+            // A by-value struct field with no explicit default still needs the
+            // contained struct's own defaults applied. Recurse into its slot; the
+            // recursion rebinds to that struct's declaring module for its defaults.
+            if (!wrote && fieldType && fieldType->isStruct() && fieldType->structInfo) {
+                llvm::Value* fieldAddr = builder->CreateStructGEP(
+                    st, base, static_cast<unsigned>(i), asAscii(fi.name) + ".addr");
+                initStructFieldDefaults(fieldType, fieldAddr);
             }
         }
         defaultInitStack.pop_back();
@@ -5028,13 +5038,29 @@ struct CodeGenerator::Impl {
         return recordHasFieldDefaults(t->structInfo);
     }
 
+    // True when the record, or any by-value struct field it transitively
+    // contains, declares a field default. Gates the per-slot default loop so an
+    // array of `Mid` still runs the nested `Leaf`'s defaults. The visited set
+    // guards a by-value cycle (itself a compile error) against infinite descent.
     bool recordHasFieldDefaults(StructInfo* si) {
-        if (!si) return false;
+        std::unordered_set<StructInfo*> visited;
+        return recordHasFieldDefaultsImpl(si, visited);
+    }
+
+    bool recordHasFieldDefaultsImpl(StructInfo* si,
+                                    std::unordered_set<StructInfo*>& visited) {
+        if (!si || !visited.insert(si).second) return false;
         for (auto& f : si->fields) {
-            if (!f.declaration) continue;
-            auto fieldNode = SyntaxNode::makeRoot(f.declaration);
-            auto fd = ast::FieldDecl::cast(*fieldNode);
-            if (fd && fd->defaultValue()) return true;
+            if (f.declaration) {
+                auto fieldNode = SyntaxNode::makeRoot(f.declaration);
+                auto fd = ast::FieldDecl::cast(*fieldNode);
+                if (fd && fd->defaultValue()) return true;
+            }
+            ::Type* ft = f.type ? subst(f.type) : nullptr;
+            if (ft && ft->isStruct() && ft->structInfo &&
+                recordHasFieldDefaultsImpl(ft->structInfo, visited)) {
+                return true;
+            }
         }
         return false;
     }
@@ -5407,10 +5433,21 @@ struct CodeGenerator::Impl {
         }
     }
 
+    // True when the struct holds an ARC-managed reference directly or inside a
+    // by-value struct field, so copies retain and scope exits release through
+    // the whole tree. The visited set guards a by-value cycle (a compile error).
     bool structHasClassFields(::Type* t) {
+        std::unordered_set<StructInfo*> visited;
+        return structHasClassFieldsImpl(t, visited);
+    }
+
+    bool structHasClassFieldsImpl(::Type* t, std::unordered_set<StructInfo*>& visited) {
         if (!t || !t->isStruct() || !t->structInfo) return false;
+        if (!visited.insert(t->structInfo).second) return false;
         for (auto& f : t->structInfo->fields) {
             if (isReferenceType(f.type)) return true;
+            ::Type* ft = f.type ? subst(f.type) : nullptr;
+            if (ft && ft->isStruct() && structHasClassFieldsImpl(ft, visited)) return true;
         }
         return false;
     }
