@@ -314,8 +314,14 @@ void EscapeAnalyzer::scanCall(const ast::CallExpression& e) {
         }
     }
 
-    auto args = e.arguments();
-    const std::vector<int>* order = analysis.callArgOrderOf(e.node.greenNode());
+    scanArgumentList(calleeSym, e.node.greenNode(), e.arguments());
+}
+
+// Shared by calls and constructor invocations: an identifier argument escapes unless the callee
+// is known to keep that parameter local; everything else is scanned recursively.
+void EscapeAnalyzer::scanArgumentList(Symbol* calleeSym, const GreenElement* callNode,
+                                      const std::vector<ast::Expression>& args) {
+    const std::vector<int>* order = analysis.callArgOrderOf(callNode);
     for (size_t i = 0; i < args.size(); ++i) {
         ast::Expression arg = args[i];
         if (auto na = arg.asNamedArgument()) {
@@ -361,13 +367,12 @@ void EscapeAnalyzer::scanParen(const ast::ParenExpression& e) {
 }
 
 void EscapeAnalyzer::scanNew(const ast::NewExpression& e) {
-    for (auto& arg : e.arguments()) {
-        if (auto na = arg.asNamedArgument()) {
-            if (auto value = na->value()) scanExpression(*value);
-            continue;
-        }
-        scanExpression(arg);
+    for (auto& size : e.arraySizeExpressions()) {
+        scanExpression(size);
     }
+    auto* info = analysis.find(e.node.greenNode());
+    Symbol* ctorSym = info ? info->resolvedMethodSymbol : nullptr;
+    scanArgumentList(ctorSym, e.node.greenNode(), e.arguments());
 }
 
 void EscapeAnalyzer::scanArrayLiteral(const ast::ArrayLiteralExpression& e) {

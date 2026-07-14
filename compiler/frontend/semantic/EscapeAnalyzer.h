@@ -51,6 +51,8 @@ private:
     void scanIdent(const ast::IdentExpression& e);
     void scanAssign(const ast::AssignExpression& e);
     void scanCall(const ast::CallExpression& e);
+    void scanArgumentList(Symbol* calleeSym, const GreenElement* callNode,
+                          const std::vector<ast::Expression>& args);
     void scanMember(const ast::MemberExpression& e);
     void scanSubscript(const ast::SubscriptExpression& e);
     void scanBinary(const ast::BinaryExpression& e);
