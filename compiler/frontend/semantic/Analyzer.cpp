@@ -2703,51 +2703,6 @@ void Analyzer::analyzeBranchWithNarrowing(const ast::Block& block,
     popScope();
 }
 
-// True when control can never fall out the bottom of a block (every path returns,
-// throws, or rethrows), so the guard that led there holds for the following code.
-static bool blockAlwaysExits(const ast::Block& block);
-static bool switchStatementAlwaysExits(const ast::SwitchStatement& sw);
-
-static bool ifStatementAlwaysExits(const ast::IfStatement& i) {
-    auto then = i.thenBlock();
-    auto ec = i.elseClause();
-    if (!then || !ec || !blockAlwaysExits(*then)) return false;
-    if (auto inner = ec->ifStatement()) return ifStatementAlwaysExits(*inner);
-    if (auto bb = ec->block()) return blockAlwaysExits(*bb);
-    return false;
-}
-
-static bool statementAlwaysExits(const ast::Statement& s) {
-    if (s.asReturn() || s.asThrow() || s.asRethrow()) return true;
-    if (auto b = s.asBlock()) return blockAlwaysExits(*b);
-    if (auto i = s.asIf()) return ifStatementAlwaysExits(*i);
-    if (auto sw = s.asSwitch()) return switchStatementAlwaysExits(*sw);
-    return false;
-}
-
-static bool blockAlwaysExits(const ast::Block& block) {
-    for (auto& s : block.statements()) {
-        if (statementAlwaysExits(s)) return true;
-    }
-    return false;
-}
-
-// A switch always exits only when it has a `default` arm and every arm body is
-// a block that always exits. This is a deliberate under-approximation: an
-// exhaustive enum switch without a default, or an expression-bodied arm, is not
-// counted, which keeps the narrowing it feeds conservative.
-static bool switchStatementAlwaysExits(const ast::SwitchStatement& sw) {
-    bool hasDefault = false;
-    for (auto& arm : sw.arms()) {
-        if (arm.isDefault()) hasDefault = true;
-        auto bn = arm.bodyBlockNode();
-        if (!bn) return false;
-        auto blk = ast::Block::cast(*bn);
-        if (!blk || !blockAlwaysExits(*blk)) return false;
-    }
-    return hasDefault;
-}
-
 // =========================================================
 // Missing-return analysis
 // =========================================================
@@ -2908,11 +2863,11 @@ void Analyzer::analyzeIfStmt(const ast::IfStatement& stmt) {
     // block, so a null check can narrow past the `if` (e.g. `if (x == null) { throw; }`
     // leaves x non-null below).
     if (currentScope) {
-        bool thenExits = thenBlock && blockAlwaysExits(*thenBlock);
+        bool thenExits = thenBlock && blockTerminates(*thenBlock);
         bool elseExits = false;
         if (elseClause) {
-            if (auto inner = elseClause->ifStatement()) elseExits = ifStatementAlwaysExits(*inner);
-            else if (auto bb = elseClause->block()) elseExits = blockAlwaysExits(*bb);
+            if (auto inner = elseClause->ifStatement()) elseExits = ifStatementTerminates(*inner);
+            else if (auto bb = elseClause->block()) elseExits = blockTerminates(*bb);
         }
         const std::vector<NullCheckInfo>* survives = nullptr;
         if (thenExits && !elseExits) survives = &whenFalse;
