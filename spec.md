@@ -252,6 +252,8 @@ In both cases, the path is `/src/engine/renderer.ens` and the file contains a pu
 
 Only `public` declarations are accessible from another module. Types (classes and structs) may be brought into scope by name as above, but free functions are always called through their module namespace, never imported by name: write `import engine.renderer;` then call `renderer.configure()`. Importing a function by name (`import configure from engine.renderer;`) is an error.
 
+Two modules may import each other: circular imports are allowed, and declarations resolve across the cycle like any other import.
+
 Importing from packages follows the format `@packageorg.packagename.path`.
 
 ```ens

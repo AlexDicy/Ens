@@ -316,6 +316,7 @@ Type* Analyzer::analyzeExprAdapt(const ast::Expression& expr, Type* target) {
 void Analyzer::analyze(const SyntaxNode& root) {
     collectDeclarations(root);
     bindImports([](const std::u16string&) -> const Analyzer* { return nullptr; });
+    checkStructValueCycles();
     analyzeBodies();
     if (astRoot) {
         ThrowsAnalyzer throwsAnalyzer(*astRoot, analysis, errorClassInfo_);
@@ -5547,19 +5548,94 @@ static bool fieldHasDefaultValue(const FieldInfo& f) {
 }
 
 bool Analyzer::isDefaultable(Type* t) const {
+    std::unordered_set<const StructInfo*> visiting;
+    return isDefaultable(t, visiting);
+}
+
+bool Analyzer::isDefaultable(Type* t, std::unordered_set<const StructInfo*>& visiting) const {
     if (!t) return false;
     if (t->isPrimitive()) return true;
     if (t->isOptional()) return true;
     if (t->isStruct()) {
         if (!t->structInfo) return false;
+        if (!visiting.insert(t->structInfo).second) return true;
         for (auto& f : t->structInfo->fields) {
-            if (isDefaultable(f.type)) continue;
+            if (isDefaultable(f.type, visiting)) continue;
             if (fieldHasDefaultValue(f)) continue;
+            visiting.erase(t->structInfo);
             return false;
         }
+        visiting.erase(t->structInfo);
         return true;
     }
     return false;
+}
+
+namespace {
+
+// A field stores a struct inline when its type is that struct or an optional of it.
+// Classes, arrays, and strings are references and never nest a struct's storage.
+StructInfo* byValueFieldStruct(Type* t) {
+    if (t && t->isOptional()) t = t->inner;
+    return t && t->isStruct() ? t->structInfo : nullptr;
+}
+
+struct StructCycleStep {
+    StructInfo* owner;
+    const FieldInfo* field;
+    StructInfo* target;
+};
+
+// Depth-first search for a by-value field path from `origin` back to itself.
+// Instantiations count as their template, so `Wrap<T>` inside 'struct Wrap<T>'
+// closes the cycle. `explored` bounds the walk on graphs with shared members.
+bool findPathBackTo(StructInfo* origin, StructInfo* current,
+                    std::vector<StructCycleStep>& path,
+                    std::unordered_set<StructInfo*>& explored) {
+    for (const auto& f : current->fields) {
+        StructInfo* next = byValueFieldStruct(f.type);
+        if (!next) continue;
+        path.push_back({current, &f, next});
+        StructInfo* authority = next->templateOf ? next->templateOf : next;
+        if (authority == origin) return true;
+        if (explored.insert(next).second &&
+            findPathBackTo(origin, next, path, explored)) {
+            return true;
+        }
+        path.pop_back();
+    }
+    return false;
+}
+
+}  // namespace
+
+void Analyzer::checkStructValueCycles() {
+    if (!astRoot) return;
+    for (auto& sd : astRoot->structs()) {
+        Type* t = analysis.typeOf(sd.node.greenNode());
+        if (!t || !t->structInfo) continue;
+        StructInfo* origin = t->structInfo;
+
+        std::vector<StructCycleStep> path;
+        std::unordered_set<StructInfo*> explored;
+        if (!findPathBackTo(origin, origin, path, explored)) continue;
+
+        std::string msg = "Struct '" + asciiOf(origin->name) + "' contains itself by value: ";
+        for (size_t i = 0; i < path.size(); ++i) {
+            if (i > 0) msg += i + 1 == path.size() ? ", and " : ", ";
+            msg += "field '" + asciiOf(path[i].field->name) + "' of '" +
+                asciiOf(path[i].owner->name) + "' has type '" +
+                (path[i].field->type ? path[i].field->type->toString() : std::string("?")) + "'";
+        }
+        StructInfo* firstTarget = path[0].target->templateOf
+            ? path[0].target->templateOf : path[0].target;
+        std::string example = asciiOf(firstTarget->name);
+        msg += ". Struct fields are stored inline, so this layout would be infinitely large. "
+            "Break the cycle, for example by declaring '" + example + "' as a class "
+            "('class " + example + " { ... }') so the field stores a reference.";
+        const FieldInfo& f = *path[0].field;
+        sink.error({f.line, f.column, static_cast<int>(f.name.size())}, std::move(msg));
+    }
 }
 
 static bool ctorHasThisFieldParam(const ast::FuncDecl& ctor, const std::u16string& fieldName) {

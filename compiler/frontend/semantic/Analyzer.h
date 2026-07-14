@@ -49,6 +49,10 @@ public:
     void bindImports(const ModuleResolver& resolver);
     void bindTypeImports(const ModuleResolver& resolver);
     void bindValueImports(const ModuleResolver& resolver);
+    // Reports every struct declared in this module that contains itself by value,
+    // possibly through structs from other modules. Runs after all modules' struct
+    // fields are resolved and generic instantiations are materialized.
+    void checkStructValueCycles();
     void analyzeBodies();
 
     void importPrelude();
@@ -336,8 +340,10 @@ private:
     void checkMemberAccess(const SyntaxNode& diagNode, const std::u16string& memberName,
                            Visibility visibility, StructInfo* definingClass);
 
-    // True if `t` can be considered non-null without an initializer.
+    // True if `t` can be considered non-null without an initializer. The visiting
+    // set keeps a struct-containment cycle (reported separately) from recursing forever.
     bool isDefaultable(Type* t) const;
+    bool isDefaultable(Type* t, std::unordered_set<const StructInfo*>& visiting) const;
     // `fillExampleName`, when set, marks the single-dimension `new T[n]` form
     // where the fill-loop idiom applies; the diagnostic then teaches the idiom
     // using that variable name.

@@ -351,6 +351,10 @@ bool analyzeModuleGraph(std::vector<std::unique_ptr<Module>>& modules,
     sharedCtx.materializeInstantiations();
     sharedCtx.refreshInstantiationInheritance();
 
+    // Every module's struct fields are resolved now, so a by-value containment
+    // cycle can be detected across module boundaries.
+    for (auto& m : modules) m->analyzer->checkStructValueCycles();
+
     for (auto& m : modules) m->analyzer->analyzeBodies();
 
     // Checked-exception throws-set fixpoint. Sets propagate cross-module via shared Symbol*.
