@@ -2231,8 +2231,36 @@ static bool isPlainIndexType(const ast::TypeReference& tr) {
     return !tr.qualifierText() && tr.typeArguments().empty() && tr.suffixChain().empty();
 }
 
+// A step-by-one update on `indexName`: `i = i + 1`, `i++`, or `++i` all count.
+static bool isUnitIncrementOf(const ast::Expression& update, const std::u16string& indexName) {
+    if (auto step = update.asAssign()) {
+        auto stepOp = step->operatorToken();
+        if (!stepOp || stepOp->kind() != SyntaxKind::Eq) return false;
+        auto stepTarget = step->target();
+        if (!stepTarget || identExprName(*stepTarget) != indexName) return false;
+        auto stepValue = step->value();
+        if (!stepValue) return false;
+        auto increment = stepValue->asBinary();
+        if (!increment) return false;
+        auto incrementOp = increment->operatorToken();
+        if (!incrementOp || incrementOp->kind() != SyntaxKind::Plus) return false;
+        auto incrementLeft = increment->left();
+        if (!incrementLeft || identExprName(*incrementLeft) != indexName) return false;
+        auto incrementRight = increment->right();
+        return incrementRight && isIntegerLiteralToken(*incrementRight, u"1");
+    }
+    std::optional<ast::Expression> operand;
+    std::optional<SyntaxNode> op;
+    if (auto post = update.asPostfix()) { operand = post->operand(); op = post->operatorToken(); }
+    else if (auto pre = update.asPrefix()) { operand = pre->operand(); op = pre->operatorToken(); }
+    else return false;
+    if (!op || op->kind() != SyntaxKind::PlusPlus) return false;
+    return operand && identExprName(*operand) == indexName;
+}
+
 // Matches `for (long i = 0; i < name.length; i = i + 1) { name[i] = expr; }`
-// with a fresh `long`/`int` index of any name and `expr` never mentioning `name`.
+// (the update also accepts `i++`/`++i`) with a fresh `long`/`int` index of any
+// name and `expr` never mentioning `name`.
 static bool isArrayFillLoop(const ast::ForStatement& loop, const std::u16string& arrayName) {
     std::u16string indexName;
     auto init = loop.init();
@@ -2272,23 +2300,7 @@ static bool isArrayFillLoop(const ast::ForStatement& loop, const std::u16string&
     if (!lengthName || *lengthName != u"length") return false;
 
     auto update = loop.update();
-    if (!update) return false;
-    auto step = update->asAssign();
-    if (!step) return false;
-    auto stepOp = step->operatorToken();
-    if (!stepOp || stepOp->kind() != SyntaxKind::Eq) return false;
-    auto stepTarget = step->target();
-    if (!stepTarget || identExprName(*stepTarget) != indexName) return false;
-    auto stepValue = step->value();
-    if (!stepValue) return false;
-    auto increment = stepValue->asBinary();
-    if (!increment) return false;
-    auto incrementOp = increment->operatorToken();
-    if (!incrementOp || incrementOp->kind() != SyntaxKind::Plus) return false;
-    auto incrementLeft = increment->left();
-    if (!incrementLeft || identExprName(*incrementLeft) != indexName) return false;
-    auto incrementRight = increment->right();
-    if (!incrementRight || !isIntegerLiteralToken(*incrementRight, u"1")) return false;
+    if (!update || !isUnitIncrementOf(*update, indexName)) return false;
 
     auto body = loop.body();
     if (!body) return false;
@@ -5757,7 +5769,8 @@ bool Analyzer::validateArrayElement(Type* elem, const SyntaxNode& diagNode,
             errorAtNode(diagNode, "An array of non-nullable '" + elem->toString() +
                 "' must be filled as it is created: assign it to a new variable and "
                 "follow the declaration with `for (long i = 0; i < " + name +
-                ".length; i = i + 1) { " + name + "[i] = ...; }`. Alternatively use '" +
+                ".length; i++) { " + name + "[i] = ...; }` (the update may be written "
+                "'i++', '++i', or 'i = i + 1'). Alternatively use '" +
                 elem->toString() + "?[]' so slots can start as null.");
             return false;
         }
