@@ -4383,21 +4383,15 @@ struct CodeGenerator::Impl {
                 size_t next;
                 scalar = decodeEscapeSequence(text, i, end, next);
                 i = next - 1;
+            } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < end) {
+                char16_t low = text[i + 1];
+                if (low >= 0xDC00 && low <= 0xDFFF) {
+                    scalar = 0x10000u + ((static_cast<uint32_t>(c) - 0xD800u) << 10) +
+                             (static_cast<uint32_t>(low) - 0xDC00u);
+                    ++i;
+                }
             }
-            if (scalar < 0x80) utf8.push_back(static_cast<char>(scalar));
-            else if (scalar < 0x800) {
-                utf8.push_back(static_cast<char>(0xC0 | (scalar >> 6)));
-                utf8.push_back(static_cast<char>(0x80 | (scalar & 0x3F)));
-            } else if (scalar < 0x10000) {
-                utf8.push_back(static_cast<char>(0xE0 | (scalar >> 12)));
-                utf8.push_back(static_cast<char>(0x80 | ((scalar >> 6) & 0x3F)));
-                utf8.push_back(static_cast<char>(0x80 | (scalar & 0x3F)));
-            } else {
-                utf8.push_back(static_cast<char>(0xF0 | (scalar >> 18)));
-                utf8.push_back(static_cast<char>(0x80 | ((scalar >> 12) & 0x3F)));
-                utf8.push_back(static_cast<char>(0x80 | ((scalar >> 6) & 0x3F)));
-                utf8.push_back(static_cast<char>(0x80 | (scalar & 0x3F)));
-            }
+            appendUtf8(utf8, scalar);
         }
         return utf8;
     }

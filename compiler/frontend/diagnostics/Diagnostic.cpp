@@ -1,4 +1,5 @@
 #include "Diagnostic.h"
+#include "semantic/Literals.h"
 #include <string>
 
 Diagnostic::Diagnostic(DiagnosticLevel lvl, SourceSpan sp, std::string msg)
@@ -13,19 +14,6 @@ static const char* levelName(DiagnosticLevel level) {
     return "diagnostic";
 }
 
-static void writeChar16(std::ostream& os, char16_t c) {
-    if (c < 0x80) {
-        os << static_cast<char>(c);
-    } else if (c < 0x800) {
-        os << static_cast<char>(0xC0 | (c >> 6));
-        os << static_cast<char>(0x80 | (c & 0x3F));
-    } else {
-        os << static_cast<char>(0xE0 | (c >> 12));
-        os << static_cast<char>(0x80 | ((c >> 6) & 0x3F));
-        os << static_cast<char>(0x80 | (c & 0x3F));
-    }
-}
-
 void Diagnostic::print(const SourceFile& source, std::ostream& os) const {
     os << levelName(level) << ": " << message << "\n";
     os << "  --> " << source.getFilename() << ":" << span.line << ":" << span.column << "\n";
@@ -36,7 +24,7 @@ void Diagnostic::print(const SourceFile& source, std::ostream& os) const {
 
     os << " " << pad << " |\n";
     os << " " << lineNumStr << " | ";
-    for (char16_t c : lineText) writeChar16(os, c);
+    os << utf16ToUtf8(lineText);
     os << "\n";
 
     os << " " << pad << " | ";

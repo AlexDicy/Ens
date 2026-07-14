@@ -10,6 +10,7 @@
 #include "parser/Parser.h"
 #include "semantic/Analyzer.h"
 #include "semantic/EscapeAnalyzer.h"
+#include "semantic/Literals.h"
 #include "semantic/Prelude.h"
 #include "semantic/ThrowsAnalyzer.h"
 #include "semantic/Symbol.h"
@@ -46,26 +47,20 @@ bool isTestFile(const fs::path& relativePath) {
            stem.compare(stem.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
-std::string utf8OfU16(const std::u16string& s) {
-    std::string out;
-    out.reserve(s.size());
-    for (char16_t c : s) {
-        if (c < 0x80) {
-            out.push_back(static_cast<char>(c));
-        } else if (c < 0x800) {
-            out.push_back(static_cast<char>(0xC0 | (c >> 6)));
-            out.push_back(static_cast<char>(0x80 | (c & 0x3F)));
-        } else {
-            out.push_back(static_cast<char>(0xE0 | (c >> 12)));
-            out.push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F)));
-            out.push_back(static_cast<char>(0x80 | (c & 0x3F)));
-        }
-    }
-    return out;
-}
-
 void appendAscii(std::u16string& out, std::string_view ascii) {
     for (char c : ascii) out.push_back(static_cast<char16_t>(c));
+}
+
+// Reads a whole stream and decodes its UTF-8 bytes into UTF-16. On invalid
+// UTF-8 prints a diagnostic naming `filename` and returns false.
+bool readStreamToU16(std::istream& source, const std::string& filename, std::u16string& out) {
+    std::string code((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
+    Utf8DecodeError error;
+    if (!decodeUtf8ToUtf16(code, out, error)) {
+        std::cerr << "ERROR: " << filename << ": " << describeUtf8DecodeError(error) << '\n';
+        return false;
+    }
+    return true;
 }
 
 std::string escapeKindStr(EscapeKind k) {
@@ -499,7 +494,7 @@ int Compiler::test(const fs::path& sourceDir, const fs::path& testsDir,
             t.modulePath = modulePath;
             t.index = index++;
             t.rawLiteral = td.rawDescriptionLiteral().value_or(u"\"\"");
-            t.description = utf8OfU16(td.descriptionText().value_or(std::u16string{}));
+            t.description = utf16ToUtf8(td.descriptionText().value_or(std::u16string{}));
             tests.push_back(std::move(t));
         }
     }
@@ -686,8 +681,8 @@ static void dumpTypedOutline(const SyntaxNode& root, std::ostream& os) {
 }
 
 bool Compiler::dumpCst(std::istream& source, const std::string& filename) {
-    std::string code((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
-    std::u16string u16code(code.begin(), code.end());
+    std::u16string u16code;
+    if (!readStreamToU16(source, filename, u16code)) return false;
     SourceFile sourceFile(filename, std::move(u16code));
 
     DiagnosticSink sink;
@@ -706,8 +701,8 @@ bool Compiler::dumpCst(std::istream& source, const std::string& filename) {
 }
 
 bool Compiler::analyzeCst(std::istream& source, const std::string& filename) {
-    std::string code((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
-    std::u16string u16code(code.begin(), code.end());
+    std::u16string u16code;
+    if (!readStreamToU16(source, filename, u16code)) return false;
     SourceFile sourceFile(filename, std::move(u16code));
 
     DiagnosticSink sink;
@@ -725,8 +720,8 @@ bool Compiler::analyzeCst(std::istream& source, const std::string& filename) {
 }
 
 bool Compiler::compileSingle(std::istream& source, const fs::path& outputFile, const std::string& filename, bool explainArc, const std::string& targetTriple) {
-    std::string code((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
-    std::u16string u16code(code.begin(), code.end());
+    std::u16string u16code;
+    if (!readStreamToU16(source, filename, u16code)) return false;
 
     const std::u16string userPath = u"main";
     std::vector<std::unique_ptr<Module>> modules;

@@ -2,6 +2,7 @@
 
 #include "ast/Declaration.h"
 #include "parser/Parser.h"
+#include "semantic/Literals.h"
 #include "semantic/Prelude.h"
 #include "semantic/Symbol.h"
 #include "semantic/ThrowsAnalyzer.h"
@@ -33,11 +34,19 @@ std::string asAscii(std::u16string_view s) {
     return r;
 }
 
-bool readFileToU16(const fs::path& path, std::u16string& out) {
-    std::ifstream f(path);
+// Reads `path` and decodes its UTF-8 bytes into UTF-16. Returns false on
+// failure: an empty `error` means the file could not be opened, a non-empty
+// `error` describes invalid UTF-8 content.
+bool readFileToU16(const fs::path& path, std::u16string& out, std::string& error) {
+    error.clear();
+    std::ifstream f(path, std::ios::binary);
     if (!f) return false;
     std::string code((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    out.assign(code.begin(), code.end());
+    Utf8DecodeError decodeError;
+    if (!decodeUtf8ToUtf16(code, out, decodeError)) {
+        error = describeUtf8DecodeError(decodeError);
+        return false;
+    }
     return true;
 }
 
@@ -100,8 +109,13 @@ std::unique_ptr<Module> loadModule(const fs::path& sourceRoot,
                                    const std::u16string& modulePath) {
     fs::path absolute = sourceRoot / relativePath;
     std::u16string code;
-    if (!readFileToU16(absolute, code)) {
-        std::cerr << "ERROR: Couldn't read " << absolute.string() << '\n';
+    std::string readError;
+    if (!readFileToU16(absolute, code, readError)) {
+        if (readError.empty()) {
+            std::cerr << "ERROR: Couldn't read " << absolute.string() << '\n';
+        } else {
+            std::cerr << "ERROR: " << absolute.string() << ": " << readError << '\n';
+        }
         return nullptr;
     }
     auto m = std::make_unique<Module>();
