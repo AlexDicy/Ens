@@ -1,0 +1,163 @@
+// Declaration-level recovery and adversarial inputs: every parse, however broken, must round
+// trip byte for byte and never loop or panic.
+import @std.testing;
+import parser_support;
+import SyntaxKind from syntax.kind;
+import syntax.factory;
+import SourceFileNode from syntax.nodes;
+import ErrorDeclarationNode from syntax.nodes;
+import ExternalTypeDeclarationNode from syntax.nodes;
+import InterfaceDeclarationNode from syntax.nodes;
+import ClassDeclarationNode from syntax.nodes;
+import FunctionDeclarationNode from syntax.nodes;
+
+private parseFile(string text) -> SourceFileNode {
+    let result = parser_support.parseText(text);
+    let root = factory.createRoot(result.root());
+    if (root is SourceFileNode) {
+        return root;
+    }
+    panic("the root should be a SourceFileNode");
+}
+
+test "modifiers before external become their own error declaration" {
+    let text = "public external type HANDLE;\n";
+    let result = parser_support.parseText(text);
+    try parser_support.assertRoundTrip(text, result);
+    try parser_support.assertDiagnosticCount(result, 1);
+    try testing.assertEqual(result.diagnostics()[0].message(),
+        "External declarations do not take modifiers; write 'external' at the start of the line");
+    let file = parseFile(text);
+    try testing.assertEqual(file.itemsCount(), 2L);
+    try testing.assertTrue(file.items(0) is ErrorDeclarationNode, "the modifier is junk");
+    try testing.assertTrue(file.items(1) is ExternalTypeDeclarationNode,
+        "the external type still parses");
+}
+
+test "an interface with extends keeps its members after the junk" {
+    let text = "interface I extends J \{\n"
+        + "    speak() -> string;\n"
+        + "\}\n";
+    let result = parser_support.parseText(text);
+    try parser_support.assertRoundTrip(text, result);
+    try parser_support.assertDiagnosticCount(result, 1);
+    let file = parseFile(text);
+    let item = file.items(0);
+    if (item is InterfaceDeclarationNode) {
+        let body = item.body();
+        try testing.assertEqual(body.openBrace().kind(), SyntaxKind.Missing);
+        try testing.assertEqual(body.membersCount(), 2L);
+        try testing.assertTrue(body.members(0) is ErrorDeclarationNode,
+            "the stray clause is wrapped as junk");
+        try testing.assertTrue(body.members(1) is FunctionDeclarationNode,
+            "the method signature survives");
+    } else {
+        try testing.fail("the item should still be an interface");
+    }
+}
+
+test "keyword names recover with one diagnostic each" {
+    let text = "class Meta \{\n"
+        + "    type() -> long \{\n"
+        + "        return 1;\n"
+        + "    \}\n"
+        + "\n"
+        + "    copy(string from) \{\n"
+        + "    \}\n"
+        + "\}\n";
+    let result = parser_support.parseText(text);
+    try parser_support.assertRoundTrip(text, result);
+    try parser_support.assertDiagnosticCount(result, 2);
+    let file = parseFile(text);
+    let item = file.items(0);
+    if (item is ClassDeclarationNode) {
+        let method = item.body().members(0);
+        if (method is FunctionDeclarationNode) {
+            try testing.assertEqual(method.name().kind(), SyntaxKind.Identifier);
+            try testing.assertEqual(method.name().text(), "type");
+        } else {
+            try testing.fail("the keyword-named member should parse as a method");
+        }
+    } else {
+        try testing.fail("the item should be a class");
+    }
+}
+
+test "parameter lists recover from missing commas and junk" {
+    let missingComma = "combine(int a int b) -> int \{\n    return a + b;\n\}\n";
+    let result = parser_support.parseText(missingComma);
+    try parser_support.assertRoundTrip(missingComma, result);
+    try parser_support.assertDiagnosticCount(result, 1);
+    let file = parseFile(missingComma);
+    let item = file.items(0);
+    if (item is FunctionDeclarationNode) {
+        try testing.assertEqual(item.parameters().parametersCount(), 2L);
+    } else {
+        try testing.fail("the item should be a function");
+    }
+
+    let junk = "draw(??? , int x) \{\n\}\n";
+    let junkResult = parser_support.parseText(junk);
+    try parser_support.assertRoundTrip(junk, junkResult);
+    try testing.assertTrue(junkResult.diagnostics().length > 0, "the junk is reported");
+}
+
+test "top-level statements are rejected with a helpful message" {
+    let text = "let x = 5;\n";
+    let result = parser_support.parseText(text);
+    try parser_support.assertRoundTrip(text, result);
+    try parser_support.assertDiagnosticCount(result, 1);
+    try testing.assertEqual(result.diagnostics()[0].message(),
+        "Variables cannot be declared at the top level; move the declaration inside a function");
+}
+
+test "unterminated declarations still round trip" {
+    let samples = [
+        "class C \{ foo() \{",
+        "class C \{ int x \}",
+        "import a.b",
+        "external from \"c\" \{ Read(",
+        "enum E \{ A B \}",
+        "test \"unfinished\" \{ run();",
+        "struct S \{ \{ \} \}",
+        "interface \{ \}",
+        "foo(",
+    ];
+    for (let text in samples) {
+        let result = parser_support.parseText(text);
+        try parser_support.assertRoundTrip(text, result);
+        try testing.assertTrue(result.diagnostics().length > 0,
+            "'{text}' should report at least one diagnostic");
+    }
+}
+
+test "adversarial token soup round trips at every entry point" {
+    let samples = [
+        ">>>= >>> >> << <<= ?? ?. ?[ ... :: @ #",
+        "class class class ( \} \{ ) ;;",
+        "\"unterminated \{hole",
+        "a<b<c<d<e<f(((((((",
+        "new new new [ ] ] ] \} \} \}",
+        "if while for switch else catch finally",
+        "x ?\{ : ?: \} [ , ] =",
+        "0x 0b 'unclosed \\q \"bad\\u12\"",
+    ];
+    for (let text in samples) {
+        let fileResult = parser_support.parseText(text);
+        try parser_support.assertRoundTrip(text, fileResult);
+        let statementResult = parser_support.parseStatementText(text);
+        try parser_support.assertRoundTrip(text, statementResult);
+        let expressionResult = parser_support.parseExpressionText(text);
+        try parser_support.assertRoundTrip(text, expressionResult);
+    }
+}
+
+test "deeply nested expressions stop at the depth guard instead of crashing" {
+    let builder = "x";
+    for (long i = 0; i < 600; i++) {
+        builder = "(" + builder;
+    }
+    let result = parser_support.parseExpressionText(builder);
+    try parser_support.assertRoundTrip(builder, result);
+    try testing.assertTrue(result.diagnostics().length > 0, "the depth guard reports");
+}
