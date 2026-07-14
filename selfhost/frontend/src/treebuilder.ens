@@ -1,0 +1,155 @@
+// Folds the parser's flat event stream and the lexed token stream into an immutable green tree.
+// Slot layout is the parser's responsibility: the builder appends exactly one child per Token,
+// NullSlot, and finished-node event, in event order, so every green node's slots land in the
+// grammar's declaration order. Token text and trivia are sliced from the source here, never
+// copied earlier.
+import Source from source;
+import SyntaxKind from syntax.kind;
+import GreenTrivia from syntax.green;
+import GreenToken from syntax.green;
+import GreenNode from syntax.green;
+import GreenElement from syntax.green;
+import LexedToken from token;
+import RawToken from token;
+import EventKind from events;
+import ParseEvent from events;
+import Vector from @std.vector;
+
+public buildTree(Source input, LexedToken[] tokens, ParseEvent[] events) -> GreenNode {
+    let builder = new TreeBuilder(input, tokens, events);
+    return builder.build();
+}
+
+class TreeBuilder {
+    private Source input;
+    private LexedToken[] tokens;
+    private ParseEvent[] events;
+    private bool[] hoisted;
+
+    // Parallel stacks of the nodes being built; depth is the logical size, so the backing
+    // vectors can grow without a pop operation.
+    private Vector<SyntaxKind> openKinds;
+    private Vector<Vector<GreenElement?>> openChildren;
+    private long depth;
+
+    private GreenNode? rootNode;
+
+    TreeBuilder(Source input, LexedToken[] tokens, ParseEvent[] events) {
+        this.input = input;
+        this.tokens = tokens;
+        this.events = events;
+        this.hoisted = new bool[events.length];
+        this.openKinds = new Vector<SyntaxKind>();
+        this.openChildren = new Vector<Vector<GreenElement?>>();
+        this.depth = 0;
+        this.rootNode = null;
+    }
+
+    build() -> GreenNode {
+        for (long i = 0; i < this.events.length; i++) {
+            if (this.hoisted[i]) {
+                continue;
+            }
+            let event = this.events[i];
+            switch (event.eventKind) {
+                Tombstone -> { },
+                StartNode -> this.processStart(i),
+                FinishNode -> this.finishNode(),
+                Token -> this.addToken(event),
+                NullSlot -> this.addChild(null),
+            }
+        }
+        if (this.depth != 0) {
+            panic("Internal: {this.depth} nodes were started but never finished");
+        }
+        let root = this.rootNode;
+        if (root != null) {
+            return root;
+        }
+        panic("Internal: the parse event stream produced no root node");
+    }
+
+    // Opens the node chain rooted at a StartNode event: forward parents are later events that
+    // retroactively wrap this one, so they open first, outermost to innermost.
+    private processStart(long startIndex) {
+        let kinds = new Vector<SyntaxKind>();
+        long index = startIndex;
+        while (true) {
+            let event = this.events[index];
+            kinds.push(event.kind);
+            if (event.forwardParent < 0) {
+                break;
+            }
+            index = event.forwardParent;
+            this.hoisted[index] = true;
+        }
+        for (long i = kinds.length() - 1; i >= 0; i--) {
+            this.openNode(kinds.get(i));
+        }
+    }
+
+    private openNode(SyntaxKind kind) {
+        if (this.depth == this.openKinds.length()) {
+            this.openKinds.push(kind);
+            this.openChildren.push(new Vector<GreenElement?>());
+        } else {
+            this.openKinds.set(this.depth, kind);
+            this.openChildren.set(this.depth, new Vector<GreenElement?>());
+        }
+        this.depth++;
+    }
+
+    private finishNode() {
+        if (this.depth == 0) {
+            panic("Internal: a FinishNode event arrived with no open node");
+        }
+        this.depth--;
+        let kind = this.openKinds.get(this.depth);
+        let children = this.openChildren.get(this.depth);
+        let node = new GreenNode(kind, children.toArray());
+        if (this.depth == 0) {
+            if (this.rootNode != null) {
+                panic("Internal: the parse event stream produced two root nodes");
+            }
+            this.rootNode = node;
+        } else {
+            this.addChild(node);
+        }
+    }
+
+    private addChild(GreenElement? child) {
+        if (this.depth == 0) {
+            panic("Internal: a child was produced outside any open node");
+        }
+        this.openChildren.get(this.depth - 1).push(child);
+    }
+
+    private addToken(ParseEvent event) {
+        if (event.tokenIndex < 0) {
+            GreenTrivia[] none = [];
+            this.addChild(new GreenToken(SyntaxKind.Missing, "", none, none));
+            return;
+        }
+        let token = this.tokens[event.tokenIndex];
+        let start = token.offset + event.pieceStart;
+        let text = this.input.text().substring(start, start + event.pieceLength);
+        GreenTrivia[] leading = [];
+        if (event.takeLeading) {
+            leading = this.convertTrivia(token.leading);
+        }
+        GreenTrivia[] trailing = [];
+        if (event.takeTrailing) {
+            trailing = this.convertTrivia(token.trailing);
+        }
+        this.addChild(new GreenToken(event.kind, text, leading, trailing));
+    }
+
+    private convertTrivia(RawToken[] pieces) -> GreenTrivia[] {
+        GreenTrivia[] result = new GreenTrivia[pieces.length];
+        for (long i = 0; i < result.length; i = i + 1) {
+            result[i] = new GreenTrivia(pieces[i].kind,
+                this.input.text().substring(pieces[i].offset, pieces[i].offset + pieces[i].length));
+        }
+        return result;
+    }
+}

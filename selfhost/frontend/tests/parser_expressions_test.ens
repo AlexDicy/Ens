@@ -1,0 +1,342 @@
+// Expression parsing: shapes through the typed accessors, precedence, and recovery basics.
+// Every parse asserts the byte-for-byte round trip.
+import @std.testing;
+import parser_support;
+import SyntaxKind from syntax.kind;
+import SyntaxNode from syntax.node;
+import Expression from syntax.nodes;
+import LiteralExpressionNode from syntax.nodes;
+import IdentifierExpressionNode from syntax.nodes;
+import BinaryExpressionNode from syntax.nodes;
+import PrefixExpressionNode from syntax.nodes;
+import PostfixExpressionNode from syntax.nodes;
+import AssignmentExpressionNode from syntax.nodes;
+import NullCoalesceExpressionNode from syntax.nodes;
+import TernaryExpressionNode from syntax.nodes;
+import CallExpressionNode from syntax.nodes;
+import OutArgumentNode from syntax.nodes;
+import NamedArgumentNode from syntax.nodes;
+import MemberExpressionNode from syntax.nodes;
+import SafeMemberExpressionNode from syntax.nodes;
+import SubscriptExpressionNode from syntax.nodes;
+import SafeSubscriptExpressionNode from syntax.nodes;
+import CastExpressionNode from syntax.nodes;
+import CheckedCastExpressionNode from syntax.nodes;
+import TypeTestExpressionNode from syntax.nodes;
+import NewExpressionNode from syntax.nodes;
+import ArrayLiteralExpressionNode from syntax.nodes;
+import ParenthesizedExpressionNode from syntax.nodes;
+import TryExpressionNode from syntax.nodes;
+import ErrorExpressionNode from syntax.nodes;
+import NamedTypeNode from syntax.nodes;
+import OptionalTypeNode from syntax.nodes;
+import ArrayTypeNode from syntax.nodes;
+
+test "literals and simple primaries parse and round trip" {
+    let literals = ["42", "10L", "2.5f", "3.25", "\"hello\"", "'a'", "true", "false", "null"];
+    for (let text in literals) {
+        let node = try parser_support.expressionNode(text);
+        try testing.assertTrue(node.kind() == SyntaxKind.LiteralExpression,
+            "'{text}' should be a literal expression");
+    }
+    let identifier = try parser_support.expressionNode("total");
+    if (identifier is IdentifierExpressionNode) {
+        try testing.assertEqual(identifier.name().text(), "total");
+    } else {
+        try testing.fail("'total' should be an identifier expression");
+    }
+    let thisNode = try parser_support.expressionNode("this");
+    try testing.assertEqual(thisNode.kind(), SyntaxKind.ThisExpression);
+    let superNode = try parser_support.expressionNode("super");
+    try testing.assertEqual(superNode.kind(), SyntaxKind.SuperExpression);
+}
+
+test "multiplication binds tighter than addition" {
+    let node = try parser_support.expressionNode("1 + 2 * 3");
+    if (node is BinaryExpressionNode) {
+        try testing.assertEqual(node.operator().text(), "+");
+        try testing.assertEqual(node.left().kind(), SyntaxKind.LiteralExpression);
+        let right = node.right();
+        if (right is BinaryExpressionNode) {
+            try testing.assertEqual(right.operator().text(), "*");
+        } else {
+            try testing.fail("the right operand should be the multiplication");
+        }
+    } else {
+        try testing.fail("the root should be the addition");
+    }
+}
+
+test "assignment and null coalescing associate to the right" {
+    let assignment = try parser_support.expressionNode("a = b += c");
+    if (assignment is AssignmentExpressionNode) {
+        try testing.assertEqual(assignment.operator().text(), "=");
+        try testing.assertTrue(assignment.value().kind() == SyntaxKind.AssignmentExpression,
+            "the value of 'a =' should be the inner assignment");
+    } else {
+        try testing.fail("the root should be an assignment");
+    }
+    let coalesce = try parser_support.expressionNode("a ?? b ?? c");
+    if (coalesce is NullCoalesceExpressionNode) {
+        try testing.assertTrue(coalesce.right().kind() == SyntaxKind.NullCoalesceExpression,
+            "'??' should nest to the right");
+    } else {
+        try testing.fail("the root should be a null-coalesce expression");
+    }
+}
+
+test "prefix and postfix operators take their operands" {
+    let negation = try parser_support.expressionNode("-x * y");
+    if (negation is BinaryExpressionNode) {
+        try testing.assertEqual(negation.left().kind(), SyntaxKind.PrefixExpression);
+    } else {
+        try testing.fail("the root should be the multiplication");
+    }
+    let increment = try parser_support.expressionNode("count++");
+    if (increment is PostfixExpressionNode) {
+        try testing.assertEqual(increment.operator().text(), "++");
+        try testing.assertEqual(increment.operand().kind(), SyntaxKind.IdentifierExpression);
+    } else {
+        try testing.fail("'count++' should be a postfix expression");
+    }
+    let decrement = try parser_support.expressionNode("--count");
+    try testing.assertEqual(decrement.kind(), SyntaxKind.PrefixExpression);
+    let logical = try parser_support.expressionNode("!ready");
+    try testing.assertEqual(logical.kind(), SyntaxKind.PrefixExpression);
+}
+
+test "member, subscript, and safe variants chain in source order" {
+    let node = try parser_support.expressionNode("a.b?.c[0]?[1]");
+    if (node is SafeSubscriptExpressionNode) {
+        let inner = node.object();
+        if (inner is SubscriptExpressionNode) {
+            let member = inner.object();
+            if (member is SafeMemberExpressionNode) {
+                try testing.assertEqual(member.member().text(), "c");
+                let head = member.object();
+                if (head is MemberExpressionNode) {
+                    try testing.assertEqual(head.member().text(), "b");
+                } else {
+                    try testing.fail("the chain should start with 'a.b'");
+                }
+            } else {
+                try testing.fail("the subscript receiver should be '?.c'");
+            }
+        } else {
+            try testing.fail("the safe subscript receiver should be '[0]'");
+        }
+    } else {
+        try testing.fail("the root should be the safe subscript");
+    }
+}
+
+test "calls parse plain, named, and out arguments" {
+    let node = try parser_support.expressionNode("write(buffer, count: 3, out written)");
+    if (node is CallExpressionNode) {
+        try testing.assertEqual(node.callee().kind(), SyntaxKind.IdentifierExpression);
+        try testing.assertTrue(node.typeArguments() == null, "no type arguments were written");
+        let arguments = node.arguments();
+        try testing.assertEqual(arguments.argumentsCount(), 3L);
+        try testing.assertTrue(arguments.arguments(0) is Expression, "plain argument");
+        let named = arguments.arguments(1);
+        if (named is NamedArgumentNode) {
+            try testing.assertEqual(named.name().text(), "count");
+        } else {
+            try testing.fail("the second argument should be named");
+        }
+        let out = arguments.arguments(2);
+        if (out is OutArgumentNode) {
+            try testing.assertEqual(out.outKeyword().kind(), SyntaxKind.OutKeyword);
+            try testing.assertEqual(out.name().text(), "written");
+        } else {
+            try testing.fail("the third argument should be an out argument");
+        }
+    } else {
+        try testing.fail("the root should be a call");
+    }
+}
+
+test "casts and type tests take types with suffixes" {
+    let cast = try parser_support.expressionNode("value as long");
+    if (cast is CastExpressionNode) {
+        try testing.assertEqual(cast.target().kind(), SyntaxKind.NamedType);
+    } else {
+        try testing.fail("'as' should build a cast");
+    }
+    let generic = try parser_support.expressionNode("items as Vector<int>");
+    if (generic is CastExpressionNode) {
+        let target = generic.target();
+        if (target is NamedTypeNode) {
+            let arguments = target.typeArguments();
+            try testing.assertTrue(arguments != null, "the cast target has type arguments");
+        } else {
+            try testing.fail("the cast target should be a named type");
+        }
+    } else {
+        try testing.fail("'as Vector<int>' should build a cast");
+    }
+    let checked = try parser_support.expressionNode("shape as? Circle?[]");
+    if (checked is CheckedCastExpressionNode) {
+        try testing.assertEqual(checked.target().kind(), SyntaxKind.ArrayType);
+    } else {
+        try testing.fail("'as?' should build a checked cast");
+    }
+    let test1 = try parser_support.expressionNode("shape is Circle");
+    if (test1 is TypeTestExpressionNode) {
+        try testing.assertEqual(test1.target().name().text(), "Circle");
+    } else {
+        try testing.fail("'is' should build a type test");
+    }
+}
+
+test "a type test condition still allows a ternary" {
+    let node = try parser_support.expressionNode("shape is Circle ? 1 : 2");
+    if (node is TernaryExpressionNode) {
+        try testing.assertEqual(node.condition().kind(), SyntaxKind.TypeTestExpression);
+    } else {
+        try testing.fail("the root should be the ternary");
+    }
+}
+
+test "new expressions split the created type from the dimensions" {
+    let constructed = try parser_support.expressionNode("new Point(0, 0)");
+    if (constructed is NewExpressionNode) {
+        try testing.assertEqual(constructed.createdType().kind(), SyntaxKind.NamedType);
+        try testing.assertTrue(constructed.arguments() != null, "constructor arguments present");
+        try testing.assertEqual(constructed.dimensionsCount(), 0L);
+    } else {
+        try testing.fail("'new Point(0, 0)' should be a new expression");
+    }
+
+    let array = try parser_support.expressionNode("new Box?[3]");
+    if (array is NewExpressionNode) {
+        try testing.assertEqual(array.createdType().kind(), SyntaxKind.OptionalType);
+        try testing.assertTrue(array.arguments() == null, "no constructor arguments");
+        try testing.assertEqual(array.dimensionsCount(), 1L);
+        let size = array.dimensions(0).size();
+        try testing.assertTrue(size != null, "the dimension has a size");
+    } else {
+        try testing.fail("'new Box?[3]' should be a new expression");
+    }
+
+    let grid = try parser_support.expressionNode("new int[3][]");
+    if (grid is NewExpressionNode) {
+        try testing.assertEqual(grid.createdType().kind(), SyntaxKind.NamedType);
+        try testing.assertEqual(grid.dimensionsCount(), 2L);
+        try testing.assertTrue(grid.dimensions(1).size() == null, "the tail dimension is empty");
+    } else {
+        try testing.fail("'new int[3][]' should be a new expression");
+    }
+
+    let nested = try parser_support.expressionNode("new string[][4]");
+    if (nested is NewExpressionNode) {
+        try testing.assertEqual(nested.createdType().kind(), SyntaxKind.ArrayType);
+        try testing.assertEqual(nested.dimensionsCount(), 1L);
+    } else {
+        try testing.fail("'new string[][4]' should be a new expression");
+    }
+}
+
+test "array literals allow a trailing comma" {
+    let node = try parser_support.expressionNode("[1, 2, 3,]");
+    if (node is ArrayLiteralExpressionNode) {
+        try testing.assertEqual(node.elementsCount(), 3L);
+    } else {
+        try testing.fail("the root should be an array literal");
+    }
+}
+
+test "parentheses and try wrap their operands" {
+    let paren = try parser_support.expressionNode("(1 + 2) * 3");
+    if (paren is BinaryExpressionNode) {
+        try testing.assertEqual(paren.left().kind(), SyntaxKind.ParenthesizedExpression);
+    } else {
+        try testing.fail("the root should be the multiplication");
+    }
+    let tried = try parser_support.expressionNode("try readAll() ?? fallback");
+    if (tried is NullCoalesceExpressionNode) {
+        let left = tried.left();
+        if (left is TryExpressionNode) {
+            try testing.assertEqual(left.operand().kind(), SyntaxKind.CallExpression);
+        } else {
+            try testing.fail("'try' should bind only the call");
+        }
+    } else {
+        try testing.fail("'??' should apply outside the try");
+    }
+}
+
+test "a missing operand becomes an error expression with one diagnostic" {
+    let result = parser_support.parseExpressionText("1 + ");
+    try parser_support.assertRoundTrip("1 + ", result);
+    try parser_support.assertDiagnosticCount(result, 1);
+    let node = parser_support.standaloneNode(result);
+    if (node is BinaryExpressionNode) {
+        try testing.assertTrue(node.right().kind() == SyntaxKind.ErrorExpression,
+            "the absent right operand should be an error expression");
+        let error = node.right();
+        if (error is ErrorExpressionNode) {
+            try testing.assertEqual(error.skippedCount(), 0L);
+        }
+    } else {
+        try testing.fail("the root should still be the addition");
+    }
+}
+
+test "an unclosed call reports the missing parenthesis and round trips" {
+    let result = parser_support.parseExpressionText("write(a, b");
+    try parser_support.assertRoundTrip("write(a, b", result);
+    try parser_support.assertDiagnosticCount(result, 1);
+    try testing.assertEqual(result.diagnostics()[0].message(),
+        "Expected ')' to close the arguments");
+}
+
+test "missing tokens anchor at the previous content end, not the next line" {
+    let text = "(1 + 2\n";
+    let result = parser_support.parseExpressionText(text);
+    try parser_support.assertRoundTrip(text, result);
+    try parser_support.assertDiagnosticCount(result, 1);
+    let span = result.diagnostics()[0].span();
+    try testing.assertEqual(span.start, 6L);
+    try testing.assertEqual(span.length, 0L);
+}
+
+test "lex and parse diagnostics merge in span order" {
+    let text = "1 + `";
+    let result = parser_support.parseExpressionText(text);
+    try parser_support.assertRoundTrip(text, result);
+    let diagnostics = result.diagnostics();
+    try testing.assertTrue(diagnostics.length >= 2, "both a lex and a parse diagnostic appear");
+    for (long i = 1; i < diagnostics.length; i++) {
+        try testing.assertTrue(diagnostics[i - 1].span().start <= diagnostics[i].span().start,
+            "diagnostics stay ordered by span start");
+    }
+}
+
+test "garbage input still round trips as error nodes" {
+    let text = "%%% ??? ,,,";
+    let result = parser_support.parseExpressionText(text);
+    try parser_support.assertRoundTrip(text, result);
+    try testing.assertTrue(result.diagnostics().length > 0, "garbage reports at least one error");
+
+    let empty = parser_support.parseExpressionText("");
+    try parser_support.assertRoundTrip("", empty);
+    try testing.assertEqual(parser_support.standaloneNode(empty).kind(),
+        SyntaxKind.ErrorExpression);
+}
+
+test "a full file of junk parses into error declarations and round trips" {
+    let text = "??? junk )(\n\{ nested \{ braces \} \}\nmore ;\n";
+    let result = parser_support.parseText(text);
+    try parser_support.assertRoundTrip(text, result);
+    try testing.assertTrue(result.diagnostics().length > 0, "junk reports errors");
+    try testing.assertEqual(result.root().kind(), SyntaxKind.SourceFile);
+
+    let empty = parser_support.parseText("");
+    try parser_support.assertRoundTrip("", empty);
+    try parser_support.assertNoDiagnostics(empty);
+
+    let triviaOnly = parser_support.parseText("  // just a comment\n\n");
+    try parser_support.assertRoundTrip("  // just a comment\n\n", triviaOnly);
+    try parser_support.assertNoDiagnostics(triviaOnly);
+}

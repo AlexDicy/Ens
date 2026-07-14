@@ -1,0 +1,204 @@
+// Unit tests for the parse event list and the tree builder, driving them directly with
+// hand-written event streams over lexed tokens.
+import @std.testing;
+import Source from source;
+import SyntaxKind from syntax.kind;
+import EventKind from events;
+import ParseEvent from events;
+import EventList from events;
+import treebuilder;
+import lexer;
+import LexedToken from token;
+import GreenToken from syntax.green;
+import GreenNode from syntax.green;
+
+private startEvent(SyntaxKind kind) -> ParseEvent {
+    ParseEvent event;
+    event.eventKind = EventKind.StartNode;
+    event.kind = kind;
+    return event;
+}
+
+private finishEvent() -> ParseEvent {
+    ParseEvent event;
+    event.eventKind = EventKind.FinishNode;
+    return event;
+}
+
+private nullSlotEvent() -> ParseEvent {
+    ParseEvent event;
+    event.eventKind = EventKind.NullSlot;
+    return event;
+}
+
+private tokenEvent(SyntaxKind kind, long tokenIndex, LexedToken[] tokens) -> ParseEvent {
+    ParseEvent event;
+    event.eventKind = EventKind.Token;
+    event.kind = kind;
+    event.tokenIndex = tokenIndex;
+    event.pieceStart = 0;
+    event.pieceLength = tokens[tokenIndex].length;
+    return event;
+}
+
+private missingTokenEvent() -> ParseEvent {
+    ParseEvent event;
+    event.eventKind = EventKind.Token;
+    event.kind = SyntaxKind.Missing;
+    event.tokenIndex = -1;
+    event.takeLeading = false;
+    event.takeTrailing = false;
+    return event;
+}
+
+test "the event list pushes, reads, overwrites, and truncates" {
+    let list = new EventList();
+    try testing.assertEqual(list.count(), 0L);
+    let first = list.push(startEvent(SyntaxKind.Block));
+    let second = list.push(finishEvent());
+    try testing.assertEqual(first, 0L);
+    try testing.assertEqual(second, 1L);
+    try testing.assertEqual(list.count(), 2L);
+    try testing.assertTrue(list.get(0).kind == SyntaxKind.Block, "the pushed kind is stored");
+
+    let updated = list.get(0);
+    updated.forwardParent = 7;
+    list.set(0, updated);
+    try testing.assertEqual(list.get(0).forwardParent, 7L);
+
+    list.truncate(1);
+    try testing.assertEqual(list.count(), 1L);
+    list.push(nullSlotEvent());
+    try testing.assertEqual(list.count(), 2L);
+    try testing.assertTrue(list.get(1).eventKind == EventKind.NullSlot,
+        "pushing after truncate overwrites the dropped event");
+
+    let events = list.toArray();
+    try testing.assertEqual(events.length, 2L);
+    try testing.assertTrue(events[1].eventKind == EventKind.NullSlot, "toArray honors the count");
+}
+
+test "the tree builder folds a flat event stream into a green tree" {
+    let text = "a + b";
+    let input = new Source("test.ens", text);
+    let tokens = lexer.lex(input).tokens();
+    let list = new EventList();
+    list.push(startEvent(SyntaxKind.BinaryExpression));
+    list.push(startEvent(SyntaxKind.IdentifierExpression));
+    list.push(tokenEvent(SyntaxKind.Identifier, 0, tokens));
+    list.push(finishEvent());
+    list.push(tokenEvent(SyntaxKind.Plus, 1, tokens));
+    list.push(startEvent(SyntaxKind.IdentifierExpression));
+    list.push(tokenEvent(SyntaxKind.Identifier, 2, tokens));
+    list.push(finishEvent());
+    list.push(finishEvent());
+
+    let root = treebuilder.buildTree(input, tokens, list.toArray());
+    try testing.assertEqual(root.kind(), SyntaxKind.BinaryExpression);
+    try testing.assertEqual(root.slotCount(), 3L);
+    try testing.assertEqual(root.fullText(), text);
+    let operator = root.slot(1);
+    if (operator is GreenToken) {
+        try testing.assertEqual(operator.text(), "+");
+        try testing.assertEqual(operator.trailingTrivia().length, 1L);
+    } else {
+        try testing.fail("slot 1 should hold the operator token");
+    }
+}
+
+test "forward parents wrap an already-finished node" {
+    let text = "a++";
+    let input = new Source("test.ens", text);
+    let tokens = lexer.lex(input).tokens();
+    let list = new EventList();
+    let inner = startEvent(SyntaxKind.IdentifierExpression);
+    inner.forwardParent = 3;
+    list.push(inner);
+    list.push(tokenEvent(SyntaxKind.Identifier, 0, tokens));
+    list.push(finishEvent());
+    list.push(startEvent(SyntaxKind.PostfixExpression));
+    list.push(tokenEvent(SyntaxKind.PlusPlus, 1, tokens));
+    list.push(finishEvent());
+
+    let root = treebuilder.buildTree(input, tokens, list.toArray());
+    try testing.assertEqual(root.kind(), SyntaxKind.PostfixExpression);
+    try testing.assertEqual(root.slotCount(), 2L);
+    try testing.assertEqual(root.fullText(), text);
+    let operand = root.slot(0);
+    if (operand is GreenNode) {
+        try testing.assertEqual(operand.kind(), SyntaxKind.IdentifierExpression);
+    } else {
+        try testing.fail("slot 0 should hold the wrapped identifier expression");
+    }
+}
+
+test "null slots and missing tokens keep slot layout without adding text" {
+    let text = "return ";
+    let input = new Source("test.ens", text);
+    let tokens = lexer.lex(input).tokens();
+    let list = new EventList();
+    list.push(startEvent(SyntaxKind.ReturnStatement));
+    list.push(tokenEvent(SyntaxKind.ReturnKeyword, 0, tokens));
+    list.push(nullSlotEvent());
+    list.push(missingTokenEvent());
+    list.push(finishEvent());
+
+    let root = treebuilder.buildTree(input, tokens, list.toArray());
+    try testing.assertEqual(root.slotCount(), 3L);
+    try testing.assertTrue(root.slot(1) == null, "the null slot stays empty");
+    let semicolon = root.slot(2);
+    if (semicolon is GreenToken) {
+        try testing.assertEqual(semicolon.kind(), SyntaxKind.Missing);
+        try testing.assertEqual(semicolon.text(), "");
+        try testing.assertEqual(semicolon.fullLength(), 0L);
+    } else {
+        try testing.fail("slot 2 should hold the missing token");
+    }
+    try testing.assertEqual(root.fullText(), text);
+}
+
+test "split token pieces partition the span and the trivia" {
+    let text = "a\n// note\n>> b";
+    let input = new Source("test.ens", text);
+    let tokens = lexer.lex(input).tokens();
+    let list = new EventList();
+    list.push(startEvent(SyntaxKind.List));
+    list.push(tokenEvent(SyntaxKind.Identifier, 0, tokens));
+    ParseEvent firstPiece;
+    firstPiece.eventKind = EventKind.Token;
+    firstPiece.kind = SyntaxKind.Greater;
+    firstPiece.tokenIndex = 1;
+    firstPiece.pieceStart = 0;
+    firstPiece.pieceLength = 1;
+    firstPiece.takeTrailing = false;
+    list.push(firstPiece);
+    ParseEvent secondPiece;
+    secondPiece.eventKind = EventKind.Token;
+    secondPiece.kind = SyntaxKind.Greater;
+    secondPiece.tokenIndex = 1;
+    secondPiece.pieceStart = 1;
+    secondPiece.pieceLength = 1;
+    secondPiece.takeLeading = false;
+    list.push(secondPiece);
+    list.push(tokenEvent(SyntaxKind.Identifier, 2, tokens));
+    list.push(finishEvent());
+
+    let root = treebuilder.buildTree(input, tokens, list.toArray());
+    try testing.assertEqual(root.fullText(), text);
+    let first = root.slot(1);
+    if (first is GreenToken) {
+        try testing.assertEqual(first.kind(), SyntaxKind.Greater);
+        try testing.assertEqual(first.text(), ">");
+        try testing.assertEqual(first.leadingTrivia().length, 2L);
+        try testing.assertEqual(first.trailingTrivia().length, 0L);
+    } else {
+        try testing.fail("slot 1 should hold the first '>' piece");
+    }
+    let second = root.slot(2);
+    if (second is GreenToken) {
+        try testing.assertEqual(second.leadingTrivia().length, 0L);
+        try testing.assertEqual(second.trailingTrivia().length, 1L);
+    } else {
+        try testing.fail("slot 2 should hold the second '>' piece");
+    }
+}
