@@ -342,6 +342,32 @@ void Analyzer::registerNames(const SyntaxNode& root) {
     registerInterfaceNames(*sf);
     registerEnumNames(*sf);
     registerExternalTypeNames(*sf);
+    rejectTopLevelVariables(*sf);
+}
+
+// A `let`, `const`, or typed variable declaration written at file scope parses
+// but has no meaning: Ens has no top-level variables. The analyzer would drop it
+// silently, so a later use fails far away with 'Undefined name'. Report it here
+// at the declaration instead.
+void Analyzer::rejectTopLevelVariables(const ast::SourceFile& file) {
+    for (auto& child : file.node.children()) {
+        std::optional<SyntaxNode> nameTok;
+        std::optional<std::u16string> name;
+        if (auto v = ast::TypedVarDeclStatement::cast(child)) {
+            nameTok = v->nameToken();
+            name = v->nameText();
+        } else if (auto l = ast::LetStatement::cast(child)) {
+            nameTok = l->nameToken();
+            name = l->nameText();
+        } else {
+            continue;
+        }
+        std::string named = name ? "'" + asciiOf(*name) + "'" : "it";
+        errorAtNode(nameTok ? *nameTok : child, "Top-level variables are not supported: " +
+            named + " must be declared inside a function. Move it into a function, or "
+            "expose it through a function that returns the value, for example "
+            "'getValue() -> int { return 3; }'.");
+    }
 }
 
 void Analyzer::resolveSignatures() {

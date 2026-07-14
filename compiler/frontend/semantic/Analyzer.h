@@ -132,6 +132,7 @@ private:
     void registerInterfaceNames(const ast::SourceFile& file);
     void registerEnumNames(const ast::SourceFile& file);
     void registerExternalTypeNames(const ast::SourceFile& file);
+    void rejectTopLevelVariables(const ast::SourceFile& file);
     void collectStructs(const ast::SourceFile& file);
     void collectInterfaces(const ast::SourceFile& file);
     void collectEnums(const ast::SourceFile& file);
