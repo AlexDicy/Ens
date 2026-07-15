@@ -65,11 +65,12 @@ Analyzer::Analyzer(const SourceFile& src, DiagnosticSink& s)
 }
 
 Analyzer::Analyzer(const SourceFile& src, DiagnosticSink& s,
-                   TypeContext& sharedContext, std::u16string mp)
+                   TypeContext& sharedContext, std::u16string mp, std::u16string packagePrefix)
     : source(src), sink(s),
       ownedTypeCtx(),
       typeCtx(sharedContext),
-      modulePath_(std::move(mp)) {
+      modulePath_(std::move(mp)),
+      packagePrefix_(std::move(packagePrefix)) {
     auto scope = std::make_unique<Scope>(nullptr);
     globalScope = scope.get();
     currentScope = globalScope;
@@ -598,6 +599,12 @@ void Analyzer::collectEnums(const ast::SourceFile& file) {
     }
 }
 
+std::u16string Analyzer::importTargetPath(const ast::ImportDecl& imp) const {
+    std::u16string mp = imp.modulePath();
+    if (imp.isPackage() || packagePrefix_.empty()) return mp;
+    return packagePrefix_ + u"." + mp;
+}
+
 void Analyzer::bindImports(const ModuleResolver& resolver) {
     bindTypeImports(resolver);
     bindValueImports(resolver);
@@ -609,7 +616,7 @@ void Analyzer::bindImports(const ModuleResolver& resolver) {
 void Analyzer::bindTypeImports(const ModuleResolver& resolver) {
     if (!astRoot) return;
     for (auto& imp : astRoot->imports()) {
-        std::u16string targetPath = imp.modulePath();
+        std::u16string targetPath = importTargetPath(imp);
         const Analyzer* target = resolver(targetPath);
         if (!target) {
             // A module that failed to load already produced a clear diagnostic in the
@@ -658,7 +665,7 @@ void Analyzer::bindValueImports(const ModuleResolver& resolver) {
     for (auto& imp : astRoot->imports()) {
         auto alias = imp.aliasText();
         if (!alias) continue;            // namespace imports bound in bindTypeImports
-        std::u16string targetPath = imp.modulePath();
+        std::u16string targetPath = importTargetPath(imp);
         const Analyzer* target = resolver(targetPath);
         if (!target) continue;           // unresolved import already diagnosed in the module graph
         if (typeCtx.lookupNamedType(targetPath, *alias)) continue;  // bound as a type in bindTypeImports

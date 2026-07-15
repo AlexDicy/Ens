@@ -189,6 +189,177 @@ static std::unique_ptr<Module> loadOrOverride(const fs::path& base, const fs::pa
     return loadModule(base, rel, mp);
 }
 
+namespace {
+
+std::u16string joinSegments(const std::vector<std::u16string>& segs, size_t from, size_t to) {
+    std::u16string out;
+    for (size_t i = from; i < to; ++i) {
+        if (i > from) out.push_back(u'.');
+        out += segs[i];
+    }
+    return out;
+}
+
+std::u16string canonicalModulePath(const Workspace& ws, const fs::path& rel) {
+    std::u16string mp = modulePathOfRelative(rel);
+    if (ws.packagePrefix.empty()) return mp;
+    return ws.packagePrefix + u"." + mp;
+}
+
+}  // namespace
+
+bool buildModuleGraph(Workspace& root,
+                      WorkspaceRegistry& registry,
+                      const fs::path& stdlibRoot,
+                      std::deque<fs::path>& seedRelatives,
+                      std::vector<std::unique_ptr<Module>>& modulesOut,
+                      std::unordered_map<std::u16string, Module*>& byPath,
+                      const SourceOverrides* overrides) {
+    // A pseudo-workspace for the standard library: its modules keep their full `std.*`
+    // path (no prefix) and live directly under the stdlib root.
+    Workspace stdWs;
+    stdWs.root = stdlibRoot;
+    stdWs.srcRoot = stdlibRoot;
+
+    struct WorkItem {
+        Workspace* ws;
+        fs::path base;             // folder the relative path is under
+        fs::path rel;              // relative to base
+        std::u16string canonical;  // canonical (package-qualified) module path
+    };
+    std::unordered_set<std::u16string> queued;
+    std::deque<WorkItem> work;
+
+    auto enqueue = [&](Workspace* ws, const fs::path& base, const fs::path& rel,
+                       const std::u16string& canonical) {
+        if (canonical.empty() || queued.count(canonical)) return;
+        queued.insert(canonical);
+        work.push_back({ws, base, rel, canonical});
+    };
+
+    // Seeds belong to the root workspace. When a tests root is set they resolve against it
+    // (`ens test --tests`); otherwise against the source root.
+    const fs::path seedBase = root.testsRoot.empty() ? root.srcRoot : root.testsRoot;
+    for (auto& r : seedRelatives) enqueue(&root, seedBase, r, canonicalModulePath(root, r));
+    seedRelatives.clear();
+
+    while (!work.empty()) {
+        WorkItem item = work.front();
+        work.pop_front();
+
+        auto module = loadOrOverride(item.base, item.rel, item.canonical, overrides);
+        if (!module) return false;
+        module->packagePrefix = item.ws->packagePrefix;
+
+        Module* raw = module.get();
+        modulesOut.push_back(std::move(module));
+        byPath.emplace(item.canonical, raw);
+
+        auto sf = ast::SourceFile::cast(*raw->rootNode);
+        if (!sf) continue;
+        Workspace& ws = *item.ws;
+
+        for (auto& imp : sf->imports()) {
+            auto& sink = *raw->sink;
+            auto reportAt = [&](const std::string& message) {
+                auto [line, col] = raw->source->offsetToPosition(imp.node.startOffset());
+                sink.error({line, col, 1}, message);
+            };
+
+            std::u16string modPath = imp.modulePath();
+            std::vector<std::u16string> segs = imp.pathSegments();
+            if (segs.empty()) continue;
+
+            // Resolve the import to (targetWs, base folder, relative path within it, and the
+            // canonical package-qualified module path). `@std` is built in; `@package`
+            // follows the owning workspace's dependencies; a bare path stays local.
+            Workspace* targetWs = nullptr;
+            fs::path base;
+            fs::path targetRel;
+            std::u16string canonical;
+
+            if (imp.isPackage()) {
+                if (segs.front() == u"std") {
+                    targetWs = &stdWs;
+                    base = stdlibRoot;
+                    targetRel = relativeFromModulePath(modPath);
+                    canonical = modPath;
+                } else {
+                    auto match = matchPackage(ws.deps, segs);
+                    if (!match) {
+                        if (ws.deps.empty()) {
+                            reportAt("External package '" + asAscii(modPath) +
+                                "' is not available; add it to dependencies.txt (only @std is built in).");
+                        } else {
+                            reportAt("Package '" + asAscii(modPath) + "' is not listed in " +
+                                (ws.root / "dependencies.txt").string() + ".");
+                        }
+                        continue;
+                    }
+                    if (match->segmentCount == segs.size()) {
+                        reportAt("Import a module within package '" + asAscii(modPath) +
+                            "', not the package itself.");
+                        continue;
+                    }
+                    std::u16string prefix = joinSegments(segs, 0, match->segmentCount);
+                    targetWs = registry.getOrLoad(match->folder, prefix);
+                    base = targetWs->srcRoot;
+                    targetRel = relativeFromModulePath(joinSegments(segs, match->segmentCount, segs.size()));
+                    canonical = modPath;  // == package prefix + remaining path
+                }
+            } else if (isStdlibPath(modPath)) {
+                reportAt("Import the standard library as a package: write '@" +
+                    asAscii(modPath) + "'.");
+                continue;
+            } else {
+                targetWs = &ws;
+                base = ws.srcRoot;
+                targetRel = relativeFromModulePath(modPath);
+                canonical = canonicalModulePath(ws, targetRel);
+                // The root workspace's tests fall back to the tests root after the source
+                // root; a module present under both is ambiguous.
+                if (!ws.testsRoot.empty()) {
+                    auto present = [&](const fs::path& r) {
+                        fs::path candidate = r / targetRel;
+                        return fs::exists(candidate) ||
+                            (overrides && overrides->count(overrideKey(candidate)) > 0);
+                    };
+                    bool underSource = present(ws.srcRoot);
+                    bool underTests = present(ws.testsRoot);
+                    if (underSource && underTests) {
+                        reportAt("Module '" + asAscii(modPath) +
+                            "' exists under both the source folder and the tests folder; rename one of the files.");
+                        continue;
+                    }
+                    if (underTests) base = ws.testsRoot;
+                }
+            }
+
+            if (canonical.empty() || queued.count(canonical)) continue;
+
+            fs::path absolute = base.empty() ? fs::path() : base / targetRel;
+            bool haveOverride = overrides && !absolute.empty() &&
+                overrides->count(overrideKey(absolute)) > 0;
+            if (base.empty() || (!haveOverride && !fs::exists(absolute))) {
+                if (targetWs == &stdWs) {
+                    reportAt("Cannot find standard library module '" + asAscii(modPath) +
+                        "'. Set ENS_STDLIB to the directory containing 'std/' (normally <repo>/libs).");
+                } else {
+                    std::string lookedFor = absolute.string();
+                    if (targetWs == &ws && !ws.testsRoot.empty()) {
+                        lookedFor += " and " + (ws.testsRoot / targetRel).string();
+                    }
+                    reportAt("Cannot find module '" + asAscii(modPath) +
+                        "' (looked for " + lookedFor + ")");
+                }
+                continue;
+            }
+            enqueue(targetWs, base, targetRel, canonical);
+        }
+    }
+    return true;
+}
+
 bool buildModuleGraph(const fs::path& sourceRoot,
                       const fs::path& stdlibRoot,
                       std::deque<fs::path>& seedRelatives,
@@ -196,105 +367,10 @@ bool buildModuleGraph(const fs::path& sourceRoot,
                       std::unordered_map<std::u16string, Module*>& byPath,
                       const SourceOverrides* overrides,
                       const fs::path& testsRoot) {
-    struct WorkItem { fs::path base; fs::path rel; };
-    std::unordered_set<std::u16string> queued;
-    std::deque<WorkItem> work;
-
-    auto enqueue = [&](const fs::path& base, const fs::path& rel) {
-        std::u16string mp = modulePathOfRelative(rel);
-        if (queued.count(mp)) return;
-        queued.insert(mp);
-        work.push_back({base, rel});
-    };
-
-    const fs::path& seedBase = testsRoot.empty() ? sourceRoot : testsRoot;
-    for (auto& r : seedRelatives) enqueue(seedBase, r);
-    seedRelatives.clear();
-
-    while (!work.empty()) {
-        WorkItem item = work.front();
-        work.pop_front();
-        std::u16string mp = modulePathOfRelative(item.rel);
-
-        auto module = loadOrOverride(item.base, item.rel, mp, overrides);
-        if (!module) return false;
-
-        Module* raw = module.get();
-        modulesOut.push_back(std::move(module));
-        byPath.emplace(mp, raw);
-
-        auto sf = ast::SourceFile::cast(*raw->rootNode);
-        if (!sf) continue;
-        for (auto& imp : sf->imports()) {
-            std::u16string targetPath = imp.modulePath();
-            if (queued.count(targetPath)) continue;
-            fs::path targetRel = relativeFromModulePath(targetPath);
-            if (targetRel.empty()) continue;
-
-            auto& sink = *raw->sink;
-            auto reportAt = [&](const std::string& message) {
-                auto [line, col] = raw->source->offsetToPosition(imp.node.startOffset());
-                sink.error({line, col, 1}, message);
-            };
-
-            // `@pkg...` selects an external package root; a bare path is local to the
-            // source root. Only the standard library (`@std`) is available as a package.
-            bool isStd = false;
-            fs::path base;
-            if (imp.isPackage()) {
-                auto segs = imp.pathSegments();
-                if (!segs.empty() && segs.front() == u"std") {
-                    isStd = true;
-                    base = stdlibRoot;
-                } else {
-                    reportAt("External package '" + asAscii(targetPath) +
-                        "' is not available yet; only the standard library (@std) is supported.");
-                    continue;
-                }
-            } else if (isStdlibPath(targetPath)) {
-                reportAt("Import the standard library as a package: write '@" +
-                    asAscii(targetPath) + "'.");
-                continue;
-            } else {
-                base = sourceRoot;
-                if (!testsRoot.empty()) {
-                    auto present = [&](const fs::path& root) {
-                        fs::path candidate = root / targetRel;
-                        return fs::exists(candidate) ||
-                            (overrides && overrides->count(overrideKey(candidate)) > 0);
-                    };
-                    bool underSource = present(sourceRoot);
-                    bool underTests = present(testsRoot);
-                    if (underSource && underTests) {
-                        reportAt("Module '" + asAscii(targetPath) +
-                            "' exists under both the source folder and the tests folder; rename one of the files.");
-                        continue;
-                    }
-                    if (underTests) base = testsRoot;
-                }
-            }
-
-            fs::path absolute = base.empty() ? fs::path() : base / targetRel;
-            bool haveOverride = overrides && !absolute.empty() &&
-                overrides->count(overrideKey(absolute)) > 0;
-            if (base.empty() || (!haveOverride && !fs::exists(absolute))) {
-                if (isStd) {
-                    reportAt("Cannot find standard library module '" + asAscii(targetPath) +
-                        "'. Set ENS_STDLIB to the directory containing 'std/' (normally <repo>/libs).");
-                } else {
-                    std::string lookedFor = absolute.string();
-                    if (!testsRoot.empty()) {
-                        lookedFor += " and " + (testsRoot / targetRel).string();
-                    }
-                    reportAt("Cannot find module '" + asAscii(targetPath) +
-                        "' (looked for " + lookedFor + ")");
-                }
-                continue;
-            }
-            enqueue(base, targetRel);
-        }
-    }
-    return true;
+    WorkspaceRegistry registry;
+    Workspace& root = registry.defineRoot(sourceRoot, sourceRoot, testsRoot,
+                                          /*withDependencies=*/false);
+    return buildModuleGraph(root, registry, stdlibRoot, seedRelatives, modulesOut, byPath, overrides);
 }
 
 void insertPreludeModule(std::vector<std::unique_ptr<Module>>& modules,
@@ -309,7 +385,8 @@ bool analyzeModuleGraph(std::vector<std::unique_ptr<Module>>& modules,
                         std::unordered_map<std::u16string, Module*>& byPath,
                         TypeContext& sharedCtx) {
     for (auto& m : modules) {
-        m->analyzer = std::make_unique<Analyzer>(*m->source, *m->sink, sharedCtx, m->modulePath);
+        m->analyzer = std::make_unique<Analyzer>(*m->source, *m->sink, sharedCtx,
+                                                 m->modulePath, m->packagePrefix);
     }
 
     for (auto& m : modules) m->analyzer->registerNames(*m->rootNode);

@@ -29,9 +29,12 @@ public:
 
     // Shared-TypeContext form: used by the driver to compile a multi-file
     // program. `modulePath` is the canonical key (e.g. u"engine.renderer") used
-    // when registering / looking up types in the shared context.
+    // when registering / looking up types in the shared context. `packagePrefix`
+    // is this module's workspace prefix, prepended to bare imports so a package's
+    // sibling imports name the same canonical module as an external `@package` import.
     Analyzer(const SourceFile& source, DiagnosticSink& sink,
-             TypeContext& sharedContext, std::u16string modulePath);
+             TypeContext& sharedContext, std::u16string modulePath,
+             std::u16string packagePrefix = {});
 
     ~Analyzer();
 
@@ -89,6 +92,12 @@ private:
     std::unique_ptr<TypeContext> ownedTypeCtx;
     TypeContext& typeCtx;
     std::u16string modulePath_;
+    std::u16string packagePrefix_;
+
+    // The canonical module path an import refers to. `@package`/`@std` imports carry their
+    // full path; a bare import is qualified by this module's package prefix so it resolves
+    // to the same module as the equivalent `@package` import from outside.
+    std::u16string importTargetPath(const ast::ImportDecl& imp) const;
 
     std::vector<std::unique_ptr<Symbol>> ownedSymbols;
     std::vector<std::unique_ptr<Scope>> ownedScopes;

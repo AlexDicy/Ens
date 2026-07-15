@@ -12,6 +12,7 @@
 #include "cst/SyntaxNode.h"
 #include "diagnostics/DiagnosticSink.h"
 #include "diagnostics/SourceFile.h"
+#include "module/Workspace.h"
 #include "semantic/Analyzer.h"
 #include "semantic/TypeContext.h"
 
@@ -24,6 +25,11 @@ struct Module {
     std::u16string modulePath;
     fs::path absolutePath;
     fs::path relativePath;  // relative to the source root
+    // Canonical module-path prefix of the owning workspace: empty for the root, or the
+    // dependency key (e.g. u"ens.frontend") for a module pulled in as a package. The
+    // analyzer prepends it to bare imports so a package's sibling imports resolve to the
+    // same canonical module as an external `@package` import.
+    std::u16string packagePrefix;
     std::unique_ptr<SourceFile> source;
     std::unique_ptr<DiagnosticSink> sink;
     GreenElementPtr cstRoot;
@@ -58,10 +64,24 @@ std::string overrideKey(const fs::path& absolute);
 // (see overrideKey). Lets the LSP analyze unsaved editor buffers.
 using SourceOverrides = std::unordered_map<std::string, std::u16string>;
 
-// Load the seed files and everything they transitively import (following `@std` to the
-// stdlib root and bare paths to the source root). Returns false if a file cannot be read.
-// When testsRoot is non-empty, seeds resolve against it and bare imports fall back to it
-// after the source root (`ens test --tests`); a module under both roots is an error.
+// Load the seed files and everything they transitively import. `@std` follows the stdlib
+// root; `@package` imports follow the owning workspace's dependencies into the package's
+// `src/`; bare paths stay within the importing module's workspace. Module paths are
+// package-qualified so the same file resolves to one module however it is reached. Returns
+// false if a file cannot be read. `registry` supplies the root and (lazily) every
+// dependency workspace and outlives the call.
+bool buildModuleGraph(Workspace& root,
+                      WorkspaceRegistry& registry,
+                      const fs::path& stdlibRoot,
+                      std::deque<fs::path>& seedRelatives,
+                      std::vector<std::unique_ptr<Module>>& modulesOut,
+                      std::unordered_map<std::u16string, Module*>& byPath,
+                      const SourceOverrides* overrides = nullptr);
+
+// Backward-compatible entry point with no package dependencies: only `@std` packages
+// resolve. Seeds resolve against `sourceRoot`, or against `testsRoot` when it is non-empty,
+// with bare imports falling back to it after the source root (`ens test --tests`); a module
+// under both roots is an error.
 bool buildModuleGraph(const fs::path& sourceRoot,
                       const fs::path& stdlibRoot,
                       std::deque<fs::path>& seedRelatives,

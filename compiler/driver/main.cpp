@@ -5,6 +5,7 @@
 #include <string>
 #include <unordered_map>
 #include "Compiler.h"
+#include "module/Workspace.h"
 
 namespace fs = std::filesystem;
 
@@ -49,9 +50,16 @@ static bool execute(const std::unordered_map<std::string, std::string>& argument
         fs::path source = arguments.at("--source");
         fs::path sourcePath = fs::is_directory(source) ? source : source.parent_path();
         return Compiler::compile(source, outputFile, sourcePath, explainArc, targetTriple);
-    } else {
-        return Compiler::compileSingle(std::cin, outputFile, "<stdin>", explainArc, targetTriple);
     }
+
+    // No explicit source: if the current folder sits in a workspace (a dependencies.txt
+    // walking up), compile its `src/`; otherwise read a single program from stdin.
+    fs::path workspaceRoot = ens::modules::discoverWorkspaceRoot(fs::current_path());
+    fs::path src = workspaceRoot.empty() ? fs::path() : workspaceRoot / "src";
+    if (!src.empty() && fs::is_directory(src)) {
+        return Compiler::compile(src, outputFile, src, explainArc, targetTriple);
+    }
+    return Compiler::compileSingle(std::cin, outputFile, "<stdin>", explainArc, targetTriple);
 }
 
 static bool isBooleanFlag(const std::string& arg) {
@@ -97,7 +105,7 @@ static int runTestCommand(int argc, char* argv[]) {
             return 2;
         }
     }
-    fs::path source = arguments.count("--source") ? fs::path(arguments.at("--source")) : fs::path(".");
+    fs::path source = arguments.count("--source") ? fs::path(arguments.at("--source")) : fs::path();
     fs::path tests = arguments.count("--tests") ? fs::path(arguments.at("--tests")) : fs::path();
     std::string filter = arguments.count("--filter") ? arguments.at("--filter") : "";
     return Compiler::test(source, tests, filter, arguments.count("--explain-arc") > 0);
@@ -117,9 +125,11 @@ int main(int argc, char* argv[]) {
     }
 
     if (arguments.count("-h") || arguments.count("--help")) {
-        std::cout << "Use --source to specify the input file or folder to compile, otherwise use stdin\n";
+        std::cout << "Use --source to specify the input file or folder to compile.\n";
+        std::cout << "With no --source, compiles the current workspace's src/ (nearest dependencies.txt\n";
+        std::cout << "walking up), or reads a single program from stdin when there is no workspace.\n";
         std::cout << "Use --output to specify the output folder\n";
-        std::cout << "Use 'ens test [--source <folder>] [--filter <substring>]' to run the folder's tests\n";
+        std::cout << "Use 'ens test [--source <folder>] [--tests <folder>] [--filter <substring>]' to run tests\n";
         return 0;
     }
 

@@ -295,6 +295,14 @@ bool linkModulesToExe(std::vector<std::unique_ptr<Module>>& modules,
     return Linker::link(objectPaths, libraries, outputFile.string(), std::cerr, targetTriple);
 }
 
+// Print any dependencies.txt parse problems collected while loading workspaces. Returns
+// true when there were none, so callers can bail on a malformed dependency file.
+bool printWorkspaceErrors(const WorkspaceRegistry& registry) {
+    if (registry.errors().empty()) return true;
+    for (const auto& e : registry.errors()) std::cerr << "ERROR: " << e << '\n';
+    return false;
+}
+
 }  // namespace
 
 bool Compiler::compile(const fs::path& source,
@@ -331,7 +339,17 @@ bool Compiler::compile(const fs::path& source,
     std::vector<std::unique_ptr<Module>> modules;
     std::unordered_map<std::u16string, Module*> byPath;
     fs::path stdlibRoot = findStdlibRoot();
-    if (!buildModuleGraph(sourceRoot, stdlibRoot, seeds, modules, byPath)) return false;
+
+    // The governing workspace (nearest dependencies.txt walking up from the source) supplies
+    // `@package` dependencies; its src root stays whatever was compiled here.
+    fs::path workspaceRoot = discoverWorkspaceRoot(sourceRoot);
+    WorkspaceRegistry registry;
+    Workspace& root = workspaceRoot.empty()
+        ? registry.defineRoot(sourceRoot, sourceRoot, {}, /*withDependencies=*/false)
+        : registry.defineRoot(workspaceRoot, sourceRoot, {}, /*withDependencies=*/true);
+    if (!printWorkspaceErrors(registry)) return false;
+    if (!buildModuleGraph(root, registry, stdlibRoot, seeds, modules, byPath)) return false;
+    if (!printWorkspaceErrors(registry)) return false;
 
     insertPreludeModule(modules, byPath);
 
@@ -435,18 +453,38 @@ std::u16string buildRunnerSource(const std::vector<DiscoveredTest>& tests) {
 int Compiler::test(const fs::path& sourceDir, const fs::path& testsDir,
                    const std::string& filter, bool explainArc) {
     std::error_code ec;
-    if (!fs::is_directory(sourceDir, ec)) {
-        std::cerr << "ERROR: '" << sourceDir.string() << "' is not a folder\n";
+
+    // With no explicit source, discover the workspace from the current folder and run its
+    // `src/` against its `tests/`. An explicit source is kept as-is but still discovers a
+    // governing workspace (walking up) so `@package` imports resolve.
+    fs::path sourceFolder = sourceDir;
+    fs::path testsFolder = testsDir;
+    fs::path workspaceRoot;
+    if (sourceFolder.empty()) {
+        workspaceRoot = discoverWorkspaceRoot(fs::current_path());
+        if (!workspaceRoot.empty()) {
+            sourceFolder = workspaceRoot / "src";
+            fs::path wsTests = workspaceRoot / "tests";
+            if (testsFolder.empty() && fs::is_directory(wsTests, ec)) testsFolder = wsTests;
+        } else {
+            sourceFolder = ".";
+        }
+    } else {
+        workspaceRoot = discoverWorkspaceRoot(sourceFolder);
+    }
+
+    if (!fs::is_directory(sourceFolder, ec)) {
+        std::cerr << "ERROR: '" << sourceFolder.string() << "' is not a folder\n";
         return 2;
     }
-    const fs::path& sourceRoot = sourceDir;
-    if (!testsDir.empty() && !fs::is_directory(testsDir, ec)) {
-        std::cerr << "ERROR: '" << testsDir.string() << "' is not a folder\n";
+    const fs::path& sourceRoot = sourceFolder;
+    if (!testsFolder.empty() && !fs::is_directory(testsFolder, ec)) {
+        std::cerr << "ERROR: '" << testsFolder.string() << "' is not a folder\n";
         return 2;
     }
     // Tests are discovered under (and their module paths are relative to) the
     // tests folder when one is given, otherwise the source folder.
-    const fs::path discoveryRoot = testsDir.empty() ? sourceRoot : testsDir;
+    const fs::path discoveryRoot = testsFolder.empty() ? sourceRoot : testsFolder;
 
     std::vector<fs::path> testFiles;
     for (auto& rel : getFileTree(discoveryRoot, discoveryRoot)) {
@@ -528,10 +566,15 @@ int Compiler::test(const fs::path& sourceDir, const fs::path& testsDir,
 
     std::vector<std::unique_ptr<Module>> modules;
     std::unordered_map<std::u16string, Module*> byPath;
-    if (!buildModuleGraph(sourceRoot, findStdlibRoot(), seeds, modules, byPath, &overrides,
-                          testsDir.empty() ? fs::path() : discoveryRoot)) {
+    WorkspaceRegistry registry;
+    Workspace& root = workspaceRoot.empty()
+        ? registry.defineRoot(sourceRoot, sourceRoot, testsFolder, /*withDependencies=*/false)
+        : registry.defineRoot(workspaceRoot, sourceRoot, testsFolder, /*withDependencies=*/true);
+    if (!printWorkspaceErrors(registry)) return 2;
+    if (!buildModuleGraph(root, registry, findStdlibRoot(), seeds, modules, byPath, &overrides)) {
         return 2;
     }
+    if (!printWorkspaceErrors(registry)) return 2;
 
     // Only the runner may define main(): a second entry point cannot be linked.
     for (auto& m : modules) {
