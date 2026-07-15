@@ -100,6 +100,14 @@ StructInfo* structInfoOf(Type* t) {
     return t->structInfo;
 }
 
+// The named type a type reference denotes, peeling array and optional suffixes so
+// go-to-definition and rename on `T[]`, `T?`, or `T[]?` all target T's declaration.
+// Distinct from structInfoOf, which keeps a receiver's own type (e.g. `array.length`).
+StructInfo* namedTypeStruct(Type* t) {
+    while (t && (t->isArray() || t->isOptional()) && t->inner) t = t->inner;
+    return t ? t->structInfo : nullptr;
+}
+
 std::string formatFunctionSignature(const Symbol& s) {
     std::string r = (s.methodOwner ? "method " : "function ") + utf16To8(s.name) + "(";
     for (size_t i = 0; i < s.paramTypes.size(); ++i) {
@@ -295,7 +303,7 @@ std::optional<DefinitionTarget> resolveDefinitionTarget(const AnalysisResult& an
         }
         return targetForSymbol(s);
     }
-    if (StructInfo* si = structInfoOf(info->resolvedType)) {
+    if (StructInfo* si = namedTypeStruct(info->resolvedType)) {
         DefinitionTarget t;
         t.modulePath = si->modulePath;
         t.line = si->line;
@@ -533,7 +541,7 @@ Entity entityForNode(const AnalysisResult& analysis, const SyntaxNode& node) {
     // Bare tokens cover resolutions attached directly to name tokens (extends bases).
     if (node.isToken() || k == SyntaxKind::IdentExpr || k == SyntaxKind::TypeRef ||
         k == SyntaxKind::NewExpr) {
-        if (StructInfo* si = structInfoOf(info->resolvedType)) return typeEntity(si);
+        if (StructInfo* si = namedTypeStruct(info->resolvedType)) return typeEntity(si);
     }
     return {};
 }
@@ -1134,6 +1142,9 @@ uint32_t typeForSymbol(const Symbol& sym, bool isMember) {
 }
 
 uint32_t typeForType(const ::Type* t) {
+    // Peel array/optional suffixes so `T[]` and `T?` color their name by T's kind,
+    // matching a plain `T` reference.
+    while (t && (t->isArray() || t->isOptional()) && t->inner) t = t->inner;
     if (!t) return StType;
     if (t->kind == TypeKind::Class)  return StClass;
     if (t->kind == TypeKind::Struct) return StStruct;
