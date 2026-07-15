@@ -206,15 +206,14 @@ std::u16string canonicalModulePath(const Workspace& ws, const fs::path& rel) {
     return ws.packagePrefix + u"." + mp;
 }
 
-}  // namespace
-
-bool buildModuleGraph(Workspace& root,
-                      WorkspaceRegistry& registry,
-                      const fs::path& stdlibRoot,
-                      std::deque<fs::path>& seedRelatives,
-                      std::vector<std::unique_ptr<Module>>& modulesOut,
-                      std::unordered_map<std::u16string, Module*>& byPath,
-                      const SourceOverrides* overrides) {
+// Build the graph from explicit (base, rel) seeds, all belonging to `root`.
+bool buildModuleGraphFromSeeds(Workspace& root,
+                               WorkspaceRegistry& registry,
+                               const fs::path& stdlibRoot,
+                               const std::vector<std::pair<fs::path, fs::path>>& seeds,
+                               std::vector<std::unique_ptr<Module>>& modulesOut,
+                               std::unordered_map<std::u16string, Module*>& byPath,
+                               const SourceOverrides* overrides) {
     // A pseudo-workspace for the standard library: its modules keep their full `std.*`
     // path (no prefix) and live directly under the stdlib root.
     Workspace stdWs;
@@ -237,11 +236,9 @@ bool buildModuleGraph(Workspace& root,
         work.push_back({ws, base, rel, canonical});
     };
 
-    // Seeds belong to the root workspace. When a tests root is set they resolve against it
-    // (`ens test --tests`); otherwise against the source root.
-    const fs::path seedBase = root.testsRoot.empty() ? root.srcRoot : root.testsRoot;
-    for (auto& r : seedRelatives) enqueue(&root, seedBase, r, canonicalModulePath(root, r));
-    seedRelatives.clear();
+    for (const auto& seed : seeds) {
+        enqueue(&root, seed.first, seed.second, canonicalModulePath(root, seed.second));
+    }
 
     while (!work.empty()) {
         WorkItem item = work.front();
@@ -358,6 +355,35 @@ bool buildModuleGraph(Workspace& root,
         }
     }
     return true;
+}
+
+}  // namespace
+
+bool buildModuleGraph(Workspace& root,
+                      WorkspaceRegistry& registry,
+                      const fs::path& stdlibRoot,
+                      std::deque<fs::path>& seedRelatives,
+                      std::vector<std::unique_ptr<Module>>& modulesOut,
+                      std::unordered_map<std::u16string, Module*>& byPath,
+                      const SourceOverrides* overrides) {
+    // Seeds belong to the root workspace. When a tests root is set they resolve against it
+    // (`ens test --tests`); otherwise against the source root.
+    const fs::path seedBase = root.testsRoot.empty() ? root.srcRoot : root.testsRoot;
+    std::vector<std::pair<fs::path, fs::path>> seeds;
+    seeds.reserve(seedRelatives.size());
+    for (auto& r : seedRelatives) seeds.emplace_back(seedBase, r);
+    seedRelatives.clear();
+    return buildModuleGraphFromSeeds(root, registry, stdlibRoot, seeds, modulesOut, byPath, overrides);
+}
+
+bool buildModuleGraph(Workspace& root,
+                      WorkspaceRegistry& registry,
+                      const fs::path& stdlibRoot,
+                      const std::vector<std::pair<fs::path, fs::path>>& seeds,
+                      std::vector<std::unique_ptr<Module>>& modulesOut,
+                      std::unordered_map<std::u16string, Module*>& byPath,
+                      const SourceOverrides* overrides) {
+    return buildModuleGraphFromSeeds(root, registry, stdlibRoot, seeds, modulesOut, byPath, overrides);
 }
 
 bool buildModuleGraph(const fs::path& sourceRoot,

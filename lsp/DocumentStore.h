@@ -11,13 +11,23 @@
 
 class DocumentStore;
 
-// A module graph seeded with every Ens file under the workspace root, so files
+// A module graph seeded with every Ens file in a document's workspace, so files
 // that import a given document (reverse dependencies) are part of the graph.
 // Used by workspace-scoped features: references and rename.
 struct WorkspaceModules {
     std::vector<std::unique_ptr<ens::modules::Module>> modules;
     std::unordered_map<std::u16string, ens::modules::Module*> byPath;
     std::unique_ptr<TypeContext> typeCtx;
+};
+
+// The build roots a file resolves against: its `src/` root, the `tests/` root when the file
+// itself is a test, the folder to read dependencies.txt from, and whether packages apply.
+// A file with no governing dependencies.txt falls back to a single source root and no deps.
+struct ResolvedWorkspace {
+    std::filesystem::path depsFolder;
+    std::filesystem::path srcRoot;
+    std::filesystem::path testsRoot;
+    bool withDependencies = false;
 };
 
 // One open editor buffer. Analysis builds a module graph rooted at the document's source
@@ -87,6 +97,11 @@ public:
     // under it, otherwise the file's own directory.
     std::filesystem::path sourceRootFor(const std::filesystem::path& fileAbs) const;
 
+    // Resolve a file to its build roots by walking up for a dependencies.txt (like the
+    // compiler). Each file resolves independently, so several nested ens workspaces can
+    // coexist under one editor session.
+    ResolvedWorkspace resolveWorkspaceFor(const std::filesystem::path& fileAbs) const;
+
     // In-memory text for every open buffer, keyed for SourceOverrides.
     ens::modules::SourceOverrides collectOverrides() const;
 
@@ -95,8 +110,10 @@ public:
     void setTransientOverride(const std::filesystem::path& absolute, std::u16string text);
     void clearTransientOverride(const std::filesystem::path& absolute);
 
-    // Empty modules when there is no workspace root or the graph cannot be built.
-    WorkspaceModules buildWorkspaceModules() const;
+    // Build a graph of `forFile`'s whole workspace (its src/ and tests/, plus package
+    // dependencies), seeding every file so reverse dependencies are covered. Empty when the
+    // file has no workspace and no root hint, or the graph cannot be built.
+    WorkspaceModules buildWorkspaceModules(const std::filesystem::path& forFile) const;
 
 private:
     std::unordered_map<std::string, std::unique_ptr<Document>> docs;

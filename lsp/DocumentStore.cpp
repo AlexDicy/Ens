@@ -39,15 +39,19 @@ void Document::analyze() {
     fs::path fileAbs = path();
     if (fileAbs.empty()) { analyzeSingleFileFallback(); return; }
 
-    fs::path sourceRoot = store_.sourceRootFor(fileAbs);
+    ResolvedWorkspace rw = store_.resolveWorkspaceFor(fileAbs);
+    fs::path seedBase = rw.testsRoot.empty() ? rw.srcRoot : rw.testsRoot;
     std::error_code ec;
-    fs::path rel = fs::relative(fileAbs, sourceRoot, ec);
+    fs::path rel = fs::relative(fileAbs, seedBase, ec);
     if (ec || rel.empty()) { analyzeSingleFileFallback(); return; }
     std::u16string modPath = ens::modules::modulePathOfRelative(rel);
 
     ens::modules::SourceOverrides overrides = store_.collectOverrides();
     std::deque<fs::path> seeds{ rel };
-    bool ok = ens::modules::buildModuleGraph(sourceRoot, store_.stdlibRoot(),
+    ens::modules::WorkspaceRegistry registry;
+    ens::modules::Workspace& root = registry.defineRoot(
+        rw.depsFolder, rw.srcRoot, rw.testsRoot, rw.withDependencies);
+    bool ok = ens::modules::buildModuleGraph(root, registry, store_.stdlibRoot(),
                                              seeds, modules_, byPath_, &overrides);
     if (!ok) { analyzeSingleFileFallback(); return; }
 
@@ -111,6 +115,38 @@ fs::path DocumentStore::sourceRootFor(const fs::path& fileAbs) const {
     return fileAbs.parent_path();
 }
 
+static bool isUnder(const fs::path& p, const fs::path& base) {
+    fs::path rel = p.lexically_relative(base);
+    return !rel.empty() && rel.string().compare(0, 2, "..") != 0;
+}
+
+ResolvedWorkspace DocumentStore::resolveWorkspaceFor(const fs::path& fileAbs) const {
+    ResolvedWorkspace r;
+    fs::path wsRoot = ens::modules::discoverWorkspaceRoot(fileAbs.parent_path());
+    if (wsRoot.empty()) {
+        r.srcRoot = sourceRootFor(fileAbs);
+        r.depsFolder = r.srcRoot;
+        return r;
+    }
+
+    std::error_code ec;
+    fs::path src = wsRoot / "src";
+    fs::path tests = wsRoot / "tests";
+    r.depsFolder = wsRoot;
+    r.withDependencies = true;
+    bool hasSrc = fs::is_directory(src, ec);
+    if (hasSrc && isUnder(fileAbs, src)) {
+        r.srcRoot = src;
+    } else if (fs::is_directory(tests, ec) && isUnder(fileAbs, tests)) {
+        r.srcRoot = hasSrc ? src : wsRoot;
+        r.testsRoot = tests;
+    } else {
+        // The file sits directly under the workspace root (no src/ layout).
+        r.srcRoot = wsRoot;
+    }
+    return r;
+}
+
 ens::modules::SourceOverrides DocumentStore::collectOverrides() const {
     ens::modules::SourceOverrides overrides;
     for (auto& [uri, doc] : docs) {
@@ -128,32 +164,60 @@ void DocumentStore::setTransientOverride(const fs::path& absolute, std::u16strin
     transientOverrides_[ens::modules::overrideKey(absolute)] = std::move(text);
 }
 
-WorkspaceModules DocumentStore::buildWorkspaceModules() const {
+WorkspaceModules DocumentStore::buildWorkspaceModules(const fs::path& forFile) const {
     WorkspaceModules workspace;
-    if (!workspaceRoot_) return workspace;
 
-    std::deque<fs::path> seeds;
+    // Scope the graph to the file's own workspace so nested workspaces stay isolated. A file
+    // with no dependencies.txt falls back to the single workspace-root hint (flat project).
+    fs::path depsFolder, srcRoot, testsRoot;
+    bool withDependencies;
+    fs::path wsRoot = ens::modules::discoverWorkspaceRoot(forFile.parent_path());
     std::error_code ec;
-    auto iterator = fs::recursive_directory_iterator(
-        *workspaceRoot_, fs::directory_options::skip_permission_denied, ec);
-    if (ec) return workspace;
-    for (auto it = fs::begin(iterator); it != fs::end(iterator); it.increment(ec)) {
-        if (ec) break;
-        const fs::directory_entry& entry = *it;
-        std::string name = entry.path().filename().string();
-        if (entry.is_directory(ec)) {
-            if (!name.empty() && name.front() == '.') it.disable_recursion_pending();
-            continue;
-        }
-        if (entry.path().extension() != ".ens") continue;
-        fs::path rel = fs::relative(entry.path(), *workspaceRoot_, ec);
-        if (!ec && !rel.empty()) seeds.push_back(std::move(rel));
+    if (!wsRoot.empty()) {
+        depsFolder = wsRoot;
+        srcRoot = fs::is_directory(wsRoot / "src", ec) ? wsRoot / "src" : wsRoot;
+        testsRoot = fs::is_directory(wsRoot / "tests", ec) ? wsRoot / "tests" : fs::path();
+        withDependencies = true;
+    } else if (workspaceRoot_) {
+        depsFolder = *workspaceRoot_;
+        srcRoot = *workspaceRoot_;
+        withDependencies = false;
+    } else {
+        return workspace;
     }
+
+    // Seed every .ens file under the source root (and tests root) so files that import a
+    // given document are in the graph, not just its forward dependencies.
+    std::vector<std::pair<fs::path, fs::path>> seeds;
+    auto addTree = [&](const fs::path& base) {
+        if (base.empty()) return;
+        std::error_code walkEc;
+        auto iterator = fs::recursive_directory_iterator(
+            base, fs::directory_options::skip_permission_denied, walkEc);
+        if (walkEc) return;
+        for (auto it = fs::begin(iterator); it != fs::end(iterator); it.increment(walkEc)) {
+            if (walkEc) break;
+            const fs::directory_entry& entry = *it;
+            std::string name = entry.path().filename().string();
+            if (entry.is_directory(walkEc)) {
+                if (!name.empty() && name.front() == '.') it.disable_recursion_pending();
+                continue;
+            }
+            if (entry.path().extension() != ".ens") continue;
+            fs::path rel = fs::relative(entry.path(), base, walkEc);
+            if (!walkEc && !rel.empty()) seeds.emplace_back(base, std::move(rel));
+        }
+    };
+    addTree(srcRoot);
+    addTree(testsRoot);
     if (seeds.empty()) return workspace;
 
     workspace.typeCtx = std::make_unique<TypeContext>();
     ens::modules::SourceOverrides overrides = collectOverrides();
-    bool ok = ens::modules::buildModuleGraph(*workspaceRoot_, stdlibRoot_, seeds,
+    ens::modules::WorkspaceRegistry registry;
+    ens::modules::Workspace& root =
+        registry.defineRoot(depsFolder, srcRoot, testsRoot, withDependencies);
+    bool ok = ens::modules::buildModuleGraph(root, registry, stdlibRoot_, seeds,
                                              workspace.modules, workspace.byPath, &overrides);
     if (!ok) return WorkspaceModules{};
 

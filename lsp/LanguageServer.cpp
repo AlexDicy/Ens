@@ -972,9 +972,9 @@ lsp::TextDocument_ReferencesResult LanguageServer::onReferences(lsp::ReferencePa
     uint32_t offset = preferIdentifierToTheLeft(
         doc->root(), doc->sourceFile().positionToOffset(line1, col1));
 
-    // Search the whole workspace so reverse dependencies (files importing this
+    // Search the file's workspace so reverse dependencies (files importing this
     // one) are covered; the document's own forward graph is the fallback.
-    WorkspaceModules workspace = documents.buildWorkspaceModules();
+    WorkspaceModules workspace = documents.buildWorkspaceModules(doc->path());
     const ens::modules::Module* requestModule = moduleForPath(workspace.modules, doc->path());
 
     Entity target;
@@ -1033,7 +1033,7 @@ lsp::TextDocument_RenameResult LanguageServer::onRename(lsp::RenameParams&& p) {
     uint32_t offset = preferIdentifierToTheLeft(
         doc->root(), doc->sourceFile().positionToOffset(line1, col1));
 
-    WorkspaceModules workspace = documents.buildWorkspaceModules();
+    WorkspaceModules workspace = documents.buildWorkspaceModules(doc->path());
     const ens::modules::Module* requestModule = moduleForPath(workspace.modules, doc->path());
 
     Entity target;

@@ -6,6 +6,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "cst/Green.h"
@@ -74,6 +75,17 @@ bool buildModuleGraph(Workspace& root,
                       WorkspaceRegistry& registry,
                       const fs::path& stdlibRoot,
                       std::deque<fs::path>& seedRelatives,
+                      std::vector<std::unique_ptr<Module>>& modulesOut,
+                      std::unordered_map<std::u16string, Module*>& byPath,
+                      const SourceOverrides* overrides = nullptr);
+
+// Multi-root seeding: each seed is a (base folder, path relative to it) pair, so a graph
+// can be seeded from both a workspace's `src/` and `tests/` at once (used by the LSP for
+// workspace-wide references and rename). All seeds belong to `root`.
+bool buildModuleGraph(Workspace& root,
+                      WorkspaceRegistry& registry,
+                      const fs::path& stdlibRoot,
+                      const std::vector<std::pair<fs::path, fs::path>>& seeds,
                       std::vector<std::unique_ptr<Module>>& modulesOut,
                       std::unordered_map<std::u16string, Module*>& byPath,
                       const SourceOverrides* overrides = nullptr);
