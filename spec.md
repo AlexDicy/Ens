@@ -596,13 +596,13 @@ for (int x in xs) {     // x takes each element in turn
 }
 ```
 
-A class is iterable when it implements the `Iterable<T>` interface from `@std.iterator`, whose single method `makeIterator() -> Iterator<T>` returns an `Iterator<T>` (an interface with `hasNext() -> bool` and `next() -> T`).
+A class is iterable when it implements the `Iterable<T>` interface from `@std.collections.iterator`, whose single method `makeIterator() -> Iterator<T>` returns an `Iterator<T>` (an interface with `hasNext() -> bool` and `next() -> T`).
 The loop calls `makeIterator()` once, then draws values with `next()` while `hasNext()` is true.
 A value whose static type is `Iterable<T>` itself can also be iterated.
 
 ```ens
-import Iterable from @std.iterator;
-import Iterator from @std.iterator;
+import Iterable from @std.collections.iterator;
+import Iterator from @std.collections.iterator;
 
 class Range implements Iterable<int> {
     private int low;
@@ -931,13 +931,13 @@ Every value has a `hash()` method returning a `long`. Value types (primitives, e
 
 The collection modules build on hashing and iteration:
 
-- `List<T>` from `@std.list` is a growable array: `push(value)`, `get(index)`, `set(index, value)`, and `length()`, plus `toArray()` returning a fresh right-sized `T[]` holding the current contents. Iterating a list yields its values in insertion order.
-- `Map<K, V>` from `@std.map` maps keys to values: `set(key, value)` inserts or overwrites, `get(key)` returns `V?` (`null` when absent), plus `contains(key)`, `remove(key)`, `length()`, and `keys()` / `values()` snapshots. Iterating a map yields `Pair<K, V>` entries (from `@std.pair`) with `key` and `value` fields.
-- `Set<T>` from `@std.set` stores each value once: `add(value)` returns whether the value was new, plus `contains(value)`, `remove(value)`, `length()`, and `items()`. Iterating a set yields its values.
+- `List<T>` from `@std.collections.list` is a growable array: `push(value)`, `get(index)`, `set(index, value)`, and `length()`, plus `toArray()` returning a fresh right-sized `T[]` holding the current contents. Iterating a list yields its values in insertion order.
+- `Map<K, V>` from `@std.collections.map` maps keys to values: `set(key, value)` inserts or overwrites, `get(key)` returns `V?` (`null` when absent), plus `contains(key)`, `remove(key)`, `length()`, and `keys()` / `values()` snapshots. Iterating a map yields `Pair<K, V>` entries (from `@std.collections.pair`) with `key` and `value` fields.
+- `Set<T>` from `@std.collections.set` stores each value once: `add(value)` returns whether the value was new, plus `contains(value)`, `remove(value)`, `length()`, and `items()`. Iterating a set yields its values.
 
 ```ens
-import Map from @std.map;
-import Set from @std.set;
+import Map from @std.collections.map;
+import Set from @std.collections.set;
 
 let ages = new Map<string, int>();
 ages.set("ada", 36);
@@ -953,12 +953,12 @@ for (let entry in ages) {
 
 Keys are matched with `==`: strings by contents, value types by value, and classes by identity unless the key class defines its own `hash()` (identity comparison still applies). Struct keys are not supported yet because structs cannot be compared with `==`.
 
-`StringBuilder` from `@std.stringbuilder` accumulates text in a growable buffer, so building a string piece by piece stays linear where repeated `+` on immutable strings would re-copy the whole prefix.
+`StringBuilder` from `@std.text.stringbuilder` accumulates text in a growable buffer, so building a string piece by piece stays linear where repeated `+` on immutable strings would re-copy the whole prefix.
 `append(value)` accepts a string, an integer, or a `bool`; `length()` returns the number of bytes written so far; `toString()` returns the accumulated text and leaves the builder usable.
 `appendByte(value)` appends one raw byte to the buffer, where `append` on the same value would format it as decimal text.
 
 ```ens
-import StringBuilder from @std.stringbuilder;
+import StringBuilder from @std.text.stringbuilder;
 
 let report = new StringBuilder();
 report.append("processed ");
