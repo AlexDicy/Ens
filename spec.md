@@ -165,11 +165,11 @@ Speaker? quiet = null;     // nullable interface reference
 Classes, structs, functions, and methods may be generic: they declare type parameters in angle brackets and work uniformly over any type argument. A type parameter can be used as a field type, a parameter or return type, a local type, and as the element type of an array.
 
 ```ens
-class Vector<T> {
+class List<T> {
     private T[] items;
     private long count;
 
-    Vector() { this.items = new T[4]; this.count = 0; }
+    List() { this.items = new T[4]; this.count = 0; }
 
     push(T value) { /* ... grow if full ... */ }
     get(long index) -> T { return this.items[index]; }
@@ -182,12 +182,12 @@ swap<T>(T a, T b) -> T { return b; }
 A type argument is written in angle brackets wherever the type is used, including at construction:
 
 ```ens
-let numbers = new Vector<int>();
+let numbers = new List<int>();
 numbers.push(5);
-let names = new Vector<string>();
+let names = new List<string>();
 ```
 
-A generic type is specialized for each set of type arguments, so a `Vector<int>` stores its integers directly (no boxing) while a `Vector<Shape>` stores and reference counts `Shape` objects. Using a generic type without its arguments (just `Vector`) is an error.
+A generic type is specialized for each set of type arguments, so a `List<int>` stores its integers directly (no boxing) while a `List<Shape>` stores and reference counts `Shape` objects. Using a generic type without its arguments (just `List`) is an error.
 
 For a generic function, the type arguments can be passed explicitly or, where each one appears directly as a parameter type, inferred from the call:
 
@@ -931,7 +931,7 @@ Every value has a `hash()` method returning a `long`. Value types (primitives, e
 
 The collection modules build on hashing and iteration:
 
-- `Vector<T>` from `@std.vector` is a growable array: `push(value)`, `get(index)`, `set(index, value)`, and `length()`, plus `toArray()` returning a fresh right-sized `T[]` holding the current contents. Iterating a vector yields its values in insertion order.
+- `List<T>` from `@std.list` is a growable array: `push(value)`, `get(index)`, `set(index, value)`, and `length()`, plus `toArray()` returning a fresh right-sized `T[]` holding the current contents. Iterating a list yields its values in insertion order.
 - `Map<K, V>` from `@std.map` maps keys to values: `set(key, value)` inserts or overwrites, `get(key)` returns `V?` (`null` when absent), plus `contains(key)`, `remove(key)`, `length()`, and `keys()` / `values()` snapshots. Iterating a map yields `Pair<K, V>` entries (from `@std.pair`) with `key` and `value` fields.
 - `Set<T>` from `@std.set` stores each value once: `add(value)` returns whether the value was new, plus `contains(value)`, `remove(value)`, `length()`, and `items()`. Iterating a set yields its values.
 
