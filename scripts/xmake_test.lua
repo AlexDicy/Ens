@@ -121,6 +121,16 @@ task("test")
             end
         end
 
+        -- run a program with stdout and stderr merged through ONE opened handle, so the two
+        -- streams append in real order; redirecting both to the same path would open two
+        -- handles with independent write cursors that clobber each other at equal offsets.
+        local function execMerged(program, argv, logpath)
+            local logfile = io.open(logpath, "w")
+            local rc = os.execv(program, argv, {try = true, stdout = logfile, stderr = logfile})
+            logfile:close()
+            return rc
+        end
+
         -- the corpus round-trip harness: stage the front end and the harness into one source root,
         -- build the driver exe fresh, enumerate every .ens file in the real source trees into a
         -- manifest, and run the driver over it. the front end imports its siblings by bare name, so
@@ -142,8 +152,7 @@ task("test")
             os.cp(path.join(corpus_src, "**"), stage, {rootdir = corpus_src})
 
             os.tryrm(exe_file)
-            local compile_rc = os.execv(ens_exe, {"--source", stage, "--output", exe_file},
-                {try = true, stdout = log, stderr = log})
+            local compile_rc = execMerged(ens_exe, {"--source", stage, "--output", exe_file}, log)
             if not os.isfile(exe_file) then
                 return {name = name, ok = false, short = "harness build failed",
                     full = string.format("%s: harness build failed (exit %s)\n%s",
@@ -160,8 +169,7 @@ task("test")
             table.sort(files)
             io.writefile(manifest, table.concat(files, "\n") .. "\n")
 
-            local run_rc = os.execv(exe_file, {manifest},
-                {try = true, stdout = log, stderr = log})
+            local run_rc = execMerged(exe_file, {manifest}, log)
             local out = (io.readfile(log) or ""):gsub("[\r\n]+$", "")
             if run_rc == 0 then
                 return {name = name, ok = true}
@@ -237,8 +245,7 @@ task("test")
                 for _, a in ipairs(ens_test_args) do
                     table.insert(argv, (a:gsub("{dir}", (job.source:gsub("\\", "/")))))
                 end
-                local run_rc = os.execv(ens_exe, argv,
-                    {try = true, stdout = stdout_file, stderr = stdout_file})
+                local run_rc = execMerged(ens_exe, argv, stdout_file)
                 local actual_stdout = (io.readfile(stdout_file) or ""):gsub("[\r\n]+$", "")
                 local why = compareRun(run_rc, actual_stdout)
                 if #why == 0 then
@@ -252,9 +259,8 @@ task("test")
             os.tryrm(exe_file)
             os.tryrm(stdout_file)
 
-            local compile_rc = os.execv(ens_exe,
-                {"--source", job.source, "--output", exe_file},
-                {try = true, stdout = compile_log, stderr = compile_log})
+            local compile_rc = execMerged(ens_exe,
+                {"--source", job.source, "--output", exe_file}, compile_log)
             local compile_log_text = io.readfile(compile_log) or ""
 
             if expected_error ~= nil then
@@ -281,8 +287,7 @@ task("test")
                         compile_log_text:gsub("[\r\n]+$", ""))}
             end
 
-            local run_rc = os.execv(exe_file, {},
-                {try = true, stdout = stdout_file, stderr = stdout_file})
+            local run_rc = execMerged(exe_file, {}, stdout_file)
             local actual_stdout = (io.readfile(stdout_file) or ""):gsub("[\r\n]+$", "")
 
             local why = compareRun(run_rc, actual_stdout)
