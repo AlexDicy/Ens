@@ -46,8 +46,8 @@ enum class SyntaxKind : uint16_t {
     // === Keywords ===
     KwBool, KwByte, KwShort, KwUShort, KwInt, KwUInt, KwLong, KwULong,
     KwFloat, KwDouble, KwDecimal, KwChar, KwString, KwVoid,
-    KwAbstract, KwAs, KwAssert, KwBreak, KwCase, KwCatch, KwClass, KwComputed, KwConst, KwContinue,
-    KwDefault, KwDo, KwElse, KwEnum, KwExtends, KwExternal, KwFalse, KwFinal, KwFinally,
+    KwAbstract, KwAs, KwAssert, KwBreak, KwCase, KwCatch, KwClass, KwComputed, KwConst, KwConstructor, KwContinue,
+    KwDefault, KwDestructor, KwDo, KwElse, KwEnum, KwExtends, KwExternal, KwFalse, KwFinal, KwFinally,
     KwFor, KwFrom, KwGoto, KwIf, KwImplements, KwImport, KwIn, KwInterface, KwIs, KwLet, KwNew, KwNull, KwOut, KwOverride, KwPackage,
     KwPrivate, KwProtected, KwPublic, KwRethrow, KwReturn, KwSealed, KwStatic, KwStruct,
     KwSuper, KwSwitch, KwTest, KwThis, KwThrow, KwThrows, KwTrue, KwTry, KwType, KwWeak, KwWhile,

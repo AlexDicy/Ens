@@ -851,10 +851,24 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
         if (!t) continue;
         size_t tpCount = t->structInfo ? enterTemplateScope(t->structInfo, sd.typeParams()) : 0;
         for (auto& m : sd.methods()) {
+            bool isCtor = m.isConstructor();
+            if (m.isDestructor()) {
+                errorAtNode(m.node, "A struct cannot declare a destructor; destructors are "
+                    "only allowed on classes.");
+                continue;
+            }
+            auto rawName = m.nameText().value_or(std::u16string{});
+            if (!isCtor && !rawName.empty() && rawName == t->structInfo->name) {
+                errorAtNode(m.node, "To declare a constructor, use the 'constructor' keyword. "
+                    "A method cannot be named after its struct '" +
+                    asciiOf(t->structInfo->name) + "'.");
+                continue;
+            }
+            std::u16string mname = isCtor ? std::u16string(u"constructor") : rawName;
+
             Type* retType = m.returnType() && m.returnType()->typeReference()
                 ? resolveTypeReference(*m.returnType()->typeReference())
                 : typeCtx.getPrimitive(TypeKind::Void);
-            auto mname = m.nameText().value_or(std::u16string{});
             uint32_t mPos = m.nameToken() ? m.nameToken()->startOffset() : m.node.startOffset();
             Symbol* sym = makeSymbol(SymbolKind::Function, mname, nullptr, mPos);
             sym->returnType = retType;
@@ -862,7 +876,7 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             sym->declaredThrows = m.isThrows();
             sym->abiThrows = m.isThrows();  // structs have no inheritance
             sym->methodOwner = t->structInfo;
-            bool isCtor = (mname == t->structInfo->name);
+            sym->isConstructor = isCtor;
             checkFieldMethodCollision(t->structInfo, mname, isCtor, m.node);
             checkThrowsClausePlacement(m, /*isOverridable=*/false, /*isConstructor=*/isCtor);
             resolveMethodParams(m, t, sym);
@@ -882,6 +896,7 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             mi.symbol = sym;
             mi.declaration = const_cast<GreenElement*>(m.node.greenNode());
             mi.visibility = toSemanticVisibility(m.visibility());
+            mi.isConstructor = isCtor;
             t->structInfo->methods.push_back(std::move(mi));
         }
         markOverloadedMethods(t->structInfo);
@@ -904,7 +919,22 @@ void Analyzer::collectInterfaces(const ast::SourceFile& file) {
         }
 
         for (auto& m : id.methods()) {
+            if (m.isConstructor()) {
+                errorAtNode(m.node, "An interface cannot declare a constructor; '" +
+                    asciiOf(si->name) + "' has no instances of its own.");
+                continue;
+            }
+            if (m.isDestructor()) {
+                errorAtNode(m.node, "An interface cannot declare a destructor; '" +
+                    asciiOf(si->name) + "' has no instances of its own.");
+                continue;
+            }
             auto mname = m.nameText().value_or(std::u16string{});
+            if (!mname.empty() && mname == si->name) {
+                errorAtNode(m.node, "An interface cannot declare a constructor; '" +
+                    asciiOf(si->name) + "' has no instances of its own.");
+                continue;
+            }
             if (m.visibilityModifier()) {
                 errorAtNode(m.node, "Interface methods are always public; remove the "
                     "visibility modifier from '" + asciiOf(mname) + "'.");
@@ -912,11 +942,6 @@ void Analyzer::collectInterfaces(const ast::SourceFile& file) {
             if (m.isOverride() || m.isFinal() || m.isAbstract()) {
                 errorAtNode(m.node, "Interface methods are plain signatures; 'abstract', "
                     "'override', and 'final' are not allowed on '" + asciiOf(mname) + "'.");
-            }
-            if (mname == si->name) {
-                errorAtNode(m.node, "An interface cannot declare a constructor; '" +
-                    asciiOf(si->name) + "' has no instances of its own.");
-                continue;
             }
             if (m.body().has_value()) {
                 errorAtNode(m.node, "Interface method '" + asciiOf(mname) + "' cannot have a "
@@ -1231,16 +1256,33 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
 
     // Methods: collect own methods, then validate override/abstract.
     for (auto& m : cd.methods()) {
+        bool isCtor = m.isConstructor();
+        bool isDtor = m.isDestructor();
+        auto rawName = m.nameText().value_or(std::u16string{});
+        if (!isCtor && !isDtor && !rawName.empty() && rawName == si->name) {
+            errorAtNode(m.node, "To declare a constructor, use the 'constructor' keyword. "
+                "A method cannot be named after its class '" + asciiOf(si->name) + "'.");
+            continue;
+        }
+        if (isDtor && si->findDestructorIndex() >= 0) {
+            errorAtNode(m.node, "A class can declare at most one destructor.");
+            continue;
+        }
+        std::u16string mname = isCtor ? std::u16string(u"constructor")
+                             : isDtor ? std::u16string(u"destructor")
+                             : rawName;
+
         Type* retType = m.returnType() && m.returnType()->typeReference()
             ? resolveTypeReference(*m.returnType()->typeReference())
             : typeCtx.getPrimitive(TypeKind::Void);
-        auto mname = m.nameText().value_or(std::u16string{});
         uint32_t mPos = m.nameToken() ? m.nameToken()->startOffset() : m.node.startOffset();
         Symbol* sym = makeSymbol(SymbolKind::Function, mname, nullptr, mPos);
         sym->returnType = retType;
         sym->funcDeclCst = m.node.greenNode();
         sym->declaredThrows = m.isThrows();
         sym->methodOwner = si;
+        sym->isConstructor = isCtor;
+        sym->isDestructor = isDtor;
         resolveMethodParams(m, t, sym);
         analysis.setSymbol(m.node.greenNode(), sym);
         analysis.setReceiver(m.node.greenNode(), t);
@@ -1257,6 +1299,8 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
         mi.symbol = sym;
         mi.declaration = const_cast<GreenElement*>(m.node.greenNode());
         mi.visibility = toSemanticVisibility(m.visibility());
+        mi.isConstructor = isCtor;
+        mi.isDestructor = isDtor;
         mi.isOverride = m.isOverride();
         mi.isFinal = m.isFinal();
         mi.isAbstract = m.isAbstract();
@@ -1264,7 +1308,19 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
         si->methods.push_back(std::move(mi));
 
         // Validate (base methods already collected via base-before-derived order).
-        bool isCtor = (mname == si->name);
+        if (isDtor) {
+            if (m.visibilityModifier() || m.isOverride() || m.isFinal() || m.isAbstract())
+                errorAtNode(m.node, "A destructor cannot have modifiers such as visibility, "
+                    "'override', 'final', or 'abstract'.");
+            if (!m.parameters().empty())
+                errorAtNode(m.node, "A destructor cannot declare parameters.");
+            if (m.returnType())
+                errorAtNode(m.node, "A destructor cannot declare a return type.");
+            if (m.isThrows())
+                errorAtNode(m.throwsToken().value_or(m.node),
+                    "A destructor cannot be marked 'throws'.");
+            continue;
+        }
         bool overridable = !isCtor && !m.isFinal() && !si->isFinal;
         checkFieldMethodCollision(si, mname, isCtor, m.node);
         checkThrowsClausePlacement(m, overridable, isCtor);
@@ -1355,7 +1411,7 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
         std::vector<const Symbol*> checked;
         for (StructInfo* s = si; s; s = s->baseInfo) {
             for (auto& m : s->methods) {
-                if (m.name == s->name || !m.symbol) continue;  // constructor
+                if (m.isConstructor || m.isDestructor || !m.symbol) continue;
                 bool seen = false;
                 for (const Symbol* c : checked) {
                     if (c->name == m.name && sameParameterTypes(c, m.symbol)) { seen = true; break; }
@@ -1410,7 +1466,7 @@ void Analyzer::finalizeClassHierarchy(const std::vector<StructInfo*>& classes) {
     };
     for (StructInfo* si : order) {  // phase 1: mark
         for (auto& mi : si->methods) {
-            if (mi.name == si->name) continue;
+            if (mi.isConstructor || mi.isDestructor) continue;
             if (mi.isAbstract) mi.vtableSlot = VTSLOT_PENDING;
             if (mi.isOverride && si->baseInfo) {
                 if (StructInfo* bc = si->baseInfo->classDeclaringMethodBySignature(mi.name, mi.symbol)) {
@@ -1429,7 +1485,7 @@ void Analyzer::finalizeClassHierarchy(const std::vector<StructInfo*>& classes) {
         StructInfo* baseAuth = slotAuthority(si->baseInfo);
         si->vtableSize = baseAuth ? baseAuth->vtableSize : 0;
         for (auto& mi : si->methods) {
-            if (mi.name == si->name || mi.vtableSlot != VTSLOT_PENDING) continue;
+            if (mi.isConstructor || mi.isDestructor || mi.vtableSlot != VTSLOT_PENDING) continue;
             StructInfo* bc = si->baseInfo
                 ? si->baseInfo->classDeclaringMethodBySignature(mi.name, mi.symbol) : nullptr;
             int bi = bc ? bc->findMethodIndexBySignature(mi.name, mi.symbol) : -1;
@@ -1443,7 +1499,7 @@ void Analyzer::finalizeClassHierarchy(const std::vector<StructInfo*>& classes) {
     // ABI throws-ness is uniform across a vtable slot
     for (StructInfo* si : order) {
         for (auto& mi : si->methods) {
-            if (mi.name == si->name || !mi.symbol) continue;
+            if (mi.isConstructor || mi.isDestructor || !mi.symbol) continue;
             StructInfo* root = nullptr;
             int ri = -1;
             for (StructInfo* s = si; s; s = s->baseInfo) {
@@ -1560,8 +1616,7 @@ void Analyzer::collectTests(const ast::SourceFile& file) {
 
 void Analyzer::resolveMethodParams(const ast::FuncDecl& fn, ::Type* receiverType, Symbol* sym,
                                    bool isInterfaceMethod) {
-    auto fname = fn.nameText().value_or(std::u16string{});
-    bool isCtor = receiverType && receiverType->structInfo && fname == receiverType->structInfo->name;
+    bool isCtor = fn.isConstructor();
 
     if (fn.isShorthand() && !isCtor && !fn.isAbstract() && !isInterfaceMethod) {
         errorAtNode(fn.node, "Shorthand declaration ';' is only allowed on a constructor");
@@ -2107,7 +2162,7 @@ void Analyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
     // A constructor must chain to its base when the base has no zero-argument constructor.
     if (receiverType && receiverType->structInfo && !sawSuperConstructorCall) {
         StructInfo* cls = receiverType->structInfo;
-        bool isCtor = currentFunction && currentFunction->name == cls->name;
+        bool isCtor = currentFunction && currentFunction->isConstructor;
         if (isCtor && cls->baseInfo) {
             bool anyCtor = false;
             bool anyCallableWithoutArgs = false;
@@ -4098,7 +4153,7 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
         sawSuperConstructorCall = true;
         StructInfo* cls = (currentThis && currentThis->type) ? currentThis->type->structInfo : nullptr;
         StructInfo* base = cls ? cls->baseInfo : nullptr;
-        bool inCtor = cls && currentFunction && currentFunction->name == cls->name;
+        bool inCtor = cls && currentFunction && currentFunction->isConstructor;
         if (!inCtor) {
             errorAtNode(expr.node, "'super(...)' can only be called from a constructor");
         }
@@ -4108,7 +4163,7 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
         }
         std::vector<const MethodInfo*> ctorCands;
         for (const auto& m : base->methods) {
-            if (m.name == base->name && m.symbol) ctorCands.push_back(&m);
+            if (m.isConstructor && m.symbol) ctorCands.push_back(&m);
         }
         if (ctorCands.empty()) {
             if (!args.empty())
@@ -5072,7 +5127,7 @@ Type* Analyzer::analyzeNew(const ast::NewExpression& expr) {
 
     std::vector<const MethodInfo*> ctorCands;
     for (const auto& m : t->structInfo->methods) {
-        if (m.name == t->structInfo->name && m.symbol) ctorCands.push_back(&m);
+        if (m.isConstructor && m.symbol) ctorCands.push_back(&m);
     }
 
     auto args = expr.arguments();
@@ -5705,11 +5760,10 @@ void Analyzer::checkFieldInitialization(const ast::StructDecl& sd) {
 void Analyzer::checkFieldInitialization(const ast::ClassDecl& cd) {
     Type* t = analysis.typeOf(cd.node.greenNode());
     if (!t || !t->structInfo) return;
-    std::u16string className = t->structInfo->name;
 
     std::vector<ast::FuncDecl> ctors;
     for (auto& m : cd.methods()) {
-        if (auto mname = m.nameText(); mname && *mname == className) ctors.push_back(m);
+        if (m.isConstructor()) ctors.push_back(m);
     }
 
     int baseFieldCount = t->structInfo->baseFieldCount;

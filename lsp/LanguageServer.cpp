@@ -471,7 +471,7 @@ Entity entityForSymbol(Symbol* s) {
         if (StructInfo* si = structInfoOf(s->type)) return typeEntity(si);
     }
     if (s->kind == SymbolKind::Function && s->methodOwner) {
-        if (s->name == s->methodOwner->name) return typeEntity(s->methodOwner);
+        if (s->isConstructor) return typeEntity(s->methodOwner);
         s = baseMostMethodSymbol(s);
     }
     if (s->thisFieldOwner) {
@@ -719,12 +719,11 @@ lsp::DocumentSymbol buildRecordSymbol(const SourceFile& source,
 
     std::vector<lsp::DocumentSymbol> children;
     children.reserve(fields.size() + methods.size());
-    std::u16string typeName = name.value_or(std::u16string{});
     for (const auto& f : fields) {
         children.push_back(buildFieldSymbol(source, f));
     }
     for (const auto& m : methods) {
-        bool isCtor = m.nameText().has_value() && *m.nameText() == typeName;
+        bool isCtor = m.isConstructor();
         children.push_back(buildFunctionSymbol(source, m, /*isMember*/ true, /*isConstructor*/ isCtor));
     }
     sym.children = std::move(children);
@@ -1438,7 +1437,7 @@ lsp::TextDocument_CompletionResult LanguageServer::onCompletion(lsp::CompletionP
         items.push_back(std::move(item));
     }
     for (const auto& m : info.methods) {
-        if (m.name == info.name) continue;  // constructor - only callable via `new`
+        if (m.isConstructor || m.isDestructor) continue;  // not callable directly
         if (!isVisible(m.visibility)) continue;
         lsp::CompletionItem item;
         item.label = utf16To8(m.name);

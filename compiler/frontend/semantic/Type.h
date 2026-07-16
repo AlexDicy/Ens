@@ -46,6 +46,8 @@ struct MethodInfo {
     Symbol* symbol = nullptr;       // function symbol with paramTypes/returnType (no `this`)
     void* declaration = nullptr;    // FuncDecl* (kept void* to avoid AST include cycle)
     Visibility visibility = Visibility::Public;
+    bool isConstructor = false;
+    bool isDestructor = false;
     bool isOverride = false;
     bool isFinal = false;
     bool isAbstract = false;
@@ -99,6 +101,24 @@ struct StructInfo {
     int findMethodIndex(const std::u16string& methodName) const {
         for (size_t i = 0; i < methods.size(); ++i) {
             if (methods[i].name == methodName) return static_cast<int>(i);
+        }
+        return -1;
+    }
+    bool hasOwnConstructor() const {
+        for (const auto& m : methods) {
+            if (m.isConstructor) return true;
+        }
+        return false;
+    }
+    int findConstructorIndex() const {
+        for (size_t i = 0; i < methods.size(); ++i) {
+            if (methods[i].isConstructor) return static_cast<int>(i);
+        }
+        return -1;
+    }
+    int findDestructorIndex() const {
+        for (size_t i = 0; i < methods.size(); ++i) {
+            if (methods[i].isDestructor) return static_cast<int>(i);
         }
         return -1;
     }

@@ -158,6 +158,8 @@ public:
     std::optional<ReturnType> returnType() const;
     std::optional<Block> body() const;
     bool isShorthand() const;
+    bool isConstructor() const;
+    bool isDestructor() const;
     bool isOverride() const;
     bool isFinal() const;
     bool isAbstract() const;

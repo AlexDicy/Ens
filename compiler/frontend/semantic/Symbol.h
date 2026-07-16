@@ -60,6 +60,9 @@ public:
     std::u16string libraryName;
 
     StructInfo* methodOwner = nullptr;
+    // Set on the function symbol of a `constructor` / `destructor` member.
+    bool isConstructor = false;
+    bool isDestructor = false;
 
     // For a this-field constructor parameter: the class whose field it initializes.
     StructInfo* thisFieldOwner = nullptr;

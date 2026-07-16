@@ -731,7 +731,7 @@ struct CodeGenerator::Impl {
 
         std::vector<llvm::Type*> paramTypes;
         if (receiver) paramTypes.push_back(llvm::PointerType::get(ctx, 0));
-        auto fname = fn.nameText().value_or(std::u16string{});
+        auto fname = fn.nameText().value_or(sym->name);
         for (size_t i = 0; i < sym->paramTypes.size(); ++i) {
             auto* pt = sym->paramTypes[i];
             if (isUnsupportedType(pt)) {
@@ -811,7 +811,7 @@ struct CodeGenerator::Impl {
     static Symbol* implicitBaseCtor(StructInfo* base) {
         Symbol* fallback = nullptr;
         for (auto& m : base->methods) {
-            if (m.name != base->name || !m.symbol) continue;
+            if (!m.isConstructor || !m.symbol) continue;
             if (m.symbol->paramTypes.empty()) return m.symbol;
             if (!fallback && requiredParamCount(m.symbol) == 0) fallback = m.symbol;
         }
@@ -840,7 +840,7 @@ struct CodeGenerator::Impl {
         llvm::DISubprogram* sp = nullptr;
         llvm::DIScope* prevScope = currentDIScope;
         if (debugEnabled && diBuilder) {
-            auto fname = fn.nameText().value_or(std::u16string{});
+            auto fname = fn.nameText().value_or(sym->name);
             auto [line, col] = posOf(fn.node.startOffset());
             sp = diBuilder->createFunction(
                 diCU, asAscii(fname), asAscii(fname), diFile,
@@ -858,7 +858,7 @@ struct CodeGenerator::Impl {
         ::Type* receiver = recvOverride ? recvOverride : analysis->receiverOf(fn.node.greenNode());
 
         {
-            auto rawName = fn.nameText().value_or(std::u16string{});
+            auto rawName = fn.nameText().value_or(sym->name);
             std::string display = asAscii(rawName);
             if (receiver && receiver->structInfo)
                 display = asAscii(receiver->structInfo->name) + "." + display;
@@ -891,7 +891,7 @@ struct CodeGenerator::Impl {
         // Construct the base subobject first when a constructor omits an explicit super(...)
         // and the base has a constructor callable with no arguments.
         if (receiver && receiver->structInfo && receiver->structInfo->baseInfo && thisSym &&
-            sym->name == receiver->structInfo->name && !ctorHasExplicitSuper(fn)) {
+            sym->isConstructor && !ctorHasExplicitSuper(fn)) {
             StructInfo* base = receiver->structInfo->baseInfo;
             if (Symbol* baseCtor = implicitBaseCtor(base)) {
                 if (llvm::Function* bfn = getOrDeclareExternalFunction(baseCtor, nullptr)) {
@@ -4259,7 +4259,11 @@ struct CodeGenerator::Impl {
                 break;
             }
         }
-        if (!hasOwning) return llvm::ConstantPointerNull::get(ptrTy);
+        bool hasUserDtor = false;
+        for (StructInfo* s = t->structInfo; s; s = s->baseInfo) {
+            if (s->findDestructorIndex() >= 0) { hasUserDtor = true; break; }
+        }
+        if (!hasOwning && !hasUserDtor) return llvm::ConstantPointerNull::get(ptrTy);
 
         std::string name = "_dtor_" + mangledTypeName(t->structInfo);
         if (auto* existing = module->getFunction(name)) return existing;
@@ -4271,6 +4275,15 @@ struct CodeGenerator::Impl {
         auto savedIP = builder->saveIP();
         auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
         builder->SetInsertPoint(entry);
+        // User destructors run first, most-derived to base, while every field is
+        // still alive; then the object's owning fields are released.
+        for (StructInfo* s = t->structInfo; s; s = s->baseInfo) {
+            int di = s->findDestructorIndex();
+            if (di < 0 || !s->methods[di].symbol) continue;
+            if (llvm::Function* dfn = getOrDeclareExternalFunction(s->methods[di].symbol, nullptr)) {
+                builder->CreateCall(dfn, { fn->getArg(0) });
+            }
+        }
         emitStructFieldRelease(t, fn->getArg(0));
         builder->CreateRetVoid();
 
@@ -5981,7 +5994,7 @@ struct CodeGenerator::Impl {
 
         Symbol* ctorSym = methodSymbolOf(e.node);
         if (!ctorSym) {
-            int ctorIdx = t->structInfo->findMethodIndex(t->structInfo->name);
+            int ctorIdx = t->structInfo->findConstructorIndex();
             if (ctorIdx >= 0) ctorSym = t->structInfo->methods[ctorIdx].symbol;
         }
         if (ctorSym) {
@@ -5997,7 +6010,7 @@ struct CodeGenerator::Impl {
             // No own constructor: run the nearest inherited constructor that is
             // callable with no arguments.
             for (StructInfo* base = t->structInfo->baseInfo; base; base = base->baseInfo) {
-                if (base->findMethodIndex(base->name) < 0) continue;
+                if (!base->hasOwnConstructor()) continue;
                 if (Symbol* baseCtor = implicitBaseCtor(base)) {
                     if (llvm::Function* bfn = getOrDeclareExternalFunction(baseCtor, nullptr)) {
                         std::vector<llvm::Value*> callArgs{ heapPtr };

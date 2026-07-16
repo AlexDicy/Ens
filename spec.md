@@ -64,12 +64,12 @@ calculateArea(Rectangle rectangle) -> uint {
 class Animation<S: Shape + Comparable> {
     private S? shape;
 
-    // the constructor can be a full method or a shorthand which initializes the fields. Methods can have optional parameters, optional parameters must provide a default value. This syntax allows to use either new Animation(); or new Animation(myShape);
+    // A constructor is introduced by the `constructor` keyword. It can be a full method or a shorthand which initializes the fields. Methods can have optional parameters, optional parameters must provide a default value. This syntax allows to use either new Animation(); or new Animation(myShape);
     // the default expression must be assignable to the field's declared type.
-    Animation(this.shape = null);
+    constructor(this.shape = null);
 
     // or:
-    // Animation(S? shape = null) {
+    // constructor(S? shape = null) {
     //     this.shape = shape;
     // }
 
@@ -96,13 +96,13 @@ A class may extend one other class with `extends`. A subclass inherits the base 
 ```ens
 class Shape {
     protected int sides;
-    Shape(this.sides = 0);
+    constructor(this.sides = 0);
     area() -> int { return 0; }
 }
 
 class Square extends Shape {
     int side;
-    Square(int s) {
+    constructor(int s) {
         super(4);          // run the base constructor first
         this.side = s;
     }
@@ -115,6 +115,11 @@ Methods are overridable by default. An override must be marked `override` and mu
 `super.method(...)` calls the base class's implementation, bypassing any override. A constructor may call `super(...)` as its first statement to run the base constructor; if it does not, the base class must be constructible with no arguments. `protected` members (see above) are reachable from subclasses.
 
 Class fields may declare default values just like struct fields. Defaults are applied when an instance is created, in declaration order and before the constructor body runs, so constructor assignments overwrite them.
+
+A class may declare a `destructor`, introduced by the `destructor` keyword, to run cleanup when an instance is destroyed.
+A destructor takes no parameters, has no return type, and cannot be `throws`; a class declares at most one, and it cannot be called explicitly.
+When the last reference to an object is released its destructor runs, followed by each inherited destructor from the most derived class up to the base, and then the object's fields are released.
+Destructors are a class-only feature; structs and interfaces cannot declare them.
 
 An `abstract class` cannot be instantiated. It may declare `abstract` methods (a signature with no body), that every concrete subclass must `override`.
 
@@ -169,7 +174,7 @@ class List<T> {
     private T[] items;
     private long count;
 
-    List() { this.items = new T[4]; this.count = 0; }
+    constructor() { this.items = new T[4]; this.count = 0; }
 
     push(T value) { /* ... grow if full ... */ }
     get(long index) -> T { return this.items[index]; }
@@ -204,7 +209,7 @@ The `Animation<S: Shape + Comparable>` example above uses exactly this form.
 ```ens
 class Drawer<T: Shape> {
     private T shape;
-    Drawer(T s) { this.shape = s; }
+    constructor(T s) { this.shape = s; }
     area() -> int { return this.shape.area(); }
 }
 
@@ -222,7 +227,7 @@ abstract class Source<T> {
 
 class Constant<T> extends Source<T> {
     private T value;
-    Constant(this.value);
+    constructor(this.value);
     override read() -> T { return this.value; }
 }
 
@@ -390,7 +395,7 @@ A type written without a `?` always holds a value and can never be `null`. To al
 class Inner { /* ... */ }
 class Outer {
     Inner? inner;     // may be null
-    Outer(this.inner = null);
+    constructor(this.inner = null);
 }
 ```
 
@@ -607,7 +612,7 @@ import Iterator from @std.collections.iterator;
 class Range implements Iterable<int> {
     private int low;
     private int high;
-    Range(this.low, this.high);
+    constructor(this.low, this.high);
     override makeIterator() -> Iterator<int> { return new RangeIterator(this.low, this.high); }
 }
 

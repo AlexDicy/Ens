@@ -405,7 +405,7 @@ void ThrowsAnalyzer::validate(DiagnosticSink& sink, const SourceFile& source) {
         if (!info || !info->resolvedSymbol) return;
         Type* recv = analysis.receiverOf(m.node.greenNode());
         StructInfo* ri = recv ? recv->structInfo : nullptr;
-        bool isCtor = ri && info->resolvedSymbol->name == ri->name;
+        bool isCtor = info->resolvedSymbol->isConstructor;
         validateFunction(info->resolvedSymbol, m, isCtor, ri);
     };
     for (auto& sd : sf.structs()) for (auto& m : sd.methods()) eachMethod(m);

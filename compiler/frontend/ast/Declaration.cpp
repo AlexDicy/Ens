@@ -235,6 +235,8 @@ bool FuncDecl::isShorthand() const {
     return false;
 }
 
+bool FuncDecl::isConstructor() const { return hasDirectToken(node, SyntaxKind::KwConstructor); }
+bool FuncDecl::isDestructor() const  { return hasDirectToken(node, SyntaxKind::KwDestructor); }
 bool FuncDecl::isOverride() const { return hasDirectToken(node, SyntaxKind::KwOverride); }
 bool FuncDecl::isFinal() const    { return hasDirectToken(node, SyntaxKind::KwFinal); }
 bool FuncDecl::isAbstract() const { return hasDirectToken(node, SyntaxKind::KwAbstract); }

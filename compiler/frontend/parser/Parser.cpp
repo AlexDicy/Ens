@@ -400,7 +400,9 @@ void Parser::parseFuncDecl() {
     while (at(SyntaxKind::KwOverride) || at(SyntaxKind::KwFinal) || at(SyntaxKind::KwAbstract)) {
         bump();  // method modifier; analyzer validates context
     }
-    if (isKeyword(kindAt())) {
+    if (at(SyntaxKind::KwConstructor) || at(SyntaxKind::KwDestructor)) {
+        bump();  // constructor/destructor introducer; no name follows
+    } else if (isKeyword(kindAt())) {
         std::string word;
         for (char16_t c : tokenAt().text) word.push_back(c < 128 ? static_cast<char>(c) : '?');
         reportAtCurrent("'" + word + "' is a keyword and cannot be used as a method name");
