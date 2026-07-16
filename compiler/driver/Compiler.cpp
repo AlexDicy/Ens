@@ -18,6 +18,7 @@
 #include "semantic/TypeContext.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <fstream>
@@ -28,6 +29,11 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/FileSystem.h"
@@ -389,6 +395,7 @@ namespace {
 
 struct DiscoveredTest {
     std::u16string modulePath;
+    std::string file;              // source file, relative to the discovery root
     int index = 0;                 // source order within the module: $test<index>
     std::u16string rawLiteral;     // the description literal exactly as written
     std::string description;       // decoded, UTF-8; used for --filter and messages
@@ -410,7 +417,13 @@ std::u16string buildRunnerSource(const std::vector<DiscoveredTest>& tests) {
         out += t.modulePath;
         appendAscii(out, ";\n");
     }
-    appendAscii(out, "\n");
+    // Flush stdout after each result so completed results survive a crash in a
+    // later test. 'fflush(null)' flushes every stream; the FILE handle is an
+    // opaque external type here since the runner never inspects it.
+    appendAscii(out, "\nexternal type CStdioFile;\n\n"
+                     "external from \"c\" {\n"
+                     "    fflush(CStdioFile? stream) -> int;\n"
+                     "}\n\n");
 
     std::u16string alias;
     auto aliasOf = [](const std::u16string& modulePath) {
@@ -427,14 +440,14 @@ std::u16string buildRunnerSource(const std::vector<DiscoveredTest>& tests) {
         out += aliasOf(t.modulePath);
         appendAscii(out, "." + target + "();\n    print(\"PASS \" + ");
         out += t.rawLiteral;
-        appendAscii(out, ");\n    return true;\n} catch (Error e) {\n    print(\"FAIL \" + ");
+        appendAscii(out, ");\n    fflush(null);\n    return true;\n} catch (Error e) {\n    print(\"FAIL \" + ");
         out += t.rawLiteral;
         appendAscii(out, " + \": \" + e.message);\n"
                          "    for (let frame in e.getStackFrames()) {\n"
                          "        if (frame.file == \"$ens_test_runner.ens\") { break; }\n"
                          "        print(\"  at \" + frame.function + \" (\" + frame.file + \":\" + frame.line + \")\");\n"
                          "    }\n"
-                         "    return false;\n}\n\n");
+                         "    fflush(null);\n    return false;\n}\n\n");
     }
 
     std::string total = std::to_string(runIndex);
@@ -446,6 +459,58 @@ std::u16string buildRunnerSource(const std::vector<DiscoveredTest>& tests) {
                      "    if (passed == " + total + ") { return 0; }\n"
                      "    return 1;\n}\n");
     return out;
+}
+
+// Write the runner's captured stdout back to our own stdout exactly as it was
+// produced. On Windows this must go out in binary mode: the bytes already carry
+// the runner's own line endings, so a text-mode write would translate them again.
+void echoCapturedOutput(const std::string& bytes) {
+    if (bytes.empty()) return;
+    std::cout.flush();
+#ifdef _WIN32
+    std::fflush(stdout);
+    int previousMode = _setmode(_fileno(stdout), _O_BINARY);
+#endif
+    std::fwrite(bytes.data(), 1, bytes.size(), stdout);
+    std::fflush(stdout);
+#ifdef _WIN32
+    if (previousMode != -1) _setmode(_fileno(stdout), previousMode);
+#endif
+}
+
+// Count the result lines the runner flushed before it died. Each completed test
+// prints exactly one line beginning with "PASS " or "FAIL ".
+size_t countReportedResults(const std::string& output) {
+    size_t reported = 0;
+    size_t pos = 0;
+    while (pos < output.size()) {
+        size_t eol = output.find('\n', pos);
+        size_t end = (eol == std::string::npos) ? output.size() : eol;
+        std::string_view line(output.data() + pos, end - pos);
+        if (line.substr(0, 5) == "PASS " || line.substr(0, 5) == "FAIL ") reported++;
+        if (eol == std::string::npos) break;
+        pos = eol + 1;
+    }
+    return reported;
+}
+
+// A runner that exits with any code other than 0 (all passed) or 1 (some tests
+// failed) aborted partway - a panic, an unhandled exception, or a hard crash.
+// The buffered stdout is gone, so name the test that was running by counting how
+// many results the runner reported before dying: the crasher is the next one.
+void reportAbortedRun(const std::vector<DiscoveredTest>& tests,
+                      const std::string& runnerOutput, int exitCode, std::ostream& os) {
+    std::vector<const DiscoveredTest*> selected;
+    for (auto& t : tests) if (t.selected) selected.push_back(&t);
+
+    size_t reported = countReportedResults(runnerOutput);
+    os << "The test run ended unexpectedly (exit code " << exitCode << ")";
+    if (reported < selected.size()) {
+        const DiscoveredTest* culprit = selected[reported];
+        os << " while running test '" << culprit->description << "' (" << culprit->file << ")";
+    }
+    os << ". " << reported << " of " << selected.size()
+       << " tests had reported a result.\n";
 }
 
 }  // namespace
@@ -530,6 +595,7 @@ int Compiler::test(const fs::path& sourceDir, const fs::path& testsDir,
         for (auto& td : sf->tests()) {
             DiscoveredTest t;
             t.modulePath = modulePath;
+            t.file = rel.generic_string();
             t.index = index++;
             t.rawLiteral = td.rawDescriptionLiteral().value_or(u"\"\"");
             t.description = utf16ToUtf8(td.descriptionText().value_or(std::u16string{}));
@@ -614,24 +680,47 @@ int Compiler::test(const fs::path& sourceDir, const fs::path& testsDir,
         return 2;
     }
 
+    // Capture the runner's stdout to a file rather than letting it stream to the
+    // console. Each result line is flushed as it is printed (see buildRunnerSource),
+    // so a crash in a later test leaves the completed results on disk. We echo the
+    // file back verbatim afterward, so a normal run prints exactly what it did before,
+    // and count the results to name the test that was running if the run aborts.
+    fs::path capturePath = fs::path(tempDir.str().str()) / "runner.stdout";
+    std::string captureString = capturePath.string();
+
     std::string exeString = exePath.string();
     std::string errorMessage;
     bool executionFailed = false;
     llvm::StringRef argv[1] = { exeString };
+    std::optional<llvm::StringRef> redirects[3] = {
+        std::nullopt, llvm::StringRef(captureString), std::nullopt };
     int exitCode = llvm::sys::ExecuteAndWait(exeString, argv, /*Env*/ std::nullopt,
-                                             /*Redirects*/ {}, /*SecondsToWait*/ 0,
+                                             /*Redirects*/ redirects, /*SecondsToWait*/ 0,
                                              /*MemoryLimit*/ 0, &errorMessage, &executionFailed);
-    fs::remove_all(fs::path(tempDir.str().str()), ec);
 
-    if (executionFailed || exitCode < 0) {
+    std::string runnerOutput;
+    {
+        std::ifstream in(capturePath, std::ios::binary);
+        if (in) {
+            runnerOutput.assign((std::istreambuf_iterator<char>(in)),
+                                std::istreambuf_iterator<char>());
+        }
+    }
+    fs::remove_all(fs::path(tempDir.str().str()), ec);
+    echoCapturedOutput(runnerOutput);
+
+    if (executionFailed) {
         std::cerr << "ERROR: could not run the test binary"
                   << (errorMessage.empty() ? "" : ": " + errorMessage) << "\n";
         return 2;
     }
     if (exitCode == 0) return 0;
     if (exitCode != 1) {
-        std::cerr << "ens test: the test binary exited with code " << exitCode
-                  << " (a crash or panic aborts the whole run)\n";
+        reportAbortedRun(tests, runnerOutput, exitCode, std::cerr);
+        // Keep the exit-code contract: a negative code (a hard crash, e.g. a
+        // segfault) stays a 2 as before; any other abnormal code reports a
+        // failure with 1, the same as a run that merely had failing tests.
+        return exitCode < 0 ? 2 : 1;
     }
     return 1;
 }
