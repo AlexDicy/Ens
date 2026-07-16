@@ -9,6 +9,9 @@ add_requires("lsp-framework 1.3.1", { configs = { runtimes = "MT" } })
 if is_plat("windows") then
     -- libllvm is MT only
     set_runtimes("MT")
+    -- Silence the MSVC CRT's deprecation warning for standard C functions such
+    -- as 'std::getenv'; the standard names are used deliberately.
+    add_defines("_CRT_SECURE_NO_WARNINGS")
 end
 
 includes("scripts/xmake_**.lua")
