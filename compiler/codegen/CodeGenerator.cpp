@@ -57,7 +57,7 @@ static std::string mangledTypeArg(::Type* t);
 
 // A stable, symbol-safe name for a type. For a generic instantiation this folds
 // in the template name and type arguments so each instantiation has a distinct,
-// module-independent symbol (e.g. Vector<int> -> "Vector__int__").
+// module-independent symbol (e.g. List<int> -> "List__int__").
 static std::string mangledTypeName(StructInfo* si) {
     if (!si) return "_";
     if (!si->templateOf) return asAscii(si->name);
@@ -626,7 +626,7 @@ struct CodeGenerator::Impl {
         return s;
     }
 
-    // Method/owner-qualified mangled function name (e.g. Vector__int___push).
+    // Method/owner-qualified mangled function name (e.g. List__int___push).
     std::string mangledMethodName(StructInfo* owner, Symbol* sym) const {
         return mangledTypeName(owner) + "_" + asAscii(sym->name) + overloadSuffix(sym);
     }
