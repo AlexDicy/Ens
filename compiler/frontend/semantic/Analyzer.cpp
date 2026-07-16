@@ -2955,15 +2955,15 @@ void Analyzer::analyzeForStmt(const ast::ForStatement& stmt) {
     loopDepth--;
 }
 
-// True when `si` is the std.iterator Iterable interface (or an instantiation of it).
+// True when `si` is the std.collections.iterator Iterable interface (or an instantiation of it).
 static bool isIterableInterface(const StructInfo* si) {
     if (!si || !si->isInterface) return false;
     const StructInfo* authority = si->templateOf ? si->templateOf : si;
-    return authority->name == u"Iterable" && authority->modulePath == u"std.iterator";
+    return authority->name == u"Iterable" && authority->modulePath == u"std.collections.iterator";
 }
 
 // The element type a class yields in a for-in loop. Iteration is nominal: the
-// class (or a base class) must implement 'Iterable<T>' from @std.iterator, and
+// class (or a base class) must implement 'Iterable<T>' from @std.collections.iterator, and
 // the element type is that instantiation's type argument. An 'Iterable<T>'
 // value itself is iterable too. Reports and returns the error type otherwise.
 Type* Analyzer::resolveIterableElement(Type* iterT, const SyntaxNode& diag) {
@@ -2983,7 +2983,7 @@ Type* Analyzer::resolveIterableElement(Type* iterT, const SyntaxNode& diag) {
     }
     if (!iterableInst) {
         errorAtNode(diag, "'" + iterT->toString() + "' is not iterable: it does not implement "
-            "'Iterable' from '@std.iterator'. Declare 'implements Iterable<T>' and provide "
+            "'Iterable' from '@std.collections.iterator'. Declare 'implements Iterable<T>' and provide "
             "'makeIterator() -> Iterator<T>' to use it in a for-in loop.");
         return typeCtx.getError();
     }
@@ -3007,7 +3007,7 @@ void Analyzer::analyzeForEachStmt(const ast::ForEachStatement& stmt) {
         } else {
             errorAtNode(stmt.node, "'for (... in ...)' requires an array or an iterable "
                 "object, got '" + iterT->toString() + "'. A class is iterable when it "
-                "implements 'Iterable<T>' from '@std.iterator'.");
+                "implements 'Iterable<T>' from '@std.collections.iterator'.");
         }
     }
     Type* bindingT = elemT;
