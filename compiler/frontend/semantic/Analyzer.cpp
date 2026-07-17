@@ -1189,6 +1189,23 @@ bool Analyzer::overrideSignaturesCompatible(const MethodInfo& base, Symbol* der)
     return br->assignableFrom(dr);  // covariant return allowed
 }
 
+// The reserved contracts a class uses to become a content-matched key:
+// `hash() -> long` for bucketing and `equals(C other) -> bool` for the final
+// match. A method carrying either name must match its signature exactly.
+static bool hashSignatureConforms(const Symbol* sym) {
+    return sym && sym->paramTypes.empty() && sym->returnType &&
+        sym->returnType->kind == TypeKind::Long;
+}
+
+static bool equalsSignatureConforms(const Symbol* sym) {
+    if (!sym || sym->paramTypes.size() != 1 || !sym->returnType ||
+        sym->returnType->kind != TypeKind::Bool) {
+        return false;
+    }
+    Type* p = sym->paramTypes[0];
+    return p && p->isClass() && p->structInfo == sym->methodOwner;
+}
+
 void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
     Type* t = analysis.typeOf(cd.node.greenNode());
     if (!t || !t->structInfo) return;
@@ -1326,6 +1343,7 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
         checkFieldMethodCollision(si, mname, isCtor, m.node);
         checkThrowsClausePlacement(m, overridable, isCtor);
         checkHashMethodSignature(m, sym, isCtor);
+        checkEqualsMethodSignature(m, sym, isCtor);
         if (isCtor) {
             if (m.isOverride() || m.isAbstract())
                 errorAtNode(m.node, "A constructor cannot be 'override' or 'abstract'");
@@ -1341,6 +1359,16 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
             if (m.body().has_value())
                 errorAtNode(m.node, "Abstract method '" + asciiOf(mname) + "' cannot have a body");
         }
+        // A conforming `hash` or `equals` overrides the compiler's built-in
+        // identity hash/equality, so it is written with 'override' like any
+        // other override. `reservedIntent` also covers the near-miss shapes,
+        // which get their own signature diagnostics rather than a spurious
+        // "nothing to override".
+        bool reservedIntent = mname == u"hash" ||
+            (mname == u"equals" && sym->paramTypes.size() == 1 && sym->paramTypes[0] &&
+             sym->paramTypes[0]->isClass() && sym->paramTypes[0]->structInfo == sym->methodOwner);
+        bool reservedConforming = (mname == u"hash" && hashSignatureConforms(sym)) ||
+                                  (mname == u"equals" && equalsSignatureConforms(sym));
         if (m.isOverride()) {
             if (baseBySig) {
                 MethodInfo& bm = baseBySig->methods[baseBySig->findMethodIndexBySignature(mname, sym)];
@@ -1365,6 +1393,9 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
                 errorAtNode(m.node, "Override of '" + asciiOf(mname) +
                     "' does not match the signature declared in interface '" +
                     ifaceByName->toString() + "'");
+            } else if (reservedIntent) {
+                // Overrides the compiler's built-in identity hash/equality; no
+                // base declares it, but 'override' is the required marker.
             } else {
                 errorAtNode(m.node, "Method '" + asciiOf(mname) +
                     "' is marked 'override' but no base class or implemented interface declares it");
@@ -1378,9 +1409,14 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
             errorAtNode(m.node, "Method '" + asciiOf(mname) + "' of '" + asciiOf(si->name) +
                 "' implements a method declared in interface '" + ifaceT->toString() +
                 "'; mark it 'override'");
+        } else if (reservedConforming) {
+            errorAtNode(m.node, "Method '" + asciiOf(mname) + "' overrides the built-in " +
+                (mname == u"hash" ? std::string("identity hash") : std::string("identity equality")) +
+                "; mark it 'override'.");
         }
     }
     markOverloadedMethods(si);
+    checkHashEqualsPairing(cd, si);
 
     // --- The class must provide every method of every interface it implements,
     // either declared here (abstract counts) or inherited from a base class. ---
@@ -1700,11 +1736,82 @@ void Analyzer::checkFieldMethodCollision(StructInfo* owner, const std::u16string
 // match the synthesized contract so the type stays usable as a hashed key.
 void Analyzer::checkHashMethodSignature(const ast::FuncDecl& fn, Symbol* sym, bool isConstructor) {
     if (isConstructor || !sym || sym->name != u"hash") return;
-    bool conforming = sym->paramTypes.empty() && sym->returnType &&
-        sym->returnType->kind == TypeKind::Long;
-    if (!conforming) {
+    if (!hashSignatureConforms(sym)) {
         errorAtNode(fn.node, "A method named 'hash' must have the signature 'hash() -> long'; "
             "it defines how values of this type hash when used as keys (for example in a Map or Set).");
+    }
+}
+
+// `equals` opts a class into content-based '==' and '!=' only when it takes a
+// single parameter of the class's own type; that shape is an unambiguous
+// equality method. Other methods named `equals` (a no-argument token accessor,
+// for instance) are ordinary and untouched. A same-class `equals` must return
+// `bool` and cannot fail.
+void Analyzer::checkEqualsMethodSignature(const ast::FuncDecl& fn, Symbol* sym, bool isConstructor) {
+    if (isConstructor || !sym || sym->name != u"equals" || sym->paramTypes.size() != 1) return;
+    Type* p = sym->paramTypes[0];
+    if (!p || !p->isClass() || p->structInfo != sym->methodOwner) return;
+    if (fn.isThrows()) {
+        errorAtNode(fn.throwsToken().value_or(fn.node),
+            "A method named 'equals' cannot be marked 'throws'; equality comparison must not fail.");
+    }
+    if (!sym->returnType || sym->returnType->kind != TypeKind::Bool) {
+        std::u16string owner = sym->methodOwner ? sym->methodOwner->name : std::u16string{};
+        errorAtNode(fn.node, "A method named 'equals' that takes a '" + asciiOf(owner) +
+            "' must return 'bool'; it defines when two instances compare as equal "
+            "(for example as Map or Set keys).");
+    }
+}
+
+// `hash` and `equals` are a matched pair: equal values must hash equally, or
+// keyed collections silently misbehave. A class that customizes one must
+// customize the other, here or in a base class. Reported once, on the class
+// that first supplies a conforming half without its counterpart.
+void Analyzer::checkHashEqualsPairing(const ast::ClassDecl& cd, StructInfo* si) {
+    if (!si) return;
+    auto conformingHash = [](StructInfo* s) {
+        for (auto& m : s->methods)
+            if (m.name == u"hash" && hashSignatureConforms(m.symbol)) return true;
+        return false;
+    };
+    auto conformingEquals = [](StructInfo* s) {
+        for (auto& m : s->methods)
+            if (m.name == u"equals" && equalsSignatureConforms(m.symbol)) return true;
+        return false;
+    };
+    // A single same-class parameter marks an equality method even when its
+    // return type is wrong; that near-miss gets its own signature diagnostic,
+    // so the pairing check treats it as an equals already present.
+    auto equalsIntent = [](StructInfo* s) {
+        for (auto& m : s->methods) {
+            Symbol* sym = m.symbol;
+            if (m.name == u"equals" && sym && sym->paramTypes.size() == 1 &&
+                sym->paramTypes[0] && sym->paramTypes[0]->isClass() &&
+                sym->paramTypes[0]->structInfo == sym->methodOwner) return true;
+        }
+        return false;
+    };
+    auto hashNamed = [](StructInfo* s) {
+        for (auto& m : s->methods)
+            if (m.name == u"hash") return true;
+        return false;
+    };
+    bool ownHash = conformingHash(si);
+    bool ownEquals = conformingEquals(si);
+    bool equalsAnywhere = false, hashAnywhere = false;
+    for (StructInfo* s = si; s; s = s->baseInfo) {
+        if (equalsIntent(s)) equalsAnywhere = true;
+        if (hashNamed(s)) hashAnywhere = true;
+    }
+    if (ownHash && !equalsAnywhere) {
+        errorAtNode(cd.node, "Class '" + asciiOf(si->name) + "' defines 'hash' but not 'equals'. "
+            "A class that customizes one must customize both, so equal values hash equally. "
+            "Add an 'equals(" + asciiOf(si->name) + " other) -> bool' method.");
+    }
+    if (ownEquals && !hashAnywhere) {
+        errorAtNode(cd.node, "Class '" + asciiOf(si->name) + "' defines 'equals' but not 'hash'. "
+            "A class that customizes one must customize both, so equal values hash equally. "
+            "Add a 'hash() -> long' method.");
     }
 }
 

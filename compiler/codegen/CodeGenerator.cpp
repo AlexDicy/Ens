@@ -2365,6 +2365,22 @@ struct CodeGenerator::Impl {
                     error(e.node.startOffset(), "Comparing struct values with '==' is not supported yet");
                     return nullptr;
                 }
+                // A class that declares `equals` compares by content. A `null`
+                // literal operand is always a presence check, never dispatched.
+                bool leftNull = leftType && subst(leftType)->isNull();
+                bool rightNull = rightType && subst(rightType)->isNull();
+                if (!leftNull && !rightNull) {
+                    ::Type* lc = subst(leftType);
+                    if (lc && lc->isOptional() && lc->inner) lc = subst(lc->inner);
+                    Symbol* eqSym = (lc && lc->isClass()) ? declaredConformingEquals(lc) : nullptr;
+                    if (eqSym) {
+                        llvm::Value* eq = emitClassContentEquality(lc, eqSym, L, R);
+                        if (!eq) return nullptr;
+                        if (isReferenceType(leftType))  releaseIfOwnedTemp(L, *leftE);
+                        if (isReferenceType(rightType)) releaseIfOwnedTemp(R, *rightE);
+                        return op == SyntaxKind::NotEq ? builder->CreateNot(eq, "ne") : eq;
+                    }
+                }
                 llvm::Value* cmp = op == SyntaxKind::EqEq
                     ? (flt ? builder->CreateFCmpOEQ(L, R) : builder->CreateICmpEQ(L, R))
                     : (flt ? builder->CreateFCmpONE(L, R) : builder->CreateICmpNE(L, R));
@@ -2583,6 +2599,72 @@ struct CodeGenerator::Impl {
         if (!sym || !sym->paramTypes.empty() || !sym->returnType ||
             sym->returnType->kind != TypeKind::Long) return nullptr;
         return sym;
+    }
+
+    // A class type's conforming `equals(C other) -> bool` (declared here or
+    // inherited), or null when the class compares by reference identity. The
+    // signature must match exactly - a single same-class parameter returning
+    // bool - so ordinary methods named `equals` are left as identity compares.
+    Symbol* declaredConformingEquals(::Type* t) {
+        if (!t) return nullptr;
+        t = subst(t);
+        if (!t->isClass() || !t->structInfo) return nullptr;
+        for (StructInfo* s = t->structInfo; s; s = s->baseInfo) {
+            for (auto& m : s->methods) {
+                Symbol* sym = m.symbol;
+                if (!sym || m.name != u"equals" || sym->paramTypes.size() != 1 ||
+                    !sym->returnType || sym->returnType->kind != TypeKind::Bool ||
+                    sym->abiThrows) continue;
+                ::Type* p = sym->paramTypes[0];
+                if (p && p->isClass() && p->structInfo == sym->methodOwner) return sym;
+            }
+        }
+        return nullptr;
+    }
+
+    // '==' over two class references whose class declares `equals`: an identity
+    // fast path (also covering both-null), then a null guard, then equals().
+    // The caller negates the result for '!='.
+    llvm::Value* emitClassContentEquality(::Type* classT, Symbol* eqSym,
+                                          llvm::Value* recv, llvm::Value* other) {
+        auto* i1 = llvm::Type::getInt1Ty(ctx);
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        llvm::Value* nullp = llvm::ConstantPointerNull::get(ptrTy);
+        llvm::Value* samePtr = builder->CreateICmpEQ(recv, other, "eq.same");
+        llvm::BasicBlock* entryBB = builder->GetInsertBlock();
+        auto* nullBB = llvm::BasicBlock::Create(ctx, "eq.nullcheck", currentFunction);
+        auto* callBB = llvm::BasicBlock::Create(ctx, "eq.call", currentFunction);
+        auto* endBB  = llvm::BasicBlock::Create(ctx, "eq.end", currentFunction);
+        builder->CreateCondBr(samePtr, endBB, nullBB);
+
+        builder->SetInsertPoint(nullBB);
+        llvm::Value* anyNull = builder->CreateOr(
+            builder->CreateICmpEQ(recv, nullp, "eq.recvnull"),
+            builder->CreateICmpEQ(other, nullp, "eq.othernull"), "eq.anynull");
+        builder->CreateCondBr(anyNull, endBB, callBB);
+
+        builder->SetInsertPoint(callBB);
+        int vslot = -1;
+        for (StructInfo* s = classT->structInfo; s && vslot < 0; s = s->baseInfo) {
+            for (auto& m : s->methods) {
+                if (m.symbol == eqSym) { vslot = m.vtableSlot; break; }
+            }
+        }
+        llvm::Function* fn = getOrDeclareExternalFunction(eqSym, classT);
+        if (!fn) return nullptr;
+        std::vector<llvm::Value*> args{ recv, other };
+        llvm::Value* eqv = (vslot >= 0)
+            ? builder->CreateCall(fn->getFunctionType(), loadVtableSlot(recv, vslot), args, "eq.dispatch")
+            : builder->CreateCall(fn, args, "eq.dispatch");
+        llvm::BasicBlock* callEnd = builder->GetInsertBlock();
+        builder->CreateBr(endBB);
+
+        builder->SetInsertPoint(endBB);
+        auto* phi = builder->CreatePHI(i1, 3, "eq.result");
+        phi->addIncoming(llvm::ConstantInt::getTrue(ctx), entryBB);
+        phi->addIncoming(llvm::ConstantInt::getFalse(ctx), nullBB);
+        phi->addIncoming(eqv, callEnd);
+        return phi;
     }
 
     // Synthesized hash of a value: identity for reference types, contents for

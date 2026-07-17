@@ -158,6 +158,8 @@ private:
     void checkFieldMethodCollision(StructInfo* owner, const std::u16string& methodName,
                                    bool isConstructor, const SyntaxNode& diag);
     void checkHashMethodSignature(const ast::FuncDecl& fn, Symbol* sym, bool isConstructor);
+    void checkEqualsMethodSignature(const ast::FuncDecl& fn, Symbol* sym, bool isConstructor);
+    void checkHashEqualsPairing(const ast::ClassDecl& cd, StructInfo* si);
     void resolveDeclaredThrows(const ast::FuncDecl& fn, Symbol* sym);
     void checkParameterDefaults(const ast::FuncDecl& fn);
     void checkFieldDefaults(const ast::StructDecl& sd);

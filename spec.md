@@ -932,7 +932,7 @@ writeGreeting() -> int throws {
 
 ---
 
-Every value has a `hash()` method returning a `long`. Value types (primitives, enums, strings, structs) hash by their contents, so equal values hash equally; classes and arrays hash by identity, matching how `==` compares them. A class can declare its own `hash() -> long` to control its hashing; a method named `hash` must have exactly that signature. The `Hashable` interface from `@std.hash` names this contract for generic bounds, and every type satisfies it.
+Every value has a `hash()` method returning a `long`. Value types (primitives, enums, strings, structs) hash by their contents, so equal values hash equally; classes and arrays hash by identity, matching how `==` compares them. A class can declare its own `hash() -> long` to control its hashing (a method named `hash` must have exactly that signature), paired with `equals(C other) -> bool` - a method taking a single parameter of the class's own type `C` - to control equality. When a class declares such an `equals`, `==` and `!=` on that class compare by content - an identity and null check first, then `equals` - rather than by reference identity; the method must return `bool` and cannot be `throws`. Both `hash` and `equals` are written with `override`, since they replace a class's built-in identity hash and equality. The two are a matched pair: a class that declares one must declare the other, so equal instances always hash equally. The `Hashable` interface from `@std.hash` names the hashing contract for generic bounds, and every type satisfies it.
 
 The collection modules build on hashing and iteration:
 
@@ -956,7 +956,7 @@ for (let entry in ages) {
 }
 ```
 
-Keys are matched with `==`: strings by contents, value types by value, and classes by identity unless the key class defines its own `hash()` (identity comparison still applies). Struct keys are not supported yet because structs cannot be compared with `==`.
+Keys are matched with `==` and bucketed with `hash()`: strings by contents, value types by value, and classes by identity - unless the key class declares `equals` (with its paired `hash`), in which case its keys match by content. Struct keys are not supported yet because structs cannot be compared with `==`.
 
 `StringBuilder` from `@std.text.stringbuilder` accumulates text in a growable buffer, so building a string piece by piece stays linear where repeated `+` on immutable strings would re-copy the whole prefix.
 `append(value)` accepts a string, an integer, or a `bool`; `length()` returns the number of bytes written so far; `toString()` returns the accumulated text and leaves the builder usable.
