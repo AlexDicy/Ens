@@ -398,6 +398,7 @@ void Analyzer::registerExternalTypeNames(const ast::SourceFile& file) {
         if (t->structInfo) {
             t->structInfo->line = line;
             t->structInfo->column = col;
+            t->structInfo->visibility = toSemanticVisibility(ed.visibility());
         }
         analysis.setType(ed.node.greenNode(), t);
     }
@@ -503,6 +504,7 @@ void Analyzer::registerStructNames(const ast::SourceFile& file) {
             sd.nameToken() ? sd.nameToken()->startOffset() : sd.node.startOffset());
         t->structInfo->line = line;
         t->structInfo->column = col;
+        t->structInfo->visibility = toSemanticVisibility(sd.visibility());
         for (auto& tp : sd.typeParams()) {
             t->structInfo->isTemplate = true;
             t->structInfo->typeParamNames.push_back(tp.nameText().value_or(std::u16string{}));
@@ -524,6 +526,10 @@ void Analyzer::registerClassNames(const ast::SourceFile& file) {
             cd.nameToken() ? cd.nameToken()->startOffset() : cd.node.startOffset());
         t->structInfo->line = line;
         t->structInfo->column = col;
+        t->structInfo->visibility = toSemanticVisibility(cd.visibility());
+        t->structInfo->isAbstract = cd.isAbstract();
+        t->structInfo->isFinal = cd.isFinal();
+        t->structInfo->isSealed = cd.isSealed();
         for (auto& tp : cd.typeParams()) {
             t->structInfo->isTemplate = true;
             t->structInfo->typeParamNames.push_back(tp.nameText().value_or(std::u16string{}));
@@ -545,6 +551,7 @@ void Analyzer::registerInterfaceNames(const ast::SourceFile& file) {
             id.nameToken() ? id.nameToken()->startOffset() : id.node.startOffset());
         t->structInfo->line = line;
         t->structInfo->column = col;
+        t->structInfo->visibility = toSemanticVisibility(id.visibility());
         for (auto& tp : id.typeParams()) {
             t->structInfo->isTemplate = true;
             t->structInfo->typeParamNames.push_back(tp.nameText().value_or(std::u16string{}));
@@ -566,6 +573,7 @@ void Analyzer::registerEnumNames(const ast::SourceFile& file) {
             ed.nameToken() ? ed.nameToken()->startOffset() : ed.node.startOffset());
         t->structInfo->line = line;
         t->structInfo->column = col;
+        t->structInfo->visibility = toSemanticVisibility(ed.visibility());
         analysis.setType(ed.node.greenNode(), t);
     }
 }
@@ -574,7 +582,6 @@ void Analyzer::collectEnums(const ast::SourceFile& file) {
     for (auto& ed : file.enums()) {
         Type* t = analysis.typeOf(ed.node.greenNode());
         if (!t || !t->structInfo) continue;
-        t->structInfo->visibility = toSemanticVisibility(ed.visibility());
         int64_t next = 0;
         for (auto& m : ed.members()) {
             auto mname = m.nameText();
@@ -823,7 +830,6 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
     for (auto& sd : structs) {
         Type* t = analysis.typeOf(sd.node.greenNode());
         if (!t) continue;
-        if (t->structInfo) t->structInfo->visibility = toSemanticVisibility(sd.visibility());
         size_t tpCount = t->structInfo ? enterTemplateScope(t->structInfo, sd.typeParams()) : 0;
         for (auto& f : sd.fields()) {
             FieldInfo fi;
@@ -910,7 +916,6 @@ void Analyzer::collectInterfaces(const ast::SourceFile& file) {
         Type* t = analysis.typeOf(id.node.greenNode());
         if (!t || !t->structInfo) continue;
         StructInfo* si = t->structInfo;
-        si->visibility = toSemanticVisibility(id.visibility());
         size_t tpCount = enterTemplateScope(si, id.typeParams());
 
         for (auto& f : id.fields()) {
@@ -1016,10 +1021,6 @@ void Analyzer::resolveClassBases(const ast::SourceFile& file) {
         Type* t = analysis.typeOf(cd.node.greenNode());
         if (!t || !t->structInfo) continue;
         StructInfo* si = t->structInfo;
-        si->isAbstract = cd.isAbstract();
-        si->isFinal = cd.isFinal();
-        si->isSealed = cd.isSealed();
-        si->visibility = toSemanticVisibility(cd.visibility());
         if (si->isSealed && si->isFinal) {
             errorAtNode(cd.node, "Class '" + asciiOf(si->name) + "' cannot be both 'sealed' and "
                 "'final'; 'final' already forbids subclasses, so there is nothing to seal.");
