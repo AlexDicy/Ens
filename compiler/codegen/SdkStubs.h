@@ -12,5 +12,6 @@ struct SdkStub {
 
 extern const SdkStub kSdkStubs[];
 extern const std::size_t kSdkStubsCount;
+extern const char kSdkVersion[];
 
 }  // namespace ens

@@ -1,13 +1,13 @@
 #include "Linker.h"
 
 #include "SdkStubs.h"
+#include "TargetPlatform.h"
 #include "lld/Common/Driver.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Program.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/TargetParser/Host.h"
 
 #include <iostream>
 #include <vector>
@@ -149,8 +149,9 @@ std::vector<std::string> buildArgv(LinkerFlavor flavor,
             args.push_back(archFromTriple(triple));
             args.push_back("-platform_version");
             args.push_back("macos");
-            args.push_back("11.0");
-            args.push_back("14.0");
+            const std::string deploymentTarget = ens::macOSDeploymentTargetForTriple(triple);
+            args.push_back(deploymentTarget);
+            args.push_back(ens::kSdkVersion[0] == '\0' ? deploymentTarget : ens::kSdkVersion);
             const std::string& sdk = extractEmbeddedSDK();
             if (!sdk.empty()) {
                 args.push_back("-syslibroot");
@@ -243,8 +244,7 @@ bool Linker::link(const std::vector<std::string>& objectPaths,
                    const std::string& exePath,
                    std::ostream& errStream,
                    const std::string& targetTriple) {
-    const std::string triple = targetTriple.empty()
-        ? llvm::sys::getDefaultTargetTriple() : targetTriple;
+    const std::string triple = ens::resolveTargetTriple(targetTriple);
     const LinkerFlavor flavor = flavorForTriple(triple);
 
     std::vector<std::string> argv = buildArgv(flavor, triple, objectPaths, libraries, exePath);

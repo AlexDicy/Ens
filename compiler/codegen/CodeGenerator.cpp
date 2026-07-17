@@ -1,4 +1,5 @@
 #include "CodeGenerator.h"
+#include "TargetPlatform.h"
 #include "ast/Declaration.h"
 #include "ast/Expression.h"
 #include "ast/Statement.h"
@@ -28,7 +29,6 @@
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
-#include "llvm/TargetParser/Host.h"
 
 #include <filesystem>
 #include <optional>
@@ -646,8 +646,7 @@ struct CodeGenerator::Impl {
     bool initializeTargetMachine() {
         if (targetMachine) return true;
         initializeTargetsOnce();
-        std::string triple = targetTriple.empty()
-            ? llvm::sys::getDefaultTargetTriple() : targetTriple;
+        std::string triple = ens::resolveTargetTriple(targetTriple);
         std::string lookupErr;
         const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, lookupErr);
         if (!target) {

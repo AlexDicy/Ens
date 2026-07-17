@@ -10,6 +10,7 @@ rule("gen-macos-sdk-stubs")
                     "namespace ens {",
                     "const SdkStub kSdkStubs[1] = { {nullptr, nullptr, 0} };",
                     "const std::size_t kSdkStubsCount = 0;",
+                    "const char kSdkVersion[] = \"\";",
                     "}  // namespace ens",
                     "",
                 }, "\n"))
@@ -25,6 +26,16 @@ rule("gen-macos-sdk-stubs")
                 end
                 emit_empty()
                 return
+            end
+
+            local sdk_version = ""
+            local settings_path = path.join(sdk_path, "SDKSettings.json")
+            if os.isfile(settings_path) then
+                local settings = io.readfile(settings_path, { continuation = "" }) or ""
+                sdk_version = settings:match('"Version"%s*:%s*"([%d%.]+)"') or ""
+            end
+            if sdk_version == "" then
+                sdk_version = path.filename(sdk_path):match("^MacOSX([%d%.]+)%.sdk$") or ""
             end
 
             local libsystem = path.join(sdk_path, "usr/lib/libSystem.B.tbd")
@@ -43,7 +54,7 @@ rule("gen-macos-sdk-stubs")
 
             -- Skip regeneration if the source set hasn't changed. Cache a fingerprint
             -- of (sdk_path, file sizes) in a comment at the top of the generated file.
-            local fingerprint_parts = {sdk_path}
+            local fingerprint_parts = {"format=2", sdk_path, "version=" .. sdk_version}
             for _, pair in ipairs(pairs_list) do
                 local info = os.filesize(pair[2])
                 table.insert(fingerprint_parts, string.format("%s:%d", pair[1], info))
@@ -87,6 +98,7 @@ rule("gen-macos-sdk-stubs")
             end
             table.insert(lines, "};")
             table.insert(lines, string.format("const std::size_t kSdkStubsCount = %d;", #pairs_list))
+            table.insert(lines, string.format("const char kSdkVersion[] = \"%s\";", sdk_version))
             table.insert(lines, "")
             table.insert(lines, "}  // namespace ens")
             table.insert(lines, "")
@@ -95,6 +107,11 @@ rule("gen-macos-sdk-stubs")
             print(string.format("generated %s (%d files)", out_path, #pairs_list))
         end
 
-        gen_macos_sdk_stubs(gen)
+        local toolchain = target:toolchain("llvm")
+        local sdk_path = toolchain and toolchain:sdkdir() or nil
+        if sdk_path and not os.isfile(path.join(sdk_path, "usr/lib/libSystem.B.tbd")) then
+            sdk_path = nil
+        end
+        gen_macos_sdk_stubs(gen, sdk_path)
         target:add("files", gen, { always_added = true })
     end)
