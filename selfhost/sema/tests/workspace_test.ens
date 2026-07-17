@@ -1,0 +1,133 @@
+import @std.testing;
+import workspace;
+import Workspace from workspace;
+import WorkspaceLoad from workspace;
+import PackageMatch from workspace;
+import FakeFileLoader from sema_support;
+import sema_support;
+
+test "workspace root discovery finds the nearest marked ancestor" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/dependencies.txt", "");
+    try testing.assertEqual(workspace.discoverRoot(loader, "/proj") ?? "none", "/proj");
+    try testing.assertEqual(workspace.discoverRoot(loader, "/proj/src/nested") ?? "none", "/proj");
+    try testing.assertEqual(workspace.discoverRoot(loader, "/elsewhere/src") ?? "none", "none");
+}
+
+test "sources without a workspace root stand alone" {
+    let loader = new FakeFileLoader();
+    let load = workspace.loadRootWorkspace(loader, "/alone/src", "");
+    try sema_support.assertNoDiagnostics(load.diagnostics());
+    let alone = load.workspace();
+    try testing.assertEqual(alone.sourceRoot(), "/alone/src");
+    try testing.assertFalse(alone.hasTestsRoot(), "a standalone workspace has no tests root");
+    try testing.assertEqual(alone.packagePrefix(), "");
+    try testing.assertTrue(alone.matchPackage(["acme"]) == null,
+        "a standalone workspace has no packages");
+    try testing.assertEqual(alone.missingPackageMessage("acme.widgets"),
+        "External package 'acme.widgets' is not available. "
+            + "Add it to dependencies.txt (only '@std' is built in).");
+}
+
+test "dependency entries resolve aliases by longest prefix" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/dependencies.txt", "# vendored packages\n"
+        + "\n"
+        + "@acme=vendor/acme\n"
+        + "  @acme.widgets = ../shared/widgets  \n");
+    let load = workspace.loadRootWorkspace(loader, "/proj/src", "");
+    try sema_support.assertNoDiagnostics(load.diagnostics());
+    let root = load.workspace();
+    try testing.assertEqual(root.root(), "/proj");
+
+    let widgets = root.matchPackage(["acme", "widgets", "gadget"]);
+    if (widgets != null) {
+        try testing.assertEqual(widgets.segmentCount(), 2L);
+        try testing.assertEqual(widgets.folder(), "/shared/widgets");
+    } else {
+        try testing.fail("expected '@acme.widgets' to match");
+    }
+
+    let acme = root.matchPackage(["acme", "other"]);
+    if (acme != null) {
+        try testing.assertEqual(acme.segmentCount(), 1L);
+        try testing.assertEqual(acme.folder(), "/proj/vendor/acme");
+    } else {
+        try testing.fail("expected '@acme' to match");
+    }
+
+    try testing.assertTrue(root.matchPackage(["missing", "thing"]) == null,
+        "an unlisted alias must not match");
+    try testing.assertEqual(root.missingPackageMessage("missing.thing"),
+        "Package 'missing.thing' is not listed in /proj/dependencies.txt.");
+}
+
+test "malformed dependency lines are reported and skipped" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/dependencies.txt", "@good=vendor/good\n"
+        + "widgets=no/at\n"
+        + "@broken\n"
+        + "@=path\n"
+        + "@empty=   \n"
+        + "@dup=first\n"
+        + "@dup=second\n");
+    let load = workspace.loadRootWorkspace(loader, "/proj/src", "");
+
+    let diagnostics = load.diagnostics();
+    try testing.assertEqual(diagnostics.length, 5L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/dependencies.txt",
+        "A dependency line must look like '@package.name=path'; "
+            + "'widgets=no/at' does not start with '@'.");
+    try sema_support.assertDiagnostic(diagnostics, 1, "/proj/dependencies.txt",
+        "A dependency line must look like '@package.name=path'; '@broken' is missing '='.");
+    try sema_support.assertDiagnostic(diagnostics, 2, "/proj/dependencies.txt",
+        "A dependency line must look like '@package.name=path'; "
+            + "the package name and path must both be non-empty.");
+    try sema_support.assertDiagnostic(diagnostics, 3, "/proj/dependencies.txt",
+        "A dependency line must look like '@package.name=path'; "
+            + "the package name and path must both be non-empty.");
+    try sema_support.assertDiagnostic(diagnostics, 4, "/proj/dependencies.txt",
+        "Package '@dup' is already declared; remove the duplicate line.");
+
+    let root = load.workspace();
+    let good = root.matchPackage(["good", "thing"]);
+    if (good != null) {
+        try testing.assertEqual(good.folder(), "/proj/vendor/good");
+    } else {
+        try testing.fail("the valid line before the malformed ones must still register");
+    }
+    let dup = root.matchPackage(["dup", "thing"]);
+    if (dup != null) {
+        try testing.assertEqual(dup.folder(), "/proj/first");
+    } else {
+        try testing.fail("the first '@dup' entry must still register");
+    }
+}
+
+test "dependency diagnostics are anchored to the trimmed line" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/dependencies.txt", "@ok=lib\n  bad line  \n");
+    let load = workspace.loadRootWorkspace(loader, "/proj/src", "");
+    let diagnostics = load.diagnostics();
+    try testing.assertEqual(diagnostics.length, 1L);
+    try testing.assertEqual(diagnostics[0].span().start, 10L);
+    try testing.assertEqual(diagnostics[0].span().length, 8L);
+}
+
+test "a package workspace reads through src and carries its prefix" {
+    let loader = new FakeFileLoader();
+    loader.add("/vendor/widgets/dependencies.txt", "@base=../base\n");
+    let load = workspace.loadPackageWorkspace(loader, "/vendor/widgets", "acme.widgets");
+    try sema_support.assertNoDiagnostics(load.diagnostics());
+    let widgets = load.workspace();
+    try testing.assertEqual(widgets.root(), "/vendor/widgets");
+    try testing.assertEqual(widgets.sourceRoot(), "/vendor/widgets/src");
+    try testing.assertFalse(widgets.hasTestsRoot(), "a package never exposes a tests root");
+    try testing.assertEqual(widgets.packagePrefix(), "acme.widgets");
+    let base = widgets.matchPackage(["base", "core"]);
+    if (base != null) {
+        try testing.assertEqual(base.folder(), "/vendor/base");
+    } else {
+        try testing.fail("expected the package's own '@base' alias to match");
+    }
+}

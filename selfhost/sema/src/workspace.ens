@@ -1,0 +1,275 @@
+// Workspaces and package aliases. A workspace is a folder of Ens sources plus the packages its
+// imports may reach. Aliases currently come from a dependencies.txt file next to the sources; that
+// file is a temporary mechanism, so every assumption about it (its name, its format, its wording
+// in messages) stays inside this module.
+//
+// Format, one dependency per line: "@dotted.alias=relative/path", resolved against the folder
+// containing the file. Blank lines and whole-line '#' comments are skipped. A malformed line is
+// reported and skipped without aborting the load.
+import FileLoader from loader;
+import FileError from loader;
+import FileDiagnostic from diagnostics;
+import @ens.frontend.source;
+import paths;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+
+public class Workspace {
+    private string rootFolder;
+    private string workspaceSourceRoot;
+    private string workspaceTestsRoot;
+    private string prefix;
+    private Map<string, string> aliasFolders;
+
+    constructor(string root, string sourceRoot, string testsRoot, string packagePrefix,
+                Map<string, string> aliases) {
+        this.rootFolder = root;
+        this.workspaceSourceRoot = sourceRoot;
+        this.workspaceTestsRoot = testsRoot;
+        this.prefix = packagePrefix;
+        this.aliasFolders = aliases;
+    }
+
+    root() -> string {
+        return this.rootFolder;
+    }
+
+    sourceRoot() -> string {
+        return this.workspaceSourceRoot;
+    }
+
+    testsRoot() -> string {
+        return this.workspaceTestsRoot;
+    }
+
+    hasTestsRoot() -> bool {
+        return this.workspaceTestsRoot.length > 0;
+    }
+
+    packagePrefix() -> string {
+        return this.prefix;
+    }
+
+    // The longest alias key matching a prefix of the import's segments, so '@a.b.c' prefers the
+    // alias 'a.b' over the alias 'a'.
+    matchPackage(string[] segments) -> PackageMatch? {
+        for (long count = segments.length; count >= 1; count--) {
+            string key = paths.joinRange(segments, ".", 0, count);
+            string? folder = this.aliasFolders.get(key);
+            if (folder != null) {
+                return new PackageMatch(count, folder);
+            }
+        }
+        return null;
+    }
+
+    // The user-facing explanation for an import of a package this workspace does not know.
+    missingPackageMessage(string packagePath) -> string {
+        if (this.aliasFolders.length() == 0) {
+            return "External package '{packagePath}' is not available. "
+                + "Add it to dependencies.txt (only '@std' is built in).";
+        }
+        string dependenciesPath = dependenciesFilePath(this.rootFolder);
+        return "Package '{packagePath}' is not listed in {dependenciesPath}.";
+    }
+}
+
+public class PackageMatch {
+    private long matchedSegmentCount;
+    private string packageFolder;
+
+    constructor(long segmentCount, string folder) {
+        this.matchedSegmentCount = segmentCount;
+        this.packageFolder = folder;
+    }
+
+    segmentCount() -> long {
+        return this.matchedSegmentCount;
+    }
+
+    folder() -> string {
+        return this.packageFolder;
+    }
+}
+
+// A loaded workspace together with the diagnostics its dependency file produced.
+public class WorkspaceLoad {
+    private Workspace loadedWorkspace;
+    private FileDiagnostic[] loadDiagnostics;
+
+    constructor(Workspace workspace, FileDiagnostic[] diagnostics) {
+        this.loadedWorkspace = workspace;
+        this.loadDiagnostics = diagnostics;
+    }
+
+    workspace() -> Workspace {
+        return this.loadedWorkspace;
+    }
+
+    diagnostics() -> FileDiagnostic[] {
+        return this.loadDiagnostics;
+    }
+}
+
+// The nearest ancestor of startFolder (inclusive) marked as a workspace root, or null when no
+// ancestor is marked; having no workspace is valid.
+public discoverRoot(FileLoader loader, string startFolder) -> string? {
+    string folder = paths.normalize(startFolder);
+    while (true) {
+        if (loader.exists(dependenciesFilePath(folder))) {
+            return folder;
+        }
+        string parent = paths.parentFolder(folder);
+        if (parent.length == 0 || parent == folder) {
+            return null;
+        }
+        folder = parent;
+    }
+}
+
+// The workspace the whole build runs in. Its root is discovered upward from the source folder;
+// when nothing marks a root the sources stand alone, with no packages available. testsRoot may be
+// "" when the build has no separate tests folder.
+public loadRootWorkspace(FileLoader loader, string sourceRoot, string testsRoot) -> WorkspaceLoad {
+    string normalizedSource = paths.normalize(sourceRoot);
+    string normalizedTests = "";
+    if (testsRoot.length > 0) {
+        normalizedTests = paths.normalize(testsRoot);
+    }
+    string? root = discoverRoot(loader, normalizedSource);
+    if (root == null) {
+        let standalone = new Workspace(normalizedSource, normalizedSource, normalizedTests, "",
+            new Map<string, string>());
+        return new WorkspaceLoad(standalone, []);
+    }
+    return load(loader, root, normalizedSource, normalizedTests, "");
+}
+
+// A dependency package is consumed through its src/ subfolder only and never exposes tests. Its
+// own dependencies file is read here, when the package is first reached; dependencies do not
+// spread transitively to the workspaces that import the package.
+public loadPackageWorkspace(FileLoader loader, string folder, string packagePrefix)
+        -> WorkspaceLoad {
+    string normalizedFolder = paths.normalize(folder);
+    return load(loader, normalizedFolder, paths.join(normalizedFolder, "src"), "", packagePrefix);
+}
+
+// The standard library resolves against a caller-supplied root and keeps its full 'std.*' module
+// paths, so it needs no prefix and never has aliases of its own.
+public stdlibWorkspace(string stdlibRoot) -> Workspace {
+    string normalizedRoot = paths.normalize(stdlibRoot);
+    return new Workspace(normalizedRoot, normalizedRoot, "", "", new Map<string, string>());
+}
+
+private load(FileLoader loader, string root, string sourceRoot, string testsRoot,
+             string packagePrefix) -> WorkspaceLoad {
+    let aliases = new Map<string, string>();
+    let diagnostics = new List<FileDiagnostic>();
+    string dependenciesPath = dependenciesFilePath(root);
+    if (loader.exists(dependenciesPath)) {
+        string? text = readOrNull(loader, dependenciesPath);
+        if (text == null) {
+            diagnostics.push(new FileDiagnostic(dependenciesPath,
+                "Could not read {dependenciesPath}.", source.makeSpan(0, 0)));
+        } else {
+            parseDependencies(dependenciesPath, root, text, aliases, diagnostics);
+        }
+    }
+    let loaded = new Workspace(root, sourceRoot, testsRoot, packagePrefix, aliases);
+    return new WorkspaceLoad(loaded, diagnostics.toArray());
+}
+
+private readOrNull(FileLoader loader, string path) -> string? {
+    return try loader.readText(path);
+} catch (FileError error) {
+    return null;
+}
+
+private dependenciesFilePath(string folder) -> string {
+    return paths.join(folder, "dependencies.txt");
+}
+
+private parseDependencies(string filePath, string folder, string text,
+                          Map<string, string> aliases, List<FileDiagnostic> diagnostics) {
+    long lineStart = 0;
+    string rest = text;
+    while (true) {
+        long newline = rest.indexOf("\n");
+        string line = rest;
+        if (newline >= 0) {
+            line = rest.substring(0, newline);
+        }
+        parseLine(filePath, folder, line, lineStart, aliases, diagnostics);
+        if (newline < 0) {
+            return;
+        }
+        lineStart = lineStart + newline + 1;
+        rest = rest.substring(newline + 1, rest.length);
+    }
+}
+
+private parseLine(string filePath, string folder, string line, long lineStart,
+                  Map<string, string> aliases, List<FileDiagnostic> diagnostics) {
+    byte[] bytes = line.toBytes();
+    long begin = 0;
+    while (begin < bytes.length && isSpace(bytes[begin])) {
+        begin++;
+    }
+    long end = bytes.length;
+    while (end > begin && isSpace(bytes[end - 1])) {
+        end--;
+    }
+    if (end == begin || bytes[begin] == '#') {
+        return;
+    }
+    string trimmed = line.substring(begin, end);
+    let span = source.makeSpan(lineStart + begin, end - begin);
+    if (bytes[begin] != '@') {
+        diagnostics.push(new FileDiagnostic(filePath, "A dependency line must look like "
+            + "'@package.name=path'; '{trimmed}' does not start with '@'.", span));
+        return;
+    }
+    long equals = trimmed.indexOf("=");
+    if (equals < 0) {
+        diagnostics.push(new FileDiagnostic(filePath, "A dependency line must look like "
+            + "'@package.name=path'; '{trimmed}' is missing '='.", span));
+        return;
+    }
+    string key = trimText(trimmed.substring(1, equals));
+    string target = trimText(trimmed.substring(equals + 1, trimmed.length));
+    if (key.length == 0 || target.length == 0) {
+        diagnostics.push(new FileDiagnostic(filePath, "A dependency line must look like "
+            + "'@package.name=path'; the package name and path must both be non-empty.", span));
+        return;
+    }
+    if (aliases.contains(key)) {
+        diagnostics.push(new FileDiagnostic(filePath,
+            "Package '@{key}' is already declared; remove the duplicate line.", span));
+        return;
+    }
+    aliases.set(key, resolveTarget(folder, target));
+}
+
+private resolveTarget(string folder, string target) -> string {
+    if (target.substring(0, 1) == "/") {
+        return paths.normalize(target);
+    }
+    return paths.normalize(paths.join(folder, target));
+}
+
+private trimText(string text) -> string {
+    byte[] bytes = text.toBytes();
+    long begin = 0;
+    while (begin < bytes.length && isSpace(bytes[begin])) {
+        begin++;
+    }
+    long end = bytes.length;
+    while (end > begin && isSpace(bytes[end - 1])) {
+        end--;
+    }
+    return text.substring(begin, end);
+}
+
+private isSpace(byte value) -> bool {
+    return value == ' ' || value == '\t' || value == '\r';
+}
