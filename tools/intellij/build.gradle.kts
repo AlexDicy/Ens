@@ -46,4 +46,16 @@ tasks.prepareSandbox {
 tasks.processResources {
     from("../grammar/ens.tmLanguage.json") { into("textmate/ens/syntaxes") }
     from("../grammar/language-configuration.json") { into("textmate/ens") }
+    from("../assets/ens-logo.svg") {
+        into("META-INF")
+        rename { "pluginIcon.svg" }
+    }
+    from("../assets/ens-file-icon-light.svg") {
+        into("icons")
+        rename { "ensFile.svg" }
+    }
+    from("../assets/ens-file-icon.svg") {
+        into("icons")
+        rename { "ensFile_dark.svg" }
+    }
 }
