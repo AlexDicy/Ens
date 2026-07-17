@@ -120,6 +120,26 @@ bool Parser::peekIsContextualFrom(size_t n) const {
     }
 }
 
+// `type` is a contextual keyword: an ordinary identifier everywhere except after
+// `external`, where `external type Name;` declares an opaque external type.
+bool Parser::atContextualType() const {
+    return kindAt() == SyntaxKind::Identifier && tokenAt().text == u"type";
+}
+
+bool Parser::peekIsContextualType(size_t n) const {
+    size_t idx = current;
+    while (true) {
+        if (idx >= tokens.size()) return false;
+        if (!isTrivia(tokens[idx].kind)) {
+            if (n == 0) {
+                return tokens[idx].kind == SyntaxKind::Identifier && tokens[idx].text == u"type";
+            }
+            n--;
+        }
+        idx++;
+    }
+}
+
 bool Parser::eat(SyntaxKind k) {
     if (!at(k)) return false;
     bump();
@@ -314,8 +334,7 @@ void Parser::parseExternalDecl() {
     // Lookahead: 'external' 'type' IDENT ';'     -> ExternalTypeDecl
     //            'external' 'from' STRING { ... } -> ExternalBlock
     size_t externalIdx = (kindAt() == SyntaxKind::KwExternal) ? 0 : 1;
-    SyntaxKind afterExternal = peekKind(externalIdx + 1);
-    if (afterExternal == SyntaxKind::KwType) {
+    if (peekIsContextualType(externalIdx + 1)) {
         parseExternalTypeDecl();
     } else {
         parseExternalBlock();
@@ -326,7 +345,11 @@ void Parser::parseExternalTypeDecl() {
     builder.startNode(SyntaxKind::ExternalTypeDecl);
     parseVisibilityModifier();
     expect(SyntaxKind::KwExternal, "'external'");
-    expect(SyntaxKind::KwType, "'type'");
+    if (atContextualType()) {
+        bumpAs(SyntaxKind::KwType);
+    } else {
+        emitMissing(SyntaxKind::KwType, "'type'");
+    }
     expect(SyntaxKind::Identifier, "external type name");
     expect(SyntaxKind::Semi, "';' after external type declaration");
     builder.finishNode();

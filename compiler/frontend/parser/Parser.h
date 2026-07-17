@@ -47,6 +47,9 @@ private:
     // True when positioned on the contextual `from` keyword (a `from` identifier).
     bool atContextualFrom() const;
     bool peekIsContextualFrom(size_t n) const;
+    // True when positioned on the contextual `type` keyword (a `type` identifier).
+    bool atContextualType() const;
+    bool peekIsContextualType(size_t n) const;
 
     void expect(SyntaxKind k, const char* what);
     void emitMissing(SyntaxKind expectedKind, const char* what);

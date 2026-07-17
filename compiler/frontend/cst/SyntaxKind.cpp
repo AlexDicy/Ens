@@ -327,7 +327,6 @@ static constexpr std::pair<std::u16string_view, SyntaxKind> KEYWORD_TABLE[] = {
     {u"throws",    SyntaxKind::KwThrows},
     {u"true",      SyntaxKind::KwTrue},
     {u"try",       SyntaxKind::KwTry},
-    {u"type",      SyntaxKind::KwType},
     {u"weak",      SyntaxKind::KwWeak},
     {u"while",     SyntaxKind::KwWhile},
 };
