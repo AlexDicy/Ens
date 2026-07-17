@@ -100,6 +100,15 @@ task("test")
             })
         end
 
+        -- the self-hosted semantic layer's tests run the same way.
+        if want("selfhost_sema") then
+            table.insert(jobs, {
+                name = "selfhost_sema",
+                source = path.join(os.projectdir(), "selfhost", "sema", "src"),
+                ens_test_args = {"--tests", path.join(os.projectdir(), "selfhost", "sema", "tests")},
+            })
+        end
+
         -- the corpus round-trip harness parses every .ens file in the real source trees and
         -- asserts the front end is lossless and clean over all of them.
         if want("corpus_roundtrip") then
