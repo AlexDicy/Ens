@@ -100,6 +100,26 @@ bool Parser::peekIsContextualIn(size_t n) const {
     }
 }
 
+// `from` is a contextual keyword: an ordinary identifier everywhere except after an
+// import alias (`import Name from path;`) and after `external`.
+bool Parser::atContextualFrom() const {
+    return kindAt() == SyntaxKind::Identifier && tokenAt().text == u"from";
+}
+
+bool Parser::peekIsContextualFrom(size_t n) const {
+    size_t idx = current;
+    while (true) {
+        if (idx >= tokens.size()) return false;
+        if (!isTrivia(tokens[idx].kind)) {
+            if (n == 0) {
+                return tokens[idx].kind == SyntaxKind::Identifier && tokens[idx].text == u"from";
+            }
+            n--;
+        }
+        idx++;
+    }
+}
+
 bool Parser::eat(SyntaxKind k) {
     if (!at(k)) return false;
     bump();
@@ -265,9 +285,9 @@ void Parser::parseImportDecl() {
     expect(SyntaxKind::KwImport, "'import'");
 
     // Optional alias: `import Identifier from path;`
-    if (peekKind(0) == SyntaxKind::Identifier && peekKind(1) == SyntaxKind::KwFrom) {
+    if (peekKind(0) == SyntaxKind::Identifier && peekIsContextualFrom(1)) {
         bump();  // alias identifier
-        bump();  // 'from'
+        bumpAs(SyntaxKind::KwFrom);  // 'from'
     }
 
     parseImportPath();
@@ -316,7 +336,11 @@ void Parser::parseExternalBlock() {
     builder.startNode(SyntaxKind::ExternalBlock);
     parseVisibilityModifier();
     expect(SyntaxKind::KwExternal, "'external'");
-    expect(SyntaxKind::KwFrom, "'from' after 'external'");
+    if (atContextualFrom()) {
+        bumpAs(SyntaxKind::KwFrom);
+    } else {
+        emitMissing(SyntaxKind::KwFrom, "'from' after 'external'");
+    }
     {
         builder.startNode(SyntaxKind::LibrarySpec);
         expect(SyntaxKind::StringLiteral, "library name string");
@@ -490,7 +514,7 @@ void Parser::parseParameter() {
         } else {
             emitMissing(SyntaxKind::Identifier, "parameter type");
         }
-        // A keyword in the name slot (e.g. `string from`) would otherwise cascade
+        // A keyword in the name slot (e.g. `string type`) would otherwise cascade
         // into a stream of unrelated errors; report it once and recover by taking
         // the keyword as the name, mirroring keyword-named method recovery.
         if (isKeyword(kindAt())) {
