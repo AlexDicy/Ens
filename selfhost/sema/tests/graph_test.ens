@@ -1,0 +1,115 @@
+import @std.testing;
+import graph;
+import Module from graph;
+import GraphResult from graph;
+import FakeFileLoader from sema_support;
+import sema_support;
+
+test "bare sibling imports load once each and record their edges" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", "import helper;\nimport util;\n");
+    loader.add("/proj/src/helper.ens", "import main;\n");
+    loader.add("/proj/src/util.ens", "");
+    let result = graph.buildGraph(loader, "/proj/src", "", "/stdlib", ["main.ens"]);
+
+    try sema_support.assertNoDiagnostics(result.diagnostics());
+    try sema_support.assertModulePaths(result, ["main", "helper", "util"]);
+    let mainModule = try sema_support.moduleWithPath(result, "main");
+    try sema_support.assertImports(mainModule, ["helper", "util"]);
+    try testing.assertEqual(mainModule.filePath(), "/proj/src/main.ens");
+    try testing.assertEqual(mainModule.packagePrefix(), "");
+    try testing.assertEqual(mainModule.source().text(), "import helper;\nimport util;\n");
+    try testing.assertEqual(mainModule.parseResult().diagnostics().length, 0L);
+
+    let helper = try sema_support.moduleWithPath(result, "helper");
+    try sema_support.assertImports(helper, ["main"]);
+}
+
+test "package imports converge with the package's own bare imports" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/dependencies.txt", "@acme=vendor/acme\n@acme.widgets=vendor/widgets\n");
+    loader.add("/proj/src/main.ens", "import Gadget from @acme.widgets.gadget;\n"
+        + "import @acme.tool;\n"
+        + "import @acme.widgets.parts.bolt;\n");
+    loader.add("/proj/vendor/widgets/src/gadget.ens", "import parts.bolt;\n");
+    loader.add("/proj/vendor/widgets/src/parts/bolt.ens", "import gadget;\n");
+    loader.add("/proj/vendor/acme/src/tool.ens", "");
+    let result = graph.buildGraph(loader, "/proj/src", "", "/stdlib", ["main.ens"]);
+
+    try sema_support.assertNoDiagnostics(result.diagnostics());
+    try sema_support.assertModulePaths(result,
+        ["main", "acme.widgets.gadget", "acme.tool", "acme.widgets.parts.bolt"]);
+
+    let gadget = try sema_support.moduleWithPath(result, "acme.widgets.gadget");
+    try testing.assertEqual(gadget.filePath(), "/proj/vendor/widgets/src/gadget.ens");
+    try testing.assertEqual(gadget.packagePrefix(), "acme.widgets");
+    try sema_support.assertImports(gadget, ["acme.widgets.parts.bolt"]);
+
+    let bolt = try sema_support.moduleWithPath(result, "acme.widgets.parts.bolt");
+    try sema_support.assertImports(bolt, ["acme.widgets.gadget"]);
+
+    let tool = try sema_support.moduleWithPath(result, "acme.tool");
+    try testing.assertEqual(tool.filePath(), "/proj/vendor/acme/src/tool.ens");
+    try testing.assertEqual(tool.packagePrefix(), "acme");
+}
+
+test "a package resolves through its own dependencies, loaded when first reached" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/dependencies.txt", "@widgets=vendor/widgets\n");
+    loader.add("/proj/vendor/widgets/dependencies.txt", "@base=../base\n");
+    loader.add("/proj/src/main.ens", "import @widgets.gadget;\n");
+    loader.add("/proj/vendor/widgets/src/gadget.ens", "import @base.core;\n");
+    loader.add("/proj/vendor/base/src/core.ens", "");
+    let result = graph.buildGraph(loader, "/proj/src", "", "/stdlib", ["main.ens"]);
+
+    try sema_support.assertNoDiagnostics(result.diagnostics());
+    try sema_support.assertModulePaths(result, ["main", "widgets.gadget", "base.core"]);
+    let core = try sema_support.moduleWithPath(result, "base.core");
+    try testing.assertEqual(core.filePath(), "/proj/vendor/base/src/core.ens");
+    try testing.assertEqual(core.packagePrefix(), "base");
+}
+
+test "std imports resolve against the stdlib root and keep their full paths" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", "import @std.testing;\n");
+    loader.add("/stdlib/std/testing.ens", "import @std.collections.list;\n");
+    loader.add("/stdlib/std/collections/list.ens", "");
+    let result = graph.buildGraph(loader, "/proj/src", "", "/stdlib", ["main.ens"]);
+
+    try sema_support.assertNoDiagnostics(result.diagnostics());
+    try sema_support.assertModulePaths(result, ["main", "std.testing", "std.collections.list"]);
+    let testingModule = try sema_support.moduleWithPath(result, "std.testing");
+    try testing.assertEqual(testingModule.filePath(), "/stdlib/std/testing.ens");
+    try testing.assertEqual(testingModule.packagePrefix(), "");
+    try sema_support.assertImports(testingModule, ["std.collections.list"]);
+}
+
+test "repeated seeds and repeated imports load a module once" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", "import Helper from helper;\nimport helper;\n");
+    loader.add("/proj/src/helper.ens", "");
+    loader.add("/proj/src/extra.ens", "import helper;\n");
+    let result = graph.buildGraph(loader, "/proj/src", "", "/stdlib",
+        ["main.ens", "main.ens", "extra.ens"]);
+
+    try sema_support.assertNoDiagnostics(result.diagnostics());
+    try sema_support.assertModulePaths(result, ["main", "extra", "helper"]);
+    let mainModule = try sema_support.moduleWithPath(result, "main");
+    try sema_support.assertImports(mainModule, ["helper"]);
+}
+
+test "root bare imports fall back from the source root to the tests root" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/logic.ens", "");
+    loader.add("/proj/tests/support.ens", "import logic;\n");
+    loader.add("/proj/tests/logic_test.ens", "import support;\nimport logic;\n");
+    let result = graph.buildGraph(loader, "/proj/src", "/proj/tests", "/stdlib",
+        ["logic_test.ens"]);
+
+    try sema_support.assertNoDiagnostics(result.diagnostics());
+    try sema_support.assertModulePaths(result, ["logic_test", "support", "logic"]);
+    let support = try sema_support.moduleWithPath(result, "support");
+    try testing.assertEqual(support.filePath(), "/proj/tests/support.ens");
+    let logic = try sema_support.moduleWithPath(result, "logic");
+    try testing.assertEqual(logic.filePath(), "/proj/src/logic.ens");
+}

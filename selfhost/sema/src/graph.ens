@@ -1,0 +1,398 @@
+// The module graph: a breadth-first walk from seed files that loads and parses every reachable
+// module exactly once. Modules are named by canonical path, the owning package's prefix plus the
+// dotted path under its source root, so a package's bare sibling imports and an external
+// '@alias.module' import land on the same module. The builder owns everything it produces and
+// returns it in one GraphResult; nothing is written to shared state.
+import Source from @ens.frontend.source;
+import Span from @ens.frontend.source;
+import @ens.frontend.source;
+import @ens.frontend.parser;
+import ParseResult from @ens.frontend.parser;
+import @ens.frontend.syntax.factory;
+import SourceFileNode from @ens.frontend.syntax.nodes;
+import ImportDeclarationNode from @ens.frontend.syntax.nodes;
+import ImportPathNode from @ens.frontend.syntax.nodes;
+import TopLevelItem from @ens.frontend.syntax.nodes;
+import FileLoader from loader;
+import FileError from loader;
+import FileDiagnostic from diagnostics;
+import diagnostics;
+import Workspace from workspace;
+import workspace;
+import paths;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+import Set from @std.collections.set;
+import StringBuilder from @std.text.stringbuilder;
+
+// One loaded and parsed module. The parse result is kept for the later sema phases; red trees are
+// rebuilt over it on demand and never stored.
+public class Module {
+    private string moduleCanonicalPath;
+    private string moduleFilePath;
+    private string modulePackagePrefix;
+    private Source moduleSource;
+    private ParseResult moduleParseResult;
+    private string[] moduleImports;
+
+    constructor(string canonicalPath, string filePath, string packagePrefix, Source source,
+                ParseResult parseResult, string[] imports) {
+        this.moduleCanonicalPath = canonicalPath;
+        this.moduleFilePath = filePath;
+        this.modulePackagePrefix = packagePrefix;
+        this.moduleSource = source;
+        this.moduleParseResult = parseResult;
+        this.moduleImports = imports;
+    }
+
+    canonicalPath() -> string {
+        return this.moduleCanonicalPath;
+    }
+
+    filePath() -> string {
+        return this.moduleFilePath;
+    }
+
+    packagePrefix() -> string {
+        return this.modulePackagePrefix;
+    }
+
+    source() -> Source {
+        return this.moduleSource;
+    }
+
+    parseResult() -> ParseResult {
+        return this.moduleParseResult;
+    }
+
+    // Canonical paths of the modules this module imports, in source order, each listed once.
+    imports() -> string[] {
+        return this.moduleImports;
+    }
+}
+
+public class GraphResult {
+    private Module[] graphModules;
+    private FileDiagnostic[] graphDiagnostics;
+    private Map<string, Module> modulesByPath;
+
+    constructor(Module[] modules, FileDiagnostic[] diagnostics) {
+        this.graphModules = modules;
+        this.graphDiagnostics = diagnostics;
+        this.modulesByPath = new Map<string, Module>();
+        for (let loaded in modules) {
+            this.modulesByPath.set(loaded.canonicalPath(), loaded);
+        }
+    }
+
+    // Modules in load order: seeds first, then imports in discovery order.
+    modules() -> Module[] {
+        return this.graphModules;
+    }
+
+    // Graph and workspace diagnostics, ordered by (file, offset). Parse diagnostics stay on each
+    // module's ParseResult.
+    diagnostics() -> FileDiagnostic[] {
+        return this.graphDiagnostics;
+    }
+
+    moduleWithPath(string canonicalPath) -> Module? {
+        return this.modulesByPath.get(canonicalPath);
+    }
+}
+
+// Builds the graph reachable from seedFiles, which are file paths relative to the tests root when
+// one is given and to the source root otherwise. stdlibRoot is the folder containing 'std/'.
+public buildGraph(FileLoader loader, string sourceRoot, string testsRoot, string stdlibRoot,
+                  string[] seedFiles) -> GraphResult {
+    let builder = new GraphBuilder(loader, sourceRoot, testsRoot, stdlibRoot);
+    return builder.build(seedFiles);
+}
+
+private class WorkItem {
+    Workspace owner;
+    string baseFolder;
+    string relativePath;
+    string canonicalPath;
+
+    constructor(this.owner, this.baseFolder, this.relativePath, this.canonicalPath);
+}
+
+private class GraphBuilder {
+    private FileLoader loader;
+    private string stdlibRoot;
+
+    private Workspace rootWorkspace;
+    private Workspace stdWorkspace;
+    private Map<string, Workspace> workspacesByFolder;
+
+    private Set<string> queuedPaths;
+    private List<WorkItem> workItems;
+    private long nextWorkIndex;
+
+    private List<Module> loadedModules;
+    private List<FileDiagnostic> collected;
+
+    constructor(FileLoader loader, string sourceRoot, string testsRoot, string stdlibRoot) {
+        this.loader = loader;
+        this.stdlibRoot = paths.normalize(stdlibRoot);
+        this.stdWorkspace = workspace.stdlibWorkspace(stdlibRoot);
+        this.queuedPaths = new Set<string>();
+        this.workItems = new List<WorkItem>();
+        this.nextWorkIndex = 0;
+        this.loadedModules = new List<Module>();
+        this.collected = new List<FileDiagnostic>();
+        let rootLoad = workspace.loadRootWorkspace(loader, sourceRoot, testsRoot);
+        this.rootWorkspace = rootLoad.workspace();
+        this.workspacesByFolder = new Map<string, Workspace>();
+        this.workspacesByFolder.set(this.rootWorkspace.root(), this.rootWorkspace);
+        this.keep(rootLoad.diagnostics());
+    }
+
+    build(string[] seedFiles) -> GraphResult {
+        string seedBase = this.rootWorkspace.sourceRoot();
+        if (this.rootWorkspace.hasTestsRoot()) {
+            seedBase = this.rootWorkspace.testsRoot();
+        }
+        for (let seed in seedFiles) {
+            this.enqueue(this.rootWorkspace, seedBase, seed, modulePathOfRelative(seed));
+        }
+        while (this.nextWorkIndex < this.workItems.length()) {
+            let item = this.workItems.get(this.nextWorkIndex);
+            this.nextWorkIndex++;
+            this.process(item);
+        }
+        return new GraphResult(this.loadedModules.toArray(), diagnostics.sorted(this.collected));
+    }
+
+    private process(WorkItem item) {
+        string filePath = paths.join(item.baseFolder, item.relativePath);
+        string? text = this.readOrNull(filePath);
+        if (text == null) {
+            this.report(filePath, source.makeSpan(0, 0), "Could not read {filePath}.");
+            return;
+        }
+        let moduleSource = new Source(filePath, text);
+        let parsed = parser.parse(moduleSource);
+        string[] imports = this.resolveImports(item, filePath, parsed);
+        this.loadedModules.push(new Module(item.canonicalPath, filePath,
+            item.owner.packagePrefix(), moduleSource, parsed, imports));
+    }
+
+    private readOrNull(string path) -> string? {
+        return try this.loader.readText(path);
+    } catch (FileError error) {
+        return null;
+    }
+
+    // Resolves every import declaration in the parsed file, enqueuing newly reached modules, and
+    // returns the canonical paths the file imports.
+    private resolveImports(WorkItem item, string filePath, ParseResult parsed) -> string[] {
+        let imports = new List<string>();
+        let seen = new Set<string>();
+        let root = factory.createRoot(parsed.root());
+        if (root is SourceFileNode) {
+            for (long i = 0; i < root.itemsCount(); i++) {
+                let topLevel = root.items(i);
+                if (topLevel is ImportDeclarationNode) {
+                    string? canonical = this.resolveImport(item, filePath, topLevel.path());
+                    if (canonical != null && seen.add(canonical)) {
+                        imports.push(canonical);
+                    }
+                }
+            }
+        }
+        return imports.toArray();
+    }
+
+    // The canonical path the import resolves to, or null when the import is diagnosed instead.
+    private resolveImport(WorkItem item, string filePath, ImportPathNode path) -> string? {
+        string[] segments = segmentTexts(path);
+        if (segments.length == 0) {
+            return null;
+        }
+        string modulePath = paths.joinRange(segments, ".", 0, segments.length);
+        let span = path.span();
+        if (path.at() != null) {
+            if (segments[0] == "std") {
+                return this.resolveStdImport(filePath, span, modulePath);
+            }
+            return this.resolvePackageImport(item, filePath, span, modulePath, segments);
+        }
+        if (isStdlibPath(modulePath)) {
+            this.report(filePath, span,
+                "Import the standard library as a package: write '@{modulePath}'.");
+            return null;
+        }
+        return this.resolveBareImport(item, filePath, span, modulePath);
+    }
+
+    private resolveStdImport(string filePath, Span span, string modulePath) -> string? {
+        if (this.queuedPaths.contains(modulePath)) {
+            return modulePath;
+        }
+        string relativePath = relativeOfModulePath(modulePath);
+        string targetFile = paths.join(this.stdlibRoot, relativePath);
+        if (!this.loader.exists(targetFile)) {
+            this.report(filePath, span, "Cannot find standard library module '{modulePath}' "
+                + "(looked for {targetFile}).");
+            return null;
+        }
+        this.enqueue(this.stdWorkspace, this.stdlibRoot, relativePath, modulePath);
+        return modulePath;
+    }
+
+    private resolvePackageImport(WorkItem item, string filePath, Span span, string modulePath,
+                                 string[] segments) -> string? {
+        let match = item.owner.matchPackage(segments);
+        if (match == null) {
+            this.report(filePath, span, item.owner.missingPackageMessage(modulePath));
+            return null;
+        }
+        if (match.segmentCount() == segments.length) {
+            this.report(filePath, span,
+                "Import a module within package '{modulePath}', not the package itself.");
+            return null;
+        }
+        let target = this.workspaceFor(match.folder(),
+            paths.joinRange(segments, ".", 0, match.segmentCount()));
+        if (this.queuedPaths.contains(modulePath)) {
+            return modulePath;
+        }
+        string relativePath = relativeOfSegments(segments, match.segmentCount());
+        string targetFile = paths.join(target.sourceRoot(), relativePath);
+        if (!this.loader.exists(targetFile)) {
+            this.report(filePath, span,
+                "Cannot find module '{modulePath}' (looked for {targetFile}).");
+            return null;
+        }
+        this.enqueue(target, target.sourceRoot(), relativePath, modulePath);
+        return modulePath;
+    }
+
+    private resolveBareImport(WorkItem item, string filePath, Span span, string modulePath)
+            -> string? {
+        Workspace owner = item.owner;
+        string relativePath = relativeOfModulePath(modulePath);
+        string canonical = modulePath;
+        if (owner.packagePrefix().length > 0) {
+            canonical = owner.packagePrefix() + "." + modulePath;
+        }
+        string baseFolder = owner.sourceRoot();
+        // Only the root workspace resolves bare imports against its tests root as a fallback; a
+        // module present under both roots is ambiguous.
+        if (owner.hasTestsRoot()) {
+            bool underSource = this.loader.exists(paths.join(owner.sourceRoot(), relativePath));
+            bool underTests = this.loader.exists(paths.join(owner.testsRoot(), relativePath));
+            if (underSource && underTests) {
+                this.report(filePath, span, "Module '{modulePath}' exists under both the source "
+                    + "folder and the tests folder; rename one of the files.");
+                return null;
+            }
+            if (underTests) {
+                baseFolder = owner.testsRoot();
+            }
+        }
+        if (this.queuedPaths.contains(canonical)) {
+            return canonical;
+        }
+        string targetFile = paths.join(baseFolder, relativePath);
+        if (!this.loader.exists(targetFile)) {
+            string lookedFor = targetFile;
+            if (owner.hasTestsRoot()) {
+                lookedFor = lookedFor + " and " + paths.join(owner.testsRoot(), relativePath);
+            }
+            this.report(filePath, span, "Cannot find module '{modulePath}' "
+                + "(looked for {lookedFor}).");
+            return null;
+        }
+        this.enqueue(owner, baseFolder, relativePath, canonical);
+        return canonical;
+    }
+
+    // One workspace object per package folder, created the first time the folder is reached and
+    // keyed by the folder, so every route to the package shares it (and the prefix it was first
+    // given).
+    private workspaceFor(string folder, string packagePrefix) -> Workspace {
+        let existing = this.workspacesByFolder.get(folder);
+        if (existing != null) {
+            return existing;
+        }
+        let load = workspace.loadPackageWorkspace(this.loader, folder, packagePrefix);
+        this.keep(load.diagnostics());
+        this.workspacesByFolder.set(folder, load.workspace());
+        return load.workspace();
+    }
+
+    private enqueue(Workspace owner, string baseFolder, string relativePath, string canonical) {
+        if (canonical.length == 0) {
+            return;
+        }
+        if (!this.queuedPaths.add(canonical)) {
+            return;
+        }
+        this.workItems.push(new WorkItem(owner, baseFolder, relativePath, canonical));
+    }
+
+    private report(string file, Span span, string message) {
+        this.collected.push(new FileDiagnostic(file, message, span));
+    }
+
+    private keep(FileDiagnostic[] items) {
+        for (let item in items) {
+            this.collected.push(item);
+        }
+    }
+}
+
+private segmentTexts(ImportPathNode path) -> string[] {
+    let texts = new List<string>();
+    for (long i = 0; i < path.segmentsCount(); i++) {
+        texts.push(path.segments(i).text());
+    }
+    return texts.toArray();
+}
+
+private isStdlibPath(string modulePath) -> bool {
+    if (modulePath == "std") {
+        return true;
+    }
+    return modulePath.length >= 4 && modulePath.substring(0, 4) == "std.";
+}
+
+// "a/b/c.ens" -> "a.b.c"
+private modulePathOfRelative(string relativePath) -> string {
+    string bare = relativePath;
+    if (bare.length >= 4 && bare.substring(bare.length - 4, bare.length) == ".ens") {
+        bare = bare.substring(0, bare.length - 4);
+    }
+    let builder = new StringBuilder();
+    byte[] bytes = bare.toBytes();
+    for (long i = 0; i < bytes.length; i++) {
+        if (bytes[i] == '/') {
+            builder.append(".");
+        } else {
+            builder.appendByte(bytes[i]);
+        }
+    }
+    return builder.toString();
+}
+
+// "a.b.c" -> "a/b/c.ens"
+private relativeOfModulePath(string modulePath) -> string {
+    let builder = new StringBuilder();
+    byte[] bytes = modulePath.toBytes();
+    for (long i = 0; i < bytes.length; i++) {
+        if (bytes[i] == '.') {
+            builder.append("/");
+        } else {
+            builder.appendByte(bytes[i]);
+        }
+    }
+    builder.append(".ens");
+    return builder.toString();
+}
+
+private relativeOfSegments(string[] segments, long start) -> string {
+    return paths.joinRange(segments, "/", start, segments.length) + ".ens";
+}

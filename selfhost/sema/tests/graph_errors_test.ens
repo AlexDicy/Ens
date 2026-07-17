@@ -1,0 +1,146 @@
+import @std.testing;
+import graph;
+import FakeFileLoader from sema_support;
+import sema_support;
+
+test "an unknown package reports that only @std is built in when nothing is declared" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", "import @acme.widgets.gadget;\n");
+    let result = graph.buildGraph(loader, "/proj/src", "", "/stdlib", ["main.ens"]);
+
+    let diagnostics = result.diagnostics();
+    try testing.assertEqual(diagnostics.length, 1L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/src/main.ens",
+        "External package 'acme.widgets.gadget' is not available. "
+            + "Add it to dependencies.txt (only '@std' is built in).");
+    try testing.assertEqual(diagnostics[0].span().start, 7L);
+    try testing.assertEqual(diagnostics[0].span().length, 20L);
+    try sema_support.assertModulePaths(result, ["main"]);
+}
+
+test "an unlisted package points at the workspace's dependency list" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/dependencies.txt", "@other=vendor/other\n");
+    loader.add("/proj/src/main.ens", "import @acme.thing;\n");
+    let result = graph.buildGraph(loader, "/proj/src", "", "/stdlib", ["main.ens"]);
+
+    try sema_support.assertDiagnostic(result.diagnostics(), 0, "/proj/src/main.ens",
+        "Package 'acme.thing' is not listed in /proj/dependencies.txt.");
+}
+
+test "importing a package with no module tail is rejected" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/dependencies.txt", "@acme.widgets=vendor/widgets\n");
+    loader.add("/proj/src/main.ens", "import @acme.widgets;\n");
+    let result = graph.buildGraph(loader, "/proj/src", "", "/stdlib", ["main.ens"]);
+
+    try sema_support.assertDiagnostic(result.diagnostics(), 0, "/proj/src/main.ens",
+        "Import a module within package 'acme.widgets', not the package itself.");
+}
+
+test "a missing module names the path that was looked for" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/dependencies.txt", "@acme.widgets=vendor/widgets\n");
+    loader.add("/proj/src/main.ens", "import @acme.widgets.missing;\nimport nope;\n");
+    let result = graph.buildGraph(loader, "/proj/src", "", "/stdlib", ["main.ens"]);
+
+    let diagnostics = result.diagnostics();
+    try testing.assertEqual(diagnostics.length, 2L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/src/main.ens",
+        "Cannot find module 'acme.widgets.missing' "
+            + "(looked for /proj/vendor/widgets/src/missing.ens).");
+    try sema_support.assertDiagnostic(diagnostics, 1, "/proj/src/main.ens",
+        "Cannot find module 'nope' (looked for /proj/src/nope.ens).");
+}
+
+test "a missing bare module lists both roots when a tests root is set" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/tests/main_test.ens", "import nope;\n");
+    let result = graph.buildGraph(loader, "/proj/src", "/proj/tests", "/stdlib",
+        ["main_test.ens"]);
+
+    try sema_support.assertDiagnostic(result.diagnostics(), 0, "/proj/tests/main_test.ens",
+        "Cannot find module 'nope' "
+            + "(looked for /proj/src/nope.ens and /proj/tests/nope.ens).");
+}
+
+test "a missing standard library module names the stdlib path" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", "import @std.missing;\n");
+    let result = graph.buildGraph(loader, "/proj/src", "", "/stdlib", ["main.ens"]);
+
+    try sema_support.assertDiagnostic(result.diagnostics(), 0, "/proj/src/main.ens",
+        "Cannot find standard library module 'std.missing' "
+            + "(looked for /stdlib/std/missing.ens).");
+}
+
+test "a bare stdlib import steers to the package form" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", "import std.testing;\n");
+    loader.add("/stdlib/std/testing.ens", "");
+    let result = graph.buildGraph(loader, "/proj/src", "", "/stdlib", ["main.ens"]);
+
+    try sema_support.assertDiagnostic(result.diagnostics(), 0, "/proj/src/main.ens",
+        "Import the standard library as a package: write '@std.testing'.");
+    try sema_support.assertModulePaths(result, ["main"]);
+}
+
+test "a module under both the source and tests folders is ambiguous" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/dual.ens", "");
+    loader.add("/proj/tests/dual.ens", "");
+    loader.add("/proj/tests/main_test.ens", "import dual;\n");
+    let result = graph.buildGraph(loader, "/proj/src", "/proj/tests", "/stdlib",
+        ["main_test.ens"]);
+
+    try sema_support.assertDiagnostic(result.diagnostics(), 0, "/proj/tests/main_test.ens",
+        "Module 'dual' exists under both the source folder and the tests folder; "
+            + "rename one of the files.");
+    try sema_support.assertModulePaths(result, ["main_test"]);
+}
+
+test "a package cannot use aliases declared by the workspaces that import it" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/dependencies.txt", "@widgets=vendor/widgets\n@tools=vendor/tools\n");
+    loader.add("/proj/src/main.ens", "import @widgets.gadget;\nimport @tools.hammer;\n");
+    loader.add("/proj/vendor/widgets/src/gadget.ens", "import @tools.hammer;\n");
+    loader.add("/proj/vendor/tools/src/hammer.ens", "");
+    let result = graph.buildGraph(loader, "/proj/src", "", "/stdlib", ["main.ens"]);
+
+    try sema_support.assertDiagnostic(result.diagnostics(), 0,
+        "/proj/vendor/widgets/src/gadget.ens",
+        "External package 'tools.hammer' is not available. "
+            + "Add it to dependencies.txt (only '@std' is built in).");
+    try sema_support.assertModulePaths(result, ["main", "widgets.gadget", "tools.hammer"]);
+}
+
+test "an unreadable seed is reported at the start of its file" {
+    let loader = new FakeFileLoader();
+    let result = graph.buildGraph(loader, "/proj/src", "", "/stdlib", ["gone.ens"]);
+
+    let diagnostics = result.diagnostics();
+    try testing.assertEqual(diagnostics.length, 1L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/src/gone.ens",
+        "Could not read /proj/src/gone.ens.");
+    try testing.assertEqual(diagnostics[0].span().start, 0L);
+    try sema_support.assertModulePaths(result, []);
+}
+
+test "diagnostics merge deterministically by file and offset" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/dependencies.txt", "@other=vendor/other\nbroken line\n");
+    loader.add("/proj/src/main.ens", "import zed;\nimport @acme.thing;\n");
+    let result = graph.buildGraph(loader, "/proj/src", "", "/stdlib", ["main.ens"]);
+
+    let diagnostics = result.diagnostics();
+    try testing.assertEqual(diagnostics.length, 3L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/dependencies.txt",
+        "A dependency line must look like '@package.name=path'; "
+            + "'broken line' does not start with '@'.");
+    try sema_support.assertDiagnostic(diagnostics, 1, "/proj/src/main.ens",
+        "Cannot find module 'zed' (looked for /proj/src/zed.ens).");
+    try sema_support.assertDiagnostic(diagnostics, 2, "/proj/src/main.ens",
+        "Package 'acme.thing' is not listed in /proj/dependencies.txt.");
+    try testing.assertTrue(diagnostics[1].span().start < diagnostics[2].span().start,
+        "diagnostics within one file must be ordered by offset");
+}
