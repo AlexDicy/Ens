@@ -1382,6 +1382,52 @@ struct CodeGenerator::Impl {
         return fn;
     }
 
+    llvm::Function* defineRunProcessRuntime() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(i32Ty, { ptrTy }, false);
+        llvm::Function* fn = module->getFunction("ens_run_process");
+        if (!fn) {
+            fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "ens_run_process", module.get());
+        }
+        if (!fn->empty()) return fn;
+
+        auto savedIP = builder->saveIP();
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        builder->SetInsertPoint(entry);
+
+        llvm::FunctionCallee systemFn = module->getOrInsertFunction("system", fnTy);
+        llvm::Value* rawStatus = builder->CreateCall(systemFn, { fn->getArg(0) }, "raw.status");
+        if (module->getTargetTriple().isOSWindows()) {
+            builder->CreateRet(rawStatus);
+        } else {
+            llvm::Value* signal = builder->CreateAnd(
+                rawStatus, llvm::ConstantInt::get(i32Ty, 0x7f), "signal");
+            llvm::Value* exited = builder->CreateICmpEQ(
+                signal, llvm::ConstantInt::get(i32Ty, 0), "exited");
+            llvm::Value* signaled = builder->CreateAnd(
+                builder->CreateICmpNE(signal, llvm::ConstantInt::get(i32Ty, 0)),
+                builder->CreateICmpNE(signal, llvm::ConstantInt::get(i32Ty, 0x7f)),
+                "signaled");
+            llvm::Value* exitCode = builder->CreateAnd(
+                builder->CreateLShr(rawStatus, llvm::ConstantInt::get(i32Ty, 8)),
+                llvm::ConstantInt::get(i32Ty, 0xff), "exit.code");
+            llvm::Value* signalCode = builder->CreateAdd(
+                signal, llvm::ConstantInt::get(i32Ty, 128), "signal.code");
+            llvm::Value* normalized = builder->CreateSelect(
+                exited, exitCode,
+                builder->CreateSelect(signaled, signalCode, rawStatus),
+                "normalized");
+            llvm::Value* failed = builder->CreateICmpEQ(
+                rawStatus, llvm::ConstantInt::getSigned(i32Ty, -1), "failed");
+            builder->CreateRet(builder->CreateSelect(failed, rawStatus, normalized));
+        }
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
     // ===== Statements =====
 
     void emitStatement(const ast::Statement& s) {
@@ -6353,6 +6399,7 @@ struct CodeGenerator::Impl {
         // than a real C symbol; emit its definition wherever it is referenced.
         if (sym && sym->name == u"ens_arguments")
             return builder->CreateCall(defineArgsRuntime(), {});
+        if (sym && sym->name == u"ens_run_process") defineRunProcessRuntime();
         llvm::Function* fn = getOrDeclareExternalFunction(sym, /*receiver*/ nullptr);
         if (!fn) {
             error(e.node.startOffset(), "Internal: external callee has no LLVM function");
