@@ -2173,16 +2173,12 @@ struct CodeGenerator::Impl {
         return nullptr;
     }
 
+    // The literal's magnitude as a raw bit pattern; parseIntegerLiteralMagnitude handles the
+    // 0x/0b prefixes, '_' separators, the l/L suffix, and the full unsigned 64-bit range.
     static long long parseIntText(std::u16string_view text) {
-        std::string s; s.reserve(text.size());
-        for (char16_t c : text) s.push_back(static_cast<char>(c));
-        try {
-            if (s.size() > 2 && s[0] == '0' && (s[1] == 'b' || s[1] == 'B'))
-                return std::stoll(s.substr(2), nullptr, 2);
-            // strip trailing l/L
-            if (!s.empty() && (s.back() == 'l' || s.back() == 'L')) s.pop_back();
-            return std::stoll(s, nullptr, 0);
-        } catch (...) { return 0; }
+        uint64_t magnitude = 0;
+        if (!parseIntegerLiteralMagnitude(text, magnitude)) return 0;
+        return static_cast<long long>(magnitude);
     }
 
     static double parseDoubleText(std::u16string_view text) {
