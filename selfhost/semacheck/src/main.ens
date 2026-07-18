@@ -1,0 +1,368 @@
+// The semantic differential harness. It runs the self-hosted pipeline (module graph, declare,
+// link) over every program unit the build system lists in a manifest, and enforces that an
+// accepted program produces zero diagnostics. A unit whose seed files carry an @expect-error
+// directive is an expected reject; how many of those the pipeline already catches is reported as
+// an informational scoreboard, never as a failure.
+//
+// Manifest format, one keyword per line, values separated by one space:
+//   stdlib <folder containing std/>
+//   unit <display label>          starts a unit
+//   source <source root>          the unit's source folder
+//   seed <relative path>          one line per seed file, relative to the source root
+//
+// Exit codes: 0 all accepted units are clean, 1 an accepted unit produced diagnostics,
+// 2 usage or manifest problems.
+import @std.system;
+import SystemError from @std.system;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+import LineIndex from @ens.frontend.source;
+import @ens.frontend.syntax.factory;
+import SourceFileNode from @ens.frontend.syntax.nodes;
+import SystemFileLoader from @ens.sema.loader;
+import FileDiagnostic from @ens.sema.diagnostics;
+import @ens.sema.graph;
+import FileDeclarations from @ens.sema.declare;
+import @ens.sema.declare;
+import TypeStore from @ens.sema.types;
+import @ens.sema.link;
+import @ens.sema.paths;
+
+main() -> int {
+    string[] arguments = system.arguments();
+    if (arguments.length < 2) {
+        print("semacheck: usage: semacheck <manifest-path>");
+        return 2;
+    }
+    string manifestText = try system.readAllText(arguments[1]);
+    let manifest = parseManifest(manifestText);
+    if (manifest.problems.length() > 0) {
+        for (long i = 0; i < manifest.problems.length(); i++) {
+            print("semacheck: manifest: {manifest.problems.get(i)}");
+        }
+        return 2;
+    }
+
+    let loader = new SystemFileLoader();
+    long acceptedCount = 0;
+    long expectedCount = 0;
+    long caughtCount = 0;
+    long caughtAtParseOrGraph = 0;
+    long caughtAtDeclareOrLink = 0;
+    let missed = new List<string>();
+    let falseRejects = new List<string>();
+    let failureLines = new List<string>();
+
+    for (long i = 0; i < manifest.units.length(); i++) {
+        let unit = manifest.units.get(i);
+        let report = checkUnit(loader, manifest.stdlibRoot, unit);
+        if (isExpectedReject(unit)) {
+            expectedCount++;
+            if (report.total() == 0) {
+                missed.push(unit.label);
+            } else {
+                caughtCount++;
+                if (report.parseLines.length() + report.graphLines.length() > 0) {
+                    caughtAtParseOrGraph++;
+                } else {
+                    caughtAtDeclareOrLink++;
+                }
+            }
+        } else {
+            acceptedCount++;
+            if (report.total() > 0) {
+                falseRejects.push(unit.label);
+                failureLines.push("semacheck: unit {unit.label} produced "
+                    + "{report.total()} diagnostic(s):");
+                report.appendTo(failureLines);
+            }
+        }
+    }
+
+    print("semacheck: checked {manifest.units.length()} unit(s): "
+        + "{acceptedCount} accepted, {expectedCount} expected-reject");
+    print("semacheck: expected-reject caught {caughtCount} of {expectedCount} "
+        + "(parse/graph {caughtAtParseOrGraph}, declare/link {caughtAtDeclareOrLink})");
+    if (missed.length() > 0) {
+        print("semacheck: not yet caught: " + joined(missed));
+    }
+    if (falseRejects.length() == 0) {
+        print("semacheck: all accepted units are clean");
+        return 0;
+    }
+    print("semacheck: {falseRejects.length()} accepted unit(s) produced diagnostics");
+    for (long i = 0; i < failureLines.length(); i++) {
+        print(failureLines.get(i));
+    }
+    return 1;
+} catch (SystemError e) {
+    print("semacheck: {e.message}");
+    return 2;
+}
+
+private class CheckUnit {
+    string label;
+    string sourceRoot;
+    List<string> seeds;
+
+    constructor(string label) {
+        this.label = label;
+        this.sourceRoot = "";
+        this.seeds = new List<string>();
+    }
+}
+
+private class Manifest {
+    string stdlibRoot;
+    List<CheckUnit> units;
+    List<string> problems;
+
+    constructor() {
+        this.stdlibRoot = "";
+        this.units = new List<CheckUnit>();
+        this.problems = new List<string>();
+    }
+}
+
+private parseManifest(string text) -> Manifest {
+    let manifest = new Manifest();
+    CheckUnit? current = null;
+    string[] lines = splitLines(text);
+    for (long i = 0; i < lines.length; i++) {
+        string line = trim(lines[i]);
+        if (line.length == 0) {
+            continue;
+        }
+        long space = line.indexOf(" ");
+        if (space < 0) {
+            manifest.problems.push("line {i + 1}: expected '<keyword> <value>', got '{line}'");
+            continue;
+        }
+        string keyword = line.substring(0, space);
+        string value = trim(line.substring(space + 1, line.length));
+        switch (keyword) {
+            "stdlib" -> {
+                manifest.stdlibRoot = value;
+            },
+            "unit" -> {
+                let opened = new CheckUnit(value);
+                manifest.units.push(opened);
+                current = opened;
+            },
+            "source" -> {
+                if (current == null) {
+                    manifest.problems.push("line {i + 1}: 'source' before any 'unit'");
+                } else {
+                    current.sourceRoot = value;
+                }
+            },
+            "seed" -> {
+                if (current == null) {
+                    manifest.problems.push("line {i + 1}: 'seed' before any 'unit'");
+                } else {
+                    current.seeds.push(value);
+                }
+            },
+            default -> {
+                manifest.problems.push("line {i + 1}: unknown keyword '{keyword}'");
+            },
+        }
+    }
+    if (manifest.stdlibRoot.length == 0) {
+        manifest.problems.push("missing a 'stdlib' line");
+    }
+    if (manifest.units.length() == 0) {
+        manifest.problems.push("no units listed");
+    }
+    for (long i = 0; i < manifest.units.length(); i++) {
+        let unit = manifest.units.get(i);
+        if (unit.sourceRoot.length == 0) {
+            manifest.problems.push("unit {unit.label} has no 'source' line");
+        }
+        if (unit.seeds.length() == 0) {
+            manifest.problems.push("unit {unit.label} has no 'seed' line");
+        }
+    }
+    return manifest;
+}
+
+// Diagnostics of one unit, formatted per pipeline stage.
+private class StageReport {
+    List<string> parseLines;
+    List<string> graphLines;
+    List<string> declareLines;
+    List<string> linkLines;
+
+    constructor() {
+        this.parseLines = new List<string>();
+        this.graphLines = new List<string>();
+        this.declareLines = new List<string>();
+        this.linkLines = new List<string>();
+    }
+
+    total() -> long {
+        return this.parseLines.length() + this.graphLines.length()
+            + this.declareLines.length() + this.linkLines.length();
+    }
+
+    appendTo(List<string> lines) {
+        appendStage(lines, "parse", this.parseLines);
+        appendStage(lines, "graph", this.graphLines);
+        appendStage(lines, "declare", this.declareLines);
+        appendStage(lines, "link", this.linkLines);
+    }
+}
+
+private appendStage(List<string> lines, string stage, List<string> stageLines) {
+    for (long i = 0; i < stageLines.length(); i++) {
+        lines.push("  [{stage}] " + stageLines.get(i));
+    }
+}
+
+private checkUnit(SystemFileLoader loader, string stdlibRoot, CheckUnit unit) -> StageReport {
+    let result = graph.buildGraph(loader, unit.sourceRoot, "", stdlibRoot, unit.seeds.toArray());
+    let report = new StageReport();
+    let indexes = new Map<string, LineIndex>();
+    for (let loaded in result.modules()) {
+        indexes.set(loaded.filePath(), new LineIndex(loaded.source()));
+    }
+    for (let diagnostic in result.diagnostics()) {
+        report.graphLines.push(formatFileDiagnostic(indexes, diagnostic));
+    }
+    let declarations = new List<FileDeclarations>();
+    for (let loaded in result.modules()) {
+        for (let diagnostic in loaded.parseResult().diagnostics()) {
+            report.parseLines.push(formatDiagnostic(indexes, loaded.filePath(),
+                diagnostic.span().start, diagnostic.message()));
+        }
+        let root = factory.createRoot(loaded.parseResult().root());
+        if (root is SourceFileNode) {
+            let declared = declare.declareFile(root, loaded.filePath());
+            declarations.push(declared.declarations());
+            for (let diagnostic in declared.diagnostics()) {
+                report.declareLines.push(formatFileDiagnostic(indexes, diagnostic));
+            }
+        } else {
+            declarations.push(new FileDeclarations(loaded.filePath(), [], [], [], [], [], []));
+        }
+    }
+    let store = new TypeStore();
+    let linked = link.linkProgram(result, declarations.toArray(), store);
+    for (let diagnostic in linked.diagnostics()) {
+        report.linkLines.push(formatFileDiagnostic(indexes, diagnostic));
+    }
+    return report;
+}
+
+private formatFileDiagnostic(Map<string, LineIndex> indexes, FileDiagnostic diagnostic)
+        -> string {
+    return formatDiagnostic(indexes, diagnostic.file(), diagnostic.span().start,
+        diagnostic.message());
+}
+
+private formatDiagnostic(Map<string, LineIndex> indexes, string file, long offset,
+                         string message) -> string {
+    let index = indexes.get(file);
+    if (index != null) {
+        let position = index.positionAt(offset);
+        return "{file}:{position.line}:{position.column}: {message}";
+    }
+    return "{file}: (offset {offset}) {message}";
+}
+
+// True when any seed file carries an @expect-error directive, the same line shape the C++ test
+// driver reads: a comment line starting '// @expect-error'.
+private isExpectedReject(CheckUnit unit) -> bool {
+    for (long i = 0; i < unit.seeds.length(); i++) {
+        string text = readOrEmpty(paths.join(unit.sourceRoot, unit.seeds.get(i)));
+        if (hasExpectErrorDirective(text)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+private hasExpectErrorDirective(string text) -> bool {
+    string[] lines = splitLines(text);
+    for (let line in lines) {
+        string trimmed = trimLeading(line);
+        if (!startsWith(trimmed, "//")) {
+            continue;
+        }
+        string comment = trimLeading(trimmed.substring(2, trimmed.length));
+        if (startsWith(comment, "@expect-error")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+private readOrEmpty(string path) -> string {
+    return try system.readAllText(path);
+} catch (SystemError error) {
+    return "";
+}
+
+private joined(List<string> values) -> string {
+    string result = "";
+    for (long i = 0; i < values.length(); i++) {
+        if (i > 0) {
+            result = result + ", ";
+        }
+        result = result + values.get(i);
+    }
+    return result;
+}
+
+private startsWith(string text, string prefix) -> bool {
+    return text.length >= prefix.length && text.substring(0, prefix.length) == prefix;
+}
+
+private trim(string text) -> string {
+    byte[] bytes = text.toBytes();
+    long begin = 0;
+    while (begin < bytes.length && isSpace(bytes[begin])) {
+        begin++;
+    }
+    long end = bytes.length;
+    while (end > begin && isSpace(bytes[end - 1])) {
+        end--;
+    }
+    return text.substring(begin, end);
+}
+
+private trimLeading(string text) -> string {
+    byte[] bytes = text.toBytes();
+    long begin = 0;
+    while (begin < bytes.length && isSpace(bytes[begin])) {
+        begin++;
+    }
+    return text.substring(begin, text.length);
+}
+
+private isSpace(byte value) -> bool {
+    return value == ' ' || value == '\t' || value == '\r';
+}
+
+// Splits on '\n', dropping a trailing '\r' from each line.
+private splitLines(string text) -> string[] {
+    let lines = new List<string>();
+    string rest = text;
+    while (true) {
+        long newline = rest.indexOf("\n");
+        if (newline < 0) {
+            lines.push(stripCarriageReturn(rest));
+            break;
+        }
+        lines.push(stripCarriageReturn(rest.substring(0, newline)));
+        rest = rest.substring(newline + 1, rest.length);
+    }
+    return lines.toArray();
+}
+
+private stripCarriageReturn(string line) -> string {
+    if (line.length > 0 && line.substring(line.length - 1, line.length) == "\r") {
+        return line.substring(0, line.length - 1);
+    }
+    return line;
+}

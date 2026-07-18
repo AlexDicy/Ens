@@ -118,6 +118,15 @@ task("test")
             })
         end
 
+        -- the semantic differential harness runs the self-hosted graph/declare/link pipeline
+        -- over every program unit and requires zero diagnostics for every accepted one.
+        if want("semacheck") then
+            table.insert(jobs, {
+                name = "semacheck",
+                semacheck = true,
+            })
+        end
+
         -- surface any requested names that matched no test, so typos don't pass silently.
         if wanted ~= nil then
             local unknown = {}
@@ -182,10 +191,78 @@ task("test")
                 full = string.format("%s:\n%s", name, out)}
         end
 
+        -- the semantic differential harness: build the driver exe fresh from its own workspace
+        -- (it imports the front end and the sema layer as packages), enumerate every program
+        -- unit into a manifest, and run the driver over it. Units are the single-file tests,
+        -- the folder tests, and the selfhost library packages; libs/std is covered transitively
+        -- by every unit that imports @std.
+        local function run_semacheck(job)
+            local name = job.name
+            local check_dir = path.join(os.projectdir(), "build", "semacheck")
+            local exe_file  = path.join(check_dir, "semacheck.exe")
+            local manifest  = path.join(check_dir, "manifest.txt")
+            local log       = path.join(out_dir, name .. ".log")
+            local check_src = path.join(os.projectdir(), "selfhost", "semacheck", "src")
+
+            if not os.isdir(check_dir) then
+                os.mkdir(check_dir)
+            end
+            os.tryrm(exe_file)
+            local compile_rc = execMerged(ens_exe, {"--source", check_src, "--output", exe_file}, log)
+            if not os.isfile(exe_file) then
+                return {name = name, ok = false, short = "harness build failed",
+                    full = string.format("%s: harness build failed (exit %s)\n%s",
+                        name, tostring(compile_rc), (io.readfile(log) or ""):gsub("[\r\n]+$", ""))}
+            end
+
+            -- enumerate the program units.
+            local function slashed(p) return (p:gsub("\\", "/")) end
+            local lines = {"stdlib " .. slashed(path.join(os.projectdir(), "libs"))}
+            local function add_unit(label, source, seeds)
+                table.insert(lines, "unit " .. label)
+                table.insert(lines, "source " .. slashed(source))
+                for _, seed in ipairs(seeds) do
+                    table.insert(lines, "seed " .. seed)
+                end
+            end
+            local singles = os.files(path.join(tests_dir, "*.ens"))
+            table.sort(singles)
+            for _, f in ipairs(singles) do
+                add_unit("tests/" .. path.filename(f), tests_dir, {path.filename(f)})
+            end
+            local folders = os.dirs(path.join(tests_dir, "*"))
+            table.sort(folders)
+            for _, sub in ipairs(folders) do
+                if os.isfile(path.join(sub, "main.ens")) then
+                    add_unit("tests/" .. path.basename(sub), sub, {"main.ens"})
+                end
+            end
+            for _, pkg in ipairs({"corpus", "frontend", "sema", "semacheck", "syntaxgen"}) do
+                local src = path.join(os.projectdir(), "selfhost", pkg, "src")
+                local seeds = {}
+                for _, f in ipairs(os.files(path.join(src, "**.ens"))) do
+                    table.insert(seeds, slashed(path.relative(f, src)))
+                end
+                table.sort(seeds)
+                add_unit("selfhost/" .. pkg, src, seeds)
+            end
+            io.writefile(manifest, table.concat(lines, "\n") .. "\n")
+
+            local run_rc = execMerged(exe_file, {manifest}, log)
+            local out = (io.readfile(log) or ""):gsub("[\r\n]+$", "")
+            if run_rc == 0 then
+                return {name = name, ok = true, note = out:match("expected%-reject caught [^\r\n]+")}
+            end
+            return {name = name, ok = false,
+                short = string.format("harness exit %s", tostring(run_rc)),
+                full = string.format("%s:\n%s", name, out)}
+        end
+
         -- run a single test: compile, optionally run, and compare against the header.
         -- returns { name = ..., ok = bool, short = <fail reason>, full = <detailed report> }.
         local function run_one(job)
             if job.corpus then return run_corpus(job) end
+            if job.semacheck then return run_semacheck(job) end
             local name = job.name
             local ens_file = job.ens_file
             local exe_file    = path.join(out_dir, name .. ".exe")
@@ -318,7 +395,8 @@ task("test")
             local r = run_one(jobs[index])
             results[index] = r
             if r.ok then
-                print(string.format("\27[32mPASS\27[0m %s", r.name))
+                print(string.format("\27[32mPASS\27[0m %s%s", r.name,
+                    r.note and (" (" .. r.note .. ")") or ""))
             else
                 print(string.format("\27[31mFAIL\27[0m %s - %s", r.name, r.short))
             end
