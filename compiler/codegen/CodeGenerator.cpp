@@ -672,6 +672,18 @@ struct CodeGenerator::Impl {
         return tmp.CreateAlloca(t, nullptr, name);
     }
 
+    // An entry alloca zero-initialized right where it is created. Owned-temp slots use this:
+    // the store of the real value may sit in a conditionally-executed region (a short-circuited
+    // `&&` right side, a ternary arm), while the frame cleanup that releases the slot always
+    // runs, so the slot must read as null until the region actually executes.
+    llvm::AllocaInst* createZeroedEntryAlloca(llvm::Function* fn, llvm::Type* t,
+                                              const std::string& name) {
+        llvm::IRBuilder<> tmp(&fn->getEntryBlock(), fn->getEntryBlock().begin());
+        auto* alloca = tmp.CreateAlloca(t, nullptr, name);
+        tmp.CreateStore(llvm::Constant::getNullValue(t), alloca);
+        return alloca;
+    }
+
     bool paramIsByPointer(Symbol* sym, size_t i) {
         if (!sym || i >= sym->paramTypes.size()) return false;
         if (!structHasClassFields(sym->paramTypes[i])) return false;
@@ -5667,7 +5679,9 @@ struct CodeGenerator::Impl {
         }
     }
 
-    // Release frame entries [from, end) in reverse order.
+    // Release frame entries [from, end) in reverse order. Each slot is nulled after its
+    // release: cleanup code inside a loop runs once per iteration, and an expression temp
+    // in a conditionally-executed region may not be restored before the next pass.
     void emitFrameCleanupFrom(const std::vector<OwnedLocal>& frame, size_t from) {
         if (from >= frame.size()) return;
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
@@ -5683,11 +5697,14 @@ struct CodeGenerator::Impl {
                 if (auto* dtorFn = llvm::dyn_cast<llvm::Function>(dtor)) {
                     builder->CreateCall(dtorFn, { arrPtr });
                 }
+                builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), ol.alloca);
             } else if (isReferenceType(ol.type)) {
                 llvm::Value* val = builder->CreateLoad(ptrTy, ol.alloca);
                 builder->CreateCall(releaseFn, { val });
+                builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), ol.alloca);
             } else if (structHasClassFields(ol.type)) {
                 emitStructFieldRelease(ol.type, ol.alloca);
+                builder->CreateStore(llvm::Constant::getNullValue(mapType(ol.type)), ol.alloca);
             }
         }
     }
@@ -5923,7 +5940,7 @@ struct CodeGenerator::Impl {
         }
         llvm::Value* val = emitExpr(e);
         if (!val || !type) return nullptr;
-        auto* temp = createEntryAlloca(currentFunction, mapType(type), "record.tmp");
+        auto* temp = createZeroedEntryAlloca(currentFunction, mapType(type), "record.tmp");
         builder->CreateStore(val, temp);
         if (structHasClassFields(type) && expressionProducesOwnedRef(e) && !cleanupStack.empty()) {
             cleanupStack.back().push_back({ temp, type });
@@ -5941,7 +5958,7 @@ struct CodeGenerator::Impl {
             }
         }
         llvm::Type* lt = mapType(paramType);
-        auto* temp = createEntryAlloca(currentFunction, lt, "byptr.tmp");
+        auto* temp = createZeroedEntryAlloca(currentFunction, lt, "byptr.tmp");
         llvm::Value* val = emitExpr(e);
         if (!val) return nullptr;
         builder->CreateStore(val, temp);
@@ -5957,7 +5974,8 @@ struct CodeGenerator::Impl {
     void trackOwnedArgTemp(llvm::Value* v, const ast::Expression& a, ::Type* paramT) {
         if (!paramT || !isReferenceType(paramT) || cleanupStack.empty()) return;
         if (!expressionProducesOwnedRef(a)) return;
-        auto* slot = createEntryAlloca(currentFunction, llvm::PointerType::get(ctx, 0), "arg.tmp");
+        auto* slot = createZeroedEntryAlloca(currentFunction, llvm::PointerType::get(ctx, 0),
+                                             "arg.tmp");
         builder->CreateStore(v, slot);
         cleanupStack.back().push_back({ slot, paramT });
     }
