@@ -1,0 +1,212 @@
+import @std.testing;
+import ProgramAnalysis from pipeline;
+import sema_support;
+import FakeFileLoader from sema_support;
+
+private analyzeOne(string text) -> ProgramAnalysis throws {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", text);
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertNoDiagnostics(analysis.declareDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.linkDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.signatureDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.layoutDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.checkDiagnostics());
+    return analysis;
+}
+
+test "a clean body produces no diagnostics and fills the side tables" {
+    let analysis = try analyzeOne("main() -> int \{\n"
+        + "    let total = 1 + 2;\n"
+        + "    long widened = total;\n"
+        + "    string text = \"total \{total\}\";\n"
+        + "    if (widened > 2) \{\n"
+        + "        return 0;\n"
+        + "    \}\n"
+        + "    return 1;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+    let context = try sema_support.contextFor(analysis, "main");
+    try testing.assertTrue(context.result().resolvedTypeCount() > 5,
+        "expression nodes should have recorded types");
+}
+
+test "undefined names and non-functions are reported" {
+    let analysis = try analyzeOne("main() -> int \{\n"
+        + "    let value = missing;\n"
+        + "    let x = 1;\n"
+        + "    x(2);\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "Undefined name 'missing'");
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "'x' is not a function");
+}
+
+test "argument arity and types check against the signature" {
+    let analysis = try analyzeOne("add(int a, int b) -> int \{\n"
+        + "    return a + b;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    add(1);\n"
+        + "    add(1, \"two\");\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "Function 'add' expects 2 argument(s), got 1");
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "Argument 2: expected 'int', got 'string'");
+}
+
+test "named arguments map to parameters and reject unknown names" {
+    let clean = try analyzeOne("area(int width, int height = 2) -> int \{\n"
+        + "    return width * height;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return area(height: 3, width: 4) - area(width: 12);\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(clean.bodyDiagnostics());
+    let broken = try analyzeOne("area(int width, int height = 2) -> int \{\n"
+        + "    return width * height;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return area(depth: 3);\n"
+        + "\}\n");
+    try sema_support.assertMentions(broken.bodyDiagnostics(),
+        "Function 'area' has no parameter named 'depth'");
+}
+
+test "method calls resolve through the base chain with visibility" {
+    let analysis = try analyzeOne("class Base \{\n"
+        + "    private int hidden = 1;\n"
+        + "    protected shared() -> int \{ return 2; \}\n"
+        + "    reveal() -> int \{ return this.hidden; \}\n"
+        + "\}\n"
+        + "class Derived extends Base \{\n"
+        + "    use() -> int \{ return this.shared(); \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let derived = new Derived();\n"
+        + "    let ok = derived.reveal() + derived.use();\n"
+        + "    return derived.hidden;\n"
+        + "\}\n");
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "'hidden' is private to class 'Base'");
+}
+
+test "is and as? reject impossible and vacuous tests" {
+    let analysis = try analyzeOne("class Animal \{\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "class Dog extends Animal \{\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "class Rock \{\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Animal pet = new Dog();\n"
+        + "    let fineTest = pet is Dog;\n"
+        + "    let fineCast = pet as? Dog;\n"
+        + "    let never = pet is Rock;\n"
+        + "    Dog dog = new Dog();\n"
+        + "    let vacuous = dog is Animal;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "can never be a 'Rock'");
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "this 'is' test would always be true");
+}
+
+test "new requires a concrete class and a matching constructor" {
+    let analysis = try analyzeOne("abstract class Shape \{\n"
+        + "    abstract area() -> int;\n"
+        + "\}\n"
+        + "struct Point \{\n"
+        + "    int x;\n"
+        + "\}\n"
+        + "class Box \{\n"
+        + "    int size;\n"
+        + "    constructor(this.size);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let shape = new Shape();\n"
+        + "    let point = new Point();\n"
+        + "    let box = new Box();\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "Cannot create an instance of abstract class 'Shape'");
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "'new' is only valid for classes; 'Point' is a struct");
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "Constructor 'Box' expects 1 argument(s), got 0");
+}
+
+test "interpolation holes take strings, integers, bools, and enums only" {
+    let analysis = try analyzeOne("class Box \{\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let box = new Box();\n"
+        + "    let text = \"box \{box\}\";\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "Cannot interpolate a value of type 'Box'");
+}
+
+test "locals require initializers they can type from" {
+    let analysis = try analyzeOne("main() -> int \{\n"
+        + "    let unset = null;\n"
+        + "    const int fixed;\n"
+        + "    int paired = 1;\n"
+        + "    let paired = 2;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "Cannot infer type from 'null' alone");
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "Constant 'fixed' must be initialized");
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "Variable 'paired' is already defined in this scope");
+}
+
+test "generic calls infer, check bounds, and substitute returns" {
+    let clean = try analyzeOne("first<T>(T[] items, T fallback) -> T \{\n"
+        + "    if (items.length > 0) \{\n"
+        + "        return items[0];\n"
+        + "    \}\n"
+        + "    return fallback;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    int chosen = first<int>([1, 2], 3);\n"
+        + "    return chosen;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(clean.bodyDiagnostics());
+    let broken = try analyzeOne("pick<T>() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return pick();\n"
+        + "\}\n");
+    try sema_support.assertMentions(broken.bodyDiagnostics(),
+        "Cannot infer type argument 'T' for 'pick'");
+}
+
+test "a switch expression unifies its arm values" {
+    let analysis = try analyzeOne("classify(int value) -> string \{\n"
+        + "    return switch (value) \{\n"
+        + "        0 -> \"zero\",\n"
+        + "        1 -> 1,\n"
+        + "        default -> \"many\",\n"
+        + "    \};\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return classify(2).length as int;\n"
+        + "\}\n");
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "Switch arms produce incompatible types 'string' and 'int'");
+}
