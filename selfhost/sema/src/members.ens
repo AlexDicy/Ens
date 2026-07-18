@@ -1,0 +1,315 @@
+// Shared readers for member declarations: modifier sets, fields, and callable signatures. The
+// same readers serve structs, classes, interfaces, and free functions; the caller states what
+// the surrounding declaration allows.
+import FunctionDeclarationNode from @ens.frontend.syntax.nodes;
+import FieldDeclarationNode from @ens.frontend.syntax.nodes;
+import NamedTypeNode from @ens.frontend.syntax.nodes;
+import SyntaxKind from @ens.frontend.syntax.kind;
+import Span from @ens.frontend.source;
+import Reporter from diagnostics;
+import TypeResolver from resolve;
+import types;
+import Type from types;
+import Field from types;
+import Parameter from types;
+import Signature from types;
+import Method from types;
+import DeclaredType from types;
+import TypeParamType from types;
+import PrimitiveKind from types;
+import PrimitiveType from types;
+import Visibility from types;
+import List from @std.collections.list;
+
+public class MemberModifiers {
+    bool declaresPublic;
+    bool declaresPrivate;
+    bool declaresProtected;
+    bool declaresAbstract;
+    bool declaresFinal;
+    bool declaresOverride;
+    bool declaresSealed;
+    bool declaresWeak;
+
+    constructor();
+
+    add(SyntaxKind kind) {
+        switch (kind) {
+            PublicKeyword -> {
+                this.declaresPublic = true;
+            },
+            PrivateKeyword -> {
+                this.declaresPrivate = true;
+            },
+            ProtectedKeyword -> {
+                this.declaresProtected = true;
+            },
+            AbstractKeyword -> {
+                this.declaresAbstract = true;
+            },
+            FinalKeyword -> {
+                this.declaresFinal = true;
+            },
+            OverrideKeyword -> {
+                this.declaresOverride = true;
+            },
+            SealedKeyword -> {
+                this.declaresSealed = true;
+            },
+            WeakKeyword -> {
+                this.declaresWeak = true;
+            },
+            default -> { },
+        }
+    }
+
+    visibility() -> Visibility {
+        if (this.declaresPrivate) {
+            return Visibility.Private;
+        }
+        if (this.declaresProtected) {
+            return Visibility.Protected;
+        }
+        return Visibility.Public;
+    }
+
+    hasVisibilityModifier() -> bool {
+        return this.declaresPublic || this.declaresPrivate || this.declaresProtected;
+    }
+}
+
+public functionModifiers(FunctionDeclarationNode declaration) -> MemberModifiers {
+    let modifiers = new MemberModifiers();
+    for (long i = 0; i < declaration.modifiersCount(); i++) {
+        modifiers.add(declaration.modifiers(i).kind());
+    }
+    return modifiers;
+}
+
+public fieldModifiers(FieldDeclarationNode declaration) -> MemberModifiers {
+    let modifiers = new MemberModifiers();
+    for (long i = 0; i < declaration.modifiersCount(); i++) {
+        modifiers.add(declaration.modifiers(i).kind());
+    }
+    return modifiers;
+}
+
+// Reads one field declaration; the owner-specific weak rules stay with the caller.
+public readField(TypeResolver resolver, FieldDeclarationNode declaration, DeclaredType owner)
+        -> Field {
+    let modifiers = fieldModifiers(declaration);
+    Type fieldType = resolver.resolveType(declaration.declaredType());
+    return new Field(declaration.name().text(), fieldType, modifiers.visibility(),
+        modifiers.declaresWeak, declaration.defaultValue() != null, declaration.name().span(),
+        owner);
+}
+
+// Resolves one callable's signature: parameters (with the 'this.field' shorthand against the
+// receiver's fields), the return type, and the declared throws list. receiverFieldsComplete is
+// false when inherited fields may be missing, which silences unknown-field diagnostics.
+public buildSignature(TypeResolver resolver, Reporter reporter,
+                      FunctionDeclarationNode declaration, string name, Span nameSpan,
+                      bool isConstructor, bool isInterfaceMethod, bool allowBodiless,
+                      List<Field>? receiverFields, string receiverName,
+                      bool receiverFieldsComplete, TypeParamType[] typeParameters) -> Signature {
+    let store = resolver.typeStore();
+    if (declaration.body() == null && declaration.semicolon() != null && !allowBodiless) {
+        reporter.report("Shorthand declaration ';' is only allowed on a constructor.", nameSpan);
+    }
+
+    let parameterList = declaration.parameters();
+    let parameters = new List<Parameter>();
+    bool seenDefault = false;
+    for (long i = 0; i < parameterList.parametersCount(); i++) {
+        let parameterNode = parameterList.parameters(i);
+        string parameterName = parameterNode.name().text();
+        bool bindsField = parameterNode.thisPrefix() != null;
+        bool hasDefault = parameterNode.defaultValue() != null;
+        Span parameterSpan = parameterNode.span();
+        if (isInterfaceMethod && hasDefault) {
+            reporter.report("Interface method parameters cannot have default values; "
+                + "implementing classes choose their own defaults.", parameterSpan);
+        }
+        Type parameterType = store.errorType();
+        if (bindsField) {
+            if (!isConstructor) {
+                reporter.report("'this.{parameterName}' parameters are only allowed in a "
+                    + "constructor.", parameterSpan);
+            } else {
+                let bound = findField(receiverFields, parameterName);
+                if (bound != null) {
+                    parameterType = bound.type();
+                } else if (receiverFieldsComplete) {
+                    reporter.report("No field '{parameterName}' on type '{receiverName}'.",
+                        parameterSpan);
+                }
+            }
+        } else {
+            let declaredType = parameterNode.declaredType();
+            if (declaredType != null) {
+                parameterType = resolver.resolveType(declaredType);
+            }
+        }
+        if (hasDefault) {
+            seenDefault = true;
+        } else if (seenDefault) {
+            reporter.report("Parameter '{parameterName}' has no default but follows a "
+                + "defaulted parameter.", parameterSpan);
+        }
+        parameters.push(new Parameter(parameterName, parameterType, bindsField,
+            parameterNode.outKeyword() != null, hasDefault, parameterSpan));
+    }
+
+    Type returnType = store.primitive(PrimitiveKind.Void);
+    let returnClause = declaration.returnType();
+    if (returnClause != null) {
+        returnType = resolver.resolveType(returnClause.returnedType());
+    }
+
+    let throwsClause = declaration.throwsClause();
+    let throwsTypes = new List<Type>();
+    let throwsSpans = new List<Span>();
+    if (throwsClause != null) {
+        for (long i = 0; i < throwsClause.typesCount(); i++) {
+            let reference = throwsClause.types(i);
+            throwsTypes.push(resolver.resolveType(reference));
+            throwsSpans.push(reference.span());
+        }
+    }
+
+    return new Signature(name, parameters.toArray(), returnType, throwsClause != null,
+        throwsTypes.toArray(), throwsSpans.toArray(), typeParameters, declaration.green(),
+        nameSpan);
+}
+
+public findField(List<Field>? fields, string name) -> Field? {
+    if (fields == null) {
+        return null;
+    }
+    for (long i = 0; i < fields.length(); i++) {
+        if (fields.get(i).name() == name) {
+            return fields.get(i);
+        }
+    }
+    return null;
+}
+
+// A method may not share its name with a field of the same type or an inherited one.
+public checkFieldMethodCollision(Reporter reporter, List<Field> fields, string methodName,
+                                 bool isConstructor, Span span) {
+    if (isConstructor) {
+        return;
+    }
+    let collided = findField(fields, methodName);
+    if (collided != null) {
+        reporter.report("'{methodName}' is already declared as a field of "
+            + "'{collided.definingType().name()}'; a field and a method cannot share a name.",
+            span);
+    }
+}
+
+// Where a throws clause may appear: never on a constructor, always with types on an abstract
+// method, and with types only where an override could need them.
+public checkThrowsPlacement(Reporter reporter, FunctionDeclarationNode declaration,
+                            bool isOverridable, bool isConstructor, bool isAbstract) {
+    let throwsClause = declaration.throwsClause();
+    if (throwsClause == null) {
+        return;
+    }
+    Span at = throwsClause.throwsKeyword().span();
+    if (isConstructor) {
+        reporter.report("A constructor cannot be marked 'throws'. Constructors must not let "
+            + "exceptions escape; handle them with a 'catch' clause after the constructor "
+            + "body.", at);
+        return;
+    }
+    bool hasTypes = throwsClause.typesCount() > 0;
+    if (isAbstract) {
+        if (!hasTypes) {
+            reporter.report("An abstract method marked 'throws' must list its exception types, "
+                + "e.g. 'throws IOError'.", at);
+        }
+        return;
+    }
+    if (hasTypes && !isOverridable) {
+        reporter.report("Explicit 'throws' types are only allowed where the method can be "
+            + "overridden; the thrown types here are inferred. Write 'throws' with no type "
+            + "list.", at);
+    }
+}
+
+public hashSignatureConforms(Signature signature) -> bool {
+    if (signature.parameters().length != 0) {
+        return false;
+    }
+    let returned = signature.returnType();
+    if (returned is PrimitiveType) {
+        return returned.kind() == PrimitiveKind.Long;
+    }
+    return false;
+}
+
+// 'hash' is a reserved method name: any declaration must match the contract that keyed
+// collections rely on.
+public checkHashSignature(Reporter reporter, Signature signature, bool isConstructor) {
+    if (isConstructor || signature.name() != "hash") {
+        return;
+    }
+    if (!hashSignatureConforms(signature)) {
+        reporter.report("A method named 'hash' must have the signature 'hash() -> long'; it "
+            + "defines how values of this type hash when used as keys (for example in a Map "
+            + "or Set).", signature.nameSpan());
+    }
+}
+
+// True when the signature is the equality contract for its owner: one parameter of the owner's
+// own type returning bool.
+public equalsSignatureConforms(Signature signature, DeclaredType owner) -> bool {
+    if (!equalsIntent(signature, owner)) {
+        return false;
+    }
+    let returned = signature.returnType();
+    if (returned is PrimitiveType) {
+        return returned.kind() == PrimitiveKind.Bool;
+    }
+    return false;
+}
+
+// A single same-type parameter marks an equality method even when the rest of its shape is
+// wrong; the near misses get signature diagnostics instead of pairing ones.
+public equalsIntent(Signature signature, DeclaredType owner) -> bool {
+    if (signature.parameters().length != 1) {
+        return false;
+    }
+    return signature.parameters()[0].type() == owner;
+}
+
+public checkEqualsSignature(Reporter reporter, FunctionDeclarationNode declaration,
+                            Signature signature, DeclaredType owner, bool isConstructor) {
+    if (isConstructor || signature.name() != "equals" || !equalsIntent(signature, owner)) {
+        return;
+    }
+    let throwsClause = declaration.throwsClause();
+    if (throwsClause != null) {
+        reporter.report("A method named 'equals' cannot be marked 'throws'; equality "
+            + "comparison must not fail.", throwsClause.throwsKeyword().span());
+    }
+    if (!equalsSignatureConforms(signature, owner)) {
+        reporter.report("A method named 'equals' that takes a '{owner.name()}' must return "
+            + "'bool'; it defines when two instances compare as equal (for example as Map or "
+            + "Set keys).", signature.nameSpan());
+    }
+}
+
+// The first already-recorded method with the same name and parameter types, or null.
+public findSameSignature(List<Method> methods, string name, Signature signature)
+        -> Method? {
+    for (long i = 0; i < methods.length(); i++) {
+        let candidate = methods.get(i);
+        if (candidate.name() == name
+                && types.sameParameterTypes(candidate.signature(), signature)) {
+            return candidate;
+        }
+    }
+    return null;
+}

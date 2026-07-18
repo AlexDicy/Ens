@@ -1,0 +1,358 @@
+// Type reference resolution for one module. A resolver sees the module's own declared types, its
+// import table, the implicit exception base class, and whatever type parameters the current
+// declaration pushed. Every resolved reference is recorded in the module's SemaResult, and every
+// failure resolves to the error type after one diagnostic.
+import @ens.frontend.syntax.nodes;
+import NamedTypeNode from @ens.frontend.syntax.nodes;
+import ArrayTypeNode from @ens.frontend.syntax.nodes;
+import OptionalTypeNode from @ens.frontend.syntax.nodes;
+import ErrorTypeNode from @ens.frontend.syntax.nodes;
+import TypeQualifierNode from @ens.frontend.syntax.nodes;
+import TypeParameterListNode from @ens.frontend.syntax.nodes;
+import GreenNode from @ens.frontend.syntax.green;
+import Span from @ens.frontend.source;
+import FileDiagnostic from diagnostics;
+import ModuleLinkTable from link;
+import ImportedType from link;
+import ImportedNamespace from link;
+import SemaResult from result;
+import types;
+import Type from types;
+import ErrorType from types;
+import TypeStore from types;
+import DeclaredType from types;
+import ClassType from types;
+import TypeParamType from types;
+import PrimitiveKind from types;
+import Visibility from types;
+import List from @std.collections.list;
+
+public class TypeResolver {
+    private TypeStore store;
+    private string resolverModulePath;
+    private string resolverFilePath;
+    private ModuleLinkTable moduleImports;
+    private ClassType? implicitErrorClass;
+    private SemaResult semaResult;
+    private List<TypeParamType> parameterScope;
+    private List<FileDiagnostic> collected;
+
+    constructor(TypeStore store, string modulePath, string filePath, ModuleLinkTable imports,
+                ClassType? errorClass, SemaResult result) {
+        this.store = store;
+        this.resolverModulePath = modulePath;
+        this.resolverFilePath = filePath;
+        this.moduleImports = imports;
+        this.implicitErrorClass = errorClass;
+        this.semaResult = result;
+        this.parameterScope = new List<TypeParamType>();
+        this.collected = new List<FileDiagnostic>();
+    }
+
+    modulePath() -> string {
+        return this.resolverModulePath;
+    }
+
+    filePath() -> string {
+        return this.resolverFilePath;
+    }
+
+    typeStore() -> TypeStore {
+        return this.store;
+    }
+
+    errorClass() -> ClassType? {
+        return this.implicitErrorClass;
+    }
+
+    result() -> SemaResult {
+        return this.semaResult;
+    }
+
+    report(string message, Span span) {
+        this.collected.push(new FileDiagnostic(this.resolverFilePath, message, span));
+    }
+
+    // Drains the diagnostics reported since the last call.
+    takeDiagnostics() -> FileDiagnostic[] {
+        FileDiagnostic[] taken = this.collected.toArray();
+        this.collected = new List<FileDiagnostic>();
+        return taken;
+    }
+
+    pushTypeParameters(TypeParamType[] parameters) {
+        for (let parameter in parameters) {
+            this.parameterScope.push(parameter);
+        }
+    }
+
+    popTypeParameters(long count) {
+        for (long i = 0; i < count; i++) {
+            this.parameterScope.pop();
+        }
+    }
+
+    // Resolves a written type reference to its interned type, recording the result for the
+    // reference node and every nested reference.
+    resolveType(nodes.Type reference) -> Type {
+        Type resolved = this.resolveTypeInner(reference);
+        this.semaResult.setType(reference.green(), resolved);
+        return resolved;
+    }
+
+    private resolveTypeInner(nodes.Type reference) -> Type {
+        switch (reference) {
+            is NamedTypeNode named -> {
+                return this.resolveNamed(named);
+            },
+            is ArrayTypeNode array -> {
+                Type element = this.resolveType(array.element());
+                if (types.isVoidType(element)) {
+                    this.report("void cannot be an array element type.", array.span());
+                    return this.store.errorType();
+                }
+                return this.store.arrayOf(element);
+            },
+            is OptionalTypeNode optional -> {
+                Type inner = this.resolveType(optional.inner());
+                if (types.isVoidType(inner)) {
+                    this.report("void cannot be optional.", optional.span());
+                    return this.store.errorType();
+                }
+                return this.store.optionalOf(inner);
+            },
+            is ErrorTypeNode ignored -> {
+                return this.store.errorType();
+            },
+        }
+    }
+
+    private resolveNamed(NamedTypeNode named) -> Type {
+        string name = named.name().text();
+        if (name.length == 0) {
+            return this.store.errorType();
+        }
+        Span nameSpan = named.name().span();
+        Type base = this.store.errorType();
+        let qualifier = named.qualifier();
+        if (qualifier == null) {
+            let found = this.lookupUnqualified(name);
+            if (found == null) {
+                this.report("Unknown type '{name}'.", nameSpan);
+                return this.store.errorType();
+            }
+            base = found;
+        } else {
+            base = this.lookupQualified(qualifier, name, nameSpan);
+        }
+        if (base is ErrorType) {
+            return base;
+        }
+        let argumentList = named.typeArguments();
+        if (base is DeclaredType && base.isGeneric()) {
+            if (argumentList == null) {
+                this.report("Generic type '{name}' requires type arguments "
+                    + "(for example '{name}<int>').", nameSpan);
+                return this.store.errorType();
+            }
+            long arity = base.typeParameters().length;
+            long given = argumentList.argumentsCount();
+            if (given != arity) {
+                string expected = countOf(arity, "type argument");
+                this.report("Generic type '{name}' expects {expected}, but {given} "
+                    + "{wasWere(given)} given.", nameSpan);
+                return this.store.errorType();
+            }
+            let arguments = new List<Type>();
+            bool failed = false;
+            for (long i = 0; i < given; i++) {
+                Type argument = this.resolveType(argumentList.arguments(i));
+                if (argument is ErrorType) {
+                    failed = true;
+                }
+                arguments.push(argument);
+            }
+            if (failed) {
+                return this.store.errorType();
+            }
+            return this.store.instantiationOf(base, arguments.toArray());
+        }
+        if (argumentList != null) {
+            this.report("Type '{types.display(base)}' is not generic and takes no type "
+                + "arguments.", nameSpan);
+            return this.store.errorType();
+        }
+        return base;
+    }
+
+    // Unqualified lookup order: primitives, type parameters in scope (innermost first), the
+    // module's own types, imported types, then the implicit exception base class.
+    private lookupUnqualified(string name) -> Type? {
+        let primitive = this.primitiveNamed(name);
+        if (primitive != null) {
+            return primitive;
+        }
+        for (long i = this.parameterScope.length() - 1; i >= 0; i--) {
+            let parameter = this.parameterScope.get(i);
+            if (parameter.name() == name) {
+                return parameter;
+            }
+        }
+        let declared = this.store.findDeclared(this.resolverModulePath, name);
+        if (declared != null) {
+            return declared;
+        }
+        let binding = this.moduleImports.binding(name);
+        if (binding is ImportedType) {
+            return binding.target();
+        }
+        if (name == "Error") {
+            return this.implicitErrorClass;
+        }
+        return null;
+    }
+
+    private lookupQualified(TypeQualifierNode qualifier, string name, Span nameSpan) -> Type {
+        string alias = qualifier.module().text();
+        let binding = this.moduleImports.binding(alias);
+        if (binding is ImportedNamespace) {
+            string target = binding.modulePath();
+            let found = this.store.findDeclared(target, name);
+            if (found == null) {
+                this.report("Module '{target}' has no type '{name}'.", nameSpan);
+                return this.store.errorType();
+            }
+            if (found.visibility() != Visibility.Public) {
+                this.report("Type '{name}' is not public in module '{target}' and cannot be "
+                    + "used from another module.", nameSpan);
+                return this.store.errorType();
+            }
+            return found;
+        }
+        this.report("'{alias}' is not a namespace alias.", qualifier.module().span());
+        return this.store.errorType();
+    }
+
+    private primitiveNamed(string name) -> Type? {
+        switch (name) {
+            "bool" -> {
+                return this.store.primitive(PrimitiveKind.Bool);
+            },
+            "byte" -> {
+                return this.store.primitive(PrimitiveKind.Byte);
+            },
+            "short" -> {
+                return this.store.primitive(PrimitiveKind.Short);
+            },
+            "ushort" -> {
+                return this.store.primitive(PrimitiveKind.UShort);
+            },
+            "int" -> {
+                return this.store.primitive(PrimitiveKind.Int);
+            },
+            "uint" -> {
+                return this.store.primitive(PrimitiveKind.UInt);
+            },
+            "long" -> {
+                return this.store.primitive(PrimitiveKind.Long);
+            },
+            "ulong" -> {
+                return this.store.primitive(PrimitiveKind.ULong);
+            },
+            "float" -> {
+                return this.store.primitive(PrimitiveKind.Float);
+            },
+            "double" -> {
+                return this.store.primitive(PrimitiveKind.Double);
+            },
+            "decimal" -> {
+                return this.store.primitive(PrimitiveKind.Decimal);
+            },
+            "char" -> {
+                return this.store.primitive(PrimitiveKind.Char);
+            },
+            "void" -> {
+                return this.store.primitive(PrimitiveKind.Void);
+            },
+            "string" -> {
+                return this.store.stringType();
+            },
+            default -> {
+                return null;
+            },
+        }
+    }
+
+    // Resolves one declaration's type parameter list: bounds resolve before any parameter is in
+    // scope, each bound must be an interface or one non-generic class, and each is listed once.
+    // Call once per declaration; the interned parameters keep their bounds.
+    resolveTypeParameters(GreenNode owner, TypeParameterListNode? list) -> TypeParamType[] {
+        if (list == null) {
+            return [];
+        }
+        let parameters = new List<TypeParamType>();
+        for (long i = 0; i < list.parametersCount(); i++) {
+            let declaration = list.parameters(i);
+            string name = declaration.name().text();
+            let parameter = this.store.typeParameter(owner, i, name);
+            parameters.push(parameter);
+            let boundsClause = declaration.bounds();
+            if (boundsClause == null) {
+                continue;
+            }
+            let accepted = new List<Type>();
+            Type? classBound = null;
+            for (long b = 0; b < boundsClause.boundsCount(); b++) {
+                let reference = boundsClause.bounds(b);
+                Type bound = this.resolveType(reference);
+                if (bound is ErrorType) {
+                    continue;
+                }
+                bool isInterface = types.isInterfaceLike(bound);
+                if (!isInterface && !types.isClassLike(bound)) {
+                    this.report("A type-parameter bound must be a non-generic class or an "
+                        + "interface; '{types.display(bound)}' is not.", reference.span());
+                    continue;
+                }
+                bool duplicate = false;
+                for (long a = 0; a < accepted.length(); a++) {
+                    if (accepted.get(a) == bound) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate) {
+                    this.report("Duplicate bound '{types.display(bound)}' on type parameter "
+                        + "'{name}'; list each bound once.", reference.span());
+                    continue;
+                }
+                if (!isInterface) {
+                    if (classBound != null) {
+                        this.report("Type parameter '{name}' already has the class bound "
+                            + "'{types.display(classBound)}'; at most one bound can be a class, "
+                            + "every other bound must be an interface.", reference.span());
+                        continue;
+                    }
+                    classBound = bound;
+                }
+                accepted.push(bound);
+            }
+            parameter.setBounds(accepted.toArray());
+        }
+        return parameters.toArray();
+    }
+}
+
+private countOf(long count, string noun) -> string {
+    if (count == 1) {
+        return "1 {noun}";
+    }
+    return "{count} {noun}s";
+}
+
+private wasWere(long count) -> string {
+    if (count == 1) {
+        return "was";
+    }
+    return "were";
+}

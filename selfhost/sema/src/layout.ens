@@ -1,0 +1,651 @@
+// Whole-program class layout. Inheritance cycles are broken first, then every class lays out in
+// base-before-derived order: inherited fields flatten in, own fields and methods resolve, and
+// the override, interface, abstract, and hash/equals rules are checked. Where the base chain
+// crosses a generic instantiation whose members are not filled yet, the checks that would need
+// those members stay quiet instead of guessing.
+import ClassDeclarationNode from @ens.frontend.syntax.nodes;
+import FunctionDeclarationNode from @ens.frontend.syntax.nodes;
+import FieldDeclarationNode from @ens.frontend.syntax.nodes;
+import SyntaxKind from @ens.frontend.syntax.kind;
+import Span from @ens.frontend.source;
+import FileDiagnostic from diagnostics;
+import Reporter from diagnostics;
+import diagnostics;
+import ClassItem from context;
+import members;
+import MemberModifiers from members;
+import TypeResolver from resolve;
+import types;
+import Type from types;
+import ClassType from types;
+import InterfaceType from types;
+import InstantiationType from types;
+import OptionalType from types;
+import Field from types;
+import Method from types;
+import Signature from types;
+import List from @std.collections.list;
+import Set from @std.collections.set;
+import StringBuilder from @std.text.stringbuilder;
+
+// Lays out every class in the program. items arrive in (module, source) order.
+public layoutProgram(List<ClassItem> items) -> FileDiagnostic[] {
+    let collected = new List<FileDiagnostic>();
+    breakInheritanceCycles(items, collected);
+    let ordered = sortedByBaseDepth(items);
+    for (long i = 0; i < ordered.length(); i++) {
+        let worker = new ClassLayout(ordered.get(i), collected);
+        worker.run();
+    }
+    return diagnostics.sorted(collected);
+}
+
+// A class whose base chain reaches back to itself cannot be laid out; the first class found on
+// a cycle is diagnosed and its base link cleared, which dissolves the cycle for the rest.
+private breakInheritanceCycles(List<ClassItem> items, List<FileDiagnostic> collected) {
+    for (long i = 0; i < items.length(); i++) {
+        let item = items.get(i);
+        let classType = item.classType();
+        let seen = new Set<ClassType>();
+        ClassType? current = classType;
+        bool cycle = false;
+        while (current != null) {
+            ClassType link = current;
+            if (!seen.add(link)) {
+                cycle = true;
+                break;
+            }
+            current = baseAuthority(link);
+        }
+        if (!cycle) {
+            continue;
+        }
+        collected.push(new FileDiagnostic(item.context().module().filePath(),
+            "Class '{classType.name()}' eventually extends itself through its base classes. "
+            + "A class cannot inherit from itself, directly or indirectly.",
+            item.declaration().name().span()));
+        let base = classType.base();
+        if (base != null) {
+            let authority = types.authorityOf(base);
+            if (authority is ClassType) {
+                authority.removeDirectSubclass(classType);
+            }
+        }
+        classType.clearBase();
+    }
+}
+
+// The class the base link continues through: a generic base defers to its template.
+private baseAuthority(ClassType classType) -> ClassType? {
+    let base = classType.base();
+    if (base == null) {
+        return null;
+    }
+    let authority = types.authorityOf(base);
+    if (authority is ClassType) {
+        return authority;
+    }
+    return null;
+}
+
+private baseDepth(ClassType classType) -> long {
+    long depth = 0;
+    let seen = new Set<ClassType>();
+    ClassType? current = baseAuthority(classType);
+    while (current != null && seen.add(current)) {
+        depth++;
+        current = baseAuthority(current);
+    }
+    return depth;
+}
+
+// Stable insertion sort: equal depths keep (module, source) order.
+private sortedByBaseDepth(List<ClassItem> items) -> List<ClassItem> {
+    let ordered = new List<ClassItem>();
+    let depths = new List<long>();
+    for (long i = 0; i < items.length(); i++) {
+        ordered.push(items.get(i));
+        depths.push(baseDepth(items.get(i).classType()));
+        long at = ordered.length() - 1;
+        while (at > 0 && depths.get(at - 1) > depths.get(at)) {
+            let movedItem = ordered.get(at - 1);
+            ordered.set(at - 1, ordered.get(at));
+            ordered.set(at, movedItem);
+            long movedDepth = depths.get(at - 1);
+            depths.set(at - 1, depths.get(at));
+            depths.set(at, movedDepth);
+            at--;
+        }
+    }
+    return ordered;
+}
+
+private class ClassLayout {
+    private ClassItem item;
+    private ClassType classType;
+    private ClassDeclarationNode node;
+    private TypeResolver resolver;
+    private Reporter reporter;
+    private bool chainKnown;
+
+    constructor(ClassItem item, List<FileDiagnostic> collected) {
+        this.item = item;
+        this.classType = item.classType();
+        this.node = item.declaration();
+        this.resolver = item.context().resolver();
+        this.reporter = new Reporter(item.context().module().filePath(), collected);
+        this.chainKnown = true;
+    }
+
+    run() {
+        let parameters = this.classType.typeParameterTypes();
+        this.resolver.pushTypeParameters(parameters);
+        this.flattenInheritedFields();
+        this.collectOwnFields();
+        this.collectMethods();
+        if (this.chainKnown) {
+            this.checkHashEqualsPairing();
+        }
+        this.checkInterfaceSatisfaction();
+        this.checkAbstractSatisfied();
+        this.resolver.popTypeParameters(parameters.length);
+        for (let diagnostic in this.resolver.takeDiagnostics()) {
+            this.reporter.report(diagnostic.message(), diagnostic.span());
+        }
+    }
+
+    private flattenInheritedFields() {
+        let base = this.classType.base();
+        if (base == null) {
+            return;
+        }
+        if (base is ClassType) {
+            this.chainKnown = base.inheritedMembersKnown();
+            for (long i = 0; i < base.fields().length(); i++) {
+                this.classType.fields().push(base.fields().get(i));
+            }
+            this.classType.setBaseFieldCount(base.fields().length());
+        } else {
+            this.chainKnown = false;
+        }
+        this.classType.setInheritedMembersKnown(this.chainKnown);
+    }
+
+    private collectOwnFields() {
+        let body = this.node.body();
+        for (long i = 0; i < body.membersCount(); i++) {
+            let member = body.members(i);
+            if (member is FieldDeclarationNode) {
+                this.collectOwnField(member);
+            }
+        }
+    }
+
+    private collectOwnField(FieldDeclarationNode declaration) {
+        let field = members.readField(this.resolver, declaration, this.classType);
+        if (field.isWeak()) {
+            this.checkWeakField(field);
+        }
+        if (field.name().length > 0) {
+            let existing = members.findField(this.classType.fields(), field.name());
+            if (existing != null) {
+                if (existing.definingType() != this.classType) {
+                    this.reporter.report("Field '{field.name()}' is already declared in base "
+                        + "class '{existing.definingType().name()}'.", field.nameSpan());
+                } else {
+                    this.reporter.report("Field '{field.name()}' is already declared in "
+                        + "'{this.classType.name()}'.", field.nameSpan());
+                }
+                return;
+            }
+        }
+        this.classType.fields().push(field);
+    }
+
+    private checkWeakField(Field field) {
+        let fieldType = field.type();
+        if (fieldType is OptionalType) {
+            let inner = fieldType.inner();
+            if (types.isClassLike(inner)) {
+                if (types.isInterfaceLike(inner)) {
+                    this.reporter.report("'weak' fields must reference a class; "
+                        + "interface-typed weak fields are not supported. Use the "
+                        + "implementing class's type instead.", field.nameSpan());
+                }
+                return;
+            }
+        }
+        this.reporter.report("'weak' fields must be nullable class types "
+            + "(e.g. 'weak Foo? f').", field.nameSpan());
+    }
+
+    private collectMethods() {
+        let body = this.node.body();
+        for (long i = 0; i < body.membersCount(); i++) {
+            let member = body.members(i);
+            if (member is FunctionDeclarationNode) {
+                this.collectMethod(member);
+            }
+        }
+    }
+
+    private collectMethod(FunctionDeclarationNode member) {
+        let introducer = member.introducer();
+        bool isConstructor = false;
+        bool isDestructor = false;
+        Span nameSpan = member.span();
+        if (introducer != null) {
+            isConstructor = introducer.kind() == SyntaxKind.ConstructorKeyword;
+            isDestructor = introducer.kind() == SyntaxKind.DestructorKeyword;
+            nameSpan = introducer.span();
+        }
+        string rawName = "";
+        let nameToken = member.name();
+        if (nameToken != null) {
+            rawName = nameToken.text();
+            nameSpan = nameToken.span();
+        }
+        if (!isConstructor && !isDestructor) {
+            if (rawName.length == 0) {
+                return;
+            }
+            if (rawName == this.classType.name()) {
+                this.reporter.report("To declare a constructor, use the 'constructor' "
+                    + "keyword. A method cannot be named after its class "
+                    + "'{this.classType.name()}'.", nameSpan);
+                return;
+            }
+        }
+        if (isDestructor && this.findDestructor() != null) {
+            this.reporter.report("A class can declare at most one destructor.", nameSpan);
+            return;
+        }
+        string methodName = rawName;
+        if (isConstructor) {
+            methodName = "constructor";
+        }
+        if (isDestructor) {
+            methodName = "destructor";
+        }
+        let modifiers = members.functionModifiers(member);
+        let signature = members.buildSignature(this.resolver, this.reporter, member,
+            methodName, nameSpan, isConstructor, false,
+            isConstructor || modifiers.declaresAbstract, this.classType.fields(),
+            this.classType.name(), this.chainKnown, []);
+        if (members.findSameSignature(this.classType.methods(), methodName, signature)
+                != null) {
+            this.reporter.report("Method '{methodName}' of '{this.classType.name()}' is "
+                + "already declared with the same parameter types; overloads must differ in "
+                + "parameter count or types.", nameSpan);
+            return;
+        }
+        let method = new Method(signature, modifiers.visibility(), isConstructor,
+            isDestructor, modifiers.declaresOverride, modifiers.declaresFinal,
+            modifiers.declaresAbstract, member.body() != null, this.classType);
+        this.classType.methods().push(method);
+
+        if (isDestructor) {
+            if (modifiers.hasVisibilityModifier() || modifiers.declaresOverride
+                    || modifiers.declaresFinal || modifiers.declaresAbstract) {
+                this.reporter.report("A destructor cannot have modifiers such as visibility, "
+                    + "'override', 'final', or 'abstract'.", nameSpan);
+            }
+            if (member.parameters().parametersCount() > 0) {
+                this.reporter.report("A destructor cannot declare parameters.", nameSpan);
+            }
+            if (member.returnType() != null) {
+                this.reporter.report("A destructor cannot declare a return type.", nameSpan);
+            }
+            let throwsClause = member.throwsClause();
+            if (throwsClause != null) {
+                this.reporter.report("A destructor cannot be marked 'throws'.",
+                    throwsClause.throwsKeyword().span());
+            }
+            return;
+        }
+
+        bool overridable = !isConstructor && !modifiers.declaresFinal
+            && !this.classType.isFinal();
+        members.checkFieldMethodCollision(this.reporter, this.classType.fields(), methodName,
+            isConstructor, nameSpan);
+        members.checkThrowsPlacement(this.reporter, member, overridable, isConstructor,
+            modifiers.declaresAbstract);
+        members.checkHashSignature(this.reporter, signature, isConstructor);
+        members.checkEqualsSignature(this.reporter, member, signature, this.classType,
+            isConstructor);
+        if (isConstructor) {
+            if (modifiers.declaresOverride || modifiers.declaresAbstract) {
+                this.reporter.report("A constructor cannot be 'override' or 'abstract'.",
+                    nameSpan);
+            }
+            return;
+        }
+        if (modifiers.declaresAbstract) {
+            if (!this.classType.isAbstract()) {
+                this.reporter.report("Abstract method '{methodName}' requires class "
+                    + "'{this.classType.name()}' to be declared 'abstract'.", nameSpan);
+            }
+            if (member.body() != null) {
+                this.reporter.report("Abstract method '{methodName}' cannot have a body.",
+                    nameSpan);
+            }
+        }
+        this.checkOverrideRules(member, method, methodName, nameSpan, modifiers);
+    }
+
+    private findDestructor() -> Method? {
+        let methods = this.classType.methods();
+        for (long i = 0; i < methods.length(); i++) {
+            if (methods.get(i).isDestructor()) {
+                return methods.get(i);
+            }
+        }
+        return null;
+    }
+
+    // Validates the override marker against the concrete base chain and the implemented
+    // interfaces. 'hash' and 'equals' override built-in behavior, so their conforming shapes
+    // require the marker even with no base declaration.
+    private checkOverrideRules(FunctionDeclarationNode member, Method method,
+                               string methodName, Span nameSpan, MemberModifiers modifiers) {
+        let signature = method.signature();
+        let baseBySignature = this.findInBase(methodName, signature, true);
+        bool reservedIntent = methodName == "hash"
+            || (methodName == "equals" && members.equalsIntent(signature, this.classType));
+        bool reservedConforming =
+            (methodName == "hash" && members.hashSignatureConforms(signature))
+            || (methodName == "equals"
+                && members.equalsSignatureConforms(signature, this.classType));
+        bool unfilledGenerics = !this.chainKnown || this.hasGenericInterface();
+        if (modifiers.declaresOverride) {
+            if (baseBySignature != null) {
+                let owner = baseBySignature.definingType();
+                if (baseBySignature.isFinal()) {
+                    this.reporter.report("Cannot override '{methodName}' because it is "
+                        + "declared 'final' in '{owner.name()}'.", nameSpan);
+                }
+                if (!overrideCompatible(baseBySignature.signature(), signature)) {
+                    this.reporter.report("Override of '{methodName}' does not match the "
+                        + "signature declared in '{owner.name()}'.", nameSpan);
+                }
+                let throwsClause = member.throwsClause();
+                if (throwsClause != null && !baseBySignature.signature().declaresThrows()) {
+                    this.reporter.report("Method '{methodName}' is marked 'throws' but "
+                        + "overrides a method of '{owner.name()}' that is not. Mark the base "
+                        + "method 'throws' too, or handle the exceptions inside the "
+                        + "override.", throwsClause.throwsKeyword().span());
+                }
+                return;
+            }
+            if (this.findInInterfaces(methodName, signature, true) != null) {
+                return;
+            }
+            if (unfilledGenerics) {
+                return;
+            }
+            let baseByName = this.findInBase(methodName, signature, false);
+            if (baseByName != null) {
+                this.reporter.report("Override of '{methodName}' does not match the "
+                    + "signature declared in '{baseByName.definingType().name()}'.", nameSpan);
+                return;
+            }
+            let interfaceByName = this.findInInterfaces(methodName, signature, false);
+            if (interfaceByName != null) {
+                this.reporter.report("Override of '{methodName}' does not match the "
+                    + "signature declared in interface "
+                    + "'{interfaceByName.definingType().name()}'.", nameSpan);
+                return;
+            }
+            if (reservedIntent) {
+                return;
+            }
+            this.reporter.report("Method '{methodName}' is marked 'override' but no base "
+                + "class or implemented interface declares it.", nameSpan);
+            return;
+        }
+        if (baseBySignature != null) {
+            this.reporter.report("Method '{methodName}' hides a method inherited from "
+                + "'{baseBySignature.definingType().name()}'; mark it 'override' to replace "
+                + "it, or rename it.", nameSpan);
+            return;
+        }
+        let interfaceBySignature = this.findInInterfaces(methodName, signature, true);
+        if (interfaceBySignature != null) {
+            string interfaceName = interfaceBySignature.definingType().name();
+            this.reporter.report("Method '{methodName}' of '{this.classType.name()}' "
+                + "implements a method declared in interface '{interfaceName}'; mark it "
+                + "'override'.", nameSpan);
+            return;
+        }
+        if (reservedConforming) {
+            string builtin = "identity equality";
+            if (methodName == "hash") {
+                builtin = "identity hash";
+            }
+            this.reporter.report("Method '{methodName}' overrides the built-in {builtin}; "
+                + "mark it 'override'.", nameSpan);
+        }
+    }
+
+    // The nearest base-chain method with the name (and, when bySignature, the same parameter
+    // types). The walk covers the concrete prefix of the chain only.
+    private findInBase(string methodName, Signature signature, bool bySignature) -> Method? {
+        ClassType? current = concreteBase(this.classType);
+        while (current != null) {
+            ClassType owner = current;
+            let found = this.findOwn(owner, methodName, signature, bySignature);
+            if (found != null) {
+                return found;
+            }
+            current = concreteBase(owner);
+        }
+        return null;
+    }
+
+    private findOwn(ClassType owner, string methodName, Signature signature,
+                    bool bySignature) -> Method? {
+        let methods = owner.methods();
+        for (long i = 0; i < methods.length(); i++) {
+            let candidate = methods.get(i);
+            if (candidate.name() != methodName) {
+                continue;
+            }
+            if (!bySignature
+                    || types.sameParameterTypes(candidate.signature(), signature)) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    // A method of an interface named in this class's own implements clause. Generic interface
+    // instantiations are skipped until their members fill.
+    private findInInterfaces(string methodName, Signature signature, bool bySignature)
+            -> Method? {
+        for (let implemented in this.classType.interfaces()) {
+            if (implemented is InterfaceType) {
+                let methods = implemented.methods();
+                for (long i = 0; i < methods.length(); i++) {
+                    let candidate = methods.get(i);
+                    if (candidate.name() != methodName) {
+                        continue;
+                    }
+                    if (!bySignature
+                            || types.sameParameterTypes(candidate.signature(), signature)) {
+                        return candidate;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    private hasGenericInterface() -> bool {
+        for (let implemented in this.classType.interfaces()) {
+            if (implemented is InstantiationType) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 'hash' and 'equals' are a matched pair: equal values must hash equally. A class that
+    // customizes one must customize the other, here or in a base class.
+    private checkHashEqualsPairing() {
+        bool ownHash = false;
+        bool ownEquals = false;
+        let own = this.classType.methods();
+        for (long i = 0; i < own.length(); i++) {
+            let method = own.get(i);
+            if (method.name() == "hash"
+                    && members.hashSignatureConforms(method.signature())) {
+                ownHash = true;
+            }
+            if (method.name() == "equals"
+                    && members.equalsSignatureConforms(method.signature(), this.classType)) {
+                ownEquals = true;
+            }
+        }
+        if (!ownHash && !ownEquals) {
+            return;
+        }
+        bool equalsAnywhere = false;
+        bool hashAnywhere = false;
+        ClassType? current = this.classType;
+        while (current != null) {
+            let methods = current.methods();
+            for (long i = 0; i < methods.length(); i++) {
+                let method = methods.get(i);
+                if (method.name() == "hash") {
+                    hashAnywhere = true;
+                }
+                if (method.name() == "equals"
+                        && members.equalsIntent(method.signature(), method.definingType())) {
+                    equalsAnywhere = true;
+                }
+            }
+            current = concreteBase(current);
+        }
+        Span at = this.node.name().span();
+        if (ownHash && !equalsAnywhere) {
+            this.reporter.report("Class '{this.classType.name()}' defines 'hash' but not "
+                + "'equals'. A class that customizes one must customize both, so equal values "
+                + "hash equally. Add an 'equals({this.classType.name()} other) -> bool' "
+                + "method.", at);
+        }
+        if (ownEquals && !hashAnywhere) {
+            this.reporter.report("Class '{this.classType.name()}' defines 'equals' but not "
+                + "'hash'. A class that customizes one must customize both, so equal values "
+                + "hash equally. Add a 'hash() -> long' method.", at);
+        }
+    }
+
+    // The class must provide every method of every interface it implements, either declared
+    // here (abstract counts) or inherited from a base class.
+    private checkInterfaceSatisfaction() {
+        if (!this.chainKnown) {
+            return;
+        }
+        Span at = this.node.name().span();
+        for (let implemented in this.classType.interfaces()) {
+            if (implemented is InterfaceType) {
+                let methods = implemented.methods();
+                for (long i = 0; i < methods.length(); i++) {
+                    let required = methods.get(i);
+                    let provided = this.findDeclaring(required.name(), required.signature());
+                    if (provided == null) {
+                        this.reporter.report("Class '{this.classType.name()}' implements "
+                            + "'{implemented.name()}' but does not provide "
+                            + "'{methodDisplay(required)}'. Declare the method, or inherit "
+                            + "it from a base class.", at);
+                        continue;
+                    }
+                    if (!overrideCompatible(required.signature(), provided.signature())) {
+                        this.reporter.report("Method '{required.name()}' of "
+                            + "'{this.classType.name()}' does not match "
+                            + "'{methodDisplay(required)}' declared in interface "
+                            + "'{implemented.name()}'.", at);
+                    }
+                }
+            }
+        }
+    }
+
+    // The most derived declaration with the name and parameter types, searching this class and
+    // then its concrete base chain.
+    private findDeclaring(string methodName, Signature signature) -> Method? {
+        let own = this.findOwn(this.classType, methodName, signature, true);
+        if (own != null) {
+            return own;
+        }
+        return this.findInBase(methodName, signature, true);
+    }
+
+    // A concrete class must implement every abstract method it inherits or declares.
+    private checkAbstractSatisfied() {
+        if (this.classType.isAbstract() || !this.chainKnown) {
+            return;
+        }
+        Span at = this.node.name().span();
+        let checked = new List<Method>();
+        ClassType? current = this.classType;
+        while (current != null) {
+            let methods = current.methods();
+            for (long i = 0; i < methods.length(); i++) {
+                let method = methods.get(i);
+                if (method.isConstructor() || method.isDestructor()) {
+                    continue;
+                }
+                if (members.findSameSignature(checked, method.name(),
+                        method.signature()) != null) {
+                    continue;
+                }
+                checked.push(method);
+                let declaring = this.findDeclaring(method.name(), method.signature());
+                if (declaring != null && declaring.isAbstract()) {
+                    this.reporter.report("Class '{this.classType.name()}' must override "
+                        + "abstract method '{method.name()}', or be declared 'abstract'.", at);
+                }
+            }
+            current = concreteBase(current);
+        }
+    }
+}
+
+// The next class up the chain, stopping where a generic instantiation begins.
+private concreteBase(ClassType owner) -> ClassType? {
+    let base = owner.base();
+    if (base is ClassType) {
+        return base;
+    }
+    return null;
+}
+
+// Params must match exactly; the return type may be covariant.
+private overrideCompatible(Signature base, Signature derived) -> bool {
+    if (!types.sameParameterTypes(base, derived)) {
+        return false;
+    }
+    return types.overrideReturnCompatible(base.returnType(), derived.returnType());
+}
+
+// The signature as an interface requirement reads: 'speak(int) -> string'.
+private methodDisplay(Method method) -> string {
+    let builder = new StringBuilder();
+    builder.append(method.name());
+    builder.append("(");
+    let parameters = method.signature().parameters();
+    for (long i = 0; i < parameters.length; i++) {
+        if (i > 0) {
+            builder.append(", ");
+        }
+        builder.append(types.display(parameters[i].type()));
+    }
+    builder.append(")");
+    let returned = method.signature().returnType();
+    if (!types.isVoidType(returned)) {
+        builder.append(" -> ");
+        builder.append(types.display(returned));
+    }
+    return builder.toString();
+}

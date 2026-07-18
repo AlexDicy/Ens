@@ -1,0 +1,540 @@
+// Declaration-level checks that run after layout: struct by-value containment cycles, the
+// field-default ordering rule, field initialization, and the declared-throws contracts. All of
+// them read resolved members; none of them type expressions.
+import SourceFileNode from @ens.frontend.syntax.nodes;
+import StructDeclarationNode from @ens.frontend.syntax.nodes;
+import ClassDeclarationNode from @ens.frontend.syntax.nodes;
+import FieldDeclarationNode from @ens.frontend.syntax.nodes;
+import FunctionDeclarationNode from @ens.frontend.syntax.nodes;
+import ExpressionStatementNode from @ens.frontend.syntax.nodes;
+import AssignmentExpressionNode from @ens.frontend.syntax.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.nodes;
+import ThisExpressionNode from @ens.frontend.syntax.nodes;
+import MemberListNode from @ens.frontend.syntax.nodes;
+import Expression from @ens.frontend.syntax.nodes;
+import SyntaxKind from @ens.frontend.syntax.kind;
+import GreenNode from @ens.frontend.syntax.green;
+import GreenToken from @ens.frontend.syntax.green;
+import Span from @ens.frontend.source;
+import @ens.frontend.source;
+import FileDiagnostic from diagnostics;
+import Reporter from diagnostics;
+import diagnostics;
+import ModuleContext from context;
+import members;
+import types;
+import Type from types;
+import ErrorType from types;
+import OptionalType from types;
+import PrimitiveType from types;
+import PrimitiveKind from types;
+import InstantiationType from types;
+import TypeParamType from types;
+import DeclaredType from types;
+import ClassType from types;
+import StructType from types;
+import InterfaceType from types;
+import Field from types;
+import Method from types;
+import Signature from types;
+import List from @std.collections.list;
+import Set from @std.collections.set;
+import StringBuilder from @std.text.stringbuilder;
+
+public checkProgram(List<ModuleContext> contexts) -> FileDiagnostic[] {
+    let collected = new List<FileDiagnostic>();
+    for (long i = 0; i < contexts.length(); i++) {
+        let checker = new ModuleChecks(contexts.get(i), collected);
+        checker.run();
+    }
+    return diagnostics.sorted(collected);
+}
+
+private class FoundIdentifier {
+    string name;
+    Span span;
+
+    constructor(this.name, this.span);
+}
+
+private class CycleStep {
+    StructType owner;
+    Field field;
+
+    constructor(this.owner, this.field);
+}
+
+private class ModuleChecks {
+    private ModuleContext context;
+    private Reporter reporter;
+    private string modulePath;
+
+    private List<StructDeclarationNode> structNodes;
+    private List<ClassDeclarationNode> classNodes;
+
+    constructor(ModuleContext context, List<FileDiagnostic> collected) {
+        this.context = context;
+        this.reporter = new Reporter(context.module().filePath(), collected);
+        this.modulePath = context.module().canonicalPath();
+        this.structNodes = new List<StructDeclarationNode>();
+        this.classNodes = new List<ClassDeclarationNode>();
+    }
+
+    run() {
+        let root = this.context.root();
+        if (root == null) {
+            return;
+        }
+        for (long i = 0; i < root.itemsCount(); i++) {
+            switch (root.items(i)) {
+                is StructDeclarationNode declaration -> {
+                    this.structNodes.push(declaration);
+                },
+                is ClassDeclarationNode declaration -> {
+                    this.classNodes.push(declaration);
+                },
+                default -> { },
+            }
+        }
+        this.checkStructCycles();
+        this.checkFieldDefaultOrder();
+        this.checkFieldInitialization();
+        this.checkDeclaredThrows();
+    }
+
+    private structFor(StructDeclarationNode node) -> StructType? {
+        let store = this.context.resolver().typeStore();
+        let found = store.findDeclared(this.modulePath, node.name().text());
+        if (found is StructType && found.declaration() == node.green()) {
+            return found;
+        }
+        return null;
+    }
+
+    private classFor(ClassDeclarationNode node) -> ClassType? {
+        let store = this.context.resolver().typeStore();
+        let found = store.findDeclared(this.modulePath, node.name().text());
+        if (found is ClassType && found.declaration() == node.green()) {
+            return found;
+        }
+        return null;
+    }
+
+    // ---- Struct by-value containment cycles ----
+
+    private checkStructCycles() {
+        for (long i = 0; i < this.structNodes.length(); i++) {
+            let found = this.structFor(this.structNodes.get(i));
+            if (found == null) {
+                continue;
+            }
+            StructType structType = found;
+            let path = new List<CycleStep>();
+            let explored = new Set<StructType>();
+            if (!findPathBackTo(structType, structType, path, explored)) {
+                continue;
+            }
+            let builder = new StringBuilder();
+            builder.append("Struct '{structType.name()}' contains itself by value: ");
+            for (long s = 0; s < path.length(); s++) {
+                if (s > 0) {
+                    if (s + 1 == path.length()) {
+                        builder.append(", and ");
+                    } else {
+                        builder.append(", ");
+                    }
+                }
+                let step = path.get(s);
+                builder.append("field '{step.field.name()}' of '{step.owner.name()}' has "
+                    + "type '{types.display(step.field.type())}'");
+            }
+            let example = byValueFieldStruct(path.get(0).field.type());
+            string exampleName = structType.name();
+            if (example != null) {
+                exampleName = example.name();
+            }
+            builder.append(". Struct fields are stored inline, so this layout would be "
+                + "infinitely large. Break the cycle, for example by declaring "
+                + "'{exampleName}' as a class ('class {exampleName} \{ ... \}') so the field "
+                + "stores a reference.");
+            this.reporter.report(builder.toString(), path.get(0).field.nameSpan());
+        }
+    }
+
+    // ---- Field default ordering ----
+
+    // A field default may only reference fields declared before it. The rule is syntactic:
+    // an identifier in a default that names this type's own field at the same or a later
+    // position, and nothing else visible at module scope, cannot resolve.
+    private checkFieldDefaultOrder() {
+        for (long i = 0; i < this.structNodes.length(); i++) {
+            let node = this.structNodes.get(i);
+            if (this.structFor(node) != null) {
+                this.checkDefaultOrderIn(node.body());
+            }
+        }
+        for (long i = 0; i < this.classNodes.length(); i++) {
+            let node = this.classNodes.get(i);
+            if (this.classFor(node) != null) {
+                this.checkDefaultOrderIn(node.body());
+            }
+        }
+    }
+
+    private checkDefaultOrderIn(MemberListNode body) {
+        let fieldNames = new List<string>();
+        for (long i = 0; i < body.membersCount(); i++) {
+            let member = body.members(i);
+            if (member is FieldDeclarationNode) {
+                fieldNames.push(member.name().text());
+            }
+        }
+        long fieldIndex = 0;
+        for (long i = 0; i < body.membersCount(); i++) {
+            let member = body.members(i);
+            if (member is FieldDeclarationNode) {
+                let defaultValue = member.defaultValue();
+                if (defaultValue != null) {
+                    this.checkDefaultReferences(member.name().text(), fieldIndex,
+                        defaultValue.value(), fieldNames);
+                }
+                fieldIndex++;
+            }
+        }
+    }
+
+    private checkDefaultReferences(string fieldName, long fieldIndex, Expression value,
+                                   List<string> fieldNames) {
+        let found = new List<FoundIdentifier>();
+        collectIdentifiers(value.green(), value.fullSpan().start, found);
+        for (long i = 0; i < found.length(); i++) {
+            let identifier = found.get(i);
+            long named = firstIndexOf(fieldNames, identifier.name);
+            if (named < fieldIndex) {
+                continue;
+            }
+            if (this.visibleAtModuleScope(identifier.name)) {
+                continue;
+            }
+            if (named == fieldIndex && identifier.name == fieldName) {
+                this.reporter.report("The default value of field '{fieldName}' cannot "
+                    + "reference the field itself.", identifier.span);
+            } else {
+                this.reporter.report("The default value of field '{fieldName}' references "
+                    + "'{identifier.name}', which is declared later; a field default may "
+                    + "only use fields declared before it.", identifier.span);
+            }
+        }
+    }
+
+    // Names a default-value identifier could still resolve to when it is not an earlier
+    // sibling field: module functions, module types, imported names, and the built-ins.
+    private visibleAtModuleScope(string name) -> bool {
+        if (name == "print" || name == "panic" || name == "Error") {
+            return true;
+        }
+        if (this.context.declarations().hasFunctionNamed(name)) {
+            return true;
+        }
+        let store = this.context.resolver().typeStore();
+        if (store.findDeclared(this.modulePath, name) != null) {
+            return true;
+        }
+        return this.context.linkTable().binding(name) != null;
+    }
+
+    // ---- Field initialization ----
+
+    private checkFieldInitialization() {
+        for (long i = 0; i < this.structNodes.length(); i++) {
+            let structType = this.structFor(this.structNodes.get(i));
+            if (structType != null) {
+                this.checkStructFieldInitialization(structType);
+            }
+        }
+        for (long i = 0; i < this.classNodes.length(); i++) {
+            let node = this.classNodes.get(i);
+            let classType = this.classFor(node);
+            if (classType != null) {
+                this.checkClassFieldInitialization(classType, node);
+            }
+        }
+    }
+
+    private checkStructFieldInitialization(StructType structType) {
+        let fields = structType.fields();
+        for (long i = 0; i < fields.length(); i++) {
+            let field = fields.get(i);
+            if (field.type() is ErrorType || field.type() is TypeParamType) {
+                continue;
+            }
+            if (field.hasDefault() || isDefaultable(field.type())) {
+                continue;
+            }
+            string shown = types.display(field.type());
+            this.reporter.report("Field '{field.name()}' of struct '{structType.name()}' has "
+                + "non-nullable type '{shown}' and no default value. Either give it a default "
+                + "(e.g. '{shown} {field.name()} = ...;') or make it nullable "
+                + "('{shown}? {field.name()};').", field.nameSpan());
+        }
+    }
+
+    private checkClassFieldInitialization(ClassType classType, ClassDeclarationNode node) {
+        let constructors = new List<FunctionDeclarationNode>();
+        let body = node.body();
+        for (long i = 0; i < body.membersCount(); i++) {
+            let member = body.members(i);
+            if (member is FunctionDeclarationNode) {
+                let introducer = member.introducer();
+                if (introducer != null
+                        && introducer.kind() == SyntaxKind.ConstructorKeyword) {
+                    constructors.push(member);
+                }
+            }
+        }
+        let fields = classType.fields();
+        for (long i = classType.baseFieldCount(); i < fields.length(); i++) {
+            let field = fields.get(i);
+            if (field.type() is ErrorType) {
+                continue;
+            }
+            if (field.hasDefault() || isDefaultable(field.type())) {
+                continue;
+            }
+            bool everyConstructorInitializes = constructors.length() > 0;
+            for (long c = 0; c < constructors.length(); c++) {
+                if (!constructorInitializes(constructors.get(c), field.name())) {
+                    everyConstructorInitializes = false;
+                    break;
+                }
+            }
+            if (everyConstructorInitializes) {
+                continue;
+            }
+            string shown = types.display(field.type());
+            this.reporter.report("Field '{field.name()}' of class '{classType.name()}' has "
+                + "non-nullable type '{shown}' but is never initialized. Give it a default "
+                + "(e.g. '{shown} {field.name()} = ...;'), make it nullable "
+                + "('{shown}? {field.name()};'), or initialize it in every constructor (via "
+                + "a 'this.{field.name()}' parameter or 'this.{field.name()} = ...;' in the "
+                + "body).", field.nameSpan());
+        }
+    }
+
+    // ---- Declared throws ----
+
+    private checkDeclaredThrows() {
+        let functions = this.context.functions().all();
+        for (long i = 0; i < functions.length(); i++) {
+            let entry = functions.get(i);
+            if (!entry.isBuiltin() && !entry.isExternal()) {
+                this.validateThrows(entry.signature());
+            }
+        }
+        let store = this.context.resolver().typeStore();
+        for (let declared in this.context.declarations().types()) {
+            let owned = store.findDeclared(this.modulePath, declared.name());
+            if (owned == null || owned.declaration() != declared.node()) {
+                continue;
+            }
+            switch (owned) {
+                is StructType structType -> {
+                    this.validateMethodThrows(structType.methods());
+                },
+                is ClassType classType -> {
+                    this.validateMethodThrows(classType.methods());
+                },
+                is InterfaceType interfaceType -> {
+                    this.validateMethodThrows(interfaceType.methods());
+                },
+                default -> { },
+            }
+        }
+    }
+
+    private validateMethodThrows(List<Method> methods) {
+        for (long i = 0; i < methods.length(); i++) {
+            this.validateThrows(methods.get(i).signature());
+        }
+    }
+
+    private validateThrows(Signature signature) {
+        Type[] declared = signature.throwsTypes();
+        if (declared.length == 0) {
+            return;
+        }
+        Span[] spans = signature.throwsTypeSpans();
+        let errorClass = this.context.resolver().errorClass();
+        let accepted = new List<Type>();
+        for (long i = 0; i < declared.length; i++) {
+            Type thrown = declared[i];
+            if (thrown is ErrorType) {
+                continue;
+            }
+            if (errorClass == null || !types.isSubclassOf(thrown, errorClass)) {
+                this.reporter.report("A declared throws type must be 'Error' or a subclass; "
+                    + "'{types.display(thrown)}' is not.", spans[i]);
+                continue;
+            }
+            bool overlaps = false;
+            for (long a = 0; a < accepted.length(); a++) {
+                let previous = accepted.get(a);
+                if (thrown == previous || types.isSubclassOf(thrown, previous)
+                        || types.isSubclassOf(previous, thrown)) {
+                    this.reporter.report("Declared throws type '{types.display(thrown)}' "
+                        + "overlaps with another type in the list; list each exception "
+                        + "once.", spans[i]);
+                    overlaps = true;
+                    break;
+                }
+            }
+            if (!overlaps) {
+                accepted.push(thrown);
+            }
+        }
+    }
+}
+
+// The struct a field stores inline, normalized to the declaring template so an instantiation
+// of the containing struct closes its cycle.
+private byValueFieldStruct(Type fieldType) -> StructType? {
+    Type bare = fieldType;
+    if (bare is OptionalType) {
+        bare = bare.inner();
+    }
+    if (bare is StructType) {
+        return bare;
+    }
+    if (bare is InstantiationType) {
+        let template = bare.template();
+        if (template is StructType) {
+            return template;
+        }
+    }
+    return null;
+}
+
+// Depth-first search for a by-value field path from origin back to itself. explored bounds the
+// walk on graphs with shared members.
+private findPathBackTo(StructType origin, StructType current, List<CycleStep> path,
+                       Set<StructType> explored) -> bool {
+    let fields = current.fields();
+    for (long i = 0; i < fields.length(); i++) {
+        let field = fields.get(i);
+        let next = byValueFieldStruct(field.type());
+        if (next == null) {
+            continue;
+        }
+        StructType target = next;
+        path.push(new CycleStep(current, field));
+        if (target == origin) {
+            return true;
+        }
+        if (explored.add(target) && findPathBackTo(origin, target, path, explored)) {
+            return true;
+        }
+        path.pop();
+    }
+    return false;
+}
+
+// True if the type can start as a valid zero value without an initializer: primitives except
+// decimal, optionals, and structs whose every field can. An unfilled generic struct reference
+// stays permissive until its members fill.
+private isDefaultable(Type fieldType) -> bool {
+    let visiting = new Set<StructType>();
+    return isDefaultableGuarded(fieldType, visiting);
+}
+
+private isDefaultableGuarded(Type fieldType, Set<StructType> visiting) -> bool {
+    if (fieldType is PrimitiveType) {
+        return fieldType.kind() != PrimitiveKind.Decimal
+            && fieldType.kind() != PrimitiveKind.Void;
+    }
+    if (fieldType is OptionalType) {
+        return true;
+    }
+    if (fieldType is StructType) {
+        StructType structType = fieldType;
+        if (!visiting.add(structType)) {
+            return true;
+        }
+        let fields = structType.fields();
+        for (long i = 0; i < fields.length(); i++) {
+            let field = fields.get(i);
+            if (field.hasDefault() || isDefaultableGuarded(field.type(), visiting)) {
+                continue;
+            }
+            visiting.remove(structType);
+            return false;
+        }
+        visiting.remove(structType);
+        return true;
+    }
+    if (fieldType is InstantiationType) {
+        return fieldType.template() is StructType;
+    }
+    return false;
+}
+
+// True when the constructor initializes the field through a 'this.field' parameter or a
+// top-level 'this.field = ...;' statement; branches are not credited.
+private constructorInitializes(FunctionDeclarationNode declaration, string fieldName) -> bool {
+    let parameterList = declaration.parameters();
+    for (long i = 0; i < parameterList.parametersCount(); i++) {
+        let parameter = parameterList.parameters(i);
+        if (parameter.thisPrefix() != null && parameter.name().text() == fieldName) {
+            return true;
+        }
+    }
+    let body = declaration.body();
+    if (body == null) {
+        return false;
+    }
+    for (long i = 0; i < body.statementsCount(); i++) {
+        let statement = body.statements(i);
+        if (statement is ExpressionStatementNode) {
+            let expression = statement.expression();
+            if (expression is AssignmentExpressionNode) {
+                let target = expression.target();
+                if (target is MemberExpressionNode && target.object() is ThisExpressionNode
+                        && target.member().text() == fieldName) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+private firstIndexOf(List<string> names, string name) -> long {
+    for (long i = 0; i < names.length(); i++) {
+        if (names.get(i) == name) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Every bare identifier expression under the node, with its content span.
+private collectIdentifiers(GreenNode node, long fullStart, List<FoundIdentifier> out) {
+    if (node.kind() == SyntaxKind.IdentifierExpression && node.slotCount() > 0) {
+        let token = node.slot(0);
+        if (token is GreenToken) {
+            out.push(new FoundIdentifier(token.text(),
+                source.makeSpan(fullStart + token.leadingLength(), token.contentLength())));
+        }
+        return;
+    }
+    long offset = fullStart;
+    for (long i = 0; i < node.slotCount(); i++) {
+        let child = node.slot(i);
+        if (child != null) {
+            if (child is GreenNode) {
+                GreenNode inner = child;
+                collectIdentifiers(inner, offset, out);
+            }
+            offset = offset + child.fullLength();
+        }
+    }
+}

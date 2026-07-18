@@ -1,0 +1,788 @@
+// The per-module signature phase. After linking, every module resolves its declared shapes
+// against the type store: struct fields and methods, interface methods, enum members, class
+// bases and implemented interfaces, free and external functions, and test declarations. Class
+// members are left for the whole-program layout phase, which runs bases first.
+import SourceFileNode from @ens.frontend.syntax.nodes;
+import StructDeclarationNode from @ens.frontend.syntax.nodes;
+import ClassDeclarationNode from @ens.frontend.syntax.nodes;
+import InterfaceDeclarationNode from @ens.frontend.syntax.nodes;
+import EnumDeclarationNode from @ens.frontend.syntax.nodes;
+import FunctionDeclarationNode from @ens.frontend.syntax.nodes;
+import TestDeclarationNode from @ens.frontend.syntax.nodes;
+import ExternalBlockNode from @ens.frontend.syntax.nodes;
+import ExternalFunctionDeclarationNode from @ens.frontend.syntax.nodes;
+import FieldDeclarationNode from @ens.frontend.syntax.nodes;
+import MemberListNode from @ens.frontend.syntax.nodes;
+import SyntaxKind from @ens.frontend.syntax.kind;
+import Span from @ens.frontend.source;
+import @ens.frontend.source;
+import FileDiagnostic from diagnostics;
+import Reporter from diagnostics;
+import diagnostics;
+import ModuleContext from context;
+import ClassItem from context;
+import FunctionEntry from context;
+import members;
+import MemberModifiers from members;
+import TypeResolver from resolve;
+import types;
+import Type from types;
+import ErrorType from types;
+import OptionalType from types;
+import ArrayType from types;
+import PrimitiveType from types;
+import PrimitiveKind from types;
+import ExternalType from types;
+import ClassType from types;
+import StructType from types;
+import InterfaceType from types;
+import EnumType from types;
+import TypeParamType from types;
+import Field from types;
+import Method from types;
+import Parameter from types;
+import Signature from types;
+import Visibility from types;
+import List from @std.collections.list;
+
+// Resolves one module's signatures, appending the classes it declares to classItems for the
+// layout phase. Returns the module's diagnostics.
+public resolveModule(ModuleContext context, List<ClassItem> classItems) -> FileDiagnostic[] {
+    let collected = new List<FileDiagnostic>();
+    let collector = new SignatureCollector(context, collected);
+    collector.run(classItems);
+    for (let diagnostic in context.resolver().takeDiagnostics()) {
+        collected.push(diagnostic);
+    }
+    return diagnostics.sorted(collected);
+}
+
+private class SignatureCollector {
+    private ModuleContext context;
+    private TypeResolver resolver;
+    private Reporter reporter;
+    private string modulePath;
+
+    private List<StructDeclarationNode> structNodes;
+    private List<ClassDeclarationNode> classNodes;
+    private List<InterfaceDeclarationNode> interfaceNodes;
+    private List<EnumDeclarationNode> enumNodes;
+    private List<FunctionDeclarationNode> functionNodes;
+    private List<TestDeclarationNode> testNodes;
+    private List<ExternalBlockNode> externalBlockNodes;
+
+    constructor(ModuleContext context, List<FileDiagnostic> collected) {
+        this.context = context;
+        this.resolver = context.resolver();
+        this.reporter = new Reporter(context.module().filePath(), collected);
+        this.modulePath = context.module().canonicalPath();
+        this.structNodes = new List<StructDeclarationNode>();
+        this.classNodes = new List<ClassDeclarationNode>();
+        this.interfaceNodes = new List<InterfaceDeclarationNode>();
+        this.enumNodes = new List<EnumDeclarationNode>();
+        this.functionNodes = new List<FunctionDeclarationNode>();
+        this.testNodes = new List<TestDeclarationNode>();
+        this.externalBlockNodes = new List<ExternalBlockNode>();
+    }
+
+    run(List<ClassItem> classItems) {
+        this.seedBuiltins();
+        let root = this.context.root();
+        if (root == null) {
+            return;
+        }
+        this.gather(root);
+        this.collectStructFields();
+        this.collectStructMethods();
+        this.collectInterfaces();
+        this.collectEnums();
+        this.resolveClassBases(classItems);
+        this.collectFunctions();
+        this.collectExternalFunctions();
+        this.checkTests();
+    }
+
+    private gather(SourceFileNode root) {
+        for (long i = 0; i < root.itemsCount(); i++) {
+            switch (root.items(i)) {
+                is StructDeclarationNode declaration -> {
+                    this.structNodes.push(declaration);
+                },
+                is ClassDeclarationNode declaration -> {
+                    this.classNodes.push(declaration);
+                },
+                is InterfaceDeclarationNode declaration -> {
+                    this.interfaceNodes.push(declaration);
+                },
+                is EnumDeclarationNode declaration -> {
+                    this.enumNodes.push(declaration);
+                },
+                is FunctionDeclarationNode declaration -> {
+                    this.functionNodes.push(declaration);
+                },
+                is TestDeclarationNode declaration -> {
+                    this.testNodes.push(declaration);
+                },
+                is ExternalBlockNode declaration -> {
+                    this.externalBlockNodes.push(declaration);
+                },
+                default -> { },
+            }
+        }
+    }
+
+    // The built-in functions every module sees; user declarations may overload them.
+    private seedBuiltins() {
+        let store = this.resolver.typeStore();
+        Span nowhere = source.makeSpan(0, 0);
+        let message = new Parameter("message", store.stringType(), false, false, false, nowhere);
+        Type voidType = store.primitive(PrimitiveKind.Void);
+        let print = new Signature("print", [message], voidType, false, [], [], [], null, nowhere);
+        this.context.functions().add(new FunctionEntry(print, Visibility.Public, false, true, ""));
+        let panic = new Signature("panic", [message], voidType, false, [], [], [], null, nowhere);
+        this.context.functions().add(new FunctionEntry(panic, Visibility.Public, false, true, ""));
+    }
+
+    // The declared type a node owns, or null when a duplicate declaration lost its name.
+    private structFor(StructDeclarationNode node) -> StructType? {
+        let found = this.resolver.typeStore().findDeclared(this.modulePath, node.name().text());
+        if (found is StructType && found.declaration() == node.green()) {
+            return found;
+        }
+        return null;
+    }
+
+    private classFor(ClassDeclarationNode node) -> ClassType? {
+        let found = this.resolver.typeStore().findDeclared(this.modulePath, node.name().text());
+        if (found is ClassType && found.declaration() == node.green()) {
+            return found;
+        }
+        return null;
+    }
+
+    private interfaceFor(InterfaceDeclarationNode node) -> InterfaceType? {
+        let found = this.resolver.typeStore().findDeclared(this.modulePath, node.name().text());
+        if (found is InterfaceType && found.declaration() == node.green()) {
+            return found;
+        }
+        return null;
+    }
+
+    private enumFor(EnumDeclarationNode node) -> EnumType? {
+        let found = this.resolver.typeStore().findDeclared(this.modulePath, node.name().text());
+        if (found is EnumType && found.declaration() == node.green()) {
+            return found;
+        }
+        return null;
+    }
+
+    // Struct fields resolve for every struct before any struct method does, so constructor
+    // 'this.field' parameters always see the full field list.
+    private collectStructFields() {
+        for (long s = 0; s < this.structNodes.length(); s++) {
+            let node = this.structNodes.get(s);
+            let found = this.structFor(node);
+            if (found == null) {
+                continue;
+            }
+            StructType structType = found;
+            let extendsClause = node.extendsClause();
+            if (extendsClause != null) {
+                this.reporter.report("Only classes can use 'extends'; structs do not support "
+                    + "inheritance.", extendsClause.extendsKeyword().span());
+            }
+            let implementsClause = node.implementsClause();
+            if (implementsClause != null) {
+                this.reporter.report("Structs cannot implement interfaces; only classes can "
+                    + "use 'implements'.", implementsClause.implementsKeyword().span());
+            }
+            let parameters = this.resolver.resolveTypeParameters(node.green(),
+                node.typeParameters());
+            structType.setTypeParameterTypes(parameters);
+            this.resolver.pushTypeParameters(parameters);
+            let body = node.body();
+            for (long i = 0; i < body.membersCount(); i++) {
+                let member = body.members(i);
+                if (member is FieldDeclarationNode) {
+                    let field = members.readField(this.resolver, member, structType);
+                    if (field.isWeak()) {
+                        this.reporter.report("'weak' fields are not allowed on structs.",
+                            field.nameSpan());
+                    }
+                    structType.fields().push(field);
+                }
+            }
+            this.resolver.popTypeParameters(parameters.length);
+        }
+    }
+
+    private collectStructMethods() {
+        for (long s = 0; s < this.structNodes.length(); s++) {
+            let node = this.structNodes.get(s);
+            let structType = this.structFor(node);
+            if (structType == null) {
+                continue;
+            }
+            let parameters = structType.typeParameterTypes();
+            this.resolver.pushTypeParameters(parameters);
+            let body = node.body();
+            for (long i = 0; i < body.membersCount(); i++) {
+                let member = body.members(i);
+                if (member is FunctionDeclarationNode) {
+                    this.collectStructMethod(structType, member);
+                }
+            }
+            this.resolver.popTypeParameters(parameters.length);
+        }
+    }
+
+    private collectStructMethod(StructType structType, FunctionDeclarationNode member) {
+        let introducer = member.introducer();
+        bool isConstructor = false;
+        Span nameSpan = member.span();
+        if (introducer != null) {
+            if (introducer.kind() == SyntaxKind.DestructorKeyword) {
+                this.reporter.report("A struct cannot declare a destructor; destructors are "
+                    + "only allowed on classes.", introducer.span());
+                return;
+            }
+            isConstructor = true;
+            nameSpan = introducer.span();
+        }
+        string rawName = "";
+        let nameToken = member.name();
+        if (nameToken != null) {
+            rawName = nameToken.text();
+            nameSpan = nameToken.span();
+        }
+        if (!isConstructor) {
+            if (rawName.length == 0) {
+                return;
+            }
+            if (rawName == structType.name()) {
+                this.reporter.report("To declare a constructor, use the 'constructor' keyword. "
+                    + "A method cannot be named after its struct '{structType.name()}'.",
+                    nameSpan);
+                return;
+            }
+        }
+        string methodName = rawName;
+        if (isConstructor) {
+            methodName = "constructor";
+        }
+        let modifiers = members.functionModifiers(member);
+        let signature = members.buildSignature(this.resolver, this.reporter, member, methodName,
+            nameSpan, isConstructor, false, isConstructor || modifiers.declaresAbstract,
+            structType.fields(), structType.name(), true, []);
+        members.checkFieldMethodCollision(this.reporter, structType.fields(), methodName,
+            isConstructor, nameSpan);
+        members.checkThrowsPlacement(this.reporter, member, false, isConstructor,
+            modifiers.declaresAbstract);
+        members.checkHashSignature(this.reporter, signature, isConstructor);
+        if (members.findSameSignature(structType.methods(), methodName, signature) != null) {
+            this.reporter.report("Method '{methodName}' of '{structType.name()}' is already "
+                + "declared with the same parameter types; overloads must differ in parameter "
+                + "count or types.", nameSpan);
+            return;
+        }
+        structType.methods().push(new Method(signature, modifiers.visibility(), isConstructor,
+            false, modifiers.declaresOverride, modifiers.declaresFinal,
+            modifiers.declaresAbstract, member.body() != null, structType));
+    }
+
+    private collectInterfaces() {
+        for (long n = 0; n < this.interfaceNodes.length(); n++) {
+            let node = this.interfaceNodes.get(n);
+            let interfaceType = this.interfaceFor(node);
+            if (interfaceType == null) {
+                continue;
+            }
+            let parameters = this.resolver.resolveTypeParameters(node.green(),
+                node.typeParameters());
+            interfaceType.setTypeParameterTypes(parameters);
+            this.resolver.pushTypeParameters(parameters);
+            let body = node.body();
+            for (long i = 0; i < body.membersCount(); i++) {
+                switch (body.members(i)) {
+                    is FieldDeclarationNode field -> {
+                        this.reporter.report("An interface cannot declare fields; its body "
+                            + "lists only method signatures.", field.name().span());
+                    },
+                    is FunctionDeclarationNode method -> {
+                        this.collectInterfaceMethod(interfaceType, method);
+                    },
+                    default -> { },
+                }
+            }
+            this.resolver.popTypeParameters(parameters.length);
+        }
+    }
+
+    private collectInterfaceMethod(InterfaceType interfaceType, FunctionDeclarationNode member) {
+        let introducer = member.introducer();
+        if (introducer != null) {
+            if (introducer.kind() == SyntaxKind.DestructorKeyword) {
+                this.reporter.report("An interface cannot declare a destructor; "
+                    + "'{interfaceType.name()}' has no instances of its own.",
+                    introducer.span());
+            } else {
+                this.reporter.report("An interface cannot declare a constructor; "
+                    + "'{interfaceType.name()}' has no instances of its own.",
+                    introducer.span());
+            }
+            return;
+        }
+        let nameToken = member.name();
+        if (nameToken == null || nameToken.text().length == 0) {
+            return;
+        }
+        string name = nameToken.text();
+        Span nameSpan = nameToken.span();
+        if (name == interfaceType.name()) {
+            this.reporter.report("An interface cannot declare a constructor; "
+                + "'{interfaceType.name()}' has no instances of its own.", nameSpan);
+            return;
+        }
+        let modifiers = members.functionModifiers(member);
+        if (modifiers.hasVisibilityModifier()) {
+            this.reporter.report("Interface methods are always public; remove the visibility "
+                + "modifier from '{name}'.", nameSpan);
+        }
+        if (modifiers.declaresOverride || modifiers.declaresFinal || modifiers.declaresAbstract) {
+            this.reporter.report("Interface methods are plain signatures; 'abstract', "
+                + "'override', and 'final' are not allowed on '{name}'.", nameSpan);
+        }
+        if (member.body() != null) {
+            this.reporter.report("Interface method '{name}' cannot have a body; end the "
+                + "signature with ';'. Implementing classes provide the body.", nameSpan);
+        }
+        let throwsClause = member.throwsClause();
+        if (throwsClause != null && throwsClause.typesCount() == 0) {
+            this.reporter.report("An interface method marked 'throws' must list its exception "
+                + "types, e.g. 'throws IOError'.", throwsClause.throwsKeyword().span());
+        }
+        let signature = members.buildSignature(this.resolver, this.reporter, member, name,
+            nameSpan, false, true, true, null, "", true, []);
+        members.checkHashSignature(this.reporter, signature, false);
+        if (members.findSameSignature(interfaceType.methods(), name, signature) != null) {
+            this.reporter.report("Method '{name}' of '{interfaceType.name()}' is already "
+                + "declared with the same parameter types; overloads must differ in parameter "
+                + "count or types.", nameSpan);
+            return;
+        }
+        interfaceType.methods().push(new Method(signature, Visibility.Public, false, false,
+            false, false, true, member.body() != null, interfaceType));
+    }
+
+    private collectEnums() {
+        for (long n = 0; n < this.enumNodes.length(); n++) {
+            let node = this.enumNodes.get(n);
+            let enumType = this.enumFor(node);
+            if (enumType == null) {
+                continue;
+            }
+            let names = new List<string>();
+            for (long i = 0; i < node.membersCount(); i++) {
+                let memberToken = node.members(i).name();
+                string name = memberToken.text();
+                if (name.length == 0) {
+                    continue;
+                }
+                bool duplicate = false;
+                for (long j = 0; j < names.length(); j++) {
+                    if (names.get(j) == name) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate) {
+                    this.reporter.report("Duplicate enum member '{name}'.", memberToken.span());
+                    continue;
+                }
+                names.push(name);
+            }
+            if (names.length() == 0) {
+                this.reporter.report("Enum '{enumType.name()}' must have at least one member.",
+                    node.name().span());
+            }
+            enumType.setMemberNames(names.toArray());
+        }
+    }
+
+    private resolveClassBases(List<ClassItem> classItems) {
+        for (long n = 0; n < this.classNodes.length(); n++) {
+            let node = this.classNodes.get(n);
+            let found = this.classFor(node);
+            if (found == null) {
+                continue;
+            }
+            ClassType classType = found;
+            classItems.push(new ClassItem(this.context, classType, node));
+            let parameters = this.resolver.resolveTypeParameters(node.green(),
+                node.typeParameters());
+            classType.setTypeParameterTypes(parameters);
+            if (classType.isSealed() && classType.isFinal()) {
+                this.reporter.report("Class '{classType.name()}' cannot be both 'sealed' and "
+                    + "'final'; 'final' already forbids subclasses, so there is nothing to "
+                    + "seal.", node.name().span());
+            }
+            this.resolver.pushTypeParameters(parameters);
+            let extendsClause = node.extendsClause();
+            if (extendsClause != null) {
+                let reference = extendsClause.base();
+                Type base = this.resolver.resolveType(reference);
+                this.checkAndSetBase(classType, base, reference.span());
+            }
+            let implementsClause = node.implementsClause();
+            if (implementsClause != null) {
+                let accepted = new List<Type>();
+                for (long i = 0; i < implementsClause.interfacesCount(); i++) {
+                    let reference = implementsClause.interfaces(i);
+                    Type resolved = this.resolver.resolveType(reference);
+                    if (this.acceptInterface(accepted, resolved, reference.span())) {
+                        accepted.push(resolved);
+                    }
+                }
+                classType.setInterfaces(accepted.toArray());
+            }
+            this.resolver.popTypeParameters(parameters.length);
+        }
+    }
+
+    private checkAndSetBase(ClassType classType, Type base, Span span) {
+        if (base is ErrorType) {
+            return;
+        }
+        string shown = types.display(base);
+        if (types.isInterfaceLike(base)) {
+            this.reporter.report("Cannot extend interface '{shown}'; a class implements an "
+                + "interface with 'implements {shown}'.", span);
+            return;
+        }
+        if (!types.isClassLike(base)) {
+            this.reporter.report("'{shown}' is not a class; only classes can be extended.",
+                span);
+            return;
+        }
+        let authority = types.authorityOf(base);
+        if (base == classType || authority == classType) {
+            this.reporter.report("Class '{classType.name()}' cannot extend itself.", span);
+            return;
+        }
+        if (authority is ClassType) {
+            if (authority.isFinal()) {
+                this.reporter.report("Cannot extend '{authority.name()}' because it is "
+                    + "declared 'final'.", span);
+                return;
+            }
+            if (authority.isSealed() && authority.modulePath() != this.modulePath) {
+                this.reporter.report("Cannot extend '{authority.name()}' because it is "
+                    + "declared 'sealed'; every subclass of a sealed class must be declared "
+                    + "in the module that declares it.", span);
+                return;
+            }
+            classType.setBase(base);
+            authority.directSubclasses().push(classType);
+        }
+    }
+
+    private acceptInterface(List<Type> accepted, Type resolved, Span span) -> bool {
+        if (resolved is ErrorType) {
+            return false;
+        }
+        string shown = types.display(resolved);
+        if (resolved is OptionalType || resolved is ArrayType) {
+            this.reporter.report("'implements' takes plain interface names; '{shown}' is not "
+                + "an interface type.", span);
+            return false;
+        }
+        if (!types.isInterfaceLike(resolved)) {
+            if (types.isClassLike(resolved)) {
+                this.reporter.report("'{shown}' is a class, not an interface; use 'extends "
+                    + "{shown}' for a base class.", span);
+            } else {
+                this.reporter.report("'{shown}' is not an interface; 'implements' takes "
+                    + "interfaces only.", span);
+            }
+            return false;
+        }
+        for (long i = 0; i < accepted.length(); i++) {
+            if (accepted.get(i) == resolved) {
+                this.reporter.report("Interface '{shown}' is listed more than once in the "
+                    + "'implements' clause.", span);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private collectFunctions() {
+        for (long n = 0; n < this.functionNodes.length(); n++) {
+            let node = this.functionNodes.get(n);
+            let nameToken = node.name();
+            if (nameToken == null || nameToken.text().length == 0) {
+                continue;
+            }
+            string name = nameToken.text();
+            Span nameSpan = nameToken.span();
+            let modifiers = members.functionModifiers(node);
+            let typeParameters = this.resolver.resolveTypeParameters(node.green(),
+                node.typeParameters());
+            this.resolver.pushTypeParameters(typeParameters);
+            let signature = members.buildSignature(this.resolver, this.reporter, node, name,
+                nameSpan, false, false, false, null, "", true, typeParameters);
+            members.checkThrowsPlacement(this.reporter, node, false, false,
+                modifiers.declaresAbstract);
+            this.resolver.popTypeParameters(typeParameters.length);
+            if (this.nameCollidesWithBinding(name)) {
+                this.reporter.report("Duplicate function name '{name}'.", nameSpan);
+                continue;
+            }
+            let existing = this.context.functions().entriesNamed(name);
+            if (existing != null && existing.length() > 0) {
+                if (name == "main") {
+                    this.reporter.report("Function 'main' cannot be overloaded; it is the "
+                        + "program entry point.", nameSpan);
+                    continue;
+                }
+                bool anyGeneric = signature.isGeneric();
+                for (long i = 0; i < existing.length(); i++) {
+                    if (existing.get(i).signature().isGeneric()) {
+                        anyGeneric = true;
+                    }
+                }
+                if (anyGeneric) {
+                    this.reporter.report("Function '{name}' cannot be overloaded because one "
+                        + "of its declarations is generic; generic functions do not support "
+                        + "overloading.", nameSpan);
+                    continue;
+                }
+                bool duplicate = false;
+                for (long i = 0; i < existing.length(); i++) {
+                    if (types.sameParameterTypes(existing.get(i).signature(), signature)) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate) {
+                    this.reporter.report("Function '{name}' is already declared with the same "
+                        + "parameter types; overloads must differ in parameter count or "
+                        + "types.", nameSpan);
+                    continue;
+                }
+            }
+            this.context.functions().add(new FunctionEntry(signature, modifiers.visibility(),
+                false, false, ""));
+        }
+    }
+
+    private collectExternalFunctions() {
+        for (long n = 0; n < this.externalBlockNodes.length(); n++) {
+            let block = this.externalBlockNodes.get(n);
+            string library = unquote(block.library().text());
+            if (library.length == 0) {
+                this.reporter.report("The library name in 'external from \"\"' cannot be "
+                    + "empty.", block.library().span());
+            }
+            for (long i = 0; i < block.functionsCount(); i++) {
+                this.collectExternalFunction(block.functions(i), library);
+            }
+        }
+    }
+
+    private collectExternalFunction(ExternalFunctionDeclarationNode declaration,
+                                    string library) {
+        string name = declaration.name().text();
+        if (name.length == 0) {
+            return;
+        }
+        Span nameSpan = declaration.name().span();
+        let store = this.resolver.typeStore();
+        Type returnType = store.primitive(PrimitiveKind.Void);
+        let returnClause = declaration.returnType();
+        if (returnClause != null) {
+            returnType = this.resolver.resolveType(returnClause.returnedType());
+        }
+        let parameterList = declaration.parameters();
+        let parameters = new List<Parameter>();
+        for (long i = 0; i < parameterList.parametersCount(); i++) {
+            let parameterNode = parameterList.parameters(i);
+            string parameterName = parameterNode.name().text();
+            Span parameterSpan = parameterNode.span();
+            Type parameterType = store.errorType();
+            let declaredType = parameterNode.declaredType();
+            if (declaredType != null) {
+                parameterType = this.resolver.resolveType(declaredType);
+            }
+            bool isOut = parameterNode.outKeyword() != null;
+            if (isOut && !outParameterAllowed(parameterType)) {
+                this.reporter.report("Out parameter '{parameterName}' of '{name}' has type "
+                    + "'{types.display(parameterType)}'. 'out' parameters must be a primitive "
+                    + "or an external type.", parameterSpan);
+            }
+            if (!(parameterType is ErrorType)) {
+                Type bare = parameterType;
+                if (bare is OptionalType) {
+                    bare = bare.inner();
+                }
+                if (bare is ArrayType) {
+                    if (isOut) {
+                        this.reporter.report("Out parameter '{parameterName}' of '{name}' has "
+                            + "type '{types.display(parameterType)}'. Array 'out' parameters "
+                            + "are not supported.", parameterSpan);
+                    }
+                    if (!abiScalar(bare.element())) {
+                        this.reporter.report("External function parameter '{parameterName}' "
+                            + "of '{name}' has type '{types.display(parameterType)}'. Array "
+                            + "elements passed to C must be a primitive or an external type.",
+                            parameterSpan);
+                    }
+                }
+            }
+            if (parameterNode.defaultValue() != null) {
+                this.reporter.report("External function parameters cannot have default "
+                    + "values.", parameterSpan);
+            }
+            if (parameterNode.thisPrefix() != null) {
+                this.reporter.report("'this.' parameters are not allowed in external "
+                    + "functions.", parameterSpan);
+            }
+            parameters.push(new Parameter(parameterName, parameterType, false, isOut,
+                parameterNode.defaultValue() != null, parameterSpan));
+        }
+        let signature = new Signature(name, parameters.toArray(), returnType, false, [], [],
+            [], declaration.green(), nameSpan);
+        let existing = this.context.functions().entriesNamed(name);
+        if (existing != null && existing.length() > 0) {
+            this.reporter.report("External function '{name}' cannot share its name with "
+                + "another function; C symbols cannot be overloaded.", nameSpan);
+            return;
+        }
+        if (this.nameCollidesWithBinding(name)) {
+            this.reporter.report("Duplicate function name '{name}'.", nameSpan);
+            return;
+        }
+        this.context.functions().add(new FunctionEntry(signature, Visibility.Public, true,
+            false, library));
+    }
+
+    private nameCollidesWithBinding(string name) -> bool {
+        if (this.context.linkTable().binding(name) != null) {
+            return true;
+        }
+        return name == "Error" && this.resolver.errorClass() != null;
+    }
+
+    private checkTests() {
+        if (this.testNodes.length() == 0) {
+            return;
+        }
+        bool inTestFile = endsWith(this.context.module().filePath(), "_test.ens");
+        for (long n = 0; n < this.testNodes.length(); n++) {
+            let node = this.testNodes.get(n);
+            if (!inTestFile) {
+                this.reporter.report("Test declarations are only allowed in files ending "
+                    + "'_test.ens'.", node.testKeyword().span());
+            }
+            let interpolated = node.descriptionNode();
+            if (interpolated != null) {
+                this.reporter.report("A test description must be a plain string without "
+                    + "interpolation.", interpolated.span());
+                continue;
+            }
+            let token = node.descriptionToken();
+            if (token == null || token.kind() != SyntaxKind.StringLiteral) {
+                continue;
+            }
+            string content = unquote(token.text());
+            if (content.length == 0) {
+                this.reporter.report("A test description cannot be empty.", token.span());
+            } else if (hasLineBreak(content)) {
+                this.reporter.report("A test description cannot contain a line break.",
+                    token.span());
+            }
+        }
+    }
+}
+
+// The scalar shapes that can cross the C ABI boundary directly.
+private abiScalar(Type type) -> bool {
+    if (type is ExternalType) {
+        return true;
+    }
+    if (type is PrimitiveType) {
+        return switch (type.kind()) {
+            Decimal, Void -> false,
+            default -> true,
+        };
+    }
+    return false;
+}
+
+private outParameterAllowed(Type type) -> bool {
+    Type bare = type;
+    if (bare is OptionalType) {
+        bare = bare.inner();
+    }
+    return abiScalar(bare);
+}
+
+private unquote(string text) -> string {
+    if (text.length >= 2 && text.substring(0, 1) == "\""
+            && text.substring(text.length - 1, text.length) == "\"") {
+        return text.substring(1, text.length - 1);
+    }
+    return text;
+}
+
+private endsWith(string text, string suffix) -> bool {
+    return text.length >= suffix.length
+        && text.substring(text.length - suffix.length, text.length) == suffix;
+}
+
+// True when the literal's decoded text would contain a line break: a raw one, an \n or \r
+// escape, or a \u escape naming one.
+private hasLineBreak(string content) -> bool {
+    byte[] bytes = content.toBytes();
+    for (long i = 0; i < bytes.length; i++) {
+        if (bytes[i] == '\n' || bytes[i] == '\r') {
+            return true;
+        }
+        if (bytes[i] == '\\' && i + 1 < bytes.length) {
+            byte next = bytes[i + 1];
+            if (next == 'n' || next == 'r') {
+                return true;
+            }
+            if (next == 'u' && i + 5 < bytes.length) {
+                long value = 0;
+                bool valid = true;
+                for (long d = 0; d < 4; d++) {
+                    long digit = hexDigit(bytes[i + 2 + d]);
+                    if (digit < 0) {
+                        valid = false;
+                        break;
+                    }
+                    value = value * 16 + digit;
+                }
+                if (valid && (value == 10 || value == 13)) {
+                    return true;
+                }
+            }
+            i++;
+        }
+    }
+    return false;
+}
+
+private hexDigit(byte value) -> long {
+    if (value >= '0' && value <= '9') {
+        return value - '0';
+    }
+    if (value >= 'a' && value <= 'f') {
+        return value - 'a' + 10;
+    }
+    if (value >= 'A' && value <= 'F') {
+        return value - 'A' + 10;
+    }
+    return -1;
+}

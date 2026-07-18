@@ -1,0 +1,180 @@
+// The whole-program sema pipeline over a built module graph: declare each module, inject the
+// implicit prelude, link, resolve signatures, lay out classes, and run the declaration checks.
+// Each stage completes for every module before the next starts, and each stage's diagnostics
+// stay separate so callers can report them per stage.
+import Source from @ens.frontend.source;
+import @ens.frontend.parser;
+import @ens.frontend.syntax.factory;
+import SourceFileNode from @ens.frontend.syntax.nodes;
+import GraphResult from graph;
+import Module from graph;
+import FileDeclarations from declare;
+import DeclareResult from declare;
+import declare;
+import FileDiagnostic from diagnostics;
+import diagnostics;
+import LinkResult from link;
+import link;
+import ModuleContext from context;
+import ClassItem from context;
+import TypeResolver from resolve;
+import SemaResult from result;
+import signatures;
+import layout;
+import checks;
+import TypeStore from types;
+import ClassType from types;
+import List from @std.collections.list;
+
+public class ProgramAnalysis {
+    private List<ModuleContext> analysisContexts;
+    private TypeStore analysisStore;
+    private ClassType? analysisErrorClass;
+    private FileDiagnostic[] declareStage;
+    private FileDiagnostic[] linkStage;
+    private FileDiagnostic[] signatureStage;
+    private FileDiagnostic[] layoutStage;
+    private FileDiagnostic[] checkStage;
+
+    constructor(List<ModuleContext> contexts, TypeStore store, ClassType? errorClass,
+                FileDiagnostic[] declareDiagnostics, FileDiagnostic[] linkDiagnostics,
+                FileDiagnostic[] signatureDiagnostics, FileDiagnostic[] layoutDiagnostics,
+                FileDiagnostic[] checkDiagnostics) {
+        this.analysisContexts = contexts;
+        this.analysisStore = store;
+        this.analysisErrorClass = errorClass;
+        this.declareStage = declareDiagnostics;
+        this.linkStage = linkDiagnostics;
+        this.signatureStage = signatureDiagnostics;
+        this.layoutStage = layoutDiagnostics;
+        this.checkStage = checkDiagnostics;
+    }
+
+    // One context per analyzed module, the implicit prelude first.
+    contexts() -> List<ModuleContext> {
+        return this.analysisContexts;
+    }
+
+    store() -> TypeStore {
+        return this.analysisStore;
+    }
+
+    errorClass() -> ClassType? {
+        return this.analysisErrorClass;
+    }
+
+    declareDiagnostics() -> FileDiagnostic[] {
+        return this.declareStage;
+    }
+
+    linkDiagnostics() -> FileDiagnostic[] {
+        return this.linkStage;
+    }
+
+    signatureDiagnostics() -> FileDiagnostic[] {
+        return this.signatureStage;
+    }
+
+    layoutDiagnostics() -> FileDiagnostic[] {
+        return this.layoutStage;
+    }
+
+    checkDiagnostics() -> FileDiagnostic[] {
+        return this.checkStage;
+    }
+}
+
+public analyzeProgram(GraphResult graphResult) -> ProgramAnalysis {
+    let modules = new List<Module>();
+    modules.push(preludeModule());
+    for (let loaded in graphResult.modules()) {
+        modules.push(loaded);
+    }
+
+    let roots = new List<SourceFileNode?>();
+    let declarations = new List<FileDeclarations>();
+    let declareDiagnostics = new List<FileDiagnostic>();
+    for (long i = 0; i < modules.length(); i++) {
+        let module = modules.get(i);
+        let root = factory.createRoot(module.parseResult().root());
+        if (root is SourceFileNode) {
+            SourceFileNode file = root;
+            roots.push(file);
+            let declared = declare.declareFile(file, module.filePath());
+            declarations.push(declared.declarations());
+            for (let diagnostic in declared.diagnostics()) {
+                declareDiagnostics.push(diagnostic);
+            }
+        } else {
+            roots.push(null);
+            declarations.push(new FileDeclarations(module.filePath(), [], [], [], [], [], []));
+        }
+    }
+
+    let store = new TypeStore();
+    let linked = link.linkProgram(modules.toArray(), declarations.toArray(), store);
+
+    ClassType? errorClass = null;
+    let preludeError = store.findDeclared(preludePath(), "Error");
+    if (preludeError is ClassType) {
+        errorClass = preludeError;
+    }
+
+    let contexts = new List<ModuleContext>();
+    for (long i = 0; i < modules.length(); i++) {
+        let module = modules.get(i);
+        let table = linked.tableFor(module.canonicalPath());
+        if (table == null) {
+            panic("Internal: the link phase produced no table for "
+                + "'{module.canonicalPath()}'");
+        }
+        let semaResult = new SemaResult();
+        let resolver = new TypeResolver(store, module.canonicalPath(), module.filePath(),
+            table, errorClass, semaResult);
+        contexts.push(new ModuleContext(module, declarations.get(i), roots.get(i), table,
+            resolver, semaResult));
+    }
+
+    let classItems = new List<ClassItem>();
+    let signatureDiagnostics = new List<FileDiagnostic>();
+    for (long i = 0; i < contexts.length(); i++) {
+        for (let diagnostic in signatures.resolveModule(contexts.get(i), classItems)) {
+            signatureDiagnostics.push(diagnostic);
+        }
+    }
+
+    FileDiagnostic[] layoutDiagnostics = layout.layoutProgram(classItems);
+    FileDiagnostic[] checkDiagnostics = checks.checkProgram(contexts);
+
+    return new ProgramAnalysis(contexts, store, errorClass,
+        diagnostics.sorted(declareDiagnostics), linked.diagnostics(),
+        diagnostics.sorted(signatureDiagnostics), layoutDiagnostics, checkDiagnostics);
+}
+
+// The implicit prelude: a hidden module every other module can name 'Error' from without an
+// import. Its path cannot be written in source, so it is reachable only through the resolver.
+private preludePath() -> string {
+    return "$prelude";
+}
+
+private preludeModule() -> Module {
+    let source = new Source(preludePath(), preludeSource());
+    let parsed = parser.parse(source);
+    return new Module(preludePath(), preludePath(), "", source, parsed, [], []);
+}
+
+private preludeSource() -> string {
+    return "class StackFrame \{\n"
+        + "    string function;\n"
+        + "    string file;\n"
+        + "    int line;\n"
+        + "    constructor(this.function, this.file, this.line);\n"
+        + "\}\n"
+        + "class Error \{\n"
+        + "    string message;\n"
+        + "    long[]? frames;\n"
+        + "    constructor(this.message);\n"
+        + "    getStackTrace() -> string \{ return \"\"; \}\n"
+        + "    getStackFrames() -> StackFrame[] \{ return [new StackFrame(\"\", \"\", 0)]; \}\n"
+        + "\}\n";
+}

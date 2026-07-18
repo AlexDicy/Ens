@@ -1,0 +1,252 @@
+import @std.testing;
+import TestFailure from @std.testing;
+import types;
+import Type from types;
+import ClassType from types;
+import InstantiationType from types;
+import OptionalType from types;
+import PrimitiveKind from types;
+import Method from types;
+import StructDeclarationNode from @ens.frontend.syntax.nodes;
+import FieldDeclarationNode from @ens.frontend.syntax.nodes;
+import FakeFileLoader from sema_support;
+import sema_support;
+
+test "signatures fill struct, interface, enum, and function shapes" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/app.ens",
+        "struct Point \{\n"
+        + "    int x;\n"
+        + "    int y = 2;\n"
+        + "    constructor(this.x);\n"
+        + "    scaled(long factor) -> long \{ return factor; \}\n"
+        + "\}\n"
+        + "interface Speaker \{\n"
+        + "    speak(int volume) -> string;\n"
+        + "\}\n"
+        + "enum Color \{ Red, Green \}\n"
+        + "add(int a, int b = 1) -> int \{ return a + b; \}\n"
+        + "add(string a) -> string \{ return a; \}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
+    try sema_support.assertProgramClean(analysis);
+
+    let point = try sema_support.structNamed(analysis, "app", "Point");
+    try testing.assertEqual(point.fields().length(), 2L);
+    try testing.assertTrue(point.fields().get(0).type()
+        == analysis.store().primitive(PrimitiveKind.Int), "x should resolve to the int object");
+    try testing.assertFalse(point.fields().get(0).hasDefault(), "x has no default");
+    try testing.assertTrue(point.fields().get(1).hasDefault(), "y carries its default");
+    try testing.assertEqual(point.methods().length(), 2L);
+    let pointConstructor = point.methods().get(0);
+    try testing.assertTrue(pointConstructor.isConstructor(), "the first method is the constructor");
+    try testing.assertTrue(pointConstructor.signature().parameters()[0].bindsField(),
+        "this.x binds the field");
+    try testing.assertTrue(pointConstructor.signature().parameters()[0].type()
+        == analysis.store().primitive(PrimitiveKind.Int), "this.x takes the field's type");
+    let scaled = point.methods().get(1);
+    try testing.assertEqual(scaled.name(), "scaled");
+    try testing.assertTrue(scaled.signature().returnType()
+        == analysis.store().primitive(PrimitiveKind.Long), "scaled returns long");
+
+    let speaker = try sema_support.interfaceNamed(analysis, "app", "Speaker");
+    try testing.assertEqual(speaker.methods().length(), 1L);
+    try testing.assertTrue(speaker.methods().get(0).isAbstract(),
+        "interface methods are abstract");
+
+    let color = try sema_support.enumNamed(analysis, "app", "Color");
+    try testing.assertEqual(color.memberNames().length, 2L);
+    try testing.assertEqual(color.memberNames()[0], "Red");
+
+    let context = try sema_support.contextFor(analysis, "app");
+    let overloads = context.functions().entriesNamed("add");
+    if (overloads == null) {
+        throw new TestFailure("the function table should list 'add'");
+    }
+    try testing.assertEqual(overloads.length(), 2L);
+    let builtins = context.functions().entriesNamed("print");
+    if (builtins == null) {
+        throw new TestFailure("the function table should list the built-in 'print'");
+    }
+    try testing.assertTrue(builtins.get(0).isBuiltin(), "print is a built-in");
+}
+
+test "class layout flattens inherited fields bases-first across modules" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/app.ens",
+        "import Base from lib;\n"
+        + "class Derived extends Base \{\n"
+        + "    int b;\n"
+        + "    constructor(this.a, this.b);\n"
+        + "\}\n");
+    loader.add("/proj/src/lib.ens",
+        "public class Base \{\n"
+        + "    int a;\n"
+        + "    constructor(this.a);\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
+    try sema_support.assertProgramClean(analysis);
+
+    let base = try sema_support.classNamed(analysis, "lib", "Base");
+    let derived = try sema_support.classNamed(analysis, "app", "Derived");
+    try testing.assertTrue(derived.base() == base, "the base link should bind the lib class");
+    try testing.assertEqual(derived.baseFieldCount(), 1L);
+    try testing.assertEqual(derived.fields().length(), 2L);
+    try testing.assertEqual(derived.fields().get(0).name(), "a");
+    try testing.assertTrue(derived.fields().get(0).definingType() == base,
+        "the inherited field keeps its defining class");
+    try testing.assertTrue(derived.fields().get(1).definingType() == derived,
+        "the own field is defined here");
+    try testing.assertTrue(derived.inheritedMembersKnown(),
+        "a concrete base leaves the chain fully known");
+    try testing.assertEqual(base.directSubclasses().length(), 1L);
+}
+
+test "generic references intern one shell across modules" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/app.ens",
+        "import Box from lib;\n"
+        + "import keeper;\n"
+        + "class Holder \{\n"
+        + "    Box<int>? one;\n"
+        + "    constructor();\n"
+        + "\}\n");
+    loader.add("/proj/src/keeper.ens",
+        "import Box from lib;\n"
+        + "public class Keeper \{\n"
+        + "    Box<int>? two;\n"
+        + "    constructor();\n"
+        + "\}\n");
+    loader.add("/proj/src/lib.ens",
+        "public class Box<T> \{\n"
+        + "    T? value;\n"
+        + "    constructor();\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
+    try sema_support.assertProgramClean(analysis);
+
+    let holder = try sema_support.classNamed(analysis, "app", "Holder");
+    let keeper = try sema_support.classNamed(analysis, "keeper", "Keeper");
+    Type one = holder.fields().get(0).type();
+    Type two = keeper.fields().get(0).type();
+    try testing.assertTrue(one == two, "the same written reference should share one identity");
+    let boxTemplate = try sema_support.classNamed(analysis, "lib", "Box");
+    if (one is OptionalType) {
+        let shell = one.inner();
+        if (shell is InstantiationType) {
+            try testing.assertTrue(shell.template() == boxTemplate,
+                "the shell should defer to the Box template");
+            try testing.assertTrue(shell.arguments()[0]
+                == analysis.store().primitive(PrimitiveKind.Int),
+                "the argument should be the interned int");
+        } else {
+            throw new TestFailure("expected an instantiation shell inside the optional");
+        }
+    } else {
+        throw new TestFailure("expected an optional field type");
+    }
+}
+
+test "type parameters and bounds resolve on the declaration" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/app.ens",
+        "interface Speaker \{\n"
+        + "    speak() -> string;\n"
+        + "\}\n"
+        + "class Pen<T: Speaker> \{\n"
+        + "    T? item;\n"
+        + "    constructor();\n"
+        + "    hold(T item) \{ \}\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
+    try sema_support.assertProgramClean(analysis);
+
+    let pen = try sema_support.classNamed(analysis, "app", "Pen");
+    let speaker = try sema_support.interfaceNamed(analysis, "app", "Speaker");
+    try testing.assertEqual(pen.typeParameterTypes().length, 1L);
+    let parameter = pen.typeParameterTypes()[0];
+    try testing.assertEqual(parameter.name(), "T");
+    try testing.assertEqual(parameter.bounds().length, 1L);
+    try testing.assertTrue(parameter.bounds()[0] == speaker, "the bound binds the interface");
+    let hold = pen.methods().get(1);
+    try testing.assertTrue(hold.signature().parameters()[0].type() == parameter,
+        "a parameter written as T resolves to the interned type parameter");
+}
+
+test "the implicit exception base class resolves without an import" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/app.ens",
+        "class AppError extends Error \{\n"
+        + "    constructor(this.message);\n"
+        + "\}\n"
+        + "interface Failing \{\n"
+        + "    run() throws AppError;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
+    try sema_support.assertProgramClean(analysis);
+
+    let appError = try sema_support.classNamed(analysis, "app", "AppError");
+    try testing.assertTrue(appError.base() == analysis.errorClass(),
+        "'Error' should bind the implicit exception base class");
+    let failing = try sema_support.interfaceNamed(analysis, "app", "Failing");
+    Type[] thrown = failing.methods().get(0).signature().throwsTypes();
+    try testing.assertEqual(thrown.length, 1L);
+    try testing.assertTrue(thrown[0] == appError, "the throws list resolves the named class");
+}
+
+test "compatible overrides, interface implementations, and hash-equals pairs are accepted" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/app.ens",
+        "interface Greeter \{\n"
+        + "    greet() -> string;\n"
+        + "\}\n"
+        + "abstract class Base \{\n"
+        + "    abstract label() -> Base;\n"
+        + "    final id() -> int \{ return 1; \}\n"
+        + "\}\n"
+        + "class Impl extends Base implements Greeter \{\n"
+        + "    constructor();\n"
+        + "    override label() -> Impl \{ return this; \}\n"
+        + "    override greet() -> string \{ return \"hi\"; \}\n"
+        + "\}\n"
+        + "class Key \{\n"
+        + "    int id;\n"
+        + "    constructor(this.id);\n"
+        + "    override hash() -> long \{ return this.id; \}\n"
+        + "    override equals(Key other) -> bool \{ return this.id == other.id; \}\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
+    try sema_support.assertProgramClean(analysis);
+
+    let impl = try sema_support.classNamed(analysis, "app", "Impl");
+    let label = impl.methods().get(1);
+    try testing.assertTrue(label.isOverride(), "label keeps its override marker");
+    try testing.assertTrue(label.signature().returnType() == impl,
+        "the covariant return resolves to the subclass");
+}
+
+test "the side tables record resolved types for reference nodes" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/app.ens",
+        "struct Holder \{\n"
+        + "    int count;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
+    try sema_support.assertProgramClean(analysis);
+
+    let context = try sema_support.contextFor(analysis, "app");
+    let root = context.root();
+    if (root == null) {
+        throw new TestFailure("the module should have a parsed root");
+    }
+    let item = root.items(0);
+    if (item is StructDeclarationNode) {
+        let member = item.body().members(0);
+        if (member is FieldDeclarationNode) {
+            let recorded = context.result().typeOf(member.declaredType().green());
+            try testing.assertTrue(recorded == analysis.store().primitive(PrimitiveKind.Int),
+                "the field's type reference should map to the interned int");
+            return;
+        }
+    }
+    throw new TestFailure("expected a struct with one field");
+}
