@@ -1,0 +1,3591 @@
+// The body phase: every function, method, constructor, destructor, and test body is walked with
+// lexical scopes, and every expression is typed and checked. Cross-module reads are lookups into
+// the frozen declaration universe; the type store is the only shared-mutable point. Nullability
+// diagnostics are deferred behind the nullability module until narrowing exists.
+import @ens.frontend.syntax.nodes;
+import SourceFileNode from @ens.frontend.syntax.nodes;
+import StructDeclarationNode from @ens.frontend.syntax.nodes;
+import ClassDeclarationNode from @ens.frontend.syntax.nodes;
+import TestDeclarationNode from @ens.frontend.syntax.nodes;
+import FunctionDeclarationNode from @ens.frontend.syntax.nodes;
+import FieldDeclarationNode from @ens.frontend.syntax.nodes;
+import MemberListNode from @ens.frontend.syntax.nodes;
+import ParameterListNode from @ens.frontend.syntax.nodes;
+import CatchClauseNode from @ens.frontend.syntax.nodes;
+import BlockNode from @ens.frontend.syntax.nodes;
+import Statement from @ens.frontend.syntax.nodes;
+import Expression from @ens.frontend.syntax.nodes;
+import VariableDeclarationNode from @ens.frontend.syntax.nodes;
+import IfStatementNode from @ens.frontend.syntax.nodes;
+import WhileStatementNode from @ens.frontend.syntax.nodes;
+import ForStatementNode from @ens.frontend.syntax.nodes;
+import ForEachStatementNode from @ens.frontend.syntax.nodes;
+import BreakStatementNode from @ens.frontend.syntax.nodes;
+import ContinueStatementNode from @ens.frontend.syntax.nodes;
+import ReturnStatementNode from @ens.frontend.syntax.nodes;
+import ExpressionStatementNode from @ens.frontend.syntax.nodes;
+import ThrowStatementNode from @ens.frontend.syntax.nodes;
+import RethrowStatementNode from @ens.frontend.syntax.nodes;
+import SwitchStatementNode from @ens.frontend.syntax.nodes;
+import SwitchExpressionNode from @ens.frontend.syntax.nodes;
+import SwitchArm from @ens.frontend.syntax.nodes;
+import ValueArmNode from @ens.frontend.syntax.nodes;
+import TypeArmNode from @ens.frontend.syntax.nodes;
+import DefaultArmNode from @ens.frontend.syntax.nodes;
+import ArmBody from @ens.frontend.syntax.nodes;
+import LiteralExpressionNode from @ens.frontend.syntax.nodes;
+import IdentifierExpressionNode from @ens.frontend.syntax.nodes;
+import ThisExpressionNode from @ens.frontend.syntax.nodes;
+import SuperExpressionNode from @ens.frontend.syntax.nodes;
+import BinaryExpressionNode from @ens.frontend.syntax.nodes;
+import PrefixExpressionNode from @ens.frontend.syntax.nodes;
+import PostfixExpressionNode from @ens.frontend.syntax.nodes;
+import CallExpressionNode from @ens.frontend.syntax.nodes;
+import ArgumentListNode from @ens.frontend.syntax.nodes;
+import Argument from @ens.frontend.syntax.nodes;
+import OutArgumentNode from @ens.frontend.syntax.nodes;
+import NamedArgumentNode from @ens.frontend.syntax.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.nodes;
+import SafeMemberExpressionNode from @ens.frontend.syntax.nodes;
+import SubscriptExpressionNode from @ens.frontend.syntax.nodes;
+import SafeSubscriptExpressionNode from @ens.frontend.syntax.nodes;
+import CastExpressionNode from @ens.frontend.syntax.nodes;
+import CheckedCastExpressionNode from @ens.frontend.syntax.nodes;
+import TypeTestExpressionNode from @ens.frontend.syntax.nodes;
+import AssignmentExpressionNode from @ens.frontend.syntax.nodes;
+import TernaryExpressionNode from @ens.frontend.syntax.nodes;
+import NullCoalesceExpressionNode from @ens.frontend.syntax.nodes;
+import NewExpressionNode from @ens.frontend.syntax.nodes;
+import ParenthesizedExpressionNode from @ens.frontend.syntax.nodes;
+import ArrayLiteralExpressionNode from @ens.frontend.syntax.nodes;
+import InterpolatedStringExpressionNode from @ens.frontend.syntax.nodes;
+import TryExpressionNode from @ens.frontend.syntax.nodes;
+import ErrorExpressionNode from @ens.frontend.syntax.nodes;
+import NamedTypeNode from @ens.frontend.syntax.nodes;
+import OptionalTypeNode from @ens.frontend.syntax.nodes;
+import SyntaxKind from @ens.frontend.syntax.kind;
+import GreenNode from @ens.frontend.syntax.green;
+import GreenToken from @ens.frontend.syntax.green;
+import Span from @ens.frontend.source;
+import FileDiagnostic from diagnostics;
+import Reporter from diagnostics;
+import diagnostics;
+import ModuleContext from context;
+import FunctionEntry from context;
+import ImportedType from link;
+import ImportedNamespace from link;
+import TypeResolver from resolve;
+import SemaResult from result;
+import Scope from scopes;
+import LocalBinding from scopes;
+import BindingKind from scopes;
+import calls;
+import ArgumentValue from calls;
+import CallShape from calls;
+import CallCandidate from calls;
+import CallResolution from calls;
+import convert;
+import literalvalues;
+import members;
+import nullability;
+import types;
+import Type from types;
+import ErrorType from types;
+import NullType from types;
+import StringType from types;
+import OptionalType from types;
+import ArrayType from types;
+import PrimitiveType from types;
+import PrimitiveKind from types;
+import DeclaredType from types;
+import ClassType from types;
+import StructType from types;
+import InterfaceType from types;
+import EnumType from types;
+import ExternalType from types;
+import InstantiationType from types;
+import TypeParamType from types;
+import TypeStore from types;
+import Field from types;
+import Method from types;
+import Parameter from types;
+import Signature from types;
+import Visibility from types;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+import Set from @std.collections.set;
+
+// Checks every body of every module. Modules see each other only through the type store, the
+// link tables, and the other modules' function tables (for namespace-qualified calls).
+public checkBodies(List<ModuleContext> contexts) -> FileDiagnostic[] {
+    let collected = new List<FileDiagnostic>();
+    let contextsByPath = new Map<string, ModuleContext>();
+    for (long i = 0; i < contexts.length(); i++) {
+        contextsByPath.set(contexts.get(i).module().canonicalPath(), contexts.get(i));
+    }
+    for (long i = 0; i < contexts.length(); i++) {
+        let checker = new BodyChecker(contexts.get(i), contextsByPath, collected);
+        checker.run();
+        for (let diagnostic in contexts.get(i).resolver().takeDiagnostics()) {
+            collected.push(diagnostic);
+        }
+    }
+    return diagnostics.sorted(collected);
+}
+
+// What an unqualified name means at a use site, innermost scope first.
+private sealed abstract class NameResolution {
+}
+
+private class LocalName extends NameResolution {
+    LocalBinding binding;
+
+    constructor(this.binding);
+}
+
+private class FunctionName extends NameResolution {
+    List<FunctionEntry> entries;
+
+    constructor(this.entries);
+}
+
+private class TypeName extends NameResolution {
+    DeclaredType target;
+
+    constructor(this.target);
+}
+
+private class NamespaceName extends NameResolution {
+    string targetModulePath;
+
+    constructor(this.targetModulePath);
+}
+
+// What a member name means on a receiver type.
+private sealed abstract class MemberLookup {
+}
+
+private class FieldMember extends MemberLookup {
+    Field field;
+
+    constructor(this.field);
+}
+
+private class MethodMember extends MemberLookup {
+    List<Method> candidates;
+
+    constructor(this.candidates);
+}
+
+private class MissingMember extends MemberLookup {
+    constructor();
+}
+
+// A member the narrowing milestone would resolve through the value's dynamic type: missing on
+// an interface receiver, or declared differently by several subclasses. It types as the error
+// type with no diagnostic until narrowing exists.
+private class DeferredMember extends MemberLookup {
+    constructor();
+}
+
+private class BodyChecker {
+    private ModuleContext context;
+    private Map<string, ModuleContext> contextsByPath;
+    private TypeResolver resolver;
+    private TypeStore store;
+    private SemaResult result;
+    private Reporter reporter;
+    private string modulePath;
+
+    private Scope? scope;
+    private Scope? parameterScope;
+    private Type? thisType;
+    private Type? currentReturnType;
+    private bool inConstructor;
+    private bool sawSuperCall;
+    private long loopDepth;
+
+    private Set<GreenNode> fillProvenNews;
+    private Map<GreenNode, string> arrayNewNames;
+
+    constructor(ModuleContext context, Map<string, ModuleContext> contextsByPath,
+                List<FileDiagnostic> collected) {
+        this.context = context;
+        this.contextsByPath = contextsByPath;
+        this.resolver = context.resolver();
+        this.store = context.resolver().typeStore();
+        this.result = context.result();
+        this.reporter = new Reporter(context.module().filePath(), collected);
+        this.modulePath = context.module().canonicalPath();
+        this.inConstructor = false;
+        this.sawSuperCall = false;
+        this.loopDepth = 0;
+        this.fillProvenNews = new Set<GreenNode>();
+        this.arrayNewNames = new Map<GreenNode, string>();
+    }
+
+    run() {
+        let root = this.context.root();
+        if (root == null) {
+            return;
+        }
+        for (long i = 0; i < root.itemsCount(); i++) {
+            switch (root.items(i)) {
+                is FunctionDeclarationNode declaration -> {
+                    this.checkTopLevelFunction(declaration);
+                },
+                is StructDeclarationNode declaration -> {
+                    this.checkStructBodies(declaration);
+                },
+                is ClassDeclarationNode declaration -> {
+                    this.checkClassBodies(declaration);
+                },
+                is TestDeclarationNode declaration -> {
+                    this.checkTestBody(declaration);
+                },
+                default -> { },
+            }
+        }
+    }
+
+    // ---- Declaration walking ----
+
+    private checkTopLevelFunction(FunctionDeclarationNode node) {
+        let entries = this.context.functions().all();
+        for (long i = 0; i < entries.length(); i++) {
+            let entry = entries.get(i);
+            if (entry.isExternal() || entry.isBuiltin()) {
+                continue;
+            }
+            if (entry.signature().declaration() == node.green()) {
+                this.checkParameterDefaults(entry.signature(), node);
+                this.checkCallableBody(entry.signature(), null, null, node);
+                return;
+            }
+        }
+    }
+
+    private checkStructBodies(StructDeclarationNode node) {
+        let found = this.store.findDeclared(this.modulePath, node.name().text());
+        if (found is StructType && found.declaration() == node.green()) {
+            this.checkFieldDefaults(found, node.body());
+            this.checkMemberBodies(found, found.methods(), node.body());
+        }
+    }
+
+    private checkClassBodies(ClassDeclarationNode node) {
+        let found = this.store.findDeclared(this.modulePath, node.name().text());
+        if (found is ClassType && found.declaration() == node.green()) {
+            this.checkFieldDefaults(found, node.body());
+            this.checkMemberBodies(found, found.methods(), node.body());
+        }
+    }
+
+    private checkMemberBodies(DeclaredType owner, List<Method> methods, MemberListNode body) {
+        for (long i = 0; i < body.membersCount(); i++) {
+            let member = body.members(i);
+            if (member is FunctionDeclarationNode) {
+                let method = methodDeclaredBy(methods, member.green());
+                if (method != null) {
+                    this.checkParameterDefaults(method.signature(), member);
+                    this.checkCallableBody(method.signature(), owner, method, member);
+                }
+            }
+        }
+    }
+
+    private checkTestBody(TestDeclarationNode node) {
+        this.parameterScope = new Scope(null);
+        this.scope = this.parameterScope;
+        this.thisType = null;
+        this.currentReturnType = this.store.primitive(PrimitiveKind.Void);
+        this.inConstructor = false;
+        this.sawSuperCall = false;
+        this.loopDepth = 0;
+        this.enterScope();
+        this.walkBlock(node.body());
+        this.leaveScope();
+        this.scope = null;
+        this.parameterScope = null;
+        this.currentReturnType = null;
+    }
+
+    // Checks one callable's body: the parameter scope (with 'this' for methods), a child scope
+    // for the body's locals, and the catch clauses as siblings that cannot see those locals.
+    private checkCallableBody(Signature signature, Type? receiver, Method? method,
+                              FunctionDeclarationNode node) {
+        long pushed = this.pushCallableTypeParameters(signature, receiver);
+        this.parameterScope = new Scope(null);
+        this.scope = this.parameterScope;
+        this.thisType = receiver;
+        this.currentReturnType = signature.returnType();
+        this.inConstructor = method != null && method.isConstructor();
+        this.sawSuperCall = false;
+        this.loopDepth = 0;
+        if (receiver != null) {
+            this.result.setReceiver(node.green(), receiver);
+        }
+
+        Parameter[] parameters = signature.parameters();
+        let parameterList = node.parameters();
+        for (long i = 0; i < parameters.length; i++) {
+            let parameter = parameters[i];
+            let binding = new LocalBinding(parameter.name(), parameter.type(),
+                BindingKind.Parameter, false, parameter.span());
+            let owner = this.parameterScope;
+            if (owner != null && !owner.define(binding)) {
+                this.reporter.report("Duplicate parameter name '{parameter.name()}'",
+                    parameter.span());
+            }
+            if (i < parameterList.parametersCount()) {
+                this.result.setBinding(parameterList.parameters(i).green(), binding);
+            }
+        }
+
+        let body = node.body();
+        if (body != null) {
+            this.enterScope();
+            this.walkBlock(body);
+            this.leaveScope();
+        }
+
+        this.checkConstructorChainsToBase(signature, node);
+
+        for (long i = 0; i < node.catchClausesCount(); i++) {
+            this.checkCatchClause(node.catchClauses(i));
+        }
+
+        this.scope = null;
+        this.parameterScope = null;
+        this.thisType = null;
+        this.currentReturnType = null;
+        this.inConstructor = false;
+        this.resolver.popTypeParameters(pushed);
+    }
+
+    private pushCallableTypeParameters(Signature signature, Type? receiver) -> long {
+        long pushed = 0;
+        if (signature.isGeneric()) {
+            this.resolver.pushTypeParameters(signature.typeParameters());
+            pushed = pushed + signature.typeParameters().length;
+        }
+        if (receiver is DeclaredType && receiver.isGeneric()) {
+            this.resolver.pushTypeParameters(receiver.typeParameterTypes());
+            pushed = pushed + receiver.typeParameterTypes().length;
+        }
+        return pushed;
+    }
+
+    // A constructor must chain to its base when the base has constructors but none that is
+    // callable with zero arguments.
+    private checkConstructorChainsToBase(Signature signature, FunctionDeclarationNode node) {
+        if (!this.inConstructor || this.sawSuperCall) {
+            return;
+        }
+        let receiver = this.thisType;
+        if (receiver == null) {
+            return;
+        }
+        let current = types.authorityOf(receiver);
+        if (current is ClassType) {
+            let base = current.base();
+            if (base == null) {
+                return;
+            }
+            let baseAuthority = types.authorityOf(base);
+            if (baseAuthority == null) {
+                return;
+            }
+            bool anyConstructor = false;
+            bool anyZeroArgument = false;
+            let baseMethods = types.methodsOf(base);
+            if (baseMethods == null) {
+                return;
+            }
+            for (long i = 0; i < baseMethods.length(); i++) {
+                let candidate = baseMethods.get(i);
+                if (!candidate.isConstructor()) {
+                    continue;
+                }
+                anyConstructor = true;
+                if (calls.requiredArgumentCount(candidate.signature()) == 0) {
+                    anyZeroArgument = true;
+                }
+            }
+            if (anyConstructor && !anyZeroArgument) {
+                this.reporter.report("Constructor of '{current.name()}' must call 'super(...)' "
+                    + "because base class '{baseAuthority.name()}' has no zero-argument "
+                    + "constructor", signature.nameSpan());
+            }
+        }
+    }
+
+    // Catch clauses scope against the parameter scope, so body locals stay invisible. The
+    // caught-type rules belong to the exception milestone; here the binding resolves and the
+    // body walks like any other.
+    private checkCatchClause(CatchClauseNode clause) {
+        this.scope = new Scope(this.parameterScope);
+        Type caught = this.resolver.resolveType(clause.caughtType());
+        let binding = new LocalBinding(clause.name().text(), caught, BindingKind.Variable,
+            false, clause.name().span());
+        let owner = this.scope;
+        if (owner != null) {
+            owner.define(binding);
+        }
+        this.result.setBinding(clause.green(), binding);
+        this.enterScope();
+        this.walkBlock(clause.body());
+        this.leaveScope();
+        this.scope = this.parameterScope;
+    }
+
+    // Field defaults type against the declared field type. Fields declared earlier are in
+    // scope as siblings; anything else resolves at module scope.
+    private checkFieldDefaults(DeclaredType owner, MemberListNode body) {
+        let fields = types.fieldsOf(owner);
+        this.parameterScope = null;
+        this.scope = new Scope(null);
+        this.thisType = null;
+        this.currentReturnType = null;
+        for (long i = 0; i < body.membersCount(); i++) {
+            let member = body.members(i);
+            if (member is FieldDeclarationNode) {
+                let field = members.findField(fields, member.name().text());
+                Type expected = this.store.errorType();
+                if (field != null) {
+                    expected = field.type();
+                }
+                let defaultValue = member.defaultValue();
+                if (defaultValue != null) {
+                    let value = defaultValue.value();
+                    Type actual = this.analyzeExpressionAdapt(value, expected);
+                    if (!(expected is ErrorType) && !(actual is ErrorType)
+                            && !nullability.isAssignable(expected, actual)) {
+                        this.reporter.report("Default value for field '{member.name().text()}': "
+                            + "expected '{types.display(expected)}', got "
+                            + "'{types.display(actual)}'", value.span());
+                    }
+                }
+                let binding = new LocalBinding(member.name().text(), expected,
+                    BindingKind.Variable, false, member.name().span());
+                let sink = this.scope;
+                if (sink != null) {
+                    sink.define(binding);
+                }
+            }
+        }
+        this.scope = null;
+    }
+
+    // Parameter defaults type against the declared parameter type, at module scope: neither
+    // the other parameters nor 'this' are visible inside a default.
+    private checkParameterDefaults(Signature signature, FunctionDeclarationNode node) {
+        this.parameterScope = null;
+        this.scope = new Scope(null);
+        this.thisType = null;
+        this.currentReturnType = null;
+        Parameter[] parameters = signature.parameters();
+        let parameterList = node.parameters();
+        for (long i = 0; i < parameterList.parametersCount(); i++) {
+            let parameterNode = parameterList.parameters(i);
+            let defaultValue = parameterNode.defaultValue();
+            if (defaultValue == null) {
+                continue;
+            }
+            Type expected = this.store.errorType();
+            if (i < parameters.length) {
+                expected = parameters[i].type();
+            }
+            let value = defaultValue.value();
+            Type actual = this.analyzeExpressionAdapt(value, expected);
+            if (!(expected is ErrorType) && !(actual is ErrorType)
+                    && !nullability.isAssignable(expected, actual)) {
+                this.reporter.report("Default value for parameter "
+                    + "'{parameterNode.name().text()}': expected '{types.display(expected)}', "
+                    + "got '{types.display(actual)}'", value.span());
+            }
+        }
+        this.scope = null;
+    }
+
+    // ---- Scopes and names ----
+
+    private enterScope() {
+        this.scope = new Scope(this.scope);
+    }
+
+    private leaveScope() {
+        let current = this.scope;
+        if (current != null) {
+            this.scope = current.parent();
+        }
+    }
+
+    private lookupBinding(string name) -> LocalBinding? {
+        let current = this.scope;
+        if (current == null) {
+            return null;
+        }
+        return current.lookup(name);
+    }
+
+    // Unqualified name resolution: local scopes innermost-first, then the module's functions,
+    // then the file's imports, then the implicit exception base class.
+    private resolveName(string name) -> NameResolution? {
+        let binding = this.lookupBinding(name);
+        if (binding != null) {
+            return new LocalName(binding);
+        }
+        let entries = this.context.functions().entriesNamed(name);
+        if (entries != null && entries.length() > 0) {
+            return new FunctionName(entries);
+        }
+        let imported = this.context.linkTable().binding(name);
+        if (imported is ImportedType) {
+            return new TypeName(imported.target());
+        }
+        if (imported is ImportedNamespace) {
+            return new NamespaceName(imported.modulePath());
+        }
+        if (name == "Error") {
+            let errorClass = this.resolver.errorClass();
+            if (errorClass != null) {
+                return new TypeName(errorClass);
+            }
+        }
+        return null;
+    }
+
+    // ---- Statements ----
+
+    private walkBlock(BlockNode block) {
+        for (long i = 0; i < block.statementsCount(); i++) {
+            this.noteArrayFillLoop(block, i);
+            this.walkStatement(block.statements(i));
+        }
+    }
+
+    private walkScopedBlock(BlockNode block) {
+        this.enterScope();
+        this.walkBlock(block);
+        this.leaveScope();
+    }
+
+    private walkStatement(Statement statement) {
+        switch (statement) {
+            is BlockNode block -> {
+                this.walkScopedBlock(block);
+            },
+            is VariableDeclarationNode declaration -> {
+                this.checkVariableDeclaration(declaration);
+            },
+            is IfStatementNode conditional -> {
+                this.checkIfStatement(conditional);
+            },
+            is WhileStatementNode loop -> {
+                this.checkWhileStatement(loop);
+            },
+            is ForStatementNode loop -> {
+                this.checkForStatement(loop);
+            },
+            is ForEachStatementNode loop -> {
+                this.checkForEachStatement(loop);
+            },
+            is BreakStatementNode ignored -> { },
+            is ContinueStatementNode ignored -> { },
+            is ReturnStatementNode returned -> {
+                this.checkReturnStatement(returned);
+            },
+            is ExpressionStatementNode expression -> {
+                this.analyzeExpression(expression.expression());
+            },
+            is ThrowStatementNode thrown -> {
+                this.analyzeExpression(thrown.value());
+            },
+            is RethrowStatementNode ignored -> { },
+            is SwitchStatementNode switched -> {
+                this.checkSwitchArms(switched.scrutinee(), armsOfStatement(switched),
+                    switched.switchKeyword().span(), false);
+            },
+            default -> { },
+        }
+    }
+
+    private checkVariableDeclaration(VariableDeclarationNode node) {
+        string name = node.name().text();
+        bool isConst = false;
+        let modifier = node.modifier();
+        if (modifier != null && modifier.kind() == SyntaxKind.ConstKeyword) {
+            isConst = true;
+        }
+        let declaredType = node.declaredType();
+        Type bindingType = this.store.errorType();
+        if (declaredType == null) {
+            bindingType = this.checkInferredDeclaration(node, name);
+        } else {
+            bindingType = this.checkTypedDeclaration(node, name, declaredType, isConst);
+        }
+        let binding = new LocalBinding(name, bindingType, BindingKind.Variable, isConst,
+            node.name().span());
+        this.defineLocal(binding, node.name().span());
+        this.result.setBinding(node.green(), binding);
+    }
+
+    private checkInferredDeclaration(VariableDeclarationNode node, string name) -> Type {
+        let initializer = node.initializer();
+        if (initializer == null) {
+            this.reporter.report("Variable '{name}' needs an initializer", node.name().span());
+            return this.store.errorType();
+        }
+        Type initType = this.analyzeExpression(initializer.value());
+        if (initType is NullType) {
+            this.reporter.report("Cannot infer type from 'null' alone - declare the variable "
+                + "with an explicit type, e.g. 'T? {name} = null;'", node.name().span());
+            return this.store.errorType();
+        }
+        return initType;
+    }
+
+    private checkTypedDeclaration(VariableDeclarationNode node, string name,
+                                  nodes.Type declaredType, bool isConst) -> Type {
+        Type declared = this.resolver.resolveType(declaredType);
+        if (types.isVoidType(declared)) {
+            this.reporter.report("Variable cannot have void type", declaredType.span());
+            declared = this.store.errorType();
+        }
+        let initializer = node.initializer();
+        if (initializer != null) {
+            Type initType = this.analyzeExpressionAdapt(initializer.value(), declared);
+            if (!(declared is ErrorType) && !(initType is ErrorType)
+                    && !nullability.isAssignable(declared, initType)) {
+                this.reporter.report("Cannot assign value of type '{types.display(initType)}' "
+                    + "to variable of type '{types.display(declared)}'",
+                    initializer.value().span());
+            }
+            return declared;
+        }
+        if (isConst && !(declared is ErrorType)) {
+            this.reporter.report("Constant '{name}' must be initialized", node.name().span());
+            return declared;
+        }
+        if (!(declared is ErrorType) && !convert.isDefaultable(declared)
+                && !convert.containsTypeParam(declared)) {
+            this.reporter.report("Variable '{name}' has non-nullable type "
+                + "'{types.display(declared)}' but no initializer. Provide a value, or make "
+                + "the type nullable ('{types.display(declared)}?').", node.name().span());
+        }
+        return declared;
+    }
+
+    // A local may shadow anything except a sibling local or, at the body's top level, a
+    // parameter of the enclosing callable.
+    private defineLocal(LocalBinding binding, Span span) {
+        let current = this.scope;
+        if (current == null) {
+            return;
+        }
+        bool collides = !current.define(binding);
+        let parameters = this.parameterScope;
+        if (!collides && parameters != null && current.parent() == parameters
+                && parameters.lookupLocal(binding.name()) != null) {
+            collides = true;
+        }
+        if (collides) {
+            this.reporter.report("Variable '{binding.name()}' is already defined in this scope",
+                span);
+        }
+    }
+
+    private checkIfStatement(IfStatementNode node) {
+        Type condition = this.analyzeExpression(node.condition());
+        this.checkConditionIsBool(condition, "If condition", node.condition().span());
+        this.walkScopedBlock(node.thenBranch());
+        let elseClause = node.elseClause();
+        if (elseClause != null) {
+            switch (elseClause.body()) {
+                is BlockNode block -> {
+                    this.walkScopedBlock(block);
+                },
+                is IfStatementNode chained -> {
+                    this.checkIfStatement(chained);
+                },
+                default -> { },
+            }
+        }
+    }
+
+    private checkWhileStatement(WhileStatementNode node) {
+        Type condition = this.analyzeExpression(node.condition());
+        this.checkConditionIsBool(condition, "While condition", node.condition().span());
+        this.loopDepth++;
+        this.walkScopedBlock(node.body());
+        this.loopDepth--;
+    }
+
+    private checkForStatement(ForStatementNode node) {
+        this.enterScope();
+        let initializer = node.initializer();
+        if (initializer != null) {
+            switch (initializer) {
+                is VariableDeclarationNode declaration -> {
+                    this.checkVariableDeclaration(declaration);
+                },
+                is ExpressionStatementNode expression -> {
+                    this.analyzeExpression(expression.expression());
+                },
+                default -> { },
+            }
+        }
+        let condition = node.condition();
+        if (condition != null) {
+            Type conditionType = this.analyzeExpression(condition);
+            this.checkConditionIsBool(conditionType, "For condition", condition.span());
+        }
+        this.loopDepth++;
+        this.enterScope();
+        this.walkBlock(node.body());
+        let update = node.update();
+        if (update != null) {
+            this.analyzeExpression(update);
+        }
+        this.leaveScope();
+        this.loopDepth--;
+        this.leaveScope();
+    }
+
+    // The element binding takes its annotated type when one is written and the iterable's
+    // element type otherwise. Whether the expression is actually iterable is the statement
+    // milestone's rule; the element type resolves silently here so the body types against it.
+    private checkForEachStatement(ForEachStatementNode node) {
+        this.enterScope();
+        Type iterable = this.analyzeExpression(node.iterable());
+        Type element = this.iterableElementType(iterable);
+        Type bindingType = element;
+        let declaredType = node.declaredType();
+        if (declaredType != null) {
+            bindingType = this.resolver.resolveType(declaredType);
+        }
+        bool isConst = false;
+        let keyword = node.letKeyword();
+        if (keyword != null && keyword.kind() == SyntaxKind.ConstKeyword) {
+            isConst = true;
+        }
+        let binding = new LocalBinding(node.name().text(), bindingType, BindingKind.Variable,
+            isConst, node.name().span());
+        let current = this.scope;
+        if (current != null) {
+            current.define(binding);
+        }
+        this.result.setBinding(node.green(), binding);
+        this.loopDepth++;
+        this.walkScopedBlock(node.body());
+        this.loopDepth--;
+        this.leaveScope();
+    }
+
+    // The element type a value yields in a for-in loop: an array's element, or the type
+    // argument of the 'Iterable<T>' instantiation the value's class implements.
+    private iterableElementType(Type iterable) -> Type {
+        Type core = nullability.valueOf(iterable);
+        if (core is ArrayType) {
+            return core.element();
+        }
+        let direct = iterableArgument(core);
+        if (direct != null) {
+            return direct;
+        }
+        Type? current = core;
+        let seen = new Set<Type>();
+        while (current != null && seen.add(current)) {
+            for (let implemented in types.interfacesOf(current)) {
+                let found = iterableArgument(implemented);
+                if (found != null) {
+                    return found;
+                }
+            }
+            current = types.baseOf(current);
+        }
+        return this.store.errorType();
+    }
+
+    private checkReturnStatement(ReturnStatementNode node) {
+        let expected = this.currentReturnType;
+        if (expected == null) {
+            this.reporter.report("'return' outside of a function", node.returnKeyword().span());
+            let ignored = node.value();
+            if (ignored != null) {
+                this.analyzeExpression(ignored);
+            }
+            return;
+        }
+        let value = node.value();
+        if (value == null) {
+            if (!types.isVoidType(expected)) {
+                this.reporter.report("Function returns '{types.display(expected)}', but "
+                    + "'return' has no value", node.returnKeyword().span());
+            }
+            return;
+        }
+        Type actual = this.analyzeExpressionAdapt(value, expected);
+        if (types.isVoidType(expected)) {
+            this.reporter.report("Function returns 'void' but 'return' has a value",
+                value.span());
+            return;
+        }
+        if (!nullability.isAssignable(expected, actual)) {
+            this.reporter.report("Cannot return value of type '{types.display(actual)}' from "
+                + "function returning '{types.display(expected)}'", value.span());
+        }
+    }
+
+    private checkConditionIsBool(Type condition, string what, Span span) {
+        Type core = nullability.valueOf(condition);
+        if (!(core is ErrorType) && !convert.isBoolType(core)) {
+            this.reporter.report("{what} must be 'bool', got '{types.display(condition)}'",
+                span);
+        }
+    }
+
+    // ---- Expressions ----
+
+    private analyzeExpression(Expression node) -> Type {
+        Type analyzed = this.analyzeExpressionInner(node);
+        this.result.setType(node.green(), analyzed);
+        return analyzed;
+    }
+
+    private analyzeExpressionInner(Expression node) -> Type {
+        switch (node) {
+            is LiteralExpressionNode literal -> {
+                return this.analyzeLiteral(literal);
+            },
+            is IdentifierExpressionNode identifier -> {
+                return this.analyzeIdentifier(identifier);
+            },
+            is ThisExpressionNode keyword -> {
+                return this.analyzeThis(keyword);
+            },
+            is SuperExpressionNode keyword -> {
+                return this.analyzeSuper(keyword);
+            },
+            is BinaryExpressionNode binary -> {
+                return this.analyzeBinary(binary);
+            },
+            is PrefixExpressionNode prefix -> {
+                return this.analyzePrefix(prefix);
+            },
+            is PostfixExpressionNode postfix -> {
+                return this.analyzePostfix(postfix);
+            },
+            is CallExpressionNode call -> {
+                return this.analyzeCall(call);
+            },
+            is MemberExpressionNode member -> {
+                return this.analyzeMemberValue(member);
+            },
+            is SafeMemberExpressionNode member -> {
+                return this.analyzeSafeMemberValue(member);
+            },
+            is SubscriptExpressionNode subscript -> {
+                return this.analyzeSubscript(subscript);
+            },
+            is SafeSubscriptExpressionNode subscript -> {
+                return this.analyzeSafeSubscript(subscript);
+            },
+            is CastExpressionNode cast -> {
+                return this.analyzeCast(cast);
+            },
+            is CheckedCastExpressionNode cast -> {
+                return this.analyzeCheckedCast(cast);
+            },
+            is TypeTestExpressionNode test -> {
+                return this.analyzeTypeTest(test);
+            },
+            is AssignmentExpressionNode assignment -> {
+                return this.analyzeAssignment(assignment);
+            },
+            is TernaryExpressionNode ternary -> {
+                return this.analyzeTernary(ternary);
+            },
+            is NullCoalesceExpressionNode coalesce -> {
+                return this.analyzeNullCoalesce(coalesce);
+            },
+            is NewExpressionNode created -> {
+                return this.analyzeNew(created);
+            },
+            is ParenthesizedExpressionNode parenthesized -> {
+                return this.analyzeExpression(parenthesized.inner());
+            },
+            is ArrayLiteralExpressionNode literal -> {
+                return this.analyzeArrayLiteral(literal);
+            },
+            is InterpolatedStringExpressionNode interpolated -> {
+                return this.analyzeInterpolatedString(interpolated);
+            },
+            is TryExpressionNode tried -> {
+                return this.analyzeTry(tried);
+            },
+            is SwitchExpressionNode switched -> {
+                return this.checkSwitchArms(switched.scrutinee(), armsOfExpression(switched),
+                    switched.switchKeyword().span(), true);
+            },
+            is ErrorExpressionNode ignored -> {
+                return this.store.errorType();
+            },
+        }
+    }
+
+    // Analyzes toward a target type, adapting untyped integer and char literals to it and, for
+    // array literals, typing the elements against the target's element type.
+    private analyzeExpressionAdapt(Expression node, Type target) -> Type {
+        if (node is ArrayLiteralExpressionNode) {
+            Type adapted = this.analyzeArrayLiteralAdapt(node, target);
+            this.result.setType(node.green(), adapted);
+            return adapted;
+        }
+        Type analyzed = this.analyzeExpression(node);
+        if (target is ErrorType || analyzed is ErrorType) {
+            return analyzed;
+        }
+        this.adaptIntegerLiteral(node, target);
+        this.adaptCharLiteral(node, target);
+        let updated = this.result.typeOf(node.green());
+        if (updated != null) {
+            return updated;
+        }
+        return analyzed;
+    }
+
+    // Retypes an untyped integer literal to the integer target its value fits, and rejects the
+    // literal outright when the value does not fit.
+    private adaptIntegerLiteral(Expression node, Type target) {
+        if (target is PrimitiveType) {
+            this.adaptIntegerLiteralTo(node, target);
+        }
+    }
+
+    private adaptIntegerLiteralTo(Expression node, PrimitiveType target) {
+        if (!convert.isIntegerType(target)) {
+            return;
+        }
+        let literal = intLiteralOf(node);
+        if (literal == null) {
+            return;
+        }
+        let magnitude = literalvalues.integerMagnitude(literal.value().text());
+        if (magnitude == null) {
+            return;
+        }
+        bool negative = isNegativeLiteral(node);
+        if (!literalvalues.magnitudeFits(negative, magnitude, target.kind())) {
+            string sign = "";
+            if (negative) {
+                sign = "-";
+            }
+            this.reporter.report("Literal {sign}{literal.value().text()} does not fit in "
+                + "'{types.display(target)}' (range "
+                + "{literalvalues.integerRange(target.kind())})", node.span());
+            this.result.setType(node.green(), this.store.errorType());
+            return;
+        }
+        this.result.setType(node.green(), target);
+        this.result.setType(literal.green(), target);
+    }
+
+    private adaptCharLiteral(Expression node, Type target) {
+        if (target is PrimitiveType) {
+            this.adaptCharLiteralTo(node, target);
+        }
+    }
+
+    private adaptCharLiteralTo(Expression node, PrimitiveType target) {
+        if (!convert.isIntegerType(target) || target.kind() == PrimitiveKind.Char) {
+            return;
+        }
+        if (node is LiteralExpressionNode) {
+            if (node.value().kind() != SyntaxKind.CharLiteral) {
+                return;
+            }
+            ulong codepoint = literalvalues.charCodepoint(node.value().text());
+            if (!literalvalues.magnitudeFits(false, codepoint, target.kind())) {
+                this.reporter.report("Character literal does not fit in "
+                    + "'{types.display(target)}' (range "
+                    + "{literalvalues.integerRange(target.kind())})", node.span());
+                this.result.setType(node.green(), this.store.errorType());
+                return;
+            }
+            this.result.setType(node.green(), target);
+        }
+    }
+
+    private analyzeLiteral(LiteralExpressionNode node) -> Type {
+        return switch (node.value().kind()) {
+            IntLiteral -> this.store.primitive(PrimitiveKind.Int),
+            LongLiteral -> this.store.primitive(PrimitiveKind.Long),
+            FloatLiteral -> this.store.primitive(PrimitiveKind.Float),
+            DoubleLiteral -> this.store.primitive(PrimitiveKind.Double),
+            StringLiteral -> this.store.stringType(),
+            CharLiteral -> this.store.primitive(PrimitiveKind.Char),
+            TrueKeyword, FalseKeyword -> this.store.primitive(PrimitiveKind.Bool),
+            NullKeyword -> this.store.nullType(),
+            default -> this.store.errorType(),
+        };
+    }
+
+    private analyzeIdentifier(IdentifierExpressionNode node) -> Type {
+        string name = node.name().text();
+        if (name.length == 0) {
+            return this.store.errorType();
+        }
+        let resolution = this.resolveName(name);
+        if (resolution == null) {
+            this.reporter.report("Undefined name '{name}'", node.name().span());
+            return this.store.errorType();
+        }
+        switch (resolution) {
+            is LocalName local -> {
+                this.result.setBinding(node.green(), local.binding);
+                return local.binding.type();
+            },
+            is FunctionName ignored -> {
+                return this.store.errorType();
+            },
+            is TypeName named -> {
+                return named.target;
+            },
+            is NamespaceName ignored -> {
+                return this.store.errorType();
+            },
+        }
+    }
+
+    private analyzeThis(ThisExpressionNode node) -> Type {
+        let receiver = this.thisType;
+        if (receiver == null) {
+            this.reporter.report("'this' is only valid inside a method",
+                node.thisKeyword().span());
+            return this.store.errorType();
+        }
+        return receiver;
+    }
+
+    private analyzeSuper(SuperExpressionNode node) -> Type {
+        let receiver = this.thisType;
+        if (receiver == null) {
+            this.reporter.report("'super' is only valid inside a method",
+                node.superKeyword().span());
+            return this.store.errorType();
+        }
+        let base = types.baseOf(receiver);
+        if (base == null) {
+            let authority = types.authorityOf(receiver);
+            string shown = types.display(receiver);
+            if (authority != null) {
+                shown = authority.name();
+            }
+            this.reporter.report("'super' cannot be used in '{shown}' because it has no base "
+                + "class", node.superKeyword().span());
+            return this.store.errorType();
+        }
+        return base;
+    }
+
+    private analyzeBinary(BinaryExpressionNode node) -> Type {
+        SyntaxKind operator = node.operator().kind();
+        Type left = this.analyzeExpression(node.left());
+        Type right = this.analyzeExpression(node.right());
+        if (operator == SyntaxKind.AmpersandAmpersand || operator == SyntaxKind.PipePipe) {
+            if (left is ErrorType || right is ErrorType) {
+                return this.store.errorType();
+            }
+            if (!convert.isBoolType(nullability.valueOf(left))
+                    || !convert.isBoolType(nullability.valueOf(right))) {
+                this.reporter.report("Logical operator requires bool operands, got "
+                    + "'{types.display(left)}' and '{types.display(right)}'", node.span());
+            }
+            return this.store.primitive(PrimitiveKind.Bool);
+        }
+        if (left is ErrorType || right is ErrorType) {
+            return this.store.errorType();
+        }
+        switch (operator) {
+            Plus, Minus, Star, Slash, Percent -> {
+                return this.analyzeArithmetic(node, operator, left, right);
+            },
+            EqualsEquals, NotEquals -> {
+                return this.analyzeEquality(node, left, right);
+            },
+            Less, Greater, LessEquals, GreaterEquals -> {
+                return this.analyzeComparison(node, left, right);
+            },
+            Ampersand, Pipe, Caret, LessLess, GreaterGreater, GreaterGreaterGreater -> {
+                Type leftCore = nullability.valueOf(left);
+                Type rightCore = nullability.valueOf(right);
+                if (!convert.isIntegerType(leftCore) || !convert.isIntegerType(rightCore)
+                        || leftCore != rightCore) {
+                    this.reporter.report("Bitwise operator requires matching integer operands, "
+                        + "got '{types.display(left)}' and '{types.display(right)}'",
+                        node.span());
+                }
+                return leftCore;
+            },
+            default -> {
+                this.reporter.report("Unsupported binary operator", node.operator().span());
+                return this.store.errorType();
+            },
+        }
+    }
+
+    // Adapts an untyped literal on either side toward the other operand's type, then re-reads
+    // both sides.
+    private adaptOperands(BinaryExpressionNode node, Type left, Type right) -> Type[] {
+        this.adaptIntegerLiteral(node.left(), right);
+        this.adaptIntegerLiteral(node.right(), left);
+        Type adaptedLeft = left;
+        Type adaptedRight = right;
+        let updatedLeft = this.result.typeOf(node.left().green());
+        if (updatedLeft != null) {
+            adaptedLeft = updatedLeft;
+        }
+        let updatedRight = this.result.typeOf(node.right().green());
+        if (updatedRight != null) {
+            adaptedRight = updatedRight;
+        }
+        return [adaptedLeft, adaptedRight];
+    }
+
+    private analyzeArithmetic(BinaryExpressionNode node, SyntaxKind operator, Type left,
+                              Type right) -> Type {
+        Type leftCore = nullability.valueOf(left);
+        Type rightCore = nullability.valueOf(right);
+        if (operator == SyntaxKind.Plus
+                && (leftCore is StringType || rightCore is StringType)) {
+            if (isStringable(leftCore) && isStringable(rightCore)) {
+                return this.store.stringType();
+            }
+            Type other = leftCore;
+            if (leftCore is StringType) {
+                other = rightCore;
+            }
+            this.reporter.report("Cannot concatenate a value of type '{types.display(other)}' "
+                + "onto a string; only string, integer, and bool values are supported.",
+                node.span());
+            return this.store.errorType();
+        }
+        if (!convert.isNumericType(leftCore) || !convert.isNumericType(rightCore)) {
+            this.reporter.report("Operator requires numeric operands, got "
+                + "'{types.display(left)}' and '{types.display(right)}'", node.span());
+            return this.store.errorType();
+        }
+        Type[] adapted = this.adaptOperands(node, leftCore, rightCore);
+        let common = convert.numericCommonType(nullability.valueOf(adapted[0]),
+            nullability.valueOf(adapted[1]));
+        if (common == null) {
+            this.reporter.report("Operands must be the same type, got "
+                + "'{types.display(adapted[0])}' and '{types.display(adapted[1])}'",
+                node.span());
+            return this.store.errorType();
+        }
+        return common;
+    }
+
+    private analyzeEquality(BinaryExpressionNode node, Type left, Type right) -> Type {
+        Type[] adapted = this.adaptOperands(node, left, right);
+        Type leftSide = adapted[0];
+        Type rightSide = adapted[1];
+        // A comparison against 'null' is a presence test on the declared storage type; without
+        // narrowing the analyzed type is already the declared one.
+        if (!(leftSide is NullType) && !(rightSide is NullType)) {
+            if (!nullability.isAssignable(leftSide, rightSide)
+                    && !nullability.isAssignable(rightSide, leftSide)) {
+                this.reporter.report("Cannot compare '{types.display(leftSide)}' and "
+                    + "'{types.display(rightSide)}'", node.span());
+            }
+        }
+        return this.store.primitive(PrimitiveKind.Bool);
+    }
+
+    private analyzeComparison(BinaryExpressionNode node, Type left, Type right) -> Type {
+        Type leftCore = nullability.valueOf(left);
+        Type rightCore = nullability.valueOf(right);
+        if (!convert.isNumericType(leftCore) || !convert.isNumericType(rightCore)) {
+            this.reporter.report("Comparison requires numeric operands, got "
+                + "'{types.display(left)}' and '{types.display(right)}'", node.span());
+            return this.store.primitive(PrimitiveKind.Bool);
+        }
+        Type[] adapted = this.adaptOperands(node, leftCore, rightCore);
+        if (convert.numericCommonType(nullability.valueOf(adapted[0]),
+                nullability.valueOf(adapted[1])) == null) {
+            this.reporter.report("Comparison requires matching numeric operands, got "
+                + "'{types.display(adapted[0])}' and '{types.display(adapted[1])}'",
+                node.span());
+        }
+        return this.store.primitive(PrimitiveKind.Bool);
+    }
+
+    private analyzePrefix(PrefixExpressionNode node) -> Type {
+        Type operand = this.analyzeExpression(node.operand());
+        if (operand is ErrorType) {
+            return this.store.errorType();
+        }
+        Type core = nullability.valueOf(operand);
+        switch (node.operator().kind()) {
+            Minus, Plus -> {
+                if (!convert.isNumericType(core)) {
+                    this.reporter.report("Unary '-' requires numeric, got "
+                        + "'{types.display(operand)}'", node.span());
+                    return this.store.errorType();
+                }
+                return core;
+            },
+            Exclamation -> {
+                if (!convert.isBoolType(core)) {
+                    this.reporter.report("Unary '!' requires bool, got "
+                        + "'{types.display(operand)}'", node.span());
+                    return this.store.errorType();
+                }
+                return core;
+            },
+            PlusPlus, MinusMinus -> {
+                return this.analyzeIncrement(node.span(), node.operand(), core,
+                    node.operator().kind() == SyntaxKind.PlusPlus, true);
+            },
+            default -> {
+                this.reporter.report("Unsupported unary operator", node.operator().span());
+                return this.store.errorType();
+            },
+        }
+    }
+
+    private analyzePostfix(PostfixExpressionNode node) -> Type {
+        Type operand = this.analyzeExpression(node.operand());
+        if (operand is ErrorType) {
+            return this.store.errorType();
+        }
+        return this.analyzeIncrement(node.span(), node.operand(), nullability.valueOf(operand),
+            node.operator().kind() == SyntaxKind.PlusPlus, false);
+    }
+
+    private analyzeIncrement(Span span, Expression operand, Type operandType, bool isIncrement,
+                             bool isPrefix) -> Type {
+        string operator = "--";
+        if (isIncrement) {
+            operator = "++";
+        }
+        string example = "count{operator}";
+        if (isPrefix) {
+            example = "{operator}count";
+        }
+        if (!convert.isNumericType(operandType)) {
+            this.reporter.report("The '{operator}' operator works only on numbers, so it "
+                + "cannot be applied to a value of type '{types.display(operandType)}'; use "
+                + "it on an integer or floating-point variable, for example '{example}'.",
+                span);
+            return operandType;
+        }
+        if (!this.isLValue(operand)) {
+            this.reporter.report("The '{operator}' operator needs a variable to change, for "
+                + "example '{example}'; it cannot be applied to something that is not a "
+                + "variable, field, or array element.", span);
+            return operandType;
+        }
+        if (operand is IdentifierExpressionNode) {
+            let binding = this.result.bindingOf(operand.green());
+            if (binding != null && binding.isConst()) {
+                this.reporter.report("The '{operator}' operator cannot change "
+                    + "'{binding.name()}' because it is declared as constant; use 'let' "
+                    + "instead of 'const' if it needs to change.", span);
+            }
+        }
+        return operandType;
+    }
+
+    // A member write through a class reference mutates the heap object, so any object works; a
+    // struct member write needs an addressable struct, so the object must itself be an lvalue.
+    private isLValue(Expression node) -> bool {
+        switch (node) {
+            is IdentifierExpressionNode ignored -> {
+                return true;
+            },
+            is SubscriptExpressionNode ignored -> {
+                return true;
+            },
+            is ThisExpressionNode ignored -> {
+                return true;
+            },
+            is MemberExpressionNode member -> {
+                let objectType = this.result.typeOf(member.object().green());
+                if (objectType != null && isStructValue(objectType)) {
+                    return this.isLValue(member.object());
+                }
+                return true;
+            },
+            default -> {
+                return false;
+            },
+        }
+    }
+
+    private analyzeAssignment(AssignmentExpressionNode node) -> Type {
+        Type targetType = this.analyzeExpression(node.target());
+        if (!this.isLValue(node.target())) {
+            this.reporter.report("Left side of assignment must be an assignable expression",
+                node.span());
+        }
+        Type assignTarget = this.declaredTargetType(node.target(), targetType);
+        Type valueType = this.analyzeExpressionAdapt(node.value(), assignTarget);
+        if (!(assignTarget is ErrorType) && !(valueType is ErrorType)
+                && !nullability.isAssignable(assignTarget, valueType)) {
+            this.reporter.report("Cannot assign '{types.display(valueType)}' to "
+                + "'{types.display(assignTarget)}'", node.span());
+        }
+        if (assignTarget != targetType) {
+            this.result.setType(node.target().green(), assignTarget);
+        }
+        return assignTarget;
+    }
+
+    // The declared type of the written slot: the binding's, field's, or element's own type.
+    private declaredTargetType(Expression target, Type analyzed) -> Type {
+        switch (target) {
+            is IdentifierExpressionNode identifier -> {
+                let binding = this.result.bindingOf(identifier.green());
+                if (binding == null) {
+                    return analyzed;
+                }
+                if (binding.isConst()) {
+                    this.reporter.report("Cannot assign a new value to '{binding.name()}' "
+                        + "because it is declared as constant", identifier.span());
+                }
+                return binding.type();
+            },
+            is MemberExpressionNode member -> {
+                let objectType = this.result.typeOf(member.object().green());
+                if (objectType != null) {
+                    Type core = nullability.valueOf(objectType);
+                    let field = members.findField(types.fieldsOf(core),
+                        member.member().text());
+                    if (field != null) {
+                        return field.type();
+                    }
+                }
+                return analyzed;
+            },
+            is SubscriptExpressionNode subscript -> {
+                let objectType = this.result.typeOf(subscript.object().green());
+                if (objectType != null) {
+                    Type core = nullability.valueOf(objectType);
+                    if (core is ArrayType) {
+                        return core.element();
+                    }
+                }
+                return analyzed;
+            },
+            default -> {
+                return analyzed;
+            },
+        }
+    }
+
+    private analyzeTernary(TernaryExpressionNode node) -> Type {
+        Type condition = this.analyzeExpression(node.condition());
+        Type thenType = this.analyzeExpression(node.thenValue());
+        Type elseType = this.analyzeExpression(node.elseValue());
+        this.checkConditionIsBool(condition, "Ternary condition", node.condition().span());
+        if (thenType is ErrorType || elseType is ErrorType) {
+            return this.store.errorType();
+        }
+        this.adaptIntegerLiteral(node.thenValue(), elseType);
+        this.adaptIntegerLiteral(node.elseValue(), thenType);
+        let updatedThen = this.result.typeOf(node.thenValue().green());
+        if (updatedThen != null) {
+            thenType = updatedThen;
+        }
+        let updatedElse = this.result.typeOf(node.elseValue().green());
+        if (updatedElse != null) {
+            elseType = updatedElse;
+        }
+        let unified = convert.unifyValueTypes(thenType, elseType, this.store);
+        if (unified != null) {
+            return unified;
+        }
+        this.reporter.report("Ternary branches have incompatible types "
+            + "'{types.display(thenType)}' and '{types.display(elseType)}'", node.span());
+        return this.store.errorType();
+    }
+
+    private analyzeNullCoalesce(NullCoalesceExpressionNode node) -> Type {
+        Type left = this.analyzeExpression(node.left());
+        Type right = this.analyzeExpression(node.right());
+        if (left is ErrorType || right is ErrorType) {
+            return this.store.errorType();
+        }
+        // A non-nullable left side is deferred to the nullability milestone; it reads as its
+        // own type here.
+        if (left is OptionalType) {
+            Type unwrapped = left.inner();
+            if (nullability.isAssignable(unwrapped, right)) {
+                return unwrapped;
+            }
+            if (nullability.isAssignable(left, right)) {
+                return left;
+            }
+            this.reporter.report("Right of '??' has type '{types.display(right)}' which is "
+                + "not compatible with '{types.display(unwrapped)}'", node.span());
+            return this.store.errorType();
+        }
+        return nullability.coalesceOperand(left);
+    }
+
+    private analyzeCast(CastExpressionNode node) -> Type {
+        Type source = this.analyzeExpression(node.value());
+        Type target = this.resolver.resolveType(node.target());
+        if (source is ErrorType || target is ErrorType) {
+            return this.store.errorType();
+        }
+        Type core = nullability.valueOf(source);
+        if (!convert.isNumericType(core) || !convert.isNumericType(target)) {
+            this.reporter.report("Cannot cast '{types.display(source)}' to "
+                + "'{types.display(target)}'; 'as' only supports numeric conversions.",
+                node.span());
+            return this.store.errorType();
+        }
+        return target;
+    }
+
+    private analyzeTypeTest(TypeTestExpressionNode node) -> Type {
+        Type source = this.analyzeExpression(node.value());
+        Type target = this.resolver.resolveType(node.target());
+        if (source is ErrorType || target is ErrorType) {
+            return this.store.errorType();
+        }
+        if (!this.checkClassTypeTest(source, target, false, node.span())) {
+            return this.store.errorType();
+        }
+        return this.store.primitive(PrimitiveKind.Bool);
+    }
+
+    private analyzeCheckedCast(CheckedCastExpressionNode node) -> Type {
+        Type source = this.analyzeExpression(node.value());
+        Type target = this.resolver.resolveType(node.target());
+        if (source is ErrorType || target is ErrorType) {
+            return this.store.errorType();
+        }
+        if (!this.checkClassTypeTest(source, target, true, node.span())) {
+            return this.store.errorType();
+        }
+        return this.store.optionalOf(target);
+    }
+
+    // The 'is' and 'as?' rule set: the target must be a plain class or interface, and the pair
+    // must be able to succeed without always succeeding. Open-typed operands defer to each
+    // instantiation.
+    private checkClassTypeTest(Type source, Type target, bool isCast, Span span) -> bool {
+        string operator = "is";
+        if (isCast) {
+            operator = "as?";
+        }
+        if (target is OptionalType) {
+            string inner = types.display(target.inner());
+            if (isCast) {
+                this.reporter.report("The target of 'as?' cannot be nullable; 'as? {inner}' "
+                    + "already produces '{inner}?'. Drop the '?' on the target.", span);
+            } else {
+                this.reporter.report("The target of 'is' cannot be nullable; 'is' is never "
+                    + "true for null. Test against '{inner}' instead.", span);
+            }
+            return false;
+        }
+        if (target is TypeParamType) {
+            this.reporter.report("The target of '{operator}' must be a concrete class; "
+                + "'{types.display(target)}' is a type parameter.", span);
+            return false;
+        }
+        if (!types.isClassLike(target)) {
+            this.reporter.report("The target of '{operator}' must be a class or an interface, "
+                + "got '{types.display(target)}'.", span);
+            return false;
+        }
+        Type sourceCore = convert.bareOf(source);
+        if (convert.containsTypeParam(source) || convert.containsTypeParam(target)) {
+            return true;
+        }
+        if (!types.isClassLike(sourceCore)) {
+            string action = "tested.";
+            if (isCast) {
+                action = "cast.";
+            }
+            this.reporter.report("Cannot use '{operator}' on a value of type "
+                + "'{types.display(source)}'; only class values can be {action}", span);
+            return false;
+        }
+        if (types.isSubclassOrConforms(sourceCore, target)) {
+            if (!isCast && source is OptionalType) {
+                return true;
+            }
+            if (isCast) {
+                this.reporter.report("'as? {types.display(target)}' is not needed here: a "
+                    + "value of type '{types.display(source)}' always converts to "
+                    + "'{types.display(target)}?'. Use the value directly.", span);
+            } else {
+                this.reporter.report("A value of type '{types.display(source)}' is always a "
+                    + "'{types.display(target)}'; this 'is' test would always be true. "
+                    + "Remove it.", span);
+            }
+            return false;
+        }
+        if (types.isInterfaceLike(sourceCore)) {
+            return true;
+        }
+        if (types.isInterfaceLike(target)) {
+            if (isFinalClass(sourceCore)) {
+                string outcome = "This 'is' test would always be false.";
+                if (isCast) {
+                    outcome = "This 'as?' cast would always be null.";
+                }
+                this.reporter.report("A value of type '{types.display(source)}' can never be "
+                    + "a '{types.display(target)}': '{types.display(sourceCore)}' is 'final' "
+                    + "and does not implement it. {outcome} Remove it.", span);
+                return false;
+            }
+            return true;
+        }
+        if (!types.isSubclassOf(target, sourceCore)) {
+            string outcome = "this 'is' test would always be false.";
+            if (isCast) {
+                outcome = "this 'as?' cast would always be null.";
+            }
+            this.reporter.report("A value of type '{types.display(source)}' can never be a "
+                + "'{types.display(target)}'; {outcome} Remove it.", span);
+            return false;
+        }
+        return true;
+    }
+
+    private analyzeSubscript(SubscriptExpressionNode node) -> Type {
+        Type objectType = this.analyzeExpression(node.object());
+        Type indexType = this.analyzeExpression(node.index());
+        if (objectType is ErrorType) {
+            return this.store.errorType();
+        }
+        Type core = nullability.valueOf(objectType);
+        if (core is ArrayType) {
+            this.checkIndexIsInteger(indexType, node.index().span());
+            return core.element();
+        }
+        this.reporter.report("Cannot index '{types.display(objectType)}'; only arrays "
+            + "support [] indexing.", node.span());
+        return this.store.errorType();
+    }
+
+    private analyzeSafeSubscript(SafeSubscriptExpressionNode node) -> Type {
+        Type objectType = this.analyzeExpression(node.object());
+        Type indexType = this.analyzeExpression(node.index());
+        if (objectType is ErrorType) {
+            return this.store.errorType();
+        }
+        Type inner = nullability.safeReceiverInner(objectType);
+        if (inner is ArrayType) {
+            this.checkIndexIsInteger(indexType, node.index().span());
+            return this.store.optionalOf(inner.element());
+        }
+        if (objectType is OptionalType) {
+            this.reporter.report("The value on the left of '?[' has type "
+                + "'{types.display(objectType)}', which is not a nullable array.",
+                node.span());
+        }
+        return this.store.errorType();
+    }
+
+    private checkIndexIsInteger(Type indexType, Span span) {
+        Type core = nullability.valueOf(indexType);
+        if (!(core is ErrorType) && !convert.isIntegerType(core)) {
+            this.reporter.report("Array index must be an integer, got "
+                + "'{types.display(indexType)}'", span);
+        }
+    }
+
+    private analyzeInterpolatedString(InterpolatedStringExpressionNode node) -> Type {
+        this.checkInterpolationHole(node.firstHole());
+        for (long i = 0; i < node.continuationsCount(); i++) {
+            this.checkInterpolationHole(node.continuations(i).hole());
+        }
+        return this.store.stringType();
+    }
+
+    // A hole must be a string, integer, bool, or enum value; a hole mentioning a type
+    // parameter is checked per instantiation.
+    private checkInterpolationHole(Expression hole) {
+        Type analyzed = this.analyzeExpression(hole);
+        if (analyzed is ErrorType) {
+            return;
+        }
+        Type core = nullability.valueOf(analyzed);
+        if (core is TypeParamType) {
+            return;
+        }
+        if (convert.isIntegerType(core) || convert.isBoolType(core) || core is StringType
+                || convert.isEnumLike(core)) {
+            return;
+        }
+        this.reporter.report("Cannot interpolate a value of type '{types.display(analyzed)}'; "
+            + "only string, integer, bool, and enum values are supported here. Convert it "
+            + "with '.toString()' first.", hole.span());
+    }
+
+    private analyzeTry(TryExpressionNode node) -> Type {
+        if (!(node.operand() is CallExpressionNode)) {
+            this.reporter.report("'try' must directly prefix a single call, e.g. 'try f(x)' "
+                + "or 'try obj.m()'.", node.span());
+        }
+        return this.analyzeExpression(node.operand());
+    }
+
+    // Array literal with no target type: the first element's type drives the rest.
+    private analyzeArrayLiteral(ArrayLiteralExpressionNode node) -> Type {
+        if (node.elementsCount() == 0) {
+            this.reporter.report("Cannot infer element type from an empty array literal; "
+                + "annotate the type, e.g. 'int[] xs = [];'.", node.span());
+            return this.store.errorType();
+        }
+        Type elementType = this.analyzeExpression(node.elements(0));
+        if (elementType is ErrorType) {
+            for (long i = 1; i < node.elementsCount(); i++) {
+                this.analyzeExpression(node.elements(i));
+            }
+            return this.store.errorType();
+        }
+        if (elementType is NullType) {
+            this.reporter.report("Cannot infer element type from 'null' alone; annotate the "
+                + "array's element type, e.g. 'T?[] xs = [null, ...];'.",
+                node.elements(0).span());
+            for (long i = 1; i < node.elementsCount(); i++) {
+                this.analyzeExpression(node.elements(i));
+            }
+            return this.store.errorType();
+        }
+        for (long i = 1; i < node.elementsCount(); i++) {
+            Type actual = this.analyzeExpressionAdapt(node.elements(i), elementType);
+            if (actual is ErrorType) {
+                continue;
+            }
+            if (!nullability.isAssignable(elementType, actual)) {
+                this.reporter.report("Element {i + 1}: expected "
+                    + "'{types.display(elementType)}', got '{types.display(actual)}'.",
+                    node.elements(i).span());
+            }
+        }
+        return this.store.arrayOf(elementType);
+    }
+
+    // Array literal with a target type: each element adapts to the target's element type. The
+    // target may be 'T[]' or 'T[]?'; the optional wrap applies at the use site.
+    private analyzeArrayLiteralAdapt(ArrayLiteralExpressionNode node, Type target) -> Type {
+        if (target is ErrorType) {
+            return this.analyzeArrayLiteral(node);
+        }
+        Type arrayType = convert.bareOf(target);
+        if (!(arrayType is ArrayType)) {
+            this.reporter.report("Cannot assign array literal to non-array type "
+                + "'{types.display(target)}'.", node.span());
+            for (long i = 0; i < node.elementsCount(); i++) {
+                this.analyzeExpression(node.elements(i));
+            }
+            return this.store.errorType();
+        }
+        Type elementType = this.store.errorType();
+        if (arrayType is ArrayType) {
+            elementType = arrayType.element();
+        }
+        for (long i = 0; i < node.elementsCount(); i++) {
+            Type actual = this.analyzeExpressionAdapt(node.elements(i), elementType);
+            if (actual is ErrorType) {
+                continue;
+            }
+            if (!nullability.isAssignable(elementType, actual)) {
+                this.reporter.report("Element {i + 1}: expected "
+                    + "'{types.display(elementType)}', got '{types.display(actual)}'.",
+                    node.elements(i).span());
+            }
+        }
+        return arrayType;
+    }
+
+    // ---- Member access ----
+
+    // The type whose members a receiver exposes: an optional reads as its inner type (the
+    // "may be null" diagnostic is the narrowing milestone's), and a bounded type parameter
+    // exposes the members of its bounds, the first bound declaring the member winning.
+    private memberReceiverCore(Type analyzed, string memberName) -> Type {
+        Type core = nullability.valueOf(analyzed);
+        if (core is TypeParamType) {
+            Type[] bounds = core.bounds();
+            for (let bound in bounds) {
+                if (!(this.lookupMember(bound, memberName) is MissingMember)) {
+                    return bound;
+                }
+            }
+            if (bounds.length > 0) {
+                return bounds[0];
+            }
+        }
+        return core;
+    }
+
+    private lookupMember(Type record, string name) -> MemberLookup {
+        let field = members.findField(types.fieldsOf(record), name);
+        if (field != null) {
+            return new FieldMember(field);
+        }
+        let candidates = methodCandidates(record, name);
+        if (candidates.length() > 0) {
+            return new MethodMember(candidates);
+        }
+        // A member missing on the declared type but reachable through flow narrowing - on a
+        // subclass, or on any implementer of an interface - resolves permissively until
+        // narrowing exists.
+        if (types.isInterfaceLike(record)) {
+            return new DeferredMember();
+        }
+        let narrowed = subclassMember(record, name);
+        if (narrowed != null) {
+            return narrowed;
+        }
+        return new MissingMember();
+    }
+
+    // Private members are visible inside the declaring type; protected ones in a subclass
+    // method or anywhere in the module that declares the type.
+    private isAccessAllowed(Visibility visibility, Type definingType) -> bool {
+        if (visibility == Visibility.Public) {
+            return true;
+        }
+        let defining = types.authorityOf(definingType);
+        if (defining == null) {
+            return true;
+        }
+        DeclaredType? current = null;
+        let receiver = this.thisType;
+        if (receiver != null) {
+            current = types.authorityOf(receiver);
+        }
+        if (visibility == Visibility.Private) {
+            return current != null && current == defining;
+        }
+        if (current != null && types.isSubclassOf(current, defining)) {
+            return true;
+        }
+        return defining.modulePath() == this.modulePath;
+    }
+
+    private checkMemberAccess(string memberName, Visibility visibility, Type definingType,
+                              Span span) {
+        if (this.isAccessAllowed(visibility, definingType)) {
+            return;
+        }
+        string owner = types.display(definingType);
+        let authority = types.authorityOf(definingType);
+        if (authority != null) {
+            owner = authority.name();
+        }
+        if (visibility == Visibility.Private) {
+            this.reporter.report("'{memberName}' is private to class '{owner}' and can only "
+                + "be accessed from inside '{owner}'", span);
+        } else {
+            this.reporter.report("'{memberName}' is protected to class '{owner}' and can only "
+                + "be accessed from inside '{owner}', a subclass of it, or the file where "
+                + "'{owner}' is declared", span);
+        }
+    }
+
+    private analyzeMemberValue(MemberExpressionNode node) -> Type {
+        let object = node.object();
+        string name = node.member().text();
+        if (object is IdentifierExpressionNode) {
+            string objectName = object.name().text();
+            let resolution = this.resolveName(objectName);
+            if (resolution is NamespaceName) {
+                return this.analyzeNamespaceMemberType(resolution.targetModulePath, name,
+                    node.member().span());
+            }
+            let enumType = this.enumTypeNamed(objectName, resolution);
+            if (enumType != null) {
+                this.result.setType(object.green(), enumType);
+                long ordinal = enumOrdinal(enumType, name);
+                if (ordinal >= 0) {
+                    this.result.setEnumConstant(node.green(), ordinal);
+                    return enumType;
+                }
+                this.reporter.report("'{name}' is not a member of enum '{enumType.name()}'",
+                    node.member().span());
+                return this.store.errorType();
+            }
+        }
+        Type objectType = this.analyzeExpression(object);
+        if (objectType is ErrorType) {
+            return this.store.errorType();
+        }
+        Type core = this.memberReceiverCore(objectType, name);
+        if (core is ArrayType) {
+            if (name == "length") {
+                return this.store.primitive(PrimitiveKind.Long);
+            }
+            this.reporter.report("Type '{types.display(core)}' has no member '{name}'; "
+                + "arrays only have 'length'.", node.member().span());
+            return this.store.errorType();
+        }
+        if (core is StringType) {
+            if (name == "length") {
+                return this.store.primitive(PrimitiveKind.Long);
+            }
+            this.reporter.report("Type 'string' has no member '{name}'.",
+                node.member().span());
+            return this.store.errorType();
+        }
+        if (!isRecordLike(core)) {
+            this.reporter.report("Cannot read a member of '{types.display(core)}' because it "
+                + "has no members.", node.span());
+            return this.store.errorType();
+        }
+        switch (this.lookupMember(core, name)) {
+            is FieldMember found -> {
+                this.checkMemberAccess(name, found.field.visibility(),
+                    found.field.definingType(), node.member().span());
+                return found.field.type();
+            },
+            is MethodMember found -> {
+                if (found.candidates.length() <= 1) {
+                    let single = found.candidates.get(0);
+                    this.checkMemberAccess(name, single.visibility(), single.definingType(),
+                        node.member().span());
+                }
+                this.result.setMethod(node.green(), found.candidates.get(0));
+                return this.store.errorType();
+            },
+            is MissingMember ignored -> {
+                this.reporter.report("No field or method '{name}' on type "
+                    + "'{types.display(core)}'", node.member().span());
+                return this.store.errorType();
+            },
+            is DeferredMember ignored -> {
+                return this.store.errorType();
+            },
+        }
+    }
+
+    private analyzeSafeMemberValue(SafeMemberExpressionNode node) -> Type {
+        Type objectType = this.analyzeExpression(node.object());
+        if (objectType is ErrorType) {
+            return this.store.errorType();
+        }
+        Type inner = nullability.safeReceiverInner(objectType);
+        string name = node.member().text();
+        if ((inner is StringType || inner is ArrayType) && name == "length") {
+            return this.store.optionalOf(this.store.primitive(PrimitiveKind.Long));
+        }
+        if (!isRecordLike(inner)) {
+            this.reporter.report("The value on the left of '?.' has type "
+                + "'{types.display(inner)}?', which has no members to access.", node.span());
+            return this.store.errorType();
+        }
+        switch (this.lookupMember(inner, name)) {
+            is FieldMember found -> {
+                this.checkMemberAccess(name, found.field.visibility(),
+                    found.field.definingType(), node.member().span());
+                return this.store.optionalOf(found.field.type());
+            },
+            is MethodMember found -> {
+                if (found.candidates.length() <= 1) {
+                    let single = found.candidates.get(0);
+                    this.checkMemberAccess(name, single.visibility(), single.definingType(),
+                        node.member().span());
+                }
+                this.result.setMethod(node.green(), found.candidates.get(0));
+                return this.store.errorType();
+            },
+            is MissingMember ignored -> {
+                this.reporter.report("No field or method named '{name}' on "
+                    + "'{types.display(inner)}'.", node.member().span());
+                return this.store.errorType();
+            },
+            is DeferredMember ignored -> {
+                return this.store.errorType();
+            },
+        }
+    }
+
+    private analyzeNamespaceMemberType(string targetPath, string name, Span span) -> Type {
+        let found = this.store.findDeclared(targetPath, name);
+        if (found == null) {
+            this.reporter.report("Module '{targetPath}' has no '{name}'", span);
+            return this.store.errorType();
+        }
+        if (found.visibility() != Visibility.Public) {
+            this.reporter.report("Type '{name}' is not public in module '{targetPath}' and "
+                + "cannot be used from another module.", span);
+            return this.store.errorType();
+        }
+        return found;
+    }
+
+    private enumTypeNamed(string objectName, NameResolution? resolution) -> EnumType? {
+        if (resolution == null) {
+            let found = this.store.findDeclared(this.modulePath, objectName);
+            if (found is EnumType) {
+                return found;
+            }
+            return null;
+        }
+        if (resolution is TypeName) {
+            let target = resolution.target;
+            if (target is EnumType) {
+                return target;
+            }
+        }
+        return null;
+    }
+
+    // ---- Call shapes and argument checking ----
+
+    private buildCallShape(ArgumentListNode arguments) -> BuiltShape {
+        let shape = new CallShape();
+        let positionalValues = new List<Expression?>();
+        let namedValues = new List<Expression?>();
+        for (long i = 0; i < arguments.argumentsCount(); i++) {
+            switch (arguments.arguments(i)) {
+                is NamedArgumentNode named -> {
+                    string name = named.name().text();
+                    for (long j = 0; j < shape.named().length(); j++) {
+                        if (shape.named().get(j).name() == name) {
+                            this.reporter.report("Duplicate named argument '{name}'.",
+                                named.name().span());
+                            shape.markMalformed();
+                            break;
+                        }
+                    }
+                    Type analyzed = this.analyzeExpression(named.value());
+                    this.result.setType(named.green(), analyzed);
+                    if (analyzed is ErrorType) {
+                        shape.markErrorArgument();
+                    }
+                    shape.named().push(this.argumentValueOf(name, named.value(), analyzed));
+                    namedValues.push(named.value());
+                },
+                is OutArgumentNode outArgument -> {
+                    this.reporter.report("'out' can only be used when calling an external "
+                        + "function.", outArgument.span());
+                    shape.markErrorArgument();
+                    shape.positional().push(new ArgumentValue("", this.store.errorType(),
+                        false, false, 0, false, outArgument.span()));
+                    positionalValues.push(null);
+                },
+                is Expression value -> {
+                    if (shape.named().length() > 0 && !shape.isMalformed()) {
+                        this.reporter.report("Positional arguments must come before named "
+                            + "arguments.", value.span());
+                        shape.markMalformed();
+                    }
+                    Type analyzed = this.analyzeExpression(value);
+                    if (analyzed is ErrorType) {
+                        shape.markErrorArgument();
+                    }
+                    shape.positional().push(this.argumentValueOf("", value, analyzed));
+                    positionalValues.push(value);
+                },
+                default -> { },
+            }
+        }
+        let values = new List<Expression?>();
+        for (long i = 0; i < positionalValues.length(); i++) {
+            values.push(positionalValues.get(i));
+        }
+        for (long i = 0; i < namedValues.length(); i++) {
+            values.push(namedValues.get(i));
+        }
+        return new BuiltShape(shape, values);
+    }
+
+    private argumentValueOf(string name, Expression value, Type analyzed) -> ArgumentValue {
+        let literal = intLiteralOf(value);
+        if (literal != null) {
+            let magnitude = literalvalues.integerMagnitude(literal.value().text());
+            if (magnitude != null) {
+                return new ArgumentValue(name, analyzed, true, isNegativeLiteral(value),
+                    magnitude, false, value.span());
+            }
+        }
+        if (value is LiteralExpressionNode && value.value().kind() == SyntaxKind.CharLiteral) {
+            return new ArgumentValue(name, analyzed, false, false,
+                literalvalues.charCodepoint(value.value().text()), true, value.span());
+        }
+        return new ArgumentValue(name, analyzed, false, false, 0, false, value.span());
+    }
+
+    // Final argument checking against the chosen candidate: adapt untyped literals to the
+    // parameter types and verify assignability, mirroring the single-candidate path.
+    private checkResolvedArguments(BuiltShape built, CallResolution resolution,
+                                   GreenNode callNode) -> Type {
+        let chosen = resolution.chosen();
+        if (chosen == null) {
+            return this.store.errorType();
+        }
+        Parameter[] parameters = chosen.signature().parameters();
+        long[] mapping = resolution.mapping();
+        let shape = built.shape;
+        for (long i = 0; i < shape.argumentCount() && i < mapping.length; i++) {
+            let argument = shape.argumentAt(i);
+            Type parameterType = parameters[mapping[i]].type();
+            if (parameterType is ErrorType || argument.type() is ErrorType) {
+                continue;
+            }
+            Type finalType = argument.type();
+            let value = built.values.get(i);
+            if (value != null) {
+                this.adaptIntegerLiteral(value, parameterType);
+                this.adaptCharLiteral(value, parameterType);
+                let updated = this.result.typeOf(value.green());
+                if (updated != null) {
+                    finalType = updated;
+                }
+            }
+            if (!nullability.isAssignable(parameterType, finalType)) {
+                string label = "{i + 1}";
+                if (argument.name().length > 0) {
+                    label = "'{argument.name()}'";
+                }
+                this.reporter.report("Argument {label}: expected "
+                    + "'{types.display(parameterType)}', got '{types.display(finalType)}'",
+                    argument.span());
+            }
+        }
+        if (shape.named().length() > 0) {
+            this.result.setArgumentOrder(callNode, mapping);
+        }
+        return chosen.signature().returnType();
+    }
+
+    // Argument count and type checking against a single known signature.
+    private checkDirectArguments(string kindWord, string displayName, Signature signature,
+                                 ArgumentListNode arguments, Span callSpan) -> Type {
+        Parameter[] parameters = signature.parameters();
+        long count = arguments.argumentsCount();
+        long required = calls.requiredArgumentCount(signature);
+        if (count < required || count > parameters.length) {
+            this.reporter.report("{kindWord} '{displayName}' expects "
+                + "{calls.expectedCountText(signature)} argument(s), got {count}", callSpan);
+        }
+        for (long i = 0; i < count; i++) {
+            switch (arguments.arguments(i)) {
+                is OutArgumentNode outArgument -> {
+                    this.reporter.report("'out' can only be used when calling an external "
+                        + "function.", outArgument.span());
+                },
+                is Expression value -> {
+                    if (i < parameters.length) {
+                        Type parameterType = parameters[i].type();
+                        Type actual = this.analyzeExpressionAdapt(value, parameterType);
+                        if (!(parameterType is ErrorType) && !(actual is ErrorType)
+                                && !nullability.isAssignable(parameterType, actual)) {
+                            this.reporter.report("Argument {i + 1}: expected "
+                                + "'{types.display(parameterType)}', got "
+                                + "'{types.display(actual)}'", value.span());
+                        }
+                    } else {
+                        this.analyzeExpression(value);
+                    }
+                },
+                default -> { },
+            }
+        }
+        return signature.returnType();
+    }
+
+    private analyzeArgumentsOnly(ArgumentListNode arguments) {
+        for (long i = 0; i < arguments.argumentsCount(); i++) {
+            switch (arguments.arguments(i)) {
+                is NamedArgumentNode named -> {
+                    this.analyzeExpression(named.value());
+                },
+                is Expression value -> {
+                    this.analyzeExpression(value);
+                },
+                default -> { },
+            }
+        }
+    }
+
+    // ---- Calls ----
+
+    private analyzeCall(CallExpressionNode node) -> Type {
+        switch (node.callee()) {
+            is MemberExpressionNode member -> {
+                return this.analyzeMemberCall(node, member);
+            },
+            is SafeMemberExpressionNode member -> {
+                return this.analyzeSafeMemberCall(node, member);
+            },
+            is SuperExpressionNode chained -> {
+                return this.analyzeSuperCall(node, chained);
+            },
+            is IdentifierExpressionNode identifier -> {
+                return this.analyzeFunctionCall(node, identifier);
+            },
+            default -> {
+                this.reporter.report("Only direct function calls are supported", node.span());
+                this.analyzeArgumentsOnly(node.arguments());
+                return this.store.errorType();
+            },
+        }
+    }
+
+    private analyzeFunctionCall(CallExpressionNode node, IdentifierExpressionNode identifier)
+            -> Type {
+        string name = identifier.name().text();
+        let resolution = this.resolveName(name);
+        if (resolution == null) {
+            this.reporter.report("Undefined function '{name}'", identifier.span());
+            this.analyzeArgumentsOnly(node.arguments());
+            return this.store.errorType();
+        }
+        if (resolution is FunctionName) {
+            return this.dispatchFunctionCall(node, identifier, name, resolution.entries);
+        }
+        this.reporter.report("'{name}' is not a function", identifier.span());
+        this.analyzeArgumentsOnly(node.arguments());
+        return this.store.errorType();
+    }
+
+    private dispatchFunctionCall(CallExpressionNode node, IdentifierExpressionNode identifier,
+                                 string name, List<FunctionEntry> entries) -> Type {
+        let first = entries.get(0);
+        if (first.isExternal()) {
+            this.result.setCallable(identifier.green(), first.signature());
+            return this.analyzeExternalCall(node, first, name);
+        }
+        if (first.signature().isGeneric()) {
+            this.result.setCallable(identifier.green(), first.signature());
+            return this.analyzeGenericCall(node, first, name);
+        }
+        if (entries.length() > 1 || usesNamedArguments(node.arguments())) {
+            let built = this.buildCallShape(node.arguments());
+            let candidates = new List<CallCandidate>();
+            for (long i = 0; i < entries.length(); i++) {
+                candidates.push(new CallCandidate(entries.get(i).signature(), null, true));
+            }
+            let resolved = calls.resolveCall(candidates, built.shape, this.reporter,
+                node.span(), name, "Function");
+            if (resolved.failed()) {
+                return this.store.errorType();
+            }
+            let chosen = resolved.chosen();
+            if (chosen != null) {
+                this.result.setCallable(identifier.green(), chosen.signature());
+            }
+            return this.checkResolvedArguments(built, resolved, node.green());
+        }
+        this.result.setCallable(identifier.green(), first.signature());
+        return this.checkDirectArguments("Function", name, first.signature(),
+            node.arguments(), node.span());
+    }
+
+    private analyzeMemberCall(CallExpressionNode node, MemberExpressionNode member) -> Type {
+        let object = member.object();
+        string memberName = member.member().text();
+        if (object is IdentifierExpressionNode) {
+            if (object.name().kind() == SyntaxKind.StringKeyword) {
+                return this.analyzeStringStatic(node, memberName);
+            }
+            let resolution = this.resolveName(object.name().text());
+            if (resolution is NamespaceName) {
+                let handled = this.analyzeNamespaceFunctionCall(node, member,
+                    resolution.targetModulePath, memberName);
+                if (handled != null) {
+                    return handled;
+                }
+            }
+        }
+        let intercepted = this.interceptBuiltinCall(node, object, memberName);
+        if (intercepted != null) {
+            return intercepted;
+        }
+        Type memberType = this.analyzeMemberValue(member);
+        this.result.setType(member.green(), memberType);
+        let method = this.result.methodOf(member.green());
+        if (method == null) {
+            this.analyzeArgumentsOnly(node.arguments());
+            return this.store.errorType();
+        }
+        return this.finishMethodCall(node, member.green(), member.member().span(), memberName,
+            object, method, false);
+    }
+
+    private analyzeSafeMemberCall(CallExpressionNode node, SafeMemberExpressionNode member)
+            -> Type {
+        let object = member.object();
+        if (object is IdentifierExpressionNode) {
+            let resolution = this.resolveName(object.name().text());
+            if (resolution is NamespaceName) {
+                this.reporter.report("'?.' cannot be used on the module namespace "
+                    + "'{object.name().text()}'; call it directly with '.'.", node.span());
+                this.analyzeArgumentsOnly(node.arguments());
+                return this.store.errorType();
+            }
+        }
+        Type memberType = this.analyzeSafeMemberValue(member);
+        this.result.setType(member.green(), memberType);
+        let method = this.result.methodOf(member.green());
+        if (method == null) {
+            this.analyzeArgumentsOnly(node.arguments());
+            return this.store.errorType();
+        }
+        return this.finishMethodCall(node, member.green(), member.member().span(),
+            member.member().text(), object, method, true);
+    }
+
+    // Resolves the method a receiver's call picks: overloads and named arguments go through
+    // full resolution; the single-candidate path checks directly. A safe call wraps a
+    // non-void result optional.
+    private finishMethodCall(CallExpressionNode node, GreenNode memberGreen, Span memberSpan,
+                             string name, Expression object, Method primary, bool isSafe)
+            -> Type {
+        Type receiverCore = this.store.errorType();
+        let objectType = this.result.typeOf(object.green());
+        if (objectType != null) {
+            receiverCore = this.memberReceiverCore(objectType, name);
+        }
+        let candidates = methodCandidates(receiverCore, name);
+        let arguments = node.arguments();
+        if (candidates.length() > 1 || usesNamedArguments(arguments)) {
+            let built = this.buildCallShape(arguments);
+            let callCandidates = new List<CallCandidate>();
+            for (long i = 0; i < candidates.length(); i++) {
+                let candidate = candidates.get(i);
+                callCandidates.push(new CallCandidate(candidate.signature(), candidate,
+                    this.isAccessAllowed(candidate.visibility(), candidate.definingType())));
+            }
+            if (callCandidates.length() == 0) {
+                callCandidates.push(new CallCandidate(primary.signature(), primary, true));
+            }
+            let resolved = calls.resolveCall(callCandidates, built.shape, this.reporter,
+                node.span(), name, "Method");
+            if (resolved.failed()) {
+                return this.store.errorType();
+            }
+            let chosen = resolved.chosen();
+            if (chosen == null) {
+                return this.store.errorType();
+            }
+            let chosenMethod = chosen.method();
+            if (chosenMethod != null) {
+                if (!chosen.isAccessible()) {
+                    this.checkMemberAccess(name, chosenMethod.visibility(),
+                        chosenMethod.definingType(), memberSpan);
+                }
+                this.result.setMethod(memberGreen, chosenMethod);
+            }
+            Type returned = this.checkResolvedArguments(built, resolved, node.green());
+            if (isSafe) {
+                return this.wrapSafeResult(returned);
+            }
+            return returned;
+        }
+        Type returned = this.checkDirectArguments("Method", name, primary.signature(),
+            arguments, node.span());
+        if (isSafe) {
+            return this.wrapSafeResult(returned);
+        }
+        return returned;
+    }
+
+    // A void safe call is a statement: it runs only when the receiver is non-null and
+    // produces no value.
+    private wrapSafeResult(Type returned) -> Type {
+        if (returned is ErrorType || types.isVoidType(returned)) {
+            return returned;
+        }
+        return this.store.optionalOf(returned);
+    }
+
+    // A namespace-qualified free-function call, or null when the member is not a function of
+    // the target module (the member then resolves as a type reference).
+    private analyzeNamespaceFunctionCall(CallExpressionNode node, MemberExpressionNode member,
+                                         string targetPath, string memberName) -> Type? {
+        let target = this.contextsByPath.get(targetPath);
+        if (target == null) {
+            return null;
+        }
+        let entries = target.functions().entriesNamed(memberName);
+        if (entries == null || entries.length() == 0) {
+            return null;
+        }
+        if (entries.length() > 1 || usesNamedArguments(node.arguments())) {
+            let built = this.buildCallShape(node.arguments());
+            let candidates = new List<CallCandidate>();
+            for (long i = 0; i < entries.length(); i++) {
+                let entry = entries.get(i);
+                candidates.push(new CallCandidate(entry.signature(), null,
+                    entry.visibility() == Visibility.Public));
+            }
+            let resolved = calls.resolveCall(candidates, built.shape, this.reporter,
+                node.span(), memberName, "Function");
+            if (resolved.failed()) {
+                return this.store.errorType();
+            }
+            let chosen = resolved.chosen();
+            if (chosen == null) {
+                return this.store.errorType();
+            }
+            this.result.setCallable(member.green(), chosen.signature());
+            if (!chosen.isAccessible()) {
+                this.reporter.report("Function '{memberName}' is not public in module "
+                    + "'{targetPath}' and cannot be called from another module.",
+                    member.member().span());
+                return this.store.errorType();
+            }
+            return this.checkResolvedArguments(built, resolved, node.green());
+        }
+        let entry = entries.get(0);
+        if (entry.visibility() != Visibility.Public) {
+            this.reporter.report("Function '{memberName}' is not public in module "
+                + "'{targetPath}' and cannot be called from another module.",
+                member.member().span());
+            this.analyzeArgumentsOnly(node.arguments());
+            return this.store.errorType();
+        }
+        this.result.setCallable(member.green(), entry.signature());
+        if (entry.isExternal()) {
+            return this.analyzeExternalCall(node, entry, memberName);
+        }
+        if (entry.signature().isGeneric()) {
+            return this.analyzeGenericCall(node, entry, memberName);
+        }
+        return this.checkDirectArguments("Function", memberName, entry.signature(),
+            node.arguments(), node.span());
+    }
+
+    private analyzeSuperCall(CallExpressionNode node, SuperExpressionNode chained) -> Type {
+        this.analyzeExpression(chained);
+        this.sawSuperCall = true;
+        Type voidType = this.store.primitive(PrimitiveKind.Void);
+        if (!this.inConstructor) {
+            this.reporter.report("'super(...)' can only be called from a constructor",
+                node.span());
+        }
+        Type? base = null;
+        let receiver = this.thisType;
+        if (receiver != null) {
+            base = types.baseOf(receiver);
+        }
+        if (base == null) {
+            this.analyzeArgumentsOnly(node.arguments());
+            return voidType;
+        }
+        string baseName = types.display(base);
+        let baseAuthority = types.authorityOf(base);
+        if (baseAuthority != null) {
+            baseName = baseAuthority.name();
+        }
+        let constructors = constructorsOf(base);
+        let arguments = node.arguments();
+        if (constructors.length() == 0) {
+            if (arguments.argumentsCount() > 0) {
+                this.reporter.report("Base class '{baseName}' has no constructor, so "
+                    + "'super(...)' takes no arguments", node.span());
+            }
+            this.analyzeArgumentsOnly(arguments);
+            return voidType;
+        }
+        if (constructors.length() > 1 || usesNamedArguments(arguments)) {
+            let built = this.buildCallShape(arguments);
+            let candidates = new List<CallCandidate>();
+            for (long i = 0; i < constructors.length(); i++) {
+                candidates.push(new CallCandidate(constructors.get(i).signature(),
+                    constructors.get(i), true));
+            }
+            let resolved = calls.resolveCall(candidates, built.shape, this.reporter,
+                node.span(), baseName, "Base constructor");
+            if (resolved.failed()) {
+                return voidType;
+            }
+            let chosen = resolved.chosen();
+            if (chosen != null) {
+                let chosenMethod = chosen.method();
+                if (chosenMethod != null) {
+                    this.result.setMethod(chained.green(), chosenMethod);
+                }
+                this.checkResolvedArguments(built, resolved, node.green());
+            }
+            return voidType;
+        }
+        let baseConstructor = constructors.get(0);
+        this.result.setMethod(chained.green(), baseConstructor);
+        this.checkDirectArguments("Base constructor", baseName, baseConstructor.signature(),
+            arguments, node.span());
+        return voidType;
+    }
+
+    // Static builtins on the 'string' type keyword: string.fromBytes(byte[]).
+    private analyzeStringStatic(CallExpressionNode node, string memberName) -> Type {
+        let arguments = node.arguments();
+        if (memberName == "fromBytes") {
+            Type byteArray = this.store.arrayOf(this.store.primitive(PrimitiveKind.Byte));
+            if (arguments.argumentsCount() != 1) {
+                this.reporter.report("'string.fromBytes' expects 1 argument (a byte[]), got "
+                    + "{arguments.argumentsCount()}.", node.span());
+                this.analyzeArgumentsOnly(arguments);
+                return this.store.stringType();
+            }
+            let argument = arguments.arguments(0);
+            if (argument is Expression) {
+                Type actual = this.analyzeExpression(argument);
+                if (!(actual is ErrorType) && !nullability.isAssignable(byteArray, actual)) {
+                    this.reporter.report("'string.fromBytes' expects a byte[], got "
+                        + "'{types.display(actual)}'.", argument.span());
+                }
+            }
+            return this.store.stringType();
+        }
+        this.reporter.report("'string' has no static member '{memberName}'.", node.span());
+        this.analyzeArgumentsOnly(arguments);
+        return this.store.errorType();
+    }
+
+    // The built-in members of strings, arrays, and primitives, intercepted before general
+    // member resolution; a record declaring its own member of the same name falls through
+    // (null result) to normal resolution.
+    private interceptBuiltinCall(CallExpressionNode node, Expression object, string name)
+            -> Type? {
+        if (name != "toString" && name != "toBytes" && name != "indexOf" && name != "contains"
+                && name != "substring" && name != "slice" && name != "hash") {
+            return null;
+        }
+        Type objectType = this.analyzeExpression(object);
+        if (objectType is ErrorType) {
+            this.analyzeArgumentsOnly(node.arguments());
+            return this.store.errorType();
+        }
+        Type core = nullability.valueOf(objectType);
+        let arguments = node.arguments();
+        if (name == "toString") {
+            if (convert.isIntegerType(core) || convert.isBoolType(core) || core is StringType
+                    || convert.isEnumLike(core)) {
+                this.checkNoArguments(node, "toString");
+                return this.store.stringType();
+            }
+            if (convert.isFloatType(core)) {
+                this.reporter.report("'.toString()' is not yet available for type "
+                    + "'{types.display(core)}'.", node.span());
+                this.analyzeArgumentsOnly(arguments);
+                return this.store.errorType();
+            }
+            return null;
+        }
+        if (name == "toBytes") {
+            if (core is StringType) {
+                this.checkNoArguments(node, "toBytes");
+                return this.store.arrayOf(this.store.primitive(PrimitiveKind.Byte));
+            }
+            return null;
+        }
+        if (name == "indexOf" || name == "contains") {
+            if (core is StringType) {
+                if (arguments.argumentsCount() != 1) {
+                    this.reporter.report("'{name}' expects 1 argument (a string), got "
+                        + "{arguments.argumentsCount()}.", node.span());
+                    this.analyzeArgumentsOnly(arguments);
+                } else {
+                    let argument = arguments.arguments(0);
+                    if (argument is Expression) {
+                        Type actual = this.analyzeExpression(argument);
+                        if (!(actual is ErrorType)
+                                && !(nullability.valueOf(actual) is StringType)) {
+                            this.reporter.report("'{name}' expects a string argument, got "
+                                + "'{types.display(actual)}'.", argument.span());
+                        }
+                    }
+                }
+                if (name == "indexOf") {
+                    return this.store.primitive(PrimitiveKind.Long);
+                }
+                return this.store.primitive(PrimitiveKind.Bool);
+            }
+            return null;
+        }
+        if (name == "substring") {
+            if (core is StringType) {
+                this.checkRangeArguments(node, "substring");
+                return this.store.stringType();
+            }
+            return null;
+        }
+        if (name == "slice") {
+            if (core is ArrayType) {
+                this.checkRangeArguments(node, "slice");
+                return core;
+            }
+            return null;
+        }
+        if (types.isVoidType(core)) {
+            this.reporter.report("Cannot call 'hash' on a void expression.", node.span());
+            this.analyzeArgumentsOnly(arguments);
+            return this.store.errorType();
+        }
+        bool declaresHash = false;
+        if (core is TypeParamType) {
+            for (let bound in core.bounds()) {
+                if (methodCandidates(bound, "hash").length() > 0) {
+                    declaresHash = true;
+                }
+            }
+        } else if (isRecordLike(core)) {
+            declaresHash = methodCandidates(core, "hash").length() > 0;
+        }
+        if (declaresHash) {
+            return null;
+        }
+        this.checkNoArguments(node, "hash");
+        return this.store.primitive(PrimitiveKind.Long);
+    }
+
+    private checkNoArguments(CallExpressionNode node, string name) {
+        if (node.arguments().argumentsCount() > 0) {
+            this.reporter.report("'{name}' takes no arguments.", node.span());
+            this.analyzeArgumentsOnly(node.arguments());
+        }
+    }
+
+    // Half-open range builtins take a start and an end index.
+    private checkRangeArguments(CallExpressionNode node, string name) {
+        let arguments = node.arguments();
+        if (arguments.argumentsCount() != 2) {
+            this.reporter.report("'{name}' expects 2 arguments (start and end), got "
+                + "{arguments.argumentsCount()}.", node.span());
+            this.analyzeArgumentsOnly(arguments);
+            return;
+        }
+        for (long i = 0; i < arguments.argumentsCount(); i++) {
+            let argument = arguments.arguments(i);
+            if (argument is Expression) {
+                Type actual = this.analyzeExpression(argument);
+                if (!(actual is ErrorType)
+                        && !convert.isIntegerType(nullability.valueOf(actual))) {
+                    this.reporter.report("'{name}' expects an integer index, got "
+                        + "'{types.display(actual)}'.", argument.span());
+                }
+            }
+        }
+    }
+
+    // A generic function call: explicit type arguments, or single-level inference from the
+    // arguments whose parameter is exactly a type-parameter placeholder of the function.
+    private analyzeGenericCall(CallExpressionNode node, FunctionEntry entry, string name)
+            -> Type {
+        let signature = entry.signature();
+        let arguments = node.arguments();
+        if (usesNamedArguments(arguments)) {
+            this.reporter.report("Generic function '{name}' does not support named arguments; "
+                + "pass the arguments in order.", node.span());
+            this.analyzeArgumentsOnly(arguments);
+            return this.store.errorType();
+        }
+        let owner = signature.declaration();
+        if (owner == null) {
+            return signature.returnType();
+        }
+        let typeParameters = signature.typeParameters();
+        long arity = typeParameters.length;
+        let typeArguments = new List<Type?>();
+        for (long i = 0; i < arity; i++) {
+            typeArguments.push(null);
+        }
+        let explicitList = node.typeArguments();
+        if (explicitList != null) {
+            long given = explicitList.argumentsCount();
+            if (given != arity) {
+                string expected = "{arity} type arguments";
+                if (arity == 1) {
+                    expected = "1 type argument";
+                }
+                string wasWere = "were";
+                if (given == 1) {
+                    wasWere = "was";
+                }
+                this.reporter.report("Generic function '{name}' expects {expected}, but "
+                    + "{given} {wasWere} given", node.span());
+                this.analyzeArgumentsOnly(arguments);
+                return this.store.errorType();
+            }
+            for (long i = 0; i < arity; i++) {
+                typeArguments.set(i, this.resolver.resolveType(explicitList.arguments(i)));
+            }
+        }
+
+        let argumentTypes = new List<Type>();
+        for (long i = 0; i < arguments.argumentsCount(); i++) {
+            let argument = arguments.arguments(i);
+            if (argument is Expression) {
+                argumentTypes.push(this.analyzeExpression(argument));
+            } else {
+                argumentTypes.push(this.store.errorType());
+            }
+        }
+
+        Parameter[] parameters = signature.parameters();
+        if (explicitList == null) {
+            for (long i = 0; i < argumentTypes.length() && i < parameters.length; i++) {
+                let parameterType = parameters[i].type();
+                if (parameterType is TypeParamType && parameterType.owner() == owner
+                        && parameterType.index() < arity
+                        && typeArguments.get(parameterType.index()) == null
+                        && !(argumentTypes.get(i) is ErrorType)) {
+                    typeArguments.set(parameterType.index(), argumentTypes.get(i));
+                }
+            }
+        }
+
+        let resolved = new List<Type>();
+        for (long i = 0; i < arity; i++) {
+            let argument = typeArguments.get(i);
+            if (argument == null) {
+                this.reporter.report("Cannot infer type argument '{typeParameters[i].name()}' "
+                    + "for '{name}'; pass it explicitly, e.g. '{name}<int>(...)'",
+                    node.span());
+                return this.store.errorType();
+            }
+            resolved.push(argument);
+        }
+        Type[] resolvedArguments = resolved.toArray();
+
+        bool bounded = true;
+        for (long i = 0; i < arity; i++) {
+            Span at = node.span();
+            if (explicitList != null && i < explicitList.argumentsCount()) {
+                at = explicitList.arguments(i).span();
+            }
+            if (!this.resolver.checkArgumentBounds(resolvedArguments[i], typeParameters[i],
+                    at)) {
+                bounded = false;
+            }
+        }
+
+        long count = arguments.argumentsCount();
+        long required = calls.requiredArgumentCount(signature);
+        if (count < required || count > parameters.length) {
+            this.reporter.report("Function '{name}' expects "
+                + "{calls.expectedCountText(signature)} argument(s), got {count}",
+                node.span());
+            bounded = false;
+        }
+        for (long i = 0; i < count && i < parameters.length; i++) {
+            let argument = arguments.arguments(i);
+            if (argument is Expression) {
+                Type parameterType = this.store.substitute(parameters[i].type(), owner,
+                    resolvedArguments);
+                this.adaptIntegerLiteral(argument, parameterType);
+                Type actual = argumentTypes.get(i);
+                let updated = this.result.typeOf(argument.green());
+                if (updated != null) {
+                    actual = updated;
+                }
+                if (!(parameterType is ErrorType) && !(actual is ErrorType)
+                        && !nullability.isAssignable(parameterType, actual)) {
+                    this.reporter.report("Argument {i + 1}: expected "
+                        + "'{types.display(parameterType)}', got '{types.display(actual)}'",
+                        argument.span());
+                }
+            }
+        }
+
+        if (bounded) {
+            this.result.setCallTypeArguments(node.green(), resolvedArguments);
+        }
+        return this.store.substitute(signature.returnType(), owner, resolvedArguments);
+    }
+
+    // An external call: exact arity, no named arguments, and 'out' parameters take an
+    // initialized non-constant local of exactly the parameter's type.
+    private analyzeExternalCall(CallExpressionNode node, FunctionEntry entry, string name)
+            -> Type {
+        let signature = entry.signature();
+        let arguments = node.arguments();
+        if (usesNamedArguments(arguments)) {
+            this.reporter.report("External function '{name}' does not support named "
+                + "arguments; pass the arguments in order.", node.span());
+            this.analyzeArgumentsOnly(arguments);
+            return signature.returnType();
+        }
+        Parameter[] parameters = signature.parameters();
+        long count = arguments.argumentsCount();
+        if (count != parameters.length) {
+            this.reporter.report("External function '{name}' expects {parameters.length} "
+                + "argument(s), got {count}", node.span());
+        }
+        for (long i = 0; i < count; i++) {
+            let argument = arguments.arguments(i);
+            if (i >= parameters.length) {
+                this.analyzeExtraExternalArgument(argument);
+                continue;
+            }
+            let parameter = parameters[i];
+            if (parameter.isOut()) {
+                if (argument is OutArgumentNode) {
+                    this.checkOutArgument(argument, parameter, name, i);
+                } else if (argument is Expression) {
+                    this.reporter.report("Argument {i + 1} of '{name}' is an 'out' "
+                        + "parameter; pass a local variable as 'out <name>'.",
+                        argument.span());
+                    this.analyzeExpression(argument);
+                }
+                continue;
+            }
+            if (argument is OutArgumentNode) {
+                this.reporter.report("Argument {i + 1} of '{name}' is not an 'out' "
+                    + "parameter; remove 'out'.", argument.span());
+                continue;
+            }
+            if (argument is Expression) {
+                Type actual = this.analyzeExpressionAdapt(argument, parameter.type());
+                if (!(parameter.type() is ErrorType) && !(actual is ErrorType)
+                        && !nullability.isAssignable(parameter.type(), actual)) {
+                    this.reporter.report("Argument {i + 1}: expected "
+                        + "'{types.display(parameter.type())}', got "
+                        + "'{types.display(actual)}'", argument.span());
+                }
+            }
+        }
+        return signature.returnType();
+    }
+
+    private checkOutArgument(OutArgumentNode argument, Parameter parameter, string name,
+                             long index) {
+        string outName = argument.name().text();
+        let binding = this.lookupBinding(outName);
+        if (binding == null) {
+            this.reporter.report("'out {outName}' must refer to a local variable or "
+                + "parameter.", argument.span());
+            return;
+        }
+        if (binding.isConst()) {
+            this.reporter.report("Cannot pass '{outName}' as 'out' because it is declared "
+                + "as constant", argument.span());
+        }
+        this.result.setBinding(argument.green(), binding);
+        if (binding.type() != parameter.type()) {
+            this.reporter.report("Argument {index + 1} of '{name}' expects "
+                + "'out {types.display(parameter.type())}', got "
+                + "'out {types.display(binding.type())}'.", argument.span());
+        }
+    }
+
+    private analyzeExtraExternalArgument(Argument argument) {
+        switch (argument) {
+            is OutArgumentNode outArgument -> {
+                let binding = this.lookupBinding(outArgument.name().text());
+                if (binding != null) {
+                    this.result.setBinding(outArgument.green(), binding);
+                }
+            },
+            is Expression value -> {
+                this.analyzeExpression(value);
+            },
+            default -> { },
+        }
+    }
+
+    // ---- 'new' expressions ----
+
+    private analyzeNew(NewExpressionNode node) -> Type {
+        let created = node.createdType();
+        if (node.dimensionsCount() > 0) {
+            return this.analyzeArrayNew(node, created);
+        }
+        if (created is OptionalTypeNode) {
+            this.reporter.report("'new' cannot construct an optional type", created.span());
+        }
+        Type t = this.resolver.resolveType(created);
+        let arguments = node.arguments();
+        if (t is ErrorType) {
+            if (arguments != null) {
+                this.analyzeArgumentsOnly(arguments);
+            }
+            return this.store.errorType();
+        }
+        string shownName = writtenTypeName(created, t);
+        if (!types.isClassLike(t)) {
+            if (isStructValue(t)) {
+                this.reporter.report("'new' is only valid for classes; '{shownName}' is a "
+                    + "struct", node.span());
+            } else {
+                this.reporter.report("'new' requires a class type, got '{types.display(t)}'",
+                    node.span());
+            }
+            if (arguments != null) {
+                this.analyzeArgumentsOnly(arguments);
+            }
+            return this.store.errorType();
+        }
+        let authority = types.authorityOf(t);
+        if (authority is InterfaceType) {
+            this.reporter.report("Cannot create an instance of interface '{shownName}'; "
+                + "instantiate a class that implements it instead", node.span());
+        } else if (authority is ClassType && authority.isAbstract()) {
+            this.reporter.report("Cannot create an instance of abstract class '{shownName}'; "
+                + "instantiate a concrete subclass instead", node.span());
+        }
+        let constructors = constructorsOf(t);
+        long argumentCount = 0;
+        if (arguments != null) {
+            argumentCount = arguments.argumentsCount();
+        }
+        bool named = arguments != null && usesNamedArguments(arguments);
+        if (constructors.length() > 1 || (constructors.length() > 0 && named)) {
+            let built = this.buildShapeOrEmpty(arguments);
+            let candidates = new List<CallCandidate>();
+            for (long i = 0; i < constructors.length(); i++) {
+                candidates.push(new CallCandidate(constructors.get(i).signature(),
+                    constructors.get(i), true));
+            }
+            let resolved = calls.resolveCall(candidates, built.shape, this.reporter,
+                node.span(), shownName, "Constructor");
+            if (!resolved.failed()) {
+                let chosen = resolved.chosen();
+                if (chosen != null) {
+                    let chosenMethod = chosen.method();
+                    if (chosenMethod != null) {
+                        this.result.setMethod(node.green(), chosenMethod);
+                    }
+                    this.checkResolvedArguments(built, resolved, node.green());
+                }
+            }
+        } else if (constructors.length() > 0) {
+            let classConstructor = constructors.get(0);
+            this.result.setMethod(node.green(), classConstructor);
+            if (arguments != null) {
+                this.checkDirectArguments("Constructor", shownName,
+                    classConstructor.signature(), arguments, node.span());
+            } else if (calls.requiredArgumentCount(classConstructor.signature()) > 0) {
+                this.reporter.report("Constructor '{shownName}' expects "
+                    + "{calls.expectedCountText(classConstructor.signature())} argument(s), "
+                    + "got 0", node.span());
+            }
+        } else if (argumentCount > 0) {
+            this.reporter.report("Class '{shownName}' has no constructor; use "
+                + "'new {shownName}()'", node.span());
+            if (arguments != null) {
+                this.analyzeArgumentsOnly(arguments);
+            }
+        }
+        return t;
+    }
+
+    private buildShapeOrEmpty(ArgumentListNode? arguments) -> BuiltShape {
+        if (arguments != null) {
+            return this.buildCallShape(arguments);
+        }
+        return new BuiltShape(new CallShape(), new List<Expression?>());
+    }
+
+    // 'new T[n]': every allocated slot starts as T's zero value, so T must be defaultable -
+    // unless a fill loop right after the declaration proves every slot is written first, or
+    // the trailing dimensions are unsized and the slots hold nullable inner arrays.
+    private analyzeArrayNew(NewExpressionNode node, nodes.Type created) -> Type {
+        Type element = this.resolver.resolveType(created);
+        let sizes = new List<Expression>();
+        long unsized = 0;
+        for (long i = 0; i < node.dimensionsCount(); i++) {
+            let size = node.dimensions(i).size();
+            if (size != null && unsized == 0) {
+                sizes.push(size);
+            } else {
+                unsized++;
+            }
+        }
+        if (element is ErrorType) {
+            this.analyzeSizes(sizes);
+            return this.store.errorType();
+        }
+        if (types.isVoidType(element)) {
+            this.reporter.report("Cannot create an array of void", created.span());
+            this.analyzeSizes(sizes);
+            return this.store.errorType();
+        }
+        if (sizes.length() == 0) {
+            string shown = types.display(element);
+            this.reporter.report("'new {shown}[...]' requires at least one sized dimension. "
+                + "Use 'new {shown}[size]' for a 1-D array, or 'new {shown}[size][]' for a "
+                + "partially-allocated grid.", node.span());
+            return this.store.arrayOf(element);
+        }
+        Type slotElement = element;
+        if (unsized == 0) {
+            bool singleDimension = sizes.length() == 1;
+            bool referenceElement = isReferenceElement(element);
+            bool proven = singleDimension && referenceElement
+                && this.fillProvenNews.contains(node.green());
+            string fillName = "items";
+            let declared = this.arrayNewNames.get(node.green());
+            if (declared != null) {
+                fillName = declared;
+            }
+            if (!proven && !this.validateArrayElement(element, created.span(),
+                    singleDimension, fillName)) {
+                this.analyzeSizes(sizes);
+                return this.store.errorType();
+            }
+        } else {
+            Type innerArray = element;
+            for (long i = 0; i < unsized; i++) {
+                innerArray = this.store.arrayOf(innerArray);
+            }
+            slotElement = this.store.optionalOf(innerArray);
+        }
+        this.analyzeSizes(sizes);
+        Type arrayType = slotElement;
+        for (long i = 0; i < sizes.length(); i++) {
+            arrayType = this.store.arrayOf(arrayType);
+        }
+        return arrayType;
+    }
+
+    private analyzeSizes(List<Expression> sizes) {
+        for (long i = 0; i < sizes.length(); i++) {
+            Type sizeType = this.analyzeExpression(sizes.get(i));
+            if (!(sizeType is ErrorType)
+                    && !convert.isIntegerType(nullability.valueOf(sizeType))) {
+                this.reporter.report("Array size must be an integer, got "
+                    + "'{types.display(sizeType)}'", sizes.get(i).span());
+            }
+        }
+    }
+
+    private validateArrayElement(Type element, Span span, bool hasFillName, string fillName)
+            -> bool {
+        if (element is ErrorType) {
+            return false;
+        }
+        if (convert.isDefaultable(element)) {
+            return true;
+        }
+        if (element is TypeParamType) {
+            return true;
+        }
+        string shown = types.display(element);
+        string hint = "";
+        if (isReferenceElement(element)) {
+            if (hasFillName) {
+                this.reporter.report("An array of non-nullable '{shown}' must be filled as "
+                    + "it is created: assign it to a new variable and follow the declaration "
+                    + "with `for (long i = 0; i < {fillName}.length; i++) \{ {fillName}[i] = "
+                    + "...; \}` (the update may be written 'i++', '++i', or 'i = i + 1'). "
+                    + "Alternatively use '{shown}?[]' so slots can start as null.", span);
+                return false;
+            }
+            hint = " Use '{shown}?[]' so freshly-allocated slots can start as null.";
+        } else if (isStructValue(element)) {
+            let fields = types.fieldsOf(element);
+            if (fields != null) {
+                for (long i = 0; i < fields.length(); i++) {
+                    let field = fields.get(i);
+                    if (!field.hasDefault() && !convert.isDefaultable(field.type())) {
+                        hint = " Field '{field.name()}' of '{shown}' has type "
+                            + "'{types.display(field.type())}' which cannot start as a "
+                            + "default zero value. Make that field nullable.";
+                        break;
+                    }
+                }
+            }
+        }
+        this.reporter.report("Cannot use '{shown}' as an array element type because "
+            + "freshly-allocated slots would not be valid values of '{shown}'.{hint}", span);
+        return false;
+    }
+
+    // Records single-dimension array-new declaration initializers (for diagnostic wording)
+    // and proves the ones immediately followed by their canonical fill loop.
+    private noteArrayFillLoop(BlockNode block, long index) {
+        let statement = block.statements(index);
+        if (statement is VariableDeclarationNode) {
+            let initializer = statement.initializer();
+            if (initializer == null) {
+                return;
+            }
+            let value = initializer.value();
+            if (value is NewExpressionNode) {
+                if (value.dimensionsCount() != 1 || value.dimensions(0).size() == null) {
+                    return;
+                }
+                string name = statement.name().text();
+                if (name.length == 0) {
+                    return;
+                }
+                this.arrayNewNames.set(value.green(), name);
+                if (index + 1 >= block.statementsCount()) {
+                    return;
+                }
+                let next = block.statements(index + 1);
+                if (next is ForStatementNode && isArrayFillLoop(next, name)) {
+                    this.fillProvenNews.add(value.green());
+                }
+            }
+        }
+    }
+
+    // ---- Switch arms ----
+
+    // Walks a switch's scrutinee, labels, and arm bodies, and types the value form by
+    // unifying the arm expressions. Label validity and exhaustiveness are the statement
+    // milestone's rules.
+    private checkSwitchArms(Expression scrutinee, List<SwitchArm> arms, Span span,
+                            bool requireValue) -> Type {
+        Type scrutineeType = this.analyzeExpression(scrutinee);
+        Type inner = convert.bareOf(scrutineeType);
+        let valueExpressions = new List<Expression>();
+        bool sawValueBlock = false;
+        for (long a = 0; a < arms.length(); a++) {
+            switch (arms.get(a)) {
+                is DefaultArmNode arm -> {
+                    if (this.walkArmBody(arm.body(), requireValue, valueExpressions)) {
+                        sawValueBlock = true;
+                    }
+                },
+                is TypeArmNode arm -> {
+                    Type armType = this.resolver.resolveType(arm.target());
+                    this.enterScope();
+                    let bindingToken = arm.binding();
+                    if (bindingToken != null) {
+                        Type bindingType = this.store.errorType();
+                        if (types.isClassLike(armType)) {
+                            bindingType = armType;
+                        }
+                        let binding = new LocalBinding(bindingToken.text(), bindingType,
+                            BindingKind.Variable, true, bindingToken.span());
+                        let current = this.scope;
+                        if (current != null) {
+                            current.define(binding);
+                        }
+                        this.result.setBinding(arm.green(), binding);
+                    }
+                    if (this.walkArmBody(arm.body(), requireValue, valueExpressions)) {
+                        sawValueBlock = true;
+                    }
+                    this.leaveScope();
+                },
+                is ValueArmNode arm -> {
+                    for (long i = 0; i < arm.labelsCount(); i++) {
+                        this.checkSwitchLabel(arm.labels(i), inner);
+                    }
+                    if (this.walkArmBody(arm.body(), requireValue, valueExpressions)) {
+                        sawValueBlock = true;
+                    }
+                },
+            }
+        }
+        if (!requireValue) {
+            return this.store.primitive(PrimitiveKind.Void);
+        }
+        if (sawValueBlock) {
+            return this.store.errorType();
+        }
+        if (valueExpressions.length() == 0) {
+            this.reporter.report("A switch used as a value needs at least one arm.", span);
+            return this.store.errorType();
+        }
+        Type unified = this.store.errorType();
+        for (long i = 0; i < valueExpressions.length(); i++) {
+            let expression = valueExpressions.get(i);
+            Type analyzed = this.recordedType(expression);
+            if (analyzed is ErrorType) {
+                return this.store.errorType();
+            }
+            if (i == 0) {
+                unified = analyzed;
+                continue;
+            }
+            this.adaptIntegerLiteral(expression, unified);
+            Type adapted = this.recordedType(expression);
+            if (!(adapted is ErrorType)) {
+                analyzed = adapted;
+            }
+            let joined = convert.unifyValueTypes(unified, analyzed, this.store);
+            if (joined == null) {
+                this.reporter.report("Switch arms produce incompatible types "
+                    + "'{types.display(unified)}' and '{types.display(analyzed)}'.", span);
+                return this.store.errorType();
+            }
+            unified = joined;
+        }
+        if (types.isVoidType(unified)) {
+            this.reporter.report("A switch used as a value must produce a value in every "
+                + "arm.", span);
+            return this.store.errorType();
+        }
+        for (long i = 0; i < valueExpressions.length(); i++) {
+            this.adaptIntegerLiteral(valueExpressions.get(i), unified);
+        }
+        return unified;
+    }
+
+    // A 'null' label types as null, an identifier label over an enum scrutinee resolves as an
+    // enum member, and any other label is an ordinary expression adapted to the scrutinee.
+    private checkSwitchLabel(Expression label, Type inner) {
+        if (label is LiteralExpressionNode
+                && label.value().kind() == SyntaxKind.NullKeyword) {
+            this.result.setType(label.green(), this.store.nullType());
+            return;
+        }
+        if (inner is EnumType && label is IdentifierExpressionNode) {
+            long ordinal = enumOrdinal(inner, label.name().text());
+            if (ordinal >= 0) {
+                this.result.setType(label.green(), inner);
+                this.result.setEnumConstant(label.green(), ordinal);
+            }
+            return;
+        }
+        if (convert.isIntegerType(inner)) {
+            this.analyzeExpressionAdapt(label, inner);
+            return;
+        }
+        this.analyzeExpression(label);
+    }
+
+    // The recorded type of an already-analyzed expression node.
+    private recordedType(Expression expression) -> Type {
+        let recorded = this.result.typeOf(expression.green());
+        if (recorded != null) {
+            return recorded;
+        }
+        return this.store.errorType();
+    }
+
+    private walkArmBody(ArmBody body, bool requireValue, List<Expression> sink) -> bool {
+        switch (body) {
+            is BlockNode block -> {
+                bool sawBlock = false;
+                if (requireValue) {
+                    this.reporter.report("A switch used as a value must use expression arms, "
+                        + "not '\{ \}' blocks.", block.span());
+                    sawBlock = true;
+                }
+                this.walkScopedBlock(block);
+                return sawBlock;
+            },
+            is Expression expression -> {
+                this.analyzeExpression(expression);
+                if (requireValue) {
+                    sink.push(expression);
+                }
+                return false;
+            },
+            default -> {
+                return false;
+            },
+        }
+    }
+}
+
+// The call shape paired with each argument's written expression, positional first and named
+// after, so resolved calls can adapt literals in place. An 'out' misuse leaves a null hole.
+private class BuiltShape {
+    CallShape shape;
+    List<Expression?> values;
+
+    constructor(this.shape, this.values);
+}
+
+// Every method the receiver's chain declares under the name, nearest first; a base method
+// whose parameter types a derived one repeats is shadowed. Constructors and destructors are
+// not members.
+private methodCandidates(Type record, string name) -> List<Method> {
+    let found = new List<Method>();
+    Type? current = record;
+    let seen = new Set<Type>();
+    while (current != null && seen.add(current)) {
+        let methods = types.methodsOf(current);
+        if (methods == null) {
+            break;
+        }
+        long derivedCount = found.length();
+        for (long i = 0; i < methods.length(); i++) {
+            let candidate = methods.get(i);
+            if (candidate.name() != name || candidate.isConstructor()
+                    || candidate.isDestructor()) {
+                continue;
+            }
+            bool shadowed = false;
+            for (long j = 0; j < derivedCount; j++) {
+                if (types.sameParameterTypes(found.get(j).signature(),
+                        candidate.signature())) {
+                    shadowed = true;
+                    break;
+                }
+            }
+            if (!shadowed) {
+                found.push(candidate);
+            }
+        }
+        current = types.baseOf(current);
+    }
+    return found;
+}
+
+// Breadth-first search of the subclass tree for a member the narrowing milestone would have
+// proven reachable. Subclasses that disagree about the member defer it instead: without the
+// flow proof there is no single answer to type against.
+private subclassMember(Type record, string name) -> MemberLookup? {
+    let authority = types.authorityOf(record);
+    if (authority is ClassType) {
+        let fieldsFound = new List<Field>();
+        let methodsFound = new List<Method>();
+        let queue = new List<ClassType>();
+        for (long i = 0; i < authority.directSubclasses().length(); i++) {
+            queue.push(authority.directSubclasses().get(i));
+        }
+        long at = 0;
+        while (at < queue.length()) {
+            let candidate = queue.get(at);
+            at++;
+            let field = members.findField(candidate.fields(), name);
+            if (field != null) {
+                fieldsFound.push(field);
+            }
+            let found = methodCandidates(candidate, name);
+            for (long i = 0; i < found.length(); i++) {
+                methodsFound.push(found.get(i));
+            }
+            for (long i = 0; i < candidate.directSubclasses().length(); i++) {
+                queue.push(candidate.directSubclasses().get(i));
+            }
+        }
+        if (fieldsFound.length() == 0 && methodsFound.length() == 0) {
+            return null;
+        }
+        if (fieldsFound.length() > 0 && methodsFound.length() > 0) {
+            return new DeferredMember();
+        }
+        if (fieldsFound.length() > 0) {
+            for (long i = 1; i < fieldsFound.length(); i++) {
+                if (fieldsFound.get(i).type() != fieldsFound.get(0).type()) {
+                    return new DeferredMember();
+                }
+            }
+            return new FieldMember(fieldsFound.get(0));
+        }
+        let first = methodsFound.get(0);
+        for (long i = 1; i < methodsFound.length(); i++) {
+            let other = methodsFound.get(i);
+            if (!types.sameParameterTypes(other.signature(), first.signature())
+                    || other.signature().returnType() != first.signature().returnType()) {
+                return new DeferredMember();
+            }
+        }
+        let agreed = new List<Method>();
+        agreed.push(first);
+        return new MethodMember(agreed);
+    }
+    return null;
+}
+
+private constructorsOf(Type record) -> List<Method> {
+    let found = new List<Method>();
+    let methods = types.methodsOf(record);
+    if (methods != null) {
+        for (long i = 0; i < methods.length(); i++) {
+            if (methods.get(i).isConstructor()) {
+                found.push(methods.get(i));
+            }
+        }
+    }
+    return found;
+}
+
+private isRecordLike(Type type) -> bool {
+    return type is ClassType || type is InterfaceType || type is StructType
+        || type is InstantiationType;
+}
+
+private isStructValue(Type type) -> bool {
+    if (type is StructType) {
+        return true;
+    }
+    if (type is InstantiationType) {
+        return type.template() is StructType;
+    }
+    return false;
+}
+
+private isFinalClass(Type type) -> bool {
+    let authority = types.authorityOf(type);
+    if (authority is ClassType) {
+        return authority.isFinal();
+    }
+    return false;
+}
+
+private isReferenceElement(Type element) -> bool {
+    return types.isClassLike(element) || element is ArrayType || element is StringType
+        || element is ExternalType;
+}
+
+private isStringable(Type core) -> bool {
+    return core is StringType || convert.isIntegerType(core) || convert.isBoolType(core);
+}
+
+private usesNamedArguments(ArgumentListNode arguments) -> bool {
+    for (long i = 0; i < arguments.argumentsCount(); i++) {
+        if (arguments.arguments(i) is NamedArgumentNode) {
+            return true;
+        }
+    }
+    return false;
+}
+
+private enumOrdinal(EnumType enumType, string memberName) -> long {
+    string[] names = enumType.memberNames();
+    for (long i = 0; i < names.length; i++) {
+        if (names[i] == memberName) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// The written name of a created type, for constructor diagnostics.
+private writtenTypeName(nodes.Type created, Type resolved) -> string {
+    if (created is NamedTypeNode) {
+        return created.name().text();
+    }
+    return types.display(resolved);
+}
+
+// The literal an untyped integer adaptation applies to: the literal itself, or one behind a
+// single '+' or '-' prefix.
+private intLiteralOf(Expression node) -> LiteralExpressionNode? {
+    if (node is LiteralExpressionNode) {
+        if (node.value().kind() == SyntaxKind.IntLiteral) {
+            return node;
+        }
+        return null;
+    }
+    if (node is PrefixExpressionNode) {
+        SyntaxKind operator = node.operator().kind();
+        if (operator != SyntaxKind.Plus && operator != SyntaxKind.Minus) {
+            return null;
+        }
+        let operand = node.operand();
+        if (operand is LiteralExpressionNode
+                && operand.value().kind() == SyntaxKind.IntLiteral) {
+            return operand;
+        }
+    }
+    return null;
+}
+
+private isNegativeLiteral(Expression node) -> bool {
+    if (node is PrefixExpressionNode) {
+        return node.operator().kind() == SyntaxKind.Minus;
+    }
+    return false;
+}
+
+// ---- The canonical fill loop ----
+
+private identName(Expression node) -> string {
+    if (node is IdentifierExpressionNode) {
+        return node.name().text();
+    }
+    return "";
+}
+
+private isIntegerLiteralText(Expression node, string text) -> bool {
+    if (node is LiteralExpressionNode) {
+        SyntaxKind kind = node.value().kind();
+        if (kind == SyntaxKind.IntLiteral || kind == SyntaxKind.LongLiteral) {
+            return node.value().text() == text;
+        }
+    }
+    return false;
+}
+
+private isPlainIndexType(nodes.Type reference) -> bool {
+    if (reference is NamedTypeNode) {
+        string name = reference.name().text();
+        if (name != "long" && name != "int") {
+            return false;
+        }
+        return reference.qualifier() == null && reference.typeArguments() == null;
+    }
+    return false;
+}
+
+// A step-by-one update on the index: 'i = i + 1', 'i++', or '++i'.
+private isUnitIncrement(Expression update, string indexName) -> bool {
+    if (update is AssignmentExpressionNode) {
+        if (update.operator().kind() != SyntaxKind.Equals) {
+            return false;
+        }
+        if (identName(update.target()) != indexName) {
+            return false;
+        }
+        return isPlusOne(update.value(), indexName);
+    }
+    if (update is PostfixExpressionNode) {
+        return update.operator().kind() == SyntaxKind.PlusPlus
+            && identName(update.operand()) == indexName;
+    }
+    if (update is PrefixExpressionNode) {
+        return update.operator().kind() == SyntaxKind.PlusPlus
+            && identName(update.operand()) == indexName;
+    }
+    return false;
+}
+
+private isPlusOne(Expression value, string indexName) -> bool {
+    if (value is BinaryExpressionNode) {
+        return value.operator().kind() == SyntaxKind.Plus
+            && identName(value.left()) == indexName
+            && isIntegerLiteralText(value.right(), "1");
+    }
+    return false;
+}
+
+// Any identifier token spelling the name counts as a mention; the fill expression must
+// provably never read the array.
+private mentionsIdentifier(GreenNode node, string name) -> bool {
+    for (long i = 0; i < node.slotCount(); i++) {
+        let child = node.slot(i);
+        if (child == null) {
+            continue;
+        }
+        if (child is GreenToken) {
+            if (child.kind() == SyntaxKind.Identifier && child.text() == name) {
+                return true;
+            }
+        } else if (child is GreenNode) {
+            if (mentionsIdentifier(child, name)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Matches 'for (long i = 0; i < name.length; i = i + 1) { name[i] = expr; }' (the update also
+// accepts 'i++' and '++i') with a fresh 'long'/'int' index and 'expr' never mentioning 'name'.
+private isArrayFillLoop(ForStatementNode loop, string arrayName) -> bool {
+    let indexName = fillLoopIndexName(loop, arrayName);
+    if (indexName == null) {
+        return false;
+    }
+    if (!fillLoopConditionMatches(loop.condition(), arrayName, indexName)) {
+        return false;
+    }
+    let update = loop.update();
+    if (update == null || !isUnitIncrement(update, indexName)) {
+        return false;
+    }
+    return fillLoopBodyMatches(loop.body(), arrayName, indexName);
+}
+
+// The fresh 'long'/'int' index the loop declares starting at 0, or null when the initializer
+// does not match.
+private fillLoopIndexName(ForStatementNode loop, string arrayName) -> string? {
+    let initializer = loop.initializer();
+    if (initializer is VariableDeclarationNode) {
+        let declaredType = initializer.declaredType();
+        if (declaredType != null && !isPlainIndexType(declaredType)) {
+            return null;
+        }
+        let initialValue = initializer.initializer();
+        if (initialValue == null || !isIntegerLiteralText(initialValue.value(), "0")) {
+            return null;
+        }
+        string indexName = initializer.name().text();
+        if (indexName.length == 0 || indexName == arrayName) {
+            return null;
+        }
+        return indexName;
+    }
+    return null;
+}
+
+private fillLoopConditionMatches(Expression? condition, string arrayName, string indexName)
+        -> bool {
+    if (condition is BinaryExpressionNode) {
+        if (condition.operator().kind() != SyntaxKind.Less) {
+            return false;
+        }
+        if (identName(condition.left()) != indexName) {
+            return false;
+        }
+        let lengthAccess = condition.right();
+        if (lengthAccess is MemberExpressionNode) {
+            return identName(lengthAccess.object()) == arrayName
+                && lengthAccess.member().text() == "length";
+        }
+    }
+    return false;
+}
+
+private fillLoopBodyMatches(BlockNode body, string arrayName, string indexName) -> bool {
+    if (body.statementsCount() != 1) {
+        return false;
+    }
+    let statement = body.statements(0);
+    if (statement is ExpressionStatementNode) {
+        let assignment = statement.expression();
+        if (assignment is AssignmentExpressionNode) {
+            if (assignment.operator().kind() != SyntaxKind.Equals) {
+                return false;
+            }
+            let slot = assignment.target();
+            if (slot is SubscriptExpressionNode) {
+                if (identName(slot.object()) != arrayName
+                        || identName(slot.index()) != indexName) {
+                    return false;
+                }
+                return !mentionsIdentifier(assignment.value().green(), arrayName);
+            }
+        }
+    }
+    return false;
+}
+
+// The first method whose signature was read from the given declaration node.
+private methodDeclaredBy(List<Method> methods, GreenNode declaration) -> Method? {
+    for (long i = 0; i < methods.length(); i++) {
+        if (methods.get(i).signature().declaration() == declaration) {
+            return methods.get(i);
+        }
+    }
+    return null;
+}
+
+// The element type argument when the type is an 'Iterable<T>' instantiation from
+// '@std.collections.iterator'.
+private iterableArgument(Type candidate) -> Type? {
+    if (candidate is InstantiationType) {
+        let template = candidate.template();
+        if (template is InterfaceType && template.name() == "Iterable"
+                && template.modulePath() == "std.collections.iterator"
+                && candidate.arguments().length > 0) {
+            return candidate.arguments()[0];
+        }
+    }
+    return null;
+}
+
+private armsOfStatement(SwitchStatementNode node) -> List<SwitchArm> {
+    let arms = new List<SwitchArm>();
+    for (long i = 0; i < node.armsCount(); i++) {
+        arms.push(node.arms(i));
+    }
+    return arms;
+}
+
+private armsOfExpression(SwitchExpressionNode node) -> List<SwitchArm> {
+    let arms = new List<SwitchArm>();
+    for (long i = 0; i < node.armsCount(); i++) {
+        arms.push(node.arms(i));
+    }
+    return arms;
+}
