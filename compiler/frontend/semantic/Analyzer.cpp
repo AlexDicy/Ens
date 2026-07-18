@@ -3120,6 +3120,7 @@ void Analyzer::analyzeForStmt(const ast::ForStatement& stmt) {
     if (auto u = stmt.update()) analyzeExpr(*u);
     popScope();
     loopDepth--;
+    popScope();  // the init-binding scope opened at the top
 }
 
 // True when `si` is the std.collections.iterator Iterable interface (or an instantiation of it).
