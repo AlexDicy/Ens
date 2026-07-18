@@ -58,7 +58,7 @@ private class FoundIdentifier {
 }
 
 private class CycleStep {
-    StructType owner;
+    Type owner;
     Field field;
 
     constructor(this.owner, this.field);
@@ -129,7 +129,7 @@ private class ModuleChecks {
                 continue;
             }
             let path = new List<CycleStep>();
-            let explored = new Set<StructType>();
+            let explored = new Set<Type>();
             if (!findPathBackTo(found, found, path, explored)) {
                 continue;
             }
@@ -144,13 +144,17 @@ private class ModuleChecks {
                     }
                 }
                 let step = path.get(s);
-                builder.append("field '{step.field.name()}' of '{step.owner.name()}' has "
+                builder.append("field '{step.field.name()}' of "
+                    + "'{types.display(step.owner)}' has "
                     + "type '{types.display(step.field.type())}'");
             }
-            let example = byValueFieldStruct(path.get(0).field.type());
             string exampleName = found.name();
+            let example = byValueStruct(path.get(0).field.type());
             if (example != null) {
-                exampleName = example.name();
+                let authority = types.authorityOf(example);
+                if (authority != null) {
+                    exampleName = authority.name();
+                }
             }
             builder.append(". Struct fields are stored inline, so this layout would be "
                 + "infinitely large. Break the cycle, for example by declaring "
@@ -394,9 +398,9 @@ private class ModuleChecks {
     }
 }
 
-// The struct a field stores inline, normalized to the declaring template so an instantiation
-// of the containing struct closes its cycle.
-private byValueFieldStruct(Type fieldType) -> StructType? {
+// The struct a field stores inline: a plain struct, or an instantiation of a generic struct
+// with its own substituted fields.
+private byValueStruct(Type fieldType) -> Type? {
     Type bare = fieldType;
     if (bare is OptionalType) {
         bare = bare.inner();
@@ -404,28 +408,29 @@ private byValueFieldStruct(Type fieldType) -> StructType? {
     if (bare is StructType) {
         return bare;
     }
-    if (bare is InstantiationType) {
-        let template = bare.template();
-        if (template is StructType) {
-            return template;
-        }
+    if (bare is InstantiationType && bare.template() is StructType) {
+        return bare;
     }
     return null;
 }
 
-// Depth-first search for a by-value field path from origin back to itself. explored bounds the
-// walk on graphs with shared members.
-private findPathBackTo(StructType origin, StructType current, List<CycleStep> path,
-                       Set<StructType> explored) -> bool {
-    let fields = current.fields();
+// Depth-first search for a by-value field path from origin back to itself. An instantiation
+// counts as its template, so 'Wrap<T>' inside 'struct Wrap<T>' closes the cycle. explored
+// bounds the walk on graphs with shared members.
+private findPathBackTo(StructType origin, Type current, List<CycleStep> path,
+                       Set<Type> explored) -> bool {
+    let fields = types.fieldsOf(current);
+    if (fields == null) {
+        return false;
+    }
     for (long i = 0; i < fields.length(); i++) {
         let field = fields.get(i);
-        let next = byValueFieldStruct(field.type());
+        let next = byValueStruct(field.type());
         if (next == null) {
             continue;
         }
         path.push(new CycleStep(current, field));
-        if (next == origin) {
+        if (types.authorityOf(next) == origin) {
             return true;
         }
         if (explored.add(next) && findPathBackTo(origin, next, path, explored)) {
@@ -437,14 +442,13 @@ private findPathBackTo(StructType origin, StructType current, List<CycleStep> pa
 }
 
 // True if the type can start as a valid zero value without an initializer: primitives except
-// decimal, optionals, and structs whose every field can. An unfilled generic struct reference
-// stays permissive until its members fill.
+// decimal, optionals, and structs - generic instantiations included - whose every field can.
 private isDefaultable(Type fieldType) -> bool {
-    let visiting = new Set<StructType>();
+    let visiting = new Set<Type>();
     return isDefaultableGuarded(fieldType, visiting);
 }
 
-private isDefaultableGuarded(Type fieldType, Set<StructType> visiting) -> bool {
+private isDefaultableGuarded(Type fieldType, Set<Type> visiting) -> bool {
     if (fieldType is PrimitiveType) {
         return fieldType.kind() != PrimitiveKind.Decimal
             && fieldType.kind() != PrimitiveKind.Void;
@@ -453,25 +457,33 @@ private isDefaultableGuarded(Type fieldType, Set<StructType> visiting) -> bool {
         return true;
     }
     if (fieldType is StructType) {
-        if (!visiting.add(fieldType)) {
-            return true;
-        }
-        let fields = fieldType.fields();
-        for (long i = 0; i < fields.length(); i++) {
-            let field = fields.get(i);
-            if (field.hasDefault() || isDefaultableGuarded(field.type(), visiting)) {
-                continue;
-            }
-            visiting.remove(fieldType);
-            return false;
-        }
-        visiting.remove(fieldType);
-        return true;
+        return structFieldsDefaultable(fieldType, visiting);
     }
-    if (fieldType is InstantiationType) {
-        return fieldType.template() is StructType;
+    if (fieldType is InstantiationType && fieldType.template() is StructType) {
+        return structFieldsDefaultable(fieldType, visiting);
     }
     return false;
+}
+
+private structFieldsDefaultable(Type structLike, Set<Type> visiting) -> bool {
+    if (!visiting.add(structLike)) {
+        return true;
+    }
+    let fields = types.fieldsOf(structLike);
+    if (fields == null) {
+        visiting.remove(structLike);
+        return true;
+    }
+    for (long i = 0; i < fields.length(); i++) {
+        let field = fields.get(i);
+        if (field.hasDefault() || isDefaultableGuarded(field.type(), visiting)) {
+            continue;
+        }
+        visiting.remove(structLike);
+        return false;
+    }
+    visiting.remove(structLike);
+    return true;
 }
 
 // True when the constructor initializes the field through a 'this.field' parameter or a

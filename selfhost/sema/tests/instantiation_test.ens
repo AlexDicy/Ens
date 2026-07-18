@@ -1,0 +1,211 @@
+import @std.testing;
+import TestFailure from @std.testing;
+import types;
+import Type from types;
+import ClassType from types;
+import InstantiationType from types;
+import OptionalType from types;
+import ArrayType from types;
+import PrimitiveKind from types;
+import FakeFileLoader from sema_support;
+import sema_support;
+
+// The instantiation a field type wraps, unwrapping one optional layer.
+private instantiationIn(Type type) -> InstantiationType throws {
+    Type bare = type;
+    if (bare is OptionalType) {
+        bare = bare.inner();
+    }
+    if (bare is InstantiationType) {
+        return bare;
+    }
+    throw new TestFailure("expected a generic instantiation, got '{types.display(type)}'");
+}
+
+test "a filled instantiation substitutes fields, methods, and self-references in place" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/app.ens",
+        "class Node<T> \{\n"
+        + "    T? value;\n"
+        + "    Node<T>? next;\n"
+        + "    T[] history = [];\n"
+        + "    constructor();\n"
+        + "    push(T value) -> Node<T> \{ return this; \}\n"
+        + "\}\n"
+        + "class Chain \{\n"
+        + "    Node<int>? head;\n"
+        + "    constructor();\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
+    try sema_support.assertProgramClean(analysis);
+
+    let chain = try sema_support.classNamed(analysis, "app", "Chain");
+    let node = try instantiationIn(chain.fields().get(0).type());
+    try testing.assertTrue(node.isFilled(), "the instantiation should be filled");
+    let intType = analysis.store().primitive(PrimitiveKind.Int);
+
+    try testing.assertEqual(node.fields().length(), 3L);
+    try testing.assertTrue(node.fields().get(0).type()
+        == analysis.store().optionalOf(intType), "T? substitutes to int?");
+    try testing.assertTrue(node.fields().get(1).type()
+        == analysis.store().optionalOf(node),
+        "the self-referential field resolves back to the same instantiation");
+    try testing.assertTrue(node.fields().get(2).type()
+        == analysis.store().arrayOf(intType), "T[] substitutes to int[]");
+    try testing.assertTrue(node.fields().get(0).definingType() == node,
+        "a substituted field belongs to the instantiation");
+
+    let push = node.methods().get(1);
+    try testing.assertTrue(push.signature().parameters()[0].type() == intType,
+        "the method parameter substitutes");
+    try testing.assertTrue(push.signature().returnType() == node,
+        "the method return substitutes to the same instantiation");
+}
+
+test "a generic base rebinds to a concrete instantiation and flattens across modules" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/app.ens",
+        "import Sub from lib;\n"
+        + "class Impl extends Sub<int> \{\n"
+        + "    constructor();\n"
+        + "\}\n");
+    loader.add("/proj/src/lib.ens",
+        "public class Base<T> \{\n"
+        + "    T? item;\n"
+        + "    constructor();\n"
+        + "    read() -> T? \{ return this.item; \}\n"
+        + "\}\n"
+        + "public class Sub<U> extends Base<U[]> \{\n"
+        + "    U? latest;\n"
+        + "    constructor();\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
+    try sema_support.assertProgramClean(analysis);
+
+    let impl = try sema_support.classNamed(analysis, "app", "Impl");
+    let store = analysis.store();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let base = impl.base();
+    if (base is InstantiationType) {
+        try testing.assertTrue(base.isFilled(), "Sub<int> should be filled");
+        let baseOfBase = base.base();
+        if (baseOfBase is InstantiationType) {
+            try testing.assertTrue(baseOfBase.template()
+                == try sema_support.classNamed(analysis, "lib", "Base"),
+                "the generic base rebinds to the Base template");
+            try testing.assertTrue(baseOfBase.arguments()[0] == store.arrayOf(intType),
+                "the rebound base substitutes through nested shapes: Base<int[]>");
+            try testing.assertTrue(baseOfBase.isFilled(), "Base<int[]> fills on demand");
+        } else {
+            throw new TestFailure("expected Sub<int> to extend an instantiation of Base");
+        }
+        try testing.assertEqual(base.fields().length(), 2L);
+        try testing.assertEqual(base.baseFieldCount(), 1L);
+    } else {
+        throw new TestFailure("expected Impl to extend an instantiation of Sub");
+    }
+    try testing.assertEqual(impl.fields().length(), 2L);
+    try testing.assertTrue(impl.fields().get(0).type()
+        == store.optionalOf(store.arrayOf(intType)),
+        "the flattened inherited field reads int[]?");
+    try testing.assertTrue(impl.fields().get(1).type() == store.optionalOf(intType),
+        "the second flattened field reads int?");
+}
+
+test "instantiations queued before their template's members resolve fill at the fixpoint" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/app.ens",
+        "import Late from zlib;\n"
+        + "struct Holder \{\n"
+        + "    Late<bool> flag;\n"
+        + "\}\n");
+    loader.add("/proj/src/zlib.ens",
+        "public struct Late<T> \{\n"
+        + "    T? inner;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
+    try sema_support.assertProgramClean(analysis);
+
+    let holder = try sema_support.structNamed(analysis, "app", "Holder");
+    let late = try instantiationIn(holder.fields().get(0).type());
+    try testing.assertTrue(late.isFilled(),
+        "an instantiation requested before its template resolves still fills");
+    try testing.assertTrue(late.fields().get(0).type()
+        == analysis.store().optionalOf(analysis.store().primitive(PrimitiveKind.Bool)),
+        "the queued fill substitutes the argument");
+}
+
+test "overrides and interface satisfaction resolve across filled generic bases" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/app.ens",
+        "interface Source<T> \{\n"
+        + "    get() -> T;\n"
+        + "\}\n"
+        + "class Constant<T> implements Source<T> \{\n"
+        + "    constructor();\n"
+        + "    override get() -> T \{ return this.get(); \}\n"
+        + "\}\n"
+        + "class Amount extends Constant<int> \{\n"
+        + "    constructor();\n"
+        + "    override get() -> int \{ return 0; \}\n"
+        + "\}\n"
+        + "class Numbers implements Source<int> \{\n"
+        + "    constructor();\n"
+        + "    override get() -> int \{ return 1; \}\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
+    try sema_support.assertProgramClean(analysis);
+}
+
+test "type-parameter arguments satisfy bounds through their own bounds" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/app.ens",
+        "interface Speaker \{\n"
+        + "    speak() -> string;\n"
+        + "\}\n"
+        + "class Chorus<T: Speaker> \{\n"
+        + "    T? lead;\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "class Ensemble<U: Speaker> \{\n"
+        + "    Chorus<U>? chorus;\n"
+        + "    constructor();\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
+    try sema_support.assertProgramClean(analysis);
+}
+
+test "every type satisfies the standard hashing contract" {
+    let loader = new FakeFileLoader();
+    loader.add("/stdlib/std/hash.ens",
+        "public interface Hashable \{\n"
+        + "    hash() -> long;\n"
+        + "\}\n");
+    loader.add("/proj/src/app.ens",
+        "import Hashable from @std.hash;\n"
+        + "class Bag<T: Hashable> \{\n"
+        + "    T? item;\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "class Use \{\n"
+        + "    Bag<int>? numbers;\n"
+        + "    Bag<string>? names;\n"
+        + "    constructor();\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
+    try sema_support.assertProgramClean(analysis);
+}
+
+test "defaultability reads the filled instantiation's fields" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/app.ens",
+        "struct Pair<A, B> \{\n"
+        + "    A first;\n"
+        + "    B second;\n"
+        + "\}\n"
+        + "struct Corner \{\n"
+        + "    Pair<int, bool> at;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
+    try sema_support.assertProgramClean(analysis);
+}
