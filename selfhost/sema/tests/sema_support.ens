@@ -1,13 +1,31 @@
 // Shared helpers for the sema test files: an in-memory file tree standing in for the file system,
-// and assertions over graph results and diagnostics.
+// assertions over graph results and diagnostics, and the declare + link pipeline the harness runs.
 import @std.testing;
 import TestFailure from @std.testing;
+import List from @std.collections.list;
 import Map from @std.collections.map;
+import Source from @ens.frontend.source;
+import @ens.frontend.parser;
+import @ens.frontend.syntax.factory;
+import SourceFileNode from @ens.frontend.syntax.nodes;
+import GreenNode from @ens.frontend.syntax.green;
 import FileLoader from loader;
 import FileError from loader;
 import FileDiagnostic from diagnostics;
+import diagnostics;
 import Module from graph;
 import GraphResult from graph;
+import graph;
+import DeclareResult from declare;
+import FileDeclarations from declare;
+import declare;
+import TypeStore from types;
+import DeclaredType from types;
+import LinkResult from link;
+import NameBinding from link;
+import ImportedType from link;
+import ImportedNamespace from link;
+import link;
 
 public class FakeFileLoader implements FileLoader {
     private Map<string, string> files;
@@ -87,4 +105,111 @@ private describeModules(Module[] modules) -> string {
         described = described + modules[i].canonicalPath();
     }
     return described;
+}
+
+public parseSource(string filePath, string text) -> SourceFileNode {
+    let parsed = parser.parse(new Source(filePath, text));
+    let root = factory.createRoot(parsed.root());
+    if (root is SourceFileNode) {
+        return root;
+    }
+    panic("Internal: the parser did not produce a source file for {filePath}");
+}
+
+public declareSource(string filePath, string text) -> DeclareResult {
+    return declare.declareFile(parseSource(filePath, text), filePath);
+}
+
+// A green node for tests that only need a declaration-site placeholder.
+public anyGreenNode() -> GreenNode {
+    return parser.parse(new Source("placeholder.ens", "")).root();
+}
+
+// The declared and linked view of one in-memory program, produced the way the harness produces
+// it: graph, then declare over every module, then link.
+public class Pipeline {
+    private GraphResult pipelineGraph;
+    private TypeStore pipelineStore;
+    private LinkResult pipelineLink;
+    private FileDiagnostic[] pipelineDeclareDiagnostics;
+
+    constructor(GraphResult graphResult, TypeStore store, LinkResult linkResult,
+                FileDiagnostic[] declareDiagnostics) {
+        this.pipelineGraph = graphResult;
+        this.pipelineStore = store;
+        this.pipelineLink = linkResult;
+        this.pipelineDeclareDiagnostics = declareDiagnostics;
+    }
+
+    graphResult() -> GraphResult {
+        return this.pipelineGraph;
+    }
+
+    store() -> TypeStore {
+        return this.pipelineStore;
+    }
+
+    linkResult() -> LinkResult {
+        return this.pipelineLink;
+    }
+
+    declareDiagnostics() -> FileDiagnostic[] {
+        return this.pipelineDeclareDiagnostics;
+    }
+}
+
+public analyze(FakeFileLoader loader, string sourceRoot, string[] seeds) -> Pipeline {
+    let result = graph.buildGraph(loader, sourceRoot, "", "/stdlib", seeds);
+    let declarations = new List<FileDeclarations>();
+    let declareDiagnostics = new List<FileDiagnostic>();
+    for (let loaded in result.modules()) {
+        let root = factory.createRoot(loaded.parseResult().root());
+        if (root is SourceFileNode) {
+            let declared = declare.declareFile(root, loaded.filePath());
+            declarations.push(declared.declarations());
+            for (let diagnostic in declared.diagnostics()) {
+                declareDiagnostics.push(diagnostic);
+            }
+        } else {
+            declarations.push(new FileDeclarations(loaded.filePath(), [], [], [], [], [], []));
+        }
+    }
+    let store = new TypeStore();
+    let linked = link.linkProgram(result, declarations.toArray(), store);
+    return new Pipeline(result, store, linked, diagnostics.sorted(declareDiagnostics));
+}
+
+// Asserts the whole pipeline produced no diagnostics: graph, declare, and link.
+public assertClean(Pipeline pipeline) throws {
+    try assertNoDiagnostics(pipeline.graphResult().diagnostics());
+    try assertNoDiagnostics(pipeline.declareDiagnostics());
+    try assertNoDiagnostics(pipeline.linkResult().diagnostics());
+}
+
+public boundType(Pipeline pipeline, string modulePath, string name) -> DeclaredType throws {
+    let binding = try namedBinding(pipeline, modulePath, name);
+    if (binding is ImportedType) {
+        return binding.target();
+    }
+    throw new TestFailure("binding '{name}' in module '{modulePath}' is not a type import");
+}
+
+public boundNamespace(Pipeline pipeline, string modulePath, string name) -> string throws {
+    let binding = try namedBinding(pipeline, modulePath, name);
+    if (binding is ImportedNamespace) {
+        return binding.modulePath();
+    }
+    throw new TestFailure("binding '{name}' in module '{modulePath}' is not a namespace import");
+}
+
+private namedBinding(Pipeline pipeline, string modulePath, string name) -> NameBinding throws {
+    let table = pipeline.linkResult().tableFor(modulePath);
+    if (table == null) {
+        throw new TestFailure("no link table for module '{modulePath}'");
+    }
+    let binding = table.binding(name);
+    if (binding == null) {
+        throw new TestFailure("no binding named '{name}' in module '{modulePath}'");
+    }
+    return binding;
 }

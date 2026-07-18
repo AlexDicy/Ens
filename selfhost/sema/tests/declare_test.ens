@@ -1,0 +1,146 @@
+import @std.testing;
+import TestFailure from @std.testing;
+import DeclaredKind from declare;
+import TypeDeclaration from declare;
+import FileDeclarations from declare;
+import declare;
+import Visibility from types;
+import sema_support;
+
+test "declare captures every top-level declaration of a file" {
+    let result = sema_support.declareSource("/proj/src/app.ens",
+        "import lib.util;\n"
+        + "import Box from @acme.widgets.box;\n"
+        + "public class Shape<T, U> \{ \}\n"
+        + "sealed abstract class Expr \{ \}\n"
+        + "final class Leaf \{ \}\n"
+        + "private struct Point \{ int x; \}\n"
+        + "interface Speaker \{ speak() -> string; \}\n"
+        + "private enum Color \{ Red, Green \}\n"
+        + "external type HANDLE;\n"
+        + "external from \"kernel32\" \{\n"
+        + "    ReadFile(HANDLE handle) -> int;\n"
+        + "    CloseHandle(HANDLE handle) -> int;\n"
+        + "\}\n"
+        + "private helper() -> int \{ return 1; \}\n"
+        + "main() \{ \}\n"
+        + "test \"declared tests are counted\" \{ \}\n");
+    try sema_support.assertNoDiagnostics(result.diagnostics());
+    let declarations = result.declarations();
+    try testing.assertEqual(declarations.filePath(), "/proj/src/app.ens");
+    try testing.assertEqual(declarations.types().length, 7L);
+    try testing.assertEqual(declarations.functions().length, 2L);
+    try testing.assertEqual(declarations.externalFunctions().length, 2L);
+    try testing.assertEqual(declarations.externalLibraries().length, 1L);
+    try testing.assertEqual(declarations.externalLibraries()[0], "kernel32");
+    try testing.assertEqual(declarations.tests().length, 1L);
+    try testing.assertEqual(declarations.imports().length, 2L);
+
+    let shape = try typeNamed(declarations, "Shape");
+    try testing.assertTrue(shape.kind() == DeclaredKind.Class, "Shape should be a class");
+    try testing.assertTrue(shape.visibility() == Visibility.Public, "Shape should be public");
+    try testing.assertEqual(shape.typeParameters().length, 2L);
+    try testing.assertEqual(shape.typeParameters()[0], "T");
+    try testing.assertEqual(shape.typeParameters()[1], "U");
+    try testing.assertFalse(shape.isSealed(), "Shape is not sealed");
+
+    let expr = try typeNamed(declarations, "Expr");
+    try testing.assertTrue(expr.isSealed(), "Expr should be sealed");
+    try testing.assertTrue(expr.isAbstract(), "Expr should be abstract");
+    try testing.assertFalse(expr.isFinal(), "Expr is not final");
+
+    let leaf = try typeNamed(declarations, "Leaf");
+    try testing.assertTrue(leaf.isFinal(), "Leaf should be final");
+
+    let point = try typeNamed(declarations, "Point");
+    try testing.assertTrue(point.kind() == DeclaredKind.Struct, "Point should be a struct");
+    try testing.assertTrue(point.visibility() == Visibility.Private, "Point should be private");
+
+    let speaker = try typeNamed(declarations, "Speaker");
+    try testing.assertTrue(speaker.kind() == DeclaredKind.Interface,
+        "Speaker should be an interface");
+
+    let color = try typeNamed(declarations, "Color");
+    try testing.assertTrue(color.kind() == DeclaredKind.Enum, "Color should be an enum");
+    try testing.assertTrue(color.visibility() == Visibility.Private, "Color should be private");
+
+    let handle = try typeNamed(declarations, "HANDLE");
+    try testing.assertTrue(handle.kind() == DeclaredKind.External,
+        "HANDLE should be an external type");
+    try testing.assertTrue(handle.visibility() == Visibility.Public,
+        "an external type is always public");
+
+    try testing.assertEqual(declarations.functions()[0].name(), "helper");
+    try testing.assertTrue(declarations.functions()[0].visibility() == Visibility.Private,
+        "helper should be private");
+    try testing.assertEqual(declarations.functions()[1].name(), "main");
+    try testing.assertTrue(declarations.functions()[1].visibility() == Visibility.Public,
+        "main should default to public");
+    try testing.assertEqual(declarations.externalFunctions()[0].name(), "ReadFile");
+    try testing.assertEqual(declarations.externalFunctions()[0].library(), "kernel32");
+    try testing.assertTrue(declarations.hasFunctionNamed("ReadFile"),
+        "external functions count as functions");
+    try testing.assertTrue(declarations.hasFunctionNamed("helper"),
+        "free functions count as functions");
+    try testing.assertFalse(declarations.hasFunctionNamed("Shape"),
+        "a type is not a function");
+}
+
+test "declare records imports in source order with their shape" {
+    let result = sema_support.declareSource("/proj/src/app.ens",
+        "import lib.util;\n"
+        + "import Box from @acme.widgets.box;\n"
+        + "import @std.testing;\n");
+    try sema_support.assertNoDiagnostics(result.diagnostics());
+    let imports = result.declarations().imports();
+    try testing.assertEqual(imports.length, 3L);
+
+    try testing.assertFalse(imports[0].isNamed(), "a namespace import has no bound name");
+    try testing.assertEqual(imports[0].namespaceName(), "util");
+    try testing.assertEqual(imports[0].pathText(), "lib.util");
+    try testing.assertFalse(imports[0].isPackage(), "a bare import is not a package import");
+
+    try testing.assertTrue(imports[1].isNamed(), "a from-import is a named import");
+    try testing.assertEqual(imports[1].name(), "Box");
+    try testing.assertEqual(imports[1].namespaceName(), "box");
+    try testing.assertEqual(imports[1].pathText(), "acme.widgets.box");
+    try testing.assertTrue(imports[1].isPackage(), "an @ import is a package import");
+
+    try testing.assertFalse(imports[2].isNamed(), "a package namespace import is not named");
+    try testing.assertEqual(imports[2].namespaceName(), "testing");
+}
+
+test "a duplicate type name is diagnosed once per extra declaration" {
+    let result = sema_support.declareSource("/proj/src/app.ens",
+        "class Box \{ \}\n"
+        + "struct Box \{ int x; \}\n"
+        + "enum Box \{ Red \}\n");
+    try sema_support.assertDiagnostic(result.diagnostics(), 0, "/proj/src/app.ens",
+        "Duplicate type 'Box'; this file already declares a class with this name.");
+    try sema_support.assertDiagnostic(result.diagnostics(), 1, "/proj/src/app.ens",
+        "Duplicate type 'Box'; this file already declares a class with this name.");
+    try testing.assertEqual(result.diagnostics().length, 2L);
+    let declarations = result.declarations();
+    try testing.assertEqual(declarations.types().length, 3L);
+    let winner = try typeNamed(declarations, "Box");
+    try testing.assertTrue(winner.kind() == DeclaredKind.Class,
+        "the first declaration should win the name");
+}
+
+test "a type may share its name with a function, and functions may overload" {
+    let result = sema_support.declareSource("/proj/src/app.ens",
+        "class render \{ \}\n"
+        + "render() \{ \}\n"
+        + "render(int frame) \{ \}\n");
+    try sema_support.assertNoDiagnostics(result.diagnostics());
+    try testing.assertEqual(result.declarations().types().length, 1L);
+    try testing.assertEqual(result.declarations().functions().length, 2L);
+}
+
+private typeNamed(FileDeclarations declarations, string name) -> TypeDeclaration throws {
+    let found = declarations.typeNamed(name);
+    if (found == null) {
+        throw new TestFailure("no type named '{name}' was declared");
+    }
+    return found;
+}

@@ -1,0 +1,252 @@
+// The link phase: registers every declared type in the store, then binds each module's imports
+// into a per-module name table. Each stage completes for all modules before the next starts, so
+// circular imports link cleanly. The output table is what signature resolution needs to see the
+// names a file imported.
+import GraphResult from graph;
+import Module from graph;
+import FileDeclarations from declare;
+import ImportRecord from declare;
+import TypeDeclaration from declare;
+import FileDiagnostic from diagnostics;
+import diagnostics;
+import TypeStore from types;
+import DeclaredType from types;
+import Visibility from types;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+
+public sealed abstract class NameBinding {
+}
+
+// A named import: the name refers to one public type of another module.
+public class ImportedType extends NameBinding {
+    private DeclaredType boundType;
+
+    constructor(DeclaredType target) {
+        this.boundType = target;
+    }
+
+    target() -> DeclaredType {
+        return this.boundType;
+    }
+}
+
+// A namespace import: the name qualifies accesses into another module.
+public class ImportedNamespace extends NameBinding {
+    private string boundModulePath;
+
+    constructor(string modulePath) {
+        this.boundModulePath = modulePath;
+    }
+
+    modulePath() -> string {
+        return this.boundModulePath;
+    }
+}
+
+public class ModuleLinkTable {
+    private string tableModulePath;
+    private Map<string, NameBinding> nameBindings;
+
+    constructor(string modulePath, Map<string, NameBinding> bindings) {
+        this.tableModulePath = modulePath;
+        this.nameBindings = bindings;
+    }
+
+    modulePath() -> string {
+        return this.tableModulePath;
+    }
+
+    binding(string name) -> NameBinding? {
+        return this.nameBindings.get(name);
+    }
+
+    bindingCount() -> long {
+        return this.nameBindings.length();
+    }
+}
+
+public class LinkResult {
+    private ModuleLinkTable[] linkTables;
+    private FileDiagnostic[] linkDiagnostics;
+    private Map<string, ModuleLinkTable> tablesByPath;
+
+    constructor(ModuleLinkTable[] tables, FileDiagnostic[] diagnostics) {
+        this.linkTables = tables;
+        this.linkDiagnostics = diagnostics;
+        this.tablesByPath = new Map<string, ModuleLinkTable>();
+        for (let table in tables) {
+            this.tablesByPath.set(table.modulePath(), table);
+        }
+    }
+
+    // One table per module, in the graph's module order.
+    tables() -> ModuleLinkTable[] {
+        return this.linkTables;
+    }
+
+    tableFor(string modulePath) -> ModuleLinkTable? {
+        return this.tablesByPath.get(modulePath);
+    }
+
+    diagnostics() -> FileDiagnostic[] {
+        return this.linkDiagnostics;
+    }
+}
+
+// Links the whole program. declarations aligns with graphResult.modules() by index.
+public linkProgram(GraphResult graphResult, FileDeclarations[] declarations, TypeStore store)
+        -> LinkResult {
+    Module[] modules = graphResult.modules();
+    if (modules.length != declarations.length) {
+        panic("Internal: link needs one FileDeclarations per module, got {declarations.length} "
+            + "for {modules.length} modules");
+    }
+    let declarationsByPath = new Map<string, FileDeclarations>();
+    for (long i = 0; i < modules.length; i++) {
+        declarationsByPath.set(modules[i].canonicalPath(), declarations[i]);
+    }
+    for (long i = 0; i < modules.length; i++) {
+        registerModuleTypes(store, modules[i], declarations[i]);
+    }
+    let tables = new List<ModuleLinkTable>();
+    let collected = new List<FileDiagnostic>();
+    for (long i = 0; i < modules.length; i++) {
+        tables.push(bindModuleImports(store, modules[i], declarations[i], declarationsByPath,
+            collected));
+    }
+    return new LinkResult(tables.toArray(), diagnostics.sorted(collected));
+}
+
+// Publishes each declared type's identity and metadata. The first declaration of a name wins;
+// later duplicates were already diagnosed by the declare phase.
+private registerModuleTypes(TypeStore store, Module module, FileDeclarations declarations) {
+    for (let declared in declarations.types()) {
+        if (store.hasDeclared(module.canonicalPath(), declared.name())) {
+            continue;
+        }
+        switch (declared.kind()) {
+            Class -> {
+                store.addClass(declared.name(), module.canonicalPath(), module.filePath(),
+                    declared.node(), declared.visibility(), declared.typeParameters(),
+                    declared.isAbstract(), declared.isFinal(), declared.isSealed());
+            },
+            Interface -> {
+                store.addInterface(declared.name(), module.canonicalPath(), module.filePath(),
+                    declared.node(), declared.visibility(), declared.typeParameters());
+            },
+            Struct -> {
+                store.addStruct(declared.name(), module.canonicalPath(), module.filePath(),
+                    declared.node(), declared.visibility(), declared.typeParameters());
+            },
+            Enum -> {
+                store.addEnum(declared.name(), module.canonicalPath(), module.filePath(),
+                    declared.node(), declared.visibility());
+            },
+            External -> {
+                store.addExternal(declared.name(), module.canonicalPath(), module.filePath(),
+                    declared.node(), declared.visibility());
+            },
+        }
+    }
+}
+
+// Binds one module's imports. Named imports that do not resolve to a type are held back and
+// diagnosed in a second sweep, so a name bound as a type by any import of the file silences the
+// failures of its other imports, exactly as signature resolution will see it.
+private bindModuleImports(TypeStore store, Module module, FileDeclarations declarations,
+                          Map<string, FileDeclarations> declarationsByPath,
+                          List<FileDiagnostic> collected) -> ModuleLinkTable {
+    ImportRecord[] records = declarations.imports();
+    string?[] targets = module.importTargets();
+    if (records.length != targets.length) {
+        panic("Internal: module '{module.canonicalPath()}' has {targets.length} import targets "
+            + "for {records.length} import records");
+    }
+    let bindings = new Map<string, NameBinding>();
+    bool[] held = new bool[records.length];
+    for (long i = 0; i < records.length; i++) {
+        let target = targets[i];
+        if (target != null) {
+            held[i] = bindImport(store, module, records[i], target, bindings, collected);
+        }
+    }
+    for (long i = 0; i < records.length; i++) {
+        let target = targets[i];
+        if (held[i] && target != null) {
+            diagnoseHeldImport(module, records[i], target, bindings, declarationsByPath,
+                collected);
+        }
+    }
+    return new ModuleLinkTable(module.canonicalPath(), bindings);
+}
+
+// Binds one resolved import; returns true when a named import found no type and must be held for
+// the second sweep.
+private bindImport(TypeStore store, Module module, ImportRecord record, string target,
+                   Map<string, NameBinding> bindings, List<FileDiagnostic> collected) -> bool {
+    if (!record.isNamed()) {
+        bindNamespace(module, record, target, bindings, collected);
+        return false;
+    }
+    let found = store.findDeclared(target, record.name());
+    if (found == null) {
+        return true;
+    }
+    if (found.visibility() != Visibility.Public) {
+        report(collected, module, record, "Type '{record.name()}' is not public in module "
+            + "'{target}' and cannot be used from another module.");
+        return false;
+    }
+    if (bindings.contains(record.name())) {
+        report(collected, module, record, "Imported name '{record.name()}' conflicts with "
+            + "an earlier import in this file.");
+        return false;
+    }
+    bindings.set(record.name(), new ImportedType(found));
+    return false;
+}
+
+private diagnoseHeldImport(Module module, ImportRecord record, string target,
+                           Map<string, NameBinding> bindings,
+                           Map<string, FileDeclarations> declarationsByPath,
+                           List<FileDiagnostic> collected) {
+    if (bindings.get(record.name()) is ImportedType) {
+        return;
+    }
+    let targetDeclarations = declarationsByPath.get(target);
+    if (targetDeclarations == null) {
+        return;
+    }
+    if (targetDeclarations.hasFunctionNamed(record.name())) {
+        string moduleImport = record.pathText();
+        if (record.isPackage()) {
+            moduleImport = "@" + moduleImport;
+        }
+        report(collected, module, record, "Function '{record.name()}' cannot be imported by "
+            + "name. Import the module instead: 'import {moduleImport};' then call it as "
+            + "'{record.namespaceName()}.{record.name()}'.");
+    } else {
+        report(collected, module, record,
+            "Module '{target}' has no type named '{record.name()}'.");
+    }
+}
+
+private bindNamespace(Module module, ImportRecord record, string target,
+                      Map<string, NameBinding> bindings, List<FileDiagnostic> collected) {
+    string name = record.namespaceName();
+    if (name.length == 0) {
+        return;
+    }
+    if (bindings.contains(name)) {
+        report(collected, module, record,
+            "Namespace alias '{name}' conflicts with an earlier import in this file.");
+        return;
+    }
+    bindings.set(name, new ImportedNamespace(target));
+}
+
+private report(List<FileDiagnostic> collected, Module module, ImportRecord record,
+               string message) {
+    collected.push(new FileDiagnostic(module.filePath(), message, record.span()));
+}

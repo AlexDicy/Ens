@@ -1,0 +1,104 @@
+import @std.testing;
+import ClassType from types;
+import EnumType from types;
+import InterfaceType from types;
+import StructType from types;
+import ExternalType from types;
+import FakeFileLoader from sema_support;
+import sema_support;
+
+test "a named import binds the target module's type by identity" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", "import lib.box;\nimport Box from lib.box;\n");
+    loader.add("/proj/src/lib/box.ens",
+        "public class Box \{ \}\npublic doubled(int x) -> int \{ return x * 2; \}\n");
+    let pipeline = sema_support.analyze(loader, "/proj/src", ["main.ens"]);
+
+    try sema_support.assertClean(pipeline);
+    let bound = try sema_support.boundType(pipeline, "main", "Box");
+    try testing.assertTrue(bound == pipeline.store().findDeclared("lib.box", "Box"),
+        "the binding should be the interned type object");
+    try testing.assertTrue(bound is ClassType, "Box should link as a class");
+    let namespace = try sema_support.boundNamespace(pipeline, "main", "box");
+    try testing.assertEqual(namespace, "lib.box");
+}
+
+test "named imports bind every declared type kind" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens",
+        "import Color from lib.zoo;\n"
+        + "import Speaker from lib.zoo;\n"
+        + "import Point from lib.zoo;\n"
+        + "import HANDLE from lib.zoo;\n");
+    loader.add("/proj/src/lib/zoo.ens",
+        "public enum Color \{ Red \}\n"
+        + "public interface Speaker \{ speak() -> string; \}\n"
+        + "public struct Point \{ int x; \}\n"
+        + "external type HANDLE;\n");
+    let pipeline = sema_support.analyze(loader, "/proj/src", ["main.ens"]);
+
+    try sema_support.assertClean(pipeline);
+    try testing.assertTrue(try sema_support.boundType(pipeline, "main", "Color") is EnumType,
+        "Color should link as an enum");
+    try testing.assertTrue(try sema_support.boundType(pipeline, "main", "Speaker")
+        is InterfaceType, "Speaker should link as an interface");
+    try testing.assertTrue(try sema_support.boundType(pipeline, "main", "Point") is StructType,
+        "Point should link as a struct");
+    try testing.assertTrue(try sema_support.boundType(pipeline, "main", "HANDLE")
+        is ExternalType, "HANDLE should link as an external type");
+}
+
+test "circular imports link cleanly in both directions" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/left.ens",
+        "import right;\nimport Right from right;\npublic class Left \{ \}\n");
+    loader.add("/proj/src/right.ens",
+        "import left;\nimport Left from left;\npublic class Right \{ \}\n");
+    let pipeline = sema_support.analyze(loader, "/proj/src", ["left.ens"]);
+
+    try sema_support.assertClean(pipeline);
+    try testing.assertTrue(try sema_support.boundType(pipeline, "left", "Right")
+        == pipeline.store().findDeclared("right", "Right"), "left should see right's class");
+    try testing.assertTrue(try sema_support.boundType(pipeline, "right", "Left")
+        == pipeline.store().findDeclared("left", "Left"), "right should see left's class");
+    try testing.assertEqual(try sema_support.boundNamespace(pipeline, "left", "right"), "right");
+    try testing.assertEqual(try sema_support.boundNamespace(pipeline, "right", "left"), "left");
+}
+
+test "a package namespace import binds the last segment to the canonical module" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/dependencies.txt", "@acme.tools=vendor/tools\n");
+    loader.add("/proj/src/main.ens", "import @acme.tools.hammer;\n");
+    loader.add("/proj/vendor/tools/src/hammer.ens", "public class Hammer \{ \}\n");
+    let pipeline = sema_support.analyze(loader, "/proj/src", ["main.ens"]);
+
+    try sema_support.assertClean(pipeline);
+    let namespace = try sema_support.boundNamespace(pipeline, "main", "hammer");
+    try testing.assertEqual(namespace, "acme.tools.hammer");
+}
+
+test "a failed named import is silenced when another import binds the name as a type" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens",
+        "import Gadget from lib.tools;\nimport Gadget from lib.parts;\n");
+    loader.add("/proj/src/lib/tools.ens", "public Gadget() \{ \}\n");
+    loader.add("/proj/src/lib/parts.ens", "public class Gadget \{ \}\n");
+    let pipeline = sema_support.analyze(loader, "/proj/src", ["main.ens"]);
+
+    try sema_support.assertClean(pipeline);
+    try testing.assertTrue(try sema_support.boundType(pipeline, "main", "Gadget")
+        == pipeline.store().findDeclared("lib.parts", "Gadget"),
+        "the class import should win and silence the function import");
+}
+
+test "duplicate declarations register the first one, which imports then see" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/other.ens", "import Box from main;\n");
+    loader.add("/proj/src/main.ens", "public class Box \{ \}\npublic struct Box \{ int x; \}\n");
+    let pipeline = sema_support.analyze(loader, "/proj/src", ["other.ens", "main.ens"]);
+
+    try testing.assertEqual(pipeline.declareDiagnostics().length, 1L);
+    try sema_support.assertNoDiagnostics(pipeline.linkResult().diagnostics());
+    try testing.assertTrue(try sema_support.boundType(pipeline, "other", "Box") is ClassType,
+        "the first declaration should be the one imports bind to");
+}

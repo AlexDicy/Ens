@@ -1,0 +1,597 @@
+// The declare phase: a pure per-file pass that records what a file declares and publishes each
+// type's metadata before any cross-file resolution happens. It reads one parsed tree and nothing
+// else: no type store, no other modules, no file system.
+import SourceFileNode from @ens.frontend.syntax.nodes;
+import ClassDeclarationNode from @ens.frontend.syntax.nodes;
+import InterfaceDeclarationNode from @ens.frontend.syntax.nodes;
+import StructDeclarationNode from @ens.frontend.syntax.nodes;
+import EnumDeclarationNode from @ens.frontend.syntax.nodes;
+import ExternalTypeDeclarationNode from @ens.frontend.syntax.nodes;
+import ExternalBlockNode from @ens.frontend.syntax.nodes;
+import FunctionDeclarationNode from @ens.frontend.syntax.nodes;
+import TestDeclarationNode from @ens.frontend.syntax.nodes;
+import ImportDeclarationNode from @ens.frontend.syntax.nodes;
+import ImportPathNode from @ens.frontend.syntax.nodes;
+import TypeParameterListNode from @ens.frontend.syntax.nodes;
+import TopLevelItem from @ens.frontend.syntax.nodes;
+import SyntaxToken from @ens.frontend.syntax.node;
+import SyntaxKind from @ens.frontend.syntax.kind;
+import GreenNode from @ens.frontend.syntax.green;
+import Span from @ens.frontend.source;
+import FileDiagnostic from diagnostics;
+import Visibility from types;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+import Set from @std.collections.set;
+import StringBuilder from @std.text.stringbuilder;
+
+public enum DeclaredKind {
+    Class,
+    Interface,
+    Struct,
+    Enum,
+    External,
+}
+
+// The declaration's kind as it reads in a diagnostic.
+public kindWord(DeclaredKind kind) -> string {
+    return switch (kind) {
+        Class -> "class",
+        Interface -> "interface",
+        Struct -> "struct",
+        Enum -> "enum",
+        External -> "external type",
+    };
+}
+
+// One declared type name with the metadata it publishes. The green node is the stable identity of
+// the declaration site.
+public class TypeDeclaration {
+    private string declaredName;
+    private DeclaredKind declaredKind;
+    private Visibility declaredVisibility;
+    private string[] declaredTypeParameters;
+    private bool declaredAbstract;
+    private bool declaredFinal;
+    private bool declaredSealed;
+    private GreenNode declarationNode;
+    private Span declaredNameSpan;
+
+    constructor(string name, DeclaredKind kind, Visibility visibility, string[] typeParameters,
+                bool isAbstract, bool isFinal, bool isSealed, GreenNode node, Span nameSpan) {
+        this.declaredName = name;
+        this.declaredKind = kind;
+        this.declaredVisibility = visibility;
+        this.declaredTypeParameters = typeParameters;
+        this.declaredAbstract = isAbstract;
+        this.declaredFinal = isFinal;
+        this.declaredSealed = isSealed;
+        this.declarationNode = node;
+        this.declaredNameSpan = nameSpan;
+    }
+
+    name() -> string {
+        return this.declaredName;
+    }
+
+    kind() -> DeclaredKind {
+        return this.declaredKind;
+    }
+
+    visibility() -> Visibility {
+        return this.declaredVisibility;
+    }
+
+    typeParameters() -> string[] {
+        return this.declaredTypeParameters;
+    }
+
+    isAbstract() -> bool {
+        return this.declaredAbstract;
+    }
+
+    isFinal() -> bool {
+        return this.declaredFinal;
+    }
+
+    isSealed() -> bool {
+        return this.declaredSealed;
+    }
+
+    node() -> GreenNode {
+        return this.declarationNode;
+    }
+
+    nameSpan() -> Span {
+        return this.declaredNameSpan;
+    }
+}
+
+public class FunctionDeclaration {
+    private string functionName;
+    private Visibility functionVisibility;
+    private GreenNode declarationNode;
+    private Span functionNameSpan;
+
+    constructor(string name, Visibility visibility, GreenNode node, Span nameSpan) {
+        this.functionName = name;
+        this.functionVisibility = visibility;
+        this.declarationNode = node;
+        this.functionNameSpan = nameSpan;
+    }
+
+    name() -> string {
+        return this.functionName;
+    }
+
+    visibility() -> Visibility {
+        return this.functionVisibility;
+    }
+
+    node() -> GreenNode {
+        return this.declarationNode;
+    }
+
+    nameSpan() -> Span {
+        return this.functionNameSpan;
+    }
+}
+
+public class ExternalFunctionDeclaration {
+    private string functionName;
+    private string libraryName;
+    private GreenNode declarationNode;
+    private Span functionNameSpan;
+
+    constructor(string name, string library, GreenNode node, Span nameSpan) {
+        this.functionName = name;
+        this.libraryName = library;
+        this.declarationNode = node;
+        this.functionNameSpan = nameSpan;
+    }
+
+    name() -> string {
+        return this.functionName;
+    }
+
+    library() -> string {
+        return this.libraryName;
+    }
+
+    node() -> GreenNode {
+        return this.declarationNode;
+    }
+
+    nameSpan() -> Span {
+        return this.functionNameSpan;
+    }
+}
+
+public class TestDeclaration {
+    private GreenNode declarationNode;
+    private Span declarationSpan;
+
+    constructor(GreenNode node, Span span) {
+        this.declarationNode = node;
+        this.declarationSpan = span;
+    }
+
+    node() -> GreenNode {
+        return this.declarationNode;
+    }
+
+    span() -> Span {
+        return this.declarationSpan;
+    }
+}
+
+// One import declaration as written. Records align one to one with the module graph's
+// per-declaration import targets, so the link phase joins the two by index.
+public class ImportRecord {
+    private bool namedImport;
+    private string importedName;
+    private string lastSegment;
+    private bool packageImport;
+    private string writtenPath;
+    private Span importSpan;
+    private GreenNode declarationNode;
+
+    constructor(bool named, string name, string namespaceName, bool isPackage, string pathText,
+                Span span, GreenNode node) {
+        this.namedImport = named;
+        this.importedName = name;
+        this.lastSegment = namespaceName;
+        this.packageImport = isPackage;
+        this.writtenPath = pathText;
+        this.importSpan = span;
+        this.declarationNode = node;
+    }
+
+    // True for 'import Name from path;', false for a namespace import 'import path;'.
+    isNamed() -> bool {
+        return this.namedImport;
+    }
+
+    // The imported name of a named import; "" for a namespace import.
+    name() -> string {
+        return this.importedName;
+    }
+
+    // The last path segment, which a namespace import binds.
+    namespaceName() -> string {
+        return this.lastSegment;
+    }
+
+    isPackage() -> bool {
+        return this.packageImport;
+    }
+
+    // The dotted path as written, without the leading '@'.
+    pathText() -> string {
+        return this.writtenPath;
+    }
+
+    span() -> Span {
+        return this.importSpan;
+    }
+
+    node() -> GreenNode {
+        return this.declarationNode;
+    }
+}
+
+// Everything one file declares, captured syntactically. Type metadata is published here, before
+// any cross-file resolution; signatures stay unresolved.
+public class FileDeclarations {
+    private string declaredFilePath;
+    private TypeDeclaration[] fileTypes;
+    private FunctionDeclaration[] fileFunctions;
+    private ExternalFunctionDeclaration[] fileExternalFunctions;
+    private string[] fileExternalLibraries;
+    private TestDeclaration[] fileTests;
+    private ImportRecord[] fileImports;
+    private Map<string, TypeDeclaration> typesByName;
+    private Set<string> functionNames;
+
+    constructor(string filePath, TypeDeclaration[] types, FunctionDeclaration[] functions,
+                ExternalFunctionDeclaration[] externalFunctions, string[] externalLibraries,
+                TestDeclaration[] tests, ImportRecord[] imports) {
+        this.declaredFilePath = filePath;
+        this.fileTypes = types;
+        this.fileFunctions = functions;
+        this.fileExternalFunctions = externalFunctions;
+        this.fileExternalLibraries = externalLibraries;
+        this.fileTests = tests;
+        this.fileImports = imports;
+        this.typesByName = new Map<string, TypeDeclaration>();
+        for (let declared in types) {
+            if (!this.typesByName.contains(declared.name())) {
+                this.typesByName.set(declared.name(), declared);
+            }
+        }
+        this.functionNames = new Set<string>();
+        for (let declared in functions) {
+            this.functionNames.add(declared.name());
+        }
+        for (let declared in externalFunctions) {
+            this.functionNames.add(declared.name());
+        }
+    }
+
+    filePath() -> string {
+        return this.declaredFilePath;
+    }
+
+    types() -> TypeDeclaration[] {
+        return this.fileTypes;
+    }
+
+    functions() -> FunctionDeclaration[] {
+        return this.fileFunctions;
+    }
+
+    externalFunctions() -> ExternalFunctionDeclaration[] {
+        return this.fileExternalFunctions;
+    }
+
+    externalLibraries() -> string[] {
+        return this.fileExternalLibraries;
+    }
+
+    tests() -> TestDeclaration[] {
+        return this.fileTests;
+    }
+
+    imports() -> ImportRecord[] {
+        return this.fileImports;
+    }
+
+    // The first declaration of the name; later duplicates were diagnosed and do not resolve.
+    typeNamed(string name) -> TypeDeclaration? {
+        return this.typesByName.get(name);
+    }
+
+    // True when the file declares a free or external function with the name, at any visibility.
+    hasFunctionNamed(string name) -> bool {
+        return this.functionNames.contains(name);
+    }
+}
+
+public class DeclareResult {
+    private FileDeclarations declareDeclarations;
+    private FileDiagnostic[] declareDiagnostics;
+
+    constructor(FileDeclarations declarations, FileDiagnostic[] diagnostics) {
+        this.declareDeclarations = declarations;
+        this.declareDiagnostics = diagnostics;
+    }
+
+    declarations() -> FileDeclarations {
+        return this.declareDeclarations;
+    }
+
+    diagnostics() -> FileDiagnostic[] {
+        return this.declareDiagnostics;
+    }
+}
+
+public declareFile(SourceFileNode file, string filePath) -> DeclareResult {
+    let collector = new FileCollector(filePath);
+    for (long i = 0; i < file.itemsCount(); i++) {
+        collector.collect(file.items(i));
+    }
+    return collector.finish();
+}
+
+private class FileCollector {
+    private string filePath;
+    private List<TypeDeclaration> types;
+    private List<FunctionDeclaration> functions;
+    private List<ExternalFunctionDeclaration> externalFunctions;
+    private List<string> externalLibraries;
+    private List<TestDeclaration> tests;
+    private List<ImportRecord> imports;
+    private Map<string, TypeDeclaration> typesByName;
+    private List<FileDiagnostic> collected;
+
+    constructor(string filePath) {
+        this.filePath = filePath;
+        this.types = new List<TypeDeclaration>();
+        this.functions = new List<FunctionDeclaration>();
+        this.externalFunctions = new List<ExternalFunctionDeclaration>();
+        this.externalLibraries = new List<string>();
+        this.tests = new List<TestDeclaration>();
+        this.imports = new List<ImportRecord>();
+        this.typesByName = new Map<string, TypeDeclaration>();
+        this.collected = new List<FileDiagnostic>();
+    }
+
+    collect(TopLevelItem item) {
+        switch (item) {
+            is ClassDeclarationNode declaration -> {
+                this.collectClass(declaration);
+            },
+            is InterfaceDeclarationNode declaration -> {
+                this.collectInterface(declaration);
+            },
+            is StructDeclarationNode declaration -> {
+                this.collectStruct(declaration);
+            },
+            is EnumDeclarationNode declaration -> {
+                this.collectEnum(declaration);
+            },
+            is ExternalTypeDeclarationNode declaration -> {
+                this.collectExternalType(declaration);
+            },
+            is ExternalBlockNode declaration -> {
+                this.collectExternalBlock(declaration);
+            },
+            is FunctionDeclarationNode declaration -> {
+                this.collectFunction(declaration);
+            },
+            is TestDeclarationNode declaration -> {
+                this.collectTest(declaration);
+            },
+            is ImportDeclarationNode declaration -> {
+                this.collectImport(declaration);
+            },
+            default -> { },
+        }
+    }
+
+    finish() -> DeclareResult {
+        let declarations = new FileDeclarations(this.filePath, this.types.toArray(),
+            this.functions.toArray(), this.externalFunctions.toArray(),
+            this.externalLibraries.toArray(), this.tests.toArray(), this.imports.toArray());
+        return new DeclareResult(declarations, this.collected.toArray());
+    }
+
+    private collectClass(ClassDeclarationNode declaration) {
+        let name = declaration.name();
+        if (name.text().length == 0) {
+            return;
+        }
+        let modifiers = new ModifierSet();
+        for (long i = 0; i < declaration.modifiersCount(); i++) {
+            modifiers.add(declaration.modifiers(i).kind());
+        }
+        this.registerType(new TypeDeclaration(name.text(), DeclaredKind.Class,
+            modifiers.visibility(), typeParameterNames(declaration.typeParameters()),
+            modifiers.declaresAbstract, modifiers.declaresFinal, modifiers.declaresSealed,
+            declaration.green(), name.span()));
+    }
+
+    private collectInterface(InterfaceDeclarationNode declaration) {
+        let name = declaration.name();
+        if (name.text().length == 0) {
+            return;
+        }
+        let modifiers = new ModifierSet();
+        for (long i = 0; i < declaration.modifiersCount(); i++) {
+            modifiers.add(declaration.modifiers(i).kind());
+        }
+        this.registerType(new TypeDeclaration(name.text(), DeclaredKind.Interface,
+            modifiers.visibility(), typeParameterNames(declaration.typeParameters()),
+            false, false, false, declaration.green(), name.span()));
+    }
+
+    private collectStruct(StructDeclarationNode declaration) {
+        let name = declaration.name();
+        if (name.text().length == 0) {
+            return;
+        }
+        let modifiers = new ModifierSet();
+        for (long i = 0; i < declaration.modifiersCount(); i++) {
+            modifiers.add(declaration.modifiers(i).kind());
+        }
+        this.registerType(new TypeDeclaration(name.text(), DeclaredKind.Struct,
+            modifiers.visibility(), typeParameterNames(declaration.typeParameters()),
+            false, false, false, declaration.green(), name.span()));
+    }
+
+    private collectEnum(EnumDeclarationNode declaration) {
+        let name = declaration.name();
+        if (name.text().length == 0) {
+            return;
+        }
+        let modifiers = new ModifierSet();
+        for (long i = 0; i < declaration.modifiersCount(); i++) {
+            modifiers.add(declaration.modifiers(i).kind());
+        }
+        this.registerType(new TypeDeclaration(name.text(), DeclaredKind.Enum,
+            modifiers.visibility(), [], false, false, false, declaration.green(), name.span()));
+    }
+
+    private collectExternalType(ExternalTypeDeclarationNode declaration) {
+        let name = declaration.name();
+        if (name.text().length == 0) {
+            return;
+        }
+        this.registerType(new TypeDeclaration(name.text(), DeclaredKind.External,
+            Visibility.Public, [], false, false, false, declaration.green(), name.span()));
+    }
+
+    private collectExternalBlock(ExternalBlockNode declaration) {
+        this.externalLibraries.push(unquote(declaration.library().text()));
+        for (long i = 0; i < declaration.functionsCount(); i++) {
+            let function = declaration.functions(i);
+            let name = function.name();
+            if (name.text().length == 0) {
+                continue;
+            }
+            this.externalFunctions.push(new ExternalFunctionDeclaration(name.text(),
+                unquote(declaration.library().text()), function.green(), name.span()));
+        }
+    }
+
+    private collectFunction(FunctionDeclarationNode declaration) {
+        let name = declaration.name();
+        if (name == null || name.text().length == 0) {
+            return;
+        }
+        let modifiers = new ModifierSet();
+        for (long i = 0; i < declaration.modifiersCount(); i++) {
+            modifiers.add(declaration.modifiers(i).kind());
+        }
+        this.functions.push(new FunctionDeclaration(name.text(), modifiers.visibility(),
+            declaration.green(), name.span()));
+    }
+
+    private collectTest(TestDeclarationNode declaration) {
+        this.tests.push(new TestDeclaration(declaration.green(), declaration.span()));
+    }
+
+    private collectImport(ImportDeclarationNode declaration) {
+        let path = declaration.path();
+        string namespaceName = "";
+        if (path.segmentsCount() > 0) {
+            namespaceName = path.segments(path.segmentsCount() - 1).text();
+        }
+        let binding = declaration.binding();
+        string importedName = "";
+        Span span = path.span();
+        if (binding != null) {
+            importedName = binding.name().text();
+            span = binding.name().span();
+        }
+        this.imports.push(new ImportRecord(binding != null, importedName, namespaceName,
+            path.at() != null, pathText(path), span, declaration.green()));
+    }
+
+    private registerType(TypeDeclaration declaration) {
+        let existing = this.typesByName.get(declaration.name());
+        if (existing == null) {
+            this.typesByName.set(declaration.name(), declaration);
+        } else {
+            this.collected.push(new FileDiagnostic(this.filePath,
+                "Duplicate type '{declaration.name()}'; this file already declares a "
+                + "{kindWord(existing.kind())} with this name.", declaration.nameSpan()));
+        }
+        this.types.push(declaration);
+    }
+}
+
+// A top-level 'protected' carries no cross-module meaning, so it shares 'private''s behavior.
+private class ModifierSet {
+    bool declaresPrivate;
+    bool declaresAbstract;
+    bool declaresFinal;
+    bool declaresSealed;
+
+    constructor();
+
+    add(SyntaxKind kind) {
+        switch (kind) {
+            PrivateKeyword, ProtectedKeyword -> {
+                this.declaresPrivate = true;
+            },
+            AbstractKeyword -> {
+                this.declaresAbstract = true;
+            },
+            FinalKeyword -> {
+                this.declaresFinal = true;
+            },
+            SealedKeyword -> {
+                this.declaresSealed = true;
+            },
+            default -> { },
+        }
+    }
+
+    visibility() -> Visibility {
+        if (this.declaresPrivate) {
+            return Visibility.Private;
+        }
+        return Visibility.Public;
+    }
+}
+
+private typeParameterNames(TypeParameterListNode? list) -> string[] {
+    if (list == null) {
+        return [];
+    }
+    string[] names = new string[list.parametersCount()];
+    for (long i = 0; i < names.length; i++) {
+        names[i] = list.parameters(i).name().text();
+    }
+    return names;
+}
+
+private pathText(ImportPathNode path) -> string {
+    let builder = new StringBuilder();
+    for (long i = 0; i < path.segmentsCount(); i++) {
+        if (i > 0) {
+            builder.append(".");
+        }
+        builder.append(path.segments(i).text());
+    }
+    return builder.toString();
+}
+
+private unquote(string text) -> string {
+    if (text.length >= 2 && text.substring(0, 1) == "\""
+            && text.substring(text.length - 1, text.length) == "\"") {
+        return text.substring(1, text.length - 1);
+    }
+    return text;
+}

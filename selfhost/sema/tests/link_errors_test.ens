@@ -1,0 +1,114 @@
+import @std.testing;
+import FakeFileLoader from sema_support;
+import sema_support;
+
+test "importing a missing name reports what the module actually offers" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", "import Missing from lib.box;\n");
+    loader.add("/proj/src/lib/box.ens", "public class Box \{ \}\n");
+    let pipeline = sema_support.analyze(loader, "/proj/src", ["main.ens"]);
+
+    try sema_support.assertDiagnostic(pipeline.linkResult().diagnostics(), 0,
+        "/proj/src/main.ens", "Module 'lib.box' has no type named 'Missing'.");
+    try testing.assertEqual(pipeline.linkResult().diagnostics().length, 1L);
+}
+
+test "importing a function by name steers to the namespace form" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", "import doubled from lib.box;\n");
+    loader.add("/proj/src/lib/box.ens", "public doubled(int x) -> int \{ return x * 2; \}\n");
+    let pipeline = sema_support.analyze(loader, "/proj/src", ["main.ens"]);
+
+    try sema_support.assertDiagnostic(pipeline.linkResult().diagnostics(), 0,
+        "/proj/src/main.ens", "Function 'doubled' cannot be imported by name. Import the module "
+        + "instead: 'import lib.box;' then call it as 'box.doubled'.");
+}
+
+test "importing a package function by name keeps the package form in the suggestion" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/dependencies.txt", "@acme=vendor/acme\n");
+    loader.add("/proj/src/main.ens", "import greet from @acme.tools;\n");
+    loader.add("/proj/vendor/acme/src/tools.ens", "public greet() \{ \}\n");
+    let pipeline = sema_support.analyze(loader, "/proj/src", ["main.ens"]);
+
+    try sema_support.assertDiagnostic(pipeline.linkResult().diagnostics(), 0,
+        "/proj/src/main.ens", "Function 'greet' cannot be imported by name. Import the module "
+        + "instead: 'import @acme.tools;' then call it as 'tools.greet'.");
+}
+
+test "importing an external function by name is diagnosed like any function" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", "import ReadFile from lib.native;\n");
+    loader.add("/proj/src/lib/native.ens",
+        "external from \"kernel32\" \{\n    ReadFile(int handle) -> int;\n\}\n");
+    let pipeline = sema_support.analyze(loader, "/proj/src", ["main.ens"]);
+
+    try sema_support.assertDiagnostic(pipeline.linkResult().diagnostics(), 0,
+        "/proj/src/main.ens", "Function 'ReadFile' cannot be imported by name. Import the module "
+        + "instead: 'import lib.native;' then call it as 'native.ReadFile'.");
+}
+
+test "importing a private type is rejected with its module named" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", "import Secret from lib.secret;\n");
+    loader.add("/proj/src/lib/secret.ens",
+        "private class Secret \{ \}\npublic class Gadget \{ \}\n");
+    let pipeline = sema_support.analyze(loader, "/proj/src", ["main.ens"]);
+
+    try sema_support.assertDiagnostic(pipeline.linkResult().diagnostics(), 0,
+        "/proj/src/main.ens", "Type 'Secret' is not public in module 'lib.secret' and cannot "
+        + "be used from another module.");
+}
+
+test "two imports binding the same name conflict, and the first binding survives" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens",
+        "import Box from lib.first;\nimport Box from lib.second;\n");
+    loader.add("/proj/src/lib/first.ens", "public class Box \{ \}\n");
+    loader.add("/proj/src/lib/second.ens", "public class Box \{ \}\n");
+    let pipeline = sema_support.analyze(loader, "/proj/src", ["main.ens"]);
+
+    try sema_support.assertDiagnostic(pipeline.linkResult().diagnostics(), 0,
+        "/proj/src/main.ens", "Imported name 'Box' conflicts with an earlier import in this "
+        + "file.");
+    try testing.assertTrue(try sema_support.boundType(pipeline, "main", "Box")
+        == pipeline.store().findDeclared("lib.first", "Box"),
+        "the first import should keep the name");
+}
+
+test "two namespace imports sharing a last segment conflict" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", "import lib.util;\nimport other.util;\n");
+    loader.add("/proj/src/lib/util.ens", "");
+    loader.add("/proj/src/other/util.ens", "");
+    let pipeline = sema_support.analyze(loader, "/proj/src", ["main.ens"]);
+
+    try sema_support.assertDiagnostic(pipeline.linkResult().diagnostics(), 0,
+        "/proj/src/main.ens",
+        "Namespace alias 'util' conflicts with an earlier import in this file.");
+    try testing.assertEqual(try sema_support.boundNamespace(pipeline, "main", "util"),
+        "lib.util");
+}
+
+test "link diagnostics order by file and then offset" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens",
+        "import helper;\n"
+        + "import Missing from lib.box;\n"
+        + "import Secret from lib.box;\n");
+    loader.add("/proj/src/helper.ens", "import doubled from lib.box;\n");
+    loader.add("/proj/src/lib/box.ens",
+        "private class Secret \{ \}\npublic doubled(int x) -> int \{ return x; \}\n");
+    let pipeline = sema_support.analyze(loader, "/proj/src", ["main.ens"]);
+
+    let diagnostics = pipeline.linkResult().diagnostics();
+    try testing.assertEqual(diagnostics.length, 3L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/src/helper.ens",
+        "Function 'doubled' cannot be imported by name. Import the module instead: "
+        + "'import lib.box;' then call it as 'box.doubled'.");
+    try sema_support.assertDiagnostic(diagnostics, 1, "/proj/src/main.ens",
+        "Module 'lib.box' has no type named 'Missing'.");
+    try sema_support.assertDiagnostic(diagnostics, 2, "/proj/src/main.ens",
+        "Type 'Secret' is not public in module 'lib.box' and cannot be used from another "
+        + "module.");
+}
