@@ -424,6 +424,24 @@ listener?.notify();                 // runs only when listener is present
 
 Inside `if (x != null) { ... }` the `x` is considered as the non-nullable form for the rest of the block, so you can use `.` directly. The same narrowing applies to the `else` branch of `if (x == null) { ... } else { ... }`. Reassigning `x` inside the block drops the narrowing from that point on.
 
+A binding also narrows without an explicit check.
+Assigning a value whose type is non-nullable to a plain local variable or parameter of nullable declared type narrows it to the non-nullable form from that point on, and a declaration initializer behaves the same way.
+
+```ens
+string? s;
+s = compute();   // compute() returns a non-null 'string'
+s.length;        // s is treated as non-nullable 'string' here
+
+string? t = "x"; // starts narrowed from its initializer
+```
+
+This refinement is deliberately limited.
+Writing through a member or element path never refines it: `this.field = x` and `arr[0] = x` leave the path nullable, because another reference could write null through the same storage.
+Assigning in only one branch of an `if` does not narrow after it: `if (x == null) { x = fallback(); }` leaves `x` nullable below the `if`.
+
+Because narrowing governs only the reads, `== null`, `!= null`, `??`, `?.`, and `?[` on a binding whose declared type is nullable stay legal even where the value has already been proven non-null; the redundant check is simply constant at runtime.
+A binding whose declared type is not nullable still rejects these operators.
+
 Narrowing also follows the short-circuit operators and conditions: `x != null && x.ready()` narrows `x` on the right of `&&`, `x == null || x.ready()` narrows on the right of `||`, a conjunction of checks narrows the whole `if` branch or ternary branch, and a loop condition narrows the loop body.
 
 ```ens
