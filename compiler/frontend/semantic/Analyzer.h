@@ -264,6 +264,19 @@ private:
     // Drops any narrowings recorded for the storage written by `target`, mirroring
     // the invalidation an assignment to `target` performs.
     void invalidateNarrowingsForWrite(const ast::Expression& target);
+    // The declared storage type of a narrowable operand (plain binding, `this`,
+    // or a member/element path), ignoring any active flow narrowing. Returns
+    // null when the operand is not a narrowable storage location.
+    Type* declaredBindingType(const ast::Expression& operand) const;
+    // Re-types a presence-operator operand from its declared type so that a
+    // binding declared optional stays testable even after narrowing proved it
+    // non-null. Stamps the operand node with the declared type so codegen loads
+    // the optional representation storage always holds; the check is constant.
+    Type* presenceOperandType(const ast::Expression& operand, Type* analyzed);
+    // Narrows a plain local or parameter of optional declared type to its inner
+    // type after a straight-line assignment or initializer whose value is
+    // statically non-nullable. No-op for any other binding, target, or value.
+    void establishAssignmentNarrowing(Symbol* sym, Type* valueT);
     Type* analyzeCall(const ast::CallExpression& expr);
     Type* analyzeExternalCall(const ast::CallExpression& expr, Symbol* sym,
                               const std::u16string& funcName);

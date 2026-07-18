@@ -2646,6 +2646,7 @@ void Analyzer::analyzeTypedVarDeclStmt(const ast::TypedVarDeclStatement& stmt) {
     if (collides) {
         errorAtNode(stmt.node, "Variable '" + asciiOf(name) + "' is already defined in this scope");
     }
+    if (initType) establishAssignmentNarrowing(sym, initType);
     analysis.setSymbol(stmt.node.greenNode(), sym);
 }
 
@@ -3463,12 +3464,18 @@ Type* Analyzer::analyzeBinary(const ast::BinaryExpression& expr) {
         }
 
         case SyntaxKind::EqEq:
-        case SyntaxKind::NotEq:
+        case SyntaxKind::NotEq: {
             tryAdaptOperands();
+            // A comparison against `null` is a presence test on the declared
+            // storage type, so it stays legal on a binding declared optional
+            // even where narrowing already proved the value non-null.
+            if (r->isNull())      l = presenceOperandType(*left, l);
+            else if (l->isNull()) r = presenceOperandType(*right, r);
             if (!l->assignableFrom(r) && !r->assignableFrom(l)) {
                 errorAtNode(expr.node, "Cannot compare '" + l->toString() + "' and '" + r->toString() + "'");
             }
             return typeCtx.getPrimitive(TypeKind::Bool);
+        }
 
         case SyntaxKind::Lt:
         case SyntaxKind::Gt:
@@ -4730,6 +4737,7 @@ Type* Analyzer::analyzeSafeMember(const ast::SafeMemberExpression& expr) {
     if (!obj) return typeCtx.getError();
     Type* objT = analyzeExpr(*obj);
     if (objT->isError()) return typeCtx.getError();
+    objT = presenceOperandType(*obj, objT);
 
     if (!objT->isOptional()) {
         errorAtNode(expr.node, "The value on the left of '?.' has type '" + objT->toString() +
@@ -4970,6 +4978,7 @@ Type* Analyzer::analyzeSafeSubscript(const ast::SafeSubscriptExpression& expr) {
     Type* objT = analyzeExpr(*obj);
     Type* idxT = analyzeExpr(*idx);
     if (objT->isError()) return typeCtx.getError();
+    objT = presenceOperandType(*obj, objT);
 
     if (!objT->isOptional()) {
         errorAtNode(expr.node, "The value on the left of '?[' has type '" + objT->toString() +
@@ -5007,6 +5016,49 @@ void Analyzer::invalidateNarrowingsForWrite(const ast::Expression& target) {
             currentScope->clearNarrowingsThatMayAlias(*p);
         }
     }
+}
+
+Type* Analyzer::declaredBindingType(const ast::Expression& operand) const {
+    ast::Expression core = unwrapParens(operand);
+    if (auto id = core.asIdent()) {
+        if (auto* info = analysis.find(id->node.greenNode())) {
+            if (Symbol* sym = info->resolvedSymbol) return sym->type;
+        }
+    } else if (core.asThis()) {
+        if (currentThis) return currentThis->type;
+    } else if (auto m = core.asMember()) {
+        auto obj = m->object();
+        auto name = m->memberText();
+        Type* objT = obj ? analysis.typeOf(obj->node.greenNode()) : nullptr;
+        if (name && objT && objT->structInfo) {
+            int idx = objT->structInfo->findFieldIndex(*name);
+            if (idx >= 0) return objT->structInfo->fields[idx].type;
+        }
+    } else if (auto su = core.asSubscript()) {
+        auto obj = su->object();
+        Type* objT = obj ? analysis.typeOf(obj->node.greenNode()) : nullptr;
+        if (objT && objT->isArray()) return objT->inner;
+    }
+    return nullptr;
+}
+
+Type* Analyzer::presenceOperandType(const ast::Expression& operand, Type* analyzed) {
+    Type* declared = declaredBindingType(operand);
+    if (!declared || !declared->isOptional() || declared->equals(analyzed)) return analyzed;
+    analysis.setType(operand.node.greenNode(), declared);
+    ast::Expression core = unwrapParens(operand);
+    analysis.setType(core.node.greenNode(), declared);
+    return declared;
+}
+
+void Analyzer::establishAssignmentNarrowing(Symbol* sym, Type* valueT) {
+    if (!sym || !currentScope || !valueT) return;
+    if (sym->kind != SymbolKind::Variable && sym->kind != SymbolKind::Parameter) return;
+    Type* declared = sym->type;
+    if (!declared || !declared->isOptional() || !declared->inner) return;
+    if (valueT->isError() || valueT->isNull() || valueT->isOptional()) return;
+    if (!declared->inner->assignableFrom(valueT)) return;
+    currentScope->narrowedTypes[NarrowingPath{sym, {}}] = declared->inner;
 }
 
 Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
@@ -5066,6 +5118,11 @@ Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
         analysis.setType(target->node.greenNode(), assignTargetT);
     }
     invalidateNarrowingsForWrite(*target);
+    if (auto id = target->asIdent()) {
+        if (auto* targetInfo = analysis.find(id->node.greenNode())) {
+            establishAssignmentNarrowing(targetInfo->resolvedSymbol, valueT);
+        }
+    }
     return assignTargetT;
 }
 
@@ -5146,6 +5203,10 @@ Type* Analyzer::analyzeNullCoalesce(const ast::NullCoalesceExpression& expr) {
     Type* l = analyzeExpr(*left);
     Type* r = analyzeExpr(*right);
     if (l->isError() || r->isError()) return typeCtx.getError();
+    // `?\?` is a presence test on the left's declared storage type, so a
+    // binding declared optional keeps it legal even after narrowing proved the
+    // value non-null; the check is then constant and yields the value.
+    l = presenceOperandType(*left, l);
     if (!l->isOptional() || !l->inner) {
         errorAtNode(expr.node, "Left of '?\?' must be a nullable value, got '" + l->toString() + "'");
         return typeCtx.getError();
