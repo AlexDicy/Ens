@@ -487,8 +487,9 @@ Narrowing is dropped when the analyzer can't prove the narrowed value is still n
   Elements narrowed at a different literal index are kept: `xs[2] = null` leaves `xs[0]` and `xs[1]` narrowed.
 - Reassigning the root variable or, for subscripts, the index variable.
 - Any function or method call whose receiver path or class/array-typed argument could touch the narrowed root. Calls that don't touch the relevant root (e.g. `print("hi")`) leave the narrowing intact.
-  One exception: when the narrowed path is a plain local variable (or parameter), calling a method on it (`xs.length()`) keeps the binding's narrowing, because no callee can reassign the caller's binding.
-  Member-path narrowings (`this.field`, `a.b`) are still dropped by any call rooted at them, and passing the local as an argument still drops its narrowing.
+  A call never drops the own narrowing of a plain local variable (or parameter), whether the binding is the call's receiver (`x.method()`) or an argument (`use(x)`): a callee cannot reassign the caller's binding, and the binding's own reference keeps the narrowed object alive.
+  What a call does drop is any member-path narrowing (`this.field`, `a.b`) rooted at a value it touches, since the callee may mutate those fields.
+  Passing the local as an `out` argument is the sole exception: `out` lets the callee write the caller's variable directly, so it drops the binding's own narrowing too.
 
 A write through a narrowed path is checked against the declared field or element type, not the narrowed one.
 Nulling out a just-checked field (`r.door = null`) or storing a base value over an `is`-narrowed one (`c.shape = new Shape()`) is therefore allowed; the write drops the narrowing, and reading the path again requires a new check.
