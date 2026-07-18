@@ -2759,17 +2759,15 @@ std::optional<NarrowingPath> Analyzer::buildNarrowingPath(
 
 void Analyzer::clearNarrowingsForCall(const ast::CallExpression& expr) {
     if (!currentScope) return;
-    auto dropRoot = [&](const ast::Expression& e) {
-        if (auto p = buildNarrowingPath(e)) {
-            currentScope->clearNarrowingsForRoot(p->root);
-        }
-    };
-    // Receiver (method / safe-method call): the call could mutate state
-    // reachable through it, which drops every narrowing that passes through
-    // the receiver's root. A plain local (or parameter) receiver keeps the
-    // narrowing of the binding itself: no callee can reassign the caller's
-    // binding.
-    auto dropReceiver = [&](const ast::Expression& e) {
+    // A value the call can reach - the receiver, or a class / array argument -
+    // loses every narrowing that passes through its root, since the callee may
+    // mutate the state reachable from it. The root binding's own narrowing
+    // survives: a callee cannot reassign the caller's local (or parameter), and
+    // the local's strong reference keeps the narrowed object alive, so its
+    // non-null / type fact holds across the call. `out` arguments are the
+    // exception - the callee writes the caller's variable - and are dropped in
+    // full on the external-call path.
+    auto dropTouched = [&](const ast::Expression& e) {
         auto p = buildNarrowingPath(e);
         if (!p) return;
         if (p->chain.empty() && p->root &&
@@ -2782,14 +2780,13 @@ void Analyzer::clearNarrowingsForCall(const ast::CallExpression& expr) {
     };
     if (auto callee = expr.callee()) {
         if (auto m = callee->asMember()) {
-            if (auto obj = m->object()) dropReceiver(*obj);
+            if (auto obj = m->object()) dropTouched(*obj);
         } else if (auto sm = callee->asSafeMember()) {
-            if (auto obj = sm->object()) dropReceiver(*obj);
+            if (auto obj = sm->object()) dropTouched(*obj);
         }
     }
-    // Arguments: only class / array references expose mutable state; struct
-    // and primitive args are passed by value, so the call can't mutate
-    // through them.
+    // Only class / array references expose mutable state; struct and primitive
+    // arguments are passed by value, so a call can't mutate through them.
     for (const auto& arg : expr.arguments()) {
         if (arg.asOutArgument()) continue;
         ast::Expression target = arg;
@@ -2803,7 +2800,7 @@ void Analyzer::clearNarrowingsForCall(const ast::CallExpression& expr) {
         Type* base = t->isOptional() ? t->inner : t;
         if (!base) continue;
         if (!base->isClass() && !base->isArray()) continue;
-        dropRoot(target);
+        dropTouched(target);
     }
 }
 
