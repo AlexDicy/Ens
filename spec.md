@@ -451,6 +451,19 @@ draw(Outer? outer) {
 }
 ```
 
+When one branch of an `if` always exits, the opposite narrowing survives after the `if`, so the `else` above is optional.
+A branch exits by `return`, `throw`, or `panic`, and, inside a loop, also by `break` or `continue`.
+A loop guard clause therefore narrows the checked value for the rest of the iteration:
+
+```ens
+for (let cursor in nodes) {
+    if (cursor == null) {
+        continue;
+    }
+    cursor.visit();   // cursor is non-nullable for the rest of the body
+}
+```
+
 Narrowing extends to **member chains** (`this.field`, `obj.field`, `a.b.c`) and to **array subscripts** (`arr[K]` for an integer-literal index, `arr[i]` for a plain identifier index, arithmetic and call indices are not narrowed). The same `!= null` / `== null` patterns work; the narrowed form holds for as long as nothing invalidates it.
 
 ```ens
