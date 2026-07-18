@@ -2958,19 +2958,19 @@ bool Analyzer::isPanicCall(const ast::Expression& expr) const {
     return sym && sym->isBuiltin && sym->name == u"panic";
 }
 
-bool Analyzer::blockTerminates(const ast::Block& block) const {
+bool Analyzer::blockTerminates(const ast::Block& block, ExitScope scope) const {
     for (auto& s : block.statements()) {
-        if (statementTerminates(s)) return true;
+        if (statementTerminates(s, scope)) return true;
     }
     return false;
 }
 
-bool Analyzer::ifStatementTerminates(const ast::IfStatement& stmt) const {
+bool Analyzer::ifStatementTerminates(const ast::IfStatement& stmt, ExitScope scope) const {
     auto then = stmt.thenBlock();
     auto ec = stmt.elseClause();
-    if (!then || !ec || !blockTerminates(*then)) return false;
-    if (auto inner = ec->ifStatement()) return ifStatementTerminates(*inner);
-    if (auto bb = ec->block()) return blockTerminates(*bb);
+    if (!then || !ec || !blockTerminates(*then, scope)) return false;
+    if (auto inner = ec->ifStatement()) return ifStatementTerminates(*inner, scope);
+    if (auto bb = ec->block()) return blockTerminates(*bb, scope);
     return false;
 }
 
@@ -2978,14 +2978,14 @@ bool Analyzer::ifStatementTerminates(const ast::IfStatement& stmt) const {
 // switch must cover every member or have a default, an int/string switch must
 // have a default, and a sealed type switch must cover every subclass), so a
 // switch terminates when every arm body is a block that terminates.
-bool Analyzer::switchStatementTerminates(const ast::SwitchStatement& stmt) const {
+bool Analyzer::switchStatementTerminates(const ast::SwitchStatement& stmt, ExitScope scope) const {
     auto arms = stmt.arms();
     if (arms.empty()) return false;
     for (auto& arm : arms) {
         auto bn = arm.bodyBlockNode();
         if (!bn) return false;
         auto blk = ast::Block::cast(*bn);
-        if (!blk || !blockTerminates(*blk)) return false;
+        if (!blk || !blockTerminates(*blk, scope)) return false;
     }
     return true;
 }
@@ -2999,11 +2999,14 @@ bool Analyzer::whileStatementTerminates(const ast::WhileStatement& stmt) const {
     return !body || !blockContainsLoopBreak(*body);
 }
 
-bool Analyzer::statementTerminates(const ast::Statement& s) const {
+bool Analyzer::statementTerminates(const ast::Statement& s, ExitScope scope) const {
     if (s.asReturn() || s.asThrow() || s.asRethrow()) return true;
-    if (auto b = s.asBlock()) return blockTerminates(*b);
-    if (auto i = s.asIf()) return ifStatementTerminates(*i);
-    if (auto sw = s.asSwitch()) return switchStatementTerminates(*sw);
+    if (scope == ExitScope::Branch && (s.asBreak() || s.asContinue())) return true;
+    if (auto b = s.asBlock()) return blockTerminates(*b, scope);
+    if (auto i = s.asIf()) return ifStatementTerminates(*i, scope);
+    if (auto sw = s.asSwitch()) return switchStatementTerminates(*sw, scope);
+    // A nested loop keeps function semantics: a break/continue inside it binds to
+    // that loop, not to the branch, so only a proven-infinite loop exits here.
     if (auto w = s.asWhile()) return whileStatementTerminates(*w);
     if (auto e = s.asExpressionStmt()) {
         auto expr = e->expression();
@@ -3018,14 +3021,14 @@ void Analyzer::checkFunctionReturnPaths(const ast::FuncDecl& fn) {
     auto body = fn.body();
     if (!body) return;
     std::string name = asciiOf(currentFunction->name);
-    if (!blockTerminates(*body)) {
+    if (!blockTerminates(*body, ExitScope::Function)) {
         errorAtNode(fn.nameToken() ? *fn.nameToken() : fn.node, "Function '" + name +
             "' can reach the end of its body without returning a value");
         return;
     }
     for (auto& cc : fn.catchClauses()) {
         auto cb = cc.body();
-        if (cb && !blockTerminates(*cb)) {
+        if (cb && !blockTerminates(*cb, ExitScope::Function)) {
             errorAtNode(cc.node, "Function '" + name +
                 "' can reach the end of its body without returning a value");
         }
@@ -3057,13 +3060,14 @@ void Analyzer::analyzeIfStmt(const ast::IfStatement& stmt) {
 
     // When one branch always exits, the opposite case survives into the enclosing
     // block, so a null check can narrow past the `if` (e.g. `if (x == null) { throw; }`
-    // leaves x non-null below).
+    // leaves x non-null below). Inside a loop, `break`/`continue` also exit the branch.
     if (currentScope) {
-        bool thenExits = thenBlock && blockTerminates(*thenBlock);
+        ExitScope scope = loopDepth > 0 ? ExitScope::Branch : ExitScope::Function;
+        bool thenExits = thenBlock && blockTerminates(*thenBlock, scope);
         bool elseExits = false;
         if (elseClause) {
-            if (auto inner = elseClause->ifStatement()) elseExits = ifStatementTerminates(*inner);
-            else if (auto bb = elseClause->block()) elseExits = blockTerminates(*bb);
+            if (auto inner = elseClause->ifStatement()) elseExits = ifStatementTerminates(*inner, scope);
+            else if (auto bb = elseClause->block()) elseExits = blockTerminates(*bb, scope);
         }
         const std::vector<NullCheckInfo>* survives = nullptr;
         if (thenExits && !elseExits) survives = &whenFalse;

@@ -171,10 +171,14 @@ private:
     void analyzeFunctionBody(const ast::FuncDecl& fn);
     void analyzeTestBody(const ast::TestDecl& test);
     void checkFunctionReturnPaths(const ast::FuncDecl& fn);
-    bool statementTerminates(const ast::Statement& stmt) const;
-    bool blockTerminates(const ast::Block& block) const;
-    bool ifStatementTerminates(const ast::IfStatement& stmt) const;
-    bool switchStatementTerminates(const ast::SwitchStatement& stmt) const;
+    // Whether a branch's exit leaves only the function (return/throw/rethrow/panic)
+    // or also the enclosing loop (adding break/continue). Return-path analysis uses
+    // Function; the surviving-branch narrowing carry uses Branch.
+    enum class ExitScope { Function, Branch };
+    bool statementTerminates(const ast::Statement& stmt, ExitScope scope) const;
+    bool blockTerminates(const ast::Block& block, ExitScope scope) const;
+    bool ifStatementTerminates(const ast::IfStatement& stmt, ExitScope scope) const;
+    bool switchStatementTerminates(const ast::SwitchStatement& stmt, ExitScope scope) const;
     bool whileStatementTerminates(const ast::WhileStatement& stmt) const;
     bool isPanicCall(const ast::Expression& expr) const;
     void analyzeImplicitConstructorAssignments(const ast::FuncDecl& fn);
