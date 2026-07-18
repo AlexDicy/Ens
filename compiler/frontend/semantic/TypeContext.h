@@ -63,6 +63,14 @@ public:
         return it == instanceTypes_.end() ? nullptr : it->second;
     }
 
+    // The canonical class Type owning `info`, whether it is a plain class or a
+    // generic instantiation. Null when `info` is not a registered class.
+    Type* classTypeFor(StructInfo* info) const {
+        if (!info) return nullptr;
+        if (Type* t = typeForInstance(info)) return t;
+        return lookupClass(info->modulePath, info->name);
+    }
+
     // True if the type mentions any unsubstituted type parameter (an "open"
     // type, e.g. a generic base recorded on a template).
     static bool containsTypeParam(const Type* t);

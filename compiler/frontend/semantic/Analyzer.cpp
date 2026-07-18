@@ -5072,6 +5072,43 @@ Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
     return assignTargetT;
 }
 
+// Nearest ancestor shared by both class chains (self counts), walking the
+// single `extends` chain. Interfaces live off this chain, so the result is
+// always a class; null when the two classes share no ancestor.
+static StructInfo* nearestCommonBaseClass(StructInfo* a, StructInfo* b) {
+    for (StructInfo* s = a; s; s = s->baseInfo) {
+        if (b->isSubclassOf(s)) return s;
+    }
+    return nullptr;
+}
+
+Type* Analyzer::unifyValueTypes(Type* a, Type* b) {
+    if (a->equals(b)) return a;
+    if (Type* c = numericCommonType(a, b)) return c;
+    if (a->assignableFrom(b)) return a;
+    if (b->assignableFrom(a)) return b;
+    // A 'null' side beside a typed side yields the nullable of that type.
+    if (a->isNull() != b->isNull()) {
+        Type* typed = a->isNull() ? b : a;
+        if (!typed->isVoid()) return typeCtx.getOptional(typed);
+    }
+    // Two sibling class values unify to their nearest common base class; through
+    // shared interfaces alone they do not, since interfaces are off the base
+    // chain. A nullable side keeps the result nullable.
+    bool anyOptional = a->isOptional() || b->isOptional();
+    Type* ac = a->isOptional() ? a->inner : a;
+    Type* bc = b->isOptional() ? b->inner : b;
+    if (ac && bc && ac->isClass() && bc->isClass() &&
+        !ac->isInterface() && !bc->isInterface() && ac->structInfo && bc->structInfo) {
+        if (StructInfo* base = nearestCommonBaseClass(ac->structInfo, bc->structInfo)) {
+            if (Type* baseT = typeCtx.classTypeFor(base)) {
+                return anyOptional ? typeCtx.getOptional(baseT) : baseT;
+            }
+        }
+    }
+    return nullptr;
+}
+
 Type* Analyzer::analyzeTernary(const ast::TernaryExpression& expr) {
     auto cond = expr.condition();
     auto thenE = expr.thenBranch();
@@ -5099,15 +5136,7 @@ Type* Analyzer::analyzeTernary(const ast::TernaryExpression& expr) {
     if (elseE) tryAdaptIntegerLiteral(*elseE, thenT);
     if (thenE) { Type* upd = analysis.typeOf(thenE->node.greenNode()); if (upd) thenT = upd; }
     if (elseE) { Type* upd = analysis.typeOf(elseE->node.greenNode()); if (upd) elseT = upd; }
-    if (thenT->equals(elseT)) return thenT;
-    if (Type* common = numericCommonType(thenT, elseT)) return common;
-    if (thenT->assignableFrom(elseT)) return thenT;
-    if (elseT->assignableFrom(thenT)) return elseT;
-    // A 'null' branch beside a typed branch yields the nullable of that type.
-    if (thenT->isNull() != elseT->isNull()) {
-        Type* typed = thenT->isNull() ? elseT : thenT;
-        if (!typed->isVoid()) return typeCtx.getOptional(typed);
-    }
+    if (Type* unified = unifyValueTypes(thenT, elseT)) return unified;
     errorAtNode(expr.node, "Ternary branches have incompatible types '" + thenT->toString() +
         "' and '" + elseT->toString() + "'");
     return typeCtx.getError();
@@ -5613,15 +5642,7 @@ Type* Analyzer::analyzeSwitchArms(const std::optional<ast::Expression>& scrutine
         if (!result) { result = t; continue; }
         tryAdaptIntegerLiteral(ve, result);
         if (Type* u = analysis.typeOf(ve.node.greenNode())) t = u;
-        if (t->equals(result)) continue;
-        if (Type* c = numericCommonType(result, t)) { result = c; continue; }
-        if (result->assignableFrom(t)) continue;
-        if (t->assignableFrom(result)) { result = t; continue; }
-        // A 'null' arm beside a typed arm yields the nullable of that type.
-        if (t->isNull() != result->isNull()) {
-            Type* typed = t->isNull() ? result : t;
-            if (!typed->isVoid()) { result = typeCtx.getOptional(typed); continue; }
-        }
+        if (Type* unified = unifyValueTypes(result, t)) { result = unified; continue; }
         errorAtNode(diagNode, "Switch arms produce incompatible types '" + result->toString() +
             "' and '" + t->toString() + "'.");
         return typeCtx.getError();

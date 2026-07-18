@@ -291,6 +291,12 @@ private:
     void tryAdaptIntegerLiteral(const ast::Expression& src, Type* target);
     void tryAdaptCharLiteral(const ast::Expression& src, Type* target);
     Type* numericCommonType(Type* a, Type* b);
+    // Least upper bound of two value types, shared by `?:` branches and switch
+    // arms: identical types, a numeric common type, an assignable-either-way
+    // pair, a `null`/`T` pair yielding `T?`, or two sibling class values sharing
+    // a common ancestor yielding the nearest common base class (nullable when
+    // either side is). Returns null when the types have no common type.
+    Type* unifyValueTypes(Type* a, Type* b);
     // analyzeExpr + try to adapt an integer literal to `target` in one step.
     // Returns the (possibly retyped) expression type.
     Type* analyzeExprAdapt(const ast::Expression& expr, Type* target);
