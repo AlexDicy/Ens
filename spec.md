@@ -668,10 +668,14 @@ A switch over an enum must be exhaustive: it either covers every member or provi
 A switch is also an expression: each arm yields a value, the arms unify to a common type (the same way the branches of `?:` do), and the switch evaluates to the matched arm's value. In statement position an arm's body may be a `{ }` block; used as a value, each arm is a single expression.
 
 Unification treats `null` as the absent case of a nullable type: a `null` branch or arm beside a `T` one yields `T?`, and a `T` one beside a `T?` one yields `T?`.
+Two class values that share a common ancestor unify to their nearest common base class, so `Circle` beside `Square` yields the closest class both extend.
+When either side is nullable, the result is that base class made nullable, so `Circle?` beside `Square` yields `Shape?`.
+Classes that share only an interface do not unify, because a class may implement several interfaces at once and the intended one would be ambiguous; give the expression an explicit type in that case.
 Unrelated types still do not unify, and branches that are all `null` give the expression no type of its own, so it can appear only where a plain `null` could.
 
 ```ens
 string? label = hasLabel ? readLabel() : null;   // string beside null -> string?
+Shape shape = round ? new Circle() : new Square();  // Circle beside Square -> Shape
 int? bonus = switch (rank) {
     1 -> 100,
     2 -> 50,
