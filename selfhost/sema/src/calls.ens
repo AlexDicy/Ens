@@ -1,0 +1,460 @@
+// Overload resolution over pre-analyzed arguments. The body checker turns each written argument
+// into an ArgumentValue - its analyzed type plus the literal facts untyped literals adapt with -
+// so this module ranks and picks candidates without touching the syntax tree.
+import Span from @ens.frontend.source;
+import Reporter from diagnostics;
+import convert;
+import literalvalues;
+import nullability;
+import types;
+import Type from types;
+import ErrorType from types;
+import PrimitiveType from types;
+import Method from types;
+import Parameter from types;
+import Signature from types;
+import List from @std.collections.list;
+import StringBuilder from @std.text.stringbuilder;
+
+// One analyzed call argument. The literal facts carry what conversionRank needs to know about
+// untyped integer and char literals: their value, so fitting a narrower parameter still counts.
+public class ArgumentValue {
+    private string argumentName;
+    private Type argumentType;
+    private bool integerLiteral;
+    private bool negativeLiteral;
+    private ulong literalMagnitude;
+    private bool characterLiteral;
+    private Span argumentSpan;
+
+    constructor(string name, Type type, bool isIntegerLiteral, bool isNegative,
+                ulong magnitude, bool isCharacterLiteral, Span span) {
+        this.argumentName = name;
+        this.argumentType = type;
+        this.integerLiteral = isIntegerLiteral;
+        this.negativeLiteral = isNegative;
+        this.literalMagnitude = magnitude;
+        this.characterLiteral = isCharacterLiteral;
+        this.argumentSpan = span;
+    }
+
+    // The named-argument name, or "" for a positional argument.
+    name() -> string {
+        return this.argumentName;
+    }
+
+    type() -> Type {
+        return this.argumentType;
+    }
+
+    isIntegerLiteral() -> bool {
+        return this.integerLiteral;
+    }
+
+    isNegative() -> bool {
+        return this.negativeLiteral;
+    }
+
+    magnitude() -> ulong {
+        return this.literalMagnitude;
+    }
+
+    isCharacterLiteral() -> bool {
+        return this.characterLiteral;
+    }
+
+    span() -> Span {
+        return this.argumentSpan;
+    }
+}
+
+// The analyzed shape of one call: positional arguments, named arguments, and whether the shape
+// already failed (duplicate or misplaced names) or carries an errored argument.
+public class CallShape {
+    private List<ArgumentValue> positionalArguments;
+    private List<ArgumentValue> namedArguments;
+    private bool shapeMalformed;
+    private bool erroredArgument;
+
+    constructor() {
+        this.positionalArguments = new List<ArgumentValue>();
+        this.namedArguments = new List<ArgumentValue>();
+        this.shapeMalformed = false;
+        this.erroredArgument = false;
+    }
+
+    positional() -> List<ArgumentValue> {
+        return this.positionalArguments;
+    }
+
+    named() -> List<ArgumentValue> {
+        return this.namedArguments;
+    }
+
+    // Every argument in source order: positional first, then named.
+    argumentAt(long index) -> ArgumentValue {
+        if (index < this.positionalArguments.length()) {
+            return this.positionalArguments.get(index);
+        }
+        return this.namedArguments.get(index - this.positionalArguments.length());
+    }
+
+    argumentCount() -> long {
+        return this.positionalArguments.length() + this.namedArguments.length();
+    }
+
+    isMalformed() -> bool {
+        return this.shapeMalformed;
+    }
+
+    markMalformed() {
+        this.shapeMalformed = true;
+    }
+
+    hasErrorArgument() -> bool {
+        return this.erroredArgument;
+    }
+
+    markErrorArgument() {
+        this.erroredArgument = true;
+    }
+}
+
+// One callable a call could resolve to. method is present for method and constructor
+// candidates and null for free functions.
+public class CallCandidate {
+    private Signature candidateSignature;
+    private Method? candidateMethod;
+    private bool candidateAccessible;
+
+    constructor(Signature signature, Method? method, bool accessible) {
+        this.candidateSignature = signature;
+        this.candidateMethod = method;
+        this.candidateAccessible = accessible;
+    }
+
+    signature() -> Signature {
+        return this.candidateSignature;
+    }
+
+    method() -> Method? {
+        return this.candidateMethod;
+    }
+
+    isAccessible() -> bool {
+        return this.candidateAccessible;
+    }
+}
+
+public class CallResolution {
+    private bool resolutionFailed;
+    private CallCandidate? chosenCandidate;
+    private long[] argumentMapping;
+
+    constructor(bool failed, CallCandidate? chosen, long[] mapping) {
+        this.resolutionFailed = failed;
+        this.chosenCandidate = chosen;
+        this.argumentMapping = mapping;
+    }
+
+    failed() -> bool {
+        return this.resolutionFailed;
+    }
+
+    chosen() -> CallCandidate? {
+        return this.chosenCandidate;
+    }
+
+    // Source-order argument index to parameter index.
+    mapping() -> long[] {
+        return this.argumentMapping;
+    }
+}
+
+// The number of leading parameters without defaults: the least a call must supply.
+public requiredArgumentCount(Signature signature) -> long {
+    Parameter[] parameters = signature.parameters();
+    long required = 0;
+    for (long i = 0; i < parameters.length; i++) {
+        if (parameters[i].hasDefault()) {
+            break;
+        }
+        required++;
+    }
+    return required;
+}
+
+// The expected-count phrase of an arity diagnostic: "2" or "2-4".
+public expectedCountText(Signature signature) -> string {
+    long required = requiredArgumentCount(signature);
+    long total = signature.parameters().length;
+    if (required == total) {
+        return "{required}";
+    }
+    return "{required}-{total}";
+}
+
+private class MapOutcome {
+    bool ok;
+    long[] mapping;
+    long defaulted;
+    string failure;
+
+    constructor() {
+        this.ok = false;
+        this.mapping = [];
+        this.defaulted = 0;
+        this.failure = "";
+    }
+}
+
+// Binds every source-order argument to a parameter index. On failure the outcome's text
+// explains why for single-candidate reporting.
+private mapArguments(Signature signature, CallShape shape, string kindWord,
+                     string displayName) -> MapOutcome {
+    let outcome = new MapOutcome();
+    Parameter[] parameters = signature.parameters();
+    long parameterCount = parameters.length;
+    long positionalCount = shape.positional().length();
+    long total = shape.argumentCount();
+    long required = requiredArgumentCount(signature);
+    if (positionalCount > parameterCount) {
+        outcome.failure = "{kindWord} '{displayName}' expects {expectedCountText(signature)} "
+            + "argument(s), got {total}";
+        return outcome;
+    }
+    bool[] bound = new bool[parameterCount];
+    let mapping = new List<long>();
+    for (long i = 0; i < positionalCount; i++) {
+        bound[i] = true;
+        mapping.push(i);
+    }
+    for (long n = 0; n < shape.named().length(); n++) {
+        let argument = shape.named().get(n);
+        long index = -1;
+        for (long j = 0; j < parameterCount; j++) {
+            if (parameters[j].name() == argument.name()) {
+                index = j;
+                break;
+            }
+        }
+        if (index < 0) {
+            outcome.failure = "{kindWord} '{displayName}' has no parameter named "
+                + "'{argument.name()}'";
+            return outcome;
+        }
+        if (bound[index]) {
+            outcome.failure = "{kindWord} '{displayName}': parameter '{argument.name()}' is "
+                + "already bound by a positional argument";
+            return outcome;
+        }
+        bound[index] = true;
+        mapping.push(index);
+    }
+    for (long j = 0; j < parameterCount; j++) {
+        if (bound[j]) {
+            continue;
+        }
+        if (parameters[j].hasDefault()) {
+            outcome.defaulted++;
+            continue;
+        }
+        string parameterName = "{j + 1}";
+        if (parameters[j].name().length > 0) {
+            parameterName = "'{parameters[j].name()}'";
+        }
+        outcome.failure = "{kindWord} '{displayName}' is missing an argument for parameter "
+            + "{parameterName}";
+        return outcome;
+    }
+    outcome.ok = true;
+    outcome.mapping = mapping.toArray();
+    return outcome;
+}
+
+// How well an argument fits a parameter: 3 exact, 2 implicit conversion, 1 viable only because
+// a literal's value fits or the null-blind policy lets an optional pass, 0 not at all.
+public conversionRank(ArgumentValue argument, Type parameterType) -> long {
+    Type argumentType = argument.type();
+    if (argumentType is ErrorType || parameterType is ErrorType) {
+        return 3;
+    }
+    if (argumentType == parameterType) {
+        return 3;
+    }
+    if (parameterType is PrimitiveType && convert.isIntegerType(parameterType)) {
+        if (argument.isIntegerLiteral() && literalvalues.magnitudeFits(argument.isNegative(),
+                argument.magnitude(), parameterType.kind())) {
+            if (types.widensTo(argumentType, parameterType)) {
+                return 2;
+            }
+            return 1;
+        }
+        if (argument.isCharacterLiteral() && literalvalues.magnitudeFits(false,
+                argument.magnitude(), parameterType.kind())) {
+            if (types.widensTo(argumentType, parameterType)) {
+                return 2;
+            }
+            return 1;
+        }
+    }
+    if (convert.isAssignableStrict(parameterType, argumentType)) {
+        return 2;
+    }
+    if (nullability.isAssignable(parameterType, argumentType)) {
+        return 1;
+    }
+    return 0;
+}
+
+private class ViableCandidate {
+    CallCandidate candidate;
+    long[] mapping;
+    long[] ranks;
+    long defaulted;
+
+    constructor(this.candidate, this.mapping, this.ranks, this.defaulted);
+}
+
+// Picks the best candidate: filter by argument shape and viability, rank argument matches
+// (exact beats conversion beats literal fitting), prefer accessible candidates, keep the
+// Pareto-undominated set with fewer defaulted parameters as the tiebreak, and report the
+// no-match and ambiguity diagnostics here.
+public resolveCall(List<CallCandidate> candidates, CallShape shape, Reporter reporter,
+                   Span span, string displayName, string kindWord) -> CallResolution {
+    if (shape.isMalformed()) {
+        return new CallResolution(true, null, []);
+    }
+    let viable = new List<ViableCandidate>();
+    string singleFailure = "";
+    long sourceCount = shape.argumentCount();
+    for (long c = 0; c < candidates.length(); c++) {
+        let candidate = candidates.get(c);
+        let outcome = mapArguments(candidate.signature(), shape, kindWord, displayName);
+        if (!outcome.ok) {
+            if (candidates.length() == 1) {
+                singleFailure = outcome.failure;
+            }
+            continue;
+        }
+        let ranks = new List<long>();
+        bool usable = true;
+        for (long i = 0; i < sourceCount; i++) {
+            let argument = shape.argumentAt(i);
+            Type parameterType =
+                candidate.signature().parameters()[outcome.mapping[i]].type();
+            long rank = conversionRank(argument, parameterType);
+            if (rank == 0 && candidates.length() > 1 && !shape.hasErrorArgument()) {
+                usable = false;
+                break;
+            }
+            ranks.push(rank);
+        }
+        if (!usable) {
+            continue;
+        }
+        viable.push(new ViableCandidate(candidate, outcome.mapping, ranks.toArray(),
+            outcome.defaulted));
+    }
+
+    if (viable.length() == 0) {
+        if (candidates.length() == 1 && singleFailure.length > 0) {
+            reporter.report(singleFailure, span);
+        } else {
+            reporter.report("No overload of '{displayName}' matches this call. Candidates: "
+                + "{candidateList(candidates)}.", span);
+        }
+        return new CallResolution(true, null, []);
+    }
+
+    bool anyAccessible = false;
+    for (long i = 0; i < viable.length(); i++) {
+        if (viable.get(i).candidate.isAccessible()) {
+            anyAccessible = true;
+        }
+    }
+    let pool = new List<ViableCandidate>();
+    for (long i = 0; i < viable.length(); i++) {
+        if (viable.get(i).candidate.isAccessible() == anyAccessible) {
+            pool.push(viable.get(i));
+        }
+    }
+
+    let best = new List<ViableCandidate>();
+    for (long i = 0; i < pool.length(); i++) {
+        bool dominated = false;
+        for (long j = 0; j < pool.length(); j++) {
+            if (j != i && betterThan(pool.get(j), pool.get(i))) {
+                dominated = true;
+                break;
+            }
+        }
+        if (!dominated) {
+            best.push(pool.get(i));
+        }
+    }
+    if (best.length() == 0) {
+        best.push(pool.get(0));
+    }
+    if (best.length() > 1 && !shape.hasErrorArgument()) {
+        let shown = new List<CallCandidate>();
+        for (long i = 0; i < best.length(); i++) {
+            shown.push(best.get(i).candidate);
+        }
+        reporter.report("Call to '{displayName}' is ambiguous. Candidates: "
+            + "{candidateList(shown)}.", span);
+        return new CallResolution(true, null, []);
+    }
+
+    let winner = best.get(0);
+    return new CallResolution(false, winner.candidate, winner.mapping);
+}
+
+private betterThan(ViableCandidate left, ViableCandidate right) -> bool {
+    bool atLeastAsGood = true;
+    bool strictlyBetter = false;
+    for (long i = 0; i < left.ranks.length; i++) {
+        if (left.ranks[i] < right.ranks[i]) {
+            atLeastAsGood = false;
+        }
+        if (left.ranks[i] > right.ranks[i]) {
+            strictlyBetter = true;
+        }
+    }
+    if (!atLeastAsGood) {
+        return false;
+    }
+    if (strictlyBetter) {
+        return true;
+    }
+    return left.defaulted < right.defaulted;
+}
+
+private candidateList(List<CallCandidate> candidates) -> string {
+    let builder = new StringBuilder();
+    for (long i = 0; i < candidates.length(); i++) {
+        if (i > 0) {
+            builder.append(", ");
+        }
+        builder.append("'");
+        builder.append(signatureDisplay(candidates.get(i).signature()));
+        builder.append("'");
+    }
+    return builder.toString();
+}
+
+// The signature as it reads in an overload diagnostic: 'name(int, string)'.
+public signatureDisplay(Signature signature) -> string {
+    let builder = new StringBuilder();
+    builder.append(signature.name());
+    builder.append("(");
+    Parameter[] parameters = signature.parameters();
+    for (long i = 0; i < parameters.length; i++) {
+        if (i > 0) {
+            builder.append(", ");
+        }
+        builder.append(types.display(parameters[i].type()));
+    }
+    builder.append(")");
+    return builder.toString();
+}

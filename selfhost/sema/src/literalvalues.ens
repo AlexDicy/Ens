@@ -1,0 +1,180 @@
+// Literal value readers for expression checking: the magnitude of an integer literal, the
+// codepoint of a character literal, and the range table untyped literals adapt against.
+import PrimitiveKind from types;
+
+// The magnitude of an integer literal token, or null when the text does not parse. Underscore
+// separators and the 'l'/'L' suffix are ignored; '0x' and '0b' prefixes select the base.
+public integerMagnitude(string text) -> ulong? {
+    byte[] raw = text.toBytes();
+    let digits = new byte[raw.length];
+    long count = 0;
+    for (long i = 0; i < raw.length; i++) {
+        byte value = raw[i];
+        if (value == '_' || value == 'l' || value == 'L') {
+            continue;
+        }
+        digits[count] = value;
+        count++;
+    }
+    long base = 10;
+    long start = 0;
+    if (count > 2 && digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X')) {
+        base = 16;
+        start = 2;
+    } else if (count > 2 && digits[0] == '0' && (digits[1] == 'b' || digits[1] == 'B')) {
+        base = 2;
+        start = 2;
+    }
+    if (start == count) {
+        return null;
+    }
+    ulong ceiling = 18446744073709551615;
+    ulong scale = base as ulong;
+    ulong value = 0;
+    for (long i = start; i < count; i++) {
+        long digit = digitValue(digits[i]);
+        if (digit < 0 || digit >= base) {
+            return null;
+        }
+        ulong step = digit as ulong;
+        if (value > (ceiling - step) / scale) {
+            return null;
+        }
+        value = value * scale + step;
+    }
+    return value;
+}
+
+private digitValue(byte value) -> long {
+    if (value >= '0' && value <= '9') {
+        return value - '0';
+    }
+    if (value >= 'a' && value <= 'f') {
+        return value - 'a' + 10;
+    }
+    if (value >= 'A' && value <= 'F') {
+        return value - 'A' + 10;
+    }
+    return -1;
+}
+
+// The codepoint a character literal token names, quotes and escapes decoded. A malformed escape
+// falls back to the escaped byte itself, matching the tokenizer.
+public charCodepoint(string text) -> ulong {
+    byte[] raw = text.toBytes();
+    long start = 0;
+    long end = raw.length;
+    if (end >= 2 && raw[0] == '\'' && raw[end - 1] == '\'') {
+        start = 1;
+        end--;
+    }
+    if (start >= end) {
+        return 0;
+    }
+    if (raw[start] == '\\' && start + 1 < end) {
+        return escapeCodepoint(raw, start, end);
+    }
+    return decodeUtf8(raw, start, end);
+}
+
+private escapeCodepoint(byte[] raw, long backslash, long end) -> ulong {
+    byte next = raw[backslash + 1];
+    switch (next) {
+        'n' -> {
+            return 10;
+        },
+        't' -> {
+            return 9;
+        },
+        'r' -> {
+            return 13;
+        },
+        'b' -> {
+            return 8;
+        },
+        'f' -> {
+            return 12;
+        },
+        '0' -> {
+            return 0;
+        },
+        'u' -> {
+            if (backslash + 6 <= end) {
+                ulong value = 0;
+                for (long i = 0; i < 4; i++) {
+                    long digit = digitValue(raw[backslash + 2 + i]);
+                    if (digit < 0 || digit >= 16) {
+                        return next;
+                    }
+                    value = value * 16 + (digit as ulong);
+                }
+                return value;
+            }
+            return next;
+        },
+        default -> {
+            return next;
+        },
+    }
+}
+
+private decodeUtf8(byte[] raw, long start, long end) -> ulong {
+    ulong first = raw[start];
+    if (first < 0x80) {
+        return first;
+    }
+    if (first >= 0xC0 && first < 0xE0 && start + 1 < end) {
+        ulong second = raw[start + 1];
+        return (first - 0xC0) * 64 + (second - 0x80);
+    }
+    if (first >= 0xE0 && first < 0xF0 && start + 2 < end) {
+        ulong second = raw[start + 1];
+        ulong third = raw[start + 2];
+        return (first - 0xE0) * 4096 + (second - 0x80) * 64 + (third - 0x80);
+    }
+    if (first >= 0xF0 && start + 3 < end) {
+        ulong second = raw[start + 1];
+        ulong third = raw[start + 2];
+        ulong fourth = raw[start + 3];
+        return (first - 0xF0) * 262144 + (second - 0x80) * 4096 + (third - 0x80) * 64
+            + (fourth - 0x80);
+    }
+    return first;
+}
+
+// True when a literal of the given sign and magnitude is a value of the integer kind.
+public magnitudeFits(bool negative, ulong magnitude, PrimitiveKind kind) -> bool {
+    return switch (kind) {
+        Byte -> !negative && magnitude <= 255,
+        Short -> fitsSigned(negative, magnitude, 32767),
+        Int -> fitsSigned(negative, magnitude, 2147483647),
+        Long -> fitsSigned(negative, magnitude, 9223372036854775807),
+        UShort -> !negative && magnitude <= 65535,
+        UInt -> !negative && magnitude <= 4294967295,
+        ULong -> !negative,
+        Char -> !negative && magnitude <= 1114111,
+        default -> false,
+    };
+}
+
+private fitsSigned(bool negative, ulong magnitude, ulong positiveLimit) -> bool {
+    if (negative) {
+        return magnitude <= positiveLimit + 1;
+    }
+    return magnitude <= positiveLimit;
+}
+
+// The kind's value range as it reads in a diagnostic.
+public integerRange(PrimitiveKind kind) -> string {
+    return switch (kind) {
+        Byte -> "0..255",
+        Short -> "-32768..32767",
+        Int -> "-2147483648..2147483647",
+        Long -> "-9223372036854775808..9223372036854775807",
+        UShort -> "0..65535",
+        UInt -> "0..4294967295",
+        ULong -> "0..18446744073709551615",
+        Char -> "0..1114111",
+        default -> "",
+    };
+}

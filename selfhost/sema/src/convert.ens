@@ -1,0 +1,247 @@
+// Implicit conversions and value unification: the assignability relation, the common numeric
+// type of two operands, and the nearest-common-base unification switch and ternary values use.
+import types;
+import Type from types;
+import ErrorType from types;
+import NullType from types;
+import OptionalType from types;
+import ArrayType from types;
+import PrimitiveType from types;
+import PrimitiveKind from types;
+import EnumType from types;
+import StructType from types;
+import InstantiationType from types;
+import TypeParamType from types;
+import TypeStore from types;
+import Set from @std.collections.set;
+
+public isIntegerType(Type type) -> bool {
+    if (type is PrimitiveType) {
+        return switch (type.kind()) {
+            Byte, Short, UShort, Int, UInt, Long, ULong, Char -> true,
+            default -> false,
+        };
+    }
+    return false;
+}
+
+public isFloatType(Type type) -> bool {
+    if (type is PrimitiveType) {
+        return switch (type.kind()) {
+            Float, Double, Decimal -> true,
+            default -> false,
+        };
+    }
+    return false;
+}
+
+public isNumericType(Type type) -> bool {
+    return isIntegerType(type) || isFloatType(type);
+}
+
+public isBoolType(Type type) -> bool {
+    if (type is PrimitiveType) {
+        return type.kind() == PrimitiveKind.Bool;
+    }
+    return false;
+}
+
+public isEnumLike(Type type) -> bool {
+    return type is EnumType;
+}
+
+// The strict assignability relation, exactly as declared types allow it: identity, lossless
+// numeric widening, class upcasts and interface conversions, and the optional acceptances.
+public isAssignableStrict(Type target, Type source) -> bool {
+    if (target is ErrorType || source is ErrorType) {
+        return true;
+    }
+    if (target == source) {
+        return true;
+    }
+    if (types.widensTo(source, target)) {
+        return true;
+    }
+    if (types.isClassLike(target) && types.isClassLike(source)
+            && types.isSubclassOrConforms(source, target)) {
+        return true;
+    }
+    if (target is OptionalType) {
+        Type inner = target.inner();
+        if (source is NullType) {
+            return true;
+        }
+        if (inner == source || types.widensTo(source, inner)) {
+            return true;
+        }
+        Type bare = source;
+        if (source is OptionalType) {
+            bare = source.inner();
+        }
+        if (inner == bare) {
+            return true;
+        }
+        if (types.isClassLike(inner) && types.isClassLike(bare)
+                && types.isSubclassOrConforms(bare, inner)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The type two numeric operands share: one of them, when the other is the same type or widens
+// to it losslessly. Null when the operands do not meet.
+public numericCommonType(Type left, Type right) -> Type? {
+    if (left is ErrorType || right is ErrorType) {
+        return null;
+    }
+    if (left == right) {
+        return left;
+    }
+    if (types.widensTo(left, right)) {
+        return right;
+    }
+    if (types.widensTo(right, left)) {
+        return left;
+    }
+    return null;
+}
+
+// The single type both branch values convert to: identity, the numeric common type, one side
+// absorbing the other by assignability, null beside a typed value making it optional, or two
+// sibling class values meeting at their nearest common base class. Null when nothing unifies.
+public unifyValueTypes(Type left, Type right, TypeStore store) -> Type? {
+    if (left == right) {
+        return left;
+    }
+    let numeric = numericCommonType(left, right);
+    if (numeric != null) {
+        return numeric;
+    }
+    if (isAssignableStrict(left, right)) {
+        return left;
+    }
+    if (isAssignableStrict(right, left)) {
+        return right;
+    }
+    if (left is NullType != right is NullType) {
+        Type typed = left;
+        if (left is NullType) {
+            typed = right;
+        }
+        if (!types.isVoidType(typed)) {
+            return store.optionalOf(typed);
+        }
+    }
+    bool anyOptional = left is OptionalType || right is OptionalType;
+    Type leftCore = bareOf(left);
+    Type rightCore = bareOf(right);
+    if (isConcreteClassValue(leftCore) && isConcreteClassValue(rightCore)) {
+        let base = nearestCommonBase(leftCore, rightCore);
+        if (base != null) {
+            if (anyOptional) {
+                return store.optionalOf(base);
+            }
+            return base;
+        }
+    }
+    return null;
+}
+
+public bareOf(Type type) -> Type {
+    if (type is OptionalType) {
+        return type.inner();
+    }
+    return type;
+}
+
+private isConcreteClassValue(Type type) -> bool {
+    return types.isClassLike(type) && !types.isInterfaceLike(type);
+}
+
+// The nearest ancestor both class chains share, walking the single extends chain; interfaces
+// live off this chain, so the result is always a class.
+private nearestCommonBase(Type left, Type right) -> Type? {
+    Type? current = left;
+    while (current != null) {
+        if (types.isSubclassOf(right, current)) {
+            return current;
+        }
+        current = types.baseOf(current);
+    }
+    return null;
+}
+
+// True when the type mentions a type parameter anywhere; such types defer their per-value
+// checks to each instantiation.
+public containsTypeParam(Type type) -> bool {
+    switch (type) {
+        is TypeParamType ignored -> {
+            return true;
+        },
+        is OptionalType optional -> {
+            return containsTypeParam(optional.inner());
+        },
+        is ArrayType array -> {
+            return containsTypeParam(array.element());
+        },
+        is InstantiationType instantiation -> {
+            for (let argument in instantiation.arguments()) {
+                if (containsTypeParam(argument)) {
+                    return true;
+                }
+            }
+            return false;
+        },
+        default -> {
+            return false;
+        },
+    }
+}
+
+// True if the type can start as a valid zero value without an initializer: primitives except
+// decimal and void, optionals, and structs - generic instantiations included - whose every
+// field can.
+public isDefaultable(Type type) -> bool {
+    let visiting = new Set<Type>();
+    return isDefaultableGuarded(type, visiting);
+}
+
+private isDefaultableGuarded(Type type, Set<Type> visiting) -> bool {
+    if (type is PrimitiveType) {
+        return type.kind() != PrimitiveKind.Decimal && type.kind() != PrimitiveKind.Void;
+    }
+    if (type is OptionalType) {
+        return true;
+    }
+    if (!isStructLike(type)) {
+        return false;
+    }
+    if (!visiting.add(type)) {
+        return true;
+    }
+    let fields = types.fieldsOf(type);
+    bool defaultable = true;
+    if (fields != null) {
+        for (long i = 0; i < fields.length(); i++) {
+            let field = fields.get(i);
+            if (field.hasDefault() || isDefaultableGuarded(field.type(), visiting)) {
+                continue;
+            }
+            defaultable = false;
+            break;
+        }
+    }
+    visiting.remove(type);
+    return defaultable;
+}
+
+private isStructLike(Type type) -> bool {
+    if (type is StructType) {
+        return true;
+    }
+    if (type is InstantiationType) {
+        return type.template() is StructType;
+    }
+    return false;
+}

@@ -1,0 +1,261 @@
+import @std.testing;
+import @ens.frontend.source;
+import Span from @ens.frontend.source;
+import FileDiagnostic from diagnostics;
+import Reporter from diagnostics;
+import calls;
+import ArgumentValue from calls;
+import CallShape from calls;
+import CallCandidate from calls;
+import convert;
+import literalvalues;
+import nullability;
+import Scope from scopes;
+import LocalBinding from scopes;
+import BindingKind from scopes;
+import types;
+import Type from types;
+import TypeStore from types;
+import PrimitiveKind from types;
+import Parameter from types;
+import Signature from types;
+import Visibility from types;
+import ClassType from types;
+import List from @std.collections.list;
+import sema_support;
+
+private magnitudeIs(string text, ulong expected) -> bool {
+    let magnitude = literalvalues.integerMagnitude(text);
+    return magnitude != null && magnitude == expected;
+}
+
+test "integer literal magnitudes parse across bases, separators, and suffixes" {
+    try testing.assertTrue(magnitudeIs("0", 0), "zero");
+    try testing.assertTrue(magnitudeIs("200", 200), "decimal");
+    try testing.assertTrue(magnitudeIs("1_000_000", 1000000), "underscore separators");
+    try testing.assertTrue(magnitudeIs("42L", 42), "long suffix");
+    try testing.assertTrue(magnitudeIs("0xFF", 255), "hex");
+    try testing.assertTrue(magnitudeIs("0b101", 5), "binary");
+    try testing.assertTrue(magnitudeIs("18446744073709551615", 18446744073709551615),
+        "the full unsigned 64-bit range parses");
+    try testing.assertTrue(literalvalues.integerMagnitude("18446744073709551616") == null,
+        "one past the unsigned range overflows");
+    try testing.assertTrue(literalvalues.integerMagnitude("12a") == null, "bad digit");
+}
+
+test "char literal codepoints decode escapes and multi-byte text" {
+    try testing.assertTrue(literalvalues.charCodepoint("'A'") == 65, "plain ascii");
+    try testing.assertTrue(literalvalues.charCodepoint("'\\n'") == 10, "newline escape");
+    try testing.assertTrue(literalvalues.charCodepoint("'\\0'") == 0, "nul escape");
+    try testing.assertTrue(literalvalues.charCodepoint("'\\u0041'") == 65, "unicode escape");
+    try testing.assertTrue(literalvalues.charCodepoint("'é'") == 233, "two-byte utf-8");
+    try testing.assertTrue(literalvalues.charCodepoint("'€'") == 8364, "three-byte utf-8");
+}
+
+test "the literal range table matches the language's integer kinds" {
+    try testing.assertTrue(literalvalues.magnitudeFits(false, 255, PrimitiveKind.Byte),
+        "255 is the last byte");
+    try testing.assertTrue(!literalvalues.magnitudeFits(false, 256, PrimitiveKind.Byte),
+        "256 is out of byte range");
+    try testing.assertTrue(!literalvalues.magnitudeFits(true, 1, PrimitiveKind.Byte),
+        "bytes are unsigned");
+    try testing.assertTrue(literalvalues.magnitudeFits(true, 32768, PrimitiveKind.Short),
+        "-32768 is the first short");
+    try testing.assertTrue(!literalvalues.magnitudeFits(false, 32768, PrimitiveKind.Short),
+        "32768 is past the last short");
+    try testing.assertTrue(literalvalues.magnitudeFits(false, 1114111, PrimitiveKind.Char),
+        "the last scalar fits char");
+    try testing.assertTrue(!literalvalues.magnitudeFits(false, 1114112, PrimitiveKind.Char),
+        "past the last scalar does not fit char");
+    try testing.assertTrue(
+        literalvalues.magnitudeFits(false, 18446744073709551615, PrimitiveKind.ULong),
+        "every positive magnitude fits ulong");
+    try testing.assertTrue(
+        literalvalues.magnitudeFits(true, 9223372036854775808, PrimitiveKind.Long),
+        "the most negative long fits");
+}
+
+test "numeric common types follow lossless widening" {
+    let store = new TypeStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let longType = store.primitive(PrimitiveKind.Long);
+    let uintType = store.primitive(PrimitiveKind.UInt);
+    let doubleType = store.primitive(PrimitiveKind.Double);
+    try testing.assertTrue(convert.numericCommonType(intType, longType) == longType,
+        "int and long meet at long");
+    try testing.assertTrue(convert.numericCommonType(longType, intType) == longType,
+        "widening is symmetric in the result");
+    try testing.assertTrue(convert.numericCommonType(intType, intType) == intType,
+        "a type meets itself");
+    try testing.assertTrue(convert.numericCommonType(uintType, intType) == null,
+        "uint and int do not meet");
+    try testing.assertTrue(convert.numericCommonType(intType, doubleType) == doubleType,
+        "int widens to double");
+}
+
+test "strict assignability accepts identity, widening, and optional acceptances" {
+    let store = new TypeStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let longType = store.primitive(PrimitiveKind.Long);
+    let optionalLong = store.optionalOf(longType);
+    try testing.assertTrue(convert.isAssignableStrict(longType, intType),
+        "int widens into long");
+    try testing.assertTrue(!convert.isAssignableStrict(intType, longType),
+        "long does not narrow into int");
+    try testing.assertTrue(convert.isAssignableStrict(optionalLong, store.nullType()),
+        "null fits an optional");
+    try testing.assertTrue(convert.isAssignableStrict(optionalLong, intType),
+        "a widening source fits the optional's inner type");
+    try testing.assertTrue(!convert.isAssignableStrict(longType, store.nullType()),
+        "null does not fit a non-optional");
+}
+
+test "null-blind assignability defers the narrowing diagnostics" {
+    let store = new TypeStore();
+    let longType = store.primitive(PrimitiveKind.Long);
+    let optionalLong = store.optionalOf(longType);
+    try testing.assertTrue(nullability.isAssignable(longType, optionalLong),
+        "an optional source passes where its inner type would");
+    try testing.assertTrue(nullability.isAssignable(longType, store.nullType()),
+        "null passes anywhere until narrowing exists");
+    try testing.assertTrue(!nullability.isAssignable(longType, store.stringType()),
+        "unrelated types still do not pass");
+}
+
+test "class values unify at their nearest common base and null makes optionals" {
+    let store = new TypeStore();
+    let node = sema_support.anyGreenNode();
+    let base = store.addClass("Base", "m", "/m.ens", node, Visibility.Public, [], false,
+        false, false);
+    let left = store.addClass("Left", "m", "/m.ens", node, Visibility.Public, [], false,
+        false, false);
+    let right = store.addClass("Right", "m", "/m.ens", node, Visibility.Public, [], false,
+        false, false);
+    left.setBase(base);
+    right.setBase(base);
+    try testing.assertTrue(convert.unifyValueTypes(left, right, store) == base,
+        "siblings unify to the base class");
+    try testing.assertTrue(convert.unifyValueTypes(left, base, store) == base,
+        "a subclass and its base unify to the base");
+    let optional = convert.unifyValueTypes(left, store.nullType(), store);
+    try testing.assertTrue(optional == store.optionalOf(left),
+        "a null side makes the typed side optional");
+    try testing.assertTrue(
+        convert.unifyValueTypes(store.stringType(), store.primitive(PrimitiveKind.Int),
+            store) == null,
+        "string and int do not unify");
+}
+
+test "conversion ranks order exact above conversion above literal fitting" {
+    let store = new TypeStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let longType = store.primitive(PrimitiveKind.Long);
+    let byteType = store.primitive(PrimitiveKind.Byte);
+    Span nowhere = source.makeSpan(0, 0);
+    let plainInt = new ArgumentValue("", intType, false, false, 0, false, nowhere);
+    let literalFive = new ArgumentValue("", intType, true, false, 5, false, nowhere);
+    let literalBig = new ArgumentValue("", intType, true, false, 300, false, nowhere);
+    try testing.assertTrue(calls.conversionRank(plainInt, intType) == 3, "identity is exact");
+    try testing.assertTrue(calls.conversionRank(plainInt, longType) == 2,
+        "widening is a conversion");
+    try testing.assertTrue(calls.conversionRank(plainInt, byteType) == 0,
+        "a non-literal int never narrows to byte");
+    try testing.assertTrue(calls.conversionRank(literalFive, byteType) == 1,
+        "a fitting literal is viable at the lowest rank");
+    try testing.assertTrue(calls.conversionRank(literalFive, longType) == 2,
+        "a literal that also widens ranks as a conversion");
+    try testing.assertTrue(calls.conversionRank(literalBig, byteType) == 0,
+        "a literal whose value does not fit is not viable");
+}
+
+test "overload resolution picks the dominant candidate and reports ambiguity" {
+    let store = new TypeStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let longType = store.primitive(PrimitiveKind.Long);
+    Span nowhere = source.makeSpan(0, 0);
+    let intSignature = new Signature("f", [new Parameter("value", intType, false, false,
+        false, nowhere)], intType, false, [], [], [], null, nowhere);
+    let longSignature = new Signature("f", [new Parameter("value", longType, false, false,
+        false, nowhere)], longType, false, [], [], [], null, nowhere);
+    let candidates = new List<CallCandidate>();
+    candidates.push(new CallCandidate(intSignature, null, true));
+    candidates.push(new CallCandidate(longSignature, null, true));
+
+    let sink = new List<FileDiagnostic>();
+    let reporter = new Reporter("/t.ens", sink);
+    let shape = new CallShape();
+    shape.positional().push(new ArgumentValue("", intType, false, false, 0, false, nowhere));
+    let resolved = calls.resolveCall(candidates, shape, reporter, nowhere, "f", "Function");
+    try testing.assertTrue(!resolved.failed(), "an exact match resolves");
+    let chosen = resolved.chosen();
+    try testing.assertTrue(chosen != null && chosen.signature() == intSignature,
+        "the exact int overload wins over the widening long one");
+    try testing.assertTrue(sink.length() == 0, "a clean resolution reports nothing");
+}
+
+test "fewer defaulted parameters break rank ties" {
+    let store = new TypeStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    Span nowhere = source.makeSpan(0, 0);
+    let oneParameter = new Signature("f", [new Parameter("a", intType, false, false, false,
+        nowhere)], intType, false, [], [], [], null, nowhere);
+    let withDefault = new Signature("f", [new Parameter("a", intType, false, false, false,
+        nowhere), new Parameter("b", intType, false, false, true, nowhere)], intType, false,
+        [], [], [], null, nowhere);
+    let candidates = new List<CallCandidate>();
+    candidates.push(new CallCandidate(withDefault, null, true));
+    candidates.push(new CallCandidate(oneParameter, null, true));
+
+    let sink = new List<FileDiagnostic>();
+    let reporter = new Reporter("/t.ens", sink);
+    let shape = new CallShape();
+    shape.positional().push(new ArgumentValue("", intType, false, false, 0, false, nowhere));
+    let resolved = calls.resolveCall(candidates, shape, reporter, nowhere, "f", "Function");
+    try testing.assertTrue(!resolved.failed(), "the tie resolves");
+    let chosen = resolved.chosen();
+    try testing.assertTrue(chosen != null && chosen.signature() == oneParameter,
+        "the candidate defaulting fewer parameters wins");
+}
+
+test "unmatchable calls report the single-candidate failure" {
+    let store = new TypeStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    Span nowhere = source.makeSpan(0, 0);
+    let signature = new Signature("f", [new Parameter("amount", intType, false, false, false,
+        nowhere)], intType, false, [], [], [], null, nowhere);
+    let candidates = new List<CallCandidate>();
+    candidates.push(new CallCandidate(signature, null, true));
+
+    let sink = new List<FileDiagnostic>();
+    let reporter = new Reporter("/t.ens", sink);
+    let shape = new CallShape();
+    let named = new ArgumentValue("misnamed", intType, false, false, 0, false, nowhere);
+    shape.named().push(named);
+    let resolved = calls.resolveCall(candidates, shape, reporter, nowhere, "f", "Function");
+    try testing.assertTrue(resolved.failed(), "a bad name cannot resolve");
+    try sema_support.assertDiagnostic(sink.toArray(), 0, "/t.ens",
+        "Function 'f' has no parameter named 'misnamed'");
+}
+
+test "scopes shadow outward and reject sibling duplicates" {
+    let store = new TypeStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let longType = store.primitive(PrimitiveKind.Long);
+    Span nowhere = source.makeSpan(0, 0);
+    let outer = new Scope(null);
+    let inner = new Scope(outer);
+    let outerBinding = new LocalBinding("value", intType, BindingKind.Parameter, false,
+        nowhere);
+    let innerBinding = new LocalBinding("value", longType, BindingKind.Variable, true,
+        nowhere);
+    try testing.assertTrue(outer.define(outerBinding), "the first definition succeeds");
+    try testing.assertTrue(!outer.define(outerBinding), "a sibling duplicate is rejected");
+    try testing.assertTrue(inner.define(innerBinding), "an inner scope may shadow");
+    try testing.assertTrue(inner.lookup("value") == innerBinding,
+        "lookup finds the innermost binding");
+    try testing.assertTrue(outer.lookup("value") == outerBinding,
+        "the outer scope still sees its own binding");
+    try testing.assertTrue(inner.lookup("missing") == null, "unknown names resolve to null");
+    try testing.assertTrue(inner.lookupLocal("value") == innerBinding
+        && outer.lookupLocal("value") == outerBinding, "local lookup stays in one scope");
+}
