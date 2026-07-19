@@ -99,6 +99,31 @@ uint32_t parseCharLiteralCodepoint(std::u16string_view text) {
     return static_cast<uint32_t>(c);
 }
 
+std::u16string decodeStringLiteral(std::u16string_view text) {
+    size_t start = 0, end = text.size();
+    if (end >= 2 && text.front() == u'"' && text.back() == u'"') { start = 1; end--; }
+    std::u16string out;
+    out.reserve(end - start);
+    for (size_t i = start; i < end; ++i) {
+        char16_t c = text[i];
+        if (c == u'\\' && i + 1 < end) {
+            size_t next;
+            uint32_t scalar = decodeEscapeSequence(text, i, end, next);
+            i = next - 1;
+            if (scalar <= 0xFFFF) {
+                out.push_back(static_cast<char16_t>(scalar));
+            } else {
+                scalar -= 0x10000u;
+                out.push_back(static_cast<char16_t>(0xD800u | (scalar >> 10)));
+                out.push_back(static_cast<char16_t>(0xDC00u | (scalar & 0x3FFu)));
+            }
+        } else {
+            out.push_back(c);
+        }
+    }
+    return out;
+}
+
 void appendUtf8(std::string& out, uint32_t scalar) {
     if (scalar < 0x80) {
         out.push_back(static_cast<char>(scalar));

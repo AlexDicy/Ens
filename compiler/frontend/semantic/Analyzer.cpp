@@ -5481,10 +5481,12 @@ bool isNullLabel(const ast::Expression& e) {
     return false;
 }
 
+// A string label's decoded value, so two spellings of the same string (for
+// example "\t" and a literal tab) collide as a duplicate.
 bool stringLabelText(const ast::Expression& e, std::u16string& out) {
     if (auto lit = e.asLiteral()) {
         if (lit->literalKind() == SyntaxKind::StringLiteral) {
-            if (auto tok = lit->token()) { out = std::u16string(tok->tokenText()); return true; }
+            if (auto tok = lit->token()) { out = decodeStringLiteral(tok->tokenText()); return true; }
         }
     }
     return false;

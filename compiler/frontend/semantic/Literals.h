@@ -30,6 +30,12 @@ uint32_t parseCharLiteralCodepoint(std::u16string_view text);
 uint32_t decodeEscapeSequence(std::u16string_view text, size_t backslashIndex,
                               size_t end, size_t& next);
 
+// Decodes a `StringLiteral` token's text (still surrounded by double quotes,
+// possibly containing escape sequences) into its value, so two spellings of the
+// same string compare equal. Escapes follow the shared set of decodeEscapeSequence;
+// astral scalars are re-encoded as UTF-16 surrogate pairs.
+std::u16string decodeStringLiteral(std::u16string_view text);
+
 // Appends the UTF-8 encoding (1 to 4 bytes) of a Unicode scalar to `out`.
 // Values in the surrogate range or above U+10FFFF are still encoded byte-wise;
 // callers decoding from UTF-16 recombine surrogate pairs before calling this.
