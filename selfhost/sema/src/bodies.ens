@@ -206,6 +206,7 @@ private class BodyChecker implements PanicCalls {
     private Type? currentReturnType;
     private bool inConstructor;
     private bool sawSuperCall;
+    private bool inCatchClause;
     private long loopDepth;
 
     private Set<GreenNode> fillProvenNews;
@@ -222,6 +223,7 @@ private class BodyChecker implements PanicCalls {
         this.modulePath = context.module().canonicalPath();
         this.inConstructor = false;
         this.sawSuperCall = false;
+        this.inCatchClause = false;
         this.loopDepth = 0;
         this.fillProvenNews = new Set<GreenNode>();
         this.arrayNewNames = new Map<GreenNode, string>();
@@ -480,9 +482,11 @@ private class BodyChecker implements PanicCalls {
             owner.define(binding);
         }
         this.result.setBinding(clause.green(), binding);
+        this.inCatchClause = true;
         this.enterScope();
         this.walkBlock(clause.body());
         this.leaveScope();
+        this.inCatchClause = false;
         this.scope = this.parameterScope;
     }
 
@@ -638,8 +642,16 @@ private class BodyChecker implements PanicCalls {
             is ForEachStatementNode loop -> {
                 this.checkForEachStatement(loop);
             },
-            is BreakStatementNode ignored -> { },
-            is ContinueStatementNode ignored -> { },
+            is BreakStatementNode broken -> {
+                if (this.loopDepth == 0) {
+                    this.reporter.report("'break' outside of a loop", broken.span());
+                }
+            },
+            is ContinueStatementNode continued -> {
+                if (this.loopDepth == 0) {
+                    this.reporter.report("'continue' outside of a loop", continued.span());
+                }
+            },
             is ReturnStatementNode returned -> {
                 this.checkReturnStatement(returned);
             },
@@ -647,9 +659,14 @@ private class BodyChecker implements PanicCalls {
                 this.analyzeExpression(expression.expression());
             },
             is ThrowStatementNode thrown -> {
-                this.analyzeExpression(thrown.value());
+                this.checkThrowStatement(thrown);
             },
-            is RethrowStatementNode ignored -> { },
+            is RethrowStatementNode rethrown -> {
+                if (!this.inCatchClause) {
+                    this.reporter.report("'rethrow' can only be used inside a 'catch' block.",
+                        rethrown.span());
+                }
+            },
             is SwitchStatementNode switched -> {
                 this.checkSwitchArms(switched.scrutinee(), armsOfStatement(switched),
                     switched.switchKeyword().span(), false);
@@ -800,17 +817,37 @@ private class BodyChecker implements PanicCalls {
         this.leaveScope();
     }
 
-    // The element binding takes its annotated type when one is written and the iterable's
-    // element type otherwise. Whether the expression is actually iterable is the statement
-    // milestone's rule; the element type resolves silently here so the body types against it.
+    // The loop needs an array or a value whose class implements 'Iterable<T>'; the element
+    // binding takes its annotated type when one is written and the element type otherwise. A
+    // nullable iterable reads as its inner type until narrowing exists.
     private checkForEachStatement(ForEachStatementNode node) {
         this.enterScope();
         Type iterable = this.analyzeExpression(node.iterable());
-        Type element = this.iterableElementType(iterable);
+        Type element = this.store.errorType();
+        if (!(iterable is ErrorType)) {
+            Type core = nullability.valueOf(iterable);
+            if (core is ArrayType) {
+                element = core.element();
+            } else if (types.isClassLike(core)) {
+                element = this.iterableElementType(core, node.iterable().span());
+            } else {
+                this.reporter.report("'for (... in ...)' requires an array or an iterable "
+                    + "object, got '{types.display(iterable)}'. A class is iterable when it "
+                    + "implements 'Iterable<T>' from '@std.collections.iterator'.",
+                    node.iterable().span());
+            }
+        }
         Type bindingType = element;
         let declaredType = node.declaredType();
         if (declaredType != null) {
-            bindingType = this.resolver.resolveType(declaredType);
+            Type declared = this.resolver.resolveType(declaredType);
+            if (!(declared is ErrorType) && !(element is ErrorType)
+                    && !nullability.isAssignable(declared, element)) {
+                this.reporter.report("Loop variable of type '{types.display(declared)}' "
+                    + "cannot hold array elements of type '{types.display(element)}'",
+                    declaredType.span());
+            }
+            bindingType = declared;
         }
         bool isConst = false;
         let keyword = node.letKeyword();
@@ -830,13 +867,10 @@ private class BodyChecker implements PanicCalls {
         this.leaveScope();
     }
 
-    // The element type a value yields in a for-in loop: an array's element, or the type
-    // argument of the 'Iterable<T>' instantiation the value's class implements.
-    private iterableElementType(Type iterable) -> Type {
-        Type core = nullability.valueOf(iterable);
-        if (core is ArrayType) {
-            return core.element();
-        }
+    // The element type a class value yields in a for-in loop. Iteration is nominal: the class
+    // (or a base class) must implement 'Iterable<T>' from '@std.collections.iterator', and a
+    // value whose own type is 'Iterable<T>' iterates too.
+    private iterableElementType(Type core, Span span) -> Type {
         let direct = iterableArgument(core);
         if (direct != null) {
             return direct;
@@ -852,6 +886,9 @@ private class BodyChecker implements PanicCalls {
             }
             current = types.baseOf(current);
         }
+        this.reporter.report("'{types.display(core)}' is not iterable: it does not implement "
+            + "'Iterable' from '@std.collections.iterator'. Declare 'implements Iterable<T>' "
+            + "and provide 'makeIterator() -> Iterator<T>' to use it in a for-in loop.", span);
         return this.store.errorType();
     }
 
@@ -882,6 +919,23 @@ private class BodyChecker implements PanicCalls {
         if (!nullability.isAssignable(expected, actual)) {
             this.reporter.report("Cannot return value of type '{types.display(actual)}' from "
                 + "function returning '{types.display(expected)}'", value.span());
+        }
+    }
+
+    // A thrown value must be an 'Error' or a subclass of it; a nullable operand reads as its
+    // inner type until narrowing exists.
+    private checkThrowStatement(ThrowStatementNode node) {
+        Type thrown = this.analyzeExpression(node.value());
+        if (thrown is ErrorType) {
+            return;
+        }
+        Type core = nullability.valueOf(thrown);
+        let errorClass = this.resolver.errorClass();
+        bool allowed = errorClass != null && types.isClassLike(core)
+            && types.isSubclassOf(core, errorClass);
+        if (!allowed) {
+            this.reporter.report("Cannot throw a value of type '{types.display(thrown)}'; "
+                + "only 'Error' or a subclass of it can be thrown.", node.value().span());
         }
     }
 
