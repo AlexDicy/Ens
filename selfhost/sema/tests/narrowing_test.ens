@@ -1,0 +1,247 @@
+import @std.testing;
+import @ens.frontend.source;
+import Span from @ens.frontend.source;
+import LocalBinding from scopes;
+import BindingKind from scopes;
+import Scope from scopes;
+import narrow;
+import NarrowingPath from narrow;
+import NarrowingState from narrow;
+import PathSegment from narrow;
+import SegmentKind from narrow;
+import types;
+import Type from types;
+import TypeStore from types;
+import PrimitiveKind from types;
+import List from @std.collections.list;
+
+private binding(string name, Type type) -> LocalBinding {
+    return new LocalBinding(name, type, BindingKind.Variable, false, source.makeSpan(0, 0));
+}
+
+private pathOf(LocalBinding root, List<PathSegment> segments) -> NarrowingPath {
+    return new NarrowingPath(root, segments);
+}
+
+private fieldPath(LocalBinding root, string field) -> NarrowingPath {
+    let segments = new List<PathSegment>();
+    segments.push(narrow.fieldSegment(field));
+    return new NarrowingPath(root, segments);
+}
+
+private literalPath(LocalBinding root, long index) -> NarrowingPath {
+    let segments = new List<PathSegment>();
+    segments.push(narrow.literalIndexSegment(index));
+    return new NarrowingPath(root, segments);
+}
+
+private indexPath(LocalBinding root, LocalBinding index) -> NarrowingPath {
+    let segments = new List<PathSegment>();
+    segments.push(narrow.bindingIndexSegment(index));
+    return new NarrowingPath(root, segments);
+}
+
+test "paths compare and hash by content" {
+    let store = new TypeStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let root = binding("root", intType);
+    let other = binding("other", intType);
+
+    try testing.assertTrue(narrow.bindingPath(root) == narrow.bindingPath(root),
+        "two spellings of the same root should be equal");
+    try testing.assertTrue(narrow.bindingPath(root).hash() == narrow.bindingPath(root).hash(),
+        "equal paths should hash equally");
+    try testing.assertTrue(narrow.bindingPath(root) != narrow.bindingPath(other),
+        "distinct roots should differ");
+
+    try testing.assertTrue(fieldPath(root, "door") == fieldPath(root, "door"),
+        "field segments should compare by name");
+    try testing.assertTrue(fieldPath(root, "door").hash() == fieldPath(root, "door").hash(),
+        "equal field paths should hash equally");
+    try testing.assertTrue(fieldPath(root, "door") != fieldPath(root, "window"),
+        "different field names should differ");
+    try testing.assertTrue(fieldPath(root, "door") != narrow.bindingPath(root),
+        "a longer path should differ from its root");
+
+    try testing.assertTrue(literalPath(root, 0) == literalPath(root, 0),
+        "literal indices should compare by value");
+    try testing.assertTrue(literalPath(root, 0) != literalPath(root, 1),
+        "different literal indices should differ");
+
+    let index = binding("i", intType);
+    try testing.assertTrue(indexPath(root, index) == indexPath(root, index),
+        "identifier indices should compare by binding identity");
+    try testing.assertTrue(indexPath(root, index) != indexPath(root, binding("i", intType)),
+        "same-named but distinct index bindings should differ");
+    try testing.assertTrue(literalPath(root, 0) != indexPath(root, index),
+        "segment kinds should not cross-match");
+}
+
+test "segment aliasing distinguishes literal indices and nothing else" {
+    let door = narrow.fieldSegment("door");
+    let window = narrow.fieldSegment("window");
+    let zero = narrow.literalIndexSegment(0);
+    let two = narrow.literalIndexSegment(2);
+    let store = new TypeStore();
+    let index = binding("i", store.primitive(PrimitiveKind.Int));
+    let identIndex = narrow.bindingIndexSegment(index);
+    let anyIndex = narrow.anyIndexSegment();
+
+    try testing.assertTrue(narrow.segmentsMayAlias(door, door),
+        "a field aliases itself");
+    try testing.assertTrue(!narrow.segmentsMayAlias(door, window),
+        "distinct fields never alias");
+    try testing.assertTrue(!narrow.segmentsMayAlias(door, zero),
+        "a field never aliases a subscript");
+    try testing.assertTrue(narrow.segmentsMayAlias(zero, zero),
+        "the same literal index aliases itself");
+    try testing.assertTrue(!narrow.segmentsMayAlias(zero, two),
+        "two distinct literal indices never alias");
+    try testing.assertTrue(narrow.segmentsMayAlias(zero, identIndex),
+        "an identifier index may alias any literal index");
+    try testing.assertTrue(narrow.segmentsMayAlias(identIndex, zero),
+        "a literal write may alias an identifier-index narrowing");
+    try testing.assertTrue(narrow.segmentsMayAlias(identIndex, identIndex),
+        "identifier indices may alias each other");
+    try testing.assertTrue(narrow.segmentsMayAlias(zero, anyIndex),
+        "a computed-index write may alias every element");
+}
+
+test "state layers narrow, look up innermost-first, and pop cleanly" {
+    let store = new TypeStore();
+    let optionalInt = store.optionalOf(store.primitive(PrimitiveKind.Int));
+    let intType = store.primitive(PrimitiveKind.Int);
+    let longType = store.primitive(PrimitiveKind.Long);
+    let root = binding("value", optionalInt);
+    let state = new NarrowingState();
+
+    try testing.assertTrue(state.provenType(narrow.bindingPath(root)) == null,
+        "an unproven path reads as null");
+    state.narrow(narrow.bindingPath(root), intType);
+    try testing.assertTrue(state.provenType(narrow.bindingPath(root)) == intType,
+        "a narrowed path reads its proven type");
+
+    state.push();
+    try testing.assertTrue(state.provenType(narrow.bindingPath(root)) == intType,
+        "an inner layer sees the outer proof");
+    state.narrow(narrow.bindingPath(root), longType);
+    try testing.assertTrue(state.provenType(narrow.bindingPath(root)) == longType,
+        "the innermost proof wins");
+    state.pop();
+    try testing.assertTrue(state.provenType(narrow.bindingPath(root)) == intType,
+        "popping a layer restores the outer proof");
+}
+
+test "invalidation erases across every layer" {
+    let store = new TypeStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let root = binding("room", intType);
+    let unrelated = binding("other", intType);
+    let state = new NarrowingState();
+
+    state.narrow(fieldPath(root, "door"), intType);
+    state.push();
+    state.narrow(narrow.bindingPath(root), intType);
+    state.narrow(fieldPath(unrelated, "door"), intType);
+
+    state.clearForRootMembers(root);
+    try testing.assertTrue(state.provenType(fieldPath(root, "door")) == null,
+        "a member path rooted at the touched binding drops, even in an outer layer");
+    try testing.assertTrue(state.provenType(narrow.bindingPath(root)) == intType,
+        "the binding's own narrowing survives a member clear");
+    try testing.assertTrue(state.provenType(fieldPath(unrelated, "door")) == intType,
+        "paths under other roots are untouched");
+
+    state.clearForRoot(root);
+    try testing.assertTrue(state.provenType(narrow.bindingPath(root)) == null,
+        "a root clear drops the binding's own narrowing too");
+}
+
+test "write invalidation follows the aliasing matrix" {
+    let store = new TypeStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let xs = binding("xs", intType);
+    let index = binding("i", intType);
+    let state = new NarrowingState();
+
+    state.narrow(literalPath(xs, 0), intType);
+    state.narrow(literalPath(xs, 1), intType);
+    state.narrow(indexPath(xs, index), intType);
+
+    state.clearMayAlias(literalPath(xs, 2));
+    try testing.assertTrue(state.provenType(literalPath(xs, 0)) == intType
+        && state.provenType(literalPath(xs, 1)) == intType,
+        "a write at a distinct literal index keeps other literal narrowings");
+    try testing.assertTrue(state.provenType(indexPath(xs, index)) == null,
+        "a literal write drops an identifier-index narrowing");
+
+    state.narrow(indexPath(xs, index), intType);
+    state.clearMayAlias(indexPath(xs, index));
+    try testing.assertTrue(state.provenType(literalPath(xs, 0)) == null
+        && state.provenType(literalPath(xs, 1)) == null,
+        "an identifier-index write drops every literal narrowing");
+
+    state.narrow(literalPath(xs, 0), intType);
+    let anySegments = new List<PathSegment>();
+    anySegments.push(narrow.anyIndexSegment());
+    state.clearMayAlias(pathOf(xs, anySegments));
+    try testing.assertTrue(state.provenType(literalPath(xs, 0)) == null,
+        "a computed-index write drops every element narrowing");
+
+    state.narrow(literalPath(xs, 0), intType);
+    state.narrow(narrow.bindingPath(xs), intType);
+    state.clearMayAlias(literalPath(xs, 0));
+    try testing.assertTrue(state.provenType(narrow.bindingPath(xs)) == intType,
+        "an element write keeps the array binding's own narrowing");
+}
+
+test "a deeper write drops the paths it prefixes and nothing shorter" {
+    let store = new TypeStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let house = binding("house", intType);
+    let state = new NarrowingState();
+
+    let roomDoor = new List<PathSegment>();
+    roomDoor.push(narrow.fieldSegment("room"));
+    roomDoor.push(narrow.fieldSegment("door"));
+    state.narrow(fieldPath(house, "room"), intType);
+    state.narrow(pathOf(house, roomDoor), intType);
+
+    let written = new List<PathSegment>();
+    written.push(narrow.fieldSegment("room"));
+    written.push(narrow.fieldSegment("door"));
+    state.clearMayAlias(pathOf(house, written));
+    try testing.assertTrue(state.provenType(fieldPath(house, "room")) == intType,
+        "writing house.room.door keeps the shorter house.room narrowing");
+    let reread = new List<PathSegment>();
+    reread.push(narrow.fieldSegment("room"));
+    reread.push(narrow.fieldSegment("door"));
+    try testing.assertTrue(state.provenType(pathOf(house, reread)) == null,
+        "writing house.room.door drops house.room.door itself");
+
+    state.narrow(pathOf(house, roomDoor), intType);
+    state.clearMayAlias(fieldPath(house, "room"));
+    try testing.assertTrue(state.provenType(pathOf(house, roomDoor)) == null,
+        "writing house.room drops the deeper house.room.door narrowing");
+}
+
+test "index-binding invalidation drops only paths indexed through it" {
+    let store = new TypeStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let xs = binding("xs", intType);
+    let index = binding("i", intType);
+    let otherIndex = binding("j", intType);
+    let state = new NarrowingState();
+
+    state.narrow(indexPath(xs, index), intType);
+    state.narrow(indexPath(xs, otherIndex), intType);
+    state.narrow(literalPath(xs, 0), intType);
+
+    state.clearForIndexBinding(index);
+    try testing.assertTrue(state.provenType(indexPath(xs, index)) == null,
+        "reassigning the index variable drops paths indexed through it");
+    try testing.assertTrue(state.provenType(indexPath(xs, otherIndex)) == intType,
+        "paths indexed through another binding survive");
+    try testing.assertTrue(state.provenType(literalPath(xs, 0)) == intType,
+        "literal-index paths survive an index-binding clear");
+}

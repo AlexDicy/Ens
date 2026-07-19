@@ -1,0 +1,280 @@
+// Flow narrowing: the storage paths a body has proven non-null or proven to be a subclass,
+// and the layered state those proofs live in. A path names one storage location - a local
+// binding, optionally followed by field hops and array-subscript hops - and keys the proven
+// type by content equality, so two spellings of the same location share one entry.
+import Type from types;
+import LocalBinding from scopes;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+
+// One hop in a narrowing path. Subscript hops distinguish the index form so invalidation can
+// be precise: two distinct literal indices never alias, everything else may. AnyIndex stands
+// for an index expression reads cannot re-recognize; it appears only in the written path of
+// an invalidation query, never in a stored key.
+public enum SegmentKind {
+    Field,
+    LiteralIndex,
+    BindingIndex,
+    AnyIndex,
+}
+
+public class PathSegment {
+    private SegmentKind segmentKind;
+    private string segmentField;
+    private long segmentLiteral;
+    private LocalBinding? segmentBinding;
+
+    constructor(SegmentKind kind, string field, long literal, LocalBinding? binding) {
+        this.segmentKind = kind;
+        this.segmentField = field;
+        this.segmentLiteral = literal;
+        this.segmentBinding = binding;
+    }
+
+    kind() -> SegmentKind {
+        return this.segmentKind;
+    }
+
+    fieldName() -> string {
+        return this.segmentField;
+    }
+
+    literalIndex() -> long {
+        return this.segmentLiteral;
+    }
+
+    indexBinding() -> LocalBinding? {
+        return this.segmentBinding;
+    }
+
+    override hash() -> long {
+        switch (this.segmentKind) {
+            Field -> {
+                return 17 + this.segmentField.hash() * 31;
+            },
+            LiteralIndex -> {
+                return 19 + this.segmentLiteral * 31;
+            },
+            BindingIndex -> {
+                let binding = this.segmentBinding;
+                if (binding == null) {
+                    return 23;
+                }
+                return 23 + binding.hash() * 31;
+            },
+            AnyIndex -> {
+                return 29;
+            },
+        }
+    }
+
+    override equals(PathSegment other) -> bool {
+        if (this.segmentKind != other.segmentKind) {
+            return false;
+        }
+        switch (this.segmentKind) {
+            Field -> {
+                return this.segmentField == other.segmentField;
+            },
+            LiteralIndex -> {
+                return this.segmentLiteral == other.segmentLiteral;
+            },
+            BindingIndex -> {
+                return this.segmentBinding == other.segmentBinding;
+            },
+            AnyIndex -> {
+                return true;
+            },
+        }
+    }
+}
+
+public fieldSegment(string name) -> PathSegment {
+    return new PathSegment(SegmentKind.Field, name, 0, null);
+}
+
+public literalIndexSegment(long index) -> PathSegment {
+    return new PathSegment(SegmentKind.LiteralIndex, "", index, null);
+}
+
+public bindingIndexSegment(LocalBinding index) -> PathSegment {
+    return new PathSegment(SegmentKind.BindingIndex, "", 0, index);
+}
+
+public anyIndexSegment() -> PathSegment {
+    return new PathSegment(SegmentKind.AnyIndex, "", 0, null);
+}
+
+// A storage location: the root binding ('this' included, as the callable's receiver binding)
+// followed by the segments. The root compares by binding identity, the segments by content.
+public class NarrowingPath {
+    private LocalBinding pathRoot;
+    private List<PathSegment> pathSegments;
+
+    constructor(LocalBinding root, List<PathSegment> segments) {
+        this.pathRoot = root;
+        this.pathSegments = segments;
+    }
+
+    root() -> LocalBinding {
+        return this.pathRoot;
+    }
+
+    segmentCount() -> long {
+        return this.pathSegments.length();
+    }
+
+    segment(long index) -> PathSegment {
+        return this.pathSegments.get(index);
+    }
+
+    override hash() -> long {
+        long combined = this.pathRoot.hash();
+        for (long i = 0; i < this.pathSegments.length(); i++) {
+            combined = combined * 31 + this.pathSegments.get(i).hash();
+        }
+        return combined;
+    }
+
+    override equals(NarrowingPath other) -> bool {
+        if (this.pathRoot != other.pathRoot) {
+            return false;
+        }
+        if (this.pathSegments.length() != other.pathSegments.length()) {
+            return false;
+        }
+        for (long i = 0; i < this.pathSegments.length(); i++) {
+            if (this.pathSegments.get(i) != other.pathSegments.get(i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+public bindingPath(LocalBinding root) -> NarrowingPath {
+    return new NarrowingPath(root, new List<PathSegment>());
+}
+
+// Whether a write through 'written' could land in the storage 'narrowed' names. Fields alias
+// only themselves; subscripts with distinct literal indices never collide; every other index
+// pairing might, since a variable or computed index can hold any value at runtime.
+public segmentsMayAlias(PathSegment narrowed, PathSegment written) -> bool {
+    if (narrowed.kind() == SegmentKind.Field || written.kind() == SegmentKind.Field) {
+        return narrowed.kind() == written.kind()
+            && narrowed.fieldName() == written.fieldName();
+    }
+    if (narrowed.kind() == SegmentKind.LiteralIndex
+            && written.kind() == SegmentKind.LiteralIndex) {
+        return narrowed.literalIndex() == written.literalIndex();
+    }
+    return true;
+}
+
+// The proven types, one map layer per branch of control flow. Establishment writes the top
+// layer; lookup prefers the innermost layer; invalidation erases from every layer, since a
+// write inside a branch may have happened by any later read.
+public class NarrowingState {
+    private List<Map<NarrowingPath, Type>> layers;
+
+    constructor() {
+        this.layers = new List<Map<NarrowingPath, Type>>();
+        this.layers.push(new Map<NarrowingPath, Type>());
+    }
+
+    push() {
+        this.layers.push(new Map<NarrowingPath, Type>());
+    }
+
+    pop() {
+        if (this.layers.length() > 1) {
+            this.layers.pop();
+        }
+    }
+
+    narrow(NarrowingPath path, Type proven) {
+        this.layers.get(this.layers.length() - 1).set(path, proven);
+    }
+
+    provenType(NarrowingPath path) -> Type? {
+        for (long i = this.layers.length() - 1; i >= 0; i--) {
+            let found = this.layers.get(i).get(path);
+            if (found != null) {
+                return found;
+            }
+        }
+        return null;
+    }
+
+    clearForRoot(LocalBinding root) {
+        for (long i = 0; i < this.layers.length(); i++) {
+            let layer = this.layers.get(i);
+            for (let key in layer.keys()) {
+                if (key.root() == root) {
+                    layer.remove(key);
+                }
+            }
+        }
+    }
+
+    // Erases the narrowings that pass through the root but keeps the binding's own narrowing:
+    // a callee can mutate what the root reaches, never the caller's binding itself.
+    clearForRootMembers(LocalBinding root) {
+        for (long i = 0; i < this.layers.length(); i++) {
+            let layer = this.layers.get(i);
+            for (let key in layer.keys()) {
+                if (key.root() == root && key.segmentCount() > 0) {
+                    layer.remove(key);
+                }
+            }
+        }
+    }
+
+    // Erases every narrowing whose storage a write through 'written' could reach: the written
+    // path must be a may-alias prefix of the narrowed one.
+    clearMayAlias(NarrowingPath written) {
+        for (long i = 0; i < this.layers.length(); i++) {
+            let layer = this.layers.get(i);
+            for (let key in layer.keys()) {
+                if (key.root() == written.root() && mayAliasPrefix(key, written)) {
+                    layer.remove(key);
+                }
+            }
+        }
+    }
+
+    // Erases every narrowing whose path indexes through the binding: once the index variable
+    // changes, the element the path named can no longer be re-recognized.
+    clearForIndexBinding(LocalBinding binding) {
+        for (long i = 0; i < this.layers.length(); i++) {
+            let layer = this.layers.get(i);
+            for (let key in layer.keys()) {
+                if (pathUsesIndexBinding(key, binding)) {
+                    layer.remove(key);
+                }
+            }
+        }
+    }
+}
+
+private mayAliasPrefix(NarrowingPath narrowed, NarrowingPath written) -> bool {
+    if (narrowed.segmentCount() < written.segmentCount()) {
+        return false;
+    }
+    for (long i = 0; i < written.segmentCount(); i++) {
+        if (!segmentsMayAlias(narrowed.segment(i), written.segment(i))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+private pathUsesIndexBinding(NarrowingPath path, LocalBinding binding) -> bool {
+    for (long i = 0; i < path.segmentCount(); i++) {
+        let segment = path.segment(i);
+        if (segment.kind() == SegmentKind.BindingIndex && segment.indexBinding() == binding) {
+            return true;
+        }
+    }
+    return false;
+}
