@@ -3076,30 +3076,73 @@ private class BodyChecker implements PanicCalls {
 
     // ---- Switch arms ----
 
-    // Walks a switch's scrutinee, labels, and arm bodies, and types the value form by
-    // unifying the arm expressions. Label validity and exhaustiveness are the statement
-    // milestone's rules.
+    // Checks a switch in either form: the scrutinee kind, the labels or 'is' arm targets, arm
+    // reachability, exhaustiveness, and the unified value type of the expression form.
+    // Exhaustiveness reasons over the unwrapped scrutinee type; whether a nullable scrutinee
+    // needs its 'null' arm is the narrowing milestone's rule.
     private checkSwitchArms(Expression scrutinee, List<SwitchArm> arms, Span span,
                             bool requireValue) -> Type {
         Type scrutineeType = this.analyzeExpression(scrutinee);
         Type inner = convert.bareOf(scrutineeType);
+        bool known = !(scrutineeType is ErrorType);
+        bool classScrutinee = known && types.isClassLike(inner);
+        bool valueScrutinee = known && (inner is EnumType || convert.isIntegerType(inner)
+            || inner is StringType);
+        bool typeSwitch = classScrutinee && hasTypeArm(arms);
+        if (known) {
+            if (classScrutinee && !typeSwitch) {
+                this.reporter.report("A switch over a class value needs at least one "
+                    + "'is Type ->' arm.", scrutinee.span());
+            } else if (!classScrutinee && !valueScrutinee) {
+                this.reporter.report("Cannot switch on a value of type "
+                    + "'{types.display(scrutineeType)}'; switch supports enum, integer, "
+                    + "string, and class values.", scrutinee.span());
+            }
+        }
+
+        bool hasDefault = false;
+        bool nullCovered = false;
+        let coveredEnumOrdinals = new Set<long>();
+        let seenIntegerLabels = new Set<long>();
+        let seenStringLabels = new Set<string>();
+        let armTargets = new List<Type>();
         let valueExpressions = new List<Expression>();
         bool sawValueBlock = false;
         for (long a = 0; a < arms.length(); a++) {
             switch (arms.get(a)) {
                 is DefaultArmNode arm -> {
+                    if (hasDefault) {
+                        this.reporter.report("A switch can have only one 'default' arm.",
+                            arm.span());
+                    }
+                    hasDefault = true;
                     if (this.walkArmBody(arm.body(), requireValue, valueExpressions)) {
                         sawValueBlock = true;
                     }
                 },
                 is TypeArmNode arm -> {
                     Type armType = this.resolver.resolveType(arm.target());
+                    Type? armTarget = null;
+                    if (!classScrutinee) {
+                        if (valueScrutinee) {
+                            this.reporter.report("An 'is' arm needs a class switch value, but "
+                                + "this switch is over '{types.display(scrutineeType)}'.",
+                                arm.target().span());
+                        }
+                    } else if (!(armType is ErrorType)) {
+                        armTarget = this.checkTypeArmTarget(scrutineeType, inner, armType,
+                            arm.target().span());
+                    }
+                    if (armTarget != null) {
+                        this.checkTypeArmReachable(armTarget, armTargets, arm.target().span());
+                        armTargets.push(armTarget);
+                    }
                     this.enterScope();
                     let bindingToken = arm.binding();
                     if (bindingToken != null) {
                         Type bindingType = this.store.errorType();
-                        if (types.isClassLike(armType)) {
-                            bindingType = armType;
+                        if (armTarget != null) {
+                            bindingType = armTarget;
                         }
                         let binding = new LocalBinding(bindingToken.text(), bindingType,
                             BindingKind.Variable, true, bindingToken.span());
@@ -3115,14 +3158,52 @@ private class BodyChecker implements PanicCalls {
                     this.leaveScope();
                 },
                 is ValueArmNode arm -> {
+                    bool mixReported = false;
                     for (long i = 0; i < arm.labelsCount(); i++) {
-                        this.checkSwitchLabel(arm.labels(i), inner);
+                        let label = arm.labels(i);
+                        if (isNullLabel(label)) {
+                            this.result.setType(label.green(), this.store.nullType());
+                            if (!nullability.nullLabelPermitted(scrutineeType)) {
+                                this.reporter.report("'null' is only a valid label when the "
+                                    + "switch value is nullable.", label.span());
+                            } else if (nullCovered) {
+                                this.reporter.report("Duplicate 'null' label.", label.span());
+                            } else {
+                                nullCovered = true;
+                            }
+                            continue;
+                        }
+                        if (typeSwitch) {
+                            if (!mixReported) {
+                                this.reporter.report("Cannot mix value labels with 'is' arms "
+                                    + "in the same switch.", label.span());
+                                mixReported = true;
+                            }
+                            continue;
+                        }
+                        if (!valueScrutinee) {
+                            continue;
+                        }
+                        if (inner is EnumType) {
+                            this.checkEnumLabel(label, inner, coveredEnumOrdinals);
+                        } else if (convert.isIntegerType(inner)) {
+                            this.checkIntegerLabel(label, inner, seenIntegerLabels);
+                        } else {
+                            this.checkStringLabel(label, seenStringLabels);
+                        }
                     }
                     if (this.walkArmBody(arm.body(), requireValue, valueExpressions)) {
                         sawValueBlock = true;
                     }
                 },
             }
+        }
+
+        if (valueScrutinee && !hasDefault) {
+            this.checkValueExhaustiveness(inner, coveredEnumOrdinals, span);
+        }
+        if (typeSwitch && !hasDefault) {
+            this.checkTypeExhaustiveness(inner, armTargets, span);
         }
         if (!requireValue) {
             return this.store.primitive(PrimitiveKind.Void);
@@ -3169,27 +3250,206 @@ private class BodyChecker implements PanicCalls {
         return unified;
     }
 
-    // A 'null' label types as null, an identifier label over an enum scrutinee resolves as an
-    // enum member, and any other label is an ordinary expression adapted to the scrutinee.
-    private checkSwitchLabel(Expression label, Type inner) {
-        if (label is LiteralExpressionNode
-                && label.value().kind() == SyntaxKind.NullKeyword) {
-            this.result.setType(label.green(), this.store.nullType());
-            return;
-        }
-        if (inner is EnumType && label is IdentifierExpressionNode) {
-            long ordinal = enumOrdinal(inner, label.name().text());
+    // An identifier label over an enum scrutinee names a member; any other label must be an
+    // expression of the enum's own type that resolved to a member constant.
+    private checkEnumLabel(Expression label, EnumType inner, Set<long> covered) {
+        long ordinal = -1;
+        if (label is IdentifierExpressionNode) {
+            ordinal = enumOrdinal(inner, label.name().text());
             if (ordinal >= 0) {
                 this.result.setType(label.green(), inner);
                 this.result.setEnumConstant(label.green(), ordinal);
+            } else {
+                this.reporter.report("'{label.name().text()}' is not a member of enum "
+                    + "'{types.display(inner)}'.", label.span());
+            }
+        } else {
+            Type labelType = this.analyzeExpression(label);
+            if (!(labelType is ErrorType) && labelType != inner) {
+                this.reporter.report("Switch label of type '{types.display(labelType)}' does "
+                    + "not match the switch value of type '{types.display(inner)}'.",
+                    label.span());
+            }
+            let constant = this.result.enumConstantOf(label.green());
+            if (constant != null) {
+                ordinal = constant;
+            }
+        }
+        if (ordinal >= 0 && !covered.add(ordinal)) {
+            this.reporter.report("Duplicate switch label.", label.span());
+        }
+    }
+
+    // Integer labels are integer constants; a char literal is the constant of its codepoint,
+    // so 'A' and 65 name the same label.
+    private checkIntegerLabel(Expression label, Type inner, Set<long> seen) {
+        Type labelType = this.analyzeExpressionAdapt(label, inner);
+        if (!(labelType is ErrorType) && !convert.isAssignableStrict(inner, labelType)
+                && !convert.isAssignableStrict(labelType, inner)) {
+            this.reporter.report("Switch label of type '{types.display(labelType)}' does not "
+                + "match the switch value of type '{types.display(inner)}'.", label.span());
+        }
+        let value = integerLabelValue(label);
+        if (value == null) {
+            this.reporter.report("Switch labels for an integer switch must be integer "
+                + "constants.", label.span());
+            return;
+        }
+        if (!seen.add(value)) {
+            this.reporter.report("Duplicate switch label '{value}'.", label.span());
+        }
+    }
+
+    private checkStringLabel(Expression label, Set<string> seen) {
+        Type labelType = this.analyzeExpression(label);
+        if (!(labelType is ErrorType) && !(labelType is StringType)) {
+            this.reporter.report("Switch label of type '{types.display(labelType)}' does not "
+                + "match the switch value of type 'string'.", label.span());
+            return;
+        }
+        let text = stringLabelText(label);
+        if (text != null) {
+            if (!seen.add(text)) {
+                this.reporter.report("Duplicate switch label.", label.span());
+            }
+        } else if (!(labelType is ErrorType)) {
+            this.reporter.report("Switch labels for a string switch must be string literals.",
+                label.span());
+        }
+    }
+
+    // The class or interface an 'is' arm matches, or null when the arm is rejected: the
+    // target must be able to match some values of the scrutinee without matching all of them.
+    private checkTypeArmTarget(Type scrutineeType, Type inner, Type armType, Span span)
+            -> Type? {
+        if (armType is OptionalType) {
+            this.reporter.report("The type of an 'is' arm cannot be nullable; 'is' never "
+                + "matches null. Test against '{types.display(armType.inner())}' and handle "
+                + "null with a 'null ->' arm.", span);
+            return null;
+        }
+        if (armType is TypeParamType) {
+            this.reporter.report("The type of an 'is' arm must be a concrete class; "
+                + "'{types.display(armType)}' is a type parameter.", span);
+            return null;
+        }
+        if (!types.isClassLike(armType)) {
+            this.reporter.report("The type of an 'is' arm must be a class or an interface, "
+                + "got '{types.display(armType)}'.", span);
+            return null;
+        }
+        if (armType == inner) {
+            this.reporter.report("'is {types.display(armType)}' matches every value of this "
+                + "switch over '{types.display(scrutineeType)}'; use a 'default' arm "
+                + "instead.", span);
+            return null;
+        }
+        if (types.isSubclassOrConforms(inner, armType)) {
+            this.reporter.report("A value of type '{types.display(inner)}' is always a "
+                + "'{types.display(armType)}'; this arm would match every value. Use a "
+                + "'default' arm instead.", span);
+            return null;
+        }
+        if (types.isInterfaceLike(inner)) {
+            return armType;
+        }
+        if (types.isInterfaceLike(armType)) {
+            if (isFinalClass(inner)) {
+                this.reporter.report("A value of type '{types.display(inner)}' can never be "
+                    + "a '{types.display(armType)}': '{types.display(inner)}' is 'final' and "
+                    + "does not implement it. This arm would never match. Remove it.", span);
+                return null;
+            }
+            return armType;
+        }
+        if (!types.isSubclassOf(armType, inner)) {
+            this.reporter.report("A value of type '{types.display(inner)}' can never be a "
+                + "'{types.display(armType)}'; this arm would never match. Remove it.", span);
+            return null;
+        }
+        return armType;
+    }
+
+    // An arm is unreachable when an earlier arm already matches every value of its type.
+    private checkTypeArmReachable(Type armTarget, List<Type> earlier, Span span) {
+        for (long i = 0; i < earlier.length(); i++) {
+            if (types.isSubclassOrConforms(armTarget, earlier.get(i))) {
+                this.reporter.report("This 'is {shortTypeName(armTarget)}' arm is "
+                    + "unreachable: the earlier 'is {shortTypeName(earlier.get(i))}' arm "
+                    + "already matches every '{shortTypeName(armTarget)}'. Move it before "
+                    + "the broader arm, or remove it.", span);
+                return;
+            }
+        }
+    }
+
+    // An enum switch without a default must cover every member; integer and string switches
+    // always need one.
+    private checkValueExhaustiveness(Type inner, Set<long> coveredEnumOrdinals, Span span) {
+        if (inner is EnumType) {
+            string[] names = inner.memberNames();
+            let missing = new List<string>();
+            for (long i = 0; i < names.length; i++) {
+                if (!coveredEnumOrdinals.contains(i)) {
+                    missing.push(names[i]);
+                }
+            }
+            if (missing.length() > 0) {
+                this.reporter.report("This switch does not handle enum "
+                    + "'{types.display(inner)}' member(s) {quotedList(missing)}. Add them or "
+                    + "a 'default' arm.", span);
             }
             return;
         }
-        if (convert.isIntegerType(inner)) {
-            this.analyzeExpressionAdapt(label, inner);
+        this.reporter.report("A switch on '{types.display(inner)}' must have a 'default' "
+            + "arm.", span);
+    }
+
+    // A type switch without a default: an interface or an unsealed or concrete root always
+    // needs one; a sealed abstract root instead needs every direct subclass covered, an arm
+    // for a subclass covering its descendants.
+    private checkTypeExhaustiveness(Type inner, List<Type> armTargets, Span span) {
+        string rootName = types.display(inner);
+        let authority = types.authorityOf(inner);
+        if (authority is InterfaceType) {
+            this.reporter.report("A switch over '{rootName}' must have a 'default' arm: "
+                + "interfaces are open, so any class anywhere may implement '{rootName}'.",
+                span);
             return;
         }
-        this.analyzeExpression(label);
+        if (authority is ClassType) {
+            if (!authority.isSealed()) {
+                this.reporter.report("A switch over '{rootName}' must have a 'default' arm "
+                    + "because '{rootName}' is not sealed.", span);
+                return;
+            }
+            if (!authority.isAbstract()) {
+                this.reporter.report("A switch over '{rootName}' must have a 'default' arm: "
+                    + "'{rootName}' is concrete, so a value may be a plain '{rootName}' that "
+                    + "no subclass arm matches.", span);
+                return;
+            }
+            let missing = new List<string>();
+            let subclasses = authority.directSubclasses();
+            for (long i = 0; i < subclasses.length(); i++) {
+                let subclass = subclasses.get(i);
+                bool covered = false;
+                for (long j = 0; j < armTargets.length(); j++) {
+                    if (types.isSubclassOrConforms(subclass, armTargets.get(j))) {
+                        covered = true;
+                        break;
+                    }
+                }
+                if (!covered) {
+                    missing.push(subclass.name());
+                }
+            }
+            if (missing.length() > 0) {
+                this.reporter.report("This switch does not handle subclass(es) "
+                    + "{quotedList(missing)} of sealed class '{rootName}'. Add arms for them "
+                    + "or a 'default' arm.", span);
+            }
+        }
     }
 
     // The recorded type of an already-analyzed expression node.
@@ -3391,6 +3651,66 @@ private enumOrdinal(EnumType enumType, string memberName) -> long {
         }
     }
     return -1;
+}
+
+private hasTypeArm(List<SwitchArm> arms) -> bool {
+    for (long i = 0; i < arms.length(); i++) {
+        if (arms.get(i) is TypeArmNode) {
+            return true;
+        }
+    }
+    return false;
+}
+
+private isNullLabel(Expression label) -> bool {
+    return label is LiteralExpressionNode && label.value().kind() == SyntaxKind.NullKeyword;
+}
+
+// The constant an integer switch label names: a char literal's codepoint, or an integer
+// literal's value behind an optional sign.
+private integerLabelValue(Expression label) -> long? {
+    if (label is LiteralExpressionNode && label.value().kind() == SyntaxKind.CharLiteral) {
+        return literalvalues.charCodepoint(label.value().text()) as long;
+    }
+    let literal = intLiteralOf(label);
+    if (literal == null) {
+        return null;
+    }
+    let magnitude = literalvalues.integerMagnitude(literal.value().text());
+    if (magnitude == null) {
+        return null;
+    }
+    long value = magnitude as long;
+    if (isNegativeLiteral(label)) {
+        return 0 - value;
+    }
+    return value;
+}
+
+private stringLabelText(Expression label) -> string? {
+    if (label is LiteralExpressionNode && label.value().kind() == SyntaxKind.StringLiteral) {
+        return label.value().text();
+    }
+    return null;
+}
+
+private shortTypeName(Type type) -> string {
+    let authority = types.authorityOf(type);
+    if (authority != null) {
+        return authority.name();
+    }
+    return types.display(type);
+}
+
+private quotedList(List<string> names) -> string {
+    string joined = "";
+    for (long i = 0; i < names.length(); i++) {
+        if (i > 0) {
+            joined = joined + ", ";
+        }
+        joined = joined + "'" + names.get(i) + "'";
+    }
+    return joined;
 }
 
 // The written name of a created type, for constructor diagnostics.
