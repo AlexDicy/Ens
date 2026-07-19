@@ -2810,7 +2810,7 @@ void Analyzer::clearNarrowingsForCall(const ast::CallExpression& expr) {
     auto dropTouched = [&](const ast::Expression& e) {
         auto p = buildNarrowingPath(e);
         if (!p) return;
-        if (p->chain.empty() && p->root &&
+        if (p->root &&
             (p->root->kind == SymbolKind::Variable ||
              p->root->kind == SymbolKind::Parameter)) {
             currentScope->clearNarrowingsForRootMembers(p->root);
