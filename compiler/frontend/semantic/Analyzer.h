@@ -335,6 +335,8 @@ private:
         bool allowAnyIndex = false) const;
 
     void clearNarrowingsForCall(const ast::CallExpression& expr);
+    void clearNarrowingsForArguments(const std::vector<ast::Expression>& args);
+    void clearNarrowingsTouchedBy(const ast::Expression& e);
 
     struct NullCheckInfo {
         NarrowingPath key;

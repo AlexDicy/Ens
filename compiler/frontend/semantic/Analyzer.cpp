@@ -2797,37 +2797,35 @@ std::optional<NarrowingPath> Analyzer::buildNarrowingPath(
     return std::nullopt;
 }
 
-void Analyzer::clearNarrowingsForCall(const ast::CallExpression& expr) {
+// A value a call can reach - the receiver, or a class / array argument - loses
+// every narrowing that passes through its root, since the callee may mutate the
+// state reachable from it. The root binding's own narrowing survives: a callee
+// cannot reassign the caller's local (or parameter), and the local's strong
+// reference keeps the narrowed object alive, so its non-null / type fact holds
+// across the call. This applies even when the touched value is itself a member
+// chain (`r.door.open()`): only the member paths under `r` drop, `r`'s own fact
+// stays. `out` arguments are the exception - the callee writes the caller's
+// variable - and are dropped in full on the external-call path.
+void Analyzer::clearNarrowingsTouchedBy(const ast::Expression& e) {
     if (!currentScope) return;
-    // A value the call can reach - the receiver, or a class / array argument -
-    // loses every narrowing that passes through its root, since the callee may
-    // mutate the state reachable from it. The root binding's own narrowing
-    // survives: a callee cannot reassign the caller's local (or parameter), and
-    // the local's strong reference keeps the narrowed object alive, so its
-    // non-null / type fact holds across the call. `out` arguments are the
-    // exception - the callee writes the caller's variable - and are dropped in
-    // full on the external-call path.
-    auto dropTouched = [&](const ast::Expression& e) {
-        auto p = buildNarrowingPath(e);
-        if (!p) return;
-        if (p->root &&
-            (p->root->kind == SymbolKind::Variable ||
-             p->root->kind == SymbolKind::Parameter)) {
-            currentScope->clearNarrowingsForRootMembers(p->root);
-        } else {
-            currentScope->clearNarrowingsForRoot(p->root);
-        }
-    };
-    if (auto callee = expr.callee()) {
-        if (auto m = callee->asMember()) {
-            if (auto obj = m->object()) dropTouched(*obj);
-        } else if (auto sm = callee->asSafeMember()) {
-            if (auto obj = sm->object()) dropTouched(*obj);
-        }
+    auto p = buildNarrowingPath(e);
+    if (!p) return;
+    if (p->root &&
+        (p->root->kind == SymbolKind::Variable ||
+         p->root->kind == SymbolKind::Parameter)) {
+        currentScope->clearNarrowingsForRootMembers(p->root);
+    } else {
+        currentScope->clearNarrowingsForRoot(p->root);
     }
-    // Only class / array references expose mutable state; struct and primitive
-    // arguments are passed by value, so a call can't mutate through them.
-    for (const auto& arg : expr.arguments()) {
+}
+
+// Only class / array references expose mutable state; struct and primitive
+// arguments are passed by value, so the call can't mutate through them. A
+// constructor call (`new T(...)`) reaches its arguments the same way, so both
+// call and `new` route through here.
+void Analyzer::clearNarrowingsForArguments(const std::vector<ast::Expression>& args) {
+    if (!currentScope) return;
+    for (const auto& arg : args) {
         if (arg.asOutArgument()) continue;
         ast::Expression target = arg;
         if (auto na = arg.asNamedArgument()) {
@@ -2840,8 +2838,20 @@ void Analyzer::clearNarrowingsForCall(const ast::CallExpression& expr) {
         Type* base = t->isOptional() ? t->inner : t;
         if (!base) continue;
         if (!base->isClass() && !base->isArray()) continue;
-        dropTouched(target);
+        clearNarrowingsTouchedBy(target);
     }
+}
+
+void Analyzer::clearNarrowingsForCall(const ast::CallExpression& expr) {
+    if (!currentScope) return;
+    if (auto callee = expr.callee()) {
+        if (auto m = callee->asMember()) {
+            if (auto obj = m->object()) clearNarrowingsTouchedBy(*obj);
+        } else if (auto sm = callee->asSafeMember()) {
+            if (auto obj = sm->object()) clearNarrowingsTouchedBy(*obj);
+        }
+    }
+    clearNarrowingsForArguments(expr.arguments());
 }
 
 Analyzer::NullCheckInfo Analyzer::detectNullCheck(const ast::Expression& cond) {
@@ -5416,6 +5426,7 @@ Type* Analyzer::analyzeNew(const ast::NewExpression& expr) {
             asciiOf(*typeName) + "()'");
         for (auto& a : args) analyzeExpr(a);
     }
+    clearNarrowingsForArguments(args);
     return t;
 }
 
