@@ -302,6 +302,7 @@ private:
                                    const SyntaxNode& diagNode);
 
     void tryAdaptIntegerLiteral(const ast::Expression& src, Type* target);
+    void adaptIntegerLiteralLabel(const ast::Expression& src, Type* target);
     void tryAdaptCharLiteral(const ast::Expression& src, Type* target);
     Type* numericCommonType(Type* a, Type* b);
     // Least upper bound of two value types, shared by `?:` branches and switch

@@ -162,10 +162,14 @@ Symbol* Analyzer::globalSymbol(const std::u16string& name) const {
 
 namespace {
 
-const ast::LiteralExpression* asIntLiteralChild(const ast::Expression& e) {
+bool isIntegerLiteralKind(SyntaxKind k, bool allowLong) {
+    return k == SyntaxKind::IntLiteral || (allowLong && k == SyntaxKind::LongLiteral);
+}
+
+const ast::LiteralExpression* asIntegerLiteralChild(const ast::Expression& e, bool allowLong) {
     if (auto lit = e.asLiteral()) {
         static thread_local std::optional<ast::LiteralExpression> hold;
-        if (lit->literalKind() != SyntaxKind::IntLiteral) return nullptr;
+        if (!isIntegerLiteralKind(lit->literalKind(), allowLong)) return nullptr;
         hold = lit;
         return &*hold;
     }
@@ -176,13 +180,17 @@ const ast::LiteralExpression* asIntLiteralChild(const ast::Expression& e) {
         auto operand = pre->operand();
         if (!operand) return nullptr;
         if (auto lit = operand->asLiteral()) {
-            if (lit->literalKind() != SyntaxKind::IntLiteral) return nullptr;
+            if (!isIntegerLiteralKind(lit->literalKind(), allowLong)) return nullptr;
             static thread_local std::optional<ast::LiteralExpression> hold;
             hold = lit;
             return &*hold;
         }
     }
     return nullptr;
+}
+
+const ast::LiteralExpression* asIntLiteralChild(const ast::Expression& e) {
+    return asIntegerLiteralChild(e, /*allowLong=*/false);
 }
 
 bool literalIsNegative(const ast::Expression& e) {
@@ -283,6 +291,34 @@ void Analyzer::tryAdaptIntegerLiteral(const ast::Expression& src, Type* target) 
 
     // In-range: retype the literal-bearing nodes so codegen emits at the
     // target's width.
+    analysis.setType(src.node.greenNode(), target);
+    analysis.setType(lit->node.greenNode(), target);
+}
+
+// A switch integer label may be written in any integer-literal form, including a
+// typed long literal like `65L`. It adapts to the scrutinee like an int literal:
+// its value must fit, and the node is retyped so codegen emits it at the
+// scrutinee's width. Unlike tryAdaptIntegerLiteral this accepts long literals,
+// which otherwise keep their 'long' type and would be rejected as labels.
+void Analyzer::adaptIntegerLiteralLabel(const ast::Expression& src, Type* target) {
+    if (!target || target->isError() || !target->isInteger()) return;
+    const ast::LiteralExpression* lit = asIntegerLiteralChild(src, /*allowLong=*/true);
+    if (!lit) return;
+
+    auto tok = lit->token();
+    if (!tok) return;
+    std::u16string text(tok->tokenText());
+    uint64_t magnitude = 0;
+    if (!parseIntegerLiteralMagnitude(text, magnitude)) return;
+    bool negative = literalIsNegative(src);
+
+    if (!literalFitsTarget(negative, magnitude, target)) {
+        std::string num = (negative ? std::string("-") : std::string("")) + asciiOf(text);
+        errorAtNode(src.node, "Literal " + num + " does not fit in '" + target->toString() +
+            "' (range " + integerRangeString(target) + ")");
+        analysis.setType(src.node.greenNode(), typeCtx.getError());
+        return;
+    }
     analysis.setType(src.node.greenNode(), target);
     analysis.setType(lit->node.greenNode(), target);
 }
@@ -5419,8 +5455,9 @@ void Analyzer::analyzeRethrowStmt(const ast::RethrowStatement& stmt) {
 namespace {
 
 std::optional<int64_t> switchIntLabelValue(const ast::Expression& e) {
-    // A char literal is an integer constant: its value is its codepoint. This
-    // lets `'A'` and `65` name the same label, so mixing them is a duplicate.
+    // Any integer-literal form names a constant: an int or long literal by its
+    // value, a char literal by its codepoint. This lets `'A'`, `65`, and `65L`
+    // name the same label, so mixing them is a duplicate.
     if (auto lit = e.asLiteral()) {
         if (lit->literalKind() == SyntaxKind::CharLiteral) {
             if (auto tok = lit->token())
@@ -5428,7 +5465,7 @@ std::optional<int64_t> switchIntLabelValue(const ast::Expression& e) {
             return std::nullopt;
         }
     }
-    const ast::LiteralExpression* lit = asIntLiteralChild(e);
+    const ast::LiteralExpression* lit = asIntegerLiteralChild(e, /*allowLong=*/true);
     if (!lit) return std::nullopt;
     auto tok = lit->token();
     if (!tok) return std::nullopt;
@@ -5605,18 +5642,31 @@ Type* Analyzer::analyzeSwitchArms(const std::optional<ast::Expression>& scrutine
                         else coveredEnum.push_back(*value);
                     }
                 } else if (inner->isInteger()) {
-                    Type* lt = analyzeExprAdapt(label, inner);
-                    if (!lt->isError() && !inner->assignableFrom(lt) && !lt->assignableFrom(inner)) {
-                        errorAtNode(label.node, "Switch label of type '" + lt->toString() +
-                            "' does not match the switch value of type '" + inner->toString() + "'.");
-                    }
+                    Type* lt = analyzeExpr(label);
                     if (auto v = switchIntLabelValue(label)) {
-                        bool dup = false;
-                        for (int64_t s : seenInts) if (s == *v) { dup = true; break; }
-                        if (dup) errorAtNode(label.node, "Duplicate switch label '" + std::to_string(*v) + "'.");
-                        else seenInts.push_back(*v);
-                    } else {
-                        errorAtNode(label.node, "Switch labels for an integer switch must be integer constants.");
+                        // An integer-literal label adapts to the scrutinee: a char
+                        // literal like an int/long literal, its value fit-checked and
+                        // the node retyped to the scrutinee's width.
+                        if (auto cl = label.asLiteral();
+                            cl && cl->literalKind() == SyntaxKind::CharLiteral) {
+                            tryAdaptCharLiteral(label, inner);
+                        } else {
+                            adaptIntegerLiteralLabel(label, inner);
+                        }
+                        Type* adapted = analysis.typeOf(label.node.greenNode());
+                        if (!adapted || !adapted->isError()) {
+                            bool dup = false;
+                            for (int64_t s : seenInts) if (s == *v) { dup = true; break; }
+                            if (dup) errorAtNode(label.node, "Duplicate switch label '" + std::to_string(*v) + "'.");
+                            else seenInts.push_back(*v);
+                        }
+                    } else if (!lt->isError()) {
+                        if (!inner->assignableFrom(lt) && !lt->assignableFrom(inner)) {
+                            errorAtNode(label.node, "Switch label of type '" + lt->toString() +
+                                "' does not match the switch value of type '" + inner->toString() + "'.");
+                        } else {
+                            errorAtNode(label.node, "Switch labels for an integer switch must be integer constants.");
+                        }
                     }
                 } else {  // string
                     Type* lt = analyzeExpr(label);

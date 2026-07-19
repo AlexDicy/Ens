@@ -1093,6 +1093,43 @@ private class BodyChecker implements PanicCalls {
         this.result.setType(literal.green(), target);
     }
 
+    // A switch integer label adapts to the scrutinee like an int literal does, but also accepts a
+    // typed long literal like '65L', which otherwise keeps its 'long' type. The value must fit and
+    // the node is retyped so codegen emits it at the scrutinee's width.
+    private adaptIntegerLiteralLabel(Expression node, Type target) {
+        if (target is PrimitiveType) {
+            this.adaptIntegerLiteralLabelTo(node, target);
+        }
+    }
+
+    private adaptIntegerLiteralLabelTo(Expression node, PrimitiveType target) {
+        if (!convert.isIntegerType(target)) {
+            return;
+        }
+        let literal = integerLiteralOf(node, true);
+        if (literal == null) {
+            return;
+        }
+        let magnitude = literalvalues.integerMagnitude(literal.value().text());
+        if (magnitude == null) {
+            return;
+        }
+        bool negative = isNegativeLiteral(node);
+        if (!literalvalues.magnitudeFits(negative, magnitude, target.kind())) {
+            string sign = "";
+            if (negative) {
+                sign = "-";
+            }
+            this.reporter.report("Literal {sign}{literal.value().text()} does not fit in "
+                + "'{types.display(target)}' (range "
+                + "{literalvalues.integerRange(target.kind())})", node.span());
+            this.result.setType(node.green(), this.store.errorType());
+            return;
+        }
+        this.result.setType(node.green(), target);
+        this.result.setType(literal.green(), target);
+    }
+
     private adaptCharLiteral(Expression node, Type target) {
         if (target is PrimitiveType) {
             this.adaptCharLiteralTo(node, target);
@@ -3334,19 +3371,33 @@ private class BodyChecker implements PanicCalls {
         }
     }
 
-    // Integer labels are integer constants; a char literal is the constant of its codepoint,
-    // so 'A' and 65 name the same label.
+    // Integer labels are integer constants written in any integer-literal form: an int or long
+    // literal by its value, a char literal by its codepoint, so 'A', 65, and 65L name the same
+    // label. A literal label adapts to the scrutinee, its value fit-checked against the type.
     private checkIntegerLabel(Expression label, Type inner, Set<long> seen) {
-        Type labelType = this.analyzeExpressionAdapt(label, inner);
-        if (!(labelType is ErrorType) && !convert.isAssignableStrict(inner, labelType)
-                && !convert.isAssignableStrict(labelType, inner)) {
-            this.reporter.report("Switch label of type '{types.display(labelType)}' does not "
-                + "match the switch value of type '{types.display(inner)}'.", label.span());
-        }
+        Type labelType = this.analyzeExpression(label);
         let value = integerLabelValue(label);
         if (value == null) {
-            this.reporter.report("Switch labels for an integer switch must be integer "
-                + "constants.", label.span());
+            if (!(labelType is ErrorType)) {
+                if (!convert.isAssignableStrict(inner, labelType)
+                        && !convert.isAssignableStrict(labelType, inner)) {
+                    this.reporter.report("Switch label of type '{types.display(labelType)}' does "
+                        + "not match the switch value of type '{types.display(inner)}'.",
+                        label.span());
+                } else {
+                    this.reporter.report("Switch labels for an integer switch must be integer "
+                        + "constants.", label.span());
+                }
+            }
+            return;
+        }
+        if (label is LiteralExpressionNode && label.value().kind() == SyntaxKind.CharLiteral) {
+            this.adaptCharLiteral(label, inner);
+        } else {
+            this.adaptIntegerLiteralLabel(label, inner);
+        }
+        let adapted = this.result.typeOf(label.green());
+        if (adapted != null && adapted is ErrorType) {
             return;
         }
         if (!seen.add(value)) {
@@ -3720,13 +3771,13 @@ private isNullLabel(Expression label) -> bool {
     return label is LiteralExpressionNode && label.value().kind() == SyntaxKind.NullKeyword;
 }
 
-// The constant an integer switch label names: a char literal's codepoint, or an integer
+// The constant an integer switch label names: a char literal's codepoint, or an int or long
 // literal's value behind an optional sign.
 private integerLabelValue(Expression label) -> long? {
     if (label is LiteralExpressionNode && label.value().kind() == SyntaxKind.CharLiteral) {
         return literalvalues.charCodepoint(label.value().text()) as long;
     }
-    let literal = intLiteralOf(label);
+    let literal = integerLiteralOf(label, true);
     if (literal == null) {
         return null;
     }
@@ -3776,10 +3827,10 @@ private writtenTypeName(nodes.Type created, Type resolved) -> string {
 }
 
 // The literal an untyped integer adaptation applies to: the literal itself, or one behind a
-// single '+' or '-' prefix.
-private intLiteralOf(Expression node) -> LiteralExpressionNode? {
+// single '+' or '-' prefix. 'allowLong' also accepts a typed long literal, as switch labels do.
+private integerLiteralOf(Expression node, bool allowLong) -> LiteralExpressionNode? {
     if (node is LiteralExpressionNode) {
-        if (node.value().kind() == SyntaxKind.IntLiteral) {
+        if (isIntegerLiteralKind(node.value().kind(), allowLong)) {
             return node;
         }
         return null;
@@ -3791,11 +3842,22 @@ private intLiteralOf(Expression node) -> LiteralExpressionNode? {
         }
         let operand = node.operand();
         if (operand is LiteralExpressionNode
-                && operand.value().kind() == SyntaxKind.IntLiteral) {
+                && isIntegerLiteralKind(operand.value().kind(), allowLong)) {
             return operand;
         }
     }
     return null;
+}
+
+private intLiteralOf(Expression node) -> LiteralExpressionNode? {
+    return integerLiteralOf(node, false);
+}
+
+private isIntegerLiteralKind(SyntaxKind kind, bool allowLong) -> bool {
+    if (kind == SyntaxKind.IntLiteral) {
+        return true;
+    }
+    return allowLong && kind == SyntaxKind.LongLiteral;
 }
 
 private isNegativeLiteral(Expression node) -> bool {
