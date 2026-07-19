@@ -3229,7 +3229,9 @@ void Analyzer::analyzeForEachStmt(const ast::ForEachStatement& stmt) {
         Type* declared = resolveTypeReference(*tr);
         if (!declared->isError() && !elemT->isError() && !declared->assignableFrom(elemT)) {
             errorAtNode(tr->node, "Loop variable of type '" + declared->toString() +
-                "' cannot hold array elements of type '" + elemT->toString() + "'");
+                "' cannot hold the '" + elemT->toString() + "' values this sequence yields. "
+                "Declare it as '" + elemT->toString() + "' or a type '" + elemT->toString() +
+                "' fits into.");
         }
         bindingT = declared;
     }
