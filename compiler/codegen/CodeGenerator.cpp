@@ -631,6 +631,25 @@ struct CodeGenerator::Impl {
         return mangledTypeName(owner) + "_" + asAscii(sym->name) + overloadSuffix(sym);
     }
 
+    // Single source of truth for a receiver-less (free) function's linker symbol,
+    // used by both the definition and every reference so they always agree. A
+    // public free function is qualified by its defining module so same-named
+    // public functions in different modules do not collide at link time; the
+    // module path and the plain name are joined with '$', which cannot appear in
+    // an Ens identifier, and the module qualifier precedes the '$'-prefixed
+    // overload suffix. main keeps its renamed entry symbol, `external` and
+    // builtin functions keep their exact C name, and a private function keeps the
+    // bare name it links under with internal linkage. An explicit linkName (e.g.
+    // a test's module-qualified name) always wins.
+    std::string freeFunctionLinkName(Symbol* sym) const {
+        if (!sym->linkName.empty()) return asAscii(sym->linkName);
+        std::string base = asAscii(sym->name) + overloadSuffix(sym);
+        if (sym->name == u"main") return "ens.main";
+        if (!sym->isPublic || sym->isExternal || sym->isBuiltin) return base;
+        std::string mp = sanitizeModulePath(sym->modulePath);
+        return mp.empty() ? base : mp + "$" + base;
+    }
+
     bool initializeTargetsOnce() {
         static const bool ok = []() {
             llvm::InitializeAllTargetInfos();
@@ -721,9 +740,8 @@ struct CodeGenerator::Impl {
         llvm::Type* retType = mapType(sym->returnType);
         auto* fnType = llvm::FunctionType::get(retType, paramTypes, false);
 
-        std::string mangled = sym->linkName.empty()
-            ? asAscii(sym->name) + overloadSuffix(sym) : asAscii(sym->linkName);
-        if (owner) mangled = mangledMethodName(owner, sym);
+        std::string mangled = owner ? mangledMethodName(owner, sym)
+                                    : freeFunctionLinkName(sym);
 
         if (auto* existing = module->getFunction(mangled)) {
             values[sym] = existing;
@@ -766,14 +784,13 @@ struct CodeGenerator::Impl {
         llvm::Type* retType = mapType(sym->returnType);
         auto* fnType = llvm::FunctionType::get(retType, paramTypes, false);
 
-        std::string mangled = asAscii(fname) + overloadSuffix(sym);
-        if (receiver && receiver->structInfo) {
-            mangled = mangledMethodName(receiver->structInfo, sym);
-        }
-        // A top-level `main` is renamed; a compiler-emitted `main` wrapper
-        // records the process arguments and, when `main` throws, handles the
-        // error slot and prints any escaping exception.
-        if (!receiver && mangled == "main") mangled = "ens.main";
+        // A method is named by its owning class; a free function gets its
+        // module-qualified linker name (main is renamed to `ens.main`, and a
+        // compiler-emitted `main` wrapper records the process arguments and, when
+        // `main` throws, handles the error slot and prints any escaping exception).
+        std::string mangled = (receiver && receiver->structInfo)
+            ? mangledMethodName(receiver->structInfo, sym)
+            : freeFunctionLinkName(sym);
         // A top-level `private` free function is only ever called from inside its
         // own module (the analyzer rejects cross-module private calls), so it gets
         // internal linkage under its unmangled name. Without this, two modules that
@@ -7201,7 +7218,11 @@ struct CodeGenerator::Impl {
     }
 
     std::string mangledGenericFnName(Symbol* fn, const std::vector<::Type*>& args) {
-        std::string out = asAscii(fn->name) + "__";
+        // A generic free-function instance always gets external linkage, so it is
+        // qualified by its defining module (like a public free function) to keep
+        // same-named instantiations in different modules from colliding.
+        std::string mp = sanitizeModulePath(fn->modulePath);
+        std::string out = (mp.empty() ? "" : mp + "$") + asAscii(fn->name) + "__";
         for (size_t i = 0; i < args.size(); ++i) {
             if (i) out += "_";
             out += mangledTypeArg(args[i]);
