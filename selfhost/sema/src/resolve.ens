@@ -37,6 +37,8 @@ public class TypeResolver {
     private SemaResult semaResult;
     private List<TypeParamType> parameterScope;
     private List<FileDiagnostic> collected;
+    private List<DeferredBoundCheck> deferredBoundChecks;
+    private bool checkBoundsImmediately;
 
     constructor(TypeStore store, string modulePath, string filePath, ModuleLinkTable imports,
                 ClassType? errorClass, SemaResult result) {
@@ -48,6 +50,8 @@ public class TypeResolver {
         this.semaResult = result;
         this.parameterScope = new List<TypeParamType>();
         this.collected = new List<FileDiagnostic>();
+        this.deferredBoundChecks = new List<DeferredBoundCheck>();
+        this.checkBoundsImmediately = false;
     }
 
     modulePath() -> string {
@@ -176,18 +180,28 @@ public class TypeResolver {
             if (failed) {
                 return this.store.errorType();
             }
-            TypeParamType[] parameters = base.typeParameterTypes();
-            bool bounded = true;
-            for (long i = 0; i < parameters.length && i < given; i++) {
-                if (!this.checkArgumentBounds(arguments.get(i), parameters[i],
-                        argumentList.arguments(i).span())) {
-                    bounded = false;
+            Type[] argumentTypes = arguments.toArray();
+            if (this.checkBoundsImmediately) {
+                TypeParamType[] parameters = base.typeParameterTypes();
+                bool bounded = true;
+                for (long i = 0; i < parameters.length && i < given; i++) {
+                    if (!this.checkArgumentBounds(argumentTypes[i], parameters[i],
+                            argumentList.arguments(i).span())) {
+                        bounded = false;
+                    }
                 }
+                if (!bounded) {
+                    return this.store.errorType();
+                }
+            } else {
+                let spans = new List<Span>();
+                for (long i = 0; i < given; i++) {
+                    spans.push(argumentList.arguments(i).span());
+                }
+                this.deferredBoundChecks.push(new DeferredBoundCheck(base, argumentTypes,
+                    spans.toArray()));
             }
-            if (!bounded) {
-                return this.store.errorType();
-            }
-            return this.store.instantiationOf(base, arguments.toArray());
+            return this.store.instantiationOf(base, argumentTypes);
         }
         if (argumentList != null) {
             this.report("Type '{types.display(base)}' is not generic and takes no type "
@@ -246,6 +260,25 @@ public class TypeResolver {
             satisfied = false;
         }
         return satisfied;
+    }
+
+    // Checks the type arguments of every instantiation resolved so far. Bound checks wait until
+    // every module's parameter lists, class bases, and implemented interfaces are complete, so a
+    // reference can name a declaration that resolves later; the pipeline runs this once after
+    // the signature phase, and every later reference checks immediately.
+    checkDeferredBounds() {
+        this.checkBoundsImmediately = true;
+        let deferred = this.deferredBoundChecks;
+        this.deferredBoundChecks = new List<DeferredBoundCheck>();
+        for (long i = 0; i < deferred.length(); i++) {
+            let check = deferred.get(i);
+            TypeParamType[] parameters = check.template().typeParameterTypes();
+            Type[] arguments = check.arguments();
+            Span[] spans = check.spans();
+            for (long a = 0; a < parameters.length && a < arguments.length; a++) {
+                this.checkArgumentBounds(arguments[a], parameters[a], spans[a]);
+            }
+        }
     }
 
     private lookupQualified(TypeQualifierNode qualifier, string name, Span nameSpan) -> Type {
@@ -346,6 +379,32 @@ public class TypeResolver {
             parameter.setBounds(accepted.toArray());
         }
         return parameters.toArray();
+    }
+}
+
+// One instantiation whose type arguments still await their bound checks: the template, the
+// resolved arguments, and each argument's source span for diagnostics.
+private class DeferredBoundCheck {
+    private DeclaredType checkTemplate;
+    private Type[] checkArguments;
+    private Span[] checkSpans;
+
+    constructor(DeclaredType template, Type[] arguments, Span[] spans) {
+        this.checkTemplate = template;
+        this.checkArguments = arguments;
+        this.checkSpans = spans;
+    }
+
+    template() -> DeclaredType {
+        return this.checkTemplate;
+    }
+
+    arguments() -> Type[] {
+        return this.checkArguments;
+    }
+
+    spans() -> Span[] {
+        return this.checkSpans;
     }
 }
 
