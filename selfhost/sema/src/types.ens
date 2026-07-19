@@ -3,6 +3,8 @@
 // the metadata published at name registration; members and bases are filled by later phases.
 import GreenNode from @ens.frontend.syntax.green;
 import Span from @ens.frontend.source;
+import @ens.frontend.source;
+import FileDiagnostic from diagnostics;
 import List from @std.collections.list;
 import Map from @std.collections.map;
 import Set from @std.collections.set;
@@ -782,6 +784,8 @@ public class TypeStore {
     private Map<TypeParamKey, TypeParamType> typeParameters;
     private Map<InstantiationKey, InstantiationType> instantiations;
     private List<InstantiationType> pendingFills;
+    private List<InstantiationType> instantiationChain;
+    private List<FileDiagnostic> instantiationOverflows;
 
     constructor() {
         this.primitives = new Map<PrimitiveKind, PrimitiveType>();
@@ -794,6 +798,8 @@ public class TypeStore {
         this.typeParameters = new Map<TypeParamKey, TypeParamType>();
         this.instantiations = new Map<InstantiationKey, InstantiationType>();
         this.pendingFills = new List<InstantiationType>();
+        this.instantiationChain = new List<InstantiationType>();
+        this.instantiationOverflows = new List<FileDiagnostic>();
     }
 
     primitive(PrimitiveKind kind) -> PrimitiveType {
@@ -870,12 +876,37 @@ public class TypeStore {
         }
         let created = new InstantiationType(template, arguments);
         this.instantiations.set(key, created);
+        if (this.instantiationChain.length() >= maxInstantiationDepth()) {
+            this.recordInstantiationOverflow();
+            return created;
+        }
         if (template.membersComplete()) {
             this.fill(created);
         } else {
             this.pendingFills.push(created);
         }
         return created;
+    }
+
+    // The diagnostics for instantiation chains that never terminate, cleared as they are taken.
+    takeInstantiationOverflows() -> FileDiagnostic[] {
+        FileDiagnostic[] taken = this.instantiationOverflows.toArray();
+        this.instantiationOverflows = new List<FileDiagnostic>();
+        return taken;
+    }
+
+    private recordInstantiationOverflow() {
+        let root = this.instantiationChain.get(0);
+        let firstNested = this.instantiationChain.get(1);
+        let secondNested = this.instantiationChain.get(2);
+        string rootName = display(root);
+        string message = "Instantiating '" + rootName + "' never finishes: each instantiation "
+            + "requires another ('" + rootName + "' needs '" + display(firstNested)
+            + "', which needs '" + display(secondNested)
+            + "', ...). Break the recursive type argument.";
+        let template = root.template();
+        this.instantiationOverflows.push(
+            new FileDiagnostic(template.filePath(), message, overflowSpan(template)));
     }
 
     // Fills one queued instantiation early, for a base link the layout phase needs now.
@@ -945,6 +976,7 @@ public class TypeStore {
     }
 
     private fill(InstantiationType instantiation) {
+        this.instantiationChain.push(instantiation);
         let template = instantiation.template();
         Type[] arguments = instantiation.arguments();
         GreenNode owner = template.declaration();
@@ -970,6 +1002,7 @@ public class TypeStore {
             default -> { },
         }
         instantiation.setFilled();
+        this.instantiationChain.pop();
     }
 
     private fillFields(InstantiationType instantiation, List<Field> templateFields,
@@ -1063,6 +1096,52 @@ public class TypeStore {
                 + "'{created.modulePath()}'");
         }
         this.declaredTypes.set(key, created);
+    }
+}
+
+// The instantiation nesting a well-formed program stays far below; a chain that reaches it is a
+// polymorphically recursive template that would never terminate.
+private maxInstantiationDepth() -> long {
+    return 200;
+}
+
+// The span of the field whose type re-enters the template, so the diagnostic points at the
+// recursive reference; the template's start otherwise.
+private overflowSpan(DeclaredType template) -> Span {
+    let fields = fieldsOf(template);
+    if (fields != null) {
+        for (long i = 0; i < fields.length(); i++) {
+            let field = fields.get(i);
+            if (referencesTemplate(field.type(), template)) {
+                return field.nameSpan();
+            }
+        }
+    }
+    return source.makeSpan(0, 0);
+}
+
+private referencesTemplate(Type type, DeclaredType template) -> bool {
+    switch (type) {
+        is OptionalType optional -> {
+            return referencesTemplate(optional.inner(), template);
+        },
+        is ArrayType array -> {
+            return referencesTemplate(array.element(), template);
+        },
+        is InstantiationType instantiation -> {
+            if (instantiation.template() == template) {
+                return true;
+            }
+            for (let argument in instantiation.arguments()) {
+                if (referencesTemplate(argument, template)) {
+                    return true;
+                }
+            }
+            return false;
+        },
+        default -> {
+            return false;
+        },
     }
 }
 
