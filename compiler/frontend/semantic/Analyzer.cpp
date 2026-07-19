@@ -2846,9 +2846,11 @@ Analyzer::NullCheckInfo Analyzer::detectNullCheck(const ast::Expression& cond) {
     return info;
 }
 
-// A type test narrows its operand to the target class while the condition
-// holds. There is no negative counterpart: failing the test proves nothing
-// about the operand's type, so nothing narrows in the else branch.
+// A type test proves its operand is the target class exactly when the test
+// succeeds, so the fact carries only positive polarity: failing a bare `is`
+// proves nothing about the operand's type. A `!` around the test flips the
+// polarity in collectNarrowings, which is why `!(x is C)` narrows in the else
+// branch and past an always-exiting guard.
 Analyzer::NullCheckInfo Analyzer::detectTypeTest(const ast::TypeTestExpression& test) {
     NullCheckInfo info;
     auto operand = test.operand();
@@ -2870,6 +2872,13 @@ Analyzer::NullCheckInfo Analyzer::detectTypeTest(const ast::TypeTestExpression& 
 void Analyzer::collectNarrowings(const ast::Expression& cond, bool conditionHolds,
                                  std::vector<NullCheckInfo>& out) {
     ast::Expression core = unwrapParens(cond);
+    if (auto pre = core.asPrefix()) {
+        auto opTok = pre->operatorToken();
+        if (opTok && opTok->kind() == SyntaxKind::Bang) {
+            if (auto inner = pre->operand()) collectNarrowings(*inner, !conditionHolds, out);
+            return;
+        }
+    }
     if (auto tt = core.asTypeTest()) {
         NullCheckInfo info = detectTypeTest(*tt);
         if (info.valid && conditionHolds) out.push_back(std::move(info));
