@@ -1,0 +1,558 @@
+// Per-instantiation validation of the judgments a generic body defers because a type mentions a
+// type parameter: interpolation holes and 'is'/'as?' tests. Body checking records each deferred
+// judgment on its enclosing template or generic function; once every body is checked, the pass
+// replays each obligation against the concrete type arguments of every instantiation that
+// actually occurs, cascading through generic calls and through instantiations that only become
+// concrete inside another instantiation.
+import GreenNode from @ens.frontend.syntax.green;
+import Span from @ens.frontend.source;
+import FileDiagnostic from diagnostics;
+import diagnostics;
+import convert;
+import types;
+import Type from types;
+import TypeStore from types;
+import Signature from types;
+import InstantiationType from types;
+import TypeParamType from types;
+import OptionalType from types;
+import ArrayType from types;
+import ClassType from types;
+import ErrorType from types;
+import StringType from types;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+import Set from @std.collections.set;
+import StringBuilder from @std.text.stringbuilder;
+
+// One deferred judgment: where it sits in its template's file, and the open types to re-judge
+// once concrete type arguments arrive.
+public sealed abstract class Obligation {
+    private Span obligationSpan;
+
+    constructor(Span span) {
+        this.obligationSpan = span;
+    }
+
+    span() -> Span {
+        return this.obligationSpan;
+    }
+}
+
+public class InterpolationObligation extends Obligation {
+    private Type holeType;
+
+    constructor(Type hole, Span span) {
+        super(span);
+        this.holeType = hole;
+    }
+
+    hole() -> Type {
+        return this.holeType;
+    }
+}
+
+public class TypeTestObligation extends Obligation {
+    private Type testSource;
+    private Type testTarget;
+    private bool castForm;
+
+    constructor(Type source, Type target, bool isCast, Span span) {
+        super(span);
+        this.testSource = source;
+        this.testTarget = target;
+        this.castForm = isCast;
+    }
+
+    source() -> Type {
+        return this.testSource;
+    }
+
+    target() -> Type {
+        return this.testTarget;
+    }
+
+    isCast() -> bool {
+        return this.castForm;
+    }
+}
+
+// A generic call whose type arguments still mention a type parameter of the enclosing owner;
+// it names a concrete callee instantiation only once the owner's own arguments arrive.
+private class OpenCall {
+    Signature callee;
+    Type[] arguments;
+
+    constructor(this.callee, this.arguments);
+}
+
+private class ConcreteCall {
+    Signature callee;
+    Type[] arguments;
+
+    constructor(this.callee, this.arguments);
+}
+
+// Everything recorded against one generic owner: a class or struct template, or a generic
+// function, identified by its declaration node.
+private class OwnerEntry {
+    private string entryName;
+    private string entryFile;
+    private List<Obligation> entryObligations;
+    private List<OpenCall> entryOpenCalls;
+
+    constructor(string name, string filePath) {
+        this.entryName = name;
+        this.entryFile = filePath;
+        this.entryObligations = new List<Obligation>();
+        this.entryOpenCalls = new List<OpenCall>();
+    }
+
+    name() -> string {
+        return this.entryName;
+    }
+
+    file() -> string {
+        return this.entryFile;
+    }
+
+    obligations() -> List<Obligation> {
+        return this.entryObligations;
+    }
+
+    openCalls() -> List<OpenCall> {
+        return this.entryOpenCalls;
+    }
+}
+
+// Collects deferred judgments and generic calls while bodies are checked; the pass reads it.
+public class ObligationRegistry {
+    private Map<GreenNode, OwnerEntry> owners;
+    private List<ConcreteCall> concreteCalls;
+
+    constructor() {
+        this.owners = new Map<GreenNode, OwnerEntry>();
+        this.concreteCalls = new List<ConcreteCall>();
+    }
+
+    recordObligation(GreenNode owner, string name, string filePath, Obligation obligation) {
+        this.entryFor(owner, name, filePath).obligations().push(obligation);
+    }
+
+    recordOpenCall(GreenNode owner, string name, string filePath, Signature callee,
+                   Type[] arguments) {
+        this.entryFor(owner, name, filePath).openCalls().push(
+            new OpenCall(callee, arguments));
+    }
+
+    recordConcreteCall(Signature callee, Type[] arguments) {
+        this.concreteCalls.push(new ConcreteCall(callee, arguments));
+    }
+
+    entryOf(GreenNode owner) -> OwnerEntry? {
+        return this.owners.get(owner);
+    }
+
+    allOwners() -> GreenNode[] {
+        return this.owners.keys();
+    }
+
+    allConcreteCalls() -> List<ConcreteCall> {
+        return this.concreteCalls;
+    }
+
+    private entryFor(GreenNode owner, string name, string filePath) -> OwnerEntry {
+        let existing = this.owners.get(owner);
+        if (existing != null) {
+            return existing;
+        }
+        let created = new OwnerEntry(name, filePath);
+        this.owners.set(owner, created);
+        return created;
+    }
+}
+
+// Runs every recorded obligation against every concrete type-argument assignment its owner
+// receives, and returns the diagnostics, each anchored in the owner's file and naming the
+// instantiation it was judged for.
+public check(TypeStore store, ObligationRegistry registry) -> FileDiagnostic[] {
+    let pass = new ObligationPass(store, registry);
+    return pass.run();
+}
+
+// One concrete type-argument assignment for one owner, plus how it reads in a diagnostic and
+// how many cascade steps produced it.
+private class Assignment {
+    GreenNode owner;
+    Type[] arguments;
+    string display;
+    long depth;
+
+    constructor(this.owner, this.arguments, this.display, this.depth);
+}
+
+private class AssignmentKey {
+    private GreenNode keyOwner;
+    private Type[] keyArguments;
+
+    constructor(GreenNode owner, Type[] arguments) {
+        this.keyOwner = owner;
+        this.keyArguments = arguments;
+    }
+
+    override hash() -> long {
+        long combined = this.keyOwner.hash();
+        for (let argument in this.keyArguments) {
+            combined = combined * 31 + argument.hash();
+        }
+        return combined;
+    }
+
+    override equals(AssignmentKey other) -> bool {
+        if (this.keyOwner != other.keyOwner) {
+            return false;
+        }
+        if (this.keyArguments.length != other.keyArguments.length) {
+            return false;
+        }
+        for (long i = 0; i < this.keyArguments.length; i++) {
+            if (this.keyArguments[i] != other.keyArguments[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+private class ObligationPass {
+    private TypeStore store;
+    private ObligationRegistry registry;
+    private List<FileDiagnostic> collected;
+    private Set<AssignmentKey> seen;
+    private List<Assignment> worklist;
+    private Map<GreenNode, List<InstantiationType>> openInstantiationsByOwner;
+    private Set<GreenNode> productive;
+
+    constructor(TypeStore store, ObligationRegistry registry) {
+        this.store = store;
+        this.registry = registry;
+        this.collected = new List<FileDiagnostic>();
+        this.seen = new Set<AssignmentKey>();
+        this.worklist = new List<Assignment>();
+        this.openInstantiationsByOwner = new Map<GreenNode, List<InstantiationType>>();
+        this.productive = new Set<GreenNode>();
+    }
+
+    run() -> FileDiagnostic[] {
+        let concreteInstantiations = new List<InstantiationType>();
+        for (let instantiation in this.store.allInstantiations()) {
+            let owners = new Set<GreenNode>();
+            for (let argument in instantiation.arguments()) {
+                collectOwners(argument, owners);
+            }
+            if (owners.length() == 0) {
+                concreteInstantiations.push(instantiation);
+            } else {
+                for (let owner in owners.items()) {
+                    this.openInstantiationsFor(owner).push(instantiation);
+                }
+            }
+        }
+        this.computeProductive();
+        for (long i = 0; i < concreteInstantiations.length(); i++) {
+            let instantiation = concreteInstantiations.get(i);
+            this.push(instantiation.template().declaration(),
+                instantiation.template().name(), instantiation.arguments(), 0);
+        }
+        for (let call in this.registry.allConcreteCalls().toArray()) {
+            let declaration = call.callee.declaration();
+            if (declaration != null) {
+                this.push(declaration, call.callee.name(), call.arguments, 0);
+            }
+        }
+        while (this.worklist.length() > 0) {
+            this.process(this.worklist.pop());
+        }
+        return diagnostics.sorted(this.collected);
+    }
+
+    private openInstantiationsFor(GreenNode owner) -> List<InstantiationType> {
+        let existing = this.openInstantiationsByOwner.get(owner);
+        if (existing != null) {
+            return existing;
+        }
+        let created = new List<InstantiationType>();
+        this.openInstantiationsByOwner.set(owner, created);
+        return created;
+    }
+
+    // An owner is productive when one of its assignments can surface a diagnostic: it has
+    // obligations of its own, or an open call or open instantiation in its bodies leads to a
+    // productive owner. Everything else is pruned so an obligation-free program costs nothing.
+    private computeProductive() {
+        for (let owner in this.registry.allOwners()) {
+            let entry = this.registry.entryOf(owner);
+            if (entry != null && entry.obligations().length() > 0) {
+                this.productive.add(owner);
+            }
+        }
+        bool progress = true;
+        while (progress) {
+            progress = false;
+            for (let owner in this.registry.allOwners()) {
+                if (!this.productive.contains(owner) && this.reachesProductive(owner)) {
+                    this.productive.add(owner);
+                    progress = true;
+                }
+            }
+            for (let owner in this.openInstantiationsByOwner.keys()) {
+                if (!this.productive.contains(owner) && this.reachesProductive(owner)) {
+                    this.productive.add(owner);
+                    progress = true;
+                }
+            }
+        }
+    }
+
+    private reachesProductive(GreenNode owner) -> bool {
+        let entry = this.registry.entryOf(owner);
+        if (entry != null) {
+            for (long i = 0; i < entry.openCalls().length(); i++) {
+                let declaration = entry.openCalls().get(i).callee.declaration();
+                if (declaration != null && this.productive.contains(declaration)) {
+                    return true;
+                }
+            }
+        }
+        let openInstantiations = this.openInstantiationsByOwner.get(owner);
+        if (openInstantiations != null) {
+            for (long i = 0; i < openInstantiations.length(); i++) {
+                let declaration = openInstantiations.get(i).template().declaration();
+                if (this.productive.contains(declaration)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // Queues one concrete assignment, once, for productive owners only. Cascades past the
+    // depth limit come from a polymorphically recursive generic call chain that would never
+    // close; the judged prefix is deep enough for any real code.
+    private push(GreenNode owner, string name, Type[] arguments, long depth) {
+        if (depth > maxCascadeDepth()) {
+            return;
+        }
+        if (!this.productive.contains(owner)) {
+            return;
+        }
+        if (!this.seen.add(new AssignmentKey(owner, arguments))) {
+            return;
+        }
+        this.worklist.push(new Assignment(owner, arguments, displayFor(name, arguments),
+            depth));
+    }
+
+    private process(Assignment assignment) {
+        let entry = this.registry.entryOf(assignment.owner);
+        if (entry != null) {
+            for (long i = 0; i < entry.obligations().length(); i++) {
+                this.judge(entry, assignment, entry.obligations().get(i));
+            }
+            for (long i = 0; i < entry.openCalls().length(); i++) {
+                let call = entry.openCalls().get(i);
+                let declaration = call.callee.declaration();
+                if (declaration == null || !this.productive.contains(declaration)) {
+                    continue;
+                }
+                let substituted = this.substituteAll(call.arguments, assignment);
+                if (substituted != null) {
+                    this.push(declaration, call.callee.name(), substituted,
+                        assignment.depth + 1);
+                }
+            }
+        }
+        let openInstantiations = this.openInstantiationsByOwner.get(assignment.owner);
+        if (openInstantiations != null) {
+            for (long i = 0; i < openInstantiations.length(); i++) {
+                let instantiation = openInstantiations.get(i);
+                let declaration = instantiation.template().declaration();
+                if (!this.productive.contains(declaration)) {
+                    continue;
+                }
+                let substituted = this.substituteAll(instantiation.arguments(), assignment);
+                if (substituted != null) {
+                    this.push(declaration, instantiation.template().name(), substituted,
+                        assignment.depth + 1);
+                }
+            }
+        }
+    }
+
+    // The arguments with the assignment's substitution applied, or null when one still
+    // mentions a type parameter of some other owner.
+    private substituteAll(Type[] arguments, Assignment assignment) -> Type[]? {
+        let substituted = new List<Type>();
+        for (let argument in arguments) {
+            let concrete = this.store.substitute(argument, assignment.owner,
+                assignment.arguments);
+            if (convert.containsTypeParam(concrete)) {
+                return null;
+            }
+            substituted.push(concrete);
+        }
+        return substituted.toArray();
+    }
+
+    private judge(OwnerEntry entry, Assignment assignment, Obligation obligation) {
+        switch (obligation) {
+            is InterpolationObligation hole -> {
+                let concrete = this.substituteOne(hole.hole(), assignment);
+                if (concrete != null) {
+                    this.report(entry, assignment, interpolationIssue(concrete),
+                        obligation.span());
+                }
+            },
+            is TypeTestObligation test -> {
+                let source = this.substituteOne(test.source(), assignment);
+                let target = this.substituteOne(test.target(), assignment);
+                if (source != null && target != null) {
+                    this.report(entry, assignment,
+                        typeTestIssue(source, target, test.isCast()), obligation.span());
+                }
+            },
+        }
+    }
+
+    private substituteOne(Type open, Assignment assignment) -> Type? {
+        let concrete = this.store.substitute(open, assignment.owner, assignment.arguments);
+        if (concrete is ErrorType || convert.containsTypeParam(concrete)) {
+            return null;
+        }
+        return concrete;
+    }
+
+    private report(OwnerEntry entry, Assignment assignment, string? issue, Span span) {
+        if (issue != null) {
+            this.collected.push(new FileDiagnostic(entry.file(),
+                "In '{assignment.display}': " + issue, span));
+        }
+    }
+}
+
+private maxCascadeDepth() -> long {
+    return 200;
+}
+
+private collectOwners(Type type, Set<GreenNode> owners) {
+    switch (type) {
+        is TypeParamType parameter -> {
+            owners.add(parameter.owner());
+        },
+        is OptionalType optional -> {
+            collectOwners(optional.inner(), owners);
+        },
+        is ArrayType array -> {
+            collectOwners(array.element(), owners);
+        },
+        is InstantiationType instantiation -> {
+            for (let argument in instantiation.arguments()) {
+                collectOwners(argument, owners);
+            }
+        },
+        default -> { },
+    }
+}
+
+private displayFor(string name, Type[] arguments) -> string {
+    let builder = new StringBuilder();
+    builder.append(name);
+    builder.append("<");
+    for (long i = 0; i < arguments.length; i++) {
+        if (i > 0) {
+            builder.append(", ");
+        }
+        builder.append(types.display(arguments[i]));
+    }
+    builder.append(">");
+    return builder.toString();
+}
+
+// Why a value of this type cannot fill an interpolation hole, or null when it can.
+public interpolationIssue(Type analyzed) -> string? {
+    if (convert.isIntegerType(analyzed) || convert.isBoolType(analyzed)
+            || analyzed is StringType || convert.isEnumLike(analyzed)) {
+        return null;
+    }
+    if (analyzed is OptionalType) {
+        return "Cannot interpolate a value of type '{types.display(analyzed)}' because it "
+            + "may be null. Check it for null first ('if (value != null)'), or supply a "
+            + "fallback with '??'.";
+    }
+    return "Cannot interpolate a value of type '{types.display(analyzed)}'; only string, "
+        + "integer, bool, and enum values are supported here. Convert it with '.toString()' "
+        + "first.";
+}
+
+// Why 'is' or 'as?' between these concrete types is malformed, always true, or never true, or
+// null when the test is meaningful. The target is already known to be a plain class or
+// interface shape.
+public typeTestIssue(Type source, Type target, bool isCast) -> string? {
+    string operator = "is";
+    if (isCast) {
+        operator = "as?";
+    }
+    Type sourceCore = convert.bareOf(source);
+    if (!types.isClassLike(sourceCore)) {
+        string action = "tested.";
+        if (isCast) {
+            action = "cast.";
+        }
+        return "Cannot use '{operator}' on a value of type '{types.display(source)}'; only "
+            + "class values can be {action}";
+    }
+    if (types.isSubclassOrConforms(sourceCore, target)) {
+        if (!isCast && source is OptionalType) {
+            return null;
+        }
+        if (isCast) {
+            return "'as? {types.display(target)}' is not needed here: a value of type "
+                + "'{types.display(source)}' always converts to '{types.display(target)}?'. "
+                + "Use the value directly.";
+        }
+        return "A value of type '{types.display(source)}' is always a "
+            + "'{types.display(target)}'; this 'is' test would always be true. Remove it.";
+    }
+    if (types.isInterfaceLike(sourceCore)) {
+        return null;
+    }
+    if (types.isInterfaceLike(target)) {
+        if (isFinalClass(sourceCore)) {
+            string outcome = "This 'is' test would always be false.";
+            if (isCast) {
+                outcome = "This 'as?' cast would always be null.";
+            }
+            return "A value of type '{types.display(source)}' can never be a "
+                + "'{types.display(target)}': '{types.display(sourceCore)}' is 'final' and "
+                + "does not implement it. {outcome} Remove it.";
+        }
+        return null;
+    }
+    if (!types.isSubclassOf(target, sourceCore)) {
+        string outcome = "this 'is' test would always be false.";
+        if (isCast) {
+            outcome = "this 'as?' cast would always be null.";
+        }
+        return "A value of type '{types.display(source)}' can never be a "
+            + "'{types.display(target)}'; {outcome} Remove it.";
+    }
+    return null;
+}
+
+private isFinalClass(Type type) -> bool {
+    let authority = types.authorityOf(type);
+    if (authority is ClassType) {
+        return authority.isFinal();
+    }
+    return false;
+}

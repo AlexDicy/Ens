@@ -119,20 +119,26 @@ import Method from types;
 import Parameter from types;
 import Signature from types;
 import Visibility from types;
+import ObligationRegistry from obligations;
+import Obligation from obligations;
+import InterpolationObligation from obligations;
+import TypeTestObligation from obligations;
+import obligations;
 import List from @std.collections.list;
 import Map from @std.collections.map;
 import Set from @std.collections.set;
 
 // Checks every body of every module. Modules see each other only through the type store, the
 // link tables, and the other modules' function tables (for namespace-qualified calls).
-public checkBodies(List<ModuleContext> contexts) -> FileDiagnostic[] {
+public checkBodies(List<ModuleContext> contexts, ObligationRegistry deferred)
+        -> FileDiagnostic[] {
     let collected = new List<FileDiagnostic>();
     let contextsByPath = new Map<string, ModuleContext>();
     for (long i = 0; i < contexts.length(); i++) {
         contextsByPath.set(contexts.get(i).module().canonicalPath(), contexts.get(i));
     }
     for (long i = 0; i < contexts.length(); i++) {
-        let checker = new BodyChecker(contexts.get(i), contextsByPath, collected);
+        let checker = new BodyChecker(contexts.get(i), contextsByPath, collected, deferred);
         checker.run();
         for (let diagnostic in contexts.get(i).resolver().takeDiagnostics()) {
             collected.push(diagnostic);
@@ -222,8 +228,12 @@ private class BodyChecker implements PanicCalls {
     private Set<GreenNode> fillProvenNews;
     private Map<GreenNode, string> arrayNewNames;
 
+    private ObligationRegistry deferredObligations;
+    private GreenNode? obligationOwner;
+    private string obligationOwnerName;
+
     constructor(ModuleContext context, Map<string, ModuleContext> contextsByPath,
-                List<FileDiagnostic> collected) {
+                List<FileDiagnostic> collected, ObligationRegistry deferred) {
         this.context = context;
         this.contextsByPath = contextsByPath;
         this.resolver = context.resolver();
@@ -239,6 +249,9 @@ private class BodyChecker implements PanicCalls {
         this.loopDepth = 0;
         this.fillProvenNews = new Set<GreenNode>();
         this.arrayNewNames = new Map<GreenNode, string>();
+        this.deferredObligations = deferred;
+        this.obligationOwner = null;
+        this.obligationOwnerName = "";
     }
 
     run() {
@@ -285,16 +298,60 @@ private class BodyChecker implements PanicCalls {
     private checkStructBodies(StructDeclarationNode node) {
         let found = this.store.findDeclared(this.modulePath, node.name().text());
         if (found is StructType && found.declaration() == node.green()) {
+            this.enterObligationOwner(found);
             this.checkFieldDefaults(found, node.body());
             this.checkMemberBodies(found, found.methods(), node.body());
+            this.leaveObligationOwner();
         }
     }
 
     private checkClassBodies(ClassDeclarationNode node) {
         let found = this.store.findDeclared(this.modulePath, node.name().text());
         if (found is ClassType && found.declaration() == node.green()) {
+            this.enterObligationOwner(found);
             this.checkFieldDefaults(found, node.body());
             this.checkMemberBodies(found, found.methods(), node.body());
+            this.leaveObligationOwner();
+        }
+    }
+
+    // Deferred judgments and open generic calls found while checking a generic template's or
+    // generic function's bodies record against that owner, keyed by its declaration node.
+    private enterObligationOwner(DeclaredType found) {
+        if (found.isGeneric()) {
+            this.obligationOwner = found.declaration();
+            this.obligationOwnerName = found.name();
+        }
+    }
+
+    private leaveObligationOwner() {
+        this.obligationOwner = null;
+        this.obligationOwnerName = "";
+    }
+
+    private recordObligation(Obligation obligation) {
+        let owner = this.obligationOwner;
+        if (owner != null) {
+            this.deferredObligations.recordObligation(owner, this.obligationOwnerName,
+                this.context.module().filePath(), obligation);
+        }
+    }
+
+    private recordGenericCall(Signature signature, Type[] arguments) {
+        bool open = false;
+        for (let argument in arguments) {
+            if (convert.containsTypeParam(argument)) {
+                open = true;
+            }
+        }
+        if (!open) {
+            this.deferredObligations.recordConcreteCall(signature, arguments);
+            return;
+        }
+        let owner = this.obligationOwner;
+        if (owner != null) {
+            this.deferredObligations.recordOpenCall(owner, this.obligationOwnerName,
+                this.context.module().filePath(), signature, arguments);
         }
     }
 
@@ -333,6 +390,13 @@ private class BodyChecker implements PanicCalls {
     // for the body's locals, and the catch clauses as siblings that cannot see those locals.
     private checkCallableBody(Signature signature, Type? receiver, Method? method,
                               FunctionDeclarationNode node) {
+        if (receiver == null && signature.isGeneric()) {
+            let declaration = signature.declaration();
+            if (declaration != null) {
+                this.obligationOwner = declaration;
+                this.obligationOwnerName = signature.name();
+            }
+        }
         long pushed = this.pushCallableTypeParameters(signature, receiver);
         this.parameterScope = new Scope(null);
         this.scope = this.parameterScope;
@@ -389,6 +453,9 @@ private class BodyChecker implements PanicCalls {
         this.currentReturnType = null;
         this.inConstructor = false;
         this.resolver.popTypeParameters(pushed);
+        if (receiver == null) {
+            this.leaveObligationOwner();
+        }
     }
 
     private pushCallableTypeParameters(Signature signature, Type? receiver) -> long {
@@ -2197,57 +2264,13 @@ private class BodyChecker implements PanicCalls {
                 + "got '{types.display(target)}'.", span);
             return false;
         }
-        Type sourceCore = convert.bareOf(source);
         if (convert.containsTypeParam(source) || convert.containsTypeParam(target)) {
+            this.recordObligation(new TypeTestObligation(source, target, isCast, span));
             return true;
         }
-        if (!types.isClassLike(sourceCore)) {
-            string action = "tested.";
-            if (isCast) {
-                action = "cast.";
-            }
-            this.reporter.report("Cannot use '{operator}' on a value of type "
-                + "'{types.display(source)}'; only class values can be {action}", span);
-            return false;
-        }
-        if (types.isSubclassOrConforms(sourceCore, target)) {
-            if (!isCast && source is OptionalType) {
-                return true;
-            }
-            if (isCast) {
-                this.reporter.report("'as? {types.display(target)}' is not needed here: a "
-                    + "value of type '{types.display(source)}' always converts to "
-                    + "'{types.display(target)}?'. Use the value directly.", span);
-            } else {
-                this.reporter.report("A value of type '{types.display(source)}' is always a "
-                    + "'{types.display(target)}'; this 'is' test would always be true. "
-                    + "Remove it.", span);
-            }
-            return false;
-        }
-        if (types.isInterfaceLike(sourceCore)) {
-            return true;
-        }
-        if (types.isInterfaceLike(target)) {
-            if (isFinalClass(sourceCore)) {
-                string outcome = "This 'is' test would always be false.";
-                if (isCast) {
-                    outcome = "This 'as?' cast would always be null.";
-                }
-                this.reporter.report("A value of type '{types.display(source)}' can never be "
-                    + "a '{types.display(target)}': '{types.display(sourceCore)}' is 'final' "
-                    + "and does not implement it. {outcome} Remove it.", span);
-                return false;
-            }
-            return true;
-        }
-        if (!types.isSubclassOf(target, sourceCore)) {
-            string outcome = "this 'is' test would always be false.";
-            if (isCast) {
-                outcome = "this 'as?' cast would always be null.";
-            }
-            this.reporter.report("A value of type '{types.display(source)}' can never be a "
-                + "'{types.display(target)}'; {outcome} Remove it.", span);
+        let issue = obligations.typeTestIssue(source, target, isCast);
+        if (issue != null) {
+            this.reporter.report(issue, span);
             return false;
         }
         return true;
@@ -2330,22 +2353,13 @@ private class BodyChecker implements PanicCalls {
             return;
         }
         if (analyzed is TypeParamType) {
+            this.recordObligation(new InterpolationObligation(analyzed, hole.span()));
             return;
         }
-        if (convert.isIntegerType(analyzed) || convert.isBoolType(analyzed)
-                || analyzed is StringType || convert.isEnumLike(analyzed)) {
-            return;
+        let issue = obligations.interpolationIssue(analyzed);
+        if (issue != null) {
+            this.reporter.report(issue, hole.span());
         }
-        if (analyzed is OptionalType) {
-            this.reporter.report("Cannot interpolate a value of type "
-                + "'{types.display(analyzed)}' because it may be null. Check it for null "
-                + "first ('if (value != null)'), or supply a fallback with '??'.",
-                hole.span());
-            return;
-        }
-        this.reporter.report("Cannot interpolate a value of type '{types.display(analyzed)}'; "
-            + "only string, integer, bool, and enum values are supported here. Convert it "
-            + "with '.toString()' first.", hole.span());
     }
 
     private analyzeTry(TryExpressionNode node) -> Type {
@@ -3441,6 +3455,7 @@ private class BodyChecker implements PanicCalls {
 
         if (bounded) {
             this.result.setCallTypeArguments(node.green(), resolvedArguments);
+            this.recordGenericCall(signature, resolvedArguments);
         }
         return this.store.substitute(signature.returnType(), owner, resolvedArguments);
     }

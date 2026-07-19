@@ -1,0 +1,179 @@
+import @std.testing;
+import TestFailure from @std.testing;
+import ProgramAnalysis from pipeline;
+import FileDiagnostic from diagnostics;
+import sema_support;
+import FakeFileLoader from sema_support;
+
+private analyzeOne(string text) -> ProgramAnalysis throws {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", text);
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertNoDiagnostics(analysis.declareDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.linkDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.signatureDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.layoutDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.checkDiagnostics());
+    return analysis;
+}
+
+test "a generic function hole is judged once per concrete call type argument set" {
+    let analysis = try analyzeOne("class Point \{\n"
+        + "    int x;\n"
+        + "    constructor(this.x);\n"
+        + "\}\n"
+        + "describe<T>(T value) -> string \{\n"
+        + "    return \"value is \{value\}\";\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    print(describe(42));\n"
+        + "    print(describe(\"tools\"));\n"
+        + "    print(describe(new Point(1)));\n"
+        + "    print(describe(new Point(2)));\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let diagnostics = analysis.bodyDiagnostics();
+    try testing.assertEqual(diagnostics.length, 1L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/src/main.ens",
+        "In 'describe<Point>': Cannot interpolate a value of type 'Point'; only string, "
+            + "integer, bool, and enum values are supported here. Convert it with "
+            + "'.toString()' first.");
+}
+
+test "a class template hole is judged per instantiation and anchors in the template" {
+    let analysis = try analyzeOne("class Shape \{\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "class Box<T> \{\n"
+        + "    private T item;\n"
+        + "    constructor(T value) \{ this.item = value; \}\n"
+        + "    label() -> string \{ return \"box of \{this.item\}\"; \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    print(new Box<int>(7).label());\n"
+        + "    let bad = new Box<Shape>(new Shape());\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let diagnostics = analysis.bodyDiagnostics();
+    try testing.assertEqual(diagnostics.length, 1L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/src/main.ens",
+        "In 'Box<Shape>': Cannot interpolate a value of type 'Shape'; only string, integer, "
+            + "bool, and enum values are supported here. Convert it with '.toString()' "
+            + "first.");
+    let hole = diagnostics[0].span();
+    try testing.assertTrue(hole.start > 0, "the diagnostic anchors at the template's hole");
+}
+
+test "a deferred type test is judged against each instantiation's concrete scrutinee" {
+    let analysis = try analyzeOne("class Shape \{\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "class Square extends Shape \{\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "class Widget \{\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "class Wrap<T> \{\n"
+        + "    private T item;\n"
+        + "    constructor(T value) \{ this.item = value; \}\n"
+        + "    isShape() -> bool \{ return this.item is Shape; \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let related = new Wrap<Square>(new Square());\n"
+        + "    let unrelated = new Wrap<Widget>(new Widget());\n"
+        + "    let fine = new Wrap<Shape>(new Shape());\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let diagnostics = analysis.bodyDiagnostics();
+    try testing.assertEqual(diagnostics.length, 3L);
+    bool sawAlwaysTrue = false;
+    bool sawNeverTrue = false;
+    for (let diagnostic in diagnostics) {
+        if (diagnostic.message() == "In 'Wrap<Square>': A value of type 'Square' is always "
+                + "a 'Shape'; this 'is' test would always be true. Remove it.") {
+            sawAlwaysTrue = true;
+        }
+        if (diagnostic.message() == "In 'Wrap<Widget>': A value of type 'Widget' can never "
+                + "be a 'Shape'; this 'is' test would always be false. Remove it.") {
+            sawNeverTrue = true;
+        }
+    }
+    try testing.assertTrue(sawAlwaysTrue, "Wrap<Square> makes the test constant");
+    try testing.assertTrue(sawNeverTrue, "Wrap<Widget> can never pass the test");
+}
+
+test "an open generic call cascades the callee's obligations from the caller's arguments" {
+    let analysis = try analyzeOne("class Point \{\n"
+        + "    int x;\n"
+        + "    constructor(this.x);\n"
+        + "\}\n"
+        + "inner<T>(T value) -> string \{\n"
+        + "    return \"got \{value\}\";\n"
+        + "\}\n"
+        + "outer<T>(T value) -> string \{\n"
+        + "    return inner(value);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    print(outer(3));\n"
+        + "    print(outer(new Point(1)));\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let diagnostics = analysis.bodyDiagnostics();
+    try testing.assertEqual(diagnostics.length, 1L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/src/main.ens",
+        "In 'inner<Point>': Cannot interpolate a value of type 'Point'; only string, "
+            + "integer, bool, and enum values are supported here. Convert it with "
+            + "'.toString()' first.");
+}
+
+test "an instantiation open inside a generic body cascades from the enclosing template" {
+    let analysis = try analyzeOne("class Shape \{\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "class Box<T> \{\n"
+        + "    private T item;\n"
+        + "    constructor(T value) \{ this.item = value; \}\n"
+        + "    label() -> string \{ return \"box of \{this.item\}\"; \}\n"
+        + "\}\n"
+        + "class Holder<T> \{\n"
+        + "    private T kept;\n"
+        + "    constructor(T value) \{ this.kept = value; \}\n"
+        + "    describe() -> string \{\n"
+        + "        let boxed = new Box<T>(this.kept);\n"
+        + "        return boxed.label();\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let ok = new Holder<string>(\"fine\");\n"
+        + "    let bad = new Holder<Shape>(new Shape());\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let diagnostics = analysis.bodyDiagnostics();
+    try testing.assertEqual(diagnostics.length, 1L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/src/main.ens",
+        "In 'Box<Shape>': Cannot interpolate a value of type 'Shape'; only string, integer, "
+            + "bool, and enum values are supported here. Convert it with '.toString()' "
+            + "first.");
+}
+
+test "enum and optional substitutions keep the concrete judgment's own wording" {
+    let analysis = try analyzeOne("enum Color \{ Red, Green, \}\n"
+        + "describe<T>(T value) -> string \{\n"
+        + "    return \"value is \{value\}\";\n"
+        + "\}\n"
+        + "perhaps() -> int? \{\n"
+        + "    return 4;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    print(describe(Color.Red));\n"
+        + "    print(describe(perhaps()));\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let diagnostics = analysis.bodyDiagnostics();
+    try testing.assertEqual(diagnostics.length, 1L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/src/main.ens",
+        "In 'describe<int?>': Cannot interpolate a value of type 'int?' because it may be "
+            + "null. Check it for null first ('if (value != null)'), or supply a fallback "
+            + "with '??'.");
+}
