@@ -49,6 +49,7 @@ If the spec, the C++ compiler, and the self-hosted compiler disagree, that is a 
   Header directives drive assertions: `// @exit N`, `// @stdout ...`, `// @expect-error <substring>`, `// @ens-test <args>`.
 - Group related scenarios into one or two files (happy paths vs errors), not one file per scenario.
 - Unit test coverage matters: new code ships with tests for its own logic (the self-hosted packages keep unit tests in their `tests/` folders), not just end-to-end fixtures.
+- A package's `tests/` folder mirrors the grouping of its `src/` folder; put new tests in the subfolder matching the code under test.
 - `corpus_roundtrip` asserts the self-hosted front end parses the whole repo byte-exact with no unexpected diagnostics.
 - `semacheck` is a bidirectional gate: every accepted program must produce zero self-hosted sema diagnostics, and every `@expect-error` fixture must be rejected by sema.
   A fixture whose diagnostic belongs to a later phase carries `// @expect-error-at <phase>`; a tag sema outgrows fails the run as stale.
