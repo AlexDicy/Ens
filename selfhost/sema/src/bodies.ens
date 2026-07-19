@@ -13,6 +13,7 @@ import FieldDeclarationNode from @ens.frontend.syntax.nodes;
 import MemberListNode from @ens.frontend.syntax.nodes;
 import ParameterListNode from @ens.frontend.syntax.nodes;
 import CatchClauseNode from @ens.frontend.syntax.nodes;
+import SyntaxNode from @ens.frontend.syntax.node;
 import BlockNode from @ens.frontend.syntax.nodes;
 import Statement from @ens.frontend.syntax.nodes;
 import Expression from @ens.frontend.syntax.nodes;
@@ -641,27 +642,35 @@ private class BodyChecker implements PanicCalls {
     // location: a local or parameter, 'this', or such a root followed by field hops and
     // subscript hops with literal or plain-identifier indices. 'allowAnyIndex' admits every
     // other index form as an AnyIndex hop, for write-invalidation queries only.
-    private buildNarrowingPath(Expression expression, bool allowAnyIndex) -> NarrowingPath? {
+    private buildNarrowingPath(Expression expression, bool allowAnyIndex,
+                               bool byName = false) -> NarrowingPath? {
         let segments = new List<PathSegment>();
-        let root = this.collectPathSegments(expression, allowAnyIndex, segments);
+        let root = this.collectPathSegments(expression, allowAnyIndex, byName, segments);
         if (root == null) {
             return null;
         }
         return new NarrowingPath(root, segments);
     }
 
-    private collectPathSegments(Expression expression, bool allowAnyIndex,
+    // 'byName' resolves each root and identifier index by name against the current scope rather
+    // than by the analyzed side table, for the loop-entry pre-clear whose body nodes are not yet
+    // analyzed.
+    private collectPathSegments(Expression expression, bool allowAnyIndex, bool byName,
                                 List<PathSegment> segments) -> LocalBinding? {
         Expression core = unwrapParentheses(expression);
         switch (core) {
             is IdentifierExpressionNode identifier -> {
+                if (byName) {
+                    return this.lookupBinding(identifier.name().text());
+                }
                 return this.result.bindingOf(identifier.green());
             },
             is ThisExpressionNode ignored -> {
                 return this.thisBinding;
             },
             is MemberExpressionNode member -> {
-                let root = this.collectPathSegments(member.object(), allowAnyIndex, segments);
+                let root = this.collectPathSegments(member.object(), allowAnyIndex, byName,
+                    segments);
                 if (root == null) {
                     return null;
                 }
@@ -669,12 +678,12 @@ private class BodyChecker implements PanicCalls {
                 return root;
             },
             is SubscriptExpressionNode subscript -> {
-                let root = this.collectPathSegments(subscript.object(), allowAnyIndex,
+                let root = this.collectPathSegments(subscript.object(), allowAnyIndex, byName,
                     segments);
                 if (root == null) {
                     return null;
                 }
-                if (!this.collectIndexSegment(subscript.index(), allowAnyIndex, segments)) {
+                if (!this.collectIndexSegment(subscript.index(), allowAnyIndex, byName, segments)) {
                     return null;
                 }
                 return root;
@@ -686,7 +695,7 @@ private class BodyChecker implements PanicCalls {
     }
 
     // Appends the subscript hop for an index expression; false rejects the whole path.
-    private collectIndexSegment(Expression index, bool allowAnyIndex,
+    private collectIndexSegment(Expression index, bool allowAnyIndex, bool byName,
                                 List<PathSegment> segments) -> bool {
         Expression core = unwrapParentheses(index);
         let literal = integerLiteralOf(core, true);
@@ -701,7 +710,12 @@ private class BodyChecker implements PanicCalls {
                 return true;
             }
         } else if (core is IdentifierExpressionNode) {
-            let binding = this.result.bindingOf(core.green());
+            LocalBinding? binding = null;
+            if (byName) {
+                binding = this.lookupBinding(core.name().text());
+            } else {
+                binding = this.result.bindingOf(core.green());
+            }
             if (binding != null) {
                 segments.push(narrow.bindingIndexSegment(binding));
                 return true;
@@ -979,6 +993,99 @@ private class BodyChecker implements PanicCalls {
         this.narrowing.clearForRootMembers(path.root());
     }
 
+    // Loop-entry pre-clearing: before the loop body is analyzed, drop every narrowing whose
+    // storage the body may write, so a fact a later body write kills cannot be read stale on a
+    // following iteration. The condition re-establishes its own narrowing each iteration, so a
+    // condition-derived fact is not pre-cleared. Roots resolve by name against the current scope,
+    // since the body nodes are not analyzed yet.
+    private preClearLoopBodyWrites(SyntaxNode node) {
+        switch (node) {
+            is AssignmentExpressionNode assignment -> {
+                this.preClearWrite(assignment.target());
+            },
+            is PrefixExpressionNode prefix -> {
+                let operator = prefix.operator().kind();
+                if (operator == SyntaxKind.PlusPlus || operator == SyntaxKind.MinusMinus) {
+                    this.preClearWrite(prefix.operand());
+                }
+            },
+            is PostfixExpressionNode postfix -> {
+                let operator = postfix.operator().kind();
+                if (operator == SyntaxKind.PlusPlus || operator == SyntaxKind.MinusMinus) {
+                    this.preClearWrite(postfix.operand());
+                }
+            },
+            is OutArgumentNode outArgument -> {
+                let binding = this.lookupBinding(outArgument.name().text());
+                if (binding != null) {
+                    this.narrowing.clearForRoot(binding);
+                    this.narrowing.clearForIndexBinding(binding);
+                }
+            },
+            is CallExpressionNode call -> {
+                switch (call.callee()) {
+                    is MemberExpressionNode member -> {
+                        this.preClearTouch(member.object());
+                    },
+                    is SafeMemberExpressionNode member -> {
+                        this.preClearTouch(member.object());
+                    },
+                    default -> { },
+                }
+                this.preClearTouchedArguments(call.arguments());
+            },
+            is NewExpressionNode created -> {
+                this.preClearTouchedArguments(created.arguments());
+            },
+            default -> { },
+        }
+        for (let child in node.childNodes()) {
+            this.preClearLoopBodyWrites(child);
+        }
+    }
+
+    private preClearTouchedArguments(ArgumentListNode? arguments) {
+        if (arguments == null) {
+            return;
+        }
+        for (long i = 0; i < arguments.argumentsCount(); i++) {
+            switch (arguments.arguments(i)) {
+                is NamedArgumentNode named -> {
+                    this.preClearTouch(named.value());
+                },
+                is OutArgumentNode ignored -> { },
+                is Expression plain -> {
+                    this.preClearTouch(plain);
+                },
+                default -> { },
+            }
+        }
+    }
+
+    private preClearWrite(Expression target) {
+        if (target is IdentifierExpressionNode) {
+            let binding = this.lookupBinding(target.name().text());
+            if (binding != null) {
+                this.narrowing.clearForRoot(binding);
+                this.narrowing.clearForIndexBinding(binding);
+            }
+            return;
+        }
+        if (target is MemberExpressionNode || target is SubscriptExpressionNode) {
+            let path = this.buildNarrowingPath(target, true, true);
+            if (path != null) {
+                this.narrowing.clearMayAlias(path);
+            }
+        }
+    }
+
+    private preClearTouch(Expression value) {
+        let path = this.buildNarrowingPath(value, false, true);
+        if (path != null) {
+            this.narrowing.clearForRootMembers(path.root());
+        }
+    }
+
     // ---- Statements ----
 
     private walkBlock(BlockNode block) {
@@ -1195,6 +1302,7 @@ private class BodyChecker implements PanicCalls {
     // The condition is rechecked every iteration and body writes drop narrowing at their own
     // point, so condition narrowing is safe in the body.
     private checkWhileStatement(WhileStatementNode node) {
+        this.preClearLoopBodyWrites(node.body());
         Type condition = this.analyzeExpression(node.condition());
         this.checkConditionIsBool(condition, "While condition", node.condition().span());
         let facts = new List<NarrowingFact>();
@@ -1218,6 +1326,11 @@ private class BodyChecker implements PanicCalls {
                 default -> { },
             }
         }
+        this.preClearLoopBodyWrites(node.body());
+        let update = node.update();
+        if (update != null) {
+            this.preClearLoopBodyWrites(update);
+        }
         let facts = new List<NarrowingFact>();
         let condition = node.condition();
         if (condition != null) {
@@ -1229,7 +1342,6 @@ private class BodyChecker implements PanicCalls {
         this.enterScope();
         this.applyFacts(facts);
         this.walkBlock(node.body());
-        let update = node.update();
         if (update != null) {
             this.analyzeExpression(update);
         }
@@ -1288,6 +1400,7 @@ private class BodyChecker implements PanicCalls {
         }
         this.result.setBinding(node.green(), binding);
         this.loopDepth++;
+        this.preClearLoopBodyWrites(node.body());
         this.walkScopedBlock(node.body());
         this.loopDepth--;
         this.leaveScope();

@@ -332,11 +332,21 @@ private:
     std::optional<NarrowingPath> buildNarrowingPath(
         const ast::Expression& expr,
         std::vector<Symbol*>* indexSymbols = nullptr,
-        bool allowAnyIndex = false) const;
+        bool allowAnyIndex = false,
+        bool byName = false) const;
 
     void clearNarrowingsForCall(const ast::CallExpression& expr);
     void clearNarrowingsForArguments(const std::vector<ast::Expression>& args);
     void clearNarrowingsTouchedBy(const ast::Expression& e);
+
+    // Loop-entry pre-clearing: before a loop body is analyzed, drop every
+    // narrowing whose storage the body may write, so a fact killed by a later
+    // body write cannot be read stale on a following iteration. The roots are
+    // resolved by name against the current scope, since the body nodes are not
+    // analyzed yet.
+    void preClearLoopBodyWrites(const SyntaxNode& node);
+    void preClearWrite(const ast::Expression& target);
+    void preClearTouch(const ast::Expression& value);
 
     struct NullCheckInfo {
         NarrowingPath key;

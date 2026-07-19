@@ -2702,12 +2702,19 @@ static ast::Expression unwrapParens(const ast::Expression& e) {
 std::optional<NarrowingPath> Analyzer::buildNarrowingPath(
     const ast::Expression& expr,
     std::vector<Symbol*>* indexSymbols,
-    bool allowAnyIndex) const {
+    bool allowAnyIndex,
+    bool byName) const {
     ast::Expression core = unwrapParens(expr);
 
     if (auto id = core.asIdent()) {
-        auto* info = analysis.find(id->node.greenNode());
-        Symbol* sym = info ? info->resolvedSymbol : nullptr;
+        Symbol* sym = nullptr;
+        if (byName) {
+            auto name = id->nameText();
+            sym = (name && currentScope) ? currentScope->lookup(*name) : nullptr;
+        } else {
+            auto* info = analysis.find(id->node.greenNode());
+            sym = info ? info->resolvedSymbol : nullptr;
+        }
         if (!sym) return std::nullopt;
         if (sym->kind != SymbolKind::Variable && sym->kind != SymbolKind::Parameter) {
             return std::nullopt;
@@ -2722,7 +2729,7 @@ std::optional<NarrowingPath> Analyzer::buildNarrowingPath(
         auto obj = m->object();
         auto name = m->memberText();
         if (!obj || !name) return std::nullopt;
-        auto base = buildNarrowingPath(*obj, indexSymbols, allowAnyIndex);
+        auto base = buildNarrowingPath(*obj, indexSymbols, allowAnyIndex, byName);
         if (!base) return std::nullopt;
         PathSegment seg;
         seg.kind = PathSegment::Kind::Field;
@@ -2734,7 +2741,7 @@ std::optional<NarrowingPath> Analyzer::buildNarrowingPath(
         auto obj = su->object();
         auto idx = su->index();
         if (!obj || !idx) return std::nullopt;
-        auto base = buildNarrowingPath(*obj, indexSymbols, allowAnyIndex);
+        auto base = buildNarrowingPath(*obj, indexSymbols, allowAnyIndex, byName);
         if (!base) return std::nullopt;
         ast::Expression idxCore = unwrapParens(*idx);
         PathSegment seg;
@@ -2780,8 +2787,14 @@ std::optional<NarrowingPath> Analyzer::buildNarrowingPath(
         // Plain identifier index. Track the symbol so callers can invalidate
         // the narrowing if the index variable is reassigned.
         if (auto idId = idxCore.asIdent()) {
-            auto* info = analysis.find(idId->node.greenNode());
-            Symbol* sym = info ? info->resolvedSymbol : nullptr;
+            Symbol* sym = nullptr;
+            if (byName) {
+                auto idName = idId->nameText();
+                sym = (idName && currentScope) ? currentScope->lookup(*idName) : nullptr;
+            } else {
+                auto* info = analysis.find(idId->node.greenNode());
+                sym = info ? info->resolvedSymbol : nullptr;
+            }
             if (!sym) return unrecognizedIndex();
             if (sym->kind != SymbolKind::Variable && sym->kind != SymbolKind::Parameter) {
                 return unrecognizedIndex();
@@ -2852,6 +2865,97 @@ void Analyzer::clearNarrowingsForCall(const ast::CallExpression& expr) {
         }
     }
     clearNarrowingsForArguments(expr.arguments());
+}
+
+void Analyzer::preClearWrite(const ast::Expression& target) {
+    if (!currentScope) return;
+    ast::Expression core = unwrapParens(target);
+    if (auto id = core.asIdent()) {
+        if (auto name = id->nameText()) {
+            if (Symbol* sym = currentScope->lookup(*name)) {
+                currentScope->clearNarrowingsForRoot(sym);
+                currentScope->clearNarrowingsForIndexSymbol(sym);
+            }
+        }
+        return;
+    }
+    if (core.asMember() || core.asSubscript()) {
+        if (auto p = buildNarrowingPath(core, nullptr, /*allowAnyIndex=*/true, /*byName=*/true)) {
+            currentScope->clearNarrowingsThatMayAlias(*p);
+        }
+    }
+}
+
+void Analyzer::preClearTouch(const ast::Expression& value) {
+    if (!currentScope) return;
+    auto p = buildNarrowingPath(value, nullptr, /*allowAnyIndex=*/false, /*byName=*/true);
+    if (!p) return;
+    if (p->root &&
+        (p->root->kind == SymbolKind::Variable ||
+         p->root->kind == SymbolKind::Parameter)) {
+        currentScope->clearNarrowingsForRootMembers(p->root);
+    } else {
+        currentScope->clearNarrowingsForRoot(p->root);
+    }
+}
+
+void Analyzer::preClearLoopBodyWrites(const SyntaxNode& node) {
+    if (!currentScope) return;
+    ast::Expression e{node};
+    if (auto a = e.asAssign()) {
+        if (auto t = a->target()) preClearWrite(*t);
+    } else if (auto pre = e.asPrefix()) {
+        if (auto op = pre->operatorToken()) {
+            SyntaxKind k = op->kind();
+            if ((k == SyntaxKind::PlusPlus || k == SyntaxKind::MinusMinus) && pre->operand()) {
+                preClearWrite(*pre->operand());
+            }
+        }
+    } else if (auto post = e.asPostfix()) {
+        if (auto op = post->operatorToken()) {
+            SyntaxKind k = op->kind();
+            if ((k == SyntaxKind::PlusPlus || k == SyntaxKind::MinusMinus) && post->operand()) {
+                preClearWrite(*post->operand());
+            }
+        }
+    } else if (auto oa = e.asOutArgument()) {
+        if (auto name = oa->nameText()) {
+            if (Symbol* local = currentScope->lookup(*name)) {
+                currentScope->clearNarrowingsForRoot(local);
+                currentScope->clearNarrowingsForIndexSymbol(local);
+            }
+        }
+    } else if (auto call = e.asCall()) {
+        if (auto callee = call->callee()) {
+            if (auto m = callee->asMember()) {
+                if (auto obj = m->object()) preClearTouch(*obj);
+            } else if (auto sm = callee->asSafeMember()) {
+                if (auto obj = sm->object()) preClearTouch(*obj);
+            }
+        }
+        for (const auto& arg : call->arguments()) {
+            if (arg.asOutArgument()) continue;
+            ast::Expression argTarget = arg;
+            if (auto na = arg.asNamedArgument()) {
+                auto value = na->value();
+                if (!value) continue;
+                argTarget = *value;
+            }
+            preClearTouch(argTarget);
+        }
+    } else if (auto nw = e.asNew()) {
+        for (const auto& arg : nw->arguments()) {
+            if (arg.asOutArgument()) continue;
+            ast::Expression argTarget = arg;
+            if (auto na = arg.asNamedArgument()) {
+                auto value = na->value();
+                if (!value) continue;
+                argTarget = *value;
+            }
+            preClearTouch(argTarget);
+        }
+    }
+    for (const auto& child : node.children()) preClearLoopBodyWrites(child);
 }
 
 Analyzer::NullCheckInfo Analyzer::detectNullCheck(const ast::Expression& cond) {
@@ -3139,6 +3243,9 @@ void Analyzer::analyzeIfStmt(const ast::IfStatement& stmt) {
 void Analyzer::analyzeWhileStmt(const ast::WhileStatement& stmt) {
     // The condition is rechecked every iteration and writes inside the body
     // drop narrowing at that point, so condition narrowing is safe in the body.
+    // A narrowing established before the loop, however, is stale once a later
+    // body write kills it, so drop every such narrowing up front.
+    if (auto b = stmt.body()) preClearLoopBodyWrites(b->node);
     std::vector<NullCheckInfo> narrowings;
     if (auto c = stmt.condition()) {
         Type* ct = analyzeExpr(*c);
@@ -3155,6 +3262,11 @@ void Analyzer::analyzeWhileStmt(const ast::WhileStatement& stmt) {
 void Analyzer::analyzeForStmt(const ast::ForStatement& stmt) {
     pushScope();  // the init binding is scoped to the loop
     if (auto init = stmt.init()) analyzeStatement(*init);
+    // A narrowing established before the loop is stale once a later body or
+    // update write kills it, so drop every such narrowing before the condition,
+    // which then re-establishes its own narrowing for each iteration.
+    if (auto b = stmt.body()) preClearLoopBodyWrites(b->node);
+    if (auto u = stmt.update()) preClearLoopBodyWrites(u->node);
     std::vector<NullCheckInfo> narrowings;
     if (auto c = stmt.condition()) {
         Type* ct = analyzeExpr(*c);
@@ -3253,7 +3365,10 @@ void Analyzer::analyzeForEachStmt(const ast::ForEachStatement& stmt) {
     currentScope->define(sym);
     analysis.setSymbol(stmt.node.greenNode(), sym);
     loopDepth++;
-    if (auto b = stmt.body()) analyzeBlock(*b);
+    if (auto b = stmt.body()) {
+        preClearLoopBodyWrites(b->node);
+        analyzeBlock(*b);
+    }
     loopDepth--;
     popScope();
 }
