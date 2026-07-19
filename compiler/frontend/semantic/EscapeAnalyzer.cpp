@@ -217,6 +217,12 @@ void EscapeAnalyzer::scanExpression(const ast::Expression& e) {
     if (auto al = e.asArrayLiteral()) { scanArrayLiteral(*al); return; }
     if (auto tr = e.asTry()) { if (auto op = tr->operand()) scanExpression(*op); return; }
     if (auto sw = e.asSwitch()) { scanSwitchArms(sw->scrutinee(), sw->arms()); return; }
+    if (auto p = e.asPrefix()) { if (auto op = p->operand()) scanExpression(*op); return; }
+    if (auto po = e.asPostfix()) { if (auto op = po->operand()) scanExpression(*op); return; }
+    if (auto is = e.asInterpString()) {
+        for (auto& hole : is->holes()) scanExpression(hole);
+        return;
+    }
     if (auto id = e.asIdent()) { scanIdent(*id); return; }
 }
 
@@ -698,6 +704,18 @@ void EscapeAnalyzer::walkExprForLastUses(const ast::Expression& e) {
         for (auto& arm : sw->arms()) {
             if (auto be = arm.bodyExpr()) walkExprForLastUses(*be);
         }
+        return;
+    }
+    if (auto p = e.asPrefix()) {
+        if (auto op = p->operand()) walkExprForLastUses(*op);
+        return;
+    }
+    if (auto po = e.asPostfix()) {
+        if (auto op = po->operand()) walkExprForLastUses(*op);
+        return;
+    }
+    if (auto is = e.asInterpString()) {
+        for (auto& hole : is->holes()) walkExprForLastUses(hole);
         return;
     }
     if (auto id = e.asIdent()) {
