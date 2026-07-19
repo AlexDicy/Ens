@@ -215,6 +215,11 @@ Type* TypeContext::instantiateInternal(StructInfo* templ, TypeKind kind,
     auto it = instantiationCache.find(key);
     if (it != instantiationCache.end()) return it->second;
 
+    if (static_cast<int>(instantiationChain_.size()) >= kMaxInstantiationDepth) {
+        recordInstantiationOverflow();
+        return errorType;
+    }
+
     auto info = std::make_unique<StructInfo>();
     info->name = templ->name;
     info->modulePath = templ->modulePath;
@@ -250,6 +255,8 @@ Type* TypeContext::instantiateInternal(StructInfo* templ, TypeKind kind,
 
 void TypeContext::fillInstantiation(StructInfo* inst, StructInfo* templ,
                                     const std::vector<Type*>& args) {
+    auto selfIt = instanceTypes_.find(inst);
+    instantiationChain_.push_back(selfIt == instanceTypes_.end() ? nullptr : selfIt->second);
     const void* owner = static_cast<const void*>(templ);
     // Base layout is settled by fill time; refresh what the shell copied at
     // creation, and rebind a generic base to its concrete instantiation.
@@ -291,6 +298,59 @@ void TypeContext::fillInstantiation(StructInfo* inst, StructInfo* templ,
         }
         inst->methods.push_back(nm);
     }
+    instantiationChain_.pop_back();
+}
+
+static bool fieldReferencesTemplate(const Type* t, const StructInfo* templ) {
+    if (!t) return false;
+    switch (t->kind) {
+        case TypeKind::Optional:
+        case TypeKind::Array:
+            return fieldReferencesTemplate(t->inner, templ);
+        case TypeKind::Struct:
+        case TypeKind::Class:
+            if (t->structInfo) {
+                if (t->structInfo->templateOf == templ) return true;
+                for (const Type* a : t->structInfo->typeArgs) {
+                    if (fieldReferencesTemplate(a, templ)) return true;
+                }
+            }
+            return false;
+        default:
+            return false;
+    }
+}
+
+void TypeContext::recordInstantiationOverflow() {
+    Type* root = instantiationChain_[0];
+    Type* first = instantiationChain_[1];
+    Type* second = instantiationChain_[2];
+    StructInfo* templ = root && root->structInfo ? root->structInfo->templateOf : nullptr;
+    for (const auto& o : instantiationOverflows_) {
+        if (o.templ == templ) return;
+    }
+
+    std::string rootName = root ? root->toString() : std::string("?");
+    std::string message = "Instantiating '" + rootName +
+        "' never finishes: each instantiation requires another ('" + rootName + "' needs '" +
+        (first ? first->toString() : std::string("?")) + "', which needs '" +
+        (second ? second->toString() : std::string("?")) +
+        "', ...). Break the recursive type argument.";
+
+    int line = templ ? templ->line : 0;
+    int column = templ ? templ->column : 0;
+    int length = 1;
+    if (templ) {
+        for (const auto& f : templ->fields) {
+            if (fieldReferencesTemplate(f.type, templ)) {
+                line = f.line;
+                column = f.column;
+                length = static_cast<int>(f.name.size());
+                break;
+            }
+        }
+    }
+    instantiationOverflows_.push_back({templ, std::move(message), line, column, length});
 }
 
 void TypeContext::recordFunctionInstantiation(Symbol* fn, std::vector<Type*> args) {

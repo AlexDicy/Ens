@@ -474,6 +474,20 @@ bool analyzeModuleGraph(std::vector<std::unique_ptr<Module>>& modules,
 
     for (auto& m : modules) m->analyzer->analyzeBodies();
 
+    // A generic instantiation that never terminates was capped; report it against
+    // the module that declares the recursive template so codegen never sees it.
+    for (const auto& o : sharedCtx.takeInstantiationOverflows()) {
+        DiagnosticSink* target = nullptr;
+        for (auto& m : modules) {
+            if (o.templ && m->modulePath == o.templ->modulePath) {
+                target = m->sink.get();
+                break;
+            }
+        }
+        if (!target && !modules.empty()) target = modules.back()->sink.get();
+        if (target) target->error({o.line, o.column, o.length}, o.message);
+    }
+
     // Checked-exception throws-set fixpoint. Sets propagate cross-module via shared Symbol*.
     StructInfo* errorClass = nullptr;
     for (auto& m : modules) { errorClass = m->analyzer->errorClass(); if (errorClass) break; }

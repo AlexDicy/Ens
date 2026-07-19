@@ -324,6 +324,9 @@ void Analyzer::analyze(const SyntaxNode& root) {
         throwsAnalyzer.analyze();
         throwsAnalyzer.validate(sink, source);
     }
+    for (const auto& o : typeCtx.takeInstantiationOverflows()) {
+        sink.error({o.line, o.column, o.length}, o.message);
+    }
 }
 
 void Analyzer::collectDeclarations(const SyntaxNode& root) {

@@ -75,6 +75,19 @@ public:
     // type, e.g. a generic base recorded on a template).
     static bool containsTypeParam(const Type* t);
 
+    // A generic instantiation chain that never terminates, ready to report at
+    // its recursive field. Drained by the analyzer, which clears the list.
+    struct InstantiationOverflow {
+        StructInfo* templ;
+        std::string message;
+        int line;
+        int column;
+        int length;
+    };
+    std::vector<InstantiationOverflow> takeInstantiationOverflows() {
+        return std::move(instantiationOverflows_);
+    }
+
     // Generic free-function instantiations, recorded at call sites.
     struct FunctionInstantiation {
         Symbol* function;
@@ -88,6 +101,11 @@ public:
 private:
     Type* instantiateInternal(StructInfo* templ, TypeKind kind, const std::vector<Type*>& args);
     void fillInstantiation(StructInfo* inst, StructInfo* templ, const std::vector<Type*>& args);
+    void recordInstantiationOverflow();
+
+    static constexpr int kMaxInstantiationDepth = 200;
+    std::vector<Type*> instantiationChain_;
+    std::vector<InstantiationOverflow> instantiationOverflows_;
 
     struct PendingInstantiation {
         StructInfo* inst;
