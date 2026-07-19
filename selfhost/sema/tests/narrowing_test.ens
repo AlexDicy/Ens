@@ -1,6 +1,9 @@
 import @std.testing;
 import @ens.frontend.source;
 import Span from @ens.frontend.source;
+import ProgramAnalysis from pipeline;
+import sema_support;
+import FakeFileLoader from sema_support;
 import LocalBinding from scopes;
 import BindingKind from scopes;
 import Scope from scopes;
@@ -223,6 +226,102 @@ test "a deeper write drops the paths it prefixes and nothing shorter" {
     state.clearMayAlias(fieldPath(house, "room"));
     try testing.assertTrue(state.provenType(pathOf(house, roomDoor)) == null,
         "writing house.room drops the deeper house.room.door narrowing");
+}
+
+private analyzeBody(string text) -> ProgramAnalysis throws {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", text);
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertNoDiagnostics(analysis.declareDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.linkDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.signatureDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.layoutDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.checkDiagnostics());
+    return analysis;
+}
+
+test "guards, re-checks, refinement, and calls keep sound narrowings" {
+    let analysis = try analyzeBody("class Door \{ int code; constructor(this.code = 0); \}\n"
+        + "enum Color \{ Red, Green, \}\n"
+        + "use(Door d) \{ \}\n"
+        + "guarded(Door? d) -> int \{\n"
+        + "    if (d == null) \{ return 0; \}\n"
+        + "    return d.code;\n"
+        + "\}\n"
+        + "recheck(int? n) -> int \{\n"
+        + "    if (n != null) \{\n"
+        + "        if (n != null) \{ return n; \}\n"
+        + "        return n ?? 0;\n"
+        + "    \}\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "refined() -> int \{\n"
+        + "    int? n = null;\n"
+        + "    n = 5;\n"
+        + "    return n;\n"
+        + "\}\n"
+        + "keepAcrossCall(Door? d) -> int \{\n"
+        + "    if (d != null) \{\n"
+        + "        use(d);\n"
+        + "        return d.code;\n"
+        + "    \}\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "narrowedScrutinee(Color? c) -> int \{\n"
+        + "    if (c == null) \{ return -1; \}\n"
+        + "    return switch (c) \{ Red -> 1, Green -> 2, \};\n"
+        + "\}\n"
+        + "nullArm(Color? c) -> int \{\n"
+        + "    return switch (c) \{ Red -> 1, Green -> 2, null -> 0, \};\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return guarded(new Door(1)) + recheck(2) + refined()\n"
+        + "        + keepAcrossCall(new Door(3)) + narrowedScrutinee(Color.Red)\n"
+        + "        + nullArm(null);\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+}
+
+test "unsound reads stay rejected under narrowing" {
+    let analysis = try analyzeBody("class Door \{ int code; constructor(this.code = 0); \}\n"
+        + "class Room \{ Door? door; constructor(this.door = null); \}\n"
+        + "enum Color \{ Red, Green, \}\n"
+        + "touch(Room r) \{ \}\n"
+        + "maybeInt() -> int? \{ return 3; \}\n"
+        + "dropped(Room r) -> int \{\n"
+        + "    if (r.door != null) \{\n"
+        + "        touch(r);\n"
+        + "        return r.door.code;\n"
+        + "    \}\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "leaky(Door? d) -> int \{\n"
+        + "    if (d == null) \{ \}\n"
+        + "    return d.code;\n"
+        + "\}\n"
+        + "widened() -> int \{\n"
+        + "    int? n = 5;\n"
+        + "    n = maybeInt();\n"
+        + "    return n;\n"
+        + "\}\n"
+        + "presence(int y) -> int \{\n"
+        + "    return y ?? 3;\n"
+        + "\}\n"
+        + "missingNullArm(Color? c) -> int \{\n"
+        + "    return switch (c) \{ Red -> 1, Green -> 2, \};\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return dropped(new Room()) + leaky(null) + widened() + presence(1)\n"
+        + "        + missingNullArm(null);\n"
+        + "\}\n");
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "Cannot read a member of 'Door?' because it may be null");
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "Cannot return value of type 'int?' from function returning 'int'");
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "Left of '??' must be a nullable value, got 'int'");
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "This switch value can be null but no arm handles it");
 }
 
 test "index-binding invalidation drops only paths indexed through it" {
