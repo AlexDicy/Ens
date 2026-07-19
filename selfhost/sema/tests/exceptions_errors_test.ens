@@ -1,0 +1,299 @@
+import @std.testing;
+import ProgramAnalysis from pipeline;
+import FileDiagnostic from diagnostics;
+import sema_support;
+import FakeFileLoader from sema_support;
+
+private analyzeOne(string text) -> ProgramAnalysis throws {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", text);
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertNoDiagnostics(analysis.declareDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.linkDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.signatureDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.layoutDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.checkDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+    return analysis;
+}
+
+private assertOne(ProgramAnalysis analysis, string message) throws {
+    let diagnostics = analysis.exceptionDiagnostics();
+    try testing.assertEqual(diagnostics.length, 1L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/src/main.ens", message);
+}
+
+private errorPrefix() -> string {
+    return "class DatabaseError extends Error \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "query() -> int throws \{\n"
+        + "    throw new DatabaseError(\"q\");\n"
+        + "\}\n";
+}
+
+test "a throwing call without try names the types and the fixes" {
+    let analysis = try analyzeOne(errorPrefix()
+        + "caller() -> int throws \{\n"
+        + "    return query();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return try caller();\n"
+        + "\} catch (DatabaseError e) \{\n"
+        + "    return 1;\n"
+        + "\}\n");
+    try assertOne(analysis, "Call to 'query' can throw 'DatabaseError'; prefix it with "
+        + "'try' (and handle it with a 'catch' clause or mark the function 'throws').");
+}
+
+test "try on a call that cannot throw is rejected" {
+    let analysis = try analyzeOne("safe() -> int \{\n"
+        + "    return 1;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return try safe();\n"
+        + "\}\n");
+    try assertOne(analysis, "'try' is not needed here: 'safe' cannot throw. Remove 'try'.");
+}
+
+test "an unmarked function that can throw must be marked or handle it" {
+    let analysis = try analyzeOne(errorPrefix()
+        + "caller() -> int \{\n"
+        + "    return try query();\n"
+        + "\}\n");
+    try assertOne(analysis, "'caller' can throw 'DatabaseError' but is not marked "
+        + "'throws'. Add 'throws' after the signature, or handle the exceptions with "
+        + "'catch' clauses after the body.");
+}
+
+test "a bare throws marker on a function that cannot throw is rejected" {
+    let analysis = try analyzeOne("safe() -> int throws \{\n"
+        + "    return 1;\n"
+        + "\}\n");
+    try assertOne(analysis, "'safe' is marked 'throws' but cannot throw; remove 'throws'.");
+}
+
+test "a declared throws list must cover the computed set" {
+    let analysis = try analyzeOne("class IoError extends Error \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "class NetError extends Error \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "abstract class Base \{\n"
+        + "    constructor();\n"
+        + "    abstract read() -> int throws IoError;\n"
+        + "\}\n"
+        + "class Derived extends Base \{\n"
+        + "    constructor();\n"
+        + "    override read() -> int throws IoError \{\n"
+        + "        throw new NetError(\"n\");\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try assertOne(analysis, "'read' can throw 'NetError', which is not in its declared "
+        + "throws list. Add it to the list, or handle it with 'catch' clauses.");
+}
+
+test "an override may not widen the base contract" {
+    let analysis = try analyzeOne("class IoError extends Error \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "class NetError extends Error \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "abstract class Base \{\n"
+        + "    constructor();\n"
+        + "    abstract read() -> int throws IoError;\n"
+        + "\}\n"
+        + "class Derived extends Base \{\n"
+        + "    constructor();\n"
+        + "    override read() -> int throws NetError \{\n"
+        + "        throw new NetError(\"n\");\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try assertOne(analysis, "Override 'read' can throw 'NetError', which 'Base' does not "
+        + "allow. An override may only throw types already allowed by the method it "
+        + "overrides.");
+}
+
+test "an implementing method may not widen the interface contract" {
+    let analysis = try analyzeOne("class IoError extends Error \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "class NetError extends Error \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "interface Store \{\n"
+        + "    save() -> int throws IoError;\n"
+        + "\}\n"
+        + "class DiskStore implements Store \{\n"
+        + "    constructor();\n"
+        + "    override save() -> int throws NetError \{\n"
+        + "        throw new NetError(\"n\");\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try assertOne(analysis, "Method 'save' of 'DiskStore' can throw 'NetError', which "
+        + "interface 'Store' does not allow. An implementing method may only throw types "
+        + "the interface method declares.");
+}
+
+test "a catch clause the body can never reach with its type is dead" {
+    let analysis = try analyzeOne("class IoError extends Error \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "class ParseError extends Error \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "load() -> int throws \{\n"
+        + "    throw new IoError(\"x\");\n"
+        + "\}\n"
+        + "run() -> int \{\n"
+        + "    return try load();\n"
+        + "\} catch (IoError e) \{\n"
+        + "    return 0;\n"
+        + "\} catch (ParseError e) \{\n"
+        + "    return 1;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return run();\n"
+        + "\}\n");
+    try assertOne(analysis, "This 'catch (ParseError ...)' is dead: the body of 'run' "
+        + "cannot throw 'ParseError' or a subclass. Remove the clause.");
+}
+
+test "a catch clause behind a broader one is unreachable" {
+    let analysis = try analyzeOne(errorPrefix()
+        + "run() -> int \{\n"
+        + "    return try query();\n"
+        + "\} catch (Error e) \{\n"
+        + "    return 0;\n"
+        + "\} catch (DatabaseError e) \{\n"
+        + "    return 1;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return run();\n"
+        + "\}\n");
+    try assertOne(analysis, "This 'catch (DatabaseError ...)' is unreachable: an earlier "
+        + "'catch' clause already handles it. Move it before the broader clause, or "
+        + "remove it.");
+}
+
+test "catch clauses on a body that cannot throw are redundant" {
+    let analysis = try analyzeOne("run() -> int \{\n"
+        + "    return 1;\n"
+        + "\} catch (Error e) \{\n"
+        + "    return 2;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return run();\n"
+        + "\}\n");
+    try assertOne(analysis, "'run' has 'catch' clauses but its body cannot throw; "
+        + "remove them.");
+}
+
+test "a constructor must not let exceptions escape" {
+    let analysis = try analyzeOne("class IoError extends Error \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "class Resource \{\n"
+        + "    constructor() \{\n"
+        + "        throw new IoError(\"x\");\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let resource = new Resource();\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try assertOne(analysis, "Constructor of 'Resource' cannot let exceptions escape, but "
+        + "it can throw 'IoError'. Catch the exceptions with 'catch' clauses after the "
+        + "constructor body.");
+}
+
+test "a destructor must not let exceptions escape" {
+    let analysis = try analyzeOne("class IoError extends Error \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "class Resource \{\n"
+        + "    constructor();\n"
+        + "    destructor() \{\n"
+        + "        throw new IoError(\"x\");\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let resource = new Resource();\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try assertOne(analysis, "Destructor of 'Resource' cannot let exceptions escape, but "
+        + "it can throw 'IoError'. Catch the exceptions with 'catch' clauses after the "
+        + "destructor body.");
+}
+
+test "a parameter default must not call a throwing function" {
+    let analysis = try analyzeOne(errorPrefix()
+        + "use(int value = query()) -> int \{\n"
+        + "    return value;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return use(1);\n"
+        + "\}\n");
+    try assertOne(analysis, "A default value cannot call 'query' because it can throw "
+        + "'DatabaseError'; it must not throw.");
+}
+
+test "a field default must not call a throwing function" {
+    let analysis = try analyzeOne(errorPrefix()
+        + "class Config \{\n"
+        + "    int port = query();\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try assertOne(analysis, "A field default cannot call 'query' because it can throw "
+        + "'DatabaseError'; it must not throw.");
+}
+
+test "only Error or a subclass can be caught" {
+    let analysis = try analyzeOne("class Widget \{\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "class IoError extends Error \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "run() -> int throws \{\n"
+        + "    throw new IoError(\"x\");\n"
+        + "\} catch (Widget w) \{\n"
+        + "    return 1;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return try run();\n"
+        + "\} catch (IoError e) \{\n"
+        + "    return 1;\n"
+        + "\}\n");
+    try assertOne(analysis, "Cannot catch 'Widget'; only 'Error' or a subclass of it can "
+        + "be caught.");
+}
+
+test "a test body validates try usage" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main_test.ens", errorPrefix()
+        + "test \"calls need try here too\" \{\n"
+        + "    int value = query();\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main_test.ens"]);
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+    let diagnostics = analysis.exceptionDiagnostics();
+    try testing.assertEqual(diagnostics.length, 1L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/src/main_test.ens",
+        "Call to 'query' can throw 'DatabaseError'; prefix it with 'try' (and handle it "
+        + "with a 'catch' clause or mark the function 'throws').");
+}

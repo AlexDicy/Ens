@@ -1,0 +1,327 @@
+import @std.testing;
+import TestFailure from @std.testing;
+import ProgramAnalysis from pipeline;
+import ModuleContext from context;
+import SourceFileNode from @ens.frontend.syntax.nodes;
+import FunctionDeclarationNode from @ens.frontend.syntax.nodes;
+import exceptions;
+import ThrowSet from exceptions;
+import types;
+import Type from types;
+import ClassType from types;
+import sema_support;
+import FakeFileLoader from sema_support;
+import List from @std.collections.list;
+
+private analyzeOne(string text) -> ProgramAnalysis throws {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", text);
+    return try analyzeFiles(loader, ["main.ens"]);
+}
+
+private analyzeFiles(FakeFileLoader loader, string[] seeds) -> ProgramAnalysis throws {
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", seeds);
+    try sema_support.assertNoDiagnostics(analysis.declareDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.linkDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.signatureDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.layoutDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.checkDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+    return analysis;
+}
+
+private classNamed(ProgramAnalysis analysis, string modulePath, string name)
+        -> ClassType throws {
+    let found = analysis.store().findDeclared(modulePath, name);
+    if (found is ClassType) {
+        return found;
+    }
+    throw new TestFailure("no class '{name}' in module '{modulePath}'");
+}
+
+private functionNamed(ModuleContext context, string name)
+        -> FunctionDeclarationNode throws {
+    let root = context.root();
+    if (root == null) {
+        throw new TestFailure("module '{context.module().canonicalPath()}' has no root");
+    }
+    for (long i = 0; i < root.itemsCount(); i++) {
+        let item = root.items(i);
+        if (item is FunctionDeclarationNode) {
+            let nameToken = item.name();
+            if (nameToken != null && nameToken.text() == name) {
+                return item;
+            }
+        }
+    }
+    throw new TestFailure("no top-level function '{name}'");
+}
+
+private assertThrowsSet(ProgramAnalysis analysis, string modulePath, string name,
+                        string[] expected) throws {
+    let context = try sema_support.contextFor(analysis, modulePath);
+    let declaration = try functionNamed(context, name);
+    let recorded = context.result().throwsSetOf(declaration.green());
+    if (recorded == null) {
+        throw new TestFailure("no throws set recorded for '{name}'");
+    }
+    try testing.assertEqual(recorded.length, expected.length);
+    for (let wanted in expected) {
+        bool found = false;
+        for (let member in recorded) {
+            if (types.display(member) == wanted) {
+                found = true;
+            }
+        }
+        try testing.assertTrue(found,
+            "expected '{wanted}' in the throws set of '{name}'");
+    }
+}
+
+test "a throw set dedups by identity and covers subclasses" {
+    let analysis = try analyzeOne("class AppError extends Error \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "class DbError extends AppError \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let appError = try classNamed(analysis, "main", "AppError");
+    let dbError = try classNamed(analysis, "main", "DbError");
+    let set = new ThrowSet();
+    try testing.assertTrue(set.isEmpty(), "a new set is empty");
+    try testing.assertTrue(set.add(appError), "first add grows the set");
+    try testing.assertFalse(set.add(appError), "a duplicate does not grow the set");
+    try testing.assertTrue(set.add(dbError), "a subclass is kept alongside its base");
+    try testing.assertEqual(set.members().length(), 2L);
+    try testing.assertTrue(set.covers(dbError), "a base member covers the subclass");
+    let narrow = new ThrowSet();
+    let ignored = narrow.add(dbError);
+    try testing.assertFalse(narrow.covers(appError),
+        "a subclass member does not cover its base");
+    let strays = exceptions.strayMembers(set, narrow);
+    try testing.assertEqual(strays.members().length(), 1L);
+    try testing.assertEqual(types.display(strays.members().get(0)), "AppError");
+}
+
+test "a thrown base type survives a subclass catch clause" {
+    let analysis = try analyzeOne("class AppError extends Error \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "class DbError extends AppError \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "mayFail(int x) -> int throws \{\n"
+        + "    if (x > 0) \{\n"
+        + "        throw new AppError(\"a\");\n"
+        + "    \}\n"
+        + "    return x;\n"
+        + "\} catch (DbError e) \{\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return try mayFail(1);\n"
+        + "\} catch (AppError e) \{\n"
+        + "    return 1;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.exceptionDiagnostics());
+    try assertThrowsSet(analysis, "main", "mayFail", ["AppError"]);
+    try assertThrowsSet(analysis, "main", "main", []);
+}
+
+test "a broader catch clause removes the thrown subclass" {
+    let analysis = try analyzeOne("class AppError extends Error \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "class DbError extends AppError \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "handled(int x) -> int \{\n"
+        + "    if (x > 0) \{\n"
+        + "        throw new DbError(\"d\");\n"
+        + "    \}\n"
+        + "    return x;\n"
+        + "\} catch (AppError e) \{\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return handled(1);\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.exceptionDiagnostics());
+    try assertThrowsSet(analysis, "main", "handled", []);
+}
+
+test "a rethrow re-raises what its clause caught" {
+    let analysis = try analyzeOne("class AppError extends Error \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "class DbError extends AppError \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "forwards(int x) -> int throws \{\n"
+        + "    if (x > 0) \{\n"
+        + "        throw new DbError(\"d\");\n"
+        + "    \}\n"
+        + "    return x;\n"
+        + "\} catch (DbError e) \{\n"
+        + "    rethrow;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return try forwards(1);\n"
+        + "\} catch (DbError e) \{\n"
+        + "    return 1;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.exceptionDiagnostics());
+    try assertThrowsSet(analysis, "main", "forwards", ["DbError"]);
+}
+
+test "a rethrow under a subclass clause keeps the base and adds the clause type" {
+    let analysis = try analyzeOne("class AppError extends Error \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "class DbError extends AppError \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "partial(int x) -> int throws \{\n"
+        + "    if (x > 0) \{\n"
+        + "        throw new AppError(\"a\");\n"
+        + "    \}\n"
+        + "    return x;\n"
+        + "\} catch (DbError e) \{\n"
+        + "    rethrow;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return try partial(1);\n"
+        + "\} catch (AppError e) \{\n"
+        + "    return 1;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.exceptionDiagnostics());
+    try assertThrowsSet(analysis, "main", "partial", ["AppError", "DbError"]);
+}
+
+test "the fixpoint converges across a recursion cycle" {
+    let analysis = try analyzeOne("class AppError extends Error \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "first(int x) -> int throws \{\n"
+        + "    if (x <= 0) \{\n"
+        + "        throw new AppError(\"a\");\n"
+        + "    \}\n"
+        + "    return try second(x - 1);\n"
+        + "\}\n"
+        + "second(int x) -> int throws \{\n"
+        + "    return try first(x);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return try second(3);\n"
+        + "\} catch (AppError e) \{\n"
+        + "    return 1;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.exceptionDiagnostics());
+    try assertThrowsSet(analysis, "main", "first", ["AppError"]);
+    try assertThrowsSet(analysis, "main", "second", ["AppError"]);
+}
+
+test "a declared throws list is the contract even when the body throws less" {
+    let analysis = try analyzeOne("class IoError extends Error \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "abstract class Reader \{\n"
+        + "    constructor();\n"
+        + "    abstract read() -> int throws IoError;\n"
+        + "\}\n"
+        + "class MemoryReader extends Reader \{\n"
+        + "    constructor();\n"
+        + "    override read() -> int throws IoError \{\n"
+        + "        return 1;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "use(Reader reader) -> int throws \{\n"
+        + "    return try reader.read();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return try use(new MemoryReader());\n"
+        + "\} catch (IoError e) \{\n"
+        + "    return 1;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.exceptionDiagnostics());
+    try assertThrowsSet(analysis, "main", "use", ["IoError"]);
+}
+
+test "a contract crosses modules and a generic instantiation shares its template's set" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/lib/db.ens", "public class DbError extends Error \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "public class TimeoutError extends DbError \{\n"
+        + "    constructor() \{ super(\"timeout\"); \}\n"
+        + "\}\n"
+        + "public class Db \{\n"
+        + "    constructor();\n"
+        + "    run(int q) -> int throws \{\n"
+        + "        if (q > 0) \{\n"
+        + "            throw new TimeoutError();\n"
+        + "        \}\n"
+        + "        return q;\n"
+        + "    \}\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens", "import Db from lib.db;\n"
+        + "import DbError from lib.db;\n"
+        + "class Box<T> \{\n"
+        + "    private T item;\n"
+        + "    constructor(T value) \{ this.item = value; \}\n"
+        + "    take(bool fail) -> T throws \{\n"
+        + "        if (fail) \{\n"
+        + "            throw new DbError(\"empty\");\n"
+        + "        \}\n"
+        + "        return this.item;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "query() -> int throws \{\n"
+        + "    let db = new Db();\n"
+        + "    return try db.run(2);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let box = new Box<int>(1);\n"
+        + "    int taken = try box.take(false);\n"
+        + "    return taken + try query();\n"
+        + "\} catch (DbError e) \{\n"
+        + "    return 1;\n"
+        + "\}\n");
+    let analysis = try analyzeFiles(loader, ["main.ens"]);
+    try sema_support.assertNoDiagnostics(analysis.exceptionDiagnostics());
+    try assertThrowsSet(analysis, "main", "query", ["TimeoutError"]);
+    try assertThrowsSet(analysis, "main", "main", []);
+}
+
+test "a constructor may handle its exceptions with catch clauses and tests may throw" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main_test.ens", "class IoError extends Error \{\n"
+        + "    constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "risky(int x) -> int throws \{\n"
+        + "    if (x > 0) \{\n"
+        + "        throw new IoError(\"r\");\n"
+        + "    \}\n"
+        + "    return x;\n"
+        + "\}\n"
+        + "class Resource \{\n"
+        + "    int size;\n"
+        + "    constructor(int x) \{\n"
+        + "        this.size = try risky(x);\n"
+        + "    \} catch (IoError e) \{\n"
+        + "        this.size = 0;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let resource = new Resource(0);\n"
+        + "    return resource.size;\n"
+        + "\}\n"
+        + "test \"a test body may let exceptions escape\" \{\n"
+        + "    int value = try risky(0);\n"
+        + "\}\n");
+    let analysis = try analyzeFiles(loader, ["main_test.ens"]);
+    try sema_support.assertNoDiagnostics(analysis.exceptionDiagnostics());
+}
