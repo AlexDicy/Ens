@@ -580,7 +580,11 @@ An interface target over a class scrutinee is an error only in the impossible ca
 An interface scrutinee may be tested against any class or interface target; the outcome is decided by the value's runtime type.
 
 `if (x is Derived)` narrows `x` to `Derived` inside the branch, following the same rules as null narrowing above: the same paths narrow (locals, member chains, subscripts), `x is Derived && x.derivedMethod()` narrows the right side of `&&`, conjunctions narrow the branch, a loop condition narrows the body, and the same writes and calls drop the narrowing.
-Failing the test proves nothing about the value's type, so nothing narrows in the else branch.
+Failing the test proves nothing about the value's type, so the plain else branch of a positive `is` does not narrow.
+
+Negating a check flips what it proves, so the fact that survives is the negated test and a negative guard narrows.
+`!(x is Circle)` proves `x is Circle` on its surviving side, which is the else branch and the code following a guard that always exits, as in `if (!(x is Circle)) { return; }` where `x` is a `Circle` on every line below.
+Negated null checks are symmetric: `!(x == null)` narrows like `x != null`, `!(x != null)` narrows like `x == null`, and double negation composes.
 
 `is` sits at the comparison precedence level, so `a is Circle && b is Square` reads as `(a is Circle) && (b is Square)`.
 `as?` binds tightly to the value just before it, like `as`.
