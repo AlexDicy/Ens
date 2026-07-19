@@ -505,9 +505,13 @@ Narrowing is dropped when the analyzer can't prove the narrowed value is still n
   Elements narrowed at a different literal index are kept: `xs[2] = null` leaves `xs[0]` and `xs[1]` narrowed.
 - Reassigning the root variable or, for subscripts, the index variable.
 - Any function or method call whose receiver path or class/array-typed argument could touch the narrowed root. Calls that don't touch the relevant root (e.g. `print("hi")`) leave the narrowing intact.
+  A constructor call `new T(...)` reaches its class/array arguments the same way an ordinary call does, so it drops the member-path narrowings rooted at them too.
   A call never drops the own narrowing of a plain local variable (or parameter), whether the binding is the call's receiver (`x.method()`) or an argument (`use(x)`): a callee cannot reassign the caller's binding, and the binding's own reference keeps the narrowed object alive.
-  What a call does drop is any member-path narrowing (`this.field`, `a.b`) rooted at a value it touches, since the callee may mutate those fields.
+  What a call does drop is any member-path narrowing (`this.field`, `a.b`) rooted at a value it touches, since the callee may mutate those fields; touching a member chain such as `r.door` therefore drops the paths under `r` but keeps `r`'s own narrowing.
   Passing the local as an `out` argument is the sole exception: `out` lets the callee write the caller's variable directly, so it drops the binding's own narrowing too.
+
+Inside a loop a narrowing must hold on every iteration, so a narrowing established before the loop is dropped at the loop's entry when any statement in the body (or a `for` update) could write its path: a later write would otherwise leave an earlier read in the body using a value that is already stale on the next pass.
+A narrowing the loop condition or an in-body guard clause re-establishes on each iteration is unaffected, so `while (x != null)` loops and guard-narrowed loops keep working.
 
 A write through a narrowed path is checked against the declared field or element type, not the narrowed one.
 Nulling out a just-checked field (`r.door = null`) or storing a base value over an `is`-narrowed one (`c.shape = new Shape()`) is therefore allowed; the write drops the narrowing, and reading the path again requires a new check.
