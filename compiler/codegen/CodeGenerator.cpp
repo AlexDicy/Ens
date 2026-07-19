@@ -123,6 +123,16 @@ struct CodeGenerator::Impl {
     ::Type* substInstanceType = nullptr;    // the instance type for `this`
     std::vector<::Type*> substArgs;
 
+    // While a generic call has switched the active substitution to the callee to
+    // resolve its signature, the user argument expressions still belong to the
+    // caller and must be emitted under the caller's substitution. Set for the span
+    // of one generic call's argument emission.
+    bool callerSubstActive = false;
+    const void* callerSubstOwner = nullptr;
+    StructInfo* callerSubstTemplate = nullptr;
+    ::Type* callerSubstInstance = nullptr;
+    std::vector<::Type*> callerSubstArgs;
+
     llvm::LLVMContext ctx;
     std::unique_ptr<llvm::Module> module;
     std::unique_ptr<llvm::IRBuilder<>> builder;
@@ -5993,6 +6003,25 @@ struct CodeGenerator::Impl {
         cleanupStack.back().push_back({ slot, paramT });
     }
 
+    // Emit one user-supplied argument, converting it to the (already concrete)
+    // parameter type. When a generic call has redirected the active substitution
+    // to the callee, the argument expression is emitted under the caller's own
+    // substitution so its type parameters still resolve.
+    llvm::Value* emitUserCallArg(const ast::Expression& a, ::Type* paramT, bool byPointer) {
+        if (!callerSubstActive) {
+            return byPointer ? emitAddressForByPointerArg(a, paramT)
+                             : emitExprConverted(a, paramT);
+        }
+        const void* so = substOwner; StructInfo* st = substTemplate;
+        ::Type* si = substInstanceType; std::vector<::Type*> sa = std::move(substArgs);
+        substOwner = callerSubstOwner; substTemplate = callerSubstTemplate;
+        substInstanceType = callerSubstInstance; substArgs = callerSubstArgs;
+        llvm::Value* v = byPointer ? emitAddressForByPointerArg(a, paramT)
+                                   : emitExprConverted(a, paramT);
+        substOwner = so; substTemplate = st; substInstanceType = si; substArgs = std::move(sa);
+        return v;
+    }
+
     bool appendCallArgs(Symbol* sym, const std::vector<ast::Expression>& userArgs,
                         const GreenElement* callNode, std::vector<llvm::Value*>& out) {
         const std::vector<int>* order = callNode ? analysis->callArgOrderOf(callNode) : nullptr;
@@ -6000,16 +6029,11 @@ struct CodeGenerator::Impl {
         for (size_t i = 0; i < userArgs.size(); ++i) {
             auto& a = userArgs[i];
             ::Type* paramT = subst((sym && i < sym->paramTypes.size()) ? sym->paramTypes[i] : nullptr);
-            if (sym && paramIsByPointer(sym, i)) {
-                llvm::Value* v = emitAddressForByPointerArg(a, paramT);
-                if (!v) return false;
-                out.push_back(v);
-            } else {
-                llvm::Value* v = emitExprConverted(a, paramT);
-                if (!v) return false;
-                trackOwnedArgTemp(v, a, paramT);
-                out.push_back(v);
-            }
+            bool byPointer = sym && paramIsByPointer(sym, i);
+            llvm::Value* v = emitUserCallArg(a, paramT, byPointer);
+            if (!v) return false;
+            if (!byPointer) trackOwnedArgTemp(v, a, paramT);
+            out.push_back(v);
         }
         if (!sym || !sym->funcDeclCst) return true;
         auto rootNode = SyntaxNode::makeRoot(sym->funcDeclCst);
@@ -6052,13 +6076,9 @@ struct CodeGenerator::Impl {
                 value = *inner;
             }
             ::Type* paramT = subst(sym->paramTypes[j]);
-            llvm::Value* v;
-            if (paramIsByPointer(sym, static_cast<size_t>(j))) {
-                v = emitAddressForByPointerArg(value, paramT);
-            } else {
-                v = emitExprConverted(value, paramT);
-                if (v) trackOwnedArgTemp(v, value, paramT);
-            }
+            bool byPointer = paramIsByPointer(sym, static_cast<size_t>(j));
+            llvm::Value* v = emitUserCallArg(value, paramT, byPointer);
+            if (!byPointer && v) trackOwnedArgTemp(v, value, paramT);
             if (!v) return false;
             slots[j] = v;
             filled[j] = true;
@@ -6485,13 +6505,38 @@ struct CodeGenerator::Impl {
             error(e.node.startOffset(), "Internal: generic call has no resolved type arguments");
             return nullptr;
         }
+        // Resolve the call's type arguments against the active substitution: a call
+        // inside a generic body carries the caller's own type parameters, which turn
+        // concrete only once the caller is monomorphized. Enqueue the resulting
+        // instance so its body is emitted too (emitInstantiations drains the list).
+        std::vector<::Type*> callArgs;
+        callArgs.reserve(targs->size());
+        bool open = false;
+        for (::Type* a : *targs) {
+            ::Type* c = subst(a);
+            if (TypeContext::containsTypeParam(c)) open = true;
+            callArgs.push_back(c);
+        }
+        if (typeCtx && !open) typeCtx->recordFunctionInstantiation(sym, callArgs);
+
         const void* savedOwner = substOwner;
         StructInfo* savedT = substTemplate;
         ::Type* savedI = substInstanceType;
         std::vector<::Type*> savedArgs = substArgs;
-        substOwner = sym; substTemplate = nullptr; substInstanceType = nullptr; substArgs = *targs;
+        bool savedCallerActive = callerSubstActive;
+        const void* savedCallerOwner = callerSubstOwner;
+        StructInfo* savedCallerT = callerSubstTemplate;
+        ::Type* savedCallerI = callerSubstInstance;
+        std::vector<::Type*> savedCallerArgs = std::move(callerSubstArgs);
 
-        llvm::Function* fn = getOrDeclareGenericFn(sym, mangledGenericFnName(sym, *targs));
+        // Redirect the active substitution to the callee so its signature and
+        // parameter types come out concrete, and record the caller's substitution
+        // so the argument expressions still resolve under it.
+        callerSubstActive = true; callerSubstOwner = savedOwner; callerSubstTemplate = savedT;
+        callerSubstInstance = savedI; callerSubstArgs = savedArgs;
+        substOwner = sym; substTemplate = nullptr; substInstanceType = nullptr; substArgs = callArgs;
+
+        llvm::Function* fn = getOrDeclareGenericFn(sym, mangledGenericFnName(sym, callArgs));
         std::vector<llvm::Value*> args;
         bool ok = fn && appendCallArgs(sym, e.arguments(), e.node.greenNode(), args);
         llvm::Value* result = nullptr;
@@ -6502,6 +6547,9 @@ struct CodeGenerator::Impl {
 
         substOwner = savedOwner; substTemplate = savedT; substInstanceType = savedI;
         substArgs = std::move(savedArgs);
+        callerSubstActive = savedCallerActive; callerSubstOwner = savedCallerOwner;
+        callerSubstTemplate = savedCallerT; callerSubstInstance = savedCallerI;
+        callerSubstArgs = std::move(savedCallerArgs);
         if (!ok) return nullptr;
         emitThrowsCheck(sym);
         return result;
@@ -7302,12 +7350,42 @@ struct CodeGenerator::Impl {
             if (open) continue;
             emitClassInstantiation(instT);
         }
+        // Generic free-function instances. Emitting one body can cascade into more
+        // (it calls another generic with this instance's arguments), so index
+        // through the growing list rather than iterating it. A tuple whose function
+        // is declared in another module is emitted with that module.
+        std::unordered_map<Symbol*, ast::FuncDecl> declBySymbol;
         for (auto& fn : sf.functions()) {
             Symbol* sym = symbolOf(fn.node);
-            if (!sym || !sym->isTemplate) continue;
-            for (auto& fi : typeCtx->functionInstantiations()) {
-                if (fi.function == sym) emitGenericFunctionInstance(fn, sym, fi.args);
+            if (sym && sym->isTemplate) declBySymbol.emplace(sym, fn);
+        }
+        std::unordered_map<Symbol*, int> instanceCount;
+        for (size_t i = 0; i < typeCtx->functionInstantiations().size(); ++i) {
+            TypeContext::FunctionInstantiation fi = typeCtx->functionInstantiations()[i];
+            auto it = declBySymbol.find(fi.function);
+            if (it == declBySymbol.end()) continue;
+            bool open = false;
+            for (::Type* a : fi.args) {
+                if (TypeContext::containsTypeParam(a)) { open = true; break; }
             }
+            if (open) continue;
+            // Polymorphic recursion at the function level (`grow<Box<T>>`) grows the
+            // argument tuple without bound. Cap the cascade at the same depth as
+            // class instantiation and report once, rather than expand until the
+            // stack overflows.
+            int count = ++instanceCount[fi.function];
+            if (count > TypeContext::maxInstantiationDepth()) {
+                if (count == TypeContext::maxInstantiationDepth() + 1) {
+                    auto nameTok = it->second.nameToken();
+                    uint32_t off = nameTok ? nameTok->startOffset() : it->second.node.startOffset();
+                    error(off,
+                          "Instantiating '" + asAscii(fi.function->name) +
+                          "' never finishes: each call needs a deeper instantiation. "
+                          "Break the recursive type argument.");
+                }
+                continue;
+            }
+            emitGenericFunctionInstance(it->second, fi.function, fi.args);
         }
     }
 

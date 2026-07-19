@@ -98,6 +98,10 @@ public:
         return functionInstantiations_;
     }
 
+    // The cap the class-instantiation depth guard uses; codegen applies the same
+    // bound to the generic-function instantiation cascade.
+    static constexpr int maxInstantiationDepth() { return kMaxInstantiationDepth; }
+
 private:
     Type* instantiateInternal(StructInfo* templ, TypeKind kind, const std::vector<Type*>& args);
     void fillInstantiation(StructInfo* inst, StructInfo* templ, const std::vector<Type*>& args);
