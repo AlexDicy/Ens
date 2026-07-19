@@ -1,8 +1,11 @@
 // The semantic differential harness. It runs the self-hosted pipeline (module graph, declare,
 // link, signatures, layout, checks, bodies) over every program unit the build system lists in a
-// manifest, and enforces that an accepted program produces zero diagnostics. A unit whose seed
-// files carry an @expect-error directive is an expected reject; how many of those the pipeline
-// already catches is reported as an informational scoreboard, never as a failure.
+// manifest, and gates the build in both directions: an accepted program must produce zero
+// diagnostics, and a unit whose seed files carry an @expect-error directive must produce at
+// least one. A seed file may add '// @expect-error-at <phase>' to record that its diagnostic
+// belongs to a later compiler phase sema structurally cannot see; such a unit is exempt from
+// the catch requirement but is always listed, and if sema starts catching it the tag is stale
+// and the gate fails so the exemption list cannot rot.
 //
 // Manifest format, one keyword per line, values separated by one space:
 //   stdlib <folder containing std/>
@@ -10,8 +13,8 @@
 //   source <source root>          the unit's source folder
 //   seed <relative path>          one line per seed file, relative to the source root
 //
-// Exit codes: 0 all accepted units are clean, 1 an accepted unit produced diagnostics,
-// 2 usage or manifest problems.
+// Exit codes: 0 the gate passed, 1 an accepted unit produced diagnostics or an enforced
+// expected-reject was missed or a phase tag is stale, 2 usage or manifest problems.
 import @std.system;
 import SystemError from @std.system;
 import List from @std.collections.list;
@@ -50,6 +53,8 @@ main() -> int {
     long caughtAtBodies = 0;
     long caughtAtExceptions = 0;
     let missed = new List<string>();
+    let deferred = new List<string>();
+    let staleTags = new List<string>();
     let falseRejects = new List<string>();
     let failureLines = new List<string>();
 
@@ -57,6 +62,15 @@ main() -> int {
         let unit = manifest.units.get(i);
         let report = checkUnit(loader, manifest.stdlibRoot, unit);
         if (isExpectedReject(unit)) {
+            string phase = deferredPhase(unit);
+            if (phase.length > 0) {
+                if (report.total() > 0) {
+                    staleTags.push("{unit.label} (tagged {phase})");
+                } else {
+                    deferred.push("{unit.label} -> {phase}");
+                }
+                continue;
+            }
             expectedCount++;
             if (report.total() == 0) {
                 missed.push(unit.label);
@@ -90,24 +104,39 @@ main() -> int {
     }
 
     print("semacheck: checked {manifest.units.length()} unit(s): "
-        + "{acceptedCount} accepted, {expectedCount} expected-reject");
+        + "{acceptedCount} accepted, {expectedCount} expected-reject enforced, "
+        + "{deferred.length() + staleTags.length()} deferred to a later phase");
     print("semacheck: expected-reject caught {caughtCount} of {expectedCount} "
         + "(parse/graph {caughtAtParseOrGraph}, declare/link {caughtAtDeclareOrLink}, "
         + "signatures {caughtAtSignatures}, layout {caughtAtLayout}, "
         + "checks {caughtAtChecks}, bodies {caughtAtBodies}, "
         + "exceptions {caughtAtExceptions})");
+    for (long i = 0; i < deferred.length(); i++) {
+        print("semacheck: deferred: {deferred.get(i)}");
+    }
+    bool failed = false;
     if (missed.length() > 0) {
-        print("semacheck: not yet caught: " + joined(missed));
+        failed = true;
+        print("semacheck: gate FAILED: expected-reject not caught: " + joined(missed));
     }
-    if (falseRejects.length() == 0) {
-        print("semacheck: all accepted units are clean");
-        return 0;
+    if (staleTags.length() > 0) {
+        failed = true;
+        print("semacheck: gate FAILED: stale @expect-error-at tag, sema now catches: "
+            + joined(staleTags) + "; remove the directive");
     }
-    print("semacheck: {falseRejects.length()} accepted unit(s) produced diagnostics");
-    for (long i = 0; i < failureLines.length(); i++) {
-        print(failureLines.get(i));
+    if (falseRejects.length() > 0) {
+        failed = true;
+        print("semacheck: gate FAILED: {falseRejects.length()} accepted unit(s) "
+            + "produced diagnostics");
+        for (long i = 0; i < failureLines.length(); i++) {
+            print(failureLines.get(i));
+        }
     }
-    return 1;
+    if (failed) {
+        return 1;
+    }
+    print("semacheck: gate passed: accepted units clean, all enforced rejects caught");
+    return 0;
 } catch (SystemError e) {
     print("semacheck: {e.message}");
     return 2;
@@ -322,16 +351,43 @@ private isExpectedReject(CheckUnit unit) -> bool {
 private hasExpectErrorDirective(string text) -> bool {
     string[] lines = splitLines(text);
     for (let line in lines) {
-        string trimmed = trimLeading(line);
-        if (!startsWith(trimmed, "//")) {
-            continue;
-        }
-        string comment = trimLeading(trimmed.substring(2, trimmed.length));
+        string comment = commentBody(line);
         if (startsWith(comment, "@expect-error")) {
             return true;
         }
     }
     return false;
+}
+
+// The phase named by an '// @expect-error-at <phase>' directive in any seed file, or "" when
+// the unit carries no such tag. Text after the phase name is a free-form note.
+private deferredPhase(CheckUnit unit) -> string {
+    for (long i = 0; i < unit.seeds.length(); i++) {
+        string text = readOrEmpty(paths.join(unit.sourceRoot, unit.seeds.get(i)));
+        string[] lines = splitLines(text);
+        for (let line in lines) {
+            string comment = commentBody(line);
+            if (!startsWith(comment, "@expect-error-at ")) {
+                continue;
+            }
+            string value = trimLeading(comment.substring("@expect-error-at ".length,
+                comment.length));
+            long space = value.indexOf(" ");
+            if (space < 0) {
+                return value;
+            }
+            return value.substring(0, space);
+        }
+    }
+    return "";
+}
+
+private commentBody(string line) -> string {
+    string trimmed = trimLeading(line);
+    if (!startsWith(trimmed, "//")) {
+        return "";
+    }
+    return trimLeading(trimmed.substring(2, trimmed.length));
 }
 
 private readOrEmpty(string path) -> string {

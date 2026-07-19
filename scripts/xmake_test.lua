@@ -118,8 +118,11 @@ task("test")
             })
         end
 
-        -- the semantic differential harness runs the self-hosted graph/declare/link pipeline
-        -- over every program unit and requires zero diagnostics for every accepted one.
+        -- the semantic differential harness runs the self-hosted sema pipeline over every
+        -- program unit and gates the build in both directions: accepted units must be clean,
+        -- and every @expect-error unit must be rejected unless a seed file tags the diagnostic
+        -- as belonging to a later phase with '// @expect-error-at <phase>' (a tag that sema
+        -- outgrows fails the run as stale, so the exemption list cannot rot).
         if want("semacheck") then
             table.insert(jobs, {
                 name = "semacheck",
