@@ -1,7 +1,8 @@
 // The body phase: every function, method, constructor, destructor, and test body is walked with
 // lexical scopes, and every expression is typed and checked. Cross-module reads are lookups into
-// the frozen declaration universe; the type store is the only shared-mutable point. Nullability
-// diagnostics are deferred behind the nullability module until narrowing exists.
+// the frozen declaration universe; the type store is the only shared-mutable point. Conditions,
+// guards, and straight-line assignments narrow the storage paths they prove, and every read
+// consults those proofs, so nullability and downcast checking see flow-refined types.
 import @ens.frontend.syntax.nodes;
 import SourceFileNode from @ens.frontend.syntax.nodes;
 import StructDeclarationNode from @ens.frontend.syntax.nodes;
@@ -90,7 +91,10 @@ import ExitScope from flow;
 import PanicCalls from flow;
 import literalvalues;
 import members;
-import nullability;
+import narrow;
+import NarrowingPath from narrow;
+import NarrowingState from narrow;
+import PathSegment from narrow;
 import types;
 import Type from types;
 import ErrorType from types;
@@ -164,6 +168,16 @@ private class NamespaceName extends NameResolution {
     constructor(this.targetModulePath);
 }
 
+// One fact a condition can prove: the storage path, the type the check proves for it, and
+// whether the proof holds where the condition is true or where it is false.
+private class NarrowingFact {
+    NarrowingPath path;
+    Type proven;
+    bool narrowsWhenTrue;
+
+    constructor(this.path, this.proven, this.narrowsWhenTrue);
+}
+
 // What a member name means on a receiver type.
 private sealed abstract class MemberLookup {
 }
@@ -184,13 +198,6 @@ private class MissingMember extends MemberLookup {
     constructor();
 }
 
-// A member the narrowing milestone would resolve through the value's dynamic type: missing on
-// an interface receiver, or declared differently by several subclasses. It types as the error
-// type with no diagnostic until narrowing exists.
-private class DeferredMember extends MemberLookup {
-    constructor();
-}
-
 private class BodyChecker implements PanicCalls {
     private ModuleContext context;
     private Map<string, ModuleContext> contextsByPath;
@@ -202,6 +209,8 @@ private class BodyChecker implements PanicCalls {
 
     private Scope? scope;
     private Scope? parameterScope;
+    private NarrowingState narrowing;
+    private LocalBinding? thisBinding;
     private Type? thisType;
     private Type? currentReturnType;
     private bool inConstructor;
@@ -221,6 +230,8 @@ private class BodyChecker implements PanicCalls {
         this.result = context.result();
         this.reporter = new Reporter(context.module().filePath(), collected);
         this.modulePath = context.module().canonicalPath();
+        this.narrowing = new NarrowingState();
+        this.thisBinding = null;
         this.inConstructor = false;
         this.sawSuperCall = false;
         this.inCatchClause = false;
@@ -302,6 +313,8 @@ private class BodyChecker implements PanicCalls {
     private checkTestBody(TestDeclarationNode node) {
         this.parameterScope = new Scope(null);
         this.scope = this.parameterScope;
+        this.narrowing = new NarrowingState();
+        this.thisBinding = null;
         this.thisType = null;
         this.currentReturnType = this.store.primitive(PrimitiveKind.Void);
         this.inConstructor = false;
@@ -322,6 +335,12 @@ private class BodyChecker implements PanicCalls {
         long pushed = this.pushCallableTypeParameters(signature, receiver);
         this.parameterScope = new Scope(null);
         this.scope = this.parameterScope;
+        this.narrowing = new NarrowingState();
+        this.thisBinding = null;
+        if (receiver != null) {
+            this.thisBinding = new LocalBinding("this", receiver, BindingKind.Parameter, true,
+                signature.nameSpan());
+        }
         this.thisType = receiver;
         this.currentReturnType = signature.returnType();
         this.inConstructor = method != null && method.isConstructor();
@@ -364,6 +383,7 @@ private class BodyChecker implements PanicCalls {
 
         this.scope = null;
         this.parameterScope = null;
+        this.thisBinding = null;
         this.thisType = null;
         this.currentReturnType = null;
         this.inConstructor = false;
@@ -496,6 +516,8 @@ private class BodyChecker implements PanicCalls {
         let fields = types.fieldsOf(owner);
         this.parameterScope = null;
         this.scope = new Scope(null);
+        this.narrowing = new NarrowingState();
+        this.thisBinding = null;
         this.thisType = null;
         this.currentReturnType = null;
         for (long i = 0; i < body.membersCount(); i++) {
@@ -511,10 +533,11 @@ private class BodyChecker implements PanicCalls {
                     let value = defaultValue.value();
                     Type actual = this.analyzeExpressionAdapt(value, expected);
                     if (!(expected is ErrorType) && !(actual is ErrorType)
-                            && !nullability.isAssignable(expected, actual)) {
+                            && !convert.isAssignableStrict(expected, actual)) {
                         this.reporter.report("Default value for field '{member.name().text()}': "
                             + "expected '{types.display(expected)}', got "
-                            + "'{types.display(actual)}'", value.span());
+                            + "'{types.display(actual)}'{nullabilityHint(expected, actual)}",
+                            value.span());
                     }
                 }
                 let binding = new LocalBinding(member.name().text(), expected,
@@ -533,6 +556,8 @@ private class BodyChecker implements PanicCalls {
     private checkParameterDefaults(Signature signature, FunctionDeclarationNode node) {
         this.parameterScope = null;
         this.scope = new Scope(null);
+        this.narrowing = new NarrowingState();
+        this.thisBinding = null;
         this.thisType = null;
         this.currentReturnType = null;
         Parameter[] parameters = signature.parameters();
@@ -550,10 +575,11 @@ private class BodyChecker implements PanicCalls {
             let value = defaultValue.value();
             Type actual = this.analyzeExpressionAdapt(value, expected);
             if (!(expected is ErrorType) && !(actual is ErrorType)
-                    && !nullability.isAssignable(expected, actual)) {
+                    && !convert.isAssignableStrict(expected, actual)) {
                 this.reporter.report("Default value for parameter "
                     + "'{parameterNode.name().text()}': expected '{types.display(expected)}', "
-                    + "got '{types.display(actual)}'", value.span());
+                    + "got '{types.display(actual)}'{nullabilityHint(expected, actual)}",
+                    value.span());
             }
         }
         this.scope = null;
@@ -563,6 +589,7 @@ private class BodyChecker implements PanicCalls {
 
     private enterScope() {
         this.scope = new Scope(this.scope);
+        this.narrowing.push();
     }
 
     private leaveScope() {
@@ -570,6 +597,7 @@ private class BodyChecker implements PanicCalls {
         if (current != null) {
             this.scope = current.parent();
         }
+        this.narrowing.pop();
     }
 
     private lookupBinding(string name) -> LocalBinding? {
@@ -605,6 +633,345 @@ private class BodyChecker implements PanicCalls {
             }
         }
         return null;
+    }
+
+    // ---- Narrowing ----
+
+    // The storage path an expression names, or null when the expression is not a narrowable
+    // location: a local or parameter, 'this', or such a root followed by field hops and
+    // subscript hops with literal or plain-identifier indices. 'allowAnyIndex' admits every
+    // other index form as an AnyIndex hop, for write-invalidation queries only.
+    private buildNarrowingPath(Expression expression, bool allowAnyIndex) -> NarrowingPath? {
+        let segments = new List<PathSegment>();
+        let root = this.collectPathSegments(expression, allowAnyIndex, segments);
+        if (root == null) {
+            return null;
+        }
+        return new NarrowingPath(root, segments);
+    }
+
+    private collectPathSegments(Expression expression, bool allowAnyIndex,
+                                List<PathSegment> segments) -> LocalBinding? {
+        Expression core = unwrapParentheses(expression);
+        switch (core) {
+            is IdentifierExpressionNode identifier -> {
+                return this.result.bindingOf(identifier.green());
+            },
+            is ThisExpressionNode ignored -> {
+                return this.thisBinding;
+            },
+            is MemberExpressionNode member -> {
+                let root = this.collectPathSegments(member.object(), allowAnyIndex, segments);
+                if (root == null) {
+                    return null;
+                }
+                segments.push(narrow.fieldSegment(member.member().text()));
+                return root;
+            },
+            is SubscriptExpressionNode subscript -> {
+                let root = this.collectPathSegments(subscript.object(), allowAnyIndex,
+                    segments);
+                if (root == null) {
+                    return null;
+                }
+                if (!this.collectIndexSegment(subscript.index(), allowAnyIndex, segments)) {
+                    return null;
+                }
+                return root;
+            },
+            default -> {
+                return null;
+            },
+        }
+    }
+
+    // Appends the subscript hop for an index expression; false rejects the whole path.
+    private collectIndexSegment(Expression index, bool allowAnyIndex,
+                                List<PathSegment> segments) -> bool {
+        Expression core = unwrapParentheses(index);
+        let literal = integerLiteralOf(core, true);
+        if (literal != null) {
+            let magnitude = literalvalues.integerMagnitude(literal.value().text());
+            if (magnitude != null) {
+                long value = magnitude as long;
+                if (isNegativeLiteral(core)) {
+                    value = 0 - value;
+                }
+                segments.push(narrow.literalIndexSegment(value));
+                return true;
+            }
+        } else if (core is IdentifierExpressionNode) {
+            let binding = this.result.bindingOf(core.green());
+            if (binding != null) {
+                segments.push(narrow.bindingIndexSegment(binding));
+                return true;
+            }
+        }
+        if (allowAnyIndex) {
+            segments.push(narrow.anyIndexSegment());
+            return true;
+        }
+        return false;
+    }
+
+    // Recognizes 'x == null' and 'x != null' over a narrowable path whose analyzed type is
+    // still optional; the equality analysis has already reset a checked operand back to its
+    // declared storage type, so a redundant re-check re-proves the same fact.
+    private detectNullCheck(Expression condition) -> NarrowingFact? {
+        if (!(condition is BinaryExpressionNode)) {
+            return null;
+        }
+        SyntaxKind operator = condition.operator().kind();
+        if (operator != SyntaxKind.EqualsEquals && operator != SyntaxKind.NotEquals) {
+            return null;
+        }
+        Expression left = unwrapParentheses(condition.left());
+        Expression right = unwrapParentheses(condition.right());
+        Expression? checked = null;
+        if (isNullLiteral(right) && !isNullLiteral(left)) {
+            checked = left;
+        } else if (isNullLiteral(left) && !isNullLiteral(right)) {
+            checked = right;
+        }
+        if (checked == null) {
+            return null;
+        }
+        let checkedType = this.result.typeOf(checked.green());
+        if (!(checkedType is OptionalType)) {
+            return null;
+        }
+        let path = this.buildNarrowingPath(checked, false);
+        if (path == null) {
+            return null;
+        }
+        return new NarrowingFact(path, checkedType.inner(),
+            operator == SyntaxKind.NotEquals);
+    }
+
+    // A type test proves its operand is the target exactly when the test succeeds, so the
+    // fact carries only positive polarity: failing a bare 'is' proves nothing. A '!' around
+    // the test flips the polarity in collectNarrowings.
+    private detectTypeTest(TypeTestExpressionNode test) -> NarrowingFact? {
+        let testType = this.result.typeOf(test.green());
+        if (testType == null || !convert.isBoolType(testType)) {
+            return null;
+        }
+        let target = this.result.typeOf(test.target().green());
+        if (target == null || target is OptionalType || !types.isClassLike(target)) {
+            return null;
+        }
+        let path = this.buildNarrowingPath(test.value(), false);
+        if (path == null) {
+            return null;
+        }
+        return new NarrowingFact(path, target, true);
+    }
+
+    // The facts a condition proves on the side where it evaluated to 'conditionHolds':
+    // negation flips the polarity, '&&' facts hold where the conjunction held, '||' facts
+    // hold where the disjunction failed, and both descend into their operands.
+    private collectNarrowings(Expression condition, bool conditionHolds,
+                              List<NarrowingFact> sink) {
+        Expression core = unwrapParentheses(condition);
+        if (core is PrefixExpressionNode
+                && core.operator().kind() == SyntaxKind.Exclamation) {
+            this.collectNarrowings(core.operand(), !conditionHolds, sink);
+            return;
+        }
+        if (core is TypeTestExpressionNode) {
+            let fact = this.detectTypeTest(core);
+            if (fact != null && conditionHolds) {
+                sink.push(fact);
+            }
+            return;
+        }
+        if (core is BinaryExpressionNode) {
+            SyntaxKind operator = core.operator().kind();
+            bool descend = (conditionHolds && operator == SyntaxKind.AmpersandAmpersand)
+                || (!conditionHolds && operator == SyntaxKind.PipePipe);
+            if (descend) {
+                this.collectNarrowings(core.left(), conditionHolds, sink);
+                this.collectNarrowings(core.right(), conditionHolds, sink);
+                return;
+            }
+        }
+        let fact = this.detectNullCheck(core);
+        if (fact != null && fact.narrowsWhenTrue == conditionHolds) {
+            sink.push(fact);
+        }
+    }
+
+    private applyFacts(List<NarrowingFact> facts) {
+        for (long i = 0; i < facts.length(); i++) {
+            this.narrowing.narrow(facts.get(i).path, facts.get(i).proven);
+        }
+    }
+
+    private walkBranch(BlockNode block, List<NarrowingFact> facts) {
+        this.enterScope();
+        this.applyFacts(facts);
+        this.walkBlock(block);
+        this.leaveScope();
+    }
+
+    // Analyzes a branch expression under the facts the condition proves on its side: a
+    // ternary branch, or the right operand of a short-circuit operator.
+    private analyzeGuardedBranch(Expression condition, Expression branch, bool conditionHolds)
+            -> Type {
+        let facts = new List<NarrowingFact>();
+        this.collectNarrowings(condition, conditionHolds, facts);
+        this.narrowing.push();
+        this.applyFacts(facts);
+        Type analyzed = this.analyzeExpression(branch);
+        this.narrowing.pop();
+        return analyzed;
+    }
+
+    // The declared type of the storage an expression reads, or null when it reads no single
+    // declared slot: the binding's, 'this's, field's, or array element's own type.
+    private declaredSlotType(Expression expression) -> Type? {
+        Expression core = unwrapParentheses(expression);
+        switch (core) {
+            is IdentifierExpressionNode identifier -> {
+                let binding = this.result.bindingOf(identifier.green());
+                if (binding == null) {
+                    return null;
+                }
+                return binding.type();
+            },
+            is ThisExpressionNode ignored -> {
+                return this.thisType;
+            },
+            is MemberExpressionNode member -> {
+                let objectType = this.result.typeOf(member.object().green());
+                if (objectType == null) {
+                    return null;
+                }
+                let field = members.findField(types.fieldsOf(objectType),
+                    member.member().text());
+                if (field == null) {
+                    return null;
+                }
+                return field.type();
+            },
+            is SubscriptExpressionNode subscript -> {
+                let objectType = this.result.typeOf(subscript.object().green());
+                if (objectType is ArrayType) {
+                    return objectType.element();
+                }
+                return null;
+            },
+            default -> {
+                return null;
+            },
+        }
+    }
+
+    // A presence operator ('== null', '!= null', '??', '?.', '?[') consults the declared
+    // storage type, so a re-check of a proven-non-null declared-optional stays legal; the
+    // operand is retyped back to the declared type, and a declared non-optional keeps its
+    // analyzed type and is rejected by the operator's own rule.
+    private presenceOperandType(Expression operand, Type analyzed) -> Type {
+        let declared = this.declaredSlotType(operand);
+        if (declared == null || !(declared is OptionalType) || declared == analyzed) {
+            return analyzed;
+        }
+        Expression current = operand;
+        this.result.setType(current.green(), declared);
+        while (current is ParenthesizedExpressionNode) {
+            current = current.inner();
+            this.result.setType(current.green(), declared);
+        }
+        return declared;
+    }
+
+    // Assigning a statically non-null value to a plain binding of optional declared type
+    // narrows the binding from that point on; declaration initializers come through here too.
+    private establishAssignmentNarrowing(LocalBinding binding, Type value) {
+        let declared = binding.type();
+        if (!(declared is OptionalType)) {
+            return;
+        }
+        if (value is ErrorType || value is NullType || value is OptionalType) {
+            return;
+        }
+        if (!convert.isAssignableStrict(declared.inner(), value)) {
+            return;
+        }
+        this.narrowing.narrow(narrow.bindingPath(binding), declared.inner());
+    }
+
+    // A write into the storage an expression names drops every narrowing the write could
+    // reach: the whole root for a binding write (and every path indexed through it), and the
+    // may-alias cone for a member or subscript write.
+    private invalidateForWrite(Expression target) {
+        if (target is IdentifierExpressionNode) {
+            let binding = this.result.bindingOf(target.green());
+            if (binding != null) {
+                this.narrowing.clearForRoot(binding);
+                this.narrowing.clearForIndexBinding(binding);
+                return;
+            }
+        }
+        if (target is MemberExpressionNode || target is SubscriptExpressionNode) {
+            let path = this.buildNarrowingPath(target, true);
+            if (path != null) {
+                this.narrowing.clearMayAlias(path);
+            }
+        }
+    }
+
+    // A call drops every member-path narrowing rooted at a value it touches - the receiver
+    // and each class or array argument - since the callee may mutate the state reachable from
+    // them. A plain binding's own narrowing survives: no callee can reassign the caller's
+    // binding, and the binding's reference keeps the narrowed object alive.
+    private clearNarrowingsForCall(CallExpressionNode node) {
+        switch (node.callee()) {
+            is MemberExpressionNode member -> {
+                this.dropTouchedByCall(member.object());
+            },
+            is SafeMemberExpressionNode member -> {
+                this.dropTouchedByCall(member.object());
+            },
+            default -> { },
+        }
+        let arguments = node.arguments();
+        for (long i = 0; i < arguments.argumentsCount(); i++) {
+            Expression? value = null;
+            switch (arguments.arguments(i)) {
+                is NamedArgumentNode named -> {
+                    value = named.value();
+                },
+                is OutArgumentNode ignored -> { },
+                is Expression plain -> {
+                    value = plain;
+                },
+                default -> { },
+            }
+            if (value == null) {
+                continue;
+            }
+            let argumentType = this.result.typeOf(value.green());
+            if (argumentType == null) {
+                continue;
+            }
+            Type bare = convert.bareOf(argumentType);
+            if (types.isClassLike(bare) || bare is ArrayType) {
+                this.dropTouchedByCall(value);
+            }
+        }
+    }
+
+    private dropTouchedByCall(Expression touched) {
+        let path = this.buildNarrowingPath(touched, false);
+        if (path == null) {
+            return;
+        }
+        if (path.segmentCount() == 0) {
+            this.narrowing.clearForRootMembers(path.root());
+        } else {
+            this.narrowing.clearForRoot(path.root());
+        }
     }
 
     // ---- Statements ----
@@ -693,6 +1060,13 @@ private class BodyChecker implements PanicCalls {
             node.name().span());
         this.defineLocal(binding, node.name().span());
         this.result.setBinding(node.green(), binding);
+        let initializer = node.initializer();
+        if (initializer != null) {
+            let initType = this.result.typeOf(initializer.value().green());
+            if (initType != null) {
+                this.establishAssignmentNarrowing(binding, initType);
+            }
+        }
     }
 
     private checkInferredDeclaration(VariableDeclarationNode node, string name) -> Type {
@@ -721,10 +1095,10 @@ private class BodyChecker implements PanicCalls {
         if (initializer != null) {
             Type initType = this.analyzeExpressionAdapt(initializer.value(), declared);
             if (!(declared is ErrorType) && !(initType is ErrorType)
-                    && !nullability.isAssignable(declared, initType)) {
+                    && !convert.isAssignableStrict(declared, initType)) {
                 this.reporter.report("Cannot assign value of type '{types.display(initType)}' "
-                    + "to variable of type '{types.display(declared)}'",
-                    initializer.value().span());
+                    + "to variable of type '{types.display(declared)}'"
+                    + "{nullabilityHint(declared, initType)}", initializer.value().span());
             }
             return declared;
         }
@@ -763,12 +1137,16 @@ private class BodyChecker implements PanicCalls {
     private checkIfStatement(IfStatementNode node) {
         Type condition = this.analyzeExpression(node.condition());
         this.checkConditionIsBool(condition, "If condition", node.condition().span());
-        this.walkScopedBlock(node.thenBranch());
+        let whenTrue = new List<NarrowingFact>();
+        let whenFalse = new List<NarrowingFact>();
+        this.collectNarrowings(node.condition(), true, whenTrue);
+        this.collectNarrowings(node.condition(), false, whenFalse);
+        this.walkBranch(node.thenBranch(), whenTrue);
         let elseClause = node.elseClause();
         if (elseClause != null) {
             switch (elseClause.body()) {
                 is BlockNode block -> {
-                    this.walkScopedBlock(block);
+                    this.walkBranch(block, whenFalse);
                 },
                 is IfStatementNode chained -> {
                     this.checkIfStatement(chained);
@@ -776,13 +1154,48 @@ private class BodyChecker implements PanicCalls {
                 default -> { },
             }
         }
+        this.carrySurvivingNarrowings(node, whenTrue, whenFalse);
     }
 
+    // When one branch of an 'if' always exits, the opposite side's facts survive into the
+    // code after it, so a guard like 'if (x == null) { return; }' narrows the rest of the
+    // block. Inside a loop, 'break' and 'continue' also exit the branch.
+    private carrySurvivingNarrowings(IfStatementNode node, List<NarrowingFact> whenTrue,
+                                     List<NarrowingFact> whenFalse) {
+        ExitScope exit = ExitScope.Function;
+        if (this.loopDepth > 0) {
+            exit = ExitScope.Branch;
+        }
+        bool thenExits = flow.blockTerminates(node.thenBranch(), exit, this);
+        bool elseExits = false;
+        let elseClause = node.elseClause();
+        if (elseClause != null) {
+            switch (elseClause.body()) {
+                is IfStatementNode chained -> {
+                    elseExits = flow.ifTerminates(chained, exit, this);
+                },
+                is BlockNode block -> {
+                    elseExits = flow.blockTerminates(block, exit, this);
+                },
+                default -> { },
+            }
+        }
+        if (thenExits && !elseExits) {
+            this.applyFacts(whenFalse);
+        } else if (elseExits && !thenExits && elseClause != null) {
+            this.applyFacts(whenTrue);
+        }
+    }
+
+    // The condition is rechecked every iteration and body writes drop narrowing at their own
+    // point, so condition narrowing is safe in the body.
     private checkWhileStatement(WhileStatementNode node) {
         Type condition = this.analyzeExpression(node.condition());
         this.checkConditionIsBool(condition, "While condition", node.condition().span());
+        let facts = new List<NarrowingFact>();
+        this.collectNarrowings(node.condition(), true, facts);
         this.loopDepth++;
-        this.walkScopedBlock(node.body());
+        this.walkBranch(node.body(), facts);
         this.loopDepth--;
     }
 
@@ -800,13 +1213,16 @@ private class BodyChecker implements PanicCalls {
                 default -> { },
             }
         }
+        let facts = new List<NarrowingFact>();
         let condition = node.condition();
         if (condition != null) {
             Type conditionType = this.analyzeExpression(condition);
             this.checkConditionIsBool(conditionType, "For condition", condition.span());
+            this.collectNarrowings(condition, true, facts);
         }
         this.loopDepth++;
         this.enterScope();
+        this.applyFacts(facts);
         this.walkBlock(node.body());
         let update = node.update();
         if (update != null) {
@@ -817,19 +1233,23 @@ private class BodyChecker implements PanicCalls {
         this.leaveScope();
     }
 
-    // The loop needs an array or a value whose class implements 'Iterable<T>'; the element
-    // binding takes its annotated type when one is written and the element type otherwise. A
-    // nullable iterable reads as its inner type until narrowing exists.
+    // The loop needs an array or a value whose class implements 'Iterable<T>', proven
+    // non-null; the element binding takes its annotated type when one is written and the
+    // element type otherwise.
     private checkForEachStatement(ForEachStatementNode node) {
         this.enterScope();
         Type iterable = this.analyzeExpression(node.iterable());
         Type element = this.store.errorType();
         if (!(iterable is ErrorType)) {
-            Type core = nullability.valueOf(iterable);
-            if (core is ArrayType) {
-                element = core.element();
-            } else if (types.isClassLike(core)) {
-                element = this.iterableElementType(core, node.iterable().span());
+            if (iterable is OptionalType) {
+                this.reporter.report("'for (... in ...)' cannot iterate "
+                    + "'{types.display(iterable)}' because it may be null. Check it for null "
+                    + "first ('if (value != null)'), or supply a fallback with '??'.",
+                    node.iterable().span());
+            } else if (iterable is ArrayType) {
+                element = iterable.element();
+            } else if (types.isClassLike(iterable)) {
+                element = this.iterableElementType(iterable, node.iterable().span());
             } else {
                 this.reporter.report("'for (... in ...)' requires an array or an iterable "
                     + "object, got '{types.display(iterable)}'. A class is iterable when it "
@@ -842,7 +1262,7 @@ private class BodyChecker implements PanicCalls {
         if (declaredType != null) {
             Type declared = this.resolver.resolveType(declaredType);
             if (!(declared is ErrorType) && !(element is ErrorType)
-                    && !nullability.isAssignable(declared, element)) {
+                    && !convert.isAssignableStrict(declared, element)) {
                 this.reporter.report("Loop variable of type '{types.display(declared)}' cannot "
                     + "hold the '{types.display(element)}' values this sequence yields. Declare "
                     + "it as '{types.display(element)}' or a type '{types.display(element)}' fits "
@@ -917,23 +1337,22 @@ private class BodyChecker implements PanicCalls {
                 value.span());
             return;
         }
-        if (!nullability.isAssignable(expected, actual)) {
+        if (!convert.isAssignableStrict(expected, actual)) {
             this.reporter.report("Cannot return value of type '{types.display(actual)}' from "
-                + "function returning '{types.display(expected)}'", value.span());
+                + "function returning '{types.display(expected)}'"
+                + "{nullabilityHint(expected, actual)}", value.span());
         }
     }
 
-    // A thrown value must be an 'Error' or a subclass of it; a nullable operand reads as its
-    // inner type until narrowing exists.
+    // A thrown value must be an 'Error' or a subclass of it, proven non-null.
     private checkThrowStatement(ThrowStatementNode node) {
         Type thrown = this.analyzeExpression(node.value());
         if (thrown is ErrorType) {
             return;
         }
-        Type core = nullability.valueOf(thrown);
         let errorClass = this.resolver.errorClass();
-        bool allowed = errorClass != null && types.isClassLike(core)
-            && types.isSubclassOf(core, errorClass);
+        bool allowed = errorClass != null && types.isClassLike(thrown)
+            && types.isSubclassOf(thrown, errorClass);
         if (!allowed) {
             this.reporter.report("Cannot throw a value of type '{types.display(thrown)}'; "
                 + "only 'Error' or a subclass of it can be thrown.", node.value().span());
@@ -941,8 +1360,7 @@ private class BodyChecker implements PanicCalls {
     }
 
     private checkConditionIsBool(Type condition, string what, Span span) {
-        Type core = nullability.valueOf(condition);
-        if (!(core is ErrorType) && !convert.isBoolType(core)) {
+        if (!(condition is ErrorType) && !convert.isBoolType(condition)) {
             this.reporter.report("{what} must be 'bool', got '{types.display(condition)}'",
                 span);
         }
@@ -1184,6 +1602,10 @@ private class BodyChecker implements PanicCalls {
         switch (resolution) {
             is LocalName local -> {
                 this.result.setBinding(node.green(), local.binding);
+                let proven = this.narrowing.provenType(narrow.bindingPath(local.binding));
+                if (proven != null) {
+                    return proven;
+                }
                 return local.binding.type();
             },
             is FunctionName ignored -> {
@@ -1231,19 +1653,24 @@ private class BodyChecker implements PanicCalls {
 
     private analyzeBinary(BinaryExpressionNode node) -> Type {
         SyntaxKind operator = node.operator().kind();
-        Type left = this.analyzeExpression(node.left());
-        Type right = this.analyzeExpression(node.right());
+        // '&&' and '||' evaluate the right side only when the left did not already decide
+        // the result, so a check on the left narrows the right: 'x != null && x.ready()'.
         if (operator == SyntaxKind.AmpersandAmpersand || operator == SyntaxKind.PipePipe) {
-            if (left is ErrorType || right is ErrorType) {
+            Type shortLeft = this.analyzeExpression(node.left());
+            Type shortRight = this.analyzeGuardedBranch(node.left(), node.right(),
+                operator == SyntaxKind.AmpersandAmpersand);
+            if (shortLeft is ErrorType || shortRight is ErrorType) {
                 return this.store.errorType();
             }
-            if (!convert.isBoolType(nullability.valueOf(left))
-                    || !convert.isBoolType(nullability.valueOf(right))) {
+            if (!convert.isBoolType(shortLeft) || !convert.isBoolType(shortRight)) {
                 this.reporter.report("Logical operator requires bool operands, got "
-                    + "'{types.display(left)}' and '{types.display(right)}'", node.span());
+                    + "'{types.display(shortLeft)}' and '{types.display(shortRight)}'",
+                    node.span());
             }
             return this.store.primitive(PrimitiveKind.Bool);
         }
+        Type left = this.analyzeExpression(node.left());
+        Type right = this.analyzeExpression(node.right());
         if (left is ErrorType || right is ErrorType) {
             return this.store.errorType();
         }
@@ -1258,15 +1685,13 @@ private class BodyChecker implements PanicCalls {
                 return this.analyzeComparison(node, left, right);
             },
             Ampersand, Pipe, Caret, LessLess, GreaterGreater, GreaterGreaterGreater -> {
-                Type leftCore = nullability.valueOf(left);
-                Type rightCore = nullability.valueOf(right);
-                if (!convert.isIntegerType(leftCore) || !convert.isIntegerType(rightCore)
-                        || leftCore != rightCore) {
+                if (!convert.isIntegerType(left) || !convert.isIntegerType(right)
+                        || left != right) {
                     this.reporter.report("Bitwise operator requires matching integer operands, "
                         + "got '{types.display(left)}' and '{types.display(right)}'",
                         node.span());
                 }
-                return leftCore;
+                return left;
             },
             default -> {
                 this.reporter.report("Unsupported binary operator", node.operator().span());
@@ -1295,30 +1720,26 @@ private class BodyChecker implements PanicCalls {
 
     private analyzeArithmetic(BinaryExpressionNode node, SyntaxKind operator, Type left,
                               Type right) -> Type {
-        Type leftCore = nullability.valueOf(left);
-        Type rightCore = nullability.valueOf(right);
-        if (operator == SyntaxKind.Plus
-                && (leftCore is StringType || rightCore is StringType)) {
-            if (isStringable(leftCore) && isStringable(rightCore)) {
+        if (operator == SyntaxKind.Plus && (left is StringType || right is StringType)) {
+            if (isStringable(left) && isStringable(right)) {
                 return this.store.stringType();
             }
-            Type other = leftCore;
-            if (leftCore is StringType) {
-                other = rightCore;
+            Type other = left;
+            if (left is StringType) {
+                other = right;
             }
             this.reporter.report("Cannot concatenate a value of type '{types.display(other)}' "
                 + "onto a string; only string, integer, and bool values are supported.",
                 node.span());
             return this.store.errorType();
         }
-        if (!convert.isNumericType(leftCore) || !convert.isNumericType(rightCore)) {
+        if (!convert.isNumericType(left) || !convert.isNumericType(right)) {
             this.reporter.report("Operator requires numeric operands, got "
                 + "'{types.display(left)}' and '{types.display(right)}'", node.span());
             return this.store.errorType();
         }
-        Type[] adapted = this.adaptOperands(node, leftCore, rightCore);
-        let common = convert.numericCommonType(nullability.valueOf(adapted[0]),
-            nullability.valueOf(adapted[1]));
+        Type[] adapted = this.adaptOperands(node, left, right);
+        let common = convert.numericCommonType(adapted[0], adapted[1]);
         if (common == null) {
             this.reporter.report("Operands must be the same type, got "
                 + "'{types.display(adapted[0])}' and '{types.display(adapted[1])}'",
@@ -1328,33 +1749,35 @@ private class BodyChecker implements PanicCalls {
         return common;
     }
 
+    // A comparison against 'null' is a presence test on the declared storage type, so it
+    // stays legal on a binding declared optional even where narrowing already proved the
+    // value non-null.
     private analyzeEquality(BinaryExpressionNode node, Type left, Type right) -> Type {
         Type[] adapted = this.adaptOperands(node, left, right);
         Type leftSide = adapted[0];
         Type rightSide = adapted[1];
-        // A comparison against 'null' is a presence test on the declared storage type; without
-        // narrowing the analyzed type is already the declared one.
-        if (!(leftSide is NullType) && !(rightSide is NullType)) {
-            if (!nullability.isAssignable(leftSide, rightSide)
-                    && !nullability.isAssignable(rightSide, leftSide)) {
-                this.reporter.report("Cannot compare '{types.display(leftSide)}' and "
-                    + "'{types.display(rightSide)}'", node.span());
-            }
+        if (rightSide is NullType) {
+            leftSide = this.presenceOperandType(node.left(), leftSide);
+        } else if (leftSide is NullType) {
+            rightSide = this.presenceOperandType(node.right(), rightSide);
+        }
+        if (!convert.isAssignableStrict(leftSide, rightSide)
+                && !convert.isAssignableStrict(rightSide, leftSide)) {
+            this.reporter.report("Cannot compare '{types.display(leftSide)}' and "
+                + "'{types.display(rightSide)}'{nullComparisonHint(leftSide, rightSide)}",
+                node.span());
         }
         return this.store.primitive(PrimitiveKind.Bool);
     }
 
     private analyzeComparison(BinaryExpressionNode node, Type left, Type right) -> Type {
-        Type leftCore = nullability.valueOf(left);
-        Type rightCore = nullability.valueOf(right);
-        if (!convert.isNumericType(leftCore) || !convert.isNumericType(rightCore)) {
+        if (!convert.isNumericType(left) || !convert.isNumericType(right)) {
             this.reporter.report("Comparison requires numeric operands, got "
                 + "'{types.display(left)}' and '{types.display(right)}'", node.span());
             return this.store.primitive(PrimitiveKind.Bool);
         }
-        Type[] adapted = this.adaptOperands(node, leftCore, rightCore);
-        if (convert.numericCommonType(nullability.valueOf(adapted[0]),
-                nullability.valueOf(adapted[1])) == null) {
+        Type[] adapted = this.adaptOperands(node, left, right);
+        if (convert.numericCommonType(adapted[0], adapted[1]) == null) {
             this.reporter.report("Comparison requires matching numeric operands, got "
                 + "'{types.display(adapted[0])}' and '{types.display(adapted[1])}'",
                 node.span());
@@ -1367,7 +1790,7 @@ private class BodyChecker implements PanicCalls {
         if (operand is ErrorType) {
             return this.store.errorType();
         }
-        Type core = nullability.valueOf(operand);
+        Type core = operand;
         switch (node.operator().kind()) {
             Minus, Plus -> {
                 if (!convert.isNumericType(core)) {
@@ -1401,7 +1824,7 @@ private class BodyChecker implements PanicCalls {
         if (operand is ErrorType) {
             return this.store.errorType();
         }
-        return this.analyzeIncrement(node.span(), node.operand(), nullability.valueOf(operand),
+        return this.analyzeIncrement(node.span(), node.operand(), operand,
             node.operator().kind() == SyntaxKind.PlusPlus, false);
     }
 
@@ -1434,8 +1857,10 @@ private class BodyChecker implements PanicCalls {
                 this.reporter.report("The '{operator}' operator cannot change "
                     + "'{binding.name()}' because it is declared as constant; use 'let' "
                     + "instead of 'const' if it needs to change.", span);
+                return operandType;
             }
         }
+        this.invalidateForWrite(operand);
         return operandType;
     }
 
@@ -1474,12 +1899,20 @@ private class BodyChecker implements PanicCalls {
         Type assignTarget = this.declaredTargetType(node.target(), targetType);
         Type valueType = this.analyzeExpressionAdapt(node.value(), assignTarget);
         if (!(assignTarget is ErrorType) && !(valueType is ErrorType)
-                && !nullability.isAssignable(assignTarget, valueType)) {
+                && !convert.isAssignableStrict(assignTarget, valueType)) {
             this.reporter.report("Cannot assign '{types.display(valueType)}' to "
-                + "'{types.display(assignTarget)}'", node.span());
+                + "'{types.display(assignTarget)}'{nullabilityHint(assignTarget, valueType)}",
+                node.span());
         }
         if (assignTarget != targetType) {
             this.result.setType(node.target().green(), assignTarget);
+        }
+        this.invalidateForWrite(node.target());
+        if (node.target() is IdentifierExpressionNode) {
+            let binding = this.result.bindingOf(node.target().green());
+            if (binding != null) {
+                this.establishAssignmentNarrowing(binding, valueType);
+            }
         }
         return assignTarget;
     }
@@ -1501,8 +1934,7 @@ private class BodyChecker implements PanicCalls {
             is MemberExpressionNode member -> {
                 let objectType = this.result.typeOf(member.object().green());
                 if (objectType != null) {
-                    Type core = nullability.valueOf(objectType);
-                    let field = members.findField(types.fieldsOf(core),
+                    let field = members.findField(types.fieldsOf(objectType),
                         member.member().text());
                     if (field != null) {
                         return field.type();
@@ -1512,11 +1944,8 @@ private class BodyChecker implements PanicCalls {
             },
             is SubscriptExpressionNode subscript -> {
                 let objectType = this.result.typeOf(subscript.object().green());
-                if (objectType != null) {
-                    Type core = nullability.valueOf(objectType);
-                    if (core is ArrayType) {
-                        return core.element();
-                    }
+                if (objectType is ArrayType) {
+                    return objectType.element();
                 }
                 return analyzed;
             },
@@ -1528,8 +1957,8 @@ private class BodyChecker implements PanicCalls {
 
     private analyzeTernary(TernaryExpressionNode node) -> Type {
         Type condition = this.analyzeExpression(node.condition());
-        Type thenType = this.analyzeExpression(node.thenValue());
-        Type elseType = this.analyzeExpression(node.elseValue());
+        Type thenType = this.analyzeGuardedBranch(node.condition(), node.thenValue(), true);
+        Type elseType = this.analyzeGuardedBranch(node.condition(), node.elseValue(), false);
         this.checkConditionIsBool(condition, "Ternary condition", node.condition().span());
         if (thenType is ErrorType || elseType is ErrorType) {
             return this.store.errorType();
@@ -1553,27 +1982,32 @@ private class BodyChecker implements PanicCalls {
         return this.store.errorType();
     }
 
+    // '??' is a presence test on the left's declared storage type, so a binding declared
+    // optional keeps it legal even after narrowing proved the value non-null; the check is
+    // then constant and yields the value.
     private analyzeNullCoalesce(NullCoalesceExpressionNode node) -> Type {
         Type left = this.analyzeExpression(node.left());
         Type right = this.analyzeExpression(node.right());
         if (left is ErrorType || right is ErrorType) {
             return this.store.errorType();
         }
-        // A non-nullable left side is deferred to the nullability milestone; it reads as its
-        // own type here.
-        if (left is OptionalType) {
-            Type unwrapped = left.inner();
-            if (nullability.isAssignable(unwrapped, right)) {
-                return unwrapped;
-            }
-            if (nullability.isAssignable(left, right)) {
-                return left;
-            }
-            this.reporter.report("Right of '??' has type '{types.display(right)}' which is "
-                + "not compatible with '{types.display(unwrapped)}'", node.span());
+        left = this.presenceOperandType(node.left(), left);
+        if (!(left is OptionalType)) {
+            this.reporter.report("Left of '??' must be a nullable value, got "
+                + "'{types.display(left)}'. '??' supplies a fallback for null, so remove it "
+                + "here, or make the left side nullable.", node.span());
             return this.store.errorType();
         }
-        return nullability.coalesceOperand(left);
+        Type unwrapped = left.inner();
+        if (convert.isAssignableStrict(unwrapped, right)) {
+            return unwrapped;
+        }
+        if (convert.isAssignableStrict(left, right)) {
+            return left;
+        }
+        this.reporter.report("Right of '??' has type '{types.display(right)}' which is "
+            + "not compatible with '{types.display(unwrapped)}'", node.span());
+        return this.store.errorType();
     }
 
     private analyzeCast(CastExpressionNode node) -> Type {
@@ -1582,8 +2016,7 @@ private class BodyChecker implements PanicCalls {
         if (source is ErrorType || target is ErrorType) {
             return this.store.errorType();
         }
-        Type core = nullability.valueOf(source);
-        if (!convert.isNumericType(core) || !convert.isNumericType(target)) {
+        if (!convert.isNumericType(source) || !convert.isNumericType(target)) {
             this.reporter.report("Cannot cast '{types.display(source)}' to "
                 + "'{types.display(target)}'; 'as' only supports numeric conversions.",
                 node.span());
@@ -1595,6 +2028,7 @@ private class BodyChecker implements PanicCalls {
     private analyzeTypeTest(TypeTestExpressionNode node) -> Type {
         Type source = this.analyzeExpression(node.value());
         Type target = this.resolver.resolveType(node.target());
+        this.result.setType(node.target().green(), target);
         if (source is ErrorType || target is ErrorType) {
             return this.store.errorType();
         }
@@ -1707,10 +2141,25 @@ private class BodyChecker implements PanicCalls {
         if (objectType is ErrorType) {
             return this.store.errorType();
         }
-        Type core = nullability.valueOf(objectType);
-        if (core is ArrayType) {
+        if (objectType is OptionalType && objectType.inner() is ArrayType) {
+            this.reporter.report("Cannot index '{types.display(objectType)}' because it may "
+                + "be null. Check it for null first ('if (value != null)'), or use '?[' to "
+                + "index it only when it is present.", node.span());
+            return this.store.errorType();
+        }
+        if (objectType is ArrayType) {
             this.checkIndexIsInteger(indexType, node.index().span());
-            return core.element();
+            Type element = objectType.element();
+            if (element is OptionalType || types.isClassLike(element)) {
+                let path = this.buildNarrowingPath(node, false);
+                if (path != null) {
+                    let proven = this.narrowing.provenType(path);
+                    if (proven != null) {
+                        return proven;
+                    }
+                }
+            }
+            return element;
         }
         this.reporter.report("Cannot index '{types.display(objectType)}'; only arrays "
             + "support [] indexing.", node.span());
@@ -1723,22 +2172,25 @@ private class BodyChecker implements PanicCalls {
         if (objectType is ErrorType) {
             return this.store.errorType();
         }
-        Type inner = nullability.safeReceiverInner(objectType);
+        objectType = this.presenceOperandType(node.object(), objectType);
+        if (!(objectType is OptionalType)) {
+            this.reporter.report("The value on the left of '?[' has type "
+                + "'{types.display(objectType)}', which can never be null. Use '[' to index "
+                + "it.", node.span());
+            return this.store.errorType();
+        }
+        Type inner = objectType.inner();
         if (inner is ArrayType) {
             this.checkIndexIsInteger(indexType, node.index().span());
             return this.store.optionalOf(inner.element());
         }
-        if (objectType is OptionalType) {
-            this.reporter.report("The value on the left of '?[' has type "
-                + "'{types.display(objectType)}', which is not a nullable array.",
-                node.span());
-        }
+        this.reporter.report("The value on the left of '?[' has type "
+            + "'{types.display(objectType)}', which is not a nullable array.", node.span());
         return this.store.errorType();
     }
 
     private checkIndexIsInteger(Type indexType, Span span) {
-        Type core = nullability.valueOf(indexType);
-        if (!(core is ErrorType) && !convert.isIntegerType(core)) {
+        if (!(indexType is ErrorType) && !convert.isIntegerType(indexType)) {
             this.reporter.report("Array index must be an integer, got "
                 + "'{types.display(indexType)}'", span);
         }
@@ -1759,12 +2211,18 @@ private class BodyChecker implements PanicCalls {
         if (analyzed is ErrorType) {
             return;
         }
-        Type core = nullability.valueOf(analyzed);
-        if (core is TypeParamType) {
+        if (analyzed is TypeParamType) {
             return;
         }
-        if (convert.isIntegerType(core) || convert.isBoolType(core) || core is StringType
-                || convert.isEnumLike(core)) {
+        if (convert.isIntegerType(analyzed) || convert.isBoolType(analyzed)
+                || analyzed is StringType || convert.isEnumLike(analyzed)) {
+            return;
+        }
+        if (analyzed is OptionalType) {
+            this.reporter.report("Cannot interpolate a value of type "
+                + "'{types.display(analyzed)}' because it may be null. Check it for null "
+                + "first ('if (value != null)'), or supply a fallback with '??'.",
+                hole.span());
             return;
         }
         this.reporter.report("Cannot interpolate a value of type '{types.display(analyzed)}'; "
@@ -1808,10 +2266,10 @@ private class BodyChecker implements PanicCalls {
             if (actual is ErrorType) {
                 continue;
             }
-            if (!nullability.isAssignable(elementType, actual)) {
+            if (!convert.isAssignableStrict(elementType, actual)) {
                 this.reporter.report("Element {i + 1}: expected "
-                    + "'{types.display(elementType)}', got '{types.display(actual)}'.",
-                    node.elements(i).span());
+                    + "'{types.display(elementType)}', got '{types.display(actual)}'"
+                    + "{nullabilityHint(elementType, actual)}", node.elements(i).span());
             }
         }
         return this.store.arrayOf(elementType);
@@ -1831,10 +2289,10 @@ private class BodyChecker implements PanicCalls {
                 if (actual is ErrorType) {
                     continue;
                 }
-                if (!nullability.isAssignable(elementType, actual)) {
+                if (!convert.isAssignableStrict(elementType, actual)) {
                     this.reporter.report("Element {i + 1}: expected "
-                        + "'{types.display(elementType)}', got '{types.display(actual)}'.",
-                        node.elements(i).span());
+                        + "'{types.display(elementType)}', got '{types.display(actual)}'"
+                        + "{nullabilityHint(elementType, actual)}", node.elements(i).span());
                 }
             }
             return arrayType;
@@ -1849,11 +2307,11 @@ private class BodyChecker implements PanicCalls {
 
     // ---- Member access ----
 
-    // The type whose members a receiver exposes: an optional reads as its inner type (the
-    // "may be null" diagnostic is the narrowing milestone's), and a bounded type parameter
-    // exposes the members of its bounds, the first bound declaring the member winning.
+    // The type whose members a receiver exposes: a bounded type parameter exposes the members
+    // of its bounds, the first bound declaring the member winning. Optional receivers are
+    // rejected before this point.
     private memberReceiverCore(Type analyzed, string memberName) -> Type {
-        Type core = nullability.valueOf(analyzed);
+        Type core = analyzed;
         if (core is TypeParamType) {
             Type[] bounds = core.bounds();
             for (let bound in bounds) {
@@ -1876,16 +2334,6 @@ private class BodyChecker implements PanicCalls {
         let candidates = methodCandidates(record, name);
         if (candidates.length() > 0) {
             return new MethodMember(candidates);
-        }
-        // A member missing on the declared type but reachable through flow narrowing - on a
-        // subclass, or on any implementer of an interface - resolves permissively until
-        // narrowing exists.
-        if (types.isInterfaceLike(record)) {
-            return new DeferredMember();
-        }
-        let narrowed = subclassMember(record, name);
-        if (narrowed != null) {
-            return narrowed;
         }
         return new MissingMember();
     }
@@ -1961,6 +2409,13 @@ private class BodyChecker implements PanicCalls {
         if (objectType is ErrorType) {
             return this.store.errorType();
         }
+        if (objectType is OptionalType) {
+            this.reporter.report("Cannot read a member of '{types.display(objectType)}' "
+                + "because it may be null here. Check it for null first "
+                + "('if (value != null)'), read it with '?.' to get a nullable result, or "
+                + "supply a fallback with '??'.", node.span());
+            return this.store.errorType();
+        }
         Type core = this.memberReceiverCore(objectType, name);
         if (core is ArrayType) {
             if (name == "length") {
@@ -1987,7 +2442,17 @@ private class BodyChecker implements PanicCalls {
             is FieldMember found -> {
                 this.checkMemberAccess(name, found.field.visibility(),
                     found.field.definingType(), node.member().span());
-                return found.field.type();
+                Type fieldType = found.field.type();
+                if (fieldType is OptionalType || types.isClassLike(fieldType)) {
+                    let path = this.buildNarrowingPath(node, false);
+                    if (path != null) {
+                        let proven = this.narrowing.provenType(path);
+                        if (proven != null) {
+                            return proven;
+                        }
+                    }
+                }
+                return fieldType;
             },
             is MethodMember found -> {
                 if (found.candidates.length() <= 1) {
@@ -2003,9 +2468,6 @@ private class BodyChecker implements PanicCalls {
                     + "'{types.display(core)}'", node.member().span());
                 return this.store.errorType();
             },
-            is DeferredMember ignored -> {
-                return this.store.errorType();
-            },
         }
     }
 
@@ -2014,7 +2476,14 @@ private class BodyChecker implements PanicCalls {
         if (objectType is ErrorType) {
             return this.store.errorType();
         }
-        Type inner = nullability.safeReceiverInner(objectType);
+        objectType = this.presenceOperandType(node.object(), objectType);
+        if (!(objectType is OptionalType)) {
+            this.reporter.report("The value on the left of '?.' has type "
+                + "'{types.display(objectType)}', which can never be null. Use '.' to access "
+                + "its members.", node.span());
+            return this.store.errorType();
+        }
+        Type inner = objectType.inner();
         string name = node.member().text();
         if ((inner is StringType || inner is ArrayType) && name == "length") {
             return this.store.optionalOf(this.store.primitive(PrimitiveKind.Long));
@@ -2042,9 +2511,6 @@ private class BodyChecker implements PanicCalls {
             is MissingMember ignored -> {
                 this.reporter.report("No field or method named '{name}' on "
                     + "'{types.display(inner)}'.", node.member().span());
-                return this.store.errorType();
-            },
-            is DeferredMember ignored -> {
                 return this.store.errorType();
             },
         }
@@ -2184,14 +2650,14 @@ private class BodyChecker implements PanicCalls {
                     finalType = updated;
                 }
             }
-            if (!nullability.isAssignable(parameterType, finalType)) {
+            if (!convert.isAssignableStrict(parameterType, finalType)) {
                 string label = "{i + 1}";
                 if (argument.name().length > 0) {
                     label = "'{argument.name()}'";
                 }
                 this.reporter.report("Argument {label}: expected "
-                    + "'{types.display(parameterType)}', got '{types.display(finalType)}'",
-                    argument.span());
+                    + "'{types.display(parameterType)}', got '{types.display(finalType)}'"
+                    + "{nullabilityHint(parameterType, finalType)}", argument.span());
             }
         }
         if (shape.named().length() > 0) {
@@ -2221,10 +2687,11 @@ private class BodyChecker implements PanicCalls {
                         Type parameterType = parameters[i].type();
                         Type actual = this.analyzeExpressionAdapt(value, parameterType);
                         if (!(parameterType is ErrorType) && !(actual is ErrorType)
-                                && !nullability.isAssignable(parameterType, actual)) {
+                                && !convert.isAssignableStrict(parameterType, actual)) {
                             this.reporter.report("Argument {i + 1}: expected "
                                 + "'{types.display(parameterType)}', got "
-                                + "'{types.display(actual)}'", value.span());
+                                + "'{types.display(actual)}'"
+                                + "{nullabilityHint(parameterType, actual)}", value.span());
                         }
                     } else {
                         this.analyzeExpression(value);
@@ -2253,6 +2720,12 @@ private class BodyChecker implements PanicCalls {
     // ---- Calls ----
 
     private analyzeCall(CallExpressionNode node) -> Type {
+        Type analyzed = this.analyzeCallInner(node);
+        this.clearNarrowingsForCall(node);
+        return analyzed;
+    }
+
+    private analyzeCallInner(CallExpressionNode node) -> Type {
         switch (node.callee()) {
             is MemberExpressionNode member -> {
                 return this.analyzeMemberCall(node, member);
@@ -2387,7 +2860,11 @@ private class BodyChecker implements PanicCalls {
         Type receiverCore = this.store.errorType();
         let objectType = this.result.typeOf(object.green());
         if (objectType != null) {
-            receiverCore = this.memberReceiverCore(objectType, name);
+            Type receiverType = objectType;
+            if (isSafe && receiverType is OptionalType) {
+                receiverType = receiverType.inner();
+            }
+            receiverCore = this.memberReceiverCore(receiverType, name);
         }
         let candidates = methodCandidates(receiverCore, name);
         let arguments = node.arguments();
@@ -2574,7 +3051,7 @@ private class BodyChecker implements PanicCalls {
             let argument = arguments.arguments(0);
             if (argument is Expression) {
                 Type actual = this.analyzeExpression(argument);
-                if (!(actual is ErrorType) && !nullability.isAssignable(byteArray, actual)) {
+                if (!(actual is ErrorType) && !convert.isAssignableStrict(byteArray, actual)) {
                     this.reporter.report("'string.fromBytes' expects a byte[], got "
                         + "'{types.display(actual)}'.", argument.span());
                 }
@@ -2600,8 +3077,22 @@ private class BodyChecker implements PanicCalls {
             this.analyzeArgumentsOnly(node.arguments());
             return this.store.errorType();
         }
-        Type core = nullability.valueOf(objectType);
+        Type core = objectType;
         let arguments = node.arguments();
+        if (core is OptionalType) {
+            if (name == "slice" && core.inner() is ArrayType) {
+                this.reporter.report("Cannot call 'slice' on '{types.display(core)}' because "
+                    + "it may be null. Check it for null first ('if (value != null)').",
+                    node.span());
+                this.analyzeArgumentsOnly(arguments);
+                return this.store.errorType();
+            }
+            if (name == "hash") {
+                this.checkNoArguments(node, "hash");
+                return this.store.primitive(PrimitiveKind.Long);
+            }
+            return null;
+        }
         if (name == "toString") {
             if (convert.isIntegerType(core) || convert.isBoolType(core) || core is StringType
                     || convert.isEnumLike(core)) {
@@ -2633,8 +3124,7 @@ private class BodyChecker implements PanicCalls {
                     let argument = arguments.arguments(0);
                     if (argument is Expression) {
                         Type actual = this.analyzeExpression(argument);
-                        if (!(actual is ErrorType)
-                                && !(nullability.valueOf(actual) is StringType)) {
+                        if (!(actual is ErrorType) && !(actual is StringType)) {
                             this.reporter.report("'{name}' expects a string argument, got "
                                 + "'{types.display(actual)}'.", argument.span());
                         }
@@ -2703,8 +3193,7 @@ private class BodyChecker implements PanicCalls {
             let argument = arguments.arguments(i);
             if (argument is Expression) {
                 Type actual = this.analyzeExpression(argument);
-                if (!(actual is ErrorType)
-                        && !convert.isIntegerType(nullability.valueOf(actual))) {
+                if (!(actual is ErrorType) && !convert.isIntegerType(actual)) {
                     this.reporter.report("'{name}' expects an integer index, got "
                         + "'{types.display(actual)}'.", argument.span());
                 }
@@ -2824,10 +3313,10 @@ private class BodyChecker implements PanicCalls {
                     actual = updated;
                 }
                 if (!(parameterType is ErrorType) && !(actual is ErrorType)
-                        && !nullability.isAssignable(parameterType, actual)) {
+                        && !convert.isAssignableStrict(parameterType, actual)) {
                     this.reporter.report("Argument {i + 1}: expected "
-                        + "'{types.display(parameterType)}', got '{types.display(actual)}'",
-                        argument.span());
+                        + "'{types.display(parameterType)}', got '{types.display(actual)}'"
+                        + "{nullabilityHint(parameterType, actual)}", argument.span());
                 }
             }
         }
@@ -2882,10 +3371,11 @@ private class BodyChecker implements PanicCalls {
             if (argument is Expression) {
                 Type actual = this.analyzeExpressionAdapt(argument, parameter.type());
                 if (!(parameter.type() is ErrorType) && !(actual is ErrorType)
-                        && !nullability.isAssignable(parameter.type(), actual)) {
+                        && !convert.isAssignableStrict(parameter.type(), actual)) {
                     this.reporter.report("Argument {i + 1}: expected "
                         + "'{types.display(parameter.type())}', got "
-                        + "'{types.display(actual)}'", argument.span());
+                        + "'{types.display(actual)}'"
+                        + "{nullabilityHint(parameter.type(), actual)}", argument.span());
                 }
             }
         }
@@ -2910,7 +3400,12 @@ private class BodyChecker implements PanicCalls {
             this.reporter.report("Argument {index + 1} of '{name}' expects "
                 + "'out {types.display(parameter.type())}', got "
                 + "'out {types.display(binding.type())}'.", argument.span());
+            return;
         }
+        // 'out' lets the callee write the caller's variable directly, so it drops even the
+        // binding's own narrowing.
+        this.narrowing.clearForRoot(binding);
+        this.narrowing.clearForIndexBinding(binding);
     }
 
     private analyzeExtraExternalArgument(Argument argument) {
@@ -3086,8 +3581,7 @@ private class BodyChecker implements PanicCalls {
     private analyzeSizes(List<Expression> sizes) {
         for (long i = 0; i < sizes.length(); i++) {
             Type sizeType = this.analyzeExpression(sizes.get(i));
-            if (!(sizeType is ErrorType)
-                    && !convert.isIntegerType(nullability.valueOf(sizeType))) {
+            if (!(sizeType is ErrorType) && !convert.isIntegerType(sizeType)) {
                 this.reporter.report("Array size must be an integer, got "
                     + "'{types.display(sizeType)}'", sizes.get(i).span());
             }
@@ -3170,8 +3664,8 @@ private class BodyChecker implements PanicCalls {
 
     // Checks a switch in either form: the scrutinee kind, the labels or 'is' arm targets, arm
     // reachability, exhaustiveness, and the unified value type of the expression form.
-    // Exhaustiveness reasons over the unwrapped scrutinee type; whether a nullable scrutinee
-    // needs its 'null' arm is the narrowing milestone's rule.
+    // Exhaustiveness reasons over the unwrapped scrutinee type; a scrutinee whose
+    // narrowing-aware type is still nullable additionally needs a 'null' arm or a default.
     private checkSwitchArms(Expression scrutinee, List<SwitchArm> arms, Span span,
                             bool requireValue) -> Type {
         Type scrutineeType = this.analyzeExpression(scrutinee);
@@ -3255,7 +3749,7 @@ private class BodyChecker implements PanicCalls {
                         let label = arm.labels(i);
                         if (isNullLabel(label)) {
                             this.result.setType(label.green(), this.store.nullType());
-                            if (!nullability.nullLabelPermitted(scrutineeType)) {
+                            if (!(scrutineeType is OptionalType)) {
                                 this.reporter.report("'null' is only a valid label when the "
                                     + "switch value is nullable.", label.span());
                             } else if (nullCovered) {
@@ -3296,6 +3790,11 @@ private class BodyChecker implements PanicCalls {
         }
         if (typeSwitch && !hasDefault) {
             this.checkTypeExhaustiveness(inner, armTargets, span);
+        }
+        if ((valueScrutinee || typeSwitch) && scrutineeType is OptionalType && !nullCovered
+                && !hasDefault) {
+            this.reporter.report("This switch value can be null but no arm handles it. Add a "
+                + "'null ->' arm or a 'default' arm.", span);
         }
         if (!requireValue) {
             return this.store.primitive(PrimitiveKind.Void);
@@ -3638,63 +4137,6 @@ private methodCandidates(Type record, string name) -> List<Method> {
     return found;
 }
 
-// Breadth-first search of the subclass tree for a member the narrowing milestone would have
-// proven reachable. Subclasses that disagree about the member defer it instead: without the
-// flow proof there is no single answer to type against.
-private subclassMember(Type record, string name) -> MemberLookup? {
-    let authority = types.authorityOf(record);
-    if (authority is ClassType) {
-        let fieldsFound = new List<Field>();
-        let methodsFound = new List<Method>();
-        let queue = new List<ClassType>();
-        for (long i = 0; i < authority.directSubclasses().length(); i++) {
-            queue.push(authority.directSubclasses().get(i));
-        }
-        long at = 0;
-        while (at < queue.length()) {
-            let candidate = queue.get(at);
-            at++;
-            let field = members.findField(candidate.fields(), name);
-            if (field != null) {
-                fieldsFound.push(field);
-            }
-            let found = methodCandidates(candidate, name);
-            for (long i = 0; i < found.length(); i++) {
-                methodsFound.push(found.get(i));
-            }
-            for (long i = 0; i < candidate.directSubclasses().length(); i++) {
-                queue.push(candidate.directSubclasses().get(i));
-            }
-        }
-        if (fieldsFound.length() == 0 && methodsFound.length() == 0) {
-            return null;
-        }
-        if (fieldsFound.length() > 0 && methodsFound.length() > 0) {
-            return new DeferredMember();
-        }
-        if (fieldsFound.length() > 0) {
-            for (long i = 1; i < fieldsFound.length(); i++) {
-                if (fieldsFound.get(i).type() != fieldsFound.get(0).type()) {
-                    return new DeferredMember();
-                }
-            }
-            return new FieldMember(fieldsFound.get(0));
-        }
-        let first = methodsFound.get(0);
-        for (long i = 1; i < methodsFound.length(); i++) {
-            let other = methodsFound.get(i);
-            if (!types.sameParameterTypes(other.signature(), first.signature())
-                    || other.signature().returnType() != first.signature().returnType()) {
-                return new DeferredMember();
-            }
-        }
-        let agreed = new List<Method>();
-        agreed.push(first);
-        return new MethodMember(agreed);
-    }
-    return null;
-}
-
 private constructorsOf(Type record) -> List<Method> {
     let found = new List<Method>();
     let methods = types.methodsOf(record);
@@ -3770,6 +4212,48 @@ private hasTypeArm(List<SwitchArm> arms) -> bool {
 
 private isNullLabel(Expression label) -> bool {
     return label is LiteralExpressionNode && label.value().kind() == SyntaxKind.NullKeyword;
+}
+
+// Guidance appended to an assignability failure when the mismatch is exactly nullability:
+// a possibly-null source flowing into a never-null slot.
+private nullabilityHint(Type target, Type source) -> string {
+    if (target is ErrorType || target is OptionalType) {
+        return "";
+    }
+    if (source is OptionalType && convert.isAssignableStrict(target, source.inner())) {
+        return ". The value may be null here; check it first ('if (value != null)'), or "
+            + "supply a fallback with '??'.";
+    }
+    if (source is NullType) {
+        return ". '{types.display(target)}' can never be null; write the type as "
+            + "'{types.display(target)}?' if it should allow null.";
+    }
+    return "";
+}
+
+// Guidance for a comparison against 'null' over a value that can never be null.
+private nullComparisonHint(Type left, Type right) -> string {
+    Type other = left;
+    if (left is NullType) {
+        other = right;
+    } else if (!(right is NullType)) {
+        return "";
+    }
+    return ". A value of type '{types.display(other)}' can never be null; make its type "
+        + "nullable ('{types.display(other)}?') if it should allow null.";
+}
+
+private isNullLiteral(Expression expression) -> bool {
+    return expression is LiteralExpressionNode
+        && expression.value().kind() == SyntaxKind.NullKeyword;
+}
+
+private unwrapParentheses(Expression expression) -> Expression {
+    Expression current = expression;
+    while (current is ParenthesizedExpressionNode) {
+        current = current.inner();
+    }
+    return current;
 }
 
 // The constant an integer switch label names: a char literal's codepoint, or an int or long
