@@ -85,6 +85,9 @@ import CallShape from calls;
 import CallCandidate from calls;
 import CallResolution from calls;
 import convert;
+import flow;
+import ExitScope from flow;
+import PanicCalls from flow;
 import literalvalues;
 import members;
 import nullability;
@@ -188,7 +191,7 @@ private class DeferredMember extends MemberLookup {
     constructor();
 }
 
-private class BodyChecker {
+private class BodyChecker implements PanicCalls {
     private ModuleContext context;
     private Map<string, ModuleContext> contextsByPath;
     private TypeResolver resolver;
@@ -355,6 +358,8 @@ private class BodyChecker {
             this.checkCatchClause(node.catchClauses(i));
         }
 
+        this.checkReturnPaths(signature, node);
+
         this.scope = null;
         this.parameterScope = null;
         this.thisType = null;
@@ -418,6 +423,48 @@ private class BodyChecker {
                     + "constructor", signature.nameSpan());
             }
         }
+    }
+
+    // A non-void callable must exit on every path: through its body and through each catch
+    // clause it declares.
+    private checkReturnPaths(Signature signature, FunctionDeclarationNode node) {
+        Type returned = signature.returnType();
+        if (types.isVoidType(returned) || returned is ErrorType) {
+            return;
+        }
+        let body = node.body();
+        if (body == null) {
+            return;
+        }
+        if (!flow.blockTerminates(body, ExitScope.Function, this)) {
+            this.reporter.report("Function '{signature.name()}' can reach the end of its body "
+                + "without returning a value", signature.nameSpan());
+            return;
+        }
+        for (long i = 0; i < node.catchClausesCount(); i++) {
+            let clause = node.catchClauses(i);
+            if (!flow.blockTerminates(clause.body(), ExitScope.Function, this)) {
+                this.reporter.report("Function '{signature.name()}' can reach the end of its "
+                    + "body without returning a value", clause.span());
+            }
+        }
+    }
+
+    // A call spelled 'panic(...)' resolving to the builtin. Local names cannot shadow it at a
+    // call site, so the module's function table is the whole story.
+    override isPanicCall(Expression expression) -> bool {
+        Expression core = expression;
+        while (core is ParenthesizedExpressionNode) {
+            core = core.inner();
+        }
+        if (core is CallExpressionNode) {
+            let callee = core.callee();
+            if (callee is IdentifierExpressionNode && callee.name().text() == "panic") {
+                let entries = this.context.functions().entriesNamed("panic");
+                return entries != null && entries.length() > 0 && entries.get(0).isBuiltin();
+            }
+        }
+        return false;
     }
 
     // Catch clauses scope against the parameter scope, so body locals stay invisible. The
