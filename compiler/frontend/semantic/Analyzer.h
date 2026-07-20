@@ -121,27 +121,27 @@ private:
     // A terminated path (return/throw/rethrow/panic, and break/continue for the
     // relevant loop) contributes nothing to a join. Structs are variable-level: a
     // struct local must be assigned as a whole before any field access.
-    struct AssignFlow {
+    struct AssignmentFlow {
         std::unordered_set<Symbol*> assigned;
         bool terminated = false;
     };
-    bool daEnabled_ = false;
-    bool daTerminated_ = false;
+    bool assignmentActive_ = false;
+    bool flowTerminated_ = false;
     // Whether the current expression position is evaluated unconditionally, so an
     // assignment found here counts as a definite assignment (false inside the
     // short-circuited operand of &&, ||, ??, ?., ?[ and inside ternary branches).
-    bool daUnconditional_ = true;
-    const void* daWriteTargetGreen_ = nullptr;
-    std::unordered_set<Symbol*> daAssigned_;
-    std::unordered_set<Symbol*> daTracked_;
-    std::vector<std::vector<AssignFlow>> daBreakFlows_;
-    void daTrackLocal(Symbol* sym, bool assigned);
-    void daMarkAssigned(Symbol* sym);
-    void daCheckRead(const ast::IdentExpression& expr, Symbol* sym);
-    AssignFlow daSnapshot() const;
-    void daRestore(const AssignFlow& flow);
-    AssignFlow daJoin(const std::vector<AssignFlow>& flows) const;
-    void daResetForBody();
+    bool unconditionalPosition_ = true;
+    const void* assignmentTargetGreen_ = nullptr;
+    std::unordered_set<Symbol*> assignedLocals_;
+    std::unordered_set<Symbol*> trackedLocals_;
+    std::vector<std::vector<AssignmentFlow>> breakFlows_;
+    void trackLocal(Symbol* sym, bool assigned);
+    void markAssigned(Symbol* sym);
+    void checkDefiniteAssignment(const ast::IdentExpression& expr, Symbol* sym);
+    AssignmentFlow snapshotAssignment() const;
+    void restoreAssignment(const AssignmentFlow& flow);
+    AssignmentFlow joinAssignment(const std::vector<AssignmentFlow>& flows) const;
+    void resetAssignmentFlow();
 
     // Cached AST root after collectDeclarations so analyzeBodies doesn't have
     // to re-parse the source. Populated by collectDeclarations.
