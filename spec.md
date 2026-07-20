@@ -39,6 +39,21 @@ struct Rectangle {
 }
 ```
 
+A struct value is built with a context-typed aggregate literal or a constructor call.
+
+An aggregate literal `{field: value, field: value}` names each field it sets, and takes its type from the surrounding context: the declared type of a variable, a parameter, a return type, an assignment target, or an array element.
+Every field that has no declared default must be listed; a field that has a default may be omitted to accept that default.
+Naming a field the struct does not have, listing the same field twice, leaving out a required field, or giving a value that is not assignable to the field's type are each errors.
+A field's visibility is respected: a private field can only be set from inside the struct that declares it, the same rule as a direct field assignment.
+A literal with no context to infer its type from, such as `let p = {x: 1};`, is an error; annotate the target or use a constructor.
+
+A struct may declare a `constructor` with the same keyword and shorthand as a class, and it is invoked by writing the struct's name followed by arguments, for example `Point(1, 2)`.
+Construction is by value and never uses `new`, which stays reserved for classes and arrays.
+The two forms coexist: a struct that has a constructor can still be built from a literal.
+
+A struct field may have any type, including a non-nullable one such as a class, a string, an array, or another struct that has no default.
+A struct with such a field cannot be zero-initialized, so it must be built with a literal or a constructor rather than declared without a value.
+
 Overloading is allowed, best match arguments first, then visibility.
 Two declarations of the same name must differ in parameter count or parameter types.
 A call picks the overload whose parameter types match the arguments exactly; when there is no exact match, an overload reachable through implicit widening is chosen.
