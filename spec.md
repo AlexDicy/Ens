@@ -49,10 +49,14 @@ A literal with no context to infer its type from, such as `let p = {x: 1};`, is 
 
 A struct may declare a `constructor` with the same keyword and shorthand as a class, and it is invoked by writing the struct's name followed by arguments, for example `Point(1, 2)`.
 Construction is by value and never uses `new`, which stays reserved for classes and arrays.
+A generic struct is constructed the same way, with the type arguments written on the name: `Pair<int, string>(1, "x")` resolves the constructor on that instantiation, just as `Pair<int, string> value = {key: 1, value: "x"}` builds the instantiation from a literal.
 The two forms coexist: a struct that has a constructor can still be built from a literal.
 
+A struct local must be built as a whole, with a literal or a constructor, before any field of it is read or written.
+`Point p; p.x = 1;` is an error because `p` is used before it holds a value; write `Point p = {x: 1, y: 2};` and then mutate a field of the already-built value.
+
 A struct field may have any type, including a non-nullable one such as a class, a string, an array, or another struct that has no default.
-A struct with such a field cannot be zero-initialized, so it must be built with a literal or a constructor rather than declared without a value.
+A struct with such a field has no default value of its own, so it cannot be an array element or a field left without a default, though it can still be built with a literal or a constructor wherever a value is needed.
 
 Overloading is allowed, best match arguments first, then visibility.
 Two declarations of the same name must differ in parameter count or parameter types.
@@ -630,6 +634,11 @@ byte big = 300;          // error: 300 does not fit in 'byte' (range -128..127)
 ---
 
 `let` and a typed declaration both introduce a mutable binding. `const` introduces an immutable one: it must be initialized, and assigning to it again, or passing it as `out`, is a compile error. Like `let`, a `const` may infer its type or state it explicitly.
+
+A local variable need not be initialized where it is declared, but it must be definitely assigned before it is read: on every path that reaches a use of the variable, an assignment to it must come first.
+A local has no implicit zero value, so this holds for every type, nullable or not: `int total; total = sum(xs); use(total)` is fine, while reading `total` before that assignment is a compile error.
+Assigning in only some branches does not count, so after `if (c) { x = 1; }` the variable `x` is assigned only when the condition held, and a later read is an error unless every path assigns it.
+Declaring a variable and never reading it is allowed; the rule governs reads, not declarations.
 
 ```ens
 let count = 0;          // mutable, inferred int
