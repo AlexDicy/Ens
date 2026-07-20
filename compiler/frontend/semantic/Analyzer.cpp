@@ -4525,6 +4525,22 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
             if (nt && nt->isStruct()) structT = nt;
         }
         if (structT) {
+            // `Pair<C, C>(args)` instantiates the generic struct first, exactly like
+            // 'new List<int>()', then resolves the constructor on the instantiation.
+            auto typeArgs = expr.typeArguments();
+            StructInfo* si = structT->structInfo;
+            if (si && si->isTemplate && !typeArgs.empty()) {
+                structT = instantiateFromArgs(structT, typeArgs, expr.node);
+                if (structT->isError()) {
+                    for (auto& a : args) analyzeExpr(a);
+                    return structT;
+                }
+            } else if (!typeArgs.empty()) {
+                errorAtNode(expr.node, "Struct '" + asciiOf(*name) +
+                    "' is not generic and takes no type arguments.");
+                for (auto& a : args) analyzeExpr(a);
+                return typeCtx.getError();
+            }
             return analyzeStructConstructorCall(expr, structT, *name);
         }
     }
@@ -6077,9 +6093,9 @@ Type* Analyzer::analyzeStructConstructorCall(const ast::CallExpression& expr, Ty
     StructInfo* si = structType->structInfo;
     if (!si) return typeCtx.getError();
     if (si->isTemplate) {
-        errorAtNode(expr.node, "Cannot build the generic struct '" + asciiOf(typeName) +
-            "' with a constructor call; use a typed aggregate literal, e.g. '" +
-            asciiOf(typeName) + "<...> value = {...};'.");
+        errorAtNode(expr.node, "Cannot tell which instantiation of the generic struct '" +
+            asciiOf(typeName) + "' to build; write the type arguments explicitly, e.g. '" +
+            asciiOf(typeName) + "<int, string>(...)'.");
         for (auto& a : args) analyzeExpr(a);
         return structType;
     }
