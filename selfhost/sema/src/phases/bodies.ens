@@ -187,6 +187,15 @@ private class NarrowingFact {
     constructor(this.path, this.proven, this.narrowsWhenTrue);
 }
 
+// A snapshot of definite-assignment state at one program point: the locals assigned so far and
+// whether the path has already left through a return, throw, break, continue, or panic.
+private class AssignmentFlow {
+    List<LocalBinding> assigned;
+    bool terminated;
+
+    constructor(this.assigned, this.terminated);
+}
+
 // What a member name means on a receiver type.
 private sealed abstract class MemberLookup {
 }
@@ -227,6 +236,13 @@ private class BodyChecker implements PanicCalls {
     private bool inCatchClause;
     private long loopDepth;
 
+    private List<LocalBinding> assignedLocals;
+    private List<LocalBinding> trackedLocals;
+    private List<List<AssignmentFlow>> breakFlows;
+    private bool flowTerminated;
+    private bool unconditionalPosition;
+    private LocalBinding? assignmentTarget;
+
     private Set<GreenNode> fillProvenNews;
     private Map<GreenNode, string> arrayNewNames;
 
@@ -249,6 +265,12 @@ private class BodyChecker implements PanicCalls {
         this.sawSuperCall = false;
         this.inCatchClause = false;
         this.loopDepth = 0;
+        this.assignedLocals = new List<LocalBinding>();
+        this.trackedLocals = new List<LocalBinding>();
+        this.breakFlows = new List<List<AssignmentFlow>>();
+        this.flowTerminated = false;
+        this.unconditionalPosition = true;
+        this.assignmentTarget = null;
         this.fillProvenNews = new Set<GreenNode>();
         this.arrayNewNames = new Map<GreenNode, string>();
         this.deferredObligations = deferred;
@@ -435,6 +457,7 @@ private class BodyChecker implements PanicCalls {
 
         let body = node.body();
         if (body != null) {
+            this.resetAssignmentFlow();
             this.enterScope();
             this.walkBlock(body);
             this.leaveScope();
@@ -575,6 +598,12 @@ private class BodyChecker implements PanicCalls {
         }
         this.result.setBinding(clause.green(), binding);
         this.inCatchClause = true;
+        // The catch body runs on the exception path, where the try body may have thrown before
+        // assigning any local, so nothing carries in but the caught variable.
+        this.assignedLocals = new List<LocalBinding>();
+        this.breakFlows = new List<List<AssignmentFlow>>();
+        this.flowTerminated = false;
+        this.trackLocal(binding, true);
         this.enterScope();
         this.walkBlock(clause.body());
         this.leaveScope();
@@ -899,6 +928,135 @@ private class BodyChecker implements PanicCalls {
         this.leaveScope();
     }
 
+    // ---- Definite assignment ----
+
+    private resetAssignmentFlow() {
+        this.assignedLocals = new List<LocalBinding>();
+        this.trackedLocals = new List<LocalBinding>();
+        this.breakFlows = new List<List<AssignmentFlow>>();
+        this.flowTerminated = false;
+        this.unconditionalPosition = true;
+        this.assignmentTarget = null;
+    }
+
+    private bindingsContain(List<LocalBinding> set, LocalBinding binding) -> bool {
+        for (long i = 0; i < set.length(); i++) {
+            if (set.get(i) == binding) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private trackLocal(LocalBinding binding, bool assigned) {
+        if (!this.bindingsContain(this.trackedLocals, binding)) {
+            this.trackedLocals.push(binding);
+        }
+        if (assigned && !this.bindingsContain(this.assignedLocals, binding)) {
+            this.assignedLocals.push(binding);
+        }
+    }
+
+    private markAssigned(LocalBinding binding) {
+        if (this.flowTerminated) {
+            return;
+        }
+        if (this.bindingsContain(this.trackedLocals, binding)
+                && !this.bindingsContain(this.assignedLocals, binding)) {
+            this.assignedLocals.push(binding);
+        }
+    }
+
+    private checkDefiniteAssignment(LocalBinding binding, Span span) {
+        if (this.flowTerminated) {
+            return;
+        }
+        let target = this.assignmentTarget;
+        if (target != null && target == binding) {
+            return;
+        }
+        if (!this.bindingsContain(this.trackedLocals, binding)
+                || this.bindingsContain(this.assignedLocals, binding)) {
+            return;
+        }
+        this.reporter.report("Variable '{binding.name()}' is used before it is assigned a "
+            + "value. Assign it on every path that reaches this point first, for example "
+            + "'{binding.name()} = ...;'.", span);
+        this.assignedLocals.push(binding);
+    }
+
+    private copyBindings(List<LocalBinding> set) -> List<LocalBinding> {
+        let copy = new List<LocalBinding>();
+        for (long i = 0; i < set.length(); i++) {
+            copy.push(set.get(i));
+        }
+        return copy;
+    }
+
+    private snapshotAssignment() -> AssignmentFlow {
+        return new AssignmentFlow(this.copyBindings(this.assignedLocals), this.flowTerminated);
+    }
+
+    private restoreAssignment(AssignmentFlow flow) {
+        this.assignedLocals = this.copyBindings(flow.assigned);
+        this.flowTerminated = flow.terminated;
+    }
+
+    // The join of several branch out-states: a local is assigned after the join only when it is
+    // assigned on every branch that can fall through. A terminated branch cannot reach the join,
+    // so it drops out. When every branch terminates the join is unreachable, so it stays
+    // terminated and credits every branch's writes to avoid reports in the dead code that follows.
+    private joinAssignment(List<AssignmentFlow> flows) -> AssignmentFlow {
+        let result = new List<LocalBinding>();
+        bool anySurvivor = false;
+        for (long i = 0; i < flows.length(); i++) {
+            let flow = flows.get(i);
+            if (flow.terminated) {
+                continue;
+            }
+            if (!anySurvivor) {
+                result = this.copyBindings(flow.assigned);
+                anySurvivor = true;
+            } else {
+                let both = new List<LocalBinding>();
+                for (long j = 0; j < result.length(); j++) {
+                    if (this.bindingsContain(flow.assigned, result.get(j))) {
+                        both.push(result.get(j));
+                    }
+                }
+                result = both;
+            }
+        }
+        if (!anySurvivor) {
+            for (long i = 0; i < flows.length(); i++) {
+                let flow = flows.get(i);
+                for (long j = 0; j < flow.assigned.length(); j++) {
+                    if (!this.bindingsContain(result, flow.assigned.get(j))) {
+                        result.push(flow.assigned.get(j));
+                    }
+                }
+            }
+        }
+        return new AssignmentFlow(result, !anySurvivor);
+    }
+
+    private conditionIsAlwaysTrue(Expression condition) -> bool {
+        if (condition is LiteralExpressionNode) {
+            return condition.value().kind() == SyntaxKind.TrueKeyword;
+        }
+        return false;
+    }
+
+    // Sets the assignment state after a loop to the join of every way it can exit normally. When
+    // nothing can exit, the loop runs forever and the code after it is unreachable.
+    private finishLoop(List<AssignmentFlow> exits) {
+        if (exits.length() == 0) {
+            this.flowTerminated = true;
+        } else {
+            this.restoreAssignment(this.joinAssignment(exits));
+        }
+    }
+
     // Analyzes a branch expression under the facts the condition proves on its side: a
     // ternary branch, or the right operand of a short-circuit operator.
     private analyzeGuardedBranch(Expression condition, Expression branch, bool conditionHolds)
@@ -907,7 +1065,10 @@ private class BodyChecker implements PanicCalls {
         this.collectNarrowings(condition, conditionHolds, facts);
         this.narrowing.push();
         this.applyFacts(facts);
+        bool previous = this.unconditionalPosition;
+        this.unconditionalPosition = false;
         Type analyzed = this.analyzeExpression(branch);
+        this.unconditionalPosition = previous;
         this.narrowing.pop();
         return analyzed;
     }
@@ -1197,27 +1358,40 @@ private class BodyChecker implements PanicCalls {
                     this.reporter.report("'break' can only be used inside a loop.",
                         broken.span());
                 }
+                if (!this.flowTerminated && this.breakFlows.length() > 0) {
+                    this.breakFlows.get(this.breakFlows.length() - 1)
+                        .push(this.snapshotAssignment());
+                }
+                this.flowTerminated = true;
             },
             is ContinueStatementNode continued -> {
                 if (this.loopDepth == 0) {
                     this.reporter.report("'continue' can only be used inside a loop.",
                         continued.span());
                 }
+                this.flowTerminated = true;
             },
             is ReturnStatementNode returned -> {
                 this.checkReturnStatement(returned);
+                this.flowTerminated = true;
             },
             is ExpressionStatementNode expression -> {
+                this.unconditionalPosition = true;
                 this.analyzeExpression(expression.expression());
+                if (this.isPanicCall(expression.expression())) {
+                    this.flowTerminated = true;
+                }
             },
             is ThrowStatementNode thrown -> {
                 this.checkThrowStatement(thrown);
+                this.flowTerminated = true;
             },
             is RethrowStatementNode rethrown -> {
                 if (!this.inCatchClause) {
                     this.reporter.report("'rethrow' can only be used inside a 'catch' block.",
                         rethrown.span());
                 }
+                this.flowTerminated = true;
             },
             is SwitchStatementNode switched -> {
                 this.checkSwitchArms(switched.scrutinee(), armsOfStatement(switched),
@@ -1246,6 +1420,7 @@ private class BodyChecker implements PanicCalls {
         this.defineLocal(binding, node.name().span());
         this.result.setBinding(node.green(), binding);
         let initializer = node.initializer();
+        this.trackLocal(binding, initializer != null);
         if (initializer != null) {
             let initType = this.result.typeOf(initializer.value().green());
             if (initType != null) {
@@ -1295,12 +1470,6 @@ private class BodyChecker implements PanicCalls {
                 + "declared; write '= ...' after the name.", node.name().span());
             return declared;
         }
-        if (!(declared is ErrorType) && !convert.isDefaultable(declared)
-                && !convert.containsTypeParam(declared)) {
-            this.reporter.report("Variable '{name}' has non-nullable type "
-                + "'{types.display(declared)}' but no initializer. Provide a value, or make "
-                + "the type nullable ('{types.display(declared)}?').", node.name().span());
-        }
         return declared;
     }
 
@@ -1330,7 +1499,10 @@ private class BodyChecker implements PanicCalls {
         let whenFalse = new List<NarrowingFact>();
         this.collectNarrowings(node.condition(), true, whenTrue);
         this.collectNarrowings(node.condition(), false, whenFalse);
+        let entry = this.snapshotAssignment();
         this.walkBranch(node.thenBranch(), whenTrue);
+        let afterThen = this.snapshotAssignment();
+        this.restoreAssignment(entry);
         let elseClause = node.elseClause();
         if (elseClause != null) {
             switch (elseClause.body()) {
@@ -1343,6 +1515,11 @@ private class BodyChecker implements PanicCalls {
                 default -> { },
             }
         }
+        let afterElse = this.snapshotAssignment();
+        let flows = new List<AssignmentFlow>();
+        flows.push(afterThen);
+        flows.push(afterElse);
+        this.restoreAssignment(this.joinAssignment(flows));
         this.carrySurvivingNarrowings(node, whenTrue, whenFalse);
     }
 
@@ -1384,9 +1561,17 @@ private class BodyChecker implements PanicCalls {
         this.checkConditionIsBool(condition, "While condition", node.condition().span());
         let facts = new List<NarrowingFact>();
         this.collectNarrowings(node.condition(), true, facts);
+        bool alwaysTrue = this.conditionIsAlwaysTrue(node.condition());
+        let postCondition = this.snapshotAssignment();
+        this.breakFlows.push(new List<AssignmentFlow>());
         this.loopDepth++;
         this.walkBranch(node.body(), facts);
         this.loopDepth--;
+        let exits = this.breakFlows.pop();
+        if (!alwaysTrue) {
+            exits.push(postCondition);
+        }
+        this.finishLoop(exits);
     }
 
     private checkForStatement(ForStatementNode node) {
@@ -1410,20 +1595,30 @@ private class BodyChecker implements PanicCalls {
         }
         let facts = new List<NarrowingFact>();
         let condition = node.condition();
+        bool alwaysTrue = false;
         if (condition != null) {
             Type conditionType = this.analyzeExpression(condition);
             this.checkConditionIsBool(conditionType, "For condition", condition.span());
             this.collectNarrowings(condition, true, facts);
+            alwaysTrue = this.conditionIsAlwaysTrue(condition);
         }
+        let postCondition = this.snapshotAssignment();
+        this.breakFlows.push(new List<AssignmentFlow>());
         this.loopDepth++;
         this.enterScope();
         this.applyFacts(facts);
         this.walkBlock(node.body());
         if (update != null) {
+            this.unconditionalPosition = true;
             this.analyzeExpression(update);
         }
         this.leaveScope();
         this.loopDepth--;
+        let exits = this.breakFlows.pop();
+        if (condition != null && !alwaysTrue) {
+            exits.push(postCondition);
+        }
+        this.finishLoop(exits);
         this.leaveScope();
     }
 
@@ -1476,10 +1671,16 @@ private class BodyChecker implements PanicCalls {
             current.define(binding);
         }
         this.result.setBinding(node.green(), binding);
+        let entry = this.snapshotAssignment();
+        this.trackLocal(binding, true);
+        this.breakFlows.push(new List<AssignmentFlow>());
         this.loopDepth++;
         this.preClearLoopBodyWrites(node.body());
         this.walkScopedBlock(node.body());
         this.loopDepth--;
+        let exits = this.breakFlows.pop();
+        exits.push(entry);
+        this.finishLoop(exits);
         this.leaveScope();
     }
 
@@ -1809,6 +2010,7 @@ private class BodyChecker implements PanicCalls {
         switch (resolution) {
             is LocalName local -> {
                 this.result.setBinding(node.green(), local.binding);
+                this.checkDefiniteAssignment(local.binding, node.name().span());
                 let proven = this.narrowing.provenType(narrow.bindingPath(local.binding));
                 if (proven != null) {
                     return proven;
@@ -2100,7 +2302,20 @@ private class BodyChecker implements PanicCalls {
     }
 
     private analyzeAssignment(AssignmentExpressionNode node) -> Type {
-        Type targetType = this.analyzeExpression(node.target());
+        // A plain `x = ...` is a definite assignment of x, so its own identifier on the left is
+        // a write, not a read to check. A compound `x += ...` reads x first, and a member or
+        // subscript target reads its base, which must already be assigned.
+        bool simpleAssign = node.operator().kind() == SyntaxKind.Equals;
+        let target = node.target();
+        let previousTarget = this.assignmentTarget;
+        if (simpleAssign && target is IdentifierExpressionNode) {
+            let resolved = this.resolveName(target.name().text());
+            if (resolved is LocalName) {
+                this.assignmentTarget = resolved.binding;
+            }
+        }
+        Type targetType = this.analyzeExpression(target);
+        this.assignmentTarget = previousTarget;
         if (!this.isLValue(node.target())) {
             this.reporter.report("The left side of '=' must be a variable, field, or array "
                 + "element.", node.span());
@@ -2121,6 +2336,9 @@ private class BodyChecker implements PanicCalls {
             let binding = this.result.bindingOf(node.target().green());
             if (binding != null) {
                 this.establishAssignmentNarrowing(binding, valueType);
+                if (this.unconditionalPosition) {
+                    this.markAssigned(binding);
+                }
             }
         }
         return assignTarget;
@@ -2198,7 +2416,10 @@ private class BodyChecker implements PanicCalls {
     // then constant and yields the value.
     private analyzeNullCoalesce(NullCoalesceExpressionNode node) -> Type {
         Type left = this.analyzeExpression(node.left());
+        bool previous = this.unconditionalPosition;
+        this.unconditionalPosition = false;
         Type right = this.analyzeExpression(node.right());
+        this.unconditionalPosition = previous;
         if (left is ErrorType || right is ErrorType) {
             return this.store.errorType();
         }
@@ -4009,6 +4230,8 @@ private class BodyChecker implements PanicCalls {
         let armTargets = new List<Type>();
         let valueExpressions = new List<Expression>();
         bool sawValueBlock = false;
+        let switchEntry = this.snapshotAssignment();
+        let armFlows = new List<AssignmentFlow>();
         for (long a = 0; a < arms.length(); a++) {
             switch (arms.get(a)) {
                 is DefaultArmNode arm -> {
@@ -4017,7 +4240,8 @@ private class BodyChecker implements PanicCalls {
                             arm.span());
                     }
                     hasDefault = true;
-                    if (this.walkArmBody(arm.body(), requireValue, valueExpressions)) {
+                    if (this.walkArmBodyFlow(arm.body(), requireValue, valueExpressions,
+                            switchEntry, armFlows)) {
                         sawValueBlock = true;
                     }
                 },
@@ -4053,7 +4277,8 @@ private class BodyChecker implements PanicCalls {
                         }
                         this.result.setBinding(arm.green(), binding);
                     }
-                    if (this.walkArmBody(arm.body(), requireValue, valueExpressions)) {
+                    if (this.walkArmBodyFlow(arm.body(), requireValue, valueExpressions,
+                            switchEntry, armFlows)) {
                         sawValueBlock = true;
                     }
                     this.leaveScope();
@@ -4093,11 +4318,17 @@ private class BodyChecker implements PanicCalls {
                             this.checkStringLabel(label, seenStringLabels);
                         }
                     }
-                    if (this.walkArmBody(arm.body(), requireValue, valueExpressions)) {
+                    if (this.walkArmBodyFlow(arm.body(), requireValue, valueExpressions,
+                            switchEntry, armFlows)) {
                         sawValueBlock = true;
                     }
                 },
             }
+        }
+        if (armFlows.length() > 0) {
+            this.restoreAssignment(this.joinAssignment(armFlows));
+        } else {
+            this.restoreAssignment(switchEntry);
         }
 
         if (valueScrutinee && !hasDefault) {
@@ -4383,6 +4614,17 @@ private class BodyChecker implements PanicCalls {
             return recorded;
         }
         return this.store.errorType();
+    }
+
+    // Walks one switch arm from the state after the scrutinee and records its out-state, so the
+    // arms can be joined: a local assigned in every arm of an exhaustive switch is assigned after.
+    private walkArmBodyFlow(ArmBody body, bool requireValue, List<Expression> sink,
+                            AssignmentFlow entry, List<AssignmentFlow> armFlows) -> bool {
+        this.restoreAssignment(entry);
+        this.unconditionalPosition = true;
+        let sawBlock = this.walkArmBody(body, requireValue, sink);
+        armFlows.push(this.snapshotAssignment());
+        return sawBlock;
     }
 
     private walkArmBody(ArmBody body, bool requireValue, List<Expression> sink) -> bool {
