@@ -251,6 +251,8 @@ static constexpr std::pair<SyntaxKind, std::string_view> KIND_NAMES[] = {
     {SyntaxKind::NewExpr,           "NewExpr"},
     {SyntaxKind::ParenExpr,         "ParenExpr"},
     {SyntaxKind::ArrayLiteralExpr,  "ArrayLiteralExpr"},
+    {SyntaxKind::StructLiteralExpr, "StructLiteralExpr"},
+    {SyntaxKind::StructLiteralField, "StructLiteralField"},
     {SyntaxKind::InterpStringExpr,  "InterpStringExpr"},
     {SyntaxKind::TryExpr,           "TryExpr"},
     {SyntaxKind::SwitchExpr,        "SwitchExpr"},

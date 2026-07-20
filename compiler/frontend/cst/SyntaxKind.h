@@ -137,6 +137,8 @@ enum class SyntaxKind : uint16_t {
     NewExpr,
     ParenExpr,
     ArrayLiteralExpr,
+    StructLiteralExpr,   // { field: value, ... }: context-typed aggregate literal
+    StructLiteralField,  // one `field: value` entry inside a struct literal
     InterpStringExpr,    // "text {expr} text": alternating literal parts and holes
     TryExpr,             // try <call>: prefixes a single throwing call
     SwitchExpr,          // switch (scrutinee) { arm, arm, ... } used as a value

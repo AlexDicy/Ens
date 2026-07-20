@@ -1775,7 +1775,8 @@ struct CodeGenerator::Impl {
         }
     }
 
-    void initStructFieldDefaults(::Type* t, llvm::Value* base) {
+    void initStructFieldDefaults(::Type* t, llvm::Value* base,
+                                 const std::vector<bool>* skip = nullptr) {
         if (!t || !t->structInfo) return;
         // A struct's field-default expressions are green nodes owned by the module
         // that declares the struct (the template's module for a generic instance).
@@ -1796,6 +1797,7 @@ struct CodeGenerator::Impl {
         defaultInitStack.push_back({t, base});
         for (size_t i = 0; i < fields.size(); ++i) {
             const auto& fi = fields[i];
+            if (skip && i < skip->size() && (*skip)[i]) continue;
             bool wrote = false;
             if (fi.declaration) {
                 auto fieldNode = SyntaxNode::makeRoot(fi.declaration);
@@ -2194,6 +2196,7 @@ struct CodeGenerator::Impl {
             return nullptr;
         }
         if (auto al = e.asArrayLiteral()) return emitArrayLiteral(*al);
+        if (auto sl = e.asStructLiteral()) return emitStructLiteral(*sl);
         if (auto is = e.asInterpString()) return emitInterpString(*is);
         if (auto sw = e.asSwitch()) return emitSwitch(sw->scrutinee(), sw->arms(), typeOf(e.node), true);
         error(e.node.startOffset(), "Unsupported expression in codegen");
@@ -5469,6 +5472,71 @@ struct CodeGenerator::Impl {
         return arrPtr;
     }
 
+    // Materializes a `{field: value, ...}` literal as a by-value struct: a fresh
+    // temporary is zero-initialized, the named fields are stored (retaining any
+    // borrowed class references), and every omitted field takes its declared
+    // default. The loaded aggregate is an owned value like 'new'.
+    llvm::Value* emitStructLiteral(const ast::StructLiteralExpression& e) {
+        ::Type* t = typeOf(e.node);
+        if (!t || !t->isStruct() || !t->structInfo) {
+            error(e.node.startOffset(), "Internal: struct literal has no resolved struct type");
+            return nullptr;
+        }
+        llvm::StructType* layout = mapStructType(t);
+        auto* tmp = createEntryAlloca(currentFunction, layout, "structlit");
+        builder->CreateStore(llvm::ConstantAggregateZero::get(layout), tmp);
+
+        const auto& fields = t->structInfo->fields;
+        std::vector<bool> provided(fields.size(), false);
+        for (auto& f : e.fields()) {
+            auto fname = f.nameText();
+            auto valueExpr = f.value();
+            if (!fname || !valueExpr) continue;
+            int idx = t->structInfo->findFieldIndex(*fname);
+            if (idx < 0) continue;
+            provided[idx] = true;
+            ::Type* fieldT = fields[idx].type;
+            bool borrowed = !expressionProducesOwnedRef(*valueExpr);
+            llvm::Value* v = emitExprConverted(*valueExpr, fieldT);
+            if (!v) return nullptr;
+            llvm::Value* slot = builder->CreateStructGEP(
+                layout, tmp, static_cast<unsigned>(idx), asAscii(fields[idx].name) + ".addr");
+            if (isReferenceType(fieldT)) {
+                if (borrowed) emitRetain(v);
+                builder->CreateStore(v, slot);
+            } else if (structHasClassFields(fieldT)) {
+                builder->CreateStore(v, slot);
+                if (borrowed) emitStructFieldRetain(fieldT, slot);
+            } else {
+                builder->CreateStore(v, slot);
+            }
+        }
+        initStructFieldDefaults(t, tmp, &provided);
+        return builder->CreateLoad(layout, tmp, "structlit.val");
+    }
+
+    // `StructName(args)`: a by-value struct built through its constructor. The
+    // temporary gets its field defaults, then the constructor runs over a pointer
+    // to it, mirroring how 'new' drives a class constructor over the heap object.
+    llvm::Value* emitStructConstructorCall(const ast::CallExpression& e, Symbol* ctorSym,
+                                           ::Type* t) {
+        llvm::StructType* layout = mapStructType(t);
+        auto* tmp = createEntryAlloca(currentFunction, layout, "structctor");
+        builder->CreateStore(llvm::ConstantAggregateZero::get(layout), tmp);
+        if (recordHasFieldDefaults(t->structInfo)) {
+            initStructFieldDefaults(t, tmp);
+        }
+        llvm::Function* fn = getOrDeclareExternalFunction(ctorSym, t);
+        if (fn) {
+            std::vector<llvm::Value*> args;
+            args.reserve(e.arguments().size() + 1);
+            args.push_back(tmp);
+            if (!appendCallArgs(ctorSym, e.arguments(), e.node.greenNode(), args)) return nullptr;
+            builder->CreateCall(fn, args);
+        }
+        return builder->CreateLoad(layout, tmp, "structctor.val");
+    }
+
     // Emits a bounds check then returns the address of element `index`.
     llvm::Value* emitArraySubscriptAddr(llvm::Value* arrPtr, llvm::Value* indexAny,
                                         ::Type* elem) {
@@ -5563,6 +5631,7 @@ struct CodeGenerator::Impl {
     bool expressionProducesOwnedRef(const ast::Expression& e) {
         if (e.asNew() || e.asCall()) return true;
         if (e.asArrayLiteral()) return true;
+        if (e.asStructLiteral()) return true;  // materializes a fresh owned struct
         if (e.asInterpString()) return true;  // builds a fresh concat result
         if (e.asSafeMember()) return true;
         if (e.asSafeSubscript()) return true;
@@ -6233,6 +6302,15 @@ struct CodeGenerator::Impl {
 
     llvm::Value* emitCall(const ast::CallExpression& e) {
         auto callee = e.callee();
+
+        // Struct construction: `StructName(args)` builds a by-value struct.
+        if (Symbol* ctorSym = methodSymbolOf(e.node)) {
+            ::Type* ct = typeOf(e.node);
+            if (ctorSym->isConstructor && ct && ct->isStruct() && ct->structInfo &&
+                !(callee && callee->asSuper())) {
+                return emitStructConstructorCall(e, ctorSym, ct);
+            }
+        }
 
         // Base-constructor chaining: super(args).
         if (callee && callee->asSuper()) {

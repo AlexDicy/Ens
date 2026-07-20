@@ -338,6 +338,11 @@ Type* Analyzer::analyzeExprAdapt(const ast::Expression& expr, Type* target) {
         analysis.setType(expr.node.greenNode(), t);
         return t;
     }
+    if (auto sl = expr.asStructLiteral()) {
+        Type* t = analyzeStructLiteralAdapt(*sl, target);
+        analysis.setType(expr.node.greenNode(), t);
+        return t;
+    }
     Type* t = analyzeExpr(expr);
     if (!target || target->isError() || t->isError()) return t;
     tryAdaptIntegerLiteral(expr, target);
@@ -886,6 +891,7 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             fi.line = line;
             fi.column = col;
             fi.declaration = f.node.greenNode();
+            fi.definingClass = t->structInfo;
             t->structInfo->fields.push_back(std::move(fi));
         }
         popTypeParams(tpCount);
@@ -3447,6 +3453,7 @@ Type* Analyzer::analyzeExpr(const ast::Expression& expr) {
     else if (auto tr = expr.asTry())    t = analyzeTry(*tr);
     else if (auto pr = expr.asParen())  t = analyzeParen(*pr);
     else if (auto al = expr.asArrayLiteral()) t = analyzeArrayLiteral(*al);
+    else if (auto sl = expr.asStructLiteral()) t = analyzeStructLiteral(*sl);
     else if (auto is = expr.asInterpString()) t = analyzeInterpString(*is);
     else if (auto sw = expr.asSwitch()) t = analyzeSwitchExpr(*sw);
     else                                t = typeCtx.getError();
@@ -4506,6 +4513,21 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
     }
     auto name = idCallee->nameText();
     Symbol* sym = (name && currentScope) ? currentScope->lookup(*name) : nullptr;
+    // `StructName(args)` builds a by-value struct through its constructor. A struct
+    // name is not a scope symbol in its own module (only imported type names are),
+    // so accept both the imported type-name symbol and a same-module lookup.
+    if (name) {
+        Type* structT = nullptr;
+        if (sym && sym->isTypeName && sym->type && sym->type->isStruct()) {
+            structT = sym->type;
+        } else if (!sym) {
+            Type* nt = typeCtx.lookupNamedType(modulePath_, *name);
+            if (nt && nt->isStruct()) structT = nt;
+        }
+        if (structT) {
+            return analyzeStructConstructorCall(expr, structT, *name);
+        }
+    }
     if (!sym) {
         errorAtNode(idCallee->node, "Undefined function '" +
             asciiOf(name.value_or(std::u16string{})) + "'");
@@ -5972,6 +5994,140 @@ Type* Analyzer::analyzeArrayLiteralAdapt(const ast::ArrayLiteralExpression& expr
     return arrayT;
 }
 
+static bool fieldHasDefaultValue(const FieldInfo& f);
+
+// A `{...}` literal with no target type: nothing to infer against.
+Type* Analyzer::analyzeStructLiteral(const ast::StructLiteralExpression& expr) {
+    for (auto& f : expr.fields()) {
+        if (auto v = f.value()) analyzeExpr(*v);
+    }
+    errorAtNode(expr.node,
+        "Cannot tell which struct this '{...}' literal builds. Annotate the target "
+        "with a struct type or use a constructor, e.g. 'Point p = {x: 1, y: 2};'.");
+    return typeCtx.getError();
+}
+
+// A struct literal with a target type: every field is set by name against the
+// target struct's declared fields.
+Type* Analyzer::analyzeStructLiteralAdapt(const ast::StructLiteralExpression& expr, Type* target) {
+    if (!target || target->isError()) {
+        return analyzeStructLiteral(expr);
+    }
+    Type* structT = target;
+    if (structT->isOptional() && structT->inner) structT = structT->inner;
+    if (!structT->isStruct() || !structT->structInfo) {
+        errorAtNode(expr.node, "Cannot build '" + target->toString() +
+            "' from a '{...}' literal; that type is not a struct.");
+        for (auto& f : expr.fields()) if (auto v = f.value()) analyzeExpr(*v);
+        return typeCtx.getError();
+    }
+    analysis.setType(expr.node.greenNode(), structT);
+    StructInfo* si = structT->structInfo;
+    std::vector<bool> provided(si->fields.size(), false);
+    for (auto& f : expr.fields()) {
+        auto fname = f.nameText();
+        auto valueExpr = f.value();
+        if (!fname) {
+            if (valueExpr) analyzeExpr(*valueExpr);
+            continue;
+        }
+        int idx = si->findFieldIndex(*fname);
+        if (idx < 0) {
+            errorAtNode(f.node, "Struct '" + asciiOf(si->name) + "' has no field named '" +
+                asciiOf(*fname) + "'.");
+            if (valueExpr) analyzeExpr(*valueExpr);
+            continue;
+        }
+        if (provided[idx]) {
+            errorAtNode(f.node, "Field '" + asciiOf(*fname) +
+                "' is set more than once in this struct literal.");
+            if (valueExpr) analyzeExpr(*valueExpr);
+            continue;
+        }
+        provided[idx] = true;
+        const FieldInfo& fi = si->fields[idx];
+        checkMemberAccess(f.node, *fname, fi.visibility, fi.definingClass);
+        if (!valueExpr) continue;
+        Type* fieldT = fi.type;
+        Type* valueT = analyzeExprAdapt(*valueExpr, fieldT);
+        if (!valueT->isError() && fieldT && !fieldT->isError() &&
+            !fieldT->assignableFrom(valueT)) {
+            errorAtNode(valueExpr->node, "Field '" + asciiOf(*fname) + "': expected '" +
+                fieldT->toString() + "', got '" + valueT->toString() + "'.");
+        }
+    }
+    for (size_t i = 0; i < si->fields.size(); ++i) {
+        if (provided[i]) continue;
+        const FieldInfo& fi = si->fields[i];
+        if (fieldHasDefaultValue(fi)) continue;
+        errorAtNode(expr.node, "Struct literal for '" + asciiOf(si->name) +
+            "' is missing the required field '" + asciiOf(fi.name) +
+            "'. Add '" + asciiOf(fi.name) + ": ...' or give the field a default value.");
+    }
+    return structT;
+}
+
+// `StructName(args)`: a by-value struct built through its constructor. Resolution
+// mirrors class-constructor resolution (overloads, named and optional arguments)
+// with no heap allocation.
+Type* Analyzer::analyzeStructConstructorCall(const ast::CallExpression& expr, Type* structType,
+                                             const std::u16string& typeName) {
+    auto args = expr.arguments();
+    analysis.setType(expr.node.greenNode(), structType);
+    StructInfo* si = structType->structInfo;
+    if (!si) return typeCtx.getError();
+    if (si->isTemplate) {
+        errorAtNode(expr.node, "Cannot build the generic struct '" + asciiOf(typeName) +
+            "' with a constructor call; use a typed aggregate literal, e.g. '" +
+            asciiOf(typeName) + "<...> value = {...};'.");
+        for (auto& a : args) analyzeExpr(a);
+        return structType;
+    }
+    std::vector<const MethodInfo*> ctorCands;
+    for (const auto& m : si->methods) {
+        if (m.isConstructor && m.symbol) ctorCands.push_back(&m);
+    }
+    if (ctorCands.empty()) {
+        errorAtNode(expr.node, "Struct '" + asciiOf(typeName) +
+            "' has no constructor to call; build it with an aggregate literal, e.g. '" +
+            asciiOf(typeName) + " value = {...};', or add a 'constructor(...)'.");
+        for (auto& a : args) analyzeExpr(a);
+        return structType;
+    }
+    if (ctorCands.size() > 1 || callUsesNamedArguments(args)) {
+        CallShape shape = analyzeCallShape(args);
+        std::vector<OverloadCandidate> candidates;
+        for (const MethodInfo* mi : ctorCands) candidates.push_back({mi->symbol, mi, true});
+        OverloadChoice choice = resolveOverloadedCall(
+            candidates, shape, expr.node, asciiOf(typeName), "Constructor");
+        if (!choice.failed) {
+            analysis.setMethodSymbol(expr.node.greenNode(), choice.symbol);
+            checkResolvedCallArguments(shape, choice, expr.node.greenNode());
+        }
+        return structType;
+    }
+    Symbol* ctor = ctorCands.front()->symbol;
+    analysis.setMethodSymbol(expr.node.greenNode(), ctor);
+    size_t req = requiredArgCount(ctor);
+    if (args.size() < req || args.size() > ctor->paramTypes.size()) {
+        errorAtNode(expr.node, "Constructor '" + asciiOf(typeName) + "' expects " +
+            std::to_string(req) +
+            (req == ctor->paramTypes.size() ? "" : "-" + std::to_string(ctor->paramTypes.size())) +
+            " argument(s), got " + std::to_string(args.size()));
+    }
+    size_t n = std::min(args.size(), ctor->paramTypes.size());
+    for (size_t i = 0; i < n; ++i) {
+        Type* paramT = ctor->paramTypes[i];
+        Type* argT = analyzeExprAdapt(args[i], paramT);
+        if (!paramT->assignableFrom(argT)) {
+            errorAtNode(args[i].node, "Argument " + std::to_string(i + 1) +
+                ": expected '" + paramT->toString() + "', got '" + argT->toString() + "'");
+        }
+    }
+    for (size_t i = n; i < args.size(); ++i) analyzeExpr(args[i]);
+    return structType;
+}
+
 bool Analyzer::isLValue(const ast::Expression& expr) const {
     SyntaxKind k = expr.kind();
     if (k == SyntaxKind::IdentExpr || k == SyntaxKind::SubscriptExpr ||
@@ -6122,23 +6278,12 @@ static bool ctorBodyAssignsThisField(const ast::FuncDecl& ctor,
 }
 
 void Analyzer::checkFieldInitialization(const ast::StructDecl& sd) {
-    Type* t = analysis.typeOf(sd.node.greenNode());
-    if (!t || !t->structInfo) return;
-    for (auto& f : t->structInfo->fields) {
-        if (isDefaultable(f.type)) continue;
-        // A type-parameter field's defaultability depends on the type argument;
-        // it is checked per instantiation where the struct is actually used.
-        if (f.type && f.type->isTypeParam()) continue;
-        if (fieldHasDefaultValue(f)) continue;
-        std::string fname = asciiOf(f.name);
-        std::string sname = asciiOf(t->structInfo->name);
-        std::string msg = "Field '" + fname + "' of struct '" + sname +
-            "' has non-nullable type '" + f.type->toString() +
-            "' and no default value. Either give it a default (e.g. `" +
-            f.type->toString() + " " + fname + " = ...;`) or make it nullable (`" +
-            f.type->toString() + "? " + fname + ";`).";
-        sink.error({f.line, f.column, static_cast<int>(fname.size())}, std::move(msg));
-    }
+    // A struct field may have any type, including a non-defaultable one (a class,
+    // string, array, or another non-defaultable struct). Such a struct is itself
+    // non-defaultable, so it cannot be zero-initialized and must be built with an
+    // aggregate literal or a constructor; the non-defaultable rules at each use
+    // site (locals, array elements) still apply.
+    (void)sd;
 }
 
 void Analyzer::checkFieldInitialization(const ast::ClassDecl& cd) {

@@ -30,6 +30,8 @@ class NullCoalesceExpression;
 class NewExpression;
 class ParenExpression;
 class ArrayLiteralExpression;
+class StructLiteralExpression;
+class StructLiteralField;
 class InterpStringExpression;
 class TryExpression;
 class SwitchArm;
@@ -68,6 +70,7 @@ public:
     std::optional<NewExpression>       asNew() const;
     std::optional<ParenExpression>     asParen() const;
     std::optional<ArrayLiteralExpression> asArrayLiteral() const;
+    std::optional<StructLiteralExpression> asStructLiteral() const;
     std::optional<InterpStringExpression> asInterpString() const;
     std::optional<TryExpression>       asTry() const;
     std::optional<SwitchExpression>    asSwitch() const;
@@ -322,6 +325,30 @@ public:
         return ArrayLiteralExpression{n};
     }
     std::vector<Expression> elements() const;
+};
+
+// One `field: value` entry of a struct literal.
+class StructLiteralField {
+public:
+    SyntaxNode node;
+    static std::optional<StructLiteralField> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::StructLiteralField) return std::nullopt;
+        return StructLiteralField{n};
+    }
+    std::optional<SyntaxNode> nameToken() const;
+    std::optional<std::u16string> nameText() const;
+    std::optional<Expression> value() const;
+};
+
+// A context-typed aggregate literal `{field: value, ...}`.
+class StructLiteralExpression {
+public:
+    SyntaxNode node;
+    static std::optional<StructLiteralExpression> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::StructLiteralExpr) return std::nullopt;
+        return StructLiteralExpression{n};
+    }
+    std::vector<StructLiteralField> fields() const;
 };
 
 class InterpStringExpression {

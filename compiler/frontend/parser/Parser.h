@@ -128,7 +128,12 @@ private:
     void parseSwitchExpr();
     void parseArgList();
     void parseCallArgument();
+    void parseStructLiteral();
+    void parseStructLiteralField();
 
     int infixPrecedence(SyntaxKind k) const;
     bool isAssignmentOp(SyntaxKind k) const;
+    // A '{' whose next two tokens are `IDENT :` starts a struct literal; every
+    // other '{' is a block.
+    bool atStructLiteralStart() const;
 };

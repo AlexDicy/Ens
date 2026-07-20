@@ -1291,7 +1291,7 @@ void Parser::parseSwitchArm() {
         }
     }
     expect(SyntaxKind::Arrow, "'->' after the switch label");
-    if (at(SyntaxKind::LBrace)) parseBlock();
+    if (at(SyntaxKind::LBrace) && !atStructLiteralStart()) parseBlock();
     else parseExpression();
     eat(SyntaxKind::Comma);
     builder.finishNode();
@@ -1606,6 +1606,13 @@ void Parser::parsePrefix() {
             builder.finishNode();
             return;
         }
+        case SyntaxKind::LBrace: {
+            // Struct literal: `{ field: value, ... }`. A '{' reaches parsePrefix
+            // only in expression position; blocks and switch-arm bodies are
+            // dispatched before this point.
+            parseStructLiteral();
+            return;
+        }
         case SyntaxKind::LBracket: {
             // Array literal: `[ ]`, `[ expr (',' expr)* ','? ]`.
             // Subscript `arr[i]` does not enter parsePrefix - it is handled as
@@ -1663,4 +1670,31 @@ void Parser::parseCallArgument() {
         return;
     }
     parseExpression();
+}
+
+bool Parser::atStructLiteralStart() const {
+    return at(SyntaxKind::LBrace) && peekKind(1) == SyntaxKind::Identifier &&
+           peekKind(2) == SyntaxKind::Colon;
+}
+
+void Parser::parseStructLiteral() {
+    builder.startNode(SyntaxKind::StructLiteralExpr);
+    expect(SyntaxKind::LBrace, "'{'");
+    if (!at(SyntaxKind::RBrace) && !atEnd()) {
+        parseStructLiteralField();
+        while (eat(SyntaxKind::Comma)) {
+            if (at(SyntaxKind::RBrace)) break;  // trailing comma OK
+            parseStructLiteralField();
+        }
+    }
+    expect(SyntaxKind::RBrace, "'}' to close the struct literal");
+    builder.finishNode();
+}
+
+void Parser::parseStructLiteralField() {
+    builder.startNode(SyntaxKind::StructLiteralField);
+    expect(SyntaxKind::Identifier, "a field name, e.g. '{x: 1, y: 2}'");
+    expect(SyntaxKind::Colon, "':' after the field name, e.g. '{x: 1}'");
+    parseExpression();
+    builder.finishNode();
 }

@@ -322,6 +322,10 @@ private:
     Type* analyzeParen(const ast::ParenExpression& expr);
     Type* analyzeArrayLiteral(const ast::ArrayLiteralExpression& expr);
     Type* analyzeArrayLiteralAdapt(const ast::ArrayLiteralExpression& expr, Type* target);
+    Type* analyzeStructLiteral(const ast::StructLiteralExpression& expr);
+    Type* analyzeStructLiteralAdapt(const ast::StructLiteralExpression& expr, Type* target);
+    Type* analyzeStructConstructorCall(const ast::CallExpression& expr, Type* structType,
+                                       const std::u16string& typeName);
     Type* analyzeInterpString(const ast::InterpStringExpression& expr);
 
     // Build a NarrowingPath from a member / subscript chain. Returns nullopt when

@@ -28,6 +28,7 @@ bool Expression::isExpressionKind(SyntaxKind k) {
         case SyntaxKind::NewExpr:
         case SyntaxKind::ParenExpr:
         case SyntaxKind::ArrayLiteralExpr:
+        case SyntaxKind::StructLiteralExpr:
         case SyntaxKind::InterpStringExpr:
         case SyntaxKind::TryExpr:
         case SyntaxKind::SwitchExpr:
@@ -80,6 +81,7 @@ std::optional<NullCoalesceExpression> Expression::asNullCoalesce() const { retur
 std::optional<NewExpression>       Expression::asNew()       const { return NewExpression::cast(node); }
 std::optional<ParenExpression>     Expression::asParen()     const { return ParenExpression::cast(node); }
 std::optional<ArrayLiteralExpression> Expression::asArrayLiteral() const { return ArrayLiteralExpression::cast(node); }
+std::optional<StructLiteralExpression> Expression::asStructLiteral() const { return StructLiteralExpression::cast(node); }
 std::optional<InterpStringExpression> Expression::asInterpString() const { return InterpStringExpression::cast(node); }
 std::optional<TryExpression>       Expression::asTry()       const { return TryExpression::cast(node); }
 std::optional<SwitchExpression>    Expression::asSwitch()    const { return SwitchExpression::cast(node); }
@@ -445,6 +447,33 @@ std::optional<Expression> ParenExpression::inner() const {
 
 std::vector<Expression> ArrayLiteralExpression::elements() const {
     return expressionChildren(node);
+}
+
+// === StructLiteralField / StructLiteralExpression ===
+
+std::optional<SyntaxNode> StructLiteralField::nameToken() const {
+    for (auto& c : node.children()) {
+        if (isTrivia(c.kind())) continue;
+        if (c.kind() == SyntaxKind::Identifier) return c;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::u16string> StructLiteralField::nameText() const {
+    if (auto t = nameToken()) return std::u16string(t->tokenText());
+    return std::nullopt;
+}
+
+std::optional<Expression> StructLiteralField::value() const {
+    return firstExpressionChild(node);
+}
+
+std::vector<StructLiteralField> StructLiteralExpression::fields() const {
+    std::vector<StructLiteralField> out;
+    for (auto& c : node.children()) {
+        if (auto f = StructLiteralField::cast(c)) out.push_back(*f);
+    }
+    return out;
 }
 
 // === InterpStringExpression ===
