@@ -60,6 +60,8 @@ import NullCoalesceExpressionNode from @ens.frontend.syntax.nodes;
 import NewExpressionNode from @ens.frontend.syntax.nodes;
 import ParenthesizedExpressionNode from @ens.frontend.syntax.nodes;
 import ArrayLiteralExpressionNode from @ens.frontend.syntax.nodes;
+import StructLiteralExpressionNode from @ens.frontend.syntax.nodes;
+import StructLiteralFieldNode from @ens.frontend.syntax.nodes;
 import InterpolatedStringExpressionNode from @ens.frontend.syntax.nodes;
 import TryExpressionNode from @ens.frontend.syntax.nodes;
 import ErrorExpressionNode from @ens.frontend.syntax.nodes;
@@ -1635,6 +1637,9 @@ private class BodyChecker implements PanicCalls {
             is ArrayLiteralExpressionNode literal -> {
                 return this.analyzeArrayLiteral(literal);
             },
+            is StructLiteralExpressionNode literal -> {
+                return this.analyzeStructLiteral(literal);
+            },
             is InterpolatedStringExpressionNode interpolated -> {
                 return this.analyzeInterpolatedString(interpolated);
             },
@@ -1656,6 +1661,11 @@ private class BodyChecker implements PanicCalls {
     private analyzeExpressionAdapt(Expression node, Type target) -> Type {
         if (node is ArrayLiteralExpressionNode) {
             Type adapted = this.analyzeArrayLiteralAdapt(node, target);
+            this.result.setType(node.green(), adapted);
+            return adapted;
+        }
+        if (node is StructLiteralExpressionNode) {
+            Type adapted = this.analyzeStructLiteralAdapt(node, target);
             this.result.setType(node.green(), adapted);
             return adapted;
         }
@@ -2453,6 +2463,138 @@ private class BodyChecker implements PanicCalls {
         return this.store.errorType();
     }
 
+    // A '\{...\}' literal with no target type: nothing to infer against.
+    private analyzeStructLiteral(StructLiteralExpressionNode node) -> Type {
+        for (long i = 0; i < node.fieldsCount(); i++) {
+            this.analyzeExpression(node.fields(i).value());
+        }
+        this.reporter.report("Cannot tell which struct this '\{...\}' literal builds. Annotate "
+            + "the target with a struct type or use a constructor, e.g. "
+            + "'Point p = \{x: 1, y: 2\};'.", node.span());
+        return this.store.errorType();
+    }
+
+    // A struct literal with a target type: every field is set by name against the target struct's
+    // declared fields, with the same visibility, adaptation, and assignability rules as a direct
+    // field write.
+    private analyzeStructLiteralAdapt(StructLiteralExpressionNode node, Type target) -> Type {
+        if (target is ErrorType) {
+            return this.analyzeStructLiteral(node);
+        }
+        Type structType = convert.bareOf(target);
+        if (!isStructValue(structType)) {
+            this.reporter.report("Cannot build '{types.display(target)}' from a '\{...\}' "
+                + "literal; that type is not a struct.", node.span());
+            for (long i = 0; i < node.fieldsCount(); i++) {
+                this.analyzeExpression(node.fields(i).value());
+            }
+            return this.store.errorType();
+        }
+        this.result.setType(node.green(), structType);
+        let fields = types.fieldsOf(structType);
+        if (fields == null) {
+            return structType;
+        }
+        string structShown = structDisplayName(structType);
+        let provided = new List<bool>();
+        for (long i = 0; i < fields.length(); i++) {
+            provided.push(false);
+        }
+        for (long i = 0; i < node.fieldsCount(); i++) {
+            let entry = node.fields(i);
+            string fieldName = entry.name().text();
+            long index = fieldIndexNamed(fields, fieldName);
+            if (index < 0) {
+                this.reporter.report("Struct '{structShown}' has no field named "
+                    + "'{fieldName}'.", entry.name().span());
+                this.analyzeExpression(entry.value());
+                continue;
+            }
+            if (provided.get(index)) {
+                this.reporter.report("Field '{fieldName}' is set more than once in this struct "
+                    + "literal.", entry.name().span());
+                this.analyzeExpression(entry.value());
+                continue;
+            }
+            provided.set(index, true);
+            let field = fields.get(index);
+            this.checkMemberAccess(fieldName, field.visibility(), field.definingType(),
+                entry.name().span());
+            Type fieldType = field.type();
+            Type valueType = this.analyzeExpressionAdapt(entry.value(), fieldType);
+            if (!(valueType is ErrorType) && !(fieldType is ErrorType)
+                    && !convert.isAssignableStrict(fieldType, valueType)) {
+                this.reporter.report("Field '{fieldName}': expected "
+                    + "'{types.display(fieldType)}', got '{types.display(valueType)}'"
+                    + "{nullabilityHint(fieldType, valueType)}", entry.value().span());
+            }
+        }
+        for (long i = 0; i < fields.length(); i++) {
+            if (provided.get(i)) {
+                continue;
+            }
+            let field = fields.get(i);
+            if (field.hasDefault()) {
+                continue;
+            }
+            this.reporter.report("Struct literal for '{structShown}' is missing the required "
+                + "field '{field.name()}'. Add '{field.name()}: ...' or give the field a "
+                + "default value.", node.span());
+        }
+        return structType;
+    }
+
+    // 'StructName(args)': a by-value struct built through its constructor. Resolution mirrors
+    // class-constructor resolution (overloads, named and optional arguments) with no allocation.
+    private analyzeStructConstructorCall(CallExpressionNode node, Type structType, string name)
+            -> Type {
+        let arguments = node.arguments();
+        this.result.setType(node.green(), structType);
+        if (structType is StructType && structType.isGeneric()) {
+            this.reporter.report("Cannot build the generic struct '{name}' with a constructor "
+                + "call; use a typed aggregate literal, e.g. '{name}<...> value = \{...\};'.",
+                node.span());
+            this.analyzeArgumentsOnly(arguments);
+            return structType;
+        }
+        let constructors = constructorsOf(structType);
+        if (constructors.length() == 0) {
+            this.reporter.report("Struct '{name}' has no constructor to call; build it with an "
+                + "aggregate literal, e.g. '{name} value = \{...\};', or add a "
+                + "'constructor(...)'.", node.span());
+            this.analyzeArgumentsOnly(arguments);
+            return structType;
+        }
+        if (constructors.length() > 1 || usesNamedArguments(arguments)) {
+            let built = this.buildCallShape(arguments);
+            let candidates = new List<CallCandidate>();
+            for (long i = 0; i < constructors.length(); i++) {
+                candidates.push(new CallCandidate(constructors.get(i).signature(),
+                    constructors.get(i), true));
+            }
+            let resolved = calls.resolveCall(candidates, built.shape, this.reporter,
+                node.span(), name, "Constructor");
+            if (!resolved.failed()) {
+                let chosen = resolved.chosen();
+                if (chosen != null) {
+                    let chosenMethod = chosen.method();
+                    if (chosenMethod != null) {
+                        this.result.setMethod(node.green(), chosenMethod);
+                    }
+                    this.checkResolvedArguments(built, resolved, node.green());
+                }
+            }
+            this.clearNarrowingsForArguments(arguments);
+            return structType;
+        }
+        let structConstructor = constructors.get(0);
+        this.result.setMethod(node.green(), structConstructor);
+        this.checkDirectArguments("Constructor", name, structConstructor.signature(),
+            arguments, node.span());
+        this.clearNarrowingsForArguments(arguments);
+        return structType;
+    }
+
     // ---- Member access ----
 
     // The type whose members a receiver exposes: a bounded type parameter exposes the members
@@ -2902,6 +3044,10 @@ private class BodyChecker implements PanicCalls {
         string name = identifier.name().text();
         let resolution = this.resolveName(name);
         if (resolution == null) {
+            let declared = this.store.findDeclared(this.modulePath, name);
+            if (declared != null && isStructValue(declared)) {
+                return this.analyzeStructConstructorCall(node, declared, name);
+            }
             this.reporter.report("Undefined function '{name}'. Check the spelling, or import "
                 + "the module that declares it.", identifier.span());
             this.analyzeArgumentsOnly(node.arguments());
@@ -2909,6 +3055,12 @@ private class BodyChecker implements PanicCalls {
         }
         if (resolution is FunctionName) {
             return this.dispatchFunctionCall(node, identifier, name, resolution.entries);
+        }
+        if (resolution is TypeName) {
+            let target = resolution.target;
+            if (isStructValue(target)) {
+                return this.analyzeStructConstructorCall(node, target, name);
+            }
         }
         this.reporter.report("'{name}' is not a function and cannot be called.",
             identifier.span());
@@ -4296,6 +4448,23 @@ private methodCandidates(Type record, string name) -> List<Method> {
         current = types.baseOf(current);
     }
     return found;
+}
+
+private fieldIndexNamed(List<Field> fields, string name) -> long {
+    for (long i = 0; i < fields.length(); i++) {
+        if (fields.get(i).name() == name) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+private structDisplayName(Type structType) -> string {
+    let authority = types.authorityOf(structType);
+    if (authority != null) {
+        return authority.name();
+    }
+    return types.display(structType);
 }
 
 private constructorsOf(Type record) -> List<Method> {
