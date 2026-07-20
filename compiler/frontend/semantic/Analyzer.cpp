@@ -2305,6 +2305,10 @@ void Analyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
     // Synthesize this.field = paramName for each this-field param.
     if (receiverType) analyzeImplicitConstructorAssignments(fn);
 
+    bool prevDaEnabled = daEnabled_;
+    daEnabled_ = true;
+    daResetForBody();
+
     // Body locals live in a child scope so catch clauses (siblings below) can't see them.
     pushScope();
     if (auto body = fn.body()) {
@@ -2333,6 +2337,7 @@ void Analyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
     }
 
     for (auto& cc : fn.catchClauses()) analyzeCatchClause(cc, funcScope);
+    daEnabled_ = prevDaEnabled;
 
     checkFunctionReturnPaths(fn);
 
@@ -2359,12 +2364,16 @@ void Analyzer::analyzeTestBody(const ast::TestDecl& test) {
 
     Scope* funcScope = pushScope();
     currentFunctionParamScope = funcScope;
+    bool prevDaEnabled = daEnabled_;
+    daEnabled_ = true;
+    daResetForBody();
     pushScope();
     if (auto body = test.body()) {
         analyzeStatements(body->statements());
     }
     popScope();
     popScope();
+    daEnabled_ = prevDaEnabled;
 
     currentFunction = prevFunction;
     currentThis = prevThis;
@@ -2388,11 +2397,20 @@ void Analyzer::analyzeCatchClause(const ast::CatchClause& clause, Scope* funcSco
         }
     }
 
+    // A catch body runs on the exception path, where the try body may have thrown
+    // before assigning any local, so nothing carries in but the caught variable.
+    AssignFlow prevFlow = daSnapshot();
+    auto prevBreaks = daBreakFlows_;
+    daBreakFlows_.clear();
+    daAssigned_.clear();
+    daTerminated_ = false;
+
     if (auto nameTok = clause.nameToken()) {
         auto cname = clause.nameText().value_or(std::u16string{});
         Symbol* var = makeSymbol(SymbolKind::Variable, cname, clauseType, nameTok->startOffset());
         currentScope->define(var);
         analysis.setSymbol(clause.node.greenNode(), var);
+        daTrackLocal(var, /*assigned=*/true);
     }
 
     bool prevInCatch = inCatchClause;
@@ -2402,6 +2420,8 @@ void Analyzer::analyzeCatchClause(const ast::CatchClause& clause, Scope* funcSco
     }
     inCatchClause = prevInCatch;
 
+    daRestore(prevFlow);
+    daBreakFlows_ = prevBreaks;
     popScope();
 }
 
@@ -2653,6 +2673,7 @@ void Analyzer::analyzeLetStmt(const ast::LetStatement& stmt) {
         errorAtNode(stmt.node, "Variable '" + asciiOf(name) + "' is already defined in this scope");
     }
     analysis.setSymbol(stmt.node.greenNode(), sym);
+    daTrackLocal(sym, /*assigned=*/initType != nullptr);
 }
 
 void Analyzer::analyzeTypedVarDeclStmt(const ast::TypedVarDeclStatement& stmt) {
@@ -2672,13 +2693,6 @@ void Analyzer::analyzeTypedVarDeclStmt(const ast::TypedVarDeclStatement& stmt) {
     auto name = stmt.nameText().value_or(std::u16string{});
     if (stmt.isConst() && !initType && !declared->isError()) {
         errorAtNode(stmt.node, "Constant '" + asciiOf(name) + "' must be initialized");
-    } else if (!initType && !isDefaultable(declared) && !declared->isError() &&
-               !TypeContext::containsTypeParam(declared)) {
-        // A type mentioning a type parameter defers its defaultability to the
-        // instantiation, like a type-parameter field.
-        errorAtNode(stmt.node, "Variable '" + asciiOf(name) + "' has non-nullable type '" +
-            declared->toString() + "' but no initializer. Provide a value, or make the type nullable ('" +
-            declared->toString() + "?').");
     }
     uint32_t namePos = stmt.nameToken() ? stmt.nameToken()->startOffset() : stmt.node.startOffset();
     Symbol* sym = makeSymbol(SymbolKind::Variable, name, declared, namePos);
@@ -2693,6 +2707,7 @@ void Analyzer::analyzeTypedVarDeclStmt(const ast::TypedVarDeclStatement& stmt) {
     }
     if (initType) establishAssignmentNarrowing(sym, initType);
     analysis.setSymbol(stmt.node.greenNode(), sym);
+    daTrackLocal(sym, /*assigned=*/initType != nullptr);
 }
 
 static ast::Expression unwrapParens(const ast::Expression& e) {
@@ -3201,6 +3216,82 @@ void Analyzer::checkFunctionReturnPaths(const ast::FuncDecl& fn) {
     }
 }
 
+// =========================================================
+// Definite assignment
+// =========================================================
+
+void Analyzer::daResetForBody() {
+    daAssigned_.clear();
+    daTracked_.clear();
+    daBreakFlows_.clear();
+    daTerminated_ = false;
+    daUnconditional_ = true;
+    daWriteTargetGreen_ = nullptr;
+}
+
+void Analyzer::daTrackLocal(Symbol* sym, bool assigned) {
+    if (!daEnabled_ || !sym) return;
+    daTracked_.insert(sym);
+    if (assigned) daAssigned_.insert(sym);
+    else daAssigned_.erase(sym);
+}
+
+void Analyzer::daMarkAssigned(Symbol* sym) {
+    if (!daEnabled_ || !sym || daTerminated_) return;
+    if (daTracked_.count(sym)) daAssigned_.insert(sym);
+}
+
+void Analyzer::daCheckRead(const ast::IdentExpression& expr, Symbol* sym) {
+    if (!daEnabled_ || !sym || daTerminated_) return;
+    if (expr.node.greenNode() == daWriteTargetGreen_) return;
+    if (!daTracked_.count(sym) || daAssigned_.count(sym)) return;
+    errorAtNode(expr.node, "Variable '" + asciiOf(sym->name) +
+        "' is used before it is assigned a value. Assign it on every path that "
+        "reaches this point first, for example '" + asciiOf(sym->name) + " = ...;'.");
+    // Suppress cascading reports for the same local by treating it as assigned.
+    daAssigned_.insert(sym);
+}
+
+Analyzer::AssignFlow Analyzer::daSnapshot() const {
+    return AssignFlow{daAssigned_, daTerminated_};
+}
+
+void Analyzer::daRestore(const AssignFlow& flow) {
+    daAssigned_ = flow.assigned;
+    daTerminated_ = flow.terminated;
+}
+
+// The join of several branch out-states: a local is assigned after the join only
+// if it is assigned on every branch that can fall through. A terminated branch is
+// the identity for the intersection (it cannot reach the join). When every branch
+// terminates the join is unreachable, so it stays terminated and, to avoid
+// spurious reports in the dead code that follows, credits every branch's writes.
+Analyzer::AssignFlow Analyzer::daJoin(const std::vector<AssignFlow>& flows) const {
+    AssignFlow out;
+    out.terminated = true;
+    bool first = true;
+    for (const auto& f : flows) {
+        if (f.terminated) continue;
+        if (first) {
+            out.assigned = f.assigned;
+            out.terminated = false;
+            first = false;
+        } else {
+            std::unordered_set<Symbol*> both;
+            for (Symbol* s : out.assigned) {
+                if (f.assigned.count(s)) both.insert(s);
+            }
+            out.assigned.swap(both);
+        }
+    }
+    if (out.terminated) {
+        for (const auto& f : flows) {
+            for (Symbol* s : f.assigned) out.assigned.insert(s);
+        }
+    }
+    return out;
+}
+
 void Analyzer::analyzeIfStmt(const ast::IfStatement& stmt) {
     std::vector<NullCheckInfo> whenTrue;
     std::vector<NullCheckInfo> whenFalse;
@@ -3214,15 +3305,21 @@ void Analyzer::analyzeIfStmt(const ast::IfStatement& stmt) {
     }
     auto thenBlock = stmt.thenBlock();
     auto elseClause = stmt.elseClause();
+    AssignFlow entry = daSnapshot();
+    daRestore(entry);
     if (thenBlock) {
         analyzeBranchWithNarrowing(*thenBlock, whenTrue);
     }
+    AssignFlow afterThen = daSnapshot();
+    daRestore(entry);
     if (elseClause) {
         if (auto inner = elseClause->ifStatement()) analyzeIfStmt(*inner);
         else if (auto bb = elseClause->block()) {
             analyzeBranchWithNarrowing(*bb, whenFalse);
         }
     }
+    AssignFlow afterElse = daSnapshot();
+    daRestore(daJoin({afterThen, afterElse}));
 
     // When one branch always exits, the opposite case survives into the enclosing
     // block, so a null check can narrow past the `if` (e.g. `if (x == null) { throw; }`
@@ -3246,6 +3343,15 @@ void Analyzer::analyzeIfStmt(const ast::IfStatement& stmt) {
     }
 }
 
+// A loop's body may run zero times, so a write inside it is not definitely
+// assigned after the loop; only the pre-loop state and the state at each `break`
+// reach the normal exit. A `while (true)` / `for (;;)` with no break never exits
+// normally, so the code after it is unreachable.
+static bool isBoolTrueLiteral(const ast::Expression& e) {
+    if (auto lit = e.asLiteral()) return lit->literalKind() == SyntaxKind::KwTrue;
+    return false;
+}
+
 void Analyzer::analyzeWhileStmt(const ast::WhileStatement& stmt) {
     // The condition is rechecked every iteration and writes inside the body
     // drop narrowing at that point, so condition narrowing is safe in the body.
@@ -3253,16 +3359,30 @@ void Analyzer::analyzeWhileStmt(const ast::WhileStatement& stmt) {
     // body write kills it, so drop every such narrowing up front.
     if (auto b = stmt.body()) preClearLoopBodyWrites(b->node);
     std::vector<NullCheckInfo> narrowings;
+    bool alwaysTrue = false;
     if (auto c = stmt.condition()) {
         Type* ct = analyzeExpr(*c);
         if (!ct->isError() && !ct->isBool()) {
             errorAtNode(c->node, "While condition must be 'bool', got '" + ct->toString() + "'");
         }
         collectNarrowings(*c, /*conditionHolds=*/true, narrowings);
+        alwaysTrue = isBoolTrueLiteral(*c);
     }
+    AssignFlow postCond = daSnapshot();
+    daBreakFlows_.push_back({});
     loopDepth++;
     if (auto b = stmt.body()) analyzeBranchWithNarrowing(*b, narrowings);
     loopDepth--;
+    std::vector<AssignFlow> exits = std::move(daBreakFlows_.back());
+    daBreakFlows_.pop_back();
+    if (!alwaysTrue) exits.push_back(postCond);
+    if (exits.empty()) {
+        AssignFlow dead = postCond;
+        dead.terminated = true;
+        daRestore(dead);
+    } else {
+        daRestore(daJoin(exits));
+    }
 }
 
 void Analyzer::analyzeForStmt(const ast::ForStatement& stmt) {
@@ -3274,15 +3394,21 @@ void Analyzer::analyzeForStmt(const ast::ForStatement& stmt) {
     if (auto b = stmt.body()) preClearLoopBodyWrites(b->node);
     if (auto u = stmt.update()) preClearLoopBodyWrites(u->node);
     std::vector<NullCheckInfo> narrowings;
+    bool hasCondition = false;
+    bool alwaysTrue = false;
     if (auto c = stmt.condition()) {
+        hasCondition = true;
         Type* ct = analyzeExpr(*c);
         if (!ct->isError() && !ct->isBool()) {
             errorAtNode(c->node, "For condition must be 'bool', got '" + ct->toString() + "'");
         }
         collectNarrowings(*c, /*conditionHolds=*/true, narrowings);
+        alwaysTrue = isBoolTrueLiteral(*c);
     }
+    AssignFlow postCond = daSnapshot();
     // The update runs after each iteration, so it is analyzed after the body
     // under the same narrowing; a body write drops the narrowing first.
+    daBreakFlows_.push_back({});
     loopDepth++;
     pushScope();
     for (const auto& info : narrowings) {
@@ -3291,9 +3417,19 @@ void Analyzer::analyzeForStmt(const ast::ForStatement& stmt) {
     if (auto b = stmt.body()) {
         analyzeStatements(b->statements());
     }
-    if (auto u = stmt.update()) analyzeExpr(*u);
+    if (auto u = stmt.update()) { daUnconditional_ = true; analyzeExpr(*u); }
     popScope();
     loopDepth--;
+    std::vector<AssignFlow> exits = std::move(daBreakFlows_.back());
+    daBreakFlows_.pop_back();
+    if (hasCondition && !alwaysTrue) exits.push_back(postCond);
+    if (exits.empty()) {
+        AssignFlow dead = postCond;
+        dead.terminated = true;
+        daRestore(dead);
+    } else {
+        daRestore(daJoin(exits));
+    }
     popScope();  // the init-binding scope opened at the top
 }
 
@@ -3370,21 +3506,34 @@ void Analyzer::analyzeForEachStmt(const ast::ForEachStatement& stmt) {
     sym->isConst = stmt.isConst();
     currentScope->define(sym);
     analysis.setSymbol(stmt.node.greenNode(), sym);
+    AssignFlow entry = daSnapshot();
+    daTrackLocal(sym, /*assigned=*/true);
+    daBreakFlows_.push_back({});
     loopDepth++;
     if (auto b = stmt.body()) {
         preClearLoopBodyWrites(b->node);
         analyzeBlock(*b);
     }
     loopDepth--;
+    std::vector<AssignFlow> exits = std::move(daBreakFlows_.back());
+    daBreakFlows_.pop_back();
+    exits.push_back(entry);  // the sequence may be empty, so the body may not run
+    daRestore(daJoin(exits));
     popScope();
 }
 
 void Analyzer::analyzeBreakStmt(const ast::BreakStatement& stmt) {
     if (loopDepth == 0) errorAtNode(stmt.node, "'break' outside of a loop");
+    // A break carries the current assignments to the loop's normal exit.
+    if (daEnabled_ && !daTerminated_ && !daBreakFlows_.empty()) {
+        daBreakFlows_.back().push_back(daSnapshot());
+    }
+    daTerminated_ = true;
 }
 
 void Analyzer::analyzeContinueStmt(const ast::ContinueStatement& stmt) {
     if (loopDepth == 0) errorAtNode(stmt.node, "'continue' outside of a loop");
+    daTerminated_ = true;
 }
 
 void Analyzer::analyzeReturnStmt(const ast::ReturnStatement& stmt) {
@@ -3399,6 +3548,7 @@ void Analyzer::analyzeReturnStmt(const ast::ReturnStatement& stmt) {
             errorAtNode(stmt.node, "Function returns '" + expected->toString() +
                 "', but 'return' has no value");
         }
+        daTerminated_ = true;
         return;
     }
     Type* actual = analyzeExprAdapt(*value, expected);
@@ -3410,10 +3560,15 @@ void Analyzer::analyzeReturnStmt(const ast::ReturnStatement& stmt) {
     } else if (expected && expected->isVoid()) {
         errorAtNode(value->node, "Function returns 'void' but 'return' has a value");
     }
+    daTerminated_ = true;
 }
 
 void Analyzer::analyzeExpressionStmt(const ast::ExpressionStatement& stmt) {
-    if (auto e = stmt.expression()) analyzeExpr(*e);
+    daUnconditional_ = true;
+    if (auto e = stmt.expression()) {
+        analyzeExpr(*e);
+        if (isPanicCall(*e)) daTerminated_ = true;
+    }
 }
 
 // =========================================================
@@ -3502,6 +3657,7 @@ Type* Analyzer::analyzeIdent(const ast::IdentExpression& expr) {
     analysis.setSymbol(expr.node.greenNode(), sym);
     if (sym->kind == SymbolKind::Function) return typeCtx.getError();
     if (sym->kind == SymbolKind::Namespace) return typeCtx.getError();
+    daCheckRead(expr, sym);
     if (currentScope) {
         if (Type* narrowed = currentScope->lookupNarrowedType(NarrowingPath{sym, {}})) {
             return narrowed;
@@ -3585,7 +3741,10 @@ Type* Analyzer::analyzeBinary(const ast::BinaryExpression& expr) {
         for (const auto& info : narrowings) {
             currentScope->narrowedTypes[info.key] = info.narrowedT;
         }
+        bool prevUncond = daUnconditional_;
+        daUnconditional_ = false;
         Type* r = analyzeExpr(*right);
+        daUnconditional_ = prevUncond;
         popScope();
         if (l->isError() || r->isError()) return typeCtx.getError();
         if (!l->isBool() || !r->isBool()) {
@@ -5278,7 +5437,17 @@ Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
     auto target = expr.target();
     auto value = expr.value();
     if (!target || !value) return typeCtx.getError();
+    // A plain `x = ...` is a definite assignment of x, so its own identifier on the
+    // left is a write, not a read to check. A compound `x += ...` reads x first, and
+    // a member or subscript target (`x.f = ...`, `x[i] = ...`) reads its base, which
+    // must already be assigned, so only a simple-assignment plain identifier is exempt.
+    auto opTok = expr.operatorToken();
+    bool simpleAssign = opTok && opTok->kind() == SyntaxKind::Eq;
+    auto plainIdentTarget = target->asIdent();
+    const void* prevWriteTarget = daWriteTargetGreen_;
+    if (plainIdentTarget && simpleAssign) daWriteTargetGreen_ = plainIdentTarget->node.greenNode();
     Type* targetT = analyzeExpr(*target);
+    daWriteTargetGreen_ = prevWriteTarget;
     if (!isLValue(*target)) {
         errorAtNode(expr.node, "Left side of assignment must be an assignable expression");
     }
@@ -5334,6 +5503,7 @@ Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
     if (auto id = target->asIdent()) {
         if (auto* targetInfo = analysis.find(id->node.greenNode())) {
             establishAssignmentNarrowing(targetInfo->resolvedSymbol, valueT);
+            if (daUnconditional_) daMarkAssigned(targetInfo->resolvedSymbol);
         }
     }
     return assignTargetT;
@@ -5388,7 +5558,10 @@ Type* Analyzer::analyzeTernary(const ast::TernaryExpression& expr) {
         for (const auto& info : narrowings) {
             currentScope->narrowedTypes[info.key] = info.narrowedT;
         }
+        bool prevUncond = daUnconditional_;
+        daUnconditional_ = false;
         Type* t = analyzeExpr(branch);
+        daUnconditional_ = prevUncond;
         popScope();
         return t;
     };
@@ -5414,7 +5587,10 @@ Type* Analyzer::analyzeNullCoalesce(const ast::NullCoalesceExpression& expr) {
     auto right = expr.right();
     if (!left || !right) return typeCtx.getError();
     Type* l = analyzeExpr(*left);
+    bool prevUncond = daUnconditional_;
+    daUnconditional_ = false;
     Type* r = analyzeExpr(*right);
+    daUnconditional_ = prevUncond;
     if (l->isError() || r->isError()) return typeCtx.getError();
     // `?\?` is a presence test on the left's declared storage type, so a
     // binding declared optional keeps it legal even after narrowing proved the
@@ -5601,8 +5777,9 @@ Type* Analyzer::analyzeTry(const ast::TryExpression& expr) {
 
 void Analyzer::analyzeThrowStmt(const ast::ThrowStatement& stmt) {
     auto value = stmt.value();
-    if (!value) return;
+    if (!value) { daTerminated_ = true; return; }
     Type* t = analyzeExpr(*value);
+    daTerminated_ = true;
     if (t->isError()) return;
     bool isErrorSubclass = t->isClass() && t->structInfo && errorClassInfo_ &&
         t->structInfo->isSubclassOf(errorClassInfo_);
@@ -5616,6 +5793,7 @@ void Analyzer::analyzeRethrowStmt(const ast::RethrowStatement& stmt) {
     if (!inCatchClause) {
         errorAtNode(stmt.node, "'rethrow' can only be used inside a 'catch' block.");
     }
+    daTerminated_ = true;
 }
 
 namespace {
@@ -5701,7 +5879,14 @@ Type* Analyzer::analyzeSwitchArms(const std::optional<ast::Expression>& scrutine
     std::vector<ast::Expression> valueExprs;
     bool sawValueBlock = false;
 
+    // Each arm starts from the state after the scrutinee. A local assigned in
+    // every arm of a switch (which the checker requires to be exhaustive) is
+    // assigned after it; a terminated arm drops out of the join.
+    AssignFlow switchEntry = daSnapshot();
+    std::vector<AssignFlow> armFlows;
     auto analyzeArmBody = [&](const ast::SwitchArm& arm) {
+        daRestore(switchEntry);
+        daUnconditional_ = true;
         if (auto bn = arm.bodyBlockNode()) {
             if (requireValue) {
                 sawValueBlock = true;
@@ -5712,6 +5897,7 @@ Type* Analyzer::analyzeSwitchArms(const std::optional<ast::Expression>& scrutine
             analyzeExpr(*be);
             if (requireValue) valueExprs.push_back(*be);
         }
+        armFlows.push_back(daSnapshot());
     };
 
     for (auto& arm : arms) {
@@ -5915,6 +6101,9 @@ Type* Analyzer::analyzeSwitchArms(const std::optional<ast::Expression>& scrutine
         errorAtNode(diagNode, "This switch value can be null but no arm handles it. "
             "Add a 'null ->' arm or a 'default' arm.");
     }
+
+    if (!armFlows.empty()) daRestore(daJoin(armFlows));
+    else daRestore(switchEntry);
 
     if (!requireValue) return typeCtx.getPrimitive(TypeKind::Void);
 

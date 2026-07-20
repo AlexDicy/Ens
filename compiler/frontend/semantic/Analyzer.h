@@ -114,6 +114,35 @@ private:
     // Nesting depth of enclosing loops in the current function, for break/continue.
     int loopDepth = 0;
 
+    // === Definite assignment ===
+    // A local variable is readable only where it is definitely assigned on every
+    // path reaching the read. This is a forward "must" analysis over the statement
+    // tree, with set intersection at each join (if/else, switch arms, loop exit).
+    // A terminated path (return/throw/rethrow/panic, and break/continue for the
+    // relevant loop) contributes nothing to a join. Structs are variable-level: a
+    // struct local must be assigned as a whole before any field access.
+    struct AssignFlow {
+        std::unordered_set<Symbol*> assigned;
+        bool terminated = false;
+    };
+    bool daEnabled_ = false;
+    bool daTerminated_ = false;
+    // Whether the current expression position is evaluated unconditionally, so an
+    // assignment found here counts as a definite assignment (false inside the
+    // short-circuited operand of &&, ||, ??, ?., ?[ and inside ternary branches).
+    bool daUnconditional_ = true;
+    const void* daWriteTargetGreen_ = nullptr;
+    std::unordered_set<Symbol*> daAssigned_;
+    std::unordered_set<Symbol*> daTracked_;
+    std::vector<std::vector<AssignFlow>> daBreakFlows_;
+    void daTrackLocal(Symbol* sym, bool assigned);
+    void daMarkAssigned(Symbol* sym);
+    void daCheckRead(const ast::IdentExpression& expr, Symbol* sym);
+    AssignFlow daSnapshot() const;
+    void daRestore(const AssignFlow& flow);
+    AssignFlow daJoin(const std::vector<AssignFlow>& flows) const;
+    void daResetForBody();
+
     // Cached AST root after collectDeclarations so analyzeBodies doesn't have
     // to re-parse the source. Populated by collectDeclarations.
     std::optional<ast::SourceFile> astRoot;
