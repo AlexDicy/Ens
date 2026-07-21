@@ -957,6 +957,118 @@ private class BodyChecker implements PanicCalls {
         this.leaveScope();
     }
 
+    // Walks a branch under the facts its condition proves and returns the narrowings that hold
+    // at its end, captured before the branch scope is discarded.
+    private walkBranchCapture(BlockNode block, List<NarrowingFact> facts)
+            -> Map<NarrowingPath, Type> {
+        this.enterScope();
+        this.applyFacts(facts);
+        this.walkBlock(block);
+        let captured = this.narrowing.flatten();
+        this.leaveScope();
+        return captured;
+    }
+
+    // The narrowings on the implicit path where a condition failed and no statements run: the
+    // else side of an 'if' without an 'else', and the fall-through of a switch scrutinee.
+    private captureConditionBranch(List<NarrowingFact> facts) -> Map<NarrowingPath, Type> {
+        this.enterScope();
+        this.applyFacts(facts);
+        let captured = this.narrowing.flatten();
+        this.leaveScope();
+        return captured;
+    }
+
+    // The proven type common to two branch end-states for one path: identity, or the wider of
+    // two types related by assignability, or null when neither contains the other.
+    private unifyNarrowed(Type left, Type right) -> Type? {
+        if (left == right) {
+            return left;
+        }
+        if (convert.isAssignableStrict(left, right)) {
+            return left;
+        }
+        if (convert.isAssignableStrict(right, left)) {
+            return right;
+        }
+        return null;
+    }
+
+    // The intersection of the surviving branch end-states: a path keeps a proof only where every
+    // survivor proves it, unified to the type they share.
+    private intersectNarrowings(List<Map<NarrowingPath, Type>> survivors)
+            -> Map<NarrowingPath, Type> {
+        let result = new Map<NarrowingPath, Type>();
+        let first = survivors.get(0);
+        for (let key in first.keys()) {
+            let value = first.get(key);
+            if (value != null) {
+                result.set(key, value);
+            }
+        }
+        for (long i = 1; i < survivors.length(); i++) {
+            let other = survivors.get(i);
+            let merged = new Map<NarrowingPath, Type>();
+            for (let key in result.keys()) {
+                let mine = result.get(key);
+                let theirs = other.get(key);
+                if (mine != null && theirs != null) {
+                    let unified = this.unifyNarrowed(mine, theirs);
+                    if (unified != null) {
+                        merged.set(key, unified);
+                    }
+                }
+            }
+            result = merged;
+        }
+        return result;
+    }
+
+    // Whether a path's root binding is still nameable after the merge, so a proof on a binding
+    // local to one branch does not leak out when that branch is the only survivor.
+    private pathRootInScope(NarrowingPath path) -> bool {
+        let root = path.root();
+        if (this.thisBinding != null && root == this.thisBinding) {
+            return true;
+        }
+        let current = this.scope;
+        if (current == null) {
+            return false;
+        }
+        return current.lookup(root.name()) == root;
+    }
+
+    // Installs the intersection of the surviving branches as the narrowing after a merge: a path
+    // stays narrowed only where every falling-through branch proves it, an entry proof a branch
+    // dropped is dropped, and a proof a branch newly established is added.
+    private applyNarrowingJoin(Map<NarrowingPath, Type> entryFacts,
+                               List<Map<NarrowingPath, Type>> survivors) {
+        if (survivors.length() == 0) {
+            return;
+        }
+        let joined = this.intersectNarrowings(survivors);
+        for (let key in entryFacts.keys()) {
+            if (joined.get(key) == null) {
+                this.narrowing.clearPath(key);
+            }
+        }
+        for (let key in joined.keys()) {
+            let joinedType = joined.get(key);
+            if (joinedType == null) {
+                continue;
+            }
+            let entryType = entryFacts.get(key);
+            if (entryType != null && entryType == joinedType) {
+                continue;
+            }
+            if (!this.pathRootInScope(key)) {
+                continue;
+            }
+            this.narrowing.clearPath(key);
+            this.narrowing.narrow(key, joinedType);
+        }
+    }
+
     // ---- Definite assignment ----
 
     private resetAssignmentFlow() {
@@ -1651,6 +1763,11 @@ private class BodyChecker implements PanicCalls {
         }
     }
 
+    // The narrowing after an 'if' is the intersection of the facts holding at the end of each
+    // branch that can fall through; a terminated branch contributes nothing, so the surviving
+    // branch's facts pass through unchanged. This subsumes the single-terminating-branch carry:
+    // 'if (x == null) { return; }' leaves the else facts, and 'if (x == null) { x = f(); }'
+    // narrows x below because the reassigned then-branch and the failed-check else both prove it.
     private checkIfStatement(IfStatementNode node) {
         Type condition = this.analyzeExpression(node.condition());
         this.checkConditionIsBool(condition, "If condition", node.condition().span());
@@ -1658,58 +1775,53 @@ private class BodyChecker implements PanicCalls {
         let whenFalse = new List<NarrowingFact>();
         this.collectNarrowings(node.condition(), true, whenTrue);
         this.collectNarrowings(node.condition(), false, whenFalse);
-        let entry = this.snapshotAssignment();
-        this.walkBranch(node.thenBranch(), whenTrue);
+
+        let entryAssign = this.snapshotAssignment();
+        let entryLayers = this.narrowing.snapshotLayers();
+        let entryFacts = this.narrowing.flatten();
+
+        let thenFacts = this.walkBranchCapture(node.thenBranch(), whenTrue);
         let afterThen = this.snapshotAssignment();
-        this.restoreAssignment(entry);
+        this.restoreAssignment(entryAssign);
+        this.narrowing.restoreLayers(entryLayers);
+
+        Map<NarrowingPath, Type> elseFacts;
+        let afterElse = entryAssign;
         let elseClause = node.elseClause();
-        if (elseClause != null) {
+        if (elseClause == null) {
+            elseFacts = this.captureConditionBranch(whenFalse);
+        } else {
             switch (elseClause.body()) {
                 is BlockNode block -> {
-                    this.walkBranch(block, whenFalse);
+                    elseFacts = this.walkBranchCapture(block, whenFalse);
+                    afterElse = this.snapshotAssignment();
                 },
                 is IfStatementNode chained -> {
                     this.checkIfStatement(chained);
+                    elseFacts = this.narrowing.flatten();
+                    afterElse = this.snapshotAssignment();
                 },
-                default -> { },
+                default -> {
+                    elseFacts = this.captureConditionBranch(whenFalse);
+                },
             }
         }
-        let afterElse = this.snapshotAssignment();
+        this.restoreAssignment(entryAssign);
+        this.narrowing.restoreLayers(entryLayers);
+
         let flows = new List<AssignmentFlow>();
         flows.push(afterThen);
         flows.push(afterElse);
         this.restoreAssignment(this.joinAssignment(flows));
-        this.carrySurvivingNarrowings(node, whenTrue, whenFalse);
-    }
 
-    // When one branch of an 'if' always exits, the opposite side's facts survive into the
-    // code after it, so a guard like 'if (x == null) { return; }' narrows the rest of the
-    // block. Inside a loop, 'break' and 'continue' also exit the branch.
-    private carrySurvivingNarrowings(IfStatementNode node, List<NarrowingFact> whenTrue,
-                                     List<NarrowingFact> whenFalse) {
-        ExitScope exit = ExitScope.Function;
-        if (this.loopDepth > 0) {
-            exit = ExitScope.Branch;
+        let survivors = new List<Map<NarrowingPath, Type>>();
+        if (!afterThen.terminated) {
+            survivors.push(thenFacts);
         }
-        bool thenExits = flow.blockTerminates(node.thenBranch(), exit, this);
-        bool elseExits = false;
-        let elseClause = node.elseClause();
-        if (elseClause != null) {
-            switch (elseClause.body()) {
-                is IfStatementNode chained -> {
-                    elseExits = flow.ifTerminates(chained, exit, this);
-                },
-                is BlockNode block -> {
-                    elseExits = flow.blockTerminates(block, exit, this);
-                },
-                default -> { },
-            }
+        if (!afterElse.terminated) {
+            survivors.push(elseFacts);
         }
-        if (thenExits && !elseExits) {
-            this.applyFacts(whenFalse);
-        } else if (elseExits && !thenExits && elseClause != null) {
-            this.applyFacts(whenTrue);
-        }
+        this.applyNarrowingJoin(entryFacts, survivors);
     }
 
     // The condition is rechecked every iteration and body writes drop narrowing at their own
@@ -4403,8 +4515,14 @@ private class BodyChecker implements PanicCalls {
         let valueExpressions = new List<Expression>();
         bool sawValueBlock = false;
         let switchEntry = this.snapshotAssignment();
+        let entryLayers = this.narrowing.snapshotLayers();
+        let entryFacts = this.narrowing.flatten();
         let armFlows = new List<AssignmentFlow>();
+        let armNarrowings = new List<Map<NarrowingPath, Type>>();
         for (long a = 0; a < arms.length(); a++) {
+            this.restoreAssignment(switchEntry);
+            this.narrowing.restoreLayers(entryLayers);
+            this.unconditionalPosition = true;
             switch (arms.get(a)) {
                 is DefaultArmNode arm -> {
                     if (hasDefault) {
@@ -4413,7 +4531,7 @@ private class BodyChecker implements PanicCalls {
                     }
                     hasDefault = true;
                     if (this.walkArmBodyFlow(arm.body(), requireValue, valueExpressions,
-                            switchEntry, armFlows)) {
+                            armFlows, armNarrowings)) {
                         sawValueBlock = true;
                     }
                 },
@@ -4450,7 +4568,7 @@ private class BodyChecker implements PanicCalls {
                         this.result.setBinding(arm.green(), binding);
                     }
                     if (this.walkArmBodyFlow(arm.body(), requireValue, valueExpressions,
-                            switchEntry, armFlows)) {
+                            armFlows, armNarrowings)) {
                         sawValueBlock = true;
                     }
                     this.leaveScope();
@@ -4491,7 +4609,7 @@ private class BodyChecker implements PanicCalls {
                         }
                     }
                     if (this.walkArmBodyFlow(arm.body(), requireValue, valueExpressions,
-                            switchEntry, armFlows)) {
+                            armFlows, armNarrowings)) {
                         sawValueBlock = true;
                     }
                 },
@@ -4502,6 +4620,15 @@ private class BodyChecker implements PanicCalls {
         } else {
             this.restoreAssignment(switchEntry);
         }
+
+        this.narrowing.restoreLayers(entryLayers);
+        let survivors = new List<Map<NarrowingPath, Type>>();
+        for (long i = 0; i < armFlows.length(); i++) {
+            if (!armFlows.get(i).terminated) {
+                survivors.push(armNarrowings.get(i));
+            }
+        }
+        this.applyNarrowingJoin(entryFacts, survivors);
 
         if (valueScrutinee && !hasDefault) {
             this.checkValueExhaustiveness(inner, coveredEnumOrdinals, span);
@@ -4788,18 +4915,20 @@ private class BodyChecker implements PanicCalls {
         return this.store.errorType();
     }
 
-    // Walks one switch arm from the state after the scrutinee and records its out-state, so the
-    // arms can be joined: a local assigned in every arm of an exhaustive switch is assigned after.
+    // Walks one switch arm from the state after the scrutinee and records both its assignment
+    // out-state and the narrowings holding at its end, so the arms can be joined: a local
+    // assigned in every arm of an exhaustive switch is assigned after, and a path narrowed by
+    // every arm stays narrowed after.
     private walkArmBodyFlow(ArmBody body, bool requireValue, List<Expression> sink,
-                            AssignmentFlow entry, List<AssignmentFlow> armFlows) -> bool {
-        this.restoreAssignment(entry);
-        this.unconditionalPosition = true;
-        let sawBlock = this.walkArmBody(body, requireValue, sink);
+                            List<AssignmentFlow> armFlows,
+                            List<Map<NarrowingPath, Type>> armNarrowings) -> bool {
+        let sawBlock = this.walkArmBody(body, requireValue, sink, armNarrowings);
         armFlows.push(this.snapshotAssignment());
         return sawBlock;
     }
 
-    private walkArmBody(ArmBody body, bool requireValue, List<Expression> sink) -> bool {
+    private walkArmBody(ArmBody body, bool requireValue, List<Expression> sink,
+                        List<Map<NarrowingPath, Type>> armNarrowings) -> bool {
         switch (body) {
             is BlockNode block -> {
                 bool sawBlock = false;
@@ -4808,17 +4937,22 @@ private class BodyChecker implements PanicCalls {
                         + "not '\{ \}' blocks.", block.span());
                     sawBlock = true;
                 }
-                this.walkScopedBlock(block);
+                this.enterScope();
+                this.walkBlock(block);
+                armNarrowings.push(this.narrowing.flatten());
+                this.leaveScope();
                 return sawBlock;
             },
             is Expression expression -> {
                 this.analyzeExpression(expression);
+                armNarrowings.push(this.narrowing.flatten());
                 if (requireValue) {
                     sink.push(expression);
                 }
                 return false;
             },
             default -> {
+                armNarrowings.push(this.narrowing.flatten());
                 return false;
             },
         }
