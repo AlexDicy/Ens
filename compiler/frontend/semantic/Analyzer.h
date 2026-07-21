@@ -412,6 +412,35 @@ private:
     void analyzeBranchWithNarrowing(const ast::Block& block,
                                     const std::vector<NullCheckInfo>& narrowings);
 
+    // The narrowing facts that hold at one program point: the proven type of
+    // every storage path visible in the current scope chain, innermost first.
+    using NarrowingFacts =
+        std::unordered_map<NarrowingPath, Type*, NarrowingPathHash>;
+    // A saved copy of the narrowing maps in the current scope chain. The arms of
+    // an if/else or switch are analyzed from the same entry state and their
+    // end-states joined, so each arm restores this before it runs.
+    struct NarrowingSnapshot {
+        std::vector<std::pair<Scope*, NarrowingFacts>> layers;
+    };
+    NarrowingSnapshot captureNarrowings() const;
+    void restoreNarrowings(const NarrowingSnapshot& snap);
+    NarrowingFacts flattenNarrowings() const;
+    // Analyzes a branch block under the facts its condition proves and returns the
+    // narrowing facts that hold at its end, before the branch scope is discarded.
+    NarrowingFacts analyzeBranchCapturing(const ast::Block& block,
+                                          const std::vector<NullCheckInfo>& narrowings);
+    NarrowingFacts factsFromNarrowings(const std::vector<NullCheckInfo>& narrowings);
+    // The proven type common to two branch end-states for one path: identity, or
+    // the wider of two class types related by subtyping, or null when neither
+    // contains the other and no common narrowing survives.
+    Type* unifyNarrowedTypes(Type* a, Type* b);
+    // Installs the intersection of the surviving branch end-states as the
+    // narrowing state after a merge: a path stays narrowed only when every branch
+    // that falls through narrows it, and an entry fact a branch dropped is dropped.
+    void applyNarrowingJoin(const NarrowingFacts& entry,
+                            const std::vector<NarrowingFacts>& survivors);
+    bool pathRootInScope(const NarrowingPath& path) const;
+
     Type* resolveTypeReference(const ast::TypeReference& tr);
     Type* lookupTypeByName(const std::u16string& qualifier, const std::u16string& name,
                            const SyntaxNode& diagNode);

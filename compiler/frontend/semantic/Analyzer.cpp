@@ -3104,6 +3104,93 @@ void Analyzer::analyzeBranchWithNarrowing(const ast::Block& block,
     popScope();
 }
 
+Analyzer::NarrowingSnapshot Analyzer::captureNarrowings() const {
+    NarrowingSnapshot snap;
+    for (Scope* s = currentScope; s; s = s->parent) {
+        snap.layers.push_back({s, s->narrowedTypes});
+    }
+    return snap;
+}
+
+void Analyzer::restoreNarrowings(const NarrowingSnapshot& snap) {
+    for (const auto& [scope, map] : snap.layers) {
+        scope->narrowedTypes = map;
+    }
+}
+
+Analyzer::NarrowingFacts Analyzer::flattenNarrowings() const {
+    NarrowingFacts flat;
+    for (Scope* s = currentScope; s; s = s->parent) {
+        for (const auto& [path, type] : s->narrowedTypes) flat.emplace(path, type);
+    }
+    return flat;
+}
+
+Analyzer::NarrowingFacts Analyzer::analyzeBranchCapturing(
+        const ast::Block& block, const std::vector<NullCheckInfo>& narrowings) {
+    pushScope();
+    for (const auto& info : narrowings) {
+        currentScope->narrowedTypes[info.key] = info.narrowedT;
+    }
+    analyzeStatements(block.statements());
+    NarrowingFacts facts = flattenNarrowings();
+    popScope();
+    return facts;
+}
+
+Analyzer::NarrowingFacts Analyzer::factsFromNarrowings(
+        const std::vector<NullCheckInfo>& narrowings) {
+    pushScope();
+    for (const auto& info : narrowings) {
+        currentScope->narrowedTypes[info.key] = info.narrowedT;
+    }
+    NarrowingFacts facts = flattenNarrowings();
+    popScope();
+    return facts;
+}
+
+Type* Analyzer::unifyNarrowedTypes(Type* a, Type* b) {
+    if (a == b || a->equals(b)) return a;
+    if (a->assignableFrom(b)) return a;
+    if (b->assignableFrom(a)) return b;
+    return nullptr;
+}
+
+bool Analyzer::pathRootInScope(const NarrowingPath& path) const {
+    if (path.root == currentThis) return true;
+    if (!currentScope || !path.root) return false;
+    return currentScope->lookup(path.root->name) == path.root;
+}
+
+void Analyzer::applyNarrowingJoin(const NarrowingFacts& entry,
+                                  const std::vector<NarrowingFacts>& survivors) {
+    if (survivors.empty()) return;
+    NarrowingFacts joined = survivors.front();
+    for (size_t i = 1; i < survivors.size(); ++i) {
+        const NarrowingFacts& other = survivors[i];
+        NarrowingFacts merged;
+        for (const auto& [path, type] : joined) {
+            auto it = other.find(path);
+            if (it == other.end()) continue;
+            if (Type* u = unifyNarrowedTypes(type, it->second)) merged.emplace(path, u);
+        }
+        joined.swap(merged);
+    }
+    auto eraseEverywhere = [&](const NarrowingPath& path) {
+        for (Scope* s = currentScope; s; s = s->parent) s->narrowedTypes.erase(path);
+    };
+    for (const auto& [path, type] : entry) {
+        if (joined.find(path) == joined.end()) eraseEverywhere(path);
+    }
+    for (const auto& [path, type] : joined) {
+        auto it = entry.find(path);
+        if (it != entry.end() && it->second->equals(type)) continue;
+        if (!pathRootInScope(path)) continue;
+        eraseEverywhere(path);
+        currentScope->narrowedTypes[path] = type;
+    }
+}
+
 // =========================================================
 // Missing-return analysis
 // =========================================================
@@ -3378,42 +3465,47 @@ void Analyzer::analyzeIfStmt(const ast::IfStatement& stmt) {
     }
     auto thenBlock = stmt.thenBlock();
     auto elseClause = stmt.elseClause();
-    AssignmentFlow entry = snapshotAssignment();
-    restoreAssignment(entry);
-    if (thenBlock) {
-        analyzeBranchWithNarrowing(*thenBlock, whenTrue);
-    }
+    AssignmentFlow entryAssign = snapshotAssignment();
+    NarrowingSnapshot entryNarrowing = captureNarrowings();
+    NarrowingFacts entryFacts = flattenNarrowings();
+
+    NarrowingFacts thenFacts = thenBlock ? analyzeBranchCapturing(*thenBlock, whenTrue)
+                                         : factsFromNarrowings(whenTrue);
     AssignmentFlow afterThen = snapshotAssignment();
-    restoreAssignment(entry);
+    restoreAssignment(entryAssign);
+    restoreNarrowings(entryNarrowing);
+
+    NarrowingFacts elseFacts;
+    AssignmentFlow afterElse = entryAssign;
     if (elseClause) {
-        if (auto inner = elseClause->ifStatement()) analyzeIfStmt(*inner);
-        else if (auto bb = elseClause->block()) {
-            analyzeBranchWithNarrowing(*bb, whenFalse);
+        if (auto inner = elseClause->ifStatement()) {
+            analyzeIfStmt(*inner);
+            elseFacts = flattenNarrowings();
+            afterElse = snapshotAssignment();
+        } else if (auto bb = elseClause->block()) {
+            elseFacts = analyzeBranchCapturing(*bb, whenFalse);
+            afterElse = snapshotAssignment();
+        } else {
+            elseFacts = factsFromNarrowings(whenFalse);
         }
+    } else {
+        elseFacts = factsFromNarrowings(whenFalse);
     }
-    AssignmentFlow afterElse = snapshotAssignment();
+    restoreAssignment(entryAssign);
+    restoreNarrowings(entryNarrowing);
+
     restoreAssignment(joinAssignment({afterThen, afterElse}));
 
-    // When one branch always exits, the opposite case survives into the enclosing
-    // block, so a null check can narrow past the `if` (e.g. `if (x == null) { throw; }`
-    // leaves x non-null below). Inside a loop, `break`/`continue` also exit the branch.
-    if (currentScope) {
-        ExitScope scope = loopDepth > 0 ? ExitScope::Branch : ExitScope::Function;
-        bool thenExits = thenBlock && blockTerminates(*thenBlock, scope);
-        bool elseExits = false;
-        if (elseClause) {
-            if (auto inner = elseClause->ifStatement()) elseExits = ifStatementTerminates(*inner, scope);
-            else if (auto bb = elseClause->block()) elseExits = blockTerminates(*bb, scope);
-        }
-        const std::vector<NullCheckInfo>* survives = nullptr;
-        if (thenExits && !elseExits) survives = &whenFalse;
-        else if (elseExits && !thenExits && elseClause) survives = &whenTrue;
-        if (survives) {
-            for (const auto& info : *survives) {
-                currentScope->narrowedTypes[info.key] = info.narrowedT;
-            }
-        }
-    }
+    // The narrowing after the `if` is the intersection of the facts holding at the
+    // end of each branch that can fall through; a terminated branch contributes
+    // nothing, so the surviving branch's facts pass through unchanged. This
+    // subsumes the old single-terminating-branch carry: `if (x == null) { return; }`
+    // leaves the else facts, and `if (x == null) { x = f(); }` narrows x below
+    // because both the reassigned then-branch and the failed-check else prove it.
+    std::vector<NarrowingFacts> survivors;
+    if (!afterThen.terminated) survivors.push_back(std::move(thenFacts));
+    if (!afterElse.terminated) survivors.push_back(std::move(elseFacts));
+    applyNarrowingJoin(entryFacts, survivors);
 }
 
 // A loop's body may run zero times, so a write inside it is not definitely
@@ -5967,26 +6059,42 @@ Type* Analyzer::analyzeSwitchArms(const std::optional<ast::Expression>& scrutine
 
     // Each arm starts from the state after the scrutinee. A local assigned in
     // every arm of a switch (which the checker requires to be exhaustive) is
-    // assigned after it; a terminated arm drops out of the join.
+    // assigned after it; a terminated arm drops out of the join. The narrowing
+    // facts join the same way: a path stays narrowed after the switch only when
+    // every arm that falls through proves it.
     AssignmentFlow switchEntry = snapshotAssignment();
+    NarrowingSnapshot entryNarrowing = captureNarrowings();
+    NarrowingFacts entryFacts = flattenNarrowings();
     std::vector<AssignmentFlow> armFlows;
+    std::vector<NarrowingFacts> armNarrowings;
     auto analyzeArmBody = [&](const ast::SwitchArm& arm) {
-        restoreAssignment(switchEntry);
-        unconditionalPosition_ = true;
         if (auto bn = arm.bodyBlockNode()) {
             if (requireValue) {
                 sawValueBlock = true;
                 errorAtNode(*bn, "A switch used as a value must use expression arms, not '{ }' blocks.");
             }
-            if (auto blk = ast::Block::cast(*bn)) analyzeBlock(*blk);
+            if (auto blk = ast::Block::cast(*bn)) {
+                pushScope();
+                analyzeStatements(blk->statements());
+                armNarrowings.push_back(flattenNarrowings());
+                popScope();
+            } else {
+                armNarrowings.push_back(flattenNarrowings());
+            }
         } else if (auto be = arm.bodyExpr()) {
             analyzeExpr(*be);
+            armNarrowings.push_back(flattenNarrowings());
             if (requireValue) valueExprs.push_back(*be);
+        } else {
+            armNarrowings.push_back(flattenNarrowings());
         }
         armFlows.push_back(snapshotAssignment());
     };
 
     for (auto& arm : arms) {
+        restoreAssignment(switchEntry);
+        restoreNarrowings(entryNarrowing);
+        unconditionalPosition_ = true;
         if (arm.isDefault()) {
             if (hasDefault) errorAtNode(arm.node, "A switch can have only one 'default' arm.");
             hasDefault = true;
@@ -6190,6 +6298,13 @@ Type* Analyzer::analyzeSwitchArms(const std::optional<ast::Expression>& scrutine
 
     if (!armFlows.empty()) restoreAssignment(joinAssignment(armFlows));
     else restoreAssignment(switchEntry);
+
+    restoreNarrowings(entryNarrowing);
+    std::vector<NarrowingFacts> survivors;
+    for (size_t i = 0; i < armFlows.size(); ++i) {
+        if (!armFlows[i].terminated) survivors.push_back(std::move(armNarrowings[i]));
+    }
+    applyNarrowingJoin(entryFacts, survivors);
 
     if (!requireValue) return typeCtx.getPrimitive(TypeKind::Void);
 
