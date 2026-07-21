@@ -199,6 +199,7 @@ private:
     void resolveFunctionParams(const ast::FuncDecl& fn, Symbol* sym);
     bool overrideSignaturesCompatible(const MethodInfo& base, Symbol* derived);
     void checkThrowsClausePlacement(const ast::FuncDecl& fn, bool isOverridable, bool isConstructor);
+    void checkNoreturnPlacement(const ast::FuncDecl& fn, bool isConstructor, bool isDestructor);
     void checkFieldMethodCollision(StructInfo* owner, const std::u16string& methodName,
                                    bool isConstructor, const SyntaxNode& diag);
     void checkHashMethodSignature(const ast::FuncDecl& fn, Symbol* sym, bool isConstructor);
@@ -224,7 +225,7 @@ private:
     bool ifStatementTerminates(const ast::IfStatement& stmt, ExitScope scope) const;
     bool switchStatementTerminates(const ast::SwitchStatement& stmt, ExitScope scope) const;
     bool whileStatementTerminates(const ast::WhileStatement& stmt) const;
-    bool isPanicCall(const ast::Expression& expr) const;
+    bool isNoreturnCall(const ast::Expression& expr) const;
     void analyzeImplicitConstructorAssignments(const ast::FuncDecl& fn);
     void analyzeCatchClause(const ast::CatchClause& clause, Scope* funcScope);
 

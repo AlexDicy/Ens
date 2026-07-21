@@ -51,6 +51,7 @@ struct MethodInfo {
     bool isOverride = false;
     bool isFinal = false;
     bool isAbstract = false;
+    bool isNoreturn = false;
     int vtableSlot = -1;            // >= 0 => dispatched virtually through the vtable
     int itableSlot = -1;            // interface methods: index in the interface's method table
     StructInfo* definingClass = nullptr;  // class that declares this method (for codegen mangling)

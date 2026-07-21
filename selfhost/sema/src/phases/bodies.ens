@@ -91,7 +91,7 @@ import CallResolution from phases.calls;
 import model.convert;
 import model.flow;
 import ExitScope from model.flow;
-import PanicCalls from model.flow;
+import NoreturnCalls from model.flow;
 import model.literalvalues;
 import phases.members;
 import model.narrow;
@@ -218,7 +218,7 @@ private class MissingMember extends MemberLookup {
     constructor();
 }
 
-private class BodyChecker implements PanicCalls {
+private class BodyChecker implements NoreturnCalls {
     private ModuleContext context;
     private Map<string, ModuleContext> contextsByPath;
     private TypeResolver resolver;
@@ -233,6 +233,7 @@ private class BodyChecker implements PanicCalls {
     private LocalBinding? thisBinding;
     private Type? thisType;
     private Type? currentReturnType;
+    private bool currentNoreturn;
     private bool inConstructor;
     private bool sawSuperCall;
     private bool inCatchClause;
@@ -271,6 +272,7 @@ private class BodyChecker implements PanicCalls {
         this.modulePath = context.module().canonicalPath();
         this.narrowing = new NarrowingState();
         this.thisBinding = null;
+        this.currentNoreturn = false;
         this.inConstructor = false;
         this.sawSuperCall = false;
         this.inCatchClause = false;
@@ -412,6 +414,7 @@ private class BodyChecker implements PanicCalls {
         this.thisBinding = null;
         this.thisType = null;
         this.currentReturnType = this.store.primitive(PrimitiveKind.Void);
+        this.currentNoreturn = false;
         this.inConstructor = false;
         this.sawSuperCall = false;
         this.loopDepth = 0;
@@ -445,6 +448,7 @@ private class BodyChecker implements PanicCalls {
         }
         this.thisType = receiver;
         this.currentReturnType = signature.returnType();
+        this.currentNoreturn = signature.isNoreturn();
         this.inConstructor = method != null && method.isConstructor();
         this.sawSuperCall = false;
         this.loopDepth = 0;
@@ -498,6 +502,7 @@ private class BodyChecker implements PanicCalls {
         this.thisBinding = null;
         this.thisType = null;
         this.currentReturnType = null;
+        this.currentNoreturn = false;
         this.inConstructor = false;
         this.resolver.popTypeParameters(pushed);
         if (receiver == null) {
@@ -563,8 +568,13 @@ private class BodyChecker implements PanicCalls {
     }
 
     // A non-void callable must exit on every path: through its body and through each catch
-    // clause it declares.
+    // clause it declares. A 'noreturn' callable carries the stronger obligation that no path
+    // completes at all.
     private checkReturnPaths(Signature signature, FunctionDeclarationNode node) {
+        if (signature.isNoreturn()) {
+            this.checkNoreturnBody(signature, node);
+            return;
+        }
         Type returned = signature.returnType();
         if (types.isVoidType(returned) || returned is ErrorType) {
             return;
@@ -589,21 +599,70 @@ private class BodyChecker implements PanicCalls {
         }
     }
 
-    // A call spelled 'panic(...)' resolving to the builtin. Local names cannot shadow it at a
-    // call site, so the module's function table is the whole story.
-    override isPanicCall(Expression expression) -> bool {
-        Expression core = expression;
-        while (core is ParenthesizedExpressionNode) {
-            core = core.inner();
+    // A 'noreturn' body must be unable to complete normally: every path ends by throwing,
+    // calling 'panic' or another 'noreturn' function, or looping forever. A bodiless form
+    // (abstract or interface method) carries the contract without a body to check.
+    private checkNoreturnBody(Signature signature, FunctionDeclarationNode node) {
+        let body = node.body();
+        if (body == null) {
+            return;
         }
-        if (core is CallExpressionNode) {
-            let callee = core.callee();
-            if (callee is IdentifierExpressionNode && callee.name().text() == "panic") {
-                let entries = this.context.functions().entriesNamed("panic");
-                return entries != null && entries.length() > 0 && entries.get(0).isBuiltin();
+        if (!flow.blockTerminates(body, ExitScope.Function, this)) {
+            this.reporter.report("Function '{signature.name()}' is declared 'noreturn' but can "
+                + "reach the end of its body. Every path must end by throwing, calling 'panic', "
+                + "or calling another 'noreturn' function.", signature.nameSpan());
+        }
+        for (long i = 0; i < node.catchClausesCount(); i++) {
+            let clause = node.catchClauses(i);
+            if (!flow.blockTerminates(clause.body(), ExitScope.Function, this)) {
+                this.reporter.report("Function '{signature.name()}' is declared 'noreturn' but "
+                    + "its 'catch' clause can complete normally. End it by throwing, calling "
+                    + "'panic', or calling another 'noreturn' function.", clause.span());
             }
         }
-        return false;
+    }
+
+    // A call ends the path when its target is declared 'noreturn' (the builtin 'panic' among
+    // them). 'try noreturnCall()' also ends it: the call either throws or never returns.
+    override callNeverReturns(Expression expression) -> bool {
+        Expression core = unwrapParentheses(expression);
+        if (core is TryExpressionNode) {
+            core = unwrapParentheses(core.operand());
+        }
+        if (!(core is CallExpressionNode)) {
+            return false;
+        }
+        let target = this.calleeSignatureOf(core);
+        return target != null && target.isNoreturn();
+    }
+
+    // The static target of a call, or null for a constructor chain or an unresolved callee.
+    private calleeSignatureOf(CallExpressionNode call) -> Signature? {
+        switch (call.callee()) {
+            is IdentifierExpressionNode identifier -> {
+                return this.result.callableOf(identifier.green());
+            },
+            is MemberExpressionNode member -> {
+                let method = this.result.methodOf(member.green());
+                if (method != null) {
+                    if (method.isConstructor()) {
+                        return null;
+                    }
+                    return method.signature();
+                }
+                return this.result.callableOf(member.green());
+            },
+            is SafeMemberExpressionNode member -> {
+                let method = this.result.methodOf(member.green());
+                if (method != null && !method.isConstructor()) {
+                    return method.signature();
+                }
+                return null;
+            },
+            default -> {
+                return null;
+            },
+        }
     }
 
     // Catch clauses scope against the parameter scope, so body locals stay invisible. The
@@ -1649,7 +1708,7 @@ private class BodyChecker implements PanicCalls {
             is ExpressionStatementNode expression -> {
                 this.unconditionalPosition = true;
                 this.analyzeExpression(expression.expression());
-                if (this.isPanicCall(expression.expression())) {
+                if (this.callNeverReturns(expression.expression())) {
                     this.flowTerminated = true;
                 }
             },
@@ -1981,6 +2040,16 @@ private class BodyChecker implements PanicCalls {
     }
 
     private checkReturnStatement(ReturnStatementNode node) {
+        if (this.currentNoreturn) {
+            this.reporter.report("A 'noreturn' function cannot use 'return'; it never returns "
+                + "normally. Throw, call 'panic', or call another 'noreturn' function instead.",
+                node.returnKeyword().span());
+            let returned = node.value();
+            if (returned != null) {
+                this.analyzeExpression(returned);
+            }
+            return;
+        }
         let expected = this.currentReturnType;
         if (expected == null) {
             this.reporter.report("'return' can only be used inside a function body.",

@@ -118,6 +118,7 @@ void Analyzer::registerBuiltins() {
     panicSym->returnType = voidTy;
     panicSym->paramTypes = {stringTy};
     panicSym->isBuiltin = true;
+    panicSym->isNoreturn = true;
     globalScope->define(panicSym);
 }
 
@@ -928,8 +929,10 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             sym->abiThrows = m.isThrows();  // structs have no inheritance
             sym->methodOwner = t->structInfo;
             sym->isConstructor = isCtor;
+            sym->isNoreturn = m.isNoreturn();
             checkFieldMethodCollision(t->structInfo, mname, isCtor, m.node);
             checkThrowsClausePlacement(m, /*isOverridable=*/false, /*isConstructor=*/isCtor);
+            checkNoreturnPlacement(m, /*isConstructor=*/isCtor, /*isDestructor=*/false);
             resolveMethodParams(m, t, sym);
             checkHashMethodSignature(m, sym, isCtor);
             analysis.setSymbol(m.node.greenNode(), sym);
@@ -948,6 +951,7 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             mi.declaration = const_cast<GreenElement*>(m.node.greenNode());
             mi.visibility = toSemanticVisibility(m.visibility());
             mi.isConstructor = isCtor;
+            mi.isNoreturn = m.isNoreturn();
             t->structInfo->methods.push_back(std::move(mi));
         }
         markOverloadedMethods(t->structInfo);
@@ -1012,8 +1016,10 @@ void Analyzer::collectInterfaces(const ast::SourceFile& file) {
             sym->declaredThrows = m.isThrows();
             sym->abiThrows = m.isThrows();
             sym->methodOwner = si;
+            sym->isNoreturn = m.isNoreturn();
             resolveMethodParams(m, t, sym, /*isInterfaceMethod=*/true);
             checkHashMethodSignature(m, sym, /*isConstructor=*/false);
+            checkNoreturnPlacement(m, /*isConstructor=*/false, /*isDestructor=*/false);
             analysis.setSymbol(m.node.greenNode(), sym);
 
             if (si->findMethodIndexBySignature(mname, sym) >= 0) {
@@ -1028,6 +1034,7 @@ void Analyzer::collectInterfaces(const ast::SourceFile& file) {
             mi.symbol = sym;
             mi.declaration = const_cast<GreenElement*>(m.node.greenNode());
             mi.isAbstract = true;  // no body; never emitted as a function
+            mi.isNoreturn = m.isNoreturn();
             mi.itableSlot = static_cast<int>(si->methods.size());
             mi.definingClass = si;
             si->methods.push_back(std::move(mi));
@@ -1346,6 +1353,7 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
         sym->methodOwner = si;
         sym->isConstructor = isCtor;
         sym->isDestructor = isDtor;
+        sym->isNoreturn = m.isNoreturn();
         resolveMethodParams(m, t, sym);
         analysis.setSymbol(m.node.greenNode(), sym);
         analysis.setReceiver(m.node.greenNode(), t);
@@ -1367,8 +1375,11 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
         mi.isOverride = m.isOverride();
         mi.isFinal = m.isFinal();
         mi.isAbstract = m.isAbstract();
+        mi.isNoreturn = m.isNoreturn();
         mi.definingClass = si;
         si->methods.push_back(std::move(mi));
+
+        checkNoreturnPlacement(m, /*isConstructor=*/isCtor, /*isDestructor=*/isDtor);
 
         // Validate (base methods already collected via base-before-derived order).
         if (isDtor) {
@@ -1428,6 +1439,11 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
                         "' is marked 'throws' but overrides a method of '" + asciiOf(baseBySig->name) +
                         "' that is not. Mark the base method 'throws' too, or handle the exceptions "
                         "inside the override.");
+                if (bm.isNoreturn && !m.isNoreturn())
+                    errorAtNode(m.node, "Override of '" + asciiOf(mname) + "' must be marked "
+                        "'noreturn' because the method it overrides in '" + asciiOf(baseBySig->name) +
+                        "' is 'noreturn'; callers rely on it never returning. Add 'noreturn' "
+                        "before the method name.");
             } else if (interfaceDeclaring(mname, sym, /*bySignature=*/true)) {
                 // Implements an interface method; the implements clause check
                 // below validates the return type and throws conformance.
@@ -1484,6 +1500,12 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
                 errorAtNode(cd.node, "Method '" + asciiOf(im.name) + "' of '" +
                     asciiOf(si->name) + "' does not match '" + interfaceMethodSignature(im) +
                     "' declared in interface '" + ifaceT->toString() + "'.");
+            }
+            if (im.isNoreturn && !cm.isNoreturn) {
+                errorAtNode(cd.node, "Method '" + asciiOf(im.name) + "' of '" +
+                    asciiOf(si->name) + "' must be marked 'noreturn' because interface '" +
+                    ifaceT->toString() + "' declares it 'noreturn'; callers rely on it never "
+                    "returning.");
             }
         }
     }
@@ -1603,6 +1625,7 @@ void Analyzer::collectFunctions(const ast::SourceFile& file) {
         sym->isPublic = fn.visibility() == ast::Visibility::Public;
         sym->declaredThrows = fn.isThrows();
         sym->abiThrows = fn.isThrows();
+        sym->isNoreturn = fn.isNoreturn();
 
         auto tparams = fn.typeParams();
         size_t tpCount = 0;
@@ -1616,6 +1639,7 @@ void Analyzer::collectFunctions(const ast::SourceFile& file) {
             ? resolveTypeReference(*fn.returnType()->typeReference())
             : typeCtx.getPrimitive(TypeKind::Void);
         checkThrowsClausePlacement(fn, /*isOverridable=*/false, /*isConstructor=*/false);
+        checkNoreturnPlacement(fn, /*isConstructor=*/false, /*isDestructor=*/false);
         resolveFunctionParams(fn, sym);
         popTypeParams(tpCount);
 
@@ -1879,6 +1903,29 @@ void Analyzer::checkThrowsClausePlacement(const ast::FuncDecl& fn, bool isOverri
     if (hasTypes && !isOverridable) {
         errorAtNode(at, "Explicit 'throws' types are only allowed where the method can be "
             "overridden; the thrown types here are inferred. Write 'throws' with no type list.");
+    }
+}
+
+// 'noreturn' is legal on free functions and methods, including abstract and interface methods,
+// where it is part of the contract. It is never legal on a constructor or destructor, and a
+// 'noreturn' callable declares no return type because it returns nothing at all.
+void Analyzer::checkNoreturnPlacement(const ast::FuncDecl& fn, bool isConstructor,
+                                      bool isDestructor) {
+    if (!fn.isNoreturn()) return;
+    SyntaxNode at = fn.nameToken().value_or(fn.node);
+    if (isConstructor) {
+        errorAtNode(at, "A constructor cannot be marked 'noreturn'; a constructor always "
+            "returns the new instance. Remove 'noreturn'.");
+        return;
+    }
+    if (isDestructor) {
+        errorAtNode(at, "A destructor cannot be marked 'noreturn'; it runs during cleanup and "
+            "must return. Remove 'noreturn'.");
+        return;
+    }
+    if (auto rt = fn.returnType()) {
+        errorAtNode(rt->node, "A 'noreturn' function declares no return type; it never returns "
+            "a value, so remove the '-> ...' clause after the parameter list.");
     }
 }
 
@@ -3237,17 +3284,21 @@ static bool statementContainsLoopBreak(const ast::Statement& s) {
     return false;
 }
 
-bool Analyzer::isPanicCall(const ast::Expression& expr) const {
+// A call ends the path when its target is declared `noreturn` (the builtin `panic` among them).
+// `try noreturnCall()` also ends it: the call either throws or never returns.
+bool Analyzer::isNoreturnCall(const ast::Expression& expr) const {
     ast::Expression core = unwrapParens(expr);
+    if (auto t = core.asTry()) {
+        if (auto op = t->operand()) core = unwrapParens(*op);
+    }
     auto call = core.asCall();
     if (!call) return false;
     auto callee = call->callee();
     if (!callee) return false;
-    auto id = callee->asIdent();
-    if (!id) return false;
-    const auto* info = analysis.find(id->node.greenNode());
-    Symbol* sym = info ? info->resolvedSymbol : nullptr;
-    return sym && sym->isBuiltin && sym->name == u"panic";
+    const auto* info = analysis.find(callee->node.greenNode());
+    if (!info) return false;
+    Symbol* sym = info->resolvedMethodSymbol ? info->resolvedMethodSymbol : info->resolvedSymbol;
+    return sym && sym->isNoreturn;
 }
 
 bool Analyzer::blockTerminates(const ast::Block& block, ExitScope scope) const {
@@ -3302,12 +3353,34 @@ bool Analyzer::statementTerminates(const ast::Statement& s, ExitScope scope) con
     if (auto w = s.asWhile()) return whileStatementTerminates(*w);
     if (auto e = s.asExpressionStmt()) {
         auto expr = e->expression();
-        return expr && isPanicCall(*expr);
+        return expr && isNoreturnCall(*expr);
     }
     return false;
 }
 
 void Analyzer::checkFunctionReturnPaths(const ast::FuncDecl& fn) {
+    // A `noreturn` body must be unable to complete normally: every path ends by throwing,
+    // calling `panic` or another `noreturn` function, or looping forever. A bodiless form
+    // (abstract or interface method) carries the contract without a body to check.
+    if (currentFunction && currentFunction->isNoreturn) {
+        auto body = fn.body();
+        if (!body) return;
+        std::string name = asciiOf(currentFunction->name);
+        if (!blockTerminates(*body, ExitScope::Function)) {
+            errorAtNode(fn.nameToken() ? *fn.nameToken() : fn.node, "Function '" + name +
+                "' is declared 'noreturn' but can reach the end of its body. Every path must "
+                "end by throwing, calling 'panic', or calling another 'noreturn' function.");
+        }
+        for (auto& cc : fn.catchClauses()) {
+            auto cb = cc.body();
+            if (cb && !blockTerminates(*cb, ExitScope::Function)) {
+                errorAtNode(cc.node, "Function '" + name + "' is declared 'noreturn' but its "
+                    "'catch' clause can complete normally. End it by throwing, calling 'panic', "
+                    "or calling another 'noreturn' function.");
+            }
+        }
+        return;
+    }
     Type* ret = currentFunction ? currentFunction->returnType : nullptr;
     if (!ret || ret->isVoid() || ret->isError()) return;
     auto body = fn.body();
@@ -3706,6 +3779,13 @@ void Analyzer::analyzeReturnStmt(const ast::ReturnStatement& stmt) {
         errorAtNode(stmt.node, "'return' outside of a function");
         return;
     }
+    if (currentFunction->isNoreturn) {
+        errorAtNode(stmt.node, "A 'noreturn' function cannot use 'return'; it never returns "
+            "normally. Throw, call 'panic', or call another 'noreturn' function instead.");
+        if (auto value = stmt.value()) analyzeExpr(*value);
+        flowTerminated_ = true;
+        return;
+    }
     // A return leaves the constructor normally, so every own non-defaultable field
     // must already be assigned on the path reaching it.
     if (ctorFieldClass_) checkConstructorFieldsAssigned(stmt.node);
@@ -3735,7 +3815,7 @@ void Analyzer::analyzeExpressionStmt(const ast::ExpressionStatement& stmt) {
     unconditionalPosition_ = true;
     if (auto e = stmt.expression()) {
         analyzeExpr(*e);
-        if (isPanicCall(*e)) flowTerminated_ = true;
+        if (isNoreturnCall(*e)) flowTerminated_ = true;
     }
 }
 

@@ -259,7 +259,8 @@ void Parser::parseTopLevel() {
     while (true) {
         SyntaxKind k = peekKind(declMods);
         if (k == SyntaxKind::KwPrivate || k == SyntaxKind::KwProtected || k == SyntaxKind::KwPublic ||
-            k == SyntaxKind::KwAbstract || k == SyntaxKind::KwFinal || k == SyntaxKind::KwSealed) {
+            k == SyntaxKind::KwAbstract || k == SyntaxKind::KwFinal || k == SyntaxKind::KwSealed ||
+            k == SyntaxKind::KwNoreturn) {
             declMods++;
             continue;
         }
@@ -742,7 +743,8 @@ bool Parser::looksLikeKeywordNamedMethod() const {
     }
     while (idx < tokens.size() && (tokens[idx].kind == SyntaxKind::KwOverride ||
                                    tokens[idx].kind == SyntaxKind::KwFinal ||
-                                   tokens[idx].kind == SyntaxKind::KwAbstract)) {
+                                   tokens[idx].kind == SyntaxKind::KwAbstract ||
+                                   tokens[idx].kind == SyntaxKind::KwNoreturn)) {
         idx++;
         skipTrivia();
     }

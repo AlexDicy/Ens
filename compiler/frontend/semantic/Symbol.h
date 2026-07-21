@@ -63,6 +63,9 @@ public:
     // Set on the function symbol of a `constructor` / `destructor` member.
     bool isConstructor = false;
     bool isDestructor = false;
+    // A `noreturn` function or method: it never completes normally, so a call to it in
+    // statement position ends the path exactly as `panic` does.
+    bool isNoreturn = false;
 
     // For a this-field constructor parameter: the class whose field it initializes.
     StructInfo* thisFieldOwner = nullptr;
