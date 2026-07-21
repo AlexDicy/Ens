@@ -187,13 +187,15 @@ private class NarrowingFact {
     constructor(this.path, this.proven, this.narrowsWhenTrue);
 }
 
-// A snapshot of definite-assignment state at one program point: the locals assigned so far and
-// whether the path has already left through a return, throw, break, continue, or panic.
+// A snapshot of definite-assignment state at one program point: the locals and this-fields
+// assigned so far and whether the path has already left through a return, throw, break,
+// continue, or panic.
 private class AssignmentFlow {
     List<LocalBinding> assigned;
+    List<Field> assignedFields;
     bool terminated;
 
-    constructor(this.assigned, this.terminated);
+    constructor(this.assigned, this.assignedFields, this.terminated);
 }
 
 // What a member name means on a receiver type.
@@ -243,6 +245,14 @@ private class BodyChecker implements PanicCalls {
     private bool unconditionalPosition;
     private LocalBinding? assignmentTarget;
 
+    // The class whose constructor body is being analyzed, or null outside a constructor.
+    // assignedThisFields is the current flow's set of own fields definitely assigned;
+    // ctorSeededThisFields is the entry state (this-field parameters), which each catch
+    // clause resets to on the exception path.
+    private Type? ctorFieldOwner;
+    private List<Field> assignedThisFields;
+    private List<Field> ctorSeededThisFields;
+
     private Set<GreenNode> fillProvenNews;
     private Map<GreenNode, string> arrayNewNames;
 
@@ -271,6 +281,9 @@ private class BodyChecker implements PanicCalls {
         this.flowTerminated = false;
         this.unconditionalPosition = true;
         this.assignmentTarget = null;
+        this.ctorFieldOwner = null;
+        this.assignedThisFields = new List<Field>();
+        this.ctorSeededThisFields = new List<Field>();
         this.fillProvenNews = new Set<GreenNode>();
         this.arrayNewNames = new Map<GreenNode, string>();
         this.deferredObligations = deferred;
@@ -455,12 +468,21 @@ private class BodyChecker implements PanicCalls {
             }
         }
 
+        this.resetAssignmentFlow();
+        // A constructor also tracks its own fields: a this-field shorthand parameter assigns
+        // the field before the body runs, and every own non-defaultable field must be assigned
+        // on every path that leaves the body normally.
+        if (this.inConstructor && receiver != null) {
+            this.seedConstructorFields(signature, receiver);
+        }
         let body = node.body();
         if (body != null) {
-            this.resetAssignmentFlow();
             this.enterScope();
             this.walkBlock(body);
             this.leaveScope();
+        }
+        if (this.ctorFieldOwner != null) {
+            this.checkConstructorFieldsAssigned(signature.nameSpan());
         }
 
         this.checkConstructorChainsToBase(signature, node);
@@ -599,14 +621,21 @@ private class BodyChecker implements PanicCalls {
         this.result.setBinding(clause.green(), binding);
         this.inCatchClause = true;
         // The catch body runs on the exception path, where the try body may have thrown before
-        // assigning any local, so nothing carries in but the caught variable.
+        // assigning any local or field, so only the caught variable and the fields assigned
+        // before the body (the this-field parameters) carry in.
         this.assignedLocals = new List<LocalBinding>();
+        this.assignedThisFields = this.copyFields(this.ctorSeededThisFields);
         this.breakFlows = new List<List<AssignmentFlow>>();
         this.flowTerminated = false;
         this.trackLocal(binding, true);
         this.enterScope();
         this.walkBlock(clause.body());
         this.leaveScope();
+        // A catch that falls through without rethrowing returns the object normally, so its
+        // fields must be assigned there too.
+        if (this.ctorFieldOwner != null) {
+            this.checkConstructorFieldsAssigned(clause.catchKeyword().span());
+        }
         this.inCatchClause = false;
         this.scope = this.parameterScope;
     }
@@ -937,6 +966,9 @@ private class BodyChecker implements PanicCalls {
         this.flowTerminated = false;
         this.unconditionalPosition = true;
         this.assignmentTarget = null;
+        this.ctorFieldOwner = null;
+        this.assignedThisFields = new List<Field>();
+        this.ctorSeededThisFields = new List<Field>();
     }
 
     private bindingsContain(List<LocalBinding> set, LocalBinding binding) -> bool {
@@ -967,6 +999,114 @@ private class BodyChecker implements PanicCalls {
         }
     }
 
+    private fieldsContain(List<Field> set, Field field) -> bool {
+        for (long i = 0; i < set.length(); i++) {
+            if (set.get(i) == field) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private copyFields(List<Field> set) -> List<Field> {
+        let copy = new List<Field>();
+        for (long i = 0; i < set.length(); i++) {
+            copy.push(set.get(i));
+        }
+        return copy;
+    }
+
+    // Records the this-field shorthand parameters as assigned before the body runs, so a
+    // constructor whose only initialization is 'constructor(this.field)' starts complete.
+    private seedConstructorFields(Signature signature, Type receiver) {
+        this.ctorFieldOwner = receiver;
+        let fields = types.fieldsOf(receiver);
+        if (fields == null) {
+            return;
+        }
+        Parameter[] parameters = signature.parameters();
+        for (long i = 0; i < parameters.length; i++) {
+            let parameter = parameters[i];
+            if (!parameter.bindsField()) {
+                continue;
+            }
+            let field = members.findField(fields, parameter.name());
+            if (field != null && !this.fieldsContain(this.assignedThisFields, field)) {
+                this.assignedThisFields.push(field);
+            }
+        }
+        this.ctorSeededThisFields = this.copyFields(this.assignedThisFields);
+    }
+
+    private markThisFieldAssigned(Field field) {
+        if (this.flowTerminated || this.ctorFieldOwner == null) {
+            return;
+        }
+        if (!this.fieldsContain(this.assignedThisFields, field)) {
+            this.assignedThisFields.push(field);
+        }
+    }
+
+    // Reports every own non-defaultable field left unassigned on the path reaching span, and
+    // credits them so the same field is not reported twice.
+    private checkConstructorFieldsAssigned(Span span) {
+        let owner = this.ctorFieldOwner;
+        if (owner == null || this.flowTerminated) {
+            return;
+        }
+        let fields = types.fieldsOf(owner);
+        if (fields == null) {
+            return;
+        }
+        let missing = new List<Field>();
+        for (long i = types.baseFieldCount(owner); i < fields.length(); i++) {
+            let field = fields.get(i);
+            if (field.type() is ErrorType) {
+                continue;
+            }
+            if (field.hasDefault() || convert.isDefaultable(field.type())) {
+                continue;
+            }
+            if (this.fieldsContain(this.assignedThisFields, field)) {
+                continue;
+            }
+            missing.push(field);
+        }
+        if (missing.length() == 0) {
+            return;
+        }
+        string names = "";
+        for (long i = 0; i < missing.length(); i++) {
+            if (i > 0) {
+                if (i + 1 == missing.length()) {
+                    names = names + " and ";
+                } else {
+                    names = names + ", ";
+                }
+            }
+            names = names + "'{missing.get(i).name()}'";
+        }
+        string subject = "Fields ";
+        string verb = "are";
+        if (missing.length() == 1) {
+            subject = "Field ";
+            verb = "is";
+        }
+        string owningName = types.display(owner);
+        let authority = types.authorityOf(owner);
+        if (authority != null) {
+            owningName = authority.name();
+        }
+        string example = "'this.{missing.get(0).name()} = ...;'";
+        this.reporter.report(subject + names + " of class '{owningName}' " + verb + " not "
+            + "assigned on every path through this constructor. A non-nullable field must be "
+            + "assigned before the constructor returns; assign it on every path, for example "
+            + example + ".", span);
+        for (long i = 0; i < missing.length(); i++) {
+            this.assignedThisFields.push(missing.get(i));
+        }
+    }
+
     private checkDefiniteAssignment(LocalBinding binding, Span span) {
         if (this.flowTerminated) {
             return;
@@ -994,11 +1134,13 @@ private class BodyChecker implements PanicCalls {
     }
 
     private snapshotAssignment() -> AssignmentFlow {
-        return new AssignmentFlow(this.copyBindings(this.assignedLocals), this.flowTerminated);
+        return new AssignmentFlow(this.copyBindings(this.assignedLocals),
+            this.copyFields(this.assignedThisFields), this.flowTerminated);
     }
 
     private restoreAssignment(AssignmentFlow flow) {
         this.assignedLocals = this.copyBindings(flow.assigned);
+        this.assignedThisFields = this.copyFields(flow.assignedFields);
         this.flowTerminated = flow.terminated;
     }
 
@@ -1008,6 +1150,7 @@ private class BodyChecker implements PanicCalls {
     // terminated and credits every branch's writes to avoid reports in the dead code that follows.
     private joinAssignment(List<AssignmentFlow> flows) -> AssignmentFlow {
         let result = new List<LocalBinding>();
+        let resultFields = new List<Field>();
         bool anySurvivor = false;
         for (long i = 0; i < flows.length(); i++) {
             let flow = flows.get(i);
@@ -1016,6 +1159,7 @@ private class BodyChecker implements PanicCalls {
             }
             if (!anySurvivor) {
                 result = this.copyBindings(flow.assigned);
+                resultFields = this.copyFields(flow.assignedFields);
                 anySurvivor = true;
             } else {
                 let both = new List<LocalBinding>();
@@ -1025,6 +1169,13 @@ private class BodyChecker implements PanicCalls {
                     }
                 }
                 result = both;
+                let bothFields = new List<Field>();
+                for (long j = 0; j < resultFields.length(); j++) {
+                    if (this.fieldsContain(flow.assignedFields, resultFields.get(j))) {
+                        bothFields.push(resultFields.get(j));
+                    }
+                }
+                resultFields = bothFields;
             }
         }
         if (!anySurvivor) {
@@ -1035,9 +1186,14 @@ private class BodyChecker implements PanicCalls {
                         result.push(flow.assigned.get(j));
                     }
                 }
+                for (long j = 0; j < flow.assignedFields.length(); j++) {
+                    if (!this.fieldsContain(resultFields, flow.assignedFields.get(j))) {
+                        resultFields.push(flow.assignedFields.get(j));
+                    }
+                }
             }
         }
-        return new AssignmentFlow(result, !anySurvivor);
+        return new AssignmentFlow(result, resultFields, !anySurvivor);
     }
 
     private conditionIsAlwaysTrue(Expression condition) -> bool {
@@ -1372,6 +1528,9 @@ private class BodyChecker implements PanicCalls {
                 this.flowTerminated = true;
             },
             is ReturnStatementNode returned -> {
+                if (this.ctorFieldOwner != null) {
+                    this.checkConstructorFieldsAssigned(returned.returnKeyword().span());
+                }
                 this.checkReturnStatement(returned);
                 this.flowTerminated = true;
             },
@@ -2332,12 +2491,25 @@ private class BodyChecker implements PanicCalls {
             this.result.setType(node.target().green(), assignTarget);
         }
         this.invalidateForWrite(node.target());
-        if (node.target() is IdentifierExpressionNode) {
-            let binding = this.result.bindingOf(node.target().green());
+        let assignTargetNode = node.target();
+        if (assignTargetNode is IdentifierExpressionNode) {
+            let binding = this.result.bindingOf(assignTargetNode.green());
             if (binding != null) {
                 this.establishAssignmentNarrowing(binding, valueType);
                 if (this.unconditionalPosition) {
                     this.markAssigned(binding);
+                }
+            }
+        } else if (assignTargetNode is MemberExpressionNode) {
+            if (simpleAssign && this.unconditionalPosition
+                    && assignTargetNode.object() is ThisExpressionNode) {
+                let objectType = this.result.typeOf(assignTargetNode.object().green());
+                if (objectType != null) {
+                    let field = members.findField(types.fieldsOf(objectType),
+                        assignTargetNode.member().text());
+                    if (field != null) {
+                        this.markThisFieldAssigned(field);
+                    }
                 }
             }
         }

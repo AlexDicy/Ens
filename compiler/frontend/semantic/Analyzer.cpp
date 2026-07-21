@@ -2309,12 +2309,30 @@ void Analyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
     assignmentActive_ = true;
     resetAssignmentFlow();
 
+    // A constructor also tracks its own fields: a `this.field` shorthand parameter
+    // assigns the field before the body runs, and every own non-defaultable field
+    // must be assigned on every path that leaves the body normally.
+    if (currentFunction->isConstructor && receiverType && receiverType->structInfo) {
+        ctorFieldClass_ = receiverType->structInfo;
+        for (auto& p : fn.parameters()) {
+            if (!p.isThisField()) continue;
+            auto pname = p.nameText();
+            if (!pname) continue;
+            int idx = ctorFieldClass_->findFieldIndex(*pname);
+            if (idx >= 0) assignedThisFields_.insert(&ctorFieldClass_->fields[idx]);
+        }
+        ctorSeededThisFields_ = assignedThisFields_;
+    }
+
     // Body locals live in a child scope so catch clauses (siblings below) can't see them.
     pushScope();
     if (auto body = fn.body()) {
         analyzeStatements(body->statements());
     }
     popScope();
+
+    // Every own non-defaultable field must be assigned where the body falls through.
+    if (ctorFieldClass_) checkConstructorFieldsAssigned(fn.node);
 
     // A constructor must chain to its base when the base has no zero-argument constructor.
     if (receiverType && receiverType->structInfo && !sawSuperConstructorCall) {
@@ -2398,11 +2416,13 @@ void Analyzer::analyzeCatchClause(const ast::CatchClause& clause, Scope* funcSco
     }
 
     // A catch body runs on the exception path, where the try body may have thrown
-    // before assigning any local, so nothing carries in but the caught variable.
+    // before assigning any local or field, so only the caught variable and the
+    // fields assigned before the body (the `this.field` parameters) carry in.
     AssignmentFlow prevFlow = snapshotAssignment();
     auto prevBreaks = breakFlows_;
     breakFlows_.clear();
     assignedLocals_.clear();
+    assignedThisFields_ = ctorSeededThisFields_;
     flowTerminated_ = false;
 
     if (auto nameTok = clause.nameToken()) {
@@ -2419,6 +2439,10 @@ void Analyzer::analyzeCatchClause(const ast::CatchClause& clause, Scope* funcSco
         analyzeStatements(body->statements());
     }
     inCatchClause = prevInCatch;
+
+    // A catch that falls through without rethrowing returns the object normally, so
+    // its fields must be assigned there too.
+    if (ctorFieldClass_) checkConstructorFieldsAssigned(clause.node);
 
     restoreAssignment(prevFlow);
     breakFlows_ = prevBreaks;
@@ -3220,6 +3244,8 @@ void Analyzer::checkFunctionReturnPaths(const ast::FuncDecl& fn) {
 // Definite assignment
 // =========================================================
 
+static bool fieldHasDefaultValue(const FieldInfo& f);
+
 void Analyzer::resetAssignmentFlow() {
     assignedLocals_.clear();
     trackedLocals_.clear();
@@ -3227,6 +3253,9 @@ void Analyzer::resetAssignmentFlow() {
     flowTerminated_ = false;
     unconditionalPosition_ = true;
     assignmentTargetGreen_ = nullptr;
+    ctorFieldClass_ = nullptr;
+    assignedThisFields_.clear();
+    ctorSeededThisFields_.clear();
 }
 
 void Analyzer::trackLocal(Symbol* sym, bool assigned) {
@@ -3241,6 +3270,11 @@ void Analyzer::markAssigned(Symbol* sym) {
     if (trackedLocals_.count(sym)) assignedLocals_.insert(sym);
 }
 
+void Analyzer::markThisFieldAssigned(const FieldInfo* field) {
+    if (!assignmentActive_ || !field || flowTerminated_ || !ctorFieldClass_) return;
+    assignedThisFields_.insert(field);
+}
+
 void Analyzer::checkDefiniteAssignment(const ast::IdentExpression& expr, Symbol* sym) {
     if (!assignmentActive_ || !sym || flowTerminated_) return;
     if (expr.node.greenNode() == assignmentTargetGreen_) return;
@@ -3252,12 +3286,44 @@ void Analyzer::checkDefiniteAssignment(const ast::IdentExpression& expr, Symbol*
     assignedLocals_.insert(sym);
 }
 
+void Analyzer::checkConstructorFieldsAssigned(const SyntaxNode& diag) {
+    if (!ctorFieldClass_ || flowTerminated_) return;
+    std::vector<const FieldInfo*> missing;
+    int baseCount = ctorFieldClass_->baseFieldCount;
+    for (size_t i = 0; i < ctorFieldClass_->fields.size(); ++i) {
+        if (static_cast<int>(i) < baseCount) continue;
+        const FieldInfo& f = ctorFieldClass_->fields[i];
+        if (isDefaultable(f.type)) continue;
+        if (fieldHasDefaultValue(f)) continue;
+        if (assignedThisFields_.count(&f)) continue;
+        missing.push_back(&f);
+    }
+    if (missing.empty()) return;
+
+    std::string cname = asciiOf(ctorFieldClass_->name);
+    std::string names;
+    for (size_t i = 0; i < missing.size(); ++i) {
+        if (i > 0) names += i + 1 == missing.size() ? " and " : ", ";
+        names += "'" + asciiOf(missing[i]->name) + "'";
+    }
+    std::string subject = missing.size() == 1 ? "Field " : "Fields ";
+    std::string verb = missing.size() == 1 ? "is" : "are";
+    std::string example = "'this." + asciiOf(missing[0]->name) + " = ...;'";
+    errorAtNode(diag, subject + names + " of class '" + cname + "' " + verb +
+        " not assigned on every path through this constructor. A non-nullable field must "
+        "be assigned before the constructor returns; assign it on every path, for example " +
+        example + ".");
+    // Credit the reported fields so a later exit does not report them again.
+    for (const FieldInfo* f : missing) assignedThisFields_.insert(f);
+}
+
 Analyzer::AssignmentFlow Analyzer::snapshotAssignment() const {
-    return AssignmentFlow{assignedLocals_, flowTerminated_};
+    return AssignmentFlow{assignedLocals_, assignedThisFields_, flowTerminated_};
 }
 
 void Analyzer::restoreAssignment(const AssignmentFlow& flow) {
     assignedLocals_ = flow.assigned;
+    assignedThisFields_ = flow.assignedFields;
     flowTerminated_ = flow.terminated;
 }
 
@@ -3274,6 +3340,7 @@ Analyzer::AssignmentFlow Analyzer::joinAssignment(const std::vector<AssignmentFl
         if (f.terminated) continue;
         if (first) {
             out.assigned = f.assigned;
+            out.assignedFields = f.assignedFields;
             out.terminated = false;
             first = false;
         } else {
@@ -3282,11 +3349,17 @@ Analyzer::AssignmentFlow Analyzer::joinAssignment(const std::vector<AssignmentFl
                 if (f.assigned.count(s)) both.insert(s);
             }
             out.assigned.swap(both);
+            std::unordered_set<const FieldInfo*> bothFields;
+            for (const FieldInfo* fld : out.assignedFields) {
+                if (f.assignedFields.count(fld)) bothFields.insert(fld);
+            }
+            out.assignedFields.swap(bothFields);
         }
     }
     if (out.terminated) {
         for (const auto& f : flows) {
             for (Symbol* s : f.assigned) out.assigned.insert(s);
+            for (const FieldInfo* fld : f.assignedFields) out.assignedFields.insert(fld);
         }
     }
     return out;
@@ -3541,6 +3614,9 @@ void Analyzer::analyzeReturnStmt(const ast::ReturnStatement& stmt) {
         errorAtNode(stmt.node, "'return' outside of a function");
         return;
     }
+    // A return leaves the constructor normally, so every own non-defaultable field
+    // must already be assigned on the path reaching it.
+    if (ctorFieldClass_) checkConstructorFieldsAssigned(stmt.node);
     Type* expected = currentFunction->returnType;
     auto value = stmt.value();
     if (!value) {
@@ -5505,6 +5581,16 @@ Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
             establishAssignmentNarrowing(targetInfo->resolvedSymbol, valueT);
             if (unconditionalPosition_) markAssigned(targetInfo->resolvedSymbol);
         }
+    } else if (auto mem = target->asMember()) {
+        auto obj = mem->object();
+        if (simpleAssign && unconditionalPosition_ && obj && obj->asThis()) {
+            auto name = mem->memberText();
+            Type* objT = obj ? analysis.typeOf(obj->node.greenNode()) : nullptr;
+            if (name && objT && objT->structInfo) {
+                int idx = objT->structInfo->findFieldIndex(*name);
+                if (idx >= 0) markThisFieldAssigned(&objT->structInfo->fields[idx]);
+            }
+        }
     }
     return assignTargetT;
 }
@@ -6449,39 +6535,6 @@ void Analyzer::checkStructValueCycles() {
     }
 }
 
-static bool ctorHasThisFieldParam(const ast::FuncDecl& ctor, const std::u16string& fieldName) {
-    for (auto& p : ctor.parameters()) {
-        if (!p.isThisField()) continue;
-        if (auto pname = p.nameText(); pname && *pname == fieldName) return true;
-    }
-    return false;
-}
-
-// Returns true if there is at least one top-level assignment in the body.
-// Branches and loops aren't credited as not considered to guarantee initialization.
-static bool ctorBodyAssignsThisField(const ast::FuncDecl& ctor,
-                                     const std::u16string& fieldName) {
-    auto body = ctor.body();
-    if (!body) return false;
-    for (auto& s : body->statements()) {
-        auto e = s.asExpressionStmt();
-        if (!e) continue;
-        auto expr = e->expression();
-        if (!expr) continue;
-        auto a = expr->asAssign();
-        if (!a) continue;
-        auto target = a->target();
-        if (!target) continue;
-        auto m = target->asMember();
-        if (!m) continue;
-        auto obj = m->object();
-        if (!obj || !obj->asThis()) continue;
-        auto mname = m->memberText();
-        if (mname && *mname == fieldName) return true;
-    }
-    return false;
-}
-
 void Analyzer::checkFieldInitialization(const ast::StructDecl& sd) {
     // A struct field may have any type, including a non-defaultable one (a class,
     // string, array, or another non-defaultable struct). Such a struct is itself
@@ -6495,9 +6548,11 @@ void Analyzer::checkFieldInitialization(const ast::ClassDecl& cd) {
     Type* t = analysis.typeOf(cd.node.greenNode());
     if (!t || !t->structInfo) return;
 
-    std::vector<ast::FuncDecl> ctors;
+    // A class that declares any constructor is checked by the definite-assignment
+    // pass over each constructor body. Only a class with no constructor at all is
+    // caught here: it has no path on which a non-defaultable field could be assigned.
     for (auto& m : cd.methods()) {
-        if (m.isConstructor()) ctors.push_back(m);
+        if (m.isConstructor()) return;
     }
 
     int baseFieldCount = t->structInfo->baseFieldCount;
@@ -6507,24 +6562,14 @@ void Analyzer::checkFieldInitialization(const ast::ClassDecl& cd) {
         if (isDefaultable(f.type)) continue;
         if (fieldHasDefaultValue(f)) continue;
 
-        bool everyCtorInits = !ctors.empty();
-        for (auto& ctor : ctors) {
-            if (!ctorHasThisFieldParam(ctor, f.name) &&
-                !ctorBodyAssignsThisField(ctor, f.name)) {
-                everyCtorInits = false;
-                break;
-            }
-        }
-        if (everyCtorInits) continue;
-
         std::string fname = asciiOf(f.name);
         std::string cname = asciiOf(t->structInfo->name);
         std::string msg = "Field '" + fname + "' of class '" + cname +
             "' has non-nullable type '" + f.type->toString() +
             "' but is never initialized. Give it a default (e.g. `" +
             f.type->toString() + " " + fname + " = ...;`), make it nullable (`" +
-            f.type->toString() + "? " + fname + ";`), or initialize it in every constructor " +
-            "(via `this." + fname + "` parameter or `this." + fname + " = ...;` in the body).";
+            f.type->toString() + "? " + fname + ";`), or add a constructor that assigns it " +
+            "(via a `this." + fname + "` parameter or `this." + fname + " = ...;` in the body).";
         sink.error({f.line, f.column, static_cast<int>(fname.size())}, std::move(msg));
     }
 }

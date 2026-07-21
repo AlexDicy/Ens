@@ -121,8 +121,12 @@ private:
     // A terminated path (return/throw/rethrow/panic, and break/continue for the
     // relevant loop) contributes nothing to a join. Structs are variable-level: a
     // struct local must be assigned as a whole before any field access.
+    // In a constructor body the same analysis also tracks which of the class's own
+    // fields are definitely assigned, so a non-defaultable field is required to be
+    // written on every path that leaves the constructor normally.
     struct AssignmentFlow {
         std::unordered_set<Symbol*> assigned;
+        std::unordered_set<const FieldInfo*> assignedFields;
         bool terminated = false;
     };
     bool assignmentActive_ = false;
@@ -135,9 +139,20 @@ private:
     std::unordered_set<Symbol*> assignedLocals_;
     std::unordered_set<Symbol*> trackedLocals_;
     std::vector<std::vector<AssignmentFlow>> breakFlows_;
+    // The class whose constructor body is being analyzed, or null outside a
+    // constructor. `assignedThisFields_` is the current flow's set of own fields
+    // definitely assigned; `ctorSeededThisFields_` is the entry state (`this.field`
+    // shorthand parameters), which each catch clause resets to on the exception path.
+    StructInfo* ctorFieldClass_ = nullptr;
+    std::unordered_set<const FieldInfo*> assignedThisFields_;
+    std::unordered_set<const FieldInfo*> ctorSeededThisFields_;
     void trackLocal(Symbol* sym, bool assigned);
     void markAssigned(Symbol* sym);
+    void markThisFieldAssigned(const FieldInfo* field);
     void checkDefiniteAssignment(const ast::IdentExpression& expr, Symbol* sym);
+    // Reports every own non-defaultable field left unassigned on the path reaching
+    // `diag`, and credits them so the same field is not reported twice.
+    void checkConstructorFieldsAssigned(const SyntaxNode& diag);
     AssignmentFlow snapshotAssignment() const;
     void restoreAssignment(const AssignmentFlow& flow);
     AssignmentFlow joinAssignment(const std::vector<AssignmentFlow>& flows) const;
