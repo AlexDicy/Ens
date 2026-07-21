@@ -79,7 +79,7 @@ A struct does not customize equality: a method named `equals` on a struct is an 
 
 A struct serializes to a JSON string through `.toString()` and in interpolation holes, honoring the default-serialization promise.
 The form is a JSON object listing every field, including private and protected ones, in declaration order: `{"field": value, ...}`.
-Numbers render as decimals, `bool` as `true` or `false`, strings and enum members as JSON-quoted text (with `"`, `\`, and control characters escaped), an absent nullable field as `null`, and a nested struct as its own JSON object.
+Numbers render as decimals, `bool` as `true` or `false`, strings and enum members as JSON-quoted text (with `"`, `\`, and control characters escaped), a `char` as a one-character quoted string with its scalar encoded to UTF-8 and escaped the same way, an absent nullable field as `null`, and a nested struct as its own JSON object.
 A struct that declares its own `toString` method uses that method instead.
 A struct is serializable only when every field is: a value type, a string, an enum, one of those made nullable, or a nested such struct.
 A field that is a class, an array, or an external handle has no JSON form and makes serializing the struct an error that names the offending field, mirroring the `==` rule.
