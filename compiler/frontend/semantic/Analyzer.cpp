@@ -1884,6 +1884,56 @@ void Analyzer::checkHashEqualsPairing(const ast::ClassDecl& cd, StructInfo* si) 
     }
 }
 
+// A struct compares memberwise, so every field's type must have its own '=='.
+// Reports the offending field's dotted path and its type when one does not. A
+// field whose type mentions a type parameter is judged per instantiation during
+// code generation, exactly like an interpolation hole, so it is skipped here.
+void Analyzer::checkStructEquatable(Type* structT, const SyntaxNode& node) {
+    if (!structT || !structT->structInfo) return;
+    std::vector<StructInfo*> visiting;
+    std::string fieldPath;
+    Type* leaf = nullptr;
+    if (findNonComparableField(structT, visiting, fieldPath, leaf) && leaf) {
+        errorAtNode(node, "Struct '" + asciiOf(structT->structInfo->name) +
+            "' cannot be compared with '=='. Field '" + fieldPath + "' has type '" +
+            leaf->toString() + "', which has no '=='; external types have no value equality. "
+            "Compare the fields you need directly instead.");
+    }
+}
+
+// Walks a struct's fields for one whose type has no '=='. Descends through
+// nullable wrappers and nested structs, recording the dotted path to the leaf.
+// External-typed fields are the only concrete leaf without '=='; arrays and
+// classes compare by identity, so they are fine.
+bool Analyzer::findNonComparableField(Type* structT, std::vector<StructInfo*>& visiting,
+                                      std::string& fieldPath, Type*& leaf) {
+    if (!structT || !structT->structInfo) return false;
+    for (StructInfo* seen : visiting) {
+        if (seen == structT->structInfo) return false;
+    }
+    visiting.push_back(structT->structInfo);
+    for (const FieldInfo& f : structT->structInfo->fields) {
+        Type* ft = f.type;
+        if (!ft || TypeContext::containsTypeParam(ft)) continue;
+        Type* core = ft;
+        if (core->isOptional() && core->inner) core = core->inner;
+        if (core->isExternal()) {
+            fieldPath = asciiOf(f.name);
+            leaf = core;
+            return true;
+        }
+        if (core->isStruct()) {
+            std::string sub;
+            if (findNonComparableField(core, visiting, sub, leaf)) {
+                fieldPath = asciiOf(f.name) + "." + sub;
+                return true;
+            }
+        }
+    }
+    visiting.pop_back();
+    return false;
+}
+
 void Analyzer::checkThrowsClausePlacement(const ast::FuncDecl& fn, bool isOverridable,
                                           bool isConstructor) {
     if (!fn.isThrows()) return;
@@ -4062,6 +4112,10 @@ Type* Analyzer::analyzeBinary(const ast::BinaryExpression& expr) {
             else if (l->isNull()) r = presenceOperandType(*right, r);
             if (!l->assignableFrom(r) && !r->assignableFrom(l)) {
                 errorAtNode(expr.node, "Cannot compare '" + l->toString() + "' and '" + r->toString() + "'");
+            } else if (l->isStruct() && r->isStruct() && l->structInfo && l->equals(r)) {
+                // Same-type struct '==' lowers to a memberwise compare; a field
+                // whose type has no '==' of its own makes the whole compare an error.
+                checkStructEquatable(l, expr.node);
             }
             return typeCtx.getPrimitive(TypeKind::Bool);
         }

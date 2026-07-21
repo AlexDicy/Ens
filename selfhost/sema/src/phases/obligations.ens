@@ -18,8 +18,11 @@ import TypeParamType from model.types;
 import OptionalType from model.types;
 import ArrayType from model.types;
 import ClassType from model.types;
+import StructType from model.types;
+import ExternalType from model.types;
 import ErrorType from model.types;
 import StringType from model.types;
+import Field from model.types;
 import List from @std.collections.list;
 import Map from @std.collections.map;
 import Set from @std.collections.set;
@@ -74,6 +77,19 @@ public class TypeTestObligation extends Obligation {
 
     isCast() -> bool {
         return this.castForm;
+    }
+}
+
+public class EqualityObligation extends Obligation {
+    private Type comparedStruct;
+
+    constructor(Type structType, Span span) {
+        super(span);
+        this.comparedStruct = structType;
+    }
+
+    structType() -> Type {
+        return this.comparedStruct;
     }
 }
 
@@ -421,6 +437,13 @@ private class ObligationPass {
                         typeTestIssue(source, target, test.isCast()), obligation.span());
                 }
             },
+            is EqualityObligation equality -> {
+                let concrete = this.substituteOne(equality.structType(), assignment);
+                if (concrete != null) {
+                    this.report(entry, assignment, equalityComparabilityIssue(concrete),
+                        obligation.span());
+                }
+            },
         }
     }
 
@@ -553,6 +576,84 @@ private isFinalClass(Type type) -> bool {
     let authority = types.authorityOf(type);
     if (authority is ClassType) {
         return authority.isFinal();
+    }
+    return false;
+}
+
+// Why two values of struct type 'structType' cannot be compared memberwise with '==', or null
+// when every field has its own '=='. Names the offending field's dotted path and its type.
+public equalityComparabilityIssue(Type structType) -> string? {
+    let authority = types.authorityOf(structType);
+    if (authority == null) {
+        return null;
+    }
+    let found = firstNonComparableField(structType, new Set<Type>());
+    if (found == null) {
+        return null;
+    }
+    return "Struct '{authority.name()}' cannot be compared with '=='. Field '{found.path()}' "
+        + "has type '{types.display(found.leaf())}', which has no '=='; external types have no "
+        + "value equality. Compare the fields you need directly instead.";
+}
+
+// A struct field with no '==' of its own: the dotted path from the compared struct down to it,
+// and the non-comparable leaf type it bottoms out at.
+private class NonComparableField {
+    private string fieldPath;
+    private Type fieldLeaf;
+
+    constructor(string path, Type leaf) {
+        this.fieldPath = path;
+        this.fieldLeaf = leaf;
+    }
+
+    path() -> string {
+        return this.fieldPath;
+    }
+
+    leaf() -> Type {
+        return this.fieldLeaf;
+    }
+}
+
+// Walks a struct's fields for the first whose type has no '=='. Descends through nullable
+// wrappers and nested structs; external is the only concrete leaf without '==', since arrays
+// and classes compare by identity. A field mentioning a type parameter is left for the
+// per-instantiation replay.
+private firstNonComparableField(Type structType, Set<Type> visiting) -> NonComparableField? {
+    if (!visiting.add(structType)) {
+        return null;
+    }
+    let fields = types.fieldsOf(structType);
+    if (fields == null) {
+        return null;
+    }
+    for (long i = 0; i < fields.length(); i++) {
+        let field = fields.get(i);
+        let fieldType = field.type();
+        if (convert.containsTypeParam(fieldType)) {
+            continue;
+        }
+        Type core = convert.bareOf(fieldType);
+        if (core is ExternalType) {
+            return new NonComparableField(field.name(), core);
+        }
+        if (isStructValue(core)) {
+            let nested = firstNonComparableField(core, visiting);
+            if (nested != null) {
+                return new NonComparableField(field.name() + "." + nested.path(), nested.leaf());
+            }
+        }
+    }
+    return null;
+}
+
+private isStructValue(Type type) -> bool {
+    if (type is StructType) {
+        return true;
+    }
+    if (type is InstantiationType) {
+        return type.template() is StructType;
     }
     return false;
 }

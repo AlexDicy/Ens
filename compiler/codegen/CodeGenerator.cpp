@@ -2398,10 +2398,14 @@ struct CodeGenerator::Impl {
             case SyntaxKind::Percent: return flt ? builder->CreateFRem(L, R) : (sgn ? builder->CreateSRem(L, R) : builder->CreateURem(L, R));
             case SyntaxKind::EqEq:
             case SyntaxKind::NotEq: {
-                if ((leftType && subst(leftType)->isStruct()) ||
-                    (rightType && subst(rightType)->isStruct())) {
-                    error(e.node.startOffset(), "Comparing struct values with '==' is not supported yet");
-                    return nullptr;
+                // Same-type struct operands compare field by field. The analyzer
+                // guarantees both sides are the one struct type, so either side's
+                // type describes the layout.
+                ::Type* lStruct = leftType ? subst(leftType) : nullptr;
+                if (lStruct && lStruct->isStruct()) {
+                    llvm::Value* eq = emitStructEquality(lStruct, L, R, e.node.startOffset());
+                    if (!eq) return nullptr;
+                    return op == SyntaxKind::NotEq ? builder->CreateNot(eq, "struct.ne") : eq;
                 }
                 // A class that declares `equals` compares by content. A `null`
                 // literal operand is always a presence check, never dispatched.
@@ -2567,6 +2571,7 @@ struct CodeGenerator::Impl {
         auto innerEquals = [&](llvm::Value* a, llvm::Value* b, ::Type* inner) -> llvm::Value* {
             if (inner && inner->isFloat()) return builder->CreateFCmpOEQ(a, b, "opt.val.eq");
             if (a->getType()->isIntegerTy()) return builder->CreateICmpEQ(a, b, "opt.val.eq");
+            if (inner && inner->isStruct()) return emitStructEquality(inner, a, b, offset);
             error(offset, "Comparing optional values of type '" +
                 (inner ? inner->toString() : "?") + "' is not supported yet");
             return nullptr;
@@ -2703,6 +2708,105 @@ struct CodeGenerator::Impl {
         phi->addIncoming(llvm::ConstantInt::getFalse(ctx), nullBB);
         phi->addIncoming(eqv, callEnd);
         return phi;
+    }
+
+    // Memberwise '==' over two struct values: compares fields in declaration
+    // order, short-circuiting to false at the first difference. Nested struct
+    // fields recurse; the caller negates the result for '!='.
+    llvm::Value* emitStructEquality(::Type* structT, llvm::Value* L, llvm::Value* R,
+                                    uint32_t offset) {
+        structT = subst(structT);
+        if (!structT->structInfo || structT->structInfo->fields.empty()) {
+            return llvm::ConstantInt::getTrue(ctx);
+        }
+        std::string structDesc = asAscii(structT->structInfo->name);
+        const auto& fields = structT->structInfo->fields;
+        auto* i1 = llvm::Type::getInt1Ty(ctx);
+        auto* falseBB = llvm::BasicBlock::Create(ctx, "struct.eq.false", currentFunction);
+        auto* endBB = llvm::BasicBlock::Create(ctx, "struct.eq.end", currentFunction);
+        llvm::BasicBlock* trueBB = nullptr;
+        for (size_t i = 0; i < fields.size(); ++i) {
+            llvm::Value* fa = builder->CreateExtractValue(L, {static_cast<unsigned>(i)}, "struct.a.fld");
+            llvm::Value* fb = builder->CreateExtractValue(R, {static_cast<unsigned>(i)}, "struct.b.fld");
+            llvm::Value* feq = emitFieldEquality(fa, fb, fields[i].type, structDesc,
+                                                 asAscii(fields[i].name), offset);
+            if (!feq) return nullptr;
+            bool last = (i + 1 == fields.size());
+            llvm::BasicBlock* cont = llvm::BasicBlock::Create(
+                ctx, last ? "struct.eq.true" : "struct.eq.next", currentFunction);
+            builder->CreateCondBr(feq, cont, falseBB);
+            builder->SetInsertPoint(cont);
+            if (last) trueBB = cont;
+        }
+        builder->CreateBr(endBB);
+        builder->SetInsertPoint(falseBB);
+        builder->CreateBr(endBB);
+        builder->SetInsertPoint(endBB);
+        auto* phi = builder->CreatePHI(i1, 2, "struct.eq");
+        phi->addIncoming(llvm::ConstantInt::getTrue(ctx), trueBB);
+        phi->addIncoming(llvm::ConstantInt::getFalse(ctx), falseBB);
+        return phi;
+    }
+
+    // Compares one field of two struct values by that field's own '==': primitives
+    // and enums by value, strings by content, classes by reference identity (or by
+    // 'equals' when the class opted in), arrays by reference identity, nested
+    // structs memberwise, and optionals null-aware. Returns null after reporting a
+    // field whose type has no '=='; a field mentioning a type parameter reaches
+    // this only after monomorphization, so the report names the concrete type.
+    llvm::Value* emitFieldEquality(llvm::Value* a, llvm::Value* b, ::Type* ft,
+                                   const std::string& structDesc, const std::string& fieldName,
+                                   uint32_t offset) {
+        ft = subst(ft);
+        if (isValueTypeOptional(ft)) {
+            ::Type* inner = subst(ft->inner);
+            llvm::Value* presA = builder->CreateExtractValue(a, {0}, "opt.a.present");
+            llvm::Value* presB = builder->CreateExtractValue(b, {0}, "opt.b.present");
+            llvm::Value* valEq = emitFieldEquality(
+                builder->CreateExtractValue(a, {1}, "opt.a.val"),
+                builder->CreateExtractValue(b, {1}, "opt.b.val"), inner, structDesc, fieldName, offset);
+            if (!valEq) return nullptr;
+            llvm::Value* samePresence = builder->CreateICmpEQ(presA, presB, "opt.same.presence");
+            llvm::Value* absentOrEqual = builder->CreateOr(
+                builder->CreateNot(presA), valEq, "opt.absent.or.eq");
+            return builder->CreateAnd(samePresence, absentOrEqual, "opt.fld.eq");
+        }
+        ::Type* core = ft;
+        if (core->isOptional() && core->inner) core = subst(core->inner);
+        switch (core->kind) {
+            case TypeKind::Bool:
+            case TypeKind::Byte:
+            case TypeKind::Short:
+            case TypeKind::UShort:
+            case TypeKind::Int:
+            case TypeKind::UInt:
+            case TypeKind::Long:
+            case TypeKind::ULong:
+            case TypeKind::Char:
+            case TypeKind::Enum:
+                return builder->CreateICmpEQ(a, b, "fld.eq");
+            case TypeKind::Float:
+            case TypeKind::Double:
+                return builder->CreateFCmpOEQ(a, b, "fld.eq");
+            case TypeKind::String:
+                return builder->CreateCall(getOrDefineEnsStringEq(), { a, b }, "fld.streq");
+            case TypeKind::Class: {
+                if (Symbol* eqSym = declaredConformingEquals(core)) {
+                    return emitClassContentEquality(core, eqSym, a, b);
+                }
+                return builder->CreateICmpEQ(a, b, "fld.refeq");
+            }
+            case TypeKind::Array:
+                return builder->CreateICmpEQ(a, b, "fld.refeq");
+            case TypeKind::Struct:
+                return emitStructEquality(core, a, b, offset);
+            default:
+                error(offset, "Struct '" + structDesc + "' cannot be compared with '=='. Field '" +
+                    fieldName + "' has type '" + core->toString() +
+                    "', which has no '=='; external types have no value equality. "
+                    "Compare the fields you need directly instead.");
+                return nullptr;
+        }
     }
 
     // Synthesized hash of a value: identity for reference types, contents for
