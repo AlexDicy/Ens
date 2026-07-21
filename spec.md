@@ -20,8 +20,22 @@ printArea() { // no need to specify -> void
 }
 ```
 
-A function with a non-void return type must return a value on every path through its body: the compiler rejects a function that can reach the end of its body without hitting a `return`, `throw`, `rethrow`, or `panic()`.
+A function with a non-void return type must return a value on every path through its body: the compiler rejects a function that can reach the end of its body without hitting a `return`, `throw`, `rethrow`, or a call that never returns (`panic()` or any `noreturn` function).
 An `if`/`else` where every branch exits counts as exiting, as does a `switch` whose arms all exit and a `while (true)` loop with no `break`.
+
+A function or method may be declared `noreturn`, a modifier stating that it never returns to its caller: every path through its body ends by throwing, by calling `panic`, or by calling another `noreturn` function, or the body loops forever.
+A `noreturn` declaration has no return type, since it returns nothing at all, so writing a `-> T` clause alongside it is an error; it combines with visibility, `override`, `final`, and `throws`, but is not allowed on a constructor, a destructor, or a test.
+The compiler holds the body to this promise: a `return` statement is rejected, and a body that can reach its end is rejected, reusing the same path analysis as the missing-return check.
+A call to a `noreturn` function ends the path it sits on, exactly as `panic()` does, so a value-returning function may close a branch with such a call and still be accepted, and a value narrowed before the call stays narrowed afterward.
+The built-in `panic` is itself a `noreturn` function, so this is one rule rather than a special case.
+An abstract or interface method may be `noreturn` as part of its contract, and an override of a `noreturn` method must remain `noreturn`, because callers rely on it never returning.
+A throwing `noreturn` function still takes part in checked exceptions as usual: its call sites need `try`, and its declared or inferred `throws` set applies normally.
+
+```ens
+public noreturn fail(string message) throws {
+    throw new TestFailure(message);
+}
+```
 
 Everything public by default.
 
