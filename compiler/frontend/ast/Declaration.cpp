@@ -189,7 +189,8 @@ std::optional<SyntaxNode> FuncDecl::nameToken() const {
     for (auto& c : node.children()) {
         if (isTrivia(c.kind()) || c.kind() == SyntaxKind::VisibilityModifier) continue;
         if (c.kind() == SyntaxKind::KwOverride || c.kind() == SyntaxKind::KwFinal ||
-            c.kind() == SyntaxKind::KwAbstract) continue;  // skip method modifiers
+            c.kind() == SyntaxKind::KwAbstract || c.kind() == SyntaxKind::KwNoreturn)
+            continue;  // skip method modifiers
         if (c.kind() == SyntaxKind::Identifier) return c;
         break;
     }
@@ -240,6 +241,7 @@ bool FuncDecl::isDestructor() const  { return hasDirectToken(node, SyntaxKind::K
 bool FuncDecl::isOverride() const { return hasDirectToken(node, SyntaxKind::KwOverride); }
 bool FuncDecl::isFinal() const    { return hasDirectToken(node, SyntaxKind::KwFinal); }
 bool FuncDecl::isAbstract() const { return hasDirectToken(node, SyntaxKind::KwAbstract); }
+bool FuncDecl::isNoreturn() const { return hasDirectToken(node, SyntaxKind::KwNoreturn); }
 
 std::optional<ThrowsClause> FuncDecl::throwsClause() const {
     if (auto t = firstChildNode(node, SyntaxKind::ThrowsClause)) return ThrowsClause::cast(*t);

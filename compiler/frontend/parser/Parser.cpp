@@ -80,6 +80,20 @@ bool Parser::atContextualTest() const {
     return kindAt() == SyntaxKind::Identifier && tokenAt().text == u"test";
 }
 
+bool Parser::peekIsContextualTest(size_t n) const {
+    size_t idx = current;
+    while (true) {
+        if (idx >= tokens.size()) return false;
+        if (!isTrivia(tokens[idx].kind)) {
+            if (n == 0) {
+                return tokens[idx].kind == SyntaxKind::Identifier && tokens[idx].text == u"test";
+            }
+            n--;
+        }
+        idx++;
+    }
+}
+
 // `in` is a contextual keyword, an ordinary identifier everywhere except between
 // a foreach binding and its iterable.
 bool Parser::atContextualIn() const {
@@ -274,6 +288,17 @@ void Parser::parseTopLevel() {
         return;
     }
 
+    // A modifier in front of a test is not allowed: a test declaration carries no modifiers.
+    if (declMods > 0 && peekIsContextualTest(declMods) &&
+        (peekKind(declMods + 1) == SyntaxKind::StringLiteral ||
+         peekKind(declMods + 1) == SyntaxKind::InterpStringStart)) {
+        reportAtCurrent("A test cannot have modifiers such as 'noreturn'; write 'test' at the "
+                        "start of the line");
+        for (int i = 0; i < declMods; i++) bump();
+        parseTestDecl();
+        return;
+    }
+
     // Check function decl first, then typed var decl.
     if (looksLikeFuncDecl(/*allowShorthand=*/false)) {
         parseFuncDecl();
@@ -408,10 +433,11 @@ bool Parser::looksLikeFuncDecl(bool allowShorthand) const {
         idx++;
         while (idx < tokens.size() && isTrivia(tokens[idx].kind)) idx++;
     }
-    // Skip optional method modifiers (override / final / abstract).
+    // Skip optional method modifiers (override / final / abstract / noreturn).
     while (idx < tokens.size() && (tokens[idx].kind == SyntaxKind::KwOverride ||
                                    tokens[idx].kind == SyntaxKind::KwFinal ||
-                                   tokens[idx].kind == SyntaxKind::KwAbstract)) {
+                                   tokens[idx].kind == SyntaxKind::KwAbstract ||
+                                   tokens[idx].kind == SyntaxKind::KwNoreturn)) {
         idx++;
         while (idx < tokens.size() && isTrivia(tokens[idx].kind)) idx++;
     }
@@ -444,7 +470,8 @@ bool Parser::looksLikeFuncDecl(bool allowShorthand) const {
 void Parser::parseFuncDecl() {
     builder.startNode(SyntaxKind::FuncDecl);
     parseVisibilityModifier();
-    while (at(SyntaxKind::KwOverride) || at(SyntaxKind::KwFinal) || at(SyntaxKind::KwAbstract)) {
+    while (at(SyntaxKind::KwOverride) || at(SyntaxKind::KwFinal) || at(SyntaxKind::KwAbstract) ||
+           at(SyntaxKind::KwNoreturn)) {
         bump();  // method modifier; analyzer validates context
     }
     if (at(SyntaxKind::KwConstructor) || at(SyntaxKind::KwDestructor)) {

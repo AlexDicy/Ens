@@ -163,6 +163,7 @@ public:
     bool isOverride() const;
     bool isFinal() const;
     bool isAbstract() const;
+    bool isNoreturn() const;
     bool isThrows() const;
     std::optional<ThrowsClause> throwsClause() const;
     std::optional<SyntaxNode> throwsToken() const;

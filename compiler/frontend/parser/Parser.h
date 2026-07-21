@@ -44,6 +44,7 @@ private:
     bool atContextualOut() const;
     // True when positioned on the contextual `test` keyword (a `test` identifier).
     bool atContextualTest() const;
+    bool peekIsContextualTest(size_t n) const;
     // True when positioned on the contextual `from` keyword (a `from` identifier).
     bool atContextualFrom() const;
     bool peekIsContextualFrom(size_t n) const;
