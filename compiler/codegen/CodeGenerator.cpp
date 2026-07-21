@@ -5034,6 +5034,166 @@ struct CodeGenerator::Impl {
         return fn;
     }
 
+    // string ens_double_to_string(double value): compact decimal via snprintf
+    // "%g", copied into a fresh owned string.
+    llvm::Function* getOrDefineEnsDoubleToString() {
+        if (auto* existing = module->getFunction("ens_double_to_string")) return existing;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+        auto* dblTy = llvm::Type::getDoubleTy(ctx);
+        auto* fnTy = llvm::FunctionType::get(ptrTy, { dblTy }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+            "ens_double_to_string", module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+        auto savedIP = builder->saveIP();
+        builder->SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", fn));
+        llvm::Value* buf = builder->CreateAlloca(llvm::ArrayType::get(i8Ty, 32), nullptr, "d2s.buf");
+        llvm::Value* w = builder->CreateCall(getOrDeclareSnprintf(),
+            { buf, llvm::ConstantInt::get(i64Ty, 32),
+              builder->CreateGlobalString("%g", ".fmt.g"), fn->getArg(0) }, "d2s.w");
+        llvm::Value* len = builder->CreateSExt(w, i64Ty);
+        llvm::Value* obj = emitStringAlloc(len);
+        builder->CreateMemCpy(emitStringDataPtr(obj), llvm::MaybeAlign(1), buf, llvm::MaybeAlign(1), len);
+        builder->CreateRet(obj);
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    // string ens_json_escape_string(string s): the JSON string form of s -
+    // double-quoted, with '"', '\\', and control characters escaped (short forms
+    // for \b \t \n \f \r, `\u00XX` otherwise). Owned (+1). Null renders as "".
+    llvm::Function* getOrDefineEnsJsonEscape() {
+        if (auto* existing = module->getFunction("ens_json_escape_string")) return existing;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(ptrTy, { ptrTy }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+            "ens_json_escape_string", module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+        auto savedIP = builder->saveIP();
+
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* computeBB = llvm::BasicBlock::Create(ctx, "je.compute", fn);
+        auto* emptyBB = llvm::BasicBlock::Create(ctx, "je.empty", fn);
+        auto* setupBB = llvm::BasicBlock::Create(ctx, "je.setup", fn);
+        auto* condBB = llvm::BasicBlock::Create(ctx, "je.cond", fn);
+        auto* bodyBB = llvm::BasicBlock::Create(ctx, "je.body", fn);
+        auto* notTwoBB = llvm::BasicBlock::Create(ctx, "je.nottwo", fn);
+        auto* twoBB = llvm::BasicBlock::Create(ctx, "je.two", fn);
+        auto* uniBB = llvm::BasicBlock::Create(ctx, "je.uni", fn);
+        auto* plainBB = llvm::BasicBlock::Create(ctx, "je.plain", fn);
+        auto* incBB = llvm::BasicBlock::Create(ctx, "je.inc", fn);
+        auto* tailBB = llvm::BasicBlock::Create(ctx, "je.tail", fn);
+        auto i8c = [&](int ch) { return llvm::ConstantInt::get(i8Ty, ch); };
+        auto i64c = [&](int64_t n) { return llvm::ConstantInt::get(i64Ty, n); };
+
+        builder->SetInsertPoint(entry);
+        auto* lenSlot = builder->CreateAlloca(i64Ty, nullptr, "je.lenSlot");
+        auto* dataSlot = builder->CreateAlloca(ptrTy, nullptr, "je.dataSlot");
+        auto* outSlot = builder->CreateAlloca(i64Ty, nullptr, "je.outSlot");
+        auto* iSlot = builder->CreateAlloca(i64Ty, nullptr, "je.iSlot");
+        llvm::Value* s = fn->getArg(0);
+        builder->CreateCondBr(
+            builder->CreateICmpEQ(s, llvm::ConstantPointerNull::get(ptrTy)), emptyBB, computeBB);
+
+        builder->SetInsertPoint(computeBB);
+        builder->CreateStore(emitStringLength(s), lenSlot);
+        builder->CreateStore(emitStringDataPtr(s), dataSlot);
+        builder->CreateBr(setupBB);
+
+        builder->SetInsertPoint(emptyBB);
+        builder->CreateStore(i64c(0), lenSlot);
+        builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), dataSlot);
+        builder->CreateBr(setupBB);
+
+        builder->SetInsertPoint(setupBB);
+        llvm::Value* len = builder->CreateLoad(i64Ty, lenSlot, "je.len");
+        llvm::Value* worst = builder->CreateAdd(builder->CreateMul(len, i64c(6)), i64c(2), "je.worst");
+        llvm::Value* tmp = emitStringAlloc(worst);
+        llvm::Value* tmpData = emitStringDataPtr(tmp);
+        builder->CreateStore(i8c('"'), tmpData);
+        builder->CreateStore(i64c(1), outSlot);
+        builder->CreateStore(i64c(0), iSlot);
+        builder->CreateBr(condBB);
+
+        builder->SetInsertPoint(condBB);
+        llvm::Value* i = builder->CreateLoad(i64Ty, iSlot, "je.i");
+        builder->CreateCondBr(builder->CreateICmpSLT(i, len), bodyBB, tailBB);
+
+        builder->SetInsertPoint(bodyBB);
+        llvm::Value* data = builder->CreateLoad(ptrTy, dataSlot, "je.data");
+        llvm::Value* iB = builder->CreateLoad(i64Ty, iSlot, "je.i.b");
+        llvm::Value* c = builder->CreateLoad(i8Ty, builder->CreateGEP(i8Ty, data, iB, "je.c.addr"), "je.c");
+        llvm::Value* out = builder->CreateLoad(i64Ty, outSlot, "je.out");
+        auto isC = [&](int ch) { return builder->CreateICmpEQ(c, i8c(ch)); };
+        llvm::Value* isB = isC('\b');
+        llvm::Value* isT = isC('\t');
+        llvm::Value* isN = isC('\n');
+        llvm::Value* isF = isC('\f');
+        llvm::Value* isR = isC('\r');
+        llvm::Value* hasShort = builder->CreateOr(
+            builder->CreateOr(builder->CreateOr(isB, isT), builder->CreateOr(isN, isF)), isR);
+        llvm::Value* isControl = builder->CreateICmpULT(c, i8c(0x20));
+        llvm::Value* esc = c;
+        esc = builder->CreateSelect(isB, i8c('b'), esc);
+        esc = builder->CreateSelect(isT, i8c('t'), esc);
+        esc = builder->CreateSelect(isN, i8c('n'), esc);
+        esc = builder->CreateSelect(isF, i8c('f'), esc);
+        esc = builder->CreateSelect(isR, i8c('r'), esc);
+        llvm::Value* twoChar = builder->CreateOr(
+            builder->CreateOr(isC('"'), isC('\\')), hasShort);
+        llvm::Value* isUni = builder->CreateAnd(isControl, builder->CreateNot(hasShort));
+        builder->CreateCondBr(twoChar, twoBB, notTwoBB);
+        builder->SetInsertPoint(notTwoBB);
+        builder->CreateCondBr(isUni, uniBB, plainBB);
+
+        auto storeAt = [&](llvm::Value* base, int off, llvm::Value* val) {
+            builder->CreateStore(val, builder->CreateGEP(i8Ty, tmpData, builder->CreateAdd(base, i64c(off))));
+        };
+        builder->SetInsertPoint(twoBB);
+        storeAt(out, 0, i8c('\\'));
+        storeAt(out, 1, esc);
+        builder->CreateStore(builder->CreateAdd(out, i64c(2)), outSlot);
+        builder->CreateBr(incBB);
+
+        builder->SetInsertPoint(uniBB);
+        storeAt(out, 0, i8c('\\'));
+        storeAt(out, 1, i8c('u'));
+        storeAt(out, 2, i8c('0'));
+        storeAt(out, 3, i8c('0'));
+        auto hexDigit = [&](llvm::Value* n) -> llvm::Value* {
+            return builder->CreateSelect(builder->CreateICmpULT(n, i8c(10)),
+                builder->CreateAdd(n, i8c('0')), builder->CreateAdd(n, i8c('a' - 10)));
+        };
+        storeAt(out, 4, hexDigit(builder->CreateAnd(builder->CreateLShr(c, i8c(4)), i8c(0xF))));
+        storeAt(out, 5, hexDigit(builder->CreateAnd(c, i8c(0xF))));
+        builder->CreateStore(builder->CreateAdd(out, i64c(6)), outSlot);
+        builder->CreateBr(incBB);
+
+        builder->SetInsertPoint(plainBB);
+        storeAt(out, 0, c);
+        builder->CreateStore(builder->CreateAdd(out, i64c(1)), outSlot);
+        builder->CreateBr(incBB);
+
+        builder->SetInsertPoint(incBB);
+        builder->CreateStore(builder->CreateAdd(iB, i64c(1)), iSlot);
+        builder->CreateBr(condBB);
+
+        builder->SetInsertPoint(tailBB);
+        llvm::Value* outFinal = builder->CreateLoad(i64Ty, outSlot, "je.outfinal");
+        builder->CreateStore(i8c('"'), builder->CreateGEP(i8Ty, tmpData, outFinal));
+        llvm::Value* finalLen = builder->CreateAdd(outFinal, i64c(1), "je.finallen");
+        llvm::Value* result = emitStringAlloc(finalLen);
+        builder->CreateMemCpy(emitStringDataPtr(result), llvm::MaybeAlign(1), tmpData, llvm::MaybeAlign(1), finalLen);
+        builder->CreateCall(getOrDefineEnsRelease(), { tmp });
+        builder->CreateRet(result);
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
     // A per-enum `[N x ptr]` table of immortal member-name string objects,
     // indexed by the member's value (0..N-1).
     llvm::GlobalVariable* getOrEmitEnumNameTable(StructInfo* si) {
@@ -5091,7 +5251,124 @@ struct CodeGenerator::Impl {
             builder->CreateCall(getOrDefineEnsRetain(), { v });
             return v;
         }
+        ::Type* st = subst(recvT);
+        if (st->isStruct()) return emitStructToJson(v, st, obj.node.startOffset());
         return emitValueToString(v, recvT);
+    }
+
+    // A struct value's JSON object form: {"field": value, ...} in declaration
+    // order, built by concatenation. Owned (+1). Inline, matching the shape of
+    // the hash and equality emitters; nested structs recurse.
+    llvm::Value* emitStructToJson(llvm::Value* v, ::Type* structT, uint32_t offset) {
+        structT = subst(structT);
+        auto* concatFn = getOrDefineEnsStringConcat();
+        auto* releaseFn = getOrDefineEnsRelease();
+        llvm::Value* acc = emitStringLiteralObject("{");
+        if (structT->structInfo) {
+            const auto& fields = structT->structInfo->fields;
+            for (size_t i = 0; i < fields.size(); ++i) {
+                std::string prefix = (i == 0 ? std::string("\"") : std::string(", \"")) +
+                    asAscii(fields[i].name) + "\": ";
+                llvm::Value* withPre = builder->CreateCall(
+                    concatFn, { acc, emitStringLiteralObject(prefix) }, "json.pre");
+                builder->CreateCall(releaseFn, { acc });
+                acc = withPre;
+                llvm::Value* fv = builder->CreateExtractValue(v, {static_cast<unsigned>(i)}, "json.fld");
+                llvm::Value* fs = emitFieldToJson(fv, fields[i].type,
+                    asAscii(structT->structInfo->name), asAscii(fields[i].name), offset);
+                if (!fs) return nullptr;
+                llvm::Value* withVal = builder->CreateCall(concatFn, { acc, fs }, "json.val");
+                builder->CreateCall(releaseFn, { acc });
+                builder->CreateCall(releaseFn, { fs });
+                acc = withVal;
+            }
+        }
+        llvm::Value* full = builder->CreateCall(concatFn, { acc, emitStringLiteralObject("}") }, "json.close");
+        builder->CreateCall(releaseFn, { acc });
+        return full;
+    }
+
+    // Renders one struct field to its JSON value: numbers as decimals, bool as
+    // true/false, strings and enum member names JSON-quoted-and-escaped, absent
+    // optionals as null, nested structs recursively. Returns null after reporting
+    // a field with no JSON form; a type-parameter field reaches this only after
+    // monomorphization, so the report names the concrete type.
+    llvm::Value* emitFieldToJson(llvm::Value* v, ::Type* ft, const std::string& structDesc,
+                                 const std::string& fieldName, uint32_t offset) {
+        ft = subst(ft);
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        if (isValueTypeOptional(ft)) {
+            ::Type* inner = subst(ft->inner);
+            llvm::Value* present = builder->CreateExtractValue(v, {0}, "json.opt.present");
+            auto* presentBB = llvm::BasicBlock::Create(ctx, "json.opt.present", currentFunction);
+            auto* absentBB = llvm::BasicBlock::Create(ctx, "json.opt.absent", currentFunction);
+            auto* joinBB = llvm::BasicBlock::Create(ctx, "json.opt.join", currentFunction);
+            builder->CreateCondBr(present, presentBB, absentBB);
+            builder->SetInsertPoint(presentBB);
+            llvm::Value* innerStr = emitFieldToJson(
+                builder->CreateExtractValue(v, {1}, "json.opt.val"), inner, structDesc, fieldName, offset);
+            if (!innerStr) return nullptr;
+            llvm::BasicBlock* presentEnd = builder->GetInsertBlock();
+            builder->CreateBr(joinBB);
+            builder->SetInsertPoint(absentBB);
+            llvm::Value* nullStr = emitStringLiteralObject("null");
+            builder->CreateBr(joinBB);
+            builder->SetInsertPoint(joinBB);
+            auto* phi = builder->CreatePHI(ptrTy, 2, "json.opt");
+            phi->addIncoming(innerStr, presentEnd);
+            phi->addIncoming(nullStr, absentBB);
+            return phi;
+        }
+        if (ft->isOptional() && ft->inner && subst(ft->inner)->isString()) {
+            llvm::Value* isNull = builder->CreateICmpEQ(v, llvm::ConstantPointerNull::get(ptrTy), "json.str.isnull");
+            auto* presentBB = llvm::BasicBlock::Create(ctx, "json.str.present", currentFunction);
+            auto* absentBB = llvm::BasicBlock::Create(ctx, "json.str.absent", currentFunction);
+            auto* joinBB = llvm::BasicBlock::Create(ctx, "json.str.join", currentFunction);
+            builder->CreateCondBr(isNull, absentBB, presentBB);
+            builder->SetInsertPoint(presentBB);
+            llvm::Value* esc = builder->CreateCall(getOrDefineEnsJsonEscape(), { v }, "json.str.esc");
+            builder->CreateBr(joinBB);
+            builder->SetInsertPoint(absentBB);
+            llvm::Value* nullStr = emitStringLiteralObject("null");
+            builder->CreateBr(joinBB);
+            builder->SetInsertPoint(joinBB);
+            auto* phi = builder->CreatePHI(ptrTy, 2, "json.str.opt");
+            phi->addIncoming(esc, presentBB);
+            phi->addIncoming(nullStr, absentBB);
+            return phi;
+        }
+        ::Type* core = ft;
+        switch (core->kind) {
+            case TypeKind::Bool:
+            case TypeKind::Byte:
+            case TypeKind::Short:
+            case TypeKind::UShort:
+            case TypeKind::Int:
+            case TypeKind::UInt:
+            case TypeKind::Long:
+            case TypeKind::ULong:
+            case TypeKind::Char:
+                return emitValueToString(v, core);
+            case TypeKind::Float:
+            case TypeKind::Double: {
+                llvm::Value* d = core->kind == TypeKind::Float
+                    ? builder->CreateFPExt(v, llvm::Type::getDoubleTy(ctx), "json.f2d") : v;
+                return builder->CreateCall(getOrDefineEnsDoubleToString(), { d }, "json.dbl");
+            }
+            case TypeKind::String:
+                return builder->CreateCall(getOrDefineEnsJsonEscape(), { v }, "json.str");
+            case TypeKind::Enum:
+                return builder->CreateCall(getOrDefineEnsJsonEscape(),
+                    { emitValueToString(v, core) }, "json.enum");
+            case TypeKind::Struct:
+                return emitStructToJson(v, core, offset);
+            default:
+                error(offset, "Struct '" + structDesc + "' cannot be converted to a string. Field '" +
+                    fieldName + "' has type '" + core->toString() + "', which has no string form; only "
+                    "value types, strings, enums, their nullable forms, and nested such structs "
+                    "serialize to JSON. Convert or drop the field.");
+                return nullptr;
+        }
     }
 
     // string.toBytes(): a fresh byte[] copy of the UTF-8 bytes (no trailing NUL).
@@ -5511,7 +5788,8 @@ struct CodeGenerator::Impl {
         for (size_t i = 0; i < holes.size(); ++i) {
             ::Type* holeType = typeOf(holes[i].node);
             if (holeType && !holeType->isError() && !holeType->isInteger() &&
-                !holeType->isBool() && !holeType->isString() && !holeType->isEnum()) {
+                !holeType->isBool() && !holeType->isString() && !holeType->isEnum() &&
+                !subst(holeType)->isStruct()) {
                 error(holes[i].node.startOffset(),
                     "Cannot interpolate a value of type '" + holeType->toString() +
                     "'; only string, integer, bool, and enum values are supported here.");
@@ -6447,7 +6725,8 @@ struct CodeGenerator::Impl {
                 auto memberName = member.memberText();
                 ::Type* recvT = typeOf(obj->node);
                 if (memberName && *memberName == u"toString" && !methodSymbolOf(member.node) &&
-                    recvT && (recvT->isInteger() || recvT->isBool() || recvT->isString() || recvT->isEnum())) {
+                    recvT && (recvT->isInteger() || recvT->isBool() || recvT->isString() ||
+                              recvT->isEnum() || subst(recvT)->isStruct())) {
                     return emitToString(*obj, recvT);
                 }
                 if (memberName && *memberName == u"toBytes" && !methodSymbolOf(member.node) &&

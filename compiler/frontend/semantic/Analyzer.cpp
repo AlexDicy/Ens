@@ -1934,6 +1934,58 @@ bool Analyzer::findNonComparableField(Type* structT, std::vector<StructInfo*>& v
     return false;
 }
 
+// A struct serializes to JSON field by field, so every field's type must have a
+// JSON form. Reports the offending field's dotted path and type when one does
+// not. A field mentioning a type parameter is judged per instantiation during
+// code generation, so it is skipped here.
+void Analyzer::checkStructJsonable(Type* structT, const SyntaxNode& node) {
+    if (!structT || !structT->structInfo) return;
+    std::vector<StructInfo*> visiting;
+    std::string fieldPath;
+    Type* leaf = nullptr;
+    if (findNonJsonableField(structT, visiting, fieldPath, leaf) && leaf) {
+        errorAtNode(node, "Struct '" + asciiOf(structT->structInfo->name) +
+            "' cannot be converted to a string. Field '" + fieldPath + "' has type '" +
+            leaf->toString() + "', which has no string form; only value types, strings, enums, "
+            "their nullable forms, and nested such structs serialize to JSON. Convert or drop the field.");
+    }
+}
+
+// Walks a struct's fields for one with no JSON form. Value types, strings, and
+// enums (and their nullable forms) serialize; a class, interface, array, or
+// external field does not. Descends through nested structs, recording the dotted
+// path to the leaf.
+bool Analyzer::findNonJsonableField(Type* structT, std::vector<StructInfo*>& visiting,
+                                    std::string& fieldPath, Type*& leaf) {
+    if (!structT || !structT->structInfo) return false;
+    for (StructInfo* seen : visiting) {
+        if (seen == structT->structInfo) return false;
+    }
+    visiting.push_back(structT->structInfo);
+    for (const FieldInfo& f : structT->structInfo->fields) {
+        Type* ft = f.type;
+        if (!ft || TypeContext::containsTypeParam(ft)) continue;
+        Type* core = ft;
+        if (core->isOptional() && core->inner) core = core->inner;
+        bool jsonableLeaf = core->isInteger() || core->kind == TypeKind::Float ||
+            core->kind == TypeKind::Double || core->isBool() || core->isString() || core->isEnum();
+        if (jsonableLeaf) continue;
+        if (core->isStruct()) {
+            std::string sub;
+            if (findNonJsonableField(core, visiting, sub, leaf)) {
+                fieldPath = asciiOf(f.name) + "." + sub;
+                return true;
+            }
+            continue;
+        }
+        fieldPath = asciiOf(f.name);
+        leaf = core;
+        return true;
+    }
+    visiting.pop_back();
+    return false;
+}
+
 void Analyzer::checkThrowsClausePlacement(const ast::FuncDecl& fn, bool isOverridable,
                                           bool isConstructor) {
     if (!fn.isThrows()) return;
@@ -3919,12 +3971,18 @@ Type* Analyzer::analyzeInterpString(const ast::InterpStringExpression& expr) {
     for (auto& hole : expr.holes()) {
         Type* ht = analyzeExpr(hole);
         if (ht->isError()) continue;
-        // A type-parameter hole is checked per instantiation during code generation.
-        if (ht->isTypeParam()) continue;
-        if (!ht->isInteger() && !ht->isBool() && !ht->isString() && !ht->isEnum()) {
-            errorAtNode(hole.node, "Cannot interpolate a value of type '" + ht->toString() +
-                "'; only string, integer, bool, and enum values are supported here. Convert it with '.toString()' first.");
+        // A bare type parameter or a generic struct is judged per instantiation during code
+        // generation, the same way its equality and JSON emission are.
+        if (ht->isTypeParam() || (ht->isStruct() && TypeContext::containsTypeParam(ht))) continue;
+        if (ht->isInteger() || ht->isBool() || ht->isString() || ht->isEnum()) continue;
+        if (ht->isStruct()) {
+            // A struct interpolates as its JSON form, valid when every field is JSON-able.
+            checkStructJsonable(ht, hole.node);
+            continue;
         }
+        errorAtNode(hole.node, "Cannot interpolate a value of type '" + ht->toString() +
+            "'; only string, integer, bool, enum, and JSON-serializable struct values are supported here. "
+            "Convert it with '.toString()' first.");
     }
     return stringTy;
 }
@@ -4672,6 +4730,18 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                         recvT->toString() + "'.");
                     for (auto& a : args) analyzeExpr(a);
                     return typeCtx.getError();
+                }
+                // A struct without its own toString serializes to its JSON form; a struct
+                // that declares one falls through to normal method resolution.
+                if (recvT->isStruct() && recvT->structInfo &&
+                    recvT->structInfo->findMethodIndex(u"toString") < 0) {
+                    if (!args.empty()) {
+                        errorAtNode(expr.node, "'toString' takes no arguments.");
+                        for (auto& a : args) analyzeExpr(a);
+                    }
+                    // A generic struct is judged per instantiation during code generation.
+                    if (!TypeContext::containsTypeParam(recvT)) checkStructJsonable(recvT, expr.node);
+                    return typeCtx.getPrimitive(TypeKind::String);
                 }
                 // Records may declare their own toString: fall through to resolution.
             }

@@ -22,6 +22,8 @@ import StructType from model.types;
 import ExternalType from model.types;
 import ErrorType from model.types;
 import StringType from model.types;
+import PrimitiveType from model.types;
+import PrimitiveKind from model.types;
 import Field from model.types;
 import List from @std.collections.list;
 import Map from @std.collections.map;
@@ -501,11 +503,14 @@ private displayFor(string name, Type[] arguments) -> string {
     return builder.toString();
 }
 
-// Why a value of this type cannot fill an interpolation hole, or null when it can.
+// Why a value of this type cannot fill an interpolation hole, or null when it can. A struct
+// interpolates as its JSON form when every field is JSON-able.
 public interpolationIssue(Type analyzed) -> string? {
-    if (convert.isIntegerType(analyzed) || convert.isBoolType(analyzed)
-            || analyzed is StringType || convert.isEnumLike(analyzed)) {
+    if (isJsonableLeaf(analyzed)) {
         return null;
+    }
+    if (isStructValue(analyzed)) {
+        return structJsonabilityIssue(analyzed);
     }
     if (analyzed is OptionalType) {
         return "Cannot interpolate a value of type '{types.display(analyzed)}' because it "
@@ -513,8 +518,23 @@ public interpolationIssue(Type analyzed) -> string? {
             + "fallback with '??'.";
     }
     return "Cannot interpolate a value of type '{types.display(analyzed)}'; only string, "
-        + "integer, bool, and enum values are supported here. Convert it with '.toString()' "
-        + "first.";
+        + "integer, bool, enum, and JSON-serializable struct values are supported here. Convert "
+        + "it with '.toString()' first.";
+}
+
+// A value type, string, or enum that has a direct JSON form. 'decimal' is excluded because the
+// back end has no decimal support yet.
+private isJsonableLeaf(Type type) -> bool {
+    if (convert.isIntegerType(type) || convert.isBoolType(type) || convert.isEnumLike(type)) {
+        return true;
+    }
+    if (type is StringType) {
+        return true;
+    }
+    if (type is PrimitiveType) {
+        return type.kind() == PrimitiveKind.Float || type.kind() == PrimitiveKind.Double;
+    }
+    return false;
 }
 
 // Why 'is' or 'as?' between these concrete types is malformed, always true, or never true, or
@@ -596,9 +616,26 @@ public equalityComparabilityIssue(Type structType) -> string? {
         + "value equality. Compare the fields you need directly instead.";
 }
 
-// A struct field with no '==' of its own: the dotted path from the compared struct down to it,
-// and the non-comparable leaf type it bottoms out at.
-private class NonComparableField {
+// Why two values of struct type 'structType' cannot serialize to JSON, or null when every field
+// is JSON-able. Names the offending field's dotted path and its type.
+public structJsonabilityIssue(Type structType) -> string? {
+    let authority = types.authorityOf(structType);
+    if (authority == null) {
+        return null;
+    }
+    let found = firstNonJsonableField(structType, new Set<Type>());
+    if (found == null) {
+        return null;
+    }
+    return "Struct '{authority.name()}' cannot be converted to a string. Field '{found.path()}' "
+        + "has type '{types.display(found.leaf())}', which has no string form; only value types, "
+        + "strings, enums, their nullable forms, and nested such structs serialize to JSON. "
+        + "Convert or drop the field.";
+}
+
+// A struct field with no operator of its own: the dotted path from the compared struct down to
+// it, and the offending leaf type it bottoms out at.
+private class OffendingField {
     private string fieldPath;
     private Type fieldLeaf;
 
@@ -620,7 +657,7 @@ private class NonComparableField {
 // wrappers and nested structs; external is the only concrete leaf without '==', since arrays
 // and classes compare by identity. A field mentioning a type parameter is left for the
 // per-instantiation replay.
-private firstNonComparableField(Type structType, Set<Type> visiting) -> NonComparableField? {
+private firstNonComparableField(Type structType, Set<Type> visiting) -> OffendingField? {
     if (!visiting.add(structType)) {
         return null;
     }
@@ -636,14 +673,48 @@ private firstNonComparableField(Type structType, Set<Type> visiting) -> NonCompa
         }
         Type core = convert.bareOf(fieldType);
         if (core is ExternalType) {
-            return new NonComparableField(field.name(), core);
+            return new OffendingField(field.name(), core);
         }
         if (isStructValue(core)) {
             let nested = firstNonComparableField(core, visiting);
             if (nested != null) {
-                return new NonComparableField(field.name() + "." + nested.path(), nested.leaf());
+                return new OffendingField(field.name() + "." + nested.path(), nested.leaf());
             }
         }
+    }
+    return null;
+}
+
+// Walks a struct's fields for the first with no JSON form. Value types, strings, and enums (and
+// their nullable forms) serialize; a class, interface, array, or external field does not.
+// Descends through nested structs. A field mentioning a type parameter is left for the
+// per-instantiation replay.
+private firstNonJsonableField(Type structType, Set<Type> visiting) -> OffendingField? {
+    if (!visiting.add(structType)) {
+        return null;
+    }
+    let fields = types.fieldsOf(structType);
+    if (fields == null) {
+        return null;
+    }
+    for (long i = 0; i < fields.length(); i++) {
+        let field = fields.get(i);
+        let fieldType = field.type();
+        if (convert.containsTypeParam(fieldType)) {
+            continue;
+        }
+        Type core = convert.bareOf(fieldType);
+        if (isJsonableLeaf(core)) {
+            continue;
+        }
+        if (isStructValue(core)) {
+            let nested = firstNonJsonableField(core, visiting);
+            if (nested != null) {
+                return new OffendingField(field.name() + "." + nested.path(), nested.leaf());
+            }
+            continue;
+        }
+        return new OffendingField(field.name(), core);
     }
     return null;
 }

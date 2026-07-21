@@ -208,6 +208,9 @@ private:
     void checkStructEquatable(Type* structT, const SyntaxNode& node);
     bool findNonComparableField(Type* structT, std::vector<StructInfo*>& visiting,
                                 std::string& fieldPath, Type*& leaf);
+    void checkStructJsonable(Type* structT, const SyntaxNode& node);
+    bool findNonJsonableField(Type* structT, std::vector<StructInfo*>& visiting,
+                              std::string& fieldPath, Type*& leaf);
     void resolveDeclaredThrows(const ast::FuncDecl& fn, Symbol* sym);
     void checkParameterDefaults(const ast::FuncDecl& fn);
     void checkFieldDefaults(const ast::StructDecl& sd);
