@@ -5317,6 +5317,9 @@ struct CodeGenerator::Impl {
             return builder->CreateSelect(inBounds, name,
                 emitStringLiteralObject("<invalid>"), "enum.str");
         }
+        if (t->kind == TypeKind::Char) {
+            return builder->CreateCall(getOrDefineEnsCharToString(), { v }, "char.str");
+        }
         llvm::Value* asI64 = builder->CreateIntCast(
             v, llvm::Type::getInt64Ty(ctx), t->isSignedInteger(), "i2s.ext");
         return builder->CreateCall(getOrDefineEnsIntToString(),
