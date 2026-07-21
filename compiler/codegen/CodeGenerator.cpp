@@ -5060,6 +5060,86 @@ struct CodeGenerator::Impl {
         return fn;
     }
 
+    // string ens_char_to_string(i32 scalar): the UTF-8 encoding of a Unicode
+    // scalar as a fresh owned string (1-4 bytes).
+    llvm::Function* getOrDefineEnsCharToString() {
+        if (auto* existing = module->getFunction("ens_char_to_string")) return existing;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(ptrTy, { i32Ty }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+            "ens_char_to_string", module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+        auto savedIP = builder->saveIP();
+
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* b1 = llvm::BasicBlock::Create(ctx, "c2s.b1", fn);
+        auto* chk2 = llvm::BasicBlock::Create(ctx, "c2s.chk2", fn);
+        auto* b2 = llvm::BasicBlock::Create(ctx, "c2s.b2", fn);
+        auto* chk3 = llvm::BasicBlock::Create(ctx, "c2s.chk3", fn);
+        auto* b3 = llvm::BasicBlock::Create(ctx, "c2s.b3", fn);
+        auto* b4 = llvm::BasicBlock::Create(ctx, "c2s.b4", fn);
+        auto* done = llvm::BasicBlock::Create(ctx, "c2s.done", fn);
+        auto i32c = [&](int n) { return llvm::ConstantInt::get(i32Ty, n); };
+        auto i64c = [&](int64_t n) { return llvm::ConstantInt::get(i64Ty, n); };
+
+        builder->SetInsertPoint(entry);
+        llvm::Value* sc = fn->getArg(0);
+        auto* lenSlot = builder->CreateAlloca(i64Ty, nullptr, "c2s.lenSlot");
+        auto* buf = builder->CreateAlloca(llvm::ArrayType::get(i8Ty, 4), nullptr, "c2s.buf");
+        auto put = [&](int off, llvm::Value* v32) {
+            builder->CreateStore(builder->CreateTrunc(v32, i8Ty),
+                builder->CreateGEP(i8Ty, buf, i64c(off)));
+        };
+        auto orLow = [&](int high, llvm::Value* v) { return builder->CreateOr(i32c(high), v); };
+        auto lowBits = [&](llvm::Value* v, int shift) {
+            return builder->CreateAnd(builder->CreateLShr(v, i32c(shift)), i32c(0x3F));
+        };
+        builder->CreateCondBr(builder->CreateICmpULT(sc, i32c(0x80)), b1, chk2);
+
+        builder->SetInsertPoint(b1);
+        put(0, sc);
+        builder->CreateStore(i64c(1), lenSlot);
+        builder->CreateBr(done);
+
+        builder->SetInsertPoint(chk2);
+        builder->CreateCondBr(builder->CreateICmpULT(sc, i32c(0x800)), b2, chk3);
+
+        builder->SetInsertPoint(b2);
+        put(0, orLow(0xC0, builder->CreateLShr(sc, i32c(6))));
+        put(1, orLow(0x80, builder->CreateAnd(sc, i32c(0x3F))));
+        builder->CreateStore(i64c(2), lenSlot);
+        builder->CreateBr(done);
+
+        builder->SetInsertPoint(chk3);
+        builder->CreateCondBr(builder->CreateICmpULT(sc, i32c(0x10000)), b3, b4);
+
+        builder->SetInsertPoint(b3);
+        put(0, orLow(0xE0, builder->CreateLShr(sc, i32c(12))));
+        put(1, orLow(0x80, lowBits(sc, 6)));
+        put(2, orLow(0x80, builder->CreateAnd(sc, i32c(0x3F))));
+        builder->CreateStore(i64c(3), lenSlot);
+        builder->CreateBr(done);
+
+        builder->SetInsertPoint(b4);
+        put(0, orLow(0xF0, builder->CreateLShr(sc, i32c(18))));
+        put(1, orLow(0x80, lowBits(sc, 12)));
+        put(2, orLow(0x80, lowBits(sc, 6)));
+        put(3, orLow(0x80, builder->CreateAnd(sc, i32c(0x3F))));
+        builder->CreateStore(i64c(4), lenSlot);
+        builder->CreateBr(done);
+
+        builder->SetInsertPoint(done);
+        llvm::Value* len = builder->CreateLoad(i64Ty, lenSlot, "c2s.len");
+        llvm::Value* obj = emitStringAlloc(len);
+        builder->CreateMemCpy(emitStringDataPtr(obj), llvm::MaybeAlign(1), buf, llvm::MaybeAlign(1), len);
+        builder->CreateRet(obj);
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
     // string ens_json_escape_string(string s): the JSON string form of s -
     // double-quoted, with '"', '\\', and control characters escaped (short forms
     // for \b \t \n \f \r, `\u00XX` otherwise). Owned (+1). Null renders as "".
@@ -5347,8 +5427,15 @@ struct CodeGenerator::Impl {
             case TypeKind::UInt:
             case TypeKind::Long:
             case TypeKind::ULong:
-            case TypeKind::Char:
                 return emitValueToString(v, core);
+            case TypeKind::Char: {
+                // A char renders as a one-character JSON string: encode its scalar
+                // to UTF-8, then escape it like any other string.
+                llvm::Value* cs = builder->CreateCall(getOrDefineEnsCharToString(), { v }, "json.char.utf8");
+                llvm::Value* esc = builder->CreateCall(getOrDefineEnsJsonEscape(), { cs }, "json.char");
+                builder->CreateCall(getOrDefineEnsRelease(), { cs });
+                return esc;
+            }
             case TypeKind::Float:
             case TypeKind::Double: {
                 llvm::Value* d = core->kind == TypeKind::Float
