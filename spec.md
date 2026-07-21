@@ -460,7 +460,7 @@ string? t = "x"; // starts narrowed from its initializer
 
 This refinement is deliberately limited.
 Writing through a member or element path never refines it: `this.field = x` and `arr[0] = x` leave the path nullable, because another reference could write null through the same storage.
-Assigning in only one branch of an `if` does not narrow after it: `if (x == null) { x = fallback(); }` leaves `x` nullable below the `if`.
+Assigning in only one branch of an `if` refines the value below only when every other branch proves it non-null too (see the join rule below): `if (ready) { x = fallback(); }` leaves `x` nullable below, because the path that skips the assignment learns nothing from `ready`.
 
 Because narrowing governs only the reads, `== null`, `!= null`, `??`, `?.`, and `?[` on a binding whose declared type is nullable stay legal even where the value has already been proven non-null; the redundant check is simply constant at runtime.
 A binding whose declared type is not nullable still rejects these operators.
@@ -492,8 +492,9 @@ draw(Outer? outer) {
 }
 ```
 
-When one branch of an `if` always exits, the opposite narrowing survives after the `if`, so the `else` above is optional.
-A branch exits by `return`, `throw`, or `panic`, and, inside a loop, also by `break` or `continue`.
+A narrowing holds after an `if`/`else` (or a `switch`) when it holds at the end of every branch that can fall through: the branches are intersected at the merge.
+A branch that always exits - by `return`, `throw`, or `panic`, and, inside a loop, also by `break` or `continue` - reaches nothing below the merge, so it places no constraint on the result.
+This makes the `else` above optional, and it lets a value narrow when the branches prove the fact in different ways: after `if (x == null) { x = fallback(); }` the value is non-null below, because the then-branch reassigned it to a non-null value while the else-path failed the `== null` check, so both paths reaching the merge prove it.
 A loop guard clause therefore narrows the checked value for the rest of the iteration:
 
 ```ens
