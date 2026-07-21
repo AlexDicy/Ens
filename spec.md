@@ -77,6 +77,13 @@ Each field compares by its own `==`: primitives and enums by value (so IEEE rule
 Comparing two different struct types is an error, and so is comparing structs whose type has a field with no `==` of its own, such as an `external` handle; the error names the offending field.
 A struct does not customize equality: a method named `equals` on a struct is an ordinary method, and `==` stays memberwise.
 
+A struct serializes to a JSON string through `.toString()` and in interpolation holes, honoring the default-serialization promise.
+The form is a JSON object listing every field, including private and protected ones, in declaration order: `{"field": value, ...}`.
+Numbers render as decimals, `bool` as `true` or `false`, strings and enum members as JSON-quoted text (with `"`, `\`, and control characters escaped), an absent nullable field as `null`, and a nested struct as its own JSON object.
+A struct that declares its own `toString` method uses that method instead.
+A struct is serializable only when every field is: a value type, a string, an enum, one of those made nullable, or a nested such struct.
+A field that is a class, an array, or an external handle has no JSON form and makes serializing the struct an error that names the offending field, mirroring the `==` rule.
+
 Overloading is allowed, best match arguments first, then visibility.
 Two declarations of the same name must differ in parameter count or parameter types.
 A call picks the overload whose parameter types match the arguments exactly; when there is no exact match, an overload reachable through implicit widening is chosen.
@@ -908,7 +915,7 @@ Strings are immutable text values, written with double quotes (`"hello"`), and a
 - `==` and `!=` compare **contents**, not identity, so `"ab" == "a" + "b"` is true.
 - `s.length` returns the number of UTF-8 **bytes** as a `long`.
 - `+` concatenates strings. When one side is a string, an integer or `bool` on the other side is converted to text implicitly (the same way `.toString()` would). Types without a string conversion yet are still rejected.
-- `.toString()` produces a string from a value explicitly: integer types format as decimal, `bool` as `true` or `false`, and a string returns itself. It can be written directly on a literal, as in `42.toString()`.
+- `.toString()` produces a string from a value explicitly: integer types format as decimal, `bool` as `true` or `false`, a string returns itself, and a struct produces its JSON form. It can be written directly on a literal, as in `42.toString()`.
 - `s.toBytes()` returns the UTF-8 bytes as a `byte[]`, and `string.fromBytes(bytes)` builds a string from a `byte[]` by interpreting it as UTF-8.
 - `s.contains(needle)` reports whether `needle` occurs in `s`.
   `s.indexOf(needle)` returns the byte offset of the first occurrence as a `long`, or `-1` when absent; an empty needle is found at offset `0`.
@@ -936,7 +943,7 @@ let status = "done={finished}, items={count}";                // bool and intege
 let braces = "use \{these\} verbatim";                        // "use {these} verbatim"
 ```
 
-Holes currently accept string, integer, `bool`, and enum values; convert other types explicitly with `.toString()` first.
+Holes accept string, integer, `bool`, and enum values, and structs whose fields are all serializable (rendered as JSON); convert other types explicitly with `.toString()` first.
 Inside a generic body a hole may hold a value of a type-parameter type; the requirement is then checked against the concrete type of each instantiation.
 
 ---
