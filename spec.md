@@ -1032,7 +1032,7 @@ writeGreeting() -> int throws {
 }
 ```
 
-`system.exists(path)` reports whether a readable file exists at the path, without throwing: a missing path or a directory reports `false`.
+`system.exists(path)` reports whether a file or directory exists at the path, without throwing: only a missing path reports `false`.
 
 ---
 

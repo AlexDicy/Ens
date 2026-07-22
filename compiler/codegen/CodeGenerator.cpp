@@ -1467,6 +1467,33 @@ struct CodeGenerator::Impl {
         return fn;
     }
 
+    llvm::Function* definePathExistsRuntime() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(i32Ty, { ptrTy }, false);
+        llvm::Function* fn = module->getFunction("ens_path_exists");
+        if (!fn) {
+            fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "ens_path_exists", module.get());
+        }
+        if (!fn->empty()) return fn;
+
+        auto savedIP = builder->saveIP();
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        builder->SetInsertPoint(entry);
+
+        auto* accessTy = llvm::FunctionType::get(i32Ty, { ptrTy, i32Ty }, false);
+        const char* accessName =
+            module->getTargetTriple().isOSWindows() ? "_access" : "access";
+        llvm::FunctionCallee accessFn = module->getOrInsertFunction(accessName, accessTy);
+        llvm::Value* status = builder->CreateCall(
+            accessFn, { fn->getArg(0), llvm::ConstantInt::get(i32Ty, 0) }, "status");
+        builder->CreateRet(status);
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
     // ===== Statements =====
 
     void emitStatement(const ast::Statement& s) {
@@ -7112,6 +7139,7 @@ struct CodeGenerator::Impl {
         if (sym && sym->name == u"ens_arguments")
             return builder->CreateCall(defineArgsRuntime(), {});
         if (sym && sym->name == u"ens_run_process") defineRunProcessRuntime();
+        if (sym && sym->name == u"ens_path_exists") definePathExistsRuntime();
         llvm::Function* fn = getOrDeclareExternalFunction(sym, /*receiver*/ nullptr);
         if (!fn) {
             error(e.node.startOffset(), "Internal: external callee has no LLVM function");
