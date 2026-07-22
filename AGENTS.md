@@ -99,5 +99,5 @@ A comment only states what the code cannot; never phase tags, decision rationale
 - Commit messages start with a short imperative line.
 - One commit per completed milestone or logical change; unrelated fixes discovered along the way go in their own commits.
 - When opening a pull request, prefer small diffs a human can actually review over one huge drop; split large efforts into a sequence of reviewable changes.
-- Spec changes are user-facing only, written one sentence per line, and always in their own commit, separate from implementation.
+- Spec changes are user-facing only and written one sentence per line.
 - In reports and reviews, label behavioral claims as verified (you ran it) or inferred (you reasoned from code); do not present inference as established fact.
