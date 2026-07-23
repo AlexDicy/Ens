@@ -291,12 +291,64 @@ bool linkModulesToExe(std::vector<std::unique_ptr<Module>>& modules,
         libraries.push_back(std::move(asciiLib));
     };
     CodeGenerator::ModuleResolver resolver = makeModuleResolver(modules);
+
+    // Each module's object path is deterministic, so re-emitting overwrites it in
+    // place. Collect the paths and link libraries once, up front.
     for (auto& m : modules) {
         std::string name = baseStem + "." + sanitizeForFilename(m->modulePath) + ".obj";
-        fs::path objPath = outDir / name;
-        if (!emitModule(*m, "ens_" + sanitizeForFilename(m->modulePath), objPath, targetTriple, sharedCtx, resolver)) return false;
-        objectPaths.push_back(objPath.string());
+        objectPaths.push_back((outDir / name).string());
         for (auto& lib : m->analyzer->linkLibraries()) addLibrary(lib);
+    }
+
+    // How many concrete generic instances (free functions and classes/structs) are
+    // recorded so far whose declaring module is `path`. A generic body is monomorphized
+    // during codegen (emitGenericCall / a `new` over a type parameter), so an instance
+    // can turn concrete only while some other module is emitted - possibly one already
+    // written out - and each module emits only the instances declared in it
+    // (emitInstantiations). A free function's declaring module is Symbol::modulePath and
+    // a template's is StructInfo::modulePath, both the module's own canonical path.
+    auto anyOpen = [](const std::vector<Type*>& args) {
+        for (Type* a : args)
+            if (TypeContext::containsTypeParam(a)) return true;
+        return false;
+    };
+    auto concreteInstancesIn = [&](const std::u16string& path) {
+        size_t n = 0;
+        for (auto& fi : sharedCtx.functionInstantiations()) {
+            if (!fi.function || fi.function->modulePath != path) continue;
+            if (!anyOpen(fi.args)) ++n;
+        }
+        for (Type* t : sharedCtx.classInstantiations()) {
+            StructInfo* inst = t ? t->structInfo : nullptr;
+            StructInfo* templ = inst ? inst->templateOf : nullptr;
+            if (!templ || templ->modulePath != path) continue;
+            if (!anyOpen(inst->typeArgs)) ++n;
+        }
+        return n;
+    };
+
+    // Emit modules to a fixed point: after a pass, any module that gained a concrete
+    // instance since it was last written out is emitted again (its cascade may in turn
+    // reveal instances in further modules). The recorded set only grows and is bounded
+    // by the monomorphization depth guard, so the loop terminates; the resulting object
+    // files are independent of module discovery order.
+    std::unordered_map<std::u16string, size_t> emittedCount;
+    std::vector<bool> pending(modules.size(), true);
+    for (bool anyPending = true; anyPending; ) {
+        for (size_t i = 0; i < modules.size(); ++i) {
+            if (!pending[i]) continue;
+            Module& m = *modules[i];
+            if (!emitModule(m, "ens_" + sanitizeForFilename(m.modulePath),
+                            objectPaths[i], targetTriple, sharedCtx, resolver))
+                return false;
+            emittedCount[m.modulePath] = concreteInstancesIn(m.modulePath);
+        }
+        anyPending = false;
+        for (size_t i = 0; i < modules.size(); ++i) {
+            pending[i] =
+                concreteInstancesIn(modules[i]->modulePath) != emittedCount[modules[i]->modulePath];
+            if (pending[i]) anyPending = true;
+        }
     }
     return Linker::link(objectPaths, libraries, outputFile.string(), std::cerr, targetTriple);
 }
