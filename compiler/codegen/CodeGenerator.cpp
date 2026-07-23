@@ -2373,7 +2373,22 @@ struct CodeGenerator::Impl {
         if (!L || !R) return nullptr;
         ::Type* leftType = typeOf(leftE->node);
         ::Type* rightType = typeOf(rightE->node);
+        auto opTok = e.operatorToken();
+        SyntaxKind op = opTok ? opTok->kind() : SyntaxKind::Invalid;
+        return emitBinaryValue(op, L, leftType, &*leftE, R, rightType, &*rightE,
+                               e.node.startOffset());
+    }
 
+    // The value-level core of a non-short-circuit binary operation, shared by
+    // 'emitBinary' and by compound assignment. 'leftE'/'rightE' are the operand
+    // expressions when available (used to decide temporary releases in the
+    // string and reference paths) and may be null when the caller supplies a
+    // borrowed value, such as the current contents of a compound-assignment
+    // target.
+    llvm::Value* emitBinaryValue(SyntaxKind op, llvm::Value* L, ::Type* leftType,
+                                 const ast::Expression* leftE, llvm::Value* R,
+                                 ::Type* rightType, const ast::Expression* rightE,
+                                 uint32_t offset) {
         ::Type* opType = leftType;
         if (leftType && rightType && (leftType->isNumeric() || rightType->isNumeric())) {
             if (::Type* common = commonNumericType(leftType, rightType)) {
@@ -2384,38 +2399,66 @@ struct CodeGenerator::Impl {
         }
         bool flt = opType && opType->isFloat();
         bool sgn = opType && opType->isSignedInteger();
-        auto opTok = e.operatorToken();
-        SyntaxKind op = opTok ? opTok->kind() : SyntaxKind::Invalid;
         if ((op == SyntaxKind::EqEq || op == SyntaxKind::NotEq) &&
             (isStringLike(leftType) || isStringLike(rightType))) {
             llvm::Value* eq = builder->CreateCall(getOrDefineEnsStringEq(), { L, R }, "str.eq");
-            releaseIfOwnedTemp(L, *leftE);
-            releaseIfOwnedTemp(R, *rightE);
+            if (leftE)  releaseIfOwnedTemp(L, *leftE);
+            if (rightE) releaseIfOwnedTemp(R, *rightE);
             return op == SyntaxKind::NotEq ? builder->CreateNot(eq) : eq;
         }
         if ((op == SyntaxKind::EqEq || op == SyntaxKind::NotEq) &&
             (isValueTypeOptional(leftType) || isValueTypeOptional(rightType))) {
-            llvm::Value* eq = emitValueOptionalEquality(L, leftType, R, rightType,
-                                                        e.node.startOffset());
+            llvm::Value* eq = emitValueOptionalEquality(L, leftType, R, rightType, offset);
             if (!eq) return nullptr;
             return op == SyntaxKind::NotEq ? builder->CreateNot(eq, "opt.ne") : eq;
         }
         if (op == SyntaxKind::Plus && ((leftType && leftType->isString()) ||
                                        (rightType && rightType->isString()))) {
             // Concatenation: the non-string operand gets an implicit .toString().
-            auto stringify = [&](llvm::Value* raw, ::Type* t, const ast::Expression& e,
+            auto stringify = [&](llvm::Value* raw, ::Type* t, const ast::Expression* e,
                                  bool& release) -> llvm::Value* {
-                if (t && t->isString()) { release = expressionProducesOwnedRef(e); return raw; }
+                if (t && t->isString()) { release = e ? expressionProducesOwnedRef(*e) : false; return raw; }
                 release = true;  // fresh integer string (owned) or bool literal (immortal no-op)
                 return emitValueToString(raw, t);
             };
             bool relL = false, relR = false;
-            llvm::Value* Ls = stringify(L, leftType, *leftE, relL);
-            llvm::Value* Rs = stringify(R, rightType, *rightE, relR);
+            llvm::Value* Ls = stringify(L, leftType, leftE, relL);
+            llvm::Value* Rs = stringify(R, rightType, rightE, relR);
             llvm::Value* result = builder->CreateCall(getOrDefineEnsStringConcat(), { Ls, Rs }, "str.concat");
             if (relL) builder->CreateCall(getOrDefineEnsRelease(), { Ls });
             if (relR) builder->CreateCall(getOrDefineEnsRelease(), { Rs });
             return result;
+        }
+        // Arithmetic and bit/shift operators require numeric (integer for the
+        // bitwise and shift forms) operands. The analyzer enforces this for a
+        // binary expression, but a compound assignment's looser check can route
+        // e.g. 's -= s' here, so reject it cleanly instead of emitting bad IR.
+        switch (op) {
+            case SyntaxKind::Plus:
+            case SyntaxKind::Minus:
+            case SyntaxKind::Star:
+            case SyntaxKind::Slash:
+            case SyntaxKind::Percent:
+                if (!opType || !opType->isNumeric()) {
+                    error(offset, "This operator needs numbers on both sides, got '" +
+                          (leftType ? leftType->toString() : "?") + "'.");
+                    return nullptr;
+                }
+                break;
+            case SyntaxKind::Amp:
+            case SyntaxKind::Pipe:
+            case SyntaxKind::Caret:
+            case SyntaxKind::LtLt:
+            case SyntaxKind::GtGt:
+            case SyntaxKind::GtGtGt:
+                if (!opType || !opType->isInteger()) {
+                    error(offset, "This operator needs matching integer operands, got '" +
+                          (leftType ? leftType->toString() : "?") + "'.");
+                    return nullptr;
+                }
+                break;
+            default:
+                break;
         }
         switch (op) {
             case SyntaxKind::Plus:    return flt ? builder->CreateFAdd(L, R) : builder->CreateAdd(L, R);
@@ -2430,7 +2473,7 @@ struct CodeGenerator::Impl {
                 // type describes the layout.
                 ::Type* lStruct = leftType ? subst(leftType) : nullptr;
                 if (lStruct && lStruct->isStruct()) {
-                    llvm::Value* eq = emitStructEquality(lStruct, L, R, e.node.startOffset());
+                    llvm::Value* eq = emitStructEquality(lStruct, L, R, offset);
                     if (!eq) return nullptr;
                     return op == SyntaxKind::NotEq ? builder->CreateNot(eq, "struct.ne") : eq;
                 }
@@ -2445,16 +2488,16 @@ struct CodeGenerator::Impl {
                     if (eqSym) {
                         llvm::Value* eq = emitClassContentEquality(lc, eqSym, L, R);
                         if (!eq) return nullptr;
-                        if (isReferenceType(leftType))  releaseIfOwnedTemp(L, *leftE);
-                        if (isReferenceType(rightType)) releaseIfOwnedTemp(R, *rightE);
+                        if (isReferenceType(leftType) && leftE)   releaseIfOwnedTemp(L, *leftE);
+                        if (isReferenceType(rightType) && rightE) releaseIfOwnedTemp(R, *rightE);
                         return op == SyntaxKind::NotEq ? builder->CreateNot(eq, "ne") : eq;
                     }
                 }
                 llvm::Value* cmp = op == SyntaxKind::EqEq
                     ? (flt ? builder->CreateFCmpOEQ(L, R) : builder->CreateICmpEQ(L, R))
                     : (flt ? builder->CreateFCmpONE(L, R) : builder->CreateICmpNE(L, R));
-                if (isReferenceType(leftType))  releaseIfOwnedTemp(L, *leftE);
-                if (isReferenceType(rightType)) releaseIfOwnedTemp(R, *rightE);
+                if (isReferenceType(leftType) && leftE)   releaseIfOwnedTemp(L, *leftE);
+                if (isReferenceType(rightType) && rightE) releaseIfOwnedTemp(R, *rightE);
                 return cmp;
             }
             case SyntaxKind::Lt:      return flt ? builder->CreateFCmpOLT(L, R) : (sgn ? builder->CreateICmpSLT(L, R) : builder->CreateICmpULT(L, R));
@@ -2468,7 +2511,7 @@ struct CodeGenerator::Impl {
             case SyntaxKind::GtGt:    return sgn ? builder->CreateAShr(L, R) : builder->CreateLShr(L, R);
             case SyntaxKind::GtGtGt:  return builder->CreateLShr(L, R);
             default:
-                error(e.node.startOffset(), "Unsupported binary operator in codegen");
+                error(offset, "Unsupported binary operator in codegen");
                 return nullptr;
         }
     }
@@ -7224,11 +7267,75 @@ struct CodeGenerator::Impl {
         return &objType->structInfo->fields[static_cast<size_t>(idx)];
     }
 
+    // The binary operator a compound-assignment token stands for, or Invalid.
+    static SyntaxKind compoundBinaryOperator(SyntaxKind k) {
+        switch (k) {
+            case SyntaxKind::PlusEq:    return SyntaxKind::Plus;
+            case SyntaxKind::MinusEq:   return SyntaxKind::Minus;
+            case SyntaxKind::StarEq:    return SyntaxKind::Star;
+            case SyntaxKind::SlashEq:   return SyntaxKind::Slash;
+            case SyntaxKind::PercentEq: return SyntaxKind::Percent;
+            case SyntaxKind::AmpEq:     return SyntaxKind::Amp;
+            case SyntaxKind::PipeEq:    return SyntaxKind::Pipe;
+            case SyntaxKind::CaretEq:   return SyntaxKind::Caret;
+            case SyntaxKind::LtLtEq:    return SyntaxKind::LtLt;
+            case SyntaxKind::GtGtEq:    return SyntaxKind::GtGt;
+            case SyntaxKind::GtGtGtEq:  return SyntaxKind::GtGtGt;
+            default:                    return SyntaxKind::Invalid;
+        }
+    }
+
+    // 'target OP= rhs' lowers to loading the target once, computing 'value OP rhs'
+    // with the same semantics as the plain binary operator, and storing the
+    // result back to that same location.
+    llvm::Value* emitCompoundAssign(const ast::AssignExpression& e, SyntaxKind opKind,
+                                    uint32_t offset) {
+        SyntaxKind binOp = compoundBinaryOperator(opKind);
+        auto target = e.target();
+        auto value = e.value();
+        if (!target || !value) return nullptr;
+        if (binOp == SyntaxKind::Invalid) {
+            error(offset, "Internal: unrecognized compound assignment operator");
+            return nullptr;
+        }
+
+        ::Type* targetType = typeOf(target->node);
+
+        // Evaluate the target's location exactly once, so a side-effecting
+        // receiver or index (e.g. 'arr[next()] += 1') runs a single time and is
+        // shared by both the load and the store.
+        llvm::Value* lv = emitLValue(*target);
+        if (!lv) return nullptr;
+
+        llvm::Value* cur = builder->CreateLoad(mapType(targetType), lv, "compound.cur");
+        llvm::Value* rhs = emitExpr(*value);
+        if (!rhs) return nullptr;
+        ::Type* rhsType = typeOf(value->node);
+
+        // The loaded value is borrowed (it still lives in the slot), so pass no
+        // expression for the left operand: the binary core must not release it.
+        llvm::Value* result = emitBinaryValue(binOp, cur, targetType, /*leftE*/nullptr,
+                                              rhs, rhsType, &*value, offset);
+        if (!result) return nullptr;
+
+        // A reference-typed target (e.g. 's += other' on a string) follows the
+        // same release-old/store-new discipline as a plain assignment; 'cur' is
+        // the old contents, and the computed result is a fresh owned value, so
+        // it needs no extra retain.
+        if (isReferenceType(targetType)) {
+            emitRelease(cur);
+        }
+        builder->CreateStore(result, lv);
+        return result;
+    }
+
     llvm::Value* emitAssign(const ast::AssignExpression& e) {
         auto opTok = e.operatorToken();
-        if (!opTok || opTok->kind() != SyntaxKind::Eq) {
-            error(e.node.startOffset(), "Compound assignment not yet supported in codegen");
-            return nullptr;
+        SyntaxKind opKind = opTok ? opTok->kind() : SyntaxKind::Invalid;
+        if (opKind != SyntaxKind::Eq) {
+            // The node's own start includes leading trivia; use the content
+            // range so a diagnostic points at the statement, not the prior line.
+            return emitCompoundAssign(e, opKind, e.node.contentRange().first);
         }
         auto target = e.target();
         auto value = e.value();
