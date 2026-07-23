@@ -37,6 +37,17 @@ static std::string asciiOf(std::u16string_view s) {
     return r;
 }
 
+// The declared kind of an existing type as it reads in a diagnostic.
+static std::string typeKindWord(const Type* t) {
+    if (!t) return "type";
+    if (t->isEnum()) return "enum";
+    if (t->isExternal()) return "external type";
+    if (t->isInterface()) return "interface";
+    if (t->isStruct()) return "struct";
+    if (t->isClass()) return "class";
+    return "type";
+}
+
 // =========================================================
 // Construction / scaffolding
 // =========================================================
@@ -453,8 +464,9 @@ void Analyzer::registerExternalTypeNames(const ast::SourceFile& file) {
     for (auto& ed : file.externalTypes()) {
         auto name = ed.nameText();
         if (!name) continue;
-        if (typeCtx.lookupNamedType(modulePath_, *name)) {
-            errorAtNode(ed.node, "Duplicate type '" + asciiOf(*name) + "'");
+        if (Type* existing = typeCtx.lookupNamedType(modulePath_, *name)) {
+            errorAtNode(ed.node, "Duplicate type '" + asciiOf(*name) +
+                "'; this file already declares a " + typeKindWord(existing) + " with this name.");
             continue;
         }
         Type* t = typeCtx.registerExternalType(modulePath_, *name);
@@ -560,8 +572,9 @@ void Analyzer::registerStructNames(const ast::SourceFile& file) {
     for (auto& sd : file.structs()) {
         auto name = sd.nameText();
         if (!name) continue;
-        if (typeCtx.lookupNamedType(modulePath_, *name)) {
-            errorAtNode(sd.node, "Duplicate type '" + asciiOf(*name) + "'");
+        if (Type* existing = typeCtx.lookupNamedType(modulePath_, *name)) {
+            errorAtNode(sd.node, "Duplicate type '" + asciiOf(*name) +
+                "'; this file already declares a " + typeKindWord(existing) + " with this name.");
             continue;
         }
         Type* t = typeCtx.registerStruct(modulePath_, *name);
@@ -582,8 +595,9 @@ void Analyzer::registerClassNames(const ast::SourceFile& file) {
     for (auto& cd : file.classes()) {
         auto name = cd.nameText();
         if (!name) continue;
-        if (typeCtx.lookupNamedType(modulePath_, *name)) {
-            errorAtNode(cd.node, "Duplicate type '" + asciiOf(*name) + "'");
+        if (Type* existing = typeCtx.lookupNamedType(modulePath_, *name)) {
+            errorAtNode(cd.node, "Duplicate type '" + asciiOf(*name) +
+                "'; this file already declares a " + typeKindWord(existing) + " with this name.");
             continue;
         }
         Type* t = typeCtx.registerClass(modulePath_, *name);
@@ -607,8 +621,9 @@ void Analyzer::registerInterfaceNames(const ast::SourceFile& file) {
     for (auto& id : file.interfaces()) {
         auto name = id.nameText();
         if (!name) continue;
-        if (typeCtx.lookupNamedType(modulePath_, *name)) {
-            errorAtNode(id.node, "Duplicate type '" + asciiOf(*name) + "'");
+        if (Type* existing = typeCtx.lookupNamedType(modulePath_, *name)) {
+            errorAtNode(id.node, "Duplicate type '" + asciiOf(*name) +
+                "'; this file already declares a " + typeKindWord(existing) + " with this name.");
             continue;
         }
         Type* t = typeCtx.registerInterface(modulePath_, *name);
@@ -629,8 +644,9 @@ void Analyzer::registerEnumNames(const ast::SourceFile& file) {
     for (auto& ed : file.enums()) {
         auto name = ed.nameText();
         if (!name) continue;
-        if (typeCtx.lookupNamedType(modulePath_, *name)) {
-            errorAtNode(ed.node, "Duplicate type '" + asciiOf(*name) + "'");
+        if (Type* existing = typeCtx.lookupNamedType(modulePath_, *name)) {
+            errorAtNode(ed.node, "Duplicate type '" + asciiOf(*name) +
+                "'; this file already declares a " + typeKindWord(existing) + " with this name.");
             continue;
         }
         Type* t = typeCtx.registerEnum(modulePath_, *name);
@@ -1498,7 +1514,8 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
                         "' because it is declared 'final' in '" + asciiOf(baseBySig->name) + "'");
                 if (!overrideSignaturesCompatible(bm, sym))
                     errorAtNode(m.node, "Override of '" + asciiOf(mname) +
-                        "' does not match the signature declared in '" + asciiOf(baseBySig->name) + "'");
+                        "' does not match the signature declared in '" + asciiOf(baseBySig->name) +
+                        "'; expected '" + interfaceMethodSignature(bm) + "'.");
                 if (m.isThrows() && bm.symbol && !bm.symbol->declaredThrows)
                     errorAtNode(m.throwsToken().value_or(m.node), "Method '" + asciiOf(mname) +
                         "' is marked 'throws' but overrides a method of '" + asciiOf(baseBySig->name) +
@@ -1513,12 +1530,16 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
                 // Implements an interface method; the implements clause check
                 // below validates the return type and throws conformance.
             } else if (baseByName) {
+                const MethodInfo& bnm = baseByName->methods[baseByName->findMethodIndex(mname)];
                 errorAtNode(m.node, "Override of '" + asciiOf(mname) +
-                    "' does not match the signature declared in '" + asciiOf(baseByName->name) + "'");
+                    "' does not match the signature declared in '" + asciiOf(baseByName->name) +
+                    "'; expected '" + interfaceMethodSignature(bnm) + "'.");
             } else if (Type* ifaceByName = interfaceDeclaring(mname, sym, /*bySignature=*/false)) {
+                StructInfo* ifaceInfo = ifaceByName->structInfo;
+                const MethodInfo& ifm = ifaceInfo->methods[ifaceInfo->findMethodIndex(mname)];
                 errorAtNode(m.node, "Override of '" + asciiOf(mname) +
                     "' does not match the signature declared in interface '" +
-                    ifaceByName->toString() + "'");
+                    ifaceByName->toString() + "'; expected '" + interfaceMethodSignature(ifm) + "'.");
             } else if (reservedIntent) {
                 // Overrides the compiler's built-in identity hash/equality; no
                 // base declares it, but 'override' is the required marker.
@@ -2374,7 +2395,8 @@ Type* Analyzer::lookupTypeByName(const std::u16string& qualifier,
             if (sym->type && (sym->type->isStruct() || sym->type->isClass() ||
                               sym->type->isEnum() || sym->type->isExternal())) return sym->type;
         }
-        errorAtNode(diagNode, "Unknown type '" + asciiOf(name) + "'");
+        errorAtNode(diagNode, "Unknown type '" + asciiOf(name) +
+            "'. Check the spelling, or import the module that declares it.");
         return typeCtx.getError();
     }
 
@@ -3928,7 +3950,7 @@ void Analyzer::analyzeForEachStmt(const ast::ForEachStatement& stmt) {
 }
 
 void Analyzer::analyzeBreakStmt(const ast::BreakStatement& stmt) {
-    if (loopDepth == 0) errorAtNode(stmt.node, "'break' outside of a loop");
+    if (loopDepth == 0) errorAtNode(stmt.node, "'break' can only be used inside a loop.");
     // A break carries the current assignments to the loop's normal exit.
     if (assignmentActive_ && !flowTerminated_ && !breakFlows_.empty()) {
         breakFlows_.back().push_back(snapshotAssignment());
@@ -3937,13 +3959,13 @@ void Analyzer::analyzeBreakStmt(const ast::BreakStatement& stmt) {
 }
 
 void Analyzer::analyzeContinueStmt(const ast::ContinueStatement& stmt) {
-    if (loopDepth == 0) errorAtNode(stmt.node, "'continue' outside of a loop");
+    if (loopDepth == 0) errorAtNode(stmt.node, "'continue' can only be used inside a loop.");
     flowTerminated_ = true;
 }
 
 void Analyzer::analyzeReturnStmt(const ast::ReturnStatement& stmt) {
     if (!currentFunction) {
-        errorAtNode(stmt.node, "'return' outside of a function");
+        errorAtNode(stmt.node, "'return' can only be used inside a function body.");
         return;
     }
     if (currentFunction->isNoreturn) {
@@ -4150,6 +4172,7 @@ Type* Analyzer::analyzeBinary(const ast::BinaryExpression& expr) {
 
     auto opTok = expr.operatorToken();
     SyntaxKind op = opTok ? opTok->kind() : SyntaxKind::Invalid;
+    std::string opText = opTok ? asciiOf(opTok->tokenText()) : "";
 
     // `&&` and `||` evaluate the right side only when the left side did not
     // already decide the result, so a null check on the left narrows the right:
@@ -4169,8 +4192,8 @@ Type* Analyzer::analyzeBinary(const ast::BinaryExpression& expr) {
         popScope();
         if (l->isError() || r->isError()) return typeCtx.getError();
         if (!l->isBool() || !r->isBool()) {
-            errorAtNode(expr.node, "Logical operator requires bool operands, got '" +
-                l->toString() + "' and '" + r->toString() + "'");
+            errorAtNode(expr.node, "'" + opText + "' needs 'bool' on both sides, got '" +
+                l->toString() + "' and '" + r->toString() + "'.");
         }
         return typeCtx.getPrimitive(TypeKind::Bool);
     }
@@ -4211,15 +4234,16 @@ Type* Analyzer::analyzeBinary(const ast::BinaryExpression& expr) {
                 return typeCtx.getError();
             }
             if (!l->isNumeric() || !r->isNumeric()) {
-                errorAtNode(expr.node, "Operator requires numeric operands, got '" +
-                    l->toString() + "' and '" + r->toString() + "'");
+                errorAtNode(expr.node, "'" + opText + "' needs numbers on both sides, got '" +
+                    l->toString() + "' and '" + r->toString() + "'.");
                 return typeCtx.getError();
             }
             tryAdaptOperands();
             Type* common = numericCommonType(l, r);
             if (!common) {
-                errorAtNode(expr.node, "Operands must be the same type, got '" +
-                    l->toString() + "' and '" + r->toString() + "'");
+                errorAtNode(expr.node, "'" + opText + "' needs the same numeric type on both "
+                    "sides, got '" + l->toString() + "' and '" + r->toString() +
+                    "'; convert one side with 'as'.");
                 return typeCtx.getError();
             }
             return common;
@@ -4248,14 +4272,15 @@ Type* Analyzer::analyzeBinary(const ast::BinaryExpression& expr) {
         case SyntaxKind::LtEq:
         case SyntaxKind::GtEq: {
             if (!l->isNumeric() || !r->isNumeric()) {
-                errorAtNode(expr.node, "Comparison requires numeric operands, got '" +
-                    l->toString() + "' and '" + r->toString() + "'");
+                errorAtNode(expr.node, "'" + opText + "' compares numbers, got '" +
+                    l->toString() + "' and '" + r->toString() + "'.");
                 return typeCtx.getPrimitive(TypeKind::Bool);
             }
             tryAdaptOperands();
             if (!numericCommonType(l, r)) {
-                errorAtNode(expr.node, "Comparison requires matching numeric operands, got '" +
-                    l->toString() + "' and '" + r->toString() + "'");
+                errorAtNode(expr.node, "'" + opText + "' needs the same numeric type on both "
+                    "sides, got '" + l->toString() + "' and '" + r->toString() +
+                    "'; convert one side with 'as'.");
             }
             return typeCtx.getPrimitive(TypeKind::Bool);
         }
@@ -6087,8 +6112,9 @@ Type* Analyzer::analyzeTernary(const ast::TernaryExpression& expr) {
     if (thenE) { Type* upd = analysis.typeOf(thenE->node.greenNode()); if (upd) thenT = upd; }
     if (elseE) { Type* upd = analysis.typeOf(elseE->node.greenNode()); if (upd) elseT = upd; }
     if (Type* unified = unifyValueTypes(thenT, elseT)) return unified;
-    errorAtNode(expr.node, "Ternary branches have incompatible types '" + thenT->toString() +
-        "' and '" + elseT->toString() + "'");
+    errorAtNode(expr.node, "The two results of this '?:' have incompatible types '" +
+        thenT->toString() + "' and '" + elseT->toString() +
+        "'; both branches must produce one common type.");
     return typeCtx.getError();
 }
 

@@ -304,6 +304,13 @@ void ThrowsAnalyzer::validateFunction(Symbol* sym, const ast::FuncDecl& fn, bool
                 "' cannot let exceptions escape, but it can throw " + nameList(outward) +
                 ". Catch it with a 'catch' clause after the constructor body.");
         }
+    } else if (sym->isDestructor) {
+        if (!outward.empty()) {
+            std::string owner = receiver ? " of '" + asciiOf(receiver->name) + "'" : "";
+            errorAt(fn.nameToken().value_or(fn.node), "Destructor" + owner +
+                " cannot let exceptions escape, but it can throw " + nameList(outward) +
+                ". Catch the exceptions with 'catch' clauses after the destructor body.");
+        }
     } else if (sym->declaredThrows) {
         if (!declared.empty()) {
             // Computed outward must stay within the declared contract.

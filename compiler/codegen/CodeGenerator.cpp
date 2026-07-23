@@ -5916,7 +5916,8 @@ struct CodeGenerator::Impl {
                 !subst(holeType)->isStruct()) {
                 error(holes[i].node.startOffset(),
                     "Cannot interpolate a value of type '" + holeType->toString() +
-                    "'; only string, integer, bool, and enum values are supported here.");
+                    "'; only string, integer, bool, enum, and JSON-serializable struct values are supported here. "
+                    "Convert it with '.toString()' first.");
                 return nullptr;
             }
             llvm::Value* hs = emitToString(holes[i], holeType);
