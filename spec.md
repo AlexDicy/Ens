@@ -590,6 +590,10 @@ double d = 3.7;
 int t = d as int;        // float -> int truncates toward zero (3)
 ```
 
+A numeric enum converts to an integer type with `as`, yielding the member's assigned value: `Errno.EACCES as int` is `13`, and `as long` is the widest form; a narrower integer target truncates by the same rules as above.
+This direction never fails, so it is always `as`, never `as?`.
+A plain enum has no numeric value and cannot be converted in either direction; the error explains how to give its members values.
+
 `as` binds tightly to the value just before it. It has higher precedence than `*`, `+`, and unary `-`. To cast a whole expression, parenthesize it:
 
 ```ens
@@ -628,7 +632,14 @@ Circle? c = s as? Circle;              // the circle, or null
 int r = (s as? Circle)?.radius ?? 0;
 ```
 
-The target must be a class or an interface; testing against a struct, primitive, enum, array, or string is a compile error, and so is a nullable target like `as? Circle?`, whose result would already be nullable.
+An integer converts to a numeric enum with `as?`, which evaluates to the enum made nullable: the member whose assigned value equals the integer, or `null` when no member has that value.
+
+```ens
+Errno? e = code as? Errno;             // the matching member, or null
+Errno chosen = 13 as? Errno ?? Errno.EPERM;
+```
+
+The target must be a class or an interface (or, for `as?` only, a numeric enum); testing against a struct, a primitive, a plain enum, an array, or a string is a compile error, and so is a nullable target like `as? Circle?`, whose result would already be nullable.
 The scrutinee must be a class, an interface, or a nullable form of either, and the target must be related to it: a test that could never succeed (unrelated classes) and a test the static type already satisfies (always true) are both compile errors.
 A nullable scrutinee tested against a type it already satisfies is the exception: for `Base? x`, the test `x is Base` is a combined null-plus-type check and is allowed.
 An interface target over a class scrutinee is an error only in the impossible case, a `final` class that does not implement it (any other class could have an implementing subclass), or the always-true case where the static class already implements it.
@@ -743,6 +754,22 @@ if (command == Command.Submit) {
     Log.info("running {command}");   // running Submit
 }
 ```
+
+An enum member may be given an explicit integer value with `= value`, and an enum that assigns any of its members a value is a *numeric* enum.
+In a numeric enum the first member must carry a value, and each later member without one continues from the previous member's value plus one.
+Values may be negative or sparse, and every member's resulting value must be distinct; a collision, written directly or produced by continuation, is a compile error.
+
+```ens
+enum Errno {
+    EPERM = 1,
+    ENOENT,          // continues at 2
+    EACCES = 13,
+}
+```
+
+A plain enum, one that assigns no values anywhere, is a set of distinct names with no numeric identity, exactly as described above.
+Assigning values does not change any of an enum's other behavior: numeric or plain, its members still compare by identity, drive `switch` by member, and print (and interpolate and serialize) as their member name.
+The assigned value is only the backing number the member converts to and from.
 
 `switch` matches a value against a set of arms and runs (or evaluates to) the first matching arm. It works over an enum, an integer, a string, or a class value. Each arm is written `label -> body`, or `default -> body` for the catch-all; several labels separated by commas share one arm. There is no fall-through, so exactly one arm runs.
 
