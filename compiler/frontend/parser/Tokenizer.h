@@ -50,4 +50,10 @@ private:
     LexedToken lexStringBody(uint32_t startPos, int startLine, int startCol, bool atStart);
     LexedToken lexChar(uint32_t startPos, int startLine, int startCol);
     LexedToken lexOperator(uint32_t startPos, int startLine, int startCol);
+
+    // Consumes a backslash escape (the backslash plus its target, and the four
+    // hex digits of a `\uXXXX`) and reports an unknown escape or a malformed
+    // `\uXXXX` over the offending span. Shared by string, char, and
+    // interpolated-segment lexing.
+    void consumeEscape();
 };

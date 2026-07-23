@@ -3,6 +3,7 @@
 #include <utility>
 #include "../diagnostics/Diagnostic.h"
 #include "../diagnostics/DiagnosticSink.h"
+#include "../semantic/Literals.h"
 
 namespace {
 
@@ -24,6 +25,11 @@ bool isIdentStart(char16_t c) {
 
 bool isIdentContinue(char16_t c) {
     return isIdentStart(c) || isDigit(c);
+}
+
+bool isSimpleEscape(char16_t c) {
+    return c == u'\\' || c == u'"' || c == u'\'' || c == u'n' || c == u'r' ||
+           c == u't' || c == u'b' || c == u'f' || c == u'0' || c == u'{' || c == u'}';
 }
 
 }  // namespace
@@ -240,8 +246,7 @@ LexedToken Tokenizer::lexStringBody(uint32_t startPos, int startLine, int startC
         if (c == u'{') { advance(); hole = true; break; }
         if (c == u'\n' || c == u'\r') break;
         if (c == u'\\') {
-            advance();
-            if (!atEnd()) advance();
+            consumeEscape();
             continue;
         }
         advance();
@@ -268,8 +273,7 @@ LexedToken Tokenizer::lexChar(uint32_t startPos, int startLine, int startCol) {
         if (c == u'\'') { advance(); closed = true; break; }
         if (c == u'\n' || c == u'\r') break;
         if (c == u'\\') {
-            advance();
-            if (!atEnd()) advance();
+            consumeEscape();
             continue;
         }
         advance();
@@ -279,6 +283,38 @@ LexedToken Tokenizer::lexChar(uint32_t startPos, int startLine, int startCol) {
                    "Unterminated character literal");
     }
     return makeToken(SyntaxKind::CharLiteral, startPos, startLine, startCol);
+}
+
+void Tokenizer::consumeEscape() {
+    uint32_t escapeStartPos = pos;
+    int escapeStartLine = line;
+    int escapeStartCol = column;
+    advance();  // backslash
+    if (atEnd()) return;
+    char16_t escaped = peek();
+    if (isSimpleEscape(escaped)) {
+        advance();
+        return;
+    }
+    auto spliced = [&] {
+        return utf16ToUtf8(source.substr(escapeStartPos, pos - escapeStartPos));
+    };
+    if (escaped == u'u') {
+        advance();
+        if (isHexDigit(peek(0)) && isHexDigit(peek(1)) &&
+            isHexDigit(peek(2)) && isHexDigit(peek(3))) {
+            advance(); advance(); advance(); advance();
+            return;
+        }
+        sink.error({escapeStartLine, escapeStartCol, static_cast<int>(pos - escapeStartPos)},
+                   "Invalid Unicode escape sequence '" + spliced() +
+                       "': write four hex digits, for example \\u00E9");
+        return;
+    }
+    advance();
+    sink.error({escapeStartLine, escapeStartCol, static_cast<int>(pos - escapeStartPos)},
+               "Invalid escape sequence '" + spliced() +
+                   "': valid escapes include \\n, \\t, and \\\\");
 }
 
 LexedToken Tokenizer::lexOperator(uint32_t startPos, int startLine, int startCol) {
