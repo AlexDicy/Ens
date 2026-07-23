@@ -777,6 +777,7 @@ void Parser::parseEnumDecl() {
         if (at(SyntaxKind::Identifier)) {
             builder.startNode(SyntaxKind::EnumMember);
             bump();
+            if (at(SyntaxKind::Eq)) parseDefaultValue();
             builder.finishNode();
             eat(SyntaxKind::Comma);
         } else {

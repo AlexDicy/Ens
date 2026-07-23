@@ -218,6 +218,26 @@ std::string integerRangeString(Type* target) {
     }
 }
 
+// The 64-bit value of an integer-constant expression: an int or long literal by
+// its value, a char literal by its codepoint, behind an optional '+'/'-' sign.
+// Returns nullopt when the expression is not such a constant.
+std::optional<int64_t> integerConstantValue(const ast::Expression& e) {
+    if (auto lit = e.asLiteral()) {
+        if (lit->literalKind() == SyntaxKind::CharLiteral) {
+            if (auto tok = lit->token())
+                return static_cast<int64_t>(parseCharLiteralCodepoint(tok->tokenText()));
+            return std::nullopt;
+        }
+    }
+    const ast::LiteralExpression* lit = asIntegerLiteralChild(e, /*allowLong=*/true);
+    if (!lit) return std::nullopt;
+    auto tok = lit->token();
+    if (!tok) return std::nullopt;
+    uint64_t mag = 0;
+    if (!parseIntegerLiteralMagnitude(std::u16string(tok->tokenText()), mag)) return std::nullopt;
+    return literalIsNegative(e) ? -static_cast<int64_t>(mag) : static_cast<int64_t>(mag);
+}
+
 bool literalFitsTarget(bool negative, uint64_t magnitude, Type* target) {
     if (!target) return false;
     switch (target->kind) {
@@ -627,25 +647,70 @@ void Analyzer::collectEnums(const ast::SourceFile& file) {
     for (auto& ed : file.enums()) {
         Type* t = analysis.typeOf(ed.node.greenNode());
         if (!t || !t->structInfo) continue;
+        StructInfo* si = t->structInfo;
+        auto members = ed.members();
+
+        // An enum is numeric when any member carries an explicit `= value`; a
+        // plain enum keeps its members' declaration ordinals as their values.
+        bool numeric = false;
+        for (auto& m : members) {
+            if (m.value()) { numeric = true; break; }
+        }
+        si->enumIsNumeric = numeric;
+
         int64_t next = 0;
-        for (auto& m : ed.members()) {
+        bool isFirst = true;
+        for (auto& m : members) {
             auto mname = m.nameText();
             if (!mname) continue;
-            bool dup = false;
-            for (auto& existing : t->structInfo->enumMembers) {
-                if (existing.name == *mname) { dup = true; break; }
+            bool dupName = false;
+            for (auto& existing : si->enumMembers) {
+                if (existing.name == *mname) { dupName = true; break; }
             }
-            if (dup) {
-                errorAtNode(m.node, "Duplicate enum member '" + asciiOf(*mname) + "'");
+            if (dupName) {
+                errorAtNode(m.node, "Enum '" + asciiOf(si->name) + "' already has a member named '" +
+                    asciiOf(*mname) + "'; remove the duplicate.");
                 continue;
             }
+
+            int64_t value = next;
+            if (auto dv = m.value()) {
+                auto expr = dv->expression();
+                std::optional<int64_t> v = expr ? integerConstantValue(*expr) : std::nullopt;
+                if (v) {
+                    value = *v;
+                } else {
+                    errorAtNode(expr ? expr->node : m.node, "The value of enum member '" +
+                        asciiOf(*mname) + "' must be an integer constant, for example '" +
+                        asciiOf(*mname) + " = 1'.");
+                }
+            } else if (numeric && isFirst) {
+                errorAtNode(m.node, "Enum '" + asciiOf(si->name) + "' assigns values to its "
+                    "members, so its first member '" + asciiOf(*mname) + "' must have one too; "
+                    "give it a value, for example '" + asciiOf(*mname) + " = 0'.");
+            }
+            next = value + 1;
+            isFirst = false;
+
+            if (numeric) {
+                for (auto& existing : si->enumMembers) {
+                    if (existing.value == value) {
+                        errorAtNode(m.node, "Enum members '" + asciiOf(*mname) + "' and '" +
+                            asciiOf(existing.name) + "' both have the value " +
+                            std::to_string(value) + "; give each member of enum '" +
+                            asciiOf(si->name) + "' a distinct value.");
+                        break;
+                    }
+                }
+            }
+
             EnumMemberInfo info;
             info.name = *mname;
-            info.value = next++;
-            t->structInfo->enumMembers.push_back(std::move(info));
+            info.value = value;
+            si->enumMembers.push_back(std::move(info));
         }
-        if (t->structInfo->enumMembers.empty()) {
-            errorAtNode(ed.node, "Enum '" + asciiOf(t->structInfo->name) +
+        if (si->enumMembers.empty()) {
+            errorAtNode(ed.node, "Enum '" + asciiOf(si->name) +
                 "' must have at least one member.");
         }
     }
@@ -5520,6 +5585,17 @@ Type* Analyzer::analyzeSafeMember(const ast::SafeMemberExpression& expr) {
     return typeCtx.getError();
 }
 
+// Guidance appended when a plain enum is used in a numeric conversion: it names
+// the enum and shows how to make it numeric using its own first member.
+static std::string enumNeedsValuesMessage(Type* enumT) {
+    std::string name = enumT->toString();
+    std::string member = "First";
+    if (enumT->structInfo && !enumT->structInfo->enumMembers.empty())
+        member = asciiOf(enumT->structInfo->enumMembers.front().name);
+    return "Enum '" + name + "' has no assigned values; give its members explicit values (for "
+        "example '" + member + " = 0') to convert it to and from integers.";
+}
+
 Type* Analyzer::analyzeCast(const ast::CastExpression& expr) {
     auto src = expr.source();
     auto tr = expr.targetType();
@@ -5527,6 +5603,35 @@ Type* Analyzer::analyzeCast(const ast::CastExpression& expr) {
     Type* srcT = analyzeExpr(*src);
     Type* dstT = resolveTypeReference(*tr);
     if (srcT->isError() || dstT->isError()) return typeCtx.getError();
+
+    // A numeric enum yields its member's assigned value; the target must be an
+    // integer type (widening to 'long' or narrowing per the usual 'as' rules).
+    if (srcT->isEnum()) {
+        if (!srcT->structInfo || !srcT->structInfo->enumIsNumeric) {
+            errorAtNode(expr.node, enumNeedsValuesMessage(srcT));
+            return typeCtx.getError();
+        }
+        if (!dstT->isInteger()) {
+            errorAtNode(expr.node, "Cannot convert enum '" + srcT->toString() + "' to '" +
+                dstT->toString() + "' with 'as'; a numeric enum converts to an integer type such "
+                "as 'int' or 'long'.");
+            return typeCtx.getError();
+        }
+        return dstT;
+    }
+
+    // An integer to enum conversion may find no matching member, so it is offered
+    // only as the checked 'as?'; plain 'as' would be unsound.
+    if (dstT->isEnum()) {
+        if (dstT->structInfo && dstT->structInfo->enumIsNumeric) {
+            errorAtNode(expr.node, "Converting '" + srcT->toString() + "' to enum '" +
+                dstT->toString() + "' can fail when no member has that value; use 'as?', which "
+                "yields '" + dstT->toString() + "?' (null when no member matches).");
+        } else {
+            errorAtNode(expr.node, enumNeedsValuesMessage(dstT));
+        }
+        return typeCtx.getError();
+    }
 
     auto isNumeric = [](Type* t) { return t && (t->isInteger() || t->isFloat()); };
     if (!isNumeric(srcT) || !isNumeric(dstT)) {
@@ -5679,6 +5784,29 @@ Type* Analyzer::analyzeCheckedCast(const ast::CheckedCastExpression& expr) {
     Type* srcT = analyzeExpr(*src);
     Type* dstT = resolveTypeReference(*tr);
     if (srcT->isError() || dstT->isError()) return typeCtx.getError();
+
+    // An integer to numeric-enum conversion: the result is the matching member,
+    // or null when no member has that value.
+    if (dstT->isEnum()) {
+        if (!dstT->structInfo || !dstT->structInfo->enumIsNumeric) {
+            errorAtNode(expr.node, enumNeedsValuesMessage(dstT));
+            return typeCtx.getError();
+        }
+        if (!srcT->isInteger()) {
+            errorAtNode(expr.node, "Cannot convert '" + srcT->toString() + "' to enum '" +
+                dstT->toString() + "' with 'as?'; the value being matched must be an integer.");
+            return typeCtx.getError();
+        }
+        return typeCtx.getOptional(dstT);
+    }
+
+    // enum -> integer never fails, so 'as?' is the wrong tool; point at 'as'.
+    if (srcT->isEnum() && srcT->structInfo && srcT->structInfo->enumIsNumeric && dstT->isInteger()) {
+        errorAtNode(expr.node, "Converting enum '" + srcT->toString() + "' to '" +
+            dstT->toString() + "' always succeeds; use 'as', not 'as?'.");
+        return typeCtx.getError();
+    }
+
     if (!checkClassTypeTest(srcT, dstT, /*isCast=*/true, expr.node)) return typeCtx.getError();
     return typeCtx.getOptional(dstT);
 }
@@ -6184,20 +6312,7 @@ std::optional<int64_t> switchIntLabelValue(const ast::Expression& e) {
     // Any integer-literal form names a constant: an int or long literal by its
     // value, a char literal by its codepoint. This lets `'A'`, `65`, and `65L`
     // name the same label, so mixing them is a duplicate.
-    if (auto lit = e.asLiteral()) {
-        if (lit->literalKind() == SyntaxKind::CharLiteral) {
-            if (auto tok = lit->token())
-                return static_cast<int64_t>(parseCharLiteralCodepoint(tok->tokenText()));
-            return std::nullopt;
-        }
-    }
-    const ast::LiteralExpression* lit = asIntegerLiteralChild(e, /*allowLong=*/true);
-    if (!lit) return std::nullopt;
-    auto tok = lit->token();
-    if (!tok) return std::nullopt;
-    uint64_t mag = 0;
-    if (!parseIntegerLiteralMagnitude(std::u16string(tok->tokenText()), mag)) return std::nullopt;
-    return literalIsNegative(e) ? -static_cast<int64_t>(mag) : static_cast<int64_t>(mag);
+    return integerConstantValue(e);
 }
 
 bool isNullLabel(const ast::Expression& e) {

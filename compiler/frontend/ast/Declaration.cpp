@@ -580,6 +580,11 @@ std::optional<std::u16string> EnumMember::nameText() const {
     return std::nullopt;
 }
 
+std::optional<DefaultValue> EnumMember::value() const {
+    if (auto d = firstChildNode(node, SyntaxKind::DefaultValue)) return DefaultValue::cast(*d);
+    return std::nullopt;
+}
+
 // === EnumDecl ===
 
 std::optional<VisibilityModifier> EnumDecl::visibilityModifier() const { return visibilityOfDeclNode(node); }

@@ -347,6 +347,7 @@ public:
     }
     std::optional<SyntaxNode> nameToken() const;
     std::optional<std::u16string> nameText() const;
+    std::optional<DefaultValue> value() const;
 };
 
 class EnumDecl {

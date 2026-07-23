@@ -63,7 +63,8 @@ struct StructInfo {
     Visibility visibility = Visibility::Public;  // only public types are reachable cross-module
     std::vector<FieldInfo> fields;   // for a class, base fields are flattened in first
     std::vector<MethodInfo> methods; // methods are NOT flattened; walk baseInfo to inherit
-    std::vector<EnumMemberInfo> enumMembers;  // for an enum: members in declaration order, values 0..N-1
+    std::vector<EnumMemberInfo> enumMembers;  // for an enum: members in declaration order
+    bool enumIsNumeric = false;               // enum with explicit assigned values: convertible to/from integers
     int line = 0;
     int column = 0;
 

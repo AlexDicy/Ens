@@ -144,7 +144,6 @@ struct CodeGenerator::Impl {
     std::unordered_map<::Type*, llvm::DIType*> diStructTypeCache;
     std::unordered_map<::Type*, llvm::DIType*> diClassPointerCache;
     std::unordered_map<StructInfo*, llvm::GlobalVariable*> descriptorCache;
-    std::unordered_map<StructInfo*, llvm::GlobalVariable*> enumNameTableCache;
     std::unordered_map<std::string, llvm::Constant*> stringLiteralCache;
     llvm::StructType* typeDescriptorTy = nullptr;
     llvm::StructType* interfaceEntryTy = nullptr;
@@ -374,7 +373,8 @@ struct CodeGenerator::Impl {
             case TypeKind::String:  return llvm::PointerType::get(ctx, 0);
             case TypeKind::Struct:  return mapStructType(t);
             case TypeKind::Class:   return llvm::PointerType::get(ctx, 0);
-            case TypeKind::Enum:    return llvm::Type::getInt32Ty(ctx);
+            case TypeKind::Enum:    return (t->structInfo && t->structInfo->enumIsNumeric)
+                                        ? llvm::Type::getInt64Ty(ctx) : llvm::Type::getInt32Ty(ctx);
             case TypeKind::External: return llvm::PointerType::get(ctx, 0);
             case TypeKind::TypeParam:
                 error(0, "Internal: unsubstituted type parameter '" + t->toString() + "' in codegen");
@@ -3061,6 +3061,32 @@ struct CodeGenerator::Impl {
         if (!src || !tr) return nullptr;
         ::Type* srcT = typeOf(src->node);
         ::Type* dstT = typeOf(tr->node);
+
+        // Integer to numeric enum: the result is the matching member (present),
+        // or null when no member has that value.
+        if (dstT && dstT->isEnum()) {
+            llvm::Value* srcV = emitExpr(*src);
+            if (!srcV) return nullptr;
+            auto* enumTy = llvm::cast<llvm::IntegerType>(mapType(dstT));
+            llvm::Value* key = srcV;
+            if (key->getType() != enumTy) {
+                key = (srcT && srcT->isSignedInteger())
+                    ? builder->CreateSExtOrTrunc(key, enumTy, "as.key")
+                    : builder->CreateZExtOrTrunc(key, enumTy, "as.key");
+            }
+            llvm::Value* present = llvm::ConstantInt::getFalse(ctx);
+            for (auto& m : dstT->structInfo->enumMembers) {
+                llvm::Value* eq = builder->CreateICmpEQ(
+                    key, llvm::ConstantInt::get(enumTy, m.value, /*isSigned=*/true), "as.eq");
+                present = builder->CreateOr(present, eq, "as.any");
+            }
+            llvm::Type* optTy = mapType(typeOf(e.node));
+            llvm::Value* result = llvm::UndefValue::get(optTy);
+            result = builder->CreateInsertValue(result, present, {0}, "as.opt");
+            result = builder->CreateInsertValue(result, key, {1}, "as.opt");
+            return result;
+        }
+
         if (!checkClassTypeTest(srcT, dstT, /*isCast=*/true, e.node.startOffset())) return nullptr;
         llvm::Value* v = emitExpr(*src);
         if (!v) return nullptr;
@@ -5301,23 +5327,6 @@ struct CodeGenerator::Impl {
         return fn;
     }
 
-    // A per-enum `[N x ptr]` table of immortal member-name string objects,
-    // indexed by the member's value (0..N-1).
-    llvm::GlobalVariable* getOrEmitEnumNameTable(StructInfo* si) {
-        auto it = enumNameTableCache.find(si);
-        if (it != enumNameTableCache.end()) return it->second;
-        auto* ptrTy = llvm::PointerType::get(ctx, 0);
-        std::vector<llvm::Constant*> entries;
-        entries.reserve(si->enumMembers.size());
-        for (auto& m : si->enumMembers) entries.push_back(emitStringLiteralObject(asAscii(m.name)));
-        auto* arrTy = llvm::ArrayType::get(ptrTy, entries.size());
-        auto* gv = new llvm::GlobalVariable(*module, arrTy, /*isConstant=*/true,
-            llvm::GlobalValue::PrivateLinkage, llvm::ConstantArray::get(arrTy, entries),
-            "_enumnames_" + asAscii(si->name));
-        enumNameTableCache[si] = gv;
-        return gv;
-    }
-
     // Lowers a `.toString()` call on a primitive or string receiver to an owned
     // (+1) string, matching the ownership the call site expects.
     // Converts an already-emitted non-string primitive value to a string: a
@@ -5328,21 +5337,19 @@ struct CodeGenerator::Impl {
                 emitStringLiteralObject("true"), emitStringLiteralObject("false"), "bool.str");
         }
         if (t->isEnum() && t->structInfo) {
+            // The member name for the value, matched against each member's value so
+            // sparse and negative assigned values resolve correctly. Folding from the
+            // last member back to the first leaves the earliest match on the outside.
             StructInfo* si = t->structInfo;
-            auto* ptrTy = llvm::PointerType::get(ctx, 0);
-            auto* i64Ty = llvm::Type::getInt64Ty(ctx);
-            auto* arrTy = llvm::ArrayType::get(ptrTy, si->enumMembers.size());
-            llvm::Value* idx = builder->CreateSExt(v, i64Ty, "enum.idx");
-            llvm::Value* n = llvm::ConstantInt::get(i64Ty, static_cast<int64_t>(si->enumMembers.size()));
-            llvm::Value* inBounds = builder->CreateAnd(
-                builder->CreateICmpSGE(idx, llvm::ConstantInt::get(i64Ty, 0)),
-                builder->CreateICmpSLT(idx, n), "enum.inb");
-            llvm::Value* safeIdx = builder->CreateSelect(inBounds, idx, llvm::ConstantInt::get(i64Ty, 0));
-            llvm::Value* slot = builder->CreateGEP(arrTy, getOrEmitEnumNameTable(si),
-                { llvm::ConstantInt::get(i64Ty, 0), safeIdx }, "enum.name.addr");
-            llvm::Value* name = builder->CreateLoad(ptrTy, slot, "enum.name");
-            return builder->CreateSelect(inBounds, name,
-                emitStringLiteralObject("<invalid>"), "enum.str");
+            auto* intTy = llvm::cast<llvm::IntegerType>(mapType(t));
+            llvm::Value* name = emitStringLiteralObject("<invalid>");
+            for (auto it = si->enumMembers.rbegin(); it != si->enumMembers.rend(); ++it) {
+                llvm::Value* isMember = builder->CreateICmpEQ(
+                    v, llvm::ConstantInt::get(intTy, it->value, /*isSigned=*/true), "enum.is");
+                name = builder->CreateSelect(isMember,
+                    emitStringLiteralObject(asAscii(it->name)), name, "enum.name");
+            }
+            return name;
         }
         if (t->kind == TypeKind::Char) {
             return builder->CreateCall(getOrDefineEnsCharToString(), { v }, "char.str");
@@ -7350,7 +7357,10 @@ struct CodeGenerator::Impl {
     llvm::Value* emitMember(const ast::MemberExpression& e) {
         // the analyzer resolved this to an enum member constant.
         if (auto ec = analysis->enumConstantOf(e.node.greenNode())) {
-            return llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), *ec, /*isSigned=*/true);
+            ::Type* et = typeOf(e.node);
+            auto* it = llvm::cast<llvm::IntegerType>(
+                et && et->isEnum() ? mapType(et) : llvm::Type::getInt32Ty(ctx));
+            return llvm::ConstantInt::get(it, *ec, /*isSigned=*/true);
         }
         auto obj = e.object();
         ::Type* objType = obj ? typeOf(obj->node) : nullptr;
