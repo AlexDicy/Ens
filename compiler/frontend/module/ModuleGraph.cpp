@@ -219,6 +219,7 @@ bool buildModuleGraphFromSeeds(Workspace& root,
     Workspace stdWs;
     stdWs.root = stdlibRoot;
     stdWs.srcRoot = stdlibRoot;
+    stdWs.packagePrefix = u"std";
 
     struct WorkItem {
         Workspace* ws;
@@ -473,6 +474,9 @@ bool analyzeModuleGraph(std::vector<std::unique_ptr<Module>>& modules,
     for (auto& m : modules) m->analyzer->checkStructValueCycles();
 
     for (auto& m : modules) m->analyzer->analyzeBodies();
+
+    // Runs after bodies so declared throws clauses are resolved.
+    for (auto& m : modules) m->analyzer->checkSignatureVisibility();
 
     // A generic instantiation that never terminates was capped; report it against
     // the module that declares the recursive template so codegen never sees it.

@@ -22,14 +22,35 @@ static Visibility toSemanticVisibility(ast::Visibility v) {
         case ast::Visibility::Public:    return Visibility::Public;
         case ast::Visibility::Export:    return Visibility::Export;
     }
-    return Visibility::Public;
+    return Visibility::Private;
 }
 
-// A record type may be referenced from another module only when it is public. Primitives
-// and external types (no StructInfo) are always accessible.
-static bool isTypeVisibleAcrossModules(const Type* t) {
-    return !t || !t->structInfo || t->structInfo->visibility == Visibility::Public ||
-           t->structInfo->visibility == Visibility::Export;
+// The visibility of a member that follows its containing type: such a member is
+// accessible wherever the type is nameable. A private type is nameable throughout
+// its file, which for members is exactly the protected floor.
+static Visibility followedMemberVisibility(Visibility container) {
+    if (container == Visibility::Private) return Visibility::Protected;
+    return container;
+}
+
+// The declaring StructInfo for identity/visibility questions: an instantiation
+// answers through its template.
+static StructInfo* declarationAuthority(StructInfo* si) {
+    return si && si->templateOf ? si->templateOf : si;
+}
+
+static const StructInfo* declarationAuthority(const StructInfo* si) {
+    return si && si->templateOf ? si->templateOf : si;
+}
+
+static const char* visibilityWord(Visibility v) {
+    switch (v) {
+        case Visibility::Private:   return "private";
+        case Visibility::Protected: return "protected";
+        case Visibility::Public:    return "public";
+        case Visibility::Export:    return "export";
+    }
+    return "private";
 }
 
 static std::string asciiOf(std::u16string_view s) {
@@ -172,6 +193,84 @@ void Analyzer::errorAtNode(const SyntaxNode& node, std::string message) {
 Symbol* Analyzer::globalSymbol(const std::u16string& name) const {
     if (!globalScope) return nullptr;
     return globalScope->lookupLocal(name);
+}
+
+Visibility Analyzer::topLevelVisibility(const std::optional<ast::VisibilityModifier>& modifier,
+                                        const std::string& declName) {
+    if (!modifier) return Visibility::Private;
+    Visibility v = toSemanticVisibility(modifier->visibility());
+    if (v == Visibility::Protected) {
+        errorAtNode(modifier->node, "'protected' is not allowed on a top-level declaration; it "
+            "is only meaningful for class and struct members. Use 'public' to share '" +
+            declName + "' with the rest of the package, or leave it unmarked to keep it "
+            "private to this file.");
+        return Visibility::Private;
+    }
+    return v;
+}
+
+Visibility Analyzer::memberVisibility(const std::optional<ast::VisibilityModifier>& modifier,
+                                      Visibility defaultVisibility, StructInfo* owner,
+                                      const std::string& memberKindWord,
+                                      const std::u16string& memberName) {
+    if (!modifier) return defaultVisibility;
+    Visibility v = toSemanticVisibility(modifier->visibility());
+    if (v != Visibility::Protected && owner &&
+        visibilityTier(v) > visibilityTier(owner->visibility)) {
+        errorAtNode(modifier->node, memberKindWord + " '" + asciiOf(memberName) +
+            "' is marked '" + visibilityWord(v) + "' but '" + asciiOf(owner->name) + "' is " +
+            (owner->visibility == Visibility::Private ? "private to its file"
+                                                      : std::string("only '") +
+                                                        visibilityWord(owner->visibility) + "'") +
+            "; a member cannot be more visible than the type that contains it. Raise '" +
+            asciiOf(owner->name) + "' to '" + visibilityWord(v) + "', or lower '" +
+            asciiOf(memberName) + "'.");
+        return owner->visibility;
+    }
+    return v;
+}
+
+bool Analyzer::isTopLevelVisibleFrom(Visibility v, const std::u16string& declModulePath,
+                                     const std::u16string& declPackagePrefix) const {
+    if (declModulePath == modulePath_) return true;
+    if (v == Visibility::Export) return true;
+    if (v == Visibility::Public) return declPackagePrefix == packagePrefix_;
+    return false;
+}
+
+// Whether a type is nameable from this module. Primitives and other built-in
+// forms (no StructInfo) are visible everywhere.
+bool Analyzer::isTypeVisibleFrom(const Type* t) const {
+    if (!t || !t->structInfo) return true;
+    const StructInfo* si = declarationAuthority(t->structInfo);
+    return isTopLevelVisibleFrom(si->visibility, si->modulePath, si->packagePrefix);
+}
+
+std::string Analyzer::invisibleSymbolMessage(const std::string& kindWord,
+                                             const std::u16string& name, Visibility v,
+                                             const std::u16string& declModulePath,
+                                             const std::u16string& declPackagePrefix) const {
+    bool samePackage = declPackagePrefix == packagePrefix_;
+    std::string shownName = asciiOf(name);
+    if (v == Visibility::Public && !samePackage) {
+        std::string packageName = declPackagePrefix.empty()
+            ? std::string("its package") : "package '" + asciiOf(declPackagePrefix) + "'";
+        return kindWord + " '" + shownName + "' is public inside " + packageName +
+            " but not exported. Mark it 'export' in module '" + asciiOf(declModulePath) +
+            "' to use it from another package.";
+    }
+    std::string fix = samePackage
+        ? "Mark it 'public' to use it from other modules in the package."
+        : "Mark it 'export' to use it from another package.";
+    return kindWord + " '" + shownName + "' is private to module '" + asciiOf(declModulePath) +
+        "'; it can only be used inside that file. " + fix;
+}
+
+std::string Analyzer::invisibleTypeMessage(const std::u16string& name, const Type* t) const {
+    const StructInfo* si = t && t->structInfo ? declarationAuthority(t->structInfo) : nullptr;
+    if (!si) return "Type '" + asciiOf(name) + "' is not visible here.";
+    return invisibleSymbolMessage("Type", name, si->visibility, si->modulePath,
+                                  si->packagePrefix);
 }
 
 namespace {
@@ -394,6 +493,7 @@ void Analyzer::analyze(const SyntaxNode& root) {
     bindImports([](const std::u16string&) -> const Analyzer* { return nullptr; });
     checkStructValueCycles();
     analyzeBodies();
+    checkSignatureVisibility();
     if (astRoot) {
         ThrowsAnalyzer throwsAnalyzer(*astRoot, analysis, errorClassInfo_);
         throwsAnalyzer.analyze();
@@ -471,13 +571,19 @@ void Analyzer::registerExternalTypeNames(const ast::SourceFile& file) {
                 "'; this file already declares a " + typeKindWord(existing) + " with this name.");
             continue;
         }
+        if (auto modifier = ed.visibilityModifier()) {
+            errorAtNode(modifier->node, "An external declaration cannot have a visibility "
+                "modifier; external types and functions are always private to their file. "
+                "Wrap the handle in an Ens type to share it.");
+        }
         Type* t = typeCtx.registerExternalType(modulePath_, *name);
         auto [line, col] = source.offsetToPosition(
             ed.nameToken() ? ed.nameToken()->startOffset() : ed.node.startOffset());
         if (t->structInfo) {
             t->structInfo->line = line;
             t->structInfo->column = col;
-            t->structInfo->visibility = toSemanticVisibility(ed.visibility());
+            t->structInfo->visibility = Visibility::Private;
+            t->structInfo->packagePrefix = packagePrefix_;
         }
         analysis.setType(ed.node.greenNode(), t);
     }
@@ -485,6 +591,11 @@ void Analyzer::registerExternalTypeNames(const ast::SourceFile& file) {
 
 void Analyzer::collectExternalFunctions(const ast::SourceFile& file) {
     for (auto& block : file.externalBlocks()) {
+        if (auto modifier = block.visibilityModifier()) {
+            errorAtNode(modifier->node, "An external declaration cannot have a visibility "
+                "modifier; external types and functions are always private to their file. "
+                "Wrap the calls in Ens functions to share them.");
+        }
         auto libName = block.libraryName();
         if (!libName || libName->empty()) {
             errorAtNode(block.node, "The library name in 'external from \"\"' cannot be empty.");
@@ -584,7 +695,8 @@ void Analyzer::registerStructNames(const ast::SourceFile& file) {
             sd.nameToken() ? sd.nameToken()->startOffset() : sd.node.startOffset());
         t->structInfo->line = line;
         t->structInfo->column = col;
-        t->structInfo->visibility = toSemanticVisibility(sd.visibility());
+        t->structInfo->visibility = topLevelVisibility(sd.visibilityModifier(), asciiOf(*name));
+        t->structInfo->packagePrefix = packagePrefix_;
         for (auto& tp : sd.typeParams()) {
             t->structInfo->isTemplate = true;
             t->structInfo->typeParamNames.push_back(tp.nameText().value_or(std::u16string{}));
@@ -607,7 +719,8 @@ void Analyzer::registerClassNames(const ast::SourceFile& file) {
             cd.nameToken() ? cd.nameToken()->startOffset() : cd.node.startOffset());
         t->structInfo->line = line;
         t->structInfo->column = col;
-        t->structInfo->visibility = toSemanticVisibility(cd.visibility());
+        t->structInfo->visibility = topLevelVisibility(cd.visibilityModifier(), asciiOf(*name));
+        t->structInfo->packagePrefix = packagePrefix_;
         t->structInfo->isAbstract = cd.isAbstract();
         t->structInfo->isFinal = cd.isFinal();
         t->structInfo->isSealed = cd.isSealed();
@@ -633,7 +746,8 @@ void Analyzer::registerInterfaceNames(const ast::SourceFile& file) {
             id.nameToken() ? id.nameToken()->startOffset() : id.node.startOffset());
         t->structInfo->line = line;
         t->structInfo->column = col;
-        t->structInfo->visibility = toSemanticVisibility(id.visibility());
+        t->structInfo->visibility = topLevelVisibility(id.visibilityModifier(), asciiOf(*name));
+        t->structInfo->packagePrefix = packagePrefix_;
         for (auto& tp : id.typeParams()) {
             t->structInfo->isTemplate = true;
             t->structInfo->typeParamNames.push_back(tp.nameText().value_or(std::u16string{}));
@@ -656,7 +770,8 @@ void Analyzer::registerEnumNames(const ast::SourceFile& file) {
             ed.nameToken() ? ed.nameToken()->startOffset() : ed.node.startOffset());
         t->structInfo->line = line;
         t->structInfo->column = col;
-        t->structInfo->visibility = toSemanticVisibility(ed.visibility());
+        t->structInfo->visibility = topLevelVisibility(ed.visibilityModifier(), asciiOf(*name));
+        t->structInfo->packagePrefix = packagePrefix_;
         analysis.setType(ed.node.greenNode(), t);
     }
 }
@@ -762,9 +877,8 @@ void Analyzer::bindTypeImports(const ModuleResolver& resolver) {
         if (auto alias = imp.aliasText()) {
             // Named import: `import Alias from path;`, bring `Alias` into scope.
             Type* importedType = typeCtx.lookupNamedType(targetPath, *alias);
-            if (importedType && !isTypeVisibleAcrossModules(importedType)) {
-                errorAtNode(imp.node, "Type '" + asciiOf(*alias) + "' is not public in module '" +
-                    asciiOf(targetPath) + "' and cannot be used from another module.");
+            if (importedType && !isTypeVisibleFrom(importedType)) {
+                errorAtNode(imp.node, invisibleTypeMessage(*alias, importedType));
                 continue;
             }
             if (importedType) {
@@ -816,7 +930,7 @@ void Analyzer::bindValueImports(const ModuleResolver& resolver) {
             continue;
         }
         errorAtNode(imp.node, "Module '" + asciiOf(targetPath) +
-            "' has no exported '" + asciiOf(*alias) + "'");
+            "' has no top-level declaration named '" + asciiOf(*alias) + "'.");
     }
 }
 
@@ -965,7 +1079,9 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             if (fname) fi.name = *fname;
             Type* ft = f.typeReference() ? resolveTypeReference(*f.typeReference()) : typeCtx.getError();
             fi.type = ft;
-            fi.visibility = toSemanticVisibility(f.visibility());
+            fi.visibility = memberVisibility(f.visibilityModifier(),
+                                             followedMemberVisibility(t->structInfo->visibility),
+                                             t->structInfo, "Field", fi.name);
             fi.isWeak = f.isWeak();
             if (fi.isWeak) {
                 errorAtNode(f.node, "'weak' fields are not allowed on structs");
@@ -1032,9 +1148,12 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             mi.name = mname;
             mi.symbol = sym;
             mi.declaration = const_cast<GreenElement*>(m.node.greenNode());
-            mi.visibility = toSemanticVisibility(m.visibility());
+            mi.visibility = memberVisibility(m.visibilityModifier(), Visibility::Private,
+                                             t->structInfo,
+                                             isCtor ? "Constructor" : "Method", mname);
             mi.isConstructor = isCtor;
             mi.isNoreturn = m.isNoreturn();
+            mi.definingClass = t->structInfo;
             t->structInfo->methods.push_back(std::move(mi));
         }
         markOverloadedMethods(t->structInfo);
@@ -1072,9 +1191,9 @@ void Analyzer::collectInterfaces(const ast::SourceFile& file) {
                     asciiOf(si->name) + "' has no instances of its own.");
                 continue;
             }
-            if (m.visibilityModifier()) {
-                errorAtNode(m.node, "Interface methods are always public; remove the "
-                    "visibility modifier from '" + asciiOf(mname) + "'.");
+            if (auto modifier = m.visibilityModifier()) {
+                errorAtNode(modifier->node, "The members of an interface always share the "
+                    "interface's visibility; remove the modifier from '" + asciiOf(mname) + "'.");
             }
             if (m.isOverride() || m.isFinal() || m.isAbstract()) {
                 errorAtNode(m.node, "Interface methods are plain signatures; 'abstract', "
@@ -1116,6 +1235,7 @@ void Analyzer::collectInterfaces(const ast::SourceFile& file) {
             mi.name = mname;
             mi.symbol = sym;
             mi.declaration = const_cast<GreenElement*>(m.node.greenNode());
+            mi.visibility = followedMemberVisibility(si->visibility);
             mi.isAbstract = true;  // no body; never emitted as a function
             mi.isNoreturn = m.isNoreturn();
             mi.itableSlot = static_cast<int>(si->methods.size());
@@ -1364,7 +1484,8 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
         if (fname) fi.name = *fname;
         Type* ft = f.typeReference() ? resolveTypeReference(*f.typeReference()) : typeCtx.getError();
         fi.type = ft;
-        fi.visibility = toSemanticVisibility(f.visibility());
+        fi.visibility = memberVisibility(f.visibilityModifier(), Visibility::Private, si,
+                                         "Field", fi.name);
         fi.isWeak = f.isWeak();
         fi.definingClass = si;
         if (fi.isWeak) {
@@ -1452,7 +1573,9 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
         mi.name = mname;
         mi.symbol = sym;
         mi.declaration = const_cast<GreenElement*>(m.node.greenNode());
-        mi.visibility = toSemanticVisibility(m.visibility());
+        mi.visibility = isDtor ? Visibility::Private
+                               : memberVisibility(m.visibilityModifier(), Visibility::Private,
+                                                  si, isCtor ? "Constructor" : "Method", mname);
         mi.isConstructor = isCtor;
         mi.isDestructor = isDtor;
         mi.isOverride = m.isOverride();
@@ -1710,8 +1833,7 @@ void Analyzer::collectFunctions(const ast::SourceFile& file) {
         uint32_t fPos = fn.nameToken() ? fn.nameToken()->startOffset() : fn.node.startOffset();
         Symbol* sym = makeSymbol(SymbolKind::Function, fname, nullptr, fPos);
         sym->funcDeclCst = fn.node.greenNode();
-        sym->isPublic = fn.visibility() == ast::Visibility::Public ||
-                        fn.visibility() == ast::Visibility::Export;
+        sym->visibility = topLevelVisibility(fn.visibilityModifier(), asciiOf(fname));
         sym->declaredThrows = fn.isThrows();
         sym->abiThrows = fn.isThrows();
         sym->isNoreturn = fn.isNoreturn();
@@ -1798,7 +1920,7 @@ void Analyzer::collectTests(const ast::SourceFile& file) {
         for (char c : std::to_string(index)) name.push_back(static_cast<char16_t>(c));
         Symbol* sym = makeSymbol(SymbolKind::Function, name, nullptr, td.node.startOffset());
         sym->funcDeclCst = td.node.greenNode();
-        sym->isPublic = true;
+        sym->visibility = Visibility::Public;
         sym->declaredThrows = true;
         sym->abiThrows = true;
         sym->linkName = modulePath_.empty() ? name : modulePath_ + u"." + name;
@@ -2414,9 +2536,8 @@ Type* Analyzer::lookupTypeByName(const std::u16string& qualifier,
             "' has no type '" + asciiOf(name) + "'");
         return typeCtx.getError();
     }
-    if (!isTypeVisibleAcrossModules(t)) {
-        errorAtNode(diagNode, "Type '" + asciiOf(name) + "' is not public in module '" +
-            asciiOf(nsSym->namespaceModulePath) + "' and cannot be used from another module.");
+    if (!isTypeVisibleFrom(t)) {
+        errorAtNode(diagNode, invisibleTypeMessage(name, t));
         return typeCtx.getError();
     }
     return t;
@@ -2581,14 +2702,18 @@ void Analyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
             bool anyCtor = false;
             bool anyCallableWithoutArgs = false;
             for (auto& m : cls->baseInfo->methods) {
-                if (m.name != cls->baseInfo->name || !m.symbol) continue;
+                if (!m.isConstructor || !m.symbol) continue;
                 anyCtor = true;
-                if (requiredArgCount(m.symbol) == 0) anyCallableWithoutArgs = true;
+                bool callable = requiredArgCount(m.symbol) == 0 &&
+                    isMemberAccessAllowed(m.visibility,
+                                          m.definingClass ? m.definingClass : cls->baseInfo);
+                if (callable) anyCallableWithoutArgs = true;
             }
             if (anyCtor && !anyCallableWithoutArgs) {
                 errorAtNode(fn.node, "Constructor of '" + asciiOf(cls->name) +
                     "' must call 'super(...)' because base class '" +
-                    asciiOf(cls->baseInfo->name) + "' has no zero-argument constructor");
+                    asciiOf(cls->baseInfo->name) +
+                    "' has no zero-argument constructor callable from here.");
             }
         }
     }
@@ -4139,15 +4264,19 @@ Type* Analyzer::analyzeSuper(const ast::SuperExpression& expr) {
 
 bool Analyzer::isLocalClass(StructInfo* definingClass) {
     if (!definingClass) return false;
-    Type* t = typeCtx.lookupClass(modulePath_, definingClass->name);
-    return t && t->structInfo == definingClass;
+    return declarationAuthority(definingClass)->modulePath == modulePath_;
 }
 
 bool Analyzer::isMemberAccessAllowed(Visibility visibility, StructInfo* definingClass) {
-    if (visibility == Visibility::Public || visibility == Visibility::Export) return true;
+    if (visibility == Visibility::Export) return true;
+    if (visibility == Visibility::Public) {
+        const StructInfo* defining = declarationAuthority(definingClass);
+        return !defining || defining->packagePrefix == packagePrefix_;
+    }
     StructInfo* current = (currentThis && currentThis->type) ? currentThis->type->structInfo : nullptr;
     if (visibility == Visibility::Private) {
-        return current && current == definingClass;
+        return current && definingClass &&
+               declarationAuthority(current) == declarationAuthority(definingClass);
     }
     // Protected: visible in a subclass method, or anywhere in the declaring class's own file.
     if (current && definingClass && current->isSubclassOf(definingClass)) return true;
@@ -4161,10 +4290,214 @@ void Analyzer::checkMemberAccess(const SyntaxNode& diagNode, const std::u16strin
     if (visibility == Visibility::Private) {
         errorAtNode(diagNode, "'" + asciiOf(memberName) + "' is private to class '" + owner +
             "' and can only be accessed from inside '" + owner + "'");
+    } else if (visibility == Visibility::Public) {
+        const StructInfo* defining = declarationAuthority(definingClass);
+        std::string packageName = defining && !defining->packagePrefix.empty()
+            ? "package '" + asciiOf(defining->packagePrefix) + "'" : "its own package";
+        errorAtNode(diagNode, "'" + asciiOf(memberName) + "' of '" + owner +
+            "' is public inside " + packageName + " but not exported. Mark it 'export' to use "
+            "it from another package.");
     } else {
         errorAtNode(diagNode, "'" + asciiOf(memberName) + "' is protected to class '" + owner +
             "' and can only be accessed from inside '" + owner +
             "', a subclass of it, or the file where '" + owner + "' is declared");
+    }
+}
+
+// The least-visible declared type mentioned anywhere inside `t`: arrays and
+// optionals look through to their element, an instantiation covers its template
+// and every type argument, and type parameters mention nothing themselves.
+static void collectLeastVisible(const Type* t, const StructInfo*& worst) {
+    if (!t) return;
+    if (t->isOptional() || t->isArray()) {
+        collectLeastVisible(t->inner, worst);
+        return;
+    }
+    if (t->isTypeParam()) return;
+    const StructInfo* si = t->structInfo;
+    if (!si) return;
+    const StructInfo* authority = declarationAuthority(si);
+    if (!worst || visibilityTier(authority->visibility) < visibilityTier(worst->visibility)) {
+        worst = authority;
+    }
+    for (const Type* arg : si->typeArgs) collectLeastVisible(arg, worst);
+}
+
+static std::string invisibleTypePhrase(const StructInfo* si) {
+    if (si->visibility == Visibility::Private) {
+        return "private to module '" + asciiOf(si->modulePath) + "'";
+    }
+    std::string packageName = si->packagePrefix.empty()
+        ? std::string("its own package") : "package '" + asciiOf(si->packagePrefix) + "'";
+    return "only public inside " + packageName;
+}
+
+void Analyzer::checkMentionedType(const ast::TypeReference& tr, Visibility declVisibility,
+                                  const std::string& declPhrase, const std::string& role) {
+    Type* t = analysis.typeOf(tr.node.greenNode());
+    if (!t) return;
+    const StructInfo* worst = nullptr;
+    collectLeastVisible(t, worst);
+    if (!worst || visibilityTier(worst->visibility) >= visibilityTier(declVisibility)) return;
+    std::string mentioned = asciiOf(worst->name);
+    errorAtNode(tr.node, declPhrase + " is visible as '" + visibilityWord(declVisibility) +
+        "' but its " + role + " mentions '" + mentioned + "', which is " +
+        invisibleTypePhrase(worst) + ". Mark '" + mentioned + "' as '" +
+        visibilityWord(declVisibility) + "', or lower the declaration.");
+}
+
+void Analyzer::checkTypeParamBoundsVisibility(const std::vector<ast::TypeParam>& params,
+                                              Visibility declVisibility,
+                                              const std::string& declPhrase) {
+    for (auto& tp : params) {
+        for (auto& bound : tp.bounds()) {
+            checkMentionedType(bound, declVisibility, declPhrase, "type-parameter bound");
+        }
+    }
+}
+
+void Analyzer::checkCallableSignatureVisibility(const ast::FuncDecl& fn,
+                                                Visibility declVisibility,
+                                                const std::string& declPhrase) {
+    // Protected members reach subclasses through the receiver, not by name; their
+    // guaranteed reach is the declaring file, which mentions everything.
+    if (visibilityTier(declVisibility) == 0) return;
+    for (auto& p : fn.parameters()) {
+        if (auto tr = p.typeReference()) {
+            checkMentionedType(*tr, declVisibility, declPhrase, "parameter type");
+        }
+    }
+    if (auto rt = fn.returnType()) {
+        if (auto tr = rt->typeReference()) {
+            checkMentionedType(*tr, declVisibility, declPhrase, "return type");
+        }
+    }
+    for (auto& tr : fn.declaredThrowsTypes()) {
+        checkMentionedType(tr, declVisibility, declPhrase, "thrown type");
+    }
+    checkTypeParamBoundsVisibility(fn.typeParams(), declVisibility, declPhrase);
+}
+
+void Analyzer::checkSignatureVisibility() {
+    if (!astRoot) return;
+    auto& sf = *astRoot;
+
+    for (auto& fn : sf.functions()) {
+        const ResolutionInfo* info = analysis.find(fn.node.greenNode());
+        Symbol* sym = info ? info->resolvedSymbol : nullptr;
+        if (!sym) continue;
+        checkCallableSignatureVisibility(fn, sym->visibility,
+            "Function '" + asciiOf(sym->name) + "'");
+    }
+
+    auto methodVisibilityOf = [](StructInfo* si, const ast::FuncDecl& m) {
+        for (auto& mi : si->methods) {
+            if (mi.declaration == m.node.greenNode()) return mi.visibility;
+        }
+        return Visibility::Private;
+    };
+    auto fieldVisibilityOf = [](StructInfo* si, const ast::FieldDecl& f) {
+        for (auto& fi : si->fields) {
+            if (fi.declaration == f.node.greenNode()) return fi.visibility;
+        }
+        return Visibility::Private;
+    };
+    auto checkMembers = [&](StructInfo* si, const std::string& kindWord,
+                            const std::vector<ast::FieldDecl>& fields,
+                            const std::vector<ast::FuncDecl>& methods) {
+        std::string owner = kindWord + " '" + asciiOf(si->name) + "'";
+        for (auto& f : fields) {
+            Visibility v = fieldVisibilityOf(si, f);
+            if (visibilityTier(v) == 0) continue;
+            if (auto tr = f.typeReference()) {
+                checkMentionedType(*tr, v, "Field '" +
+                    asciiOf(f.nameText().value_or(std::u16string{})) + "' of " + owner,
+                    "type");
+            }
+        }
+        for (auto& m : methods) {
+            Visibility v = methodVisibilityOf(si, m);
+            std::string memberWord = m.isConstructor() ? "Constructor" : "Method '" +
+                asciiOf(m.nameText().value_or(std::u16string{})) + "'";
+            checkCallableSignatureVisibility(m, v, memberWord + " of " + owner);
+        }
+    };
+
+    for (auto& sd : sf.structs()) {
+        Type* t = analysis.typeOf(sd.node.greenNode());
+        if (!t || !t->structInfo) continue;
+        StructInfo* si = t->structInfo;
+        std::string declPhrase = "Struct '" + asciiOf(si->name) + "'";
+        checkTypeParamBoundsVisibility(sd.typeParams(), si->visibility, declPhrase);
+        checkMembers(si, "struct", sd.fields(), sd.methods());
+    }
+
+    for (auto& cd : sf.classes()) {
+        Type* t = analysis.typeOf(cd.node.greenNode());
+        if (!t || !t->structInfo) continue;
+        StructInfo* si = t->structInfo;
+        std::string declPhrase = "Class '" + asciiOf(si->name) + "'";
+        if (si->baseInfo && visibilityTier(si->visibility) > 0) {
+            const StructInfo* baseAuthority = declarationAuthority(si->baseInfo);
+            if (visibilityTier(baseAuthority->visibility) < visibilityTier(si->visibility)) {
+                errorAtNode(cd.baseClassToken().value_or(cd.node), declPhrase +
+                    " is visible as '" + visibilityWord(si->visibility) +
+                    "' but its base class '" + asciiOf(baseAuthority->name) + "' is " +
+                    invisibleTypePhrase(baseAuthority) + ". Mark '" +
+                    asciiOf(baseAuthority->name) + "' as '" + visibilityWord(si->visibility) +
+                    "', or lower the declaration.");
+            }
+            for (auto& tr : cd.baseTypeArguments()) {
+                checkMentionedType(tr, si->visibility, declPhrase, "base class type argument");
+            }
+        }
+        if (visibilityTier(si->visibility) > 0) {
+            for (auto& tr : cd.implementedInterfaceRefs()) {
+                checkMentionedType(tr, si->visibility, declPhrase, "implemented interface");
+            }
+        }
+        checkTypeParamBoundsVisibility(cd.typeParams(), si->visibility, declPhrase);
+        checkMembers(si, "class", cd.fields(), cd.methods());
+    }
+
+    for (auto& id : sf.interfaces()) {
+        Type* t = analysis.typeOf(id.node.greenNode());
+        if (!t || !t->structInfo) continue;
+        StructInfo* si = t->structInfo;
+        std::string declPhrase = "Interface '" + asciiOf(si->name) + "'";
+        checkTypeParamBoundsVisibility(id.typeParams(), si->visibility, declPhrase);
+        std::string owner = "interface '" + asciiOf(si->name) + "'";
+        for (auto& m : id.methods()) {
+            std::string memberWord = "Method '" +
+                asciiOf(m.nameText().value_or(std::u16string{})) + "'";
+            checkCallableSignatureVisibility(m, si->visibility, memberWord + " of " + owner);
+        }
+    }
+}
+
+// Constructor calls run through the same accessibility rules as any other member;
+// only the wording is constructor-specific.
+void Analyzer::checkConstructorAccess(const SyntaxNode& diagNode, StructInfo* owner,
+                                      const MethodInfo& constructor) {
+    StructInfo* defining = constructor.definingClass ? constructor.definingClass : owner;
+    if (isMemberAccessAllowed(constructor.visibility, defining)) return;
+    std::string name = asciiOf(owner ? owner->name : std::u16string(u"?"));
+    const StructInfo* authority = declarationAuthority(defining);
+    if (constructor.visibility == Visibility::Private) {
+        std::string fix = authority && authority->packagePrefix == packagePrefix_
+            ? "public" : "export";
+        errorAtNode(diagNode, "The constructor of '" + name + "' is private and can only be "
+            "called from inside '" + name + "'. Mark it '" + fix + "' to construct '" + name +
+            "' here.");
+    } else if (constructor.visibility == Visibility::Public) {
+        std::string packageName = authority && !authority->packagePrefix.empty()
+            ? "package '" + asciiOf(authority->packagePrefix) + "'" : "its own package";
+        errorAtNode(diagNode, "The constructor of '" + name + "' is public inside " +
+            packageName + " but not exported. Mark it 'export' to construct '" + name +
+            "' from another package.");
+    } else {
+        errorAtNode(diagNode, "The constructor of '" + name + "' is protected; only '" + name +
+            "', its subclasses, and the file that declares '" + name + "' can call it.");
     }
 }
 
@@ -4760,32 +5093,36 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                         Symbol* fnSym = nsSym->namespaceTarget->globalSymbol(*memberName);
                         if (fnSym && fnSym->kind == SymbolKind::Function) {
                             analysis.setSymbol(idObj->node.greenNode(), nsSym);
+                            const std::u16string& targetPackage =
+                                nsSym->namespaceTarget->packagePrefix();
+                            auto callableHere = [&](Symbol* s) {
+                                return isTopLevelVisibleFrom(s->visibility,
+                                    nsSym->namespaceModulePath, targetPackage);
+                            };
                             std::vector<Symbol*> chain = overloadChainOf(fnSym);
                             if (chain.size() > 1 || callUsesNamedArguments(args)) {
                                 analysis.setSymbol(member.node.greenNode(), fnSym);
                                 CallShape shape = analyzeCallShape(args);
                                 std::vector<OverloadCandidate> candidates;
                                 for (Symbol* s : chain) {
-                                    candidates.push_back({s, nullptr, s->isPublic});
+                                    candidates.push_back({s, nullptr, callableHere(s)});
                                 }
                                 OverloadChoice choice = resolveOverloadedCall(
                                     candidates, shape, expr.node, asciiOf(*memberName), "Function");
                                 if (choice.failed) return typeCtx.getError();
                                 analysis.setSymbol(member.node.greenNode(), choice.symbol);
                                 if (!choice.accessible) {
-                                    errorAtNode(member.node, "Function '" + asciiOf(*memberName) +
-                                        "' is not public in module '" +
-                                        asciiOf(nsSym->namespaceModulePath) +
-                                        "' and cannot be called from another module.");
+                                    errorAtNode(member.node, invisibleSymbolMessage("Function",
+                                        *memberName, choice.symbol->visibility,
+                                        nsSym->namespaceModulePath, targetPackage));
                                     return typeCtx.getError();
                                 }
                                 return checkResolvedCallArguments(shape, choice, expr.node.greenNode());
                             }
-                            if (!fnSym->isPublic) {
-                                errorAtNode(member.node, "Function '" + asciiOf(*memberName) +
-                                    "' is not public in module '" +
-                                    asciiOf(nsSym->namespaceModulePath) +
-                                    "' and cannot be called from another module.");
+                            if (!callableHere(fnSym)) {
+                                errorAtNode(member.node, invisibleSymbolMessage("Function",
+                                    *memberName, fnSym->visibility,
+                                    nsSym->namespaceModulePath, targetPackage));
                                 for (auto& a : args) analyzeExpr(a);
                                 return typeCtx.getError();
                             }
@@ -5098,14 +5435,22 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
         if (ctorCands.size() > 1 || callUsesNamedArguments(args)) {
             CallShape shape = analyzeCallShape(args);
             std::vector<OverloadCandidate> candidates;
-            for (const MethodInfo* mi : ctorCands) candidates.push_back({mi->symbol, mi, true});
+            for (const MethodInfo* mi : ctorCands) {
+                candidates.push_back({mi->symbol, mi,
+                    isMemberAccessAllowed(mi->visibility,
+                                          mi->definingClass ? mi->definingClass : base)});
+            }
             OverloadChoice choice = resolveOverloadedCall(
                 candidates, shape, expr.node, asciiOf(base->name), "Base constructor");
             if (choice.failed) return typeCtx.getPrimitive(TypeKind::Void);
+            if (!choice.accessible && choice.method) {
+                checkConstructorAccess(expr.node, base, *choice.method);
+            }
             analysis.setMethodSymbol(callee->node.greenNode(), choice.symbol);
             checkResolvedCallArguments(shape, choice, expr.node.greenNode());
             return typeCtx.getPrimitive(TypeKind::Void);
         }
+        checkConstructorAccess(expr.node, base, *ctorCands.front());
         Symbol* ctorSym = ctorCands.front()->symbol;
         analysis.setMethodSymbol(callee->node.greenNode(), ctorSym);
         size_t req = requiredArgCount(ctorSym);
@@ -5437,10 +5782,8 @@ Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
                 auto memberName = expr.memberText();
                 if (!memberName) return typeCtx.getError();
                 if (Type* t = typeCtx.lookupNamedType(nsSym->namespaceModulePath, *memberName)) {
-                    if (!isTypeVisibleAcrossModules(t)) {
-                        errorAtNode(expr.node, "Type '" + asciiOf(*memberName) +
-                            "' is not public in module '" + asciiOf(nsSym->namespaceModulePath) +
-                            "' and cannot be used from another module.");
+                    if (!isTypeVisibleFrom(t)) {
+                        errorAtNode(expr.node, invisibleTypeMessage(*memberName, t));
                         return typeCtx.getError();
                     }
                     analysis.setType(expr.node.greenNode(), t);
@@ -6262,14 +6605,22 @@ Type* Analyzer::analyzeNew(const ast::NewExpression& expr) {
     if (ctorCands.size() > 1 || (!ctorCands.empty() && callUsesNamedArguments(args))) {
         CallShape shape = analyzeCallShape(args);
         std::vector<OverloadCandidate> candidates;
-        for (const MethodInfo* mi : ctorCands) candidates.push_back({mi->symbol, mi, true});
+        for (const MethodInfo* mi : ctorCands) {
+            candidates.push_back({mi->symbol, mi,
+                isMemberAccessAllowed(mi->visibility,
+                                      mi->definingClass ? mi->definingClass : t->structInfo)});
+        }
         OverloadChoice choice = resolveOverloadedCall(
             candidates, shape, expr.node, asciiOf(*typeName), "Constructor");
         if (!choice.failed) {
+            if (!choice.accessible && choice.method) {
+                checkConstructorAccess(expr.node, t->structInfo, *choice.method);
+            }
             analysis.setMethodSymbol(expr.node.greenNode(), choice.symbol);
             checkResolvedCallArguments(shape, choice, expr.node.greenNode());
         }
     } else if (!ctorCands.empty()) {
+        checkConstructorAccess(expr.node, t->structInfo, *ctorCands.front());
         Symbol* ctor = ctorCands.front()->symbol;
         analysis.setMethodSymbol(expr.node.greenNode(), ctor);
         size_t req = requiredArgCount(ctor);
@@ -6851,15 +7202,23 @@ Type* Analyzer::analyzeStructConstructorCall(const ast::CallExpression& expr, Ty
     if (ctorCands.size() > 1 || callUsesNamedArguments(args)) {
         CallShape shape = analyzeCallShape(args);
         std::vector<OverloadCandidate> candidates;
-        for (const MethodInfo* mi : ctorCands) candidates.push_back({mi->symbol, mi, true});
+        for (const MethodInfo* mi : ctorCands) {
+            candidates.push_back({mi->symbol, mi,
+                isMemberAccessAllowed(mi->visibility,
+                                      mi->definingClass ? mi->definingClass : si)});
+        }
         OverloadChoice choice = resolveOverloadedCall(
             candidates, shape, expr.node, asciiOf(typeName), "Constructor");
         if (!choice.failed) {
+            if (!choice.accessible && choice.method) {
+                checkConstructorAccess(expr.node, si, *choice.method);
+            }
             analysis.setMethodSymbol(expr.node.greenNode(), choice.symbol);
             checkResolvedCallArguments(shape, choice, expr.node.greenNode());
         }
         return structType;
     }
+    checkConstructorAccess(expr.node, si, *ctorCands.front());
     Symbol* ctor = ctorCands.front()->symbol;
     analysis.setMethodSymbol(expr.node.greenNode(), ctor);
     size_t req = requiredArgCount(ctor);

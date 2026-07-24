@@ -21,29 +21,39 @@ import PrimitiveType from model.types;
 import Visibility from model.types;
 import List from @std.collections.list;
 
+class MemberVisibilityMark {
+    protected Visibility marked;
+    protected Span markSpan;
+
+    protected constructor(this.marked, this.markSpan);
+}
+
 public class MemberModifiers {
-    bool declaresPublic;
-    bool declaresPrivate;
-    bool declaresProtected;
-    bool declaresAbstract;
-    bool declaresFinal;
-    bool declaresOverride;
+    protected List<MemberVisibilityMark> visibilityMarks;
+    public bool declaresAbstract;
+    public bool declaresFinal;
+    public bool declaresOverride;
     bool declaresSealed;
-    bool declaresWeak;
-    bool declaresNoreturn;
+    protected bool declaresWeak;
+    public bool declaresNoreturn;
 
-    constructor();
+    protected constructor() {
+        this.visibilityMarks = new List<MemberVisibilityMark>();
+    }
 
-    add(SyntaxKind kind) {
+    protected add(SyntaxKind kind, Span span) {
         switch (kind) {
             PublicKeyword -> {
-                this.declaresPublic = true;
+                this.visibilityMarks.push(new MemberVisibilityMark(Visibility.Public, span));
             },
             PrivateKeyword -> {
-                this.declaresPrivate = true;
+                this.visibilityMarks.push(new MemberVisibilityMark(Visibility.Private, span));
             },
             ProtectedKeyword -> {
-                this.declaresProtected = true;
+                this.visibilityMarks.push(new MemberVisibilityMark(Visibility.Protected, span));
+            },
+            ExportKeyword -> {
+                this.visibilityMarks.push(new MemberVisibilityMark(Visibility.Export, span));
             },
             AbstractKeyword -> {
                 this.declaresAbstract = true;
@@ -67,25 +77,24 @@ public class MemberModifiers {
         }
     }
 
-    visibility() -> Visibility {
-        if (this.declaresPrivate) {
-            return Visibility.Private;
-        }
-        if (this.declaresProtected) {
-            return Visibility.Protected;
-        }
-        return Visibility.Public;
+    public hasVisibilityModifier() -> bool {
+        return this.visibilityMarks.length() > 0;
     }
 
-    hasVisibilityModifier() -> bool {
-        return this.declaresPublic || this.declaresPrivate || this.declaresProtected;
+    // Where a diagnostic about the visibility modifier points: the first mark, or the fallback
+    // when the member carries none.
+    public visibilityModifierSpan(Span fallback) -> Span {
+        if (this.visibilityMarks.length() == 0) {
+            return fallback;
+        }
+        return this.visibilityMarks.get(0).markSpan;
     }
 }
 
 public functionModifiers(FunctionDeclarationNode declaration) -> MemberModifiers {
     let modifiers = new MemberModifiers();
     for (long i = 0; i < declaration.modifiersCount(); i++) {
-        modifiers.add(declaration.modifiers(i).kind());
+        modifiers.add(declaration.modifiers(i).kind(), declaration.modifiers(i).span());
     }
     return modifiers;
 }
@@ -93,17 +102,65 @@ public functionModifiers(FunctionDeclarationNode declaration) -> MemberModifiers
 public fieldModifiers(FieldDeclarationNode declaration) -> MemberModifiers {
     let modifiers = new MemberModifiers();
     for (long i = 0; i < declaration.modifiersCount(); i++) {
-        modifiers.add(declaration.modifiers(i).kind());
+        modifiers.add(declaration.modifiers(i).kind(), declaration.modifiers(i).span());
     }
     return modifiers;
 }
 
+// A member's visibility: the given default when unmarked, 'protected' as written, and an
+// over-marked member capped at its owner's visibility after a diagnostic. Protected is exempt
+// from the ladder: its guaranteed reach never exceeds the declaring file.
+public memberVisibility(MemberModifiers modifiers, Visibility defaultVisibility,
+                        DeclaredType owner, string memberKindWord, string memberName,
+                        Reporter reporter) -> Visibility {
+    let marks = modifiers.visibilityMarks;
+    if (marks.length() == 0) {
+        return defaultVisibility;
+    }
+    for (long i = 1; i < marks.length(); i++) {
+        reporter.report("'{memberName}' already has a visibility modifier; remove "
+            + "'{types.visibilityWord(marks.get(i).marked)}'.", marks.get(i).markSpan);
+    }
+    let mark = marks.get(0);
+    Visibility declared = mark.marked;
+    if (declared != Visibility.Protected
+            && types.visibilityTier(declared) > types.visibilityTier(owner.visibility())) {
+        string ownerStanding = "private to its file";
+        if (owner.visibility() != Visibility.Private) {
+            ownerStanding = "only '{types.visibilityWord(owner.visibility())}'";
+        }
+        reporter.report("{memberKindWord} '{memberName}' is marked "
+            + "'{types.visibilityWord(declared)}' but '{owner.name()}' is {ownerStanding}; a "
+            + "member cannot be more visible than the type that contains it. Raise "
+            + "'{owner.name()}' to '{types.visibilityWord(declared)}', or lower "
+            + "'{memberName}'.", mark.markSpan);
+        return owner.visibility();
+    }
+    return declared;
+}
+
+// The top-level reading of a member modifier list, for the signature phase's function entries:
+// private when unmarked, and 'protected' counted as private because the declare phase already
+// rejected it.
+public topLevelVisibility(MemberModifiers modifiers) -> Visibility {
+    let marks = modifiers.visibilityMarks;
+    if (marks.length() == 0) {
+        return Visibility.Private;
+    }
+    if (marks.get(0).marked == Visibility.Protected) {
+        return Visibility.Private;
+    }
+    return marks.get(0).marked;
+}
+
 // Reads one field declaration; the owner-specific weak rules stay with the caller.
-public readField(TypeResolver resolver, FieldDeclarationNode declaration, DeclaredType owner)
-        -> Field {
+public readField(TypeResolver resolver, Reporter reporter, FieldDeclarationNode declaration,
+                 DeclaredType owner, Visibility defaultVisibility) -> Field {
     let modifiers = fieldModifiers(declaration);
     Type fieldType = resolver.resolveType(declaration.declaredType());
-    return new Field(declaration.name().text(), fieldType, modifiers.visibility(),
+    Visibility visibility = memberVisibility(modifiers, defaultVisibility, owner, "Field",
+        declaration.name().text(), reporter);
+    return new Field(declaration.name().text(), fieldType, visibility,
         modifiers.declaresWeak, declaration.defaultValue() != null, declaration.name().span(),
         owner);
 }
@@ -212,7 +269,7 @@ public checkNoreturnPlacement(Reporter reporter, FunctionDeclarationNode declara
     }
 }
 
-private noreturnModifierSpan(FunctionDeclarationNode declaration) -> Span {
+noreturnModifierSpan(FunctionDeclarationNode declaration) -> Span {
     for (long i = 0; i < declaration.modifiersCount(); i++) {
         if (declaration.modifiers(i).kind() == SyntaxKind.NoreturnKeyword) {
             return declaration.modifiers(i).span();

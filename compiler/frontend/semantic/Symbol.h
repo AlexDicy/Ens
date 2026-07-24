@@ -1,11 +1,10 @@
 #pragma once
 #include <string>
 #include <vector>
+#include "Type.h"
 
-class Type;
 class GreenElement;
 class Analyzer;
-struct StructInfo;
 
 enum class SymbolKind { Variable, Parameter, Function, Namespace, SiblingField };
 
@@ -40,8 +39,8 @@ public:
     // For a Namespace symbol: the imported module, used to resolve qualified calls.
     const Analyzer* namespaceTarget = nullptr;
 
-    // For a top-level function: whether it is reachable from other modules.
-    bool isPublic = true;
+    // For a top-level function: how far outside its declaring module it is reachable.
+    Visibility visibility = Visibility::Private;
 
     // Overrides the linker-level name when non-empty. Used by test declarations,
     // whose scope names ($test0, $test1, ...) repeat across modules.

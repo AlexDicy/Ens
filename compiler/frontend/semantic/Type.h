@@ -23,12 +23,27 @@ class Type;
 class Symbol;
 struct StructInfo;
 
-enum class Visibility { Public, Private, Protected, Export };
+// The visibility ladder: private (declaring file, or declaring type for members),
+// public (every module in the declaring package), export (packages that consume
+// the declaring package). Protected sits alongside: declaring file plus subclasses.
+enum class Visibility { Private, Protected, Public, Export };
+
+// The ladder position used by the boundary and leakage checks. Protected shares
+// the private floor: its guaranteed reach is the declaring file.
+inline int visibilityTier(Visibility v) {
+    switch (v) {
+        case Visibility::Private:
+        case Visibility::Protected: return 0;
+        case Visibility::Public:    return 1;
+        case Visibility::Export:    return 2;
+    }
+    return 0;
+}
 
 struct FieldInfo {
     std::u16string name;
     Type* type;
-    Visibility visibility = Visibility::Public;
+    Visibility visibility = Visibility::Private;
     bool isWeak = false;
     int line = 0;
     int column = 0;
@@ -45,7 +60,7 @@ struct MethodInfo {
     std::u16string name;
     Symbol* symbol = nullptr;       // function symbol with paramTypes/returnType (no `this`)
     void* declaration = nullptr;    // FuncDecl* (kept void* to avoid AST include cycle)
-    Visibility visibility = Visibility::Public;
+    Visibility visibility = Visibility::Private;
     bool isConstructor = false;
     bool isDestructor = false;
     bool isOverride = false;
@@ -60,7 +75,8 @@ struct MethodInfo {
 struct StructInfo {
     std::u16string name;
     std::u16string modulePath;       // owning module's canonical path; "" for single-file/stdin
-    Visibility visibility = Visibility::Public;  // only public types are reachable cross-module
+    std::u16string packagePrefix;    // owning package's prefix; "" for the root package
+    Visibility visibility = Visibility::Private;
     std::vector<FieldInfo> fields;   // for a class, base fields are flattened in first
     std::vector<MethodInfo> methods; // methods are NOT flattened; walk baseInfo to inherit
     std::vector<EnumMemberInfo> enumMembers;  // for an enum: members in declaration order

@@ -56,6 +56,9 @@ public:
     // possibly through structs from other modules. Runs after all modules' struct
     // fields are resolved and generic instantiations are materialized.
     void checkStructValueCycles();
+    // Reports every declaration whose signature mentions a type less visible than
+    // the declaration itself. Runs after signatures and class layout are complete.
+    void checkSignatureVisibility();
     void analyzeBodies();
 
     void importPrelude();
@@ -70,6 +73,7 @@ public:
 
     TypeContext& types() { return typeCtx; }
     const std::u16string& modulePath() const { return modulePath_; }
+    const std::u16string& packagePrefix() const { return packagePrefix_; }
 
     // Used by other Analyzers' bindImports to look up an exported symbol in
     // this module. Returns nullptr if no such symbol exists at the global
@@ -474,6 +478,36 @@ private:
     bool isLocalClass(StructInfo* definingClass);
     void checkMemberAccess(const SyntaxNode& diagNode, const std::u16string& memberName,
                            Visibility visibility, StructInfo* definingClass);
+    void checkConstructorAccess(const SyntaxNode& diagNode, StructInfo* owner,
+                                const MethodInfo& constructor);
+
+    // === Visibility boundaries ===
+    // The effective visibility of a top-level declaration: the written modifier,
+    // or private when none is written. Top-level 'protected' is rejected.
+    Visibility topLevelVisibility(const std::optional<ast::VisibilityModifier>& modifier,
+                                  const std::string& declName);
+    // The effective visibility of a type or struct/class member, with over-marking
+    // (a member more visible than its containing type) rejected.
+    Visibility memberVisibility(const std::optional<ast::VisibilityModifier>& modifier,
+                                Visibility defaultVisibility, StructInfo* owner,
+                                const std::string& memberKindWord,
+                                const std::u16string& memberName);
+    // True when a top-level symbol with the given visibility, declared in the given
+    // module and package, is nameable from this module.
+    bool isTopLevelVisibleFrom(Visibility v, const std::u16string& declModulePath,
+                               const std::u16string& declPackagePrefix) const;
+    bool isTypeVisibleFrom(const Type* t) const;
+    // "Type 'X' is private to module 'M'; ..." with the modifier that fixes it.
+    std::string invisibleSymbolMessage(const std::string& kindWord, const std::u16string& name,
+                                       Visibility v, const std::u16string& declModulePath,
+                                       const std::u16string& declPackagePrefix) const;
+    std::string invisibleTypeMessage(const std::u16string& name, const Type* t) const;
+    void checkCallableSignatureVisibility(const ast::FuncDecl& fn, Visibility declVisibility,
+                                          const std::string& declPhrase);
+    void checkTypeParamBoundsVisibility(const std::vector<ast::TypeParam>& params,
+                                        Visibility declVisibility, const std::string& declPhrase);
+    void checkMentionedType(const ast::TypeReference& tr, Visibility declVisibility,
+                            const std::string& declPhrase, const std::string& role);
 
     // True if `t` can be considered non-null without an initializer. The visiting
     // set keeps a struct-containment cycle (reported separately) from recursing forever.

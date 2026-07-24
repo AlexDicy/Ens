@@ -223,6 +223,7 @@ Type* TypeContext::instantiateInternal(StructInfo* templ, TypeKind kind,
     auto info = std::make_unique<StructInfo>();
     info->name = templ->name;
     info->modulePath = templ->modulePath;
+    info->packagePrefix = templ->packagePrefix;
     info->visibility = templ->visibility;
     info->isAbstract = templ->isAbstract;
     info->isFinal = templ->isFinal;

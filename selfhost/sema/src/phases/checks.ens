@@ -1,9 +1,10 @@
 // Declaration-level checks that run after layout: struct by-value containment cycles, the
-// field-default ordering rule, field initialization, and the declared-throws contracts. All of
-// them read resolved members; none of them type expressions.
+// field-default ordering rule, field initialization, the declared-throws contracts, and the
+// signature-leakage rule. All of them read resolved members; none of them type expressions.
 import SourceFileNode from @ens.frontend.syntax.generated.nodes;
 import StructDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import ClassDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import InterfaceDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import FieldDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import MemberListNode from @ens.frontend.syntax.generated.nodes;
@@ -22,6 +23,7 @@ import model.types;
 import Type from model.types;
 import ErrorType from model.types;
 import OptionalType from model.types;
+import ArrayType from model.types;
 import PrimitiveType from model.types;
 import PrimitiveKind from model.types;
 import InstantiationType from model.types;
@@ -29,9 +31,11 @@ import DeclaredType from model.types;
 import ClassType from model.types;
 import StructType from model.types;
 import InterfaceType from model.types;
+import TypeParamType from model.types;
 import Field from model.types;
 import Method from model.types;
 import Signature from model.types;
+import Visibility from model.types;
 import List from @std.collections.list;
 import Set from @std.collections.set;
 import StringBuilder from @std.text.stringbuilder;
@@ -45,37 +49,39 @@ public checkProgram(List<ModuleContext> contexts) -> FileDiagnostic[] {
     return diagnostics.sorted(collected);
 }
 
-private class FoundIdentifier {
-    string name;
-    Span span;
+class FoundIdentifier {
+    protected string name;
+    protected Span span;
 
-    constructor(this.name, this.span);
+    protected constructor(this.name, this.span);
 }
 
-private class CycleStep {
-    Type owner;
-    Field field;
+class CycleStep {
+    protected Type owner;
+    protected Field field;
 
-    constructor(this.owner, this.field);
+    protected constructor(this.owner, this.field);
 }
 
-private class ModuleChecks {
-    private ModuleContext context;
-    private Reporter reporter;
-    private string modulePath;
+class ModuleChecks {
+    ModuleContext context;
+    Reporter reporter;
+    string modulePath;
 
-    private List<StructDeclarationNode> structNodes;
-    private List<ClassDeclarationNode> classNodes;
+    List<StructDeclarationNode> structNodes;
+    List<ClassDeclarationNode> classNodes;
+    List<InterfaceDeclarationNode> interfaceNodes;
 
-    constructor(ModuleContext context, List<FileDiagnostic> collected) {
+    protected constructor(ModuleContext context, List<FileDiagnostic> collected) {
         this.context = context;
         this.reporter = new Reporter(context.module().filePath(), collected);
         this.modulePath = context.module().canonicalPath();
         this.structNodes = new List<StructDeclarationNode>();
         this.classNodes = new List<ClassDeclarationNode>();
+        this.interfaceNodes = new List<InterfaceDeclarationNode>();
     }
 
-    run() {
+    protected run() {
         let root = this.context.root();
         if (root == null) {
             return;
@@ -88,6 +94,9 @@ private class ModuleChecks {
                 is ClassDeclarationNode declaration -> {
                     this.classNodes.push(declaration);
                 },
+                is InterfaceDeclarationNode declaration -> {
+                    this.interfaceNodes.push(declaration);
+                },
                 default -> { },
             }
         }
@@ -95,9 +104,10 @@ private class ModuleChecks {
         this.checkFieldDefaultOrder();
         this.checkFieldInitialization();
         this.checkDeclaredThrows();
+        this.checkVisibilityLeaks();
     }
 
-    private structFor(StructDeclarationNode node) -> StructType? {
+    structFor(StructDeclarationNode node) -> StructType? {
         let store = this.context.resolver().typeStore();
         let found = store.findDeclared(this.modulePath, node.name().text());
         if (found is StructType && found.declaration() == node.green()) {
@@ -106,7 +116,7 @@ private class ModuleChecks {
         return null;
     }
 
-    private classFor(ClassDeclarationNode node) -> ClassType? {
+    classFor(ClassDeclarationNode node) -> ClassType? {
         let store = this.context.resolver().typeStore();
         let found = store.findDeclared(this.modulePath, node.name().text());
         if (found is ClassType && found.declaration() == node.green()) {
@@ -115,9 +125,18 @@ private class ModuleChecks {
         return null;
     }
 
+    interfaceFor(InterfaceDeclarationNode node) -> InterfaceType? {
+        let store = this.context.resolver().typeStore();
+        let found = store.findDeclared(this.modulePath, node.name().text());
+        if (found is InterfaceType && found.declaration() == node.green()) {
+            return found;
+        }
+        return null;
+    }
+
     // ---- Struct by-value containment cycles ----
 
-    private checkStructCycles() {
+    checkStructCycles() {
         for (long i = 0; i < this.structNodes.length(); i++) {
             let found = this.structFor(this.structNodes.get(i));
             if (found == null) {
@@ -164,7 +183,7 @@ private class ModuleChecks {
     // A field default may only reference fields declared before it. The rule is syntactic:
     // an identifier in a default that names this type's own field at the same or a later
     // position, and nothing else visible at module scope, cannot resolve.
-    private checkFieldDefaultOrder() {
+    checkFieldDefaultOrder() {
         for (long i = 0; i < this.structNodes.length(); i++) {
             let node = this.structNodes.get(i);
             if (this.structFor(node) != null) {
@@ -179,7 +198,7 @@ private class ModuleChecks {
         }
     }
 
-    private checkDefaultOrderIn(MemberListNode body) {
+    checkDefaultOrderIn(MemberListNode body) {
         let fieldNames = new List<string>();
         for (long i = 0; i < body.membersCount(); i++) {
             let member = body.members(i);
@@ -201,7 +220,7 @@ private class ModuleChecks {
         }
     }
 
-    private checkDefaultReferences(string fieldName, long fieldIndex, Expression value,
+    checkDefaultReferences(string fieldName, long fieldIndex, Expression value,
                                    List<string> fieldNames) {
         let found = new List<FoundIdentifier>();
         collectIdentifiers(value.green(), value.fullSpan().start, found);
@@ -227,7 +246,7 @@ private class ModuleChecks {
 
     // Names a default-value identifier could still resolve to when it is not an earlier
     // sibling field: module functions, module types, imported names, and the built-ins.
-    private visibleAtModuleScope(string name) -> bool {
+    visibleAtModuleScope(string name) -> bool {
         if (name == "print" || name == "panic" || name == "Error") {
             return true;
         }
@@ -246,7 +265,7 @@ private class ModuleChecks {
     // A struct field may have any type, including a non-defaultable one; such a struct becomes
     // non-defaultable itself and must be constructed rather than zero-initialized. Only class
     // fields are checked here, since a class always has a constructor path.
-    private checkFieldInitialization() {
+    checkFieldInitialization() {
         for (long i = 0; i < this.classNodes.length(); i++) {
             let node = this.classNodes.get(i);
             let classType = this.classFor(node);
@@ -259,7 +278,7 @@ private class ModuleChecks {
     // A class that declares any constructor is checked by the definite-assignment pass over each
     // constructor body. Only a class with no constructor at all is caught here: it has no path on
     // which a non-defaultable field could be assigned.
-    private checkClassFieldInitialization(ClassType classType, ClassDeclarationNode node) {
+    checkClassFieldInitialization(ClassType classType, ClassDeclarationNode node) {
         let body = node.body();
         for (long i = 0; i < body.membersCount(); i++) {
             let member = body.members(i);
@@ -292,7 +311,7 @@ private class ModuleChecks {
 
     // ---- Declared throws ----
 
-    private checkDeclaredThrows() {
+    checkDeclaredThrows() {
         let functions = this.context.functions().all();
         for (long i = 0; i < functions.length(); i++) {
             let entry = functions.get(i);
@@ -321,13 +340,13 @@ private class ModuleChecks {
         }
     }
 
-    private validateMethodThrows(List<Method> methods) {
+    validateMethodThrows(List<Method> methods) {
         for (long i = 0; i < methods.length(); i++) {
             this.validateThrows(methods.get(i).signature());
         }
     }
 
-    private validateThrows(Signature signature) {
+    validateThrows(Signature signature) {
         Type[] declared = signature.throwsTypes();
         if (declared.length == 0) {
             return;
@@ -362,11 +381,241 @@ private class ModuleChecks {
             }
         }
     }
+
+    // ---- Signature leakage ----
+
+    // A declaration's signature may not mention a type less visible than the declaration
+    // itself; a caller who can name the declaration could otherwise be handed a type it
+    // cannot name. Protected members are exempt: their guaranteed reach is the declaring
+    // file, which can name everything the file can.
+    checkVisibilityLeaks() {
+        let functions = this.context.functions().all();
+        for (long i = 0; i < functions.length(); i++) {
+            let entry = functions.get(i);
+            if (entry.isBuiltin() || entry.isExternal()) {
+                continue;
+            }
+            this.checkCallableLeaks(entry.signature(), entry.visibility(),
+                "Function '{entry.signature().name()}'");
+        }
+        for (long i = 0; i < this.structNodes.length(); i++) {
+            let node = this.structNodes.get(i);
+            let structType = this.structFor(node);
+            if (structType == null) {
+                continue;
+            }
+            string declPhrase = "Struct '{structType.name()}'";
+            this.checkBoundLeaks(structType.typeParameterTypes(), structType.visibility(),
+                declPhrase, node.name().span());
+            this.checkMemberLeaks("struct", structType.name(), structType.fields(), 0,
+                structType.methods());
+        }
+        for (long i = 0; i < this.classNodes.length(); i++) {
+            let node = this.classNodes.get(i);
+            let classType = this.classFor(node);
+            if (classType == null) {
+                continue;
+            }
+            string declPhrase = "Class '{classType.name()}'";
+            this.checkClassBaseLeaks(classType, node, declPhrase);
+            this.checkImplementedInterfaceLeaks(classType, node, declPhrase);
+            this.checkBoundLeaks(classType.typeParameterTypes(), classType.visibility(),
+                declPhrase, node.name().span());
+            this.checkMemberLeaks("class", classType.name(), classType.fields(),
+                classType.baseFieldCount(), classType.methods());
+        }
+        for (long i = 0; i < this.interfaceNodes.length(); i++) {
+            let node = this.interfaceNodes.get(i);
+            let interfaceType = this.interfaceFor(node);
+            if (interfaceType == null) {
+                continue;
+            }
+            string declPhrase = "Interface '{interfaceType.name()}'";
+            this.checkBoundLeaks(interfaceType.typeParameterTypes(),
+                interfaceType.visibility(), declPhrase, node.name().span());
+            let methods = interfaceType.methods();
+            for (long m = 0; m < methods.length(); m++) {
+                let method = methods.get(m);
+                this.checkCallableLeaks(method.signature(), method.visibility(),
+                    "Method '{method.name()}' of interface '{interfaceType.name()}'");
+            }
+        }
+    }
+
+    checkClassBaseLeaks(ClassType classType, ClassDeclarationNode node, string declPhrase) {
+        if (types.visibilityTier(classType.visibility()) == 0) {
+            return;
+        }
+        let base = classType.base();
+        if (base == null) {
+            return;
+        }
+        Span at = node.name().span();
+        let extendsClause = node.extendsClause();
+        if (extendsClause != null) {
+            at = extendsClause.base().span();
+        }
+        let baseAuthority = types.authorityOf(base);
+        if (baseAuthority != null
+                && types.visibilityTier(baseAuthority.visibility())
+                    < types.visibilityTier(classType.visibility())) {
+            this.reporter.report("{declPhrase} is visible as "
+                + "'{types.visibilityWord(classType.visibility())}' but its base class "
+                + "'{baseAuthority.name()}' is {notNameablePhrase(baseAuthority)}. Mark "
+                + "'{baseAuthority.name()}' as "
+                + "'{types.visibilityWord(classType.visibility())}', or lower the "
+                + "declaration.", at);
+        }
+        if (base is InstantiationType) {
+            for (let argument in base.arguments()) {
+                this.checkMentionedType(argument, classType.visibility(), declPhrase,
+                    "base class type argument", at);
+            }
+        }
+    }
+
+    checkImplementedInterfaceLeaks(ClassType classType, ClassDeclarationNode node,
+                                   string declPhrase) {
+        if (types.visibilityTier(classType.visibility()) == 0) {
+            return;
+        }
+        let implementsClause = node.implementsClause();
+        if (implementsClause == null) {
+            return;
+        }
+        for (long i = 0; i < implementsClause.interfacesCount(); i++) {
+            let reference = implementsClause.interfaces(i);
+            let resolved = this.context.result().typeOf(reference.green());
+            if (resolved != null) {
+                this.checkMentionedType(resolved, classType.visibility(), declPhrase,
+                    "implemented interface", reference.span());
+            }
+        }
+    }
+
+    checkMemberLeaks(string ownerKindWord, string ownerName, List<Field> fields,
+                     long firstOwnField, List<Method> methods) {
+        string owner = "{ownerKindWord} '{ownerName}'";
+        for (long i = firstOwnField; i < fields.length(); i++) {
+            let field = fields.get(i);
+            if (types.visibilityTier(field.visibility()) == 0) {
+                continue;
+            }
+            this.checkMentionedType(field.type(), field.visibility(),
+                "Field '{field.name()}' of {owner}", "type", field.nameSpan());
+        }
+        for (long i = 0; i < methods.length(); i++) {
+            let method = methods.get(i);
+            string memberWord = "Method '{method.name()}'";
+            if (method.isConstructor()) {
+                memberWord = "Constructor";
+            }
+            this.checkCallableLeaks(method.signature(), method.visibility(),
+                memberWord + " of " + owner);
+        }
+    }
+
+    checkCallableLeaks(Signature signature, Visibility declVisibility, string declPhrase) {
+        if (types.visibilityTier(declVisibility) == 0) {
+            return;
+        }
+        for (let parameter in signature.parameters()) {
+            this.checkMentionedType(parameter.type(), declVisibility, declPhrase,
+                "parameter type", parameter.span());
+        }
+        this.checkMentionedType(signature.returnType(), declVisibility, declPhrase,
+            "return type", signature.nameSpan());
+        Type[] thrown = signature.throwsTypes();
+        Span[] thrownSpans = signature.throwsTypeSpans();
+        for (long i = 0; i < thrown.length; i++) {
+            this.checkMentionedType(thrown[i], declVisibility, declPhrase, "thrown type",
+                thrownSpans[i]);
+        }
+        this.checkBoundLeaks(signature.typeParameters(), declVisibility, declPhrase,
+            signature.nameSpan());
+    }
+
+    checkBoundLeaks(TypeParamType[] parameters, Visibility declVisibility, string declPhrase,
+                    Span at) {
+        if (types.visibilityTier(declVisibility) == 0) {
+            return;
+        }
+        for (let parameter in parameters) {
+            for (let bound in parameter.bounds()) {
+                this.checkMentionedType(bound, declVisibility, declPhrase,
+                    "type-parameter bound", at);
+            }
+        }
+    }
+
+    checkMentionedType(Type mentioned, Visibility declVisibility, string declPhrase,
+                       string role, Span at) {
+        let worst = leastVisibleMention(mentioned);
+        if (worst == null || types.visibilityTier(worst.visibility())
+                >= types.visibilityTier(declVisibility)) {
+            return;
+        }
+        this.reporter.report("{declPhrase} is visible as "
+            + "'{types.visibilityWord(declVisibility)}' but its {role} mentions "
+            + "'{worst.name()}', which is {notNameablePhrase(worst)}. Mark '{worst.name()}' "
+            + "as '{types.visibilityWord(declVisibility)}', or lower the declaration.", at);
+    }
+}
+
+// The least-visible declared type mentioned anywhere inside the type: arrays and optionals
+// look through to their element, an instantiation covers its template and every type argument,
+// and type parameters mention nothing themselves.
+leastVisibleMention(Type type) -> DeclaredType? {
+    switch (type) {
+        is OptionalType optional -> {
+            return leastVisibleMention(optional.inner());
+        },
+        is ArrayType array -> {
+            return leastVisibleMention(array.element());
+        },
+        is InstantiationType instantiation -> {
+            DeclaredType? worst = instantiation.template();
+            for (let argument in instantiation.arguments()) {
+                worst = lessVisibleOf(worst, leastVisibleMention(argument));
+            }
+            return worst;
+        },
+        is DeclaredType declared -> {
+            return declared;
+        },
+        default -> {
+            return null;
+        },
+    }
+}
+
+lessVisibleOf(DeclaredType? left, DeclaredType? right) -> DeclaredType? {
+    if (left == null) {
+        return right;
+    }
+    if (right == null) {
+        return left;
+    }
+    if (types.visibilityTier(right.visibility()) < types.visibilityTier(left.visibility())) {
+        return right;
+    }
+    return left;
+}
+
+notNameablePhrase(DeclaredType worst) -> string {
+    if (worst.visibility() == Visibility.Private) {
+        return "private to module '{worst.modulePath()}'";
+    }
+    string packageName = "its own package";
+    if (worst.packagePrefix().length > 0) {
+        packageName = "package '{worst.packagePrefix()}'";
+    }
+    return "only public inside {packageName}";
 }
 
 // The struct a field stores inline: a plain struct, or an instantiation of a generic struct
 // with its own substituted fields.
-private byValueStruct(Type fieldType) -> Type? {
+byValueStruct(Type fieldType) -> Type? {
     Type bare = fieldType;
     if (bare is OptionalType) {
         bare = bare.inner();
@@ -383,7 +632,7 @@ private byValueStruct(Type fieldType) -> Type? {
 // Depth-first search for a by-value field path from origin back to itself. An instantiation
 // counts as its template, so 'Wrap<T>' inside 'struct Wrap<T>' closes the cycle. explored
 // bounds the walk on graphs with shared members.
-private findPathBackTo(StructType origin, Type current, List<CycleStep> path,
+findPathBackTo(StructType origin, Type current, List<CycleStep> path,
                        Set<Type> explored) -> bool {
     let fields = types.fieldsOf(current);
     if (fields == null) {
@@ -409,12 +658,12 @@ private findPathBackTo(StructType origin, Type current, List<CycleStep> path,
 
 // True if the type can start as a valid zero value without an initializer: primitives except
 // decimal, optionals, and structs - generic instantiations included - whose every field can.
-private isDefaultable(Type fieldType) -> bool {
+isDefaultable(Type fieldType) -> bool {
     let visiting = new Set<Type>();
     return isDefaultableGuarded(fieldType, visiting);
 }
 
-private isDefaultableGuarded(Type fieldType, Set<Type> visiting) -> bool {
+isDefaultableGuarded(Type fieldType, Set<Type> visiting) -> bool {
     if (fieldType is PrimitiveType) {
         return fieldType.kind() != PrimitiveKind.Decimal
             && fieldType.kind() != PrimitiveKind.Void;
@@ -431,7 +680,7 @@ private isDefaultableGuarded(Type fieldType, Set<Type> visiting) -> bool {
     return false;
 }
 
-private structFieldsDefaultable(Type structLike, Set<Type> visiting) -> bool {
+structFieldsDefaultable(Type structLike, Set<Type> visiting) -> bool {
     if (!visiting.add(structLike)) {
         return true;
     }
@@ -452,7 +701,7 @@ private structFieldsDefaultable(Type structLike, Set<Type> visiting) -> bool {
     return true;
 }
 
-private firstIndexOf(List<string> names, string name) -> long {
+firstIndexOf(List<string> names, string name) -> long {
     for (long i = 0; i < names.length(); i++) {
         if (names.get(i) == name) {
             return i;
@@ -462,7 +711,7 @@ private firstIndexOf(List<string> names, string name) -> long {
 }
 
 // Every bare identifier expression under the node, with its content span.
-private collectIdentifiers(GreenNode node, long fullStart, List<FoundIdentifier> out) {
+collectIdentifiers(GreenNode node, long fullStart, List<FoundIdentifier> out) {
     if (node.kind() == SyntaxKind.IdentifierExpression && node.slotCount() > 0) {
         let token = node.slot(0);
         if (token is GreenToken) {

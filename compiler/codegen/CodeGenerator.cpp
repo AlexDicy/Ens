@@ -55,12 +55,18 @@ static std::string sanitizeModulePath(std::u16string_view s) {
 
 static std::string mangledTypeArg(::Type* t);
 
-// A stable, symbol-safe name for a type. For a generic instantiation this folds
-// in the template name and type arguments so each instantiation has a distinct,
-// module-independent symbol (e.g. List<int> -> "List__int__").
+// A stable, symbol-safe name for a type. A plain type is qualified by its
+// defining module so same-named types in different modules never collide at
+// link time. For a generic instantiation this folds in the template name and
+// type arguments so each instantiation has a distinct, module-independent
+// symbol (e.g. List<int> -> "List__int__") that the linker collapses.
 static std::string mangledTypeName(StructInfo* si) {
     if (!si) return "_";
-    if (!si->templateOf) return asAscii(si->name);
+    if (!si->templateOf) {
+        std::string m = sanitizeModulePath(si->modulePath);
+        std::string n = asAscii(si->name);
+        return m.empty() ? n : m + "_" + n;
+    }
     std::string out = asAscii(si->templateOf->name) + "__";
     for (size_t i = 0; i < si->typeArgs.size(); ++i) {
         if (i) out += "_";
@@ -655,7 +661,7 @@ struct CodeGenerator::Impl {
         if (!sym->linkName.empty()) return asAscii(sym->linkName);
         std::string base = asAscii(sym->name) + overloadSuffix(sym);
         if (sym->name == u"main") return "ens.main";
-        if (!sym->isPublic || sym->isExternal || sym->isBuiltin) return base;
+        if (sym->visibility == Visibility::Private || sym->isExternal || sym->isBuiltin) return base;
         std::string mp = sanitizeModulePath(sym->modulePath);
         return mp.empty() ? base : mp + "$" + base;
     }
@@ -807,7 +813,7 @@ struct CodeGenerator::Impl {
         // each declare a same-named private function would collide at link time.
         // Public functions keep external linkage, and methods are mangled by their
         // owning class so they never collide across modules.
-        auto linkage = (!receiver && !sym->isPublic)
+        auto linkage = (!receiver && sym->visibility == Visibility::Private)
             ? llvm::Function::InternalLinkage
             : llvm::Function::ExternalLinkage;
         auto* func = llvm::Function::Create(fnType, linkage, mangled, module.get());
