@@ -1,0 +1,307 @@
+// Manifest parsing: the package, workspace, and overrides forms, file-name selection, and
+// recovery through every manifest error node.
+import @std.testing;
+import parse.parser_support;
+import Source from support.source;
+import parse.parser;
+import SyntaxKind from syntax.generated.kind;
+import syntax.generated.factory;
+import SourceFileNode from syntax.generated.nodes;
+import ManifestFileNode from syntax.generated.nodes;
+import PackageDeclarationNode from syntax.generated.nodes;
+import WorkspaceDeclarationNode from syntax.generated.nodes;
+import OverridesDeclarationNode from syntax.generated.nodes;
+import VersionDeclarationNode from syntax.generated.nodes;
+import EnsDeclarationNode from syntax.generated.nodes;
+import DependencyDeclarationNode from syntax.generated.nodes;
+import MemberDeclarationNode from syntax.generated.nodes;
+import OverrideDeclarationNode from syntax.generated.nodes;
+import NativeDeclarationNode from syntax.generated.nodes;
+import NativeLibraryBindingNode from syntax.generated.nodes;
+import NativeArtifactBindingNode from syntax.generated.nodes;
+import ErrorManifestDeclarationNode from syntax.generated.nodes;
+import ErrorPackageItemNode from syntax.generated.nodes;
+import ErrorWorkspaceItemNode from syntax.generated.nodes;
+import ErrorOverridesItemNode from syntax.generated.nodes;
+import ErrorNativeBindingNode from syntax.generated.nodes;
+
+manifestFileNode(string text) -> ManifestFileNode throws {
+    let result = parser_support.parseManifestText(text);
+    try parser_support.assertRoundTrip(text, result);
+    try parser_support.assertNoDiagnostics(result);
+    let root = factory.createRoot(result.root());
+    if (root is ManifestFileNode) {
+        return root;
+    }
+    panic("the root should be a ManifestFileNode");
+}
+
+recoveredManifest(string text, long diagnostics) -> ManifestFileNode throws {
+    let result = parser_support.parseManifestText(text);
+    try parser_support.assertRoundTrip(text, result);
+    try parser_support.assertDiagnosticCount(result, diagnostics);
+    let root = factory.createRoot(result.root());
+    if (root is ManifestFileNode) {
+        return root;
+    }
+    panic("the root should be a ManifestFileNode");
+}
+
+test "a package manifest parses every item form" {
+    let file = try manifestFileNode("// the jsonkit package\n"
+        + "package alex.jsonkit \{\n"
+        + "    version \"1.3.0\";\n"
+        + "    ens \"1.2\";\n"
+        + "\n"
+        + "    dependency ens.frontend;\n"
+        + "    dependency alex.json \"2.0\";\n"
+        + "\n"
+        + "    native zlib;\n"
+        + "    native libc system;\n"
+        + "    native llvm \{\n"
+        + "        windows \"LLVM-C\";\n"
+        + "        linux \"LLVM-18\" \"LLVM-17\";\n"
+        + "        macos artifact \"https://example.com/llvm.tar\" hash \"sha256:"
+        + "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\";\n"
+        + "    \}\n"
+        + "\}\n");
+    try testing.assertEqual(file.declarationsCount(), 1L);
+    let declaration = file.declarations(0);
+    if (declaration is PackageDeclarationNode) {
+        try testing.assertEqual(declaration.name().segmentsCount(), 2L);
+        try testing.assertEqual(declaration.name().segments(0).text(), "alex");
+        try testing.assertEqual(declaration.name().segments(1).text(), "jsonkit");
+        try testing.assertEqual(declaration.itemsCount(), 7L);
+        let version = declaration.items(0);
+        if (version is VersionDeclarationNode) {
+            try testing.assertEqual(version.value().text(), "\"1.3.0\"");
+        } else {
+            try testing.fail("the first item should be a version declaration");
+        }
+        let language = declaration.items(1);
+        if (language is EnsDeclarationNode) {
+            try testing.assertEqual(language.value().text(), "\"1.2\"");
+        } else {
+            try testing.fail("the second item should be an ens declaration");
+        }
+        let bare = declaration.items(2);
+        if (bare is DependencyDeclarationNode) {
+            try testing.assertEqual(bare.name().segments(0).text(), "ens");
+            try testing.assertTrue(bare.version() == null, "no version on the bare dependency");
+        } else {
+            try testing.fail("the third item should be a dependency");
+        }
+        let versioned = declaration.items(3);
+        if (versioned is DependencyDeclarationNode) {
+            try testing.assertTrue(versioned.version()?.text() == "\"2.0\"",
+                "the versioned dependency keeps its version string");
+        } else {
+            try testing.fail("the fourth item should be a dependency");
+        }
+        let zlib = declaration.items(4);
+        if (zlib is NativeDeclarationNode) {
+            try testing.assertEqual(zlib.name().text(), "zlib");
+            try testing.assertTrue(zlib.systemKeyword() == null, "zlib is not a system library");
+            try testing.assertTrue(zlib.bindings() == null, "the bare form has no bindings");
+        } else {
+            try testing.fail("the fifth item should be a native declaration");
+        }
+        let libc = declaration.items(5);
+        if (libc is NativeDeclarationNode) {
+            try testing.assertTrue(libc.systemKeyword()?.kind() == SyntaxKind.SystemKeyword,
+                "the system word is re-tagged");
+        } else {
+            try testing.fail("the sixth item should be a native declaration");
+        }
+        let llvm = declaration.items(6);
+        if (llvm is NativeDeclarationNode) {
+            let bindings = llvm.bindings();
+            if (bindings == null) {
+                try testing.fail("the llvm native should carry a binding block");
+            } else {
+                try testing.assertEqual(bindings.bindingsCount(), 3L);
+                let windows = bindings.bindings(0);
+                if (windows is NativeLibraryBindingNode) {
+                    try testing.assertEqual(windows.platform().text(), "windows");
+                    try testing.assertEqual(windows.namesCount(), 1L);
+                    try testing.assertEqual(windows.names(0).text(), "\"LLVM-C\"");
+                } else {
+                    try testing.fail("the windows binding should be a library binding");
+                }
+                let linux = bindings.bindings(1);
+                if (linux is NativeLibraryBindingNode) {
+                    try testing.assertEqual(linux.namesCount(), 2L);
+                } else {
+                    try testing.fail("the linux binding should be a library binding");
+                }
+                let macos = bindings.bindings(2);
+                if (macos is NativeArtifactBindingNode) {
+                    try testing.assertEqual(macos.platform().text(), "macos");
+                    try testing.assertEqual(macos.url().text(),
+                        "\"https://example.com/llvm.tar\"");
+                    try testing.assertTrue(
+                        macos.hashKeyword().kind() == SyntaxKind.HashKeyword,
+                        "the hash word is re-tagged");
+                } else {
+                    try testing.fail("the macos binding should be an artifact binding");
+                }
+            }
+        } else {
+            try testing.fail("the seventh item should be a native declaration");
+        }
+    } else {
+        try testing.fail("the declaration should be a package");
+    }
+}
+
+test "workspace and overrides manifests parse their declarations" {
+    let workspace = try manifestFileNode("workspace \{\n"
+        + "    member \"syntaxgen\";\n"
+        + "    member \"frontend\";\n"
+        + "\}\n");
+    let declaration = workspace.declarations(0);
+    if (declaration is WorkspaceDeclarationNode) {
+        try testing.assertEqual(declaration.itemsCount(), 2L);
+        let first = declaration.items(0);
+        if (first is MemberDeclarationNode) {
+            try testing.assertEqual(first.folder().text(), "\"syntaxgen\"");
+        } else {
+            try testing.fail("the first item should be a member declaration");
+        }
+    } else {
+        try testing.fail("the declaration should be a workspace");
+    }
+
+    let overrides = try manifestFileNode("overrides \{\n"
+        + "    override alex.library \"../library\";\n"
+        + "\}\n");
+    let overridesDeclaration = overrides.declarations(0);
+    if (overridesDeclaration is OverridesDeclarationNode) {
+        try testing.assertEqual(overridesDeclaration.itemsCount(), 1L);
+        let item = overridesDeclaration.items(0);
+        if (item is OverrideDeclarationNode) {
+            try testing.assertEqual(item.name().segments(0).text(), "alex");
+            try testing.assertEqual(item.folder().text(), "\"../library\"");
+        } else {
+            try testing.fail("the item should be an override declaration");
+        }
+    } else {
+        try testing.fail("the declaration should be an overrides block");
+    }
+}
+
+test "parse selects the grammar by file name" {
+    let manifest = parser.parse(new Source("selfhost/ens.package", "workspace \{ \}"));
+    try testing.assertTrue(factory.createRoot(manifest.root()) is ManifestFileNode,
+        "an ens.package file parses as a manifest");
+    let overrides = parser.parse(new Source("proj\\ens.overrides", "overrides \{ \}"));
+    try testing.assertTrue(factory.createRoot(overrides.root()) is ManifestFileNode,
+        "an ens.overrides file parses as a manifest");
+    let source = parser.parse(new Source("proj/main.ens", "main() -> int \{ return 0; \}"));
+    try testing.assertTrue(factory.createRoot(source.root()) is SourceFileNode,
+        "every other file parses as ordinary source");
+}
+
+test "junk at the top of a manifest becomes an error declaration" {
+    let file = try recoveredManifest("module \{ version \"1\"; \}\npackage a \{ \}\n", 1);
+    try testing.assertEqual(file.declarationsCount(), 2L);
+    try testing.assertTrue(file.declarations(0) is ErrorManifestDeclarationNode,
+        "the junk is wrapped in an error declaration");
+    try testing.assertTrue(file.declarations(1) is PackageDeclarationNode,
+        "the package after the junk still parses");
+}
+
+test "junk inside a package block becomes an error item" {
+    let file = try recoveredManifest("package a.b \{\n"
+        + "    widget 12;\n"
+        + "    version \"1.0\";\n"
+        + "\}\n", 1);
+    let declaration = file.declarations(0);
+    if (declaration is PackageDeclarationNode) {
+        try testing.assertEqual(declaration.itemsCount(), 2L);
+        try testing.assertTrue(declaration.items(0) is ErrorPackageItemNode,
+            "the junk is wrapped in an error item");
+        try testing.assertTrue(declaration.items(1) is VersionDeclarationNode,
+            "the version after the junk still parses");
+    } else {
+        try testing.fail("the declaration should be a package");
+    }
+}
+
+test "junk inside workspace and overrides blocks becomes error items" {
+    let workspace = try recoveredManifest("workspace \{\n"
+        + "    version \"1.0\";\n"
+        + "    member \"frontend\";\n"
+        + "\}\n", 1);
+    let workspaceDeclaration = workspace.declarations(0);
+    if (workspaceDeclaration is WorkspaceDeclarationNode) {
+        try testing.assertEqual(workspaceDeclaration.itemsCount(), 2L);
+        try testing.assertTrue(workspaceDeclaration.items(0) is ErrorWorkspaceItemNode,
+            "a non-member item is junk in a workspace");
+        try testing.assertTrue(workspaceDeclaration.items(1) is MemberDeclarationNode,
+            "the member after the junk still parses");
+    } else {
+        try testing.fail("the declaration should be a workspace");
+    }
+
+    let overrides = try recoveredManifest("overrides \{\n"
+        + "    member \"x\";\n"
+        + "    override a.b \"../b\";\n"
+        + "\}\n", 1);
+    let overridesDeclaration = overrides.declarations(0);
+    if (overridesDeclaration is OverridesDeclarationNode) {
+        try testing.assertEqual(overridesDeclaration.itemsCount(), 2L);
+        try testing.assertTrue(overridesDeclaration.items(0) is ErrorOverridesItemNode,
+            "a non-override item is junk in an overrides block");
+        try testing.assertTrue(overridesDeclaration.items(1) is OverrideDeclarationNode,
+            "the override after the junk still parses");
+    } else {
+        try testing.fail("the declaration should be an overrides block");
+    }
+}
+
+test "junk inside a native binding block becomes an error binding" {
+    let file = try recoveredManifest("package a \{\n"
+        + "    native llvm \{\n"
+        + "        42;\n"
+        + "        windows \"LLVM-C\";\n"
+        + "    \}\n"
+        + "\}\n", 1);
+    let declaration = file.declarations(0);
+    if (declaration is PackageDeclarationNode) {
+        let item = declaration.items(0);
+        if (item is NativeDeclarationNode) {
+            let bindings = item.bindings();
+            if (bindings == null) {
+                try testing.fail("the native should carry a binding block");
+            } else {
+                try testing.assertEqual(bindings.bindingsCount(), 2L);
+                try testing.assertTrue(bindings.bindings(0) is ErrorNativeBindingNode,
+                    "the junk is wrapped in an error binding");
+                try testing.assertTrue(bindings.bindings(1) is NativeLibraryBindingNode,
+                    "the binding after the junk still parses");
+            }
+        } else {
+            try testing.fail("the item should be a native declaration");
+        }
+    } else {
+        try testing.fail("the declaration should be a package");
+    }
+}
+
+test "missing pieces of manifest items are reported and recovered" {
+    let file = try recoveredManifest("package a \{\n"
+        + "    dependency ;\n"
+        + "    native x\n"
+        + "\}\n", 2);
+    let declaration = file.declarations(0);
+    if (declaration is PackageDeclarationNode) {
+        try testing.assertEqual(declaration.itemsCount(), 2L);
+        try testing.assertTrue(declaration.items(0) is DependencyDeclarationNode,
+            "a dependency with a missing name still produces its node");
+        try testing.assertTrue(declaration.items(1) is NativeDeclarationNode,
+            "a native with a missing ';' still produces its node");
+    } else {
+        try testing.fail("the declaration should be a package");
+    }
+}

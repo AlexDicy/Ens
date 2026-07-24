@@ -33,7 +33,8 @@ export class ParseResult {
     }
 
     // The green root; factory.createRoot builds the typed red tree over it. For parse() this is
-    // always a SourceFile node whose full text equals the source byte for byte.
+    // a SourceFile node (or a ManifestFile node for a manifest) whose full text equals the source
+    // byte for byte.
     export root() -> GreenNode {
         return this.greenRoot;
     }
@@ -44,11 +45,42 @@ export class ParseResult {
     }
 }
 
+// Parses input as ordinary source, or as a manifest when its file name says so (see
+// isManifestPath).
 export parse(Source input) -> ParseResult {
+    if (isManifestPath(input.path())) {
+        return parseManifest(input);
+    }
     let lexed = lexer.lex(input);
     let parser = new Parser(input, lexed.tokens());
     parser.parseSourceFile();
     return finishParse(input, lexed, parser);
+}
+
+// Parses one manifest file; the root is a ManifestFile node.
+export parseManifest(Source input) -> ParseResult {
+    let lexed = lexer.lex(input);
+    let parser = new Parser(input, lexed.tokens());
+    parser.parseManifestFile();
+    return finishParse(input, lexed, parser);
+}
+
+// True for the file names that hold manifests, with any folder prefix: 'ens.package' marks a
+// package or workspace, 'ens.overrides' holds local overrides.
+export isManifestPath(string path) -> bool {
+    string name = fileName(path);
+    return name == "ens.package" || name == "ens.overrides";
+}
+
+fileName(string path) -> string {
+    byte[] bytes = path.toBytes();
+    long start = 0;
+    for (long i = 0; i < bytes.length; i++) {
+        if (bytes[i] == '/' || bytes[i] == '\\') {
+            start = i + 1;
+        }
+    }
+    return path.substring(start, path.length);
 }
 
 // Testing entry: parses one expression. The root is a List node holding the expression, any
@@ -194,6 +226,17 @@ class Parser {
         this.complete(items, SyntaxKind.List);
         this.emitEndOfFile();
         this.complete(marker, SyntaxKind.SourceFile);
+    }
+
+    protected parseManifestFile() {
+        let marker = this.start();
+        let declarations = this.start();
+        while (!this.atEnd()) {
+            this.parseManifestDeclaration();
+        }
+        this.complete(declarations, SyntaxKind.List);
+        this.emitEndOfFile();
+        this.complete(marker, SyntaxKind.ManifestFile);
     }
 
     protected parseStandaloneExpression() {
@@ -506,6 +549,276 @@ class Parser {
         }
         this.parseTopLevelError("Expected a top-level declaration such as a function, "
             + "class, struct, interface, enum, import, or test");
+    }
+
+    // ============================================================ manifests
+
+    parseManifestDeclaration() {
+        if (this.at(SyntaxKind.PackageKeyword)) {
+            this.parsePackageDeclaration();
+            return;
+        }
+        if (this.atContextual("workspace")) {
+            this.parseWorkspaceDeclaration();
+            return;
+        }
+        if (this.atContextual("overrides")) {
+            this.parseOverridesDeclaration();
+            return;
+        }
+        this.parseManifestDeclarationError();
+    }
+
+    atManifestDeclarationStart() -> bool {
+        return this.at(SyntaxKind.PackageKeyword) || this.atContextual("workspace")
+            || this.atContextual("overrides");
+    }
+
+    parsePackageDeclaration() {
+        let marker = this.start();
+        this.bump();
+        this.parsePackagePath("Expected the package name after 'package', for example "
+            + "'package acme.tools'");
+        this.expect(SyntaxKind.OpenBrace, "Expected '\{' to begin the package declaration");
+        let items = this.start();
+        while (!this.at(SyntaxKind.CloseBrace) && !this.atEnd()) {
+            this.parsePackageItem();
+        }
+        this.complete(items, SyntaxKind.List);
+        this.expect(SyntaxKind.CloseBrace, "Expected '\}' to close the package declaration");
+        this.complete(marker, SyntaxKind.PackageDeclaration);
+    }
+
+    parseWorkspaceDeclaration() {
+        let marker = this.start();
+        this.bumpAs(SyntaxKind.WorkspaceKeyword);
+        this.expect(SyntaxKind.OpenBrace, "Expected '\{' to begin the workspace declaration");
+        let items = this.start();
+        while (!this.at(SyntaxKind.CloseBrace) && !this.atEnd()) {
+            this.parseWorkspaceItem();
+        }
+        this.complete(items, SyntaxKind.List);
+        this.expect(SyntaxKind.CloseBrace, "Expected '\}' to close the workspace declaration");
+        this.complete(marker, SyntaxKind.WorkspaceDeclaration);
+    }
+
+    parseOverridesDeclaration() {
+        let marker = this.start();
+        this.bumpAs(SyntaxKind.OverridesKeyword);
+        this.expect(SyntaxKind.OpenBrace, "Expected '\{' to begin the overrides declaration");
+        let items = this.start();
+        while (!this.at(SyntaxKind.CloseBrace) && !this.atEnd()) {
+            this.parseOverridesItem();
+        }
+        this.complete(items, SyntaxKind.List);
+        this.expect(SyntaxKind.CloseBrace, "Expected '\}' to close the overrides declaration");
+        this.complete(marker, SyntaxKind.OverridesDeclaration);
+    }
+
+    parsePackagePath(string missingMessage) {
+        let marker = this.start();
+        let segments = this.start();
+        this.expect(SyntaxKind.Identifier, missingMessage);
+        while (this.at(SyntaxKind.Dot) && this.peekKind(1) == SyntaxKind.Identifier) {
+            this.bump();
+            this.bump();
+        }
+        this.complete(segments, SyntaxKind.List);
+        this.complete(marker, SyntaxKind.PackagePath);
+    }
+
+    parsePackageItem() {
+        if (this.atContextual("version")) {
+            this.parseManifestValueItem(SyntaxKind.VersionKeyword, SyntaxKind.VersionDeclaration,
+                "Expected the package version as a string, for example 'version \"1.3.0\";'",
+                "Expected ';' after the version declaration");
+            return;
+        }
+        if (this.atContextual("ens")) {
+            this.parseManifestValueItem(SyntaxKind.EnsKeyword, SyntaxKind.EnsDeclaration,
+                "Expected the language version as a string, for example 'ens \"1.2\";'",
+                "Expected ';' after the ens declaration");
+            return;
+        }
+        if (this.atContextual("dependency")) {
+            this.parseDependencyDeclaration();
+            return;
+        }
+        if (this.atContextual("native")) {
+            this.parseNativeDeclaration();
+            return;
+        }
+        this.parseManifestItemError(SyntaxKind.ErrorPackageItem, "Expected a package item: "
+            + "'version', 'ens', 'dependency', or 'native'");
+    }
+
+    parseManifestValueItem(SyntaxKind keywordKind, SyntaxKind nodeKind, string valueMessage,
+                           string semicolonMessage) {
+        let marker = this.start();
+        this.bumpAs(keywordKind);
+        this.expect(SyntaxKind.StringLiteral, valueMessage);
+        this.expect(SyntaxKind.Semicolon, semicolonMessage);
+        this.complete(marker, nodeKind);
+    }
+
+    parseDependencyDeclaration() {
+        let marker = this.start();
+        this.bumpAs(SyntaxKind.DependencyKeyword);
+        this.parsePackagePath("Expected the dependency's package name, for example "
+            + "'dependency acme.json;'");
+        if (this.at(SyntaxKind.StringLiteral)) {
+            this.bump();
+        } else {
+            this.nullSlot();
+        }
+        this.expect(SyntaxKind.Semicolon, "Expected ';' after the dependency declaration");
+        this.complete(marker, SyntaxKind.DependencyDeclaration);
+    }
+
+    parseNativeDeclaration() {
+        let marker = this.start();
+        this.bumpAs(SyntaxKind.NativeKeyword);
+        this.expect(SyntaxKind.Identifier, "Expected the native library's name, for example "
+            + "'native zlib;'");
+        if (this.atContextual("system")) {
+            this.bumpAs(SyntaxKind.SystemKeyword);
+        } else {
+            this.nullSlot();
+        }
+        if (this.at(SyntaxKind.OpenBrace)) {
+            this.parseNativeBindingList();
+            this.nullSlot();
+        } else {
+            this.nullSlot();
+            this.expect(SyntaxKind.Semicolon, "Expected ';' or a '\{ ... \}' binding block "
+                + "after the native library's name");
+        }
+        this.complete(marker, SyntaxKind.NativeDeclaration);
+    }
+
+    parseNativeBindingList() {
+        let marker = this.start();
+        this.bump();
+        let bindings = this.start();
+        while (!this.at(SyntaxKind.CloseBrace) && !this.atEnd()) {
+            this.parseNativeBinding();
+        }
+        this.complete(bindings, SyntaxKind.List);
+        this.expect(SyntaxKind.CloseBrace, "Expected '\}' to close the binding block");
+        this.complete(marker, SyntaxKind.NativeBindingList);
+    }
+
+    parseNativeBinding() {
+        if (!this.at(SyntaxKind.Identifier)) {
+            this.parseManifestItemError(SyntaxKind.ErrorNativeBinding, "Expected a platform "
+                + "binding, for example 'windows \"LLVM-C\";'");
+            return;
+        }
+        if (this.peekIsContextual(1, "artifact")) {
+            let marker = this.start();
+            this.bump();
+            this.bumpAs(SyntaxKind.ArtifactKeyword);
+            this.expect(SyntaxKind.StringLiteral, "Expected the artifact URL as a string");
+            if (this.atContextual("hash")) {
+                this.bumpAs(SyntaxKind.HashKeyword);
+            } else {
+                this.missing("Expected 'hash' and the artifact's checksum after the URL");
+            }
+            this.expect(SyntaxKind.StringLiteral, "Expected the artifact's checksum as a "
+                + "string, for example 'hash \"sha256:...\"'");
+            this.expect(SyntaxKind.Semicolon, "Expected ';' after the artifact binding");
+            this.complete(marker, SyntaxKind.NativeArtifactBinding);
+            return;
+        }
+        let marker = this.start();
+        this.bump();
+        let names = this.start();
+        this.expect(SyntaxKind.StringLiteral, "Expected at least one library base name as a "
+            + "string, for example 'windows \"LLVM-C\";'");
+        while (this.at(SyntaxKind.StringLiteral)) {
+            this.bump();
+        }
+        this.complete(names, SyntaxKind.List);
+        this.expect(SyntaxKind.Semicolon, "Expected ';' after the platform binding");
+        this.complete(marker, SyntaxKind.NativeLibraryBinding);
+    }
+
+    parseWorkspaceItem() {
+        if (this.atContextual("member")) {
+            let marker = this.start();
+            this.bumpAs(SyntaxKind.MemberKeyword);
+            this.expect(SyntaxKind.StringLiteral, "Expected the member's folder as a string, "
+                + "for example 'member \"frontend\";'");
+            this.expect(SyntaxKind.Semicolon, "Expected ';' after the member declaration");
+            this.complete(marker, SyntaxKind.MemberDeclaration);
+            return;
+        }
+        this.parseManifestItemError(SyntaxKind.ErrorWorkspaceItem, "Expected a member "
+            + "declaration, for example 'member \"frontend\";'");
+    }
+
+    parseOverridesItem() {
+        if (this.at(SyntaxKind.OverrideKeyword)) {
+            let marker = this.start();
+            this.bump();
+            this.parsePackagePath("Expected the overridden package's name after 'override'");
+            this.expect(SyntaxKind.StringLiteral, "Expected the replacement folder as a "
+                + "string, for example 'override alex.library \"../library\";'");
+            this.expect(SyntaxKind.Semicolon, "Expected ';' after the override declaration");
+            this.complete(marker, SyntaxKind.OverrideDeclaration);
+            return;
+        }
+        this.parseManifestItemError(SyntaxKind.ErrorOverridesItem, "Expected an override "
+            + "declaration, for example 'override alex.library \"../library\";'");
+    }
+
+    // Recovery inside a manifest block: wraps the junk in the block's error kind. A ';' ends the
+    // junk and is consumed into it, a braced region is skipped whole, and a '\}' ends it
+    // unconsumed so the enclosing block can close.
+    parseManifestItemError(SyntaxKind errorKind, string message) {
+        this.reportAtCurrent(message);
+        let marker = this.start();
+        let skipped = this.start();
+        while (!this.atEnd()) {
+            let kind = this.currentKind();
+            if (kind == SyntaxKind.CloseBrace) {
+                break;
+            }
+            if (kind == SyntaxKind.Semicolon) {
+                this.bump();
+                break;
+            }
+            if (kind == SyntaxKind.OpenBrace) {
+                this.bumpBalancedBraces();
+                break;
+            }
+            this.bump();
+        }
+        this.complete(skipped, SyntaxKind.List);
+        this.complete(marker, errorKind);
+    }
+
+    // Recovery at the top of a manifest: skips to the next declaration keyword, taking braced
+    // regions whole.
+    parseManifestDeclarationError() {
+        this.reportAtCurrent("Expected 'package', 'workspace', or 'overrides' to begin the "
+            + "manifest declaration");
+        let marker = this.start();
+        let skipped = this.start();
+        bool first = true;
+        while (!this.atEnd()) {
+            if (!first && this.atManifestDeclarationStart()) {
+                break;
+            }
+            if (this.currentKind() == SyntaxKind.OpenBrace) {
+                this.bumpBalancedBraces();
+                break;
+            }
+            this.bump();
+            first = false;
+        }
+        this.complete(skipped, SyntaxKind.List);
+        this.complete(marker, SyntaxKind.ErrorManifestDeclaration);
     }
 
     // ============================================================ declarations
