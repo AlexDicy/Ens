@@ -227,6 +227,7 @@ GreenElementPtr Parser::parseSourceFile() {
             recoverTo({SyntaxKind::KwImport, SyntaxKind::KwStruct, SyntaxKind::KwClass,
                        SyntaxKind::KwInterface,
                        SyntaxKind::KwPrivate, SyntaxKind::KwProtected, SyntaxKind::KwPublic,
+                       SyntaxKind::KwExport,
                        SyntaxKind::Identifier, SyntaxKind::Semi, SyntaxKind::EndOfFile});
             if (current == before && !atEnd()) bump();
         }
@@ -247,7 +248,8 @@ void Parser::parseTopLevel() {
         return;
     }
 
-    bool hasVisibility = atAny({SyntaxKind::KwPrivate, SyntaxKind::KwProtected, SyntaxKind::KwPublic});
+    bool hasVisibility = atAny({SyntaxKind::KwPrivate, SyntaxKind::KwProtected, SyntaxKind::KwPublic,
+                                SyntaxKind::KwExport});
 
     if (at(SyntaxKind::KwExternal) ||
         peekKind(hasVisibility ? 1 : 0) == SyntaxKind::KwExternal) {
@@ -259,6 +261,7 @@ void Parser::parseTopLevel() {
     while (true) {
         SyntaxKind k = peekKind(declMods);
         if (k == SyntaxKind::KwPrivate || k == SyntaxKind::KwProtected || k == SyntaxKind::KwPublic ||
+            k == SyntaxKind::KwExport ||
             k == SyntaxKind::KwAbstract || k == SyntaxKind::KwFinal || k == SyntaxKind::KwSealed ||
             k == SyntaxKind::KwNoreturn) {
             declMods++;
@@ -316,7 +319,8 @@ void Parser::parseTopLevel() {
 }
 
 void Parser::parseVisibilityModifier() {
-    if (!atAny({SyntaxKind::KwPrivate, SyntaxKind::KwProtected, SyntaxKind::KwPublic})) return;
+    if (!atAny({SyntaxKind::KwPrivate, SyntaxKind::KwProtected, SyntaxKind::KwPublic,
+                SyntaxKind::KwExport})) return;
     builder.startNode(SyntaxKind::VisibilityModifier);
     bump();
     builder.finishNode();
@@ -430,7 +434,8 @@ bool Parser::looksLikeFuncDecl(bool allowShorthand) const {
     // Skip an optional visibility modifier.
     if (idx < tokens.size() && (tokens[idx].kind == SyntaxKind::KwPrivate ||
                                 tokens[idx].kind == SyntaxKind::KwProtected ||
-                                tokens[idx].kind == SyntaxKind::KwPublic)) {
+                                tokens[idx].kind == SyntaxKind::KwPublic ||
+                                tokens[idx].kind == SyntaxKind::KwExport)) {
         idx++;
         while (idx < tokens.size() && isTrivia(tokens[idx].kind)) idx++;
     }
@@ -509,6 +514,7 @@ void Parser::parseFuncDecl() {
         recoverTo({SyntaxKind::RBrace, SyntaxKind::Semi,
                    SyntaxKind::KwStruct, SyntaxKind::KwClass,
                    SyntaxKind::KwPrivate, SyntaxKind::KwProtected, SyntaxKind::KwPublic,
+                   SyntaxKind::KwExport,
                    SyntaxKind::EndOfFile});
         eat(SyntaxKind::Semi);
     }
@@ -535,6 +541,7 @@ void Parser::parseTestDecl() {
         recoverTo({SyntaxKind::RBrace, SyntaxKind::Semi,
                    SyntaxKind::KwStruct, SyntaxKind::KwClass,
                    SyntaxKind::KwPrivate, SyntaxKind::KwProtected, SyntaxKind::KwPublic,
+                   SyntaxKind::KwExport,
                    SyntaxKind::EndOfFile});
         eat(SyntaxKind::Semi);
     }
@@ -625,6 +632,7 @@ void Parser::parseCatchClause() {
         recoverTo({SyntaxKind::KwCatch, SyntaxKind::KwFinally, SyntaxKind::RBrace,
                    SyntaxKind::KwStruct, SyntaxKind::KwClass,
                    SyntaxKind::KwPrivate, SyntaxKind::KwProtected, SyntaxKind::KwPublic,
+                   SyntaxKind::KwExport,
                    SyntaxKind::EndOfFile});
     }
     builder.finishNode();
@@ -737,7 +745,8 @@ bool Parser::looksLikeKeywordNamedMethod() const {
     };
     if (idx < tokens.size() && (tokens[idx].kind == SyntaxKind::KwPrivate ||
                                 tokens[idx].kind == SyntaxKind::KwProtected ||
-                                tokens[idx].kind == SyntaxKind::KwPublic)) {
+                                tokens[idx].kind == SyntaxKind::KwPublic ||
+                                tokens[idx].kind == SyntaxKind::KwExport)) {
         idx++;
         skipTrivia();
     }

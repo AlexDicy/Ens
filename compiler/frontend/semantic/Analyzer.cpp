@@ -20,6 +20,7 @@ static Visibility toSemanticVisibility(ast::Visibility v) {
         case ast::Visibility::Private:   return Visibility::Private;
         case ast::Visibility::Protected: return Visibility::Protected;
         case ast::Visibility::Public:    return Visibility::Public;
+        case ast::Visibility::Export:    return Visibility::Export;
     }
     return Visibility::Public;
 }
@@ -27,7 +28,8 @@ static Visibility toSemanticVisibility(ast::Visibility v) {
 // A record type may be referenced from another module only when it is public. Primitives
 // and external types (no StructInfo) are always accessible.
 static bool isTypeVisibleAcrossModules(const Type* t) {
-    return !t || !t->structInfo || t->structInfo->visibility == Visibility::Public;
+    return !t || !t->structInfo || t->structInfo->visibility == Visibility::Public ||
+           t->structInfo->visibility == Visibility::Export;
 }
 
 static std::string asciiOf(std::u16string_view s) {
@@ -1708,7 +1710,8 @@ void Analyzer::collectFunctions(const ast::SourceFile& file) {
         uint32_t fPos = fn.nameToken() ? fn.nameToken()->startOffset() : fn.node.startOffset();
         Symbol* sym = makeSymbol(SymbolKind::Function, fname, nullptr, fPos);
         sym->funcDeclCst = fn.node.greenNode();
-        sym->isPublic = fn.visibility() == ast::Visibility::Public;
+        sym->isPublic = fn.visibility() == ast::Visibility::Public ||
+                        fn.visibility() == ast::Visibility::Export;
         sym->declaredThrows = fn.isThrows();
         sym->abiThrows = fn.isThrows();
         sym->isNoreturn = fn.isNoreturn();
@@ -4141,7 +4144,7 @@ bool Analyzer::isLocalClass(StructInfo* definingClass) {
 }
 
 bool Analyzer::isMemberAccessAllowed(Visibility visibility, StructInfo* definingClass) {
-    if (visibility == Visibility::Public) return true;
+    if (visibility == Visibility::Public || visibility == Visibility::Export) return true;
     StructInfo* current = (currentThis && currentThis->type) ? currentThis->type->structInfo : nullptr;
     if (visibility == Visibility::Private) {
         return current && current == definingClass;

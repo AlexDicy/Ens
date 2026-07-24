@@ -23,7 +23,7 @@ class Type;
 class Symbol;
 struct StructInfo;
 
-enum class Visibility { Public, Private, Protected };
+enum class Visibility { Public, Private, Protected, Export };
 
 struct FieldInfo {
     std::u16string name;

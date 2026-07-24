@@ -9,7 +9,7 @@
 
 namespace ast {
 
-enum class Visibility { Public, Private, Protected };
+enum class Visibility { Public, Private, Protected, Export };
 
 class VisibilityModifier;
 class TypeParam;

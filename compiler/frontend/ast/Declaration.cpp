@@ -13,6 +13,7 @@ Visibility VisibilityModifier::visibility() const {
             case SyntaxKind::KwPrivate:   return Visibility::Private;
             case SyntaxKind::KwProtected: return Visibility::Protected;
             case SyntaxKind::KwPublic:    return Visibility::Public;
+            case SyntaxKind::KwExport:    return Visibility::Export;
             default: break;
         }
     }
