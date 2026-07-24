@@ -4,14 +4,28 @@
 Primitive types: `bool (1)`, `byte (1)`, `short (2)`, `ushort (2)`, `int (4)`, `uint (4)`, `long (8)`, `ulong (8)`, `float (4)`, `double (8)`, `char (4)`. `byte` is unsigned (0..255); `short`/`int`/`long` are signed; `ushort`/`uint`/`ulong` are their unsigned counterparts.
 `char` is an unsigned 32-bit Unicode scalar value (0..0x10FFFF); it counts as an integer type, and converts to text as the character it denotes.
 
-Public by default. Top-level `private` applies to the file scope. When `private` is used in a class or struct it applies to the class/struct level. `Protected` fields/methods in classes and structs apply to the file scope and subclasses in the case of classes. Top-level `protected` is not allowed as it currently carries no meaning.
+Visibility has three tiers, `private` < `public` < `export`, with `protected` alongside them.
+Everything is private by default.
+An unmarked top-level declaration is visible only within its file, and an unmarked class or struct member, including a constructor, is visible only within its type.
+`public` makes a declaration visible to every module in the same package; other packages cannot see it.
+`export` makes a declaration visible to the packages that consume this one through `@` imports, including programs using `@std`.
+`protected` keeps its own meaning for class and struct members: the declaring file, plus subclasses in the case of classes.
+Top-level `protected` is not allowed.
+Struct fields follow their struct's visibility; a field that writes its own modifier, such as `private`, opts out.
+Class members never follow their class: they stay private unless marked.
+Interface members carry no visibility of their own: they always follow the interface, and writing a visibility modifier on an interface member is an error.
+Enum cases follow their enum.
+A member may not be declared more visible than the type that contains it: an `export` method on a `public` class is an error, never a silent cap.
+Writing the default explicitly, such as `private` on a class member, is allowed.
+A declaration's signature may not mention a type less visible than the declaration itself; this covers parameter types, the return type, declared thrown types, field types, a base class, implemented interfaces, and generic arguments and bounds.
+A `test` declaration sees its file's private top-level declarations like any other code in the file, but not the private members of types.
 
 ```ens
-private calculateArea(uint width, uint height) -> uint {
+public calculateArea(uint width, uint height) -> uint {
     return width * height;
 }
 
-printArea() { // no need to specify -> void
+printArea() { // private by default; no need to specify -> void
     uint width = 20;
     uint height = 18;
     let area = calculateArea(width, height);
@@ -37,8 +51,6 @@ public noreturn fail(string message) throws {
     throw new TestFailure(message);
 }
 ```
-
-Everything public by default.
 
 Structs automatically implement `copy()` and are `(de)serializable` by default, which also allows printing them as JSON strings. Private and protected fields are included in the serialization.
 
@@ -181,7 +193,7 @@ Because the compiler sees the whole hierarchy, a `switch` over a sealed class ca
 ---
 
 An `interface` declares a named contract: a set of method signatures with no bodies.
-Interfaces are declared at the top level and follow the same `public`/`private` visibility rules as classes; they may be generic, specialized per type-argument set like generic classes.
+Interfaces are declared at the top level and follow the same visibility tiers as classes; they may be generic, specialized per type-argument set like generic classes.
 An interface body contains only method signatures, each ended with `;`.
 An interface cannot declare fields, constructors, or method bodies, and it cannot extend or implement anything.
 A throwing interface method must list its thrown types explicitly (`load(string path) -> string throws IOError;`), the same rule as abstract methods.
@@ -305,7 +317,9 @@ Allows `new Renderer();`
 
 In both cases, the path is `/src/engine/renderer.ens` and the file contains a public `Renderer` class.
 
-Only `public` declarations are accessible from another module. Types (classes and structs) may be brought into scope by name as above, but free functions are always called through their module namespace, never imported by name: write `import engine.renderer;` then call `renderer.configure()`. Importing a function by name (`import configure from engine.renderer;`) is an error.
+A module's private declarations never leave its file; `public` declarations are visible to every module in the same package, and `export` declarations also to the packages that consume it.
+Types (classes and structs) may be brought into scope by name as above, but free functions are always called through their module namespace, never imported by name: write `import engine.renderer;` then call `renderer.configure()`.
+Importing a function by name (`import configure from engine.renderer;`) is an error.
 
 Two modules may import each other: circular imports are allowed, and declarations resolve across the cycle like any other import.
 
@@ -315,6 +329,11 @@ Importing from packages follows the format `@packageorg.packagename.path`.
 import @std.fs.file; // for external dependency /src/std/fs/file.ens
 import Observable from @alexdicy.reactivity.observable; // for class Observable in external dependency /src/alexdicy/reactivity/observable.ens
 ```
+
+A package boundary is crossed exactly when a module is consumed through an `@` import from another package, including `@std`.
+Only `export` declarations are visible across that boundary; `public` stops at the edge of the declaring package.
+A program and its tests form one package, so tests see the `public` declarations of the sources they test.
+Protected members of an exported non-final class are visible to subclasses in consuming packages too; no `export protected` spelling exists or is needed.
 
 Methods that can throw exceptions are marked with `throws`; any other method can be considered safe. Every thrown value must be an instance of `Error` or a subclass of it. For most methods the set of throwable types is computed by the compiler and shown by IDEs on hover. A method may also declare its thrown types explicitly — `read() -> bytes throws IOError` or `read() -> bytes throws IOError, ParseError`, which is required for abstract methods and forms a contract: an override may throw those types or their subclasses, never others.
 
@@ -1063,7 +1082,7 @@ The compiler performs **escape analysis** to elide retain/release pairs and larg
 
 ---
 
-The standard library is an external package, imported with `@`, and is opt-in: its declarations are visible only after they are imported. The `std.system` module wraps common operating system facilities and reports failures as exceptions. Import the module to call its functions through the `system` namespace, and import any types you use by name:
+The standard library is an external package, imported with `@`, and is opt-in: its exported declarations are visible only after they are imported. The `std.system` module wraps common operating system facilities and reports failures as exceptions. Import the module to call its functions through the `system` namespace, and import any types you use by name:
 
 ```ens
 import @std.system;
