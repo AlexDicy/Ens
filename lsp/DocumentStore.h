@@ -21,8 +21,8 @@ struct WorkspaceModules {
 };
 
 // The build roots a file resolves against: its `src/` root, the `tests/` root when the file
-// itself is a test, the folder to read dependencies.txt from, and whether packages apply.
-// A file with no governing dependencies.txt falls back to a single source root and no deps.
+// itself is a test, the folder holding the governing ens.package, and whether packages apply.
+// A file with no governing manifest falls back to a single source root and no deps.
 struct ResolvedWorkspace {
     std::filesystem::path depsFolder;
     std::filesystem::path srcRoot;
@@ -97,7 +97,7 @@ public:
     // under it, otherwise the file's own directory.
     std::filesystem::path sourceRootFor(const std::filesystem::path& fileAbs) const;
 
-    // Resolve a file to its build roots by walking up for a dependencies.txt (like the
+    // Resolve a file to its build roots by walking up for an ens.package manifest (like the
     // compiler). Each file resolves independently, so several nested ens workspaces can
     // coexist under one editor session.
     ResolvedWorkspace resolveWorkspaceFor(const std::filesystem::path& fileAbs) const;

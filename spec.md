@@ -336,6 +336,73 @@ Only `export` declarations are visible across that boundary; `public` stops at t
 A program and its tests form one package, so tests see the `public` declarations of the sources they test.
 Protected members of an exported non-final class are visible to subclasses in consuming packages too; no `export protected` spelling exists or is needed.
 
+---
+
+Every package is described by an `ens.package` manifest in its root folder.
+The manifest uses declaration notation: each declaration is introduced by a keyword, package names are dotted paths, physical values such as versions and folders are string literals, and a blockless declaration ends with `;`.
+Comments work exactly as in source files.
+A manifest holds exactly one declaration, either a package or a workspace.
+
+```ens
+package alex.jsonkit {
+    version "1.3.0";
+    ens "1.2";
+
+    dependency ens.frontend;
+    dependency alex.json "2.0";
+
+    native zlib;
+    native libc system;
+    native llvm {
+        windows "LLVM-C";
+        linux "LLVM-18";
+        macos "LLVM";
+    }
+}
+```
+
+A package's sources live in its `src/` folder, with its tests in a sibling `tests/` folder.
+`version` and `ens` are optional and informational: `version` is the package's own version in dotted numerals, and `ens` names the language version the package targets as major.minor.
+Each `dependency` declares a package this one may import with `@`: the leading segments of an `@` import select the dependency with the longest matching name, and the remaining segments name the module inside it.
+
+A workspace groups packages that are developed together.
+Its manifest lists the member folders, each relative to the manifest and written with forward slashes:
+
+```ens
+workspace {
+    member "syntaxgen";
+    member "frontend";
+    member "sema";
+}
+```
+
+Every member folder must itself contain a package manifest.
+Dependencies resolve by name against the workspace: `dependency ens.frontend;` in one member finds the member whose manifest declares `package ens.frontend`, wherever that folder sits, so package names must be unique within a workspace.
+A dependency that resolves to a workspace member never carries a version; members are used exactly as checked out.
+There is no package registry yet, so a dependency must resolve to a workspace member or an override, and anything else is reported as having no source.
+`@std` is built in and is never declared as a dependency.
+
+The compiler finds the governing manifest by walking up from the compiled sources to the nearest folder containing `ens.package`, the way `git` finds a repository from a subfolder.
+A file with no manifest anywhere above it compiles standalone, with only `@std` available.
+
+Overrides redirect a dependency to a local folder, for example to build against a fix in a package checked out elsewhere.
+They live in an `ens.overrides` file next to the manifest, and that file is meant to stay out of version control: overrides describe one machine's checkout, not the project.
+
+```ens
+overrides {
+    override alex.library "../library";
+}
+```
+
+Only the overrides next to the root manifest of a build apply, and they apply build-wide: every dependency on the overridden name, in every package of the build, resolves to the given folder.
+The target folder's manifest must declare exactly the overridden package name, a dependency resolving to an override never carries a version, and every build that uses an override prints a notice.
+
+`native` declarations name the native libraries the package's `external` blocks bind to (see the section on native calls), and tell the linker what to link.
+`native libc system;` declares a library the platform links by default, so nothing extra is passed to the linker.
+`native zlib;` links the library under its conventional platform name.
+The block form spells out base names per platform (`windows`, `linux`, `macos`), several per platform when needed.
+When two packages in one build declare the same native library, the declarations must be identical; identical declarations are linked once.
+
 Methods that can throw exceptions are marked with `throws`; any other method can be considered safe. Every thrown value must be an instance of `Error` or a subclass of it. For most methods the set of throwable types is computed by the compiler and shown by IDEs on hover. A method may also declare its thrown types explicitly — `read() -> bytes throws IOError` or `read() -> bytes throws IOError, ParseError`, which is required for abstract methods and forms a contract: an override may throw those types or their subclasses, never others.
 
 If any exception is not handled and the method is not marked as `throws`, this should result in a compilation error explaining which exceptions were not handled and how to handle them (either with a `catch` block or via the `throws` keyword).
@@ -1023,7 +1090,7 @@ Native libraries can be called from Ens through `external` declarations. They ar
 ```ens
 external type HANDLE;
 
-external from "kernel32" {
+external from kernel32 {
     ReadFile(HANDLE h, byte[] buf, uint n, out uint bytesRead, HANDLE? ov) -> int;
     CloseHandle(HANDLE h) -> int;
 }
@@ -1039,7 +1106,7 @@ read(HANDLE h, byte[] buf) -> uint {
 ```
 
 - `external type Name;` declares an opaque foreign handle. The handle is passed around and compared with `null`, but it has no members.
-- `external from "libname" { ... }` groups foreign function signatures. The library name is what the linker will look for (e.g. `"kernel32"` resolves to `kernel32.lib` on Windows; `"c"` is libc on Unix and is auto-linked).
+- `external from libname { ... }` groups foreign function signatures. The name is an identifier naming a native library declared in the package's `ens.package` manifest (here `native kernel32;`); using an undeclared name is an error, and the manifest's declaration tells the linker what to link (see the packages section). `libc` is the platform C runtime, declared `native libc system;` and linked by default.
 - The `out` modifier marks a parameter the C function writes back to. At the call site, the caller passes an initialized local variable as `out name`. The variable's type must match the declared parameter type exactly.
 - A `string` argument is converted automatically to a NUL-terminated UTF-8 buffer at the call boundary. The C function must not retain that pointer past the call.
 

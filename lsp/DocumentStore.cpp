@@ -168,7 +168,7 @@ WorkspaceModules DocumentStore::buildWorkspaceModules(const fs::path& forFile) c
     WorkspaceModules workspace;
 
     // Scope the graph to the file's own workspace so nested workspaces stay isolated. A file
-    // with no dependencies.txt falls back to the single workspace-root hint (flat project).
+    // with no ens.package manifest falls back to the single workspace-root hint (flat project).
     fs::path depsFolder, srcRoot, testsRoot;
     bool withDependencies;
     fs::path wsRoot = ens::modules::discoverWorkspaceRoot(forFile.parent_path());
