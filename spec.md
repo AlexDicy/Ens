@@ -18,6 +18,7 @@ Enum cases follow their enum.
 A member may not be declared more visible than the type that contains it: an `export` method on a `public` class is an error, never a silent cap.
 Writing the default explicitly, such as `private` on a class member, is allowed.
 A declaration's signature may not mention a type less visible than the declaration itself; this covers parameter types, the return type, declared thrown types, field types, a base class, implemented interfaces, and generic arguments and bounds.
+A protected member is held to the same rule at the widest scope its class can be subclassed from: the file for a `final`, `sealed`, or file-private class, the package for an open `public` class, and everywhere for an open `export` class, whose external subclassers must be able to name every type its protected members mention.
 A `test` declaration sees its file's private top-level declarations like any other code in the file, but not the private members of types.
 
 ```ens

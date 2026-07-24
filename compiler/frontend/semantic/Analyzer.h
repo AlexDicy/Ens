@@ -503,11 +503,17 @@ private:
                                        const std::u16string& declPackagePrefix) const;
     std::string invisibleTypeMessage(const std::u16string& name, const Type* t) const;
     void checkCallableSignatureVisibility(const ast::FuncDecl& fn, Visibility declVisibility,
-                                          const std::string& declPhrase);
+                                          const std::string& declPhrase,
+                                          StructInfo* protectedOwner = nullptr);
     void checkTypeParamBoundsVisibility(const std::vector<ast::TypeParam>& params,
-                                        Visibility declVisibility, const std::string& declPhrase);
+                                        Visibility declVisibility, const std::string& declPhrase,
+                                        StructInfo* protectedOwner = nullptr);
     void checkMentionedType(const ast::TypeReference& tr, Visibility declVisibility,
-                            const std::string& declPhrase, const std::string& role);
+                            const std::string& declPhrase, const std::string& role,
+                            StructInfo* protectedOwner = nullptr);
+    void checkMentionedTypeValue(Type* t, const SyntaxNode& diagNode, Visibility declVisibility,
+                                 const std::string& declPhrase, const std::string& role,
+                                 StructInfo* protectedOwner = nullptr);
 
     // True if `t` can be considered non-null without an initializer. The visiting
     // set keeps a struct-containment cycle (reported separately) from recursing forever.

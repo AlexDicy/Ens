@@ -407,8 +407,8 @@ class ModuleChecks {
             string declPhrase = "Struct '{structType.name()}'";
             this.checkBoundLeaks(structType.typeParameterTypes(), structType.visibility(),
                 declPhrase, node.name().span());
-            this.checkMemberLeaks("struct", structType.name(), structType.fields(), 0,
-                structType.methods());
+            this.checkMemberLeaks("struct", structType, structType.fields(), 0,
+                structType.methods(), Visibility.Protected);
         }
         for (long i = 0; i < this.classNodes.length(); i++) {
             let node = this.classNodes.get(i);
@@ -421,8 +421,9 @@ class ModuleChecks {
             this.checkImplementedInterfaceLeaks(classType, node, declPhrase);
             this.checkBoundLeaks(classType.typeParameterTypes(), classType.visibility(),
                 declPhrase, node.name().span());
-            this.checkMemberLeaks("class", classType.name(), classType.fields(),
-                classType.baseFieldCount(), classType.methods());
+            this.checkMemberLeaks("class", classType, classType.fields(),
+                classType.baseFieldCount(), classType.methods(),
+                protectedMemberReach(classType));
         }
         for (long i = 0; i < this.interfaceNodes.length(); i++) {
             let node = this.interfaceNodes.get(i);
@@ -493,73 +494,115 @@ class ModuleChecks {
         }
     }
 
-    checkMemberLeaks(string ownerKindWord, string ownerName, List<Field> fields,
-                     long firstOwnField, List<Method> methods) {
-        string owner = "{ownerKindWord} '{ownerName}'";
+    // A protected member checks against its class's subclass reach instead of its own tier;
+    // protectedOwner carries the class into the protected message shape.
+    checkMemberLeaks(string ownerKindWord, DeclaredType ownerType, List<Field> fields,
+                     long firstOwnField, List<Method> methods, Visibility protectedReach) {
+        string owner = "{ownerKindWord} '{ownerType.name()}'";
         for (long i = firstOwnField; i < fields.length(); i++) {
             let field = fields.get(i);
-            if (types.visibilityTier(field.visibility()) == 0) {
+            Visibility effective = field.visibility();
+            DeclaredType? protectedOwner = null;
+            if (effective == Visibility.Protected) {
+                effective = protectedReach;
+                if (types.visibilityTier(effective) > 0) {
+                    protectedOwner = ownerType;
+                }
+            }
+            if (types.visibilityTier(effective) == 0) {
                 continue;
             }
-            this.checkMentionedType(field.type(), field.visibility(),
-                "Field '{field.name()}' of {owner}", "type", field.nameSpan());
+            this.checkMentionedType(field.type(), effective,
+                "Field '{field.name()}' of {owner}", "type", field.nameSpan(),
+                protectedOwner);
         }
         for (long i = 0; i < methods.length(); i++) {
             let method = methods.get(i);
+            Visibility effective = method.visibility();
+            DeclaredType? protectedOwner = null;
+            if (effective == Visibility.Protected) {
+                effective = protectedReach;
+                if (types.visibilityTier(effective) > 0) {
+                    protectedOwner = ownerType;
+                }
+            }
             string memberWord = "Method '{method.name()}'";
             if (method.isConstructor()) {
                 memberWord = "Constructor";
             }
-            this.checkCallableLeaks(method.signature(), method.visibility(),
-                memberWord + " of " + owner);
+            this.checkCallableLeaks(method.signature(), effective,
+                memberWord + " of " + owner, protectedOwner);
         }
     }
 
-    checkCallableLeaks(Signature signature, Visibility declVisibility, string declPhrase) {
+    checkCallableLeaks(Signature signature, Visibility declVisibility, string declPhrase,
+                       DeclaredType? protectedOwner = null) {
         if (types.visibilityTier(declVisibility) == 0) {
             return;
         }
         for (let parameter in signature.parameters()) {
             this.checkMentionedType(parameter.type(), declVisibility, declPhrase,
-                "parameter type", parameter.span());
+                "parameter type", parameter.span(), protectedOwner);
         }
         this.checkMentionedType(signature.returnType(), declVisibility, declPhrase,
-            "return type", signature.nameSpan());
+            "return type", signature.nameSpan(), protectedOwner);
         Type[] thrown = signature.throwsTypes();
         Span[] thrownSpans = signature.throwsTypeSpans();
         for (long i = 0; i < thrown.length; i++) {
             this.checkMentionedType(thrown[i], declVisibility, declPhrase, "thrown type",
-                thrownSpans[i]);
+                thrownSpans[i], protectedOwner);
         }
         this.checkBoundLeaks(signature.typeParameters(), declVisibility, declPhrase,
-            signature.nameSpan());
+            signature.nameSpan(), protectedOwner);
     }
 
     checkBoundLeaks(TypeParamType[] parameters, Visibility declVisibility, string declPhrase,
-                    Span at) {
+                    Span at, DeclaredType? protectedOwner = null) {
         if (types.visibilityTier(declVisibility) == 0) {
             return;
         }
         for (let parameter in parameters) {
             for (let bound in parameter.bounds()) {
                 this.checkMentionedType(bound, declVisibility, declPhrase,
-                    "type-parameter bound", at);
+                    "type-parameter bound", at, protectedOwner);
             }
         }
     }
 
     checkMentionedType(Type mentioned, Visibility declVisibility, string declPhrase,
-                       string role, Span at) {
+                       string role, Span at, DeclaredType? protectedOwner = null) {
         let worst = leastVisibleMention(mentioned);
         if (worst == null || types.visibilityTier(worst.visibility())
                 >= types.visibilityTier(declVisibility)) {
             return;
         }
-        this.reporter.report("{declPhrase} is visible as "
-            + "'{types.visibilityWord(declVisibility)}' but its {role} mentions "
+        string needed = types.visibilityWord(declVisibility);
+        if (protectedOwner != null) {
+            string reach = "subclasses anywhere in the package";
+            if (declVisibility == Visibility.Export) {
+                reach = "subclasses in other packages";
+            }
+            this.reporter.report("{declPhrase} is protected, and '{protectedOwner.name()}' "
+                + "is an open {needed} class whose {reach} can reach it, but its {role} "
+                + "mentions '{worst.name()}', which is {notNameablePhrase(worst)}. Mark "
+                + "'{worst.name()}' as '{needed}', lower '{protectedOwner.name()}', or mark "
+                + "'{protectedOwner.name()}' 'final'.", at);
+            return;
+        }
+        this.reporter.report("{declPhrase} is visible as '{needed}' but its {role} mentions "
             + "'{worst.name()}', which is {notNameablePhrase(worst)}. Mark '{worst.name()}' "
-            + "as '{types.visibilityWord(declVisibility)}', or lower the declaration.", at);
+            + "as '{needed}', or lower the declaration.", at);
     }
+}
+
+// The widest scope from which a class can legally be subclassed, which is the leakage floor
+// of its protected members: every subclasser must be able to name the types those members
+// mention.
+protectedMemberReach(ClassType classType) -> Visibility {
+    if (classType.isFinal() || classType.isSealed()) {
+        return Visibility.Protected;
+    }
+    return classType.visibility();
 }
 
 // The least-visible declared type mentioned anywhere inside the type: arrays and optionals

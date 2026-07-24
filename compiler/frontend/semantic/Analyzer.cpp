@@ -4332,50 +4332,86 @@ static std::string invisibleTypePhrase(const StructInfo* si) {
     return "only public inside " + packageName;
 }
 
-void Analyzer::checkMentionedType(const ast::TypeReference& tr, Visibility declVisibility,
-                                  const std::string& declPhrase, const std::string& role) {
-    Type* t = analysis.typeOf(tr.node.greenNode());
+// The widest scope from which a class can legally be subclassed, which is the
+// leakage floor of its protected members: every subclasser must be able to name
+// the types those members mention.
+static Visibility protectedMemberReach(const StructInfo* si) {
+    if (!si || si->isFinal || si->isSealed) return Visibility::Protected;
+    return si->visibility;
+}
+
+void Analyzer::checkMentionedTypeValue(Type* t, const SyntaxNode& diagNode,
+                                       Visibility declVisibility, const std::string& declPhrase,
+                                       const std::string& role, StructInfo* protectedOwner) {
     if (!t) return;
     const StructInfo* worst = nullptr;
     collectLeastVisible(t, worst);
     if (!worst || visibilityTier(worst->visibility) >= visibilityTier(declVisibility)) return;
     std::string mentioned = asciiOf(worst->name);
-    errorAtNode(tr.node, declPhrase + " is visible as '" + visibilityWord(declVisibility) +
+    std::string needed = visibilityWord(declVisibility);
+    if (protectedOwner) {
+        std::string owner = asciiOf(protectedOwner->name);
+        std::string reach = declVisibility == Visibility::Export
+            ? "subclasses in other packages" : "subclasses anywhere in the package";
+        errorAtNode(diagNode, declPhrase + " is protected, and '" + owner + "' is an open " +
+            needed + " class whose " + reach + " can reach it, but its " + role +
+            " mentions '" + mentioned + "', which is " + invisibleTypePhrase(worst) +
+            ". Mark '" + mentioned + "' as '" + needed + "', lower '" + owner +
+            "', or mark '" + owner + "' 'final'.");
+        return;
+    }
+    errorAtNode(diagNode, declPhrase + " is visible as '" + needed +
         "' but its " + role + " mentions '" + mentioned + "', which is " +
-        invisibleTypePhrase(worst) + ". Mark '" + mentioned + "' as '" +
-        visibilityWord(declVisibility) + "', or lower the declaration.");
+        invisibleTypePhrase(worst) + ". Mark '" + mentioned + "' as '" + needed +
+        "', or lower the declaration.");
+}
+
+void Analyzer::checkMentionedType(const ast::TypeReference& tr, Visibility declVisibility,
+                                  const std::string& declPhrase, const std::string& role,
+                                  StructInfo* protectedOwner) {
+    checkMentionedTypeValue(analysis.typeOf(tr.node.greenNode()), tr.node, declVisibility,
+                            declPhrase, role, protectedOwner);
 }
 
 void Analyzer::checkTypeParamBoundsVisibility(const std::vector<ast::TypeParam>& params,
                                               Visibility declVisibility,
-                                              const std::string& declPhrase) {
+                                              const std::string& declPhrase,
+                                              StructInfo* protectedOwner) {
     for (auto& tp : params) {
         for (auto& bound : tp.bounds()) {
-            checkMentionedType(bound, declVisibility, declPhrase, "type-parameter bound");
+            checkMentionedType(bound, declVisibility, declPhrase, "type-parameter bound",
+                               protectedOwner);
         }
     }
 }
 
 void Analyzer::checkCallableSignatureVisibility(const ast::FuncDecl& fn,
                                                 Visibility declVisibility,
-                                                const std::string& declPhrase) {
-    // Protected members reach subclasses through the receiver, not by name; their
-    // guaranteed reach is the declaring file, which mentions everything.
+                                                const std::string& declPhrase,
+                                                StructInfo* protectedOwner) {
     if (visibilityTier(declVisibility) == 0) return;
-    for (auto& p : fn.parameters()) {
-        if (auto tr = p.typeReference()) {
-            checkMentionedType(*tr, declVisibility, declPhrase, "parameter type");
+    const ResolutionInfo* info = analysis.find(fn.node.greenNode());
+    Symbol* sym = info ? info->resolvedSymbol : nullptr;
+    auto params = fn.parameters();
+    for (size_t i = 0; i < params.size(); ++i) {
+        if (auto tr = params[i].typeReference()) {
+            checkMentionedType(*tr, declVisibility, declPhrase, "parameter type",
+                               protectedOwner);
+        } else if (params[i].isThisField() && sym && i < sym->paramTypes.size()) {
+            // A `this.field` shorthand parameter mentions the field's type.
+            checkMentionedTypeValue(sym->paramTypes[i], params[i].node, declVisibility,
+                                    declPhrase, "parameter type", protectedOwner);
         }
     }
     if (auto rt = fn.returnType()) {
         if (auto tr = rt->typeReference()) {
-            checkMentionedType(*tr, declVisibility, declPhrase, "return type");
+            checkMentionedType(*tr, declVisibility, declPhrase, "return type", protectedOwner);
         }
     }
     for (auto& tr : fn.declaredThrowsTypes()) {
-        checkMentionedType(tr, declVisibility, declPhrase, "thrown type");
+        checkMentionedType(tr, declVisibility, declPhrase, "thrown type", protectedOwner);
     }
-    checkTypeParamBoundsVisibility(fn.typeParams(), declVisibility, declPhrase);
+    checkTypeParamBoundsVisibility(fn.typeParams(), declVisibility, declPhrase, protectedOwner);
 }
 
 void Analyzer::checkSignatureVisibility() {
@@ -4402,24 +4438,34 @@ void Analyzer::checkSignatureVisibility() {
         }
         return Visibility::Private;
     };
-    auto checkMembers = [&](StructInfo* si, const std::string& kindWord,
+    auto checkMembers = [&](StructInfo* si, const std::string& kindWord, bool isClass,
                             const std::vector<ast::FieldDecl>& fields,
                             const std::vector<ast::FuncDecl>& methods) {
         std::string owner = kindWord + " '" + asciiOf(si->name) + "'";
+        auto effectiveReach = [&](Visibility v, StructInfo*& protectedOwner) {
+            protectedOwner = nullptr;
+            if (v != Visibility::Protected || !isClass) return v;
+            Visibility reach = protectedMemberReach(si);
+            if (visibilityTier(reach) > 0) protectedOwner = si;
+            return reach;
+        };
         for (auto& f : fields) {
-            Visibility v = fieldVisibilityOf(si, f);
+            StructInfo* protectedOwner = nullptr;
+            Visibility v = effectiveReach(fieldVisibilityOf(si, f), protectedOwner);
             if (visibilityTier(v) == 0) continue;
             if (auto tr = f.typeReference()) {
                 checkMentionedType(*tr, v, "Field '" +
                     asciiOf(f.nameText().value_or(std::u16string{})) + "' of " + owner,
-                    "type");
+                    "type", protectedOwner);
             }
         }
         for (auto& m : methods) {
-            Visibility v = methodVisibilityOf(si, m);
+            StructInfo* protectedOwner = nullptr;
+            Visibility v = effectiveReach(methodVisibilityOf(si, m), protectedOwner);
             std::string memberWord = m.isConstructor() ? "Constructor" : "Method '" +
                 asciiOf(m.nameText().value_or(std::u16string{})) + "'";
-            checkCallableSignatureVisibility(m, v, memberWord + " of " + owner);
+            checkCallableSignatureVisibility(m, v, memberWord + " of " + owner,
+                                             protectedOwner);
         }
     };
 
@@ -4429,7 +4475,7 @@ void Analyzer::checkSignatureVisibility() {
         StructInfo* si = t->structInfo;
         std::string declPhrase = "Struct '" + asciiOf(si->name) + "'";
         checkTypeParamBoundsVisibility(sd.typeParams(), si->visibility, declPhrase);
-        checkMembers(si, "struct", sd.fields(), sd.methods());
+        checkMembers(si, "struct", false, sd.fields(), sd.methods());
     }
 
     for (auto& cd : sf.classes()) {
@@ -4457,7 +4503,7 @@ void Analyzer::checkSignatureVisibility() {
             }
         }
         checkTypeParamBoundsVisibility(cd.typeParams(), si->visibility, declPhrase);
-        checkMembers(si, "class", cd.fields(), cd.methods());
+        checkMembers(si, "class", true, cd.fields(), cd.methods());
     }
 
     for (auto& id : sf.interfaces()) {
