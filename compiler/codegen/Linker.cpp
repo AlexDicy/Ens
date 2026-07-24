@@ -138,8 +138,8 @@ std::vector<std::string> buildArgv(LinkerFlavor flavor,
             args.push_back("/defaultlib:oldnames");
             args.push_back("/defaultlib:kernel32");   // RtlCaptureStackBackTrace for stack traces
             for (auto& lib : libraries) {
-                // libc and msvcrt are already covered by the defaultlibs above.
-                if (lib == "c" || lib == "msvcrt" || lib == "libcmt") continue;
+                // The C runtime is already covered by the defaultlibs above.
+                if (lib == "msvcrt" || lib == "libcmt") continue;
                 args.push_back(lib + ".lib");
             }
             return args;
@@ -162,7 +162,7 @@ std::vector<std::string> buildArgv(LinkerFlavor flavor,
             args.push_back(exe);
             args.push_back("-lSystem");
             for (auto& lib : libraries) {
-                if (lib == "c" || lib == "System") continue;  // auto-linked
+                if (lib == "System") continue;  // auto-linked
                 args.push_back("-l" + lib);
             }
             return args;
@@ -195,7 +195,6 @@ std::vector<std::string> buildArgv(LinkerFlavor flavor,
             for (auto& o : objs) args.push_back(o);
 
             for (auto& lib : libraries) {
-                if (lib == "c") continue;  // libc is added explicitly below
                 args.push_back("-l" + lib);
             }
             appendUnwinder(args);

@@ -1,9 +1,7 @@
 #include "module/Workspace.h"
 
-#include <cctype>
-#include <fstream>
-#include <sstream>
 #include <system_error>
+#include <utility>
 
 namespace ens::modules {
 
@@ -23,63 +21,8 @@ std::u16string toU16(std::string_view s) {
     return out;
 }
 
-std::string trim(std::string_view s) {
-    size_t begin = 0;
-    size_t end = s.size();
-    while (begin < end && std::isspace(static_cast<unsigned char>(s[begin]))) ++begin;
-    while (end > begin && std::isspace(static_cast<unsigned char>(s[end - 1]))) --end;
-    return std::string(s.substr(begin, end - begin));
-}
-
-// Parse `folder/dependencies.txt` into `deps`, resolving each value against `folder`.
-// Malformed lines are appended to `errors` and skipped; a missing file is not an error.
-void loadDependencies(const fs::path& folder,
-                      std::unordered_map<std::u16string, fs::path>& deps,
-                      std::vector<std::string>& errors) {
-    fs::path depFile = folder / "dependencies.txt";
-    std::error_code ec;
-    if (!fs::exists(depFile, ec)) return;
-
-    std::ifstream file(depFile);
-    if (!file) {
-        errors.push_back("Could not read " + depFile.string());
-        return;
-    }
-
-    std::string line;
-    int lineNumber = 0;
-    while (std::getline(file, line)) {
-        ++lineNumber;
-        std::string trimmed = trim(line);
-        if (trimmed.empty() || trimmed[0] == '#') continue;
-
-        auto at = [&](const std::string& message) {
-            return depFile.string() + ":" + std::to_string(lineNumber) + ": " + message;
-        };
-
-        if (trimmed[0] != '@') {
-            errors.push_back(at("dependency lines must start with '@', got '" + trimmed + "'"));
-            continue;
-        }
-        auto eq = trimmed.find('=');
-        if (eq == std::string::npos) {
-            errors.push_back(at("expected '@package.name=path', missing '='"));
-            continue;
-        }
-        std::string key = trim(std::string_view(trimmed).substr(1, eq - 1));
-        std::string value = trim(std::string_view(trimmed).substr(eq + 1));
-        if (key.empty() || value.empty()) {
-            errors.push_back(at("expected '@package.name=path'"));
-            continue;
-        }
-
-        std::u16string packageKey = toU16(key);
-        if (deps.count(packageKey)) {
-            errors.push_back(at("duplicate dependency '@" + key + "'"));
-            continue;
-        }
-        deps.emplace(std::move(packageKey), (folder / value).lexically_normal());
-    }
+std::string positionOf(const std::string& manifestPath, int line, int column) {
+    return manifestPath + ":" + std::to_string(line) + ":" + std::to_string(column) + ": ";
 }
 
 }  // namespace
@@ -89,7 +32,7 @@ std::optional<PackageMatch> matchPackage(
     const std::vector<std::u16string>& segments) {
     if (deps.empty() || segments.empty()) return std::nullopt;
 
-    // Try the longest prefix first so `@a.b.c` prefers key `a.b` over key `a`.
+    // Try the longest prefix first so `@a.b.c` prefers the package `a.b` over the package `a`.
     for (size_t count = segments.size(); count >= 1; --count) {
         std::u16string key;
         for (size_t i = 0; i < count; ++i) {
@@ -109,40 +52,303 @@ fs::path discoverWorkspaceRoot(const fs::path& startDir) {
     dir = dir.lexically_normal();
 
     for (fs::path d = dir;; d = d.parent_path()) {
-        if (fs::exists(d / "dependencies.txt", ec)) return d;
+        if (fs::exists(d / "ens.package", ec)) return d;
         if (d == d.parent_path()) break;
     }
     return {};
 }
 
 Workspace& WorkspaceRegistry::create(const fs::path& folder, const fs::path& srcRoot,
-                                     const fs::path& testsRoot, std::u16string prefix,
-                                     bool withDependencies) {
+                                     const fs::path& testsRoot, std::u16string prefix) {
     auto ws = std::make_unique<Workspace>();
     ws->root = folder;
     ws->srcRoot = srcRoot;
     ws->testsRoot = testsRoot;
     ws->packagePrefix = std::move(prefix);
-    if (withDependencies) loadDependencies(folder, ws->deps, errors_);
 
     Workspace* raw = ws.get();
-    byFolder_.emplace(canonicalFolderKey(folder), raw);
     owned_.push_back(std::move(ws));
     return *raw;
 }
 
+const Manifest& WorkspaceRegistry::manifestFor(const fs::path& manifestFile) {
+    std::string key = canonicalFolderKey(manifestFile);
+    auto it = manifests_.find(key);
+    if (it != manifests_.end()) return it->second;
+    Manifest manifest = loadManifestFile(manifestFile, errors_);
+    return manifests_.emplace(std::move(key), std::move(manifest)).first->second;
+}
+
+const WorkspaceRegistry::MemberIndex& WorkspaceRegistry::memberIndexFor(const fs::path& folder) {
+    std::string key = canonicalFolderKey(folder);
+    auto cached = memberIndexes_.find(key);
+    if (cached != memberIndexes_.end()) return cached->second;
+
+    MemberIndex index;
+    fs::path manifestFile = folder / "ens.package";
+    std::error_code ec;
+    if (fs::exists(manifestFile, ec)) {
+        const Manifest& manifest = manifestFor(manifestFile);
+        if (manifest.form == ManifestForm::Workspace) {
+            index.isWorkspace = true;
+            std::string manifestPath = manifestFile.string();
+            for (const auto& member : manifest.members) {
+                auto at = [&] { return positionOf(manifestPath, member.line, member.column); };
+                fs::path memberFolder = (folder / member.folder).lexically_normal();
+                fs::path memberManifest = memberFolder / "ens.package";
+                if (!fs::exists(memberManifest, ec)) {
+                    errors_.push_back(at() + "Workspace member \"" + member.folder +
+                                      "\" has no ens.package manifest; every member folder "
+                                      "declares a package.");
+                    continue;
+                }
+                const Manifest& memberDeclaration = manifestFor(memberManifest);
+                if (memberDeclaration.form != ManifestForm::Package) {
+                    errors_.push_back(at() + "Workspace member \"" + member.folder +
+                                      "\" must declare a package.");
+                    continue;
+                }
+                const std::string& name = memberDeclaration.packageName;
+                auto existing = index.foldersByName.find(name);
+                if (existing != index.foldersByName.end()) {
+                    errors_.push_back(at() + "Members \"" + existing->second.string() +
+                                      "\" and \"" + memberFolder.string() + "\" both declare "
+                                      "package '" + name + "'; package names must be unique "
+                                      "within a workspace.");
+                    continue;
+                }
+                index.foldersByName.emplace(name, memberFolder);
+                index.memberFolderKeys.insert(canonicalFolderKey(memberFolder));
+            }
+        }
+    }
+    return memberIndexes_.emplace(std::move(key), std::move(index)).first->second;
+}
+
+// The member index a package resolves its dependencies against: the nearest ancestor holding a
+// workspace-form manifest, and only when that workspace lists the package as a member.
+const WorkspaceRegistry::MemberIndex* WorkspaceRegistry::enclosingMemberIndex(
+        const fs::path& packageFolder) {
+    std::error_code ec;
+    fs::path folder = fs::absolute(packageFolder, ec);
+    if (ec) folder = packageFolder;
+    folder = folder.lexically_normal();
+    std::string packageKey = canonicalFolderKey(folder);
+
+    for (fs::path d = folder.parent_path();; d = d.parent_path()) {
+        if (d.empty()) break;
+        if (fs::exists(d / "ens.package", ec)) {
+            const MemberIndex& index = memberIndexFor(d);
+            if (index.isWorkspace) {
+                return index.memberFolderKeys.count(packageKey) ? &index : nullptr;
+            }
+        }
+        if (d == d.parent_path()) break;
+    }
+    return nullptr;
+}
+
+void WorkspaceRegistry::applyPackageManifest(Workspace& ws, const Manifest& manifest) {
+    ws.hasPackageManifest = true;
+    ws.packageName = toU16(manifest.packageName);
+    ws.natives = manifest.natives;
+    for (const auto& native : manifest.natives) {
+        ws.nativeNames.push_back(toU16(native.name));
+    }
+    resolveDependencies(ws, manifest);
+}
+
+void WorkspaceRegistry::resolveDependencies(Workspace& ws, const Manifest& manifest) {
+    const MemberIndex* enclosing = nullptr;
+    bool enclosingComputed = false;
+    for (const auto& dependency : manifest.dependencies) {
+        auto at = [&] {
+            return positionOf(ws.manifestPath, dependency.line, dependency.column);
+        };
+        auto overridden = overrides_.find(dependency.name);
+        if (overridden != overrides_.end()) {
+            if (dependency.hasVersion) {
+                errors_.push_back(at() + "Dependency '" + dependency.name + "' resolves to "
+                                  "the override at " + overridden->second.string() + "; a "
+                                  "local override is used as-is, so remove the version \"" +
+                                  dependency.version + "\".");
+            }
+            ws.deps.emplace(toU16(dependency.name), overridden->second);
+            continue;
+        }
+        if (!enclosingComputed) {
+            enclosing = enclosingMemberIndex(ws.root);
+            enclosingComputed = true;
+        }
+        if (enclosing) {
+            auto member = enclosing->foldersByName.find(dependency.name);
+            if (member != enclosing->foldersByName.end()) {
+                if (dependency.hasVersion) {
+                    errors_.push_back(at() + "Dependency '" + dependency.name + "' resolves "
+                                      "to the workspace member at " + member->second.string() +
+                                      "; a member is used as-is, so remove the version \"" +
+                                      dependency.version + "\".");
+                }
+                ws.deps.emplace(toU16(dependency.name), member->second);
+                continue;
+            }
+        }
+        errors_.push_back(at() + "No source for package '" + dependency.name + "': there is "
+                          "no package registry yet, so a dependency must be a member of the "
+                          "enclosing workspace or an override in ens.overrides pointing at a "
+                          "local folder.");
+    }
+}
+
+void WorkspaceRegistry::loadRootOverrides(const fs::path& rootFolder) {
+    fs::path file = rootFolder / "ens.overrides";
+    std::error_code ec;
+    if (!fs::exists(file, ec)) return;
+
+    std::string filePath = file.string();
+    const Manifest& manifest = manifestFor(file);
+    if (manifest.form != ManifestForm::Overrides && manifest.form != ManifestForm::None) {
+        errors_.push_back(filePath + ": An ens.overrides file holds a single overrides "
+                          "declaration; packages and workspaces are declared in ens.package.");
+        return;
+    }
+    for (const auto& override : manifest.overrides) {
+        auto at = [&] { return positionOf(filePath, override.line, override.column); };
+        fs::path target = (rootFolder / override.folder).lexically_normal();
+        fs::path targetManifest = target / "ens.package";
+        if (!fs::exists(targetManifest, ec)) {
+            errors_.push_back(at() + "The override for package '" + override.name +
+                              "' points at " + target.string() + ", which has no ens.package "
+                              "manifest.");
+            continue;
+        }
+        const Manifest& targetDeclaration = manifestFor(targetManifest);
+        if (targetDeclaration.form != ManifestForm::Package) {
+            errors_.push_back(at() + "The override for package '" + override.name +
+                              "' points at " + target.string() + ", which does not declare a "
+                              "package.");
+            continue;
+        }
+        if (targetDeclaration.packageName != override.name) {
+            errors_.push_back(at() + "The override for package '" + override.name +
+                              "' points at " + target.string() + ", which declares package '" +
+                              targetDeclaration.packageName + "' instead; the names must match "
+                              "exactly.");
+            continue;
+        }
+        overrides_.emplace(override.name, target);
+    }
+}
+
+void WorkspaceRegistry::noticeOverrideUse(const std::string& name, const fs::path& folder) {
+    if (!noticedOverrides_.insert(name).second) return;
+    notices_.push_back("Using the override for package '" + name + "' at " + folder.string() +
+                       ".");
+}
+
 Workspace& WorkspaceRegistry::defineRoot(const fs::path& folder, const fs::path& srcRoot,
-                                         const fs::path& testsRoot, bool withDependencies) {
-    return create(folder, srcRoot, testsRoot, std::u16string(), withDependencies);
+                                         const fs::path& testsRoot, bool withManifest) {
+    Workspace& ws = create(folder, srcRoot, testsRoot, std::u16string());
+    byFolder_.emplace(canonicalFolderKey(folder), &ws);
+    if (!withManifest) return ws;
+
+    fs::path manifestFile = folder / "ens.package";
+    ws.manifestPath = manifestFile.string();
+    const Manifest& manifest = manifestFor(manifestFile);
+    loadRootOverrides(folder);
+
+    switch (manifest.form) {
+        case ManifestForm::Package:
+            applyPackageManifest(ws, manifest);
+            break;
+        case ManifestForm::Workspace: {
+            ws.isWorkspaceRoot = true;
+            const MemberIndex& index = memberIndexFor(folder);
+            for (const auto& [name, memberFolder] : index.foldersByName) {
+                ws.deps.emplace(toU16(name), memberFolder);
+            }
+            for (const auto& [name, overrideFolder] : overrides_) {
+                ws.deps[toU16(name)] = overrideFolder;
+            }
+            break;
+        }
+        case ManifestForm::Overrides:
+            errors_.push_back(ws.manifestPath + ": An ens.package file holds a package or "
+                              "workspace declaration; overrides live in the ens.overrides "
+                              "file next to it.");
+            break;
+        case ManifestForm::None:
+            errors_.push_back(ws.manifestPath + ": Expected a 'package' or 'workspace' "
+                              "declaration.");
+            break;
+    }
+    return ws;
 }
 
 Workspace* WorkspaceRegistry::getOrLoad(const fs::path& folder, const std::u16string& prefix) {
-    auto it = byFolder_.find(canonicalFolderKey(folder));
+    std::string key = canonicalFolderKey(folder);
+    for (const auto& [name, overrideFolder] : overrides_) {
+        if (canonicalFolderKey(overrideFolder) == key) {
+            noticeOverrideUse(name, overrideFolder);
+            break;
+        }
+    }
+    auto it = byFolder_.find(key);
     if (it != byFolder_.end()) return it->second;
+
     // A dependency is consumed through its `src/` only; its own tests never take part in a
     // dependent's build, so it carries no tests root (which would otherwise enable the
     // root-only src/tests fallback for its bare imports).
-    return &create(folder, folder / "src", /*testsRoot=*/{}, prefix, /*withDependencies=*/true);
+    Workspace& ws = create(folder, folder / "src", /*testsRoot=*/{}, prefix);
+    byFolder_.emplace(std::move(key), &ws);
+
+    fs::path manifestFile = folder / "ens.package";
+    ws.manifestPath = manifestFile.string();
+    std::error_code ec;
+    if (!fs::exists(manifestFile, ec)) {
+        errors_.push_back("Package folder " + folder.string() + " has no ens.package "
+                          "manifest.");
+        return &ws;
+    }
+    const Manifest& manifest = manifestFor(manifestFile);
+    if (manifest.form == ManifestForm::Package) {
+        applyPackageManifest(ws, manifest);
+    } else {
+        errors_.push_back(ws.manifestPath + ": Expected a package declaration; a package "
+                          "consumed as a dependency cannot hold a workspace or overrides "
+                          "declaration.");
+    }
+    return &ws;
+}
+
+Workspace& WorkspaceRegistry::getOrLoadStdlib(const fs::path& stdlibRoot) {
+    std::string key = "std|" + canonicalFolderKey(stdlibRoot);
+    auto it = byFolder_.find(key);
+    if (it != byFolder_.end()) return *it->second;
+
+    Workspace& ws = create(stdlibRoot, stdlibRoot, /*testsRoot=*/{}, u"std");
+    byFolder_.emplace(std::move(key), &ws);
+    if (stdlibRoot.empty()) return ws;
+
+    fs::path manifestFile = stdlibRoot / "std" / "ens.package";
+    std::error_code ec;
+    if (!fs::exists(manifestFile, ec)) return ws;
+    ws.manifestPath = manifestFile.string();
+    const Manifest& manifest = manifestFor(manifestFile);
+    if (manifest.form == ManifestForm::Package) {
+        applyPackageManifest(ws, manifest);
+    }
+    return ws;
+}
+
+std::vector<CollectedNative> WorkspaceRegistry::collectNatives() const {
+    std::vector<CollectedNative> collected;
+    for (const auto& ws : owned_) {
+        for (const auto& native : ws->natives) {
+            collected.push_back({native, ws->manifestPath});
+        }
+    }
+    return collected;
 }
 
 }  // namespace ens::modules

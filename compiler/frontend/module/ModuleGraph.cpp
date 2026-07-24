@@ -214,12 +214,9 @@ bool buildModuleGraphFromSeeds(Workspace& root,
                                std::vector<std::unique_ptr<Module>>& modulesOut,
                                std::unordered_map<std::u16string, Module*>& byPath,
                                const SourceOverrides* overrides) {
-    // A pseudo-workspace for the standard library: its modules keep their full `std.*`
-    // path (no prefix) and live directly under the stdlib root.
-    Workspace stdWs;
-    stdWs.root = stdlibRoot;
-    stdWs.srcRoot = stdlibRoot;
-    stdWs.packagePrefix = u"std";
+    // The standard library workspace: its modules keep their full `std.*` path and live
+    // directly under the stdlib root. `@std` is built in and never declared as a dependency.
+    Workspace& stdWs = registry.getOrLoadStdlib(stdlibRoot);
 
     struct WorkItem {
         Workspace* ws;
@@ -248,6 +245,9 @@ bool buildModuleGraphFromSeeds(Workspace& root,
         auto module = loadOrOverride(item.base, item.rel, item.canonical, overrides);
         if (!module) return false;
         module->packagePrefix = item.ws->packagePrefix;
+        module->restrictNatives = item.ws->hasPackageManifest;
+        module->declaredNatives = item.ws->nativeNames;
+        module->manifestPath = item.ws->manifestPath;
 
         Module* raw = module.get();
         modulesOut.push_back(std::move(module));
@@ -285,12 +285,16 @@ bool buildModuleGraphFromSeeds(Workspace& root,
                 } else {
                     auto match = matchPackage(ws.deps, segs);
                     if (!match) {
-                        if (ws.deps.empty()) {
-                            reportAt("External package '" + asAscii(modPath) +
-                                "' is not available; add it to dependencies.txt (only @std is built in).");
+                        if (ws.hasPackageManifest) {
+                            reportAt("Package '" + asAscii(modPath) + "' is not declared as a "
+                                "dependency in " + ws.manifestPath + ".");
+                        } else if (ws.isWorkspaceRoot) {
+                            reportAt("Package '" + asAscii(modPath) + "' is not a member of "
+                                "the workspace at " + ws.manifestPath + ".");
                         } else {
-                            reportAt("Package '" + asAscii(modPath) + "' is not listed in " +
-                                (ws.root / "dependencies.txt").string() + ".");
+                            reportAt("External package '" + asAscii(modPath) + "' is not "
+                                "available; these sources have no ens.package manifest "
+                                "(only '@std' is built in).");
                         }
                         continue;
                     }
@@ -414,6 +418,7 @@ bool analyzeModuleGraph(std::vector<std::unique_ptr<Module>>& modules,
     for (auto& m : modules) {
         m->analyzer = std::make_unique<Analyzer>(*m->source, *m->sink, sharedCtx,
                                                  m->modulePath, m->packagePrefix);
+        m->analyzer->setNativePolicy(m->restrictNatives, m->declaredNatives, m->manifestPath);
     }
 
     for (auto& m : modules) m->analyzer->registerNames(*m->rootNode);

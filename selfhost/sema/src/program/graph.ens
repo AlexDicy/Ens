@@ -18,6 +18,8 @@ import FileError from support.loader;
 import FileDiagnostic from support.diagnostics;
 import support.diagnostics;
 import Workspace from program.workspace;
+import WorkspaceLoader from program.workspace;
+import NativeInfo from program.workspace;
 import program.workspace;
 import support.paths;
 import List from @std.collections.list;
@@ -35,6 +37,9 @@ export class Module {
     ParseResult moduleParseResult;
     string[] moduleImports;
     string?[] moduleImportTargets;
+    bool restrictedNatives;
+    string[] moduleNativeNames;
+    string moduleManifestPath;
 
     public constructor(string canonicalPath, string filePath, string packagePrefix, Source source,
                 ParseResult parseResult, string[] imports, string?[] importTargets) {
@@ -45,6 +50,34 @@ export class Module {
         this.moduleParseResult = parseResult;
         this.moduleImports = imports;
         this.moduleImportTargets = importTargets;
+        this.restrictedNatives = false;
+        this.moduleNativeNames = [];
+        this.moduleManifestPath = "";
+    }
+
+    // Native-library policy from the owning workspace: when a package manifest governs the
+    // module, `external from` may name only the natives it declares.
+    public setNativePolicy(bool restricted, string[] nativeNames, string manifestPath) {
+        this.restrictedNatives = restricted;
+        this.moduleNativeNames = nativeNames;
+        this.moduleManifestPath = manifestPath;
+    }
+
+    public nativesRestricted() -> bool {
+        return this.restrictedNatives;
+    }
+
+    public declaresNative(string name) -> bool {
+        for (let declared in this.moduleNativeNames) {
+            if (declared == name) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public manifestPath() -> string {
+        return this.moduleManifestPath;
     }
 
     public canonicalPath() -> string {
@@ -137,6 +170,7 @@ class GraphBuilder {
     FileLoader loader;
     string stdlibRoot;
 
+    WorkspaceLoader workspaceLoader;
     Workspace rootWorkspace;
     Workspace stdWorkspace;
     Map<string, Workspace> workspacesByFolder;
@@ -151,17 +185,16 @@ class GraphBuilder {
     protected constructor(FileLoader loader, string sourceRoot, string testsRoot, string stdlibRoot) {
         this.loader = loader;
         this.stdlibRoot = paths.normalize(stdlibRoot);
-        this.stdWorkspace = workspace.stdlibWorkspace(stdlibRoot);
+        this.workspaceLoader = new WorkspaceLoader(loader);
+        this.stdWorkspace = this.workspaceLoader.stdlibWorkspace(stdlibRoot);
         this.queuedPaths = new Set<string>();
         this.workItems = new List<WorkItem>();
         this.nextWorkIndex = 0;
         this.loadedModules = new List<Module>();
         this.collected = new List<FileDiagnostic>();
-        let rootLoad = workspace.loadRootWorkspace(loader, sourceRoot, testsRoot);
-        this.rootWorkspace = rootLoad.workspace();
+        this.rootWorkspace = this.workspaceLoader.loadRoot(sourceRoot, testsRoot);
         this.workspacesByFolder = new Map<string, Workspace>();
         this.workspacesByFolder.set(this.rootWorkspace.root(), this.rootWorkspace);
-        this.keep(rootLoad.diagnostics());
     }
 
     protected build(string[] seedFiles) -> GraphResult {
@@ -177,7 +210,49 @@ class GraphBuilder {
             this.nextWorkIndex++;
             this.process(item);
         }
+        this.checkNativeConflicts();
+        this.keep(this.workspaceLoader.diagnostics());
         return new GraphResult(this.loadedModules.toArray(), diagnostics.sorted(this.collected));
+    }
+
+    // The same logical native library declared with different bindings anywhere in the resolved
+    // package graph is a hard error; identical declarations dedupe at link time.
+    checkNativeConflicts() {
+        let names = new List<string>();
+        let firstDeclarations = new List<NativeInfo>();
+        let firstManifests = new List<string>();
+        let workspaces = new List<Workspace>();
+        workspaces.push(this.stdWorkspace);
+        for (let folder in this.workspacesByFolder.keys()) {
+            let loaded = this.workspacesByFolder.get(folder);
+            if (loaded != null) {
+                workspaces.push(loaded);
+            }
+        }
+        for (long w = 0; w < workspaces.length(); w++) {
+            let owner = workspaces.get(w);
+            for (let native in owner.natives()) {
+                long existing = -1;
+                for (long i = 0; i < names.length(); i++) {
+                    if (names.get(i) == native.name()) {
+                        existing = i;
+                        break;
+                    }
+                }
+                if (existing < 0) {
+                    names.push(native.name());
+                    firstDeclarations.push(native);
+                    firstManifests.push(owner.manifestPath());
+                    continue;
+                }
+                if (!workspace.sameNative(firstDeclarations.get(existing), native)) {
+                    this.report(owner.manifestPath(), native.span(),
+                        "Native library '{native.name()}' is declared with different bindings "
+                        + "by {firstManifests.get(existing)} and {owner.manifestPath()}; every "
+                        + "package must agree on a native library's binding.");
+                }
+            }
+        }
     }
 
     process(WorkItem item) {
@@ -197,9 +272,12 @@ class GraphBuilder {
         let moduleSource = new Source(filePath, text);
         let parsed = parser.parse(moduleSource);
         let scan = this.resolveImports(item, filePath, parsed);
-        this.loadedModules.push(new Module(item.canonicalPath, filePath,
+        let loaded = new Module(item.canonicalPath, filePath,
             item.owner.packagePrefix(), moduleSource, parsed, scan.importedPaths,
-            scan.declarationTargets));
+            scan.declarationTargets);
+        loaded.setNativePolicy(item.owner.hasPackageManifest(), item.owner.nativeNames(),
+            item.owner.manifestPath());
+        this.loadedModules.push(loaded);
     }
 
     readOrNull(string path) -> string? {
@@ -352,10 +430,9 @@ class GraphBuilder {
         if (existing != null) {
             return existing;
         }
-        let load = workspace.loadPackageWorkspace(this.loader, folder, packagePrefix);
-        this.keep(load.diagnostics());
-        this.workspacesByFolder.set(folder, load.workspace());
-        return load.workspace();
+        let loaded = this.workspaceLoader.loadPackage(folder, packagePrefix);
+        this.workspacesByFolder.set(folder, loaded);
+        return loaded;
     }
 
     enqueue(Workspace owner, string baseFolder, string relativePath, string canonical) {

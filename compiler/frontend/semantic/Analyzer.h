@@ -81,8 +81,18 @@ public:
     // synthetic Variable-kind symbol whose `type` is the user-defined type.
     Symbol* globalSymbol(const std::u16string& name) const;
 
-    // Distinct library names referenced by `external from "..."` blocks in
-    // this module. Order matches first occurrence in source.
+    // Native-library policy for this module: when restricted, `external from` may name only
+    // the natives declared in the owning package's manifest at `manifestPath`.
+    void setNativePolicy(bool restricted, std::vector<std::u16string> declaredNatives,
+                         std::string manifestPath) {
+        restrictNatives_ = restricted;
+        declaredNatives_ = std::move(declaredNatives);
+        nativeManifestPath_ = std::move(manifestPath);
+    }
+
+    // Distinct library names referenced by `external from` blocks in this module, collected
+    // only when no manifest governs it (the names then bind by convention at link time).
+    // Order matches first occurrence in source.
     const std::vector<std::u16string>& linkLibraries() const { return linkLibraries_; }
 
 private:
@@ -106,6 +116,9 @@ private:
     std::vector<std::unique_ptr<Symbol>> ownedSymbols;
     std::vector<std::unique_ptr<Scope>> ownedScopes;
     std::vector<std::u16string> linkLibraries_;
+    bool restrictNatives_ = false;
+    std::vector<std::u16string> declaredNatives_;
+    std::string nativeManifestPath_;
     Scope* globalScope = nullptr;
     Scope* currentScope = nullptr;
     Symbol* currentFunction = nullptr;

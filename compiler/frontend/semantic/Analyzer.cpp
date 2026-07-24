@@ -597,9 +597,16 @@ void Analyzer::collectExternalFunctions(const ast::SourceFile& file) {
                 "Wrap the calls in Ens functions to share them.");
         }
         auto libName = block.libraryName();
-        if (!libName || libName->empty()) {
-            errorAtNode(block.node, "The library name in 'external from \"\"' cannot be empty.");
-        } else {
+        if (libName && restrictNatives_) {
+            bool declared = false;
+            for (auto& n : declaredNatives_) { if (n == *libName) { declared = true; break; } }
+            if (!declared) {
+                errorAtNode(block.node, "External library '" + asciiOf(*libName) +
+                    "' is not declared in " + nativeManifestPath_ + ". Add 'native " +
+                    asciiOf(*libName) + ";' (or a 'system' or per-platform form) to the "
+                    "package manifest.");
+            }
+        } else if (libName) {
             bool already = false;
             for (auto& l : linkLibraries_) { if (l == *libName) { already = true; break; } }
             if (!already) linkLibraries_.push_back(*libName);

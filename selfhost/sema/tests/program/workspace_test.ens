@@ -1,14 +1,14 @@
 import @std.testing;
 import program.workspace;
 import Workspace from program.workspace;
-import WorkspaceLoad from program.workspace;
+import WorkspaceLoader from program.workspace;
 import PackageMatch from program.workspace;
 import FakeFileLoader from sema_support;
 import sema_support;
 
 test "workspace root discovery finds the nearest marked ancestor" {
     let loader = new FakeFileLoader();
-    loader.add("/proj/dependencies.txt", "");
+    loader.add("/proj/ens.package", "package demo.app \{ \}");
     try testing.assertEqual(workspace.discoverRoot(loader, "/proj") ?? "none", "/proj");
     try testing.assertEqual(workspace.discoverRoot(loader, "/proj/src/nested") ?? "none", "/proj");
     try testing.assertEqual(workspace.discoverRoot(loader, "/elsewhere/src") ?? "none", "none");
@@ -16,118 +16,295 @@ test "workspace root discovery finds the nearest marked ancestor" {
 
 test "sources without a workspace root stand alone" {
     let loader = new FakeFileLoader();
-    let load = workspace.loadRootWorkspace(loader, "/alone/src", "");
-    try sema_support.assertNoDiagnostics(load.diagnostics());
-    let alone = load.workspace();
+    let loading = new WorkspaceLoader(loader);
+    let alone = loading.loadRoot("/alone/src", "");
+    try sema_support.assertNoDiagnostics(loading.diagnostics());
     try testing.assertEqual(alone.sourceRoot(), "/alone/src");
     try testing.assertFalse(alone.hasTestsRoot(), "a standalone workspace has no tests root");
     try testing.assertEqual(alone.packagePrefix(), "");
+    try testing.assertFalse(alone.hasPackageManifest(), "no manifest governs standalone sources");
     try testing.assertTrue(alone.matchPackage(["acme"]) == null,
         "a standalone workspace has no packages");
     try testing.assertEqual(alone.missingPackageMessage("acme.widgets"),
-        "External package 'acme.widgets' is not available. "
-            + "Add it to dependencies.txt (only '@std' is built in).");
+        "External package 'acme.widgets' is not available; these sources have no ens.package "
+            + "manifest (only '@std' is built in).");
 }
 
-test "dependency entries resolve aliases by longest prefix" {
+test "a root package resolves dependencies against its enclosing workspace by name" {
     let loader = new FakeFileLoader();
-    loader.add("/proj/dependencies.txt", "# vendored packages\n"
-        + "\n"
-        + "@acme=vendor/acme\n"
-        + "  @acme.widgets = ../shared/widgets  \n");
-    let load = workspace.loadRootWorkspace(loader, "/proj/src", "");
-    try sema_support.assertNoDiagnostics(load.diagnostics());
-    let root = load.workspace();
-    try testing.assertEqual(root.root(), "/proj");
+    loader.add("/ws/ens.package", "workspace \{\n"
+        + "    member \"proj\";\n"
+        + "    member \"vendor/acme\";\n"
+        + "    member \"vendor/widgets\";\n"
+        + "\}\n");
+    loader.add("/ws/proj/ens.package", "package demo.app \{\n"
+        + "    version \"1.3.0\";\n"
+        + "    ens \"1.2\";\n"
+        + "    dependency acme;\n"
+        + "    dependency acme.widgets;\n"
+        + "\}\n");
+    loader.add("/ws/vendor/acme/ens.package", "package acme \{ \}\n");
+    loader.add("/ws/vendor/widgets/ens.package", "package acme.widgets \{ \}\n");
+    let loading = new WorkspaceLoader(loader);
+    let root = loading.loadRoot("/ws/proj/src", "");
+    try sema_support.assertNoDiagnostics(loading.diagnostics());
+    try testing.assertEqual(root.root(), "/ws/proj");
+    try testing.assertTrue(root.hasPackageManifest(), "the root declares a package");
+    try testing.assertEqual(root.packageName(), "demo.app");
 
     let widgets = root.matchPackage(["acme", "widgets", "gadget"]);
     if (widgets != null) {
         try testing.assertEqual(widgets.segmentCount(), 2L);
-        try testing.assertEqual(widgets.folder(), "/shared/widgets");
+        try testing.assertEqual(widgets.folder(), "/ws/vendor/widgets");
     } else {
-        try testing.fail("expected '@acme.widgets' to match");
+        try testing.fail("expected 'acme.widgets' to match by its longest prefix");
     }
 
     let acme = root.matchPackage(["acme", "other"]);
     if (acme != null) {
         try testing.assertEqual(acme.segmentCount(), 1L);
-        try testing.assertEqual(acme.folder(), "/proj/vendor/acme");
+        try testing.assertEqual(acme.folder(), "/ws/vendor/acme");
     } else {
-        try testing.fail("expected '@acme' to match");
+        try testing.fail("expected 'acme' to match");
     }
 
     try testing.assertTrue(root.matchPackage(["missing", "thing"]) == null,
-        "an unlisted alias must not match");
+        "an undeclared package must not match");
     try testing.assertEqual(root.missingPackageMessage("missing.thing"),
-        "Package 'missing.thing' is not listed in /proj/dependencies.txt.");
+        "Package 'missing.thing' is not declared as a dependency in /ws/proj/ens.package.");
 }
 
-test "malformed dependency lines are reported and skipped" {
+test "a workspace-form root exposes its members by name" {
     let loader = new FakeFileLoader();
-    loader.add("/proj/dependencies.txt", "@good=vendor/good\n"
-        + "widgets=no/at\n"
-        + "@broken\n"
-        + "@=path\n"
-        + "@empty=   \n"
-        + "@dup=first\n"
-        + "@dup=second\n");
-    let load = workspace.loadRootWorkspace(loader, "/proj/src", "");
-
-    let diagnostics = load.diagnostics();
-    try testing.assertEqual(diagnostics.length, 5L);
-    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/dependencies.txt",
-        "A dependency line must look like '@package.name=path'; "
-            + "'widgets=no/at' does not start with '@'.");
-    try sema_support.assertDiagnostic(diagnostics, 1, "/proj/dependencies.txt",
-        "A dependency line must look like '@package.name=path'; '@broken' is missing '='.");
-    try sema_support.assertDiagnostic(diagnostics, 2, "/proj/dependencies.txt",
-        "A dependency line must look like '@package.name=path'; "
-            + "the package name and path must both be non-empty.");
-    try sema_support.assertDiagnostic(diagnostics, 3, "/proj/dependencies.txt",
-        "A dependency line must look like '@package.name=path'; "
-            + "the package name and path must both be non-empty.");
-    try sema_support.assertDiagnostic(diagnostics, 4, "/proj/dependencies.txt",
-        "Package '@dup' is already declared; remove the duplicate line.");
-
-    let root = load.workspace();
-    let good = root.matchPackage(["good", "thing"]);
-    if (good != null) {
-        try testing.assertEqual(good.folder(), "/proj/vendor/good");
+    loader.add("/ws/ens.package", "workspace \{\n"
+        + "    member \"frontend\";\n"
+        + "    member \"sema\";\n"
+        + "\}\n");
+    loader.add("/ws/frontend/ens.package", "package ens.frontend \{ \}\n");
+    loader.add("/ws/sema/ens.package", "package ens.sema \{\n"
+        + "    dependency ens.frontend;\n"
+        + "\}\n");
+    let loading = new WorkspaceLoader(loader);
+    let root = loading.loadRoot("/ws", "");
+    try sema_support.assertNoDiagnostics(loading.diagnostics());
+    try testing.assertTrue(root.isWorkspaceRoot(), "the root manifest is the workspace form");
+    let frontend = root.matchPackage(["ens", "frontend", "lexer"]);
+    if (frontend != null) {
+        try testing.assertEqual(frontend.folder(), "/ws/frontend");
     } else {
-        try testing.fail("the valid line before the malformed ones must still register");
+        try testing.fail("expected the member 'ens.frontend' to match");
     }
-    let dup = root.matchPackage(["dup", "thing"]);
-    if (dup != null) {
-        try testing.assertEqual(dup.folder(), "/proj/first");
+    try testing.assertEqual(root.missingPackageMessage("acme.gone"),
+        "Package 'acme.gone' is not a member of the workspace at /ws/ens.package.");
+
+    let member = loading.loadPackage("/ws/sema", "ens.sema");
+    try sema_support.assertNoDiagnostics(loading.diagnostics());
+    try testing.assertEqual(member.sourceRoot(), "/ws/sema/src");
+    try testing.assertFalse(member.hasTestsRoot(), "a package never exposes a tests root");
+    try testing.assertEqual(member.packagePrefix(), "ens.sema");
+    let sibling = member.matchPackage(["ens", "frontend", "lexer"]);
+    if (sibling != null) {
+        try testing.assertEqual(sibling.folder(), "/ws/frontend");
     } else {
-        try testing.fail("the first '@dup' entry must still register");
+        try testing.fail("expected the member's dependency to resolve to its sibling");
     }
 }
 
-test "dependency diagnostics are anchored to the trimmed line" {
+test "dependency resolution failures are reported on the manifest" {
     let loader = new FakeFileLoader();
-    loader.add("/proj/dependencies.txt", "@ok=lib\n  bad line  \n");
-    let load = workspace.loadRootWorkspace(loader, "/proj/src", "");
-    let diagnostics = load.diagnostics();
+    loader.add("/ws/ens.package", "workspace \{\n"
+        + "    member \"proj\";\n"
+        + "    member \"lib\";\n"
+        + "\}\n");
+    loader.add("/ws/proj/ens.package", "package demo.app \{\n"
+        + "    dependency acme.lib \"2.0\";\n"
+        + "    dependency ghost.lib;\n"
+        + "\}\n");
+    loader.add("/ws/lib/ens.package", "package acme.lib \{ \}\n");
+    let loading = new WorkspaceLoader(loader);
+    let root = loading.loadRoot("/ws/proj/src", "");
+    let diagnostics = loading.diagnostics();
+    try testing.assertEqual(diagnostics.length, 2L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/ws/proj/ens.package",
+        "Dependency 'acme.lib' resolves to the workspace member at /ws/lib; a member is used "
+            + "as-is, so remove the version \"2.0\".");
+    try sema_support.assertDiagnostic(diagnostics, 1, "/ws/proj/ens.package",
+        "No source for package 'ghost.lib': there is no package registry yet, so a dependency "
+            + "must be a member of the enclosing workspace or an override in ens.overrides "
+            + "pointing at a local folder.");
+    let lib = root.matchPackage(["acme", "lib", "core"]);
+    if (lib == null) {
+        try testing.fail("the versioned member dependency still resolves after the error");
+    }
+}
+
+test "a package that is not a member gets no member index" {
+    let loader = new FakeFileLoader();
+    loader.add("/ws/ens.package", "workspace \{\n"
+        + "    member \"lib\";\n"
+        + "\}\n");
+    loader.add("/ws/lib/ens.package", "package acme.lib \{ \}\n");
+    loader.add("/ws/stray/ens.package", "package demo.stray \{\n"
+        + "    dependency acme.lib;\n"
+        + "\}\n");
+    let loading = new WorkspaceLoader(loader);
+    let root = loading.loadRoot("/ws/stray/src", "");
+    let diagnostics = loading.diagnostics();
     try testing.assertEqual(diagnostics.length, 1L);
-    try testing.assertEqual(diagnostics[0].span().start, 10L);
-    try testing.assertEqual(diagnostics[0].span().length, 8L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/ws/stray/ens.package",
+        "No source for package 'acme.lib': there is no package registry yet, so a dependency "
+            + "must be a member of the enclosing workspace or an override in ens.overrides "
+            + "pointing at a local folder.");
+    try testing.assertTrue(root.matchPackage(["acme", "lib"]) == null,
+        "a non-member package resolves nothing through the workspace");
 }
 
-test "a package workspace reads through src and carries its prefix" {
+test "only the root's overrides apply and their targets must match by name" {
     let loader = new FakeFileLoader();
-    loader.add("/vendor/widgets/dependencies.txt", "@base=../base\n");
-    let load = workspace.loadPackageWorkspace(loader, "/vendor/widgets", "acme.widgets");
-    try sema_support.assertNoDiagnostics(load.diagnostics());
-    let widgets = load.workspace();
-    try testing.assertEqual(widgets.root(), "/vendor/widgets");
-    try testing.assertEqual(widgets.sourceRoot(), "/vendor/widgets/src");
-    try testing.assertFalse(widgets.hasTestsRoot(), "a package never exposes a tests root");
-    try testing.assertEqual(widgets.packagePrefix(), "acme.widgets");
-    let base = widgets.matchPackage(["base", "core"]);
-    if (base != null) {
-        try testing.assertEqual(base.folder(), "/vendor/base");
+    loader.add("/ws/ens.package", "workspace \{\n"
+        + "    member \"proj\";\n"
+        + "    member \"lib\";\n"
+        + "\}\n");
+    loader.add("/ws/proj/ens.package", "package demo.app \{\n"
+        + "    dependency acme.lib;\n"
+        + "    dependency acme.gone \"1.0\";\n"
+        + "    dependency other.lib;\n"
+        + "\}\n");
+    loader.add("/ws/proj/ens.overrides", "overrides \{\n"
+        + "    override acme.lib \"../../local/lib\";\n"
+        + "    override acme.gone \"../../local/gone\";\n"
+        + "    override other.lib \"../../local/misnamed\";\n"
+        + "\}\n");
+    loader.add("/ws/lib/ens.package", "package acme.lib \{ \}\n");
+    loader.add("/ws/lib/ens.overrides", "overrides \{\n"
+        + "    override acme.lib \"../../local/ignored\";\n"
+        + "\}\n");
+    loader.add("/local/lib/ens.package", "package acme.lib \{ \}\n");
+    loader.add("/local/gone/ens.package", "package acme.gone \{ \}\n");
+    loader.add("/local/misnamed/ens.package", "package something.unrelated \{ \}\n");
+    let loading = new WorkspaceLoader(loader);
+    let root = loading.loadRoot("/ws/proj/src", "");
+    let diagnostics = loading.diagnostics();
+    try testing.assertEqual(diagnostics.length, 3L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/ws/proj/ens.overrides",
+        "The override for package 'other.lib' points at /local/misnamed, which declares "
+            + "package 'something.unrelated' instead; the names must match exactly.");
+    try sema_support.assertDiagnostic(diagnostics, 1, "/ws/proj/ens.package",
+        "Dependency 'acme.gone' resolves to the override at /local/gone; a local override is "
+            + "used as-is, so remove the version \"1.0\".");
+    try sema_support.assertDiagnostic(diagnostics, 2, "/ws/proj/ens.package",
+        "No source for package 'other.lib': there is no package registry yet, so a dependency "
+            + "must be a member of the enclosing workspace or an override in ens.overrides "
+            + "pointing at a local folder.");
+
+    let overridden = root.matchPackage(["acme", "lib"]);
+    if (overridden != null) {
+        try testing.assertEqual(overridden.folder(), "/local/lib");
     } else {
-        try testing.fail("expected the package's own '@base' alias to match");
+        try testing.fail("the override must win over the workspace member");
     }
+
+    let member = loading.loadPackage("/ws/lib", "acme.lib");
+    let after = loading.diagnostics();
+    try testing.assertEqual(after.length, 3L);
+    try testing.assertEqual(member.packageName(), "acme.lib");
+}
+
+test "manifest form problems are reported against the file" {
+    let loader = new FakeFileLoader();
+    loader.add("/one/ens.package", "package demo.a \{ \}\nworkspace \{ \}\n");
+    let first = new WorkspaceLoader(loader);
+    first.loadRoot("/one/src", "");
+    try sema_support.assertDiagnostic(first.diagnostics(), 0, "/one/ens.package",
+        "A manifest file holds exactly one declaration; remove the extra declarations.");
+
+    loader.add("/two/ens.package", "overrides \{ \}\n");
+    let second = new WorkspaceLoader(loader);
+    second.loadRoot("/two/src", "");
+    try sema_support.assertDiagnostic(second.diagnostics(), 0, "/two/ens.package",
+        "An ens.package file holds a package or workspace declaration; overrides live in the "
+            + "ens.overrides file next to it.");
+
+    loader.add("/three/ens.package", "package demo.c \{ \}\n");
+    loader.add("/three/ens.overrides", "package demo.d \{ \}\n");
+    let third = new WorkspaceLoader(loader);
+    third.loadRoot("/three/src", "");
+    try sema_support.assertDiagnostic(third.diagnostics(), 0, "/three/ens.overrides",
+        "An ens.overrides file holds a single overrides declaration; packages and workspaces "
+            + "are declared in ens.package.");
+
+    loader.add("/four/ens.package", "workspace \{\n"
+        + "    member \"ghost\";\n"
+        + "    member \"twin_a\";\n"
+        + "    member \"twin_b\";\n"
+        + "\}\n");
+    loader.add("/four/twin_a/ens.package", "package acme.twin \{ \}\n");
+    loader.add("/four/twin_b/ens.package", "package acme.twin \{ \}\n");
+    let fourth = new WorkspaceLoader(loader);
+    fourth.loadRoot("/four", "");
+    let diagnostics = fourth.diagnostics();
+    try testing.assertEqual(diagnostics.length, 2L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/four/ens.package",
+        "Workspace member \"ghost\" has no ens.package manifest; every member folder declares "
+            + "a package.");
+    try sema_support.assertDiagnostic(diagnostics, 1, "/four/ens.package",
+        "Members \"/four/twin_a\" and \"/four/twin_b\" both declare package 'acme.twin'; "
+            + "package names must be unique within a workspace.");
+}
+
+test "version, native, and artifact declarations validate their shapes" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/ens.package", "package demo.app \{\n"
+        + "    version \"one\";\n"
+        + "    ens \"1.2.3\";\n"
+        + "    native libc system \{\n"
+        + "        windows \"c\";\n"
+        + "    \}\n"
+        + "    native llvm \{\n"
+        + "        windows \"LLVM-C\";\n"
+        + "        windows \"LLVM-C2\";\n"
+        + "        beos \"LLVM\";\n"
+        + "        macos artifact \"https://example.com/llvm.tar\" hash \"sha256:short\";\n"
+        + "    \}\n"
+        + "\}\n");
+    let loading = new WorkspaceLoader(loader);
+    let root = loading.loadRoot("/proj/src", "");
+    let diagnostics = loading.diagnostics();
+    try testing.assertEqual(diagnostics.length, 7L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/ens.package",
+        "The version 'one' is not a valid version; use dotted numerals such as \"1.3.0\".");
+    try sema_support.assertDiagnostic(diagnostics, 1, "/proj/ens.package",
+        "The language version '1.2.3' is not valid; use major.minor, such as \"1.2\".");
+    try sema_support.assertDiagnostic(diagnostics, 2, "/proj/ens.package",
+        "Native library 'libc' is marked 'system', so it is linked by platform defaults and "
+            + "cannot carry a binding block.");
+    try sema_support.assertDiagnostic(diagnostics, 3, "/proj/ens.package",
+        "Platform 'windows' is bound twice for native library 'llvm'; remove the duplicate.");
+    try sema_support.assertDiagnostic(diagnostics, 4, "/proj/ens.package",
+        "Unknown platform 'beos' in native library 'llvm'; bindings use 'windows', 'linux', "
+            + "or 'macos'.");
+    try sema_support.assertDiagnostic(diagnostics, 5, "/proj/ens.package",
+        "The artifact checksum for native library 'llvm' must look like \"sha256:\" followed "
+            + "by 64 hex digits.");
+    try sema_support.assertDiagnostic(diagnostics, 6, "/proj/ens.package",
+        "Native library 'llvm' binds an artifact for 'macos', but artifact fetching is not "
+            + "supported yet; name a library installed on this machine instead.");
+    try testing.assertEqual(root.natives().length, 2L);
+    try testing.assertTrue(root.natives()[0].isSystem(), "libc keeps its system flag");
+    try testing.assertEqual(root.nativeNames()[1], "llvm");
+}
+
+test "the standard library workspace reads its own manifest" {
+    let loader = new FakeFileLoader();
+    loader.add("/stdlib/std/ens.package", "package std \{\n"
+        + "    native libc system;\n"
+        + "\}\n");
+    let loading = new WorkspaceLoader(loader);
+    let stdlib = loading.stdlibWorkspace("/stdlib");
+    try sema_support.assertNoDiagnostics(loading.diagnostics());
+    try testing.assertEqual(stdlib.sourceRoot(), "/stdlib");
+    try testing.assertEqual(stdlib.packagePrefix(), "std");
+    try testing.assertTrue(stdlib.hasPackageManifest(), "the std manifest is read");
+    try testing.assertEqual(stdlib.natives().length, 1L);
+    try testing.assertEqual(stdlib.natives()[0].name(), "libc");
 }

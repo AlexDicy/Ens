@@ -27,10 +27,16 @@ struct Module {
     fs::path absolutePath;
     fs::path relativePath;  // relative to the source root
     // Canonical module-path prefix of the owning workspace: empty for the root, or the
-    // dependency key (e.g. u"ens.frontend") for a module pulled in as a package. The
+    // package name (e.g. u"ens.frontend") for a module pulled in as a package. The
     // analyzer prepends it to bare imports so a package's sibling imports resolve to the
     // same canonical module as an external `@package` import.
     std::u16string packagePrefix;
+    // Native-library policy from the owning workspace: when a package manifest governs the
+    // module, `external from` may name only the natives it declares. Without a manifest the
+    // names bind by convention at link time.
+    bool restrictNatives = false;
+    std::vector<std::u16string> declaredNatives;
+    std::string manifestPath;
     std::unique_ptr<SourceFile> source;
     std::unique_ptr<DiagnosticSink> sink;
     GreenElementPtr cstRoot;

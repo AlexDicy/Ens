@@ -1,6 +1,7 @@
 #include "Compiler.h"
 #include "CodeGenerator.h"
 #include "Linker.h"
+#include "TargetPlatform.h"
 #include "module/ModuleGraph.h"
 #include "ast/Declaration.h"
 #include "cst/SyntaxNode.h"
@@ -273,10 +274,103 @@ bool emitModule(Module& module,
     return true;
 }
 
+// The platform name native bindings select on, for the resolved target triple.
+std::string platformOfTriple(const std::string& triple) {
+    if (triple.find("windows") != std::string::npos ||
+        triple.find("win32") != std::string::npos ||
+        triple.find("msvc") != std::string::npos) {
+        return "windows";
+    }
+    if (triple.find("darwin") != std::string::npos ||
+        triple.find("apple") != std::string::npos) {
+        return "macos";
+    }
+    return "linux";
+}
+
+bool sameNativeBinding(const ManifestNative& a, const ManifestNative& b) {
+    if (a.isSystem != b.isSystem || a.hasBindingBlock != b.hasBindingBlock) return false;
+    if (a.bindings.size() != b.bindings.size()) return false;
+    for (size_t i = 0; i < a.bindings.size(); ++i) {
+        const ManifestNativeBinding& left = a.bindings[i];
+        const ManifestNativeBinding& right = b.bindings[i];
+        if (left.platform != right.platform || left.isArtifact != right.isArtifact ||
+            left.artifactUrl != right.artifactUrl ||
+            left.artifactChecksum != right.artifactChecksum ||
+            left.baseNames != right.baseNames) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Map the build's native-library declarations to linker inputs for the target: the natives of
+// every loaded manifest plus, for modules no manifest governs, their `external from` names bound
+// by convention (`libc` is the C runtime, linked by platform defaults; any other name passes as
+// a conventional library name). The same name declared twice with different bindings is an
+// error; identical declarations dedupe.
+bool collectLinkLibraries(const WorkspaceRegistry* registry,
+                          const std::vector<std::unique_ptr<Module>>& modules,
+                          const std::string& targetTriple,
+                          std::vector<std::string>& libraries) {
+    std::vector<CollectedNative> natives;
+    if (registry) natives = registry->collectNatives();
+    for (auto& m : modules) {
+        if (m->restrictNatives || !m->analyzer) continue;
+        for (auto& lib : m->analyzer->linkLibraries()) {
+            CollectedNative implicit;
+            implicit.native.name = asciiOfU16(lib);
+            implicit.native.isSystem = implicit.native.name == "libc";
+            implicit.declaredIn = m->source ? m->source->getFilename() : "<module>";
+            natives.push_back(std::move(implicit));
+        }
+    }
+
+    bool ok = true;
+    std::vector<CollectedNative> unique;
+    for (auto& n : natives) {
+        CollectedNative* existing = nullptr;
+        for (auto& u : unique) {
+            if (u.native.name == n.native.name) { existing = &u; break; }
+        }
+        if (!existing) {
+            unique.push_back(n);
+            continue;
+        }
+        if (!sameNativeBinding(existing->native, n.native)) {
+            std::cerr << "ERROR: Native library '" << n.native.name << "' is declared with "
+                      << "different bindings by " << existing->declaredIn << " and "
+                      << n.declaredIn << "; every package must agree on a native library's "
+                      << "binding.\n";
+            ok = false;
+        }
+    }
+    if (!ok) return false;
+
+    const std::string platform = platformOfTriple(ens::resolveTargetTriple(targetTriple));
+    auto add = [&](const std::string& baseName) {
+        for (auto& l : libraries) if (l == baseName) return;
+        libraries.push_back(baseName);
+    };
+    for (auto& u : unique) {
+        if (u.native.isSystem) continue;
+        if (!u.native.hasBindingBlock) {
+            add(u.native.name);
+            continue;
+        }
+        for (auto& binding : u.native.bindings) {
+            if (binding.platform != platform || binding.isArtifact) continue;
+            for (auto& baseName : binding.baseNames) add(baseName);
+        }
+    }
+    return true;
+}
+
 bool linkModulesToExe(std::vector<std::unique_ptr<Module>>& modules,
                       const fs::path& outputFile,
                       const std::string& targetTriple,
-                      TypeContext& sharedCtx) {
+                      TypeContext& sharedCtx,
+                      const std::vector<std::string>& libraries) {
     fs::path outDir = outputFile.parent_path();
     if (outDir.empty()) outDir = fs::current_path();
     std::string baseStem = outputFile.stem().string();
@@ -284,20 +378,12 @@ bool linkModulesToExe(std::vector<std::unique_ptr<Module>>& modules,
 
     std::vector<std::string> objectPaths;
     objectPaths.reserve(modules.size());
-    std::vector<std::string> libraries;
-    auto addLibrary = [&](const std::u16string& lib) {
-        std::string asciiLib = asciiOfU16(lib);
-        for (auto& l : libraries) if (l == asciiLib) return;
-        libraries.push_back(std::move(asciiLib));
-    };
     CodeGenerator::ModuleResolver resolver = makeModuleResolver(modules);
 
-    // Each module's object path is deterministic, so re-emitting overwrites it in
-    // place. Collect the paths and link libraries once, up front.
+    // Each module's object path is deterministic, so re-emitting overwrites it in place.
     for (auto& m : modules) {
         std::string name = baseStem + "." + sanitizeForFilename(m->modulePath) + ".obj";
         objectPaths.push_back((outDir / name).string());
-        for (auto& lib : m->analyzer->linkLibraries()) addLibrary(lib);
     }
 
     // How many concrete generic instances (free functions and classes/structs) are
@@ -353,12 +439,16 @@ bool linkModulesToExe(std::vector<std::unique_ptr<Module>>& modules,
     return Linker::link(objectPaths, libraries, outputFile.string(), std::cerr, targetTriple);
 }
 
-// Print any dependencies.txt parse problems collected while loading workspaces. Returns
-// true when there were none, so callers can bail on a malformed dependency file.
+// Print any manifest problems collected while loading workspaces. Returns true when there
+// were none, so callers can bail on a malformed manifest.
 bool printWorkspaceErrors(const WorkspaceRegistry& registry) {
     if (registry.errors().empty()) return true;
     for (const auto& e : registry.errors()) std::cerr << "ERROR: " << e << '\n';
     return false;
+}
+
+void printWorkspaceNotices(const WorkspaceRegistry& registry) {
+    for (const auto& n : registry.notices()) std::cerr << "NOTE: " << n << '\n';
 }
 
 }  // namespace
@@ -398,15 +488,16 @@ bool Compiler::compile(const fs::path& source,
     std::unordered_map<std::u16string, Module*> byPath;
     fs::path stdlibRoot = findStdlibRoot();
 
-    // The governing workspace (nearest dependencies.txt walking up from the source) supplies
+    // The governing workspace (nearest ens.package walking up from the source) supplies
     // `@package` dependencies; its src root stays whatever was compiled here.
     fs::path workspaceRoot = discoverWorkspaceRoot(sourceRoot);
     WorkspaceRegistry registry;
     Workspace& root = workspaceRoot.empty()
-        ? registry.defineRoot(sourceRoot, sourceRoot, {}, /*withDependencies=*/false)
-        : registry.defineRoot(workspaceRoot, sourceRoot, {}, /*withDependencies=*/true);
+        ? registry.defineRoot(sourceRoot, sourceRoot, {}, /*withManifest=*/false)
+        : registry.defineRoot(workspaceRoot, sourceRoot, {}, /*withManifest=*/true);
     if (!printWorkspaceErrors(registry)) return false;
     if (!buildModuleGraph(root, registry, stdlibRoot, seeds, modules, byPath)) return false;
+    printWorkspaceNotices(registry);
     if (!printWorkspaceErrors(registry)) return false;
 
     insertPreludeModule(modules, byPath);
@@ -440,7 +531,9 @@ bool Compiler::compile(const fs::path& source,
         return false;
     }
 
-    return linkModulesToExe(modules, outputFolder, targetTriple, sharedCtx);
+    std::vector<std::string> libraries;
+    if (!collectLinkLibraries(&registry, modules, targetTriple, libraries)) return false;
+    return linkModulesToExe(modules, outputFolder, targetTriple, sharedCtx, libraries);
 }
 
 namespace {
@@ -473,7 +566,7 @@ std::u16string buildRunnerSource(const std::vector<DiscoveredTest>& tests) {
     // later test. 'fflush(null)' flushes every stream; the FILE handle is an
     // opaque external type here since the runner never inspects it.
     appendAscii(out, "\nexternal type CStdioFile;\n\n"
-                     "external from \"c\" {\n"
+                     "external from libc {\n"
                      "    fflush(CStdioFile? stream) -> int;\n"
                      "}\n\n");
 
@@ -686,13 +779,20 @@ int Compiler::test(const fs::path& sourceDir, const fs::path& testsDir,
     std::unordered_map<std::u16string, Module*> byPath;
     WorkspaceRegistry registry;
     Workspace& root = workspaceRoot.empty()
-        ? registry.defineRoot(sourceRoot, sourceRoot, testsFolder, /*withDependencies=*/false)
-        : registry.defineRoot(workspaceRoot, sourceRoot, testsFolder, /*withDependencies=*/true);
+        ? registry.defineRoot(sourceRoot, sourceRoot, testsFolder, /*withManifest=*/false)
+        : registry.defineRoot(workspaceRoot, sourceRoot, testsFolder, /*withManifest=*/true);
     if (!printWorkspaceErrors(registry)) return 2;
     if (!buildModuleGraph(root, registry, findStdlibRoot(), seeds, modules, byPath, &overrides)) {
         return 2;
     }
+    printWorkspaceNotices(registry);
     if (!printWorkspaceErrors(registry)) return 2;
+
+    // The generated runner is compiler-owned source, not part of the workspace's package; its
+    // one external block (libc) is exempt from the manifest's native declarations.
+    if (auto runner = byPath.find(runnerModulePath); runner != byPath.end()) {
+        runner->second->restrictNatives = false;
+    }
 
     // Only the runner may define main(): a second entry point cannot be linked.
     for (auto& m : modules) {
@@ -727,7 +827,12 @@ int Compiler::test(const fs::path& sourceDir, const fs::path& testsDir,
 #else
     fs::path exePath = fs::path(tempDir.str().str()) / "runner";
 #endif
-    if (!linkModulesToExe(modules, exePath, /*targetTriple*/ "", sharedCtx)) {
+    std::vector<std::string> linkLibraries;
+    if (!collectLinkLibraries(&registry, modules, /*targetTriple*/ "", linkLibraries)) {
+        fs::remove_all(fs::path(tempDir.str().str()), ec);
+        return 2;
+    }
+    if (!linkModulesToExe(modules, exePath, /*targetTriple*/ "", sharedCtx, linkLibraries)) {
         fs::remove_all(fs::path(tempDir.str().str()), ec);
         return 2;
     }
@@ -927,7 +1032,11 @@ bool Compiler::compileSingle(std::istream& source, const fs::path& outputFile, c
     for (auto& c : ext) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
     const bool linkToExe = !outputFile.empty() && (ext == ".exe" || ext.empty());
 
-    if (linkToExe) return linkModulesToExe(modules, outputFile, targetTriple, sharedCtx);
+    if (linkToExe) {
+        std::vector<std::string> libraries;
+        if (!collectLinkLibraries(nullptr, modules, targetTriple, libraries)) return false;
+        return linkModulesToExe(modules, outputFile, targetTriple, sharedCtx, libraries);
+    }
 
     CodeGenerator codegen("ens_" + sanitizeForFilename(user->modulePath),
                           user->source->getFilename(),

@@ -793,13 +793,8 @@ std::optional<std::u16string> ExternalBlock::libraryName() const {
     auto spec = firstChildNode(node, SyntaxKind::LibrarySpec);
     if (!spec) return std::nullopt;
     for (auto& c : spec->children()) {
-        if (c.kind() == SyntaxKind::StringLiteral) {
-            std::u16string raw{c.tokenText()};
-            // Strip surrounding quotes.
-            if (raw.size() >= 2 && raw.front() == u'"' && raw.back() == u'"') {
-                return raw.substr(1, raw.size() - 2);
-            }
-            return raw;
+        if (c.kind() == SyntaxKind::Identifier) {
+            return std::u16string{c.tokenText()};
         }
     }
     return std::nullopt;

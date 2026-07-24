@@ -52,7 +52,7 @@ static bool execute(const std::unordered_map<std::string, std::string>& argument
         return Compiler::compile(source, outputFile, sourcePath, explainArc, targetTriple);
     }
 
-    // No explicit source: if the current folder sits in a workspace (a dependencies.txt
+    // No explicit source: if the current folder sits in a workspace (an ens.package
     // walking up), compile its `src/`; otherwise read a single program from stdin.
     fs::path workspaceRoot = ens::modules::discoverWorkspaceRoot(fs::current_path());
     fs::path src = workspaceRoot.empty() ? fs::path() : workspaceRoot / "src";
@@ -126,7 +126,7 @@ int main(int argc, char* argv[]) {
 
     if (arguments.count("-h") || arguments.count("--help")) {
         std::cout << "Use --source to specify the input file or folder to compile.\n";
-        std::cout << "With no --source, compiles the current workspace's src/ (nearest dependencies.txt\n";
+        std::cout << "With no --source, compiles the current workspace's src/ (nearest ens.package\n";
         std::cout << "walking up), or reads a single program from stdin when there is no workspace.\n";
         std::cout << "Use --output to specify the output folder\n";
         std::cout << "Use 'ens test [--source <folder>] [--tests <folder>] [--filter <substring>]' to run tests\n";

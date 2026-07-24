@@ -153,8 +153,9 @@ task("test")
         end
 
         -- the corpus round-trip harness: build the driver exe fresh from its own workspace (it
-        -- imports the front end as the @ens.frontend package), enumerate every .ens file in the
-        -- real source trees into a manifest, and run the driver over it.
+        -- imports the front end as the @ens.frontend package), enumerate every .ens file and
+        -- every ens.package/ens.overrides manifest in the real source trees, and run the
+        -- driver over the list.
         local function run_corpus(job)
             local name = job.name
             local corpus_dir  = path.join(os.projectdir(), "build", "corpus")
@@ -174,11 +175,22 @@ task("test")
                         name, tostring(compile_rc), (io.readfile(log) or ""):gsub("[\r\n]+$", ""))}
             end
 
-            -- enumerate the corpus.
+            -- enumerate the corpus: every source file plus every manifest file.
             local files = {}
+            local seen = {}
+            local function add(f)
+                local normalized = (f:gsub("\\", "/"))
+                if not seen[normalized] then
+                    seen[normalized] = true
+                    table.insert(files, normalized)
+                end
+            end
             for _, root in ipairs({"selfhost", "libs", "tests"}) do
-                for _, f in ipairs(os.files(path.join(os.projectdir(), root, "**.ens"))) do
-                    table.insert(files, (f:gsub("\\", "/")))
+                for _, pattern in ipairs({"**.ens", "ens.package", "**/ens.package",
+                                          "ens.overrides", "**/ens.overrides"}) do
+                    for _, f in ipairs(os.files(path.join(os.projectdir(), root, pattern))) do
+                        add(f)
+                    end
                 end
             end
             table.sort(files)

@@ -396,7 +396,7 @@ void Parser::parseExternalBlock() {
     }
     {
         builder.startNode(SyntaxKind::LibrarySpec);
-        expect(SyntaxKind::StringLiteral, "library name string");
+        expect(SyntaxKind::Identifier, "library name after 'from'");
         builder.finishNode();
     }
     expect(SyntaxKind::LBrace, "'{' to begin external block");

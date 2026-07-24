@@ -1,33 +1,61 @@
-// Workspaces and package aliases. A workspace is a folder of Ens sources plus the packages its
-// imports may reach. Aliases currently come from a dependencies.txt file next to the sources; that
-// file is a temporary mechanism, so every assumption about it (its name, its format, its wording
-// in messages) stays inside this module.
-//
-// Format, one dependency per line: "@dotted.alias=relative/path", resolved against the folder
-// containing the file. Blank lines and whole-line '#' comments are skipped. A malformed line is
-// reported and skipped without aborting the load.
+// Workspaces and package manifests. A workspace is a folder governed by an `ens.package`
+// manifest: either a single package, or a workspace listing member package folders. A package's
+// `dependency` declarations resolve by name against the members of its enclosing workspace (the
+// nearest ancestor whose manifest lists the package as a member), with the root's untracked
+// `ens.overrides` taking precedence build-wide. Everything the sema layer knows about manifest
+// files (their names, their forms, their validation, their wording in messages) stays inside
+// this module.
 import FileLoader from support.loader;
 import FileError from support.loader;
 import FileDiagnostic from support.diagnostics;
 import @ens.frontend.support.source;
+import Source from @ens.frontend.support.source;
+import Span from @ens.frontend.support.source;
+import @ens.frontend.parse.parser;
+import @ens.frontend.syntax.generated.factory;
+import ManifestFileNode from @ens.frontend.syntax.generated.nodes;
+import ManifestDeclaration from @ens.frontend.syntax.generated.nodes;
+import PackageDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import WorkspaceDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import OverridesDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import VersionDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import EnsDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import DependencyDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import MemberDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import OverrideDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import NativeDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import NativeLibraryBindingNode from @ens.frontend.syntax.generated.nodes;
+import NativeArtifactBindingNode from @ens.frontend.syntax.generated.nodes;
+import PackagePathNode from @ens.frontend.syntax.generated.nodes;
 import support.paths;
 import List from @std.collections.list;
 import Map from @std.collections.map;
+import Set from @std.collections.set;
+import StringBuilder from @std.text.stringbuilder;
 
 public class Workspace {
-    string rootFolder;
-    string workspaceSourceRoot;
-    string workspaceTestsRoot;
-    string prefix;
-    Map<string, string> aliasFolders;
+    protected string rootFolder;
+    protected string workspaceSourceRoot;
+    protected string workspaceTestsRoot;
+    protected string prefix;
+    protected Map<string, string> dependencyFolders;
+    protected bool packageForm;
+    protected bool workspaceForm;
+    protected string manifestFile;
+    protected string declaredPackageName;
+    protected NativeInfo[] declaredNatives;
 
-    protected constructor(string root, string sourceRoot, string testsRoot, string packagePrefix,
-                Map<string, string> aliases) {
+    protected constructor(string root, string sourceRoot, string testsRoot, string packagePrefix) {
         this.rootFolder = root;
         this.workspaceSourceRoot = sourceRoot;
         this.workspaceTestsRoot = testsRoot;
         this.prefix = packagePrefix;
-        this.aliasFolders = aliases;
+        this.dependencyFolders = new Map<string, string>();
+        this.packageForm = false;
+        this.workspaceForm = false;
+        this.manifestFile = "";
+        this.declaredPackageName = "";
+        this.declaredNatives = [];
     }
 
     public root() -> string {
@@ -50,12 +78,40 @@ public class Workspace {
         return this.prefix;
     }
 
-    // The longest alias key matching a prefix of the import's segments, so '@a.b.c' prefers the
-    // alias 'a.b' over the alias 'a'.
+    public hasPackageManifest() -> bool {
+        return this.packageForm;
+    }
+
+    public isWorkspaceRoot() -> bool {
+        return this.workspaceForm;
+    }
+
+    public manifestPath() -> string {
+        return this.manifestFile;
+    }
+
+    public packageName() -> string {
+        return this.declaredPackageName;
+    }
+
+    public natives() -> NativeInfo[] {
+        return this.declaredNatives;
+    }
+
+    public nativeNames() -> string[] {
+        let names = new List<string>();
+        for (let native in this.declaredNatives) {
+            names.push(native.name());
+        }
+        return names.toArray();
+    }
+
+    // The longest dependency name matching a prefix of the import's segments, so '@a.b.c'
+    // prefers the package 'a.b' over the package 'a'.
     public matchPackage(string[] segments) -> PackageMatch? {
         for (long count = segments.length; count >= 1; count--) {
             string key = paths.joinRange(segments, ".", 0, count);
-            string? folder = this.aliasFolders.get(key);
+            string? folder = this.dependencyFolders.get(key);
             if (folder != null) {
                 return new PackageMatch(count, folder);
             }
@@ -65,12 +121,16 @@ public class Workspace {
 
     // The user-facing explanation for an import of a package this workspace does not know.
     public missingPackageMessage(string packagePath) -> string {
-        if (this.aliasFolders.length() == 0) {
-            return "External package '{packagePath}' is not available. "
-                + "Add it to dependencies.txt (only '@std' is built in).";
+        if (this.packageForm) {
+            return "Package '{packagePath}' is not declared as a dependency in "
+                + "{this.manifestFile}.";
         }
-        string dependenciesPath = dependenciesFilePath(this.rootFolder);
-        return "Package '{packagePath}' is not listed in {dependenciesPath}.";
+        if (this.workspaceForm) {
+            return "Package '{packagePath}' is not a member of the workspace at "
+                + "{this.manifestFile}.";
+        }
+        return "External package '{packagePath}' is not available; these sources have no "
+            + "ens.package manifest (only '@std' is built in).";
     }
 }
 
@@ -92,31 +152,196 @@ public class PackageMatch {
     }
 }
 
-// A loaded workspace together with the diagnostics its dependency file produced.
-public class WorkspaceLoad {
-    Workspace loadedWorkspace;
-    FileDiagnostic[] loadDiagnostics;
+// One per-platform binding inside a native declaration's block.
+public class NativeBindingInfo {
+    string bindingPlatform;
+    string[] bindingNames;
+    bool artifactBinding;
+    string bindingUrl;
+    string bindingChecksum;
 
-    protected constructor(Workspace workspace, FileDiagnostic[] diagnostics) {
-        this.loadedWorkspace = workspace;
-        this.loadDiagnostics = diagnostics;
+    protected constructor(string platform, string[] names, bool isArtifact, string url,
+                string checksum) {
+        this.bindingPlatform = platform;
+        this.bindingNames = names;
+        this.artifactBinding = isArtifact;
+        this.bindingUrl = url;
+        this.bindingChecksum = checksum;
     }
 
-    public workspace() -> Workspace {
-        return this.loadedWorkspace;
+    public platform() -> string {
+        return this.bindingPlatform;
     }
 
-    public diagnostics() -> FileDiagnostic[] {
-        return this.loadDiagnostics;
+    public baseNames() -> string[] {
+        return this.bindingNames;
+    }
+
+    public isArtifact() -> bool {
+        return this.artifactBinding;
+    }
+
+    public url() -> string {
+        return this.bindingUrl;
+    }
+
+    public checksum() -> string {
+        return this.bindingChecksum;
     }
 }
 
-// The nearest ancestor of startFolder (inclusive) marked as a workspace root, or null when no
-// ancestor is marked; having no workspace is valid.
+// One native library declaration from a package manifest.
+public class NativeInfo {
+    string nativeName;
+    bool systemLibrary;
+    bool blockPresent;
+    NativeBindingInfo[] nativeBindings;
+    Span nativeSpan;
+
+    protected constructor(string name, bool isSystem, bool hasBindingBlock,
+                NativeBindingInfo[] bindings, Span span) {
+        this.nativeName = name;
+        this.systemLibrary = isSystem;
+        this.blockPresent = hasBindingBlock;
+        this.nativeBindings = bindings;
+        this.nativeSpan = span;
+    }
+
+    public name() -> string {
+        return this.nativeName;
+    }
+
+    public isSystem() -> bool {
+        return this.systemLibrary;
+    }
+
+    public hasBindingBlock() -> bool {
+        return this.blockPresent;
+    }
+
+    public bindings() -> NativeBindingInfo[] {
+        return this.nativeBindings;
+    }
+
+    public span() -> Span {
+        return this.nativeSpan;
+    }
+}
+
+// True when the two declarations bind the same logical library identically, so a build may
+// dedupe them; anything else is a conflict.
+public sameNative(NativeInfo first, NativeInfo second) -> bool {
+    if (first.isSystem() != second.isSystem()
+            || first.hasBindingBlock() != second.hasBindingBlock()) {
+        return false;
+    }
+    let firstBindings = first.bindings();
+    let secondBindings = second.bindings();
+    if (firstBindings.length != secondBindings.length) {
+        return false;
+    }
+    for (long i = 0; i < firstBindings.length; i++) {
+        if (!sameBinding(firstBindings[i], secondBindings[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+sameBinding(NativeBindingInfo first, NativeBindingInfo second) -> bool {
+    if (first.platform() != second.platform() || first.isArtifact() != second.isArtifact()
+            || first.url() != second.url() || first.checksum() != second.checksum()) {
+        return false;
+    }
+    string[] firstNames = first.baseNames();
+    string[] secondNames = second.baseNames();
+    if (firstNames.length != secondNames.length) {
+        return false;
+    }
+    for (long i = 0; i < firstNames.length; i++) {
+        if (firstNames[i] != secondNames[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+enum ManifestForm {
+    Absent,
+    PackageForm,
+    WorkspaceForm,
+    OverridesForm,
+}
+
+class DependencyInfo {
+    protected string name;
+    protected bool hasVersion;
+    protected string version;
+    protected Span span;
+
+    protected constructor(this.name, this.hasVersion, this.version, this.span);
+}
+
+class MemberInfo {
+    protected string folder;
+    protected Span span;
+
+    protected constructor(this.folder, this.span);
+}
+
+class OverrideInfo {
+    protected string name;
+    protected string folder;
+    protected Span span;
+
+    protected constructor(this.name, this.folder, this.span);
+}
+
+class ManifestData {
+    protected ManifestForm form;
+    protected string packageName;
+    protected List<DependencyInfo> dependencies;
+    protected List<NativeInfo> natives;
+    protected List<MemberInfo> members;
+    protected List<OverrideInfo> overrides;
+
+    protected constructor() {
+        this.form = ManifestForm.Absent;
+        this.packageName = "";
+        this.dependencies = new List<DependencyInfo>();
+        this.natives = new List<NativeInfo>();
+        this.members = new List<MemberInfo>();
+        this.overrides = new List<OverrideInfo>();
+    }
+}
+
+// The member index of one workspace-form manifest: member package names to member folders.
+class MemberIndex {
+    protected bool isWorkspaceForm;
+    protected Map<string, string> foldersByName;
+    protected Set<string> memberFolders;
+
+    protected constructor() {
+        this.isWorkspaceForm = false;
+        this.foldersByName = new Map<string, string>();
+        this.memberFolders = new Set<string>();
+    }
+}
+
+public manifestFilePath(string folder) -> string {
+    return paths.join(folder, "ens.package");
+}
+
+overridesFilePath(string folder) -> string {
+    return paths.join(folder, "ens.overrides");
+}
+
+// The nearest ancestor of startFolder (inclusive) holding an ens.package manifest, or null when
+// no ancestor is marked; having no workspace is valid.
 public discoverRoot(FileLoader loader, string startFolder) -> string? {
     string folder = paths.normalize(startFolder);
     while (true) {
-        if (loader.exists(dependenciesFilePath(folder))) {
+        if (loader.exists(manifestFilePath(folder))) {
             return folder;
         }
         string parent = paths.parentFolder(folder);
@@ -127,128 +352,560 @@ public discoverRoot(FileLoader loader, string startFolder) -> string? {
     }
 }
 
-// The workspace the whole build runs in. Its root is discovered upward from the source folder;
-// when nothing marks a root the sources stand alone, with no packages available. testsRoot may be
-// "" when the build has no separate tests folder.
-public loadRootWorkspace(FileLoader loader, string sourceRoot, string testsRoot) -> WorkspaceLoad {
-    string normalizedSource = paths.normalize(sourceRoot);
-    string normalizedTests = "";
-    if (testsRoot.length > 0) {
-        normalizedTests = paths.normalize(testsRoot);
+// Loads every workspace of one build: the root, the standard library, and each dependency
+// package as it is reached. Manifests parse once and their diagnostics accumulate here; the
+// caller drains them with diagnostics().
+public class WorkspaceLoader {
+    FileLoader loader;
+    Map<string, ManifestData> manifestCache;
+    Map<string, MemberIndex> memberIndexCache;
+    Map<string, string> overrideFolders;
+    List<FileDiagnostic> collected;
+
+    public constructor(FileLoader loader) {
+        this.loader = loader;
+        this.manifestCache = new Map<string, ManifestData>();
+        this.memberIndexCache = new Map<string, MemberIndex>();
+        this.overrideFolders = new Map<string, string>();
+        this.collected = new List<FileDiagnostic>();
     }
-    string? root = discoverRoot(loader, normalizedSource);
-    if (root == null) {
-        let standalone = new Workspace(normalizedSource, normalizedSource, normalizedTests, "",
-            new Map<string, string>());
-        return new WorkspaceLoad(standalone, []);
+
+    public diagnostics() -> FileDiagnostic[] {
+        return this.collected.toArray();
     }
-    return load(loader, root, normalizedSource, normalizedTests, "");
-}
 
-// A dependency package is consumed through its src/ subfolder only and never exposes tests. Its
-// own dependencies file is read here, when the package is first reached; dependencies do not
-// spread transitively to the workspaces that import the package.
-public loadPackageWorkspace(FileLoader loader, string folder, string packagePrefix)
-        -> WorkspaceLoad {
-    string normalizedFolder = paths.normalize(folder);
-    return load(loader, normalizedFolder, paths.join(normalizedFolder, "src"), "", packagePrefix);
-}
+    // The workspace the whole build runs in. Its root is discovered upward from the source
+    // folder; when nothing marks a root the sources stand alone, with no packages available.
+    // testsRoot may be "" when the build has no separate tests folder.
+    public loadRoot(string sourceRoot, string testsRoot) -> Workspace {
+        string normalizedSource = paths.normalize(sourceRoot);
+        string normalizedTests = "";
+        if (testsRoot.length > 0) {
+            normalizedTests = paths.normalize(testsRoot);
+        }
+        string? root = discoverRoot(this.loader, normalizedSource);
+        if (root == null) {
+            return new Workspace(normalizedSource, normalizedSource, normalizedTests, "");
+        }
+        let workspace = new Workspace(root, normalizedSource, normalizedTests, "");
+        workspace.manifestFile = manifestFilePath(root);
+        let manifest = this.manifestAt(root);
+        this.loadOverrides(root);
+        switch (manifest.form) {
+            PackageForm -> this.applyPackage(workspace, manifest),
+            WorkspaceForm -> {
+                workspace.workspaceForm = true;
+                let index = this.memberIndexFor(root);
+                for (let name in index.foldersByName.keys()) {
+                    let folder = index.foldersByName.get(name);
+                    if (folder != null) {
+                        workspace.dependencyFolders.set(name, folder);
+                    }
+                }
+                for (let name in this.overrideFolders.keys()) {
+                    let folder = this.overrideFolders.get(name);
+                    if (folder != null) {
+                        workspace.dependencyFolders.set(name, folder);
+                    }
+                }
+            },
+            OverridesForm -> this.report(workspace.manifestFile, source.makeSpan(0, 0),
+                "An ens.package file holds a package or workspace declaration; overrides live "
+                + "in the ens.overrides file next to it."),
+            Absent -> this.report(workspace.manifestFile, source.makeSpan(0, 0),
+                "Expected a 'package' or 'workspace' declaration."),
+        }
+        return workspace;
+    }
 
-// The standard library resolves against a caller-supplied root and keeps its full 'std.*' module
-// paths; the 'std' package prefix only marks its package boundary. It never has aliases of its
-// own.
-public stdlibWorkspace(string stdlibRoot) -> Workspace {
-    string normalizedRoot = paths.normalize(stdlibRoot);
-    return new Workspace(normalizedRoot, normalizedRoot, "", "std", new Map<string, string>());
-}
-
-load(FileLoader loader, string root, string sourceRoot, string testsRoot,
-             string packagePrefix) -> WorkspaceLoad {
-    let aliases = new Map<string, string>();
-    let diagnostics = new List<FileDiagnostic>();
-    string dependenciesPath = dependenciesFilePath(root);
-    if (loader.exists(dependenciesPath)) {
-        string? text = readOrNull(loader, dependenciesPath);
-        if (text == null) {
-            diagnostics.push(new FileDiagnostic(dependenciesPath,
-                "Could not read {dependenciesPath}.", source.makeSpan(0, 0)));
+    // A dependency package is consumed through its src/ subfolder only and never exposes tests.
+    // Its manifest is read when the package is first reached; its dependencies resolve against
+    // its own enclosing workspace, under the root's overrides.
+    public loadPackage(string folder, string packagePrefix) -> Workspace {
+        string normalizedFolder = paths.normalize(folder);
+        let workspace = new Workspace(normalizedFolder,
+            paths.join(normalizedFolder, "src"), "", packagePrefix);
+        workspace.manifestFile = manifestFilePath(normalizedFolder);
+        if (!this.loader.exists(workspace.manifestFile)) {
+            this.report(workspace.manifestFile, source.makeSpan(0, 0),
+                "Package folder {normalizedFolder} has no ens.package manifest.");
+            return workspace;
+        }
+        let manifest = this.manifestAt(normalizedFolder);
+        if (manifest.form == ManifestForm.PackageForm) {
+            this.applyPackage(workspace, manifest);
         } else {
-            parseDependencies(dependenciesPath, root, text, aliases, diagnostics);
+            this.report(workspace.manifestFile, source.makeSpan(0, 0),
+                "Expected a package declaration; a package consumed as a dependency cannot "
+                + "hold a workspace or overrides declaration.");
+        }
+        return workspace;
+    }
+
+    // The standard library resolves against a caller-supplied root and keeps its full 'std.*'
+    // module paths; the 'std' package prefix only marks its package boundary. Its manifest,
+    // when present, sits at <root>/std/ens.package and declares only natives.
+    public stdlibWorkspace(string stdlibRoot) -> Workspace {
+        string normalizedRoot = paths.normalize(stdlibRoot);
+        let workspace = new Workspace(normalizedRoot, normalizedRoot, "", "std");
+        string packageFolder = paths.join(normalizedRoot, "std");
+        if (this.loader.exists(manifestFilePath(packageFolder))) {
+            workspace.manifestFile = manifestFilePath(packageFolder);
+            let manifest = this.manifestAt(packageFolder);
+            if (manifest.form == ManifestForm.PackageForm) {
+                this.applyPackage(workspace, manifest);
+            }
+        }
+        return workspace;
+    }
+
+    applyPackage(Workspace workspace, ManifestData manifest) {
+        workspace.packageForm = true;
+        workspace.declaredPackageName = manifest.packageName;
+        workspace.declaredNatives = manifest.natives.toArray();
+        for (long i = 0; i < manifest.dependencies.length(); i++) {
+            this.resolveDependency(workspace, manifest.dependencies.get(i));
         }
     }
-    let loaded = new Workspace(root, sourceRoot, testsRoot, packagePrefix, aliases);
-    return new WorkspaceLoad(loaded, diagnostics.toArray());
-}
 
-readOrNull(FileLoader loader, string path) -> string? {
-    return try loader.readText(path);
-} catch (FileError error) {
-    return null;
-}
-
-dependenciesFilePath(string folder) -> string {
-    return paths.join(folder, "dependencies.txt");
-}
-
-parseDependencies(string filePath, string folder, string text,
-                          Map<string, string> aliases, List<FileDiagnostic> diagnostics) {
-    long lineStart = 0;
-    string rest = text;
-    while (true) {
-        long newline = rest.indexOf("\n");
-        string line = rest;
-        if (newline >= 0) {
-            line = rest.substring(0, newline);
-        }
-        parseLine(filePath, folder, line, lineStart, aliases, diagnostics);
-        if (newline < 0) {
+    resolveDependency(Workspace workspace, DependencyInfo dependency) {
+        string? overrideFolder = this.overrideFolders.get(dependency.name);
+        if (overrideFolder != null) {
+            if (dependency.hasVersion) {
+                this.report(workspace.manifestFile, dependency.span,
+                    "Dependency '{dependency.name}' resolves to the override at "
+                    + "{overrideFolder}; a local override is used as-is, so remove the "
+                    + "version \"{dependency.version}\".");
+            }
+            workspace.dependencyFolders.set(dependency.name, overrideFolder);
             return;
         }
-        lineStart = lineStart + newline + 1;
-        rest = rest.substring(newline + 1, rest.length);
+        let index = this.enclosingMemberIndex(workspace.rootFolder);
+        if (index != null) {
+            string? memberFolder = index.foldersByName.get(dependency.name);
+            if (memberFolder != null) {
+                if (dependency.hasVersion) {
+                    this.report(workspace.manifestFile, dependency.span,
+                        "Dependency '{dependency.name}' resolves to the workspace member at "
+                        + "{memberFolder}; a member is used as-is, so remove the version "
+                        + "\"{dependency.version}\".");
+                }
+                workspace.dependencyFolders.set(dependency.name, memberFolder);
+                return;
+            }
+        }
+        this.report(workspace.manifestFile, dependency.span,
+            "No source for package '{dependency.name}': there is no package registry yet, so "
+            + "a dependency must be a member of the enclosing workspace or an override in "
+            + "ens.overrides pointing at a local folder.");
+    }
+
+    // The member index a package resolves its dependencies against: the nearest ancestor
+    // holding a workspace-form manifest, and only when that workspace lists the package as a
+    // member.
+    enclosingMemberIndex(string packageFolder) -> MemberIndex? {
+        string normalized = paths.normalize(packageFolder);
+        string folder = paths.parentFolder(normalized);
+        while (folder.length > 0) {
+            if (this.loader.exists(manifestFilePath(folder))) {
+                let index = this.memberIndexFor(folder);
+                if (index.isWorkspaceForm) {
+                    if (index.memberFolders.contains(normalized)) {
+                        return index;
+                    }
+                    return null;
+                }
+            }
+            string parent = paths.parentFolder(folder);
+            if (parent.length == 0 || parent == folder) {
+                return null;
+            }
+            folder = parent;
+        }
+        return null;
+    }
+
+    memberIndexFor(string folder) -> MemberIndex {
+        string key = paths.normalize(folder);
+        let cached = this.memberIndexCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        let index = new MemberIndex();
+        string file = manifestFilePath(key);
+        if (this.loader.exists(file)) {
+            let manifest = this.manifestAt(key);
+            if (manifest.form == ManifestForm.WorkspaceForm) {
+                index.isWorkspaceForm = true;
+                for (long i = 0; i < manifest.members.length(); i++) {
+                    this.indexMember(file, key, manifest.members.get(i), index);
+                }
+            }
+        }
+        this.memberIndexCache.set(key, index);
+        return index;
+    }
+
+    indexMember(string file, string workspaceFolder, MemberInfo member, MemberIndex index) {
+        string memberFolder = paths.normalize(paths.join(workspaceFolder, member.folder));
+        if (!this.loader.exists(manifestFilePath(memberFolder))) {
+            this.report(file, member.span, "Workspace member \"{member.folder}\" has no "
+                + "ens.package manifest; every member folder declares a package.");
+            return;
+        }
+        let declared = this.manifestAt(memberFolder);
+        if (declared.form != ManifestForm.PackageForm) {
+            this.report(file, member.span,
+                "Workspace member \"{member.folder}\" must declare a package.");
+            return;
+        }
+        string? existing = index.foldersByName.get(declared.packageName);
+        if (existing != null) {
+            this.report(file, member.span, "Members \"{existing}\" and \"{memberFolder}\" "
+                + "both declare package '{declared.packageName}'; package names must be "
+                + "unique within a workspace.");
+            return;
+        }
+        index.foldersByName.set(declared.packageName, memberFolder);
+        index.memberFolders.add(memberFolder);
+    }
+
+    loadOverrides(string rootFolder) {
+        string file = overridesFilePath(rootFolder);
+        if (!this.loader.exists(file)) {
+            return;
+        }
+        string? text = this.readOrNull(file);
+        if (text == null) {
+            this.report(file, source.makeSpan(0, 0), "Could not read {file}.");
+            return;
+        }
+        let data = this.readManifest(file, text);
+        if (data.form != ManifestForm.OverridesForm && data.form != ManifestForm.Absent) {
+            this.report(file, source.makeSpan(0, 0), "An ens.overrides file holds a single "
+                + "overrides declaration; packages and workspaces are declared in "
+                + "ens.package.");
+            return;
+        }
+        for (long i = 0; i < data.overrides.length(); i++) {
+            this.registerOverride(file, rootFolder, data.overrides.get(i));
+        }
+    }
+
+    registerOverride(string file, string rootFolder, OverrideInfo redirect) {
+        string target = resolveTarget(rootFolder, redirect.folder);
+        if (!this.loader.exists(manifestFilePath(target))) {
+            this.report(file, redirect.span, "The override for package '{redirect.name}' "
+                + "points at {target}, which has no ens.package manifest.");
+            return;
+        }
+        let declared = this.manifestAt(target);
+        if (declared.form != ManifestForm.PackageForm) {
+            this.report(file, redirect.span, "The override for package '{redirect.name}' "
+                + "points at {target}, which does not declare a package.");
+            return;
+        }
+        if (declared.packageName != redirect.name) {
+            this.report(file, redirect.span, "The override for package '{redirect.name}' "
+                + "points at {target}, which declares package '{declared.packageName}' "
+                + "instead; the names must match exactly.");
+            return;
+        }
+        this.overrideFolders.set(redirect.name, target);
+    }
+
+    manifestAt(string folder) -> ManifestData {
+        string key = paths.normalize(folder);
+        let cached = this.manifestCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        string file = manifestFilePath(key);
+        string? text = this.readOrNull(file);
+        ManifestData data = new ManifestData();
+        if (text == null) {
+            this.report(file, source.makeSpan(0, 0), "Could not read {file}.");
+        } else {
+            data = this.readManifest(file, text);
+        }
+        this.manifestCache.set(key, data);
+        return data;
+    }
+
+    readManifest(string file, string text) -> ManifestData {
+        let parsed = parser.parseManifest(new Source(file, text));
+        for (let diagnostic in parsed.diagnostics()) {
+            this.collected.push(new FileDiagnostic(file, diagnostic.message(),
+                diagnostic.span()));
+        }
+        let data = new ManifestData();
+        let root = factory.createRoot(parsed.root());
+        if (root is ManifestFileNode) {
+            if (root.declarationsCount() > 1) {
+                this.report(file, root.declarations(1).span(), "A manifest file holds exactly "
+                    + "one declaration; remove the extra declarations.");
+            }
+            if (root.declarationsCount() > 0) {
+                this.readDeclaration(file, root.declarations(0), data);
+            }
+        }
+        return data;
+    }
+
+    readDeclaration(string file, ManifestDeclaration declaration, ManifestData data) {
+        switch (declaration) {
+            is PackageDeclarationNode node -> {
+                data.form = ManifestForm.PackageForm;
+                data.packageName = pathText(node.name());
+                bool sawVersion = false;
+                bool sawEns = false;
+                for (long i = 0; i < node.itemsCount(); i++) {
+                    let item = node.items(i);
+                    switch (item) {
+                        is VersionDeclarationNode version -> {
+                            if (sawVersion) {
+                                this.report(file, version.span(), "The package already "
+                                    + "declares 'version'; remove the duplicate.");
+                            }
+                            sawVersion = true;
+                            string raw = version.value().text();
+                            string value = unquote(raw);
+                            if (raw.length > 0 && !isVersionText(value)) {
+                                this.report(file, version.value().span(), "The version "
+                                    + "'{value}' is not a valid version; use dotted numerals "
+                                    + "such as \"1.3.0\".");
+                            }
+                        },
+                        is EnsDeclarationNode language -> {
+                            if (sawEns) {
+                                this.report(file, language.span(), "The package already "
+                                    + "declares 'ens'; remove the duplicate.");
+                            }
+                            sawEns = true;
+                            string raw = language.value().text();
+                            string value = unquote(raw);
+                            if (raw.length > 0
+                                    && (!isVersionText(value) || dotCount(value) != 1)) {
+                                this.report(file, language.value().span(), "The language "
+                                    + "version '{value}' is not valid; use major.minor, such "
+                                    + "as \"1.2\".");
+                            }
+                        },
+                        is DependencyDeclarationNode dependency -> {
+                            this.readDependency(file, dependency, data);
+                        },
+                        is NativeDeclarationNode native -> {
+                            this.readNative(file, native, data);
+                        },
+                        default -> {
+                        },
+                    }
+                }
+            },
+            is WorkspaceDeclarationNode node -> {
+                data.form = ManifestForm.WorkspaceForm;
+                for (long i = 0; i < node.itemsCount(); i++) {
+                    let item = node.items(i);
+                    if (item is MemberDeclarationNode) {
+                        this.readMember(file, item, data);
+                    }
+                }
+            },
+            is OverridesDeclarationNode node -> {
+                data.form = ManifestForm.OverridesForm;
+                for (long i = 0; i < node.itemsCount(); i++) {
+                    let item = node.items(i);
+                    if (item is OverrideDeclarationNode) {
+                        this.readOverride(file, item, data);
+                    }
+                }
+            },
+            default -> {
+            },
+        }
+    }
+
+    readDependency(string file, DependencyDeclarationNode node, ManifestData data) {
+        string name = pathText(node.name());
+        if (name.length == 0) {
+            return;
+        }
+        for (long i = 0; i < data.dependencies.length(); i++) {
+            if (data.dependencies.get(i).name == name) {
+                this.report(file, node.span(), "Package '{name}' is already declared as a "
+                    + "dependency; remove the duplicate.");
+                return;
+            }
+        }
+        bool hasVersion = false;
+        string version = "";
+        let versionToken = node.version();
+        if (versionToken != null) {
+            hasVersion = true;
+            version = unquote(versionToken.text());
+            if (!isVersionText(version)) {
+                this.report(file, versionToken.span(), "The version '{version}' of dependency "
+                    + "'{name}' is not a valid version; use dotted numerals such as \"2.0\".");
+            }
+        }
+        data.dependencies.push(new DependencyInfo(name, hasVersion, version, node.span()));
+    }
+
+    readNative(string file, NativeDeclarationNode node, ManifestData data) {
+        string name = node.name().text();
+        if (name.length == 0) {
+            return;
+        }
+        for (long i = 0; i < data.natives.length(); i++) {
+            if (data.natives.get(i).name() == name) {
+                this.report(file, node.span(), "Native library '{name}' is already declared; "
+                    + "remove the duplicate.");
+                return;
+            }
+        }
+        bool isSystem = node.systemKeyword() != null;
+        let block = node.bindings();
+        if (isSystem && block != null) {
+            this.report(file, node.span(), "Native library '{name}' is marked 'system', so it "
+                + "is linked by platform defaults and cannot carry a binding block.");
+        }
+        let bindings = new List<NativeBindingInfo>();
+        if (block != null) {
+            let platforms = new Set<string>();
+            for (long i = 0; i < block.bindingsCount(); i++) {
+                let binding = block.bindings(i);
+                switch (binding) {
+                    is NativeLibraryBindingNode names -> {
+                        this.checkPlatform(file, name, names.platform().text(),
+                            names.platform().span(), platforms);
+                        let baseNames = new List<string>();
+                        for (long j = 0; j < names.namesCount(); j++) {
+                            string baseName = unquote(names.names(j).text());
+                            if (baseName.length == 0 && names.names(j).text().length > 0) {
+                                this.report(file, names.names(j).span(), "A library base name "
+                                    + "for native library '{name}' cannot be empty.");
+                            }
+                            baseNames.push(baseName);
+                        }
+                        bindings.push(new NativeBindingInfo(names.platform().text(),
+                            baseNames.toArray(), false, "", ""));
+                    },
+                    is NativeArtifactBindingNode artifact -> {
+                        this.checkPlatform(file, name, artifact.platform().text(),
+                            artifact.platform().span(), platforms);
+                        string checksum = unquote(artifact.checksum().text());
+                        if (artifact.checksum().text().length > 0
+                                && !isChecksumText(checksum)) {
+                            this.report(file, artifact.checksum().span(), "The artifact "
+                                + "checksum for native library '{name}' must look like "
+                                + "\"sha256:\" followed by 64 hex digits.");
+                        }
+                        this.report(file, artifact.span(), "Native library '{name}' binds an "
+                            + "artifact for '{artifact.platform().text()}', but artifact "
+                            + "fetching is not supported yet; name a library installed on "
+                            + "this machine instead.");
+                        bindings.push(new NativeBindingInfo(artifact.platform().text(), [],
+                            true, unquote(artifact.url().text()), checksum));
+                    },
+                    default -> {
+                    },
+                }
+            }
+        }
+        data.natives.push(new NativeInfo(name, isSystem, block != null, bindings.toArray(),
+            node.span()));
+    }
+
+    checkPlatform(string file, string nativeName, string platform, Span span,
+                  Set<string> platforms) {
+        if (platform.length == 0) {
+            return;
+        }
+        if (platform != "windows" && platform != "linux" && platform != "macos") {
+            this.report(file, span, "Unknown platform '{platform}' in native library "
+                + "'{nativeName}'; bindings use 'windows', 'linux', or 'macos'.");
+        }
+        if (!platforms.add(platform)) {
+            this.report(file, span, "Platform '{platform}' is bound twice for native library "
+                + "'{nativeName}'; remove the duplicate.");
+        }
+    }
+
+    readMember(string file, MemberDeclarationNode node, ManifestData data) {
+        string raw = node.folder().text();
+        if (raw.length == 0) {
+            return;
+        }
+        string folder = unquote(raw);
+        if (folder.length == 0) {
+            this.report(file, node.folder().span(), "A member folder cannot be empty.");
+            return;
+        }
+        for (long i = 0; i < data.members.length(); i++) {
+            if (data.members.get(i).folder == folder) {
+                this.report(file, node.span(), "Member \"{folder}\" is already listed; remove "
+                    + "the duplicate.");
+                return;
+            }
+        }
+        data.members.push(new MemberInfo(folder, node.span()));
+    }
+
+    readOverride(string file, OverrideDeclarationNode node, ManifestData data) {
+        string name = pathText(node.name());
+        string raw = node.folder().text();
+        if (name.length == 0 || raw.length == 0) {
+            return;
+        }
+        string folder = unquote(raw);
+        if (folder.length == 0) {
+            this.report(file, node.folder().span(), "An override folder cannot be empty.");
+            return;
+        }
+        for (long i = 0; i < data.overrides.length(); i++) {
+            if (data.overrides.get(i).name == name) {
+                this.report(file, node.span(), "Package '{name}' is already overridden; "
+                    + "remove the duplicate.");
+                return;
+            }
+        }
+        data.overrides.push(new OverrideInfo(name, folder, node.span()));
+    }
+
+    readOrNull(string path) -> string? {
+        return try this.loader.readText(path);
+    } catch (FileError error) {
+        return null;
+    }
+
+    report(string file, Span span, string message) {
+        this.collected.push(new FileDiagnostic(file, message, span));
     }
 }
 
-parseLine(string filePath, string folder, string line, long lineStart,
-                  Map<string, string> aliases, List<FileDiagnostic> diagnostics) {
-    byte[] bytes = line.toBytes();
-    long begin = 0;
-    while (begin < bytes.length && isSpace(bytes[begin])) {
-        begin++;
+pathText(PackagePathNode path) -> string {
+    let builder = new StringBuilder();
+    bool first = true;
+    for (long i = 0; i < path.segmentsCount(); i++) {
+        string segment = path.segments(i).text();
+        if (segment.length == 0) {
+            continue;
+        }
+        if (!first) {
+            builder.append(".");
+        }
+        builder.append(segment);
+        first = false;
     }
-    long end = bytes.length;
-    while (end > begin && isSpace(bytes[end - 1])) {
-        end--;
+    return builder.toString();
+}
+
+unquote(string raw) -> string {
+    if (raw.length >= 2 && raw.substring(0, 1) == "\""
+            && raw.substring(raw.length - 1, raw.length) == "\"") {
+        return raw.substring(1, raw.length - 1);
     }
-    if (end == begin || bytes[begin] == '#') {
-        return;
-    }
-    string trimmed = line.substring(begin, end);
-    let span = source.makeSpan(lineStart + begin, end - begin);
-    if (bytes[begin] != '@') {
-        diagnostics.push(new FileDiagnostic(filePath, "A dependency line must look like "
-            + "'@package.name=path'; '{trimmed}' does not start with '@'.", span));
-        return;
-    }
-    long equals = trimmed.indexOf("=");
-    if (equals < 0) {
-        diagnostics.push(new FileDiagnostic(filePath, "A dependency line must look like "
-            + "'@package.name=path'; '{trimmed}' is missing '='.", span));
-        return;
-    }
-    string key = trimText(trimmed.substring(1, equals));
-    string target = trimText(trimmed.substring(equals + 1, trimmed.length));
-    if (key.length == 0 || target.length == 0) {
-        diagnostics.push(new FileDiagnostic(filePath, "A dependency line must look like "
-            + "'@package.name=path'; the package name and path must both be non-empty.", span));
-        return;
-    }
-    if (aliases.contains(key)) {
-        diagnostics.push(new FileDiagnostic(filePath,
-            "Package '@{key}' is already declared; remove the duplicate line.", span));
-        return;
-    }
-    aliases.set(key, resolveTarget(folder, target));
+    return raw;
 }
 
 resolveTarget(string folder, string target) -> string {
@@ -258,19 +915,55 @@ resolveTarget(string folder, string target) -> string {
     return paths.normalize(paths.join(folder, target));
 }
 
-trimText(string text) -> string {
+isVersionText(string text) -> bool {
     byte[] bytes = text.toBytes();
-    long begin = 0;
-    while (begin < bytes.length && isSpace(bytes[begin])) {
-        begin++;
+    if (bytes.length == 0) {
+        return false;
     }
-    long end = bytes.length;
-    while (end > begin && isSpace(bytes[end - 1])) {
-        end--;
+    bool digitInSegment = false;
+    for (long i = 0; i < bytes.length; i++) {
+        byte value = bytes[i];
+        if (value == '.') {
+            if (!digitInSegment) {
+                return false;
+            }
+            digitInSegment = false;
+        } else if (value >= '0' && value <= '9') {
+            digitInSegment = true;
+        } else {
+            return false;
+        }
     }
-    return text.substring(begin, end);
+    return digitInSegment;
 }
 
-isSpace(byte value) -> bool {
-    return value == ' ' || value == '\t' || value == '\r';
+dotCount(string text) -> long {
+    byte[] bytes = text.toBytes();
+    long count = 0;
+    for (long i = 0; i < bytes.length; i++) {
+        if (bytes[i] == '.') {
+            count++;
+        }
+    }
+    return count;
+}
+
+isChecksumText(string text) -> bool {
+    string prefix = "sha256:";
+    if (text.length != prefix.length + 64) {
+        return false;
+    }
+    if (text.substring(0, prefix.length) != prefix) {
+        return false;
+    }
+    byte[] bytes = text.substring(prefix.length, text.length).toBytes();
+    for (long i = 0; i < bytes.length; i++) {
+        byte value = bytes[i];
+        bool hex = (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f')
+            || (value >= 'A' && value <= 'F');
+        if (!hex) {
+            return false;
+        }
+    }
+    return true;
 }
