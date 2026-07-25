@@ -165,6 +165,18 @@ task("test")
             })
         end
 
+        -- git-sourced dependencies end to end: tag resolution (verbatim, v-prefix, ambiguity),
+        -- fetching into the content store, ens.lock creation, no-network reuse, minimal
+        -- updates, --offline and --locked, MVS across transitive requirements, and the
+        -- conflict and rejection errors. Everything runs against scratch git repos and a
+        -- scratch ENS_CACHE, so no network or real cache is ever touched.
+        if want("cli_git") then
+            table.insert(jobs, {
+                name = "cli_git",
+                cli_git = true,
+            })
+        end
+
         -- surface any requested names that matched no test, so typos don't pass silently.
         if wanted ~= nil then
             local unknown = {}
@@ -599,6 +611,375 @@ task("test")
                 full = string.format("%s:\n%s", name, table.concat(failures, "\n"))}
         end
 
+        -- git-sourced dependencies, driven against scratch git repositories over file://
+        -- URLs and a scratch ENS_CACHE, so nothing touches the network or the real cache.
+        local function run_cli_git(job)
+            local name = job.name
+            local scratch = path.join(os.projectdir(), "build", "cli", "git")
+            os.tryrm(scratch)
+            os.tryrm(scratch .. ".away")
+            os.mkdir(scratch)
+            local log = path.join(out_dir, name .. ".log")
+            local failures = {}
+
+            local cache = path.join(scratch, "cache")
+            local cache_cold = path.join(scratch, "cache_cold")
+            local repos = path.join(scratch, "repos")
+
+            local function envs_with_cache(cache_dir)
+                local envs = os.getenvs()
+                envs.ENS_CACHE = cache_dir
+                return envs
+            end
+
+            local function run(argv, opt, expected_rc, ...)
+                local rc = execMerged(ens_exe, argv, log, opt)
+                local out = io.readfile(log) or ""
+                local label = table.concat(argv, " ")
+                if expected_rc ~= nil and rc ~= expected_rc then
+                    table.insert(failures, string.format("ens %s: exit=%s expected=%s\n%s",
+                        label, tostring(rc), tostring(expected_rc), out))
+                end
+                for _, fragment in ipairs({...}) do
+                    if not out:find(fragment, 1, true) then
+                        table.insert(failures, string.format("ens %s: output missing %q\n%s",
+                            label, fragment, out))
+                    end
+                end
+                return rc, out
+            end
+
+            local function run_program(exe, expected_rc, expected_stdout)
+                if not os.isfile(exe) then
+                    table.insert(failures, string.format("expected executable %s", exe))
+                    return
+                end
+                local rc = execMerged(exe, {}, log)
+                local out = (io.readfile(log) or ""):gsub("[\r\n]+$", "")
+                if rc ~= expected_rc or out ~= expected_stdout then
+                    table.insert(failures, string.format("%s: exit=%s stdout=%q",
+                        path.filename(exe), tostring(rc), out))
+                end
+            end
+
+            local function git(dir, ...)
+                os.iorunv("git", table.join({"-c", "user.name=ens", "-c",
+                    "user.email=ens@test"}, {...}), {curdir = dir})
+            end
+
+            local function make_repo(dir)
+                os.mkdir(dir)
+                git(dir, "init", "-q", "-b", "main", ".")
+            end
+
+            local function commit_all(dir, message)
+                git(dir, "add", "-A")
+                git(dir, "commit", "-q", "-m", message)
+            end
+
+            local function commit_of(dir, tag)
+                local out = os.iorunv("git", {"rev-parse", tag .. "^{commit}"}, {curdir = dir})
+                return (out:gsub("%s+$", ""))
+            end
+
+            local function url_of(dir)
+                return "file:///" .. (path.absolute(dir):gsub("\\", "/"))
+            end
+
+            local function write_package(dir, package_name, dependencies)
+                local lines = {"package " .. package_name .. " {", '    ens "0.1";'}
+                if dependencies and #dependencies > 0 then
+                    table.insert(lines, "")
+                    for _, dep in ipairs(dependencies) do
+                        table.insert(lines, "    " .. dep)
+                    end
+                end
+                table.insert(lines, "}")
+                io.writefile(path.join(dir, "ens.package"), table.concat(lines, "\n") .. "\n")
+            end
+
+            -- the scratch repositories: a plain package with several tagged versions, a
+            -- package with a transitive git requirement, a workspace-form tag root, a
+            -- submodule user, and a package that will be re-tagged.
+            local json_dir = path.join(repos, "json")
+            make_repo(json_dir)
+            write_package(json_dir, "alex.json")
+            io.writefile(path.join(json_dir, "src", "parse.ens"),
+                'export tag() -> string {\n    return "json 1.0";\n}\n')
+            commit_all(json_dir, "1.0")
+            git(json_dir, "tag", "1.0")
+            io.writefile(path.join(json_dir, "src", "parse.ens"),
+                'export tag() -> string {\n    return "json 1.1";\n}\n')
+            commit_all(json_dir, "1.1")
+            git(json_dir, "tag", "v1.1")
+            io.writefile(path.join(json_dir, "src", "parse.ens"),
+                'export tag() -> string {\n    return "json 2.0";\n}\n')
+            commit_all(json_dir, "2.0")
+            git(json_dir, "tag", "2.0")
+            git(json_dir, "tag", "v2.0")
+            local url_json = url_of(json_dir)
+
+            local utils_dir = path.join(repos, "utils")
+            make_repo(utils_dir)
+            write_package(utils_dir, "beta.utils")
+            io.writefile(path.join(utils_dir, "src", "helper.ens"),
+                'export describe() -> string {\n    return "utils 1.0";\n}\n')
+            commit_all(utils_dir, "1.0")
+            git(utils_dir, "tag", "1.0")
+            io.writefile(path.join(utils_dir, "src", "helper.ens"),
+                'export describe() -> string {\n    return "utils 1.1";\n}\n')
+            commit_all(utils_dir, "1.1")
+            git(utils_dir, "tag", "1.1")
+            local url_utils = url_of(utils_dir)
+
+            local tools_dir = path.join(repos, "tools")
+            make_repo(tools_dir)
+            write_package(tools_dir, "acme.tools",
+                {'dependency beta.utils "1.1" from "' .. url_utils .. '";'})
+            io.writefile(path.join(tools_dir, "src", "tool.ens"),
+                'import @beta.utils.helper;\n\nexport describe() -> string {\n'
+                .. '    return "tools(" + helper.describe() + ")";\n}\n')
+            commit_all(tools_dir, "1.0")
+            git(tools_dir, "tag", "1.0")
+            local url_tools = url_of(tools_dir)
+
+            local ws_dir = path.join(repos, "ws")
+            make_repo(ws_dir)
+            io.writefile(path.join(ws_dir, "ens.package"),
+                'workspace {\n    member "core";\n    member "extra";\n}\n')
+            write_package(path.join(ws_dir, "core"), "ws.core", {"dependency ws.extra;"})
+            io.writefile(path.join(ws_dir, "core", "src", "api.ens"),
+                'import @ws.extra.helper;\n\nexport describe() -> string {\n'
+                .. '    return "core(" + helper.describe() + ")";\n}\n')
+            write_package(path.join(ws_dir, "extra"), "ws.extra")
+            io.writefile(path.join(ws_dir, "extra", "src", "helper.ens"),
+                'export describe() -> string {\n    return "extra";\n}\n')
+            commit_all(ws_dir, "1.0")
+            git(ws_dir, "tag", "1.0")
+            local url_ws = url_of(ws_dir)
+
+            local sub_dir = path.join(repos, "sub")
+            make_repo(sub_dir)
+            write_package(sub_dir, "sub.pkg")
+            io.writefile(path.join(sub_dir, ".gitmodules"),
+                '[submodule "vendored"]\n\tpath = vendored\n\turl = https://example.com/x.git\n')
+            io.writefile(path.join(sub_dir, "src", "x.ens"),
+                'export x() -> int {\n    return 0;\n}\n')
+            commit_all(sub_dir, "1.0")
+            git(sub_dir, "tag", "1.0")
+            local url_sub = url_of(sub_dir)
+
+            local retag_dir = path.join(repos, "retag")
+            make_repo(retag_dir)
+            write_package(retag_dir, "rt.pkg")
+            io.writefile(path.join(retag_dir, "src", "thing.ens"),
+                'export tag() -> string {\n    return "retag 1";\n}\n')
+            commit_all(retag_dir, "1.0")
+            git(retag_dir, "tag", "1.0")
+            local url_retag = url_of(retag_dir)
+
+            -- the main application: three git dependencies, one of which raises another's
+            -- version transitively (MVS selects the maximum requirement).
+            local app1 = path.join(scratch, "app1")
+            local function write_app1(json_version)
+                write_package(app1, "demo.gitapp", {
+                    'dependency alex.json "' .. json_version .. '" from "' .. url_json .. '";',
+                    'dependency acme.tools "1.0" from "' .. url_tools .. '";',
+                    'dependency beta.utils "1.0" from "' .. url_utils .. '";',
+                })
+            end
+            write_app1("1.0")
+            io.writefile(path.join(app1, "src", "main.ens"),
+                'import @alex.json.parse;\nimport @acme.tools.tool;\n\n'
+                .. 'main() -> int {\n    print(parse.tag() + " | " + tool.describe());\n'
+                .. '    return 0;\n}\n')
+            local in_app1 = {curdir = app1, envs = envs_with_cache(cache)}
+            local lock_file = path.join(app1, "ens.lock")
+            local function lock_text()
+                return ((io.readfile(lock_file) or ""):gsub("\r\n", "\n"))
+            end
+
+            -- first build: fetches, locks, links, and the program runs against the
+            -- transitively raised beta.utils 1.1
+            run({"build", "."}, in_app1, 0,
+                "Fetched alex.json 1.0 from " .. url_json .. " (tag 1.0).",
+                "Fetched acme.tools 1.0",
+                "Fetched beta.utils 1.1",
+                "Updated ens.lock: locked acme.tools 1.0, locked alex.json 1.0, "
+                    .. "locked beta.utils 1.1")
+            run_program(path.join(app1, "gitapp.exe"), 0, "json 1.0 | tools(utils 1.1)")
+
+            -- the lock is deterministic, sorted, and complete
+            local lock1 = lock_text()
+            local expected_head = "lock 1\nroot demo.gitapp\npackage acme.tools 1.0\n"
+                .. "source " .. url_tools .. " " .. commit_of(tools_dir, "1.0") .. "\n"
+            if lock1:sub(1, #expected_head) ~= expected_head then
+                table.insert(failures, string.format("lock head is %q, expected %q",
+                    lock1:sub(1, #expected_head), expected_head))
+            end
+            for _, fragment in ipairs({
+                "\nrequire beta.utils 1.1\n",
+                "\npackage alex.json 1.0\nsource " .. url_json .. " "
+                    .. commit_of(json_dir, "1.0") .. "\ncontent sha256:",
+                "\npackage beta.utils 1.1\nsource " .. url_utils .. " "
+                    .. commit_of(utils_dir, "1.1") .. "\ncontent sha256:",
+            }) do
+                if not lock1:find(fragment, 1, true) then
+                    table.insert(failures, string.format("ens.lock missing %q\n%s",
+                        fragment, lock1))
+                end
+            end
+
+            -- the fetched tree sits in the content store under its locked hash
+            local json_hex = lock1:match("package alex%.json 1%.0\nsource [^\n]*\n"
+                .. "content sha256:(%x+)")
+            if not json_hex then
+                table.insert(failures, "could not find alex.json's content hash in the lock")
+            elseif not os.isdir(path.join(cache, "trees", "sha256-" .. json_hex)) then
+                table.insert(failures, "the content store has no tree for alex.json's hash")
+            end
+
+            -- a locked build needs no network: the repositories are gone, yet the build
+            -- reproduces byte-identically from the lock and the content store
+            os.mv(repos, repos .. ".away")
+            local _, reuse_out = run({"build", "."}, in_app1, 0, "Compiled successfully")
+            if reuse_out:find("Fetched", 1, true) then
+                table.insert(failures, "a locked, cached build still fetched something")
+            end
+            if lock_text() ~= lock1 then
+                table.insert(failures, "a locked, cached build rewrote ens.lock")
+            end
+            run({"build", ".", "--offline"}, in_app1, 0, "Compiled successfully")
+            run({"build", ".", "--offline"},
+                {curdir = app1, envs = envs_with_cache(cache_cold)}, 1,
+                "--offline forbids fetching package")
+            os.mv(repos .. ".away", repos)
+
+            -- --locked turns a pending lock change into an error and leaves the lock alone
+            write_app1("1.1")
+            run({"build", ".", "--locked"}, in_app1, 1, "ens.lock is out of date",
+                "updated alex.json 1.0 -> 1.1", "--locked forbids")
+            if lock_text() ~= lock1 then
+                table.insert(failures, "--locked changed ens.lock")
+            end
+
+            -- the minimal update fetches the raised version through its v-prefixed tag and
+            -- summarizes the change
+            run({"build", "."}, in_app1, 0,
+                "Fetched alex.json 1.1 from " .. url_json .. " (tag v1.1).",
+                "Updated ens.lock: updated alex.json 1.0 -> 1.1")
+            run_program(path.join(app1, "gitapp.exe"), 0, "json 1.1 | tools(utils 1.1)")
+            if not lock_text():find("package alex.json 1.1", 1, true) then
+                table.insert(failures, "ens.lock does not record the updated version")
+            end
+
+            -- both '2.0' and 'v2.0' exist, so version 2.0 is ambiguous
+            write_app1("2.0")
+            run({"build", "."}, in_app1, 1, 'version "2.0" of package \'alex.json\' is '
+                .. "ambiguous")
+
+            -- requirements spanning majors are a hard error naming both requirers
+            local app2 = path.join(scratch, "app2")
+            write_package(app2, "demo.major", {
+                'dependency acme.tools "1.0" from "' .. url_tools .. '";',
+                'dependency beta.utils "2.0" from "' .. url_utils .. '";',
+            })
+            io.writefile(path.join(app2, "src", "main.ens"),
+                'main() -> int {\n    return 0;\n}\n')
+            run({"build", "."}, {curdir = app2, envs = envs_with_cache(cache)}, 1,
+                "The requirements on package 'beta.utils' span major versions",
+                'requires "1.1"', 'requires "2.0"')
+
+            -- every package must agree on a dependency's source URL
+            local app3 = path.join(scratch, "app3")
+            write_package(app3, "demo.urls", {
+                'dependency acme.tools "1.0" from "' .. url_tools .. '";',
+                'dependency beta.utils "1.0" from "' .. url_json .. '";',
+            })
+            io.writefile(path.join(app3, "src", "main.ens"),
+                'main() -> int {\n    return 0;\n}\n')
+            run({"build", "."}, {curdir = app3, envs = envs_with_cache(cache)}, 1,
+                "Package 'beta.utils' is required from different git sources",
+                "every package must agree on a dependency's source")
+
+            -- the tag root must declare the required package
+            local app_name = path.join(scratch, "app_name")
+            write_package(app_name, "demo.wrongname", {
+                'dependency wrong.name "1.0" from "' .. url_json .. '";',
+            })
+            io.writefile(path.join(app_name, "src", "main.ens"),
+                'main() -> int {\n    return 0;\n}\n')
+            run({"build", "."}, {curdir = app_name, envs = envs_with_cache(cache)}, 1,
+                "declares package 'alex.json', not 'wrong.name'")
+
+            -- a workspace-form tag root resolves the required member, and the members
+            -- resolve each other inside the fetched tree; the sibling is never locked
+            local app_ws = path.join(scratch, "app_ws")
+            write_package(app_ws, "demo.wsapp", {
+                'dependency ws.core "1.0" from "' .. url_ws .. '";',
+            })
+            io.writefile(path.join(app_ws, "src", "main.ens"),
+                'import @ws.core.api;\n\nmain() -> int {\n    print(api.describe());\n'
+                .. '    return 0;\n}\n')
+            run({"build", "."}, {curdir = app_ws, envs = envs_with_cache(cache)}, 0,
+                "Fetched ws.core 1.0")
+            run_program(path.join(app_ws, "wsapp.exe"), 0, "core(extra)")
+            local ws_lock = (io.readfile(path.join(app_ws, "ens.lock")) or "")
+            if not ws_lock:find("package ws.core 1.0", 1, true) then
+                table.insert(failures, "the workspace-form package was not locked")
+            end
+            if ws_lock:find("ws.extra", 1, true) then
+                table.insert(failures, "a member internal to the fetched workspace leaked "
+                    .. "into the lock")
+            end
+
+            -- packages using git submodules are rejected
+            local app_sub = path.join(scratch, "app_sub")
+            write_package(app_sub, "demo.subapp", {
+                'dependency sub.pkg "1.0" from "' .. url_sub .. '";',
+            })
+            io.writefile(path.join(app_sub, "src", "main.ens"),
+                'main() -> int {\n    return 0;\n}\n')
+            run({"build", "."}, {curdir = app_sub, envs = envs_with_cache(cache)}, 1,
+                "uses git submodules", "self-contained")
+
+            -- a moved tag is caught: the fetched content no longer matches the lock
+            local app_retag = path.join(scratch, "app_retag")
+            write_package(app_retag, "demo.retag", {
+                'dependency rt.pkg "1.0" from "' .. url_retag .. '";',
+            })
+            io.writefile(path.join(app_retag, "src", "main.ens"),
+                'import @rt.pkg.thing;\n\nmain() -> int {\n    print(thing.tag());\n'
+                .. '    return 0;\n}\n')
+            local in_retag = {curdir = app_retag, envs = envs_with_cache(cache)}
+            run({"build", "."}, in_retag, 0, "Fetched rt.pkg 1.0")
+            run_program(path.join(app_retag, "retag.exe"), 0, "retag 1")
+            io.writefile(path.join(retag_dir, "src", "thing.ens"),
+                'export tag() -> string {\n    return "retag 2";\n}\n')
+            commit_all(retag_dir, "moved")
+            git(retag_dir, "tag", "-f", "1.0")
+            os.tryrm(path.join(cache, "trees"))
+            run({"build", "."}, in_retag, 1, "does not match ens.lock",
+                "the lock records sha256:", "hashes to sha256:", "may have been moved")
+
+            -- dropping the last git dependency removes the lock
+            write_package(app_retag, "demo.retag")
+            io.writefile(path.join(app_retag, "src", "main.ens"),
+                'main() -> int {\n    return 0;\n}\n')
+            run({"build", "."}, in_retag, 0,
+                "Removed ens.lock: the build has no git-sourced packages.")
+            if os.isfile(path.join(app_retag, "ens.lock")) then
+                table.insert(failures, "ens.lock survived losing its last git dependency")
+            end
+
+            if #failures == 0 then
+                return {name = name, ok = true}
+            end
+            return {name = name, ok = false,
+                short = string.format("%d CLI assertion(s) failed", #failures),
+                full = string.format("%s:\n%s", name, table.concat(failures, "\n"))}
+        end
+
         -- run a single test: compile, optionally run, and compare against the header.
         -- returns { name = ..., ok = bool, short = <fail reason>, full = <detailed report> }.
         local function run_one(job)
@@ -607,6 +988,7 @@ task("test")
             if job.cli_core then return run_cli_core(job) end
             if job.cli_workspace then return run_cli_workspace(job) end
             if job.cli_override then return run_cli_override(job) end
+            if job.cli_git then return run_cli_git(job) end
             local name = job.name
             local ens_file = job.ens_file
             local exe_file    = path.join(out_dir, name .. ".exe")

@@ -3,6 +3,8 @@
 #include <istream>
 #include <string>
 
+#include "PackageResolution.h"
+
 class Compiler {
 public:
     enum class BuildOutcome { Failed, BuiltExecutable, ValidatedLibrary };
@@ -18,17 +20,20 @@ public:
     // without an entry point is a library: the full pipeline runs, including codegen, and no
     // artifact is kept; a non-empty `outputFile` is then an error. A non-empty `overridesRoot`
     // names the folder whose ens.overrides governs the build (the workspace root when it
-    // builds its members); by default the source's own workspace root does.
+    // builds its members); by default the source's own workspace root does. `packages` holds
+    // the git-sourced packages the driver resolved for this invocation.
     static BuildResult build(const std::filesystem::path& source,
                              const std::filesystem::path& outputFile,
                              const std::string& defaultName,
                              bool explainArc = false,
                              const std::string& targetTriple = "",
-                             const std::filesystem::path& overridesRoot = {});
+                             const std::filesystem::path& overridesRoot = {},
+                             const ens::packages::ResolvedPackages* packages = nullptr);
 
     // Front end and semantic analysis only: prints diagnostics and generates nothing.
     static bool check(const std::filesystem::path& source,
-                      const std::filesystem::path& overridesRoot = {});
+                      const std::filesystem::path& overridesRoot = {},
+                      const ens::packages::ResolvedPackages* packages = nullptr);
 
     // True when the target's main module (the file itself, or main.ens in a folder) defines a
     // top-level main(), making the target an application.
@@ -46,5 +51,6 @@ public:
                     const std::filesystem::path& testsDir,
                     const std::string& filter,
                     bool explainArc = false,
-                    const std::filesystem::path& overridesRoot = {});
+                    const std::filesystem::path& overridesRoot = {},
+                    const ens::packages::ResolvedPackages* packages = nullptr);
 };

@@ -492,7 +492,8 @@ struct LoadedProgram {
 };
 
 // Seeds and loads the module graph for `source`, a single .ens file or a folder of sources.
-bool loadProgram(const fs::path& source, const fs::path& overridesRoot, LoadedProgram& out) {
+bool loadProgram(const fs::path& source, const fs::path& overridesRoot,
+                 const ens::packages::ResolvedPackages* packages, LoadedProgram& out) {
     fs::path sourceRoot = fs::is_directory(source) ? source : source.parent_path();
     // A bare file name has an empty parent; resolve it against the current
     // folder so the module paths below stay non-empty.
@@ -524,6 +525,7 @@ bool loadProgram(const fs::path& source, const fs::path& overridesRoot, LoadedPr
     // The governing workspace (nearest ens.package walking up from the source) supplies
     // `@package` dependencies; its src root stays whatever was compiled here.
     fs::path workspaceRoot = discoverWorkspaceRoot(sourceRoot);
+    if (packages) out.registry.setResolvedGitPackages(packages->folders);
     Workspace& root = workspaceRoot.empty()
         ? out.registry.defineRoot(sourceRoot, sourceRoot, {}, /*withManifest=*/false)
         : out.registry.defineRoot(workspaceRoot, sourceRoot, {}, /*withManifest=*/true,
@@ -571,10 +573,11 @@ Compiler::BuildResult Compiler::build(const fs::path& source,
                                       const std::string& defaultName,
                                       bool explainArc,
                                       const std::string& targetTriple,
-                                      const fs::path& overridesRoot) {
+                                      const fs::path& overridesRoot,
+                                      const ens::packages::ResolvedPackages* packages) {
     BuildResult result;
     LoadedProgram program;
-    if (!loadProgram(source, overridesRoot, program)) return result;
+    if (!loadProgram(source, overridesRoot, packages, program)) return result;
 
     bool isApplication = false;
     if (auto it = program.byPath.find(u"main"); it != program.byPath.end()) {
@@ -641,9 +644,10 @@ Compiler::BuildResult Compiler::build(const fs::path& source,
     return result;
 }
 
-bool Compiler::check(const fs::path& source, const fs::path& overridesRoot) {
+bool Compiler::check(const fs::path& source, const fs::path& overridesRoot,
+                     const ens::packages::ResolvedPackages* packages) {
     LoadedProgram program;
-    if (!loadProgram(source, overridesRoot, program)) return false;
+    if (!loadProgram(source, overridesRoot, packages, program)) return false;
     insertPreludeModule(program.modules, program.byPath);
 
     TypeContext sharedCtx;
@@ -796,7 +800,8 @@ void reportAbortedRun(const std::vector<DiscoveredTest>& tests,
 
 int Compiler::test(const fs::path& sourceDir, const fs::path& testsDir,
                    const std::string& filter, bool explainArc,
-                   const fs::path& overridesRoot) {
+                   const fs::path& overridesRoot,
+                   const ens::packages::ResolvedPackages* packages) {
     std::error_code ec;
 
     // With no explicit source, discover the workspace from the current folder and run its
@@ -913,6 +918,7 @@ int Compiler::test(const fs::path& sourceDir, const fs::path& testsDir,
     std::vector<std::unique_ptr<Module>> modules;
     std::unordered_map<std::u16string, Module*> byPath;
     WorkspaceRegistry registry;
+    if (packages) registry.setResolvedGitPackages(packages->folders);
     Workspace& root = workspaceRoot.empty()
         ? registry.defineRoot(sourceRoot, sourceRoot, testsFolder, /*withManifest=*/false)
         : registry.defineRoot(workspaceRoot, sourceRoot, testsFolder, /*withManifest=*/true,

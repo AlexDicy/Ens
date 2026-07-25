@@ -7,6 +7,7 @@
 
 #include "Compiler.h"
 #include "Overrides.h"
+#include "PackageResolution.h"
 #include "Version.h"
 #include "module/Manifest.h"
 #include "module/Workspace.h"
@@ -218,6 +219,31 @@ int resolveTarget(const std::vector<std::string>& positionals, const std::string
     return 0;
 }
 
+// The manifest folder governing a build: the workspace root itself, or the nearest
+// ens.package above the compiled sources - the same discovery the compilation performs.
+// Git-sourced dependencies and ens.lock resolve against this folder.
+fs::path resolutionRootFor(const Target& target) {
+    if (target.isWorkspace) return target.root;
+    fs::path base = target.isFile ? target.source.parent_path() : target.source;
+    if (base.empty()) base = ".";
+    return ens::modules::discoverWorkspaceRoot(base);
+}
+
+// Resolves the build's git-sourced packages and reports the outcome. Returns 0 on success,
+// else the exit code to fail the command with.
+int resolveGitPackagesFor(const Target& target, const ParsedCommand& arguments,
+                          ens::packages::ResolutionOutcome& resolution) {
+    resolution = ens::packages::resolveGitPackages(resolutionRootFor(target),
+                                                   arguments.flag("--offline"),
+                                                   arguments.flag("--locked"));
+    for (const auto& note : resolution.notes) std::cerr << "NOTE: " << note << '\n';
+    if (!resolution.ok) {
+        for (const auto& error : resolution.errors) std::cerr << "ERROR: " << error << '\n';
+        return 1;
+    }
+    return 0;
+}
+
 const char kGeneralHelp[] =
     "Ens compiler and build tool.\n"
     "\n"
@@ -255,29 +281,39 @@ int printHelp(const std::string& command) {
             "Options:\n"
             "  --output <file>    Where to put the executable (single-target builds only)\n"
             "  --target <triple>  Cross-compile for the given LLVM target triple\n"
-            "  --explain-arc      Print what the ARC optimizer elided and why\n";
+            "  --explain-arc      Print what the ARC optimizer elided and why\n"
+            "  --offline          Fail instead of fetching anything over the network\n"
+            "  --locked           Fail if the build would change ens.lock\n";
         return 0;
     }
     if (command == "run") {
         std::cout <<
             "Build an application and run it.\n"
             "\n"
-            "Usage: ens run [path] [-- arguments]\n"
+            "Usage: ens run [path] [options] [-- arguments]\n"
             "\n"
             "The path names an application: an .ens file, a package folder, or a workspace\n"
             "root with exactly one application member. Everything after '--' is passed to\n"
-            "the program, and the program's exit code becomes ens's exit code.\n";
+            "the program, and the program's exit code becomes ens's exit code.\n"
+            "\n"
+            "Options:\n"
+            "  --offline  Fail instead of fetching anything over the network\n"
+            "  --locked   Fail if the build would change ens.lock\n";
         return 0;
     }
     if (command == "check") {
         std::cout <<
             "Look for errors without building.\n"
             "\n"
-            "Usage: ens check [path]\n"
+            "Usage: ens check [path] [options]\n"
             "\n"
             "Runs the front end and semantic analysis and prints any diagnostics, but\n"
             "generates no code. The path rules match 'ens build'; at a workspace root every\n"
-            "member is checked.\n";
+            "member is checked.\n"
+            "\n"
+            "Options:\n"
+            "  --offline  Fail instead of fetching anything over the network\n"
+            "  --locked   Fail if the build would change ens.lock\n";
         return 0;
     }
     if (command == "test") {
@@ -292,7 +328,9 @@ int printHelp(const std::string& command) {
             "Options:\n"
             "  --filter <substring>  Run only the tests whose description contains it\n"
             "  --tests <folder>      Look for test files in this folder\n"
-            "  --explain-arc         Print what the ARC optimizer elided and why\n";
+            "  --explain-arc         Print what the ARC optimizer elided and why\n"
+            "  --offline             Fail instead of fetching anything over the network\n"
+            "  --locked              Fail if the build would change ens.lock\n";
         return 0;
     }
     if (command == "override") {
@@ -322,12 +360,17 @@ int printHelp(const std::string& command) {
 
 int runBuild(int argc, char* argv[]) {
     ParsedCommand arguments;
-    int rc = parseCommand(argc, argv, 2, {"--output", "--target"}, {"--explain-arc"},
+    int rc = parseCommand(argc, argv, 2, {"--output", "--target"},
+                          {"--explain-arc", "--offline", "--locked"},
                           1, false, "build", arguments);
     if (rc != 0) return rc;
 
     Target target;
     rc = resolveTarget(arguments.positionals, "build", target);
+    if (rc != 0) return rc;
+
+    ens::packages::ResolutionOutcome resolution;
+    rc = resolveGitPackagesFor(target, arguments, resolution);
     if (rc != 0) return rc;
 
     fs::path outputFile = arguments.option("--output");
@@ -356,7 +399,7 @@ int runBuild(int argc, char* argv[]) {
                 member.packageName;
             Compiler::BuildResult result =
                 Compiler::build(member.folder / "src", {}, lastSegment(member.packageName),
-                                explainArc, targetTriple, target.root);
+                                explainArc, targetTriple, target.root, &resolution.packages);
             switch (result.outcome) {
                 case Compiler::BuildOutcome::BuiltExecutable:
                     std::cout << label << ": built "
@@ -375,7 +418,8 @@ int runBuild(int argc, char* argv[]) {
     }
 
     Compiler::BuildResult result = Compiler::build(target.source, outputFile, target.name,
-                                                   explainArc, targetTriple);
+                                                   explainArc, targetTriple, {},
+                                                   &resolution.packages);
     switch (result.outcome) {
         case Compiler::BuildOutcome::BuiltExecutable:
             std::cout << "Compiled successfully to " << result.executable.string() << '\n';
@@ -392,11 +436,16 @@ int runBuild(int argc, char* argv[]) {
 
 int runCheck(int argc, char* argv[]) {
     ParsedCommand arguments;
-    int rc = parseCommand(argc, argv, 2, {}, {}, 1, false, "check", arguments);
+    int rc = parseCommand(argc, argv, 2, {}, {"--offline", "--locked"}, 1, false, "check",
+                          arguments);
     if (rc != 0) return rc;
 
     Target target;
     rc = resolveTarget(arguments.positionals, "check", target);
+    if (rc != 0) return rc;
+
+    ens::packages::ResolutionOutcome resolution;
+    rc = resolveGitPackagesFor(target, arguments, resolution);
     if (rc != 0) return rc;
 
     if (target.isWorkspace) {
@@ -412,7 +461,7 @@ int runCheck(int argc, char* argv[]) {
             std::string label =
                 "[" + std::to_string(i + 1) + "/" + std::to_string(total) + "] " +
                 member.packageName;
-            if (Compiler::check(member.folder / "src", target.root)) {
+            if (Compiler::check(member.folder / "src", target.root, &resolution.packages)) {
                 std::cout << label << ": ok\n";
             } else {
                 std::cout << label << ": failed\n";
@@ -426,7 +475,7 @@ int runCheck(int argc, char* argv[]) {
         return 0;
     }
 
-    if (!Compiler::check(target.source)) {
+    if (!Compiler::check(target.source, {}, &resolution.packages)) {
         std::cerr << "Please check the errors and retry.\n";
         return 1;
     }
@@ -436,7 +485,8 @@ int runCheck(int argc, char* argv[]) {
 
 int runTest(int argc, char* argv[]) {
     ParsedCommand arguments;
-    int rc = parseCommand(argc, argv, 2, {"--filter", "--tests"}, {"--explain-arc"},
+    int rc = parseCommand(argc, argv, 2, {"--filter", "--tests"},
+                          {"--explain-arc", "--offline", "--locked"},
                           1, false, "test", arguments);
     if (rc != 0) return rc;
 
@@ -448,6 +498,10 @@ int runTest(int argc, char* argv[]) {
         return usageError("'" + target.root.string() + "' is a file; 'ens test' runs the "
                           "tests of a folder or package.");
     }
+
+    ens::packages::ResolutionOutcome resolution;
+    rc = resolveGitPackagesFor(target, arguments, resolution);
+    if (rc != 0) return 2;
     if (target.isWorkspace) {
         size_t total = target.members.size();
         if (total == 0) {
@@ -465,7 +519,8 @@ int runTest(int argc, char* argv[]) {
             if (!fs::is_directory(memberTests, ec)) memberTests.clear();
             int rc = Compiler::test(member.folder / "src", memberTests,
                                     arguments.option("--filter"),
-                                    arguments.flag("--explain-arc"), target.root);
+                                    arguments.flag("--explain-arc"), target.root,
+                                    &resolution.packages);
             if (rc > worst) worst = rc;
         }
         return worst;
@@ -474,17 +529,21 @@ int runTest(int argc, char* argv[]) {
     fs::path testsFolder = arguments.option("--tests");
     if (testsFolder.empty()) testsFolder = target.testsFolder;
     return Compiler::test(target.source, testsFolder, arguments.option("--filter"),
-                          arguments.flag("--explain-arc"));
+                          arguments.flag("--explain-arc"), {}, &resolution.packages);
 }
 
 int runRun(int argc, char* argv[]) {
     ParsedCommand arguments;
-    int rc = parseCommand(argc, argv, 2, {}, {}, 1, /*allowProgramArguments=*/true, "run",
-                          arguments);
+    int rc = parseCommand(argc, argv, 2, {}, {"--offline", "--locked"}, 1,
+                          /*allowProgramArguments=*/true, "run", arguments);
     if (rc != 0) return rc;
 
     Target target;
     rc = resolveTarget(arguments.positionals, "run", target);
+    if (rc != 0) return rc;
+
+    ens::packages::ResolutionOutcome resolution;
+    rc = resolveGitPackagesFor(target, arguments, resolution);
     if (rc != 0) return rc;
 
     fs::path source;
@@ -537,7 +596,8 @@ int runRun(int argc, char* argv[]) {
 
     std::error_code ec;
     Compiler::BuildResult built = Compiler::build(source, exePath, name, /*explainArc=*/false,
-                                                  /*targetTriple=*/"", overridesRoot);
+                                                  /*targetTriple=*/"", overridesRoot,
+                                                  &resolution.packages);
     if (built.outcome != Compiler::BuildOutcome::BuiltExecutable) {
         fs::remove_all(tempFolder, ec);
         std::cerr << "Please check the errors and retry.\n";
