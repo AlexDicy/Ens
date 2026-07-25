@@ -97,6 +97,10 @@ public:
     // registry keeps the prefix it was first given.
     Workspace* getOrLoad(const fs::path& folder, const std::u16string& prefix);
 
+    // Packages the driver resolved from their git sources before the build: dependency name
+    // to the folder holding the fetched package. Consulted after overrides and members.
+    void setResolvedGitPackages(std::unordered_map<std::string, fs::path> folders);
+
     // Every native library declared by a manifest loaded into this build.
     std::vector<CollectedNative> collectNatives() const;
 
@@ -128,6 +132,7 @@ private:
     std::unordered_map<std::string, Manifest> manifests_;
     std::unordered_map<std::string, MemberIndex> memberIndexes_;
     std::unordered_map<std::string, fs::path> overrides_;
+    std::unordered_map<std::string, fs::path> gitPackages_;
     std::unordered_set<std::string> noticedOverrides_;
     std::vector<std::string> errors_;
     std::vector<std::string> notices_;

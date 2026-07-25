@@ -36,6 +36,8 @@ struct ManifestDependency {
     std::string name;
     bool hasVersion = false;
     std::string version;
+    bool hasSource = false;
+    std::string sourceUrl;
     int line = 0;
     int column = 0;
 };

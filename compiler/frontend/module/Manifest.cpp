@@ -200,6 +200,21 @@ private:
             dependency.version = stringValue(current());
             advance();
         }
+        if (atWord(u"from")) {
+            advance();
+            if (at(SyntaxKind::StringLiteral)) {
+                dependency.hasSource = true;
+                dependency.sourceUrl = stringValue(current());
+                advance();
+            } else {
+                errorHere("Expected the package's git URL as a string after 'from', for "
+                          "example 'dependency " + dependency.name + " \"2.0\" from "
+                          "\"https://github.com/acme/json.git\";'.");
+                skipItem();
+                manifest.dependencies.push_back(std::move(dependency));
+                return;
+            }
+        }
         expectSemicolon();
         manifest.dependencies.push_back(std::move(dependency));
     }
@@ -554,6 +569,16 @@ void validateManifest(const Manifest& manifest, const std::string& path,
             errorAt(dependency.line, dependency.column, "The version '" + dependency.version +
                     "' of dependency '" + dependency.name + "' is not a valid version; use "
                     "dotted numerals such as \"2.0\".");
+        }
+        if (dependency.hasSource && !dependency.hasVersion) {
+            errorAt(dependency.line, dependency.column, "Dependency '" + dependency.name +
+                    "' declares a git source but no version; a git source fetches a tagged "
+                    "version, for example 'dependency " + dependency.name + " \"1.0\" from \"" +
+                    dependency.sourceUrl + "\";'.");
+        }
+        if (dependency.hasSource && dependency.sourceUrl.empty()) {
+            errorAt(dependency.line, dependency.column, "The git URL of dependency '" +
+                    dependency.name + "' cannot be empty.");
         }
         for (size_t j = 0; j < i; ++j) {
             if (manifest.dependencies[j].name == dependency.name) {

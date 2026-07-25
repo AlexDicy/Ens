@@ -240,15 +240,46 @@ void WorkspaceRegistry::resolveDependencies(Workspace& ws, const Manifest& manif
                                       "; a member is used as-is, so remove the version \"" +
                                       dependency.version + "\".");
                 }
+                if (dependency.hasSource) {
+                    errors_.push_back(at() + "Dependency '" + dependency.name + "' resolves "
+                                      "to the workspace member at " + member->second.string() +
+                                      "; a member is used as-is, so remove the from clause.");
+                }
                 ws.deps.emplace(toU16(dependency.name), member->second);
                 continue;
             }
         }
-        errors_.push_back(at() + "No source for package '" + dependency.name + "': there is "
-                          "no package registry yet, so a dependency must be a member of the "
-                          "enclosing workspace or an override in ens.overrides pointing at a "
+        auto fetched = gitPackages_.find(dependency.name);
+        if (fetched != gitPackages_.end()) {
+            if (!dependency.hasVersion) {
+                errors_.push_back(at() + "Dependency '" + dependency.name + "' declares no "
+                                  "version; a dependency is versionless only when it resolves "
+                                  "to a workspace member. Add the version this package "
+                                  "requires, for example 'dependency " + dependency.name +
+                                  " \"1.0\";'.");
+            }
+            ws.deps.emplace(toU16(dependency.name), fetched->second);
+            continue;
+        }
+        if (dependency.hasSource) {
+            errors_.push_back(at() + "Dependency '" + dependency.name + "' names a git "
+                              "source that was not fetched for this build; git sources are "
+                              "fetched by the ens build, check, run, and test commands. To "
+                              "use a local copy instead, point an override at a checkout "
+                              "with 'ens override add " + dependency.name + " <folder>'.");
+            continue;
+        }
+        errors_.push_back(at() + "No source for package '" + dependency.name + "': it is not "
+                          "a member of the enclosing workspace, no override redirects it, and "
+                          "it names no git source. Add a from clause with the package's git "
+                          "URL, for example 'dependency " + dependency.name + " \"1.0\" from "
+                          "\"https://github.com/owner/repo.git\";', or point an override at a "
                           "local folder.");
     }
+}
+
+void WorkspaceRegistry::setResolvedGitPackages(std::unordered_map<std::string, fs::path> folders) {
+    gitPackages_ = std::move(folders);
 }
 
 void WorkspaceRegistry::loadRootOverrides(const fs::path& rootFolder) {
