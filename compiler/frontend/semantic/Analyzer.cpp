@@ -1881,6 +1881,7 @@ void Analyzer::collectFunctions(const ast::SourceFile& file) {
         checkNoreturnPlacement(fn, /*isConstructor=*/false, /*isDestructor=*/false);
         resolveFunctionParams(fn, sym);
         popTypeParams(tpCount);
+        if (fname == u"main" && mayDefineMain) checkEntrySignature(fn, sym);
 
         if (!globalScope->define(sym)) {
             Symbol* existing = globalScope->lookupLocal(fname);
@@ -2267,6 +2268,41 @@ void Analyzer::checkNoreturnPlacement(const ast::FuncDecl& fn, bool isConstructo
     if (auto rt = fn.returnType()) {
         errorAtNode(rt->node, "A 'noreturn' function declares no return type; it never returns "
             "a value, so remove the '-> ...' clause after the parameter list.");
+    }
+}
+
+// The entry point is started by the operating system, which passes no arguments and
+// takes the returned `int` as the process exit code, so `main` is a plain function
+// with no type parameters, no parameters, and either `int` or no return type.
+void Analyzer::checkEntrySignature(const ast::FuncDecl& fn, Symbol* sym) {
+    auto tparams = fn.typeParams();
+    if (!tparams.empty()) {
+        errorAtNode(tparams.front().node, "Function 'main' is the program entry point and cannot "
+            "be generic, so it cannot declare the type parameter '" +
+            asciiOf(tparams.front().nameText().value_or(std::u16string{})) + "'; nothing calls it "
+            "with type arguments. Declare it as 'main() -> int' (or 'main()') and put the generic "
+            "work in a function that 'main' calls.");
+    }
+    auto params = fn.parameters();
+    if (!params.empty()) {
+        errorAtNode(params.front().node, "Function 'main' is the program entry point and takes no "
+            "parameters, so it cannot declare '" +
+            asciiOf(params.front().nameText().value_or(std::u16string{})) + "'. Declare it as "
+            "'main() -> int' (or 'main()') and read the command line with 'system.arguments()' "
+            "after 'import @std.system;'.");
+    }
+    Type* returned = sym->returnType;
+    if (returned && !returned->isVoid() && !returned->isError() &&
+        returned->kind != TypeKind::Int) {
+        SyntaxNode at = fn.node;
+        if (auto rt = fn.returnType()) {
+            auto tr = rt->typeReference();
+            at = tr ? tr->node : rt->node;
+        }
+        errorAtNode(at, "Function 'main' is the program entry point and must return 'int' or "
+            "nothing, not '" + returned->toString() + "'; the value it returns becomes the "
+            "process exit code. Write 'main() -> int' to choose the exit code, or 'main()' to "
+            "leave it 0.");
     }
 }
 

@@ -327,6 +327,10 @@ Two modules may import each other: circular imports are allowed, and declaration
 A program's entry point is the top-level function `main` in its **main module**: `src/main.ens` for a package or a folder of sources, or the compiled file itself for a single-file program.
 No other module may define a top-level `main`; the compiler rejects one wherever it is loaded from, including through an import of another package's main module.
 
+`main` is declared either as `main()` or as `main() -> int`, and it may add `throws` or `noreturn` like any other function.
+The `int` it returns becomes the process exit code, a `main()` that returns nothing exits with 0, and an exception that escapes `main` is reported on stderr and exits with 1.
+Any other return type is an error, and so are parameters and type parameters: nothing passes arguments to `main`, and a program reads its command line through `system.arguments()` from `@std.system`.
+
 Importing from packages follows the format `@packageorg.packagename.path`.
 
 ```ens
