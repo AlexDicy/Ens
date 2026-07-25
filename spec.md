@@ -386,6 +386,7 @@ There is no package registry yet, so a dependency must resolve to a workspace me
 
 The compiler finds the governing manifest by walking up from the compiled sources to the nearest folder containing `ens.package`, the way `git` finds a repository from a subfolder.
 A file with no manifest anywhere above it compiles standalone, with only `@std` available.
+Sources that sit under a workspace root but outside any member package likewise see only `@std`: a workspace declares its members without being a package itself.
 
 Overrides redirect a dependency to a local folder, for example to build against a fix in a package checked out elsewhere.
 They live in an `ens.overrides` file next to the manifest, and that file is meant to stay out of version control: overrides describe one machine's checkout, not the project.

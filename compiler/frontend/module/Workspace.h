@@ -18,8 +18,7 @@ namespace fs = std::filesystem;
 // and (for the root) its tests in `tests/`. `packagePrefix` is the canonical module-path prefix
 // for every module in this workspace: empty for the root, or the package name (e.g.
 // u"ens.frontend") for a package pulled in as a dependency. `deps` maps each resolved dependency
-// name (or, at a workspace-form root, each member's package name) to the absolute folder it
-// resolves to.
+// name to the absolute folder it resolves to; only package manifests have dependencies.
 struct Workspace {
     fs::path root;
     fs::path srcRoot;

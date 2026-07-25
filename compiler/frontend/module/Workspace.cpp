@@ -262,17 +262,13 @@ Workspace& WorkspaceRegistry::defineRoot(const fs::path& folder, const fs::path&
         case ManifestForm::Package:
             applyPackageManifest(ws, manifest);
             break;
-        case ManifestForm::Workspace: {
+        case ManifestForm::Workspace:
+            // A workspace declares members without being a package itself: modules under its
+            // root belong to no package and resolve no dependencies. The index is built here
+            // so member problems surface on every build rooted at the workspace.
             ws.isWorkspaceRoot = true;
-            const MemberIndex& index = memberIndexFor(folder);
-            for (const auto& [name, memberFolder] : index.foldersByName) {
-                ws.deps.emplace(toU16(name), memberFolder);
-            }
-            for (const auto& [name, overrideFolder] : overrides_) {
-                ws.deps[toU16(name)] = overrideFolder;
-            }
+            memberIndexFor(folder);
             break;
-        }
         case ManifestForm::Overrides:
             errors_.push_back(ws.manifestPath + ": An ens.package file holds a package or "
                               "workspace declaration; overrides live in the ens.overrides "

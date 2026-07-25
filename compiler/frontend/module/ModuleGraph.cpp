@@ -297,8 +297,10 @@ bool buildModuleGraphFromSeeds(Workspace& root,
                             reportAt("Package '" + asAscii(modPath) + "' is not declared as a "
                                 "dependency in " + ws.manifestPath + ".");
                         } else if (ws.isWorkspaceRoot) {
-                            reportAt("Package '" + asAscii(modPath) + "' is not a member of "
-                                "the workspace at " + ws.manifestPath + ".");
+                            reportAt("Package '" + asAscii(modPath) + "' is not available "
+                                "here: these sources sit under the workspace at " +
+                                ws.manifestPath + " but not inside a member package, so only "
+                                "'@std' is importable.");
                         } else {
                             reportAt("External package '" + asAscii(modPath) + "' is not "
                                 "available; these sources have no ens.package manifest "

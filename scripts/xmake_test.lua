@@ -59,6 +59,7 @@ task("test")
         -- list of tests:
         --   * every tests/*.ens file (single-file mode)
         --   * every tests/<dir>/main.ens (folder mode)
+        --   * every tests/<dir>/src/main.ens (package mode: the folder holds an ens.package)
         local jobs = {}
         for _, ens_file in ipairs(os.files(path.join(tests_dir, "*.ens"))) do
             local name = path.basename(ens_file)
@@ -72,12 +73,19 @@ task("test")
         end
         for _, sub in ipairs(os.dirs(path.join(tests_dir, "*"))) do
             local main_ens = path.join(sub, "main.ens")
+            local src_main_ens = path.join(sub, "src", "main.ens")
             local name = path.basename(sub)
             if os.isfile(main_ens) and want(name) then
                 table.insert(jobs, {
                     name = name,
                     ens_file = main_ens,
                     source = sub,
+                })
+            elseif os.isfile(src_main_ens) and want(name) then
+                table.insert(jobs, {
+                    name = name,
+                    ens_file = src_main_ens,
+                    source = path.join(sub, "src"),
                 })
             end
         end
@@ -250,6 +258,8 @@ task("test")
             for _, sub in ipairs(folders) do
                 if os.isfile(path.join(sub, "main.ens")) then
                     add_unit("tests/" .. path.basename(sub), sub, {"main.ens"})
+                elseif os.isfile(path.join(sub, "src", "main.ens")) then
+                    add_unit("tests/" .. path.basename(sub), path.join(sub, "src"), {"main.ens"})
                 end
             end
             for _, pkg in ipairs({"corpus", "frontend", "sema", "semacheck", "syntaxgen"}) do
