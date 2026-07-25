@@ -489,15 +489,10 @@ void validateNative(const ManifestNative& native, const std::string& path,
             }
         }
         seenPlatforms.push_back(binding.platform);
-        if (binding.isArtifact) {
-            if (!isValidChecksum(binding.artifactChecksum)) {
-                errorAt(binding.line, binding.column, "The artifact checksum for native "
-                        "library '" + native.name + "' must look like \"sha256:\" followed by "
-                        "64 hex digits.");
-            }
-            errorAt(binding.line, binding.column, "Native library '" + native.name + "' binds "
-                    "an artifact for '" + binding.platform + "', but artifact fetching is not "
-                    "supported yet; name a library installed on this machine instead.");
+        if (binding.isArtifact && !isValidChecksum(binding.artifactChecksum)) {
+            errorAt(binding.line, binding.column, "The artifact checksum for native "
+                    "library '" + native.name + "' must look like \"sha256:\" followed by "
+                    "64 hex digits.");
         }
         for (const auto& baseName : binding.baseNames) {
             if (baseName.empty()) {

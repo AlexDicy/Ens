@@ -1,4 +1,5 @@
 #include "Compiler.h"
+#include "Artifacts.h"
 #include "CodeGenerator.h"
 #include "Linker.h"
 #include "TargetPlatform.h"
@@ -327,11 +328,14 @@ bool sameNativeBinding(const ManifestNative& a, const ManifestNative& b) {
 // every loaded manifest plus, for modules no manifest governs, their `external from` names bound
 // by convention (`libc` is the C runtime, linked by platform defaults; any other name passes as
 // a conventional library name). The same name declared twice with different bindings is an
-// error; identical declarations dedupe.
+// error; identical declarations dedupe. Artifact bindings for the target platform resolve to
+// files through the artifact cache and land in `libraryFiles`.
 bool collectLinkLibraries(const WorkspaceRegistry* registry,
                           const std::vector<std::unique_ptr<Module>>& modules,
                           const std::string& targetTriple,
-                          std::vector<std::string>& libraries) {
+                          bool offline,
+                          std::vector<std::string>& libraries,
+                          std::vector<std::string>& libraryFiles) {
     std::vector<CollectedNative> natives;
     if (registry) natives = registry->collectNatives();
     for (auto& m : modules) {
@@ -371,6 +375,10 @@ bool collectLinkLibraries(const WorkspaceRegistry* registry,
         for (auto& l : libraries) if (l == baseName) return;
         libraries.push_back(baseName);
     };
+    auto addFile = [&](const std::string& file) {
+        for (auto& f : libraryFiles) if (f == file) return;
+        libraryFiles.push_back(file);
+    };
     for (auto& u : unique) {
         if (u.native.isSystem) continue;
         if (!u.native.hasBindingBlock) {
@@ -378,7 +386,17 @@ bool collectLinkLibraries(const WorkspaceRegistry* registry,
             continue;
         }
         for (auto& binding : u.native.bindings) {
-            if (binding.platform != platform || binding.isArtifact) continue;
+            if (binding.platform != platform) continue;
+            if (binding.isArtifact) {
+                ens::packages::ArtifactResult artifact = ens::packages::fetchArtifact(
+                    binding.artifactUrl, binding.artifactChecksum, offline);
+                if (!artifact.ok) {
+                    std::cerr << "ERROR: " << artifact.error << '\n';
+                    return false;
+                }
+                addFile(artifact.file.string());
+                continue;
+            }
             for (auto& baseName : binding.baseNames) add(baseName);
         }
     }
@@ -459,7 +477,8 @@ bool linkModulesToExe(std::vector<std::unique_ptr<Module>>& modules,
                       const fs::path& outputFile,
                       const std::string& targetTriple,
                       TypeContext& sharedCtx,
-                      const std::vector<std::string>& libraries) {
+                      const std::vector<std::string>& libraries,
+                      const std::vector<std::string>& libraryFiles) {
     fs::path outDir = outputFile.parent_path();
     if (outDir.empty()) outDir = fs::current_path();
     std::string baseStem = outputFile.stem().string();
@@ -469,7 +488,8 @@ bool linkModulesToExe(std::vector<std::unique_ptr<Module>>& modules,
     if (!emitModulesToObjects(modules, outDir, baseStem, targetTriple, sharedCtx, objectPaths)) {
         return false;
     }
-    return Linker::link(objectPaths, libraries, outputFile.string(), std::cerr, targetTriple);
+    return Linker::link(objectPaths, libraries, libraryFiles, outputFile.string(), std::cerr,
+                        targetTriple);
 }
 
 // Print any manifest problems collected while loading workspaces. Returns true when there
@@ -633,10 +653,13 @@ Compiler::BuildResult Compiler::build(const fs::path& source,
     }
 
     std::vector<std::string> libraries;
-    if (!collectLinkLibraries(&program.registry, program.modules, targetTriple, libraries)) {
+    std::vector<std::string> libraryFiles;
+    if (!collectLinkLibraries(&program.registry, program.modules, targetTriple,
+                              packages && packages->offline, libraries, libraryFiles)) {
         return result;
     }
-    if (!linkModulesToExe(program.modules, exePath, targetTriple, sharedCtx, libraries)) {
+    if (!linkModulesToExe(program.modules, exePath, targetTriple, sharedCtx, libraries,
+                          libraryFiles)) {
         return result;
     }
     result.outcome = BuildOutcome::BuiltExecutable;
@@ -970,11 +993,15 @@ int Compiler::test(const fs::path& sourceDir, const fs::path& testsDir,
     fs::path exePath = fs::path(tempDir.str().str()) / "runner";
 #endif
     std::vector<std::string> linkLibraries;
-    if (!collectLinkLibraries(&registry, modules, /*targetTriple*/ "", linkLibraries)) {
+    std::vector<std::string> linkLibraryFiles;
+    if (!collectLinkLibraries(&registry, modules, /*targetTriple*/ "",
+                              packages && packages->offline, linkLibraries,
+                              linkLibraryFiles)) {
         fs::remove_all(fs::path(tempDir.str().str()), ec);
         return 2;
     }
-    if (!linkModulesToExe(modules, exePath, /*targetTriple*/ "", sharedCtx, linkLibraries)) {
+    if (!linkModulesToExe(modules, exePath, /*targetTriple*/ "", sharedCtx, linkLibraries,
+                          linkLibraryFiles)) {
         fs::remove_all(fs::path(tempDir.str().str()), ec);
         return 2;
     }

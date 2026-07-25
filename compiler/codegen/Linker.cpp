@@ -124,12 +124,14 @@ std::vector<std::string> buildArgv(LinkerFlavor flavor,
                                     const std::string& triple,
                                     const std::vector<std::string>& objs,
                                     const std::vector<std::string>& libraries,
+                                    const std::vector<std::string>& libraryFiles,
                                     const std::string& exe) {
     std::vector<std::string> args;
     switch (flavor) {
         case LinkerFlavor::Coff:
             args = {"lld-link", "/nologo", "/subsystem:console"};
             for (auto& o : objs) args.push_back(o);
+            for (auto& f : libraryFiles) args.push_back(f);
             args.push_back("/out:" + exe);
             // Default C runtime libs so simple int-returning programs link.
             // Will be customized once Ens has its own runtime / a linker
@@ -158,6 +160,7 @@ std::vector<std::string> buildArgv(LinkerFlavor flavor,
                 args.push_back(sdk);
             }
             for (auto& o : objs) args.push_back(o);
+            for (auto& f : libraryFiles) args.push_back(f);
             args.push_back("-o");
             args.push_back(exe);
             args.push_back("-lSystem");
@@ -193,6 +196,7 @@ std::vector<std::string> buildArgv(LinkerFlavor flavor,
             }
 
             for (auto& o : objs) args.push_back(o);
+            for (auto& f : libraryFiles) args.push_back(f);
 
             for (auto& lib : libraries) {
                 args.push_back("-l" + lib);
@@ -243,10 +247,20 @@ bool Linker::link(const std::vector<std::string>& objectPaths,
                    const std::string& exePath,
                    std::ostream& errStream,
                    const std::string& targetTriple) {
+    return link(objectPaths, libraries, {}, exePath, errStream, targetTriple);
+}
+
+bool Linker::link(const std::vector<std::string>& objectPaths,
+                   const std::vector<std::string>& libraries,
+                   const std::vector<std::string>& libraryFiles,
+                   const std::string& exePath,
+                   std::ostream& errStream,
+                   const std::string& targetTriple) {
     const std::string triple = ens::resolveTargetTriple(targetTriple);
     const LinkerFlavor flavor = flavorForTriple(triple);
 
-    std::vector<std::string> argv = buildArgv(flavor, triple, objectPaths, libraries, exePath);
+    std::vector<std::string> argv = buildArgv(flavor, triple, objectPaths, libraries,
+                                              libraryFiles, exePath);
     std::vector<const char*> args;
     args.reserve(argv.size());
     for (auto& s : argv) args.push_back(s.c_str());

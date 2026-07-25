@@ -177,6 +177,15 @@ task("test")
             })
         end
 
+        -- native artifact fetching over file:// URLs: the happy path into the link, cache
+        -- reuse under --offline, hash-mismatch rejection, and the artifact lines in ens.lock.
+        if want("cli_artifact") then
+            table.insert(jobs, {
+                name = "cli_artifact",
+                cli_artifact = true,
+            })
+        end
+
         -- surface any requested names that matched no test, so typos don't pass silently.
         if wanted ~= nil then
             local unknown = {}
@@ -980,6 +989,167 @@ task("test")
                 full = string.format("%s:\n%s", name, table.concat(failures, "\n"))}
         end
 
+        -- native artifact fetching, driven with file:// URLs and a scratch ENS_CACHE. The
+        -- artifact is a valid empty static library, so every platform's linker accepts it.
+        local function run_cli_artifact(job)
+            local name = job.name
+            local scratch = path.join(os.projectdir(), "build", "cli", "artifact")
+            os.tryrm(scratch)
+            os.mkdir(scratch)
+            local log = path.join(out_dir, name .. ".log")
+            local failures = {}
+
+            local cache = path.join(scratch, "cache")
+            local cache_cold = path.join(scratch, "cache_cold")
+
+            local function envs_with_cache(cache_dir)
+                local envs = os.getenvs()
+                envs.ENS_CACHE = cache_dir
+                return envs
+            end
+
+            local function run(argv, opt, expected_rc, ...)
+                local rc = execMerged(ens_exe, argv, log, opt)
+                local out = io.readfile(log) or ""
+                local label = table.concat(argv, " ")
+                if expected_rc ~= nil and rc ~= expected_rc then
+                    table.insert(failures, string.format("ens %s: exit=%s expected=%s\n%s",
+                        label, tostring(rc), tostring(expected_rc), out))
+                end
+                for _, fragment in ipairs({...}) do
+                    if not out:find(fragment, 1, true) then
+                        table.insert(failures, string.format("ens %s: output missing %q\n%s",
+                            label, fragment, out))
+                    end
+                end
+                return rc, out
+            end
+
+            local function run_program(exe, expected_rc, expected_stdout)
+                if not os.isfile(exe) then
+                    table.insert(failures, string.format("expected executable %s", exe))
+                    return
+                end
+                local rc = execMerged(exe, {}, log)
+                local out = (io.readfile(log) or ""):gsub("[\r\n]+$", "")
+                if rc ~= expected_rc or out ~= expected_stdout then
+                    table.insert(failures, string.format("%s: exit=%s stdout=%q",
+                        path.filename(exe), tostring(rc), out))
+                end
+            end
+
+            local files = path.join(scratch, "files")
+            os.mkdir(files)
+            local lib_file = path.join(files, "extras.lib")
+            io.writefile(lib_file, "!<arch>\n", {encoding = "binary"})
+            local good_hash = "sha256:" .. hash.sha256(lib_file)
+            local bad_hash = "sha256:" .. string.rep("0123456789abcdef", 4)
+            local url_lib = "file:///" .. (path.absolute(lib_file):gsub("\\", "/"))
+
+            local function artifact_native(native_name, artifact_hash)
+                return "    native " .. native_name .. " {\n"
+                    .. '        windows artifact "' .. url_lib .. '" hash "'
+                    .. artifact_hash .. '";\n'
+                    .. '        linux artifact "' .. url_lib .. '" hash "'
+                    .. artifact_hash .. '";\n'
+                    .. '        macos artifact "' .. url_lib .. '" hash "'
+                    .. artifact_hash .. '";\n'
+                    .. "    }\n"
+            end
+
+            -- the happy path: the artifact is fetched, verified, cached, and linked
+            local app1 = path.join(scratch, "app1")
+            os.mkdir(path.join(app1, "src"))
+            io.writefile(path.join(app1, "ens.package"),
+                "package demo.artifactapp {\n" .. '    ens "0.1";\n\n'
+                .. artifact_native("extras", good_hash) .. "}\n")
+            io.writefile(path.join(app1, "src", "main.ens"),
+                'main() -> int {\n    print("artifact linked");\n    return 0;\n}\n')
+            local in_app1 = {curdir = app1, envs = envs_with_cache(cache)}
+            run({"build", "."}, in_app1, 0, "Compiled successfully")
+            run_program(path.join(app1, "artifactapp.exe"), 0, "artifact linked")
+            local stored = path.join(cache, "artifacts", good_hash:gsub("^sha256:", ""),
+                "extras.lib")
+            if not os.isfile(stored) then
+                table.insert(failures, "the fetched artifact is not in the content store")
+            end
+
+            -- the cached artifact satisfies --offline even with the source file gone
+            os.mv(files, files .. ".away")
+            run({"build", ".", "--offline"}, in_app1, 0, "Compiled successfully")
+            run({"build", ".", "--offline"},
+                {curdir = app1, envs = envs_with_cache(cache_cold)}, 1,
+                "--offline forbids fetching the native artifact")
+            os.mv(files .. ".away", files)
+
+            -- a hash mismatch is rejected, naming both hashes
+            local app2 = path.join(scratch, "app2")
+            os.mkdir(path.join(app2, "src"))
+            io.writefile(path.join(app2, "ens.package"),
+                "package demo.badhash {\n" .. '    ens "0.1";\n\n'
+                .. artifact_native("extras", bad_hash) .. "}\n")
+            io.writefile(path.join(app2, "src", "main.ens"),
+                'main() -> int {\n    return 0;\n}\n')
+            run({"build", "."}, {curdir = app2, envs = envs_with_cache(cache)}, 1,
+                "hashes to " .. good_hash, "declares " .. bad_hash, "refusing to use it")
+
+            -- ens.lock records the artifact bindings of the root package and of every
+            -- fetched package, flattened per platform
+            local function git(dir, ...)
+                os.iorunv("git", table.join({"-c", "user.name=ens", "-c",
+                    "user.email=ens@test"}, {...}), {curdir = dir})
+            end
+            local dep_dir = path.join(scratch, "repos", "dep")
+            os.mkdir(dep_dir)
+            git(dep_dir, "init", "-q", "-b", "main", ".")
+            io.writefile(path.join(dep_dir, "ens.package"),
+                "package art.dep {\n" .. '    ens "0.1";\n\n'
+                .. artifact_native("depextras", good_hash) .. "}\n")
+            io.writefile(path.join(dep_dir, "src", "dep.ens"),
+                'export tag() -> string {\n    return "dep with artifact";\n}\n')
+            git(dep_dir, "add", "-A")
+            git(dep_dir, "commit", "-q", "-m", "1.0")
+            git(dep_dir, "tag", "1.0")
+            local url_dep = "file:///" .. (path.absolute(dep_dir):gsub("\\", "/"))
+
+            local app3 = path.join(scratch, "app3")
+            os.mkdir(path.join(app3, "src"))
+            io.writefile(path.join(app3, "ens.package"),
+                "package demo.lockapp {\n" .. '    ens "0.1";\n\n'
+                .. '    dependency art.dep "1.0" from "' .. url_dep .. '";\n\n'
+                .. artifact_native("extras", good_hash) .. "}\n")
+            io.writefile(path.join(app3, "src", "main.ens"),
+                'import @art.dep.dep;\n\nmain() -> int {\n    print(dep.tag());\n'
+                .. '    return 0;\n}\n')
+            run({"build", "."}, {curdir = app3, envs = envs_with_cache(cache)}, 0,
+                "Fetched art.dep 1.0", "Updated ens.lock: locked art.dep 1.0")
+            run_program(path.join(app3, "lockapp.exe"), 0, "dep with artifact")
+            local lock = ((io.readfile(path.join(app3, "ens.lock")) or ""):gsub("\r\n", "\n"))
+            local root_lines = "root demo.lockapp\n"
+                .. "artifact extras linux " .. url_lib .. " " .. good_hash .. "\n"
+                .. "artifact extras macos " .. url_lib .. " " .. good_hash .. "\n"
+                .. "artifact extras windows " .. url_lib .. " " .. good_hash .. "\n"
+            if not lock:find(root_lines, 1, true) then
+                table.insert(failures, string.format(
+                    "ens.lock is missing the root artifact lines:\n%s", lock))
+            end
+            local dep_lines = "artifact depextras linux " .. url_lib .. " " .. good_hash
+                .. "\nartifact depextras macos " .. url_lib .. " " .. good_hash
+                .. "\nartifact depextras windows " .. url_lib .. " " .. good_hash .. "\n"
+            if not (lock:find("package art.dep 1.0\n", 1, true)
+                    and lock:find(dep_lines, 1, true)) then
+                table.insert(failures, string.format(
+                    "ens.lock is missing the fetched package's artifact lines:\n%s", lock))
+            end
+
+            if #failures == 0 then
+                return {name = name, ok = true}
+            end
+            return {name = name, ok = false,
+                short = string.format("%d CLI assertion(s) failed", #failures),
+                full = string.format("%s:\n%s", name, table.concat(failures, "\n"))}
+        end
+
         -- run a single test: compile, optionally run, and compare against the header.
         -- returns { name = ..., ok = bool, short = <fail reason>, full = <detailed report> }.
         local function run_one(job)
@@ -989,6 +1159,7 @@ task("test")
             if job.cli_workspace then return run_cli_workspace(job) end
             if job.cli_override then return run_cli_override(job) end
             if job.cli_git then return run_cli_git(job) end
+            if job.cli_artifact then return run_cli_artifact(job) end
             local name = job.name
             local ens_file = job.ens_file
             local exe_file    = path.join(out_dir, name .. ".exe")

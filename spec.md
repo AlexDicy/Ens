@@ -383,9 +383,13 @@ workspace {
 
 Every member folder must itself contain a package manifest.
 Dependencies resolve by name against the workspace: `dependency ens.frontend;` in one member finds the member whose manifest declares `package ens.frontend`, wherever that folder sits, so package names must be unique within a workspace.
-A dependency that resolves to a workspace member never carries a version; members are used exactly as checked out.
-Every other dependency declares the version this package requires.
-There is no package registry yet, so a dependency must resolve to a workspace member or an override, and anything else is reported as having no source.
+A dependency that resolves to a workspace member never carries a version (and never a `from` clause); members are used exactly as checked out.
+Every other dependency declares the version this package requires, and a dependency that is neither a member nor overridden names its git source with `from`:
+
+```ens
+dependency alex.json "2.0" from "https://github.com/alex/json.git";
+```
+
 `@std` is built in and is never declared as a dependency.
 
 The compiler finds the governing manifest by walking up from the compiled sources to the nearest folder containing `ens.package`, the way `git` finds a repository from a subfolder.
@@ -404,10 +408,30 @@ overrides {
 Only the overrides next to the root manifest of a build apply, and they apply build-wide: every dependency on the overridden name, in every package of the build, resolves to the given folder.
 The target folder's manifest must declare exactly the overridden package name, the dependency keeps its declared version (the override redirects where the source comes from, not what the package requires), and every build that uses an override prints a notice.
 
+A git-sourced dependency's version selects a tag in the named repository: the tag spelled exactly like the version, or the same spelling with a `v` prefix (`2.0` or `v2.0`); when both exist the version is ambiguous and the build fails.
+Only tags are fetched, never branches or commits: a tag names a release, and unreleased work is brought in by pointing an override at a local checkout.
+The repository's manifest at that tag must declare the required package, or be a workspace with a member that declares it.
+A fetched package must be self-contained: a package that uses git submodules is rejected, so either declare that code as a dependency too or commit the files into the repository.
+A fetched package's own git-sourced dependencies are fetched the same way, and its requirements join the build's.
+When several packages require the same package, every requirement must name the same URL, and the build uses the highest required version; requirements that span different major versions are an error naming the requirers.
+Versions compare numerically, component by component.
+Fetched packages land in a content-addressed cache at `~/.ens/cache` (the `ENS_CACHE` environment variable overrides the location), shared by every build on the machine.
+
+The first build that resolves git-sourced packages writes `ens.lock` next to the root manifest.
+The lock records each fetched package's exact version, source URL and commit, a hash of the fetched content, and its own requirements, so a later build reproduces the same result without touching the network, and a moved tag or altered content is detected and rejected.
+Commit `ens.lock` to version control; it is machine-owned and never edited by hand.
+Workspace members and overridden packages never appear in it.
+Builds keep the lock current: when the manifests' requirements change, the build re-resolves what changed, rewrites the lock, and prints a summary of the difference.
+`--locked`, accepted by build, check, run, and test, turns any needed lock change into an error, which is what a CI build wants.
+`--offline` forbids all network use: anything not already in the local cache fails the build by name.
+
 `native` declarations name the native libraries the package's `external` blocks bind to (see the section on native calls), and tell the linker what to link.
 `native libc system;` declares a library the platform links by default, so nothing extra is passed to the linker.
 `native zlib;` links the library under its conventional platform name.
 The block form spells out base names per platform (`windows`, `linux`, `macos`), several per platform when needed.
+A platform may instead bind a prebuilt artifact: `windows artifact "https://example.com/z.lib" hash "sha256:...";` downloads the file once into the cache, verifies it against the declared sha256 hash (a mismatch fails the build), and passes it to the linker.
+An artifact is a single library file for its platform.
+Artifact bindings and their hashes are recorded in `ens.lock`, so the exact native code a build links is reviewable in one place.
 When two packages in one build declare the same native library, the declarations must be identical; identical declarations are linked once.
 
 Methods that can throw exceptions are marked with `throws`; any other method can be considered safe. Every thrown value must be an instance of `Error` or a subclass of it. For most methods the set of throwable types is computed by the compiler and shown by IDEs on hover. A method may also declare its thrown types explicitly — `read() -> bytes throws IOError` or `read() -> bytes throws IOError, ParseError`, which is required for abstract methods and forms a contract: an override may throw those types or their subclasses, never others.
