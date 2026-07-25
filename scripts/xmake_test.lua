@@ -147,6 +147,15 @@ task("test")
             })
         end
 
+        -- the workspace-root and run behaviors: member builds in dependency order, test-all,
+        -- application selection, argument passthrough, and exit-code forwarding.
+        if want("cli_workspace") then
+            table.insert(jobs, {
+                name = "cli_workspace",
+                cli_workspace = true,
+            })
+        end
+
         -- surface any requested names that matched no test, so typos don't pass silently.
         if wanted ~= nil then
             local unknown = {}
@@ -405,12 +414,83 @@ task("test")
                 full = string.format("%s:\n%s", name, table.concat(failures, "\n"))}
         end
 
+        -- workspace-root builds and the run command, exercised against the cli_workspace
+        -- fixtures.
+        local function run_cli_workspace(job)
+            local name = job.name
+            local cli_dir = path.join(os.projectdir(), "build", "cli", "workspace")
+            os.tryrm(cli_dir)
+            os.mkdir(cli_dir)
+            local log = path.join(out_dir, name .. ".log")
+            local failures = {}
+
+            local function run(argv, opt, expected_rc, ...)
+                local rc = execMerged(ens_exe, argv, log, opt)
+                local out = io.readfile(log) or ""
+                local label = table.concat(argv, " ")
+                if expected_rc ~= nil and rc ~= expected_rc then
+                    table.insert(failures, string.format("ens %s: exit=%s expected=%s\n%s",
+                        label, tostring(rc), tostring(expected_rc), out))
+                end
+                for _, fragment in ipairs({...}) do
+                    if not out:find(fragment, 1, true) then
+                        table.insert(failures, string.format("ens %s: output missing %q\n%s",
+                            label, fragment, out))
+                    end
+                end
+                return rc, out
+            end
+
+            local workspace = path.join(tests_dir, "cli_workspace")
+            local two_apps = path.join(tests_dir, "cli_workspace_two_apps")
+
+            -- build every member in dependency order: the library goes first even though the
+            -- manifest lists the application first, and only the application leaves an artifact
+            local _, build_out = run({"build", workspace}, {curdir = cli_dir}, 0,
+                "[1/2] demo.lib: library ok", "[2/2] demo.app: built app.exe")
+            if not os.isfile(path.join(cli_dir, "app.exe")) then
+                table.insert(failures, "the workspace build did not produce app.exe")
+            end
+            run({"build", workspace, "--output", path.join(cli_dir, "x.exe")}, nil, 2,
+                "--output")
+
+            -- check and test every member
+            run({"check", workspace}, nil, 0, "[1/2] demo.lib: ok", "[2/2] demo.app: ok")
+            run({"test", workspace}, nil, 0, "PASS greeting is stable", "1/1 tests passed",
+                "demo.app")
+
+            -- run: everything after -- reaches the program, its exit code comes back, and
+            -- nothing is left in the working folder
+            local run_dir = path.join(cli_dir, "rundir")
+            os.mkdir(run_dir)
+            run({"run", workspace, "--", "alpha", "beta"}, {curdir = run_dir}, 2,
+                "cli workspace greeting", "alpha", "beta")
+            run({"run", path.join(two_apps, "one")}, {curdir = run_dir}, 7)
+            if #os.files(path.join(run_dir, "*")) ~= 0 then
+                table.insert(failures, "ens run left artifacts in the working folder")
+            end
+
+            -- run needs exactly one application
+            run({"run", two_apps}, nil, 2, "more than one application member", "demo.one",
+                "demo.two")
+            run({"run", path.join(tests_dir, "pkg_import_dep")}, nil, 2,
+                "is not an application")
+
+            if #failures == 0 then
+                return {name = name, ok = true}
+            end
+            return {name = name, ok = false,
+                short = string.format("%d CLI assertion(s) failed", #failures),
+                full = string.format("%s:\n%s", name, table.concat(failures, "\n"))}
+        end
+
         -- run a single test: compile, optionally run, and compare against the header.
         -- returns { name = ..., ok = bool, short = <fail reason>, full = <detailed report> }.
         local function run_one(job)
             if job.corpus then return run_corpus(job) end
             if job.semacheck then return run_semacheck(job) end
             if job.cli_core then return run_cli_core(job) end
+            if job.cli_workspace then return run_cli_workspace(job) end
             local name = job.name
             local ens_file = job.ens_file
             local exe_file    = path.join(out_dir, name .. ".exe")

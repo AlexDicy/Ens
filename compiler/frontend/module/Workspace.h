@@ -51,6 +51,20 @@ std::optional<PackageMatch> matchPackage(
 // when none is found. Mirrors how `git` finds a repository from a subfolder.
 fs::path discoverWorkspaceRoot(const fs::path& startDir);
 
+// One member of a workspace-form manifest: the package it declares, its folder, and the names
+// of the packages it depends on.
+struct WorkspaceMember {
+    std::string packageName;
+    fs::path folder;
+    std::vector<std::string> dependencies;
+};
+
+// Lists the members declared by the workspace-form manifest at `workspaceRoot`, in manifest
+// order. Member problems (a missing or non-package manifest, duplicate package names) append
+// to `errors`; a member's own manifest problems are left for its build to report.
+std::vector<WorkspaceMember> listWorkspaceMembers(const fs::path& workspaceRoot,
+                                                  std::vector<std::string>& errors);
+
 // A native library declaration together with the file that declares it, for whole-build
 // collection and conflict reporting.
 struct CollectedNative {

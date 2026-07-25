@@ -10,6 +10,10 @@
 #include "module/Manifest.h"
 #include "module/Workspace.h"
 
+#include "llvm/ADT/SmallString.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Program.h"
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -94,7 +98,49 @@ struct Target {
     std::string name;         // default artifact name
     fs::path testsFolder;     // <package>/tests when present
     std::string packageName;  // package form only
+    std::vector<ens::modules::WorkspaceMember> members;  // workspace form, dependency order
 };
+
+// Orders members so each one follows the members it depends on. A dependency that is not a
+// member imposes no ordering; members caught in a dependency cycle keep manifest order.
+std::vector<ens::modules::WorkspaceMember> sortByDependencies(
+        std::vector<ens::modules::WorkspaceMember> members) {
+    std::vector<ens::modules::WorkspaceMember> ordered;
+    std::vector<bool> placed(members.size(), false);
+    auto isPlaced = [&](const std::string& name) -> bool {
+        for (size_t i = 0; i < members.size(); ++i) {
+            if (members[i].packageName == name) return placed[i];
+        }
+        return true;
+    };
+    while (ordered.size() < members.size()) {
+        bool progress = false;
+        for (size_t i = 0; i < members.size(); ++i) {
+            if (placed[i]) continue;
+            bool ready = true;
+            for (const auto& dependency : members[i].dependencies) {
+                if (!isPlaced(dependency)) {
+                    ready = false;
+                    break;
+                }
+            }
+            if (ready) {
+                placed[i] = true;
+                ordered.push_back(members[i]);
+                progress = true;
+            }
+        }
+        if (!progress) {
+            for (size_t i = 0; i < members.size(); ++i) {
+                if (!placed[i]) {
+                    placed[i] = true;
+                    ordered.push_back(members[i]);
+                }
+            }
+        }
+    }
+    return ordered;
+}
 
 // Resolves the optional path argument shared by build/check/run/test: an .ens file, a package
 // or workspace folder, or a plain folder of sources; no path discovers the nearest ens.package
@@ -143,6 +189,13 @@ int resolveTarget(const std::vector<std::string>& positionals, const std::string
     ens::modules::Manifest manifest = ens::modules::loadManifestFile(manifestFile, errors);
     if (manifest.form == ens::modules::ManifestForm::Workspace) {
         out.isWorkspace = true;
+        std::vector<std::string> memberErrors;
+        out.members = sortByDependencies(
+            ens::modules::listWorkspaceMembers(given, memberErrors));
+        if (!memberErrors.empty()) {
+            for (const auto& e : memberErrors) std::cerr << "ERROR: " << e << '\n';
+            return 1;
+        }
         return 0;
     }
     fs::path src = given / "src";
@@ -171,12 +224,14 @@ const char kGeneralHelp[] =
     "\n"
     "Commands:\n"
     "  build [path]     Compile a source file, a package, or a workspace's members\n"
+    "  run [path]       Build an application and run it\n"
     "  check [path]     Look for errors without building anything\n"
     "  test [path]      Build and run the tests\n"
     "  version          Print the toolchain version\n"
     "  help [command]   Show help for a command\n"
     "\n"
-    "With no path, build/check/test use the nearest ens.package above the current folder.\n";
+    "With no path, build/run/check/test use the nearest ens.package above the current "
+    "folder.\n";
 
 int printHelp(const std::string& command) {
     if (command.empty()) {
@@ -199,6 +254,17 @@ int printHelp(const std::string& command) {
             "  --output <file>    Where to put the executable (single-target builds only)\n"
             "  --target <triple>  Cross-compile for the given LLVM target triple\n"
             "  --explain-arc      Print what the ARC optimizer elided and why\n";
+        return 0;
+    }
+    if (command == "run") {
+        std::cout <<
+            "Build an application and run it.\n"
+            "\n"
+            "Usage: ens run [path] [-- arguments]\n"
+            "\n"
+            "The path names an application: an .ens file, a package folder, or a workspace\n"
+            "root with exactly one application member. Everything after '--' is passed to\n"
+            "the program, and the program's exit code becomes ens's exit code.\n";
         return 0;
     }
     if (command == "check") {
@@ -257,9 +323,39 @@ int runBuild(int argc, char* argv[]) {
     }
 
     if (target.isWorkspace) {
-        std::cerr << "ERROR: '" << target.root.string() << "' is a workspace root; building "
-                  << "every member is not supported yet. Build a member folder instead.\n";
-        return 2;
+        if (!outputFile.empty()) {
+            return usageError("--output names one executable, but a workspace root builds "
+                              "every member; build one member and pass --output there.");
+        }
+        size_t total = target.members.size();
+        if (total == 0) {
+            std::cout << "The workspace at " << target.root.string()
+                      << " declares no members; nothing to build.\n";
+            return 0;
+        }
+        for (size_t i = 0; i < total; ++i) {
+            const auto& member = target.members[i];
+            std::string label =
+                "[" + std::to_string(i + 1) + "/" + std::to_string(total) + "] " +
+                member.packageName;
+            Compiler::BuildResult result =
+                Compiler::build(member.folder / "src", {}, lastSegment(member.packageName),
+                                explainArc, targetTriple, target.root);
+            switch (result.outcome) {
+                case Compiler::BuildOutcome::BuiltExecutable:
+                    std::cout << label << ": built "
+                              << result.executable.filename().string() << '\n';
+                    break;
+                case Compiler::BuildOutcome::ValidatedLibrary:
+                    std::cout << label << ": library ok\n";
+                    break;
+                case Compiler::BuildOutcome::Failed:
+                    std::cout << label << ": failed\n";
+                    std::cerr << "Please check the errors and retry.\n";
+                    return 1;
+            }
+        }
+        return 0;
     }
 
     Compiler::BuildResult result = Compiler::build(target.source, outputFile, target.name,
@@ -288,9 +384,30 @@ int runCheck(int argc, char* argv[]) {
     if (rc != 0) return rc;
 
     if (target.isWorkspace) {
-        std::cerr << "ERROR: '" << target.root.string() << "' is a workspace root; checking "
-                  << "every member is not supported yet. Check a member folder instead.\n";
-        return 2;
+        size_t total = target.members.size();
+        if (total == 0) {
+            std::cout << "The workspace at " << target.root.string()
+                      << " declares no members; nothing to check.\n";
+            return 0;
+        }
+        bool anyFailed = false;
+        for (size_t i = 0; i < total; ++i) {
+            const auto& member = target.members[i];
+            std::string label =
+                "[" + std::to_string(i + 1) + "/" + std::to_string(total) + "] " +
+                member.packageName;
+            if (Compiler::check(member.folder / "src", target.root)) {
+                std::cout << label << ": ok\n";
+            } else {
+                std::cout << label << ": failed\n";
+                anyFailed = true;
+            }
+        }
+        if (anyFailed) {
+            std::cerr << "Please check the errors and retry.\n";
+            return 1;
+        }
+        return 0;
     }
 
     if (!Compiler::check(target.source)) {
@@ -316,15 +433,120 @@ int runTest(int argc, char* argv[]) {
                           "tests of a folder or package.");
     }
     if (target.isWorkspace) {
-        std::cerr << "ERROR: '" << target.root.string() << "' is a workspace root; testing "
-                  << "every member is not supported yet. Test a member folder instead.\n";
-        return 2;
+        size_t total = target.members.size();
+        if (total == 0) {
+            std::cout << "The workspace at " << target.root.string()
+                      << " declares no members; nothing to test.\n";
+            return 0;
+        }
+        int worst = 0;
+        for (size_t i = 0; i < total; ++i) {
+            const auto& member = target.members[i];
+            std::cout << "[" << (i + 1) << "/" << total << "] " << member.packageName
+                      << ":\n";
+            std::error_code ec;
+            fs::path memberTests = member.folder / "tests";
+            if (!fs::is_directory(memberTests, ec)) memberTests.clear();
+            int rc = Compiler::test(member.folder / "src", memberTests,
+                                    arguments.option("--filter"),
+                                    arguments.flag("--explain-arc"), target.root);
+            if (rc > worst) worst = rc;
+        }
+        return worst;
     }
 
     fs::path testsFolder = arguments.option("--tests");
     if (testsFolder.empty()) testsFolder = target.testsFolder;
     return Compiler::test(target.source, testsFolder, arguments.option("--filter"),
                           arguments.flag("--explain-arc"));
+}
+
+int runRun(int argc, char* argv[]) {
+    ParsedCommand arguments;
+    int rc = parseCommand(argc, argv, 2, {}, {}, 1, /*allowProgramArguments=*/true, "run",
+                          arguments);
+    if (rc != 0) return rc;
+
+    Target target;
+    rc = resolveTarget(arguments.positionals, "run", target);
+    if (rc != 0) return rc;
+
+    fs::path source;
+    std::string name;
+    fs::path overridesRoot;
+    if (target.isWorkspace) {
+        std::vector<const ens::modules::WorkspaceMember*> applications;
+        for (const auto& member : target.members) {
+            if (Compiler::definesEntryPoint(member.folder / "src" / "main.ens")) {
+                applications.push_back(&member);
+            }
+        }
+        if (applications.empty()) {
+            return usageError("The workspace at '" + target.root.string() + "' has no "
+                              "application member: no member's src/main.ens defines main().");
+        }
+        if (applications.size() > 1) {
+            std::string names;
+            for (const auto* application : applications) {
+                if (!names.empty()) names += ", ";
+                names += application->packageName;
+            }
+            return usageError("The workspace at '" + target.root.string() + "' has more "
+                              "than one application member (" + names + "); run one of them "
+                              "by path.");
+        }
+        source = applications.front()->folder / "src";
+        name = lastSegment(applications.front()->packageName);
+        overridesRoot = target.root;
+    } else {
+        if (!Compiler::definesEntryPoint(target.source)) {
+            return usageError("'" + target.root.string() + "' is not an application: its "
+                              "main module does not define main().");
+        }
+        source = target.source;
+        name = target.name;
+    }
+
+    llvm::SmallString<128> tempDir;
+    if (llvm::sys::fs::createUniqueDirectory("ens-run", tempDir)) {
+        std::cerr << "ERROR: could not create a temporary folder for the build\n";
+        return 1;
+    }
+    fs::path tempFolder(tempDir.str().str());
+#ifdef _WIN32
+    fs::path exePath = tempFolder / (name + ".exe");
+#else
+    fs::path exePath = tempFolder / name;
+#endif
+
+    std::error_code ec;
+    Compiler::BuildResult built = Compiler::build(source, exePath, name, /*explainArc=*/false,
+                                                  /*targetTriple=*/"", overridesRoot);
+    if (built.outcome != Compiler::BuildOutcome::BuiltExecutable) {
+        fs::remove_all(tempFolder, ec);
+        std::cerr << "Please check the errors and retry.\n";
+        return 1;
+    }
+
+    std::string exeString = exePath.string();
+    std::vector<llvm::StringRef> processArguments;
+    processArguments.push_back(exeString);
+    for (const auto& argument : arguments.programArguments) {
+        processArguments.push_back(argument);
+    }
+    std::string errorMessage;
+    bool executionFailed = false;
+    int exitCode = llvm::sys::ExecuteAndWait(exeString, processArguments, /*Env=*/std::nullopt,
+                                             /*Redirects=*/{}, /*SecondsToWait=*/0,
+                                             /*MemoryLimit=*/0, &errorMessage,
+                                             &executionFailed);
+    fs::remove_all(tempFolder, ec);
+    if (executionFailed) {
+        std::cerr << "ERROR: could not run the program"
+                  << (errorMessage.empty() ? "" : ": " + errorMessage) << '\n';
+        return 2;
+    }
+    return exitCode;
 }
 
 // Hidden debug tools: dump or analyze the CST of one file (or stdin when no path is given).
@@ -359,6 +581,7 @@ int main(int argc, char* argv[]) {
 
     std::string command = argv[1];
     if (command == "build") return runBuild(argc, argv);
+    if (command == "run") return runRun(argc, argv);
     if (command == "check") return runCheck(argc, argv);
     if (command == "test") return runTest(argc, argv);
     if (command == "version" || command == "--version") {

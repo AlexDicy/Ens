@@ -58,6 +58,56 @@ fs::path discoverWorkspaceRoot(const fs::path& startDir) {
     return {};
 }
 
+std::vector<WorkspaceMember> listWorkspaceMembers(const fs::path& workspaceRoot,
+                                                  std::vector<std::string>& errors) {
+    std::vector<WorkspaceMember> members;
+    fs::path manifestFile = workspaceRoot / "ens.package";
+    std::string manifestPath = manifestFile.string();
+    Manifest manifest = loadManifestFile(manifestFile, errors);
+    if (manifest.form != ManifestForm::Workspace) {
+        errors.push_back(manifestPath + ": Expected a workspace declaration.");
+        return members;
+    }
+    std::error_code ec;
+    for (const auto& member : manifest.members) {
+        auto at = [&] { return positionOf(manifestPath, member.line, member.column); };
+        fs::path folder = (workspaceRoot / member.folder).lexically_normal();
+        fs::path memberManifest = folder / "ens.package";
+        if (!fs::exists(memberManifest, ec)) {
+            errors.push_back(at() + "Workspace member \"" + member.folder + "\" has no "
+                             "ens.package manifest; every member folder declares a package.");
+            continue;
+        }
+        std::vector<std::string> memberErrors;
+        Manifest declaration = loadManifestFile(memberManifest, memberErrors);
+        if (declaration.form != ManifestForm::Package) {
+            errors.push_back(at() + "Workspace member \"" + member.folder + "\" must declare "
+                             "a package.");
+            continue;
+        }
+        bool duplicate = false;
+        for (const auto& existing : members) {
+            if (existing.packageName == declaration.packageName) {
+                errors.push_back(at() + "Members \"" + existing.folder.string() + "\" and \"" +
+                                 folder.string() + "\" both declare package '" +
+                                 declaration.packageName + "'; package names must be unique "
+                                 "within a workspace.");
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        WorkspaceMember info;
+        info.packageName = declaration.packageName;
+        info.folder = folder;
+        for (const auto& dependency : declaration.dependencies) {
+            info.dependencies.push_back(dependency.name);
+        }
+        members.push_back(std::move(info));
+    }
+    return members;
+}
+
 Workspace& WorkspaceRegistry::create(const fs::path& folder, const fs::path& srcRoot,
                                      const fs::path& testsRoot, std::u16string prefix) {
     auto ws = std::make_unique<Workspace>();
