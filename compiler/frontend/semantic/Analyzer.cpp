@@ -4420,6 +4420,9 @@ void Analyzer::checkCallableSignatureVisibility(const ast::FuncDecl& fn,
     if (visibilityTier(declVisibility) == 0) return;
     const ResolutionInfo* info = analysis.find(fn.node.greenNode());
     Symbol* sym = info ? info->resolvedSymbol : nullptr;
+    // The fromCString intrinsic's declared parameter type is a placeholder the compiler overrides
+    // at every call site; a caller never names it, so it cannot leak.
+    if (isFromCStringIntrinsic(sym)) return;
     auto params = fn.parameters();
     for (size_t i = 0; i < params.size(); ++i) {
         if (auto tr = params[i].typeReference()) {
@@ -5719,8 +5722,39 @@ Type* Analyzer::analyzeGenericCall(const ast::CallExpression& expr, Symbol* sym,
 
 // Argument count/type checking shared by plain `name(args)` and namespace-qualified
 // `ns.name(args)` free-function calls. Returns the call's result type.
+bool Analyzer::isFromCStringIntrinsic(const Symbol* sym) {
+    return sym && sym->kind == SymbolKind::Function && sym->name == u"fromCString" &&
+           sym->modulePath == u"std.ffi";
+}
+
+// std.ffi.fromCString reads a foreign NUL-terminated buffer into a fresh string. Its declared
+// parameter is a placeholder: the real argument may be a value of any external type (there is
+// no common supertype to write in the signature), nullable or not, so the check is intrinsic.
+Type* Analyzer::checkFromCStringCall(const ast::CallExpression& expr) {
+    auto args = expr.arguments();
+    Type* stringTy = typeCtx.getPrimitive(TypeKind::String);
+    if (args.size() != 1) {
+        errorAtNode(expr.node, "'fromCString' expects exactly 1 argument (a foreign handle), got " +
+            std::to_string(args.size()) + ".");
+        for (auto& a : args) { if (!a.asOutArgument()) analyzeExpr(a); }
+        return stringTy;
+    }
+    if (args[0].asOutArgument()) {
+        errorAtNode(args[0].node, "'out' can only be used when calling an external function.");
+        return stringTy;
+    }
+    Type* argT = analyzeExpr(args[0]);
+    Type* base = (argT && argT->isOptional()) ? argT->inner : argT;
+    if (argT && !argT->isError() && !(base && base->isExternal())) {
+        errorAtNode(args[0].node, "'fromCString' takes a value of an external type (a foreign "
+            "handle), got '" + argT->toString() + "'. Pass a handle returned by a C function.");
+    }
+    return stringTy;
+}
+
 Type* Analyzer::checkDirectCallArguments(const ast::CallExpression& expr, Symbol* sym,
                                          const std::u16string& funcName) {
+    if (isFromCStringIntrinsic(sym)) return checkFromCStringCall(expr);
     auto args = expr.arguments();
     size_t req = requiredArgCount(sym);
     if (args.size() < req || args.size() > sym->paramTypes.size()) {

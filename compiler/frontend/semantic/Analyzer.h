@@ -350,6 +350,8 @@ private:
                               const std::u16string& funcName);
     Type* checkDirectCallArguments(const ast::CallExpression& expr, Symbol* sym,
                                    const std::u16string& funcName);
+    static bool isFromCStringIntrinsic(const Symbol* sym);
+    Type* checkFromCStringCall(const ast::CallExpression& expr);
     Type* analyzeGenericCall(const ast::CallExpression& expr, Symbol* sym,
                              const std::u16string& funcName);
     Type* analyzeMember(const ast::MemberExpression& expr);

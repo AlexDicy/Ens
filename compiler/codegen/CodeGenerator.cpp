@@ -867,6 +867,7 @@ struct CodeGenerator::Impl {
         Symbol* sym = symOverride ? symOverride : symbolOf(fn.node);
         if (!sym) return;
         if (isInterceptedTraceMethod(sym)) return;
+        if (isFromCStringIntrinsic(sym)) return;
         auto it = values.find(sym);
         if (it == values.end()) return;
 
@@ -3233,6 +3234,13 @@ struct CodeGenerator::Impl {
         if (sym->methodOwner->name != u"Error" ||
             sym->methodOwner->modulePath != kPreludeModulePath) return false;
         return sym->name == u"getStackTrace" || sym->name == u"getStackFrames";
+    }
+
+    // std.ffi.fromCString is recognized at the call site and lowered to a strlen-and-copy of the
+    // foreign buffer; its std placeholder body is never emitted.
+    bool isFromCStringIntrinsic(const Symbol* sym) const {
+        return sym && sym->kind == SymbolKind::Function && sym->name == u"fromCString" &&
+               sym->modulePath == u"std.ffi";
     }
 
     // { funcStart, name, file, line, isEntry }
@@ -6856,6 +6864,24 @@ struct CodeGenerator::Impl {
         return nullptr;
     }
 
+    // std.ffi.fromCString(handle): copy the NUL-terminated buffer the foreign handle points to
+    // into a fresh Ens string. A null handle yields the empty string rather than a null string.
+    llvm::Value* emitFromCString(const ast::CallExpression& e) {
+        auto args = e.arguments();
+        if (args.size() != 1) {
+            error(e.node.startOffset(), "Internal: fromCString expects exactly 1 argument");
+            return nullptr;
+        }
+        llvm::Value* handle = emitExpr(args[0]);
+        if (!handle) return nullptr;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        llvm::Value* str = builder->CreateCall(getOrDefineEnsStringFromCStr(), { handle },
+            "cstr.str");
+        llvm::Value* empty = emitStringLiteralObject("");
+        llvm::Value* isNull = builder->CreateICmpEQ(str, llvm::ConstantPointerNull::get(ptrTy));
+        return builder->CreateSelect(isNull, empty, str, "cstr.result");
+    }
+
     llvm::Value* emitCall(const ast::CallExpression& e) {
         auto callee = e.callee();
 
@@ -7009,6 +7035,7 @@ struct CodeGenerator::Impl {
             // call with no receiver (the namespace symbol carries no runtime value).
             if (Symbol* fnSym = symbolOf(member.node)) {
                 if (fnSym->kind == SymbolKind::Function) {
+                    if (isFromCStringIntrinsic(fnSym)) return emitFromCString(e);
                     if (fnSym->isBuiltin) return emitBuiltinCall(fnSym, e);
                     if (fnSym->isExternal) return emitForeignCall(fnSym, e);
                     if (fnSym->isTemplate) return emitGenericCall(fnSym, e);
@@ -7115,6 +7142,7 @@ struct CodeGenerator::Impl {
             error(e.node.startOffset(), "Internal: callee has no resolved symbol");
             return nullptr;
         }
+        if (isFromCStringIntrinsic(sym)) return emitFromCString(e);
         if (sym->isBuiltin) return emitBuiltinCall(sym, e);
         if (sym->isExternal) return emitForeignCall(sym, e);
         if (sym->isTemplate) return emitGenericCall(sym, e);
