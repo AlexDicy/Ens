@@ -167,11 +167,12 @@ void WorkspaceRegistry::resolveDependencies(Workspace& ws, const Manifest& manif
         };
         auto overridden = overrides_.find(dependency.name);
         if (overridden != overrides_.end()) {
-            if (dependency.hasVersion) {
-                errors_.push_back(at() + "Dependency '" + dependency.name + "' resolves to "
-                                  "the override at " + overridden->second.string() + "; a "
-                                  "local override is used as-is, so remove the version \"" +
-                                  dependency.version + "\".");
+            if (!dependency.hasVersion) {
+                errors_.push_back(at() + "Dependency '" + dependency.name + "' declares no "
+                                  "version; a dependency is versionless only when it resolves "
+                                  "to a workspace member. Add the version this package "
+                                  "requires, for example 'dependency " + dependency.name +
+                                  " \"1.0\";'.");
             }
             ws.deps.emplace(toU16(dependency.name), overridden->second);
             continue;

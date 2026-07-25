@@ -524,6 +524,12 @@ void validateManifest(const Manifest& manifest, const std::string& path,
         errors.push_back(path + ": The version '" + manifest.version + "' is not a valid "
                          "version; use dotted numerals such as \"1.3.0\".");
     }
+    if (manifest.form == ManifestForm::Package && !manifest.hasEnsVersion &&
+        !manifest.packageName.empty()) {
+        errors.push_back(path + ": Package '" + manifest.packageName + "' does not declare "
+                         "the language version it is written for; add 'ens \"0.1\";' to the "
+                         "package declaration.");
+    }
     if (manifest.hasEnsVersion && !isValidEnsVersionText(manifest.ensVersion)) {
         errors.push_back(path + ": The language version '" + manifest.ensVersion + "' is not "
                          "valid; use major.minor, such as \"1.2\".");

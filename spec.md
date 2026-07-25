@@ -362,7 +362,8 @@ package alex.jsonkit {
 ```
 
 A package's sources live in its `src/` folder, with its tests in a sibling `tests/` folder.
-`version` and `ens` are optional and informational: `version` is the package's own version in dotted numerals, and `ens` names the language version the package targets as major.minor.
+Every package declares `ens`, the language version it is written for as major.minor; `version`, the package's own version in dotted numerals, is optional.
+Both are informational today: nothing gates on their values yet.
 Each `dependency` declares a package this one may import with `@`: the leading segments of an `@` import select the dependency with the longest matching name, and the remaining segments name the module inside it.
 
 A workspace groups packages that are developed together.
@@ -379,6 +380,7 @@ workspace {
 Every member folder must itself contain a package manifest.
 Dependencies resolve by name against the workspace: `dependency ens.frontend;` in one member finds the member whose manifest declares `package ens.frontend`, wherever that folder sits, so package names must be unique within a workspace.
 A dependency that resolves to a workspace member never carries a version; members are used exactly as checked out.
+Every other dependency declares the version this package requires.
 There is no package registry yet, so a dependency must resolve to a workspace member or an override, and anything else is reported as having no source.
 `@std` is built in and is never declared as a dependency.
 
@@ -395,7 +397,7 @@ overrides {
 ```
 
 Only the overrides next to the root manifest of a build apply, and they apply build-wide: every dependency on the overridden name, in every package of the build, resolves to the given folder.
-The target folder's manifest must declare exactly the overridden package name, a dependency resolving to an override never carries a version, and every build that uses an override prints a notice.
+The target folder's manifest must declare exactly the overridden package name, the dependency keeps its declared version (the override redirects where the source comes from, not what the package requires), and every build that uses an override prints a notice.
 
 `native` declarations name the native libraries the package's `external` blocks bind to (see the section on native calls), and tell the linker what to link.
 `native libc system;` declares a library the platform links by default, so nothing extra is passed to the linker.
