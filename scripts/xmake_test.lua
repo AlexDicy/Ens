@@ -156,6 +156,15 @@ task("test")
             })
         end
 
+        -- the override subcommands: an add/remove/list roundtrip against a scratch workspace,
+        -- name-mismatch validation, and byte-exact edits of ens.overrides.
+        if want("cli_override") then
+            table.insert(jobs, {
+                name = "cli_override",
+                cli_override = true,
+            })
+        end
+
         -- surface any requested names that matched no test, so typos don't pass silently.
         if wanted ~= nil then
             local unknown = {}
@@ -484,6 +493,112 @@ task("test")
                 full = string.format("%s:\n%s", name, table.concat(failures, "\n"))}
         end
 
+        -- the override subcommands, driven against a scratch workspace so the repo tree is
+        -- never touched.
+        local function run_cli_override(job)
+            local name = job.name
+            local scratch = path.join(os.projectdir(), "build", "cli", "override")
+            os.tryrm(scratch)
+            local ws_dir = path.join(scratch, "ws")
+            os.mkdir(path.join(ws_dir, "app", "src"))
+            os.mkdir(path.join(scratch, "json", "src"))
+            os.mkdir(path.join(scratch, "wrong"))
+            io.writefile(path.join(ws_dir, "ens.package"),
+                'workspace {\n    member "app";\n}\n')
+            io.writefile(path.join(ws_dir, "app", "ens.package"),
+                'package demo.app {\n    ens "0.1";\n\n    dependency acme.json "1.0";\n}\n')
+            io.writefile(path.join(ws_dir, "app", "src", "main.ens"),
+                'import @acme.json.parse;\n\nmain() -> int {\n    print(parse.tag());\n'
+                .. '    return 0;\n}\n')
+            io.writefile(path.join(scratch, "json", "ens.package"),
+                'package acme.json {\n    ens "0.1";\n}\n')
+            io.writefile(path.join(scratch, "json", "src", "parse.ens"),
+                'export tag() -> string {\n    return "json override";\n}\n')
+            io.writefile(path.join(scratch, "wrong", "ens.package"),
+                'package acme.other {\n    ens "0.1";\n}\n')
+
+            local overrides_file = path.join(ws_dir, "ens.overrides")
+            local log = path.join(out_dir, name .. ".log")
+            local failures = {}
+
+            local function run(argv, opt, expected_rc, ...)
+                local rc = execMerged(ens_exe, argv, log, opt)
+                local out = io.readfile(log) or ""
+                local label = table.concat(argv, " ")
+                if expected_rc ~= nil and rc ~= expected_rc then
+                    table.insert(failures, string.format("ens %s: exit=%s expected=%s\n%s",
+                        label, tostring(rc), tostring(expected_rc), out))
+                end
+                for _, fragment in ipairs({...}) do
+                    if not out:find(fragment, 1, true) then
+                        table.insert(failures, string.format("ens %s: output missing %q\n%s",
+                            label, fragment, out))
+                    end
+                end
+                return rc, out
+            end
+
+            local function normalized(text)
+                return (text or ""):gsub("\r\n", "\n")
+            end
+
+            local function expect_file(label, expected)
+                local actual = normalized(io.readfile(overrides_file))
+                if actual ~= expected then
+                    table.insert(failures, string.format("%s: ens.overrides is %q, expected %q",
+                        label, actual, expected))
+                end
+            end
+
+            local in_ws = {curdir = ws_dir}
+
+            -- without an override, the dependency has no source
+            run({"override", "list"}, in_ws, 0, "No overrides")
+            run({"build"}, in_ws, 1, "No source for package 'acme.json'")
+
+            -- add creates the file, list validates the target, and the build resolves
+            -- through the override (the note names it)
+            run({"override", "add", "acme.json", "../json"}, in_ws, 0, "Added the override")
+            expect_file("add", 'overrides {\n    override acme.json "../json";\n}\n')
+            run({"override", "list"}, in_ws, 0, 'acme.json -> ../json (ok)')
+            run({"build"}, in_ws, 0, "Using the override for package 'acme.json'",
+                "[1/1] demo.app: built app.exe")
+            run({"run", "--"}, in_ws, 0, "json override")
+
+            -- a target that declares a different package is rejected and nothing changes
+            run({"override", "add", "acme.json", "../wrong"}, in_ws, 1,
+                "declares package 'acme.other' instead")
+            run({"override", "list"}, in_ws, 0, 'acme.json -> ../json (ok)')
+
+            -- edits are targeted: comments and other declarations survive byte-exact
+            io.writefile(overrides_file, '// local checkouts\noverrides {\n'
+                .. '    override acme.json "../wrong";\n'
+                .. '    override beta.tools "../missing";\n}\n')
+            run({"override", "add", "acme.json", "../json"}, in_ws, 0, "Replaced the override")
+            expect_file("replace", '// local checkouts\noverrides {\n'
+                .. '    override acme.json "../json";\n'
+                .. '    override beta.tools "../missing";\n}\n')
+            run({"override", "remove", "acme.json"}, in_ws, 0, "Removed the override")
+            expect_file("remove", '// local checkouts\noverrides {\n'
+                .. '    override beta.tools "../missing";\n}\n')
+            run({"override", "list"}, in_ws, 0, "beta.tools -> ../missing (invalid:")
+
+            -- usage and state errors
+            run({"override", "remove", "nope.pkg"}, in_ws, 1, "No override for package")
+            run({"override", "add", "not/a/name!", "../json"}, in_ws, 2,
+                "not a valid package name")
+            run({"override", "add", "acme.json"}, in_ws, 2, "takes a package name and a folder")
+            run({"override", "wat"}, in_ws, 2, "Unknown form")
+            run({"override", "list"}, {curdir = scratch}, 2, "No ens.package manifest")
+
+            if #failures == 0 then
+                return {name = name, ok = true}
+            end
+            return {name = name, ok = false,
+                short = string.format("%d CLI assertion(s) failed", #failures),
+                full = string.format("%s:\n%s", name, table.concat(failures, "\n"))}
+        end
+
         -- run a single test: compile, optionally run, and compare against the header.
         -- returns { name = ..., ok = bool, short = <fail reason>, full = <detailed report> }.
         local function run_one(job)
@@ -491,6 +606,7 @@ task("test")
             if job.semacheck then return run_semacheck(job) end
             if job.cli_core then return run_cli_core(job) end
             if job.cli_workspace then return run_cli_workspace(job) end
+            if job.cli_override then return run_cli_override(job) end
             local name = job.name
             local ens_file = job.ens_file
             local exe_file    = path.join(out_dir, name .. ".exe")

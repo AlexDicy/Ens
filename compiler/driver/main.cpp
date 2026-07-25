@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "Compiler.h"
+#include "Overrides.h"
 #include "Version.h"
 #include "module/Manifest.h"
 #include "module/Workspace.h"
@@ -227,6 +228,7 @@ const char kGeneralHelp[] =
     "  run [path]       Build an application and run it\n"
     "  check [path]     Look for errors without building anything\n"
     "  test [path]      Build and run the tests\n"
+    "  override <form>  Manage dependency overrides in ens.overrides\n"
     "  version          Print the toolchain version\n"
     "  help [command]   Show help for a command\n"
     "\n"
@@ -291,6 +293,20 @@ int printHelp(const std::string& command) {
             "  --filter <substring>  Run only the tests whose description contains it\n"
             "  --tests <folder>      Look for test files in this folder\n"
             "  --explain-arc         Print what the ARC optimizer elided and why\n";
+        return 0;
+    }
+    if (command == "override") {
+        std::cout <<
+            "Manage dependency overrides.\n"
+            "\n"
+            "Usage: ens override add <package> <folder>\n"
+            "       ens override remove <package>\n"
+            "       ens override list\n"
+            "\n"
+            "Overrides redirect a dependency to a local folder and live in the ens.overrides\n"
+            "file next to the workspace's ens.package, found from the current folder. 'add'\n"
+            "checks that the folder's manifest declares exactly the given package; 'list'\n"
+            "shows every override and whether its target is currently valid.\n";
         return 0;
     }
     if (command == "version") {
@@ -584,6 +600,7 @@ int main(int argc, char* argv[]) {
     if (command == "run") return runRun(argc, argv);
     if (command == "check") return runCheck(argc, argv);
     if (command == "test") return runTest(argc, argv);
+    if (command == "override") return runOverrideCommand(argc, argv);
     if (command == "version" || command == "--version") {
         std::cout << "ens " << ens::kToolchainVersion << '\n';
         return 0;

@@ -111,11 +111,15 @@ private:
         }
         manifest.form = ManifestForm::Overrides;
         advance();
-        parseBlock([&] { parseOverridesItem(manifest); });
+        if (auto close = parseBlock([&] { parseOverridesItem(manifest); })) {
+            manifest.hasOverridesClose = true;
+            manifest.overridesCloseOffset = *close;
+        }
     }
 
+    // Returns the offset of the closing '}' when the block was closed.
     template <typename ParseItem>
-    void parseBlock(ParseItem parseItem) {
+    std::optional<uint32_t> parseBlock(ParseItem parseItem) {
         if (at(SyntaxKind::LBrace)) {
             advance();
         } else {
@@ -125,10 +129,12 @@ private:
             parseItem();
         }
         if (at(SyntaxKind::RBrace)) {
+            uint32_t close = current().offset;
             advance();
-        } else {
-            errorHere("Expected '}' to close the declaration.");
+            return close;
         }
+        errorHere("Expected '}' to close the declaration.");
+        return std::nullopt;
     }
 
     void parsePackageItem(Manifest& manifest) {
@@ -320,6 +326,7 @@ private:
         ManifestOverride override;
         override.line = current().line;
         override.column = current().column;
+        override.startOffset = current().offset;
         advance();
         auto name = parsePackagePath("Expected the overridden package's name after 'override'.");
         if (!name) {
@@ -336,7 +343,13 @@ private:
             skipItem();
             return;
         }
-        expectSemicolon();
+        override.endOffset = current().offset;
+        if (at(SyntaxKind::Semi)) {
+            override.endOffset += static_cast<uint32_t>(current().text.size());
+            advance();
+        } else {
+            errorHere("Expected ';' after the declaration.");
+        }
         manifest.overrides.push_back(std::move(override));
     }
 

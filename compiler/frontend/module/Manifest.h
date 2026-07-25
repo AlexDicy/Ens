@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -50,6 +51,10 @@ struct ManifestOverride {
     std::string folder;
     int line = 0;
     int column = 0;
+    // The declaration's span in the manifest text, in UTF-16 code units: from the `override`
+    // keyword through the terminating ';'. Lets tooling edit one declaration in place.
+    uint32_t startOffset = 0;
+    uint32_t endOffset = 0;
 };
 
 enum class ManifestForm { None, Package, Workspace, Overrides };
@@ -65,6 +70,10 @@ struct Manifest {
     std::vector<ManifestNative> natives;
     std::vector<ManifestMember> members;
     std::vector<ManifestOverride> overrides;
+    // The offset of the '}' closing an overrides declaration, in UTF-16 code units, when the
+    // block was closed. Lets tooling insert a declaration at the end of the block.
+    bool hasOverridesClose = false;
+    uint32_t overridesCloseOffset = 0;
 };
 
 // Parses manifest text. Problems are appended to `errors` as "<path>:<line>:<col>: <message>";
