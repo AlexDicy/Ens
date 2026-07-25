@@ -4420,9 +4420,6 @@ void Analyzer::checkCallableSignatureVisibility(const ast::FuncDecl& fn,
     if (visibilityTier(declVisibility) == 0) return;
     const ResolutionInfo* info = analysis.find(fn.node.greenNode());
     Symbol* sym = info ? info->resolvedSymbol : nullptr;
-    // The fromCString intrinsic's declared parameter type is a placeholder the compiler overrides
-    // at every call site; a caller never names it, so it cannot leak.
-    if (isFromCStringIntrinsic(sym)) return;
     auto params = fn.parameters();
     for (size_t i = 0; i < params.size(); ++i) {
         if (auto tr = params[i].typeReference()) {
@@ -5204,6 +5201,9 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                                 return typeCtx.getError();
                             }
                             analysis.setSymbol(member.node.greenNode(), fnSym);
+                            if (isFromCStringIntrinsic(fnSym)) {
+                                return checkFromCStringCall(expr);
+                            }
                             if (fnSym->isExternal) {
                                 return analyzeExternalCall(expr, fnSym, *memberName);
                             }
@@ -5603,6 +5603,9 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
     }
     analysis.setSymbol(idCallee->node.greenNode(), sym);
 
+    if (isFromCStringIntrinsic(sym)) {
+        return checkFromCStringCall(expr);
+    }
     if (sym->isExternal) {
         return analyzeExternalCall(expr, sym, *name);
     }
@@ -5727,21 +5730,22 @@ bool Analyzer::isFromCStringIntrinsic(const Symbol* sym) {
            sym->modulePath == u"std.ffi";
 }
 
-// std.ffi.fromCString reads a foreign NUL-terminated buffer into a fresh string. Its declared
-// parameter is a placeholder: the real argument may be a value of any external type (there is
-// no common supertype to write in the signature), nullable or not, so the check is intrinsic.
+// std.ffi.fromCString reads a foreign NUL-terminated buffer into a fresh string, or null when the
+// handle is null. Its type parameter accepts any external type (there is no common supertype to
+// write in the signature), optional or not, so the argument check is intrinsic and the call is
+// never instantiated as a generic.
 Type* Analyzer::checkFromCStringCall(const ast::CallExpression& expr) {
     auto args = expr.arguments();
-    Type* stringTy = typeCtx.getPrimitive(TypeKind::String);
+    Type* result = typeCtx.getOptional(typeCtx.getPrimitive(TypeKind::String));
     if (args.size() != 1) {
         errorAtNode(expr.node, "'fromCString' expects exactly 1 argument (a foreign handle), got " +
             std::to_string(args.size()) + ".");
         for (auto& a : args) { if (!a.asOutArgument()) analyzeExpr(a); }
-        return stringTy;
+        return result;
     }
     if (args[0].asOutArgument()) {
         errorAtNode(args[0].node, "'out' can only be used when calling an external function.");
-        return stringTy;
+        return result;
     }
     Type* argT = analyzeExpr(args[0]);
     Type* base = (argT && argT->isOptional()) ? argT->inner : argT;
@@ -5749,12 +5753,11 @@ Type* Analyzer::checkFromCStringCall(const ast::CallExpression& expr) {
         errorAtNode(args[0].node, "'fromCString' takes a value of an external type (a foreign "
             "handle), got '" + argT->toString() + "'. Pass a handle returned by a C function.");
     }
-    return stringTy;
+    return result;
 }
 
 Type* Analyzer::checkDirectCallArguments(const ast::CallExpression& expr, Symbol* sym,
                                          const std::u16string& funcName) {
-    if (isFromCStringIntrinsic(sym)) return checkFromCStringCall(expr);
     auto args = expr.arguments();
     size_t req = requiredArgCount(sym);
     if (args.size() < req || args.size() > sym->paramTypes.size()) {

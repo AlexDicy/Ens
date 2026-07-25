@@ -867,7 +867,6 @@ struct CodeGenerator::Impl {
         Symbol* sym = symOverride ? symOverride : symbolOf(fn.node);
         if (!sym) return;
         if (isInterceptedTraceMethod(sym)) return;
-        if (isFromCStringIntrinsic(sym)) return;
         auto it = values.find(sym);
         if (it == values.end()) return;
 
@@ -6865,7 +6864,8 @@ struct CodeGenerator::Impl {
     }
 
     // std.ffi.fromCString(handle): copy the NUL-terminated buffer the foreign handle points to
-    // into a fresh Ens string. A null handle yields the empty string rather than a null string.
+    // into a fresh Ens string, or produce the null string? when the handle is null. The runtime
+    // helper already returns a null pointer for a null input, which is the null optional.
     llvm::Value* emitFromCString(const ast::CallExpression& e) {
         auto args = e.arguments();
         if (args.size() != 1) {
@@ -6874,12 +6874,7 @@ struct CodeGenerator::Impl {
         }
         llvm::Value* handle = emitExpr(args[0]);
         if (!handle) return nullptr;
-        auto* ptrTy = llvm::PointerType::get(ctx, 0);
-        llvm::Value* str = builder->CreateCall(getOrDefineEnsStringFromCStr(), { handle },
-            "cstr.str");
-        llvm::Value* empty = emitStringLiteralObject("");
-        llvm::Value* isNull = builder->CreateICmpEQ(str, llvm::ConstantPointerNull::get(ptrTy));
-        return builder->CreateSelect(isNull, empty, str, "cstr.result");
+        return builder->CreateCall(getOrDefineEnsStringFromCStr(), { handle }, "cstr.result");
     }
 
     llvm::Value* emitCall(const ast::CallExpression& e) {

@@ -1501,7 +1501,13 @@ task("test")
                         compile_log_text:gsub("[\r\n]+$", ""))}
             end
 
-            local run_rc = execMerged(exe_file, {}, stdout_file)
+            -- a controlled environment for the getenv-based ffi fixture: a dedicated variable set
+            -- to a known value, and its unset counterpart cleared, so the fixture never depends on
+            -- ambient variables such as PATH.
+            local fixture_env = os.getenvs()
+            fixture_env.ENS_FROMCSTRING_PRESENT = "hermetic"
+            fixture_env.ENS_FROMCSTRING_ABSENT = nil
+            local run_rc = execMerged(exe_file, {}, stdout_file, {envs = fixture_env})
             local actual_stdout = (io.readfile(stdout_file) or ""):gsub("[\r\n]+$", "")
 
             local why = compareRun(run_rc, actual_stdout)
