@@ -1,0 +1,459 @@
+// Mechanical emission of lowered EIR into a native object file through the LLVM-C binding. One
+// LLVM context and module serve one Ens module; temps map one-to-one onto LLVM values, slots
+// onto entry-block allocas, and blocks onto basic blocks, so nothing here makes decisions - the
+// shape was fixed by lowering. The module that defines the program entry also gets the C 'main'
+// wrapper: it records argc and argv in the ens argument globals and forwards the user main's
+// result, with 0 standing in when user main returns void.
+import EirFunction from eir.model;
+import EirInstruction from eir.model;
+import EirConstInt from eir.model;
+import EirConstFloat from eir.model;
+import EirConstBool from eir.model;
+import EirBinary from eir.model;
+import EirUnary from eir.model;
+import EirCast from eir.model;
+import EirLoadSlot from eir.model;
+import EirStoreSlot from eir.model;
+import EirCall from eir.model;
+import EirTerminator from eir.model;
+import EirReturn from eir.model;
+import EirJump from eir.model;
+import EirBranch from eir.model;
+import EirSwitch from eir.model;
+import EirUnreachable from eir.model;
+import EirBinaryOp from eir.model;
+import Type from @ens.sema.model.types;
+import PrimitiveType from @ens.sema.model.types;
+import @ens.sema.model.types;
+import support.primitives;
+import Context from @ens.llvm.core;
+import Module from @ens.llvm.core;
+import Builder from @ens.llvm.core;
+import @ens.llvm.core;
+import TypeRef from @ens.llvm.types;
+import Value from @ens.llvm.values;
+import BasicBlock from @ens.llvm.blocks;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import @ens.llvm.globals;
+import @ens.llvm.analysis;
+import TargetMachine from @ens.llvm.target;
+import @ens.llvm.target;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+
+// The entry-point shape the wrapper forwards: the user main's symbol and whether it produces
+// the process exit code itself or leaves the wrapper to return 0.
+export final class EntryPoint {
+    string entrySymbol;
+    bool voidResult;
+
+    public constructor(this.entrySymbol, this.voidResult);
+
+    export symbol() -> string {
+        return this.entrySymbol;
+    }
+
+    export returnsVoid() -> bool {
+        return this.voidResult;
+    }
+}
+
+// Emits one module's functions as a native object file for the host target. Returns "" on
+// success and a description of the failure otherwise.
+export emitModule(string moduleName, List<EirFunction> functions, EntryPoint? entry,
+                  string objectPath) -> string {
+    let emitter = new ModuleEmitter(moduleName, functions);
+    return emitter.run(entry, objectPath);
+}
+
+class ModuleEmitter {
+    string moduleName;
+    List<EirFunction> functions;
+    Context context;
+    Module module;
+    Builder builder;
+    Map<string, Value> functionValues;
+    Map<string, TypeRef> functionTypes;
+
+    protected constructor(string moduleName, List<EirFunction> functions) {
+        this.moduleName = moduleName;
+        this.functions = functions;
+        this.context = core.createContext();
+        this.module = this.context.createModule(moduleName);
+        this.builder = this.context.createBuilder();
+        this.functionValues = new Map<string, Value>();
+        this.functionTypes = new Map<string, TypeRef>();
+    }
+
+    protected run(EntryPoint? entry, string objectPath) -> string {
+        target.initializeHostTarget();
+        string triple = target.hostTargetTriple();
+        let resolved = target.targetFromTriple(triple);
+        if (resolved == null) {
+            this.builder.dispose();
+            this.context.dispose();
+            return "could not resolve the host target '{triple}'";
+        }
+        let machine = resolved.createTargetMachine(triple);
+        string outcome = this.emitInto(machine, entry, objectPath);
+        machine.dispose();
+        this.builder.dispose();
+        this.context.dispose();
+        return outcome;
+    }
+
+    emitInto(TargetMachine machine, EntryPoint? entry, string objectPath) -> string {
+        target.setModuleDataLayout(this.module, machine.createDataLayout());
+        for (long i = 0; i < this.functions.length(); i++) {
+            this.declareFunction(this.functions.get(i));
+        }
+        for (long i = 0; i < this.functions.length(); i++) {
+            string problem = this.emitFunction(this.functions.get(i));
+            if (problem.length > 0) {
+                return problem;
+            }
+        }
+        if (entry != null) {
+            string problem = this.emitEntryWrapper(entry);
+            if (problem.length > 0) {
+                return problem;
+            }
+        }
+        string verdict = analysis.verify(this.module);
+        if (verdict.length > 0) {
+            return "module '{this.moduleName}' failed LLVM verification: {verdict}";
+        }
+        bool written = machine.emitObjectFile(this.module, objectPath);
+        if (!written) {
+            return "could not write the object file {objectPath}";
+        }
+        return "";
+    }
+
+    declareFunction(EirFunction function) {
+        let parameters = function.parameters();
+        let parameterTypes = new TypeRef[parameters.length];
+        for (long i = 0; i < parameterTypes.length; i++) {
+            parameterTypes[i] = this.mapType(parameters[i].type());
+        }
+        let functionType = this.mapType(function.returnType()).functionType(parameterTypes);
+        let declared = this.module.addFunction(function.symbol(), functionType);
+        if (function.internalLinkage()) {
+            globals.setLinkage(declared, globals.linkageInternal());
+        }
+        this.functionValues.set(function.symbol(), declared);
+        this.functionTypes.set(function.symbol(), functionType);
+    }
+
+    // A callee defined in another module is declared here on first use, with external linkage.
+    calleeValue(string symbol, Type[] parameterTypes, Type returnType) -> Value {
+        let existing = this.functionValues.get(symbol);
+        if (existing != null) {
+            return existing;
+        }
+        let mapped = new TypeRef[parameterTypes.length];
+        for (long i = 0; i < mapped.length; i++) {
+            mapped[i] = this.mapType(parameterTypes[i]);
+        }
+        let functionType = this.mapType(returnType).functionType(mapped);
+        let declared = this.module.addFunction(symbol, functionType);
+        this.functionValues.set(symbol, declared);
+        this.functionTypes.set(symbol, functionType);
+        return declared;
+    }
+
+    calleeType(string symbol) -> TypeRef {
+        let found = this.functionTypes.get(symbol);
+        if (found == null) {
+            panic("Internal: no function type recorded for '{symbol}'");
+        }
+        return found;
+    }
+
+    emitFunction(EirFunction function) -> string {
+        let declared = this.functionValues.get(function.symbol());
+        if (declared == null) {
+            return "Internal: function '{function.symbol()}' was never declared";
+        }
+        let blocks = new List<BasicBlock>();
+        for (long i = 0; i < function.blocks().length(); i++) {
+            blocks.push(this.context.appendBasicBlock(declared,
+                function.blocks().get(i).label()));
+        }
+        long tempCount = function.tempTypes().length();
+        Value?[] temps = new Value?[tempCount];
+        for (long i = 0; i < function.parameters().length; i++) {
+            temps[i] = globals.getParam(declared, i as uint);
+        }
+        this.builder.positionAtEnd(blocks.get(0));
+        Value?[] slots = new Value?[function.slots().length()];
+        for (long i = 0; i < function.slots().length(); i++) {
+            let slot = function.slots().get(i);
+            slots[i] = memory.buildAlloca(this.builder, this.mapType(slot.type()),
+                slot.name());
+        }
+        for (long b = 0; b < function.blocks().length(); b++) {
+            let block = function.blocks().get(b);
+            this.builder.positionAtEnd(blocks.get(b));
+            let instructions = block.instructions();
+            for (long i = 0; i < instructions.length(); i++) {
+                string problem = this.emitInstruction(function, instructions.get(i), temps,
+                    slots);
+                if (problem.length > 0) {
+                    return problem;
+                }
+            }
+            let terminator = block.terminator();
+            if (terminator == null) {
+                return "Internal: block {block.label()} of {function.symbol()} has no "
+                    + "terminator";
+            }
+            string problem = this.emitTerminator(function, terminator, temps, blocks);
+            if (problem.length > 0) {
+                return problem;
+            }
+        }
+        return "";
+    }
+
+    emitInstruction(EirFunction function, EirInstruction instruction, Value?[] temps,
+                            Value?[] slots) -> string {
+        switch (instruction) {
+            is EirConstInt constant -> {
+                temps[constant.result] = this.mapType(constant.type).constInt(
+                    constant.bits as ulong, primitives.isSignedType(constant.type));
+            },
+            is EirConstFloat constant -> {
+                temps[constant.result] = this.mapType(constant.type).constReal(constant.value);
+            },
+            is EirConstBool constant -> {
+                ulong bit = 0;
+                if (constant.value) {
+                    bit = 1;
+                }
+                temps[constant.result] = this.context.int1Type().constInt(bit, false);
+            },
+            is EirBinary binary -> {
+                let left = tempValue(temps, binary.left);
+                let right = tempValue(temps, binary.right);
+                temps[binary.result] = this.emitBinary(binary.op, left, right);
+            },
+            is EirUnary unary -> {
+                let operand = tempValue(temps, unary.operand);
+                temps[unary.result] = switch (unary.op) {
+                    Neg -> instructions.buildNeg(this.builder, operand, ""),
+                    FloatNeg -> instructions.buildFNeg(this.builder, operand, ""),
+                    Not -> instructions.buildNot(this.builder, operand, ""),
+                };
+            },
+            is EirCast cast -> {
+                let operand = tempValue(temps, cast.operand);
+                let targetType = this.mapType(cast.type);
+                temps[cast.result] = switch (cast.op) {
+                    Trunc -> instructions.buildTrunc(this.builder, operand, targetType, ""),
+                    ZeroExtend -> instructions.buildZExt(this.builder, operand, targetType,
+                        ""),
+                    SignExtend -> instructions.buildSExt(this.builder, operand, targetType,
+                        ""),
+                    FloatTrunc -> instructions.buildFPTrunc(this.builder, operand, targetType,
+                        ""),
+                    FloatExtend -> instructions.buildFPExt(this.builder, operand, targetType,
+                        ""),
+                    SignedToFloat -> instructions.buildSIToFP(this.builder, operand,
+                        targetType, ""),
+                    UnsignedToFloat -> instructions.buildUIToFP(this.builder, operand,
+                        targetType, ""),
+                    FloatToSigned -> instructions.buildFPToSI(this.builder, operand,
+                        targetType, ""),
+                    FloatToUnsigned -> instructions.buildFPToUI(this.builder, operand,
+                        targetType, ""),
+                    Reinterpret -> operand,
+                };
+            },
+            is EirLoadSlot load -> {
+                let slot = slots[load.slot];
+                if (slot == null) {
+                    return "Internal: load from missing slot ${load.slot} in "
+                        + "{function.symbol()}";
+                }
+                temps[load.result] = memory.buildLoad(this.builder, this.mapType(load.type),
+                    slot, "");
+            },
+            is EirStoreSlot store -> {
+                let slot = slots[store.slot];
+                if (slot == null) {
+                    return "Internal: store through missing slot in {function.symbol()}";
+                }
+                let ignored = memory.buildStore(this.builder, tempValue(temps, store.value),
+                    slot);
+            },
+            is EirCall call -> {
+                let callee = this.calleeValue(call.callee.symbol(),
+                    call.callee.parameterTypes(), call.callee.returnType());
+                let argumentValues = new Value[call.arguments.length];
+                for (long i = 0; i < argumentValues.length; i++) {
+                    argumentValues[i] = tempValue(temps, call.arguments[i]);
+                }
+                let value = instructions.buildCall(this.builder,
+                    this.calleeType(call.callee.symbol()), callee, argumentValues, "");
+                if (call.result >= 0) {
+                    temps[call.result] = value;
+                }
+            },
+        }
+        return "";
+    }
+
+    emitBinary(EirBinaryOp op, Value left, Value right) -> Value {
+        return switch (op) {
+            Add -> instructions.buildAdd(this.builder, left, right, ""),
+            Sub -> instructions.buildSub(this.builder, left, right, ""),
+            Mul -> instructions.buildMul(this.builder, left, right, ""),
+            DivSigned -> instructions.buildSDiv(this.builder, left, right, ""),
+            DivUnsigned -> instructions.buildUDiv(this.builder, left, right, ""),
+            RemSigned -> instructions.buildSRem(this.builder, left, right, ""),
+            RemUnsigned -> instructions.buildURem(this.builder, left, right, ""),
+            FloatAdd -> instructions.buildFAdd(this.builder, left, right, ""),
+            FloatSub -> instructions.buildFSub(this.builder, left, right, ""),
+            FloatMul -> instructions.buildFMul(this.builder, left, right, ""),
+            FloatDiv -> instructions.buildFDiv(this.builder, left, right, ""),
+            FloatRem -> instructions.buildFRem(this.builder, left, right, ""),
+            And -> instructions.buildAnd(this.builder, left, right, ""),
+            Or -> instructions.buildOr(this.builder, left, right, ""),
+            Xor -> instructions.buildXor(this.builder, left, right, ""),
+            ShiftLeft -> instructions.buildShl(this.builder, left, right, ""),
+            ShiftRightSigned -> instructions.buildAShr(this.builder, left, right, ""),
+            ShiftRightUnsigned -> instructions.buildLShr(this.builder, left, right, ""),
+            CmpEq -> instructions.buildICmpEQ(this.builder, left, right, ""),
+            CmpNe -> instructions.buildICmpNE(this.builder, left, right, ""),
+            CmpLtSigned -> instructions.buildICmpSLT(this.builder, left, right, ""),
+            CmpLeSigned -> instructions.buildICmpSLE(this.builder, left, right, ""),
+            CmpGtSigned -> instructions.buildICmpSGT(this.builder, left, right, ""),
+            CmpGeSigned -> instructions.buildICmpSGE(this.builder, left, right, ""),
+            CmpLtUnsigned -> instructions.buildICmpULT(this.builder, left, right, ""),
+            CmpLeUnsigned -> instructions.buildICmpULE(this.builder, left, right, ""),
+            CmpGtUnsigned -> instructions.buildICmpUGT(this.builder, left, right, ""),
+            CmpGeUnsigned -> instructions.buildICmpUGE(this.builder, left, right, ""),
+            FloatCmpEq -> instructions.buildFCmpOEQ(this.builder, left, right, ""),
+            FloatCmpNe -> instructions.buildFCmpONE(this.builder, left, right, ""),
+            FloatCmpLt -> instructions.buildFCmpOLT(this.builder, left, right, ""),
+            FloatCmpLe -> instructions.buildFCmpOLE(this.builder, left, right, ""),
+            FloatCmpGt -> instructions.buildFCmpOGT(this.builder, left, right, ""),
+            FloatCmpGe -> instructions.buildFCmpOGE(this.builder, left, right, ""),
+        };
+    }
+
+    emitTerminator(EirFunction function, EirTerminator terminator, Value?[] temps,
+                           List<BasicBlock> blocks) -> string {
+        switch (terminator) {
+            is EirReturn returned -> {
+                if (returned.value < 0) {
+                    let ignored = instructions.buildRetVoid(this.builder);
+                } else {
+                    let ignored = instructions.buildRet(this.builder,
+                        tempValue(temps, returned.value));
+                }
+            },
+            is EirJump jump -> {
+                let ignored = instructions.buildBr(this.builder, blocks.get(jump.target));
+            },
+            is EirBranch branch -> {
+                let ignored = instructions.buildCondBr(this.builder,
+                    tempValue(temps, branch.condition), blocks.get(branch.thenTarget),
+                    blocks.get(branch.elseTarget));
+            },
+            is EirSwitch switched -> {
+                let scrutineeType = this.mapType(
+                    function.tempTypes().get(switched.value));
+                let instruction = instructions.buildSwitch(this.builder,
+                    tempValue(temps, switched.value), blocks.get(switched.defaultTarget),
+                    switched.caseValues.length as uint);
+                for (long i = 0; i < switched.caseValues.length; i++) {
+                    instructions.addCase(instruction,
+                        scrutineeType.constInt(switched.caseValues[i] as ulong, true),
+                        blocks.get(switched.caseTargets[i]));
+                }
+            },
+            is EirUnreachable ignored -> {
+                let unused = instructions.buildUnreachable(this.builder);
+            },
+        }
+        return "";
+    }
+
+    // The C entry point: record the process arguments in the ens globals and forward the user
+    // main's result.
+    emitEntryWrapper(EntryPoint entry) -> string {
+        let userMain = this.functionValues.get(entry.symbol());
+        if (userMain == null) {
+            return "Internal: the entry module never defined {entry.symbol()}";
+        }
+        let intType = this.context.int32Type();
+        let pointerType = this.context.pointerType();
+        let wrapperType = intType.functionType([intType, pointerType]);
+        let wrapper = this.module.addFunction("main", wrapperType);
+        let argcGlobal = globals.addGlobal(this.module, intType, "ens_argc");
+        globals.setInitializer(argcGlobal, intType.constInt(0, false));
+        let argvGlobal = globals.addGlobal(this.module, pointerType, "ens_argv");
+        globals.setInitializer(argvGlobal, pointerType.constNull());
+        this.builder.positionAtEnd(this.context.appendBasicBlock(wrapper, "entry"));
+        let storeArgc = memory.buildStore(this.builder, globals.getParam(wrapper, 0),
+            argcGlobal);
+        let storeArgv = memory.buildStore(this.builder, globals.getParam(wrapper, 1),
+            argvGlobal);
+        let called = instructions.buildCall(this.builder, this.calleeType(entry.symbol()),
+            userMain, [], "");
+        if (entry.returnsVoid()) {
+            let ignored = instructions.buildRet(this.builder, intType.constInt(0, false));
+        } else {
+            let ignored = instructions.buildRet(this.builder, called);
+        }
+        return "";
+    }
+
+    mapType(Type type) -> TypeRef {
+        if (types.isVoidType(type)) {
+            return this.context.voidType();
+        }
+        if (type is PrimitiveType) {
+            switch (type.kind()) {
+                Bool -> {
+                    return this.context.int1Type();
+                },
+                Byte -> {
+                    return this.context.int8Type();
+                },
+                Short, UShort -> {
+                    return this.context.int16Type();
+                },
+                Int, UInt, Char -> {
+                    return this.context.int32Type();
+                },
+                Long, ULong -> {
+                    return this.context.int64Type();
+                },
+                Float -> {
+                    return this.context.floatType();
+                },
+                Double -> {
+                    return this.context.doubleType();
+                },
+                default -> {
+                    panic("Internal: no LLVM mapping for type "
+                        + "'{types.display(type)}'");
+                },
+            }
+        }
+        panic("Internal: no LLVM mapping for type '{types.display(type)}'");
+    }
+}
+
+// Emission runs after the verifier proved def-before-use, so a missing temp is a bug.
+tempValue(Value?[] temps, long temp) -> Value {
+    let value = temps[temp];
+    if (value == null) {
+        panic("Internal: temp %{temp} was used before it was emitted");
+    }
+    return value;
+}

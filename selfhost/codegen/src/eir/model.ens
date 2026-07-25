@@ -1,0 +1,422 @@
+// The Ens intermediate representation lowering produces and emission consumes. It is SSA-lite:
+// values are single-assignment temps, mutable storage is explicit slots, and control flow is a
+// flat graph of basic blocks each ending in exactly one terminator. There are no phi nodes; a
+// merged value travels through a slot. Types reference the interned sema type model directly, so
+// type equality is reference identity here too.
+import Type from @ens.sema.model.types;
+import List from @std.collections.list;
+
+// One incoming parameter. Parameter i is pre-defined as temp i at function entry.
+export final class EirParameter {
+    string parameterName;
+    Type parameterType;
+
+    public constructor(this.parameterName, this.parameterType);
+
+    export name() -> string {
+        return this.parameterName;
+    }
+
+    export type() -> Type {
+        return this.parameterType;
+    }
+}
+
+// One mutable stack slot. Slots hold locals and parameters; loads and stores are explicit.
+export final class EirSlot {
+    string slotName;
+    Type slotType;
+
+    public constructor(this.slotName, this.slotType);
+
+    export name() -> string {
+        return this.slotName;
+    }
+
+    export type() -> Type {
+        return this.slotType;
+    }
+}
+
+export enum EirBinaryOp {
+    Add,
+    Sub,
+    Mul,
+    DivSigned,
+    DivUnsigned,
+    RemSigned,
+    RemUnsigned,
+    FloatAdd,
+    FloatSub,
+    FloatMul,
+    FloatDiv,
+    FloatRem,
+    And,
+    Or,
+    Xor,
+    ShiftLeft,
+    ShiftRightSigned,
+    ShiftRightUnsigned,
+    CmpEq,
+    CmpNe,
+    CmpLtSigned,
+    CmpLeSigned,
+    CmpGtSigned,
+    CmpGeSigned,
+    CmpLtUnsigned,
+    CmpLeUnsigned,
+    CmpGtUnsigned,
+    CmpGeUnsigned,
+    FloatCmpEq,
+    FloatCmpNe,
+    FloatCmpLt,
+    FloatCmpLe,
+    FloatCmpGt,
+    FloatCmpGe,
+}
+
+// True for the comparison forms, whose result type is bool while the operands share their own
+// common type.
+export isComparison(EirBinaryOp op) -> bool {
+    return switch (op) {
+        CmpEq, CmpNe, CmpLtSigned, CmpLeSigned, CmpGtSigned, CmpGeSigned, CmpLtUnsigned,
+        CmpLeUnsigned, CmpGtUnsigned, CmpGeUnsigned, FloatCmpEq, FloatCmpNe, FloatCmpLt,
+        FloatCmpLe, FloatCmpGt, FloatCmpGe -> true,
+        default -> false,
+    };
+}
+
+export isFloatBinary(EirBinaryOp op) -> bool {
+    return switch (op) {
+        FloatAdd, FloatSub, FloatMul, FloatDiv, FloatRem, FloatCmpEq, FloatCmpNe, FloatCmpLt,
+        FloatCmpLe, FloatCmpGt, FloatCmpGe -> true,
+        default -> false,
+    };
+}
+
+export enum EirUnaryOp {
+    Neg,
+    FloatNeg,
+    Not,
+}
+
+export enum EirCastOp {
+    Trunc,
+    ZeroExtend,
+    SignExtend,
+    FloatTrunc,
+    FloatExtend,
+    SignedToFloat,
+    UnsignedToFloat,
+    FloatToSigned,
+    FloatToUnsigned,
+    Reinterpret,
+}
+
+// The callee of a call: its linker symbol and the sema types its LLVM function type derives
+// from. Parameter types list every parameter after default filling, in parameter order.
+export final class EirCallee {
+    string calleeSymbol;
+    Type[] calleeParameterTypes;
+    Type calleeReturnType;
+
+    public constructor(this.calleeSymbol, this.calleeParameterTypes, this.calleeReturnType);
+
+    export symbol() -> string {
+        return this.calleeSymbol;
+    }
+
+    export parameterTypes() -> Type[] {
+        return this.calleeParameterTypes;
+    }
+
+    export returnType() -> Type {
+        return this.calleeReturnType;
+    }
+}
+
+export sealed abstract class EirInstruction {
+}
+
+// An integer constant. The value is the two's-complement bit pattern, sized by the type.
+export final class EirConstInt extends EirInstruction {
+    public long result;
+    public Type type;
+    public long bits;
+
+    public constructor(this.result, this.type, this.bits);
+}
+
+// A floating-point constant. The source spelling is kept for the textual dump.
+export final class EirConstFloat extends EirInstruction {
+    public long result;
+    public Type type;
+    public double value;
+    public string text;
+
+    public constructor(this.result, this.type, this.value, this.text);
+}
+
+export final class EirConstBool extends EirInstruction {
+    public long result;
+    public Type type;
+    public bool value;
+
+    public constructor(this.result, this.type, this.value);
+}
+
+// A binary operation. For arithmetic forms the result and both operands share the type; for
+// comparison forms the result is bool and the operands share their own type.
+export final class EirBinary extends EirInstruction {
+    public long result;
+    public Type type;
+    public EirBinaryOp op;
+    public long left;
+    public long right;
+
+    public constructor(this.result, this.type, this.op, this.left, this.right);
+}
+
+export final class EirUnary extends EirInstruction {
+    public long result;
+    public Type type;
+    public EirUnaryOp op;
+    public long operand;
+
+    public constructor(this.result, this.type, this.op, this.operand);
+}
+
+// A primitive conversion. Reinterpret changes only the type (same width, same bits) and emits
+// no machine operation.
+export final class EirCast extends EirInstruction {
+    public long result;
+    public Type type;
+    public EirCastOp op;
+    public long operand;
+
+    public constructor(this.result, this.type, this.op, this.operand);
+}
+
+export final class EirLoadSlot extends EirInstruction {
+    public long result;
+    public Type type;
+    public long slot;
+
+    public constructor(this.result, this.type, this.slot);
+}
+
+export final class EirStoreSlot extends EirInstruction {
+    public long slot;
+    public long value;
+
+    public constructor(this.slot, this.value);
+}
+
+// A non-throwing call. result is -1 when the callee returns void. Throwing calls become their
+// own terminator with an unwind edge when exceptions arrive; this form stays for calls that
+// cannot unwind.
+export final class EirCall extends EirInstruction {
+    public long result;
+    public Type type;
+    public EirCallee callee;
+    public long[] arguments;
+
+    public constructor(this.result, this.type, this.callee, this.arguments);
+}
+
+export sealed abstract class EirTerminator {
+}
+
+// Returns value, or returns void when value is -1.
+export final class EirReturn extends EirTerminator {
+    public long value;
+
+    public constructor(this.value);
+}
+
+export final class EirJump extends EirTerminator {
+    public long target;
+
+    public constructor(this.target);
+}
+
+export final class EirBranch extends EirTerminator {
+    public long condition;
+    public long thenTarget;
+    public long elseTarget;
+
+    public constructor(this.condition, this.thenTarget, this.elseTarget);
+}
+
+// An integer switch. caseValues and caseTargets are parallel; values are the scrutinee-typed
+// constants as two's-complement bit patterns.
+export final class EirSwitch extends EirTerminator {
+    public long value;
+    public long[] caseValues;
+    public long[] caseTargets;
+    public long defaultTarget;
+
+    public constructor(this.value, this.caseValues, this.caseTargets, this.defaultTarget);
+}
+
+export final class EirUnreachable extends EirTerminator {
+    public constructor();
+}
+
+export final class EirBlock {
+    string blockLabel;
+    List<EirInstruction> blockInstructions;
+    EirTerminator? blockTerminator;
+
+    public constructor(string label) {
+        this.blockLabel = label;
+        this.blockInstructions = new List<EirInstruction>();
+        this.blockTerminator = null;
+    }
+
+    export label() -> string {
+        return this.blockLabel;
+    }
+
+    export instructions() -> List<EirInstruction> {
+        return this.blockInstructions;
+    }
+
+    export terminator() -> EirTerminator? {
+        return this.blockTerminator;
+    }
+
+    public setTerminator(EirTerminator terminator) {
+        this.blockTerminator = terminator;
+    }
+}
+
+// One lowered function. The first parameters().length temps are the parameters; every temp's
+// type is recorded in tempTypes, indexed by temp id. Block 0 is the entry block.
+export final class EirFunction {
+    string functionSymbol;
+    bool internal;
+    EirParameter[] functionParameters;
+    Type functionReturnType;
+    List<EirSlot> functionSlots;
+    List<EirBlock> functionBlocks;
+    List<Type> functionTempTypes;
+
+    public constructor(string symbol, bool internalLinkage, EirParameter[] parameters,
+                Type returnType, List<EirSlot> slots, List<EirBlock> blocks,
+                List<Type> tempTypes) {
+        this.functionSymbol = symbol;
+        this.internal = internalLinkage;
+        this.functionParameters = parameters;
+        this.functionReturnType = returnType;
+        this.functionSlots = slots;
+        this.functionBlocks = blocks;
+        this.functionTempTypes = tempTypes;
+    }
+
+    export symbol() -> string {
+        return this.functionSymbol;
+    }
+
+    export internalLinkage() -> bool {
+        return this.internal;
+    }
+
+    export parameters() -> EirParameter[] {
+        return this.functionParameters;
+    }
+
+    export returnType() -> Type {
+        return this.functionReturnType;
+    }
+
+    export slots() -> List<EirSlot> {
+        return this.functionSlots;
+    }
+
+    export blocks() -> List<EirBlock> {
+        return this.functionBlocks;
+    }
+
+    export tempTypes() -> List<Type> {
+        return this.functionTempTypes;
+    }
+}
+
+// Builds one function. Temp numbering and block labels are builder-local, so lowering different
+// functions in parallel never contends on shared state.
+export final class EirFunctionBuilder {
+    string symbol;
+    bool internal;
+    EirParameter[] parameters;
+    Type returnType;
+    List<EirSlot> slots;
+    List<EirBlock> blocks;
+    List<Type> tempTypes;
+    long currentBlock;
+
+    public constructor(string symbol, bool internalLinkage, EirParameter[] parameters,
+                Type returnType) {
+        this.symbol = symbol;
+        this.internal = internalLinkage;
+        this.parameters = parameters;
+        this.returnType = returnType;
+        this.slots = new List<EirSlot>();
+        this.blocks = new List<EirBlock>();
+        this.tempTypes = new List<Type>();
+        for (let parameter in parameters) {
+            this.tempTypes.push(parameter.type());
+        }
+        this.currentBlock = this.newBlock("entry");
+    }
+
+    public newTemp(Type type) -> long {
+        this.tempTypes.push(type);
+        return this.tempTypes.length() - 1;
+    }
+
+    public tempType(long temp) -> Type {
+        return this.tempTypes.get(temp);
+    }
+
+    public addSlot(string name, Type type) -> long {
+        this.slots.push(new EirSlot(name, type));
+        return this.slots.length() - 1;
+    }
+
+    public slotType(long slot) -> Type {
+        return this.slots.get(slot).type();
+    }
+
+    public newBlock(string hint) -> long {
+        let index = this.blocks.length();
+        this.blocks.push(new EirBlock("b{index}.{hint}"));
+        return index;
+    }
+
+    public current() -> long {
+        return this.currentBlock;
+    }
+
+    public moveTo(long block) {
+        this.currentBlock = block;
+    }
+
+    // True when the current block already ended; nothing more may be appended to it.
+    public terminated() -> bool {
+        return this.blocks.get(this.currentBlock).terminator() != null;
+    }
+
+    public append(EirInstruction instruction) {
+        this.blocks.get(this.currentBlock).instructions().push(instruction);
+    }
+
+    public terminate(EirTerminator terminator) {
+        this.blocks.get(this.currentBlock).setTerminator(terminator);
+    }
+
+    public finish() -> EirFunction {
+        return new EirFunction(this.symbol, this.internal, this.parameters, this.returnType,
+            this.slots, this.blocks, this.tempTypes);
+    }
+}

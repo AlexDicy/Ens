@@ -209,6 +209,17 @@ task("test")
             })
         end
 
+        -- the self-hosted code generator's unit tests: EIR construction, golden dumps, the
+        -- structural verifier, and lowering over analyzed programs. The package depends on the
+        -- native ens.llvm binding, so the job carries the same LLVM plumbing.
+        if want("selfhost_codegen") then
+            table.insert(jobs, {
+                name = "selfhost_codegen",
+                llvm_tests = true,
+                source = path.join(os.projectdir(), "selfhost", "codegen"),
+            })
+        end
+
         -- surface any requested names that matched no test, so typos don't pass silently.
         if wanted ~= nil then
             local unknown = {}
@@ -344,7 +355,7 @@ task("test")
                 end
             end
             for _, pkg in ipairs({"corpus", "frontend", "sema", "semacheck", "syntaxgen",
-                              "llvm", "codegencheck"}) do
+                              "llvm", "codegen", "codegencheck"}) do
                 local src = path.join(os.projectdir(), "selfhost", pkg, "src")
                 local seeds = {}
                 for _, f in ipairs(os.files(path.join(src, "**.ens"))) do
@@ -447,8 +458,10 @@ task("test")
                 end
             end
 
+            -- the harness itself links the native LLVM binding through ens.codegen, so its
+            -- build needs the same linker environment as the spike.
             local harness_rc = execMerged(ens_exe,
-                {"build", check_src, "--output", harness_exe}, log)
+                {"build", check_src, "--output", harness_exe}, log, {envs = env})
             if not os.isfile(harness_exe) then
                 return {name = name, ok = false, short = "harness build failed",
                     full = string.format("%s: harness build failed (exit %s)\n%s", name,
@@ -472,6 +485,7 @@ task("test")
                 "platform " .. (on_windows and "windows" or "posix"),
                 "ens " .. ens_exe,
                 "spike " .. spike_exe,
+                "stdlib " .. (path.join(os.projectdir(), "libs"):gsub("\\", "/")),
                 "scratch " .. scratch,
                 "skiplist " .. skiplist,
             }

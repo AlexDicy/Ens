@@ -1,0 +1,114 @@
+// The code-generation driver: from a checked ProgramAnalysis to one native object file per Ens
+// module. The pipeline is staged so the later passes slot in without reshaping this file:
+// indexing (and, later, monomorphization and layout) runs once over the program, lowering runs
+// per function as a pure step, the structural verifier gates every lowered function, and
+// emission writes each module's object. Modules that define nothing are not emitted.
+import ProgramAnalysis from @ens.sema.pipeline;
+import FileDiagnostic from @ens.sema.support.diagnostics;
+import PrimitiveType from @ens.sema.model.types;
+import PrimitiveKind from @ens.sema.model.types;
+import @ens.sema.model.types;
+import @ens.frontend.support.source;
+import EirFunction from eir.model;
+import eir.verify;
+import ProgramIndex from lower.index;
+import ModuleFunctions from lower.index;
+import lower.index;
+import lower.lower;
+import lower.symbols;
+import EntryPoint from emit.emit;
+import emit.emit;
+import List from @std.collections.list;
+
+export final class EmitResult {
+    List<string> objectFiles;
+    FileDiagnostic[] emitDiagnostics;
+
+    public constructor(this.objectFiles, this.emitDiagnostics);
+
+    export objects() -> List<string> {
+        return this.objectFiles;
+    }
+
+    export diagnostics() -> FileDiagnostic[] {
+        return this.emitDiagnostics;
+    }
+
+    export succeeded() -> bool {
+        return this.emitDiagnostics.length == 0;
+    }
+}
+
+// Compiles the analyzed program into object files under outputFolder, one per module that
+// defines functions, named filePrefix plus the sanitized module path. The analysis must be
+// clean; codegen diagnostics after a clean analysis describe unsupported constructs or bugs.
+export emitProgram(ProgramAnalysis analysis, string outputFolder, string filePrefix)
+        -> EmitResult {
+    let objects = new List<string>();
+    let problems = new List<FileDiagnostic>();
+    let programIndex = index.buildIndex(analysis);
+
+    let modules = programIndex.modules();
+    for (long m = 0; m < modules.length(); m++) {
+        let moduleFunctions = modules.get(m);
+        if (moduleFunctions.functions().length() == 0) {
+            continue;
+        }
+        let lowered = new List<EirFunction>();
+        for (long f = 0; f < moduleFunctions.functions().length(); f++) {
+            let info = moduleFunctions.functions().get(f);
+            let outcome = lower.lowerFunction(info, programIndex, analysis.store());
+            for (let diagnostic in outcome.diagnostics()) {
+                problems.push(diagnostic);
+            }
+            let function = outcome.function();
+            if (function != null) {
+                for (let violation in verify.verifyFunction(function)) {
+                    problems.push(new FileDiagnostic(
+                        info.context().module().filePath(),
+                        "Internal: lowering produced malformed EIR: {violation}",
+                        info.signature().nameSpan()));
+                }
+                lowered.push(function);
+            }
+        }
+        if (problems.length() > 0) {
+            continue;
+        }
+        let entry = entryPointFor(programIndex, moduleFunctions, problems);
+        if (problems.length() > 0) {
+            continue;
+        }
+        string moduleName = moduleFunctions.context().module().canonicalPath();
+        string objectPath = outputFolder + "/" + filePrefix
+            + symbols.sanitizeModulePath(moduleName) + ".obj";
+        string failure = emit.emitModule(moduleName, lowered, entry, objectPath);
+        if (failure.length > 0) {
+            problems.push(new FileDiagnostic(moduleFunctions.context().module().filePath(),
+                "Internal: emission failed: " + failure, source.makeSpan(0, 0)));
+            continue;
+        }
+        objects.push(objectPath);
+    }
+    return new EmitResult(objects, problems.toArray());
+}
+
+// The C 'main' wrapper belongs to the module that defines the user entry function.
+entryPointFor(ProgramIndex programIndex, ModuleFunctions moduleFunctions,
+              List<FileDiagnostic> problems) -> EntryPoint? {
+    let entry = programIndex.entryFunction();
+    if (entry == null || entry.context() != moduleFunctions.context()) {
+        return null;
+    }
+    let returnType = entry.signature().returnType();
+    if (types.isVoidType(returnType)) {
+        return new EntryPoint(entry.symbol(), true);
+    }
+    if (returnType is PrimitiveType && returnType.kind() == PrimitiveKind.Int) {
+        return new EntryPoint(entry.symbol(), false);
+    }
+    problems.push(new FileDiagnostic(entry.context().module().filePath(),
+        "The program entry 'main' must return 'int' or nothing, not "
+        + "'{types.display(returnType)}'.", entry.signature().nameSpan()));
+    return null;
+}

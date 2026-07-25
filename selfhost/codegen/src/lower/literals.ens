@@ -1,0 +1,232 @@
+// Literal token readers for lowering: the magnitude of an integer literal, the codepoint of a
+// character literal, and the numeric value of a float or double literal. They mirror how the
+// checker reads the same tokens, so a value sema accepted always parses here.
+
+// The magnitude of an integer literal token, or null when the text does not parse. Underscore
+// separators and the 'l'/'L' suffix are ignored; '0x' and '0b' prefixes select the base.
+public integerMagnitude(string text) -> ulong? {
+    byte[] raw = text.toBytes();
+    let digits = new byte[raw.length];
+    long count = 0;
+    for (long i = 0; i < raw.length; i++) {
+        byte value = raw[i];
+        if (value == '_' || value == 'l' || value == 'L') {
+            continue;
+        }
+        digits[count] = value;
+        count++;
+    }
+    long base = 10;
+    long start = 0;
+    if (count > 2 && digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X')) {
+        base = 16;
+        start = 2;
+    } else if (count > 2 && digits[0] == '0' && (digits[1] == 'b' || digits[1] == 'B')) {
+        base = 2;
+        start = 2;
+    }
+    if (start == count) {
+        return null;
+    }
+    ulong ceiling = 18446744073709551615;
+    ulong scale = base as ulong;
+    ulong value = 0;
+    for (long i = start; i < count; i++) {
+        long digit = digitValue(digits[i]);
+        if (digit < 0 || digit >= base) {
+            return null;
+        }
+        ulong step = digit as ulong;
+        if (value > (ceiling - step) / scale) {
+            return null;
+        }
+        value = value * scale + step;
+    }
+    return value;
+}
+
+digitValue(byte value) -> long {
+    if (value >= '0' && value <= '9') {
+        return value - '0';
+    }
+    if (value >= 'a' && value <= 'f') {
+        return value - 'a' + 10;
+    }
+    if (value >= 'A' && value <= 'F') {
+        return value - 'A' + 10;
+    }
+    return -1;
+}
+
+// The codepoint a character literal token names, quotes and escapes decoded. A malformed escape
+// falls back to the escaped byte itself, matching the tokenizer.
+public charCodepoint(string text) -> ulong {
+    byte[] raw = text.toBytes();
+    long start = 0;
+    long end = raw.length;
+    if (end >= 2 && raw[0] == '\'' && raw[end - 1] == '\'') {
+        start = 1;
+        end--;
+    }
+    if (start >= end) {
+        return 0;
+    }
+    if (raw[start] == '\\' && start + 1 < end) {
+        return escapeCodepoint(raw, start, end);
+    }
+    return decodeUtf8(raw, start, end);
+}
+
+escapeCodepoint(byte[] raw, long backslash, long end) -> ulong {
+    byte next = raw[backslash + 1];
+    switch (next) {
+        'n' -> {
+            return 10;
+        },
+        't' -> {
+            return 9;
+        },
+        'r' -> {
+            return 13;
+        },
+        'b' -> {
+            return 8;
+        },
+        'f' -> {
+            return 12;
+        },
+        '0' -> {
+            return 0;
+        },
+        'u' -> {
+            if (backslash + 6 <= end) {
+                ulong value = 0;
+                for (long i = 0; i < 4; i++) {
+                    long digit = digitValue(raw[backslash + 2 + i]);
+                    if (digit < 0 || digit >= 16) {
+                        return next;
+                    }
+                    value = value * 16 + (digit as ulong);
+                }
+                return value;
+            }
+            return next;
+        },
+        default -> {
+            return next;
+        },
+    }
+}
+
+decodeUtf8(byte[] raw, long start, long end) -> ulong {
+    ulong first = raw[start];
+    if (first < 0x80) {
+        return first;
+    }
+    if (first >= 0xC0 && first < 0xE0 && start + 1 < end) {
+        ulong second = raw[start + 1];
+        return (first - 0xC0) * 64 + (second - 0x80);
+    }
+    if (first >= 0xE0 && first < 0xF0 && start + 2 < end) {
+        ulong second = raw[start + 1];
+        ulong third = raw[start + 2];
+        return (first - 0xE0) * 4096 + (second - 0x80) * 64 + (third - 0x80);
+    }
+    if (first >= 0xF0 && start + 3 < end) {
+        ulong second = raw[start + 1];
+        ulong third = raw[start + 2];
+        ulong fourth = raw[start + 3];
+        return (first - 0xF0) * 262144 + (second - 0x80) * 4096 + (third - 0x80) * 64
+            + (fourth - 0x80);
+    }
+    return first;
+}
+
+// The value of a float or double literal token: an optional fraction and decimal exponent, with
+// underscores and a trailing 'f'/'F' ignored. Values whose digits fit a 64-bit integer and whose
+// scale is within the exactly-representable powers of ten convert without rounding drift; wider
+// values fall back to stepwise scaling.
+public floatValue(string text) -> double {
+    byte[] raw = text.toBytes();
+    ulong mantissa = 0;
+    long digitCount = 0;
+    long fractionDigits = 0;
+    bool inFraction = false;
+    long exponent = 0;
+    bool exponentNegative = false;
+    bool inExponent = false;
+    for (long i = 0; i < raw.length; i++) {
+        byte value = raw[i];
+        if (value == '_' || value == 'f' || value == 'F' || value == '+') {
+            continue;
+        }
+        if (value == '.') {
+            inFraction = true;
+            continue;
+        }
+        if (value == 'e' || value == 'E') {
+            inExponent = true;
+            continue;
+        }
+        if (value == '-') {
+            exponentNegative = true;
+            continue;
+        }
+        if (value < '0' || value > '9') {
+            continue;
+        }
+        long digit = value - '0';
+        if (inExponent) {
+            if (exponent < 100000) {
+                exponent = exponent * 10 + digit;
+            }
+            continue;
+        }
+        if (digitCount < 19) {
+            mantissa = mantissa * 10 + (digit as ulong);
+            digitCount++;
+            if (inFraction) {
+                fractionDigits++;
+            }
+        } else if (!inFraction) {
+            fractionDigits--;
+        }
+    }
+    if (exponentNegative) {
+        exponent = 0 - exponent;
+    }
+    long scale = exponent - fractionDigits;
+    double value = mantissa as double;
+    return scaleByPowersOfTen(value, scale);
+}
+
+scaleByPowersOfTen(double value, long scale) -> double {
+    double scaled = value;
+    long remaining = scale;
+    while (remaining > 0) {
+        long step = remaining;
+        if (step > 22) {
+            step = 22;
+        }
+        scaled = scaled * powerOfTen(step);
+        remaining = remaining - step;
+    }
+    while (remaining < 0) {
+        long step = 0 - remaining;
+        if (step > 22) {
+            step = 22;
+        }
+        scaled = scaled / powerOfTen(step);
+        remaining = remaining + step;
+    }
+    return scaled;
+}
+
+// Powers of ten up to 10^22 are exactly representable in a double.
+powerOfTen(long power) -> double {
+    double result = 1.0;
+    for (long i = 0; i < power; i++) {
+        result = result * 10.0;
+    }
+    return result;
+}

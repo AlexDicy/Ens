@@ -1,0 +1,323 @@
+// Golden lowering tests: analyze a small program with the real pipeline, lower one function,
+// and compare its verified EIR dump. The goldens pin evaluation order, slot placement,
+// conversions, and control-flow shape.
+import @std.testing;
+import support;
+
+test "arithmetic over parameters loads slots and returns the sum" {
+    let dumped = try support.loweredDump(
+        "add(int a, int b) -> int \{\n"
+        + "    return a + b;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return add(40, 2);\n"
+        + "\}\n", "add");
+    try testing.assertEqual(dumped,
+        "func internal @add(%0: int, %1: int) -> int \{\n"
+        + "  $0 a: int\n"
+        + "  $1 b: int\n"
+        + "b0.entry:\n"
+        + "  store $0, %0\n"
+        + "  store $1, %1\n"
+        + "  %2 = load $0: int\n"
+        + "  %3 = load $1: int\n"
+        + "  %4 = add %2, %3: int\n"
+        + "  ret %4\n"
+        + "\}\n");
+}
+
+test "the entry function calls under its renamed symbol" {
+    let dumped = try support.loweredDump(
+        "add(int a, int b) -> int \{\n"
+        + "    return a + b;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return add(40, 2);\n"
+        + "\}\n", "main");
+    try testing.assertEqual(dumped,
+        "func internal @ens.main() -> int \{\n"
+        + "b0.entry:\n"
+        + "  %0 = const 40: int\n"
+        + "  %1 = const 2: int\n"
+        + "  %2 = call @add(%0, %1): int\n"
+        + "  ret %2\n"
+        + "\}\n");
+}
+
+test "a while loop with compound assignment and increment forms the loop diamond" {
+    let dumped = try support.loweredDump(
+        "count(int limit) -> int \{\n"
+        + "    int total = 0;\n"
+        + "    int i = 0;\n"
+        + "    while (i < limit) \{\n"
+        + "        total += i;\n"
+        + "        i++;\n"
+        + "    \}\n"
+        + "    return total;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return count(5);\n"
+        + "\}\n", "count");
+    try testing.assertEqual(dumped,
+        "func internal @count(%0: int) -> int \{\n"
+        + "  $0 limit: int\n"
+        + "  $1 total: int\n"
+        + "  $2 i: int\n"
+        + "b0.entry:\n"
+        + "  store $0, %0\n"
+        + "  %1 = const 0: int\n"
+        + "  store $1, %1\n"
+        + "  %2 = const 0: int\n"
+        + "  store $2, %2\n"
+        + "  jump b1.while.cond\n"
+        + "b1.while.cond:\n"
+        + "  %3 = load $2: int\n"
+        + "  %4 = load $0: int\n"
+        + "  %5 = cmp.slt %3, %4: bool\n"
+        + "  br %5, b2.while.body, b3.while.end\n"
+        + "b2.while.body:\n"
+        + "  %6 = load $1: int\n"
+        + "  %7 = load $2: int\n"
+        + "  %8 = add %6, %7: int\n"
+        + "  store $1, %8\n"
+        + "  %9 = load $2: int\n"
+        + "  %10 = const 1: int\n"
+        + "  %11 = add %9, %10: int\n"
+        + "  store $2, %11\n"
+        + "  jump b1.while.cond\n"
+        + "b3.while.end:\n"
+        + "  %12 = load $1: int\n"
+        + "  ret %12\n"
+        + "\}\n");
+}
+
+test "short-circuit and merges through a slot without evaluating the right side eagerly" {
+    let dumped = try support.loweredDump(
+        "both(bool a, bool b) -> bool \{\n"
+        + "    return a && b;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return both(true, true) ? 1 : 0;\n"
+        + "\}\n", "both");
+    try testing.assertEqual(dumped,
+        "func internal @both(%0: bool, %1: bool) -> bool \{\n"
+        + "  $0 a: bool\n"
+        + "  $1 b: bool\n"
+        + "  $2 logical: bool\n"
+        + "b0.entry:\n"
+        + "  store $0, %0\n"
+        + "  store $1, %1\n"
+        + "  %2 = load $0: bool\n"
+        + "  store $2, %2\n"
+        + "  br %2, b1.and.rhs, b2.and.end\n"
+        + "b1.and.rhs:\n"
+        + "  %3 = load $1: bool\n"
+        + "  store $2, %3\n"
+        + "  jump b2.and.end\n"
+        + "b2.and.end:\n"
+        + "  %4 = load $2: bool\n"
+        + "  ret %4\n"
+        + "\}\n");
+}
+
+test "casts truncate by the target and widen by the source's signedness" {
+    let dumped = try support.loweredDump(
+        "convert(int n) -> long \{\n"
+        + "    byte small = n as byte;\n"
+        + "    return small + 0L;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return convert(300) as int;\n"
+        + "\}\n", "convert");
+    try testing.assertEqual(dumped,
+        "func internal @convert(%0: int) -> long \{\n"
+        + "  $0 n: int\n"
+        + "  $1 small: byte\n"
+        + "b0.entry:\n"
+        + "  store $0, %0\n"
+        + "  %1 = load $0: int\n"
+        + "  %2 = trunc %1: byte\n"
+        + "  store $1, %2\n"
+        + "  %3 = load $1: byte\n"
+        + "  %4 = zext %3: long\n"
+        + "  %5 = const 0: long\n"
+        + "  %6 = add %4, %5: long\n"
+        + "  ret %6\n"
+        + "\}\n");
+}
+
+test "a ternary merges both branch values through the result slot" {
+    let dumped = try support.loweredDump(
+        "pick(int a, int b = 10) -> int \{\n"
+        + "    return a > b ? a : b;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return pick(2);\n"
+        + "\}\n", "pick");
+    try testing.assertEqual(dumped,
+        "func internal @pick(%0: int, %1: int) -> int \{\n"
+        + "  $0 a: int\n"
+        + "  $1 b: int\n"
+        + "  $2 ternary: int\n"
+        + "b0.entry:\n"
+        + "  store $0, %0\n"
+        + "  store $1, %1\n"
+        + "  %2 = load $0: int\n"
+        + "  %3 = load $1: int\n"
+        + "  %4 = cmp.sgt %2, %3: bool\n"
+        + "  br %4, b1.ternary.then, b2.ternary.else\n"
+        + "b1.ternary.then:\n"
+        + "  %5 = load $0: int\n"
+        + "  store $2, %5\n"
+        + "  jump b3.ternary.end\n"
+        + "b2.ternary.else:\n"
+        + "  %6 = load $1: int\n"
+        + "  store $2, %6\n"
+        + "  jump b3.ternary.end\n"
+        + "b3.ternary.end:\n"
+        + "  %7 = load $2: int\n"
+        + "  ret %7\n"
+        + "\}\n");
+}
+
+test "a call with a missing argument fills the parameter default at the call site" {
+    let dumped = try support.loweredDump(
+        "pick(int a, int b = 10) -> int \{\n"
+        + "    return a > b ? a : b;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return pick(2);\n"
+        + "\}\n", "main");
+    try testing.assertEqual(dumped,
+        "func internal @ens.main() -> int \{\n"
+        + "b0.entry:\n"
+        + "  %0 = const 2: int\n"
+        + "  %1 = const 10: int\n"
+        + "  %2 = call @pick(%0, %1): int\n"
+        + "  ret %2\n"
+        + "\}\n");
+}
+
+test "a switch expression stores each arm's value and loads the merge" {
+    let dumped = try support.loweredDump(
+        "kind(long n) -> int \{\n"
+        + "    return switch (n) \{\n"
+        + "        1L -> 1,\n"
+        + "        'A' -> 2,\n"
+        + "        default -> 0,\n"
+        + "    \};\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return kind(65);\n"
+        + "\}\n", "kind");
+    try testing.assertEqual(dumped,
+        "func internal @kind(%0: long) -> int \{\n"
+        + "  $0 n: long\n"
+        + "  $1 switch: int\n"
+        + "b0.entry:\n"
+        + "  store $0, %0\n"
+        + "  %1 = load $0: long\n"
+        + "  switch %1, [1 -> b1.switch.case, 65 -> b2.switch.case], "
+        + "default b3.switch.default\n"
+        + "b1.switch.case:\n"
+        + "  %2 = const 1: int\n"
+        + "  store $1, %2\n"
+        + "  jump b4.switch.end\n"
+        + "b2.switch.case:\n"
+        + "  %3 = const 2: int\n"
+        + "  store $1, %3\n"
+        + "  jump b4.switch.end\n"
+        + "b3.switch.default:\n"
+        + "  %4 = const 0: int\n"
+        + "  store $1, %4\n"
+        + "  jump b4.switch.end\n"
+        + "b4.switch.end:\n"
+        + "  %5 = load $1: int\n"
+        + "  ret %5\n"
+        + "\}\n");
+}
+
+test "overloaded names carry the parameter suffix and public names the module qualifier" {
+    string program = "tag(int n) -> int \{\n"
+        + "    return 1;\n"
+        + "\}\n"
+        + "tag(long n) -> int \{\n"
+        + "    return 2;\n"
+        + "\}\n"
+        + "public compute() -> int \{\n"
+        + "    return tag(1) + tag(2L);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return compute();\n"
+        + "\}\n";
+    let computeDump = try support.loweredDump(program, "compute");
+    try testing.assertEqual(computeDump,
+        "func @main$compute() -> int \{\n"
+        + "b0.entry:\n"
+        + "  %0 = const 1: int\n"
+        + "  %1 = call @tag$int(%0): int\n"
+        + "  %2 = const 2: long\n"
+        + "  %3 = call @tag$long(%2): int\n"
+        + "  %4 = add %1, %3: int\n"
+        + "  ret %4\n"
+        + "\}\n");
+}
+
+test "a classic for loop routes continue through the update block" {
+    let dumped = try support.loweredDump(
+        "evens(int limit) -> int \{\n"
+        + "    int total = 0;\n"
+        + "    for (int i = 0; i < limit; i++) \{\n"
+        + "        if (i % 2 == 1) \{\n"
+        + "            continue;\n"
+        + "        \}\n"
+        + "        total += i;\n"
+        + "    \}\n"
+        + "    return total;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return evens(5);\n"
+        + "\}\n", "evens");
+    try testing.assertEqual(dumped,
+        "func internal @evens(%0: int) -> int \{\n"
+        + "  $0 limit: int\n"
+        + "  $1 total: int\n"
+        + "  $2 i: int\n"
+        + "b0.entry:\n"
+        + "  store $0, %0\n"
+        + "  %1 = const 0: int\n"
+        + "  store $1, %1\n"
+        + "  %2 = const 0: int\n"
+        + "  store $2, %2\n"
+        + "  jump b1.for.cond\n"
+        + "b1.for.cond:\n"
+        + "  %3 = load $2: int\n"
+        + "  %4 = load $0: int\n"
+        + "  %5 = cmp.slt %3, %4: bool\n"
+        + "  br %5, b2.for.body, b4.for.end\n"
+        + "b2.for.body:\n"
+        + "  %6 = load $2: int\n"
+        + "  %7 = const 2: int\n"
+        + "  %8 = rem.s %6, %7: int\n"
+        + "  %9 = const 1: int\n"
+        + "  %10 = cmp.eq %8, %9: bool\n"
+        + "  br %10, b5.if.then, b6.if.end\n"
+        + "b3.for.update:\n"
+        + "  %14 = load $2: int\n"
+        + "  %15 = const 1: int\n"
+        + "  %16 = add %14, %15: int\n"
+        + "  store $2, %16\n"
+        + "  jump b1.for.cond\n"
+        + "b4.for.end:\n"
+        + "  %17 = load $1: int\n"
+        + "  ret %17\n"
+        + "b5.if.then:\n"
+        + "  jump b3.for.update\n"
+        + "b6.if.end:\n"
+        + "  %11 = load $1: int\n"
+        + "  %12 = load $2: int\n"
+        + "  %13 = add %11, %12: int\n"
+        + "  store $1, %13\n"
+        + "  jump b3.for.update\n"
+        + "\}\n");
+}

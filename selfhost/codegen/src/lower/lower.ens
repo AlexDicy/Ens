@@ -1,0 +1,1401 @@
+// Per-function lowering from the checked syntax tree to EIR. Lowering one function is a pure
+// step: it reads the function's red declaration and its module's sema side tables, and returns
+// the lowered function plus diagnostics as values. Nothing is shared between functions except
+// the immutable program index, so functions can lower in parallel.
+//
+// Values become single-assignment temps; every local, parameter, and merge point gets a mutable
+// slot, and LLVM's own passes promote slots back to registers downstream. Short-circuit logic,
+// ternaries, and switch expressions merge through slots, never phis.
+import Expression from @ens.frontend.syntax.generated.nodes;
+import Statement from @ens.frontend.syntax.generated.nodes;
+import ArmBody from @ens.frontend.syntax.generated.nodes;
+import SwitchArm from @ens.frontend.syntax.generated.nodes;
+import BlockNode from @ens.frontend.syntax.generated.nodes;
+import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import VariableDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import IfStatementNode from @ens.frontend.syntax.generated.nodes;
+import WhileStatementNode from @ens.frontend.syntax.generated.nodes;
+import ForStatementNode from @ens.frontend.syntax.generated.nodes;
+import ForEachStatementNode from @ens.frontend.syntax.generated.nodes;
+import BreakStatementNode from @ens.frontend.syntax.generated.nodes;
+import ContinueStatementNode from @ens.frontend.syntax.generated.nodes;
+import ReturnStatementNode from @ens.frontend.syntax.generated.nodes;
+import ExpressionStatementNode from @ens.frontend.syntax.generated.nodes;
+import ThrowStatementNode from @ens.frontend.syntax.generated.nodes;
+import RethrowStatementNode from @ens.frontend.syntax.generated.nodes;
+import SwitchStatementNode from @ens.frontend.syntax.generated.nodes;
+import LiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import BinaryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import PrefixExpressionNode from @ens.frontend.syntax.generated.nodes;
+import PostfixExpressionNode from @ens.frontend.syntax.generated.nodes;
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import CastExpressionNode from @ens.frontend.syntax.generated.nodes;
+import AssignmentExpressionNode from @ens.frontend.syntax.generated.nodes;
+import TernaryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ParenthesizedExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SwitchExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ValueArmNode from @ens.frontend.syntax.generated.nodes;
+import DefaultArmNode from @ens.frontend.syntax.generated.nodes;
+import TypeArmNode from @ens.frontend.syntax.generated.nodes;
+import NamedArgumentNode from @ens.frontend.syntax.generated.nodes;
+import ArgumentListNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxKind from @ens.frontend.syntax.generated.kind;
+import Span from @ens.frontend.support.source;
+import SemaResult from @ens.sema.result;
+import LocalBinding from @ens.sema.model.scopes;
+import Type from @ens.sema.model.types;
+import Signature from @ens.sema.model.types;
+import Parameter from @ens.sema.model.types;
+import TypeStore from @ens.sema.model.types;
+import PrimitiveKind from @ens.sema.model.types;
+import @ens.sema.model.types;
+import FileDiagnostic from @ens.sema.support.diagnostics;
+import EirFunction from eir.model;
+import EirFunctionBuilder from eir.model;
+import EirParameter from eir.model;
+import EirBinaryOp from eir.model;
+import EirUnaryOp from eir.model;
+import EirCastOp from eir.model;
+import EirCallee from eir.model;
+import EirConstInt from eir.model;
+import EirConstFloat from eir.model;
+import EirConstBool from eir.model;
+import EirBinary from eir.model;
+import EirUnary from eir.model;
+import EirCast from eir.model;
+import EirLoadSlot from eir.model;
+import EirStoreSlot from eir.model;
+import EirCall from eir.model;
+import EirReturn from eir.model;
+import EirJump from eir.model;
+import EirBranch from eir.model;
+import EirSwitch from eir.model;
+import EirUnreachable from eir.model;
+import FunctionInfo from lower.index;
+import ProgramIndex from lower.index;
+import lower.literals;
+import support.primitives;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+
+public final class FunctionLowering {
+    EirFunction? loweredFunction;
+    FileDiagnostic[] loweringDiagnostics;
+
+    public constructor(this.loweredFunction, this.loweringDiagnostics);
+
+    public function() -> EirFunction? {
+        return this.loweredFunction;
+    }
+
+    public diagnostics() -> FileDiagnostic[] {
+        return this.loweringDiagnostics;
+    }
+}
+
+// Lowers one free function to EIR. The result carries either the function or the diagnostics
+// that explain why it could not be lowered.
+public lowerFunction(FunctionInfo info, ProgramIndex index, TypeStore store)
+        -> FunctionLowering {
+    let lowerer = new FunctionLowerer(info, index, store);
+    return lowerer.run();
+}
+
+class LoopTargets {
+    protected long breakTarget;
+    protected long continueTarget;
+
+    protected constructor(this.breakTarget, this.continueTarget);
+}
+
+class FunctionLowerer {
+    FunctionInfo info;
+    ProgramIndex index;
+    TypeStore store;
+    SemaResult result;
+    string currentFile;
+    EirFunctionBuilder builder;
+    Map<LocalBinding, long> slotsByBinding;
+    List<LoopTargets> loops;
+    List<FileDiagnostic> problems;
+    bool failed;
+
+    protected constructor(FunctionInfo info, ProgramIndex index, TypeStore store) {
+        this.info = info;
+        this.index = index;
+        this.store = store;
+        this.result = info.context().result();
+        this.currentFile = info.context().module().filePath();
+        let signature = info.signature();
+        Parameter[] parameters = signature.parameters();
+        let eirParameters = new EirParameter[parameters.length];
+        for (long i = 0; i < eirParameters.length; i++) {
+            eirParameters[i] = new EirParameter(parameters[i].name(), parameters[i].type());
+        }
+        this.builder = new EirFunctionBuilder(info.symbol(), info.internalLinkage(),
+            eirParameters, signature.returnType());
+        this.slotsByBinding = new Map<LocalBinding, long>();
+        this.loops = new List<LoopTargets>();
+        this.problems = new List<FileDiagnostic>();
+        this.failed = false;
+    }
+
+    protected run() -> FunctionLowering {
+        let declaration = this.info.declaration();
+        if (declaration == null) {
+            return new FunctionLowering(null, this.problems.toArray());
+        }
+        let signature = this.info.signature();
+        if (signature.declaresThrows() || declaration.catchClausesCount() > 0) {
+            this.unsupported("a throwing function", signature.nameSpan());
+            return new FunctionLowering(null, this.problems.toArray());
+        }
+        let body = declaration.body();
+        if (body == null) {
+            this.internalError("function '{signature.name()}' has no body to lower",
+                signature.nameSpan());
+            return new FunctionLowering(null, this.problems.toArray());
+        }
+        this.bindParameters(declaration);
+        this.lowerBlock(body);
+        if (this.failed) {
+            return new FunctionLowering(null, this.problems.toArray());
+        }
+        if (!this.builder.terminated()) {
+            if (signature.isNoreturn() || !types.isVoidType(signature.returnType())) {
+                this.builder.terminate(new EirUnreachable());
+            } else {
+                this.builder.terminate(new EirReturn(-1));
+            }
+        }
+        return new FunctionLowering(this.builder.finish(), this.problems.toArray());
+    }
+
+    bindParameters(FunctionDeclarationNode declaration) {
+        let signature = this.info.signature();
+        Parameter[] parameters = signature.parameters();
+        let parameterList = declaration.parameters();
+        for (long i = 0; i < parameters.length; i++) {
+            let parameter = parameters[i];
+            if (!this.supportedValueType(parameter.type())) {
+                this.unsupported("a parameter of type '{types.display(parameter.type())}'",
+                    parameter.span());
+                return;
+            }
+            if (i >= parameterList.parametersCount()) {
+                this.internalError("parameter list is shorter than the signature",
+                    signature.nameSpan());
+                return;
+            }
+            let binding = this.result.bindingOf(parameterList.parameters(i).green());
+            if (binding == null) {
+                this.internalError("parameter '{parameter.name()}' has no binding",
+                    parameter.span());
+                return;
+            }
+            long slot = this.builder.addSlot(parameter.name(), parameter.type());
+            this.slotsByBinding.set(binding, slot);
+            this.builder.append(new EirStoreSlot(slot, i));
+        }
+    }
+
+    // Primitive value types are the M1 surface; decimal has no machine mapping yet.
+    supportedValueType(Type type) -> bool {
+        return primitives.isNumericType(type) || primitives.isBoolType(type);
+    }
+
+    unsupported(string what, Span span) {
+        this.problems.push(new FileDiagnostic(this.currentFile,
+            "The self-hosted code generator does not support {what} yet.", span));
+        this.failed = true;
+    }
+
+    internalError(string message, Span span) {
+        this.problems.push(new FileDiagnostic(this.currentFile, "Internal: " + message, span));
+        this.failed = true;
+    }
+
+    typeOf(Expression node) -> Type? {
+        let recorded = this.result.typeOf(node.green());
+        if (recorded == null) {
+            this.internalError("expression has no recorded type", node.span());
+        }
+        return recorded;
+    }
+
+    // ---- Statements ----
+
+    lowerBlock(BlockNode block) {
+        for (long i = 0; i < block.statementsCount(); i++) {
+            if (this.failed || this.builder.terminated()) {
+                return;
+            }
+            this.lowerStatement(block.statements(i));
+        }
+    }
+
+    lowerStatement(Statement statement) {
+        switch (statement) {
+            is BlockNode block -> {
+                this.lowerBlock(block);
+            },
+            is VariableDeclarationNode declaration -> {
+                this.lowerVariableDeclaration(declaration);
+            },
+            is IfStatementNode conditional -> {
+                this.lowerIf(conditional);
+            },
+            is WhileStatementNode loop -> {
+                this.lowerWhile(loop);
+            },
+            is ForStatementNode loop -> {
+                this.lowerFor(loop);
+            },
+            is ForEachStatementNode loop -> {
+                this.unsupported("a for-in loop", loop.span());
+            },
+            is BreakStatementNode broken -> {
+                if (this.loops.length() == 0) {
+                    this.internalError("'break' outside a loop", broken.span());
+                    return;
+                }
+                this.builder.terminate(
+                    new EirJump(this.loops.get(this.loops.length() - 1).breakTarget));
+            },
+            is ContinueStatementNode continued -> {
+                if (this.loops.length() == 0) {
+                    this.internalError("'continue' outside a loop", continued.span());
+                    return;
+                }
+                this.builder.terminate(
+                    new EirJump(this.loops.get(this.loops.length() - 1).continueTarget));
+            },
+            is ReturnStatementNode returned -> {
+                this.lowerReturn(returned);
+            },
+            is ExpressionStatementNode expression -> {
+                this.lowerExpressionStatement(expression);
+            },
+            is ThrowStatementNode thrown -> {
+                this.unsupported("'throw'", thrown.span());
+            },
+            is RethrowStatementNode rethrown -> {
+                this.unsupported("'rethrow'", rethrown.span());
+            },
+            is SwitchStatementNode switched -> {
+                this.lowerSwitch(switched.scrutinee(), statementArms(switched), null,
+                    switched.span());
+            },
+            default -> {
+                this.unsupported("this statement", statement.span());
+            },
+        }
+    }
+
+    lowerVariableDeclaration(VariableDeclarationNode declaration) {
+        let binding = this.result.bindingOf(declaration.green());
+        if (binding == null) {
+            this.internalError("variable '{declaration.name().text()}' has no binding",
+                declaration.name().span());
+            return;
+        }
+        if (!this.supportedValueType(binding.type())) {
+            this.unsupported("a local of type '{types.display(binding.type())}'",
+                declaration.name().span());
+            return;
+        }
+        long slot = this.builder.addSlot(binding.name(), binding.type());
+        this.slotsByBinding.set(binding, slot);
+        let initializer = declaration.initializer();
+        if (initializer != null) {
+            long value = this.lowerExpressionConverted(initializer.value(), binding.type());
+            if (value < 0) {
+                return;
+            }
+            this.builder.append(new EirStoreSlot(slot, value));
+        }
+    }
+
+    lowerIf(IfStatementNode conditional) {
+        long condition = this.lowerExpression(conditional.condition());
+        if (condition < 0) {
+            return;
+        }
+        long thenBlock = this.builder.newBlock("if.then");
+        let elseClause = conditional.elseClause();
+        long elseBlock = -1;
+        if (elseClause != null) {
+            elseBlock = this.builder.newBlock("if.else");
+        }
+        long merge = this.builder.newBlock("if.end");
+        long elseTarget = merge;
+        if (elseBlock >= 0) {
+            elseTarget = elseBlock;
+        }
+        this.builder.terminate(new EirBranch(condition, thenBlock, elseTarget));
+        this.builder.moveTo(thenBlock);
+        this.lowerBlock(conditional.thenBranch());
+        if (!this.failed && !this.builder.terminated()) {
+            this.builder.terminate(new EirJump(merge));
+        }
+        if (elseClause != null && !this.failed) {
+            this.builder.moveTo(elseBlock);
+            switch (elseClause.body()) {
+                is BlockNode block -> {
+                    this.lowerBlock(block);
+                },
+                is IfStatementNode chained -> {
+                    this.lowerIf(chained);
+                },
+                default -> {
+                    this.unsupported("this else form", conditional.span());
+                },
+            }
+            if (!this.failed && !this.builder.terminated()) {
+                this.builder.terminate(new EirJump(merge));
+            }
+        }
+        if (!this.failed) {
+            this.builder.moveTo(merge);
+        }
+    }
+
+    lowerWhile(WhileStatementNode loop) {
+        long conditionBlock = this.builder.newBlock("while.cond");
+        this.builder.terminate(new EirJump(conditionBlock));
+        this.builder.moveTo(conditionBlock);
+        long condition = this.lowerExpression(loop.condition());
+        if (condition < 0) {
+            return;
+        }
+        long body = this.builder.newBlock("while.body");
+        long exit = this.builder.newBlock("while.end");
+        this.builder.terminate(new EirBranch(condition, body, exit));
+        this.loops.push(new LoopTargets(exit, conditionBlock));
+        this.builder.moveTo(body);
+        this.lowerBlock(loop.body());
+        if (!this.failed && !this.builder.terminated()) {
+            this.builder.terminate(new EirJump(conditionBlock));
+        }
+        this.loops.pop();
+        if (!this.failed) {
+            this.builder.moveTo(exit);
+        }
+    }
+
+    lowerFor(ForStatementNode loop) {
+        let initializer = loop.initializer();
+        if (initializer != null) {
+            switch (initializer) {
+                is VariableDeclarationNode declaration -> {
+                    this.lowerVariableDeclaration(declaration);
+                },
+                is ExpressionStatementNode expression -> {
+                    let ignored = this.lowerExpression(expression.expression());
+                },
+                default -> {
+                    this.unsupported("this loop initializer", loop.span());
+                },
+            }
+        }
+        if (this.failed) {
+            return;
+        }
+        long conditionBlock = this.builder.newBlock("for.cond");
+        this.builder.terminate(new EirJump(conditionBlock));
+        this.builder.moveTo(conditionBlock);
+        let condition = loop.condition();
+        long conditionValue = -1;
+        if (condition != null) {
+            conditionValue = this.lowerExpression(condition);
+        } else {
+            let boolType = this.store.primitive(PrimitiveKind.Bool);
+            conditionValue = this.builder.newTemp(boolType);
+            this.builder.append(new EirConstBool(conditionValue, boolType, true));
+        }
+        if (conditionValue < 0) {
+            return;
+        }
+        long body = this.builder.newBlock("for.body");
+        let update = loop.update();
+        long updateBlock = -1;
+        if (update != null) {
+            updateBlock = this.builder.newBlock("for.update");
+        }
+        long exit = this.builder.newBlock("for.end");
+        this.builder.terminate(new EirBranch(conditionValue, body, exit));
+        long continueTarget = conditionBlock;
+        if (updateBlock >= 0) {
+            continueTarget = updateBlock;
+        }
+        this.loops.push(new LoopTargets(exit, continueTarget));
+        this.builder.moveTo(body);
+        this.lowerBlock(loop.body());
+        if (!this.failed && !this.builder.terminated()) {
+            this.builder.terminate(new EirJump(continueTarget));
+        }
+        this.loops.pop();
+        if (update != null && !this.failed) {
+            this.builder.moveTo(updateBlock);
+            let ignored = this.lowerExpression(update);
+            if (!this.failed && !this.builder.terminated()) {
+                this.builder.terminate(new EirJump(conditionBlock));
+            }
+        }
+        if (!this.failed) {
+            this.builder.moveTo(exit);
+        }
+    }
+
+    lowerReturn(ReturnStatementNode returned) {
+        let value = returned.value();
+        if (value == null) {
+            this.builder.terminate(new EirReturn(-1));
+            return;
+        }
+        long temp = this.lowerExpressionConverted(value, this.info.signature().returnType());
+        if (temp < 0) {
+            return;
+        }
+        this.builder.terminate(new EirReturn(temp));
+    }
+
+    lowerExpressionStatement(ExpressionStatementNode statement) {
+        let expression = statement.expression();
+        let ignored = this.lowerExpression(expression);
+        if (this.failed) {
+            return;
+        }
+        if (expression is CallExpressionNode) {
+            let callee = this.calleeSignatureOf(expression);
+            if (callee != null && callee.isNoreturn()) {
+                this.builder.terminate(new EirUnreachable());
+            }
+        }
+    }
+
+    calleeSignatureOf(CallExpressionNode call) -> Signature? {
+        switch (call.callee()) {
+            is IdentifierExpressionNode identifier -> {
+                return this.result.callableOf(identifier.green());
+            },
+            is MemberExpressionNode member -> {
+                return this.result.callableOf(member.green());
+            },
+            default -> {
+                return null;
+            },
+        }
+    }
+
+    // ---- Expressions ----
+
+    // Lowers an expression to a temp, or -1 when lowering already failed.
+    lowerExpression(Expression node) -> long {
+        if (this.failed) {
+            return -1;
+        }
+        switch (node) {
+            is LiteralExpressionNode literal -> {
+                return this.lowerLiteral(literal);
+            },
+            is IdentifierExpressionNode identifier -> {
+                return this.lowerIdentifier(identifier);
+            },
+            is ParenthesizedExpressionNode parenthesized -> {
+                return this.lowerExpression(parenthesized.inner());
+            },
+            is PrefixExpressionNode prefix -> {
+                return this.lowerPrefix(prefix);
+            },
+            is PostfixExpressionNode postfix -> {
+                return this.lowerIncrement(postfix.operand(),
+                    postfix.operator().kind() == SyntaxKind.PlusPlus, false, postfix.span());
+            },
+            is BinaryExpressionNode binary -> {
+                return this.lowerBinary(binary);
+            },
+            is CastExpressionNode cast -> {
+                return this.lowerCast(cast);
+            },
+            is AssignmentExpressionNode assignment -> {
+                return this.lowerAssignment(assignment);
+            },
+            is TernaryExpressionNode ternary -> {
+                return this.lowerTernary(ternary);
+            },
+            is CallExpressionNode call -> {
+                return this.lowerCall(call);
+            },
+            is SwitchExpressionNode switched -> {
+                let resultType = this.typeOf(switched);
+                if (resultType == null) {
+                    return -1;
+                }
+                return this.lowerSwitch(switched.scrutinee(), expressionArms(switched),
+                    resultType, switched.span());
+            },
+            default -> {
+                this.unsupported("this expression", node.span());
+                return -1;
+            },
+        }
+    }
+
+    lowerExpressionConverted(Expression node, Type target) -> long {
+        long value = this.lowerExpression(node);
+        if (value < 0) {
+            return -1;
+        }
+        return this.convert(value, target, node.span());
+    }
+
+    lowerLiteral(LiteralExpressionNode literal) -> long {
+        let type = this.typeOf(literal);
+        if (type == null) {
+            return -1;
+        }
+        switch (literal.value().kind()) {
+            IntLiteral, LongLiteral -> {
+                let magnitude = literals.integerMagnitude(literal.value().text());
+                if (magnitude == null) {
+                    this.internalError("integer literal '{literal.value().text()}' does not "
+                        + "parse", literal.span());
+                    return -1;
+                }
+                long temp = this.builder.newTemp(type);
+                this.builder.append(new EirConstInt(temp, type, magnitude as long));
+                return temp;
+            },
+            CharLiteral -> {
+                long temp = this.builder.newTemp(type);
+                this.builder.append(new EirConstInt(temp, type,
+                    literals.charCodepoint(literal.value().text()) as long));
+                return temp;
+            },
+            FloatLiteral, DoubleLiteral -> {
+                long temp = this.builder.newTemp(type);
+                this.builder.append(new EirConstFloat(temp, type,
+                    literals.floatValue(literal.value().text()), literal.value().text()));
+                return temp;
+            },
+            TrueKeyword -> {
+                long temp = this.builder.newTemp(type);
+                this.builder.append(new EirConstBool(temp, type, true));
+                return temp;
+            },
+            FalseKeyword -> {
+                long temp = this.builder.newTemp(type);
+                this.builder.append(new EirConstBool(temp, type, false));
+                return temp;
+            },
+            default -> {
+                this.unsupported("this literal", literal.span());
+                return -1;
+            },
+        }
+    }
+
+    lowerIdentifier(IdentifierExpressionNode identifier) -> long {
+        let binding = this.result.bindingOf(identifier.green());
+        if (binding == null) {
+            this.internalError("identifier '{identifier.name().text()}' has no binding",
+                identifier.span());
+            return -1;
+        }
+        let slot = this.slotsByBinding.get(binding);
+        if (slot == null) {
+            this.internalError("'{identifier.name().text()}' has no storage slot",
+                identifier.span());
+            return -1;
+        }
+        long temp = this.builder.newTemp(binding.type());
+        this.builder.append(new EirLoadSlot(temp, binding.type(), slot));
+        return temp;
+    }
+
+    lowerPrefix(PrefixExpressionNode prefix) -> long {
+        switch (prefix.operator().kind()) {
+            Minus -> {
+                long operand = this.lowerExpression(prefix.operand());
+                if (operand < 0) {
+                    return -1;
+                }
+                let type = this.builder.tempType(operand);
+                let op = EirUnaryOp.Neg;
+                if (primitives.isFloatType(type)) {
+                    op = EirUnaryOp.FloatNeg;
+                }
+                long temp = this.builder.newTemp(type);
+                this.builder.append(new EirUnary(temp, type, op, operand));
+                return temp;
+            },
+            Plus -> {
+                return this.lowerExpression(prefix.operand());
+            },
+            Exclamation -> {
+                long operand = this.lowerExpression(prefix.operand());
+                if (operand < 0) {
+                    return -1;
+                }
+                let type = this.builder.tempType(operand);
+                long temp = this.builder.newTemp(type);
+                this.builder.append(new EirUnary(temp, type, EirUnaryOp.Not, operand));
+                return temp;
+            },
+            PlusPlus, MinusMinus -> {
+                return this.lowerIncrement(prefix.operand(),
+                    prefix.operator().kind() == SyntaxKind.PlusPlus, true, prefix.span());
+            },
+            default -> {
+                this.unsupported("this prefix operator", prefix.span());
+                return -1;
+            },
+        }
+    }
+
+    // '++'/'--' on a slot-backed location: load once, add or subtract one, store back. The
+    // expression's value is the new value for the prefix form and the old one for postfix.
+    lowerIncrement(Expression operand, bool isIncrement, bool isPrefix, Span span) -> long {
+        if (!(operand is IdentifierExpressionNode)) {
+            this.unsupported("'++' or '--' on this target", span);
+            return -1;
+        }
+        let binding = this.result.bindingOf(operand.green());
+        if (binding == null) {
+            this.internalError("increment target has no binding", span);
+            return -1;
+        }
+        let slot = this.slotsByBinding.get(binding);
+        if (slot == null) {
+            this.internalError("increment target has no storage slot", span);
+            return -1;
+        }
+        let type = binding.type();
+        long oldValue = this.builder.newTemp(type);
+        this.builder.append(new EirLoadSlot(oldValue, type, slot));
+        long one = this.builder.newTemp(type);
+        bool isFloat = primitives.isFloatType(type);
+        if (isFloat) {
+            this.builder.append(new EirConstFloat(one, type, 1.0, "1"));
+        } else {
+            this.builder.append(new EirConstInt(one, type, 1));
+        }
+        let op = EirBinaryOp.Add;
+        if (isIncrement && isFloat) {
+            op = EirBinaryOp.FloatAdd;
+        } else if (!isIncrement && isFloat) {
+            op = EirBinaryOp.FloatSub;
+        } else if (!isIncrement) {
+            op = EirBinaryOp.Sub;
+        }
+        long newValue = this.builder.newTemp(type);
+        this.builder.append(new EirBinary(newValue, type, op, oldValue, one));
+        this.builder.append(new EirStoreSlot(slot, newValue));
+        if (isPrefix) {
+            return newValue;
+        }
+        return oldValue;
+    }
+
+    lowerBinary(BinaryExpressionNode binary) -> long {
+        SyntaxKind operator = binary.operator().kind();
+        if (operator == SyntaxKind.AmpersandAmpersand || operator == SyntaxKind.PipePipe) {
+            return this.lowerShortCircuit(binary, operator == SyntaxKind.AmpersandAmpersand);
+        }
+        let resultType = this.typeOf(binary);
+        if (resultType == null) {
+            return -1;
+        }
+        switch (operator) {
+            Plus, Minus, Star, Slash, Percent -> {
+                return this.lowerArithmetic(binary, operator, resultType);
+            },
+            EqualsEquals, NotEquals, Less, Greater, LessEquals, GreaterEquals -> {
+                return this.lowerComparison(binary, operator, resultType);
+            },
+            Ampersand, Pipe, Caret, LessLess, GreaterGreater, GreaterGreaterGreater -> {
+                return this.lowerBitwise(binary, operator, resultType);
+            },
+            default -> {
+                this.unsupported("this operator", binary.span());
+                return -1;
+            },
+        }
+    }
+
+    lowerArithmetic(BinaryExpressionNode binary, SyntaxKind operator, Type resultType)
+            -> long {
+        if (!this.supportedValueType(resultType) || primitives.isBoolType(resultType)) {
+            this.unsupported("arithmetic on '{types.display(resultType)}'", binary.span());
+            return -1;
+        }
+        long left = this.lowerExpressionConverted(binary.left(), resultType);
+        long right = this.lowerExpressionConverted(binary.right(), resultType);
+        if (left < 0 || right < 0) {
+            return -1;
+        }
+        bool isFloat = primitives.isFloatType(resultType);
+        bool isSigned = primitives.isSignedType(resultType);
+        let op = switch (operator) {
+            Plus -> isFloat ? EirBinaryOp.FloatAdd : EirBinaryOp.Add,
+            Minus -> isFloat ? EirBinaryOp.FloatSub : EirBinaryOp.Sub,
+            Star -> isFloat ? EirBinaryOp.FloatMul : EirBinaryOp.Mul,
+            Slash -> isFloat ? EirBinaryOp.FloatDiv
+                : (isSigned ? EirBinaryOp.DivSigned : EirBinaryOp.DivUnsigned),
+            default -> isFloat ? EirBinaryOp.FloatRem
+                : (isSigned ? EirBinaryOp.RemSigned : EirBinaryOp.RemUnsigned),
+        };
+        long temp = this.builder.newTemp(resultType);
+        this.builder.append(new EirBinary(temp, resultType, op, left, right));
+        return temp;
+    }
+
+    lowerComparison(BinaryExpressionNode binary, SyntaxKind operator, Type resultType)
+            -> long {
+        let leftType = this.typeOf(binary.left());
+        let rightType = this.typeOf(binary.right());
+        if (leftType == null || rightType == null) {
+            return -1;
+        }
+        let common = this.commonOperandType(leftType, rightType);
+        if (common == null) {
+            this.unsupported("comparing '{types.display(leftType)}' with "
+                + "'{types.display(rightType)}'", binary.span());
+            return -1;
+        }
+        long left = this.lowerExpressionConverted(binary.left(), common);
+        long right = this.lowerExpressionConverted(binary.right(), common);
+        if (left < 0 || right < 0) {
+            return -1;
+        }
+        bool isFloat = primitives.isFloatType(common);
+        bool isSigned = primitives.isSignedType(common);
+        let op = switch (operator) {
+            EqualsEquals -> isFloat ? EirBinaryOp.FloatCmpEq : EirBinaryOp.CmpEq,
+            NotEquals -> isFloat ? EirBinaryOp.FloatCmpNe : EirBinaryOp.CmpNe,
+            Less -> isFloat ? EirBinaryOp.FloatCmpLt
+                : (isSigned ? EirBinaryOp.CmpLtSigned : EirBinaryOp.CmpLtUnsigned),
+            LessEquals -> isFloat ? EirBinaryOp.FloatCmpLe
+                : (isSigned ? EirBinaryOp.CmpLeSigned : EirBinaryOp.CmpLeUnsigned),
+            Greater -> isFloat ? EirBinaryOp.FloatCmpGt
+                : (isSigned ? EirBinaryOp.CmpGtSigned : EirBinaryOp.CmpGtUnsigned),
+            default -> isFloat ? EirBinaryOp.FloatCmpGe
+                : (isSigned ? EirBinaryOp.CmpGeSigned : EirBinaryOp.CmpGeUnsigned),
+        };
+        long temp = this.builder.newTemp(resultType);
+        this.builder.append(new EirBinary(temp, resultType, op, left, right));
+        return temp;
+    }
+
+    // The type both comparison operands convert to: the same type, or the wider one when one
+    // side widens losslessly into the other. Equality over two bools compares directly.
+    commonOperandType(Type left, Type right) -> Type? {
+        if (left == right) {
+            if (this.supportedValueType(left)) {
+                return left;
+            }
+            return null;
+        }
+        if (!primitives.isNumericType(left) || !primitives.isNumericType(right)) {
+            return null;
+        }
+        if (types.widensTo(left, right)) {
+            return right;
+        }
+        if (types.widensTo(right, left)) {
+            return left;
+        }
+        return null;
+    }
+
+    lowerBitwise(BinaryExpressionNode binary, SyntaxKind operator, Type resultType) -> long {
+        if (!primitives.isIntegerType(resultType)) {
+            this.unsupported("bitwise operations on '{types.display(resultType)}'",
+                binary.span());
+            return -1;
+        }
+        long left = this.lowerExpressionConverted(binary.left(), resultType);
+        long right = this.lowerExpressionConverted(binary.right(), resultType);
+        if (left < 0 || right < 0) {
+            return -1;
+        }
+        bool isSigned = primitives.isSignedType(resultType);
+        let op = switch (operator) {
+            Ampersand -> EirBinaryOp.And,
+            Pipe -> EirBinaryOp.Or,
+            Caret -> EirBinaryOp.Xor,
+            LessLess -> EirBinaryOp.ShiftLeft,
+            GreaterGreater -> isSigned ? EirBinaryOp.ShiftRightSigned
+                : EirBinaryOp.ShiftRightUnsigned,
+            default -> EirBinaryOp.ShiftRightUnsigned,
+        };
+        long temp = this.builder.newTemp(resultType);
+        this.builder.append(new EirBinary(temp, resultType, op, left, right));
+        return temp;
+    }
+
+    // '&&' and '||' evaluate the right side only when the left has not decided the result, so
+    // the merged value travels through a slot written on both paths.
+    lowerShortCircuit(BinaryExpressionNode binary, bool isAnd) -> long {
+        let resultType = this.typeOf(binary);
+        if (resultType == null) {
+            return -1;
+        }
+        long left = this.lowerExpression(binary.left());
+        if (left < 0) {
+            return -1;
+        }
+        long slot = this.builder.addSlot("logical", resultType);
+        this.builder.append(new EirStoreSlot(slot, left));
+        string prefix = "or";
+        if (isAnd) {
+            prefix = "and";
+        }
+        long rightBlock = this.builder.newBlock("{prefix}.rhs");
+        long merge = this.builder.newBlock("{prefix}.end");
+        if (isAnd) {
+            this.builder.terminate(new EirBranch(left, rightBlock, merge));
+        } else {
+            this.builder.terminate(new EirBranch(left, merge, rightBlock));
+        }
+        this.builder.moveTo(rightBlock);
+        long right = this.lowerExpression(binary.right());
+        if (right < 0) {
+            return -1;
+        }
+        this.builder.append(new EirStoreSlot(slot, right));
+        this.builder.terminate(new EirJump(merge));
+        this.builder.moveTo(merge);
+        long temp = this.builder.newTemp(resultType);
+        this.builder.append(new EirLoadSlot(temp, resultType, slot));
+        return temp;
+    }
+
+    lowerCast(CastExpressionNode cast) -> long {
+        let targetType = this.typeOf(cast);
+        if (targetType == null) {
+            return -1;
+        }
+        if (!this.supportedValueType(targetType)) {
+            this.unsupported("a cast to '{types.display(targetType)}'", cast.span());
+            return -1;
+        }
+        long value = this.lowerExpression(cast.value());
+        if (value < 0) {
+            return -1;
+        }
+        return this.convert(value, targetType, cast.span());
+    }
+
+    lowerAssignment(AssignmentExpressionNode assignment) -> long {
+        let target = assignment.target();
+        if (!(target is IdentifierExpressionNode)) {
+            this.unsupported("assigning to this target", assignment.span());
+            return -1;
+        }
+        let binding = this.result.bindingOf(target.green());
+        if (binding == null) {
+            this.internalError("assignment target has no binding", assignment.span());
+            return -1;
+        }
+        let slot = this.slotsByBinding.get(binding);
+        if (slot == null) {
+            this.internalError("assignment target has no storage slot", assignment.span());
+            return -1;
+        }
+        let targetType = binding.type();
+        SyntaxKind operator = assignment.operator().kind();
+        if (operator == SyntaxKind.Equals) {
+            long value = this.lowerExpressionConverted(assignment.value(), targetType);
+            if (value < 0) {
+                return -1;
+            }
+            this.builder.append(new EirStoreSlot(slot, value));
+            return value;
+        }
+        long current = this.builder.newTemp(targetType);
+        this.builder.append(new EirLoadSlot(current, targetType, slot));
+        long operandValue = this.lowerExpressionConverted(assignment.value(), targetType);
+        if (operandValue < 0) {
+            return -1;
+        }
+        let op = this.compoundOperator(operator, targetType, assignment.span());
+        if (op == null) {
+            return -1;
+        }
+        long combined = this.builder.newTemp(targetType);
+        this.builder.append(new EirBinary(combined, targetType, op, current, operandValue));
+        this.builder.append(new EirStoreSlot(slot, combined));
+        return combined;
+    }
+
+    compoundOperator(SyntaxKind operator, Type targetType, Span span) -> EirBinaryOp? {
+        bool isFloat = primitives.isFloatType(targetType);
+        bool isSigned = primitives.isSignedType(targetType);
+        bool isInteger = primitives.isIntegerType(targetType);
+        if (!isFloat && !isInteger) {
+            this.unsupported("compound assignment on '{types.display(targetType)}'", span);
+            return null;
+        }
+        switch (operator) {
+            PlusEquals -> {
+                return isFloat ? EirBinaryOp.FloatAdd : EirBinaryOp.Add;
+            },
+            MinusEquals -> {
+                return isFloat ? EirBinaryOp.FloatSub : EirBinaryOp.Sub;
+            },
+            StarEquals -> {
+                return isFloat ? EirBinaryOp.FloatMul : EirBinaryOp.Mul;
+            },
+            SlashEquals -> {
+                return isFloat ? EirBinaryOp.FloatDiv
+                    : (isSigned ? EirBinaryOp.DivSigned : EirBinaryOp.DivUnsigned);
+            },
+            PercentEquals -> {
+                return isFloat ? EirBinaryOp.FloatRem
+                    : (isSigned ? EirBinaryOp.RemSigned : EirBinaryOp.RemUnsigned);
+            },
+            AmpersandEquals -> {
+                return EirBinaryOp.And;
+            },
+            PipeEquals -> {
+                return EirBinaryOp.Or;
+            },
+            CaretEquals -> {
+                return EirBinaryOp.Xor;
+            },
+            LessLessEquals -> {
+                return EirBinaryOp.ShiftLeft;
+            },
+            GreaterGreaterEquals -> {
+                return isSigned ? EirBinaryOp.ShiftRightSigned
+                    : EirBinaryOp.ShiftRightUnsigned;
+            },
+            GreaterGreaterGreaterEquals -> {
+                return EirBinaryOp.ShiftRightUnsigned;
+            },
+            default -> {
+                this.unsupported("this compound assignment", span);
+                return null;
+            },
+        }
+    }
+
+    lowerTernary(TernaryExpressionNode ternary) -> long {
+        let resultType = this.typeOf(ternary);
+        if (resultType == null) {
+            return -1;
+        }
+        if (!this.supportedValueType(resultType)) {
+            this.unsupported("a conditional of type '{types.display(resultType)}'",
+                ternary.span());
+            return -1;
+        }
+        long condition = this.lowerExpression(ternary.condition());
+        if (condition < 0) {
+            return -1;
+        }
+        long slot = this.builder.addSlot("ternary", resultType);
+        long thenBlock = this.builder.newBlock("ternary.then");
+        long elseBlock = this.builder.newBlock("ternary.else");
+        long merge = this.builder.newBlock("ternary.end");
+        this.builder.terminate(new EirBranch(condition, thenBlock, elseBlock));
+        this.builder.moveTo(thenBlock);
+        long thenValue = this.lowerExpressionConverted(ternary.thenValue(), resultType);
+        if (thenValue < 0) {
+            return -1;
+        }
+        this.builder.append(new EirStoreSlot(slot, thenValue));
+        this.builder.terminate(new EirJump(merge));
+        this.builder.moveTo(elseBlock);
+        long elseValue = this.lowerExpressionConverted(ternary.elseValue(), resultType);
+        if (elseValue < 0) {
+            return -1;
+        }
+        this.builder.append(new EirStoreSlot(slot, elseValue));
+        this.builder.terminate(new EirJump(merge));
+        this.builder.moveTo(merge);
+        long temp = this.builder.newTemp(resultType);
+        this.builder.append(new EirLoadSlot(temp, resultType, slot));
+        return temp;
+    }
+
+    // ---- Calls ----
+
+    lowerCall(CallExpressionNode call) -> long {
+        let signature = this.calleeSignatureOf(call);
+        if (signature == null) {
+            this.unsupported("this call", call.span());
+            return -1;
+        }
+        let info = this.index.infoFor(signature);
+        if (info == null) {
+            this.internalError("call to '{signature.name()}' resolves to no indexed function",
+                call.span());
+            return -1;
+        }
+        if (info.isBuiltin()) {
+            this.unsupported("the built-in function '{signature.name()}'", call.span());
+            return -1;
+        }
+        if (info.isExternal()) {
+            this.unsupported("calling the external function '{signature.name()}'",
+                call.span());
+            return -1;
+        }
+        if (signature.isGeneric()) {
+            this.unsupported("calling the generic function '{signature.name()}'",
+                call.span());
+            return -1;
+        }
+        if (signature.declaresThrows()) {
+            this.unsupported("calling the throwing function '{signature.name()}'",
+                call.span());
+            return -1;
+        }
+        Parameter[] parameters = signature.parameters();
+        for (let parameter in parameters) {
+            if (!this.supportedValueType(parameter.type())) {
+                this.unsupported("passing a '{types.display(parameter.type())}' argument",
+                    call.span());
+                return -1;
+            }
+        }
+        let returnType = signature.returnType();
+        if (!types.isVoidType(returnType) && !this.supportedValueType(returnType)) {
+            this.unsupported("a call returning '{types.display(returnType)}'", call.span());
+            return -1;
+        }
+        let writtenArguments = argumentExpressions(call.arguments());
+        if (writtenArguments == null) {
+            this.unsupported("'out' arguments", call.span());
+            return -1;
+        }
+        long[] slots = new long[parameters.length];
+        bool[] filled = new bool[parameters.length];
+        let mapping = this.result.argumentOrderOf(call.green());
+        for (long i = 0; i < writtenArguments.length(); i++) {
+            long parameterIndex = i;
+            if (mapping != null && i < mapping.length) {
+                parameterIndex = mapping[i];
+            }
+            if (parameterIndex < 0 || parameterIndex >= parameters.length) {
+                this.internalError("argument {i + 1} maps to no parameter", call.span());
+                return -1;
+            }
+            long value = this.lowerExpressionConverted(writtenArguments.get(i),
+                parameters[parameterIndex].type());
+            if (value < 0) {
+                return -1;
+            }
+            slots[parameterIndex] = value;
+            filled[parameterIndex] = true;
+        }
+        for (long j = 0; j < parameters.length; j++) {
+            if (filled[j]) {
+                continue;
+            }
+            long value = this.lowerDefaultArgument(info, j, parameters[j].type(), call.span());
+            if (value < 0) {
+                return -1;
+            }
+            slots[j] = value;
+        }
+        let parameterTypes = new Type[parameters.length];
+        for (long j = 0; j < parameterTypes.length; j++) {
+            parameterTypes[j] = parameters[j].type();
+        }
+        let callee = new EirCallee(info.symbol(), parameterTypes, returnType);
+        long resultTemp = -1;
+        if (!types.isVoidType(returnType)) {
+            resultTemp = this.builder.newTemp(returnType);
+        }
+        this.builder.append(new EirCall(resultTemp, returnType, callee, slots));
+        return resultTemp;
+    }
+
+    // A parameter left unbound takes its declared default, evaluated at the call site. The
+    // default expression lives in the callee's module, so its side tables come from there.
+    lowerDefaultArgument(FunctionInfo callee, long parameterIndex, Type parameterType,
+                                 Span callSpan) -> long {
+        let declaration = callee.declaration();
+        if (declaration == null) {
+            this.internalError("callee '{callee.signature().name()}' has no declaration for "
+                + "its defaults", callSpan);
+            return -1;
+        }
+        let parameterList = declaration.parameters();
+        if (parameterIndex >= parameterList.parametersCount()) {
+            this.internalError("callee '{callee.signature().name()}' has no parameter "
+                + "{parameterIndex + 1}", callSpan);
+            return -1;
+        }
+        let defaultValue = parameterList.parameters(parameterIndex).defaultValue();
+        if (defaultValue == null) {
+            this.internalError("parameter {parameterIndex + 1} of "
+                + "'{callee.signature().name()}' has no default to fill", callSpan);
+            return -1;
+        }
+        let savedResult = this.result;
+        let savedFile = this.currentFile;
+        this.result = callee.context().result();
+        this.currentFile = callee.context().module().filePath();
+        long value = this.lowerExpressionConverted(defaultValue.value(), parameterType);
+        this.result = savedResult;
+        this.currentFile = savedFile;
+        return value;
+    }
+
+    // ---- Switch ----
+
+    // Lowers a value switch over an integer scrutinee. With a result type the switch is an
+    // expression: every arm stores its converted value into the result slot; exactly one arm
+    // runs, and the merged value is loaded after the join.
+    lowerSwitch(Expression scrutinee, List<SwitchArm> arms, Type? resultType, Span span)
+            -> long {
+        let scrutineeType = this.typeOf(scrutinee);
+        if (scrutineeType == null) {
+            return -1;
+        }
+        if (!primitives.isIntegerType(scrutineeType)) {
+            this.unsupported("a switch over '{types.display(scrutineeType)}'", span);
+            return -1;
+        }
+        if (resultType != null && !this.supportedValueType(resultType)) {
+            this.unsupported("a switch producing '{types.display(resultType)}'", span);
+            return -1;
+        }
+        long scrutineeValue = this.lowerExpression(scrutinee);
+        if (scrutineeValue < 0) {
+            return -1;
+        }
+        long resultSlot = -1;
+        if (resultType != null) {
+            resultSlot = this.builder.addSlot("switch", resultType);
+        }
+        let caseValues = new List<long>();
+        let caseTargets = new List<long>();
+        let armBlocks = new List<long>();
+        long defaultTarget = -1;
+        for (long a = 0; a < arms.length(); a++) {
+            switch (arms.get(a)) {
+                is ValueArmNode arm -> {
+                    long block = this.builder.newBlock("switch.case");
+                    armBlocks.push(block);
+                    for (long i = 0; i < arm.labelsCount(); i++) {
+                        let label = this.integerLabelBits(arm.labels(i));
+                        if (label == null) {
+                            return -1;
+                        }
+                        caseValues.push(label);
+                        caseTargets.push(block);
+                    }
+                },
+                is DefaultArmNode arm -> {
+                    long block = this.builder.newBlock("switch.default");
+                    armBlocks.push(block);
+                    defaultTarget = block;
+                },
+                is TypeArmNode arm -> {
+                    this.unsupported("a type-testing switch arm", arm.span());
+                    return -1;
+                },
+            }
+        }
+        long unreachableBlock = -1;
+        if (defaultTarget < 0) {
+            unreachableBlock = this.builder.newBlock("switch.unreachable");
+            defaultTarget = unreachableBlock;
+        }
+        long merge = this.builder.newBlock("switch.end");
+        this.builder.terminate(new EirSwitch(scrutineeValue, caseValues.toArray(),
+            caseTargets.toArray(), defaultTarget));
+        if (unreachableBlock >= 0) {
+            this.builder.moveTo(unreachableBlock);
+            this.builder.terminate(new EirUnreachable());
+        }
+        for (long a = 0; a < arms.length(); a++) {
+            let body = armBodyOf(arms.get(a));
+            if (body == null) {
+                continue;
+            }
+            this.builder.moveTo(armBlocks.get(a));
+            this.lowerArmBody(body, resultType, resultSlot);
+            if (this.failed) {
+                return -1;
+            }
+            if (!this.builder.terminated()) {
+                this.builder.terminate(new EirJump(merge));
+            }
+        }
+        this.builder.moveTo(merge);
+        if (resultType == null) {
+            return -1;
+        }
+        long temp = this.builder.newTemp(resultType);
+        this.builder.append(new EirLoadSlot(temp, resultType, resultSlot));
+        return temp;
+    }
+
+    lowerArmBody(ArmBody body, Type? resultType, long resultSlot) {
+        switch (body) {
+            is BlockNode block -> {
+                this.lowerBlock(block);
+            },
+            is Expression expression -> {
+                if (resultType != null) {
+                    long value = this.lowerExpressionConverted(expression, resultType);
+                    if (value < 0) {
+                        return;
+                    }
+                    this.builder.append(new EirStoreSlot(resultSlot, value));
+                } else {
+                    let ignored = this.lowerExpression(expression);
+                }
+            },
+            default -> {
+                this.unsupported("this switch arm body", this.info.signature().nameSpan());
+            },
+        }
+    }
+
+    // The constant an integer switch label names, as scrutinee-typed bits: a char literal's
+    // codepoint or an int or long literal's value behind an optional sign.
+    integerLabelBits(Expression label) -> long? {
+        Expression core = label;
+        bool negative = false;
+        if (core is PrefixExpressionNode) {
+            negative = core.operator().kind() == SyntaxKind.Minus;
+            core = core.operand();
+        }
+        if (!(core is LiteralExpressionNode)) {
+            this.unsupported("this switch label", label.span());
+            return null;
+        }
+        SyntaxKind kind = core.value().kind();
+        if (kind == SyntaxKind.CharLiteral) {
+            return literals.charCodepoint(core.value().text()) as long;
+        }
+        if (kind == SyntaxKind.IntLiteral || kind == SyntaxKind.LongLiteral) {
+            let magnitude = literals.integerMagnitude(core.value().text());
+            if (magnitude == null) {
+                this.internalError("switch label '{core.value().text()}' does not parse",
+                    label.span());
+                return null;
+            }
+            long value = magnitude as long;
+            if (negative) {
+                return 0 - value;
+            }
+            return value;
+        }
+        this.unsupported("this switch label", label.span());
+        return null;
+    }
+
+    // ---- Conversions ----
+
+    // Converts a temp between primitive value types, matching the reference semantics: integer
+    // widening extends by the source's signedness, narrowing truncates, same-width conversion
+    // reinterprets the bits, integer-to-float converts by source signedness, float-to-integer
+    // truncates toward zero by target signedness, and float widths extend or truncate.
+    convert(long value, Type target, Span span) -> long {
+        let source = this.builder.tempType(value);
+        if (source == target) {
+            return value;
+        }
+        if (!this.supportedValueType(source) || !this.supportedValueType(target)
+                || primitives.isBoolType(source) || primitives.isBoolType(target)) {
+            this.unsupported("converting '{types.display(source)}' to "
+                + "'{types.display(target)}'", span);
+            return -1;
+        }
+        bool sourceFloat = primitives.isFloatType(source);
+        bool targetFloat = primitives.isFloatType(target);
+        long sourceWidth = primitives.bitWidth(source);
+        long targetWidth = primitives.bitWidth(target);
+        let op = EirCastOp.Reinterpret;
+        if (!sourceFloat && !targetFloat) {
+            if (sourceWidth == targetWidth) {
+                op = EirCastOp.Reinterpret;
+            } else if (sourceWidth > targetWidth) {
+                op = EirCastOp.Trunc;
+            } else if (primitives.isSignedType(source)) {
+                op = EirCastOp.SignExtend;
+            } else {
+                op = EirCastOp.ZeroExtend;
+            }
+        } else if (!sourceFloat) {
+            op = EirCastOp.SignedToFloat;
+            if (!primitives.isSignedType(source)) {
+                op = EirCastOp.UnsignedToFloat;
+            }
+        } else if (!targetFloat) {
+            op = EirCastOp.FloatToSigned;
+            if (!primitives.isSignedType(target)) {
+                op = EirCastOp.FloatToUnsigned;
+            }
+        } else if (sourceWidth > targetWidth) {
+            op = EirCastOp.FloatTrunc;
+        } else if (sourceWidth < targetWidth) {
+            op = EirCastOp.FloatExtend;
+        } else {
+            return value;
+        }
+        long temp = this.builder.newTemp(target);
+        this.builder.append(new EirCast(temp, target, op, value));
+        return temp;
+    }
+}
+
+// The written argument expressions in source order, or null when an 'out' argument appears.
+argumentExpressions(ArgumentListNode arguments) -> List<Expression>? {
+    let values = new List<Expression>();
+    for (long i = 0; i < arguments.argumentsCount(); i++) {
+        switch (arguments.arguments(i)) {
+            is NamedArgumentNode named -> {
+                values.push(named.value());
+            },
+            is Expression value -> {
+                values.push(value);
+            },
+            default -> {
+                return null;
+            },
+        }
+    }
+    return values;
+}
+
+armBodyOf(SwitchArm arm) -> ArmBody? {
+    switch (arm) {
+        is ValueArmNode value -> {
+            return value.body();
+        },
+        is DefaultArmNode defaulted -> {
+            return defaulted.body();
+        },
+        is TypeArmNode typed -> {
+            return typed.body();
+        },
+    }
+}
+
+statementArms(SwitchStatementNode node) -> List<SwitchArm> {
+    let arms = new List<SwitchArm>();
+    for (long i = 0; i < node.armsCount(); i++) {
+        arms.push(node.arms(i));
+    }
+    return arms;
+}
+
+expressionArms(SwitchExpressionNode node) -> List<SwitchArm> {
+    let arms = new List<SwitchArm>();
+    for (long i = 0; i < node.armsCount(); i++) {
+        arms.push(node.arms(i));
+    }
+    return arms;
+}

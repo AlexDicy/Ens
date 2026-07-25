@@ -1,0 +1,134 @@
+// Shared helpers for the codegen tests: an in-memory file tree standing in for the file system,
+// single-file program analysis through the real sema pipeline, and lowering straight to the
+// textual EIR dump the golden tests compare.
+import @std.testing;
+import TestFailure from @std.testing;
+import Map from @std.collections.map;
+import FileLoader from @ens.sema.support.loader;
+import FileError from @ens.sema.support.loader;
+import FileDiagnostic from @ens.sema.support.diagnostics;
+import @ens.sema.program.graph;
+import ProgramAnalysis from @ens.sema.pipeline;
+import @ens.sema.pipeline;
+import TypeStore from @ens.sema.model.types;
+import EirFunction from eir.model;
+import eir.dump;
+import eir.verify;
+import FunctionInfo from lower.index;
+import ProgramIndex from lower.index;
+import lower.index;
+import lower.lower;
+import FunctionLowering from lower.lower;
+
+public class MemoryFileLoader implements FileLoader {
+    Map<string, string> files;
+
+    public constructor() {
+        this.files = new Map<string, string>();
+    }
+
+    public add(string path, string text) {
+        this.files.set(path, text);
+    }
+
+    override exists(string path) -> bool {
+        return this.files.contains(path);
+    }
+
+    override readText(string path) -> string throws FileError {
+        let text = this.files.get(path);
+        if (text == null) {
+            throw new FileError("Could not read '{path}'.");
+        }
+        return text;
+    }
+}
+
+// Analyzes a single-file program and asserts the whole pipeline accepted it.
+public analyzeMain(string text) -> ProgramAnalysis throws {
+    let loader = new MemoryFileLoader();
+    loader.add("/src/main.ens", text);
+    let result = graph.buildFileProgram(loader, "/src", "", "/stdlib", "main.ens");
+    try assertNone("graph", result.diagnostics());
+    for (let loaded in result.modules()) {
+        if (loaded.parseResult().diagnostics().length > 0) {
+            try testing.fail("parse failed: "
+                + loaded.parseResult().diagnostics()[0].message());
+        }
+    }
+    let analysis = pipeline.analyzeProgram(result);
+    try assertNone("declare", analysis.declareDiagnostics());
+    try assertNone("link", analysis.linkDiagnostics());
+    try assertNone("signatures", analysis.signatureDiagnostics());
+    try assertNone("layout", analysis.layoutDiagnostics());
+    try assertNone("checks", analysis.checkDiagnostics());
+    try assertNone("bodies", analysis.bodyDiagnostics());
+    try assertNone("exceptions", analysis.exceptionDiagnostics());
+    return analysis;
+}
+
+assertNone(string stage, FileDiagnostic[] diagnostics) throws {
+    if (diagnostics.length > 0) {
+        try testing.fail("{stage} reported {diagnostics.length} diagnostic(s); first: "
+            + diagnostics[0].message());
+    }
+}
+
+// A type store for hand-built EIR: the one behind an empty analyzed program.
+public freshStore() -> TypeStore throws {
+    let analysis = try analyzeMain("main() \{\}");
+    return analysis.store();
+}
+
+public functionNamed(ProgramAnalysis analysis, ProgramIndex index, string name)
+        -> FunctionInfo throws {
+    let modules = index.modules();
+    for (long m = 0; m < modules.length(); m++) {
+        let moduleFunctions = modules.get(m);
+        for (long i = 0; i < moduleFunctions.functions().length(); i++) {
+            let info = moduleFunctions.functions().get(i);
+            if (info.signature().name() == name) {
+                return info;
+            }
+        }
+    }
+    throw new TestFailure("no lowerable function named '{name}'");
+}
+
+// Lowers one function of an accepted program, asserts the structural verifier is satisfied,
+// and returns its textual dump.
+public loweredDump(string programText, string functionName) -> string throws {
+    let analysis = try analyzeMain(programText);
+    let programIndex = index.buildIndex(analysis);
+    let info = try functionNamed(analysis, programIndex, functionName);
+    let outcome = lower.lowerFunction(info, programIndex, analysis.store());
+    let function = outcome.function();
+    if (function == null) {
+        string reason = "no diagnostics";
+        if (outcome.diagnostics().length > 0) {
+            reason = outcome.diagnostics()[0].message();
+        }
+        throw new TestFailure("lowering '{functionName}' failed: {reason}");
+    }
+    string[] violations = verify.verifyFunction(function);
+    if (violations.length > 0) {
+        throw new TestFailure("the verifier rejected '{functionName}': {violations[0]}\n"
+            + dump.dumpFunction(function));
+    }
+    return dump.dumpFunction(function);
+}
+
+// Lowers one function expecting failure, and returns the first diagnostic's message.
+public loweringFailure(string programText, string functionName) -> string throws {
+    let analysis = try analyzeMain(programText);
+    let programIndex = index.buildIndex(analysis);
+    let info = try functionNamed(analysis, programIndex, functionName);
+    let outcome = lower.lowerFunction(info, programIndex, analysis.store());
+    if (outcome.function() != null) {
+        throw new TestFailure("lowering '{functionName}' unexpectedly succeeded");
+    }
+    if (outcome.diagnostics().length == 0) {
+        throw new TestFailure("lowering '{functionName}' failed without a diagnostic");
+    }
+    return outcome.diagnostics()[0].message();
+}

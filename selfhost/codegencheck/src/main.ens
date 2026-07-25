@@ -1,27 +1,37 @@
 // The codegen differential harness. It gates the self-hosted code generator against the runnable
-// test fixtures, and until a code generator exists it holds the ground: it drives the spike (a
-// small Ens program that builds an LLVM module returning 42 and emits an object file) all the way
-// through linking and execution, and it enforces an anti-rot rule over a checked-in skip list of
-// fixtures that codegen does not yet verify.
+// test fixtures: every runnable fixture that is not on the checked-in skip list is compiled by
+// the self-hosted pipeline (module graph, sema, codegen), linked through the hidden
+// 'ens link-objects' bridge, run, and compared against its own '@exit' and '@stdout' directives,
+// which the C++ suite already validates. The harness also drives the spike (a small Ens program
+// that builds an LLVM module returning 42 and emits an object file) through linking and
+// execution, keeping the emit-link-run plumbing proven independently of the code generator.
 //
-// The skip list may only shrink: every runnable fixture must be listed in it (because no fixture
-// is codegen-verified yet), and every listed fixture must still be a runnable fixture. A runnable
-// fixture that is missing from the list, or a listed name that is no longer a runnable fixture,
-// fails the gate. As codegen learns to verify a fixture its entry is removed, never added.
+// The skip list may only shrink: every runnable fixture must be either codegen-verified or
+// listed, and every listed name must still be a runnable fixture. A runnable fixture that fails
+// verification and is missing from the list, or a listed name that is no longer a runnable
+// fixture, fails the gate. As codegen learns a fixture its entry is removed, never added.
 //
 // Manifest format, one keyword per line, values separated by one space:
 //   platform <windows|posix>   the host's command interpreter, for quoting
 //   ens <path to the ens driver>
 //   spike <path to the prebuilt spike executable>
+//   stdlib <folder containing std/>
 //   scratch <a writable scratch folder>
 //   skiplist <path to the checked-in skip-list file>
 //   fixture <label> <path to the fixture's directive-bearing source file>
 //
-// Exit codes: 0 the gate passed, 1 the spike path or the anti-rot rule failed, 2 a usage or
-// manifest problem.
+// Exit codes: 0 the gate passed, 1 the spike path, a fixture verification, or the anti-rot rule
+// failed, 2 a usage or manifest problem.
 import @std.system;
 import SystemError from @std.system;
 import List from @std.collections.list;
+import SystemFileLoader from @ens.sema.support.loader;
+import FileDiagnostic from @ens.sema.support.diagnostics;
+import GraphResult from @ens.sema.program.graph;
+import @ens.sema.program.graph;
+import ProgramAnalysis from @ens.sema.pipeline;
+import @ens.sema.pipeline;
+import @ens.codegen.driver;
 
 main() -> int {
     string[] arguments = system.arguments();
@@ -56,12 +66,20 @@ main() -> int {
 
     let skipped = loadSkipList(readOrEmpty(manifest.skiplist));
 
-    let unskipped = new List<string>();
-    for (long i = 0; i < runnable.length(); i++) {
-        if (!contains(skipped, runnable.get(i))) {
-            unskipped.push(runnable.get(i));
+    long verifiedCount = 0;
+    for (long i = 0; i < manifest.fixtures.length(); i++) {
+        let fixture = manifest.fixtures.get(i);
+        if (!contains(runnable, fixture.label) || contains(skipped, fixture.label)) {
+            continue;
+        }
+        string report = verifyFixture(manifest, fixture);
+        if (report.length == 0) {
+            verifiedCount++;
+        } else {
+            failures.push("fixture {fixture.label}: " + report);
         }
     }
+
     let stale = new List<string>();
     for (long i = 0; i < skipped.length(); i++) {
         if (!contains(runnable, skipped.get(i))) {
@@ -70,10 +88,10 @@ main() -> int {
     }
 
     print("codegencheck: {runnable.length()} runnable fixture(s), {skipped.length()} skipped, "
-        + "0 codegen-verified");
-    if (unskipped.length() > 0) {
-        failures.push("{unskipped.length()} runnable fixture(s) are neither codegen-verified nor "
-            + "skipped; add them to the skip list: " + joined(unskipped));
+        + "{verifiedCount} codegen-verified");
+    if (verifiedCount + skipped.length() < runnable.length()) {
+        failures.push("{runnable.length() - verifiedCount - skipped.length()} runnable "
+            + "fixture(s) are neither codegen-verified nor skipped");
     }
     if (stale.length() > 0) {
         failures.push("{stale.length()} skip-list entr(y/ies) name no runnable fixture; remove "
@@ -104,6 +122,7 @@ class Manifest {
     protected bool windowsShell;
     protected string ensDriver;
     protected string spikeExecutable;
+    protected string stdlibRoot;
     protected string scratch;
     protected string skiplist;
     protected List<Fixture> fixtures;
@@ -113,6 +132,7 @@ class Manifest {
         this.windowsShell = false;
         this.ensDriver = "";
         this.spikeExecutable = "";
+        this.stdlibRoot = "";
         this.scratch = "";
         this.skiplist = "";
         this.fixtures = new List<Fixture>();
@@ -145,6 +165,9 @@ parseManifest(string text) -> Manifest {
             "spike" -> {
                 manifest.spikeExecutable = value;
             },
+            "stdlib" -> {
+                manifest.stdlibRoot = value;
+            },
             "scratch" -> {
                 manifest.scratch = value;
             },
@@ -170,6 +193,9 @@ parseManifest(string text) -> Manifest {
     }
     if (manifest.spikeExecutable.length == 0) {
         manifest.problems.push("missing a 'spike' line");
+    }
+    if (manifest.stdlibRoot.length == 0) {
+        manifest.problems.push("missing a 'stdlib' line");
     }
     if (manifest.scratch.length == 0) {
         manifest.problems.push("missing a 'scratch' line");
@@ -211,6 +237,291 @@ runSpikePath(Manifest manifest) -> string {
     return "";
 } catch (SystemError e) {
     return "the spike path could not run: {e.message}";
+}
+
+// Compiles, links, and runs one fixture, comparing the outcome against its directives. Returns
+// "" when the fixture verifies, or a description of the first failing step.
+verifyFixture(Manifest manifest, Fixture fixture) -> string {
+    let directives = readDirectives(readOrEmpty(fixture.path));
+    let loader = new SystemFileLoader();
+    string path = slashed(fixture.path);
+    string sourceRoot = parentFolderOf(path);
+    GraphResult graphResult;
+    if (endsWith(fixture.label, ".ens")) {
+        graphResult = graph.buildFileProgram(loader, sourceRoot, "", manifest.stdlibRoot,
+            fileNameOf(path));
+    } else {
+        graphResult = graph.buildGraph(loader, sourceRoot, "", manifest.stdlibRoot,
+            ["main.ens"]);
+    }
+    string upstream = upstreamProblems(graphResult);
+    if (upstream.length > 0) {
+        return upstream;
+    }
+    let analysis = pipeline.analyzeProgram(graphResult);
+    string semaProblems = analysisProblems(analysis);
+    if (semaProblems.length > 0) {
+        return semaProblems;
+    }
+
+    string prefix = sanitizedLabel(fixture.label);
+    let emitted = driver.emitProgram(analysis, manifest.scratch, prefix + ".");
+    if (!emitted.succeeded()) {
+        return "codegen failed: " + firstDiagnostics(emitted.diagnostics());
+    }
+    if (emitted.objects().length() == 0) {
+        return "codegen produced no object files";
+    }
+
+    string programPath = manifest.scratch + "/" + prefix + ".exe";
+    string linkCommand = "\"{manifest.ensDriver}\" link-objects";
+    for (long i = 0; i < emitted.objects().length(); i++) {
+        linkCommand = linkCommand + " \"" + emitted.objects().get(i) + "\"";
+    }
+    linkCommand = linkCommand + " --output \"{programPath}\"";
+    long linked = try shellExit(manifest.windowsShell, linkCommand);
+    if (linked != 0) {
+        return "ens link-objects exited {linked}";
+    }
+    if (!system.exists(programPath)) {
+        return "ens link-objects did not write {programPath}";
+    }
+
+    string stdoutPath = manifest.scratch + "/" + prefix + ".stdout";
+    long ran = try shellExit(manifest.windowsShell,
+        "\"{programPath}\" > \"{stdoutPath}\"");
+    if (ran != directives.expectedExit) {
+        return "the program exited {ran}, expected {directives.expectedExit}";
+    }
+    if (directives.expectsStdout || directives.stdoutContains.length() > 0) {
+        string actual = normalizedOutput(readOrEmpty(stdoutPath));
+        if (directives.expectsStdout) {
+            string expected = joinedLines(directives.stdoutLines);
+            if (actual != expected) {
+                return "stdout was '{actual}', expected '{expected}'";
+            }
+        }
+        for (long i = 0; i < directives.stdoutContains.length(); i++) {
+            if (actual.indexOf(directives.stdoutContains.get(i)) < 0) {
+                return "stdout is missing '{directives.stdoutContains.get(i)}'";
+            }
+        }
+    }
+    return "";
+} catch (SystemError e) {
+    return "could not run: {e.message}";
+}
+
+// The fixture's ground-truth directives, the same lines the C++ test runner asserts.
+class Directives {
+    protected long expectedExit;
+    protected bool expectsStdout;
+    protected List<string> stdoutLines;
+    protected List<string> stdoutContains;
+
+    protected constructor() {
+        this.expectedExit = 0;
+        this.expectsStdout = false;
+        this.stdoutLines = new List<string>();
+        this.stdoutContains = new List<string>();
+    }
+}
+
+readDirectives(string text) -> Directives {
+    let directives = new Directives();
+    string[] lines = splitLines(text);
+    for (let line in lines) {
+        string comment = commentBody(line);
+        if (startsWith(comment, "@exit ")) {
+            let value = parseInteger(trim(comment.substring("@exit ".length, comment.length)));
+            if (value != null) {
+                directives.expectedExit = value;
+            }
+        } else if (startsWith(comment, "@stdout-contains ")) {
+            directives.stdoutContains.push(
+                comment.substring("@stdout-contains ".length, comment.length));
+        } else if (startsWith(comment, "@stdout ")) {
+            directives.expectsStdout = true;
+            directives.stdoutLines.push(comment.substring("@stdout ".length, comment.length));
+        }
+    }
+    return directives;
+}
+
+parseInteger(string text) -> long? {
+    byte[] raw = text.toBytes();
+    if (raw.length == 0) {
+        return null;
+    }
+    bool negative = raw[0] == '-';
+    long start = 0;
+    if (negative) {
+        start = 1;
+    }
+    if (start == raw.length) {
+        return null;
+    }
+    long value = 0;
+    for (long i = start; i < raw.length; i++) {
+        if (raw[i] < '0' || raw[i] > '9') {
+            return null;
+        }
+        value = value * 10 + (raw[i] - '0');
+    }
+    if (negative) {
+        return 0 - value;
+    }
+    return value;
+}
+
+// Graph or parse diagnostics mean the fixture never reached sema; both are semacheck-level
+// regressions when the C++ compiler accepts the fixture.
+upstreamProblems(GraphResult graphResult) -> string {
+    FileDiagnostic[] graphDiagnostics = graphResult.diagnostics();
+    if (graphDiagnostics.length > 0) {
+        return "the module graph reported {graphDiagnostics.length} problem(s); first: "
+            + graphDiagnostics[0].message();
+    }
+    for (let loaded in graphResult.modules()) {
+        let parseDiagnostics = loaded.parseResult().diagnostics();
+        if (parseDiagnostics.length > 0) {
+            return "{loaded.filePath()} has {parseDiagnostics.length} parse problem(s); "
+                + "first: {parseDiagnostics[0].message()}";
+        }
+    }
+    return "";
+}
+
+// A runnable fixture must be clean through every sema stage; a diagnostic here is a
+// semacheck-level bug, not a codegen failure.
+analysisProblems(ProgramAnalysis analysis) -> string {
+    let merged = new List<FileDiagnostic>();
+    appendAll(merged, analysis.declareDiagnostics());
+    appendAll(merged, analysis.linkDiagnostics());
+    appendAll(merged, analysis.signatureDiagnostics());
+    appendAll(merged, analysis.layoutDiagnostics());
+    appendAll(merged, analysis.checkDiagnostics());
+    appendAll(merged, analysis.bodyDiagnostics());
+    appendAll(merged, analysis.exceptionDiagnostics());
+    if (merged.length() > 0) {
+        return "sema reported {merged.length()} diagnostic(s) on an accepted fixture "
+            + "(a semacheck-level bug); first: {merged.get(0).message()}";
+    }
+    return "";
+}
+
+appendAll(List<FileDiagnostic> sink, FileDiagnostic[] diagnostics) {
+    for (let diagnostic in diagnostics) {
+        sink.push(diagnostic);
+    }
+}
+
+firstDiagnostics(FileDiagnostic[] diagnostics) -> string {
+    string described = "";
+    long shown = diagnostics.length;
+    if (shown > 3) {
+        shown = 3;
+    }
+    for (long i = 0; i < shown; i++) {
+        if (i > 0) {
+            described = described + "; ";
+        }
+        described = described + "{diagnostics[i].file()}: {diagnostics[i].message()}";
+    }
+    if (diagnostics.length > shown) {
+        described = described + "; and {diagnostics.length - shown} more";
+    }
+    return described;
+}
+
+// The captured output with carriage returns dropped and trailing newlines trimmed, matching
+// how the C++ test runner compares '@stdout' lines.
+normalizedOutput(string text) -> string {
+    byte[] raw = text.toBytes();
+    let kept = new List<byte>();
+    for (long i = 0; i < raw.length; i++) {
+        if (raw[i] != '\r') {
+            kept.push(raw[i]);
+        }
+    }
+    long end = kept.length();
+    while (end > 0 && kept.get(end - 1) == '\n') {
+        end--;
+    }
+    string result = "";
+    byte[] bytes = new byte[end];
+    for (long i = 0; i < end; i++) {
+        bytes[i] = kept.get(i);
+    }
+    return string.fromBytes(bytes);
+}
+
+joinedLines(List<string> lines) -> string {
+    string joined = "";
+    for (long i = 0; i < lines.length(); i++) {
+        if (i > 0) {
+            joined = joined + "\n";
+        }
+        joined = joined + lines.get(i);
+    }
+    return joined;
+}
+
+sanitizedLabel(string label) -> string {
+    byte[] raw = label.toBytes();
+    byte[] out = new byte[raw.length];
+    for (long i = 0; i < raw.length; i++) {
+        byte value = raw[i];
+        bool kept = (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z')
+            || (value >= '0' && value <= '9') || value == '_' || value == '.';
+        if (kept) {
+            out[i] = value;
+        } else {
+            out[i] = '_';
+        }
+    }
+    return string.fromBytes(out);
+}
+
+slashed(string path) -> string {
+    byte[] raw = path.toBytes();
+    byte[] out = new byte[raw.length];
+    for (long i = 0; i < raw.length; i++) {
+        if (raw[i] == '\\') {
+            out[i] = '/';
+        } else {
+            out[i] = raw[i];
+        }
+    }
+    return string.fromBytes(out);
+}
+
+parentFolderOf(string path) -> string {
+    long index = lastSlashIndex(path);
+    if (index <= 0) {
+        return path;
+    }
+    return path.substring(0, index);
+}
+
+fileNameOf(string path) -> string {
+    long index = lastSlashIndex(path);
+    return path.substring(index + 1, path.length);
+}
+
+lastSlashIndex(string path) -> long {
+    byte[] raw = path.toBytes();
+    for (long i = raw.length - 1; i >= 0; i--) {
+        if (raw[i] == '/') {
+            return i;
+        }
+    }
+    return -1;
+}
+
+endsWith(string text, string suffix) -> bool {
+    return text.length >= suffix.length
+        && text.substring(text.length - suffix.length, text.length) == suffix;
 }
 
 // True when a fixture is a runnable program: it asserts an exit code or stdout and is not an

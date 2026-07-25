@@ -1,0 +1,179 @@
+// The program index: one pure pass over the analyzed program that pairs every free-function
+// signature with its defining module, its red declaration node, and its linker symbol. Lowering
+// consults it to resolve call targets and to reach a callee's parameter defaults, and the driver
+// walks its per-module lists to know what to lower and emit.
+import ProgramAnalysis from @ens.sema.pipeline;
+import ModuleContext from @ens.sema.context;
+import Signature from @ens.sema.model.types;
+import Visibility from @ens.sema.model.types;
+import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import GreenNode from @ens.frontend.syntax.green;
+import lower.symbols;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+
+// One free function of the program: entry metadata plus the red declaration node lowering walks.
+// The declaration is null for built-in and body-less entries.
+public final class FunctionInfo {
+    ModuleContext owningContext;
+    Signature functionSignature;
+    Visibility functionVisibility;
+    bool externalFunction;
+    bool builtinFunction;
+    FunctionDeclarationNode? redDeclaration;
+    string linkSymbol;
+
+    public constructor(ModuleContext context, Signature signature, Visibility visibility,
+                bool isExternal, bool isBuiltin, FunctionDeclarationNode? declaration,
+                string symbol) {
+        this.owningContext = context;
+        this.functionSignature = signature;
+        this.functionVisibility = visibility;
+        this.externalFunction = isExternal;
+        this.builtinFunction = isBuiltin;
+        this.redDeclaration = declaration;
+        this.linkSymbol = symbol;
+    }
+
+    public context() -> ModuleContext {
+        return this.owningContext;
+    }
+
+    public signature() -> Signature {
+        return this.functionSignature;
+    }
+
+    public visibility() -> Visibility {
+        return this.functionVisibility;
+    }
+
+    public isExternal() -> bool {
+        return this.externalFunction;
+    }
+
+    public isBuiltin() -> bool {
+        return this.builtinFunction;
+    }
+
+    public declaration() -> FunctionDeclarationNode? {
+        return this.redDeclaration;
+    }
+
+    public symbol() -> string {
+        return this.linkSymbol;
+    }
+
+    // Internal linkage keeps a private function's bare name from colliding across modules.
+    public internalLinkage() -> bool {
+        return this.functionVisibility == Visibility.Private && !this.externalFunction
+            && !this.builtinFunction;
+    }
+}
+
+// The functions one module defines and must emit.
+public final class ModuleFunctions {
+    ModuleContext owningContext;
+    List<FunctionInfo> lowerableFunctions;
+
+    public constructor(ModuleContext context) {
+        this.owningContext = context;
+        this.lowerableFunctions = new List<FunctionInfo>();
+    }
+
+    public context() -> ModuleContext {
+        return this.owningContext;
+    }
+
+    public functions() -> List<FunctionInfo> {
+        return this.lowerableFunctions;
+    }
+}
+
+public final class ProgramIndex {
+    Map<Signature, FunctionInfo> infoBySignature;
+    List<ModuleFunctions> moduleList;
+    FunctionInfo? mainInfo;
+
+    public constructor() {
+        this.infoBySignature = new Map<Signature, FunctionInfo>();
+        this.moduleList = new List<ModuleFunctions>();
+        this.mainInfo = null;
+    }
+
+    public infoFor(Signature signature) -> FunctionInfo? {
+        return this.infoBySignature.get(signature);
+    }
+
+    public modules() -> List<ModuleFunctions> {
+        return this.moduleList;
+    }
+
+    // The program's entry function, when the analyzed program has one.
+    public entryFunction() -> FunctionInfo? {
+        return this.mainInfo;
+    }
+
+    public register(Signature signature, FunctionInfo info) {
+        this.infoBySignature.set(signature, info);
+    }
+
+    public addModule(ModuleFunctions moduleFunctions) {
+        this.moduleList.push(moduleFunctions);
+    }
+
+    public setEntryFunction(FunctionInfo info) {
+        this.mainInfo = info;
+    }
+}
+
+public buildIndex(ProgramAnalysis analysis) -> ProgramIndex {
+    let index = new ProgramIndex();
+    let contexts = analysis.contexts();
+    for (long c = 0; c < contexts.length(); c++) {
+        let context = contexts.get(c);
+        let declarations = redFunctionDeclarations(context);
+        let moduleFunctions = new ModuleFunctions(context);
+        let entries = context.functions().all();
+        for (long i = 0; i < entries.length(); i++) {
+            let entry = entries.get(i);
+            let signature = entry.signature();
+            let named = context.functions().entriesNamed(signature.name());
+            bool overloaded = named != null && named.length() > 1;
+            FunctionDeclarationNode? declaration = null;
+            let declarationGreen = signature.declaration();
+            if (declarationGreen != null) {
+                declaration = declarations.get(declarationGreen);
+            }
+            string symbol = symbols.linkName(signature, entry.visibility(), entry.isExternal(),
+                context.module().canonicalPath(), overloaded);
+            let info = new FunctionInfo(context, signature, entry.visibility(),
+                entry.isExternal(), entry.isBuiltin(), declaration, symbol);
+            index.register(signature, info);
+            if (!entry.isExternal() && !entry.isBuiltin() && !signature.isGeneric()
+                    && declaration != null) {
+                moduleFunctions.functions().push(info);
+                if (signature.name() == "main"
+                        && context.module().canonicalPath() == "main") {
+                    index.setEntryFunction(info);
+                }
+            }
+        }
+        index.addModule(moduleFunctions);
+    }
+    return index;
+}
+
+redFunctionDeclarations(ModuleContext context) -> Map<GreenNode, FunctionDeclarationNode> {
+    let declarations = new Map<GreenNode, FunctionDeclarationNode>();
+    let root = context.root();
+    if (root == null) {
+        return declarations;
+    }
+    for (long i = 0; i < root.itemsCount(); i++) {
+        let item = root.items(i);
+        if (item is FunctionDeclarationNode) {
+            declarations.set(item.green(), item);
+        }
+    }
+    return declarations;
+}
