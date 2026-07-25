@@ -1,0 +1,220 @@
+// Switch lowering, shared by the statement and the expression form: one integer switch
+// terminator over the arm blocks, an unreachable default when the arms are exhaustive without
+// one, and a single join block. The expression form additionally routes every arm's value through
+// a result slot the join loads.
+import Expression from @ens.frontend.syntax.generated.nodes;
+import BlockNode from @ens.frontend.syntax.generated.nodes;
+import LiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import PrefixExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SwitchStatementNode from @ens.frontend.syntax.generated.nodes;
+import SwitchExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SwitchArm from @ens.frontend.syntax.generated.nodes;
+import ArmBody from @ens.frontend.syntax.generated.nodes;
+import ValueArmNode from @ens.frontend.syntax.generated.nodes;
+import DefaultArmNode from @ens.frontend.syntax.generated.nodes;
+import TypeArmNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxKind from @ens.frontend.syntax.generated.kind;
+import Span from @ens.frontend.support.source;
+import Type from @ens.sema.model.types;
+import @ens.sema.model.types;
+import EirLoadSlot from eir.model;
+import EirStoreSlot from eir.model;
+import EirJump from eir.model;
+import EirSwitch from eir.model;
+import EirUnreachable from eir.model;
+import LoweringContext from lower.context;
+import lower.expressions;
+import lower.literals;
+import lower.statements;
+import support.primitives;
+import List from @std.collections.list;
+
+public lowerStatement(LoweringContext lowering, SwitchStatementNode switched) {
+    lowerSwitch(lowering, switched.scrutinee(), statementArms(switched), null, switched.span());
+}
+
+public lowerExpression(LoweringContext lowering, SwitchExpressionNode switched) -> long {
+    let resultType = lowering.typeOf(switched);
+    if (resultType == null) {
+        return -1;
+    }
+    return lowerSwitch(lowering, switched.scrutinee(), expressionArms(switched), resultType,
+        switched.span());
+}
+
+// Lowers a value switch over an integer scrutinee. With a result type the switch is an
+// expression: every arm stores its converted value into the result slot; exactly one arm runs,
+// and the merged value is loaded after the join.
+lowerSwitch(LoweringContext lowering, Expression scrutinee, List<SwitchArm> arms,
+            Type? resultType, Span span) -> long {
+    let scrutineeType = lowering.typeOf(scrutinee);
+    if (scrutineeType == null) {
+        return -1;
+    }
+    if (!primitives.isIntegerType(scrutineeType)) {
+        lowering.unsupported("a switch over '{types.display(scrutineeType)}'", span);
+        return -1;
+    }
+    if (resultType != null && !lowering.supportsValueType(resultType)) {
+        lowering.unsupported("a switch producing '{types.display(resultType)}'", span);
+        return -1;
+    }
+    long scrutineeValue = expressions.lower(lowering, scrutinee);
+    if (scrutineeValue < 0) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    long resultSlot = -1;
+    if (resultType != null) {
+        resultSlot = builder.addSlot("switch", resultType);
+    }
+    let caseValues = new List<long>();
+    let caseTargets = new List<long>();
+    let armBlocks = new List<long>();
+    long defaultTarget = -1;
+    for (long a = 0; a < arms.length(); a++) {
+        switch (arms.get(a)) {
+            is ValueArmNode arm -> {
+                long block = builder.newBlock("switch.case");
+                armBlocks.push(block);
+                for (long i = 0; i < arm.labelsCount(); i++) {
+                    let label = integerLabelBits(lowering, arm.labels(i));
+                    if (label == null) {
+                        return -1;
+                    }
+                    caseValues.push(label);
+                    caseTargets.push(block);
+                }
+            },
+            is DefaultArmNode arm -> {
+                long block = builder.newBlock("switch.default");
+                armBlocks.push(block);
+                defaultTarget = block;
+            },
+            is TypeArmNode arm -> {
+                lowering.unsupported("a type-testing switch arm", arm.span());
+                return -1;
+            },
+        }
+    }
+    long unreachableBlock = -1;
+    if (defaultTarget < 0) {
+        unreachableBlock = builder.newBlock("switch.unreachable");
+        defaultTarget = unreachableBlock;
+    }
+    long merge = builder.newBlock("switch.end");
+    builder.terminate(new EirSwitch(scrutineeValue, caseValues.toArray(),
+        caseTargets.toArray(), defaultTarget));
+    if (unreachableBlock >= 0) {
+        builder.moveTo(unreachableBlock);
+        builder.terminate(new EirUnreachable());
+    }
+    for (long a = 0; a < arms.length(); a++) {
+        let body = armBodyOf(arms.get(a));
+        if (body == null) {
+            continue;
+        }
+        builder.moveTo(armBlocks.get(a));
+        lowerArmBody(lowering, body, resultType, resultSlot);
+        if (lowering.failed()) {
+            return -1;
+        }
+        if (!builder.terminated()) {
+            builder.terminate(new EirJump(merge));
+        }
+    }
+    builder.moveTo(merge);
+    if (resultType == null) {
+        return -1;
+    }
+    long temp = builder.newTemp(resultType);
+    builder.append(new EirLoadSlot(temp, resultType, resultSlot));
+    return temp;
+}
+
+lowerArmBody(LoweringContext lowering, ArmBody body, Type? resultType, long resultSlot) {
+    switch (body) {
+        is BlockNode block -> {
+            statements.lowerBlock(lowering, block);
+        },
+        is Expression expression -> {
+            if (resultType != null) {
+                long value = expressions.lowerConverted(lowering, expression, resultType);
+                if (value < 0) {
+                    return;
+                }
+                lowering.builder().append(new EirStoreSlot(resultSlot, value));
+            } else {
+                let ignored = expressions.lower(lowering, expression);
+            }
+        },
+        default -> {
+            lowering.unsupported("this switch arm body",
+                lowering.info().signature().nameSpan());
+        },
+    }
+}
+
+// The constant an integer switch label names, as scrutinee-typed bits: a char literal's
+// codepoint or an int or long literal's value behind an optional sign.
+integerLabelBits(LoweringContext lowering, Expression label) -> long? {
+    Expression core = label;
+    bool negative = false;
+    if (core is PrefixExpressionNode) {
+        negative = core.operator().kind() == SyntaxKind.Minus;
+        core = core.operand();
+    }
+    if (!(core is LiteralExpressionNode)) {
+        lowering.unsupported("this switch label", label.span());
+        return null;
+    }
+    SyntaxKind kind = core.value().kind();
+    if (kind == SyntaxKind.CharLiteral) {
+        return literals.charCodepoint(core.value().text()) as long;
+    }
+    if (kind == SyntaxKind.IntLiteral || kind == SyntaxKind.LongLiteral) {
+        let magnitude = literals.integerMagnitude(core.value().text());
+        if (magnitude == null) {
+            lowering.internalError("switch label '{core.value().text()}' does not parse",
+                label.span());
+            return null;
+        }
+        long value = magnitude as long;
+        if (negative) {
+            return 0 - value;
+        }
+        return value;
+    }
+    lowering.unsupported("this switch label", label.span());
+    return null;
+}
+
+armBodyOf(SwitchArm arm) -> ArmBody? {
+    switch (arm) {
+        is ValueArmNode value -> {
+            return value.body();
+        },
+        is DefaultArmNode defaulted -> {
+            return defaulted.body();
+        },
+        is TypeArmNode typed -> {
+            return typed.body();
+        },
+    }
+}
+
+statementArms(SwitchStatementNode node) -> List<SwitchArm> {
+    let arms = new List<SwitchArm>();
+    for (long i = 0; i < node.armsCount(); i++) {
+        arms.push(node.arms(i));
+    }
+    return arms;
+}
+
+expressionArms(SwitchExpressionNode node) -> List<SwitchArm> {
+    let arms = new List<SwitchArm>();
+    for (long i = 0; i < node.armsCount(); i++) {
+        arms.push(node.arms(i));
+    }
+    return arms;
+}

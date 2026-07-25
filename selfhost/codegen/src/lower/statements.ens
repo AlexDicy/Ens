@@ -1,0 +1,279 @@
+// Statement lowering: local declarations, control flow, and the block structure branches and
+// loops need. Every construct that can leave the current block unterminated terminates it before
+// moving on, so a block always ends in exactly one terminator.
+import Statement from @ens.frontend.syntax.generated.nodes;
+import BlockNode from @ens.frontend.syntax.generated.nodes;
+import VariableDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import IfStatementNode from @ens.frontend.syntax.generated.nodes;
+import WhileStatementNode from @ens.frontend.syntax.generated.nodes;
+import ForStatementNode from @ens.frontend.syntax.generated.nodes;
+import ForEachStatementNode from @ens.frontend.syntax.generated.nodes;
+import BreakStatementNode from @ens.frontend.syntax.generated.nodes;
+import ContinueStatementNode from @ens.frontend.syntax.generated.nodes;
+import ReturnStatementNode from @ens.frontend.syntax.generated.nodes;
+import ExpressionStatementNode from @ens.frontend.syntax.generated.nodes;
+import ThrowStatementNode from @ens.frontend.syntax.generated.nodes;
+import RethrowStatementNode from @ens.frontend.syntax.generated.nodes;
+import SwitchStatementNode from @ens.frontend.syntax.generated.nodes;
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import PrimitiveKind from @ens.sema.model.types;
+import @ens.sema.model.types;
+import EirConstBool from eir.model;
+import EirStoreSlot from eir.model;
+import EirReturn from eir.model;
+import EirJump from eir.model;
+import EirBranch from eir.model;
+import EirUnreachable from eir.model;
+import LoweringContext from lower.context;
+import lower.calls;
+import lower.expressions;
+import lower.switches;
+
+public lowerBlock(LoweringContext lowering, BlockNode block) {
+    for (long i = 0; i < block.statementsCount(); i++) {
+        if (lowering.failed() || lowering.builder().terminated()) {
+            return;
+        }
+        lower(lowering, block.statements(i));
+    }
+}
+
+public lower(LoweringContext lowering, Statement statement) {
+    switch (statement) {
+        is BlockNode block -> {
+            lowerBlock(lowering, block);
+        },
+        is VariableDeclarationNode declaration -> {
+            lowerVariableDeclaration(lowering, declaration);
+        },
+        is IfStatementNode conditional -> {
+            lowerIf(lowering, conditional);
+        },
+        is WhileStatementNode loop -> {
+            lowerWhile(lowering, loop);
+        },
+        is ForStatementNode loop -> {
+            lowerFor(lowering, loop);
+        },
+        is ForEachStatementNode loop -> {
+            lowering.unsupported("a for-in loop", loop.span());
+        },
+        is BreakStatementNode broken -> {
+            if (!lowering.inLoop()) {
+                lowering.internalError("'break' outside a loop", broken.span());
+                return;
+            }
+            lowering.builder().terminate(new EirJump(lowering.breakBlock()));
+        },
+        is ContinueStatementNode continued -> {
+            if (!lowering.inLoop()) {
+                lowering.internalError("'continue' outside a loop", continued.span());
+                return;
+            }
+            lowering.builder().terminate(new EirJump(lowering.continueBlock()));
+        },
+        is ReturnStatementNode returned -> {
+            lowerReturn(lowering, returned);
+        },
+        is ExpressionStatementNode expression -> {
+            lowerExpressionStatement(lowering, expression);
+        },
+        is ThrowStatementNode thrown -> {
+            lowering.unsupported("'throw'", thrown.span());
+        },
+        is RethrowStatementNode rethrown -> {
+            lowering.unsupported("'rethrow'", rethrown.span());
+        },
+        is SwitchStatementNode switched -> {
+            switches.lowerStatement(lowering, switched);
+        },
+        default -> {
+            lowering.unsupported("this statement", statement.span());
+        },
+    }
+}
+
+lowerVariableDeclaration(LoweringContext lowering, VariableDeclarationNode declaration) {
+    let binding = lowering.result().bindingOf(declaration.green());
+    if (binding == null) {
+        lowering.internalError("variable '{declaration.name().text()}' has no binding",
+            declaration.name().span());
+        return;
+    }
+    if (!lowering.supportsValueType(binding.type())) {
+        lowering.unsupported("a local of type '{types.display(binding.type())}'",
+            declaration.name().span());
+        return;
+    }
+    long slot = lowering.defineSlot(binding, binding.name(), binding.type());
+    let initializer = declaration.initializer();
+    if (initializer != null) {
+        long value = expressions.lowerConverted(lowering, initializer.value(), binding.type());
+        if (value < 0) {
+            return;
+        }
+        lowering.builder().append(new EirStoreSlot(slot, value));
+    }
+}
+
+lowerIf(LoweringContext lowering, IfStatementNode conditional) {
+    let builder = lowering.builder();
+    long condition = expressions.lower(lowering, conditional.condition());
+    if (condition < 0) {
+        return;
+    }
+    long thenBlock = builder.newBlock("if.then");
+    let elseClause = conditional.elseClause();
+    long elseBlock = -1;
+    if (elseClause != null) {
+        elseBlock = builder.newBlock("if.else");
+    }
+    long merge = builder.newBlock("if.end");
+    long elseTarget = merge;
+    if (elseBlock >= 0) {
+        elseTarget = elseBlock;
+    }
+    builder.terminate(new EirBranch(condition, thenBlock, elseTarget));
+    builder.moveTo(thenBlock);
+    lowerBlock(lowering, conditional.thenBranch());
+    if (!lowering.failed() && !builder.terminated()) {
+        builder.terminate(new EirJump(merge));
+    }
+    if (elseClause != null && !lowering.failed()) {
+        builder.moveTo(elseBlock);
+        switch (elseClause.body()) {
+            is BlockNode block -> {
+                lowerBlock(lowering, block);
+            },
+            is IfStatementNode chained -> {
+                lowerIf(lowering, chained);
+            },
+            default -> {
+                lowering.unsupported("this else form", conditional.span());
+            },
+        }
+        if (!lowering.failed() && !builder.terminated()) {
+            builder.terminate(new EirJump(merge));
+        }
+    }
+    if (!lowering.failed()) {
+        builder.moveTo(merge);
+    }
+}
+
+lowerWhile(LoweringContext lowering, WhileStatementNode loop) {
+    let builder = lowering.builder();
+    long conditionBlock = builder.newBlock("while.cond");
+    builder.terminate(new EirJump(conditionBlock));
+    builder.moveTo(conditionBlock);
+    long condition = expressions.lower(lowering, loop.condition());
+    if (condition < 0) {
+        return;
+    }
+    long body = builder.newBlock("while.body");
+    long exit = builder.newBlock("while.end");
+    builder.terminate(new EirBranch(condition, body, exit));
+    lowering.pushLoop(exit, conditionBlock);
+    builder.moveTo(body);
+    lowerBlock(lowering, loop.body());
+    if (!lowering.failed() && !builder.terminated()) {
+        builder.terminate(new EirJump(conditionBlock));
+    }
+    lowering.popLoop();
+    if (!lowering.failed()) {
+        builder.moveTo(exit);
+    }
+}
+
+lowerFor(LoweringContext lowering, ForStatementNode loop) {
+    let builder = lowering.builder();
+    let initializer = loop.initializer();
+    if (initializer != null) {
+        switch (initializer) {
+            is VariableDeclarationNode declaration -> {
+                lowerVariableDeclaration(lowering, declaration);
+            },
+            is ExpressionStatementNode expression -> {
+                let ignored = expressions.lower(lowering, expression.expression());
+            },
+            default -> {
+                lowering.unsupported("this loop initializer", loop.span());
+            },
+        }
+    }
+    if (lowering.failed()) {
+        return;
+    }
+    long conditionBlock = builder.newBlock("for.cond");
+    builder.terminate(new EirJump(conditionBlock));
+    builder.moveTo(conditionBlock);
+    let condition = loop.condition();
+    long conditionValue = -1;
+    if (condition != null) {
+        conditionValue = expressions.lower(lowering, condition);
+    } else {
+        let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+        conditionValue = builder.newTemp(boolType);
+        builder.append(new EirConstBool(conditionValue, boolType, true));
+    }
+    if (conditionValue < 0) {
+        return;
+    }
+    long body = builder.newBlock("for.body");
+    let update = loop.update();
+    long updateBlock = -1;
+    if (update != null) {
+        updateBlock = builder.newBlock("for.update");
+    }
+    long exit = builder.newBlock("for.end");
+    builder.terminate(new EirBranch(conditionValue, body, exit));
+    long continueTarget = conditionBlock;
+    if (updateBlock >= 0) {
+        continueTarget = updateBlock;
+    }
+    lowering.pushLoop(exit, continueTarget);
+    builder.moveTo(body);
+    lowerBlock(lowering, loop.body());
+    if (!lowering.failed() && !builder.terminated()) {
+        builder.terminate(new EirJump(continueTarget));
+    }
+    lowering.popLoop();
+    if (update != null && !lowering.failed()) {
+        builder.moveTo(updateBlock);
+        let ignored = expressions.lower(lowering, update);
+        if (!lowering.failed() && !builder.terminated()) {
+            builder.terminate(new EirJump(conditionBlock));
+        }
+    }
+    if (!lowering.failed()) {
+        builder.moveTo(exit);
+    }
+}
+
+lowerReturn(LoweringContext lowering, ReturnStatementNode returned) {
+    let value = returned.value();
+    if (value == null) {
+        lowering.builder().terminate(new EirReturn(-1));
+        return;
+    }
+    long temp = expressions.lowerConverted(lowering, value,
+        lowering.info().signature().returnType());
+    if (temp < 0) {
+        return;
+    }
+    lowering.builder().terminate(new EirReturn(temp));
+}
+
+lowerExpressionStatement(LoweringContext lowering, ExpressionStatementNode statement) {
+    let expression = statement.expression();
+    let ignored = expressions.lower(lowering, expression);
+    if (lowering.failed()) {
+        return;
+    }
+    if (expression is CallExpressionNode) {
+        let callee = calls.calleeSignatureOf(lowering, expression);
+        if (callee != null && callee.isNoreturn()) {
+            lowering.builder().terminate(new EirUnreachable());
+        }
+    }
+}

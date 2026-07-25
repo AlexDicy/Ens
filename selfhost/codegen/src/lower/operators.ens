@@ -1,0 +1,296 @@
+// Unary and binary operator lowering, including '++' and '--' on slot-backed locations. Both
+// operands of an arithmetic, comparison, or bitwise operator are converted to one common type
+// first; '&&' and '||' branch instead and merge their result through a slot.
+import Expression from @ens.frontend.syntax.generated.nodes;
+import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import PrefixExpressionNode from @ens.frontend.syntax.generated.nodes;
+import PostfixExpressionNode from @ens.frontend.syntax.generated.nodes;
+import BinaryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxKind from @ens.frontend.syntax.generated.kind;
+import Span from @ens.frontend.support.source;
+import Type from @ens.sema.model.types;
+import @ens.sema.model.types;
+import EirBinaryOp from eir.model;
+import EirUnaryOp from eir.model;
+import EirBinary from eir.model;
+import EirUnary from eir.model;
+import EirConstInt from eir.model;
+import EirConstFloat from eir.model;
+import EirLoadSlot from eir.model;
+import EirStoreSlot from eir.model;
+import EirJump from eir.model;
+import EirBranch from eir.model;
+import LoweringContext from lower.context;
+import lower.expressions;
+import support.primitives;
+
+public lowerPrefix(LoweringContext lowering, PrefixExpressionNode prefix) -> long {
+    let builder = lowering.builder();
+    switch (prefix.operator().kind()) {
+        Minus -> {
+            long operand = expressions.lower(lowering, prefix.operand());
+            if (operand < 0) {
+                return -1;
+            }
+            let type = builder.tempType(operand);
+            let op = EirUnaryOp.Neg;
+            if (primitives.isFloatType(type)) {
+                op = EirUnaryOp.FloatNeg;
+            }
+            long temp = builder.newTemp(type);
+            builder.append(new EirUnary(temp, type, op, operand));
+            return temp;
+        },
+        Plus -> {
+            return expressions.lower(lowering, prefix.operand());
+        },
+        Exclamation -> {
+            long operand = expressions.lower(lowering, prefix.operand());
+            if (operand < 0) {
+                return -1;
+            }
+            let type = builder.tempType(operand);
+            long temp = builder.newTemp(type);
+            builder.append(new EirUnary(temp, type, EirUnaryOp.Not, operand));
+            return temp;
+        },
+        PlusPlus, MinusMinus -> {
+            return lowerIncrement(lowering, prefix.operand(),
+                prefix.operator().kind() == SyntaxKind.PlusPlus, true, prefix.span());
+        },
+        default -> {
+            lowering.unsupported("this prefix operator", prefix.span());
+            return -1;
+        },
+    }
+}
+
+public lowerPostfix(LoweringContext lowering, PostfixExpressionNode postfix) -> long {
+    return lowerIncrement(lowering, postfix.operand(),
+        postfix.operator().kind() == SyntaxKind.PlusPlus, false, postfix.span());
+}
+
+// '++'/'--' on a slot-backed location: load once, add or subtract one, store back. The
+// expression's value is the new value for the prefix form and the old one for postfix.
+lowerIncrement(LoweringContext lowering, Expression operand, bool isIncrement, bool isPrefix,
+               Span span) -> long {
+    if (!(operand is IdentifierExpressionNode)) {
+        lowering.unsupported("'++' or '--' on this target", span);
+        return -1;
+    }
+    let binding = lowering.result().bindingOf(operand.green());
+    if (binding == null) {
+        lowering.internalError("increment target has no binding", span);
+        return -1;
+    }
+    let slot = lowering.slotFor(binding);
+    if (slot == null) {
+        lowering.internalError("increment target has no storage slot", span);
+        return -1;
+    }
+    let builder = lowering.builder();
+    let type = binding.type();
+    long oldValue = builder.newTemp(type);
+    builder.append(new EirLoadSlot(oldValue, type, slot));
+    long one = builder.newTemp(type);
+    bool isFloat = primitives.isFloatType(type);
+    if (isFloat) {
+        builder.append(new EirConstFloat(one, type, 1.0, "1"));
+    } else {
+        builder.append(new EirConstInt(one, type, 1));
+    }
+    let op = EirBinaryOp.Add;
+    if (isIncrement && isFloat) {
+        op = EirBinaryOp.FloatAdd;
+    } else if (!isIncrement && isFloat) {
+        op = EirBinaryOp.FloatSub;
+    } else if (!isIncrement) {
+        op = EirBinaryOp.Sub;
+    }
+    long newValue = builder.newTemp(type);
+    builder.append(new EirBinary(newValue, type, op, oldValue, one));
+    builder.append(new EirStoreSlot(slot, newValue));
+    if (isPrefix) {
+        return newValue;
+    }
+    return oldValue;
+}
+
+public lowerBinary(LoweringContext lowering, BinaryExpressionNode binary) -> long {
+    SyntaxKind operator = binary.operator().kind();
+    if (operator == SyntaxKind.AmpersandAmpersand || operator == SyntaxKind.PipePipe) {
+        return lowerShortCircuit(lowering, binary, operator == SyntaxKind.AmpersandAmpersand);
+    }
+    let resultType = lowering.typeOf(binary);
+    if (resultType == null) {
+        return -1;
+    }
+    switch (operator) {
+        Plus, Minus, Star, Slash, Percent -> {
+            return lowerArithmetic(lowering, binary, operator, resultType);
+        },
+        EqualsEquals, NotEquals, Less, Greater, LessEquals, GreaterEquals -> {
+            return lowerComparison(lowering, binary, operator, resultType);
+        },
+        Ampersand, Pipe, Caret, LessLess, GreaterGreater, GreaterGreaterGreater -> {
+            return lowerBitwise(lowering, binary, operator, resultType);
+        },
+        default -> {
+            lowering.unsupported("this operator", binary.span());
+            return -1;
+        },
+    }
+}
+
+lowerArithmetic(LoweringContext lowering, BinaryExpressionNode binary, SyntaxKind operator,
+                Type resultType) -> long {
+    if (!lowering.supportsValueType(resultType) || primitives.isBoolType(resultType)) {
+        lowering.unsupported("arithmetic on '{types.display(resultType)}'", binary.span());
+        return -1;
+    }
+    long left = expressions.lowerConverted(lowering, binary.left(), resultType);
+    long right = expressions.lowerConverted(lowering, binary.right(), resultType);
+    if (left < 0 || right < 0) {
+        return -1;
+    }
+    bool isFloat = primitives.isFloatType(resultType);
+    bool isSigned = primitives.isSignedType(resultType);
+    let op = switch (operator) {
+        Plus -> isFloat ? EirBinaryOp.FloatAdd : EirBinaryOp.Add,
+        Minus -> isFloat ? EirBinaryOp.FloatSub : EirBinaryOp.Sub,
+        Star -> isFloat ? EirBinaryOp.FloatMul : EirBinaryOp.Mul,
+        Slash -> isFloat ? EirBinaryOp.FloatDiv
+            : (isSigned ? EirBinaryOp.DivSigned : EirBinaryOp.DivUnsigned),
+        default -> isFloat ? EirBinaryOp.FloatRem
+            : (isSigned ? EirBinaryOp.RemSigned : EirBinaryOp.RemUnsigned),
+    };
+    let builder = lowering.builder();
+    long temp = builder.newTemp(resultType);
+    builder.append(new EirBinary(temp, resultType, op, left, right));
+    return temp;
+}
+
+lowerComparison(LoweringContext lowering, BinaryExpressionNode binary, SyntaxKind operator,
+                Type resultType) -> long {
+    let leftType = lowering.typeOf(binary.left());
+    let rightType = lowering.typeOf(binary.right());
+    if (leftType == null || rightType == null) {
+        return -1;
+    }
+    let common = commonOperandType(lowering, leftType, rightType);
+    if (common == null) {
+        lowering.unsupported("comparing '{types.display(leftType)}' with "
+            + "'{types.display(rightType)}'", binary.span());
+        return -1;
+    }
+    long left = expressions.lowerConverted(lowering, binary.left(), common);
+    long right = expressions.lowerConverted(lowering, binary.right(), common);
+    if (left < 0 || right < 0) {
+        return -1;
+    }
+    bool isFloat = primitives.isFloatType(common);
+    bool isSigned = primitives.isSignedType(common);
+    let op = switch (operator) {
+        EqualsEquals -> isFloat ? EirBinaryOp.FloatCmpEq : EirBinaryOp.CmpEq,
+        NotEquals -> isFloat ? EirBinaryOp.FloatCmpNe : EirBinaryOp.CmpNe,
+        Less -> isFloat ? EirBinaryOp.FloatCmpLt
+            : (isSigned ? EirBinaryOp.CmpLtSigned : EirBinaryOp.CmpLtUnsigned),
+        LessEquals -> isFloat ? EirBinaryOp.FloatCmpLe
+            : (isSigned ? EirBinaryOp.CmpLeSigned : EirBinaryOp.CmpLeUnsigned),
+        Greater -> isFloat ? EirBinaryOp.FloatCmpGt
+            : (isSigned ? EirBinaryOp.CmpGtSigned : EirBinaryOp.CmpGtUnsigned),
+        default -> isFloat ? EirBinaryOp.FloatCmpGe
+            : (isSigned ? EirBinaryOp.CmpGeSigned : EirBinaryOp.CmpGeUnsigned),
+    };
+    let builder = lowering.builder();
+    long temp = builder.newTemp(resultType);
+    builder.append(new EirBinary(temp, resultType, op, left, right));
+    return temp;
+}
+
+// The type both comparison operands convert to: the same type, or the wider one when one side
+// widens losslessly into the other. Equality over two bools compares directly.
+commonOperandType(LoweringContext lowering, Type left, Type right) -> Type? {
+    if (left == right) {
+        if (lowering.supportsValueType(left)) {
+            return left;
+        }
+        return null;
+    }
+    if (!primitives.isNumericType(left) || !primitives.isNumericType(right)) {
+        return null;
+    }
+    if (types.widensTo(left, right)) {
+        return right;
+    }
+    if (types.widensTo(right, left)) {
+        return left;
+    }
+    return null;
+}
+
+lowerBitwise(LoweringContext lowering, BinaryExpressionNode binary, SyntaxKind operator,
+             Type resultType) -> long {
+    if (!primitives.isIntegerType(resultType)) {
+        lowering.unsupported("bitwise operations on '{types.display(resultType)}'",
+            binary.span());
+        return -1;
+    }
+    long left = expressions.lowerConverted(lowering, binary.left(), resultType);
+    long right = expressions.lowerConverted(lowering, binary.right(), resultType);
+    if (left < 0 || right < 0) {
+        return -1;
+    }
+    bool isSigned = primitives.isSignedType(resultType);
+    let op = switch (operator) {
+        Ampersand -> EirBinaryOp.And,
+        Pipe -> EirBinaryOp.Or,
+        Caret -> EirBinaryOp.Xor,
+        LessLess -> EirBinaryOp.ShiftLeft,
+        GreaterGreater -> isSigned ? EirBinaryOp.ShiftRightSigned
+            : EirBinaryOp.ShiftRightUnsigned,
+        default -> EirBinaryOp.ShiftRightUnsigned,
+    };
+    let builder = lowering.builder();
+    long temp = builder.newTemp(resultType);
+    builder.append(new EirBinary(temp, resultType, op, left, right));
+    return temp;
+}
+
+// '&&' and '||' evaluate the right side only when the left has not decided the result, so the
+// merged value travels through a slot written on both paths.
+lowerShortCircuit(LoweringContext lowering, BinaryExpressionNode binary, bool isAnd) -> long {
+    let resultType = lowering.typeOf(binary);
+    if (resultType == null) {
+        return -1;
+    }
+    long left = expressions.lower(lowering, binary.left());
+    if (left < 0) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    long slot = builder.addSlot("logical", resultType);
+    builder.append(new EirStoreSlot(slot, left));
+    string prefix = "or";
+    if (isAnd) {
+        prefix = "and";
+    }
+    long rightBlock = builder.newBlock("{prefix}.rhs");
+    long merge = builder.newBlock("{prefix}.end");
+    if (isAnd) {
+        builder.terminate(new EirBranch(left, rightBlock, merge));
+    } else {
+        builder.terminate(new EirBranch(left, merge, rightBlock));
+    }
+    builder.moveTo(rightBlock);
+    long right = expressions.lower(lowering, binary.right());
+    if (right < 0) {
+        return -1;
+    }
+    builder.append(new EirStoreSlot(slot, right));
+    builder.terminate(new EirJump(merge));
+    builder.moveTo(merge);
+    long temp = builder.newTemp(resultType);
+    builder.append(new EirLoadSlot(temp, resultType, slot));
+    return temp;
+}
