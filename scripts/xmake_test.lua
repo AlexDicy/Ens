@@ -198,6 +198,17 @@ task("test")
             })
         end
 
+        -- the ens.llvm binding's own unit tests: build small LLVM modules through the binding and
+        -- assert the LLVM verifier accepts them. They link the native LLVM-C library, so the job
+        -- points the linker and loader at the local LLVM package the same way codegencheck does.
+        if want("selfhost_llvm") then
+            table.insert(jobs, {
+                name = "selfhost_llvm",
+                llvm_tests = true,
+                source = path.join(os.projectdir(), "selfhost", "llvm"),
+            })
+        end
+
         -- surface any requested names that matched no test, so typos don't pass silently.
         if wanted ~= nil then
             local unknown = {}
@@ -495,6 +506,73 @@ task("test")
             end
             return {name = name, ok = false,
                 short = string.format("harness exit %s", tostring(run_rc)),
+                full = string.format("%s:\n%s", name, out)}
+        end
+
+        -- the ens.llvm binding's unit tests. They link the native LLVM-C library, so the build
+        -- needs the LLVM library on the linker path and the run needs it loadable, set up the same
+        -- way as the codegen harness.
+        local function run_llvm_tests(job)
+            local name = job.name
+            local on_windows = is_host("windows")
+            local log = path.join(out_dir, name .. ".log")
+            local packages = path.join(global.directory(), "packages", "l")
+            local llvm_lib, llvm_bin, looked
+            if on_windows then
+                looked = "bin/LLVM-C.dll with lib/LLVM-C.lib"
+                for _, dll in ipairs(os.files(path.join(packages, "*", "*", "*", "bin",
+                        "LLVM-C.dll"))) do
+                    local bindir = path.directory(dll)
+                    local libdir = path.join(path.directory(bindir), "lib")
+                    if os.isfile(path.join(libdir, "LLVM-C.lib")) then
+                        llvm_bin = bindir
+                        llvm_lib = libdir
+                        break
+                    end
+                end
+            else
+                local pattern = is_host("macosx") and "libLLVM*.dylib" or "libLLVM*.so*"
+                looked = "lib/" .. pattern
+                local matches = os.files(path.join(packages, "*", "*", "*", "lib", pattern))
+                table.sort(matches)
+                if #matches > 0 then
+                    llvm_lib = path.directory(matches[1])
+                end
+            end
+            if not llvm_lib then
+                return {name = name, ok = false, short = "no LLVM library",
+                    full = string.format("%s: could not find %s under %s; install the LLVM "
+                        .. "package the compiler builds against", name, looked, packages)}
+            end
+            local env = os.getenvs()
+            if on_windows then
+                local msvc = toolchain.load("msvc", {plat = plat, arch = arch})
+                local msvc_lib = ""
+                if msvc then
+                    local envs = msvc:runenvs()
+                    if envs and envs.LIB then msvc_lib = envs.LIB end
+                end
+                env.LIB = msvc_lib .. ";" .. llvm_lib
+                env.PATH = llvm_bin .. ";" .. (env.PATH or "")
+            else
+                local function prepend(current, dir)
+                    if current and #current > 0 then return dir .. ":" .. current end
+                    return dir
+                end
+                env.LIBRARY_PATH = prepend(env.LIBRARY_PATH, llvm_lib)
+                if is_host("macosx") then
+                    env.DYLD_LIBRARY_PATH = prepend(env.DYLD_LIBRARY_PATH, llvm_lib)
+                else
+                    env.LD_LIBRARY_PATH = prepend(env.LD_LIBRARY_PATH, llvm_lib)
+                end
+            end
+            local run_rc = execMerged(ens_exe, {"test", job.source}, log, {envs = env})
+            local out = (io.readfile(log) or ""):gsub("[\r\n]+$", "")
+            if run_rc == 0 then
+                return {name = name, ok = true, note = out:match("(%d+/%d+ tests passed)")}
+            end
+            return {name = name, ok = false,
+                short = string.format("ens test exit %s", tostring(run_rc)),
                 full = string.format("%s:\n%s", name, out)}
         end
 
@@ -1318,6 +1396,7 @@ task("test")
             if job.cli_git then return run_cli_git(job) end
             if job.cli_artifact then return run_cli_artifact(job) end
             if job.codegencheck then return run_codegencheck(job) end
+            if job.llvm_tests then return run_llvm_tests(job) end
             local name = job.name
             local ens_file = job.ens_file
             local exe_file    = path.join(out_dir, name .. ".exe")
