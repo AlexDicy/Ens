@@ -500,6 +500,24 @@ bool Compiler::compile(const fs::path& source,
     printWorkspaceNotices(registry);
     if (!printWorkspaceErrors(registry)) return false;
 
+    // A single .ens file compiles as a single-file program: the file is the program's main
+    // module regardless of its name. The natural path stays as an alias so an import chain
+    // that leads back to the entry file resolves to the same module.
+    if (!fs::is_directory(source)) {
+        std::u16string natural = modulePathOfRelative(fs::relative(source, sourceRoot));
+        if (natural != u"main") {
+            if (byPath.count(u"main")) {
+                std::cerr << "ERROR: " << fs::absolute(source).string() << " is compiled as "
+                          << "the module 'main', but the program also loads a different "
+                          << "module named 'main'; rename one of the files.\n";
+                return false;
+            }
+            Module* entry = byPath.at(natural);
+            entry->modulePath = u"main";
+            byPath.emplace(u"main", entry);
+        }
+    }
+
     insertPreludeModule(modules, byPath);
 
     TypeContext sharedCtx;

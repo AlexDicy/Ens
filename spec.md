@@ -324,6 +324,9 @@ Importing a function by name (`import configure from engine.renderer;`) is an er
 
 Two modules may import each other: circular imports are allowed, and declarations resolve across the cycle like any other import.
 
+A program's entry point is the top-level function `main` in its **main module**: `src/main.ens` for a package or a folder of sources, or the compiled file itself for a single-file program.
+No other module may define a top-level `main`; the compiler rejects one wherever it is loaded from, including through an import of another package's main module.
+
 Importing from packages follows the format `@packageorg.packagename.path`.
 
 ```ens
@@ -362,6 +365,7 @@ package alex.jsonkit {
 ```
 
 A package's sources live in its `src/` folder, with its tests in a sibling `tests/` folder.
+A package whose `src/main.ens` defines `main()` is an application and builds to an executable; a package without one is a library.
 Every package declares `ens`, the language version it is written for as major.minor; `version`, the package's own version in dotted numerals, is optional.
 Both are informational today: nothing gates on their values yet.
 Each `dependency` declares a package this one may import with `@`: the leading segments of an `@` import select the dependency with the longest matching name, and the remaining segments name the module inside it.

@@ -89,7 +89,8 @@ struct Analyzer::PreludeData {
 Analyzer::Analyzer(const SourceFile& src, DiagnosticSink& s)
     : source(src), sink(s),
       ownedTypeCtx(std::make_unique<TypeContext>()),
-      typeCtx(*ownedTypeCtx) {
+      typeCtx(*ownedTypeCtx),
+      modulePath_(u"main") {
     auto scope = std::make_unique<Scope>(nullptr);
     globalScope = scope.get();
     currentScope = globalScope;
@@ -1835,8 +1836,17 @@ void Analyzer::finalizeClassHierarchy(const std::vector<StructInfo*>& classes) {
 }
 
 void Analyzer::collectFunctions(const ast::SourceFile& file) {
+    // Compiler-owned modules ($prelude, $ens_test_runner) are exempt from the
+    // entry-point placement rule.
+    bool mayDefineMain = modulePath_ == u"main" ||
+                         (!modulePath_.empty() && modulePath_[0] == u'$');
     for (auto& fn : file.functions()) {
         auto fname = fn.nameText().value_or(std::u16string{});
+        if (fname == u"main" && !mayDefineMain) {
+            errorAtNode(fn.node, "Function 'main' is the program entry point and may only be "
+                "defined in the main module (src/main.ens); module '" + asciiOf(modulePath_) +
+                "' cannot define it.");
+        }
         uint32_t fPos = fn.nameToken() ? fn.nameToken()->startOffset() : fn.node.startOffset();
         Symbol* sym = makeSymbol(SymbolKind::Function, fname, nullptr, fPos);
         sym->funcDeclCst = fn.node.greenNode();

@@ -241,17 +241,22 @@ task("test")
             -- enumerate the program units.
             local function slashed(p) return (p:gsub("\\", "/")) end
             local lines = {"stdlib " .. slashed(path.join(os.projectdir(), "libs"))}
-            local function add_unit(label, source, seeds)
+            local function add_unit(label, source, seeds, entry)
                 table.insert(lines, "unit " .. label)
                 table.insert(lines, "source " .. slashed(source))
+                if entry then
+                    table.insert(lines, "entry " .. entry)
+                end
                 for _, seed in ipairs(seeds) do
                     table.insert(lines, "seed " .. seed)
                 end
             end
+            -- a single .ens file is compiled as a single-file program: the file itself is the
+            -- program's main module regardless of its name, matching the driver.
             local singles = os.files(path.join(tests_dir, "*.ens"))
             table.sort(singles)
             for _, f in ipairs(singles) do
-                add_unit("tests/" .. path.filename(f), tests_dir, {path.filename(f)})
+                add_unit("tests/" .. path.filename(f), tests_dir, {}, path.filename(f))
             end
             local folders = os.dirs(path.join(tests_dir, "*"))
             table.sort(folders)
