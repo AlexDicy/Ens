@@ -166,7 +166,7 @@ fs::path findStdlibRoot() {
     if (ec) return fs::path();
     for (fs::path d = dir;; d = d.parent_path()) {
         fs::path libs = d / "libs";
-        if (fs::exists(libs / "std" / "system.ens", ec)) return libs;
+        if (fs::exists(libs / "std" / "ens.package", ec)) return libs;
         if (d == d.parent_path()) break;
     }
     return fs::path();
@@ -214,10 +214,6 @@ bool buildModuleGraphFromSeeds(Workspace& root,
                                std::vector<std::unique_ptr<Module>>& modulesOut,
                                std::unordered_map<std::u16string, Module*>& byPath,
                                const SourceOverrides* overrides) {
-    // The standard library workspace: its modules keep their full `std.*` path and live
-    // directly under the stdlib root. `@std` is built in and never declared as a dependency.
-    Workspace& stdWs = registry.getOrLoadStdlib(stdlibRoot);
-
     struct WorkItem {
         Workspace* ws;
         fs::path base;             // folder the relative path is under
@@ -278,9 +274,21 @@ bool buildModuleGraphFromSeeds(Workspace& root,
 
             if (imp.isPackage()) {
                 if (segs.front() == u"std") {
-                    targetWs = &stdWs;
-                    base = stdlibRoot;
-                    targetRel = relativeFromModulePath(modPath);
+                    // `@std` is implicitly available to every package; the standard library
+                    // itself is an ordinary package under the stdlib root.
+                    if (stdlibRoot.empty()) {
+                        reportAt("Cannot find the standard library. Set ENS_STDLIB to the "
+                            "directory containing 'std/' (normally <repo>/libs).");
+                        continue;
+                    }
+                    if (segs.size() == 1) {
+                        reportAt("Import a module within package 'std', not the package "
+                            "itself.");
+                        continue;
+                    }
+                    targetWs = registry.getOrLoad(stdlibRoot / "std", u"std");
+                    base = targetWs->srcRoot;
+                    targetRel = relativeFromModulePath(joinSegments(segs, 1, segs.size()));
                     canonical = modPath;
                 } else {
                     auto match = matchPackage(ws.deps, segs);
@@ -343,7 +351,7 @@ bool buildModuleGraphFromSeeds(Workspace& root,
             bool haveOverride = overrides && !absolute.empty() &&
                 overrides->count(overrideKey(absolute)) > 0;
             if (base.empty() || (!haveOverride && !fs::exists(absolute))) {
-                if (targetWs == &stdWs) {
+                if (targetWs && targetWs->packagePrefix == u"std") {
                     reportAt("Cannot find standard library module '" + asAscii(modPath) +
                         "'. Set ENS_STDLIB to the directory containing 'std/' (normally <repo>/libs).");
                 } else {

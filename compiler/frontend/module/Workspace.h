@@ -80,11 +80,6 @@ public:
     // registry keeps the prefix it was first given.
     Workspace* getOrLoad(const fs::path& folder, const std::u16string& prefix);
 
-    // The standard library's workspace: its modules keep their full `std.*` paths and live
-    // directly under `stdlibRoot`; its manifest, when present, sits at
-    // `stdlibRoot/std/ens.package`.
-    Workspace& getOrLoadStdlib(const fs::path& stdlibRoot);
-
     // Every native library declared by a manifest loaded into this build.
     std::vector<CollectedNative> collectNatives() const;
 

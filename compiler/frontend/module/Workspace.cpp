@@ -322,26 +322,6 @@ Workspace* WorkspaceRegistry::getOrLoad(const fs::path& folder, const std::u16st
     return &ws;
 }
 
-Workspace& WorkspaceRegistry::getOrLoadStdlib(const fs::path& stdlibRoot) {
-    std::string key = "std|" + canonicalFolderKey(stdlibRoot);
-    auto it = byFolder_.find(key);
-    if (it != byFolder_.end()) return *it->second;
-
-    Workspace& ws = create(stdlibRoot, stdlibRoot, /*testsRoot=*/{}, u"std");
-    byFolder_.emplace(std::move(key), &ws);
-    if (stdlibRoot.empty()) return ws;
-
-    fs::path manifestFile = stdlibRoot / "std" / "ens.package";
-    std::error_code ec;
-    if (!fs::exists(manifestFile, ec)) return ws;
-    ws.manifestPath = manifestFile.string();
-    const Manifest& manifest = manifestFor(manifestFile);
-    if (manifest.form == ManifestForm::Package) {
-        applyPackageManifest(ws, manifest);
-    }
-    return ws;
-}
-
 std::vector<CollectedNative> WorkspaceRegistry::collectNatives() const {
     std::vector<CollectedNative> collected;
     for (const auto& ws : owned_) {
