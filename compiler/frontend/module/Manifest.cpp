@@ -5,6 +5,7 @@
 #include <iterator>
 #include <optional>
 
+#include "Version.h"
 #include "diagnostics/DiagnosticSink.h"
 #include "parser/Tokenizer.h"
 #include "semantic/Literals.h"
@@ -527,8 +528,8 @@ void validateManifest(const Manifest& manifest, const std::string& path,
     if (manifest.form == ManifestForm::Package && !manifest.hasEnsVersion &&
         !manifest.packageName.empty()) {
         errors.push_back(path + ": Package '" + manifest.packageName + "' does not declare "
-                         "the language version it is written for; add 'ens \"0.1\";' to the "
-                         "package declaration.");
+                         "the language version it is written for; add 'ens \"" +
+                         std::string(kToolchainVersion) + "\";' to the package declaration.");
     }
     if (manifest.hasEnsVersion && !isValidEnsVersionText(manifest.ensVersion)) {
         errors.push_back(path + ": The language version '" + manifest.ensVersion + "' is not "

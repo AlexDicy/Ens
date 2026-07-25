@@ -1,23 +1,38 @@
 #pragma once
 #include <filesystem>
 #include <istream>
-#include <optional>
 #include <string>
-#include <vector>
 
 class Compiler {
 public:
-    static bool compile(const std::filesystem::path& source,
-                        const std::filesystem::path& outputFolder,
-                        const std::filesystem::path& sourcePath,
-                        bool explainArc = false,
-                        const std::string& targetTriple = "");
+    enum class BuildOutcome { Failed, BuiltExecutable, ValidatedLibrary };
 
-    static bool compileSingle(std::istream& source,
-                              const std::filesystem::path& outputFile,
-                              const std::string& filename,
-                              bool explainArc = false,
-                              const std::string& targetTriple = "");
+    struct BuildResult {
+        BuildOutcome outcome = BuildOutcome::Failed;
+        std::filesystem::path executable;
+    };
+
+    // Compiles `source`, a single .ens file or a folder of sources (a package's src/). A
+    // program whose main module defines main() links an executable: `outputFile` when given,
+    // else `defaultName` plus the target's executable suffix, in the current folder. A program
+    // without an entry point is a library: the full pipeline runs, including codegen, and no
+    // artifact is kept; a non-empty `outputFile` is then an error. A non-empty `overridesRoot`
+    // names the folder whose ens.overrides governs the build (the workspace root when it
+    // builds its members); by default the source's own workspace root does.
+    static BuildResult build(const std::filesystem::path& source,
+                             const std::filesystem::path& outputFile,
+                             const std::string& defaultName,
+                             bool explainArc = false,
+                             const std::string& targetTriple = "",
+                             const std::filesystem::path& overridesRoot = {});
+
+    // Front end and semantic analysis only: prints diagnostics and generates nothing.
+    static bool check(const std::filesystem::path& source,
+                      const std::filesystem::path& overridesRoot = {});
+
+    // True when the target's main module (the file itself, or main.ens in a folder) defines a
+    // top-level main(), making the target an application.
+    static bool definesEntryPoint(const std::filesystem::path& source);
 
     static bool dumpCst(std::istream& source, const std::string& filename = "<stdin>");
     static bool analyzeCst(std::istream& source, const std::string& filename = "<stdin>");
@@ -30,10 +45,6 @@ public:
     static int test(const std::filesystem::path& sourceDir,
                     const std::filesystem::path& testsDir,
                     const std::string& filter,
-                    bool explainArc = false);
-
-private:
-    static std::vector<std::filesystem::path> getFileTree(
-        const std::filesystem::path& root,
-        const std::filesystem::path& rootPath);
+                    bool explainArc = false,
+                    const std::filesystem::path& overridesRoot = {});
 };

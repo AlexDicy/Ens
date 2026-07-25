@@ -5,7 +5,7 @@
 -- use @expect-error instead to assert the compiler reports a specific diagnostic.
 --     // @expect-error Undefined function 'testFunction'
 -- a folder test's main.ens may use @ens-test (optionally with extra arguments) to run
--- `ens test --source <folder> ...` instead of compile+run, asserting on its output.
+-- `ens test <folder> ...` instead of compile+run, asserting on its output.
 -- the token {dir} in the extra arguments expands to the folder's absolute path.
 --     // @ens-test --filter needle
 -- tests run in parallel; set ENS_TEST_JOBS to override the worker count (default: cpu count).
@@ -90,12 +90,12 @@ task("test")
             end
         end
 
-        -- the self-hosted front end's own tests run as one `ens test` job.
+        -- the self-hosted front end's own tests run as one `ens test <package>` job.
         if want("selfhost_frontend") then
             table.insert(jobs, {
                 name = "selfhost_frontend",
-                source = path.join(os.projectdir(), "selfhost", "frontend", "src"),
-                ens_test_args = {"--tests", path.join(os.projectdir(), "selfhost", "frontend", "tests")},
+                source = path.join(os.projectdir(), "selfhost", "frontend"),
+                ens_test_args = {},
             })
         end
 
@@ -103,8 +103,8 @@ task("test")
         if want("selfhost_syntaxgen") then
             table.insert(jobs, {
                 name = "selfhost_syntaxgen",
-                source = path.join(os.projectdir(), "selfhost", "syntaxgen", "src"),
-                ens_test_args = {"--tests", path.join(os.projectdir(), "selfhost", "syntaxgen", "tests")},
+                source = path.join(os.projectdir(), "selfhost", "syntaxgen"),
+                ens_test_args = {},
             })
         end
 
@@ -112,8 +112,8 @@ task("test")
         if want("selfhost_sema") then
             table.insert(jobs, {
                 name = "selfhost_sema",
-                source = path.join(os.projectdir(), "selfhost", "sema", "src"),
-                ens_test_args = {"--tests", path.join(os.projectdir(), "selfhost", "sema", "tests")},
+                source = path.join(os.projectdir(), "selfhost", "sema"),
+                ens_test_args = {},
             })
         end
 
@@ -138,6 +138,15 @@ task("test")
             })
         end
 
+        -- the driver's command-line surface: command spellings, retired flags, artifact
+        -- naming, libraries, and the hidden cst tools.
+        if want("cli_core") then
+            table.insert(jobs, {
+                name = "cli_core",
+                cli_core = true,
+            })
+        end
+
         -- surface any requested names that matched no test, so typos don't pass silently.
         if wanted ~= nil then
             local unknown = {}
@@ -153,9 +162,14 @@ task("test")
         -- run a program with stdout and stderr merged through ONE opened handle, so the two
         -- streams append in real order; redirecting both to the same path would open two
         -- handles with independent write cursors that clobber each other at equal offsets.
-        local function execMerged(program, argv, logpath)
+        -- `opt` may add os.execv options such as curdir or stdin.
+        local function execMerged(program, argv, logpath, opt)
             local logfile = io.open(logpath, "w")
-            local rc = os.execv(program, argv, {try = true, stdout = logfile, stderr = logfile})
+            local options = {try = true, stdout = logfile, stderr = logfile}
+            for key, value in pairs(opt or {}) do
+                options[key] = value
+            end
+            local rc = os.execv(program, argv, options)
             logfile:close()
             return rc
         end
@@ -170,13 +184,13 @@ task("test")
             local exe_file    = path.join(corpus_dir, "corpus.exe")
             local manifest    = path.join(corpus_dir, "manifest.txt")
             local log         = path.join(out_dir, name .. ".log")
-            local corpus_src   = path.join(os.projectdir(), "selfhost", "corpus", "src")
+            local corpus_src   = path.join(os.projectdir(), "selfhost", "corpus")
 
             if not os.isdir(corpus_dir) then
                 os.mkdir(corpus_dir)
             end
             os.tryrm(exe_file)
-            local compile_rc = execMerged(ens_exe, {"--source", corpus_src, "--output", exe_file}, log)
+            local compile_rc = execMerged(ens_exe, {"build", corpus_src, "--output", exe_file}, log)
             if not os.isfile(exe_file) then
                 return {name = name, ok = false, short = "harness build failed",
                     full = string.format("%s: harness build failed (exit %s)\n%s",
@@ -225,13 +239,13 @@ task("test")
             local exe_file  = path.join(check_dir, "semacheck.exe")
             local manifest  = path.join(check_dir, "manifest.txt")
             local log       = path.join(out_dir, name .. ".log")
-            local check_src = path.join(os.projectdir(), "selfhost", "semacheck", "src")
+            local check_src = path.join(os.projectdir(), "selfhost", "semacheck")
 
             if not os.isdir(check_dir) then
                 os.mkdir(check_dir)
             end
             os.tryrm(exe_file)
-            local compile_rc = execMerged(ens_exe, {"--source", check_src, "--output", exe_file}, log)
+            local compile_rc = execMerged(ens_exe, {"build", check_src, "--output", exe_file}, log)
             if not os.isfile(exe_file) then
                 return {name = name, ok = false, short = "harness build failed",
                     full = string.format("%s: harness build failed (exit %s)\n%s",
@@ -288,11 +302,115 @@ task("test")
                 full = string.format("%s:\n%s", name, out)}
         end
 
+        -- the driver's command-line surface, exercised end to end against real fixtures.
+        local function run_cli_core(job)
+            local name = job.name
+            local cli_dir = path.join(os.projectdir(), "build", "cli", "core")
+            os.tryrm(cli_dir)
+            os.mkdir(cli_dir)
+            local log = path.join(out_dir, name .. ".log")
+            local failures = {}
+
+            local function run(argv, opt, expected_rc, ...)
+                local rc = execMerged(ens_exe, argv, log, opt)
+                local out = io.readfile(log) or ""
+                local label = table.concat(argv, " ")
+                if expected_rc ~= nil and rc ~= expected_rc then
+                    table.insert(failures, string.format("ens %s: exit=%s expected=%s\n%s",
+                        label, tostring(rc), tostring(expected_rc), out))
+                end
+                for _, fragment in ipairs({...}) do
+                    if not out:find(fragment, 1, true) then
+                        table.insert(failures, string.format("ens %s: output missing %q\n%s",
+                            label, fragment, out))
+                    end
+                end
+                return rc, out
+            end
+
+            local function run_program(exe, expected_rc, expected_stdout)
+                if not os.isfile(exe) then
+                    table.insert(failures, string.format("expected executable %s", exe))
+                    return
+                end
+                local rc = execMerged(exe, {}, log)
+                local out = (io.readfile(log) or ""):gsub("[\r\n]+$", "")
+                if rc ~= expected_rc or out ~= expected_stdout then
+                    table.insert(failures, string.format("%s: exit=%s stdout=%q",
+                        path.filename(exe), tostring(rc), out))
+                end
+            end
+
+            local hello = path.join(tests_dir, "hello.ens")
+
+            -- version and help
+            run({"version"}, nil, 0, "ens 0.1")
+            run({"--version"}, nil, 0, "ens 0.1")
+            run({}, nil, 0, "Usage: ens <command>")
+            run({"-h"}, nil, 0, "Usage: ens <command>")
+            run({"help", "build"}, nil, 0, "--output")
+            local _, help_out = run({"help"}, nil, 0, "build")
+            if help_out:find("cst-dump", 1, true) then
+                table.insert(failures, "ens help: the hidden cst tools leaked into the help")
+            end
+
+            -- retired spellings and usage errors
+            run({"--source", hello}, nil, 2, "retired")
+            run({"--cst-dump"}, nil, 2, "ens cst-dump")
+            run({"frobnicate"}, nil, 2, "Unknown command")
+            run({"build", "--output"}, nil, 2, "needs a value")
+            run({"build", hello, "extra"}, nil, 2, "Unexpected argument")
+            run({"build", path.join(tests_dir, "no_such_place")}, nil, 2, "does not exist")
+            run({"test", "--source", tests_dir}, nil, 2, "retired")
+            run({"build"}, {curdir = cli_dir}, 2, "No ens.package manifest")
+
+            -- build a single file: explicit output, then the default name in the working folder
+            local hello_exe = path.join(cli_dir, "hello_out.exe")
+            run({"build", hello, "--output", hello_exe}, nil, 0, "Compiled successfully")
+            run_program(hello_exe, 0, "Hello, world!")
+            run({"build", hello}, {curdir = cli_dir}, 0, "Compiled successfully")
+            run_program(path.join(cli_dir, "hello.exe"), 0, "Hello, world!")
+
+            -- build a package folder: the executable is named after the package
+            run({"build", path.join(tests_dir, "pkg_import_main")}, {curdir = cli_dir},
+                0, "Compiled successfully")
+            run_program(path.join(cli_dir, "main.exe"), 0, "Hello, Ada! [acme.tools]")
+
+            -- a package without main() is a library: it validates fully, keeps no artifact,
+            -- and refuses an explicit output
+            run({"build", path.join(tests_dir, "pkg_import_dep")}, {curdir = cli_dir},
+                0, "library")
+            if os.isfile(path.join(cli_dir, "tools.exe")) then
+                table.insert(failures, "building a library left an executable behind")
+            end
+            run({"build", path.join(tests_dir, "pkg_import_dep"), "--output",
+                path.join(cli_dir, "tools.exe")}, nil, 1, "does not define main()")
+
+            -- check: no artifacts, plain success and failure
+            run({"check", hello}, nil, 0, "No problems found")
+            run({"check", path.join(tests_dir, "pkg_import_dep")}, nil, 0, "No problems found")
+            run({"check", path.join(tests_dir, "undefined_function.ens")}, nil, 1,
+                "Undefined function")
+
+            -- hidden cst tools: a path argument and stdin
+            run({"cst-dump", hello}, nil, 0, "Typed outline")
+            run({"cst-analyze", hello}, nil, 0)
+            run({"cst-dump"}, {stdin = hello}, 0, "Typed outline")
+
+            if #failures == 0 then
+                return {name = name, ok = true}
+            end
+            return {name = name, ok = false,
+                short = string.format("%d CLI assertion(s) failed", #failures),
+                full = string.format("%s:\n%s", name, table.concat(failures, "\n"))}
+        end
+
         -- run a single test: compile, optionally run, and compare against the header.
         -- returns { name = ..., ok = bool, short = <fail reason>, full = <detailed report> }.
         local function run_one(job)
             if job.corpus then return run_corpus(job) end
             if job.semacheck then return run_semacheck(job) end
+            if job.cli_core then return run_cli_core(job) end
             local name = job.name
             local ens_file = job.ens_file
             local exe_file    = path.join(out_dir, name .. ".exe")
@@ -351,7 +469,7 @@ task("test")
             -- @ens-test: invoke `ens test` on the folder and assert on its combined output.
             if ens_test_args ~= nil then
                 os.tryrm(stdout_file)
-                local argv = {"test", "--source", job.source}
+                local argv = {"test", job.source}
                 for _, a in ipairs(ens_test_args) do
                     table.insert(argv, (a:gsub("{dir}", (job.source:gsub("\\", "/")))))
                 end
@@ -370,7 +488,7 @@ task("test")
             os.tryrm(stdout_file)
 
             local compile_rc = execMerged(ens_exe,
-                {"--source", job.source, "--output", exe_file}, compile_log)
+                {"build", job.source, "--output", exe_file}, compile_log)
             local compile_log_text = io.readfile(compile_log) or ""
 
             if expected_error ~= nil then

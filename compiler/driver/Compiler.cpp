@@ -54,6 +54,25 @@ bool isTestFile(const fs::path& relativePath) {
            stem.compare(stem.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
+std::vector<fs::path> getFileTree(const fs::path& root, const fs::path& rootPath) {
+    std::vector<fs::path> files;
+
+    auto rel = fs::relative(root, rootPath);
+    bool hasSubfolder = !rel.empty() && rel != fs::path(".");
+
+    for (const auto& entry : fs::directory_iterator(root)) {
+        const auto& path = entry.path();
+        if (fs::is_directory(path)) {
+            auto sub = getFileTree(path, rootPath);
+            files.insert(files.end(), sub.begin(), sub.end());
+        } else if (fs::is_regular_file(path) && path.extension() == ".ens") {
+            files.push_back(hasSubfolder ? rel / path.filename() : path.filename());
+        }
+    }
+
+    return files;
+}
+
 void appendAscii(std::u16string& out, std::string_view ascii) {
     for (char c : ascii) out.push_back(static_cast<char16_t>(c));
 }
@@ -366,17 +385,14 @@ bool collectLinkLibraries(const WorkspaceRegistry* registry,
     return true;
 }
 
-bool linkModulesToExe(std::vector<std::unique_ptr<Module>>& modules,
-                      const fs::path& outputFile,
-                      const std::string& targetTriple,
-                      TypeContext& sharedCtx,
-                      const std::vector<std::string>& libraries) {
-    fs::path outDir = outputFile.parent_path();
-    if (outDir.empty()) outDir = fs::current_path();
-    std::string baseStem = outputFile.stem().string();
-    if (baseStem.empty()) baseStem = "ens";
-
-    std::vector<std::string> objectPaths;
+// Emits every module's object file into `outDir` (fixed-point over generic instantiations)
+// and appends the object paths to `objectPaths`.
+bool emitModulesToObjects(std::vector<std::unique_ptr<Module>>& modules,
+                          const fs::path& outDir,
+                          const std::string& baseStem,
+                          const std::string& targetTriple,
+                          TypeContext& sharedCtx,
+                          std::vector<std::string>& objectPaths) {
     objectPaths.reserve(modules.size());
     CodeGenerator::ModuleResolver resolver = makeModuleResolver(modules);
 
@@ -436,6 +452,23 @@ bool linkModulesToExe(std::vector<std::unique_ptr<Module>>& modules,
             if (pending[i]) anyPending = true;
         }
     }
+    return true;
+}
+
+bool linkModulesToExe(std::vector<std::unique_ptr<Module>>& modules,
+                      const fs::path& outputFile,
+                      const std::string& targetTriple,
+                      TypeContext& sharedCtx,
+                      const std::vector<std::string>& libraries) {
+    fs::path outDir = outputFile.parent_path();
+    if (outDir.empty()) outDir = fs::current_path();
+    std::string baseStem = outputFile.stem().string();
+    if (baseStem.empty()) baseStem = "ens";
+
+    std::vector<std::string> objectPaths;
+    if (!emitModulesToObjects(modules, outDir, baseStem, targetTriple, sharedCtx, objectPaths)) {
+        return false;
+    }
     return Linker::link(objectPaths, libraries, outputFile.string(), std::cerr, targetTriple);
 }
 
@@ -451,13 +484,15 @@ void printWorkspaceNotices(const WorkspaceRegistry& registry) {
     for (const auto& n : registry.notices()) std::cerr << "NOTE: " << n << '\n';
 }
 
-}  // namespace
+// A loaded compilation: the module graph plus the workspace registry that resolved it.
+struct LoadedProgram {
+    std::vector<std::unique_ptr<Module>> modules;
+    std::unordered_map<std::u16string, Module*> byPath;
+    WorkspaceRegistry registry;
+};
 
-bool Compiler::compile(const fs::path& source,
-                       const fs::path& outputFolder,
-                       const fs::path& /*sourcePath*/,
-                       bool explainArc,
-                       const std::string& targetTriple) {
+// Seeds and loads the module graph for `source`, a single .ens file or a folder of sources.
+bool loadProgram(const fs::path& source, const fs::path& overridesRoot, LoadedProgram& out) {
     fs::path sourceRoot = fs::is_directory(source) ? source : source.parent_path();
     // A bare file name has an empty parent; resolve it against the current
     // folder so the module paths below stay non-empty.
@@ -484,21 +519,21 @@ bool Compiler::compile(const fs::path& source,
         return false;
     }
 
-    std::vector<std::unique_ptr<Module>> modules;
-    std::unordered_map<std::u16string, Module*> byPath;
     fs::path stdlibRoot = findStdlibRoot();
 
     // The governing workspace (nearest ens.package walking up from the source) supplies
     // `@package` dependencies; its src root stays whatever was compiled here.
     fs::path workspaceRoot = discoverWorkspaceRoot(sourceRoot);
-    WorkspaceRegistry registry;
     Workspace& root = workspaceRoot.empty()
-        ? registry.defineRoot(sourceRoot, sourceRoot, {}, /*withManifest=*/false)
-        : registry.defineRoot(workspaceRoot, sourceRoot, {}, /*withManifest=*/true);
-    if (!printWorkspaceErrors(registry)) return false;
-    if (!buildModuleGraph(root, registry, stdlibRoot, seeds, modules, byPath)) return false;
-    printWorkspaceNotices(registry);
-    if (!printWorkspaceErrors(registry)) return false;
+        ? out.registry.defineRoot(sourceRoot, sourceRoot, {}, /*withManifest=*/false)
+        : out.registry.defineRoot(workspaceRoot, sourceRoot, {}, /*withManifest=*/true,
+                                  overridesRoot);
+    if (!printWorkspaceErrors(out.registry)) return false;
+    if (!buildModuleGraph(root, out.registry, stdlibRoot, seeds, out.modules, out.byPath)) {
+        return false;
+    }
+    printWorkspaceNotices(out.registry);
+    if (!printWorkspaceErrors(out.registry)) return false;
 
     // A single .ens file compiles as a single-file program: the file is the program's main
     // module regardless of its name. The natural path stays as an alias so an import chain
@@ -506,52 +541,133 @@ bool Compiler::compile(const fs::path& source,
     if (!fs::is_directory(source)) {
         std::u16string natural = modulePathOfRelative(fs::relative(source, sourceRoot));
         if (natural != u"main") {
-            if (byPath.count(u"main")) {
+            if (out.byPath.count(u"main")) {
                 std::cerr << "ERROR: " << fs::absolute(source).string() << " is compiled as "
                           << "the module 'main', but the program also loads a different "
                           << "module named 'main'; rename one of the files.\n";
                 return false;
             }
-            Module* entry = byPath.at(natural);
+            Module* entry = out.byPath.at(natural);
             entry->modulePath = u"main";
-            byPath.emplace(u"main", entry);
+            out.byPath.emplace(u"main", entry);
         }
     }
+    return true;
+}
 
-    insertPreludeModule(modules, byPath);
+bool sourceFileDefinesMain(const SyntaxNode& rootNode) {
+    auto sf = ast::SourceFile::cast(rootNode);
+    if (!sf) return false;
+    for (auto& fn : sf->functions()) {
+        if (fn.nameText().value_or(std::u16string{}) == u"main") return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+Compiler::BuildResult Compiler::build(const fs::path& source,
+                                      const fs::path& outputFile,
+                                      const std::string& defaultName,
+                                      bool explainArc,
+                                      const std::string& targetTriple,
+                                      const fs::path& overridesRoot) {
+    BuildResult result;
+    LoadedProgram program;
+    if (!loadProgram(source, overridesRoot, program)) return result;
+
+    bool isApplication = false;
+    if (auto it = program.byPath.find(u"main"); it != program.byPath.end()) {
+        isApplication = sourceFileDefinesMain(*it->second->rootNode);
+    }
+
+    insertPreludeModule(program.modules, program.byPath);
 
     TypeContext sharedCtx;
-    if (!runDriverAnalysis(modules, byPath, sharedCtx, explainArc)) return false;
-
-    std::string ext = outputFolder.extension().string();
-    for (auto& c : ext) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
-    const bool linkToExe = !outputFolder.empty() && (ext == ".exe" || ext.empty());
-
-    if (outputFolder.empty()) {
-        CodeGenerator::ModuleResolver resolver = makeModuleResolver(modules);
-        for (auto& m : modules) {
-            CodeGenerator codegen("ens_" + sanitizeForFilename(m->modulePath),
-                                  m->source->getFilename(),
-                                  *m->source, m->analyzer->result(), m->modulePath, targetTriple,
-                                  &sharedCtx, resolver);
-            if (!codegen.generate(*m->rootNode)) {
-                codegen.printDiagnostics(std::cerr);
-                return false;
-            }
-            std::cout << "--- LLVM IR (" << asciiOfU16(m->modulePath) << ") ---\n";
-            codegen.print(std::cout);
-        }
-        return true;
+    if (!runDriverAnalysis(program.modules, program.byPath, sharedCtx, explainArc)) {
+        return result;
     }
-    if (!linkToExe) {
-        std::cerr << "Multi-file compilation only supports linking to an executable; got '"
-                  << ext << "'\n";
-        return false;
+
+    if (!isApplication) {
+        if (!outputFile.empty()) {
+            std::cerr << "ERROR: " << source.string() << " does not define main() in its main "
+                      << "module, so there is no executable to produce; it builds as a "
+                      << "library.\n";
+            return result;
+        }
+        // A library validates through the full pipeline: every object file is emitted into a
+        // temporary folder and nothing is kept.
+        llvm::SmallString<128> tempDir;
+        if (llvm::sys::fs::createUniqueDirectory("ens-build", tempDir)) {
+            std::cerr << "ERROR: could not create a temporary folder for the build\n";
+            return result;
+        }
+        fs::path tempFolder(tempDir.str().str());
+        std::vector<std::string> objectPaths;
+        bool emitted = emitModulesToObjects(program.modules, tempFolder, "lib", targetTriple,
+                                            sharedCtx, objectPaths);
+        std::error_code ec;
+        fs::remove_all(tempFolder, ec);
+        if (!emitted) return result;
+        result.outcome = BuildOutcome::ValidatedLibrary;
+        return result;
+    }
+
+    fs::path exePath = outputFile;
+    if (exePath.empty()) {
+        std::string name = defaultName.empty() ? std::string("program") : defaultName;
+        if (platformOfTriple(ens::resolveTargetTriple(targetTriple)) == "windows") {
+            name += ".exe";
+        }
+        exePath = fs::current_path() / name;
+    }
+    std::string ext = exePath.extension().string();
+    for (auto& c : ext) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+    if (ext != ".exe" && !ext.empty()) {
+        std::cerr << "ERROR: the compiler produces executables; use an output name with no "
+                  << "extension or '.exe', not '" << ext << "'\n";
+        return result;
     }
 
     std::vector<std::string> libraries;
-    if (!collectLinkLibraries(&registry, modules, targetTriple, libraries)) return false;
-    return linkModulesToExe(modules, outputFolder, targetTriple, sharedCtx, libraries);
+    if (!collectLinkLibraries(&program.registry, program.modules, targetTriple, libraries)) {
+        return result;
+    }
+    if (!linkModulesToExe(program.modules, exePath, targetTriple, sharedCtx, libraries)) {
+        return result;
+    }
+    result.outcome = BuildOutcome::BuiltExecutable;
+    result.executable = exePath;
+    return result;
+}
+
+bool Compiler::check(const fs::path& source, const fs::path& overridesRoot) {
+    LoadedProgram program;
+    if (!loadProgram(source, overridesRoot, program)) return false;
+    insertPreludeModule(program.modules, program.byPath);
+
+    TypeContext sharedCtx;
+    analyzeModuleGraph(program.modules, program.byPath, sharedCtx);
+
+    bool ok = true;
+    for (auto& m : program.modules) {
+        if (m->sink->hasErrors()) {
+            m->sink->printAll(*m->source, std::cerr);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+bool Compiler::definesEntryPoint(const fs::path& source) {
+    std::error_code ec;
+    fs::path file = fs::is_directory(source, ec) ? source / "main.ens" : source;
+    if (!fs::exists(file, ec)) return false;
+    fs::path parent = file.parent_path();
+    if (parent.empty()) parent = ".";
+    auto module = loadModule(parent, file.filename(), u"main");
+    if (!module || !module->rootNode) return false;
+    return sourceFileDefinesMain(*module->rootNode);
 }
 
 namespace {
@@ -679,7 +795,8 @@ void reportAbortedRun(const std::vector<DiscoveredTest>& tests,
 }  // namespace
 
 int Compiler::test(const fs::path& sourceDir, const fs::path& testsDir,
-                   const std::string& filter, bool explainArc) {
+                   const std::string& filter, bool explainArc,
+                   const fs::path& overridesRoot) {
     std::error_code ec;
 
     // With no explicit source, discover the workspace from the current folder and run its
@@ -798,7 +915,8 @@ int Compiler::test(const fs::path& sourceDir, const fs::path& testsDir,
     WorkspaceRegistry registry;
     Workspace& root = workspaceRoot.empty()
         ? registry.defineRoot(sourceRoot, sourceRoot, testsFolder, /*withManifest=*/false)
-        : registry.defineRoot(workspaceRoot, sourceRoot, testsFolder, /*withManifest=*/true);
+        : registry.defineRoot(workspaceRoot, sourceRoot, testsFolder, /*withManifest=*/true,
+                              overridesRoot);
     if (!printWorkspaceErrors(registry)) return 2;
     if (!buildModuleGraph(root, registry, findStdlibRoot(), seeds, modules, byPath, &overrides)) {
         return 2;
@@ -898,25 +1016,6 @@ int Compiler::test(const fs::path& sourceDir, const fs::path& testsDir,
         return exitCode < 0 ? 2 : 1;
     }
     return 1;
-}
-
-std::vector<fs::path> Compiler::getFileTree(const fs::path& root, const fs::path& rootPath) {
-    std::vector<fs::path> files;
-
-    auto rel = fs::relative(root, rootPath);
-    bool hasSubfolder = !rel.empty() && rel != fs::path(".");
-
-    for (const auto& entry : fs::directory_iterator(root)) {
-        const auto& path = entry.path();
-        if (fs::is_directory(path)) {
-            auto sub = getFileTree(path, rootPath);
-            files.insert(files.end(), sub.begin(), sub.end());
-        } else if (fs::is_regular_file(path) && path.extension() == ".ens") {
-            files.push_back(hasSubfolder ? rel / path.filename() : path.filename());
-        }
-    }
-
-    return files;
 }
 
 static std::string asAscii16(std::u16string_view s) {
@@ -1024,67 +1123,4 @@ bool Compiler::analyzeCst(std::istream& source, const std::string& filename) {
         sink.printAll(sourceFile, std::cerr);
     }
     return !sink.hasErrors();
-}
-
-bool Compiler::compileSingle(std::istream& source, const fs::path& outputFile, const std::string& filename, bool explainArc, const std::string& targetTriple) {
-    std::u16string u16code;
-    if (!readStreamToU16(source, filename, u16code)) return false;
-
-    const std::u16string userPath = u"main";
-    std::vector<std::unique_ptr<Module>> modules;
-    std::unordered_map<std::u16string, Module*> byPath;
-
-    auto prelude = loadPreludeModule();
-    byPath.emplace(std::u16string(kPreludeModulePath), prelude.get());
-    modules.push_back(std::move(prelude));
-
-    auto userModule = makeInMemoryModule(userPath, filename, std::move(u16code));
-    Module* user = userModule.get();
-    byPath.emplace(userPath, user);
-    modules.push_back(std::move(userModule));
-
-    TypeContext sharedCtx;
-    if (!runDriverAnalysis(modules, byPath, sharedCtx, explainArc)) return false;
-
-    std::string ext = outputFile.extension().string();
-    for (auto& c : ext) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
-    const bool linkToExe = !outputFile.empty() && (ext == ".exe" || ext.empty());
-
-    if (linkToExe) {
-        std::vector<std::string> libraries;
-        if (!collectLinkLibraries(nullptr, modules, targetTriple, libraries)) return false;
-        return linkModulesToExe(modules, outputFile, targetTriple, sharedCtx, libraries);
-    }
-
-    CodeGenerator codegen("ens_" + sanitizeForFilename(user->modulePath),
-                          user->source->getFilename(),
-                          *user->source, user->analyzer->result(), user->modulePath, targetTriple,
-                          &sharedCtx, makeModuleResolver(modules));
-    if (!codegen.generate(*user->rootNode)) {
-        codegen.printDiagnostics(std::cerr);
-        return false;
-    }
-    if (outputFile.empty()) {
-        std::cout << "--- LLVM IR ---\n";
-        codegen.print(std::cout);
-        return true;
-    }
-    if (ext == ".ll") {
-        std::ofstream out(outputFile);
-        if (!out) {
-            std::cerr << "Could not open '" << outputFile << "' for writing\n";
-            return false;
-        }
-        codegen.print(out);
-        return true;
-    }
-    if (ext == ".obj" || ext == ".o") {
-        if (!codegen.emitObjectFile(outputFile.string())) {
-            codegen.printDiagnostics(std::cerr);
-            return false;
-        }
-        return true;
-    }
-    std::cerr << "Unsupported --output extension: '" << ext << "'\n";
-    return false;
 }

@@ -1,155 +1,385 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <stdexcept>
+#include <set>
 #include <string>
-#include <unordered_map>
+#include <vector>
+
 #include "Compiler.h"
+#include "Version.h"
+#include "module/Manifest.h"
 #include "module/Workspace.h"
 
 namespace fs = std::filesystem;
 
-static bool execute(const std::unordered_map<std::string, std::string>& arguments) {
-    if (arguments.count("--cst-dump")) {
-        if (arguments.count("--source")) {
-            fs::path source = arguments.at("--source");
-            std::ifstream file(source);
-            if (!file) {
-                std::cerr << "ERROR: Couldn't read " << fs::absolute(source).string() << '\n';
-                return false;
-            }
-            return Compiler::dumpCst(file, source.string());
-        }
-        return Compiler::dumpCst(std::cin);
-    }
-    if (arguments.count("--cst-analyze")) {
-        if (arguments.count("--source")) {
-            fs::path source = arguments.at("--source");
-            std::ifstream file(source);
-            if (!file) {
-                std::cerr << "ERROR: Couldn't read " << fs::absolute(source).string() << '\n';
-                return false;
-            }
-            return Compiler::analyzeCst(file, source.string());
-        }
-        return Compiler::analyzeCst(std::cin);
-    }
+namespace {
 
-    // --output is the output file path. Empty = print LLVM IR to stdout.
-    // The extension drives the pipeline: .ll = IR text, .obj/.o = object file,
-    // .exe (or no extension) = link to executable.
-    fs::path outputFile = arguments.count("--output") ? fs::path(arguments.at("--output")) : fs::path();
-    if (!outputFile.empty() && fs::exists(outputFile) && fs::is_directory(outputFile)) {
-        throw std::invalid_argument("The specified output is a directory; please specify a file path");
-    }
-
-    bool explainArc = arguments.count("--explain-arc") > 0;
-    std::string targetTriple = arguments.count("--target") ? arguments.at("--target") : "";
-
-    if (arguments.count("--source")) {
-        fs::path source = arguments.at("--source");
-        fs::path sourcePath = fs::is_directory(source) ? source : source.parent_path();
-        return Compiler::compile(source, outputFile, sourcePath, explainArc, targetTriple);
-    }
-
-    // No explicit source: if the current folder sits in a workspace (an ens.package
-    // walking up), compile its `src/`; otherwise read a single program from stdin.
-    fs::path workspaceRoot = ens::modules::discoverWorkspaceRoot(fs::current_path());
-    fs::path src = workspaceRoot.empty() ? fs::path() : workspaceRoot / "src";
-    if (!src.empty() && fs::is_directory(src)) {
-        return Compiler::compile(src, outputFile, src, explainArc, targetTriple);
-    }
-    return Compiler::compileSingle(std::cin, outputFile, "<stdin>", explainArc, targetTriple);
+int usageError(const std::string& message) {
+    std::cerr << "ERROR: " << message << '\n';
+    std::cerr << "Run 'ens help' for the available commands.\n";
+    return 2;
 }
 
-static bool isBooleanFlag(const std::string& arg) {
-    return arg == "-h" || arg == "--help" || arg == "--cst-dump" || arg == "--cst-analyze" || arg == "--explain-arc";
-}
+// The arguments of one subcommand: positional values, valued options, boolean flags, and
+// (for `ens run`) everything after `--`, passed to the program verbatim.
+struct ParsedCommand {
+    std::vector<std::string> positionals;
+    std::vector<std::pair<std::string, std::string>> valued;
+    std::set<std::string> flags;
+    std::vector<std::string> programArguments;
 
-static std::unordered_map<std::string, std::string> parseArguments(int argc, char* argv[]) {
-    std::unordered_map<std::string, std::string> arguments;
+    std::string option(const std::string& name) const {
+        for (const auto& [key, value] : valued) {
+            if (key == name) return value;
+        }
+        return "";
+    }
 
-    for (int i = 1; i < argc; i++) {
+    bool flag(const std::string& name) const { return flags.count(name) > 0; }
+};
+
+// Parses a subcommand's arguments. Returns 0 on success, else the exit code of the usage
+// error it reported.
+int parseCommand(int argc, char* argv[], int firstIndex,
+                 const std::set<std::string>& valuedNames,
+                 const std::set<std::string>& flagNames,
+                 size_t maxPositionals, bool allowProgramArguments,
+                 const std::string& commandName, ParsedCommand& out) {
+    for (int i = firstIndex; i < argc; i++) {
         std::string arg = argv[i];
-        if (arg[0] == '-') {
-            if (arg.size() < 2) {
-                throw std::invalid_argument("Not a valid argument: " + arg);
-            }
-            if (isBooleanFlag(arg)) {
-                arguments[arg] = "";
+        if (allowProgramArguments && arg == "--") {
+            for (int j = i + 1; j < argc; j++) out.programArguments.push_back(argv[j]);
+            return 0;
+        }
+        if (!arg.empty() && arg[0] == '-' && arg != "-") {
+            if (valuedNames.count(arg)) {
+                if (i + 1 >= argc) {
+                    return usageError("The option '" + arg + "' needs a value.");
+                }
+                out.valued.emplace_back(arg, argv[i + 1]);
+                i++;
                 continue;
             }
-            if (i + 1 >= argc) {
-                throw std::invalid_argument("Expected arg after: " + arg);
+            if (flagNames.count(arg)) {
+                out.flags.insert(arg);
+                continue;
             }
-            arguments[arg] = argv[i + 1];
-            i++;
+            if (arg == "--source") {
+                return usageError("The --source option was retired; pass the path directly, "
+                                  "for example 'ens " + commandName + " <path>'.");
+            }
+            return usageError("Unknown option '" + arg + "' for 'ens " + commandName + "'.");
         }
+        if (out.positionals.size() >= maxPositionals) {
+            return usageError("Unexpected argument '" + arg + "' for 'ens " + commandName +
+                              "'.");
+        }
+        out.positionals.push_back(arg);
     }
-    return arguments;
+    return 0;
 }
 
-// `ens test [--source <folder>] [--tests <folder>] [--filter <substring>] [--explain-arc]`:
-// discover tests, build and run them, and return the runner's exit code.
-static int runTestCommand(int argc, char* argv[]) {
-    std::unordered_map<std::string, std::string> arguments;
-    try {
-        arguments = parseArguments(argc - 1, argv + 1);
-    } catch (const std::exception& e) {
-        std::cerr << "ERROR: " << e.what() << '\n';
-        return 2;
-    }
-    for (const auto& [key, value] : arguments) {
-        if (key != "--source" && key != "--tests" && key != "--filter" && key != "--explain-arc") {
-            std::cerr << "ERROR: unknown option '" << key << "' for 'ens test'\n";
-            return 2;
-        }
-    }
-    fs::path source = arguments.count("--source") ? fs::path(arguments.at("--source")) : fs::path();
-    fs::path tests = arguments.count("--tests") ? fs::path(arguments.at("--tests")) : fs::path();
-    std::string filter = arguments.count("--filter") ? arguments.at("--filter") : "";
-    return Compiler::test(source, tests, filter, arguments.count("--explain-arc") > 0);
+std::string lastSegment(const std::string& dottedName) {
+    auto dot = dottedName.rfind('.');
+    return dot == std::string::npos ? dottedName : dottedName.substr(dot + 1);
 }
 
-int main(int argc, char* argv[]) {
-    if (argc >= 2 && std::string(argv[1]) == "test") {
-        return runTestCommand(argc, argv);
+// The resolved target of build/check/run/test: a single source (file, folder, or a package's
+// src/), or a workspace root whose members are built individually.
+struct Target {
+    bool isWorkspace = false;
+    bool isFile = false;
+    fs::path root;            // the file or folder the path resolved to
+    fs::path source;          // what the compiler consumes (file, folder, or <package>/src)
+    std::string name;         // default artifact name
+    fs::path testsFolder;     // <package>/tests when present
+    std::string packageName;  // package form only
+};
+
+// Resolves the optional path argument shared by build/check/run/test: an .ens file, a package
+// or workspace folder, or a plain folder of sources; no path discovers the nearest ens.package
+// walking up from the current folder. Returns 0 and fills `out`, or the exit code of the error
+// it reported.
+int resolveTarget(const std::vector<std::string>& positionals, const std::string& commandName,
+                  Target& out) {
+    std::error_code ec;
+    fs::path given;
+    if (!positionals.empty()) {
+        given = positionals.front();
+    } else {
+        given = ens::modules::discoverWorkspaceRoot(fs::current_path());
+        if (given.empty()) {
+            return usageError("No ens.package manifest was found here or in any parent "
+                              "folder; pass a path, for example 'ens " + commandName +
+                              " src/main.ens'.");
+        }
     }
 
-    std::unordered_map<std::string, std::string> arguments;
-    try {
-        arguments = parseArguments(argc, argv);
-    } catch (const std::exception& e) {
-        std::cerr << "ERROR: " << e.what() << '\n';
-        return 2;
+    out.root = given;
+    if (fs::is_regular_file(given, ec)) {
+        if (given.extension() != ".ens") {
+            return usageError("'" + given.string() + "' is not an .ens source file.");
+        }
+        out.isFile = true;
+        out.source = given;
+        out.name = given.stem().string();
+        return 0;
+    }
+    if (!fs::is_directory(given, ec)) {
+        return usageError("'" + given.string() + "' does not exist.");
     }
 
-    if (arguments.count("-h") || arguments.count("--help")) {
-        std::cout << "Use --source to specify the input file or folder to compile.\n";
-        std::cout << "With no --source, compiles the current workspace's src/ (nearest ens.package\n";
-        std::cout << "walking up), or reads a single program from stdin when there is no workspace.\n";
-        std::cout << "Use --output to specify the output folder\n";
-        std::cout << "Use 'ens test [--source <folder>] [--tests <folder>] [--filter <substring>]' to run tests\n";
+    fs::path manifestFile = given / "ens.package";
+    if (!fs::exists(manifestFile, ec)) {
+        out.source = given;
+        out.name = fs::absolute(given).lexically_normal().filename().string();
+        if (out.name.empty()) out.name = "program";
         return 0;
     }
 
-    bool ok = false;
-    try {
-        ok = execute(arguments);
-    } catch (const std::exception& e) {
-        std::cerr << "ERROR: " << e.what() << '\n';
+    // Manifest problems are not reported here: the build loads the manifest again through the
+    // workspace registry and reports them with the compilation.
+    std::vector<std::string> errors;
+    ens::modules::Manifest manifest = ens::modules::loadManifestFile(manifestFile, errors);
+    if (manifest.form == ens::modules::ManifestForm::Workspace) {
+        out.isWorkspace = true;
+        return 0;
+    }
+    fs::path src = given / "src";
+    if (manifest.form == ens::modules::ManifestForm::Package && fs::is_directory(src, ec)) {
+        out.source = src;
+        out.name = lastSegment(manifest.packageName);
+        out.packageName = manifest.packageName;
+        fs::path tests = given / "tests";
+        if (fs::is_directory(tests, ec)) out.testsFolder = tests;
+        return 0;
+    }
+    // A manifest folder without a src/ layout compiles its root-level sources; a malformed
+    // manifest surfaces its problems the same way.
+    out.source = given;
+    out.name = manifest.packageName.empty()
+        ? fs::absolute(given).lexically_normal().filename().string()
+        : lastSegment(manifest.packageName);
+    if (out.name.empty()) out.name = "program";
+    return 0;
+}
+
+const char kGeneralHelp[] =
+    "Ens compiler and build tool.\n"
+    "\n"
+    "Usage: ens <command> [arguments]\n"
+    "\n"
+    "Commands:\n"
+    "  build [path]     Compile a source file, a package, or a workspace's members\n"
+    "  check [path]     Look for errors without building anything\n"
+    "  test [path]      Build and run the tests\n"
+    "  version          Print the toolchain version\n"
+    "  help [command]   Show help for a command\n"
+    "\n"
+    "With no path, build/check/test use the nearest ens.package above the current folder.\n";
+
+int printHelp(const std::string& command) {
+    if (command.empty()) {
+        std::cout << kGeneralHelp;
+        return 0;
+    }
+    if (command == "build") {
+        std::cout <<
+            "Compile Ens sources.\n"
+            "\n"
+            "Usage: ens build [path] [options]\n"
+            "\n"
+            "The path is an .ens file, a package folder, or a workspace root; with no path\n"
+            "the nearest ens.package above the current folder is used. A program whose main\n"
+            "module defines main() builds an executable; one without is a library and is\n"
+            "fully compiled with no artifact kept. At a workspace root every member is built\n"
+            "in dependency order.\n"
+            "\n"
+            "Options:\n"
+            "  --output <file>    Where to put the executable (single-target builds only)\n"
+            "  --target <triple>  Cross-compile for the given LLVM target triple\n"
+            "  --explain-arc      Print what the ARC optimizer elided and why\n";
+        return 0;
+    }
+    if (command == "check") {
+        std::cout <<
+            "Look for errors without building.\n"
+            "\n"
+            "Usage: ens check [path]\n"
+            "\n"
+            "Runs the front end and semantic analysis and prints any diagnostics, but\n"
+            "generates no code. The path rules match 'ens build'; at a workspace root every\n"
+            "member is checked.\n";
+        return 0;
+    }
+    if (command == "test") {
+        std::cout <<
+            "Build and run the tests.\n"
+            "\n"
+            "Usage: ens test [path] [options]\n"
+            "\n"
+            "Discovers tests in *_test.ens files and runs them. The path rules match\n"
+            "'ens build'; at a workspace root every member's tests run.\n"
+            "\n"
+            "Options:\n"
+            "  --filter <substring>  Run only the tests whose description contains it\n"
+            "  --tests <folder>      Look for test files in this folder\n"
+            "  --explain-arc         Print what the ARC optimizer elided and why\n";
+        return 0;
+    }
+    if (command == "version") {
+        std::cout << "Print the toolchain version.\n\nUsage: ens version\n";
+        return 0;
+    }
+    if (command == "help") {
+        std::cout << "Show help for a command.\n\nUsage: ens help [command]\n";
+        return 0;
+    }
+    return usageError("Unknown command '" + command + "'.");
+}
+
+int runBuild(int argc, char* argv[]) {
+    ParsedCommand arguments;
+    int rc = parseCommand(argc, argv, 2, {"--output", "--target"}, {"--explain-arc"},
+                          1, false, "build", arguments);
+    if (rc != 0) return rc;
+
+    Target target;
+    rc = resolveTarget(arguments.positionals, "build", target);
+    if (rc != 0) return rc;
+
+    fs::path outputFile = arguments.option("--output");
+    std::string targetTriple = arguments.option("--target");
+    bool explainArc = arguments.flag("--explain-arc");
+    if (!outputFile.empty() && fs::exists(outputFile) && fs::is_directory(outputFile)) {
+        return usageError("The output '" + outputFile.string() + "' is a folder; give a "
+                          "file path.");
+    }
+
+    if (target.isWorkspace) {
+        std::cerr << "ERROR: '" << target.root.string() << "' is a workspace root; building "
+                  << "every member is not supported yet. Build a member folder instead.\n";
         return 2;
     }
-    if (arguments.count("--cst-dump") || arguments.count("--cst-analyze")) {
-        return ok ? 0 : 1;
+
+    Compiler::BuildResult result = Compiler::build(target.source, outputFile, target.name,
+                                                   explainArc, targetTriple);
+    switch (result.outcome) {
+        case Compiler::BuildOutcome::BuiltExecutable:
+            std::cout << "Compiled successfully to " << result.executable.string() << '\n';
+            return 0;
+        case Compiler::BuildOutcome::ValidatedLibrary:
+            std::cout << "Compiled successfully (library; no executable produced)\n";
+            return 0;
+        case Compiler::BuildOutcome::Failed:
+            break;
     }
-    if (ok) {
-        auto it = arguments.find("--output");
-        std::cout << "Compiled successfully to "
-                  << (it == arguments.end() ? "the current folder" : it->second) << '\n';
-    } else {
+    std::cerr << "Please check the errors and retry.\n";
+    return 1;
+}
+
+int runCheck(int argc, char* argv[]) {
+    ParsedCommand arguments;
+    int rc = parseCommand(argc, argv, 2, {}, {}, 1, false, "check", arguments);
+    if (rc != 0) return rc;
+
+    Target target;
+    rc = resolveTarget(arguments.positionals, "check", target);
+    if (rc != 0) return rc;
+
+    if (target.isWorkspace) {
+        std::cerr << "ERROR: '" << target.root.string() << "' is a workspace root; checking "
+                  << "every member is not supported yet. Check a member folder instead.\n";
+        return 2;
+    }
+
+    if (!Compiler::check(target.source)) {
         std::cerr << "Please check the errors and retry.\n";
         return 1;
     }
+    std::cout << "No problems found.\n";
     return 0;
+}
+
+int runTest(int argc, char* argv[]) {
+    ParsedCommand arguments;
+    int rc = parseCommand(argc, argv, 2, {"--filter", "--tests"}, {"--explain-arc"},
+                          1, false, "test", arguments);
+    if (rc != 0) return rc;
+
+    Target target;
+    rc = resolveTarget(arguments.positionals, "test", target);
+    if (rc != 0) return rc;
+
+    if (target.isFile) {
+        return usageError("'" + target.root.string() + "' is a file; 'ens test' runs the "
+                          "tests of a folder or package.");
+    }
+    if (target.isWorkspace) {
+        std::cerr << "ERROR: '" << target.root.string() << "' is a workspace root; testing "
+                  << "every member is not supported yet. Test a member folder instead.\n";
+        return 2;
+    }
+
+    fs::path testsFolder = arguments.option("--tests");
+    if (testsFolder.empty()) testsFolder = target.testsFolder;
+    return Compiler::test(target.source, testsFolder, arguments.option("--filter"),
+                          arguments.flag("--explain-arc"));
+}
+
+// Hidden debug tools: dump or analyze the CST of one file (or stdin when no path is given).
+int runCstTool(bool analyze, int argc, char* argv[]) {
+    ParsedCommand arguments;
+    std::string name = analyze ? "cst-analyze" : "cst-dump";
+    int rc = parseCommand(argc, argv, 2, {}, {}, 1, false, name, arguments);
+    if (rc != 0) return rc;
+
+    if (!arguments.positionals.empty() && arguments.positionals.front() != "-") {
+        fs::path source = arguments.positionals.front();
+        std::ifstream file(source);
+        if (!file) {
+            std::cerr << "ERROR: Couldn't read " << fs::absolute(source).string() << '\n';
+            return 1;
+        }
+        bool ok = analyze ? Compiler::analyzeCst(file, source.string())
+                          : Compiler::dumpCst(file, source.string());
+        return ok ? 0 : 1;
+    }
+    bool ok = analyze ? Compiler::analyzeCst(std::cin) : Compiler::dumpCst(std::cin);
+    return ok ? 0 : 1;
+}
+
+}  // namespace
+
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        std::cout << kGeneralHelp;
+        return 0;
+    }
+
+    std::string command = argv[1];
+    if (command == "build") return runBuild(argc, argv);
+    if (command == "check") return runCheck(argc, argv);
+    if (command == "test") return runTest(argc, argv);
+    if (command == "version" || command == "--version") {
+        std::cout << "ens " << ens::kToolchainVersion << '\n';
+        return 0;
+    }
+    if (command == "help") return printHelp(argc >= 3 ? argv[2] : "");
+    if (command == "-h" || command == "--help") return printHelp("");
+    if (command == "cst-dump") return runCstTool(/*analyze=*/false, argc, argv);
+    if (command == "cst-analyze") return runCstTool(/*analyze=*/true, argc, argv);
+
+    if (command == "--source") {
+        return usageError("The --source option was retired; use 'ens build <path>' to "
+                          "compile, or 'ens check <path>' to only look for errors.");
+    }
+    if (command == "--cst-dump" || command == "--cst-analyze") {
+        return usageError("The " + command + " option was retired; use 'ens " +
+                          command.substr(2) + " [path]' instead.");
+    }
+    if (!command.empty() && command[0] == '-') {
+        return usageError("Unknown option '" + command + "'.");
+    }
+    return usageError("Unknown command '" + command + "'.");
 }

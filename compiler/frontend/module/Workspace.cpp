@@ -248,7 +248,8 @@ void WorkspaceRegistry::noticeOverrideUse(const std::string& name, const fs::pat
 }
 
 Workspace& WorkspaceRegistry::defineRoot(const fs::path& folder, const fs::path& srcRoot,
-                                         const fs::path& testsRoot, bool withManifest) {
+                                         const fs::path& testsRoot, bool withManifest,
+                                         const fs::path& overridesFolder) {
     Workspace& ws = create(folder, srcRoot, testsRoot, std::u16string());
     byFolder_.emplace(canonicalFolderKey(folder), &ws);
     if (!withManifest) return ws;
@@ -256,7 +257,7 @@ Workspace& WorkspaceRegistry::defineRoot(const fs::path& folder, const fs::path&
     fs::path manifestFile = folder / "ens.package";
     ws.manifestPath = manifestFile.string();
     const Manifest& manifest = manifestFor(manifestFile);
-    loadRootOverrides(folder);
+    loadRootOverrides(overridesFolder.empty() ? folder : overridesFolder);
 
     switch (manifest.form) {
         case ManifestForm::Package:

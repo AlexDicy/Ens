@@ -70,9 +70,13 @@ public:
     // Define the compilation's root workspace. `srcRoot`/`testsRoot` may differ from
     // `folder/src` and `folder/tests` when the driver was given an explicit source or tests
     // folder. With `withManifest`, `folder/ens.package` and the sibling `ens.overrides` are
-    // read; the manifest may declare either a package or a workspace.
+    // read; the manifest may declare either a package or a workspace. A non-empty
+    // `overridesFolder` reads the ens.overrides next to that folder's manifest instead: only
+    // the root manifest of a build carries overrides, so a workspace root building its members
+    // passes itself here.
     Workspace& defineRoot(const fs::path& folder, const fs::path& srcRoot,
-                          const fs::path& testsRoot, bool withManifest);
+                          const fs::path& testsRoot, bool withManifest,
+                          const fs::path& overridesFolder = {});
 
     // Return the package workspace rooted at `folder`, loading its manifest (and resolving its
     // dependencies) on first request and assigning it `prefix`. A folder already known to the

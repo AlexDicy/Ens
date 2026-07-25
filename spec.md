@@ -515,7 +515,7 @@ expectParseFailure(string input) throws {
 }
 ```
 
-`ens test [--source <folder>] [--tests <folder>] [--filter <substring>]` discovers every `_test.ens` file under the tests folder (the source folder by default, the current one when neither is given) and runs the tests in a deterministic order: files by path, tests in source order.
+`ens test [path] [--tests <folder>] [--filter <substring>]` discovers every `_test.ens` file under the tests folder (a package's `tests/` folder, or the source folder itself when there is none) and runs the tests in a deterministic order: files by path, tests in source order.
 With `--tests`, test files live outside the source tree: their imports resolve against the source folder first and then the tests folder, and a module present under both folders is an error.
 Each test prints one line, a failing test also prints its message and the stack trace of the failure, and the run ends with a summary:
 

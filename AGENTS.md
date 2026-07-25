@@ -86,7 +86,7 @@ Ens code (selfhost, libs, tests):
 - Group related fields with no blank lines inside a group, one blank line between groups.
 - Soft 100-column limit; prefer `switch` over if/else chains when dispatching on one value.
 - Full words for identifiers; American English everywhere.
-- Programs and libraries split into `src/` plus a sibling `tests/` folder (`ens test --source <src> --tests <tests>`); library sources must not define `main()`.
+- Programs and libraries split into `src/` plus a sibling `tests/` folder (`ens test <package folder>` runs them); library sources must not define `main()`.
 
 C++ code: match the surrounding style of the file you are in.
 
