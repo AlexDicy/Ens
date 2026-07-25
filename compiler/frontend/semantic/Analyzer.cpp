@@ -572,10 +572,21 @@ void Analyzer::registerExternalTypeNames(const ast::SourceFile& file) {
                 "'; this file already declares a " + typeKindWord(existing) + " with this name.");
             continue;
         }
+        Visibility visibility = Visibility::Private;
         if (auto modifier = ed.visibilityModifier()) {
-            errorAtNode(modifier->node, "An external declaration cannot have a visibility "
-                "modifier; external types and functions are always private to their file. "
-                "Wrap the handle in an Ens type to share it.");
+            Visibility marked = toSemanticVisibility(modifier->visibility());
+            if (marked == Visibility::Public || marked == Visibility::Private) {
+                visibility = marked;
+            } else if (marked == Visibility::Protected) {
+                errorAtNode(modifier->node, "An external type may be 'private' or 'public'; "
+                    "'protected' is only meaningful for class and struct members. Mark '" +
+                    asciiOf(*name) + "' 'public' to share it across the package, or leave it "
+                    "unmarked.");
+            } else {
+                errorAtNode(modifier->node, "An external type may be 'private' or 'public'; it "
+                    "can never be exported. Wrap '" + asciiOf(*name) + "' in an Ens type to share "
+                    "it beyond the package.");
+            }
         }
         Type* t = typeCtx.registerExternalType(modulePath_, *name);
         auto [line, col] = source.offsetToPosition(
@@ -583,7 +594,7 @@ void Analyzer::registerExternalTypeNames(const ast::SourceFile& file) {
         if (t->structInfo) {
             t->structInfo->line = line;
             t->structInfo->column = col;
-            t->structInfo->visibility = Visibility::Private;
+            t->structInfo->visibility = visibility;
             t->structInfo->packagePrefix = packagePrefix_;
         }
         analysis.setType(ed.node.greenNode(), t);
@@ -593,9 +604,9 @@ void Analyzer::registerExternalTypeNames(const ast::SourceFile& file) {
 void Analyzer::collectExternalFunctions(const ast::SourceFile& file) {
     for (auto& block : file.externalBlocks()) {
         if (auto modifier = block.visibilityModifier()) {
-            errorAtNode(modifier->node, "An external declaration cannot have a visibility "
-                "modifier; external types and functions are always private to their file. "
-                "Wrap the calls in Ens functions to share them.");
+            errorAtNode(modifier->node, "An external function block is always private to its "
+                "file and cannot carry a visibility modifier; wrap its calls in Ens functions "
+                "to share them.");
         }
         auto libName = block.libraryName();
         if (libName && restrictNatives_) {

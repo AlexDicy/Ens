@@ -1136,8 +1136,8 @@ read(HANDLE h, byte[] buf) -> uint {
 }
 ```
 
-- `external type Name;` declares an opaque foreign handle. The handle is passed around and compared with `null`, but it has no members.
-- `external from libname { ... }` groups foreign function signatures. The name is an identifier naming a native library declared in the package's `ens.package` manifest (here `native kernel32;`); using an undeclared name is an error, and the manifest's declaration tells the linker what to link (see the packages section). `libc` is the platform C runtime, declared `native libc system;` and linked by default.
+- `external type Name;` declares an opaque foreign handle. The handle is passed around and compared with `null`, but it has no members. It is private to its file by default and may be marked `public` to share it with the rest of the package; it can never be `export`ed, because a foreign handle has no meaning outside the package that binds it, so wrap it in an Ens type to cross a package boundary.
+- `external from libname { ... }` groups foreign function signatures. The name is an identifier naming a native library declared in the package's `ens.package` manifest (here `native kernel32;`); using an undeclared name is an error, and the manifest's declaration tells the linker what to link (see the packages section). `libc` is the platform C runtime, declared `native libc system;` and linked by default. An external block and its functions are always private to their file and take no visibility modifier; share their behavior by wrapping the calls in Ens functions.
 - The `out` modifier marks a parameter the C function writes back to. At the call site, the caller passes an initialized local variable as `out name`. The variable's type must match the declared parameter type exactly.
 - A `string` argument is converted automatically to a NUL-terminated UTF-8 buffer at the call boundary. The C function must not retain that pointer past the call.
 
