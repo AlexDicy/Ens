@@ -38,6 +38,7 @@ If the spec, the C++ compiler, and the self-hosted compiler disagree, that is a 
   Do not build all targets routinely; `ens-lsp.exe` may be running and will fail to relink.
 - Run everything: `xmake test` (subset: `xmake test <name>...`).
   The full suite must be green before every commit, with no exceptions.
+- The packaging tests (`cli_git`, `cli_artifact`) shell out to the system `git` and `curl`; both must be on PATH.
 - `xmake test` uses the binary of the currently configured mode.
   Never run `xmake f -m release` to "fix" staleness; rebuild instead.
   If linking fails with unresolved LLVM symbols, put the LLVM package's `bin` folder (containing `clang++.exe`) on PATH, run `xmake f -c -m <current mode>`, then `xmake build ens`.
