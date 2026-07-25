@@ -3,6 +3,10 @@
 // indexing (and, later, monomorphization and layout) runs once over the program, lowering runs
 // per function as a pure step, the structural verifier gates every lowered function, and
 // emission writes each module's object. Modules that define nothing are not emitted.
+//
+// The stages run to completion program-wide before the next one starts, so a program with
+// problems in several modules reports all of them and a program that fails to lower writes no
+// object files at all.
 import ProgramAnalysis from @ens.sema.pipeline;
 import FileDiagnostic from @ens.sema.support.diagnostics;
 import PrimitiveType from @ens.sema.model.types;
@@ -41,22 +45,43 @@ export final class EmitResult {
     }
 }
 
+// One module's lowered functions and its entry wrapper, waiting for the whole program to lower
+// before anything is written.
+final class LoweredModule {
+    protected ModuleFunctions definitions;
+    protected List<EirFunction> functions;
+    protected EntryPoint? entry;
+
+    protected constructor(this.definitions, this.functions, this.entry);
+}
+
 // Compiles the analyzed program into object files under outputFolder, one per module that
 // defines functions, named filePrefix plus the sanitized module path. The analysis must be
 // clean; codegen diagnostics after a clean analysis describe unsupported constructs or bugs.
 export emitProgram(ProgramAnalysis analysis, string outputFolder, string filePrefix)
         -> EmitResult {
-    let objects = new List<string>();
     let problems = new List<FileDiagnostic>();
     let programIndex = index.buildIndex(analysis);
+    let lowered = lowerModules(programIndex, analysis, problems);
+    if (problems.length() > 0) {
+        return new EmitResult(new List<string>(), problems.toArray());
+    }
+    let objects = emitModules(lowered, outputFolder, filePrefix, problems);
+    return new EmitResult(objects, problems.toArray());
+}
 
+// Lowers and verifies every module that defines functions, reporting each module's problems
+// whatever the other modules did.
+lowerModules(ProgramIndex programIndex, ProgramAnalysis analysis, List<FileDiagnostic> problems)
+        -> List<LoweredModule> {
+    let lowered = new List<LoweredModule>();
     let modules = programIndex.modules();
     for (long m = 0; m < modules.length(); m++) {
         let moduleFunctions = modules.get(m);
         if (moduleFunctions.functions().length() == 0) {
             continue;
         }
-        let lowered = new List<EirFunction>();
+        let functions = new List<EirFunction>();
         for (long f = 0; f < moduleFunctions.functions().length(); f++) {
             let info = moduleFunctions.functions().get(f);
             let outcome = lower.lowerFunction(info, programIndex, analysis.store());
@@ -64,35 +89,41 @@ export emitProgram(ProgramAnalysis analysis, string outputFolder, string filePre
                 problems.push(diagnostic);
             }
             let function = outcome.function();
-            if (function != null) {
-                for (let violation in verify.verifyFunction(function)) {
-                    problems.push(new FileDiagnostic(
-                        info.context().module().filePath(),
-                        "Internal: lowering produced malformed EIR: {violation}",
-                        info.signature().nameSpan()));
-                }
-                lowered.push(function);
+            if (function == null) {
+                continue;
             }
-        }
-        if (problems.length() > 0) {
-            continue;
+            for (let violation in verify.verifyFunction(function)) {
+                problems.push(new FileDiagnostic(info.context().module().filePath(),
+                    "Internal: lowering produced malformed EIR: {violation}",
+                    info.signature().nameSpan()));
+            }
+            functions.push(function);
         }
         let entry = entryPointFor(programIndex, moduleFunctions, problems);
-        if (problems.length() > 0) {
-            continue;
-        }
-        string moduleName = moduleFunctions.context().module().canonicalPath();
+        lowered.push(new LoweredModule(moduleFunctions, functions, entry));
+    }
+    return lowered;
+}
+
+// Writes one object file per module. Only a program that lowered and verified cleanly gets here,
+// so a failed compile leaves no objects behind.
+emitModules(List<LoweredModule> lowered, string outputFolder, string filePrefix,
+            List<FileDiagnostic> problems) -> List<string> {
+    let objects = new List<string>();
+    for (long m = 0; m < lowered.length(); m++) {
+        let unit = lowered.get(m);
+        string moduleName = unit.definitions.context().module().canonicalPath();
         string objectPath = outputFolder + "/" + filePrefix
             + symbols.sanitizeModulePath(moduleName) + ".obj";
-        string failure = emit.emitModule(moduleName, lowered, entry, objectPath);
+        string failure = emit.emitModule(moduleName, unit.functions, unit.entry, objectPath);
         if (failure.length > 0) {
-            problems.push(new FileDiagnostic(moduleFunctions.context().module().filePath(),
+            problems.push(new FileDiagnostic(unit.definitions.context().module().filePath(),
                 "Internal: emission failed: " + failure, source.makeSpan(0, 0)));
-            continue;
+            break;
         }
         objects.push(objectPath);
     }
-    return new EmitResult(objects, problems.toArray());
+    return objects;
 }
 
 // The C 'main' wrapper belongs to the module that defines the user entry function.
