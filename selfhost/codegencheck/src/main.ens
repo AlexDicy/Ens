@@ -1,0 +1,342 @@
+// The codegen differential harness. It gates the self-hosted code generator against the runnable
+// test fixtures, and until a code generator exists it holds the ground: it drives the spike (a
+// small Ens program that builds an LLVM module returning 42 and emits an object file) all the way
+// through linking and execution, and it enforces an anti-rot rule over a checked-in skip list of
+// fixtures that codegen does not yet verify.
+//
+// The skip list may only shrink: every runnable fixture must be listed in it (because no fixture
+// is codegen-verified yet), and every listed fixture must still be a runnable fixture. A runnable
+// fixture that is missing from the list, or a listed name that is no longer a runnable fixture,
+// fails the gate. As codegen learns to verify a fixture its entry is removed, never added.
+//
+// Manifest format, one keyword per line, values separated by one space:
+//   platform <windows|posix>   the host's command interpreter, for quoting
+//   ens <path to the ens driver>
+//   spike <path to the prebuilt spike executable>
+//   scratch <a writable scratch folder>
+//   skiplist <path to the checked-in skip-list file>
+//   fixture <label> <path to the fixture's directive-bearing source file>
+//
+// Exit codes: 0 the gate passed, 1 the spike path or the anti-rot rule failed, 2 a usage or
+// manifest problem.
+import @std.system;
+import SystemError from @std.system;
+import List from @std.collections.list;
+
+main() -> int {
+    string[] arguments = system.arguments();
+    if (arguments.length < 2) {
+        print("codegencheck: usage: codegencheck <manifest-path>");
+        return 2;
+    }
+    let manifest = parseManifest(try system.readAllText(arguments[1]));
+    if (manifest.problems.length() > 0) {
+        for (long i = 0; i < manifest.problems.length(); i++) {
+            print("codegencheck: manifest: {manifest.problems.get(i)}");
+        }
+        return 2;
+    }
+
+    let failures = new List<string>();
+
+    let spikeReport = runSpikePath(manifest);
+    if (spikeReport.length > 0) {
+        failures.push(spikeReport);
+    } else {
+        print("codegencheck: spike path ok: emitted, linked, and ran returning 42");
+    }
+
+    let runnable = new List<string>();
+    for (long i = 0; i < manifest.fixtures.length(); i++) {
+        let fixture = manifest.fixtures.get(i);
+        if (isRunnableFixture(readOrEmpty(fixture.path))) {
+            runnable.push(fixture.label);
+        }
+    }
+
+    let skipped = loadSkipList(readOrEmpty(manifest.skiplist));
+
+    let unskipped = new List<string>();
+    for (long i = 0; i < runnable.length(); i++) {
+        if (!contains(skipped, runnable.get(i))) {
+            unskipped.push(runnable.get(i));
+        }
+    }
+    let stale = new List<string>();
+    for (long i = 0; i < skipped.length(); i++) {
+        if (!contains(runnable, skipped.get(i))) {
+            stale.push(skipped.get(i));
+        }
+    }
+
+    print("codegencheck: {runnable.length()} runnable fixture(s), {skipped.length()} skipped, "
+        + "0 codegen-verified");
+    if (unskipped.length() > 0) {
+        failures.push("{unskipped.length()} runnable fixture(s) are neither codegen-verified nor "
+            + "skipped; add them to the skip list: " + joined(unskipped));
+    }
+    if (stale.length() > 0) {
+        failures.push("{stale.length()} skip-list entr(y/ies) name no runnable fixture; remove "
+            + "them (the skip list may only shrink): " + joined(stale));
+    }
+
+    if (failures.length() > 0) {
+        for (long i = 0; i < failures.length(); i++) {
+            print("codegencheck: gate FAILED: " + failures.get(i));
+        }
+        return 1;
+    }
+    print("codegencheck: gate passed");
+    return 0;
+} catch (SystemError e) {
+    print("codegencheck: {e.message}");
+    return 2;
+}
+
+class Fixture {
+    protected string label;
+    protected string path;
+
+    protected constructor(this.label, this.path);
+}
+
+class Manifest {
+    protected bool windowsShell;
+    protected string ensDriver;
+    protected string spikeExecutable;
+    protected string scratch;
+    protected string skiplist;
+    protected List<Fixture> fixtures;
+    protected List<string> problems;
+
+    protected constructor() {
+        this.windowsShell = false;
+        this.ensDriver = "";
+        this.spikeExecutable = "";
+        this.scratch = "";
+        this.skiplist = "";
+        this.fixtures = new List<Fixture>();
+        this.problems = new List<string>();
+    }
+}
+
+parseManifest(string text) -> Manifest {
+    let manifest = new Manifest();
+    string[] lines = splitLines(text);
+    for (long i = 0; i < lines.length; i++) {
+        string line = trim(lines[i]);
+        if (line.length == 0) {
+            continue;
+        }
+        long space = line.indexOf(" ");
+        if (space < 0) {
+            manifest.problems.push("line {i + 1}: expected '<keyword> <value>', got '{line}'");
+            continue;
+        }
+        string keyword = line.substring(0, space);
+        string value = trim(line.substring(space + 1, line.length));
+        switch (keyword) {
+            "platform" -> {
+                manifest.windowsShell = value == "windows";
+            },
+            "ens" -> {
+                manifest.ensDriver = value;
+            },
+            "spike" -> {
+                manifest.spikeExecutable = value;
+            },
+            "scratch" -> {
+                manifest.scratch = value;
+            },
+            "skiplist" -> {
+                manifest.skiplist = value;
+            },
+            "fixture" -> {
+                long gap = value.indexOf(" ");
+                if (gap < 0) {
+                    manifest.problems.push("line {i + 1}: 'fixture' needs a label and a path");
+                } else {
+                    manifest.fixtures.push(new Fixture(value.substring(0, gap),
+                        trim(value.substring(gap + 1, value.length))));
+                }
+            },
+            default -> {
+                manifest.problems.push("line {i + 1}: unknown keyword '{keyword}'");
+            },
+        }
+    }
+    if (manifest.ensDriver.length == 0) {
+        manifest.problems.push("missing an 'ens' line");
+    }
+    if (manifest.spikeExecutable.length == 0) {
+        manifest.problems.push("missing a 'spike' line");
+    }
+    if (manifest.scratch.length == 0) {
+        manifest.problems.push("missing a 'scratch' line");
+    }
+    if (manifest.skiplist.length == 0) {
+        manifest.problems.push("missing a 'skiplist' line");
+    }
+    return manifest;
+}
+
+// Drives the spike from object emission through linking and execution. Returns "" on success, or
+// a description of the first step that failed.
+runSpikePath(Manifest manifest) -> string {
+    string objectPath = manifest.scratch + "/spike_main.obj";
+    string programPath = manifest.scratch + "/spike_program.exe";
+
+    long emit = try shellExit(manifest.windowsShell,
+        "\"{manifest.spikeExecutable}\" \"{objectPath}\"");
+    if (emit != 0) {
+        return "the spike exited {emit} instead of emitting an object file";
+    }
+    if (!system.exists(objectPath)) {
+        return "the spike did not write the object file {objectPath}";
+    }
+
+    long link = try shellExit(manifest.windowsShell, "\"{manifest.ensDriver}\" link-objects "
+        + "\"{objectPath}\" --output \"{programPath}\"");
+    if (link != 0) {
+        return "ens link-objects exited {link} instead of linking the object file";
+    }
+    if (!system.exists(programPath)) {
+        return "ens link-objects did not write {programPath}";
+    }
+
+    long ran = try shellExit(manifest.windowsShell, "\"{programPath}\"");
+    if (ran != 42) {
+        return "the linked program exited {ran} instead of 42";
+    }
+    return "";
+} catch (SystemError e) {
+    return "the spike path could not run: {e.message}";
+}
+
+// True when a fixture is a runnable program: it asserts an exit code or stdout and is not an
+// expect-error case (which the compiler must reject rather than run).
+isRunnableFixture(string text) -> bool {
+    bool asserts = false;
+    string[] lines = splitLines(text);
+    for (let line in lines) {
+        string comment = commentBody(line);
+        if (startsWith(comment, "@expect-error")) {
+            return false;
+        }
+        if (startsWith(comment, "@exit") || startsWith(comment, "@stdout")) {
+            asserts = true;
+        }
+    }
+    return asserts;
+}
+
+loadSkipList(string text) -> List<string> {
+    let entries = new List<string>();
+    string[] lines = splitLines(text);
+    for (let raw in lines) {
+        string line = trim(raw);
+        if (line.length == 0 || startsWith(line, "#")) {
+            continue;
+        }
+        entries.push(line);
+    }
+    return entries;
+}
+
+// Runs a command and returns its exit code. The command is a quoted program followed by quoted
+// arguments. The Windows interpreter (cmd) strips the first and last quote of the line before
+// running it, so the whole command is wrapped in one more pair of quotes there; a POSIX shell
+// needs no such wrapping.
+shellExit(bool windowsShell, string command) -> long throws {
+    if (windowsShell) {
+        return try system.run("\"" + command + "\"");
+    }
+    return try system.run(command);
+}
+
+readOrEmpty(string path) -> string {
+    return try system.readAllText(path);
+} catch (SystemError error) {
+    return "";
+}
+
+contains(List<string> values, string needle) -> bool {
+    for (long i = 0; i < values.length(); i++) {
+        if (values.get(i) == needle) {
+            return true;
+        }
+    }
+    return false;
+}
+
+joined(List<string> values) -> string {
+    string result = "";
+    for (long i = 0; i < values.length(); i++) {
+        if (i > 0) {
+            result = result + ", ";
+        }
+        result = result + values.get(i);
+    }
+    return result;
+}
+
+commentBody(string line) -> string {
+    string trimmed = trimLeading(line);
+    if (!startsWith(trimmed, "//")) {
+        return "";
+    }
+    return trimLeading(trimmed.substring(2, trimmed.length));
+}
+
+startsWith(string text, string prefix) -> bool {
+    return text.length >= prefix.length && text.substring(0, prefix.length) == prefix;
+}
+
+trim(string text) -> string {
+    byte[] bytes = text.toBytes();
+    long begin = 0;
+    while (begin < bytes.length && isSpace(bytes[begin])) {
+        begin++;
+    }
+    long end = bytes.length;
+    while (end > begin && isSpace(bytes[end - 1])) {
+        end--;
+    }
+    return text.substring(begin, end);
+}
+
+trimLeading(string text) -> string {
+    byte[] bytes = text.toBytes();
+    long begin = 0;
+    while (begin < bytes.length && isSpace(bytes[begin])) {
+        begin++;
+    }
+    return text.substring(begin, text.length);
+}
+
+isSpace(byte value) -> bool {
+    return value == ' ' || value == '\t' || value == '\r';
+}
+
+// Splits on '\n', dropping a trailing '\r' from each line.
+splitLines(string text) -> string[] {
+    let lines = new List<string>();
+    string rest = text;
+    while (true) {
+        long newline = rest.indexOf("\n");
+        if (newline < 0) {
+            lines.push(stripCarriageReturn(rest));
+            break;
+        }
+        lines.push(stripCarriageReturn(rest.substring(0, newline)));
+        rest = rest.substring(newline + 1, rest.length);
+    }
+    return lines.toArray();
+}
+
+stripCarriageReturn(string line) -> string {
+    if (line.length > 0 && line.substring(line.length - 1, line.length) == "\r") {
+        return line.substring(0, line.length - 1);
+    }
+    return line;
+}

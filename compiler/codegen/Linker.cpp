@@ -9,6 +9,7 @@
 #include "llvm/Support/Program.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <cstdlib>
 #include <iostream>
 #include <vector>
 
@@ -120,6 +121,27 @@ void appendUnwinder(std::vector<std::string>& args) {
     args.push_back("-lgcc_s");
 }
 
+// Extra library search directories for the ELF and Mach-O linkers, taken from LIBRARY_PATH the
+// way lld-link takes them from LIB on Windows. Each becomes both a search path (`-L`) and a
+// runtime path (`-rpath`) so a program that links a shared library found this way also loads it
+// at run time. Empty when LIBRARY_PATH is unset, leaving ordinary builds untouched.
+std::vector<std::string> extraLibrarySearchDirs() {
+    std::vector<std::string> dirs;
+    const char* value = std::getenv("LIBRARY_PATH");
+    if (!value) return dirs;
+    std::string text(value);
+    std::size_t start = 0;
+    while (start <= text.size()) {
+        std::size_t sep = text.find(':', start);
+        std::string dir = (sep == std::string::npos) ? text.substr(start)
+                                                      : text.substr(start, sep - start);
+        if (!dir.empty()) dirs.push_back(dir);
+        if (sep == std::string::npos) break;
+        start = sep + 1;
+    }
+    return dirs;
+}
+
 std::vector<std::string> buildArgv(LinkerFlavor flavor,
                                     const std::string& triple,
                                     const std::vector<std::string>& objs,
@@ -163,6 +185,11 @@ std::vector<std::string> buildArgv(LinkerFlavor flavor,
             for (auto& f : libraryFiles) args.push_back(f);
             args.push_back("-o");
             args.push_back(exe);
+            for (auto& dir : extraLibrarySearchDirs()) {
+                args.push_back("-L" + dir);
+                args.push_back("-rpath");
+                args.push_back(dir);
+            }
             args.push_back("-lSystem");
             for (auto& lib : libraries) {
                 if (lib == "System") continue;  // auto-linked
@@ -183,6 +210,12 @@ std::vector<std::string> buildArgv(LinkerFlavor flavor,
 
             args.push_back("-o");
             args.push_back(exe);
+
+            for (auto& dir : extraLibrarySearchDirs()) {
+                args.push_back("-L" + dir);
+                args.push_back("-rpath");
+                args.push_back(dir);
+            }
 
             // Link the C runtime to add an entry point and libc symbols
             const std::string scrt1 = queryCCompiler("-print-file-name=Scrt1.o");

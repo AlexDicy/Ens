@@ -21,6 +21,8 @@ task("test")
     on_run(function()
         import("core.project.config")
         import("core.base.option")
+        import("core.base.global")
+        import("core.tool.toolchain")
         import("async.runjobs")
         config.load()
         local mode = config.get("mode") or "release"
@@ -186,6 +188,16 @@ task("test")
             })
         end
 
+        -- the code-generation differential harness: build the spike (an Ens program that emits an
+        -- object file through the ens.llvm binding) and the harness, then drive the spike from
+        -- emission through linking and execution and enforce the skip-list anti-rot rule.
+        if want("codegencheck") then
+            table.insert(jobs, {
+                name = "codegencheck",
+                codegencheck = true,
+            })
+        end
+
         -- surface any requested names that matched no test, so typos don't pass silently.
         if wanted ~= nil then
             local unknown = {}
@@ -320,7 +332,8 @@ task("test")
                     add_unit("tests/" .. path.basename(sub), path.join(sub, "src"), {"main.ens"})
                 end
             end
-            for _, pkg in ipairs({"corpus", "frontend", "sema", "semacheck", "syntaxgen"}) do
+            for _, pkg in ipairs({"corpus", "frontend", "sema", "semacheck", "syntaxgen",
+                              "llvm", "codegencheck"}) do
                 local src = path.join(os.projectdir(), "selfhost", pkg, "src")
                 local seeds = {}
                 for _, f in ipairs(os.files(path.join(src, "**.ens"))) do
@@ -335,6 +348,150 @@ task("test")
             local out = (io.readfile(log) or ""):gsub("[\r\n]+$", "")
             if run_rc == 0 then
                 return {name = name, ok = true, note = out:match("expected%-reject caught [^\r\n]+")}
+            end
+            return {name = name, ok = false,
+                short = string.format("harness exit %s", tostring(run_rc)),
+                full = string.format("%s:\n%s", name, out)}
+        end
+
+        -- the code-generation differential harness: build the harness and the spike, drive the
+        -- spike from object emission through linking and execution, and enforce the skip-list
+        -- anti-rot rule over the runnable fixtures. The spike links the ens.llvm native binding,
+        -- so the build has to point the linker at the local LLVM library and the run has to make
+        -- the shared library loadable. That plumbing differs by host and is set up here.
+        local function run_codegencheck(job)
+            local name = job.name
+            local on_windows = is_host("windows")
+            local exe_suffix = on_windows and ".exe" or ""
+            local check_dir = path.join(os.projectdir(), "build", "codegencheck")
+            local harness_exe = path.join(check_dir, "codegencheck" .. exe_suffix)
+            local spike_exe = path.join(check_dir, "spike" .. exe_suffix)
+            local manifest = path.join(check_dir, "manifest.txt")
+            local scratch = path.join(check_dir, "scratch")
+            local log = path.join(out_dir, name .. ".log")
+            local check_src = path.join(os.projectdir(), "selfhost", "codegencheck")
+            local spike_src = path.join(check_src, "spike")
+            local skiplist = path.join(check_src, "skiplist.txt")
+
+            os.tryrm(check_dir)
+            os.mkdir(check_dir)
+            os.mkdir(scratch)
+
+            -- find the local LLVM library the compiler builds against: on Windows the dll plus its
+            -- import library, on Linux/macOS the shared object. A machine without it cannot build
+            -- the compiler either, so a clear hard failure is the right outcome.
+            local packages = path.join(global.directory(), "packages", "l")
+            local llvm_lib, llvm_bin, looked
+            if on_windows then
+                looked = "bin/LLVM-C.dll with lib/LLVM-C.lib"
+                for _, dll in ipairs(os.files(path.join(packages, "*", "*", "*", "bin",
+                        "LLVM-C.dll"))) do
+                    local bindir = path.directory(dll)
+                    local libdir = path.join(path.directory(bindir), "lib")
+                    if os.isfile(path.join(libdir, "LLVM-C.lib")) then
+                        llvm_bin = bindir
+                        llvm_lib = libdir
+                        break
+                    end
+                end
+            else
+                local pattern = is_host("macosx") and "libLLVM*.dylib" or "libLLVM*.so*"
+                looked = "lib/" .. pattern
+                local matches = os.files(path.join(packages, "*", "*", "*", "lib", pattern))
+                table.sort(matches)
+                if #matches > 0 then
+                    llvm_lib = path.directory(matches[1])
+                end
+            end
+            if not llvm_lib then
+                return {name = name, ok = false, short = "no LLVM library",
+                    full = string.format("%s: could not find %s under %s; install the LLVM "
+                        .. "package the compiler builds against", name, looked, packages)}
+            end
+
+            -- build-time linker search paths and run-time library paths. On Windows lld-link reads
+            -- LIB (and finds nothing else once LIB is set, so the MSVC and SDK folders must be
+            -- added too); on Linux/macOS the ens linker turns LIBRARY_PATH into -L and -rpath, and
+            -- the loader honors LD_LIBRARY_PATH / DYLD_LIBRARY_PATH.
+            local env = os.getenvs()
+            if on_windows then
+                local msvc = toolchain.load("msvc", {plat = plat, arch = arch})
+                local msvc_lib = ""
+                if msvc then
+                    local envs = msvc:runenvs()
+                    if envs and envs.LIB then msvc_lib = envs.LIB end
+                end
+                env.LIB = msvc_lib .. ";" .. llvm_lib
+                env.PATH = llvm_bin .. ";" .. (env.PATH or "")
+            else
+                local function prepend(current, dir)
+                    if current and #current > 0 then return dir .. ":" .. current end
+                    return dir
+                end
+                env.LIBRARY_PATH = prepend(env.LIBRARY_PATH, llvm_lib)
+                if is_host("macosx") then
+                    env.DYLD_LIBRARY_PATH = prepend(env.DYLD_LIBRARY_PATH, llvm_lib)
+                else
+                    env.LD_LIBRARY_PATH = prepend(env.LD_LIBRARY_PATH, llvm_lib)
+                end
+            end
+
+            local harness_rc = execMerged(ens_exe,
+                {"build", check_src, "--output", harness_exe}, log)
+            if not os.isfile(harness_exe) then
+                return {name = name, ok = false, short = "harness build failed",
+                    full = string.format("%s: harness build failed (exit %s)\n%s", name,
+                        tostring(harness_rc), (io.readfile(log) or ""):gsub("[\r\n]+$", ""))}
+            end
+            local spike_rc = execMerged(ens_exe, {"build", spike_src, "--output", spike_exe},
+                log, {envs = env})
+            if not os.isfile(spike_exe) then
+                return {name = name, ok = false, short = "spike build failed",
+                    full = string.format("%s: spike build failed (exit %s)\n%s", name,
+                        tostring(spike_rc), (io.readfile(log) or ""):gsub("[\r\n]+$", ""))}
+            end
+            -- the Windows loader searches the executable's own folder first; on Linux/macOS the
+            -- rpath the linker wrote and the library-path environment cover it.
+            if on_windows then
+                os.cp(path.join(llvm_bin, "LLVM-C.dll"), path.join(check_dir, "LLVM-C.dll"))
+            end
+
+            -- list every candidate fixture; the harness reads each for its directives.
+            local lines = {
+                "platform " .. (on_windows and "windows" or "posix"),
+                "ens " .. ens_exe,
+                "spike " .. spike_exe,
+                "scratch " .. scratch,
+                "skiplist " .. skiplist,
+            }
+            local singles = os.files(path.join(tests_dir, "*.ens"))
+            table.sort(singles)
+            for _, f in ipairs(singles) do
+                table.insert(lines, "fixture tests/" .. path.filename(f) .. " " .. f)
+            end
+            local folders = os.dirs(path.join(tests_dir, "*"))
+            table.sort(folders)
+            for _, sub in ipairs(folders) do
+                local main_ens = path.join(sub, "main.ens")
+                local src_main_ens = path.join(sub, "src", "main.ens")
+                local directive = nil
+                if os.isfile(main_ens) then
+                    directive = main_ens
+                elseif os.isfile(src_main_ens) then
+                    directive = src_main_ens
+                end
+                if directive then
+                    table.insert(lines, "fixture tests/" .. path.basename(sub) .. " " .. directive)
+                end
+            end
+            io.writefile(manifest, table.concat(lines, "\n") .. "\n")
+
+            -- the harness runs the spike as a child, so it needs the same library-path
+            -- environment for the shared library to load.
+            local run_rc = execMerged(harness_exe, {manifest}, log, {envs = env})
+            local out = (io.readfile(log) or ""):gsub("[\r\n]+$", "")
+            if run_rc == 0 then
+                return {name = name, ok = true}
             end
             return {name = name, ok = false,
                 short = string.format("harness exit %s", tostring(run_rc)),
@@ -1160,6 +1317,7 @@ task("test")
             if job.cli_override then return run_cli_override(job) end
             if job.cli_git then return run_cli_git(job) end
             if job.cli_artifact then return run_cli_artifact(job) end
+            if job.codegencheck then return run_codegencheck(job) end
             local name = job.name
             local ens_file = job.ens_file
             local exe_file    = path.join(out_dir, name .. ".exe")
