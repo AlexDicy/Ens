@@ -126,7 +126,7 @@ private:
     void addRequirement(Requirement requirement);
     void tryLockPin(const std::string& name, PackageState& state);
     void loadSelected(const std::string& name, PackageState& state);
-    void reconcileLock(ResolutionOutcome& outcome);
+    void reconcileLock();
 
     fs::path rootFolder_;
     bool offline_ = false;
@@ -391,7 +391,7 @@ void Resolver::loadSelected(const std::string& name, PackageState& state) {
                              memberNames);
 }
 
-void Resolver::reconcileLock(ResolutionOutcome& outcome) {
+void Resolver::reconcileLock() {
     Lockfile newLock;
     if (rootManifest_.form == ManifestForm::Package && !rootManifest_.packageName.empty()) {
         newLock.rootName = rootManifest_.packageName;
@@ -505,7 +505,7 @@ void Resolver::run(ResolutionOutcome& outcome) {
     }
 
     if (errors_.empty()) {
-        reconcileLock(outcome);
+        reconcileLock();
     }
 
     outcome.errors.insert(outcome.errors.end(), errors_.begin(), errors_.end());
