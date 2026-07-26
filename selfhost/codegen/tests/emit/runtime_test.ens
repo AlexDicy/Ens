@@ -1,0 +1,124 @@
+// Tests for the runtime primitives an emitted module carries. Each one builds a module, defines a
+// group of primitives from inside a host function exactly as emission does, and asserts the real
+// LLVM verifier accepts the whole module: a wrong header offset, a mistyped call, or a block left
+// without a terminator all surface here rather than at run time. The literal cache is checked
+// against the module's globals, because a per-use copy would bloat every module silently.
+import @std.testing;
+import Context from @ens.llvm.core;
+import Module from @ens.llvm.core;
+import Builder from @ens.llvm.core;
+import @ens.llvm.core;
+import @ens.llvm.instructions;
+import @ens.llvm.globals;
+import @ens.llvm.analysis;
+import Runtime from emit.runtime;
+
+// A module with one host function the builder sits inside, so every primitive is defined the way
+// emission defines it: from within a function whose insertion point has to be restored.
+class Host {
+    protected Context context;
+    protected Module module;
+    protected Builder builder;
+    protected Runtime runtime;
+
+    protected constructor(string name) {
+        this.context = core.createContext();
+        this.module = this.context.createModule(name);
+        this.builder = this.context.createBuilder();
+        let host = this.module.addFunction("host", this.context.voidType().functionType([]));
+        this.builder.positionAtEnd(this.context.appendBasicBlock(host, "entry"));
+        this.runtime = new Runtime(this.context, this.module, this.builder);
+    }
+
+    // Ends the host function and asserts the module verifies, reporting LLVM's own message.
+    protected finish() throws {
+        instructions.buildRetVoid(this.builder);
+        string problem = analysis.verify(this.module);
+        this.builder.dispose();
+        this.context.dispose();
+        try testing.assertTrue(problem.length == 0, "verification failed: {problem}");
+    }
+}
+
+test "the allocator and the reference-counting pair verify" {
+    let host = new Host("runtime_alloc");
+    let object = host.runtime.call(host.runtime.alloc(), [host.runtime.int64(24),
+        host.runtime.nullPointer(), host.runtime.nullPointer()], "");
+    host.runtime.call(host.runtime.retain(), [object], "");
+    host.runtime.call(host.runtime.release(), [object], "");
+    try host.finish();
+}
+
+test "the string primitives verify" {
+    let host = new Host("runtime_strings");
+    let literal = host.runtime.stringLiteral("hello".toBytes());
+    let allocated = host.runtime.call(host.runtime.stringAllocate(),
+        [host.runtime.int64(5)], "");
+    host.runtime.call(host.runtime.stringConcat(), [literal, allocated], "");
+    host.runtime.call(host.runtime.stringEqual(), [literal, allocated], "");
+    host.runtime.call(host.runtime.stringIndexOf(), [literal, allocated], "");
+    host.runtime.call(host.runtime.stringSubstring(), [literal, host.runtime.int64(1),
+        host.runtime.int64(4)], "");
+    try host.finish();
+}
+
+test "the text conversions verify" {
+    let host = new Host("runtime_conversions");
+    host.runtime.call(host.runtime.intToString(), [host.runtime.int64(-7),
+        host.runtime.int1Type.constInt(1, false)], "");
+    host.runtime.call(host.runtime.doubleToString(),
+        [host.runtime.doubleType.constReal(1.5)], "");
+    host.runtime.call(host.runtime.charToString(), [host.runtime.int32(128512)], "");
+    host.runtime.call(host.runtime.jsonEscape(),
+        [host.runtime.stringLiteral("a\tb".toBytes())], "");
+    try host.finish();
+}
+
+test "output, the checked guards, and the array allocator verify" {
+    let host = new Host("runtime_guards");
+    let message = host.runtime.stringLiteral("array index out of bounds".toBytes());
+    host.runtime.call(host.runtime.print(), [message], "");
+    host.runtime.call(host.runtime.boundsCheck(), [host.runtime.int64(0),
+        host.runtime.int64(1), message], "");
+    host.runtime.call(host.runtime.rangeCheck(), [host.runtime.int64(0), host.runtime.int64(1),
+        host.runtime.int64(2), message], "");
+    host.runtime.call(host.runtime.arrayAllocate(), [host.runtime.int64(3),
+        host.runtime.int64(8), host.runtime.nullPointer(), message], "");
+    host.runtime.call(host.runtime.panic(), [message], "");
+    try host.finish();
+}
+
+test "the same literal bytes reuse one global" {
+    let host = new Host("runtime_literal_cache");
+    let first = host.runtime.stringLiteral("shared".toBytes());
+    let second = host.runtime.stringLiteral("shared".toBytes());
+    try testing.assertTrue(first == second, "the same bytes must hand back one payload");
+    try testing.assertTrue(globals.getNamedGlobal(host.module, ".stringliteral") != null,
+        "the literal's global was never added");
+    try testing.assertTrue(globals.getNamedGlobal(host.module, ".stringliteral.1") == null,
+        "the same bytes were emitted as a second global");
+    host.runtime.call(host.runtime.print(), [first], "");
+    try host.finish();
+}
+
+test "distinct literal bytes get their own globals" {
+    let host = new Host("runtime_literal_distinct");
+    let first = host.runtime.stringLiteral("one".toBytes());
+    let other = host.runtime.stringLiteral("two".toBytes());
+    try testing.assertTrue(first != other, "distinct bytes must not share a payload");
+    try testing.assertTrue(globals.getNamedGlobal(host.module, ".stringliteral.1") != null,
+        "the second literal got no global of its own");
+    host.runtime.call(host.runtime.print(), [first], "");
+    host.runtime.call(host.runtime.print(), [other], "");
+    try host.finish();
+}
+
+test "a primitive needed twice is defined once" {
+    let host = new Host("runtime_reuse");
+    let first = host.runtime.stringAllocate();
+    let second = host.runtime.stringAllocate();
+    try testing.assertTrue(first.function == second.function,
+        "the second use redefined the primitive");
+    host.runtime.call(first, [host.runtime.int64(1)], "");
+    try host.finish();
+}

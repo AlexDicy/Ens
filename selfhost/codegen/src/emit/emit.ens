@@ -4,6 +4,10 @@
 // shape was fixed by lowering. The module that defines the program entry also gets the C 'main'
 // wrapper: it records argc and argv in the ens argument globals and forwards the user main's
 // result, with 0 standing in when user main returns void.
+//
+// Everything that needs machine code beyond one instruction - allocation, reference counting, the
+// string primitives, the guards, and the immortal string literals - comes from one Runtime per
+// module, so a module carries exactly the primitives it uses and one copy of each.
 import EirFunction from eir.model;
 import EirInstruction from eir.model;
 import EirConstInt from eir.model;
@@ -15,6 +19,35 @@ import EirCast from eir.model;
 import EirLoadSlot from eir.model;
 import EirStoreSlot from eir.model;
 import EirCall from eir.model;
+import EirRetain from eir.model;
+import EirRelease from eir.model;
+import EirRetainPtr from eir.model;
+import EirReleasePtr from eir.model;
+import EirSlotAddress from eir.model;
+import EirFieldAddress from eir.model;
+import EirElementAddress from eir.model;
+import EirLoadPtr from eir.model;
+import EirStorePtr from eir.model;
+import EirBoundsCheck from eir.model;
+import EirRangeCheck from eir.model;
+import EirConstString from eir.model;
+import EirArrayNew from eir.model;
+import EirArrayLength from eir.model;
+import EirStringConcat from eir.model;
+import EirStringEqual from eir.model;
+import EirStringIndexOf from eir.model;
+import EirStringSubstring from eir.model;
+import EirStringLength from eir.model;
+import EirStringToBytes from eir.model;
+import EirStringFromBytes from eir.model;
+import EirIntToString from eir.model;
+import EirCharToString from eir.model;
+import EirBoolToString from eir.model;
+import EirEnumToString from eir.model;
+import EirDoubleToString from eir.model;
+import EirJsonEscape from eir.model;
+import EirPrint from eir.model;
+import EirPanic from eir.model;
 import EirTerminator from eir.model;
 import EirReturn from eir.model;
 import EirJump from eir.model;
@@ -24,8 +57,14 @@ import EirUnreachable from eir.model;
 import EirBinaryOp from eir.model;
 import Type from @ens.sema.model.types;
 import PrimitiveType from @ens.sema.model.types;
+import StringType from @ens.sema.model.types;
+import ArrayType from @ens.sema.model.types;
+import StructType from @ens.sema.model.types;
+import EnumType from @ens.sema.model.types;
+import Field from @ens.sema.model.types;
 import @ens.sema.model.types;
 import support.primitives;
+import Runtime from emit.runtime;
 import Context from @ens.llvm.core;
 import Module from @ens.llvm.core;
 import Builder from @ens.llvm.core;
@@ -38,6 +77,7 @@ import @ens.llvm.memory;
 import @ens.llvm.globals;
 import @ens.llvm.analysis;
 import TargetMachine from @ens.llvm.target;
+import TargetData from @ens.llvm.target;
 import @ens.llvm.target;
 import List from @std.collections.list;
 import Map from @std.collections.map;
@@ -73,8 +113,12 @@ class ModuleEmitter {
     Context context;
     Module module;
     Builder builder;
+    Runtime runtime;
+
     Map<string, Value> functionValues;
     Map<string, TypeRef> functionTypes;
+    Map<Type, TypeRef> structTypes;
+    TargetData? moduleLayout;
 
     protected constructor(string moduleName, List<EirFunction> functions) {
         this.moduleName = moduleName;
@@ -82,8 +126,11 @@ class ModuleEmitter {
         this.context = core.createContext();
         this.module = this.context.createModule(moduleName);
         this.builder = this.context.createBuilder();
+        this.runtime = new Runtime(this.context, this.module, this.builder);
         this.functionValues = new Map<string, Value>();
         this.functionTypes = new Map<string, TypeRef>();
+        this.structTypes = new Map<Type, TypeRef>();
+        this.moduleLayout = null;
     }
 
     protected run(EntryPoint? entry, string objectPath) -> string {
@@ -104,7 +151,9 @@ class ModuleEmitter {
     }
 
     emitInto(TargetMachine machine, EntryPoint? entry, string objectPath) -> string {
-        target.setModuleDataLayout(this.module, machine.createDataLayout());
+        let layout = machine.createDataLayout();
+        this.moduleLayout = layout;
+        target.setModuleDataLayout(this.module, layout);
         for (long i = 0; i < this.functions.length(); i++) {
             this.declareFunction(this.functions.get(i));
         }
@@ -190,8 +239,12 @@ class ModuleEmitter {
         Value?[] slots = new Value?[function.slots().length()];
         for (long i = 0; i < function.slots().length(); i++) {
             let slot = function.slots().get(i);
-            slots[i] = memory.buildAlloca(this.builder, this.mapType(slot.type()),
-                slot.name());
+            let slotType = this.mapType(slot.type());
+            let storage = memory.buildAlloca(this.builder, slotType, slot.name());
+            slots[i] = storage;
+            if (slot.startsZeroed()) {
+                memory.buildStore(this.builder, slotType.constNull(), storage);
+            }
         }
         for (long b = 0; b < function.blocks().length(); b++) {
             let block = function.blocks().get(b);
@@ -301,11 +354,204 @@ class ModuleEmitter {
                     temps[call.result] = value;
                 }
             },
+            is EirRetain retain -> {
+                this.runtime.call(this.runtime.retain(), [tempValue(temps, retain.value)], "");
+            },
+            is EirRelease released -> {
+                this.runtime.call(this.runtime.release(), [tempValue(temps, released.value)], "");
+            },
+            is EirRetainPtr retain -> {
+                this.runtime.call(this.runtime.retain(),
+                    [this.loadReference(tempValue(temps, retain.address))], "");
+            },
+            is EirReleasePtr released -> {
+                this.releaseStorage(tempValue(temps, released.address));
+            },
+            is EirSlotAddress address -> {
+                let slot = slots[address.slot];
+                if (slot == null) {
+                    return "Internal: the address of missing slot ${address.slot} in "
+                        + "{function.symbol()}";
+                }
+                temps[address.result] = slot;
+            },
+            is EirFieldAddress address -> {
+                temps[address.result] = memory.buildStructGEP(this.builder,
+                    this.mapType(function.tempTypes().get(address.base)),
+                    tempValue(temps, address.base), address.fieldIndex as uint, "");
+            },
+            is EirElementAddress address -> {
+                let data = this.runtime.payloadData(tempValue(temps, address.array));
+                temps[address.result] = memory.buildGEP(this.builder,
+                    this.mapType(address.type), data, [tempValue(temps, address.index)], "");
+            },
+            is EirLoadPtr load -> {
+                temps[load.result] = memory.buildLoad(this.builder, this.mapType(load.type),
+                    tempValue(temps, load.address), "");
+            },
+            is EirStorePtr store -> {
+                memory.buildStore(this.builder, tempValue(temps, store.value),
+                    tempValue(temps, store.address));
+            },
+            is EirBoundsCheck check -> {
+                let length = this.runtime.payloadLength(tempValue(temps, check.array));
+                this.runtime.call(this.runtime.boundsCheck(), [tempValue(temps, check.index),
+                    length, this.message("array index out of bounds")], "");
+            },
+            is EirRangeCheck check -> {
+                this.runtime.call(this.runtime.rangeCheck(), [tempValue(temps, check.start),
+                    tempValue(temps, check.end), tempValue(temps, check.length),
+                    this.message(check.message)], "");
+            },
+            is EirConstString constant -> {
+                temps[constant.result] = this.runtime.stringLiteral(constant.bytes);
+            },
+            is EirArrayNew allocation -> {
+                temps[allocation.result] = this.allocateArray(allocation.type,
+                    tempValue(temps, allocation.size));
+            },
+            is EirArrayLength length -> {
+                temps[length.result] = this.runtime.payloadLength(
+                    tempValue(temps, length.array));
+            },
+            is EirStringLength length -> {
+                temps[length.result] = this.runtime.payloadLength(
+                    tempValue(temps, length.value));
+            },
+            is EirStringConcat joined -> {
+                temps[joined.result] = this.runtime.call(this.runtime.stringConcat(),
+                    [tempValue(temps, joined.left), tempValue(temps, joined.right)], "");
+            },
+            is EirStringEqual compared -> {
+                temps[compared.result] = this.runtime.call(this.runtime.stringEqual(),
+                    [tempValue(temps, compared.left), tempValue(temps, compared.right)], "");
+            },
+            is EirStringIndexOf search -> {
+                temps[search.result] = this.runtime.call(this.runtime.stringIndexOf(),
+                    [tempValue(temps, search.haystack), tempValue(temps, search.needle)], "");
+            },
+            is EirStringSubstring part -> {
+                temps[part.result] = this.runtime.call(this.runtime.stringSubstring(),
+                    [tempValue(temps, part.value), tempValue(temps, part.start),
+                    tempValue(temps, part.end)], "");
+            },
+            is EirStringToBytes conversion -> {
+                let text = tempValue(temps, conversion.value);
+                let length = this.runtime.payloadLength(text);
+                let array = this.allocateArray(conversion.type, length);
+                memory.buildMemCpy(this.builder, this.runtime.payloadData(array), 1,
+                    this.runtime.payloadData(text), 1, length);
+                temps[conversion.result] = array;
+            },
+            is EirStringFromBytes conversion -> {
+                let array = tempValue(temps, conversion.bytes);
+                let length = this.runtime.payloadLength(array);
+                let text = this.runtime.call(this.runtime.stringAllocate(), [length], "");
+                memory.buildMemCpy(this.builder, this.runtime.payloadData(text), 1,
+                    this.runtime.payloadData(array), 1, length);
+                temps[conversion.result] = text;
+            },
+            is EirIntToString conversion -> {
+                ulong signedness = 0;
+                if (conversion.signed) {
+                    signedness = 1;
+                }
+                temps[conversion.result] = this.runtime.call(this.runtime.intToString(),
+                    [tempValue(temps, conversion.value),
+                    this.context.int1Type().constInt(signedness, false)], "");
+            },
+            is EirCharToString conversion -> {
+                temps[conversion.result] = this.runtime.call(this.runtime.charToString(),
+                    [tempValue(temps, conversion.value)], "");
+            },
+            is EirDoubleToString conversion -> {
+                temps[conversion.result] = this.runtime.call(this.runtime.doubleToString(),
+                    [tempValue(temps, conversion.value)], "");
+            },
+            is EirBoolToString conversion -> {
+                temps[conversion.result] = instructions.buildSelect(this.builder,
+                    tempValue(temps, conversion.value), this.message("true"),
+                    this.message("false"), "");
+            },
+            is EirEnumToString conversion -> {
+                let named = conversion.enumType;
+                if (!(named is EnumType)) {
+                    return "Internal: the enum text of '{types.display(named)}' in "
+                        + "{function.symbol()}";
+                }
+                temps[conversion.result] = this.emitEnumName(named,
+                    tempValue(temps, conversion.value));
+            },
+            is EirJsonEscape escape -> {
+                temps[escape.result] = this.runtime.call(this.runtime.jsonEscape(),
+                    [tempValue(temps, escape.value)], "");
+            },
+            is EirPrint printed -> {
+                this.runtime.call(this.runtime.print(), [tempValue(temps, printed.value)], "");
+            },
+            is EirPanic aborted -> {
+                this.runtime.call(this.runtime.panic(), [tempValue(temps, aborted.value)], "");
+            },
             default -> {
                 return "Internal: no emission for this instruction in {function.symbol()}";
             },
         }
         return "";
+    }
+
+    // The reference the storage an address names currently holds.
+    loadReference(Value address) -> Value {
+        return memory.buildLoad(this.builder, this.context.pointerType(), address, "");
+    }
+
+    // Gives up the +1 the storage at an address holds and leaves the storage empty, which is what
+    // keeps the "null or one live reference" invariant a zeroed slot starts with: storage released
+    // when its scope ends is written again the next time around a loop, and that write releases
+    // whatever it finds there.
+    releaseStorage(Value address) {
+        this.runtime.call(this.runtime.release(), [this.loadReference(address)], "");
+        memory.buildStore(this.builder, this.context.pointerType().constNull(), address);
+    }
+
+    // A constant diagnostic message, as the string object the runtime guards expect.
+    message(string text) -> Value {
+        return this.runtime.stringLiteral(text.toBytes());
+    }
+
+    // A fresh array of the given length. The element finalizer is not filled in yet, so an array
+    // of references does not release its elements.
+    allocateArray(Type arrayType, Value count) -> Value {
+        let elementBytes = this.dataLayout().abiSizeOfType(
+            this.mapType(elementTypeOf(arrayType)));
+        return this.runtime.call(this.runtime.arrayAllocate(), [count,
+            this.context.int64Type().constInt(elementBytes, false),
+            this.context.pointerType().constNull(),
+            this.message("array size cannot be negative")], "");
+    }
+
+    // The member name the enum value spells, as selects folded from the last member back to the
+    // first so the earliest matching member wins. Assigned values may be sparse or negative, so
+    // the chain matches values rather than indexing a table.
+    emitEnumName(EnumType named, Value value) -> Value {
+        let memberType = this.mapType(named);
+        string[] names = named.memberNames();
+        long[] values = named.memberValues();
+        Value chosen = this.message("<invalid>");
+        for (long i = names.length - 1; i >= 0; i--) {
+            let matched = instructions.buildICmpEQ(this.builder, value,
+                memberType.constInt(values[i] as ulong, true), "");
+            chosen = instructions.buildSelect(this.builder, matched, this.message(names[i]),
+                chosen, "");
+        }
+        return chosen;
+    }
+
+    dataLayout() -> TargetData {
+        let layout = this.moduleLayout;
+        if (layout == null) {
+            panic("Internal: the module's data layout was not recorded before emission");
+        }
+        return layout;
     }
 
     emitBinary(EirBinaryOp op, Value left, Value right) -> Value {
@@ -448,8 +694,45 @@ class ModuleEmitter {
                 },
             }
         }
+        if (type is StringType || type is ArrayType) {
+            return this.context.pointerType();
+        }
+        if (type is EnumType) {
+            if (type.isNumeric()) {
+                return this.context.int64Type();
+            }
+            return this.context.int32Type();
+        }
+        if (type is StructType) {
+            return this.mapStructType(type, type.fields());
+        }
         panic("Internal: no LLVM mapping for type '{types.display(type)}'");
     }
+
+    // A struct's named LLVM type, cached by the interned sema type. The name is registered before
+    // the body is filled in, so a struct reaching itself through an array field terminates.
+    mapStructType(Type type, List<Field> fields) -> TypeRef {
+        let cached = this.structTypes.get(type);
+        if (cached != null) {
+            return cached;
+        }
+        let named = this.context.namedStructType(types.display(type));
+        this.structTypes.set(type, named);
+        let fieldTypes = new TypeRef[fields.length()];
+        for (long i = 0; i < fieldTypes.length; i++) {
+            fieldTypes[i] = this.mapType(fields.get(i).type());
+        }
+        named.setBody(fieldTypes, false);
+        return named;
+    }
+}
+
+// The element type of an array, for the allocation that sizes one element.
+elementTypeOf(Type arrayType) -> Type {
+    if (arrayType is ArrayType) {
+        return arrayType.element();
+    }
+    panic("Internal: an array allocation has type '{types.display(arrayType)}'");
 }
 
 // Emission runs after the verifier proved def-before-use, so a missing temp is a bug.
