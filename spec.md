@@ -13,7 +13,7 @@ An unmarked top-level declaration is visible only within its file, and an unmark
 Top-level `protected` is not allowed.
 Struct fields follow their struct's visibility; a field that writes its own modifier, such as `private`, opts out.
 Class members never follow their class: they stay private unless marked.
-The one exception is a method that replaces a behavior the language already provides for its type: a struct's `toString`, and a class's `hash` and `equals`.
+The one exception is a method that replaces a behavior the language already provides for its type: a struct's `toString` and `hash`, and a class's `hash` and `equals`.
 The language calls such a method wherever the type is used, so it follows its type's visibility when unmarked and may not be marked less visible than its type.
 Interface members carry no visibility of their own: they always follow the interface, and writing a visibility modifier on an interface member is an error.
 Enum cases follow their enum.
@@ -173,6 +173,7 @@ class Square extends Shape {
 
 Methods are overridable by default. An override must be marked `override` and must match a method declared in a base class; this catches typos and accidental shadowing. Mark a method or a class `final` to forbid overriding or extending it.
 `override` on a method that overrides nothing is an error, so the marker always names something real: a base or interface method, or a behavior the language provides for the type, which for a struct means only `toString` and `hash`.
+The marker is required for both of those, so a struct that declares a `toString` or a `hash` always writes it as an `override`.
 
 `super.method(...)` calls the base class's implementation, bypassing any override. A constructor may call `super(...)` as its first statement to run the base constructor; if it does not, the base class must be constructible with no arguments. `protected` members (see above) are reachable from subclasses.
 
@@ -188,6 +189,7 @@ When the last reference to an object is released its destructor runs, followed b
 Destructors are a class-only feature; structs and interfaces cannot declare them.
 
 An `abstract class` cannot be instantiated. It may declare `abstract` methods (a signature with no body), that every concrete subclass must `override`.
+`abstract` needs a type that can have subclasses, so it is not allowed on a struct member: a struct is never a base type, and nothing could ever implement the member.
 
 A `sealed class` closes its hierarchy: every direct subclass must be declared in the same module as the sealed class, and extending it from another module is a compile error.
 A sealed class may be abstract or concrete (`sealed abstract class Expr { ... }`), but it cannot also be `final`, which already forbids subclasses.

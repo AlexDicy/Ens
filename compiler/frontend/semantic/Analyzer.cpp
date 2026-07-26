@@ -1156,6 +1156,7 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             checkToStringMethodSignature(m, sym, isCtor);
             const char* behavior = builtinBehaviorReplaced(t, mname, sym);
             checkStructOverrideMarker(m, t, mname, sym, isCtor, behavior);
+            checkStructAbstractMarker(m, t, mname, isCtor);
             analysis.setSymbol(m.node.greenNode(), sym);
             analysis.setReceiver(m.node.greenNode(), t);
 
@@ -2150,16 +2151,20 @@ Visibility Analyzer::builtinReplacementVisibility(
 }
 
 // A struct inherits nothing, so `override` on a struct member marks a method that
-// replaces a built-in behavior, and the struct's own text form must carry the marker
-// exactly as a class's `hash` and `equals` do.
+// replaces a built-in behavior, and the behaviors a struct has of its own - its text
+// form and its content hash - must carry the marker exactly as a class's `hash` and
+// `equals` do. A near-miss shape gets its own signature diagnostic instead.
 void Analyzer::checkStructOverrideMarker(const ast::FuncDecl& fn, const Type* owner,
                                          const std::u16string& memberName, Symbol* sym,
                                          bool isConstructor, const char* behavior) {
     std::string ownerName = asciiOf(owner->structInfo->name);
-    if (fn.isOverride()) {
-        if (isConstructor) {
+    if (isConstructor) {
+        if (fn.isOverride() || fn.isAbstract())
             errorAtNode(fn.node, "A constructor cannot be 'override' or 'abstract'.");
-        } else if (!behavior) {
+        return;
+    }
+    if (fn.isOverride()) {
+        if (!behavior) {
             errorAtNode(fn.node, "Method '" + asciiOf(memberName) + "' of '" + ownerName +
                 "' is marked 'override' but structs do not inherit, so there is nothing to "
                 "override; only 'toString' and 'hash' replace a built-in behavior of a struct. "
@@ -2167,10 +2172,25 @@ void Analyzer::checkStructOverrideMarker(const ast::FuncDecl& fn, const Type* ow
         }
         return;
     }
-    if (memberName == u"toString" && toStringSignatureConforms(sym)) {
-        errorAtNode(fn.node, "Method 'toString' overrides the built-in text form of struct '" +
-            ownerName + "'; mark it 'override'.");
+    if (!behavior) return;
+    bool conforms = memberName == u"hash" ? hashSignatureConforms(sym)
+                                          : toStringSignatureConforms(sym);
+    if (conforms) {
+        errorAtNode(fn.node, "Method '" + asciiOf(memberName) + "' overrides the built-in " +
+            behavior + " of struct '" + ownerName + "'; mark it 'override'.");
     }
+}
+
+// `abstract` leaves a member for a subclass to implement, and a struct is never a base
+// type, so the member could never be given a body. A struct constructor is rejected as
+// a pair with `override` above.
+void Analyzer::checkStructAbstractMarker(const ast::FuncDecl& fn, const Type* owner,
+                                         const std::u16string& memberName, bool isConstructor) {
+    if (isConstructor || !fn.isAbstract()) return;
+    errorAtNode(fn.node, "Method '" + asciiOf(memberName) + "' of struct '" +
+        asciiOf(owner->structInfo->name) + "' cannot be 'abstract'; a struct cannot be "
+        "subclassed, so nothing could ever implement it. Give '" + asciiOf(memberName) +
+        "' a body, or move it to an abstract class.");
 }
 
 // `hash` and `equals` are a matched pair: equal values must hash equally, or
