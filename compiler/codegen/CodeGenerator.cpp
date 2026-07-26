@@ -968,6 +968,12 @@ struct CodeGenerator::Impl {
             } else if (structHasClassFields(psym->type)) {
                 emitStructFieldRetain(psym->type, alloca);
                 cleanupStack.back().push_back({ alloca, psym->type });
+            } else if (isReferenceType(psym->type) && psym->reassigned) {
+                // The caller's +1 covers the call only, so a parameter the body
+                // reassigns gets its own reference: the slot becomes owning and the
+                // assignment's release-old / retain-new discipline then balances.
+                emitRetain(&*argIter);
+                cleanupStack.back().push_back({ alloca, psym->type });
             }
 
             if (debugEnabled && diBuilder && sp) {
