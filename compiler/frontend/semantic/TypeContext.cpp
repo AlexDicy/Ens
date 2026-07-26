@@ -65,6 +65,7 @@ Type* TypeContext::registerStruct(const std::u16string& modulePath, std::u16stri
     StructInfo* infoPtr = info.get();
     ownedStructs.push_back(std::move(info));
 
+    infoPtr->declKind = DeclKind::Struct;
     Type* t = allocate(TypeKind::Struct);
     t->structInfo = infoPtr;
     structCache[Key{modulePath, std::move(name)}] = t;
@@ -96,6 +97,7 @@ Type* TypeContext::lookupClass(const std::u16string& modulePath, const std::u16s
 
 Type* TypeContext::registerInterface(const std::u16string& modulePath, std::u16string name) {
     Type* t = registerClass(modulePath, std::move(name));
+    t->structInfo->declKind = DeclKind::Interface;
     t->structInfo->isInterface = true;
     t->structInfo->isAbstract = true;  // never instantiable
     return t;
@@ -108,6 +110,7 @@ Type* TypeContext::registerExternalType(const std::u16string& modulePath, std::u
     StructInfo* infoPtr = info.get();
     ownedStructs.push_back(std::move(info));
 
+    infoPtr->declKind = DeclKind::External;
     Type* t = allocate(TypeKind::External);
     t->structInfo = infoPtr;
     externalCache[Key{modulePath, std::move(name)}] = t;
@@ -126,6 +129,7 @@ Type* TypeContext::registerEnum(const std::u16string& modulePath, std::u16string
     StructInfo* infoPtr = info.get();
     ownedStructs.push_back(std::move(info));
 
+    infoPtr->declKind = DeclKind::Enum;
     Type* t = allocate(TypeKind::Enum);
     t->structInfo = infoPtr;
     enumCache[Key{modulePath, std::move(name)}] = t;
@@ -224,6 +228,7 @@ Type* TypeContext::instantiateInternal(StructInfo* templ, TypeKind kind,
     info->name = templ->name;
     info->modulePath = templ->modulePath;
     info->packagePrefix = templ->packagePrefix;
+    info->declKind = templ->declKind;
     info->visibility = templ->visibility;
     info->isAbstract = templ->isAbstract;
     info->isFinal = templ->isFinal;

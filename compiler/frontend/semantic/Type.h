@@ -40,6 +40,21 @@ inline int visibilityTier(Visibility v) {
     return 0;
 }
 
+// What a StructInfo was declared as. Classes, interfaces, structs, enums and
+// external types all carry a StructInfo, so diagnostics need the real keyword.
+enum class DeclKind { Class, Struct, Interface, Enum, External };
+
+inline const char* declKindWord(DeclKind k) {
+    switch (k) {
+        case DeclKind::Struct:    return "struct";
+        case DeclKind::Interface: return "interface";
+        case DeclKind::Enum:      return "enum";
+        case DeclKind::External:  return "external type";
+        case DeclKind::Class:     return "class";
+    }
+    return "class";
+}
+
 struct FieldInfo {
     std::u16string name;
     Type* type;
@@ -76,6 +91,7 @@ struct StructInfo {
     std::u16string name;
     std::u16string modulePath;       // owning module's canonical path; "" for single-file/stdin
     std::u16string packagePrefix;    // owning package's prefix; "" for the root package
+    DeclKind declKind = DeclKind::Class;
     Visibility visibility = Visibility::Private;
     std::vector<FieldInfo> fields;   // for a class, base fields are flattened in first
     std::vector<MethodInfo> methods; // methods are NOT flattened; walk baseInfo to inherit

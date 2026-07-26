@@ -61,14 +61,19 @@ static std::string asciiOf(std::u16string_view s) {
 }
 
 // The declared kind of an existing type as it reads in a diagnostic.
+// The declaration keyword for a type that names one. Anything else - a primitive, an
+// optional, an array, or a type parameter standing in for a bound - is just "type".
 static std::string typeKindWord(const Type* t) {
-    if (!t) return "type";
-    if (t->isEnum()) return "enum";
-    if (t->isExternal()) return "external type";
-    if (t->isInterface()) return "interface";
-    if (t->isStruct()) return "struct";
-    if (t->isClass()) return "class";
-    return "type";
+    if (!t || !t->structInfo) return "type";
+    switch (t->kind) {
+        case TypeKind::Struct:
+        case TypeKind::Class:
+        case TypeKind::Enum:
+        case TypeKind::External:
+            return declKindWord(t->structInfo->declKind);
+        default:
+            return "type";
+    }
 }
 
 // =========================================================
@@ -4477,8 +4482,9 @@ void Analyzer::checkMemberAccess(const SyntaxNode& diagNode, const std::u16strin
                                  Visibility visibility, StructInfo* definingClass) {
     if (isMemberAccessAllowed(visibility, definingClass)) return;
     std::string owner = definingClass ? asciiOf(definingClass->name) : std::string("its class");
+    std::string kind = definingClass ? declKindWord(definingClass->declKind) : "type";
     if (visibility == Visibility::Private) {
-        errorAtNode(diagNode, "'" + asciiOf(memberName) + "' is private to class '" + owner +
+        errorAtNode(diagNode, "'" + asciiOf(memberName) + "' is private to " + kind + " '" + owner +
             "' and can only be accessed from inside '" + owner + "'");
     } else if (visibility == Visibility::Public) {
         const StructInfo* defining = declarationAuthority(definingClass);
@@ -4488,8 +4494,8 @@ void Analyzer::checkMemberAccess(const SyntaxNode& diagNode, const std::u16strin
             "' is public inside " + packageName + " but not exported. Mark it 'export' to use "
             "it from another package.");
     } else {
-        errorAtNode(diagNode, "'" + asciiOf(memberName) + "' is protected to class '" + owner +
-            "' and can only be accessed from inside '" + owner +
+        errorAtNode(diagNode, "'" + asciiOf(memberName) + "' is protected to " + kind + " '" +
+            owner + "' and can only be accessed from inside '" + owner +
             "', a subclass of it, or the file where '" + owner + "' is declared");
     }
 }
