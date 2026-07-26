@@ -13,6 +13,8 @@ An unmarked top-level declaration is visible only within its file, and an unmark
 Top-level `protected` is not allowed.
 Struct fields follow their struct's visibility; a field that writes its own modifier, such as `private`, opts out.
 Class members never follow their class: they stay private unless marked.
+The one exception is a method that replaces a behavior the language already provides for its type: a struct's `toString`, and a class's `hash` and `equals`.
+The language calls such a method wherever the type is used, so it follows its type's visibility when unmarked and may not be marked less visible than its type.
 Interface members carry no visibility of their own: they always follow the interface, and writing a visibility modifier on an interface member is an error.
 Enum cases follow their enum.
 A member may not be declared more visible than the type that contains it: an `export` method on a `public` class is an error, never a silent cap.
@@ -94,7 +96,7 @@ A struct does not customize equality: a method named `equals` on a struct is an 
 A struct serializes to a JSON string through `.toString()` and in interpolation holes, honoring the default-serialization promise.
 The form is a JSON object listing every field, including private and protected ones, in declaration order: `{"field": value, ...}`.
 Numbers render as decimals, `bool` as `true` or `false`, strings and enum members as JSON-quoted text (with `"`, `\`, and control characters escaped), a `char` as a one-character quoted string with its scalar encoded to UTF-8 and escaped the same way, an absent nullable field as `null`, and a nested struct as its own JSON object.
-A struct that declares its own `toString` method uses that method instead.
+A struct that declares its own `toString` method uses that method instead; because it replaces the built-in form, it is written `override toString() -> string`, taking no arguments and never `throws` - an interpolation hole has nowhere to write a `try`.
 A struct is serializable only when every field is: a value type, a string, an enum, one of those made nullable, or a nested such struct.
 A field that is a class, an array, or an external handle has no JSON form and makes serializing the struct an error that names the offending field, mirroring the `==` rule.
 
@@ -170,6 +172,7 @@ class Square extends Shape {
 ```
 
 Methods are overridable by default. An override must be marked `override` and must match a method declared in a base class; this catches typos and accidental shadowing. Mark a method or a class `final` to forbid overriding or extending it.
+`override` on a method that overrides nothing is an error, so the marker always names something real: a base or interface method, or a behavior the language provides for the type, which for a struct means only `toString` and `hash`.
 
 `super.method(...)` calls the base class's implementation, bypassing any override. A constructor may call `super(...)` as its first statement to run the base constructor; if it does not, the base class must be constructible with no arguments. `protected` members (see above) are reachable from subclasses.
 
@@ -1207,6 +1210,7 @@ writeGreeting() -> int throws {
 ---
 
 Every value has a `hash()` method returning a `long`. Value types (primitives, enums, strings, structs) hash by their contents, so equal values hash equally; classes and arrays hash by identity, matching how `==` compares them. A class can declare its own `hash() -> long` to control its hashing (a method named `hash` must have exactly that signature), paired with `equals(C other) -> bool` - a method taking a single parameter of the class's own type `C` - to control equality. When a class declares such an `equals`, `==` and `!=` on that class compare by content - an identity and null check first, then `equals` - rather than by reference identity; the method must return `bool` and cannot be `throws`. Both `hash` and `equals` are written with `override`, since they replace a class's built-in identity hash and equality. The two are a matched pair: a class that declares one must declare the other, so equal instances always hash equally. The `Hashable` interface from `@std.hash` names the hashing contract for generic bounds, and every type satisfies it.
+Because the language calls `hash` and `equals` wherever the class is used, both follow the class's visibility when unmarked and may not be marked less visible than the class itself.
 
 The collection modules build on hashing and iteration:
 

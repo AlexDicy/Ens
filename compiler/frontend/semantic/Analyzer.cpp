@@ -1153,6 +1153,9 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             checkNoreturnPlacement(m, /*isConstructor=*/isCtor, /*isDestructor=*/false);
             resolveMethodParams(m, t, sym);
             checkHashMethodSignature(m, sym, isCtor);
+            checkToStringMethodSignature(m, sym, isCtor);
+            const char* behavior = builtinBehaviorReplaced(t, mname, sym);
+            checkStructOverrideMarker(m, t, mname, sym, isCtor, behavior);
             analysis.setSymbol(m.node.greenNode(), sym);
             analysis.setReceiver(m.node.greenNode(), t);
 
@@ -1167,9 +1170,10 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             mi.name = mname;
             mi.symbol = sym;
             mi.declaration = const_cast<GreenElement*>(m.node.greenNode());
-            mi.visibility = memberVisibility(m.visibilityModifier(), Visibility::Private,
-                                             t->structInfo,
-                                             isCtor ? "Constructor" : "Method", mname);
+            mi.visibility = behavior
+                ? builtinReplacementVisibility(m.visibilityModifier(), t, mname, behavior)
+                : memberVisibility(m.visibilityModifier(), Visibility::Private, t->structInfo,
+                                   isCtor ? "Constructor" : "Method", mname);
             mi.isConstructor = isCtor;
             mi.isNoreturn = m.isNoreturn();
             mi.definingClass = t->structInfo;
@@ -1471,13 +1475,17 @@ static bool hashSignatureConforms(const Symbol* sym) {
         sym->returnType->kind == TypeKind::Long;
 }
 
-static bool equalsSignatureConforms(const Symbol* sym) {
-    if (!sym || sym->paramTypes.size() != 1 || !sym->returnType ||
-        sym->returnType->kind != TypeKind::Bool) {
-        return false;
-    }
+// A single parameter of the owner's own class type marks an equality method even when
+// the rest of its shape is wrong; those near misses get their own diagnostics.
+static bool equalsSignatureIntent(const Symbol* sym) {
+    if (!sym || sym->paramTypes.size() != 1) return false;
     Type* p = sym->paramTypes[0];
     return p && p->isClass() && p->structInfo == sym->methodOwner;
+}
+
+static bool equalsSignatureConforms(const Symbol* sym) {
+    if (!equalsSignatureIntent(sym)) return false;
+    return sym->returnType && sym->returnType->kind == TypeKind::Bool;
 }
 
 void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
@@ -1588,13 +1596,16 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
             continue;
         }
 
+        const char* behavior = isDtor ? nullptr : builtinBehaviorReplaced(t, mname, sym);
         MethodInfo mi;
         mi.name = mname;
         mi.symbol = sym;
         mi.declaration = const_cast<GreenElement*>(m.node.greenNode());
         mi.visibility = isDtor ? Visibility::Private
-                               : memberVisibility(m.visibilityModifier(), Visibility::Private,
-                                                  si, isCtor ? "Constructor" : "Method", mname);
+                     : behavior ? builtinReplacementVisibility(m.visibilityModifier(), t, mname,
+                                                               behavior)
+                                : memberVisibility(m.visibilityModifier(), Visibility::Private,
+                                                   si, isCtor ? "Constructor" : "Method", mname);
         mi.isConstructor = isCtor;
         mi.isDestructor = isDtor;
         mi.isOverride = m.isOverride();
@@ -1627,7 +1638,7 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
         checkEqualsMethodSignature(m, sym, isCtor);
         if (isCtor) {
             if (m.isOverride() || m.isAbstract())
-                errorAtNode(m.node, "A constructor cannot be 'override' or 'abstract'");
+                errorAtNode(m.node, "A constructor cannot be 'override' or 'abstract'.");
             continue;
         }
         StructInfo* baseByName = si->baseInfo ? si->baseInfo->classDeclaringMethod(mname) : nullptr;
@@ -1646,8 +1657,7 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
         // which get their own signature diagnostics rather than a spurious
         // "nothing to override".
         bool reservedIntent = mname == u"hash" ||
-            (mname == u"equals" && sym->paramTypes.size() == 1 && sym->paramTypes[0] &&
-             sym->paramTypes[0]->isClass() && sym->paramTypes[0]->structInfo == sym->methodOwner);
+            (mname == u"equals" && equalsSignatureIntent(sym));
         bool reservedConforming = (mname == u"hash" && hashSignatureConforms(sym)) ||
                                   (mname == u"equals" && equalsSignatureConforms(sym));
         if (m.isOverride()) {
@@ -1688,8 +1698,8 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
                 // Overrides the compiler's built-in identity hash/equality; no
                 // base declares it, but 'override' is the required marker.
             } else {
-                errorAtNode(m.node, "Method '" + asciiOf(mname) +
-                    "' is marked 'override' but no base class or implemented interface declares it");
+                errorAtNode(m.node, "Method '" + asciiOf(mname) + "' is marked 'override' but no "
+                    "base class or implemented interface declares it.");
             }
         } else if (baseBySig) {
             // A subclass may add a new overload of an inherited name; only a
@@ -2072,6 +2082,97 @@ void Analyzer::checkEqualsMethodSignature(const ast::FuncDecl& fn, Symbol* sym, 
     }
 }
 
+// A struct renders as text through `toString`, so a declaration must match the
+// contract that text form needs: no arguments, a `string` result, and no `throws`
+// for a caller that has nowhere to write `try`.
+static bool toStringSignatureConforms(const Symbol* sym) {
+    return sym && sym->paramTypes.empty() && !sym->declaredThrows && sym->returnType &&
+        sym->returnType->isString();
+}
+
+void Analyzer::checkToStringMethodSignature(const ast::FuncDecl& fn, Symbol* sym,
+                                            bool isConstructor) {
+    if (isConstructor || !sym || sym->name != u"toString") return;
+    if (fn.isThrows()) {
+        errorAtNode(fn.throwsToken().value_or(fn.node),
+            "A method named 'toString' cannot be marked 'throws'; a value's text form is used "
+            "where there is no room for a 'try', such as an interpolation hole. Remove 'throws', "
+            "or rename the method.");
+    }
+    if (!sym->paramTypes.empty() || !sym->returnType || !sym->returnType->isString()) {
+        errorAtNode(fn.node, "A method named 'toString' must have the signature "
+            "'toString() -> string'; it defines how values of this type render as text (for "
+            "example in an interpolation hole).");
+    }
+}
+
+// The behavior a member takes over from the language, or null for an ordinary
+// member: a struct's text form, and the hash and equality a value is keyed by. A
+// struct's `equals` is ordinary because `==` on a struct stays memberwise, and a
+// class has no text form of its own to replace.
+const char* Analyzer::builtinBehaviorReplaced(const Type* owner,
+                                              const std::u16string& memberName,
+                                              const Symbol* sym) const {
+    if (!owner || !owner->structInfo || !sym) return nullptr;
+    if (owner->isStruct()) {
+        if (memberName == u"toString") return "text form";
+        if (memberName == u"hash") return "content hash";
+        return nullptr;
+    }
+    if (owner->isClass() && !owner->isInterface()) {
+        if (memberName == u"hash") return "identity hash";
+        if (memberName == u"equals" && equalsSignatureIntent(sym)) return "identity equality";
+    }
+    return nullptr;
+}
+
+// A member that replaces a built-in behavior runs wherever its type is used - through
+// `==`, a keyed collection, an interpolation hole - so it must be reachable wherever
+// the type is nameable. Unmarked, it follows its type instead of taking the private
+// member default; a narrower marker is rejected here, and a wider one is over-marked
+// and reported by the shared member rule.
+Visibility Analyzer::builtinReplacementVisibility(
+        const std::optional<ast::VisibilityModifier>& modifier, const Type* owner,
+        const std::u16string& memberName, const char* behavior) {
+    StructInfo* si = owner->structInfo;
+    Visibility required = followedMemberVisibility(si->visibility);
+    if (!modifier) return required;
+    bool overMarked = visibilityTier(toSemanticVisibility(modifier->visibility())) >
+                      visibilityTier(si->visibility);
+    Visibility written = memberVisibility(modifier, required, si, "Method", memberName);
+    if (!overMarked && written != required) {
+        errorAtNode(modifier->node, "Method '" + asciiOf(memberName) +
+            "' replaces the built-in " + behavior + " of " + typeKindWord(owner) + " '" +
+            asciiOf(si->name) + "', so it must be as visible as '" + asciiOf(si->name) +
+            "' itself; mark it '" + visibilityWord(required) + "'.");
+    }
+    return required;
+}
+
+// A struct inherits nothing, so `override` on a struct member marks a method that
+// replaces a built-in behavior, and the struct's own text form must carry the marker
+// exactly as a class's `hash` and `equals` do.
+void Analyzer::checkStructOverrideMarker(const ast::FuncDecl& fn, const Type* owner,
+                                         const std::u16string& memberName, Symbol* sym,
+                                         bool isConstructor, const char* behavior) {
+    std::string ownerName = asciiOf(owner->structInfo->name);
+    if (fn.isOverride()) {
+        if (isConstructor) {
+            errorAtNode(fn.node, "A constructor cannot be 'override' or 'abstract'.");
+        } else if (!behavior) {
+            errorAtNode(fn.node, "Method '" + asciiOf(memberName) + "' of '" + ownerName +
+                "' is marked 'override' but structs do not inherit, so there is nothing to "
+                "override; only 'toString' and 'hash' replace a built-in behavior of a struct. "
+                "Remove 'override'.");
+        }
+        return;
+    }
+    if (memberName == u"toString" && toStringSignatureConforms(sym)) {
+        errorAtNode(fn.node, "Method 'toString' overrides the built-in text form of struct '" +
+            ownerName + "'; mark it 'override'.");
+    }
+}
+
 // `hash` and `equals` are a matched pair: equal values must hash equally, or
 // keyed collections silently misbehave. A class that customizes one must
 // customize the other, here or in a base class. Reported once, on the class
@@ -2088,16 +2189,11 @@ void Analyzer::checkHashEqualsPairing(const ast::ClassDecl& cd, StructInfo* si) 
             if (m.name == u"equals" && equalsSignatureConforms(m.symbol)) return true;
         return false;
     };
-    // A single same-class parameter marks an equality method even when its
-    // return type is wrong; that near-miss gets its own signature diagnostic,
-    // so the pairing check treats it as an equals already present.
+    // A near-miss equality method gets its own signature diagnostic, so the pairing
+    // check treats it as an equals already present.
     auto equalsIntent = [](StructInfo* s) {
-        for (auto& m : s->methods) {
-            Symbol* sym = m.symbol;
-            if (m.name == u"equals" && sym && sym->paramTypes.size() == 1 &&
-                sym->paramTypes[0] && sym->paramTypes[0]->isClass() &&
-                sym->paramTypes[0]->structInfo == sym->methodOwner) return true;
-        }
+        for (auto& m : s->methods)
+            if (m.name == u"equals" && equalsSignatureIntent(m.symbol)) return true;
         return false;
     };
     auto hashNamed = [](StructInfo* s) {
@@ -4258,11 +4354,7 @@ Type* Analyzer::analyzeInterpString(const ast::InterpStringExpression& expr) {
             // A struct that declares its own toString interpolates through that method and is
             // never serialized; without one it interpolates as its JSON form, which is valid
             // when every field is JSON-able.
-            if (const MethodInfo* own = declaredToString(ht->structInfo)) {
-                std::string issue = textFormIssue(ht->toString(), *own);
-                if (!issue.empty()) errorAtNode(hole.node, issue);
-                continue;
-            }
+            if (declaredToString(ht->structInfo)) continue;
             checkStructJsonable(ht, hole.node);
             continue;
         }

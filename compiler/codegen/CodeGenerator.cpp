@@ -5437,15 +5437,8 @@ struct CodeGenerator::Impl {
     // A struct that declares its own toString renders through that method, in an
     // interpolation hole exactly as in an explicit call: the receiver is the
     // address of the storage the expression names, and the result arrives owned.
-    // A generic struct reaches this only after monomorphization, so the report on
-    // an unusable method names the concrete type.
     llvm::Value* emitDeclaredToString(const ast::Expression& obj, ::Type* structT,
                                       const MethodInfo& method) {
-        std::string issue = textFormIssue(structT->toString(), method);
-        if (!issue.empty()) {
-            error(obj.node.startOffset(), issue);
-            return nullptr;
-        }
         llvm::Function* fn = getOrDeclareExternalFunction(method.symbol, structT);
         if (!fn) {
             error(obj.node.startOffset(), "Internal: 'toString' has no LLVM function");

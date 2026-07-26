@@ -222,6 +222,10 @@ private:
                                    bool isConstructor, const SyntaxNode& diag);
     void checkHashMethodSignature(const ast::FuncDecl& fn, Symbol* sym, bool isConstructor);
     void checkEqualsMethodSignature(const ast::FuncDecl& fn, Symbol* sym, bool isConstructor);
+    void checkToStringMethodSignature(const ast::FuncDecl& fn, Symbol* sym, bool isConstructor);
+    void checkStructOverrideMarker(const ast::FuncDecl& fn, const Type* owner,
+                                   const std::u16string& memberName, Symbol* sym,
+                                   bool isConstructor, const char* behavior);
     void checkHashEqualsPairing(const ast::ClassDecl& cd, StructInfo* si);
     void checkStructEquatable(Type* structT, const SyntaxNode& node);
     bool findNonComparableField(Type* structT, std::vector<StructInfo*>& visiting,
@@ -508,6 +512,15 @@ private:
                                 Visibility defaultVisibility, StructInfo* owner,
                                 const std::string& memberKindWord,
                                 const std::u16string& memberName);
+    // The behavior a member replaces for its type, or null when it is an ordinary
+    // member; the phrase names the behavior in a diagnostic.
+    const char* builtinBehaviorReplaced(const Type* owner, const std::u16string& memberName,
+                                        const Symbol* sym) const;
+    // The effective visibility of a member that replaces a built-in behavior: it
+    // follows its type, and a marker narrower than the type is rejected.
+    Visibility builtinReplacementVisibility(
+        const std::optional<ast::VisibilityModifier>& modifier, const Type* owner,
+        const std::u16string& memberName, const char* behavior);
     // True when a top-level symbol with the given visibility, declared in the given
     // module and package, is nameable from this module.
     bool isTopLevelVisibleFrom(Visibility v, const std::u16string& declModulePath,

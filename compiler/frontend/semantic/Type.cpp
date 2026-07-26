@@ -16,35 +16,10 @@ bool sameParameterTypes(const Symbol* a, const Symbol* b) {
 
 const MethodInfo* declaredToString(const StructInfo* info) {
     if (!info) return nullptr;
-    const MethodInfo* named = nullptr;
     for (const MethodInfo& m : info->methods) {
-        if (m.name != u"toString") continue;
-        if (producesTextForm(m)) return &m;
-        if (!named) named = &m;
+        if (m.name == u"toString") return &m;
     }
-    return named;
-}
-
-bool producesTextForm(const MethodInfo& method) {
-    const Symbol* sym = method.symbol;
-    if (!sym || !sym->paramTypes.empty() || sym->isTemplate) return false;
-    if (sym->declaredThrows) return false;
-    return sym->returnType && sym->returnType->isString();
-}
-
-std::string textFormIssue(const std::string& structName, const MethodInfo& method) {
-    if (producesTextForm(method)) return "";
-    if (method.symbol && method.symbol->declaredThrows) {
-        return "Struct '" + structName + "' declares 'toString' as 'throws', and an "
-            "interpolation hole has nowhere to write 'try'. Call it yourself and interpolate the "
-            "result (`let text = try value.toString();` then `\"{text}\"`), or drop 'throws' from "
-            "'toString'.";
-    }
-    return "Struct '" + structName + "' declares its own 'toString', so interpolating a '" +
-        structName + "' calls that method, but it cannot produce the text: a 'toString' used this "
-        "way must take no arguments and return 'string' (`public toString() -> string { ... }`). "
-        "Give it that shape, or rename the method so '" + structName + "' serializes to its JSON "
-        "form instead.";
+    return nullptr;
 }
 
 int StructInfo::findMethodIndexBySignature(const std::u16string& methodName,
