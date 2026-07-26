@@ -1,0 +1,103 @@
+// A struct's text form, which is JSON: '{' then every field as '"name": value' in declaration
+// order, separated by ', ', then '}'. Private and protected fields are included, because
+// visibility does not change what a value looks like as text.
+//
+// Fields are read through their addresses, so a nested struct renders where it already sits
+// instead of being copied out. The accumulator owns a reference throughout and every rendered
+// piece is released as soon as the concatenation that consumed it has run, so only the finished
+// text is left alive.
+import Expression from @ens.frontend.syntax.generated.nodes;
+import Span from @ens.frontend.support.source;
+import EnumType from @ens.sema.model.types;
+import StructType from @ens.sema.model.types;
+import Type from @ens.sema.model.types;
+import @ens.sema.model.types;
+import EirJsonEscape from eir.model;
+import LoweringContext from lower.context;
+import lower.ownership;
+import lower.places;
+import lower.strings;
+import lower.structs;
+import support.primitives;
+
+// The JSON text of the struct an expression names, as a string the caller owns.
+public lowerStruct(LoweringContext lowering, Expression node, StructType type) -> long {
+    long base = structs.addressOf(lowering, node, type);
+    if (base < 0) {
+        if (!lowering.failed()) {
+            lowering.unsupported("converting this expression to text", node.span());
+        }
+        return -1;
+    }
+    return renderAt(lowering, base, type, node.span());
+}
+
+// The JSON text of the struct the storage at an address holds.
+public renderAt(LoweringContext lowering, long base, StructType type, Span span) -> long {
+    long accumulator = strings.literalText(lowering, "\{");
+    ownership.retainValue(lowering, accumulator);
+    let fields = type.fields();
+    for (long i = 0; i < fields.length(); i++) {
+        string separator = "";
+        if (i > 0) {
+            separator = ", ";
+        }
+        accumulator = strings.appendText(lowering, accumulator,
+            separator + "\"" + fields.get(i).name() + "\": ");
+        long rendered = renderField(lowering, base, type, i, span);
+        if (rendered < 0) {
+            return -1;
+        }
+        accumulator = strings.appendOwned(lowering, accumulator, rendered);
+    }
+    return strings.appendText(lowering, accumulator, "\}");
+}
+
+// One field's JSON value, as a string the caller owns. A char and an enum member become text
+// first and are then escaped like any other string, so a char renders as a one-character quoted
+// string rather than a code point.
+renderField(LoweringContext lowering, long base, StructType owner, long index, Span span)
+        -> long {
+    let field = owner.fields().get(index);
+    let fieldType = field.type();
+    if (!rendersAsJson(fieldType)) {
+        lowering.unsupported("converting '{owner.name()}' to text: its field '{field.name()}' has "
+            + "type '{types.display(fieldType)}', and only integers, bool, char, float, double, "
+            + "string, enum, and nested structs of those render as JSON", span);
+        return -1;
+    }
+    long address = structs.fieldAddressAt(lowering, base, fieldType, index);
+    if (fieldType is StructType) {
+        return renderAt(lowering, address, fieldType, span);
+    }
+    long value = places.loadFrom(lowering, address, fieldType);
+    if (primitives.isStringType(fieldType)) {
+        return escaped(lowering, value);
+    }
+    if (primitives.isCharType(fieldType) || fieldType is EnumType) {
+        long text = strings.convertToString(lowering, value, fieldType, span);
+        if (text < 0) {
+            return -1;
+        }
+        long quoted = escaped(lowering, text);
+        ownership.releaseValue(lowering, text);
+        return quoted;
+    }
+    return strings.convertToString(lowering, value, fieldType, span);
+}
+
+// The field types with a JSON form the code generator can build.
+rendersAsJson(Type type) -> bool {
+    return primitives.isNumericType(type) || primitives.isBoolType(type)
+        || primitives.isStringType(type) || type is EnumType || type is StructType;
+}
+
+// The JSON string form of a string: quoted and escaped, as a fresh string the caller owns. The
+// quotes come from the escape itself, so nothing wraps its result.
+escaped(LoweringContext lowering, long text) -> long {
+    let builder = lowering.builder();
+    let stringType = lowering.store().stringType();
+    long result = builder.newTemp(stringType);
+    builder.append(new EirJsonEscape(result, stringType, text));
+    return result;
+}
