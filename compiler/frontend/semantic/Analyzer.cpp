@@ -6653,6 +6653,8 @@ Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
 
     Type* valueT = analyzeExprAdapt(*value, assignTargetT);
 
+    // What the store actually lands: the right side for `=`, the operator's result for `OP=`.
+    Type* storedT = valueT;
     if (!assignTargetT->isError() && !valueT->isError()) {
         if (simpleAssign) {
             if (!assignTargetT->assignableFrom(valueT)) {
@@ -6663,6 +6665,7 @@ Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
             // `a OP= b` means `a = a OP b`, so the right side is the operator's
             // operand and it is the operator's RESULT that has to fit the target.
             Type* resultT = compoundAssignResultType(expr, opTok->kind(), targetT, valueT);
+            if (!resultT->isError()) storedT = resultT;
             if (!resultT->isError() && !assignTargetT->assignableFrom(resultT)) {
                 std::string opText = asciiOf(opTok->tokenText());
                 errorAtNode(expr.node, "Cannot store the result of '" + opText + "' back into '" +
@@ -6682,7 +6685,7 @@ Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
     invalidateNarrowingsForWrite(*target);
     if (auto id = target->asIdent()) {
         if (auto* targetInfo = analysis.find(id->node.greenNode())) {
-            establishAssignmentNarrowing(targetInfo->resolvedSymbol, valueT);
+            establishAssignmentNarrowing(targetInfo->resolvedSymbol, storedT);
             if (unconditionalPosition_) markAssigned(targetInfo->resolvedSymbol);
         }
     } else if (auto mem = target->asMember()) {

@@ -7348,9 +7348,22 @@ struct CodeGenerator::Impl {
         if (!rhs) return nullptr;
         ::Type* rhsType = typeOf(value->node);
 
+        // The analyzer accepts the operator only where the target reads as its inner
+        // type, i.e. narrowing already proved the slot holds a value, so the operator
+        // works on that value and the result goes back into the optional slot.
+        ::Type* operandType = targetType;
+        bool wrapValueOptional = false;
+        if (targetType && subst(targetType)->isOptional() && subst(targetType)->inner) {
+            operandType = subst(targetType)->inner;
+            if (isValueTypeOptional(targetType)) {
+                cur = builder->CreateExtractValue(cur, {1}, "compound.cur.value");
+                wrapValueOptional = true;
+            }
+        }
+
         // The loaded value is borrowed (it still lives in the slot), so pass no
         // expression for the left operand: the binary core must not release it.
-        llvm::Value* result = emitBinaryValue(binOp, cur, targetType, /*leftE*/nullptr,
+        llvm::Value* result = emitBinaryValue(binOp, cur, operandType, /*leftE*/nullptr,
                                               rhs, rhsType, &*value, offset);
         if (!result) return nullptr;
 
@@ -7361,7 +7374,9 @@ struct CodeGenerator::Impl {
         if (isReferenceType(targetType)) {
             emitRelease(cur);
         }
-        builder->CreateStore(result, lv);
+        llvm::Value* stored = wrapValueOptional
+            ? emitWrapInValueOptional(result, operandType, targetType) : result;
+        builder->CreateStore(stored, lv);
         return result;
     }
 
