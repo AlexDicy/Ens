@@ -282,6 +282,11 @@ void EscapeAnalyzer::scanAssign(const ast::AssignExpression& e) {
         Symbol* targetSym = info ? info->resolvedSymbol : nullptr;
         if (targetSym) {
             markSymbolReassigned(targetSym);
+            // Replacing a parameter wholesale mutates it just as writing one of its
+            // fields does, so the by-pointer decision must see it: a struct passed by
+            // pointer would store the new value into the caller's own storage.
+            int idx = paramIndexOfSymbol(targetSym);
+            if (idx >= 0) markParamMutated(idx);
             // Reassignment invalidates any previous alias relationship.
             if (targetSym->aliasOf) targetSym->aliasOf = nullptr;
             updateBorrowMode(targetSym, *value);
