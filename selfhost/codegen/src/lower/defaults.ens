@@ -1,0 +1,175 @@
+// Field defaults: the declared value every field an aggregate leaves unset takes, whether the
+// aggregate is a literal, a constructor's temporary, a local declared bare, or one slot of a
+// freshly allocated array. A default is written and checked in the module that declares the struct,
+// so its side tables are read from there while it lowers; a field of struct type with no default of
+// its own still fills from the defaults its own struct declares, and that recursion rebinds again
+// to that struct's module.
+//
+// While a struct's defaults lower, the fields declared before the one being filled are in scope as
+// siblings, the way sema checked them: an identifier naming one resolves to a field of the
+// aggregate being filled rather than to a local slot.
+import FieldDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import StructDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import Span from @ens.frontend.support.source;
+import LocalBinding from @ens.sema.model.scopes;
+import PrimitiveKind from @ens.sema.model.types;
+import StructType from @ens.sema.model.types;
+import Type from @ens.sema.model.types;
+import EirBinary from eir.model;
+import EirBinaryOp from eir.model;
+import EirBranch from eir.model;
+import EirConstInt from eir.model;
+import EirJump from eir.model;
+import EirLoadSlot from eir.model;
+import EirStoreSlot from eir.model;
+import LoweringContext from lower.context;
+import lower.arrays;
+import lower.ownership;
+import lower.stores;
+import lower.structs;
+
+// True when the type is a struct that declares a default somewhere inside it, so filling a fresh
+// aggregate of it is more than zeroing.
+public declaresDefaults(Type type) -> bool {
+    if (!(type is StructType)) {
+        return false;
+    }
+    let fields = type.fields();
+    for (long i = 0; i < fields.length(); i++) {
+        if (fields.get(i).hasDefault() || declaresDefaults(fields.get(i).type())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Fills every field of a fresh aggregate from its declared defaults.
+public applyAll(LoweringContext lowering, long destination, StructType type, Span span) -> bool {
+    return applyOmitted(lowering, destination, type, new bool[type.fields().length()], span);
+}
+
+// Fills a slot declared without an initializer, which a struct with defaults still needs.
+public applyToSlot(LoweringContext lowering, long slot, Type type, Span span) -> bool {
+    if (!(type is StructType) || !declaresDefaults(type)) {
+        return true;
+    }
+    return applyAll(lowering, ownership.slotAddress(lowering, slot, type), type, span);
+}
+
+// Fills the fields the caller did not write. The storage is fresh, so a write initializes it and
+// has nothing to release.
+public applyOmitted(LoweringContext lowering, long destination, StructType type, bool[] written,
+                    Span span) -> bool {
+    if (!declaresDefaults(type)) {
+        return true;
+    }
+    let owner = lowering.index().structFor(type);
+    if (owner == null) {
+        lowering.internalError("struct '{type.name()}' has no declaration to read its field "
+            + "defaults from", span);
+        return false;
+    }
+    let caller = lowering.enterModule(owner.context());
+    lowering.pushFieldDefaults(destination, type);
+    bool filled = fill(lowering, destination, type, owner.declaration(), written, span);
+    lowering.popFieldDefaults();
+    let restored = lowering.enterModule(caller);
+    return filled;
+}
+
+// Walks the declaration in source order, which is the order the fields sit in and the order sema
+// brought them into scope, so a default may read a field declared before it.
+fill(LoweringContext lowering, long destination, StructType type, StructDeclarationNode node,
+     bool[] written, Span span) -> bool {
+    let body = node.body();
+    let fields = type.fields();
+    for (long i = 0; i < body.membersCount(); i++) {
+        let member = body.members(i);
+        if (!(member is FieldDeclarationNode)) {
+            continue;
+        }
+        long index = structs.fieldIndexOf(type, member.name().text());
+        if (index < 0 || written[index]) {
+            continue;
+        }
+        let fieldType = fields.get(index).type();
+        let defaultValue = member.defaultValue();
+        if (defaultValue != null) {
+            let operand = stores.lowerOperand(lowering, defaultValue.value(), fieldType);
+            if (operand == null) {
+                return false;
+            }
+            long fieldAddress = structs.fieldAddressAt(lowering, destination, fieldType, index);
+            if (!stores.initializeThroughAddress(lowering, fieldAddress, fieldType, operand)) {
+                lowering.internalError("the default of field '{member.name().text()}' borrows a "
+                    + "struct with no storage to retain", defaultValue.value().span());
+                return false;
+            }
+            continue;
+        }
+        if (fieldType is StructType && declaresDefaults(fieldType)) {
+            long nested = structs.fieldAddressAt(lowering, destination, fieldType, index);
+            if (!applyAll(lowering, nested, fieldType, span)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Runs a struct element type's field defaults over every slot of a freshly allocated array, so an
+// allocated slot reads the way a literal of that struct would. An element type with nothing to
+// default stays at the zero the allocation left it at.
+public fillArray(LoweringContext lowering, long array, Type elementType, long count, Span span)
+        -> bool {
+    if (!(elementType is StructType) || !declaresDefaults(elementType)) {
+        return true;
+    }
+    let builder = lowering.builder();
+    let longType = lowering.store().primitive(PrimitiveKind.Long);
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    long indexSlot = builder.addSlot("filled", longType, false, false);
+    long zero = builder.newTemp(longType);
+    builder.append(new EirConstInt(zero, longType, 0));
+    builder.append(new EirStoreSlot(indexSlot, zero));
+    long conditionBlock = builder.newBlock("fill.cond");
+    long bodyBlock = builder.newBlock("fill.body");
+    long exitBlock = builder.newBlock("fill.end");
+    builder.terminate(new EirJump(conditionBlock));
+    builder.moveTo(conditionBlock);
+    long index = builder.newTemp(longType);
+    builder.append(new EirLoadSlot(index, longType, indexSlot));
+    long more = builder.newTemp(boolType);
+    builder.append(new EirBinary(more, boolType, EirBinaryOp.CmpLtSigned, index, count));
+    builder.terminate(new EirBranch(more, bodyBlock, exitBlock));
+    builder.moveTo(bodyBlock);
+    long slotIndex = builder.newTemp(longType);
+    builder.append(new EirLoadSlot(slotIndex, longType, indexSlot));
+    long address = arrays.elementAddress(lowering, array, slotIndex, elementType);
+    if (!applyAll(lowering, address, elementType, span)) {
+        return false;
+    }
+    long one = builder.newTemp(longType);
+    builder.append(new EirConstInt(one, longType, 1));
+    long next = builder.newTemp(longType);
+    builder.append(new EirBinary(next, longType, EirBinaryOp.Add, slotIndex, one));
+    builder.append(new EirStoreSlot(indexSlot, next));
+    builder.terminate(new EirJump(conditionBlock));
+    builder.moveTo(exitBlock);
+    return true;
+}
+
+// The address of the sibling field an identifier inside a field default names, or -1 when no
+// default is being lowered or the name is not one of the struct's fields.
+public siblingFieldAddress(LoweringContext lowering, LocalBinding binding) -> long {
+    let owner = lowering.fieldDefaultOwner();
+    if (owner == null) {
+        return -1;
+    }
+    long index = structs.fieldIndexOf(owner, binding.name());
+    if (index < 0) {
+        return -1;
+    }
+    return structs.fieldAddressAt(lowering, lowering.fieldDefaultDestination(),
+        owner.fields().get(index).type(), index);
+}

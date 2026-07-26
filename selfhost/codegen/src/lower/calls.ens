@@ -1,6 +1,8 @@
 // Call lowering: resolving the callee through the program index, evaluating the written
 // arguments in source order into their parameter positions, filling the parameters left unbound
-// from the callee's declared defaults, and emitting the call.
+// from the callee's declared defaults, emitting the call, and giving up every temporary an argument
+// produced only for it. Struct constructors and struct methods share all of that and differ only in
+// the receiver they pass, so they resolve here and lower in lower.structs.
 import Expression from @ens.frontend.syntax.generated.nodes;
 import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
 import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
@@ -18,12 +20,28 @@ import FunctionInfo from lower.index;
 import LoweringContext from lower.context;
 import lower.builtins;
 import lower.expressions;
+import lower.ownership;
+import lower.places;
+import lower.structs;
+import support.primitives;
 import List from @std.collections.list;
 
 public lower(LoweringContext lowering, CallExpressionNode call) -> long {
     long intercepted = builtins.lowerMemberCall(lowering, call);
     if (intercepted != builtins.notIntercepted()) {
         return intercepted;
+    }
+    // A constructor is recorded on the call, a method on the member the call names.
+    let structConstructor = lowering.result().methodOf(call.green());
+    if (structConstructor != null) {
+        return structs.lowerConstructorCall(lowering, call, structConstructor);
+    }
+    let callee = call.callee();
+    if (callee is MemberExpressionNode) {
+        let method = lowering.result().methodOf(callee.green());
+        if (method != null) {
+            return structs.lowerMethodCall(lowering, call, callee, method);
+        }
     }
     let signature = calleeSignatureOf(lowering, call);
     if (signature == null) {
@@ -39,38 +57,75 @@ public lower(LoweringContext lowering, CallExpressionNode call) -> long {
     if (info.isBuiltin()) {
         return builtins.lowerFreeCall(lowering, call, signature.name());
     }
-    if (info.isExternal()) {
-        lowering.unsupported("calling the external function '{signature.name()}'",
-            call.span());
+    if (!supportedCallee(lowering, info, "function '{signature.name()}'", call.span())) {
         return -1;
+    }
+    return lowerCall(lowering, info, call, null, -1);
+}
+
+// The arguments, the call, and the end of every reference an argument produced for the call. An
+// argument passes at +0, so a temporary the caller built for it is still the caller's to give up.
+public lowerCall(LoweringContext lowering, FunctionInfo info, CallExpressionNode call,
+                 Type? receiverType, long receiver) -> long {
+    let temporaries = new List<long>();
+    let arguments = lowerArguments(lowering, info, call, temporaries);
+    if (arguments == null) {
+        return -1;
+    }
+    long result = emitCall(lowering, info, receiverType, receiver, arguments);
+    for (long i = 0; i < temporaries.length(); i++) {
+        ownership.releaseValue(lowering, temporaries.get(i));
+    }
+    return result;
+}
+
+// True when the callee's shape is one lowering can emit. 'described' names the callee the way the
+// diagnostic should read it, as in "function 'total'" or "method 'Rectangle.getArea'".
+public supportedCallee(LoweringContext lowering, FunctionInfo info, string described, Span span)
+        -> bool {
+    let signature = info.signature();
+    if (info.isExternal()) {
+        lowering.unsupported("calling the external {described}", span);
+        return false;
     }
     if (signature.isGeneric()) {
-        lowering.unsupported("calling the generic function '{signature.name()}'",
-            call.span());
-        return -1;
+        lowering.unsupported("calling the generic {described}", span);
+        return false;
     }
     if (signature.declaresThrows()) {
-        lowering.unsupported("calling the throwing function '{signature.name()}'",
-            call.span());
-        return -1;
+        lowering.unsupported("calling the throwing {described}", span);
+        return false;
     }
-    Parameter[] parameters = signature.parameters();
-    for (let parameter in parameters) {
+    let declaration = info.declaration();
+    if (declaration != null && declaration.body() == null) {
+        lowering.unsupported("calling the {described}, which is written in the shorthand form "
+            + "that assigns its fields for it", span);
+        return false;
+    }
+    for (let parameter in signature.parameters()) {
         if (!lowering.supportsValueType(parameter.type())) {
-            lowering.unsupported("passing a '{types.display(parameter.type())}' argument",
-                call.span());
-            return -1;
+            lowering.unsupported("passing a '{types.display(parameter.type())}' argument", span);
+            return false;
         }
     }
     let returnType = signature.returnType();
     if (!types.isVoidType(returnType) && !lowering.supportsValueType(returnType)) {
-        lowering.unsupported("a call returning '{types.display(returnType)}'", call.span());
-        return -1;
+        lowering.unsupported("a call returning '{types.display(returnType)}'", span);
+        return false;
     }
+    return true;
+}
+
+// The argument temps in parameter order: each written argument converted to its parameter's type,
+// then every parameter left unbound filled from its declared default. Every reference an argument
+// produced lands in 'temporaries' for the call site to give up once the call has run.
+lowerArguments(LoweringContext lowering, FunctionInfo info, CallExpressionNode call,
+               List<long> temporaries) -> long[]? {
+    Parameter[] parameters = info.signature().parameters();
     let writtenArguments = argumentExpressions(call.arguments());
     if (writtenArguments == null) {
         lowering.unsupported("'out' arguments", call.span());
-        return -1;
+        return null;
     }
     long[] slots = new long[parameters.length];
     bool[] filled = new bool[parameters.length];
@@ -82,12 +137,12 @@ public lower(LoweringContext lowering, CallExpressionNode call) -> long {
         }
         if (parameterIndex < 0 || parameterIndex >= parameters.length) {
             lowering.internalError("argument {i + 1} maps to no parameter", call.span());
-            return -1;
+            return null;
         }
-        long value = expressions.lowerConverted(lowering, writtenArguments.get(i),
-            parameters[parameterIndex].type());
+        long value = lowerArgument(lowering, writtenArguments.get(i),
+            parameters[parameterIndex].type(), temporaries);
         if (value < 0) {
-            return -1;
+            return null;
         }
         slots[parameterIndex] = value;
         filled[parameterIndex] = true;
@@ -96,24 +151,64 @@ public lower(LoweringContext lowering, CallExpressionNode call) -> long {
         if (filled[j]) {
             continue;
         }
-        long value = lowerDefaultArgument(lowering, info, j, parameters[j].type(), call.span());
+        long value = lowerDefaultArgument(lowering, info, j, parameters[j].type(), call.span(),
+            temporaries);
         if (value < 0) {
-            return -1;
+            return null;
         }
         slots[j] = value;
     }
-    let parameterTypes = new Type[parameters.length];
-    for (long j = 0; j < parameterTypes.length; j++) {
-        parameterTypes[j] = parameters[j].type();
+    return slots;
+}
+
+// One argument at its parameter's type. A reference the argument produced is remembered so the call
+// site gives it up afterwards; a struct it produced goes into storage the enclosing scope releases,
+// because a struct's +1 lives in its fields and only an address reaches them.
+lowerArgument(LoweringContext lowering, Expression argument, Type parameterType,
+              List<long> temporaries) -> long {
+    if (!primitives.hasArcContent(parameterType)
+            || !places.producesOwnedValue(lowering, argument)) {
+        return expressions.lowerConverted(lowering, argument, parameterType);
     }
+    if (primitives.isReferenceType(parameterType)) {
+        long value = expressions.lowerConverted(lowering, argument, parameterType);
+        if (value < 0) {
+            return -1;
+        }
+        temporaries.push(value);
+        return value;
+    }
+    long address = structs.addressOf(lowering, argument, parameterType);
+    if (address < 0) {
+        return -1;
+    }
+    return places.loadFrom(lowering, address, parameterType);
+}
+
+// Emits the call and hands back its result temp, or -1 when the callee returns nothing. A method
+// takes the address of the storage it runs over; a free function passes -1 for its receiver.
+public emitCall(LoweringContext lowering, FunctionInfo info, Type? receiverType, long receiver,
+                long[] arguments) -> long {
+    let signature = info.signature();
+    let returnType = signature.returnType();
     let builder = lowering.builder();
-    let callee = new EirCallee(info.symbol(), null, parameterTypes, returnType);
+    let callee = new EirCallee(info.symbol(), receiverType, parameterTypesOf(signature),
+        returnType);
     long resultTemp = -1;
     if (!types.isVoidType(returnType)) {
         resultTemp = builder.newTemp(returnType);
     }
-    builder.append(new EirCall(resultTemp, returnType, callee, -1, slots));
+    builder.append(new EirCall(resultTemp, returnType, callee, receiver, arguments));
     return resultTemp;
+}
+
+parameterTypesOf(Signature signature) -> Type[] {
+    Parameter[] parameters = signature.parameters();
+    let declared = new Type[parameters.length];
+    for (long i = 0; i < declared.length; i++) {
+        declared[i] = parameters[i].type();
+    }
+    return declared;
 }
 
 public calleeSignatureOf(LoweringContext lowering, CallExpressionNode call) -> Signature? {
@@ -133,7 +228,7 @@ public calleeSignatureOf(LoweringContext lowering, CallExpressionNode call) -> S
 // A parameter left unbound takes its declared default, evaluated at the call site. The default
 // expression lives in the callee's module, so its side tables come from there.
 lowerDefaultArgument(LoweringContext lowering, FunctionInfo callee, long parameterIndex,
-                     Type parameterType, Span callSpan) -> long {
+                     Type parameterType, Span callSpan, List<long> temporaries) -> long {
     let declaration = callee.declaration();
     if (declaration == null) {
         lowering.internalError("callee '{callee.signature().name()}' has no declaration for "
@@ -153,7 +248,7 @@ lowerDefaultArgument(LoweringContext lowering, FunctionInfo callee, long paramet
         return -1;
     }
     let caller = lowering.enterModule(callee.context());
-    long value = expressions.lowerConverted(lowering, defaultValue.value(), parameterType);
+    long value = lowerArgument(lowering, defaultValue.value(), parameterType, temporaries);
     let ignored = lowering.enterModule(caller);
     return value;
 }

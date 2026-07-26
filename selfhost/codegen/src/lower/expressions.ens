@@ -1,6 +1,6 @@
 // Expression lowering: the dispatcher every other area calls back into, the leaf forms
 // (literals and slot-backed identifiers), the explicit cast, and the ternary. Operators, calls,
-// assignments, and switch expressions each lower in their own module.
+// assignments, member reads, structs, and switch expressions each lower in their own module.
 //
 // Every entry point returns the temp holding the value, or -1 once lowering has failed.
 import Expression from @ens.frontend.syntax.generated.nodes;
@@ -19,9 +19,10 @@ import InterpolatedStringExpressionNode from @ens.frontend.syntax.generated.node
 import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
 import NewExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ArrayLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import StructLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ThisExpressionNode from @ens.frontend.syntax.generated.nodes;
 import Type from @ens.sema.model.types;
-import EnumType from @ens.sema.model.types;
 import @ens.sema.model.types;
 import EirConstInt from eir.model;
 import EirConstFloat from eir.model;
@@ -30,19 +31,20 @@ import EirLoadSlot from eir.model;
 import EirStoreSlot from eir.model;
 import EirJump from eir.model;
 import EirBranch from eir.model;
-import EirStringLength from eir.model;
-import EirArrayLength from eir.model;
 import LoweringContext from lower.context;
 import lower.arrays;
 import lower.assignments;
 import lower.calls;
 import lower.conversions;
+import lower.defaults;
 import lower.literals;
+import lower.members;
 import lower.operators;
 import lower.ownership;
 import lower.places;
 import lower.stores;
 import lower.strings;
+import lower.structs;
 import lower.switches;
 import support.primitives;
 
@@ -88,7 +90,7 @@ public lower(LoweringContext lowering, Expression node) -> long {
             return strings.lowerInterpolation(lowering, interpolated);
         },
         is MemberExpressionNode member -> {
-            return lowerMember(lowering, member);
+            return members.lower(lowering, member);
         },
         is NewExpressionNode created -> {
             return arrays.lowerNew(lowering, created);
@@ -96,67 +98,20 @@ public lower(LoweringContext lowering, Expression node) -> long {
         is ArrayLiteralExpressionNode literal -> {
             return arrays.lowerLiteral(lowering, literal);
         },
+        is StructLiteralExpressionNode literal -> {
+            return structs.lowerLiteral(lowering, literal);
+        },
         is SubscriptExpressionNode subscript -> {
             return arrays.lowerSubscript(lowering, subscript);
+        },
+        is ThisExpressionNode receiver -> {
+            return members.lowerReceiver(lowering, receiver);
         },
         default -> {
             lowering.unsupported("this expression", node.span());
             return -1;
         },
     }
-}
-
-// A member read: an enum member's constant, or the length of a string or an array.
-lowerMember(LoweringContext lowering, MemberExpressionNode member) -> long {
-    let type = lowering.typeOf(member);
-    if (type == null) {
-        return -1;
-    }
-    let builder = lowering.builder();
-    let constant = lowering.result().enumConstantOf(member.green());
-    if (constant != null) {
-        if (!(type is EnumType)) {
-            lowering.internalError("an enum member access has type "
-                + "'{types.display(type)}'", member.span());
-            return -1;
-        }
-        long[] values = type.memberValues();
-        if (constant < 0 || constant >= values.length) {
-            lowering.internalError("enum member {constant} is outside "
-                + "'{types.display(type)}'", member.span());
-            return -1;
-        }
-        long temp = builder.newTemp(type);
-        builder.append(new EirConstInt(temp, type, values[constant]));
-        return temp;
-    }
-    string name = member.member().text();
-    let objectType = lowering.typeOf(member.object());
-    if (objectType == null) {
-        return -1;
-    }
-    if (name == "length" && primitives.isStringType(objectType)) {
-        long value = lower(lowering, member.object());
-        if (value < 0) {
-            return -1;
-        }
-        long temp = builder.newTemp(type);
-        builder.append(new EirStringLength(temp, type, value));
-        releaseTemporary(lowering, member.object(), value);
-        return temp;
-    }
-    if (name == "length" && primitives.isArrayType(objectType)) {
-        long value = lower(lowering, member.object());
-        if (value < 0) {
-            return -1;
-        }
-        long temp = builder.newTemp(type);
-        builder.append(new EirArrayLength(temp, type, value));
-        releaseTemporary(lowering, member.object(), value);
-        return temp;
-    }
-    lowering.unsupported("reading the member '{name}'", member.span());
-    return -1;
 }
 
 // Gives up a reference an expression produced for one use only.
@@ -233,6 +188,10 @@ lowerIdentifier(LoweringContext lowering, IdentifierExpressionNode identifier) -
     }
     let slot = lowering.slotFor(binding);
     if (slot == null) {
+        long sibling = defaults.siblingFieldAddress(lowering, binding);
+        if (sibling >= 0) {
+            return places.loadFrom(lowering, sibling, binding.type());
+        }
         lowering.internalError("'{identifier.name().text()}' has no storage slot",
             identifier.span());
         return -1;

@@ -1,0 +1,217 @@
+// Structs as value aggregates: the address of a field or of a method's receiver, aggregate
+// literals, constructor calls, and method calls. A struct lives in storage, so everything here
+// works through addresses: a literal is built in a scratch slot and handed on as the loaded
+// aggregate, and a method runs over the address of the storage its receiver names.
+//
+// Struct ARC is address-side. The +1 a struct's reference fields hold belongs to the storage they
+// sit in, which is why the barriers in lower.stores reach a struct through its address and why a
+// struct value temp carries no ownership of its own.
+import Expression from @ens.frontend.syntax.generated.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import StructLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import Method from @ens.sema.model.types;
+import StructType from @ens.sema.model.types;
+import Type from @ens.sema.model.types;
+import @ens.sema.model.types;
+import EirFieldAddress from eir.model;
+import LoweringContext from lower.context;
+import lower.calls;
+import lower.defaults;
+import lower.ownership;
+import lower.places;
+import lower.stores;
+
+// The position of a field in its struct's declaration order, which is the symbolic index a field
+// address carries and the element index its LLVM struct uses, or -1 for a name it does not have.
+public fieldIndexOf(StructType owner, string name) -> long {
+    let fields = owner.fields();
+    for (long i = 0; i < fields.length(); i++) {
+        if (fields.get(i).name() == name) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// The address of one field inside the struct another address names.
+public fieldAddressAt(LoweringContext lowering, long base, Type fieldType, long index) -> long {
+    let builder = lowering.builder();
+    long address = builder.newTemp(fieldType);
+    builder.append(new EirFieldAddress(address, fieldType, base, index));
+    return address;
+}
+
+// The address a method's receiver occupies: temp 0, an opaque root whose caller owns the storage.
+public receiverAddress(LoweringContext lowering) -> long {
+    if (lowering.info().receiverType() == null) {
+        return -1;
+    }
+    return 0;
+}
+
+// 'value.field' as an address, or -1 when the base names no struct field.
+public lowerFieldAddress(LoweringContext lowering, MemberExpressionNode member) -> long {
+    let objectType = lowering.typeOf(member.object());
+    if (objectType == null) {
+        return -1;
+    }
+    if (!(objectType is StructType)) {
+        return -1;
+    }
+    long index = fieldIndexOf(objectType, member.member().text());
+    if (index < 0) {
+        return -1;
+    }
+    long base = addressOf(lowering, member.object(), objectType);
+    if (base < 0) {
+        return -1;
+    }
+    return fieldAddressAt(lowering, base, objectType.fields().get(index).type(), index);
+}
+
+// The address of the storage a struct expression names. An expression that is not a place has no
+// storage of its own, so its value is materialized into a slot the enclosing scope owns and whose
+// address stands in for it.
+public addressOf(LoweringContext lowering, Expression node, Type structType) -> long {
+    long address = places.lowerAddress(lowering, node);
+    if (address >= 0) {
+        return address;
+    }
+    let operand = stores.lowerOperand(lowering, node, structType);
+    if (operand == null) {
+        return -1;
+    }
+    long slot = lowering.builder().addSlot("materialized", structType, true, false);
+    if (!stores.initializeSlot(lowering, slot, structType, operand)) {
+        lowering.unsupported("reaching into the '{types.display(structType)}' this expression "
+            + "produces; assign it to a local first", node.span());
+        return -1;
+    }
+    ownership.trackSlot(lowering, slot, structType);
+    return ownership.slotAddress(lowering, slot, structType);
+}
+
+// '{f: v, ...}': a fresh aggregate. The scratch slot starts zeroed, every written field is stored
+// through the initialize barrier, the omitted fields take their declared defaults, and the loaded
+// aggregate carries onward the +1 its reference fields hold. The slot is deliberately not scope
+// tracked: the loaded value hands that ownership on, and releasing the slot as well would give up
+// the same references twice.
+public lowerLiteral(LoweringContext lowering, StructLiteralExpressionNode node) -> long {
+    let type = lowering.typeOf(node);
+    if (type == null) {
+        return -1;
+    }
+    if (!(type is StructType)) {
+        lowering.internalError("a struct literal has type '{types.display(type)}'", node.span());
+        return -1;
+    }
+    if (!lowering.supportsValueType(type)) {
+        lowering.unsupported("building a '{types.display(type)}'", node.span());
+        return -1;
+    }
+    long destination = scratchAddress(lowering, "structlit", type);
+    let fields = type.fields();
+    bool[] written = new bool[fields.length()];
+    for (long i = 0; i < node.fieldsCount(); i++) {
+        let entry = node.fields(i);
+        long index = fieldIndexOf(type, entry.name().text());
+        if (index < 0) {
+            lowering.internalError("struct '{type.name()}' has no field "
+                + "'{entry.name().text()}'", entry.name().span());
+            return -1;
+        }
+        let fieldType = fields.get(index).type();
+        let operand = stores.lowerOperand(lowering, entry.value(), fieldType);
+        if (operand == null) {
+            return -1;
+        }
+        long fieldAddress = fieldAddressAt(lowering, destination, fieldType, index);
+        if (!stores.initializeThroughAddress(lowering, fieldAddress, fieldType, operand)) {
+            lowering.internalError("field '{entry.name().text()}' borrows a struct with no "
+                + "storage to retain", entry.value().span());
+            return -1;
+        }
+        written[index] = true;
+    }
+    if (!defaults.applyOmitted(lowering, destination, type, written, node.span())) {
+        return -1;
+    }
+    return places.loadFrom(lowering, destination, type);
+}
+
+// 'StructName(args)': the aggregate takes its field defaults, then the constructor runs over its
+// address and fills in the rest, exactly the way a literal fills it in place.
+public lowerConstructorCall(LoweringContext lowering, CallExpressionNode call, Method method)
+        -> long {
+    let type = lowering.typeOf(call);
+    if (type == null) {
+        return -1;
+    }
+    if (!(type is StructType)) {
+        lowering.unsupported("creating a '{types.display(type)}'", call.span());
+        return -1;
+    }
+    if (!lowering.supportsValueType(type)) {
+        lowering.unsupported("building a '{types.display(type)}'", call.span());
+        return -1;
+    }
+    let info = lowering.index().infoFor(method.signature());
+    if (info == null) {
+        lowering.internalError("the constructor of '{type.name()}' resolves to no indexed "
+            + "function", call.span());
+        return -1;
+    }
+    if (!calls.supportedCallee(lowering, info, "constructor of '{type.name()}'", call.span())) {
+        return -1;
+    }
+    long destination = scratchAddress(lowering, "structctor", type);
+    if (!defaults.applyAll(lowering, destination, type, call.span())) {
+        return -1;
+    }
+    let ignored = calls.lowerCall(lowering, info, call, type, destination);
+    if (lowering.failed()) {
+        return -1;
+    }
+    return places.loadFrom(lowering, destination, type);
+}
+
+// 'value.method(args)': the receiver is the address of the storage the receiver expression names,
+// so what the method writes into 'this' lands in the caller's own aggregate.
+public lowerMethodCall(LoweringContext lowering, CallExpressionNode call,
+                       MemberExpressionNode member, Method method) -> long {
+    let receiverType = lowering.typeOf(member.object());
+    if (receiverType == null) {
+        return -1;
+    }
+    if (!(receiverType is StructType)) {
+        lowering.unsupported("calling the method '{method.name()}' on "
+            + "'{types.display(receiverType)}'", call.span());
+        return -1;
+    }
+    let info = lowering.index().infoFor(method.signature());
+    if (info == null) {
+        lowering.internalError("the method '{receiverType.name()}.{method.name()}' resolves to "
+            + "no indexed function", call.span());
+        return -1;
+    }
+    if (!calls.supportedCallee(lowering, info,
+            "method '{receiverType.name()}.{method.name()}'", call.span())) {
+        return -1;
+    }
+    long receiver = addressOf(lowering, member.object(), receiverType);
+    if (receiver < 0) {
+        if (!lowering.failed()) {
+            lowering.unsupported("calling '{method.name()}' on this expression", call.span());
+        }
+        return -1;
+    }
+    return calls.lowerCall(lowering, info, call, receiverType, receiver);
+}
+
+// A slot holding one anonymous struct value, and its address. It starts zeroed so that a field
+// neither written nor defaulted reads as zero.
+scratchAddress(LoweringContext lowering, string name, Type type) -> long {
+    long slot = lowering.builder().addSlot(name, type, true, false);
+    return ownership.slotAddress(lowering, slot, type);
+}
