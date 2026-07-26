@@ -4049,9 +4049,16 @@ void Analyzer::analyzeIfStmt(const ast::IfStatement& stmt) {
     AssignmentFlow afterElse = entryAssign;
     if (elseClause) {
         if (auto inner = elseClause->ifStatement()) {
+            // An `else if` is reached only when this condition failed, so the nested
+            // `if` is analyzed under the negated narrowing exactly as an else block is.
+            pushScope();
+            for (const auto& info : whenFalse) {
+                currentScope->narrowedTypes[info.key] = info.narrowedT;
+            }
             analyzeIfStmt(*inner);
             elseFacts = flattenNarrowings();
             afterElse = snapshotAssignment();
+            popScope();
         } else if (auto bb = elseClause->block()) {
             elseFacts = analyzeBranchCapturing(*bb, whenFalse);
             afterElse = snapshotAssignment();
