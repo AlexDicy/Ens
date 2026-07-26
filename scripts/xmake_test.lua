@@ -920,15 +920,23 @@ task("test")
                 end
             end
 
+            -- a scratch repository keeps its metadata in a sibling folder instead of a '.git'
+            -- child, so no folder under build/ looks like a VCS root to an IDE. Fetching reads
+            -- the metadata folder directly, which is what the file:// URLs point at.
+            local function gitdir_of(dir)
+                return path.absolute(dir) .. ".gitdir"
+            end
+
             local function git(dir, ...)
-                os.iorunv("git", table.join({"-c", "user.name=ens", "-c",
+                os.iorunv("git", table.join({"--git-dir", gitdir_of(dir), "--work-tree",
+                    path.absolute(dir), "-c", "user.name=ens", "-c",
                     "user.email=ens@test", "-c", "commit.gpgsign=false", "-c",
                     "tag.gpgsign=false"}, {...}), {curdir = dir})
             end
 
             local function make_repo(dir)
                 os.mkdir(dir)
-                git(dir, "init", "-q", "-b", "main", ".")
+                os.iorunv("git", {"init", "--bare", "-q", "-b", "main", gitdir_of(dir)})
             end
 
             local function commit_all(dir, message)
@@ -937,12 +945,13 @@ task("test")
             end
 
             local function commit_of(dir, tag)
-                local out = os.iorunv("git", {"rev-parse", tag .. "^{commit}"}, {curdir = dir})
+                local out = os.iorunv("git", {"--git-dir", gitdir_of(dir), "rev-parse",
+                    tag .. "^{commit}"})
                 return (out:gsub("%s+$", ""))
             end
 
             local function url_of(dir)
-                return "file:///" .. (path.absolute(dir):gsub("\\", "/"))
+                return "file:///" .. (gitdir_of(dir):gsub("\\", "/"))
             end
 
             local function write_package(dir, package_name, dependencies)
@@ -1345,14 +1354,18 @@ task("test")
 
             -- ens.lock records the artifact bindings of the root package and of every
             -- fetched package, flattened per platform
+            local function gitdir_of(dir)
+                return path.absolute(dir) .. ".gitdir"
+            end
             local function git(dir, ...)
-                os.iorunv("git", table.join({"-c", "user.name=ens", "-c",
+                os.iorunv("git", table.join({"--git-dir", gitdir_of(dir), "--work-tree",
+                    path.absolute(dir), "-c", "user.name=ens", "-c",
                     "user.email=ens@test", "-c", "commit.gpgsign=false", "-c",
                     "tag.gpgsign=false"}, {...}), {curdir = dir})
             end
             local dep_dir = path.join(scratch, "repos", "dep")
             os.mkdir(dep_dir)
-            git(dep_dir, "init", "-q", "-b", "main", ".")
+            os.iorunv("git", {"init", "--bare", "-q", "-b", "main", gitdir_of(dep_dir)})
             io.writefile(path.join(dep_dir, "ens.package"),
                 "package art.dep {\n" .. '    ens "0.1";\n\n'
                 .. artifact_native("depextras", good_hash) .. "}\n")
@@ -1361,7 +1374,7 @@ task("test")
             git(dep_dir, "add", "-A")
             git(dep_dir, "commit", "-q", "-m", "1.0")
             git(dep_dir, "tag", "1.0")
-            local url_dep = "file:///" .. (path.absolute(dep_dir):gsub("\\", "/"))
+            local url_dep = "file:///" .. (gitdir_of(dep_dir):gsub("\\", "/"))
 
             local app3 = path.join(scratch, "app3")
             os.mkdir(path.join(app3, "src"))
