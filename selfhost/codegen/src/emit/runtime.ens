@@ -1,0 +1,605 @@
+// The runtime primitives an emitted module calls: the allocator and the reference-counting pair,
+// the string primitives, the guards behind checked access, and the immortal globals behind string
+// literals. Each one is defined on first use with internal linkage, so a module carries exactly
+// the primitives it needs and none of them is visible to the linker.
+//
+// A definition happens while the builder sits inside a user function, so every one saves the
+// caller's insertion point, emits into fresh blocks, and positions back before returning.
+//
+// The pointer Ens code holds is the payload pointer; a 32-byte header sits below it:
+//   payload - 32: type descriptor
+//   payload - 24: strong count
+//   payload - 16: finalizer
+//   payload -  8: weak side table
+// Strings and arrays share one payload shape: an i64 length, then the bytes or the elements. A
+// string payload also carries a trailing NUL, so its data can be handed to a C function.
+import Context from @ens.llvm.core;
+import Module from @ens.llvm.core;
+import Builder from @ens.llvm.core;
+import TypeRef from @ens.llvm.types;
+import Value from @ens.llvm.values;
+import BasicBlock from @ens.llvm.blocks;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import @ens.llvm.globals;
+import @ens.llvm.target;
+import Map from @std.collections.map;
+import emit.strings;
+
+// A runtime function and the type needed to call it.
+public final class RuntimeFunction {
+    public Value function;
+    public TypeRef type;
+
+    public constructor(this.function, this.type);
+}
+
+// A runtime function whose body is being emitted: the value to fill in, the name it caches under,
+// and the insertion point to return to once the body is complete.
+public final class RuntimeDefinition {
+    public string name;
+    public Value function;
+    public TypeRef type;
+    public BasicBlock? savedBlock;
+
+    public constructor(this.name, this.function, this.type, this.savedBlock);
+}
+
+// The runtime primitives of one emitted module. One instance belongs to one module, holds every
+// cache it needs, and shares no state with any other instance.
+public final class Runtime {
+    public Context context;
+    public Module module;
+    public Builder builder;
+
+    public TypeRef voidType;
+    public TypeRef int1Type;
+    public TypeRef int8Type;
+    public TypeRef int32Type;
+    public TypeRef int64Type;
+    public TypeRef doubleType;
+    public TypeRef pointerType;
+
+    Map<string, RuntimeFunction> functions;
+    Map<string, Value> stringLiterals;
+
+    bool windowsTarget;
+    bool darwinTarget;
+
+    public constructor(Context context, Module module, Builder builder) {
+        this.context = context;
+        this.module = module;
+        this.builder = builder;
+        this.voidType = context.voidType();
+        this.int1Type = context.int1Type();
+        this.int8Type = context.int8Type();
+        this.int32Type = context.int32Type();
+        this.int64Type = context.int64Type();
+        this.doubleType = context.doubleType();
+        this.pointerType = context.pointerType();
+        this.functions = new Map<string, RuntimeFunction>();
+        this.stringLiterals = new Map<string, Value>();
+        string triple = target.hostTargetTriple();
+        this.windowsTarget = triple.contains("windows");
+        this.darwinTarget = triple.contains("darwin") || triple.contains("apple");
+    }
+
+    // ---- Allocation and reference counting ----
+
+    // ptr ens_alloc(i64 payloadBytes, ptr finalizer, ptr typeDescriptor): a zeroed object whose
+    // header names its type and finalizer and whose strong count starts at one. Returns the
+    // payload pointer, or null when the allocation fails.
+    public alloc() -> RuntimeFunction {
+        let type = this.pointerType.functionType([this.int64Type, this.pointerType,
+            this.pointerType]);
+        let known = this.existing("ens_alloc", type);
+        if (known != null) {
+            return known;
+        }
+        let allocate = this.calloc();
+        let definition = this.beginDefinition("ens_alloc", type);
+        let payloadBytes = this.parameter(definition, 0);
+        let finalizer = this.parameter(definition, 1);
+        let typeDescriptor = this.parameter(definition, 2);
+        let emptyBlock = this.block(definition, "alloc.empty");
+        let initializeBlock = this.block(definition, "alloc.initialize");
+        let total = instructions.buildAdd(this.builder, payloadBytes, this.int64(32), "");
+        let header = this.call(allocate, [this.int64(1), total], "object");
+        instructions.buildCondBr(this.builder, this.isNull(header), emptyBlock, initializeBlock);
+
+        this.builder.positionAtEnd(emptyBlock);
+        instructions.buildRet(this.builder, this.nullPointer());
+
+        this.builder.positionAtEnd(initializeBlock);
+        memory.buildStore(this.builder, typeDescriptor, header);
+        memory.buildStore(this.builder, this.int64(1), this.offsetPointer(header, 8, ""));
+        memory.buildStore(this.builder, finalizer, this.offsetPointer(header, 16, ""));
+        instructions.buildRet(this.builder, this.offsetPointer(header, 32, "payload"));
+        return this.endDefinition(definition);
+    }
+
+    // void ens_retain(ptr object): one more owner. Null and immortal objects are left alone.
+    public retain() -> RuntimeFunction {
+        let type = this.voidType.functionType([this.pointerType]);
+        let known = this.existing("ens_retain", type);
+        if (known != null) {
+            return known;
+        }
+        let definition = this.beginDefinition("ens_retain", type);
+        globals.addFunctionAttribute(this.context, definition.function, "alwaysinline");
+        let object = this.parameter(definition, 0);
+        let countBlock = this.block(definition, "retain.count");
+        let bumpBlock = this.block(definition, "retain.bump");
+        let doneBlock = this.block(definition, "retain.done");
+        instructions.buildCondBr(this.builder, this.isNull(object), doneBlock, countBlock);
+
+        this.builder.positionAtEnd(countBlock);
+        let countSlot = this.countSlot(object);
+        let count = this.loadCount(countSlot, memory.orderingMonotonic());
+        instructions.buildCondBr(this.builder, this.isImmortal(count), doneBlock, bumpBlock);
+
+        this.builder.positionAtEnd(bumpBlock);
+        memory.buildAtomicAdd(this.builder, countSlot, this.int64(1), memory.orderingMonotonic());
+        instructions.buildBr(this.builder, doneBlock);
+
+        this.builder.positionAtEnd(doneBlock);
+        instructions.buildRetVoid(this.builder);
+        return this.endDefinition(definition);
+    }
+
+    // void ens_release(ptr object): one fewer owner. The last release runs the finalizer, retires
+    // the weak side table, and frees the allocation. Null and immortal objects are left alone.
+    public release() -> RuntimeFunction {
+        let type = this.voidType.functionType([this.pointerType]);
+        let known = this.existing("ens_release", type);
+        if (known != null) {
+            return known;
+        }
+        let deallocate = this.free();
+        let definition = this.beginDefinition("ens_release", type);
+        let object = this.parameter(definition, 0);
+        let countBlock = this.block(definition, "release.count");
+        let dropBlock = this.block(definition, "release.drop");
+        let destructorBlock = this.block(definition, "release.destructor");
+        let callBlock = this.block(definition, "release.destructor.call");
+        let sideBlock = this.block(definition, "release.sidetable");
+        let retireBlock = this.block(definition, "release.sidetable.retire");
+        let sideFreeBlock = this.block(definition, "release.sidetable.free");
+        let freeBlock = this.block(definition, "release.free");
+        let doneBlock = this.block(definition, "release.done");
+        instructions.buildCondBr(this.builder, this.isNull(object), doneBlock, countBlock);
+
+        this.builder.positionAtEnd(countBlock);
+        let countSlot = this.countSlot(object);
+        let count = this.loadCount(countSlot, memory.orderingMonotonic());
+        instructions.buildCondBr(this.builder, this.isImmortal(count), doneBlock, dropBlock);
+
+        this.builder.positionAtEnd(dropBlock);
+        let previous = memory.buildAtomicSub(this.builder, countSlot, this.int64(1),
+            memory.orderingAcquireRelease());
+        let last = instructions.buildICmpEQ(this.builder, previous, this.int64(1), "");
+        instructions.buildCondBr(this.builder, last, destructorBlock, doneBlock);
+
+        this.builder.positionAtEnd(destructorBlock);
+        let destructorSlot = this.offsetPointer(object, -16, "");
+        let finalizer = memory.buildLoad(this.builder, this.pointerType, destructorSlot,
+            "destructor");
+        instructions.buildCondBr(this.builder, this.isNull(finalizer), sideBlock, callBlock);
+
+        this.builder.positionAtEnd(callBlock);
+        instructions.buildCall(this.builder, this.voidType.functionType([this.pointerType]),
+            finalizer, [object], "");
+        instructions.buildBr(this.builder, sideBlock);
+
+        // A weak reference keeps its side-table entry alive, so the entry outlives the object
+        // unless nobody is watching: null the entry's object pointer, then free it when the weak
+        // count has already reached zero.
+        this.builder.positionAtEnd(sideBlock);
+        let sideSlot = this.offsetPointer(object, -8, "");
+        let side = memory.buildLoad(this.builder, this.pointerType, sideSlot, "sidetable");
+        instructions.buildCondBr(this.builder, this.isNull(side), freeBlock, retireBlock);
+
+        this.builder.positionAtEnd(retireBlock);
+        memory.buildAtomicExchange(this.builder, side, this.nullPointer(),
+            memory.orderingRelease());
+        let weakCount = this.loadCount(this.offsetPointer(side, 8, ""), memory.orderingAcquire());
+        let unwatched = instructions.buildICmpEQ(this.builder, weakCount, this.int64(0), "");
+        instructions.buildCondBr(this.builder, unwatched, sideFreeBlock, freeBlock);
+
+        this.builder.positionAtEnd(sideFreeBlock);
+        this.call(deallocate, [side], "");
+        instructions.buildBr(this.builder, freeBlock);
+
+        this.builder.positionAtEnd(freeBlock);
+        this.call(deallocate, [this.offsetPointer(object, -32, "")], "");
+        instructions.buildBr(this.builder, doneBlock);
+
+        this.builder.positionAtEnd(doneBlock);
+        instructions.buildRetVoid(this.builder);
+        return this.endDefinition(definition);
+    }
+
+    // ---- Strings ----
+
+    // ptr ens_string_alloc(i64 length): an owned string of length bytes, its length field and
+    // trailing NUL written and its bytes left for the caller to fill.
+    public stringAllocate() -> RuntimeFunction {
+        return strings.allocateString(this);
+    }
+
+    // ptr ens_string_concat(ptr left, ptr right): an owned string holding both operands' bytes.
+    public stringConcat() -> RuntimeFunction {
+        return strings.concatStrings(this);
+    }
+
+    // i1 ens_string_eq(ptr left, ptr right): true when both hold the same bytes. Null-safe, so it
+    // also answers for an absent optional string.
+    public stringEqual() -> RuntimeFunction {
+        return strings.compareStrings(this);
+    }
+
+    // i64 ens_string_index_of(ptr haystack, ptr needle): the byte offset of the first occurrence,
+    // or -1. An empty needle matches at 0.
+    public stringIndexOf() -> RuntimeFunction {
+        return strings.searchString(this);
+    }
+
+    // ptr ens_string_substring(ptr text, i64 start, i64 end): an owned copy of the half-open byte
+    // range. The caller range-checks first.
+    public stringSubstring() -> RuntimeFunction {
+        return strings.copySubstring(this);
+    }
+
+    // ptr ens_int_to_string(i64 value, i1 signed): the decimal text of an integer.
+    public intToString() -> RuntimeFunction {
+        return strings.integerText(this);
+    }
+
+    // ptr ens_double_to_string(double value): the compact decimal text of a double.
+    public doubleToString() -> RuntimeFunction {
+        return strings.doubleText(this);
+    }
+
+    // ptr ens_char_to_string(i32 scalar): the UTF-8 encoding of one Unicode scalar.
+    public charToString() -> RuntimeFunction {
+        return strings.scalarText(this);
+    }
+
+    // ptr ens_json_escape_string(ptr text): the JSON string form of the text, quotes included.
+    public jsonEscape() -> RuntimeFunction {
+        return strings.jsonText(this);
+    }
+
+    // The immortal payload pointer for a string literal, one read-only global per distinct
+    // contents. The count sentinel makes retain and release no-ops, so the literal is never freed.
+    public stringLiteral(byte[] utf8) -> Value {
+        string key = string.fromBytes(utf8);
+        let cached = this.stringLiterals.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        let bytesType = this.int8Type.arrayType((utf8.length + 1) as ulong);
+        let objectType = this.context.structType([this.pointerType, this.int64Type,
+            this.pointerType, this.pointerType, this.int64Type, bytesType], false);
+        let bytes = new Value[utf8.length + 1];
+        for (long i = 0; i < bytes.length; i++) {
+            bytes[i] = this.int8Type.constInt(literalByte(utf8, i), false);
+        }
+        let global = globals.addGlobal(this.module, objectType, ".stringliteral");
+        globals.setInitializer(global, objectType.constNamedStruct([
+            this.nullPointer(),
+            this.int64Type.constInt(immortalCount(), false),
+            this.nullPointer(),
+            this.nullPointer(),
+            this.int64(utf8.length),
+            bytesType.constArray(bytes),
+        ]));
+        globals.setGlobalConstant(global, true);
+        globals.setLinkage(global, globals.linkagePrivate());
+        globals.setAlignment(global, 8);
+        let payload = objectType.constInBoundsGEP(global, [this.int32(0), this.int32(4)]);
+        this.stringLiterals.set(key, payload);
+        return payload;
+    }
+
+    // ---- Output and checked access ----
+
+    // void ens_print(ptr text): the string and a newline on standard output.
+    public print() -> RuntimeFunction {
+        let type = this.voidType.functionType([this.pointerType]);
+        let known = this.existing("ens_print", type);
+        if (known != null) {
+            return known;
+        }
+        let write = this.puts();
+        let definition = this.beginDefinition("ens_print", type);
+        this.call(write, [this.payloadData(this.parameter(definition, 0))], "");
+        instructions.buildRetVoid(this.builder);
+        return this.endDefinition(definition);
+    }
+
+    // void ens_panic(ptr message): "panic: " and the message on standard error, then exit 134. The
+    // message is a string object, so a literal from stringLiteral and a string the program built
+    // both work.
+    public panic() -> RuntimeFunction {
+        let type = this.voidType.functionType([this.pointerType]);
+        let known = this.existing("ens_panic", type);
+        if (known != null) {
+            return known;
+        }
+        let write = this.fputs();
+        let quit = this.exit();
+        let definition = this.beginDefinition("ens_panic", type);
+        globals.addFunctionAttribute(this.context, definition.function, "noreturn");
+        let stream = this.standardError();
+        this.call(write, [globals.buildGlobalString(this.builder, "panic: ", ".panic.prefix"),
+            stream], "");
+        this.call(write, [this.payloadData(this.parameter(definition, 0)), stream], "");
+        this.call(write, [globals.buildGlobalString(this.builder, "\n", ".panic.newline"),
+            stream], "");
+        this.call(quit, [this.int32(134)], "");
+        instructions.buildUnreachable(this.builder);
+        return this.endDefinition(definition);
+    }
+
+    // void ens_bounds_check(i64 index, i64 length, ptr message): panics unless the index addresses
+    // an element.
+    public boundsCheck() -> RuntimeFunction {
+        let type = this.voidType.functionType([this.int64Type, this.int64Type, this.pointerType]);
+        let known = this.existing("ens_bounds_check", type);
+        if (known != null) {
+            return known;
+        }
+        let abort = this.panic();
+        let definition = this.beginDefinition("ens_bounds_check", type);
+        let index = this.parameter(definition, 0);
+        let length = this.parameter(definition, 1);
+        let failBlock = this.block(definition, "bounds.fail");
+        let okBlock = this.block(definition, "bounds.ok");
+        let negative = instructions.buildICmpSLT(this.builder, index, this.int64(0), "");
+        let past = instructions.buildICmpSGE(this.builder, index, length, "");
+        let outside = instructions.buildOr(this.builder, negative, past, "");
+        instructions.buildCondBr(this.builder, outside, failBlock, okBlock);
+
+        this.builder.positionAtEnd(failBlock);
+        this.call(abort, [this.parameter(definition, 2)], "");
+        instructions.buildUnreachable(this.builder);
+
+        this.builder.positionAtEnd(okBlock);
+        instructions.buildRetVoid(this.builder);
+        return this.endDefinition(definition);
+    }
+
+    // void ens_range_check(i64 start, i64 end, i64 length, ptr message): panics unless
+    // 0 <= start <= end <= length.
+    public rangeCheck() -> RuntimeFunction {
+        let type = this.voidType.functionType([this.int64Type, this.int64Type, this.int64Type,
+            this.pointerType]);
+        let known = this.existing("ens_range_check", type);
+        if (known != null) {
+            return known;
+        }
+        let abort = this.panic();
+        let definition = this.beginDefinition("ens_range_check", type);
+        let start = this.parameter(definition, 0);
+        let end = this.parameter(definition, 1);
+        let length = this.parameter(definition, 2);
+        let failBlock = this.block(definition, "range.fail");
+        let okBlock = this.block(definition, "range.ok");
+        let negative = instructions.buildICmpSLT(this.builder, start, this.int64(0), "");
+        let inverted = instructions.buildICmpSGT(this.builder, start, end, "");
+        let past = instructions.buildICmpSGT(this.builder, end, length, "");
+        let outside = instructions.buildOr(this.builder,
+            instructions.buildOr(this.builder, negative, inverted, ""), past, "");
+        instructions.buildCondBr(this.builder, outside, failBlock, okBlock);
+
+        this.builder.positionAtEnd(failBlock);
+        this.call(abort, [this.parameter(definition, 3)], "");
+        instructions.buildUnreachable(this.builder);
+
+        this.builder.positionAtEnd(okBlock);
+        instructions.buildRetVoid(this.builder);
+        return this.endDefinition(definition);
+    }
+
+    // ---- The C library ----
+
+    public calloc() -> RuntimeFunction {
+        return this.libc("calloc", this.pointerType.functionType([this.int64Type,
+            this.int64Type]));
+    }
+
+    public free() -> RuntimeFunction {
+        return this.libc("free", this.voidType.functionType([this.pointerType]));
+    }
+
+    public memcmp() -> RuntimeFunction {
+        return this.libc("memcmp", this.int32Type.functionType([this.pointerType,
+            this.pointerType, this.int64Type]));
+    }
+
+    public snprintf() -> RuntimeFunction {
+        return this.libc("snprintf", this.int32Type.variadicFunctionType([this.pointerType,
+            this.int64Type, this.pointerType]));
+    }
+
+    public puts() -> RuntimeFunction {
+        return this.libc("puts", this.int32Type.functionType([this.pointerType]));
+    }
+
+    public fputs() -> RuntimeFunction {
+        return this.libc("fputs", this.int32Type.functionType([this.pointerType,
+            this.pointerType]));
+    }
+
+    public exit() -> RuntimeFunction {
+        let type = this.voidType.functionType([this.int32Type]);
+        let known = this.existing("exit", type);
+        if (known != null) {
+            return known;
+        }
+        let declared = this.declare("exit", type);
+        globals.addFunctionAttribute(this.context, declared.function, "noreturn");
+        return declared;
+    }
+
+    // The standard error stream: Windows reaches it through __acrt_iob_func(2), Darwin through the
+    // __stderrp global, and other systems through the stderr global.
+    standardError() -> Value {
+        if (this.windowsTarget) {
+            let stream = this.libc("__acrt_iob_func",
+                this.pointerType.functionType([this.int32Type]));
+            return this.call(stream, [this.int32(2)], "stderr");
+        }
+        string name = "stderr";
+        if (this.darwinTarget) {
+            name = "__stderrp";
+        }
+        return memory.buildLoad(this.builder, this.pointerType, this.streamGlobal(name), "stderr");
+    }
+
+    streamGlobal(string name) -> Value {
+        let found = globals.getNamedGlobal(this.module, name);
+        if (found != null) {
+            return found;
+        }
+        return globals.addGlobal(this.module, this.pointerType, name);
+    }
+
+    // ---- The emission toolkit the primitives share ----
+
+    // The function of this name the module already holds, or null when it needs defining. The
+    // module is the source of truth, so a Runtime that outlives one emission still emits one copy.
+    public existing(string name, TypeRef type) -> RuntimeFunction? {
+        let cached = this.functions.get(name);
+        if (cached != null) {
+            return cached;
+        }
+        let found = globals.getNamedFunction(this.module, name);
+        if (found == null) {
+            return null;
+        }
+        let recorded = new RuntimeFunction(found, type);
+        this.functions.set(name, recorded);
+        return recorded;
+    }
+
+    // Declares a function the program links against, once per module.
+    public libc(string name, TypeRef type) -> RuntimeFunction {
+        let known = this.existing(name, type);
+        if (known != null) {
+            return known;
+        }
+        return this.declare(name, type);
+    }
+
+    declare(string name, TypeRef type) -> RuntimeFunction {
+        let declared = new RuntimeFunction(this.module.addFunction(name, type), type);
+        this.functions.set(name, declared);
+        return declared;
+    }
+
+    // Opens a runtime function: adds it with internal linkage, remembers where the caller was
+    // building, and positions the builder in a fresh entry block.
+    public beginDefinition(string name, TypeRef type) -> RuntimeDefinition {
+        let function = this.module.addFunction(name, type);
+        globals.setLinkage(function, globals.linkageInternal());
+        globals.addFunctionAttribute(this.context, function, "nounwind");
+        let saved = this.builder.insertBlock();
+        let definition = new RuntimeDefinition(name, function, type, saved);
+        this.builder.positionAtEnd(this.context.appendBasicBlock(function, "entry"));
+        return definition;
+    }
+
+    // Closes a runtime function: caches it and puts the builder back where the caller left off.
+    public endDefinition(RuntimeDefinition definition) -> RuntimeFunction {
+        let saved = definition.savedBlock;
+        if (saved != null) {
+            this.builder.positionAtEnd(saved);
+        }
+        let defined = new RuntimeFunction(definition.function, definition.type);
+        this.functions.set(definition.name, defined);
+        return defined;
+    }
+
+    public block(RuntimeDefinition definition, string name) -> BasicBlock {
+        return this.context.appendBasicBlock(definition.function, name);
+    }
+
+    public parameter(RuntimeDefinition definition, uint index) -> Value {
+        return globals.getParam(definition.function, index);
+    }
+
+    public call(RuntimeFunction callee, Value[] arguments, string name) -> Value {
+        return instructions.buildCall(this.builder, callee.type, callee.function, arguments, name);
+    }
+
+    public int8(long value) -> Value {
+        return this.int8Type.constInt(value as ulong, true);
+    }
+
+    public int32(long value) -> Value {
+        return this.int32Type.constInt(value as ulong, true);
+    }
+
+    public int64(long value) -> Value {
+        return this.int64Type.constInt(value as ulong, true);
+    }
+
+    public nullPointer() -> Value {
+        return this.pointerType.constNull();
+    }
+
+    public isNull(Value pointer) -> Value {
+        return instructions.buildICmpEQ(this.builder, pointer, this.nullPointer(), "");
+    }
+
+    // The address the given number of bytes from a pointer.
+    public offsetPointer(Value pointer, long bytes, string name) -> Value {
+        return memory.buildGEP(this.builder, this.int8Type, pointer, [this.int64(bytes)], name);
+    }
+
+    // The i64 length that opens a string or array payload.
+    public payloadLength(Value object) -> Value {
+        return memory.buildLoad(this.builder, this.int64Type, object, "length");
+    }
+
+    // The bytes or elements, which follow the length.
+    public payloadData(Value object) -> Value {
+        return this.offsetPointer(object, 8, "data");
+    }
+
+    countSlot(Value object) -> Value {
+        return this.offsetPointer(object, -24, "");
+    }
+
+    // An ordered read of a count. Reference counts are shared, so every read is atomic and
+    // naturally aligned.
+    loadCount(Value slot, int ordering) -> Value {
+        let count = memory.buildLoad(this.builder, this.int64Type, slot, "count");
+        memory.setOrdering(count, ordering);
+        memory.setAlignment(count, 8);
+        return count;
+    }
+
+    isImmortal(Value count) -> Value {
+        return instructions.buildICmpEQ(this.builder, count,
+            this.int64Type.constInt(immortalCount(), false), "");
+    }
+}
+
+// The strong count an immortal object carries: the lowest i64 value. Real counts start at one and
+// step by one, so they never reach it.
+immortalCount() -> ulong {
+    ulong sentinel = 9223372036854775808;
+    return sentinel;
+}
+
+// The literal's byte at the index, and the NUL that terminates it one past the end, so the bytes
+// and their terminator fill the array in one pass.
+literalByte(byte[] utf8, long index) -> ulong {
+    if (index < utf8.length) {
+        return utf8[index] as ulong;
+    }
+    return 0;
+}

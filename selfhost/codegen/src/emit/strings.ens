@@ -1,0 +1,507 @@
+// The string primitives of an emitted module: allocation, comparison, search, and the conversions
+// that render a value as text. Each one is a function the Runtime toolkit defines once per module,
+// with the same internal linkage and insertion-point discipline as the rest of the runtime.
+//
+// A string payload is an i64 length, then the bytes, then a NUL the allocation always reserves, so
+// the data pointer is a valid C string. Every function that returns a string returns it owned.
+import Runtime from emit.runtime;
+import RuntimeFunction from emit.runtime;
+import Value from @ens.llvm.values;
+import BasicBlock from @ens.llvm.blocks;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import @ens.llvm.globals;
+
+// ptr ens_string_alloc(i64 length): room for length bytes plus the NUL, with the length field and
+// the terminator written and the bytes left to the caller.
+public allocateString(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([runtime.int64Type]);
+    let known = runtime.existing("ens_string_alloc", type);
+    if (known != null) {
+        return known;
+    }
+    let allocator = runtime.alloc();
+    let definition = runtime.beginDefinition("ens_string_alloc", type);
+    let length = runtime.parameter(definition, 0);
+    let payloadBytes = instructions.buildAdd(runtime.builder, length, runtime.int64(9), "");
+    let object = runtime.call(allocator, [payloadBytes, runtime.nullPointer(),
+        runtime.nullPointer()], "string");
+    memory.buildStore(runtime.builder, length, object);
+    let data = runtime.payloadData(object);
+    memory.buildStore(runtime.builder, runtime.int8(0), elementAt(runtime, data, length));
+    instructions.buildRet(runtime.builder, object);
+    return runtime.endDefinition(definition);
+}
+
+// ptr ens_string_concat(ptr left, ptr right): both operands' bytes in one fresh string.
+public concatStrings(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([runtime.pointerType, runtime.pointerType]);
+    let known = runtime.existing("ens_string_concat", type);
+    if (known != null) {
+        return known;
+    }
+    let allocator = allocateString(runtime);
+    let definition = runtime.beginDefinition("ens_string_concat", type);
+    let left = runtime.parameter(definition, 0);
+    let right = runtime.parameter(definition, 1);
+    let leftLength = runtime.payloadLength(left);
+    let rightLength = runtime.payloadLength(right);
+    let total = instructions.buildAdd(runtime.builder, leftLength, rightLength, "");
+    let object = runtime.call(allocator, [total], "");
+    let data = runtime.payloadData(object);
+    memory.buildMemCpy(runtime.builder, data, 1, runtime.payloadData(left), 1, leftLength);
+    memory.buildMemCpy(runtime.builder, elementAt(runtime, data, leftLength), 1,
+        runtime.payloadData(right), 1, rightLength);
+    instructions.buildRet(runtime.builder, object);
+    return runtime.endDefinition(definition);
+}
+
+// i1 ens_string_eq(ptr left, ptr right): equal contents. Identical pointers answer first, which
+// covers two nulls and a shared literal; lengths and bytes decide the rest.
+public compareStrings(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int1Type.functionType([runtime.pointerType, runtime.pointerType]);
+    let known = runtime.existing("ens_string_eq", type);
+    if (known != null) {
+        return known;
+    }
+    let compare = runtime.memcmp();
+    let definition = runtime.beginDefinition("ens_string_eq", type);
+    let left = runtime.parameter(definition, 0);
+    let right = runtime.parameter(definition, 1);
+    let apartBlock = runtime.block(definition, "streq.apart");
+    let lengthBlock = runtime.block(definition, "streq.length");
+    let bytesBlock = runtime.block(definition, "streq.bytes");
+    let equalBlock = runtime.block(definition, "streq.equal");
+    let differentBlock = runtime.block(definition, "streq.different");
+    let same = instructions.buildICmpEQ(runtime.builder, left, right, "");
+    instructions.buildCondBr(runtime.builder, same, equalBlock, apartBlock);
+
+    runtime.builder.positionAtEnd(apartBlock);
+    let missing = instructions.buildOr(runtime.builder, runtime.isNull(left),
+        runtime.isNull(right), "");
+    instructions.buildCondBr(runtime.builder, missing, differentBlock, lengthBlock);
+
+    runtime.builder.positionAtEnd(lengthBlock);
+    let length = runtime.payloadLength(left);
+    let sameLength = instructions.buildICmpEQ(runtime.builder, length,
+        runtime.payloadLength(right), "");
+    instructions.buildCondBr(runtime.builder, sameLength, bytesBlock, differentBlock);
+
+    runtime.builder.positionAtEnd(bytesBlock);
+    let difference = runtime.call(compare, [runtime.payloadData(left),
+        runtime.payloadData(right), length], "");
+    let sameBytes = instructions.buildICmpEQ(runtime.builder, difference, runtime.int32(0), "");
+    instructions.buildCondBr(runtime.builder, sameBytes, equalBlock, differentBlock);
+
+    runtime.builder.positionAtEnd(equalBlock);
+    instructions.buildRet(runtime.builder, runtime.int1Type.constInt(1, false));
+
+    runtime.builder.positionAtEnd(differentBlock);
+    instructions.buildRet(runtime.builder, runtime.int1Type.constInt(0, false));
+    return runtime.endDefinition(definition);
+}
+
+// i64 ens_string_index_of(ptr haystack, ptr needle): the offset of the first match, or -1. An
+// empty needle matches at 0, and a needle longer than the haystack never matches.
+public searchString(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int64Type.functionType([runtime.pointerType, runtime.pointerType]);
+    let known = runtime.existing("ens_string_index_of", type);
+    if (known != null) {
+        return known;
+    }
+    let compare = runtime.memcmp();
+    let definition = runtime.beginDefinition("ens_string_index_of", type);
+    let haystack = runtime.parameter(definition, 0);
+    let needle = runtime.parameter(definition, 1);
+    let emptyBlock = runtime.block(definition, "strfind.empty");
+    let fitBlock = runtime.block(definition, "strfind.fit");
+    let testBlock = runtime.block(definition, "strfind.test");
+    let bodyBlock = runtime.block(definition, "strfind.body");
+    let stepBlock = runtime.block(definition, "strfind.step");
+    let foundBlock = runtime.block(definition, "strfind.found");
+    let missingBlock = runtime.block(definition, "strfind.missing");
+    let indexSlot = memory.buildAlloca(runtime.builder, runtime.int64Type, "index");
+    let haystackLength = runtime.payloadLength(haystack);
+    let needleLength = runtime.payloadLength(needle);
+    let haystackData = runtime.payloadData(haystack);
+    let needleData = runtime.payloadData(needle);
+    let nothingToFind = instructions.buildICmpEQ(runtime.builder, needleLength, runtime.int64(0),
+        "");
+    instructions.buildCondBr(runtime.builder, nothingToFind, emptyBlock, fitBlock);
+
+    runtime.builder.positionAtEnd(emptyBlock);
+    instructions.buildRet(runtime.builder, runtime.int64(0));
+
+    runtime.builder.positionAtEnd(fitBlock);
+    let last = instructions.buildSub(runtime.builder, haystackLength, needleLength, "");
+    memory.buildStore(runtime.builder, runtime.int64(0), indexSlot);
+    let fits = instructions.buildICmpSLE(runtime.builder, needleLength, haystackLength, "");
+    instructions.buildCondBr(runtime.builder, fits, testBlock, missingBlock);
+
+    runtime.builder.positionAtEnd(testBlock);
+    let index = memory.buildLoad(runtime.builder, runtime.int64Type, indexSlot, "index");
+    let exhausted = instructions.buildICmpSGT(runtime.builder, index, last, "");
+    instructions.buildCondBr(runtime.builder, exhausted, missingBlock, bodyBlock);
+
+    runtime.builder.positionAtEnd(bodyBlock);
+    let difference = runtime.call(compare, [elementAt(runtime, haystackData, index), needleData,
+        needleLength], "");
+    let matched = instructions.buildICmpEQ(runtime.builder, difference, runtime.int32(0), "");
+    instructions.buildCondBr(runtime.builder, matched, foundBlock, stepBlock);
+
+    runtime.builder.positionAtEnd(stepBlock);
+    memory.buildStore(runtime.builder,
+        instructions.buildAdd(runtime.builder, index, runtime.int64(1), ""), indexSlot);
+    instructions.buildBr(runtime.builder, testBlock);
+
+    runtime.builder.positionAtEnd(foundBlock);
+    instructions.buildRet(runtime.builder, index);
+
+    runtime.builder.positionAtEnd(missingBlock);
+    instructions.buildRet(runtime.builder, runtime.int64(-1));
+    return runtime.endDefinition(definition);
+}
+
+// ptr ens_string_substring(ptr text, i64 start, i64 end): a copy of the half-open byte range. The
+// caller has already range-checked, so the copy runs unguarded.
+public copySubstring(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([runtime.pointerType, runtime.int64Type,
+        runtime.int64Type]);
+    let known = runtime.existing("ens_string_substring", type);
+    if (known != null) {
+        return known;
+    }
+    let allocator = allocateString(runtime);
+    let definition = runtime.beginDefinition("ens_string_substring", type);
+    let text = runtime.parameter(definition, 0);
+    let start = runtime.parameter(definition, 1);
+    let end = runtime.parameter(definition, 2);
+    let count = instructions.buildSub(runtime.builder, end, start, "");
+    let object = runtime.call(allocator, [count], "");
+    let source = elementAt(runtime, runtime.payloadData(text), start);
+    memory.buildMemCpy(runtime.builder, runtime.payloadData(object), 1, source, 1, count);
+    instructions.buildRet(runtime.builder, object);
+    return runtime.endDefinition(definition);
+}
+
+// ptr ens_int_to_string(i64 value, i1 signed): decimal text, read as signed or unsigned. Twenty
+// digits, a sign, and a NUL fit in the buffer.
+public integerText(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([runtime.int64Type, runtime.int1Type]);
+    let known = runtime.existing("ens_int_to_string", type);
+    if (known != null) {
+        return known;
+    }
+    let allocator = allocateString(runtime);
+    let format = runtime.snprintf();
+    let definition = runtime.beginDefinition("ens_int_to_string", type);
+    long capacity = 24;
+    let buffer = memory.buildAlloca(runtime.builder, runtime.int8Type.arrayType(capacity as ulong),
+        "buffer");
+    let signedFormat = globals.buildGlobalString(runtime.builder, "%lld", ".format.signed");
+    let unsignedFormat = globals.buildGlobalString(runtime.builder, "%llu", ".format.unsigned");
+    let chosen = instructions.buildSelect(runtime.builder, runtime.parameter(definition, 1),
+        signedFormat, unsignedFormat, "");
+    let written = runtime.call(format, [buffer, runtime.int64(capacity), chosen,
+        runtime.parameter(definition, 0)], "written");
+    instructions.buildRet(runtime.builder, copyOfBuffer(runtime, allocator, buffer, written));
+    return runtime.endDefinition(definition);
+}
+
+// ptr ens_double_to_string(double value): the shortest of decimal and exponent form, as "%g".
+public doubleText(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([runtime.doubleType]);
+    let known = runtime.existing("ens_double_to_string", type);
+    if (known != null) {
+        return known;
+    }
+    let allocator = allocateString(runtime);
+    let format = runtime.snprintf();
+    let definition = runtime.beginDefinition("ens_double_to_string", type);
+    long capacity = 32;
+    let buffer = memory.buildAlloca(runtime.builder, runtime.int8Type.arrayType(capacity as ulong),
+        "buffer");
+    let written = runtime.call(format, [buffer, runtime.int64(capacity),
+        globals.buildGlobalString(runtime.builder, "%g", ".format.general"),
+        runtime.parameter(definition, 0)], "written");
+    instructions.buildRet(runtime.builder, copyOfBuffer(runtime, allocator, buffer, written));
+    return runtime.endDefinition(definition);
+}
+
+// ptr ens_char_to_string(i32 scalar): the UTF-8 encoding of one Unicode scalar, one to four bytes.
+public scalarText(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([runtime.int32Type]);
+    let known = runtime.existing("ens_char_to_string", type);
+    if (known != null) {
+        return known;
+    }
+    let allocator = allocateString(runtime);
+    let definition = runtime.beginDefinition("ens_char_to_string", type);
+    let scalar = runtime.parameter(definition, 0);
+    let oneBlock = runtime.block(definition, "utf8.one");
+    let twoTestBlock = runtime.block(definition, "utf8.two.test");
+    let twoBlock = runtime.block(definition, "utf8.two");
+    let threeTestBlock = runtime.block(definition, "utf8.three.test");
+    let threeBlock = runtime.block(definition, "utf8.three");
+    let fourBlock = runtime.block(definition, "utf8.four");
+    let doneBlock = runtime.block(definition, "utf8.done");
+    let lengthSlot = memory.buildAlloca(runtime.builder, runtime.int64Type, "length");
+    let buffer = memory.buildAlloca(runtime.builder, runtime.int8Type.arrayType(4), "buffer");
+    instructions.buildCondBr(runtime.builder, below(runtime, scalar, 0x80), oneBlock,
+        twoTestBlock);
+
+    runtime.builder.positionAtEnd(oneBlock);
+    storeByte(runtime, buffer, 0, scalar);
+    finishEncoding(runtime, lengthSlot, 1, doneBlock);
+
+    runtime.builder.positionAtEnd(twoTestBlock);
+    instructions.buildCondBr(runtime.builder, below(runtime, scalar, 0x800), twoBlock,
+        threeTestBlock);
+
+    runtime.builder.positionAtEnd(twoBlock);
+    storeByte(runtime, buffer, 0, leadByte(runtime, scalar, 6, 0xC0));
+    storeByte(runtime, buffer, 1, continuationByte(runtime, scalar, 0));
+    finishEncoding(runtime, lengthSlot, 2, doneBlock);
+
+    runtime.builder.positionAtEnd(threeTestBlock);
+    instructions.buildCondBr(runtime.builder, below(runtime, scalar, 0x10000), threeBlock,
+        fourBlock);
+
+    runtime.builder.positionAtEnd(threeBlock);
+    storeByte(runtime, buffer, 0, leadByte(runtime, scalar, 12, 0xE0));
+    storeByte(runtime, buffer, 1, continuationByte(runtime, scalar, 6));
+    storeByte(runtime, buffer, 2, continuationByte(runtime, scalar, 0));
+    finishEncoding(runtime, lengthSlot, 3, doneBlock);
+
+    runtime.builder.positionAtEnd(fourBlock);
+    storeByte(runtime, buffer, 0, leadByte(runtime, scalar, 18, 0xF0));
+    storeByte(runtime, buffer, 1, continuationByte(runtime, scalar, 12));
+    storeByte(runtime, buffer, 2, continuationByte(runtime, scalar, 6));
+    storeByte(runtime, buffer, 3, continuationByte(runtime, scalar, 0));
+    finishEncoding(runtime, lengthSlot, 4, doneBlock);
+
+    runtime.builder.positionAtEnd(doneBlock);
+    let length = memory.buildLoad(runtime.builder, runtime.int64Type, lengthSlot, "length");
+    instructions.buildRet(runtime.builder, copyOfBytes(runtime, allocator, buffer, length));
+    return runtime.endDefinition(definition);
+}
+
+// ptr ens_json_escape_string(ptr text): the JSON form of the text, double quotes included. An
+// absent string renders as the empty JSON string. The bytes go into a scratch string sized for the
+// worst case, then into an exact-length result.
+public jsonText(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_json_escape_string", type);
+    if (known != null) {
+        return known;
+    }
+    let allocator = allocateString(runtime);
+    let release = runtime.release();
+    let definition = runtime.beginDefinition("ens_json_escape_string", type);
+    let text = runtime.parameter(definition, 0);
+    let presentBlock = runtime.block(definition, "json.present");
+    let absentBlock = runtime.block(definition, "json.absent");
+    let setupBlock = runtime.block(definition, "json.setup");
+    let testBlock = runtime.block(definition, "json.test");
+    let bodyBlock = runtime.block(definition, "json.body");
+    let escapeBlock = runtime.block(definition, "json.escape");
+    let otherBlock = runtime.block(definition, "json.other");
+    let unicodeBlock = runtime.block(definition, "json.unicode");
+    let plainBlock = runtime.block(definition, "json.plain");
+    let stepBlock = runtime.block(definition, "json.step");
+    let tailBlock = runtime.block(definition, "json.tail");
+    let lengthSlot = memory.buildAlloca(runtime.builder, runtime.int64Type, "length");
+    let dataSlot = memory.buildAlloca(runtime.builder, runtime.pointerType, "data");
+    let writtenSlot = memory.buildAlloca(runtime.builder, runtime.int64Type, "written");
+    let indexSlot = memory.buildAlloca(runtime.builder, runtime.int64Type, "index");
+    instructions.buildCondBr(runtime.builder, runtime.isNull(text), absentBlock, presentBlock);
+
+    runtime.builder.positionAtEnd(presentBlock);
+    memory.buildStore(runtime.builder, runtime.payloadLength(text), lengthSlot);
+    memory.buildStore(runtime.builder, runtime.payloadData(text), dataSlot);
+    instructions.buildBr(runtime.builder, setupBlock);
+
+    runtime.builder.positionAtEnd(absentBlock);
+    memory.buildStore(runtime.builder, runtime.int64(0), lengthSlot);
+    memory.buildStore(runtime.builder, runtime.nullPointer(), dataSlot);
+    instructions.buildBr(runtime.builder, setupBlock);
+
+    // Six bytes is the longest form one byte takes, plus the two quotes.
+    runtime.builder.positionAtEnd(setupBlock);
+    let length = memory.buildLoad(runtime.builder, runtime.int64Type, lengthSlot, "length");
+    let worstCase = instructions.buildAdd(runtime.builder,
+        instructions.buildMul(runtime.builder, length, runtime.int64(6), ""), runtime.int64(2),
+        "");
+    let scratch = runtime.call(allocator, [worstCase], "scratch");
+    let scratchData = runtime.payloadData(scratch);
+    memory.buildStore(runtime.builder, runtime.int8('"'), scratchData);
+    memory.buildStore(runtime.builder, runtime.int64(1), writtenSlot);
+    memory.buildStore(runtime.builder, runtime.int64(0), indexSlot);
+    instructions.buildBr(runtime.builder, testBlock);
+
+    runtime.builder.positionAtEnd(testBlock);
+    let index = memory.buildLoad(runtime.builder, runtime.int64Type, indexSlot, "index");
+    let more = instructions.buildICmpSLT(runtime.builder, index, length, "");
+    instructions.buildCondBr(runtime.builder, more, bodyBlock, tailBlock);
+
+    runtime.builder.positionAtEnd(bodyBlock);
+    let data = memory.buildLoad(runtime.builder, runtime.pointerType, dataSlot, "data");
+    let current = memory.buildLoad(runtime.builder, runtime.int8Type,
+        elementAt(runtime, data, index), "byte");
+    let written = memory.buildLoad(runtime.builder, runtime.int64Type, writtenSlot, "written");
+    let backspace = isByte(runtime, current, '\b');
+    let tab = isByte(runtime, current, '\t');
+    let newline = isByte(runtime, current, '\n');
+    let formFeed = isByte(runtime, current, '\f');
+    let carriageReturn = isByte(runtime, current, '\r');
+    let named = anyOf(runtime, anyOf(runtime, anyOf(runtime, backspace, tab),
+        anyOf(runtime, newline, formFeed)), carriageReturn);
+    Value letter = current;
+    letter = choose(runtime, backspace, 'b', letter);
+    letter = choose(runtime, tab, 't', letter);
+    letter = choose(runtime, newline, 'n', letter);
+    letter = choose(runtime, formFeed, 'f', letter);
+    letter = choose(runtime, carriageReturn, 'r', letter);
+    let twoCharacter = anyOf(runtime, anyOf(runtime, isByte(runtime, current, '"'),
+        isByte(runtime, current, '\\')), named);
+    let control = instructions.buildICmpULT(runtime.builder, current, runtime.int8(0x20), "");
+    let numeric = instructions.buildAnd(runtime.builder, control,
+        instructions.buildNot(runtime.builder, named, ""), "");
+    instructions.buildCondBr(runtime.builder, twoCharacter, escapeBlock, otherBlock);
+
+    runtime.builder.positionAtEnd(otherBlock);
+    instructions.buildCondBr(runtime.builder, numeric, unicodeBlock, plainBlock);
+
+    runtime.builder.positionAtEnd(escapeBlock);
+    writeByte(runtime, scratchData, written, 0, runtime.int8('\\'));
+    writeByte(runtime, scratchData, written, 1, letter);
+    advance(runtime, writtenSlot, written, 2, stepBlock);
+
+    runtime.builder.positionAtEnd(unicodeBlock);
+    writeByte(runtime, scratchData, written, 0, runtime.int8('\\'));
+    writeByte(runtime, scratchData, written, 1, runtime.int8('u'));
+    writeByte(runtime, scratchData, written, 2, runtime.int8('0'));
+    writeByte(runtime, scratchData, written, 3, runtime.int8('0'));
+    writeByte(runtime, scratchData, written, 4, hexDigit(runtime, nibble(runtime, current, 4)));
+    writeByte(runtime, scratchData, written, 5, hexDigit(runtime, nibble(runtime, current, 0)));
+    advance(runtime, writtenSlot, written, 6, stepBlock);
+
+    runtime.builder.positionAtEnd(plainBlock);
+    writeByte(runtime, scratchData, written, 0, current);
+    advance(runtime, writtenSlot, written, 1, stepBlock);
+
+    runtime.builder.positionAtEnd(stepBlock);
+    memory.buildStore(runtime.builder,
+        instructions.buildAdd(runtime.builder, index, runtime.int64(1), ""), indexSlot);
+    instructions.buildBr(runtime.builder, testBlock);
+
+    runtime.builder.positionAtEnd(tailBlock);
+    let closing = memory.buildLoad(runtime.builder, runtime.int64Type, writtenSlot, "written");
+    memory.buildStore(runtime.builder, runtime.int8('"'),
+        elementAt(runtime, scratchData, closing));
+    let total = instructions.buildAdd(runtime.builder, closing, runtime.int64(1), "");
+    let result = runtime.call(allocator, [total], "");
+    memory.buildMemCpy(runtime.builder, runtime.payloadData(result), 1, scratchData, 1, total);
+    runtime.call(release, [scratch], "");
+    instructions.buildRet(runtime.builder, result);
+    return runtime.endDefinition(definition);
+}
+
+// A fresh string holding the first `written` bytes of a formatting buffer, where written is the
+// i32 count snprintf reported.
+copyOfBuffer(Runtime runtime, RuntimeFunction allocator, Value buffer, Value written) -> Value {
+    let length = instructions.buildSExt(runtime.builder, written, runtime.int64Type, "");
+    return copyOfBytes(runtime, allocator, buffer, length);
+}
+
+copyOfBytes(Runtime runtime, RuntimeFunction allocator, Value buffer, Value length) -> Value {
+    let object = runtime.call(allocator, [length], "");
+    memory.buildMemCpy(runtime.builder, runtime.payloadData(object), 1, buffer, 1, length);
+    return object;
+}
+
+// The address of the byte at the given index.
+elementAt(Runtime runtime, Value data, Value index) -> Value {
+    return memory.buildGEP(runtime.builder, runtime.int8Type, data, [index], "");
+}
+
+// Records the encoded length and joins the shared tail of the encoder.
+finishEncoding(Runtime runtime, Value lengthSlot, long length, BasicBlock target) {
+    memory.buildStore(runtime.builder, runtime.int64(length), lengthSlot);
+    instructions.buildBr(runtime.builder, target);
+}
+
+below(Runtime runtime, Value scalar, long limit) -> Value {
+    return instructions.buildICmpULT(runtime.builder, scalar, runtime.int32(limit), "");
+}
+
+// The lead byte of a multi-byte sequence: the bits above the continuation groups, tagged with the
+// marker that states how many bytes follow.
+leadByte(Runtime runtime, Value scalar, long shift, long marker) -> Value {
+    let high = instructions.buildLShr(runtime.builder, scalar, runtime.int32(shift), "");
+    return instructions.buildOr(runtime.builder, runtime.int32(marker), high, "");
+}
+
+// One continuation byte: the six-bit group at the given shift, tagged 10xxxxxx.
+continuationByte(Runtime runtime, Value scalar, long shift) -> Value {
+    Value bits = scalar;
+    if (shift > 0) {
+        bits = instructions.buildLShr(runtime.builder, scalar, runtime.int32(shift), "");
+    }
+    let group = instructions.buildAnd(runtime.builder, bits, runtime.int32(0x3F), "");
+    return instructions.buildOr(runtime.builder, runtime.int32(0x80), group, "");
+}
+
+// Truncates a 32-bit value into the buffer's byte at the given offset.
+storeByte(Runtime runtime, Value buffer, long offset, Value value) {
+    let byteValue = instructions.buildTrunc(runtime.builder, value, runtime.int8Type, "");
+    memory.buildStore(runtime.builder, byteValue,
+        elementAt(runtime, buffer, runtime.int64(offset)));
+}
+
+// Stores a byte the given distance past the write position.
+writeByte(Runtime runtime, Value data, Value written, long offset, Value value) {
+    Value position = written;
+    if (offset > 0) {
+        position = instructions.buildAdd(runtime.builder, written, runtime.int64(offset), "");
+    }
+    memory.buildStore(runtime.builder, value, elementAt(runtime, data, position));
+}
+
+// Moves the write position on by the bytes just written and joins the loop step.
+advance(Runtime runtime, Value writtenSlot, Value written, long count, BasicBlock target) {
+    memory.buildStore(runtime.builder,
+        instructions.buildAdd(runtime.builder, written, runtime.int64(count), ""), writtenSlot);
+    instructions.buildBr(runtime.builder, target);
+}
+
+isByte(Runtime runtime, Value value, long expected) -> Value {
+    return instructions.buildICmpEQ(runtime.builder, value, runtime.int8(expected), "");
+}
+
+anyOf(Runtime runtime, Value left, Value right) -> Value {
+    return instructions.buildOr(runtime.builder, left, right, "");
+}
+
+// The escape letter when the test holds, and the byte chosen so far otherwise.
+choose(Runtime runtime, Value test, long character, Value otherwise) -> Value {
+    return instructions.buildSelect(runtime.builder, test, runtime.int8(character), otherwise, "");
+}
+
+nibble(Runtime runtime, Value value, long shift) -> Value {
+    Value bits = value;
+    if (shift > 0) {
+        bits = instructions.buildLShr(runtime.builder, value, runtime.int8(shift), "");
+    }
+    return instructions.buildAnd(runtime.builder, bits, runtime.int8(0xF), "");
+}
+
+// The lowercase hex digit a nibble spells.
+hexDigit(Runtime runtime, Value value) -> Value {
+    let small = instructions.buildICmpULT(runtime.builder, value, runtime.int8(10), "");
+    let digit = instructions.buildAdd(runtime.builder, value, runtime.int8('0'), "");
+    let letter = instructions.buildAdd(runtime.builder,
+        instructions.buildSub(runtime.builder, value, runtime.int8(10), ""), runtime.int8('a'),
+        "");
+    return instructions.buildSelect(runtime.builder, small, digit, letter, "");
+}
