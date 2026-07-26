@@ -1,6 +1,8 @@
 // Assignment lowering: the plain store into a slot-backed target, and the read-modify-write a
 // compound assignment expands into. The expression's value is the value that was stored.
+import Expression from @ens.frontend.syntax.generated.nodes;
 import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
 import AssignmentExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SyntaxKind from @ens.frontend.syntax.generated.kind;
 import Span from @ens.frontend.support.source;
@@ -10,12 +12,18 @@ import EirBinaryOp from eir.model;
 import EirBinary from eir.model;
 import EirLoadSlot from eir.model;
 import EirStoreSlot from eir.model;
+import EirStorePtr from eir.model;
 import LoweringContext from lower.context;
 import lower.expressions;
+import lower.places;
+import lower.stores;
 import support.primitives;
 
 public lower(LoweringContext lowering, AssignmentExpressionNode assignment) -> long {
     let target = assignment.target();
+    if (target is SubscriptExpressionNode) {
+        return lowerThroughAddress(lowering, assignment, target);
+    }
     if (!(target is IdentifierExpressionNode)) {
         lowering.unsupported("assigning to this target", assignment.span());
         return -1;
@@ -34,12 +42,16 @@ public lower(LoweringContext lowering, AssignmentExpressionNode assignment) -> l
     let targetType = binding.type();
     SyntaxKind operator = assignment.operator().kind();
     if (operator == SyntaxKind.Equals) {
-        long value = expressions.lowerConverted(lowering, assignment.value(), targetType);
-        if (value < 0) {
+        let operand = stores.lowerOperand(lowering, assignment.value(), targetType);
+        if (operand == null) {
             return -1;
         }
-        builder.append(new EirStoreSlot(slot, value));
-        return value;
+        if (!stores.assignSlot(lowering, slot, targetType, operand)) {
+            lowering.internalError("the assigned value borrows a struct with no storage to "
+                + "retain", assignment.span());
+            return -1;
+        }
+        return operand.value();
     }
     long current = builder.newTemp(targetType);
     builder.append(new EirLoadSlot(current, targetType, slot));
@@ -54,6 +66,48 @@ public lower(LoweringContext lowering, AssignmentExpressionNode assignment) -> l
     long combined = builder.newTemp(targetType);
     builder.append(new EirBinary(combined, targetType, op, current, operandValue));
     builder.append(new EirStoreSlot(slot, combined));
+    return combined;
+}
+
+// Assigning through a place that is not a plain local: the address is computed once, then read
+// for a compound operator and written back.
+lowerThroughAddress(LoweringContext lowering, AssignmentExpressionNode assignment,
+                    Expression target) -> long {
+    let targetType = lowering.typeOf(target);
+    if (targetType == null) {
+        return -1;
+    }
+    long address = places.lowerAddress(lowering, target);
+    if (address < 0) {
+        lowering.unsupported("assigning to this target", assignment.span());
+        return -1;
+    }
+    let builder = lowering.builder();
+    SyntaxKind operator = assignment.operator().kind();
+    if (operator == SyntaxKind.Equals) {
+        let operand = stores.lowerOperand(lowering, assignment.value(), targetType);
+        if (operand == null) {
+            return -1;
+        }
+        if (!stores.assignThroughAddress(lowering, address, targetType, operand)) {
+            lowering.internalError("the assigned value borrows a struct with no storage to "
+                + "retain", assignment.span());
+            return -1;
+        }
+        return operand.value();
+    }
+    long current = places.loadFrom(lowering, address, targetType);
+    long operandValue = expressions.lowerConverted(lowering, assignment.value(), targetType);
+    if (operandValue < 0) {
+        return -1;
+    }
+    let op = compoundOperator(lowering, operator, targetType, assignment.span());
+    if (op == null) {
+        return -1;
+    }
+    long combined = builder.newTemp(targetType);
+    builder.append(new EirBinary(combined, targetType, op, current, operandValue));
+    builder.append(new EirStorePtr(address, combined));
     return combined;
 }
 

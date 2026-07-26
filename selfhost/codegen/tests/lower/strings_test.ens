@@ -1,0 +1,191 @@
+// Golden lowering tests for strings, where the goldens pin retain and release placement: a leak
+// or a double release shows up as a diff here, and the ownership verifier gates every dump.
+import @std.testing;
+import support;
+
+test "a string literal borrows its immortal bytes and print releases nothing" {
+    let dumped = try support.loweredDump(
+        "main() -> int \{\n"
+        + "    print(\"hi\");\n"
+        + "    return 0;\n"
+        + "\}\n", "main");
+    try testing.assertEqual(dumped,
+        "func internal @ens.main() -> int \{\n"
+        + "b0.entry:\n"
+        + "  %0 = const \"hi\": string\n"
+        + "  print %0\n"
+        + "  %1 = const 0: int\n"
+        + "  ret %1\n"
+        + "\}\n");
+}
+
+test "a concatenated local takes the produced reference and gives it up at the end" {
+    let dumped = try support.loweredDump(
+        "greet(string name) -> string \{\n"
+        + "    let greeting = \"Hello, \" + name;\n"
+        + "    return greeting;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    print(greet(\"world\"));\n"
+        + "    return 0;\n"
+        + "\}\n", "greet");
+    try testing.assertEqual(dumped,
+        "func internal @greet(%0: string) -> string \{\n"
+        + "  $0 name: string borrowed\n"
+        + "  $1 greeting: string zeroed\n"
+        + "b0.entry:\n"
+        + "  store $0, %0\n"
+        + "  %1 = const \"Hello, \": string\n"
+        + "  retain %1\n"
+        + "  %2 = load $0: string\n"
+        + "  retain %2\n"
+        + "  %3 = str.concat %1, %2: string\n"
+        + "  release %1\n"
+        + "  release %2\n"
+        + "  store $1, %3\n"
+        + "  %4 = load $1: string\n"
+        + "  retain %4\n"
+        + "  %5 = slot_addr $1: &string  ; greeting\n"
+        + "  release_ptr %5\n"
+        + "  ret %4\n"
+        + "\}\n");
+}
+
+test "interpolation folds through one owned accumulator" {
+    let dumped = try support.loweredDump(
+        "label(int n) -> string \{\n"
+        + "    return \"n=\{n\}!\";\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    print(label(2));\n"
+        + "    return 0;\n"
+        + "\}\n", "label");
+    try testing.assertEqual(dumped,
+        "func internal @label(%0: int) -> string \{\n"
+        + "  $0 n: int\n"
+        + "b0.entry:\n"
+        + "  store $0, %0\n"
+        + "  %1 = const \"n=\": string\n"
+        + "  retain %1\n"
+        + "  %2 = load $0: int\n"
+        + "  %3 = sext %2: long\n"
+        + "  %4 = int.str %3 signed: string\n"
+        + "  %5 = str.concat %1, %4: string\n"
+        + "  release %1\n"
+        + "  release %4\n"
+        + "  %6 = const \"!\": string\n"
+        + "  %7 = str.concat %5, %6: string\n"
+        + "  release %5\n"
+        + "  ret %7\n"
+        + "\}\n");
+}
+
+test "comparison and length read a borrowed parameter without touching its refcount" {
+    let dumped = try support.loweredDump(
+        "same(string a) -> long \{\n"
+        + "    if (a == \"x\") \{\n"
+        + "        return a.length;\n"
+        + "    \}\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return same(\"x\") as int;\n"
+        + "\}\n", "same");
+    try testing.assertEqual(dumped,
+        "func internal @same(%0: string) -> long \{\n"
+        + "  $0 a: string borrowed\n"
+        + "b0.entry:\n"
+        + "  store $0, %0\n"
+        + "  %1 = load $0: string\n"
+        + "  %2 = const \"x\": string\n"
+        + "  %3 = str.eq %1, %2: bool\n"
+        + "  br %3, b1.if.then, b2.if.end\n"
+        + "b1.if.then:\n"
+        + "  %4 = load $0: string\n"
+        + "  %5 = str.len %4: long\n"
+        + "  ret %5\n"
+        + "b2.if.end:\n"
+        + "  %6 = const 0: long\n"
+        + "  ret %6\n"
+        + "\}\n");
+}
+
+test "a reassigned string parameter owns its slot instead of borrowing it" {
+    let dumped = try support.loweredDump(
+        "rename(string name) -> long \{\n"
+        + "    name = \"fixed\";\n"
+        + "    return name.length;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return rename(\"x\") as int;\n"
+        + "\}\n", "rename");
+    try testing.assertEqual(dumped,
+        "func internal @rename(%0: string) -> long \{\n"
+        + "  $0 name: string zeroed\n"
+        + "b0.entry:\n"
+        + "  retain %0\n"
+        + "  store $0, %0\n"
+        + "  %1 = const \"fixed\": string\n"
+        + "  retain %1\n"
+        + "  %2 = slot_addr $0: &string  ; name\n"
+        + "  release_ptr %2\n"
+        + "  store $0, %1\n"
+        + "  %3 = load $0: string\n"
+        + "  %4 = str.len %3: long\n"
+        + "  %5 = slot_addr $0: &string  ; name\n"
+        + "  release_ptr %5\n"
+        + "  ret %4\n"
+        + "\}\n");
+}
+
+test "an escaped literal decodes to its bytes" {
+    let dumped = try support.loweredDump(
+        "main() -> int \{\n"
+        + "    print(\"a\\tb\\u00e9\\n\");\n"
+        + "    return 0;\n"
+        + "\}\n", "main");
+    try testing.assertTrue(dumped.indexOf("const \"a\\tbé\\n\": string") >= 0,
+        "unexpected dump: {dumped}");
+}
+
+// The shape of the arc_string fixture: a loop that builds a concatenation, an interpolation, and
+// a byte round-trip every iteration. Ownership has to balance per iteration, not just per
+// function, or the loop leaks.
+test "a loop building derived strings balances every iteration" {
+    let dumped = try support.loweredDump(
+        "main() -> int \{\n"
+        + "    let i = 0;\n"
+        + "    let matched = 0;\n"
+        + "    while (i < 1000) \{\n"
+        + "        let s = \"item-\{i\}-\" + (i * 2).toString();\n"
+        + "        let restored = string.fromBytes(s.toBytes());\n"
+        + "        if (restored == s) \{ matched = matched + 1; \}\n"
+        + "        i = i + 1;\n"
+        + "    \}\n"
+        + "    return matched - 1000;\n"
+        + "\}\n", "main");
+    try testing.assertTrue(dumped.indexOf("bytes.str") >= 0,
+        "the byte round-trip should lower: {dumped}");
+    try testing.assertTrue(dumped.indexOf("str.eq") >= 0,
+        "the comparison should lower: {dumped}");
+}
+
+test "a discarded string result is released where the statement ends" {
+    let dumped = try support.loweredDump(
+        "build(string a) -> string \{\n"
+        + "    return a + \"!\";\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    build(\"x\");\n"
+        + "    return 0;\n"
+        + "\}\n", "main");
+    try testing.assertEqual(dumped,
+        "func internal @ens.main() -> int \{\n"
+        + "b0.entry:\n"
+        + "  %0 = const \"x\": string\n"
+        + "  %1 = call @build(%0): string\n"
+        + "  release %1\n"
+        + "  %2 = const 0: int\n"
+        + "  ret %2\n"
+        + "\}\n");
+}

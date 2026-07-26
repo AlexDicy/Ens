@@ -1,0 +1,281 @@
+// The calls that resolve to no user function: the built-in free functions 'print' and 'panic',
+// the members every string and array carries, and the static 'string.fromBytes'. Sema types
+// these structurally and records no callee for them, so lowering recognizes them by the member
+// name and the receiver's type, exactly as the checker did.
+import Expression from @ens.frontend.syntax.generated.nodes;
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ArgumentListNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxKind from @ens.frontend.syntax.generated.kind;
+import Span from @ens.frontend.support.source;
+import Type from @ens.sema.model.types;
+import PrimitiveKind from @ens.sema.model.types;
+import @ens.sema.model.types;
+import EirStringIndexOf from eir.model;
+import EirStringSubstring from eir.model;
+import EirStringToBytes from eir.model;
+import EirStringFromBytes from eir.model;
+import EirStringLength from eir.model;
+import EirRangeCheck from eir.model;
+import EirBinary from eir.model;
+import EirBinaryOp from eir.model;
+import EirConstInt from eir.model;
+import EirPrint from eir.model;
+import EirPanic from eir.model;
+import LoweringContext from lower.context;
+import lower.conversions;
+import lower.expressions;
+import lower.ownership;
+import lower.places;
+import lower.strings;
+import support.primitives;
+import List from @std.collections.list;
+
+// The result meaning "this call is not a built-in", distinct from -1, which means lowering
+// failed. Temps are never negative, so any negative value is free for this.
+public notIntercepted() -> long {
+    return -2;
+}
+
+// 'print' writes a line to standard output; 'panic' reports and ends the program. Both take one
+// string, and both give up a string the argument produced for the call.
+public lowerFreeCall(LoweringContext lowering, CallExpressionNode call, string name) -> long {
+    let argument = singleArgument(call.arguments());
+    if (argument == null) {
+        lowering.internalError("'{name}' reached lowering with "
+            + "{call.arguments().argumentsCount()} argument(s)", call.span());
+        return -1;
+    }
+    if (name != "print" && name != "panic") {
+        lowering.unsupported("the built-in function '{name}'", call.span());
+        return -1;
+    }
+    long text = expressions.lower(lowering, argument);
+    if (text < 0) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    if (name == "print") {
+        builder.append(new EirPrint(text));
+        expressions.releaseTemporary(lowering, argument, text);
+        return -1;
+    }
+    builder.append(new EirPanic(text));
+    return -1;
+}
+
+// A member call sema resolved structurally. Returns notIntercepted() when the call is an
+// ordinary function or method call.
+public lowerMemberCall(LoweringContext lowering, CallExpressionNode call) -> long {
+    let callee = call.callee();
+    if (!(callee is MemberExpressionNode)) {
+        return notIntercepted();
+    }
+    if (lowering.result().methodOf(callee.green()) != null) {
+        return notIntercepted();
+    }
+    if (lowering.result().callableOf(callee.green()) != null) {
+        return notIntercepted();
+    }
+    string name = callee.member().text();
+    let object = callee.object();
+    if (isStringTypeKeyword(object)) {
+        return lowerStringStatic(lowering, call, name);
+    }
+    let receiverType = lowering.typeOf(object);
+    if (receiverType == null) {
+        return -1;
+    }
+    if (primitives.isStringType(receiverType)) {
+        return lowerStringMember(lowering, call, object, name);
+    }
+    if (primitives.isArrayType(receiverType)) {
+        lowering.unsupported("the array member '{name}'", call.span());
+        return -1;
+    }
+    if (name == "toString") {
+        return lowerValueToString(lowering, call, object);
+    }
+    return notIntercepted();
+}
+
+// 'string.fromBytes(bytes)' reads a byte array as UTF-8 text.
+lowerStringStatic(LoweringContext lowering, CallExpressionNode call, string name) -> long {
+    if (name != "fromBytes") {
+        lowering.unsupported("the static member 'string.{name}'", call.span());
+        return -1;
+    }
+    let argument = singleArgument(call.arguments());
+    if (argument == null) {
+        lowering.internalError("'string.fromBytes' reached lowering with "
+            + "{call.arguments().argumentsCount()} argument(s)", call.span());
+        return -1;
+    }
+    long bytes = expressions.lower(lowering, argument);
+    if (bytes < 0) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    let stringType = lowering.store().stringType();
+    long text = builder.newTemp(stringType);
+    builder.append(new EirStringFromBytes(text, stringType, bytes));
+    expressions.releaseTemporary(lowering, argument, bytes);
+    return text;
+}
+
+lowerStringMember(LoweringContext lowering, CallExpressionNode call, Expression object,
+                  string name) -> long {
+    switch (name) {
+        "toString" -> {
+            return strings.lowerToString(lowering, object);
+        },
+        "length" -> {
+            lowering.unsupported("calling 'length', which is not a method", call.span());
+            return -1;
+        },
+        "toBytes" -> {
+            return lowerToBytes(lowering, call, object);
+        },
+        "indexOf" -> {
+            return lowerSearch(lowering, call, object, false);
+        },
+        "contains" -> {
+            return lowerSearch(lowering, call, object, true);
+        },
+        "substring" -> {
+            return lowerSubstring(lowering, call, object);
+        },
+        default -> {
+            lowering.unsupported("the string member '{name}'", call.span());
+            return -1;
+        },
+    }
+}
+
+// A value's own text form, for '.toString()' on an integer, char, bool, or enum.
+lowerValueToString(LoweringContext lowering, CallExpressionNode call, Expression object)
+        -> long {
+    let receiverType = lowering.typeOf(object);
+    if (receiverType == null) {
+        return -1;
+    }
+    if (primitives.isNumericType(receiverType) || primitives.isBoolType(receiverType)
+            || primitives.isEnumType(receiverType)) {
+        return strings.lowerToString(lowering, object);
+    }
+    return notIntercepted();
+}
+
+lowerToBytes(LoweringContext lowering, CallExpressionNode call, Expression object) -> long {
+    let resultType = lowering.typeOf(call);
+    if (resultType == null) {
+        return -1;
+    }
+    long text = expressions.lower(lowering, object);
+    if (text < 0) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    long bytes = builder.newTemp(resultType);
+    builder.append(new EirStringToBytes(bytes, resultType, text));
+    expressions.releaseTemporary(lowering, object, text);
+    return bytes;
+}
+
+// 'indexOf' hands back the byte offset; 'contains' compares that offset against zero.
+lowerSearch(LoweringContext lowering, CallExpressionNode call, Expression object,
+            bool asContains) -> long {
+    let argument = singleArgument(call.arguments());
+    if (argument == null) {
+        lowering.internalError("a string search reached lowering with "
+            + "{call.arguments().argumentsCount()} argument(s)", call.span());
+        return -1;
+    }
+    long haystack = expressions.lower(lowering, object);
+    if (haystack < 0) {
+        return -1;
+    }
+    long needle = expressions.lower(lowering, argument);
+    if (needle < 0) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    let longType = lowering.store().primitive(PrimitiveKind.Long);
+    long offset = builder.newTemp(longType);
+    builder.append(new EirStringIndexOf(offset, longType, haystack, needle));
+    expressions.releaseTemporary(lowering, object, haystack);
+    expressions.releaseTemporary(lowering, argument, needle);
+    if (!asContains) {
+        return offset;
+    }
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    long zero = builder.newTemp(longType);
+    builder.append(new EirConstInt(zero, longType, 0));
+    long found = builder.newTemp(boolType);
+    builder.append(new EirBinary(found, boolType, EirBinaryOp.CmpGeSigned, offset, zero));
+    return found;
+}
+
+// 'substring' copies a byte range, aborting when the range is not inside the string.
+lowerSubstring(LoweringContext lowering, CallExpressionNode call, Expression object) -> long {
+    let arguments = argumentValues(call.arguments());
+    if (arguments == null || arguments.length() != 2) {
+        lowering.internalError("'substring' reached lowering with "
+            + "{call.arguments().argumentsCount()} argument(s)", call.span());
+        return -1;
+    }
+    let stringType = lowering.store().stringType();
+    let longType = lowering.store().primitive(PrimitiveKind.Long);
+    long text = expressions.lower(lowering, object);
+    if (text < 0) {
+        return -1;
+    }
+    long start = expressions.lowerConverted(lowering, arguments.get(0), longType);
+    if (start < 0) {
+        return -1;
+    }
+    long end = expressions.lowerConverted(lowering, arguments.get(1), longType);
+    if (end < 0) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    long length = builder.newTemp(longType);
+    builder.append(new EirStringLength(length, longType, text));
+    builder.append(new EirRangeCheck(start, end, length,
+        "substring range out of bounds"));
+    long result = builder.newTemp(stringType);
+    builder.append(new EirStringSubstring(result, stringType, text, start, end));
+    expressions.releaseTemporary(lowering, object, text);
+    return result;
+}
+
+// True for the 'string' keyword standing in for the type itself, as in 'string.fromBytes'.
+isStringTypeKeyword(Expression object) -> bool {
+    if (!(object is IdentifierExpressionNode)) {
+        return false;
+    }
+    return object.name().kind() == SyntaxKind.StringKeyword;
+}
+
+singleArgument(ArgumentListNode arguments) -> Expression? {
+    let values = argumentValues(arguments);
+    if (values == null || values.length() != 1) {
+        return null;
+    }
+    return values.get(0);
+}
+
+// The written arguments in source order, or null when one of them is an 'out' argument.
+argumentValues(ArgumentListNode arguments) -> List<Expression>? {
+    let values = new List<Expression>();
+    for (long i = 0; i < arguments.argumentsCount(); i++) {
+        let argument = arguments.arguments(i);
+        if (argument is Expression) {
+            values.push(argument);
+        } else {
+            return null;
+        }
+    }
+    return values;
+}

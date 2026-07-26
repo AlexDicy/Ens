@@ -11,6 +11,11 @@
 // statement, expression, operator, assignment, call, switch, and conversion modules, all of them
 // free functions over one LoweringContext.
 import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import BlockNode from @ens.frontend.syntax.generated.nodes;
+import AssignmentExpressionNode from @ens.frontend.syntax.generated.nodes;
+import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxNode from @ens.frontend.syntax.node;
+import LocalBinding from @ens.sema.model.scopes;
 import Parameter from @ens.sema.model.types;
 import TypeStore from @ens.sema.model.types;
 import @ens.sema.model.types;
@@ -22,7 +27,9 @@ import EirUnreachable from eir.model;
 import FunctionInfo from lower.index;
 import ProgramIndex from lower.index;
 import LoweringContext from lower.context;
+import lower.ownership;
 import lower.statements;
+import support.primitives;
 
 public final class FunctionLowering {
     EirFunction? loweredFunction;
@@ -59,7 +66,8 @@ public lowerFunction(FunctionInfo info, ProgramIndex index, TypeStore store)
             signature.nameSpan());
         return new FunctionLowering(null, lowering.diagnostics());
     }
-    bindParameters(lowering, declaration);
+    lowering.pushScope();
+    bindParameters(lowering, declaration, body);
     statements.lowerBlock(lowering, body);
     if (lowering.failed()) {
         return new FunctionLowering(null, lowering.diagnostics());
@@ -69,18 +77,26 @@ public lowerFunction(FunctionInfo info, ProgramIndex index, TypeStore store)
         if (signature.isNoreturn() || !types.isVoidType(signature.returnType())) {
             builder.terminate(new EirUnreachable());
         } else {
+            ownership.releaseAllScopes(lowering);
             builder.terminate(new EirReturn(-1));
         }
     }
+    lowering.popScope();
     return new FunctionLowering(builder.finish(), lowering.diagnostics());
 }
 
 // Every parameter gets a slot holding its incoming temp, so the body reads parameters exactly
-// the way it reads locals.
-bindParameters(LoweringContext lowering, FunctionDeclarationNode declaration) {
+// the way it reads locals. A reference argument arrives borrowed and stays the caller's, so the
+// slot owns nothing; a struct argument is a copy this function may change, so it retains the
+// references it holds and releases them when the function ends.
+bindParameters(LoweringContext lowering, FunctionDeclarationNode declaration, BlockNode body) {
     let signature = lowering.info().signature();
     Parameter[] parameters = signature.parameters();
     let parameterList = declaration.parameters();
+    long offset = 0;
+    if (lowering.info().receiverType() != null) {
+        offset = 1;
+    }
     for (long i = 0; i < parameters.length; i++) {
         let parameter = parameters[i];
         if (!lowering.supportsValueType(parameter.type())) {
@@ -99,7 +115,44 @@ bindParameters(LoweringContext lowering, FunctionDeclarationNode declaration) {
                 parameter.span());
             return;
         }
-        long slot = lowering.defineSlot(binding, parameter.name(), parameter.type());
-        lowering.builder().append(new EirStoreSlot(slot, i));
+        bool borrowing = primitives.isReferenceType(parameter.type())
+            && !assignsTo(lowering, body, binding);
+        long slot = lowering.defineSlotAs(binding, parameter.name(), parameter.type(),
+            borrowing);
+        bool owns = !borrowing && primitives.hasArcContent(parameter.type());
+        if (owns && primitives.isReferenceType(parameter.type())) {
+            ownership.retainValue(lowering, i + offset);
+        }
+        lowering.builder().append(new EirStoreSlot(slot, i + offset));
+        if (owns) {
+            if (!primitives.isReferenceType(parameter.type())) {
+                long address = ownership.slotAddress(lowering, slot, parameter.type());
+                ownership.retainAt(lowering, address, parameter.type());
+            }
+            ownership.trackSlot(lowering, slot, parameter.type());
+        }
     }
+}
+
+// True when the body assigns to this binding. A reference parameter that is only read keeps its
+// caller's reference and pays no atomics; one that is written over has to own what it holds, so
+// its slot takes a reference of its own at entry and gives it up at the end.
+assignsTo(LoweringContext lowering, BlockNode body, LocalBinding binding) -> bool {
+    return assignsWithin(lowering, body, binding);
+}
+
+assignsWithin(LoweringContext lowering, SyntaxNode node, LocalBinding binding) -> bool {
+    if (node is AssignmentExpressionNode) {
+        let target = node.target();
+        if (target is IdentifierExpressionNode
+                && lowering.result().bindingOf(target.green()) == binding) {
+            return true;
+        }
+    }
+    for (let child in node.childNodes()) {
+        if (assignsWithin(lowering, child, binding)) {
+            return true;
+        }
+    }
+    return false;
 }

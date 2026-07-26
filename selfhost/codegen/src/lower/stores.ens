@@ -1,0 +1,110 @@
+// Writing values into storage under the caller-side ownership convention. A binding takes a
+// produced value's +1 as it is; a borrowed value is retained so the storage owns its own
+// reference. Initializing storage has nothing to release, while assigning over live storage
+// releases what was there after the incoming value has been retained, so a location assigned
+// from itself never drops to zero in between.
+import Expression from @ens.frontend.syntax.generated.nodes;
+import Type from @ens.sema.model.types;
+import StructType from @ens.sema.model.types;
+import EirStoreSlot from eir.model;
+import EirStorePtr from eir.model;
+import LoweringContext from lower.context;
+import lower.expressions;
+import lower.ownership;
+import lower.places;
+import support.primitives;
+
+// A lowered right-hand side: the value, whether it arrived owning a reference, and the place it
+// was read from when it was borrowed out of storage.
+public final class Operand {
+    long valueTemp;
+    bool ownedValue;
+    long sourceAddress;
+
+    public constructor(this.valueTemp, this.ownedValue, this.sourceAddress);
+
+    public value() -> long {
+        return this.valueTemp;
+    }
+
+    public owned() -> bool {
+        return this.ownedValue;
+    }
+
+    public address() -> long {
+        return this.sourceAddress;
+    }
+}
+
+// Lowers an expression for storage at the given type. A borrowed struct is reached through its
+// address, because retaining the references it holds needs one.
+public lowerOperand(LoweringContext lowering, Expression source, Type type) -> Operand? {
+    bool owned = places.producesOwnedValue(lowering, source);
+    if (!owned && type is StructType && primitives.hasArcContent(type)) {
+        long address = places.lowerAddress(lowering, source);
+        if (address >= 0) {
+            return new Operand(places.loadFrom(lowering, address, type), false, address);
+        }
+    }
+    long value = expressions.lowerConverted(lowering, source, type);
+    if (value < 0) {
+        return null;
+    }
+    return new Operand(value, owned, -1);
+}
+
+// Retains what the operand holds when it does not own it yet, so a location can keep it.
+retainForStorage(LoweringContext lowering, Operand operand, Type type) -> bool {
+    if (operand.owned() || !primitives.hasArcContent(type)) {
+        return true;
+    }
+    if (primitives.isReferenceType(type)) {
+        ownership.retainValue(lowering, operand.value());
+        return true;
+    }
+    if (operand.address() < 0) {
+        return false;
+    }
+    ownership.retainAt(lowering, operand.address(), type);
+    return true;
+}
+
+// Writes into storage that holds nothing yet.
+public initializeSlot(LoweringContext lowering, long slot, Type type, Operand operand) -> bool {
+    if (!retainForStorage(lowering, operand, type)) {
+        return false;
+    }
+    lowering.builder().append(new EirStoreSlot(slot, operand.value()));
+    return true;
+}
+
+// Writes over storage that may already hold a reference.
+public assignSlot(LoweringContext lowering, long slot, Type type, Operand operand) -> bool {
+    if (!retainForStorage(lowering, operand, type)) {
+        return false;
+    }
+    ownership.releaseSlotContents(lowering, slot, type);
+    lowering.builder().append(new EirStoreSlot(slot, operand.value()));
+    return true;
+}
+
+// Writes over the storage an address names.
+public assignThroughAddress(LoweringContext lowering, long address, Type type, Operand operand)
+        -> bool {
+    if (!retainForStorage(lowering, operand, type)) {
+        return false;
+    }
+    ownership.releaseAt(lowering, address, type);
+    lowering.builder().append(new EirStorePtr(address, operand.value()));
+    return true;
+}
+
+// Writes into storage an address names that holds nothing yet.
+public initializeThroughAddress(LoweringContext lowering, long address, Type type,
+                                Operand operand) -> bool {
+    if (!retainForStorage(lowering, operand, type)) {
+        return false;
+    }
+    lowering.builder().append(new EirStorePtr(address, operand.value()));
+    return true;
+}

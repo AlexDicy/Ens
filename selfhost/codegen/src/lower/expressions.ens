@@ -15,7 +15,13 @@ import AssignmentExpressionNode from @ens.frontend.syntax.generated.nodes;
 import TernaryExpressionNode from @ens.frontend.syntax.generated.nodes;
 import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SwitchExpressionNode from @ens.frontend.syntax.generated.nodes;
+import InterpolatedStringExpressionNode from @ens.frontend.syntax.generated.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import NewExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ArrayLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
 import Type from @ens.sema.model.types;
+import EnumType from @ens.sema.model.types;
 import @ens.sema.model.types;
 import EirConstInt from eir.model;
 import EirConstFloat from eir.model;
@@ -24,13 +30,21 @@ import EirLoadSlot from eir.model;
 import EirStoreSlot from eir.model;
 import EirJump from eir.model;
 import EirBranch from eir.model;
+import EirStringLength from eir.model;
+import EirArrayLength from eir.model;
 import LoweringContext from lower.context;
+import lower.arrays;
 import lower.assignments;
 import lower.calls;
 import lower.conversions;
 import lower.literals;
 import lower.operators;
+import lower.ownership;
+import lower.places;
+import lower.stores;
+import lower.strings;
 import lower.switches;
+import support.primitives;
 
 public lower(LoweringContext lowering, Expression node) -> long {
     if (lowering.failed()) {
@@ -70,10 +84,85 @@ public lower(LoweringContext lowering, Expression node) -> long {
         is SwitchExpressionNode switched -> {
             return switches.lowerExpression(lowering, switched);
         },
+        is InterpolatedStringExpressionNode interpolated -> {
+            return strings.lowerInterpolation(lowering, interpolated);
+        },
+        is MemberExpressionNode member -> {
+            return lowerMember(lowering, member);
+        },
+        is NewExpressionNode created -> {
+            return arrays.lowerNew(lowering, created);
+        },
+        is ArrayLiteralExpressionNode literal -> {
+            return arrays.lowerLiteral(lowering, literal);
+        },
+        is SubscriptExpressionNode subscript -> {
+            return arrays.lowerSubscript(lowering, subscript);
+        },
         default -> {
             lowering.unsupported("this expression", node.span());
             return -1;
         },
+    }
+}
+
+// A member read: an enum member's constant, or the length of a string or an array.
+lowerMember(LoweringContext lowering, MemberExpressionNode member) -> long {
+    let type = lowering.typeOf(member);
+    if (type == null) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    let constant = lowering.result().enumConstantOf(member.green());
+    if (constant != null) {
+        if (!(type is EnumType)) {
+            lowering.internalError("an enum member access has type "
+                + "'{types.display(type)}'", member.span());
+            return -1;
+        }
+        long[] values = type.memberValues();
+        if (constant < 0 || constant >= values.length) {
+            lowering.internalError("enum member {constant} is outside "
+                + "'{types.display(type)}'", member.span());
+            return -1;
+        }
+        long temp = builder.newTemp(type);
+        builder.append(new EirConstInt(temp, type, values[constant]));
+        return temp;
+    }
+    string name = member.member().text();
+    let objectType = lowering.typeOf(member.object());
+    if (objectType == null) {
+        return -1;
+    }
+    if (name == "length" && primitives.isStringType(objectType)) {
+        long value = lower(lowering, member.object());
+        if (value < 0) {
+            return -1;
+        }
+        long temp = builder.newTemp(type);
+        builder.append(new EirStringLength(temp, type, value));
+        releaseTemporary(lowering, member.object(), value);
+        return temp;
+    }
+    if (name == "length" && primitives.isArrayType(objectType)) {
+        long value = lower(lowering, member.object());
+        if (value < 0) {
+            return -1;
+        }
+        long temp = builder.newTemp(type);
+        builder.append(new EirArrayLength(temp, type, value));
+        releaseTemporary(lowering, member.object(), value);
+        return temp;
+    }
+    lowering.unsupported("reading the member '{name}'", member.span());
+    return -1;
+}
+
+// Gives up a reference an expression produced for one use only.
+public releaseTemporary(LoweringContext lowering, Expression source, long value) {
+    if (places.producesOwnedValue(lowering, source)) {
+        ownership.releaseValue(lowering, value);
     }
 }
 
@@ -124,6 +213,9 @@ lowerLiteral(LoweringContext lowering, LiteralExpressionNode literal) -> long {
             long temp = builder.newTemp(type);
             builder.append(new EirConstBool(temp, type, false));
             return temp;
+        },
+        StringLiteral -> {
+            return strings.lowerLiteral(lowering, literal, type);
         },
         default -> {
             lowering.unsupported("this literal", literal.span());
@@ -182,27 +274,42 @@ lowerTernary(LoweringContext lowering, TernaryExpressionNode ternary) -> long {
         return -1;
     }
     let builder = lowering.builder();
-    long slot = builder.addSlot("ternary", resultType);
+    long slot = ownership.defineMergeSlot(lowering, "ternary", resultType);
     long thenBlock = builder.newBlock("ternary.then");
     long elseBlock = builder.newBlock("ternary.else");
     long merge = builder.newBlock("ternary.end");
     builder.terminate(new EirBranch(condition, thenBlock, elseBlock));
     builder.moveTo(thenBlock);
-    long thenValue = lowerConverted(lowering, ternary.thenValue(), resultType);
-    if (thenValue < 0) {
+    if (!storeArm(lowering, slot, resultType, ternary.thenValue())) {
         return -1;
     }
-    builder.append(new EirStoreSlot(slot, thenValue));
     builder.terminate(new EirJump(merge));
     builder.moveTo(elseBlock);
-    long elseValue = lowerConverted(lowering, ternary.elseValue(), resultType);
-    if (elseValue < 0) {
+    if (!storeArm(lowering, slot, resultType, ternary.elseValue())) {
         return -1;
     }
-    builder.append(new EirStoreSlot(slot, elseValue));
     builder.terminate(new EirJump(merge));
     builder.moveTo(merge);
     long temp = builder.newTemp(resultType);
     builder.append(new EirLoadSlot(temp, resultType, slot));
     return temp;
+}
+
+// Writes one arm's value into the slot the branches merge through. The slot owns its contents,
+// so the write goes through the same barrier a reassignment uses.
+public storeArm(LoweringContext lowering, long slot, Type resultType, Expression value) -> bool {
+    let operand = stores.lowerOperand(lowering, value, resultType);
+    if (operand == null) {
+        return false;
+    }
+    if (!primitives.hasArcContent(resultType)) {
+        lowering.builder().append(new EirStoreSlot(slot, operand.value()));
+        return true;
+    }
+    if (!stores.assignSlot(lowering, slot, resultType, operand)) {
+        lowering.internalError("a branch yields a struct with no storage to retain",
+            value.span());
+        return false;
+    }
+    return true;
 }

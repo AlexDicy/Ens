@@ -25,17 +25,31 @@ import EirJump from eir.model;
 import EirBranch from eir.model;
 import EirUnreachable from eir.model;
 import LoweringContext from lower.context;
+import lower.arrays;
 import lower.calls;
 import lower.expressions;
+import lower.ownership;
+import lower.places;
+import lower.stores;
 import lower.switches;
+import support.primitives;
 
+// A block is a scope: the locals it declares own their contents, and reaching its end releases
+// them. A path that leaves early through 'break', 'continue', or 'return' releases them itself.
 public lowerBlock(LoweringContext lowering, BlockNode block) {
+    lowering.pushScope();
+    long depth = lowering.scopeDepth();
     for (long i = 0; i < block.statementsCount(); i++) {
         if (lowering.failed() || lowering.builder().terminated()) {
+            lowering.popScope();
             return;
         }
         lower(lowering, block.statements(i));
     }
+    if (!lowering.failed() && !lowering.builder().terminated()) {
+        ownership.releaseScopesAbove(lowering, depth - 1);
+    }
+    lowering.popScope();
 }
 
 public lower(LoweringContext lowering, Statement statement) {
@@ -56,13 +70,14 @@ public lower(LoweringContext lowering, Statement statement) {
             lowerFor(lowering, loop);
         },
         is ForEachStatementNode loop -> {
-            lowering.unsupported("a for-in loop", loop.span());
+            arrays.lowerForEach(lowering, loop);
         },
         is BreakStatementNode broken -> {
             if (!lowering.inLoop()) {
                 lowering.internalError("'break' outside a loop", broken.span());
                 return;
             }
+            ownership.releaseScopesAbove(lowering, lowering.loopScopeDepth());
             lowering.builder().terminate(new EirJump(lowering.breakBlock()));
         },
         is ContinueStatementNode continued -> {
@@ -70,6 +85,7 @@ public lower(LoweringContext lowering, Statement statement) {
                 lowering.internalError("'continue' outside a loop", continued.span());
                 return;
             }
+            ownership.releaseScopesAbove(lowering, lowering.loopScopeDepth());
             lowering.builder().terminate(new EirJump(lowering.continueBlock()));
         },
         is ReturnStatementNode returned -> {
@@ -106,13 +122,18 @@ lowerVariableDeclaration(LoweringContext lowering, VariableDeclarationNode decla
         return;
     }
     long slot = lowering.defineSlot(binding, binding.name(), binding.type());
+    ownership.trackSlot(lowering, slot, binding.type());
     let initializer = declaration.initializer();
-    if (initializer != null) {
-        long value = expressions.lowerConverted(lowering, initializer.value(), binding.type());
-        if (value < 0) {
-            return;
-        }
-        lowering.builder().append(new EirStoreSlot(slot, value));
+    if (initializer == null) {
+        return;
+    }
+    let operand = stores.lowerOperand(lowering, initializer.value(), binding.type());
+    if (operand == null) {
+        return;
+    }
+    if (!stores.initializeSlot(lowering, slot, binding.type(), operand)) {
+        lowering.internalError("the initializer of '{binding.name()}' borrows a value with no "
+            + "storage to retain", declaration.name().span());
     }
 }
 
@@ -250,25 +271,49 @@ lowerFor(LoweringContext lowering, ForStatementNode loop) {
     }
 }
 
+// A return hands its value's +1 to the caller, so a borrowed value is retained before the
+// function's own scopes are released; otherwise releasing a local could free what is on its way
+// out.
 lowerReturn(LoweringContext lowering, ReturnStatementNode returned) {
     let value = returned.value();
     if (value == null) {
+        ownership.releaseAllScopes(lowering);
         lowering.builder().terminate(new EirReturn(-1));
         return;
     }
-    long temp = expressions.lowerConverted(lowering, value,
-        lowering.info().signature().returnType());
+    let returnType = lowering.info().signature().returnType();
+    long temp = expressions.lowerConverted(lowering, value, returnType);
     if (temp < 0) {
         return;
     }
+    if (primitives.hasArcContent(returnType)
+            && !places.producesOwnedValue(lowering, value)) {
+        if (primitives.isReferenceType(returnType)) {
+            ownership.retainValue(lowering, temp);
+        } else {
+            long address = places.lowerAddress(lowering, value);
+            if (address < 0) {
+                lowering.internalError("a returned struct borrows a value with no storage to "
+                    + "retain", returned.span());
+                return;
+            }
+            ownership.retainAt(lowering, address, returnType);
+        }
+    }
+    ownership.releaseAllScopes(lowering);
     lowering.builder().terminate(new EirReturn(temp));
 }
 
+// A statement's value is discarded, so a reference it produced is released right away.
 lowerExpressionStatement(LoweringContext lowering, ExpressionStatementNode statement) {
     let expression = statement.expression();
-    let ignored = expressions.lower(lowering, expression);
+    long value = expressions.lower(lowering, expression);
     if (lowering.failed()) {
         return;
+    }
+    if (value >= 0 && primitives.isReferenceType(lowering.builder().tempType(value))
+            && places.producesOwnedValue(lowering, expression)) {
+        ownership.releaseValue(lowering, value);
     }
     if (expression is CallExpressionNode) {
         let callee = calls.calleeSignatureOf(lowering, expression);

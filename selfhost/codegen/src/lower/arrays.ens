@@ -1,0 +1,290 @@
+// Array lowering: allocation, literals, element access, and iteration. Every element access
+// carries its own bounds check, which stays a separate instruction so a later pass can drop the
+// ones it can prove redundant. An element slot owns what it holds, so writing into one retains
+// the incoming value and releases what it replaced.
+import Expression from @ens.frontend.syntax.generated.nodes;
+import NewExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ArrayLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ForEachStatementNode from @ens.frontend.syntax.generated.nodes;
+import Span from @ens.frontend.support.source;
+import Type from @ens.sema.model.types;
+import ArrayType from @ens.sema.model.types;
+import PrimitiveKind from @ens.sema.model.types;
+import @ens.sema.model.types;
+import EirArrayNew from eir.model;
+import EirArrayLength from eir.model;
+import EirBoundsCheck from eir.model;
+import EirElementAddress from eir.model;
+import EirConstInt from eir.model;
+import EirBinary from eir.model;
+import EirBinaryOp from eir.model;
+import EirStoreSlot from eir.model;
+import EirLoadSlot from eir.model;
+import EirStorePtr from eir.model;
+import EirJump from eir.model;
+import EirBranch from eir.model;
+import LoweringContext from lower.context;
+import lower.conversions;
+import lower.expressions;
+import lower.ownership;
+import lower.places;
+import lower.statements;
+import lower.stores;
+import support.primitives;
+
+// 'new T[a]', and 'new T[a][b]' which allocates every level. A trailing empty bracket leaves
+// inner slots null, which needs optionals lowering does not have yet.
+public lowerNew(LoweringContext lowering, NewExpressionNode node) -> long {
+    let type = lowering.typeOf(node);
+    if (type == null) {
+        return -1;
+    }
+    if (node.dimensionsCount() == 0) {
+        lowering.unsupported("creating an object with 'new'", node.span());
+        return -1;
+    }
+    if (!(type is ArrayType)) {
+        lowering.internalError("'new' with dimensions produced "
+            + "'{types.display(type)}'", node.span());
+        return -1;
+    }
+    for (long i = 0; i < node.dimensionsCount(); i++) {
+        if (node.dimensions(i).size() == null) {
+            lowering.unsupported("an array whose inner level is left unallocated",
+                node.span());
+            return -1;
+        }
+    }
+    return allocateLevel(lowering, node, 0, type);
+}
+
+// Allocates one level and, when deeper levels remain, fills every slot with the level below.
+allocateLevel(LoweringContext lowering, NewExpressionNode node, long level, Type levelType)
+        -> long {
+    if (!(levelType is ArrayType)) {
+        lowering.internalError("array level {level} has type "
+            + "'{types.display(levelType)}'", node.span());
+        return -1;
+    }
+    let size = node.dimensions(level).size();
+    if (size == null) {
+        lowering.internalError("array level {level} has no size", node.span());
+        return -1;
+    }
+    let longType = lowering.store().primitive(PrimitiveKind.Long);
+    long count = expressions.lowerConverted(lowering, size, longType);
+    if (count < 0) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    long array = builder.newTemp(levelType);
+    builder.append(new EirArrayNew(array, levelType, count));
+    if (level + 1 >= node.dimensionsCount()) {
+        return array;
+    }
+    let elementType = levelType.element();
+    long indexSlot = builder.addSlot("dim{level}", longType, false, false);
+    long zero = builder.newTemp(longType);
+    builder.append(new EirConstInt(zero, longType, 0));
+    builder.append(new EirStoreSlot(indexSlot, zero));
+    long conditionBlock = builder.newBlock("dim.cond");
+    long bodyBlock = builder.newBlock("dim.body");
+    long exitBlock = builder.newBlock("dim.end");
+    builder.terminate(new EirJump(conditionBlock));
+    builder.moveTo(conditionBlock);
+    long index = builder.newTemp(longType);
+    builder.append(new EirLoadSlot(index, longType, indexSlot));
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    long more = builder.newTemp(boolType);
+    builder.append(new EirBinary(more, boolType, EirBinaryOp.CmpLtSigned, index, count));
+    builder.terminate(new EirBranch(more, bodyBlock, exitBlock));
+    builder.moveTo(bodyBlock);
+    long inner = allocateLevel(lowering, node, level + 1, elementType);
+    if (inner < 0) {
+        return -1;
+    }
+    long slotIndex = builder.newTemp(longType);
+    builder.append(new EirLoadSlot(slotIndex, longType, indexSlot));
+    long address = elementAddress(lowering, array, slotIndex, elementType);
+    builder.append(new EirStorePtr(address, inner));
+    long one = builder.newTemp(longType);
+    builder.append(new EirConstInt(one, longType, 1));
+    long next = builder.newTemp(longType);
+    builder.append(new EirBinary(next, longType, EirBinaryOp.Add, slotIndex, one));
+    builder.append(new EirStoreSlot(indexSlot, next));
+    builder.terminate(new EirJump(conditionBlock));
+    builder.moveTo(exitBlock);
+    return array;
+}
+
+// '[a, b, c]' allocates for the written count and fills each slot in order.
+public lowerLiteral(LoweringContext lowering, ArrayLiteralExpressionNode node) -> long {
+    let type = lowering.typeOf(node);
+    if (type == null) {
+        return -1;
+    }
+    if (!(type is ArrayType)) {
+        lowering.internalError("an array literal has type '{types.display(type)}'",
+            node.span());
+        return -1;
+    }
+    let elementType = type.element();
+    let builder = lowering.builder();
+    let longType = lowering.store().primitive(PrimitiveKind.Long);
+    long count = builder.newTemp(longType);
+    builder.append(new EirConstInt(count, longType, node.elementsCount()));
+    long array = builder.newTemp(type);
+    builder.append(new EirArrayNew(array, type, count));
+    for (long i = 0; i < node.elementsCount(); i++) {
+        let operand = stores.lowerOperand(lowering, node.elements(i), elementType);
+        if (operand == null) {
+            return -1;
+        }
+        long index = builder.newTemp(longType);
+        builder.append(new EirConstInt(index, longType, i));
+        long address = elementAddress(lowering, array, index, elementType);
+        if (!stores.initializeThroughAddress(lowering, address, elementType, operand)) {
+            lowering.internalError("an array element borrows a struct with no storage to "
+                + "retain", node.elements(i).span());
+            return -1;
+        }
+    }
+    return array;
+}
+
+// Reading 'xs[i]'. The element stays owned by the array, so the loaded value is borrowed.
+public lowerSubscript(LoweringContext lowering, SubscriptExpressionNode node) -> long {
+    let address = lowerElementAddress(lowering, node);
+    if (address < 0) {
+        return -1;
+    }
+    let elementType = lowering.typeOf(node);
+    if (elementType == null) {
+        return -1;
+    }
+    return places.loadFrom(lowering, address, elementType);
+}
+
+// The address of the element 'xs[i]' names, bounds checked.
+public lowerElementAddress(LoweringContext lowering, SubscriptExpressionNode node) -> long {
+    let arrayType = lowering.typeOf(node.object());
+    if (arrayType == null) {
+        return -1;
+    }
+    if (!(arrayType is ArrayType)) {
+        lowering.unsupported("indexing '{types.display(arrayType)}'", node.span());
+        return -1;
+    }
+    long array = expressions.lower(lowering, node.object());
+    if (array < 0) {
+        return -1;
+    }
+    let longType = lowering.store().primitive(PrimitiveKind.Long);
+    long index = expressions.lowerConverted(lowering, node.index(), longType);
+    if (index < 0) {
+        return -1;
+    }
+    return elementAddress(lowering, array, index, arrayType.element());
+}
+
+elementAddress(LoweringContext lowering, long array, long index, Type elementType) -> long {
+    let builder = lowering.builder();
+    builder.append(new EirBoundsCheck(array, index));
+    long address = builder.newTemp(elementType);
+    builder.append(new EirElementAddress(address, elementType, array, index));
+    return address;
+}
+
+// 'for (x in xs)' walks the array by index. The element binding borrows the slot it reads, so a
+// body that keeps the value retains it through the usual store path.
+public lowerForEach(LoweringContext lowering, ForEachStatementNode loop) {
+    let iterableType = lowering.typeOf(loop.iterable());
+    if (iterableType == null) {
+        return;
+    }
+    if (!(iterableType is ArrayType)) {
+        lowering.unsupported("iterating '{types.display(iterableType)}'", loop.span());
+        return;
+    }
+    let binding = lowering.result().bindingOf(loop.green());
+    if (binding == null) {
+        lowering.internalError("the loop variable '{loop.name().text()}' has no binding",
+            loop.name().span());
+        return;
+    }
+    if (!lowering.supportsValueType(binding.type())) {
+        lowering.unsupported("a loop variable of type '{types.display(binding.type())}'",
+            loop.name().span());
+        return;
+    }
+    let builder = lowering.builder();
+    let longType = lowering.store().primitive(PrimitiveKind.Long);
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    long array = expressions.lower(lowering, loop.iterable());
+    if (array < 0) {
+        return;
+    }
+    long arraySlot = builder.addSlot("iterated", iterableType,
+        primitives.hasArcContent(iterableType), false);
+    let operand = new stores.Operand(array,
+        places.producesOwnedValue(lowering, loop.iterable()), -1);
+    if (!stores.initializeSlot(lowering, arraySlot, iterableType, operand)) {
+        lowering.internalError("the iterated array borrows a value with no storage to retain",
+            loop.iterable().span());
+        return;
+    }
+    ownership.trackSlot(lowering, arraySlot, iterableType);
+    long indexSlot = builder.addSlot("index", longType, false, false);
+    long zero = builder.newTemp(longType);
+    builder.append(new EirConstInt(zero, longType, 0));
+    builder.append(new EirStoreSlot(indexSlot, zero));
+    long elementSlot = lowering.defineSlotAs(binding, binding.name(), binding.type(), true);
+    long conditionBlock = builder.newBlock("foreach.cond");
+    long bodyBlock = builder.newBlock("foreach.body");
+    long stepBlock = builder.newBlock("foreach.step");
+    long exitBlock = builder.newBlock("foreach.end");
+    builder.terminate(new EirJump(conditionBlock));
+    builder.moveTo(conditionBlock);
+    long current = builder.newTemp(iterableType);
+    builder.append(new EirLoadSlot(current, iterableType, arraySlot));
+    long length = builder.newTemp(longType);
+    builder.append(new EirArrayLength(length, longType, current));
+    long index = builder.newTemp(longType);
+    builder.append(new EirLoadSlot(index, longType, indexSlot));
+    long more = builder.newTemp(boolType);
+    builder.append(new EirBinary(more, boolType, EirBinaryOp.CmpLtSigned, index, length));
+    builder.terminate(new EirBranch(more, bodyBlock, exitBlock));
+    builder.moveTo(bodyBlock);
+    long bodyArray = builder.newTemp(iterableType);
+    builder.append(new EirLoadSlot(bodyArray, iterableType, arraySlot));
+    long bodyIndex = builder.newTemp(longType);
+    builder.append(new EirLoadSlot(bodyIndex, longType, indexSlot));
+    long address = elementAddress(lowering, bodyArray, bodyIndex, iterableType.element());
+    long element = places.loadFrom(lowering, address, iterableType.element());
+    long converted = conversions.convert(lowering, element, binding.type(),
+        loop.name().span());
+    if (converted < 0) {
+        return;
+    }
+    builder.append(new EirStoreSlot(elementSlot, converted));
+    lowering.pushLoop(exitBlock, stepBlock);
+    statements.lowerBlock(lowering, loop.body());
+    if (!lowering.failed() && !builder.terminated()) {
+        builder.terminate(new EirJump(stepBlock));
+    }
+    lowering.popLoop();
+    if (lowering.failed()) {
+        return;
+    }
+    builder.moveTo(stepBlock);
+    long stepIndex = builder.newTemp(longType);
+    builder.append(new EirLoadSlot(stepIndex, longType, indexSlot));
+    long one = builder.newTemp(longType);
+    builder.append(new EirConstInt(one, longType, 1));
+    long next = builder.newTemp(longType);
+    builder.append(new EirBinary(next, longType, EirBinaryOp.Add, stepIndex, one));
+    builder.append(new EirStoreSlot(indexSlot, next));
+    builder.terminate(new EirJump(conditionBlock));
+    builder.moveTo(exitBlock);
+}

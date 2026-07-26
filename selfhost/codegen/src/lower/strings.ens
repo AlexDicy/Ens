@@ -1,0 +1,206 @@
+// String lowering: literals, interpolation, concatenation, comparison, and the conversions that
+// turn a value into text. Every conversion hands back a string the caller owns, so an
+// interpolation can release each piece as it consumes it and only the finished string survives.
+import Expression from @ens.frontend.syntax.generated.nodes;
+import LiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import InterpolatedStringExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxToken from @ens.frontend.syntax.node;
+import Span from @ens.frontend.support.source;
+import Type from @ens.sema.model.types;
+import EnumType from @ens.sema.model.types;
+import PrimitiveKind from @ens.sema.model.types;
+import @ens.sema.model.types;
+import EirConstString from eir.model;
+import EirStringConcat from eir.model;
+import EirStringEqual from eir.model;
+import EirIntToString from eir.model;
+import EirCharToString from eir.model;
+import EirBoolToString from eir.model;
+import EirEnumToString from eir.model;
+import EirDoubleToString from eir.model;
+import EirUnary from eir.model;
+import EirUnaryOp from eir.model;
+import LoweringContext from lower.context;
+import lower.conversions;
+import lower.expressions;
+import lower.literals;
+import lower.ownership;
+import lower.places;
+import support.primitives;
+
+// A string literal. The bytes are immortal, so the temp borrows rather than owns them.
+public lowerLiteral(LoweringContext lowering, LiteralExpressionNode literal, Type type) -> long {
+    return constantFrom(lowering, literals.decodeStringBytes(literal.value().text()), type);
+}
+
+constantFrom(LoweringContext lowering, byte[] bytes, Type type) -> long {
+    let builder = lowering.builder();
+    long temp = builder.newTemp(type);
+    builder.append(new EirConstString(temp, type, bytes));
+    return temp;
+}
+
+// Interpolation folds the pieces left to right: the accumulator owns a reference throughout, and
+// each concatenation releases the two strings it consumed.
+public lowerInterpolation(LoweringContext lowering, InterpolatedStringExpressionNode node)
+        -> long {
+    let stringType = lowering.store().stringType();
+    long accumulator = constantFrom(lowering,
+        literals.decodeStringBytes(node.start().text()), stringType);
+    ownership.retainValue(lowering, accumulator);
+    accumulator = appendHole(lowering, accumulator, node.firstHole(), stringType);
+    if (accumulator < 0) {
+        return -1;
+    }
+    for (long i = 0; i < node.continuationsCount(); i++) {
+        let part = node.continuations(i);
+        accumulator = appendLiteral(lowering, accumulator, part.middle(), stringType);
+        accumulator = appendHole(lowering, accumulator, part.hole(), stringType);
+        if (accumulator < 0) {
+            return -1;
+        }
+    }
+    return appendLiteral(lowering, accumulator, node.end(), stringType);
+}
+
+appendLiteral(LoweringContext lowering, long accumulator, SyntaxToken piece, Type stringType)
+        -> long {
+    byte[] bytes = literals.decodeStringBytes(piece.text());
+    if (bytes.length == 0) {
+        return accumulator;
+    }
+    long literal = constantFrom(lowering, bytes, stringType);
+    return concatenate(lowering, accumulator, literal, false, stringType);
+}
+
+appendHole(LoweringContext lowering, long accumulator, Expression hole, Type stringType) -> long {
+    long text = lowerToString(lowering, hole);
+    if (text < 0) {
+        return -1;
+    }
+    return concatenate(lowering, accumulator, text, true, stringType);
+}
+
+// Joins two strings, giving up the accumulator's reference and the right side's when it owned
+// one. The result owns the only reference to the joined text.
+concatenate(LoweringContext lowering, long left, long right, bool rightOwned, Type stringType)
+        -> long {
+    let builder = lowering.builder();
+    long joined = builder.newTemp(stringType);
+    builder.append(new EirStringConcat(joined, stringType, left, right));
+    ownership.releaseValue(lowering, left);
+    if (rightOwned) {
+        ownership.releaseValue(lowering, right);
+    }
+    return joined;
+}
+
+// The text form of an expression, as a string the caller owns.
+public lowerToString(LoweringContext lowering, Expression node) -> long {
+    let type = lowering.typeOf(node);
+    if (type == null) {
+        return -1;
+    }
+    if (primitives.isStringType(type)) {
+        long value = expressions.lower(lowering, node);
+        if (value < 0) {
+            return -1;
+        }
+        if (!places.producesOwnedValue(lowering, node)) {
+            ownership.retainValue(lowering, value);
+        }
+        return value;
+    }
+    long value = expressions.lower(lowering, node);
+    if (value < 0) {
+        return -1;
+    }
+    return convertToString(lowering, value, type, node.span());
+}
+
+// The text form of an already lowered value.
+public convertToString(LoweringContext lowering, long value, Type type, Span span) -> long {
+    let builder = lowering.builder();
+    let stringType = lowering.store().stringType();
+    if (primitives.isBoolType(type)) {
+        long text = builder.newTemp(stringType);
+        builder.append(new EirBoolToString(text, stringType, value));
+        return text;
+    }
+    if (type is EnumType) {
+        long text = builder.newTemp(stringType);
+        builder.append(new EirEnumToString(text, stringType, value, type));
+        return text;
+    }
+    if (primitives.isCharType(type)) {
+        long text = builder.newTemp(stringType);
+        builder.append(new EirCharToString(text, stringType, value));
+        return text;
+    }
+    if (primitives.isFloatType(type)) {
+        long widened = conversions.convert(lowering, value,
+            lowering.store().primitive(PrimitiveKind.Double), span);
+        if (widened < 0) {
+            return -1;
+        }
+        long text = builder.newTemp(stringType);
+        builder.append(new EirDoubleToString(text, stringType, widened));
+        return text;
+    }
+    if (primitives.isIntegerType(type)) {
+        long widened = conversions.convert(lowering, value,
+            lowering.store().primitive(PrimitiveKind.Long), span);
+        if (widened < 0) {
+            return -1;
+        }
+        long text = builder.newTemp(stringType);
+        builder.append(new EirIntToString(text, stringType, widened,
+            primitives.isSignedType(type)));
+        return text;
+    }
+    lowering.unsupported("converting '{types.display(type)}' to text", span);
+    return -1;
+}
+
+// Concatenation with '+': each side becomes text, and the pieces it owned are released.
+public lowerConcatenation(LoweringContext lowering, Expression left, Expression right) -> long {
+    let stringType = lowering.store().stringType();
+    long leftText = lowerToString(lowering, left);
+    if (leftText < 0) {
+        return -1;
+    }
+    long rightText = lowerToString(lowering, right);
+    if (rightText < 0) {
+        return -1;
+    }
+    return concatenate(lowering, leftText, rightText, true, stringType);
+}
+
+// Content comparison. Both sides are released when they owned their text, so a comparison over
+// freshly built strings leaks nothing.
+public lowerComparison(LoweringContext lowering, Expression left, Expression right,
+                       bool negated, Type resultType) -> long {
+    let builder = lowering.builder();
+    long leftValue = expressions.lower(lowering, left);
+    if (leftValue < 0) {
+        return -1;
+    }
+    long rightValue = expressions.lower(lowering, right);
+    if (rightValue < 0) {
+        return -1;
+    }
+    long equal = builder.newTemp(resultType);
+    builder.append(new EirStringEqual(equal, resultType, leftValue, rightValue));
+    if (places.producesOwnedValue(lowering, left)) {
+        ownership.releaseValue(lowering, leftValue);
+    }
+    if (places.producesOwnedValue(lowering, right)) {
+        ownership.releaseValue(lowering, rightValue);
+    }
+    if (!negated) {
+        return equal;
+    }
+    long inverted = builder.newTemp(resultType);
+    builder.append(new EirUnary(inverted, resultType, EirUnaryOp.Not, equal));
+    return inverted;
+}
