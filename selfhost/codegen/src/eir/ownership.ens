@@ -1,0 +1,398 @@
+// The ownership verifier: the companion to the structural checks in eir.verify, run over every
+// lowered function. It proves the property naive ARC lowering must satisfy for VALUE temps of a
+// reference type.
+//
+// Every such temp is in one of four states at each program point. Undefined before its
+// definition; Borrowed when it holds no reference of its own (a parameter, a load out of
+// storage, an immortal literal); Owned when it holds a +1 nobody else will give up; Consumed
+// once that +1 has been handed on. A producer and a retain make a temp Owned; a release, a store
+// into storage, and a return hand the +1 on. From that the pass reports a leak (Owned where the
+// function returns), a double release or a release of a reference the temp never owned, a use
+// after the +1 was handed on, and a temp whose ownership differs between two paths that join.
+//
+// What it does NOT prove: anything about the STORAGE side. Whether a slot, field, or element
+// whose +1 arrived through a store is released exactly once is a question about locations, and
+// two element addresses through different index temps may or may not be the same location, so
+// retain_ptr and release_ptr balance is out of reach here. Nor does it check the calling
+// convention itself: that a call returns +1 and takes its arguments at +0 is assumed, not
+// proven.
+import EirFunction from eir.model;
+import EirBlock from eir.model;
+import EirInstruction from eir.model;
+import EirCall from eir.model;
+import EirRetain from eir.model;
+import EirRelease from eir.model;
+import EirStoreSlot from eir.model;
+import EirStorePtr from eir.model;
+import EirLoadSlot from eir.model;
+import EirLoadPtr from eir.model;
+import EirConstString from eir.model;
+import EirArrayNew from eir.model;
+import EirStringConcat from eir.model;
+import EirStringSubstring from eir.model;
+import EirStringToBytes from eir.model;
+import EirStringFromBytes from eir.model;
+import EirIntToString from eir.model;
+import EirCharToString from eir.model;
+import EirBoolToString from eir.model;
+import EirEnumToString from eir.model;
+import EirDoubleToString from eir.model;
+import EirJsonEscape from eir.model;
+import EirTerminator from eir.model;
+import EirReturn from eir.model;
+import eir.walk;
+import Type from @ens.sema.model.types;
+import @ens.sema.model.types;
+import support.primitives;
+import List from @std.collections.list;
+
+// Verifies one function's value-level ownership; the returned list is empty when it balances.
+export verifyOwnership(EirFunction function) -> string[] {
+    let verifier = new OwnershipVerifier(function);
+    return verifier.run();
+}
+
+// Undefined joins with any state to give that state: on a path where a temp does not exist
+// there is nothing to leak, and the structural pass already rejects a use before a definition.
+// Two different defined states are a Conflict, which is sticky so one bug reports once.
+enum Ownership {
+    Undefined,
+    Borrowed,
+    Owned,
+    Consumed,
+    Conflict,
+}
+
+class OwnershipVerifier {
+    EirFunction function;
+    long tempCount;
+    bool[] tracked;
+    List<string> problems;
+    bool[] conflictReported;
+
+    protected constructor(EirFunction function) {
+        this.function = function;
+        this.tempCount = function.tempTypes().length();
+        this.tracked = new bool[this.tempCount];
+        this.problems = new List<string>();
+        this.conflictReported = new bool[this.tempCount];
+        let addresses = addressTemps(function);
+        for (long i = 0; i < this.tempCount; i++) {
+            this.tracked[i] = !addresses[i]
+                && primitives.isReferenceType(function.tempTypes().get(i));
+        }
+    }
+
+    protected run() -> string[] {
+        bool[] reached = this.reachableBlocks();
+        let entryStates = this.solve(reached);
+        this.checkBlocks(entryStates, reached);
+        return this.problems.toArray();
+    }
+
+    // The blocks a path from the entry block can reach.
+    reachableBlocks() -> bool[] {
+        let blocks = this.function.blocks();
+        bool[] reached = new bool[blocks.length() + 1];
+        if (blocks.length() == 0) {
+            return reached;
+        }
+        reached[0] = true;
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (long b = 0; b < blocks.length(); b++) {
+                if (!reached[b]) {
+                    continue;
+                }
+                for (let successor in walk.successorsOf(blocks.get(b))) {
+                    if (successor >= 0 && successor < blocks.length() && !reached[successor]) {
+                        reached[successor] = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        return reached;
+    }
+
+    report(string problem) {
+        this.problems.push("{this.function.symbol()}: {problem}");
+    }
+
+    // Propagates states forward to a fixpoint, yielding each block's entry state, and reports
+    // every temp whose state disagrees where paths join.
+    solve(bool[] reached) -> List<List<Ownership>> {
+        let blocks = this.function.blocks();
+        long blockCount = blocks.length();
+        let entryStates = new List<List<Ownership>>();
+        for (long b = 0; b < blockCount; b++) {
+            entryStates.push(this.undefinedStates());
+        }
+        if (blockCount == 0) {
+            return entryStates;
+        }
+        for (long i = 0; i < this.function.entryTempCount(); i++) {
+            if (this.isTracked(i)) {
+                entryStates.get(0).set(i, Ownership.Borrowed);
+            }
+        }
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (long b = 0; b < blockCount; b++) {
+                if (!reached[b]) {
+                    continue;
+                }
+                let exitStates = this.transferBlock(blocks.get(b), entryStates.get(b), false);
+                for (let successor in walk.successorsOf(blocks.get(b))) {
+                    if (successor < 0 || successor >= blockCount) {
+                        continue;
+                    }
+                    let target = entryStates.get(successor);
+                    for (long i = 0; i < this.tempCount; i++) {
+                        let merged = join(target.get(i), exitStates.get(i));
+                        if (merged != target.get(i)) {
+                            target.set(i, merged);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        for (long b = 0; b < blockCount; b++) {
+            if (!reached[b]) {
+                continue;
+            }
+            for (long i = 0; i < this.tempCount; i++) {
+                if (entryStates.get(b).get(i) == Ownership.Conflict
+                        && !this.conflictReported[i]) {
+                    this.conflictReported[i] = true;
+                    this.report("{blocks.get(b).label()}: the ownership of %{i} differs between "
+                        + "the paths reaching this block, so one of them leaks or releases twice");
+                }
+            }
+        }
+        return entryStates;
+    }
+
+    undefinedStates() -> List<Ownership> {
+        let states = new List<Ownership>();
+        for (long i = 0; i < this.tempCount; i++) {
+            states.push(Ownership.Undefined);
+        }
+        return states;
+    }
+
+    // Replays every reachable block with reporting on, which also checks the exits.
+    checkBlocks(List<List<Ownership>> entryStates, bool[] reached) {
+        let blocks = this.function.blocks();
+        for (long b = 0; b < blocks.length(); b++) {
+            if (!reached[b]) {
+                continue;
+            }
+            let ignored = this.transferBlock(blocks.get(b), entryStates.get(b), true);
+        }
+    }
+
+    // Runs one block's instructions and its terminator over a copy of the incoming states,
+    // returning the outgoing states. With reporting on, every violation is recorded.
+    transferBlock(EirBlock block, List<Ownership> incoming, bool reporting) -> List<Ownership> {
+        let states = new List<Ownership>();
+        for (long i = 0; i < this.tempCount; i++) {
+            states.push(incoming.get(i));
+        }
+        let instructions = block.instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (reporting) {
+                this.checkUses(block, instruction, states);
+            }
+            this.applyInstruction(block, instruction, states, reporting);
+        }
+        let terminator = block.terminator();
+        if (terminator != null) {
+            this.applyTerminator(block, terminator, states, reporting);
+        }
+        return states;
+    }
+
+    // Every operand a tracked temp appears in must still hold its reference.
+    checkUses(EirBlock block, EirInstruction instruction, List<Ownership> states) {
+        for (let used in walk.usesOf(instruction)) {
+            if (this.isTracked(used) && states.get(used) == Ownership.Consumed) {
+                this.report("{block.label()}: %{used} is used after its reference was given up");
+            }
+        }
+    }
+
+    applyInstruction(EirBlock block, EirInstruction instruction, List<Ownership> states,
+                     bool reporting) {
+        switch (instruction) {
+            is EirRetain retain -> {
+                if (!this.isTracked(retain.value)) {
+                    return;
+                }
+                if (states.get(retain.value) == Ownership.Owned && reporting) {
+                    this.report("{block.label()}: %{retain.value} is retained while it already "
+                        + "owns a reference, which leaks one");
+                }
+                states.set(retain.value, Ownership.Owned);
+            },
+            is EirRelease release -> {
+                if (!this.isTracked(release.value)) {
+                    return;
+                }
+                if (reporting) {
+                    if (states.get(release.value) == Ownership.Borrowed) {
+                        this.report("{block.label()}: %{release.value} is released although it "
+                            + "owns no reference; a borrowed value must be retained first");
+                    } else if (states.get(release.value) == Ownership.Consumed) {
+                        this.report("{block.label()}: %{release.value} is released after its "
+                            + "reference was already given up");
+                    }
+                }
+                states.set(release.value, Ownership.Consumed);
+            },
+            is EirStoreSlot store -> {
+                this.consume(block, store.value, states, reporting,
+                    "stored into ${store.slot}");
+            },
+            is EirStorePtr store -> {
+                this.consume(block, store.value, states, reporting,
+                    "stored through %{store.address}");
+            },
+            default -> {
+                long result = walk.resultOf(instruction);
+                if (!this.isTracked(result)) {
+                    return;
+                }
+                if (producesOwned(instruction)) {
+                    states.set(result, Ownership.Owned);
+                } else {
+                    states.set(result, Ownership.Borrowed);
+                }
+            },
+        }
+    }
+
+    // A store hands the temp's +1 to the storage, so the temp must own one.
+    consume(EirBlock block, long value, List<Ownership> states, bool reporting, string what) {
+        if (!this.isTracked(value)) {
+            return;
+        }
+        if (reporting) {
+            if (states.get(value) == Ownership.Borrowed) {
+                this.report("{block.label()}: %{value} is {what} without owning a reference; "
+                    + "retain it first so the storage owns its own +1");
+            } else if (states.get(value) == Ownership.Consumed) {
+                this.report("{block.label()}: %{value} is {what} after its reference was "
+                    + "already given up");
+            }
+        }
+        states.set(value, Ownership.Consumed);
+    }
+
+    applyTerminator(EirBlock block, EirTerminator terminator, List<Ownership> states,
+                    bool reporting) {
+        switch (terminator) {
+            is EirReturn returned -> {
+                this.consume(block, returned.value, states, reporting, "returned");
+                if (!reporting) {
+                    return;
+                }
+                for (long i = 0; i < this.tempCount; i++) {
+                    if (this.isTracked(i) && states.get(i) == Ownership.Owned) {
+                        this.report("{block.label()}: %{i} still owns a reference where the "
+                            + "function returns, which leaks it");
+                    }
+                }
+            },
+            default -> { },
+        }
+    }
+
+    isTracked(long temp) -> bool {
+        return temp >= 0 && temp < this.tempCount && this.tracked[temp];
+    }
+}
+
+// True for the instructions that hand their caller a fresh +1. The conversions that yield an
+// immortal string (a bool's or an enum member's name) are included: their release is a runtime
+// no-op, and treating every conversion alike keeps lowering free of special cases.
+producesOwned(EirInstruction instruction) -> bool {
+    switch (instruction) {
+        is EirArrayNew ignored -> {
+            return true;
+        },
+        is EirStringConcat ignored -> {
+            return true;
+        },
+        is EirStringSubstring ignored -> {
+            return true;
+        },
+        is EirStringToBytes ignored -> {
+            return true;
+        },
+        is EirStringFromBytes ignored -> {
+            return true;
+        },
+        is EirIntToString ignored -> {
+            return true;
+        },
+        is EirCharToString ignored -> {
+            return true;
+        },
+        is EirBoolToString ignored -> {
+            return true;
+        },
+        is EirEnumToString ignored -> {
+            return true;
+        },
+        is EirDoubleToString ignored -> {
+            return true;
+        },
+        is EirJsonEscape ignored -> {
+            return true;
+        },
+        is EirCall ignored -> {
+            return true;
+        },
+        default -> {
+            return false;
+        },
+    }
+}
+
+// The temps holding addresses rather than values; ownership tracks values only.
+addressTemps(EirFunction function) -> bool[] {
+    bool[] addresses = new bool[function.tempTypes().length() + 1];
+    if (function.receiverType() != null && function.tempTypes().length() > 0) {
+        addresses[0] = true;
+    }
+    let blocks = function.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        let instructions = blocks.get(b).instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            long result = walk.resultOf(instruction);
+            if (result >= 0 && walk.producesAddress(instruction)) {
+                addresses[result] = true;
+            }
+        }
+    }
+    return addresses;
+}
+
+join(Ownership first, Ownership second) -> Ownership {
+    if (first == second) {
+        return first;
+    }
+    if (first == Ownership.Undefined) {
+        return second;
+    }
+    if (second == Ownership.Undefined) {
+        return first;
+    }
+    return Ownership.Conflict;
+}

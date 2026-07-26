@@ -1,0 +1,131 @@
+// The ARC operations lowering emits, in one place so every site that changes who owns a
+// reference reads the same way. Nothing here decides anything: the caller-side convention says
+// what to emit and this module emits it, with no elision. Removing a retain and release pair
+// that provably cancels is the optimizer's job, not lowering's.
+//
+// The convention, as implemented:
+//   - A producer hands back +1. A binding takes that +1 without retaining again.
+//   - A borrowed value being stored is retained first, so the storage owns its own +1.
+//   - A field or slot write releases what was there after storing what replaces it.
+//   - Call arguments pass at +0: the caller's local owns them for the call's duration.
+//   - Leaving a scope releases every slot that scope owns, unless a return took the +1 out.
+import Type from @ens.sema.model.types;
+import StructType from @ens.sema.model.types;
+import EirRetain from eir.model;
+import EirRelease from eir.model;
+import EirRetainPtr from eir.model;
+import EirReleasePtr from eir.model;
+import EirSlotAddress from eir.model;
+import EirFieldAddress from eir.model;
+import EirLoadSlot from eir.model;
+import LoweringContext from lower.context;
+import support.primitives;
+
+// Takes over a +1 on a borrowed value temp.
+public retainValue(LoweringContext lowering, long value) {
+    lowering.builder().append(new EirRetain(value));
+}
+
+// Gives up the +1 a value temp owns.
+public releaseValue(LoweringContext lowering, long value) {
+    lowering.builder().append(new EirRelease(value));
+}
+
+// Retains what a borrowed value owns so a location can take it: a reference directly, a struct
+// field by field. Values of a type holding no references need nothing.
+public retainBorrowed(LoweringContext lowering, long value, Type type) {
+    if (primitives.isReferenceType(type)) {
+        retainValue(lowering, value);
+    }
+}
+
+// Retains the references the storage at an address holds, so a copy of it may be owned
+// independently. A struct recurses into its reference-holding fields.
+public retainAt(LoweringContext lowering, long address, Type type) {
+    if (primitives.isReferenceType(type)) {
+        lowering.builder().append(new EirRetainPtr(address));
+        return;
+    }
+    if (!(type is StructType)) {
+        return;
+    }
+    let fields = type.fields();
+    for (long i = 0; i < fields.length(); i++) {
+        let field = fields.get(i);
+        if (!primitives.hasArcContent(field.type())) {
+            continue;
+        }
+        long fieldAddress = fieldAddressOf(lowering, address, field.type(), i);
+        retainAt(lowering, fieldAddress, field.type());
+    }
+}
+
+// Releases the references the storage at an address holds.
+public releaseAt(LoweringContext lowering, long address, Type type) {
+    if (primitives.isReferenceType(type)) {
+        lowering.builder().append(new EirReleasePtr(address));
+        return;
+    }
+    if (!(type is StructType)) {
+        return;
+    }
+    let fields = type.fields();
+    for (long i = 0; i < fields.length(); i++) {
+        let field = fields.get(i);
+        if (!primitives.hasArcContent(field.type())) {
+            continue;
+        }
+        long fieldAddress = fieldAddressOf(lowering, address, field.type(), i);
+        releaseAt(lowering, fieldAddress, field.type());
+    }
+}
+
+// The address of a slot, for an ARC operation on its contents.
+public slotAddress(LoweringContext lowering, long slot, Type type) -> long {
+    let builder = lowering.builder();
+    long address = builder.newTemp(type);
+    builder.append(new EirSlotAddress(address, type, slot));
+    return address;
+}
+
+fieldAddressOf(LoweringContext lowering, long base, Type fieldType, long fieldIndex) -> long {
+    let builder = lowering.builder();
+    long address = builder.newTemp(fieldType);
+    builder.append(new EirFieldAddress(address, fieldType, base, fieldIndex));
+    return address;
+}
+
+// Records that a slot's scope owns its contents, when the type has any to own.
+public trackSlot(LoweringContext lowering, long slot, Type type) {
+    if (primitives.hasArcContent(type)) {
+        lowering.ownSlot(slot);
+    }
+}
+
+// Releases what a slot holds. Callers that overwrite a location retain the incoming value
+// first, so a location assigned from itself never drops to zero in between.
+public releaseSlotContents(LoweringContext lowering, long slot, Type type) {
+    if (!primitives.hasArcContent(type)) {
+        return;
+    }
+    long address = slotAddress(lowering, slot, type);
+    releaseAt(lowering, address, type);
+}
+
+// Releases every slot the scopes above depth own, innermost scope first. Used by scope exit and
+// by the early exits 'break' and 'continue' take.
+public releaseScopesAbove(LoweringContext lowering, long depth) {
+    for (long scope = lowering.scopeDepth() - 1; scope >= depth; scope--) {
+        long[] slots = lowering.ownedSlotsAt(scope);
+        for (long i = slots.length - 1; i >= 0; i--) {
+            long slot = slots[i];
+            let type = lowering.builder().slotType(slot);
+            releaseSlotContents(lowering, slot, type);
+        }
+    }
+}
+
+// Releases every owned slot, which is what a return must do before it leaves.
+public releaseAllScopes(LoweringContext lowering) {
+    releaseScopesAbove(lowering, 0);
+}

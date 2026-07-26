@@ -1,0 +1,308 @@
+// The ownership verifier and the place model, over hand-built EIR: a balanced function passes,
+// and each way naive ARC lowering can go wrong reports its own violation. The place model is
+// checked through the identity questions the verifier and the later passes ask of it.
+import @std.testing;
+import PrimitiveKind from @ens.sema.model.types;
+import EirFunctionBuilder from eir.model;
+import EirParameter from eir.model;
+import EirConstInt from eir.model;
+import EirConstString from eir.model;
+import EirStringConcat from eir.model;
+import EirRetain from eir.model;
+import EirRelease from eir.model;
+import EirRetainPtr from eir.model;
+import EirReleasePtr from eir.model;
+import EirSlotAddress from eir.model;
+import EirFieldAddress from eir.model;
+import EirElementAddress from eir.model;
+import EirLoadPtr from eir.model;
+import EirStorePtr from eir.model;
+import EirStoreSlot from eir.model;
+import EirLoadSlot from eir.model;
+import EirArrayNew from eir.model;
+import EirBoundsCheck from eir.model;
+import EirBranch from eir.model;
+import EirJump from eir.model;
+import EirReturn from eir.model;
+import EirConstBool from eir.model;
+import PlaceRelation from eir.place;
+import eir.place;
+import eir.ownership;
+import eir.verify;
+import support;
+
+test "a produced string stored into a slot and released at the end balances" {
+    let store = try support.freshStore();
+    let stringType = store.stringType();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let builder = new EirFunctionBuilder("balanced", false, null, [], intType);
+    long slot = builder.addSlot("s", stringType);
+    long left = builder.newTemp(stringType);
+    builder.append(new EirConstString(left, stringType, "a".toBytes()));
+    long right = builder.newTemp(stringType);
+    builder.append(new EirConstString(right, stringType, "b".toBytes()));
+    long joined = builder.newTemp(stringType);
+    builder.append(new EirStringConcat(joined, stringType, left, right));
+    builder.append(new EirStoreSlot(slot, joined));
+    long address = builder.newTemp(stringType);
+    builder.append(new EirSlotAddress(address, stringType, slot));
+    builder.append(new EirReleasePtr(address));
+    long zero = builder.newTemp(intType);
+    builder.append(new EirConstInt(zero, intType, 0));
+    builder.terminate(new EirReturn(zero));
+    let function = builder.finish();
+    try assertNoViolations(verify.verifyFunction(function));
+    try assertNoViolations(ownership.verifyOwnership(function));
+}
+
+test "a produced string never handed on is reported as a leak" {
+    let store = try support.freshStore();
+    let stringType = store.stringType();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let builder = new EirFunctionBuilder("leaks", false, null, [], intType);
+    long left = builder.newTemp(stringType);
+    builder.append(new EirConstString(left, stringType, "a".toBytes()));
+    long joined = builder.newTemp(stringType);
+    builder.append(new EirStringConcat(joined, stringType, left, left));
+    long zero = builder.newTemp(intType);
+    builder.append(new EirConstInt(zero, intType, 0));
+    builder.terminate(new EirReturn(zero));
+    try assertMentions(ownership.verifyOwnership(builder.finish()),
+        "%1 still owns a reference where the function returns");
+}
+
+test "releasing the same temp twice and using it afterwards are both reported" {
+    let store = try support.freshStore();
+    let stringType = store.stringType();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let builder = new EirFunctionBuilder("doubled", false, null, [], intType);
+    long text = builder.newTemp(stringType);
+    builder.append(new EirConstString(text, stringType, "a".toBytes()));
+    long joined = builder.newTemp(stringType);
+    builder.append(new EirStringConcat(joined, stringType, text, text));
+    builder.append(new EirRelease(joined));
+    builder.append(new EirRelease(joined));
+    long zero = builder.newTemp(intType);
+    builder.append(new EirConstInt(zero, intType, 0));
+    builder.terminate(new EirReturn(zero));
+    let violations = ownership.verifyOwnership(builder.finish());
+    try assertMentions(violations, "released after its reference was already given up");
+    try assertMentions(violations, "is used after its reference was given up");
+}
+
+test "releasing a borrowed value is reported" {
+    let store = try support.freshStore();
+    let stringType = store.stringType();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let builder = new EirFunctionBuilder("borrowed", false,
+        null, [new EirParameter("text", stringType)], intType);
+    builder.append(new EirRelease(0));
+    long zero = builder.newTemp(intType);
+    builder.append(new EirConstInt(zero, intType, 0));
+    builder.terminate(new EirReturn(zero));
+    try assertMentions(ownership.verifyOwnership(builder.finish()),
+        "released although it owns no reference");
+}
+
+test "storing a borrowed value without retaining it is reported" {
+    let store = try support.freshStore();
+    let stringType = store.stringType();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let builder = new EirFunctionBuilder("unretained", false,
+        null, [new EirParameter("text", stringType)], intType);
+    long slot = builder.addSlot("copy", stringType);
+    builder.append(new EirStoreSlot(slot, 0));
+    long zero = builder.newTemp(intType);
+    builder.append(new EirConstInt(zero, intType, 0));
+    builder.terminate(new EirReturn(zero));
+    try assertMentions(ownership.verifyOwnership(builder.finish()),
+        "without owning a reference");
+}
+
+test "a retain on a borrowed value makes a store balance" {
+    let store = try support.freshStore();
+    let stringType = store.stringType();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let builder = new EirFunctionBuilder("retained", false,
+        null, [new EirParameter("text", stringType)], intType);
+    long slot = builder.addSlot("copy", stringType);
+    builder.append(new EirRetain(0));
+    builder.append(new EirStoreSlot(slot, 0));
+    long address = builder.newTemp(stringType);
+    builder.append(new EirSlotAddress(address, stringType, slot));
+    builder.append(new EirReleasePtr(address));
+    long zero = builder.newTemp(intType);
+    builder.append(new EirConstInt(zero, intType, 0));
+    builder.terminate(new EirReturn(zero));
+    let function = builder.finish();
+    try assertNoViolations(verify.verifyFunction(function));
+    try assertNoViolations(ownership.verifyOwnership(function));
+}
+
+test "a reference released on one path only is reported where the paths join" {
+    let store = try support.freshStore();
+    let stringType = store.stringType();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let boolType = store.primitive(PrimitiveKind.Bool);
+    let builder = new EirFunctionBuilder("onepath", false, null, [], intType);
+    long text = builder.newTemp(stringType);
+    builder.append(new EirConstString(text, stringType, "a".toBytes()));
+    long joined = builder.newTemp(stringType);
+    builder.append(new EirStringConcat(joined, stringType, text, text));
+    long condition = builder.newTemp(boolType);
+    builder.append(new EirConstBool(condition, boolType, true));
+    long thenBlock = builder.newBlock("then");
+    long merge = builder.newBlock("merge");
+    builder.terminate(new EirBranch(condition, thenBlock, merge));
+    builder.moveTo(thenBlock);
+    builder.append(new EirRelease(joined));
+    builder.terminate(new EirJump(merge));
+    builder.moveTo(merge);
+    long zero = builder.newTemp(intType);
+    builder.append(new EirConstInt(zero, intType, 0));
+    builder.terminate(new EirReturn(zero));
+    try assertMentions(ownership.verifyOwnership(builder.finish()),
+        "the ownership of %1 differs between the paths");
+}
+
+test "an address written into storage is rejected" {
+    let store = try support.freshStore();
+    let stringType = store.stringType();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let builder = new EirFunctionBuilder("stored", false, null, [], intType);
+    long slot = builder.addSlot("s", stringType);
+    long address = builder.newTemp(stringType);
+    builder.append(new EirSlotAddress(address, stringType, slot));
+    builder.append(new EirStoreSlot(slot, address));
+    long zero = builder.newTemp(intType);
+    builder.append(new EirConstInt(zero, intType, 0));
+    builder.terminate(new EirReturn(zero));
+    try assertMentions(verify.verifyFunction(builder.finish()),
+        "addresses may be passed to a call but never stored");
+}
+
+test "a value where an address belongs is rejected" {
+    let store = try support.freshStore();
+    let stringType = store.stringType();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let builder = new EirFunctionBuilder("mixed", false, null, [], intType);
+    long text = builder.newTemp(stringType);
+    builder.append(new EirConstString(text, stringType, "a".toBytes()));
+    builder.append(new EirReleasePtr(text));
+    long zero = builder.newTemp(intType);
+    builder.append(new EirConstInt(zero, intType, 0));
+    builder.terminate(new EirReturn(zero));
+    try assertMentions(verify.verifyFunction(builder.finish()),
+        "release_ptr takes an address but %0 is a value");
+}
+
+test "two element addresses through one index name the same place, through two do not" {
+    let store = try support.freshStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let longType = store.primitive(PrimitiveKind.Long);
+    let arrayType = store.arrayOf(intType);
+    let builder = new EirFunctionBuilder("places", false, null, [], intType);
+    long size = builder.newTemp(longType);
+    builder.append(new EirConstInt(size, longType, 4));
+    long array = builder.newTemp(arrayType);
+    builder.append(new EirArrayNew(array, arrayType, size));
+    long index = builder.newTemp(longType);
+    builder.append(new EirConstInt(index, longType, 1));
+    long other = builder.newTemp(longType);
+    builder.append(new EirConstInt(other, longType, 1));
+    long first = builder.newTemp(intType);
+    builder.append(new EirBoundsCheck(array, index));
+    builder.append(new EirElementAddress(first, intType, array, index));
+    long second = builder.newTemp(intType);
+    builder.append(new EirElementAddress(second, intType, array, index));
+    long third = builder.newTemp(intType);
+    builder.append(new EirElementAddress(third, intType, array, other));
+    long loaded = builder.newTemp(intType);
+    builder.append(new EirLoadPtr(loaded, intType, first));
+    builder.append(new EirRelease(array));
+    builder.terminate(new EirReturn(loaded));
+    let function = builder.finish();
+
+    let firstPlace = place.placeOf(function, first);
+    let secondPlace = place.placeOf(function, second);
+    let thirdPlace = place.placeOf(function, third);
+    if (firstPlace == null || secondPlace == null || thirdPlace == null) {
+        try testing.fail("an element address has no place");
+        return;
+    }
+    try testing.assertTrue(place.relate(firstPlace, secondPlace) == PlaceRelation.Same,
+        "one index temp should name one place");
+    try testing.assertTrue(place.relate(firstPlace, thirdPlace) == PlaceRelation.Unknown,
+        "two index temps holding equal values are not decidably the same place");
+}
+
+test "a receiver address is an opaque root, so identity against it stays unknown" {
+    let store = try support.freshStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let builder = new EirFunctionBuilder("opaque", false, intType, [], intType);
+    long slot = builder.addSlot("local", intType);
+    long slotAddress = builder.newTemp(intType);
+    builder.append(new EirSlotAddress(slotAddress, intType, slot));
+    long loaded = builder.newTemp(intType);
+    builder.append(new EirLoadPtr(loaded, intType, 0));
+    builder.terminate(new EirReturn(loaded));
+    let function = builder.finish();
+
+    let receiverPlace = place.placeOf(function, 0);
+    let slotPlace = place.placeOf(function, slotAddress);
+    if (receiverPlace == null || slotPlace == null) {
+        try testing.fail("an address has no place");
+        return;
+    }
+    try testing.assertTrue(place.relate(receiverPlace, receiverPlace) == PlaceRelation.Same,
+        "the receiver names itself");
+    try testing.assertTrue(place.relate(receiverPlace, slotPlace) == PlaceRelation.Unknown,
+        "nothing is known about what a receiver address points at");
+    try testing.assertTrue(place.relate(slotPlace, slotPlace) == PlaceRelation.Same,
+        "a slot address names its own slot");
+}
+
+test "two distinct slots are different places" {
+    let store = try support.freshStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let builder = new EirFunctionBuilder("slots", false, null, [], intType);
+    long first = builder.addSlot("a", intType);
+    long second = builder.addSlot("b", intType);
+    long firstAddress = builder.newTemp(intType);
+    builder.append(new EirSlotAddress(firstAddress, intType, first));
+    long secondAddress = builder.newTemp(intType);
+    builder.append(new EirSlotAddress(secondAddress, intType, second));
+    long zero = builder.newTemp(intType);
+    builder.append(new EirConstInt(zero, intType, 0));
+    builder.terminate(new EirReturn(zero));
+    let function = builder.finish();
+
+    let firstPlace = place.placeOf(function, firstAddress);
+    let secondPlace = place.placeOf(function, secondAddress);
+    if (firstPlace == null || secondPlace == null) {
+        try testing.fail("a slot address has no place");
+        return;
+    }
+    try testing.assertTrue(place.relate(firstPlace, secondPlace) == PlaceRelation.Different,
+        "distinct slots cannot overlap");
+}
+
+assertNoViolations(string[] violations) throws {
+    if (violations.length > 0) {
+        try testing.fail("expected no violations, got {violations.length}: {violations[0]}");
+    }
+}
+
+assertMentions(string[] violations, string fragment) throws {
+    for (let violation in violations) {
+        if (violation.indexOf(fragment) >= 0) {
+            return;
+        }
+    }
+    string seen = "none";
+    if (violations.length > 0) {
+        seen = violations[0];
+    }
+    try testing.fail("no violation mentions '{fragment}' ({violations.length} reported; "
+        + "first: {seen})");
+}

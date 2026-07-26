@@ -3,6 +3,16 @@
 // flat graph of basic blocks each ending in exactly one terminator. There are no phi nodes; a
 // merged value travels through a slot. Types reference the interned sema type model directly, so
 // type equality is reference identity here too.
+//
+// Lvalue paths are address temps: EirSlotAddress, EirFieldAddress, and EirElementAddress produce
+// a temp whose recorded type is the pointee, and whose addressness follows from its defining
+// instruction. Addresses may be passed as call arguments but never stored: no slot holds an
+// address and no address is stored through another address. An address that arrives as a
+// function's receiver is an opaque root with no known base.
+//
+// Ownership is two-level. EirRetain and EirRelease move the +1 a VALUE temp owns; EirRetainPtr
+// and EirReleasePtr move the +1 held by the STORAGE an address names, and appear wherever a
+// struct's reference fields or a slot's current value change hands.
 import Type from @ens.sema.model.types;
 import List from @std.collections.list;
 
@@ -114,16 +124,24 @@ export enum EirCastOp {
 }
 
 // The callee of a call: its linker symbol and the sema types its LLVM function type derives
-// from. Parameter types list every parameter after default filling, in parameter order.
+// from. Parameter types list every parameter after default filling, in parameter order. A
+// method callee additionally names its receiver's type, passed by address before the
+// parameters.
 export final class EirCallee {
     string calleeSymbol;
+    Type? calleeReceiverType;
     Type[] calleeParameterTypes;
     Type calleeReturnType;
 
-    public constructor(this.calleeSymbol, this.calleeParameterTypes, this.calleeReturnType);
+    public constructor(this.calleeSymbol, this.calleeReceiverType, this.calleeParameterTypes,
+                this.calleeReturnType);
 
     export symbol() -> string {
         return this.calleeSymbol;
+    }
+
+    export receiverType() -> Type? {
+        return this.calleeReceiverType;
     }
 
     export parameterTypes() -> Type[] {
@@ -212,16 +230,276 @@ export final class EirStoreSlot extends EirInstruction {
     public constructor(this.slot, this.value);
 }
 
-// A non-throwing call. result is -1 when the callee returns void. Throwing calls become their
-// own terminator with an unwind edge when exceptions arrive; this form stays for calls that
-// cannot unwind.
+// A non-throwing call. result is -1 when the callee returns void, receiver is -1 unless the
+// callee is a method, in which case it is the address temp the method runs over. Throwing
+// calls become their own terminator with an unwind edge when exceptions arrive; this form
+// stays for calls that cannot unwind.
 export final class EirCall extends EirInstruction {
     public long result;
     public Type type;
     public EirCallee callee;
+    public long receiver;
     public long[] arguments;
 
-    public constructor(this.result, this.type, this.callee, this.arguments);
+    public constructor(this.result, this.type, this.callee, this.receiver, this.arguments);
+}
+
+// Takes over the +1 a reference-typed value temp does not yet own: the value was just loaded
+// out of storage and the retain gives the temp its own reference.
+export final class EirRetain extends EirInstruction {
+    public long value;
+
+    public constructor(this.value);
+}
+
+// Gives up the +1 a reference-typed value temp owns; the temp is dead afterwards.
+export final class EirRelease extends EirInstruction {
+    public long value;
+
+    public constructor(this.value);
+}
+
+// Bumps the +1 held by the reference-typed storage an address names, without producing a temp.
+export final class EirRetainPtr extends EirInstruction {
+    public long address;
+
+    public constructor(this.address);
+}
+
+// Drops the +1 held by the reference-typed storage an address names.
+export final class EirReleasePtr extends EirInstruction {
+    public long address;
+
+    public constructor(this.address);
+}
+
+// The address of a mutable slot.
+export final class EirSlotAddress extends EirInstruction {
+    public long result;
+    public Type type;
+    public long slot;
+
+    public constructor(this.result, this.type, this.slot);
+}
+
+// The address of field fieldIndex inside the struct an address names. The index is symbolic;
+// byte layout belongs to LLVM.
+export final class EirFieldAddress extends EirInstruction {
+    public long result;
+    public Type type;
+    public long base;
+    public long fieldIndex;
+
+    public constructor(this.result, this.type, this.base, this.fieldIndex);
+}
+
+// The address of element index inside an array value. A bounds check must have proven the
+// index; the address itself performs no checking.
+export final class EirElementAddress extends EirInstruction {
+    public long result;
+    public Type type;
+    public long array;
+    public long index;
+
+    public constructor(this.result, this.type, this.array, this.index);
+}
+
+export final class EirLoadPtr extends EirInstruction {
+    public long result;
+    public Type type;
+    public long address;
+
+    public constructor(this.result, this.type, this.address);
+}
+
+export final class EirStorePtr extends EirInstruction {
+    public long address;
+    public long value;
+
+    public constructor(this.address, this.value);
+}
+
+// Zeroes a slot's storage: null references, zero numbers, zeroed aggregates.
+export final class EirZeroSlot extends EirInstruction {
+    public long slot;
+
+    public constructor(this.slot);
+}
+
+// Aborts the program when index is outside the array's bounds.
+export final class EirBoundsCheck extends EirInstruction {
+    public long array;
+    public long index;
+
+    public constructor(this.array, this.index);
+}
+
+// Aborts the program with the message unless 0 <= start <= end <= length.
+export final class EirRangeCheck extends EirInstruction {
+    public long start;
+    public long end;
+    public long length;
+    public string message;
+
+    public constructor(this.start, this.end, this.length, this.message);
+}
+
+// An immortal string literal. The bytes are the decoded UTF-8 contents.
+export final class EirConstString extends EirInstruction {
+    public long result;
+    public Type type;
+    public byte[] bytes;
+
+    public constructor(this.result, this.type, this.bytes);
+}
+
+// A fresh array of the given length, zero-initialized. Aborts on a negative size.
+export final class EirArrayNew extends EirInstruction {
+    public long result;
+    public Type type;
+    public long size;
+
+    public constructor(this.result, this.type, this.size);
+}
+
+export final class EirArrayLength extends EirInstruction {
+    public long result;
+    public Type type;
+    public long array;
+
+    public constructor(this.result, this.type, this.array);
+}
+
+export final class EirStringConcat extends EirInstruction {
+    public long result;
+    public Type type;
+    public long left;
+    public long right;
+
+    public constructor(this.result, this.type, this.left, this.right);
+}
+
+export final class EirStringEqual extends EirInstruction {
+    public long result;
+    public Type type;
+    public long left;
+    public long right;
+
+    public constructor(this.result, this.type, this.left, this.right);
+}
+
+export final class EirStringIndexOf extends EirInstruction {
+    public long result;
+    public Type type;
+    public long haystack;
+    public long needle;
+
+    public constructor(this.result, this.type, this.haystack, this.needle);
+}
+
+// The bytes of the half-open range [start, end) as a fresh string. Aborts when the range is
+// invalid.
+export final class EirStringSubstring extends EirInstruction {
+    public long result;
+    public Type type;
+    public long value;
+    public long start;
+    public long end;
+
+    public constructor(this.result, this.type, this.value, this.start, this.end);
+}
+
+export final class EirStringLength extends EirInstruction {
+    public long result;
+    public Type type;
+    public long value;
+
+    public constructor(this.result, this.type, this.value);
+}
+
+export final class EirStringToBytes extends EirInstruction {
+    public long result;
+    public Type type;
+    public long value;
+
+    public constructor(this.result, this.type, this.value);
+}
+
+export final class EirStringFromBytes extends EirInstruction {
+    public long result;
+    public Type type;
+    public long bytes;
+
+    public constructor(this.result, this.type, this.bytes);
+}
+
+// The decimal text of a long value, read as unsigned when signed is false.
+export final class EirIntToString extends EirInstruction {
+    public long result;
+    public Type type;
+    public long value;
+    public bool signed;
+
+    public constructor(this.result, this.type, this.value, this.signed);
+}
+
+// The UTF-8 encoding of a Unicode scalar as a one-character string.
+export final class EirCharToString extends EirInstruction {
+    public long result;
+    public Type type;
+    public long value;
+
+    public constructor(this.result, this.type, this.value);
+}
+
+export final class EirBoolToString extends EirInstruction {
+    public long result;
+    public Type type;
+    public long value;
+
+    public constructor(this.result, this.type, this.value);
+}
+
+// The declared name of the enum member whose value the operand holds, resolved by matching the
+// member values so sparse and negative assignments stay correct.
+export final class EirEnumToString extends EirInstruction {
+    public long result;
+    public Type type;
+    public long value;
+    public Type enumType;
+
+    public constructor(this.result, this.type, this.value, this.enumType);
+}
+
+export final class EirDoubleToString extends EirInstruction {
+    public long result;
+    public Type type;
+    public long value;
+
+    public constructor(this.result, this.type, this.value);
+}
+
+// The JSON string form of a string: double-quoted with escapes; a null string renders as "".
+export final class EirJsonEscape extends EirInstruction {
+    public long result;
+    public Type type;
+    public long value;
+
+    public constructor(this.result, this.type, this.value);
+}
+
+// Writes the string and a newline to standard output.
+export final class EirPrint extends EirInstruction {
+    public long value;
+
+    public constructor(this.value);
+}
+
+// Writes "panic: " and the string to standard error, then exits with code 134.
+export final class EirPanic extends EirInstruction {
+    public long value;
+
+    public constructor(this.value);
 }
 
 export sealed abstract class EirTerminator {
@@ -291,22 +569,25 @@ export final class EirBlock {
     }
 }
 
-// One lowered function. The first parameters().length temps are the parameters; every temp's
-// type is recorded in tempTypes, indexed by temp id. Block 0 is the entry block.
+// One lowered function. When the function is a method, temp 0 is the receiver's address and
+// the parameters follow it; otherwise the first parameters().length temps are the parameters.
+// Every temp's type is recorded in tempTypes, indexed by temp id. Block 0 is the entry block.
 export final class EirFunction {
     string functionSymbol;
     bool internal;
+    Type? functionReceiverType;
     EirParameter[] functionParameters;
     Type functionReturnType;
     List<EirSlot> functionSlots;
     List<EirBlock> functionBlocks;
     List<Type> functionTempTypes;
 
-    public constructor(string symbol, bool internalLinkage, EirParameter[] parameters,
-                Type returnType, List<EirSlot> slots, List<EirBlock> blocks,
-                List<Type> tempTypes) {
+    public constructor(string symbol, bool internalLinkage, Type? receiverType,
+                EirParameter[] parameters, Type returnType, List<EirSlot> slots,
+                List<EirBlock> blocks, List<Type> tempTypes) {
         this.functionSymbol = symbol;
         this.internal = internalLinkage;
+        this.functionReceiverType = receiverType;
         this.functionParameters = parameters;
         this.functionReturnType = returnType;
         this.functionSlots = slots;
@@ -322,8 +603,22 @@ export final class EirFunction {
         return this.internal;
     }
 
+    export receiverType() -> Type? {
+        return this.functionReceiverType;
+    }
+
     export parameters() -> EirParameter[] {
         return this.functionParameters;
+    }
+
+    // The temps defined before the entry block runs: the receiver's address when there is one,
+    // then the parameters.
+    export entryTempCount() -> long {
+        long count = this.functionParameters.length;
+        if (this.functionReceiverType != null) {
+            count++;
+        }
+        return count;
     }
 
     export returnType() -> Type {
@@ -348,6 +643,7 @@ export final class EirFunction {
 export final class EirFunctionBuilder {
     string symbol;
     bool internal;
+    Type? receiverType;
     EirParameter[] parameters;
     Type returnType;
     List<EirSlot> slots;
@@ -355,15 +651,19 @@ export final class EirFunctionBuilder {
     List<Type> tempTypes;
     long currentBlock;
 
-    public constructor(string symbol, bool internalLinkage, EirParameter[] parameters,
-                Type returnType) {
+    public constructor(string symbol, bool internalLinkage, Type? receiverType,
+                EirParameter[] parameters, Type returnType) {
         this.symbol = symbol;
         this.internal = internalLinkage;
+        this.receiverType = receiverType;
         this.parameters = parameters;
         this.returnType = returnType;
         this.slots = new List<EirSlot>();
         this.blocks = new List<EirBlock>();
         this.tempTypes = new List<Type>();
+        if (receiverType != null) {
+            this.tempTypes.push(receiverType);
+        }
         for (let parameter in parameters) {
             this.tempTypes.push(parameter.type());
         }
@@ -416,7 +716,7 @@ export final class EirFunctionBuilder {
     }
 
     public finish() -> EirFunction {
-        return new EirFunction(this.symbol, this.internal, this.parameters, this.returnType,
-            this.slots, this.blocks, this.tempTypes);
+        return new EirFunction(this.symbol, this.internal, this.receiverType, this.parameters,
+            this.returnType, this.slots, this.blocks, this.tempTypes);
     }
 }

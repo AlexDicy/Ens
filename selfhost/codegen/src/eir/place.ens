@@ -1,0 +1,258 @@
+// Normalizes an address temp into the place it names: a root plus a projection path. The walk
+// follows each address temp's single defining instruction, so it always terminates at a slot, at
+// an array value, or at an address that arrived as the function's receiver. A receiver is an
+// opaque root: nothing is known about its base, so identity questions across it answer unknown,
+// never different. The ownership verifier is the first consumer; later passes ask the same
+// questions through this module instead of re-tracing instructions.
+import Type from @ens.sema.model.types;
+import StructType from @ens.sema.model.types;
+import ArrayType from @ens.sema.model.types;
+import EirFunction from eir.model;
+import EirInstruction from eir.model;
+import EirSlotAddress from eir.model;
+import EirFieldAddress from eir.model;
+import EirElementAddress from eir.model;
+import List from @std.collections.list;
+
+export enum PlaceRoot {
+    Slot,
+    Receiver,
+    Array,
+}
+
+// One projection step: a symbolic field index into a struct, or an element index held by a
+// temp.
+export final class PlaceStep {
+    bool field;
+    long stepValue;
+
+    public constructor(this.field, this.stepValue);
+
+    export isField() -> bool {
+        return this.field;
+    }
+
+    // The field index for a field step, the index temp for an element step.
+    export value() -> long {
+        return this.stepValue;
+    }
+}
+
+export final class Place {
+    PlaceRoot rootKind;
+    long rootValue;
+    List<PlaceStep> path;
+
+    public constructor(this.rootKind, this.rootValue, this.path);
+
+    export root() -> PlaceRoot {
+        return this.rootKind;
+    }
+
+    // The slot id for a slot root, the receiver temp for a receiver root, the array temp for an
+    // array root.
+    export rootId() -> long {
+        return this.rootValue;
+    }
+
+    export steps() -> List<PlaceStep> {
+        return this.path;
+    }
+}
+
+export enum PlaceRelation {
+    Same,
+    Different,
+    Unknown,
+}
+
+// The place an address temp names, or null when the temp is not an address of this function.
+export placeOf(EirFunction function, long address) -> Place? {
+    let definitions = addressDefinitions(function);
+    return resolvePlace(function, definitions, address);
+}
+
+// How two places relate: Same only when they provably name one location, Different only when
+// they provably cannot, Unknown otherwise. A receiver root is opaque, so any question across
+// one that is not structurally identical stays Unknown; two distinct array temps may hold the
+// same array, so those stay Unknown too. A place that is a strict prefix of the other contains
+// it, which is neither same nor disjoint, so that is Unknown as well.
+export relate(Place first, Place second) -> PlaceRelation {
+    if (first.root() != second.root()) {
+        if (first.root() == PlaceRoot.Receiver || second.root() == PlaceRoot.Receiver) {
+            return PlaceRelation.Unknown;
+        }
+        return PlaceRelation.Different;
+    }
+    if (first.rootId() != second.rootId()) {
+        return switch (first.root()) {
+            Slot -> PlaceRelation.Different,
+            default -> PlaceRelation.Unknown,
+        };
+    }
+    let firstSteps = first.steps();
+    let secondSteps = second.steps();
+    long shared = firstSteps.length();
+    if (secondSteps.length() < shared) {
+        shared = secondSteps.length();
+    }
+    bool exact = true;
+    for (long i = 0; i < shared; i++) {
+        let a = firstSteps.get(i);
+        let b = secondSteps.get(i);
+        if (a.isField() != b.isField()) {
+            return PlaceRelation.Unknown;
+        }
+        if (a.isField()) {
+            if (a.value() != b.value()) {
+                return PlaceRelation.Different;
+            }
+        } else if (a.value() != b.value()) {
+            exact = false;
+        }
+    }
+    if (firstSteps.length() != secondSteps.length()) {
+        return PlaceRelation.Unknown;
+    }
+    if (exact) {
+        return PlaceRelation.Same;
+    }
+    return PlaceRelation.Unknown;
+}
+
+// A readable spelling of the place an address temp names, for the dump: the slot's name, 'this'
+// for the receiver, or the array temp, followed by field names and [%index] steps. Returns ""
+// when the temp is not an address.
+export describe(EirFunction function, long address) -> string {
+    let place = placeOf(function, address);
+    if (place == null) {
+        return "";
+    }
+    string text = switch (place.root()) {
+        Slot -> function.slots().get(place.rootId()).name(),
+        Receiver -> "this",
+        Array -> "%{place.rootId()}",
+    };
+    Type? current = switch (place.root()) {
+        Slot -> function.slots().get(place.rootId()).type(),
+        Receiver -> function.receiverType(),
+        Array -> tempTypeOf(function, place.rootId()),
+    };
+    let steps = place.steps();
+    for (long i = 0; i < steps.length(); i++) {
+        let step = steps.get(i);
+        if (step.isField()) {
+            string fieldName = "{step.value()}";
+            let owner = current;
+            if (owner != null && owner is StructType
+                    && step.value() < owner.fields().length()) {
+                let field = owner.fields().get(step.value());
+                fieldName = field.name();
+                current = field.type();
+            } else {
+                current = null;
+            }
+            text = text + "." + fieldName;
+        } else {
+            text = text + "[%{step.value()}]";
+            current = elementTypeAfterIndex(current);
+        }
+    }
+    return text;
+}
+
+resolvePlace(EirFunction function, List<AddressDefinition> definitions, long address)
+        -> Place? {
+    let steps = new List<PlaceStep>();
+    long current = address;
+    while (true) {
+        if (function.receiverType() != null && current == 0) {
+            return new Place(PlaceRoot.Receiver, current, reversed(steps));
+        }
+        let definition = definitionOf(definitions, current);
+        if (definition == null) {
+            return null;
+        }
+        switch (definition.instruction) {
+            is EirSlotAddress slotAddress -> {
+                return new Place(PlaceRoot.Slot, slotAddress.slot, reversed(steps));
+            },
+            is EirFieldAddress fieldAddress -> {
+                steps.push(new PlaceStep(true, fieldAddress.fieldIndex));
+                current = fieldAddress.base;
+            },
+            is EirElementAddress elementAddress -> {
+                steps.push(new PlaceStep(false, elementAddress.index));
+                return new Place(PlaceRoot.Array, elementAddress.array, reversed(steps));
+            },
+            default -> {
+                return null;
+            },
+        }
+    }
+}
+
+class AddressDefinition {
+    protected long result;
+    protected EirInstruction instruction;
+
+    protected constructor(this.result, this.instruction);
+}
+
+addressDefinitions(EirFunction function) -> List<AddressDefinition> {
+    let definitions = new List<AddressDefinition>();
+    let blocks = function.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        let instructions = blocks.get(b).instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            switch (instruction) {
+                is EirSlotAddress slotAddress -> {
+                    definitions.push(new AddressDefinition(slotAddress.result, instruction));
+                },
+                is EirFieldAddress fieldAddress -> {
+                    definitions.push(new AddressDefinition(fieldAddress.result, instruction));
+                },
+                is EirElementAddress elementAddress -> {
+                    definitions.push(new AddressDefinition(elementAddress.result, instruction));
+                },
+                default -> { },
+            }
+        }
+    }
+    return definitions;
+}
+
+definitionOf(List<AddressDefinition> definitions, long temp) -> AddressDefinition? {
+    for (long i = 0; i < definitions.length(); i++) {
+        if (definitions.get(i).result == temp) {
+            return definitions.get(i);
+        }
+    }
+    return null;
+}
+
+reversed(List<PlaceStep> steps) -> List<PlaceStep> {
+    let out = new List<PlaceStep>();
+    for (long i = steps.length() - 1; i >= 0; i--) {
+        out.push(steps.get(i));
+    }
+    return out;
+}
+
+tempTypeOf(EirFunction function, long temp) -> Type? {
+    if (temp < 0 || temp >= function.tempTypes().length()) {
+        return null;
+    }
+    return function.tempTypes().get(temp);
+}
+
+elementTypeAfterIndex(Type? arrayType) -> Type? {
+    if (arrayType == null) {
+        return null;
+    }
+    if (arrayType is ArrayType) {
+        return arrayType.element();
+    }
+    return null;
+}
