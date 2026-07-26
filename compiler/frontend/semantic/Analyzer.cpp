@@ -4255,7 +4255,14 @@ Type* Analyzer::analyzeInterpString(const ast::InterpStringExpression& expr) {
         if (ht->isTypeParam() || (ht->isStruct() && TypeContext::containsTypeParam(ht))) continue;
         if (ht->isInteger() || ht->isBool() || ht->isString() || ht->isEnum()) continue;
         if (ht->isStruct()) {
-            // A struct interpolates as its JSON form, valid when every field is JSON-able.
+            // A struct that declares its own toString interpolates through that method and is
+            // never serialized; without one it interpolates as its JSON form, which is valid
+            // when every field is JSON-able.
+            if (const MethodInfo* own = declaredToString(ht->structInfo)) {
+                std::string issue = textFormIssue(ht->toString(), *own);
+                if (!issue.empty()) errorAtNode(hole.node, issue);
+                continue;
+            }
             checkStructJsonable(ht, hole.node);
             continue;
         }
@@ -5277,7 +5284,7 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                 // A struct without its own toString serializes to its JSON form; a struct
                 // that declares one falls through to normal method resolution.
                 if (recvT->isStruct() && recvT->structInfo &&
-                    recvT->structInfo->findMethodIndex(u"toString") < 0) {
+                    !declaredToString(recvT->structInfo)) {
                     if (!args.empty()) {
                         errorAtNode(expr.node, "'toString' takes no arguments.");
                         for (auto& a : args) analyzeExpr(a);

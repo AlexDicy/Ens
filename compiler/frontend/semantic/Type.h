@@ -172,6 +172,20 @@ struct StructInfo {
 // True when the two function symbols take exactly the same parameter types.
 bool sameParameterTypes(const Symbol* a, const Symbol* b);
 
+// A struct's own `toString`, whatever its shape, or null when it declares none.
+// Both an explicit `.toString()` and an interpolation hole ask this one question
+// to decide whether a struct has a text form of its own instead of its JSON form.
+// An overload that can stand in wins over one that cannot.
+const MethodInfo* declaredToString(const StructInfo* info);
+
+// True when a declared `toString` has the shape a value's text form needs: no
+// parameters, a `string` result, and no `throws` for the caller to handle.
+bool producesTextForm(const MethodInfo& method);
+
+// Why a struct's own `toString` cannot stand in for its text form where one is
+// needed, or "" when it can. `structName` is the struct's name as written.
+std::string textFormIssue(const std::string& structName, const MethodInfo& method);
+
 class Type {
 public:
     TypeKind kind;
