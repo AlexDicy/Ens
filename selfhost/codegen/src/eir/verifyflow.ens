@@ -1,0 +1,172 @@
+// The control-flow checks: what a block's terminator must carry, that the blocks a terminator
+// names exist, and that no temp is read on a path that may not have defined it yet.
+import EirBlock from eir.model;
+import EirTerminator from eir.model;
+import EirReturn from eir.model;
+import EirJump from eir.model;
+import EirBranch from eir.model;
+import EirSwitch from eir.model;
+import EirUnreachable from eir.model;
+import VerificationContext from eir.verifycontext;
+import eir.verifyoperands;
+import eir.walk;
+import @ens.sema.model.types;
+import support.primitives;
+
+public checkTerminator(VerificationContext verification, EirBlock block,
+                       EirTerminator terminator) {
+    switch (terminator) {
+        is EirReturn returned -> {
+            checkReturn(verification, block, returned);
+        },
+        is EirJump jump -> {
+            checkTarget(verification, block, jump.target);
+        },
+        is EirBranch branch -> {
+            verifyoperands.checkOperand(verification, block, branch.condition);
+            if (verification.validTemp(branch.condition)
+                    && !primitives.isBoolType(verification.typeOf(branch.condition))) {
+                verification.report("{block.label()}: branch condition %{branch.condition} is "
+                    + "not bool");
+            }
+            checkTarget(verification, block, branch.thenTarget);
+            checkTarget(verification, block, branch.elseTarget);
+        },
+        is EirSwitch switched -> {
+            verifyoperands.checkOperand(verification, block, switched.value);
+            if (verification.validTemp(switched.value)
+                    && !primitives.isIntegerLike(verification.typeOf(switched.value))) {
+                verification.report("{block.label()}: switch over non-integer "
+                    + "%{switched.value}");
+            }
+            if (switched.caseValues.length != switched.caseTargets.length) {
+                verification.report("{block.label()}: switch case values and targets differ in "
+                    + "count");
+            }
+            for (let target in switched.caseTargets) {
+                checkTarget(verification, block, target);
+            }
+            checkTarget(verification, block, switched.defaultTarget);
+        },
+        is EirUnreachable ignored -> { },
+    }
+}
+
+checkReturn(VerificationContext verification, EirBlock block, EirReturn returned) {
+    let function = verification.function();
+    bool returnsVoid = types.isVoidType(function.returnType());
+    if (returned.value < 0) {
+        if (!returnsVoid) {
+            verification.report("{block.label()}: ret without a value in a function "
+                + "returning {types.display(function.returnType())}");
+        }
+        return;
+    }
+    verifyoperands.checkOperand(verification, block, returned.value);
+    if (returnsVoid) {
+        verification.report("{block.label()}: ret with a value in a void function");
+    } else if (verification.validTemp(returned.value)
+            && verification.typeOf(returned.value) != function.returnType()) {
+        verification.report("{block.label()}: ret of type "
+            + "{types.display(verification.typeOf(returned.value))} "
+            + "in a function returning "
+            + "{types.display(function.returnType())}");
+    }
+}
+
+checkTarget(VerificationContext verification, EirBlock block, long target) {
+    if (target < 0 || target >= verification.function().blocks().length()) {
+        verification.report("{block.label()}: terminator names missing block b{target}");
+    }
+}
+
+// Def-before-use over the flow graph: a forward dataflow computes, to a fixpoint, the temps
+// definitely defined at each block entry (the intersection over predecessors), then every use
+// must be covered by that set or by an earlier definition in its own block.
+public checkDefiniteDefinition(VerificationContext verification) {
+    let function = verification.function();
+    let blocks = function.blocks();
+    long blockCount = blocks.length();
+    long tempCount = verification.tempCount();
+    if (blockCount == 0) {
+        return;
+    }
+    bool[][] definedAtEntry = new bool[blockCount][tempCount + 1];
+    bool[] reached = new bool[blockCount];
+    for (long i = 0; i < function.entryTempCount(); i++) {
+        definedAtEntry[0][i] = true;
+    }
+    reached[0] = true;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (long b = 0; b < blockCount; b++) {
+            if (!reached[b]) {
+                continue;
+            }
+            bool[] defined = new bool[tempCount + 1];
+            for (long i = 0; i < tempCount; i++) {
+                defined[i] = definedAtEntry[b][i];
+            }
+            let instructions = blocks.get(b).instructions();
+            for (long i = 0; i < instructions.length(); i++) {
+                long result = walk.resultOf(instructions.get(i));
+                if (result >= 0 && result < tempCount) {
+                    defined[result] = true;
+                }
+            }
+            for (let successor in walk.successorsOf(blocks.get(b))) {
+                if (successor < 0 || successor >= blockCount) {
+                    continue;
+                }
+                if (!reached[successor]) {
+                    reached[successor] = true;
+                    for (long i = 0; i < tempCount; i++) {
+                        definedAtEntry[successor][i] = defined[i];
+                    }
+                    changed = true;
+                    continue;
+                }
+                for (long i = 0; i < tempCount; i++) {
+                    if (definedAtEntry[successor][i] && !defined[i]) {
+                        definedAtEntry[successor][i] = false;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    for (long b = 0; b < blockCount; b++) {
+        if (!reached[b]) {
+            continue;
+        }
+        let block = blocks.get(b);
+        bool[] defined = new bool[tempCount + 1];
+        for (long i = 0; i < tempCount; i++) {
+            defined[i] = definedAtEntry[b][i];
+        }
+        let instructions = block.instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            for (let used in walk.usesOf(instruction)) {
+                if (verification.validTemp(used) && !defined[used]) {
+                    verification.report("{block.label()}: %{used} is used before it is "
+                        + "definitely defined");
+                }
+            }
+            long result = walk.resultOf(instruction);
+            if (result >= 0 && result < tempCount) {
+                defined[result] = true;
+            }
+        }
+        let terminator = block.terminator();
+        if (terminator != null) {
+            for (let used in walk.terminatorUsesOf(terminator)) {
+                if (verification.validTemp(used) && !defined[used]) {
+                    verification.report("{block.label()}: %{used} is used before it is "
+                        + "definitely defined");
+                }
+            }
+        }
+    }
+}

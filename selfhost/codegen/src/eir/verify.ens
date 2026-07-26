@@ -4,6 +4,11 @@
 // operand or result whose type disagrees with its instruction, a slot accessed at the wrong
 // type, a terminator naming a block that does not exist, or an address written into storage.
 // Ownership balance is the companion pass in eir.ownership.
+//
+// This module holds the entry point, the walk over the blocks, and the dispatch of one
+// instruction to the module that checks its area; the checks themselves live in the value,
+// memory, array, call, string, and control-flow modules, all of them free functions over one
+// VerificationContext.
 import EirFunction from eir.model;
 import EirBlock from eir.model;
 import EirInstruction from eir.model;
@@ -16,6 +21,7 @@ import EirCast from eir.model;
 import EirLoadSlot from eir.model;
 import EirStoreSlot from eir.model;
 import EirCall from eir.model;
+import EirConstString from eir.model;
 import EirRetain from eir.model;
 import EirRelease from eir.model;
 import EirRetainPtr from eir.model;
@@ -27,7 +33,6 @@ import EirLoadPtr from eir.model;
 import EirStorePtr from eir.model;
 import EirBoundsCheck from eir.model;
 import EirRangeCheck from eir.model;
-import EirConstString from eir.model;
 import EirArrayNew from eir.model;
 import EirArrayLength from eir.model;
 import EirStringConcat from eir.model;
@@ -45,748 +50,163 @@ import EirDoubleToString from eir.model;
 import EirJsonEscape from eir.model;
 import EirPrint from eir.model;
 import EirPanic from eir.model;
-import EirTerminator from eir.model;
-import EirReturn from eir.model;
-import EirJump from eir.model;
-import EirBranch from eir.model;
-import EirSwitch from eir.model;
-import EirUnreachable from eir.model;
-import eir.model;
-import eir.walk;
-import PlaceRoot from eir.place;
-import eir.place;
-import Type from @ens.sema.model.types;
-import ArrayType from @ens.sema.model.types;
-import StructType from @ens.sema.model.types;
-import PrimitiveKind from @ens.sema.model.types;
-import @ens.sema.model.types;
-import support.primitives;
-import List from @std.collections.list;
+import VerificationContext from eir.verifycontext;
+import eir.verifyarrays;
+import eir.verifycalls;
+import eir.verifycontext;
+import eir.verifyflow;
+import eir.verifymemory;
+import eir.verifystrings;
+import eir.verifyvalues;
 
 // Verifies one function; the returned list is empty when the function is well formed.
 export verifyFunction(EirFunction function) -> string[] {
-    let verifier = new FunctionVerifier(function);
-    return verifier.run();
+    let verification = new VerificationContext(function);
+    verifycontext.collectDefinitions(verification);
+    checkBlocks(verification);
+    verifyflow.checkDefiniteDefinition(verification);
+    return verification.problems();
 }
 
-class FunctionVerifier {
-    EirFunction function;
-    long tempCount;
-    List<string> problems;
-    long[] definingBlock;
-    long[] definingIndex;
-    bool[] addressTemp;
-
-    protected constructor(EirFunction function) {
-        this.function = function;
-        this.tempCount = function.tempTypes().length();
-        this.problems = new List<string>();
-        this.definingBlock = new long[this.tempCount];
-        this.definingIndex = new long[this.tempCount];
-        this.addressTemp = new bool[this.tempCount];
+// Every block holds instructions that check out and ends in exactly one terminator.
+checkBlocks(VerificationContext verification) {
+    let blocks = verification.function().blocks();
+    if (blocks.length() == 0) {
+        verification.report("function has no blocks");
+        return;
     }
-
-    protected run() -> string[] {
-        this.collectDefinitions();
-        this.checkBlocks();
-        this.checkDefiniteDefinition();
-        return this.problems.toArray();
-    }
-
-    report(string problem) {
-        this.problems.push("{this.function.symbol()}: {problem}");
-    }
-
-    // Records where each temp is defined, which temps hold addresses, and rejects double
-    // definitions. The receiver and the parameters are defined before the entry block; their
-    // defining index stays -1 in block -1.
-    collectDefinitions() {
-        for (long i = 0; i < this.tempCount; i++) {
-            this.definingBlock[i] = -2;
-            this.definingIndex[i] = -1;
+    for (long b = 0; b < blocks.length(); b++) {
+        let block = blocks.get(b);
+        let instructions = block.instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            checkInstruction(verification, block, instructions.get(i));
         }
-        for (long i = 0; i < this.function.entryTempCount(); i++) {
-            this.definingBlock[i] = -1;
-        }
-        if (this.function.receiverType() != null && this.tempCount > 0) {
-            this.addressTemp[0] = true;
-        }
-        let blocks = this.function.blocks();
-        for (long b = 0; b < blocks.length(); b++) {
-            let instructions = blocks.get(b).instructions();
-            for (long i = 0; i < instructions.length(); i++) {
-                let instruction = instructions.get(i);
-                long result = walk.resultOf(instruction);
-                if (result < 0) {
-                    continue;
-                }
-                if (result >= this.tempCount) {
-                    this.report("instruction defines %{result} but only {this.tempCount} "
-                        + "temps exist");
-                    continue;
-                }
-                if (this.definingBlock[result] != -2) {
-                    this.report("%{result} is assigned more than once");
-                    continue;
-                }
-                this.definingBlock[result] = b;
-                this.definingIndex[result] = i;
-                this.addressTemp[result] = walk.producesAddress(instruction);
-            }
+        let terminator = block.terminator();
+        if (terminator == null) {
+            verification.report("block {block.label()} has no terminator");
+        } else {
+            verifyflow.checkTerminator(verification, block, terminator);
         }
     }
+}
 
-    // Addresses may travel into a call, which is how a method reaches its receiver and how an
-    // 'out' argument works, but they may never be written into storage: no slot holds an
-    // address and no address is stored through another address. Without this rule the walk
-    // from an address back to the place it names would not terminate at a known root.
-    checkNotAddress(EirBlock block, long temp, string what) {
-        if (this.validTemp(temp) && this.addressTemp[temp]) {
-            this.report("{block.label()}: {what} stores the address %{temp}; addresses may be "
-                + "passed to a call but never stored");
-        }
-    }
-
-    checkBlocks() {
-        let blocks = this.function.blocks();
-        if (blocks.length() == 0) {
-            this.report("function has no blocks");
-            return;
-        }
-        for (long b = 0; b < blocks.length(); b++) {
-            let block = blocks.get(b);
-            let instructions = block.instructions();
-            for (long i = 0; i < instructions.length(); i++) {
-                this.checkInstruction(block, instructions.get(i));
-            }
-            let terminator = block.terminator();
-            if (terminator == null) {
-                this.report("block {block.label()} has no terminator");
-            } else {
-                this.checkTerminator(block, terminator);
-            }
-        }
-    }
-
-    checkInstruction(EirBlock block, EirInstruction instruction) {
-        switch (instruction) {
-            is EirConstInt constant -> {
-                this.checkResultType(block, constant.result, constant.type);
-                if (!primitives.isIntegerLike(constant.type)) {
-                    this.report("{block.label()}: const %{constant.result} has non-integer "
-                        + "type {types.display(constant.type)}");
-                }
-            },
-            is EirConstFloat constant -> {
-                this.checkResultType(block, constant.result, constant.type);
-                if (!primitives.isFloatType(constant.type)) {
-                    this.report("{block.label()}: const %{constant.result} has non-float "
-                        + "type {types.display(constant.type)}");
-                }
-            },
-            is EirConstBool constant -> {
-                this.checkResultType(block, constant.result, constant.type);
-                if (!primitives.isBoolType(constant.type)) {
-                    this.report("{block.label()}: const %{constant.result} has non-bool "
-                        + "type {types.display(constant.type)}");
-                }
-            },
-            is EirBinary binary -> {
-                this.checkResultType(block, binary.result, binary.type);
-                this.checkOperand(block, binary.left);
-                this.checkOperand(block, binary.right);
-                if (this.validTemp(binary.left) && this.validTemp(binary.right)) {
-                    let leftType = this.function.tempTypes().get(binary.left);
-                    let rightType = this.function.tempTypes().get(binary.right);
-                    if (leftType != rightType) {
-                        this.report("{block.label()}: %{binary.result} combines operands of "
-                            + "different types {types.display(leftType)} and "
-                            + "{types.display(rightType)}");
-                    } else if (model.isComparison(binary.op)) {
-                        if (!primitives.isBoolType(binary.type)) {
-                            this.report("{block.label()}: comparison %{binary.result} must "
-                                + "produce bool, got {types.display(binary.type)}");
-                        }
-                    } else if (leftType != binary.type) {
-                        this.report("{block.label()}: %{binary.result} of type "
-                            + "{types.display(binary.type)} disagrees with its operands of "
-                            + "type {types.display(leftType)}");
-                    }
-                }
-            },
-            is EirUnary unary -> {
-                this.checkResultType(block, unary.result, unary.type);
-                this.checkOperand(block, unary.operand);
-                if (this.validTemp(unary.operand)
-                        && this.function.tempTypes().get(unary.operand) != unary.type) {
-                    this.report("{block.label()}: %{unary.result} of type "
-                        + "{types.display(unary.type)} disagrees with its operand");
-                }
-            },
-            is EirCast cast -> {
-                this.checkResultType(block, cast.result, cast.type);
-                this.checkOperand(block, cast.operand);
-            },
-            is EirLoadSlot load -> {
-                this.checkResultType(block, load.result, load.type);
-                if (load.slot < 0 || load.slot >= this.function.slots().length()) {
-                    this.report("{block.label()}: load of missing slot ${load.slot}");
-                } else if (this.function.slots().get(load.slot).type() != load.type) {
-                    this.report("{block.label()}: load of ${load.slot} at type "
-                        + "{types.display(load.type)} but the slot holds "
-                        + "{types.display(this.function.slots().get(load.slot).type())}");
-                }
-            },
-            is EirStoreSlot store -> {
-                this.checkOperand(block, store.value);
-                this.checkNotAddress(block, store.value, "the store into ${store.slot}");
-                if (store.slot < 0 || store.slot >= this.function.slots().length()) {
-                    this.report("{block.label()}: store to missing slot ${store.slot}");
-                } else if (this.validTemp(store.value)
-                        && this.function.slots().get(store.slot).type()
-                            != this.function.tempTypes().get(store.value)) {
-                    this.report("{block.label()}: store of "
-                        + "{types.display(this.function.tempTypes().get(store.value))} into "
-                        + "${store.slot} which holds "
-                        + "{types.display(this.function.slots().get(store.slot).type())}");
-                }
-            },
-            is EirCall call -> {
-                if (call.result >= 0) {
-                    this.checkResultType(block, call.result, call.type);
-                    if (call.type != call.callee.returnType()) {
-                        this.report("{block.label()}: call result type "
-                            + "{types.display(call.type)} disagrees with callee "
-                            + "@{call.callee.symbol()} returning "
-                            + "{types.display(call.callee.returnType())}");
-                    }
-                }
-                let receiverType = call.callee.receiverType();
-                if (receiverType != null) {
-                    if (call.receiver < 0) {
-                        this.report("{block.label()}: call to @{call.callee.symbol()} passes no "
-                            + "receiver but the callee is a method on "
-                            + "{types.display(receiverType)}");
-                    } else {
-                        this.checkOperand(block, call.receiver);
-                        this.checkIsAddress(block, call.receiver, "the receiver of "
-                            + "@{call.callee.symbol()}");
-                    }
-                } else if (call.receiver >= 0) {
-                    this.report("{block.label()}: call to @{call.callee.symbol()} passes a "
-                        + "receiver but the callee takes none");
-                }
-                Type[] parameterTypes = call.callee.parameterTypes();
-                if (call.arguments.length != parameterTypes.length) {
-                    this.report("{block.label()}: call to @{call.callee.symbol()} passes "
-                        + "{call.arguments.length} argument(s) for "
-                        + "{parameterTypes.length} parameter(s)");
-                } else {
-                    for (long i = 0; i < call.arguments.length; i++) {
-                        this.checkOperand(block, call.arguments[i]);
-                        if (this.validTemp(call.arguments[i])
-                                && this.function.tempTypes().get(call.arguments[i])
-                                    != parameterTypes[i]) {
-                            this.report("{block.label()}: argument {i + 1} of "
-                                + "@{call.callee.symbol()} has type "
-                                + "{types.display(this.function.tempTypes().get(call.arguments[i]))} "
-                                + "but the parameter takes "
-                                + "{types.display(parameterTypes[i])}");
-                        }
-                    }
-                }
-            },
-            is EirConstString constant -> {
-                this.checkResultType(block, constant.result, constant.type);
-                if (!primitives.isStringType(constant.type)) {
-                    this.report("{block.label()}: string const %{constant.result} has type "
-                        + "{types.display(constant.type)}");
-                }
-            },
-            is EirRetain retain -> {
-                this.checkOperand(block, retain.value);
-                this.checkOwnable(block, retain.value, "retain");
-            },
-            is EirRelease release -> {
-                this.checkOperand(block, release.value);
-                this.checkOwnable(block, release.value, "release");
-            },
-            is EirRetainPtr retain -> {
-                this.checkOperand(block, retain.address);
-                this.checkIsAddress(block, retain.address, "retain_ptr");
-            },
-            is EirReleasePtr release -> {
-                this.checkOperand(block, release.address);
-                this.checkIsAddress(block, release.address, "release_ptr");
-                this.checkNotBorrowedStorage(block, release.address);
-            },
-            is EirSlotAddress address -> {
-                this.checkResultType(block, address.result, address.type);
-                if (address.slot < 0 || address.slot >= this.function.slots().length()) {
-                    this.report("{block.label()}: address of missing slot ${address.slot}");
-                } else if (this.function.slots().get(address.slot).type() != address.type) {
-                    this.report("{block.label()}: address of ${address.slot} at type "
-                        + "{types.display(address.type)} but the slot holds "
-                        + "{types.display(this.function.slots().get(address.slot).type())}");
-                }
-            },
-            is EirFieldAddress address -> {
-                this.checkResultType(block, address.result, address.type);
-                this.checkOperand(block, address.base);
-                this.checkIsAddress(block, address.base, "the base of field_addr");
-                if (this.validTemp(address.base)) {
-                    let owner = this.function.tempTypes().get(address.base);
-                    if (owner is StructType) {
-                        let fields = owner.fields();
-                        if (address.fieldIndex < 0 || address.fieldIndex >= fields.length()) {
-                            this.report("{block.label()}: field_addr %{address.result} names "
-                                + "field {address.fieldIndex} of {types.display(owner)}, which "
-                                + "has {fields.length()}");
-                        } else if (fields.get(address.fieldIndex).type() != address.type) {
-                            this.report("{block.label()}: field_addr %{address.result} is typed "
-                                + "{types.display(address.type)} but field "
-                                + "'{fields.get(address.fieldIndex).name()}' holds "
-                                + "{types.display(fields.get(address.fieldIndex).type())}");
-                        }
-                    } else {
-                        this.report("{block.label()}: field_addr %{address.result} reaches into "
-                            + "{types.display(owner)}, which has no fields");
-                    }
-                }
-            },
-            is EirElementAddress address -> {
-                this.checkResultType(block, address.result, address.type);
-                this.checkOperand(block, address.array);
-                this.checkOperand(block, address.index);
-                this.checkArrayOperand(block, address.array, "element_addr");
-                this.checkIntegerOperand(block, address.index, "an element index");
-                if (this.validTemp(address.array)) {
-                    let arrayType = this.function.tempTypes().get(address.array);
-                    if (arrayType is ArrayType && arrayType.element() != address.type) {
-                        this.report("{block.label()}: element_addr %{address.result} is typed "
-                            + "{types.display(address.type)} but the array holds "
-                            + "{types.display(arrayType.element())}");
-                    }
-                }
-            },
-            is EirLoadPtr load -> {
-                this.checkResultType(block, load.result, load.type);
-                this.checkOperand(block, load.address);
-                this.checkIsAddress(block, load.address, "load_ptr");
-                if (this.validTemp(load.address)
-                        && this.function.tempTypes().get(load.address) != load.type) {
-                    this.report("{block.label()}: load_ptr %{load.result} reads "
-                        + "{types.display(load.type)} through an address to "
-                        + "{types.display(this.function.tempTypes().get(load.address))}");
-                }
-            },
-            is EirStorePtr store -> {
-                this.checkOperand(block, store.address);
-                this.checkOperand(block, store.value);
-                this.checkIsAddress(block, store.address, "store_ptr");
-                this.checkNotAddress(block, store.value, "the store through %{store.address}");
-                if (this.validTemp(store.address) && this.validTemp(store.value)
-                        && this.function.tempTypes().get(store.address)
-                            != this.function.tempTypes().get(store.value)) {
-                    this.report("{block.label()}: store_ptr writes "
-                        + "{types.display(this.function.tempTypes().get(store.value))} through "
-                        + "an address to "
-                        + "{types.display(this.function.tempTypes().get(store.address))}");
-                }
-            },
-            is EirBoundsCheck check -> {
-                this.checkOperand(block, check.array);
-                this.checkOperand(block, check.index);
-                this.checkArrayOperand(block, check.array, "bounds_check");
-                this.checkIntegerOperand(block, check.index, "an element index");
-            },
-            is EirRangeCheck check -> {
-                this.checkOperand(block, check.start);
-                this.checkOperand(block, check.end);
-                this.checkOperand(block, check.length);
-                this.checkIntegerOperand(block, check.start, "a range start");
-                this.checkIntegerOperand(block, check.end, "a range end");
-                this.checkIntegerOperand(block, check.length, "a range length");
-            },
-            is EirArrayNew allocation -> {
-                this.checkResultType(block, allocation.result, allocation.type);
-                this.checkOperand(block, allocation.size);
-                this.checkIntegerOperand(block, allocation.size, "an array size");
-                if (!primitives.isArrayType(allocation.type)) {
-                    this.report("{block.label()}: array.new %{allocation.result} produces "
-                        + "{types.display(allocation.type)}, which is not an array");
-                }
-            },
-            is EirArrayLength length -> {
-                this.checkResultType(block, length.result, length.type);
-                this.checkOperand(block, length.array);
-                this.checkArrayOperand(block, length.array, "array.len");
-                this.checkLongResult(block, length.result, length.type, "array.len");
-            },
-            is EirStringConcat concat -> {
-                this.checkResultType(block, concat.result, concat.type);
-                this.checkOperand(block, concat.left);
-                this.checkOperand(block, concat.right);
-                this.checkStringOperand(block, concat.left, "str.concat");
-                this.checkStringOperand(block, concat.right, "str.concat");
-                this.checkStringResult(block, concat.result, concat.type, "str.concat");
-            },
-            is EirStringEqual equal -> {
-                this.checkResultType(block, equal.result, equal.type);
-                this.checkOperand(block, equal.left);
-                this.checkOperand(block, equal.right);
-                this.checkStringOperand(block, equal.left, "str.eq");
-                this.checkStringOperand(block, equal.right, "str.eq");
-                if (!primitives.isBoolType(equal.type)) {
-                    this.report("{block.label()}: str.eq %{equal.result} must produce bool, got "
-                        + "{types.display(equal.type)}");
-                }
-            },
-            is EirStringIndexOf search -> {
-                this.checkResultType(block, search.result, search.type);
-                this.checkOperand(block, search.haystack);
-                this.checkOperand(block, search.needle);
-                this.checkStringOperand(block, search.haystack, "str.indexof");
-                this.checkStringOperand(block, search.needle, "str.indexof");
-                this.checkLongResult(block, search.result, search.type, "str.indexof");
-            },
-            is EirStringSubstring substring -> {
-                this.checkResultType(block, substring.result, substring.type);
-                this.checkOperand(block, substring.value);
-                this.checkOperand(block, substring.start);
-                this.checkOperand(block, substring.end);
-                this.checkStringOperand(block, substring.value, "str.substr");
-                this.checkIntegerOperand(block, substring.start, "a substring start");
-                this.checkIntegerOperand(block, substring.end, "a substring end");
-                this.checkStringResult(block, substring.result, substring.type, "str.substr");
-            },
-            is EirStringLength length -> {
-                this.checkResultType(block, length.result, length.type);
-                this.checkOperand(block, length.value);
-                this.checkStringOperand(block, length.value, "str.len");
-                this.checkLongResult(block, length.result, length.type, "str.len");
-            },
-            is EirStringToBytes bytes -> {
-                this.checkResultType(block, bytes.result, bytes.type);
-                this.checkOperand(block, bytes.value);
-                this.checkStringOperand(block, bytes.value, "str.bytes");
-                if (!primitives.isArrayType(bytes.type)) {
-                    this.report("{block.label()}: str.bytes %{bytes.result} must produce an "
-                        + "array, got {types.display(bytes.type)}");
-                }
-            },
-            is EirStringFromBytes text -> {
-                this.checkResultType(block, text.result, text.type);
-                this.checkOperand(block, text.bytes);
-                this.checkArrayOperand(block, text.bytes, "bytes.str");
-                this.checkStringResult(block, text.result, text.type, "bytes.str");
-            },
-            is EirIntToString text -> {
-                this.checkResultType(block, text.result, text.type);
-                this.checkOperand(block, text.value);
-                this.checkIntegerOperand(block, text.value, "an int.str operand");
-                this.checkStringResult(block, text.result, text.type, "int.str");
-            },
-            is EirCharToString text -> {
-                this.checkResultType(block, text.result, text.type);
-                this.checkOperand(block, text.value);
-                this.checkIntegerOperand(block, text.value, "a char.str operand");
-                this.checkStringResult(block, text.result, text.type, "char.str");
-            },
-            is EirBoolToString text -> {
-                this.checkResultType(block, text.result, text.type);
-                this.checkOperand(block, text.value);
-                if (this.validTemp(text.value)
-                        && !primitives.isBoolType(this.function.tempTypes().get(text.value))) {
-                    this.report("{block.label()}: bool.str takes bool, got "
-                        + "{types.display(this.function.tempTypes().get(text.value))}");
-                }
-                this.checkStringResult(block, text.result, text.type, "bool.str");
-            },
-            is EirEnumToString text -> {
-                this.checkResultType(block, text.result, text.type);
-                this.checkOperand(block, text.value);
-                this.checkIntegerOperand(block, text.value, "an enum.str operand");
-                this.checkStringResult(block, text.result, text.type, "enum.str");
-                if (!primitives.isEnumType(text.enumType)) {
-                    this.report("{block.label()}: enum.str %{text.result} names "
-                        + "{types.display(text.enumType)}, which is not an enum");
-                }
-            },
-            is EirDoubleToString text -> {
-                this.checkResultType(block, text.result, text.type);
-                this.checkOperand(block, text.value);
-                if (this.validTemp(text.value)
-                        && !primitives.isFloatType(this.function.tempTypes().get(text.value))) {
-                    this.report("{block.label()}: double.str takes a floating-point value, got "
-                        + "{types.display(this.function.tempTypes().get(text.value))}");
-                }
-                this.checkStringResult(block, text.result, text.type, "double.str");
-            },
-            is EirJsonEscape escaped -> {
-                this.checkResultType(block, escaped.result, escaped.type);
-                this.checkOperand(block, escaped.value);
-                this.checkStringOperand(block, escaped.value, "json.escape");
-                this.checkStringResult(block, escaped.result, escaped.type, "json.escape");
-            },
-            is EirPrint printed -> {
-                this.checkOperand(block, printed.value);
-                this.checkStringOperand(block, printed.value, "print");
-            },
-            is EirPanic panicked -> {
-                this.checkOperand(block, panicked.value);
-                this.checkStringOperand(block, panicked.value, "panic");
-            },
-        }
-    }
-
-    checkIsAddress(EirBlock block, long temp, string what) {
-        if (this.validTemp(temp) && !this.addressTemp[temp]) {
-            this.report("{block.label()}: {what} takes an address but %{temp} is a value");
-        }
-    }
-
-    // The place an address names decides whether releasing through it is allowed: a borrowing
-    // slot holds a reference this function never owned, so releasing it would take away
-    // somebody else's.
-    checkNotBorrowedStorage(EirBlock block, long address) {
-        if (!this.validTemp(address) || !this.addressTemp[address]) {
-            return;
-        }
-        let named = place.placeOf(this.function, address);
-        if (named == null || named.root() != PlaceRoot.Slot) {
-            return;
-        }
-        let slot = this.function.slots().get(named.rootId());
-        if (slot.borrows() && named.steps().length() == 0) {
-            this.report("{block.label()}: releasing ${named.rootId()} '{slot.name()}', which "
-                + "borrows a reference this function does not own");
-        }
-    }
-
-    // Only a reference-typed value temp can carry the +1 retain and release move.
-    checkOwnable(EirBlock block, long temp, string what) {
-        if (!this.validTemp(temp)) {
-            return;
-        }
-        if (this.addressTemp[temp]) {
-            this.report("{block.label()}: {what} takes a value but %{temp} is an address");
-            return;
-        }
-        if (!primitives.isReferenceType(this.function.tempTypes().get(temp))) {
-            this.report("{block.label()}: {what} of %{temp}, which holds "
-                + "{types.display(this.function.tempTypes().get(temp))} and owns no reference");
-        }
-    }
-
-    checkStringOperand(EirBlock block, long temp, string what) {
-        if (this.validTemp(temp)
-                && !primitives.isStringType(this.function.tempTypes().get(temp))) {
-            this.report("{block.label()}: {what} takes a string, got "
-                + "{types.display(this.function.tempTypes().get(temp))}");
-        }
-    }
-
-    checkArrayOperand(EirBlock block, long temp, string what) {
-        if (this.validTemp(temp)
-                && !primitives.isArrayType(this.function.tempTypes().get(temp))) {
-            this.report("{block.label()}: {what} takes an array, got "
-                + "{types.display(this.function.tempTypes().get(temp))}");
-        }
-    }
-
-    checkIntegerOperand(EirBlock block, long temp, string what) {
-        if (this.validTemp(temp)
-                && !primitives.isIntegerLike(this.function.tempTypes().get(temp))) {
-            this.report("{block.label()}: {what} must be an integer, got "
-                + "{types.display(this.function.tempTypes().get(temp))}");
-        }
-    }
-
-    checkStringResult(EirBlock block, long result, Type type, string what) {
-        if (!primitives.isStringType(type)) {
-            this.report("{block.label()}: {what} %{result} must produce a string, got "
-                + "{types.display(type)}");
-        }
-    }
-
-    checkLongResult(EirBlock block, long result, Type type, string what) {
-        if (primitives.bitWidth(type) != 64 || !primitives.isIntegerType(type)) {
-            this.report("{block.label()}: {what} %{result} must produce a long, got "
-                + "{types.display(type)}");
-        }
-    }
-
-    checkTerminator(EirBlock block, EirTerminator terminator) {
-        switch (terminator) {
-            is EirReturn returned -> {
-                bool returnsVoid = types.isVoidType(this.function.returnType());
-                if (returned.value < 0) {
-                    if (!returnsVoid) {
-                        this.report("{block.label()}: ret without a value in a function "
-                            + "returning {types.display(this.function.returnType())}");
-                    }
-                } else {
-                    this.checkOperand(block, returned.value);
-                    if (returnsVoid) {
-                        this.report("{block.label()}: ret with a value in a void function");
-                    } else if (this.validTemp(returned.value)
-                            && this.function.tempTypes().get(returned.value)
-                                != this.function.returnType()) {
-                        this.report("{block.label()}: ret of type "
-                            + "{types.display(this.function.tempTypes().get(returned.value))} "
-                            + "in a function returning "
-                            + "{types.display(this.function.returnType())}");
-                    }
-                }
-            },
-            is EirJump jump -> {
-                this.checkTarget(block, jump.target);
-            },
-            is EirBranch branch -> {
-                this.checkOperand(block, branch.condition);
-                if (this.validTemp(branch.condition)
-                        && !primitives.isBoolType(this.function.tempTypes().get(branch.condition))) {
-                    this.report("{block.label()}: branch condition %{branch.condition} is "
-                        + "not bool");
-                }
-                this.checkTarget(block, branch.thenTarget);
-                this.checkTarget(block, branch.elseTarget);
-            },
-            is EirSwitch switched -> {
-                this.checkOperand(block, switched.value);
-                if (this.validTemp(switched.value)
-                        && !primitives.isIntegerLike(this.function.tempTypes().get(switched.value))) {
-                    this.report("{block.label()}: switch over non-integer "
-                        + "%{switched.value}");
-                }
-                if (switched.caseValues.length != switched.caseTargets.length) {
-                    this.report("{block.label()}: switch case values and targets differ in "
-                        + "count");
-                }
-                for (let target in switched.caseTargets) {
-                    this.checkTarget(block, target);
-                }
-                this.checkTarget(block, switched.defaultTarget);
-            },
-            is EirUnreachable ignored -> { },
-        }
-    }
-
-    checkTarget(EirBlock block, long target) {
-        if (target < 0 || target >= this.function.blocks().length()) {
-            this.report("{block.label()}: terminator names missing block b{target}");
-        }
-    }
-
-    validTemp(long temp) -> bool {
-        return temp >= 0 && temp < this.tempCount;
-    }
-
-    checkOperand(EirBlock block, long temp) {
-        if (!this.validTemp(temp)) {
-            this.report("{block.label()}: use of invalid temp %{temp}");
-        }
-    }
-
-    checkResultType(EirBlock block, long result, Type type) {
-        if (!this.validTemp(result)) {
-            this.report("{block.label()}: definition of invalid temp %{result}");
-            return;
-        }
-        if (this.function.tempTypes().get(result) != type) {
-            this.report("{block.label()}: %{result} is recorded as "
-                + "{types.display(this.function.tempTypes().get(result))} but its "
-                + "instruction produces {types.display(type)}");
-        }
-    }
-
-    // Def-before-use over the flow graph: a forward dataflow computes, to a fixpoint, the temps
-    // definitely defined at each block entry (the intersection over predecessors), then every
-    // use must be covered by that set or by an earlier definition in its own block.
-    checkDefiniteDefinition() {
-        let blocks = this.function.blocks();
-        long blockCount = blocks.length();
-        if (blockCount == 0) {
-            return;
-        }
-        bool[][] definedAtEntry = new bool[blockCount][this.tempCount + 1];
-        bool[] reached = new bool[blockCount];
-        for (long i = 0; i < this.function.entryTempCount(); i++) {
-            definedAtEntry[0][i] = true;
-        }
-        reached[0] = true;
-        bool changed = true;
-        while (changed) {
-            changed = false;
-            for (long b = 0; b < blockCount; b++) {
-                if (!reached[b]) {
-                    continue;
-                }
-                bool[] defined = new bool[this.tempCount + 1];
-                for (long i = 0; i < this.tempCount; i++) {
-                    defined[i] = definedAtEntry[b][i];
-                }
-                let instructions = blocks.get(b).instructions();
-                for (long i = 0; i < instructions.length(); i++) {
-                    long result = walk.resultOf(instructions.get(i));
-                    if (result >= 0 && result < this.tempCount) {
-                        defined[result] = true;
-                    }
-                }
-                for (let successor in walk.successorsOf(blocks.get(b))) {
-                    if (successor < 0 || successor >= blockCount) {
-                        continue;
-                    }
-                    if (!reached[successor]) {
-                        reached[successor] = true;
-                        for (long i = 0; i < this.tempCount; i++) {
-                            definedAtEntry[successor][i] = defined[i];
-                        }
-                        changed = true;
-                        continue;
-                    }
-                    for (long i = 0; i < this.tempCount; i++) {
-                        if (definedAtEntry[successor][i] && !defined[i]) {
-                            definedAtEntry[successor][i] = false;
-                            changed = true;
-                        }
-                    }
-                }
-            }
-        }
-        for (long b = 0; b < blockCount; b++) {
-            if (!reached[b]) {
-                continue;
-            }
-            let block = blocks.get(b);
-            bool[] defined = new bool[this.tempCount + 1];
-            for (long i = 0; i < this.tempCount; i++) {
-                defined[i] = definedAtEntry[b][i];
-            }
-            let instructions = block.instructions();
-            for (long i = 0; i < instructions.length(); i++) {
-                let instruction = instructions.get(i);
-                for (let used in walk.usesOf(instruction)) {
-                    if (this.validTemp(used) && !defined[used]) {
-                        this.report("{block.label()}: %{used} is used before it is "
-                            + "definitely defined");
-                    }
-                }
-                long result = walk.resultOf(instruction);
-                if (result >= 0 && result < this.tempCount) {
-                    defined[result] = true;
-                }
-            }
-            let terminator = block.terminator();
-            if (terminator != null) {
-                for (let used in walk.terminatorUsesOf(terminator)) {
-                    if (this.validTemp(used) && !defined[used]) {
-                        this.report("{block.label()}: %{used} is used before it is "
-                            + "definitely defined");
-                    }
-                }
-            }
-        }
+// The switch has no default arm, so a new instruction kind cannot be added without saying what
+// verifies it.
+checkInstruction(VerificationContext verification, EirBlock block, EirInstruction instruction) {
+    switch (instruction) {
+        is EirConstInt constant -> {
+            verifyvalues.checkConstInt(verification, block, constant);
+        },
+        is EirConstFloat constant -> {
+            verifyvalues.checkConstFloat(verification, block, constant);
+        },
+        is EirConstBool constant -> {
+            verifyvalues.checkConstBool(verification, block, constant);
+        },
+        is EirBinary binary -> {
+            verifyvalues.checkBinary(verification, block, binary);
+        },
+        is EirUnary unary -> {
+            verifyvalues.checkUnary(verification, block, unary);
+        },
+        is EirCast cast -> {
+            verifyvalues.checkCast(verification, block, cast);
+        },
+        is EirLoadSlot load -> {
+            verifymemory.checkLoadSlot(verification, block, load);
+        },
+        is EirStoreSlot store -> {
+            verifymemory.checkStoreSlot(verification, block, store);
+        },
+        is EirCall call -> {
+            verifycalls.checkCall(verification, block, call);
+        },
+        is EirConstString constant -> {
+            verifyvalues.checkConstString(verification, block, constant);
+        },
+        is EirRetain retain -> {
+            verifymemory.checkRetain(verification, block, retain);
+        },
+        is EirRelease release -> {
+            verifymemory.checkRelease(verification, block, release);
+        },
+        is EirRetainPtr retain -> {
+            verifymemory.checkRetainPtr(verification, block, retain);
+        },
+        is EirReleasePtr release -> {
+            verifymemory.checkReleasePtr(verification, block, release);
+        },
+        is EirSlotAddress address -> {
+            verifymemory.checkSlotAddress(verification, block, address);
+        },
+        is EirFieldAddress address -> {
+            verifymemory.checkFieldAddress(verification, block, address);
+        },
+        is EirElementAddress address -> {
+            verifyarrays.checkElementAddress(verification, block, address);
+        },
+        is EirLoadPtr load -> {
+            verifymemory.checkLoadPtr(verification, block, load);
+        },
+        is EirStorePtr store -> {
+            verifymemory.checkStorePtr(verification, block, store);
+        },
+        is EirBoundsCheck check -> {
+            verifyarrays.checkBoundsCheck(verification, block, check);
+        },
+        is EirRangeCheck check -> {
+            verifyarrays.checkRangeCheck(verification, block, check);
+        },
+        is EirArrayNew allocation -> {
+            verifyarrays.checkArrayNew(verification, block, allocation);
+        },
+        is EirArrayLength length -> {
+            verifyarrays.checkArrayLength(verification, block, length);
+        },
+        is EirStringConcat concat -> {
+            verifystrings.checkStringConcat(verification, block, concat);
+        },
+        is EirStringEqual equal -> {
+            verifystrings.checkStringEqual(verification, block, equal);
+        },
+        is EirStringIndexOf search -> {
+            verifystrings.checkStringIndexOf(verification, block, search);
+        },
+        is EirStringSubstring substring -> {
+            verifystrings.checkStringSubstring(verification, block, substring);
+        },
+        is EirStringLength length -> {
+            verifystrings.checkStringLength(verification, block, length);
+        },
+        is EirStringToBytes bytes -> {
+            verifystrings.checkStringToBytes(verification, block, bytes);
+        },
+        is EirStringFromBytes text -> {
+            verifystrings.checkStringFromBytes(verification, block, text);
+        },
+        is EirIntToString text -> {
+            verifystrings.checkIntToString(verification, block, text);
+        },
+        is EirCharToString text -> {
+            verifystrings.checkCharToString(verification, block, text);
+        },
+        is EirBoolToString text -> {
+            verifystrings.checkBoolToString(verification, block, text);
+        },
+        is EirEnumToString text -> {
+            verifystrings.checkEnumToString(verification, block, text);
+        },
+        is EirDoubleToString text -> {
+            verifystrings.checkDoubleToString(verification, block, text);
+        },
+        is EirJsonEscape escaped -> {
+            verifystrings.checkJsonEscape(verification, block, escaped);
+        },
+        is EirPrint printed -> {
+            verifystrings.checkPrint(verification, block, printed);
+        },
+        is EirPanic panicked -> {
+            verifystrings.checkPanic(verification, block, panicked);
+        },
     }
 }
