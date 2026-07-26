@@ -158,3 +158,7 @@ bool isLiteral(SyntaxKind k);
 std::string_view kindName(SyntaxKind k);
 
 SyntaxKind keywordKindFromText(std::u16string_view text);
+
+// The binary operator a compound-assignment token stands for (`+=` gives `+`), or
+// Invalid when the token is not a compound assignment.
+SyntaxKind compoundAssignmentOperator(SyntaxKind k);

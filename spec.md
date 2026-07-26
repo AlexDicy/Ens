@@ -822,7 +822,7 @@ limit = 11;             // error: cannot assign to constant 'limit'
 A **compound assignment** folds an operator into the store: `a += b` means `a = a + b`, and the same holds for `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, and `>>=`.
 The target is evaluated once, so in `xs[next()] += 1` the index `next()` runs a single time and serves both the read and the write.
 Each form applies wherever its operator does: the arithmetic ones (`+= -= *= /= %=`) to numeric targets, the bitwise and shift ones (`&= |= ^= <<= >>=`) to integer targets, and `+=` also to a string, where it appends the right side just as `+` concatenates.
-The right side converts to the target the same way a plain assignment does, so a wider target takes a narrower value without a cast.
+The two sides combine under the operator's own rules, and the operator's result must be assignable to the target, so a wider target takes a narrower value without a cast while a narrower target needs an explicit `as`.
 
 ```ens
 int n = 10;
@@ -831,9 +831,11 @@ n <<= 1;                // 30
 
 long total = 0;
 total += n;             // int widens to long, then adds
+n += total;             // error: 'int' and 'long' produce 'long'
 
 string greeting = "Hello";
 greeting += ", world";  // "Hello, world"
+greeting += 2;          // "Hello, world2": '+=' appends whatever '+' concatenates
 ```
 
 `while` repeats its body while the condition holds. A `for` loop comes in two forms. The C-style form has an initializer, a condition, and an update, any of which may be omitted; the initializer is scoped to the loop. The for-each form walks an array element by element, or any iterable object value by value.

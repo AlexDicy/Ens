@@ -2441,10 +2441,9 @@ struct CodeGenerator::Impl {
             if (relR) builder->CreateCall(getOrDefineEnsRelease(), { Rs });
             return result;
         }
-        // Arithmetic and bit/shift operators require numeric (integer for the
-        // bitwise and shift forms) operands. The analyzer enforces this for a
-        // binary expression, but a compound assignment's looser check can route
-        // e.g. 's -= s' here, so reject it cleanly instead of emitting bad IR.
+        // The analyzer rejects a non-numeric operand for these operators, in a binary
+        // expression and in a compound assignment alike; this guard only catches a hole
+        // there, so it never emits bad IR.
         switch (op) {
             case SyntaxKind::Plus:
             case SyntaxKind::Minus:
@@ -2452,8 +2451,8 @@ struct CodeGenerator::Impl {
             case SyntaxKind::Slash:
             case SyntaxKind::Percent:
                 if (!opType || !opType->isNumeric()) {
-                    error(offset, "This operator needs numbers on both sides, got '" +
-                          (leftType ? leftType->toString() : "?") + "'.");
+                    error(offset, "Internal: arithmetic on non-numeric operand type '" +
+                          (leftType ? leftType->toString() : "?") + "'");
                     return nullptr;
                 }
                 break;
@@ -2464,8 +2463,8 @@ struct CodeGenerator::Impl {
             case SyntaxKind::GtGt:
             case SyntaxKind::GtGtGt:
                 if (!opType || !opType->isInteger()) {
-                    error(offset, "This operator needs matching integer operands, got '" +
-                          (leftType ? leftType->toString() : "?") + "'.");
+                    error(offset, "Internal: bitwise operation on non-integer operand type '" +
+                          (leftType ? leftType->toString() : "?") + "'");
                     return nullptr;
                 }
                 break;
@@ -7322,30 +7321,12 @@ struct CodeGenerator::Impl {
         return &objType->structInfo->fields[static_cast<size_t>(idx)];
     }
 
-    // The binary operator a compound-assignment token stands for, or Invalid.
-    static SyntaxKind compoundBinaryOperator(SyntaxKind k) {
-        switch (k) {
-            case SyntaxKind::PlusEq:    return SyntaxKind::Plus;
-            case SyntaxKind::MinusEq:   return SyntaxKind::Minus;
-            case SyntaxKind::StarEq:    return SyntaxKind::Star;
-            case SyntaxKind::SlashEq:   return SyntaxKind::Slash;
-            case SyntaxKind::PercentEq: return SyntaxKind::Percent;
-            case SyntaxKind::AmpEq:     return SyntaxKind::Amp;
-            case SyntaxKind::PipeEq:    return SyntaxKind::Pipe;
-            case SyntaxKind::CaretEq:   return SyntaxKind::Caret;
-            case SyntaxKind::LtLtEq:    return SyntaxKind::LtLt;
-            case SyntaxKind::GtGtEq:    return SyntaxKind::GtGt;
-            case SyntaxKind::GtGtGtEq:  return SyntaxKind::GtGtGt;
-            default:                    return SyntaxKind::Invalid;
-        }
-    }
-
     // 'target OP= rhs' lowers to loading the target once, computing 'value OP rhs'
     // with the same semantics as the plain binary operator, and storing the
     // result back to that same location.
     llvm::Value* emitCompoundAssign(const ast::AssignExpression& e, SyntaxKind opKind,
                                     uint32_t offset) {
-        SyntaxKind binOp = compoundBinaryOperator(opKind);
+        SyntaxKind binOp = compoundAssignmentOperator(opKind);
         auto target = e.target();
         auto value = e.value();
         if (!target || !value) return nullptr;

@@ -328,6 +328,16 @@ private:
     Type* analyzeThis(const ast::ThisExpression& expr);
     Type* analyzeSuper(const ast::SuperExpression& expr);
     Type* analyzeBinary(const ast::BinaryExpression& expr);
+    // The result type of `left OP right` under the operator's own rules, reporting the
+    // operator's diagnostics. Shared by a binary expression and by a compound
+    // assignment, whose target and value are the operator's two operands.
+    Type* analyzeBinaryOperands(const SyntaxNode& diagNode, SyntaxKind op,
+                                const std::string& opText, const ast::Expression& left,
+                                const ast::Expression& right, Type* l, Type* r);
+    // The type `target OP= value` stores, i.e. the result of the operator the compound
+    // token stands for. Error when the operator itself rejects the operands.
+    Type* compoundAssignResultType(const ast::AssignExpression& expr, SyntaxKind opKind,
+                                   Type* targetT, Type* valueT);
     Type* analyzePrefix(const ast::PrefixExpression& expr);
     Type* analyzePostfix(const ast::PostfixExpression& expr);
     // Shared checks for prefix and postfix `++`/`--`: the operand must be an

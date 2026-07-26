@@ -343,3 +343,20 @@ SyntaxKind keywordKindFromText(std::u16string_view text) {
     }
     return SyntaxKind::Identifier;
 }
+
+SyntaxKind compoundAssignmentOperator(SyntaxKind k) {
+    switch (k) {
+        case SyntaxKind::PlusEq:    return SyntaxKind::Plus;
+        case SyntaxKind::MinusEq:   return SyntaxKind::Minus;
+        case SyntaxKind::StarEq:    return SyntaxKind::Star;
+        case SyntaxKind::SlashEq:   return SyntaxKind::Slash;
+        case SyntaxKind::PercentEq: return SyntaxKind::Percent;
+        case SyntaxKind::AmpEq:     return SyntaxKind::Amp;
+        case SyntaxKind::PipeEq:    return SyntaxKind::Pipe;
+        case SyntaxKind::CaretEq:   return SyntaxKind::Caret;
+        case SyntaxKind::LtLtEq:    return SyntaxKind::LtLt;
+        case SyntaxKind::GtGtEq:    return SyntaxKind::GtGt;
+        case SyntaxKind::GtGtGtEq:  return SyntaxKind::GtGtGt;
+        default:                    return SyntaxKind::Invalid;
+    }
+}

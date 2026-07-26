@@ -4773,14 +4773,19 @@ Type* Analyzer::analyzeBinary(const ast::BinaryExpression& expr) {
     Type* l = analyzeExpr(*left);
     Type* r = analyzeExpr(*right);
     if (l->isError() || r->isError()) return typeCtx.getError();
+    return analyzeBinaryOperands(expr.node, op, opText, *left, *right, l, r);
+}
 
+Type* Analyzer::analyzeBinaryOperands(const SyntaxNode& diagNode, SyntaxKind op,
+                                      const std::string& opText, const ast::Expression& left,
+                                      const ast::Expression& right, Type* l, Type* r) {
     // Adapt polymorphic integer literals to the other operand's type when one
     // side is a non-literal concrete numeric type. Re-read after adaptation.
     auto tryAdaptOperands = [&]() {
-        tryAdaptIntegerLiteral(*left, r);
-        tryAdaptIntegerLiteral(*right, l);
-        Type* lu = analysis.typeOf(left->node.greenNode());
-        Type* ru = analysis.typeOf(right->node.greenNode());
+        tryAdaptIntegerLiteral(left, r);
+        tryAdaptIntegerLiteral(right, l);
+        Type* lu = analysis.typeOf(left.node.greenNode());
+        Type* ru = analysis.typeOf(right.node.greenNode());
         if (lu) l = lu;
         if (ru) r = ru;
     };
@@ -4801,19 +4806,19 @@ Type* Analyzer::analyzeBinary(const ast::BinaryExpression& expr) {
                     return typeCtx.getPrimitive(TypeKind::String);
                 }
                 Type* other = l->isString() ? r : l;
-                errorAtNode(expr.node, "Cannot concatenate a value of type '" + other->toString() +
+                errorAtNode(diagNode, "Cannot concatenate a value of type '" + other->toString() +
                     "' onto a string; only string, integer, and bool values are supported.");
                 return typeCtx.getError();
             }
             if (!l->isNumeric() || !r->isNumeric()) {
-                errorAtNode(expr.node, "'" + opText + "' needs numbers on both sides, got '" +
+                errorAtNode(diagNode, "'" + opText + "' needs numbers on both sides, got '" +
                     l->toString() + "' and '" + r->toString() + "'.");
                 return typeCtx.getError();
             }
             tryAdaptOperands();
             Type* common = numericCommonType(l, r);
             if (!common) {
-                errorAtNode(expr.node, "'" + opText + "' needs the same numeric type on both "
+                errorAtNode(diagNode, "'" + opText + "' needs the same numeric type on both "
                     "sides, got '" + l->toString() + "' and '" + r->toString() +
                     "'; convert one side with 'as'.");
                 return typeCtx.getError();
@@ -4827,14 +4832,14 @@ Type* Analyzer::analyzeBinary(const ast::BinaryExpression& expr) {
             // A comparison against `null` is a presence test on the declared
             // storage type, so it stays legal on a binding declared optional
             // even where narrowing already proved the value non-null.
-            if (r->isNull())      l = presenceOperandType(*left, l);
-            else if (l->isNull()) r = presenceOperandType(*right, r);
+            if (r->isNull())      l = presenceOperandType(left, l);
+            else if (l->isNull()) r = presenceOperandType(right, r);
             if (!l->assignableFrom(r) && !r->assignableFrom(l)) {
-                errorAtNode(expr.node, "Cannot compare '" + l->toString() + "' and '" + r->toString() + "'");
+                errorAtNode(diagNode, "Cannot compare '" + l->toString() + "' and '" + r->toString() + "'");
             } else if (l->isStruct() && r->isStruct() && l->structInfo && l->equals(r)) {
                 // Same-type struct '==' lowers to a memberwise compare; a field
                 // whose type has no '==' of its own makes the whole compare an error.
-                checkStructEquatable(l, expr.node);
+                checkStructEquatable(l, diagNode);
             }
             return typeCtx.getPrimitive(TypeKind::Bool);
         }
@@ -4844,13 +4849,13 @@ Type* Analyzer::analyzeBinary(const ast::BinaryExpression& expr) {
         case SyntaxKind::LtEq:
         case SyntaxKind::GtEq: {
             if (!l->isNumeric() || !r->isNumeric()) {
-                errorAtNode(expr.node, "'" + opText + "' compares numbers, got '" +
+                errorAtNode(diagNode, "'" + opText + "' compares numbers, got '" +
                     l->toString() + "' and '" + r->toString() + "'.");
                 return typeCtx.getPrimitive(TypeKind::Bool);
             }
             tryAdaptOperands();
             if (!numericCommonType(l, r)) {
-                errorAtNode(expr.node, "'" + opText + "' needs the same numeric type on both "
+                errorAtNode(diagNode, "'" + opText + "' needs the same numeric type on both "
                     "sides, got '" + l->toString() + "' and '" + r->toString() +
                     "'; convert one side with 'as'.");
             }
@@ -4864,15 +4869,26 @@ Type* Analyzer::analyzeBinary(const ast::BinaryExpression& expr) {
         case SyntaxKind::GtGt:
         case SyntaxKind::GtGtGt:
             if (!l->isInteger() || !r->isInteger() || !l->equals(r)) {
-                errorAtNode(expr.node, "Bitwise operator requires matching integer operands, got '" +
-                    l->toString() + "' and '" + r->toString() + "'");
+                errorAtNode(diagNode, "'" + opText + "' needs the same integer type on both "
+                    "sides, got '" + l->toString() + "' and '" + r->toString() + "'.");
             }
             return l;
 
         default:
-            errorAtNode(expr.node, "Unsupported binary operator");
+            errorAtNode(diagNode, "Unsupported binary operator");
             return typeCtx.getError();
     }
+}
+
+Type* Analyzer::compoundAssignResultType(const ast::AssignExpression& expr, SyntaxKind opKind,
+                                         Type* targetT, Type* valueT) {
+    SyntaxKind binOp = compoundAssignmentOperator(opKind);
+    auto target = expr.target();
+    auto value = expr.value();
+    if (binOp == SyntaxKind::Invalid || !target || !value) return typeCtx.getError();
+    auto opTok = expr.operatorToken();
+    std::string opText = opTok ? asciiOf(opTok->tokenText()) : "";
+    return analyzeBinaryOperands(expr.node, binOp, opText, *target, *value, targetT, valueT);
 }
 
 Type* Analyzer::analyzePrefix(const ast::PrefixExpression& expr) {
@@ -6632,9 +6648,23 @@ Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
     Type* valueT = analyzeExprAdapt(*value, assignTargetT);
 
     if (!assignTargetT->isError() && !valueT->isError()) {
-        if (!assignTargetT->assignableFrom(valueT)) {
-            errorAtNode(expr.node, "Cannot assign '" + valueT->toString() +
-                "' to '" + assignTargetT->toString() + "'");
+        if (simpleAssign) {
+            if (!assignTargetT->assignableFrom(valueT)) {
+                errorAtNode(expr.node, "Cannot assign '" + valueT->toString() +
+                    "' to '" + assignTargetT->toString() + "'");
+            }
+        } else if (!targetT->isError()) {
+            // `a OP= b` means `a = a OP b`, so the right side is the operator's
+            // operand and it is the operator's RESULT that has to fit the target.
+            Type* resultT = compoundAssignResultType(expr, opTok->kind(), targetT, valueT);
+            if (!resultT->isError() && !assignTargetT->assignableFrom(resultT)) {
+                std::string opText = asciiOf(opTok->tokenText());
+                errorAtNode(expr.node, "Cannot store the result of '" + opText + "' back into '" +
+                    assignTargetT->toString() + "': '" + targetT->toString() + "' and '" +
+                    valueT->toString() + "' produce '" + resultT->toString() +
+                    "'. Convert the right side with 'as', or declare the target as '" +
+                    resultT->toString() + "'.");
+            }
         }
     }
     // The store lands in the declared slot: retype the target so codegen
