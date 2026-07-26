@@ -922,7 +922,8 @@ task("test")
 
             local function git(dir, ...)
                 os.iorunv("git", table.join({"-c", "user.name=ens", "-c",
-                    "user.email=ens@test"}, {...}), {curdir = dir})
+                    "user.email=ens@test", "-c", "commit.gpgsign=false", "-c",
+                    "tag.gpgsign=false"}, {...}), {curdir = dir})
             end
 
             local function make_repo(dir)
@@ -1346,7 +1347,8 @@ task("test")
             -- fetched package, flattened per platform
             local function git(dir, ...)
                 os.iorunv("git", table.join({"-c", "user.name=ens", "-c",
-                    "user.email=ens@test"}, {...}), {curdir = dir})
+                    "user.email=ens@test", "-c", "commit.gpgsign=false", "-c",
+                    "tag.gpgsign=false"}, {...}), {curdir = dir})
             end
             local dep_dir = path.join(scratch, "repos", "dep")
             os.mkdir(dep_dir)
