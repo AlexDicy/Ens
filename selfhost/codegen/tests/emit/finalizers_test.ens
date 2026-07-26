@@ -1,0 +1,90 @@
+// Tests for the element destructors an array carries. A leaked element changes no exit code and no
+// output, so these are structural: each one builds the array allocation emission builds, then reads
+// the module's own IR back to assert which finalizer the header was given and what the destructor
+// it names does. They prove the shape of what is emitted, not that nothing leaks at run time.
+import @std.testing;
+import Type from @ens.sema.model.types;
+import PrimitiveKind from @ens.sema.model.types;
+import @ens.llvm.globals;
+import EmissionHost from support;
+import support;
+
+// The array allocation emission builds, with the finalizer the element type decides.
+allocateArray(EmissionHost host, Type elementType, long elementBytes) {
+    host.runtime.call(host.runtime.arrayAllocate(), [host.runtime.int64(3),
+        host.runtime.int64(elementBytes), host.finalizers.arrayFinalizer(elementType),
+        host.runtime.stringLiteral("array size cannot be negative".toBytes())], "");
+}
+
+test "an array of strings carries a destructor that releases every element" {
+    let store = try support.freshStore();
+    let host = new EmissionHost("finalizer_strings");
+    allocateArray(host, store.stringType(), 8);
+    string text = host.text();
+    try testing.assertTrue(
+        text.indexOf("@ens_array_alloc(i64 3, i64 8, ptr @_dtor_string_array") >= 0,
+        "the allocation did not pass the element destructor: {text}");
+    try testing.assertTrue(text.indexOf("define internal void @_dtor_string_array(ptr") >= 0,
+        "the element destructor was never defined: {text}");
+    try testing.assertTrue(text.indexOf("call void @ens_release") >= 0,
+        "the element destructor releases nothing: {text}");
+    try host.finish();
+}
+
+test "an array of ints passes a null finalizer and defines no destructor" {
+    let store = try support.freshStore();
+    let host = new EmissionHost("finalizer_ints");
+    allocateArray(host, store.primitive(PrimitiveKind.Int), 4);
+    string text = host.text();
+    try testing.assertTrue(text.indexOf("@ens_array_alloc(i64 3, i64 4, ptr null") >= 0,
+        "the allocation did not pass a null finalizer: {text}");
+    try testing.assertTrue(globals.getNamedFunction(host.module, "_dtor_int_array") == null,
+        "an array of ints got a destructor it does not need");
+    try host.finish();
+}
+
+test "an array of arrays gets the destructor for its row type" {
+    let store = try support.freshStore();
+    let host = new EmissionHost("finalizer_rows");
+    let rowType = store.arrayOf(store.primitive(PrimitiveKind.Int));
+    allocateArray(host, rowType, 8);
+    string text = host.text();
+    try testing.assertTrue(
+        text.indexOf("@ens_array_alloc(i64 3, i64 8, ptr @_dtor_int_arr_array") >= 0,
+        "the allocation did not pass the row destructor: {text}");
+    try testing.assertTrue(text.indexOf("define internal void @_dtor_int_arr_array(ptr") >= 0,
+        "the row destructor was never defined: {text}");
+    try host.finish();
+}
+
+test "an array of structs releases the reference fields each element holds" {
+    let analysis = try support.analyzeMain(
+        "struct Label \{\n"
+        + "    string text;\n"
+        + "    int width;\n"
+        + "\}\n"
+        + "main() \{\}\n");
+    let host = new EmissionHost("finalizer_structs");
+    let elementType = try support.structNamed(analysis, "Label");
+    allocateArray(host, elementType, 16);
+    string text = host.text();
+    try testing.assertTrue(text.indexOf("define internal void @_dtor_Label_array(ptr") >= 0,
+        "the struct element destructor was never defined: {text}");
+    try testing.assertTrue(text.indexOf("%Label, ptr %element, i32 0, i32 0") >= 0,
+        "the destructor did not reach the struct's string field: {text}");
+    try testing.assertTrue(text.indexOf("%Label, ptr %element, i32 0, i32 1") < 0,
+        "the destructor walked a field that owns nothing: {text}");
+    try host.finish();
+}
+
+test "one element type is given one destructor" {
+    let store = try support.freshStore();
+    let host = new EmissionHost("finalizer_cache");
+    let first = host.finalizers.arrayFinalizer(store.stringType());
+    let second = host.finalizers.arrayFinalizer(store.stringType());
+    try testing.assertTrue(first == second, "the second request redefined the destructor");
+    allocateArray(host, store.stringType(), 8);
+    try testing.assertTrue(globals.getNamedFunction(host.module, "_dtor_string_array.1") == null,
+        "the destructor was defined a second time");
+    try host.finish();
+}

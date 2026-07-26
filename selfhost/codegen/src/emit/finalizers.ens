@@ -1,0 +1,94 @@
+// The finalizers an object stores in its header. ens_release runs one when the strong count
+// reaches zero, hands it the object's payload pointer, and frees the allocation afterwards, so a
+// finalizer releases only what the object owns and never touches the object itself.
+//
+// An array of elements that own nothing carries a null finalizer; an array whose elements hold
+// references carries a function that walks the payload and releases each element. The functions
+// are internal to the module and defined once per element type, so an array type used many times
+// costs one of them.
+import Type from @ens.sema.model.types;
+import StructType from @ens.sema.model.types;
+import Value from @ens.llvm.values;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import Runtime from emit.runtime;
+import RuntimeFunction from emit.runtime;
+import TypeMapper from emit.types;
+import lower.symbols;
+import support.primitives;
+
+public final class Finalizers {
+    Runtime runtime;
+    TypeMapper mapper;
+
+    public constructor(this.runtime, this.mapper);
+
+    // The finalizer pointer an array of this element type stores in its header.
+    public arrayFinalizer(Type elementType) -> Value {
+        if (!primitives.hasArcContent(elementType)) {
+            return this.runtime.nullPointer();
+        }
+        return this.arrayDestructor(elementType).function;
+    }
+
+    // void _dtor_<element>_array(ptr array): releases every element the array's payload holds.
+    arrayDestructor(Type elementType) -> RuntimeFunction {
+        let type = this.runtime.voidType.functionType([this.runtime.pointerType]);
+        string name = "_dtor_" + symbols.mangleTypeForName(elementType) + "_array";
+        let known = this.runtime.existing(name, type);
+        if (known != null) {
+            return known;
+        }
+        let builder = this.runtime.builder;
+        let definition = this.runtime.beginDefinition(name, type);
+        let array = this.runtime.parameter(definition, 0);
+        let testBlock = this.runtime.block(definition, "dtor.test");
+        let bodyBlock = this.runtime.block(definition, "dtor.body");
+        let doneBlock = this.runtime.block(definition, "dtor.done");
+        let indexSlot = memory.buildAlloca(builder, this.runtime.int64Type, "index");
+        let length = this.runtime.payloadLength(array);
+        let data = this.runtime.payloadData(array);
+        memory.buildStore(builder, this.runtime.int64(0), indexSlot);
+        instructions.buildBr(builder, testBlock);
+
+        builder.positionAtEnd(testBlock);
+        let index = memory.buildLoad(builder, this.runtime.int64Type, indexSlot, "index");
+        let more = instructions.buildICmpSLT(builder, index, length, "");
+        instructions.buildCondBr(builder, more, bodyBlock, doneBlock);
+
+        builder.positionAtEnd(bodyBlock);
+        let element = memory.buildGEP(builder, this.mapper.map(elementType), data, [index],
+            "element");
+        this.releaseAt(element, elementType);
+        memory.buildStore(builder, instructions.buildAdd(builder, index, this.runtime.int64(1),
+            ""), indexSlot);
+        instructions.buildBr(builder, testBlock);
+
+        builder.positionAtEnd(doneBlock);
+        instructions.buildRetVoid(builder);
+        return this.runtime.endDefinition(definition);
+    }
+
+    // Releases what the storage at an address owns: a reference directly, a struct field by field.
+    releaseAt(Value address, Type type) {
+        let builder = this.runtime.builder;
+        if (primitives.isReferenceType(type)) {
+            let held = memory.buildLoad(builder, this.runtime.pointerType, address, "");
+            this.runtime.call(this.runtime.release(), [held], "");
+            return;
+        }
+        if (!(type is StructType)) {
+            return;
+        }
+        let structType = this.mapper.map(type);
+        let fields = type.fields();
+        for (long i = 0; i < fields.length(); i++) {
+            let field = fields.get(i);
+            if (!primitives.hasArcContent(field.type())) {
+                continue;
+            }
+            let fieldAddress = memory.buildStructGEP(builder, structType, address, i as uint, "");
+            this.releaseAt(fieldAddress, field.type());
+        }
+    }
+}
