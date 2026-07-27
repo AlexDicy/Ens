@@ -1,0 +1,148 @@
+// The state emission threads through its area modules. A ModuleEmitter belongs to one Ens module:
+// it owns the LLVM context, module and builder, the runtime primitives, the type mapping and the
+// element finalizers, and it remembers the value and callable type of every function the module
+// declares. An EmissionFrame belongs to one function inside it: the LLVM value each temp holds,
+// the alloca each slot lives in, and the basic block each EIR block became.
+//
+// Neither one decides anything - the shape was fixed by lowering - so the areas read this state,
+// build instructions from it, and record what they produced.
+import EirFunction from eir.model;
+import Type from @ens.sema.model.types;
+import Context from @ens.llvm.core;
+import Module from @ens.llvm.core;
+import Builder from @ens.llvm.core;
+import @ens.llvm.core;
+import TypeRef from @ens.llvm.types;
+import Value from @ens.llvm.values;
+import BasicBlock from @ens.llvm.blocks;
+import TargetData from @ens.llvm.target;
+import Runtime from emit.runtime;
+import TypeMapper from emit.types;
+import Finalizers from emit.finalizers;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+
+public final class ModuleEmitter {
+    string moduleName;
+
+    public Context context;
+    public Module module;
+    public Builder builder;
+
+    public Runtime runtime;
+    TypeMapper mapper;
+    public Finalizers finalizers;
+
+    Map<string, Value> functionValues;
+    Map<string, TypeRef> functionTypes;
+    TargetData? moduleLayout;
+
+    public constructor(string moduleName) {
+        this.moduleName = moduleName;
+        this.context = core.createContext();
+        this.module = this.context.createModule(moduleName);
+        this.builder = this.context.createBuilder();
+        this.runtime = new Runtime(this.context, this.module, this.builder);
+        this.mapper = new TypeMapper(this.context);
+        this.finalizers = new Finalizers(this.runtime, this.mapper);
+        this.functionValues = new Map<string, Value>();
+        this.functionTypes = new Map<string, TypeRef>();
+        this.moduleLayout = null;
+    }
+
+    public name() -> string {
+        return this.moduleName;
+    }
+
+    public mapType(Type type) -> TypeRef {
+        return this.mapper.map(type);
+    }
+
+    // A constant diagnostic message, as the string object the runtime guards expect.
+    public message(string text) -> Value {
+        return this.runtime.stringLiteral(text.toBytes());
+    }
+
+    // Records a function this module defines or declares, with the type a call to it needs.
+    public defineFunction(string symbol, Value function, TypeRef type) {
+        this.functionValues.set(symbol, function);
+        this.functionTypes.set(symbol, type);
+    }
+
+    public functionValue(string symbol) -> Value? {
+        return this.functionValues.get(symbol);
+    }
+
+    public calleeType(string symbol) -> TypeRef {
+        let found = this.functionTypes.get(symbol);
+        if (found == null) {
+            panic("Internal: no function type recorded for '{symbol}'");
+        }
+        return found;
+    }
+
+    public rememberDataLayout(TargetData layout) {
+        this.moduleLayout = layout;
+    }
+
+    public dataLayout() -> TargetData {
+        let layout = this.moduleLayout;
+        if (layout == null) {
+            panic("Internal: the module's data layout was not recorded before emission");
+        }
+        return layout;
+    }
+
+    public dispose() {
+        this.builder.dispose();
+        this.context.dispose();
+    }
+}
+
+public final class EmissionFrame {
+    EirFunction emittedFunction;
+    Value?[] tempValues;
+    Value?[] slotStorage;
+    List<BasicBlock> basicBlocks;
+
+    public constructor(EirFunction function, List<BasicBlock> blocks) {
+        this.emittedFunction = function;
+        this.tempValues = new Value?[function.tempTypes().length()];
+        this.slotStorage = new Value?[function.slots().length()];
+        this.basicBlocks = blocks;
+    }
+
+    public symbol() -> string {
+        return this.emittedFunction.symbol();
+    }
+
+    public tempType(long temp) -> Type {
+        return this.emittedFunction.tempTypes().get(temp);
+    }
+
+    // Emission runs after the verifier proved def-before-use, so a missing temp is a bug.
+    public value(long temp) -> Value {
+        let held = this.tempValues[temp];
+        if (held == null) {
+            panic("Internal: temp %{temp} was used before it was emitted");
+        }
+        return held;
+    }
+
+    public define(long temp, Value produced) {
+        this.tempValues[temp] = produced;
+    }
+
+    // The alloca a slot lives in, or null when the function never allocated one.
+    public slotAt(long slot) -> Value? {
+        return this.slotStorage[slot];
+    }
+
+    public defineSlot(long slot, Value storage) {
+        this.slotStorage[slot] = storage;
+    }
+
+    public blockAt(long block) -> BasicBlock {
+        return this.basicBlocks.get(block);
+    }
+}

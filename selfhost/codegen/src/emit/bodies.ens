@@ -1,0 +1,232 @@
+// One function's body: the basic blocks its EIR blocks become, the entry allocas its slots live in,
+// the incoming values its parameter temps hold, and the walk that emits every instruction and
+// terminator in order.
+//
+// The dispatch below hands one instruction to the area that emits it - the operator, address, ARC,
+// call, array and text modules, all of them free functions over one ModuleEmitter and the frame of
+// the function being emitted. An area answers with a problem only where a malformed function could
+// reach it; everything else cannot fail once the verifiers have passed.
+import EirFunction from eir.model;
+import EirInstruction from eir.model;
+import EirConstInt from eir.model;
+import EirConstFloat from eir.model;
+import EirConstBool from eir.model;
+import EirBinary from eir.model;
+import EirUnary from eir.model;
+import EirCast from eir.model;
+import EirLoadSlot from eir.model;
+import EirStoreSlot from eir.model;
+import EirCall from eir.model;
+import EirRetain from eir.model;
+import EirRelease from eir.model;
+import EirRetainPtr from eir.model;
+import EirReleasePtr from eir.model;
+import EirSlotAddress from eir.model;
+import EirFieldAddress from eir.model;
+import EirElementAddress from eir.model;
+import EirLoadPtr from eir.model;
+import EirStorePtr from eir.model;
+import EirBoundsCheck from eir.model;
+import EirRangeCheck from eir.model;
+import EirConstString from eir.model;
+import EirArrayNew from eir.model;
+import EirArrayLength from eir.model;
+import EirStringConcat from eir.model;
+import EirStringEqual from eir.model;
+import EirStringIndexOf from eir.model;
+import EirStringSubstring from eir.model;
+import EirStringLength from eir.model;
+import EirStringToBytes from eir.model;
+import EirStringFromBytes from eir.model;
+import EirIntToString from eir.model;
+import EirCharToString from eir.model;
+import EirBoolToString from eir.model;
+import EirEnumToString from eir.model;
+import EirDoubleToString from eir.model;
+import EirJsonEscape from eir.model;
+import EirPrint from eir.model;
+import EirPanic from eir.model;
+import BasicBlock from @ens.llvm.blocks;
+import @ens.llvm.memory;
+import @ens.llvm.globals;
+import ModuleEmitter from emit.context;
+import EmissionFrame from emit.context;
+import emit.addresses;
+import emit.arc;
+import emit.arrays;
+import emit.calls;
+import emit.operators;
+import emit.terminators;
+import emit.text;
+import List from @std.collections.list;
+
+// Emits one function's body into the declaration the module already holds for it. Returns "" on
+// success and a description of the failure otherwise.
+public emitFunction(ModuleEmitter emitter, EirFunction function) -> string {
+    let declared = emitter.functionValue(function.symbol());
+    if (declared == null) {
+        return "Internal: function '{function.symbol()}' was never declared";
+    }
+    let blocks = new List<BasicBlock>();
+    for (long i = 0; i < function.blocks().length(); i++) {
+        blocks.push(emitter.context.appendBasicBlock(declared,
+            function.blocks().get(i).label()));
+    }
+    let frame = new EmissionFrame(function, blocks);
+    for (long i = 0; i < function.entryTempCount(); i++) {
+        frame.define(i, globals.getParam(declared, i as uint));
+    }
+    emitter.builder.positionAtEnd(blocks.get(0));
+    for (long i = 0; i < function.slots().length(); i++) {
+        let slot = function.slots().get(i);
+        let slotType = emitter.mapType(slot.type());
+        let storage = memory.buildAlloca(emitter.builder, slotType, slot.name());
+        frame.defineSlot(i, storage);
+        if (slot.startsZeroed()) {
+            memory.buildStore(emitter.builder, slotType.constNull(), storage);
+        }
+    }
+    for (long b = 0; b < function.blocks().length(); b++) {
+        let block = function.blocks().get(b);
+        emitter.builder.positionAtEnd(blocks.get(b));
+        let instructions = block.instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            string problem = emitInstruction(emitter, frame, instructions.get(i));
+            if (problem.length > 0) {
+                return problem;
+            }
+        }
+        let terminator = block.terminator();
+        if (terminator == null) {
+            return "Internal: block {block.label()} of {function.symbol()} has no terminator";
+        }
+        string problem = terminators.emitTerminator(emitter, frame, terminator);
+        if (problem.length > 0) {
+            return problem;
+        }
+    }
+    return "";
+}
+
+emitInstruction(ModuleEmitter emitter, EmissionFrame frame, EirInstruction instruction) -> string {
+    switch (instruction) {
+        is EirConstInt constant -> {
+            operators.emitConstInt(emitter, frame, constant);
+        },
+        is EirConstFloat constant -> {
+            operators.emitConstFloat(emitter, frame, constant);
+        },
+        is EirConstBool constant -> {
+            operators.emitConstBool(emitter, frame, constant);
+        },
+        is EirBinary binary -> {
+            operators.emitBinary(emitter, frame, binary);
+        },
+        is EirUnary unary -> {
+            operators.emitUnary(emitter, frame, unary);
+        },
+        is EirCast cast -> {
+            operators.emitCast(emitter, frame, cast);
+        },
+        is EirLoadSlot load -> {
+            return addresses.emitLoadSlot(emitter, frame, load);
+        },
+        is EirStoreSlot store -> {
+            return addresses.emitStoreSlot(emitter, frame, store);
+        },
+        is EirCall call -> {
+            calls.emitCall(emitter, frame, call);
+        },
+        is EirRetain retain -> {
+            arc.emitRetain(emitter, frame, retain);
+        },
+        is EirRelease released -> {
+            arc.emitRelease(emitter, frame, released);
+        },
+        is EirRetainPtr retain -> {
+            arc.emitRetainPtr(emitter, frame, retain);
+        },
+        is EirReleasePtr released -> {
+            arc.emitReleasePtr(emitter, frame, released);
+        },
+        is EirSlotAddress address -> {
+            return addresses.emitSlotAddress(emitter, frame, address);
+        },
+        is EirFieldAddress address -> {
+            addresses.emitFieldAddress(emitter, frame, address);
+        },
+        is EirElementAddress address -> {
+            addresses.emitElementAddress(emitter, frame, address);
+        },
+        is EirLoadPtr load -> {
+            addresses.emitLoadPtr(emitter, frame, load);
+        },
+        is EirStorePtr store -> {
+            addresses.emitStorePtr(emitter, frame, store);
+        },
+        is EirBoundsCheck check -> {
+            addresses.emitBoundsCheck(emitter, frame, check);
+        },
+        is EirRangeCheck check -> {
+            addresses.emitRangeCheck(emitter, frame, check);
+        },
+        is EirConstString constant -> {
+            text.emitConstString(emitter, frame, constant);
+        },
+        is EirArrayNew allocation -> {
+            arrays.emitArrayNew(emitter, frame, allocation);
+        },
+        is EirArrayLength length -> {
+            arrays.emitArrayLength(emitter, frame, length);
+        },
+        is EirStringLength length -> {
+            text.emitStringLength(emitter, frame, length);
+        },
+        is EirStringConcat joined -> {
+            text.emitStringConcat(emitter, frame, joined);
+        },
+        is EirStringEqual compared -> {
+            text.emitStringEqual(emitter, frame, compared);
+        },
+        is EirStringIndexOf search -> {
+            text.emitStringIndexOf(emitter, frame, search);
+        },
+        is EirStringSubstring part -> {
+            text.emitStringSubstring(emitter, frame, part);
+        },
+        is EirStringToBytes conversion -> {
+            text.emitStringToBytes(emitter, frame, conversion);
+        },
+        is EirStringFromBytes conversion -> {
+            text.emitStringFromBytes(emitter, frame, conversion);
+        },
+        is EirIntToString conversion -> {
+            text.emitIntToString(emitter, frame, conversion);
+        },
+        is EirCharToString conversion -> {
+            text.emitCharToString(emitter, frame, conversion);
+        },
+        is EirDoubleToString conversion -> {
+            text.emitDoubleToString(emitter, frame, conversion);
+        },
+        is EirBoolToString conversion -> {
+            text.emitBoolToString(emitter, frame, conversion);
+        },
+        is EirEnumToString conversion -> {
+            return text.emitEnumToString(emitter, frame, conversion);
+        },
+        is EirJsonEscape escape -> {
+            text.emitJsonEscape(emitter, frame, escape);
+        },
+        is EirPrint printed -> {
+            calls.emitPrint(emitter, frame, printed);
+        },
+        is EirPanic aborted -> {
+            calls.emitPanic(emitter, frame, aborted);
+        },
+        default -> {
+            return "Internal: no emission for this instruction in {frame.symbol()}";
+        },
+    }
+    return "";
+}

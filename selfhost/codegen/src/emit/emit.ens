@@ -1,87 +1,29 @@
 // Mechanical emission of lowered EIR into a native object file through the LLVM-C binding. One
-// LLVM context and module serve one Ens module; temps map one-to-one onto LLVM values, slots
-// onto entry-block allocas, and blocks onto basic blocks, so nothing here makes decisions - the
-// shape was fixed by lowering. The module that defines the program entry also gets the C 'main'
-// wrapper: it records argc and argv in the ens argument globals and forwards the user main's
-// result, with 0 standing in when user main returns void.
+// LLVM context and module serve one Ens module; temps map one-to-one onto LLVM values, slots onto
+// entry-block allocas, and blocks onto basic blocks, so nothing in emission makes decisions - the
+// shape was fixed by lowering.
 //
-// Everything that needs machine code beyond one instruction - allocation, reference counting, the
-// string primitives, the guards, and the immortal string literals - comes from one Runtime per
-// module, so a module carries exactly the primitives it uses and one copy of each. The element
-// destructors an array's header names come from one Finalizers beside it, and the Ens-to-LLVM type
-// mapping from one TypeMapper.
+// This module holds the entry point and the module-level plumbing: the host target and its data
+// layout, the pass that declares every function before any body is emitted, the pass that emits
+// the bodies, the C 'main' wrapper the entry module gets, and the verification and object write
+// that close an emission. The state lives in emit.context, signatures in emit.signatures, bodies
+// and the per-instruction dispatch in emit.bodies, and everything that needs machine code beyond
+// one instruction in emit.runtime.
+//
+// The module that defines the program entry also gets the C 'main' wrapper: it records argc and
+// argv in the ens argument globals and forwards the user main's result, with 0 standing in when
+// user main returns void.
 import EirFunction from eir.model;
-import EirInstruction from eir.model;
-import EirConstInt from eir.model;
-import EirConstFloat from eir.model;
-import EirConstBool from eir.model;
-import EirBinary from eir.model;
-import EirUnary from eir.model;
-import EirCast from eir.model;
-import EirLoadSlot from eir.model;
-import EirStoreSlot from eir.model;
-import EirCall from eir.model;
-import EirCallee from eir.model;
-import EirRetain from eir.model;
-import EirRelease from eir.model;
-import EirRetainPtr from eir.model;
-import EirReleasePtr from eir.model;
-import EirSlotAddress from eir.model;
-import EirFieldAddress from eir.model;
-import EirElementAddress from eir.model;
-import EirLoadPtr from eir.model;
-import EirStorePtr from eir.model;
-import EirBoundsCheck from eir.model;
-import EirRangeCheck from eir.model;
-import EirConstString from eir.model;
-import EirArrayNew from eir.model;
-import EirArrayLength from eir.model;
-import EirStringConcat from eir.model;
-import EirStringEqual from eir.model;
-import EirStringIndexOf from eir.model;
-import EirStringSubstring from eir.model;
-import EirStringLength from eir.model;
-import EirStringToBytes from eir.model;
-import EirStringFromBytes from eir.model;
-import EirIntToString from eir.model;
-import EirCharToString from eir.model;
-import EirBoolToString from eir.model;
-import EirEnumToString from eir.model;
-import EirDoubleToString from eir.model;
-import EirJsonEscape from eir.model;
-import EirPrint from eir.model;
-import EirPanic from eir.model;
-import EirTerminator from eir.model;
-import EirReturn from eir.model;
-import EirJump from eir.model;
-import EirBranch from eir.model;
-import EirSwitch from eir.model;
-import EirUnreachable from eir.model;
-import EirBinaryOp from eir.model;
-import Type from @ens.sema.model.types;
-import ArrayType from @ens.sema.model.types;
-import EnumType from @ens.sema.model.types;
-import @ens.sema.model.types;
-import support.primitives;
-import Runtime from emit.runtime;
-import TypeMapper from emit.types;
-import Finalizers from emit.finalizers;
-import Context from @ens.llvm.core;
-import Module from @ens.llvm.core;
-import Builder from @ens.llvm.core;
-import @ens.llvm.core;
-import TypeRef from @ens.llvm.types;
-import Value from @ens.llvm.values;
-import BasicBlock from @ens.llvm.blocks;
+import ModuleEmitter from emit.context;
+import emit.bodies;
+import emit.signatures;
 import @ens.llvm.instructions;
 import @ens.llvm.memory;
 import @ens.llvm.globals;
 import @ens.llvm.analysis;
 import TargetMachine from @ens.llvm.target;
-import TargetData from @ens.llvm.target;
 import @ens.llvm.target;
 import List from @std.collections.list;
-import Map from @std.collections.map;
 
 // The entry-point shape the wrapper forwards: the user main's symbol and whether it produces
 // the process exit code itself or leaves the wrapper to return 0.
@@ -104,604 +46,76 @@ export final class EntryPoint {
 // success and a description of the failure otherwise.
 export emitModule(string moduleName, List<EirFunction> functions, EntryPoint? entry,
                   string objectPath) -> string {
-    let emitter = new ModuleEmitter(moduleName, functions);
-    return emitter.run(entry, objectPath);
+    let emitter = new ModuleEmitter(moduleName);
+    target.initializeHostTarget();
+    string triple = target.hostTargetTriple();
+    let resolved = target.targetFromTriple(triple);
+    if (resolved == null) {
+        emitter.dispose();
+        return "could not resolve the host target '{triple}'";
+    }
+    let machine = resolved.createTargetMachine(triple);
+    string outcome = emitInto(emitter, machine, functions, entry, objectPath);
+    machine.dispose();
+    emitter.dispose();
+    return outcome;
 }
 
-class ModuleEmitter {
-    string moduleName;
-    List<EirFunction> functions;
-    Context context;
-    Module module;
-    Builder builder;
-    Runtime runtime;
-    TypeMapper mapper;
-    Finalizers finalizers;
-
-    Map<string, Value> functionValues;
-    Map<string, TypeRef> functionTypes;
-    TargetData? moduleLayout;
-
-    protected constructor(string moduleName, List<EirFunction> functions) {
-        this.moduleName = moduleName;
-        this.functions = functions;
-        this.context = core.createContext();
-        this.module = this.context.createModule(moduleName);
-        this.builder = this.context.createBuilder();
-        this.runtime = new Runtime(this.context, this.module, this.builder);
-        this.mapper = new TypeMapper(this.context);
-        this.finalizers = new Finalizers(this.runtime, this.mapper);
-        this.functionValues = new Map<string, Value>();
-        this.functionTypes = new Map<string, TypeRef>();
-        this.moduleLayout = null;
+emitInto(ModuleEmitter emitter, TargetMachine machine, List<EirFunction> functions,
+         EntryPoint? entry, string objectPath) -> string {
+    let layout = machine.createDataLayout();
+    emitter.rememberDataLayout(layout);
+    target.setModuleDataLayout(emitter.module, layout);
+    for (long i = 0; i < functions.length(); i++) {
+        signatures.declareFunction(emitter, functions.get(i));
     }
-
-    protected run(EntryPoint? entry, string objectPath) -> string {
-        target.initializeHostTarget();
-        string triple = target.hostTargetTriple();
-        let resolved = target.targetFromTriple(triple);
-        if (resolved == null) {
-            this.builder.dispose();
-            this.context.dispose();
-            return "could not resolve the host target '{triple}'";
+    for (long i = 0; i < functions.length(); i++) {
+        string problem = bodies.emitFunction(emitter, functions.get(i));
+        if (problem.length > 0) {
+            return problem;
         }
-        let machine = resolved.createTargetMachine(triple);
-        string outcome = this.emitInto(machine, entry, objectPath);
-        machine.dispose();
-        this.builder.dispose();
-        this.context.dispose();
-        return outcome;
     }
-
-    emitInto(TargetMachine machine, EntryPoint? entry, string objectPath) -> string {
-        let layout = machine.createDataLayout();
-        this.moduleLayout = layout;
-        target.setModuleDataLayout(this.module, layout);
-        for (long i = 0; i < this.functions.length(); i++) {
-            this.declareFunction(this.functions.get(i));
+    if (entry != null) {
+        string problem = emitEntryWrapper(emitter, entry);
+        if (problem.length > 0) {
+            return problem;
         }
-        for (long i = 0; i < this.functions.length(); i++) {
-            string problem = this.emitFunction(this.functions.get(i));
-            if (problem.length > 0) {
-                return problem;
-            }
-        }
-        if (entry != null) {
-            string problem = this.emitEntryWrapper(entry);
-            if (problem.length > 0) {
-                return problem;
-            }
-        }
-        string verdict = analysis.verify(this.module);
-        if (verdict.length > 0) {
-            return "module '{this.moduleName}' failed LLVM verification: {verdict}";
-        }
-        string written = machine.emitObjectFile(this.module, objectPath);
-        if (written.length > 0) {
-            return "could not write the object file {objectPath}: {written}";
-        }
-        return "";
     }
-
-    // A method takes the address of the storage it runs over as its first parameter, ahead of the
-    // declared ones.
-    declareFunction(EirFunction function) {
-        let parameters = function.parameters();
-        long offset = 0;
-        if (function.receiverType() != null) {
-            offset = 1;
-        }
-        let parameterTypes = new TypeRef[parameters.length + offset];
-        for (long i = 0; i < parameterTypes.length; i++) {
-            parameterTypes[i] = i < offset ? this.context.pointerType()
-                : this.mapType(parameters[i - offset].type());
-        }
-        let functionType = this.mapType(function.returnType()).functionType(parameterTypes);
-        let declared = this.module.addFunction(function.symbol(), functionType);
-        if (function.internalLinkage()) {
-            globals.setLinkage(declared, globals.linkageInternal());
-        }
-        this.functionValues.set(function.symbol(), declared);
-        this.functionTypes.set(function.symbol(), functionType);
+    string verdict = analysis.verify(emitter.module);
+    if (verdict.length > 0) {
+        return "module '{emitter.name()}' failed LLVM verification: {verdict}";
     }
-
-    // A callee defined in another module is declared here on first use, with external linkage, and
-    // with the same leading receiver pointer its definition carries.
-    calleeValue(EirCallee callee) -> Value {
-        let existing = this.functionValues.get(callee.symbol());
-        if (existing != null) {
-            return existing;
-        }
-        Type[] parameterTypes = callee.parameterTypes();
-        long offset = 0;
-        if (callee.receiverType() != null) {
-            offset = 1;
-        }
-        let mapped = new TypeRef[parameterTypes.length + offset];
-        for (long i = 0; i < mapped.length; i++) {
-            mapped[i] = i < offset ? this.context.pointerType()
-                : this.mapType(parameterTypes[i - offset]);
-        }
-        let functionType = this.mapType(callee.returnType()).functionType(mapped);
-        let declared = this.module.addFunction(callee.symbol(), functionType);
-        this.functionValues.set(callee.symbol(), declared);
-        this.functionTypes.set(callee.symbol(), functionType);
-        return declared;
+    string written = machine.emitObjectFile(emitter.module, objectPath);
+    if (written.length > 0) {
+        return "could not write the object file {objectPath}: {written}";
     }
-
-    calleeType(string symbol) -> TypeRef {
-        let found = this.functionTypes.get(symbol);
-        if (found == null) {
-            panic("Internal: no function type recorded for '{symbol}'");
-        }
-        return found;
-    }
-
-    emitFunction(EirFunction function) -> string {
-        let declared = this.functionValues.get(function.symbol());
-        if (declared == null) {
-            return "Internal: function '{function.symbol()}' was never declared";
-        }
-        let blocks = new List<BasicBlock>();
-        for (long i = 0; i < function.blocks().length(); i++) {
-            blocks.push(this.context.appendBasicBlock(declared,
-                function.blocks().get(i).label()));
-        }
-        long tempCount = function.tempTypes().length();
-        Value?[] temps = new Value?[tempCount];
-        for (long i = 0; i < function.entryTempCount(); i++) {
-            temps[i] = globals.getParam(declared, i as uint);
-        }
-        this.builder.positionAtEnd(blocks.get(0));
-        Value?[] slots = new Value?[function.slots().length()];
-        for (long i = 0; i < function.slots().length(); i++) {
-            let slot = function.slots().get(i);
-            let slotType = this.mapType(slot.type());
-            let storage = memory.buildAlloca(this.builder, slotType, slot.name());
-            slots[i] = storage;
-            if (slot.startsZeroed()) {
-                memory.buildStore(this.builder, slotType.constNull(), storage);
-            }
-        }
-        for (long b = 0; b < function.blocks().length(); b++) {
-            let block = function.blocks().get(b);
-            this.builder.positionAtEnd(blocks.get(b));
-            let instructions = block.instructions();
-            for (long i = 0; i < instructions.length(); i++) {
-                string problem = this.emitInstruction(function, instructions.get(i), temps,
-                    slots);
-                if (problem.length > 0) {
-                    return problem;
-                }
-            }
-            let terminator = block.terminator();
-            if (terminator == null) {
-                return "Internal: block {block.label()} of {function.symbol()} has no "
-                    + "terminator";
-            }
-            string problem = this.emitTerminator(function, terminator, temps, blocks);
-            if (problem.length > 0) {
-                return problem;
-            }
-        }
-        return "";
-    }
-
-    emitInstruction(EirFunction function, EirInstruction instruction, Value?[] temps,
-                            Value?[] slots) -> string {
-        switch (instruction) {
-            is EirConstInt constant -> {
-                temps[constant.result] = this.mapType(constant.type).constInt(
-                    constant.bits as ulong, primitives.isSignedType(constant.type));
-            },
-            is EirConstFloat constant -> {
-                temps[constant.result] = this.mapType(constant.type).constReal(constant.value);
-            },
-            is EirConstBool constant -> {
-                ulong bit = 0;
-                if (constant.value) {
-                    bit = 1;
-                }
-                temps[constant.result] = this.context.int1Type().constInt(bit, false);
-            },
-            is EirBinary binary -> {
-                let left = tempValue(temps, binary.left);
-                let right = tempValue(temps, binary.right);
-                temps[binary.result] = this.emitBinary(binary.op, left, right);
-            },
-            is EirUnary unary -> {
-                let operand = tempValue(temps, unary.operand);
-                temps[unary.result] = switch (unary.op) {
-                    Neg -> instructions.buildNeg(this.builder, operand, ""),
-                    FloatNeg -> instructions.buildFNeg(this.builder, operand, ""),
-                    Not -> instructions.buildNot(this.builder, operand, ""),
-                };
-            },
-            is EirCast cast -> {
-                let operand = tempValue(temps, cast.operand);
-                let targetType = this.mapType(cast.type);
-                temps[cast.result] = switch (cast.op) {
-                    Trunc -> instructions.buildTrunc(this.builder, operand, targetType, ""),
-                    ZeroExtend -> instructions.buildZExt(this.builder, operand, targetType,
-                        ""),
-                    SignExtend -> instructions.buildSExt(this.builder, operand, targetType,
-                        ""),
-                    FloatTrunc -> instructions.buildFPTrunc(this.builder, operand, targetType,
-                        ""),
-                    FloatExtend -> instructions.buildFPExt(this.builder, operand, targetType,
-                        ""),
-                    SignedToFloat -> instructions.buildSIToFP(this.builder, operand,
-                        targetType, ""),
-                    UnsignedToFloat -> instructions.buildUIToFP(this.builder, operand,
-                        targetType, ""),
-                    FloatToSigned -> instructions.buildFPToSI(this.builder, operand,
-                        targetType, ""),
-                    FloatToUnsigned -> instructions.buildFPToUI(this.builder, operand,
-                        targetType, ""),
-                    Reinterpret -> operand,
-                };
-            },
-            is EirLoadSlot load -> {
-                let slot = slots[load.slot];
-                if (slot == null) {
-                    return "Internal: load from missing slot ${load.slot} in "
-                        + "{function.symbol()}";
-                }
-                temps[load.result] = memory.buildLoad(this.builder, this.mapType(load.type),
-                    slot, "");
-            },
-            is EirStoreSlot store -> {
-                let slot = slots[store.slot];
-                if (slot == null) {
-                    return "Internal: store through missing slot in {function.symbol()}";
-                }
-                let ignored = memory.buildStore(this.builder, tempValue(temps, store.value),
-                    slot);
-            },
-            is EirCall call -> {
-                let callee = this.calleeValue(call.callee);
-                long offset = 0;
-                if (call.receiver >= 0) {
-                    offset = 1;
-                }
-                let argumentValues = new Value[call.arguments.length + offset];
-                for (long i = 0; i < argumentValues.length; i++) {
-                    argumentValues[i] = i < offset ? tempValue(temps, call.receiver)
-                        : tempValue(temps, call.arguments[i - offset]);
-                }
-                let value = instructions.buildCall(this.builder,
-                    this.calleeType(call.callee.symbol()), callee, argumentValues, "");
-                if (call.result >= 0) {
-                    temps[call.result] = value;
-                }
-            },
-            is EirRetain retain -> {
-                this.runtime.call(this.runtime.retain(), [tempValue(temps, retain.value)], "");
-            },
-            is EirRelease released -> {
-                this.runtime.call(this.runtime.release(), [tempValue(temps, released.value)], "");
-            },
-            is EirRetainPtr retain -> {
-                this.runtime.call(this.runtime.retain(),
-                    [this.loadReference(tempValue(temps, retain.address))], "");
-            },
-            is EirReleasePtr released -> {
-                this.releaseStorage(tempValue(temps, released.address));
-            },
-            is EirSlotAddress address -> {
-                let slot = slots[address.slot];
-                if (slot == null) {
-                    return "Internal: the address of missing slot ${address.slot} in "
-                        + "{function.symbol()}";
-                }
-                temps[address.result] = slot;
-            },
-            is EirFieldAddress address -> {
-                temps[address.result] = memory.buildStructGEP(this.builder,
-                    this.mapType(function.tempTypes().get(address.base)),
-                    tempValue(temps, address.base), address.fieldIndex as uint, "");
-            },
-            is EirElementAddress address -> {
-                let data = this.runtime.payloadData(tempValue(temps, address.array));
-                temps[address.result] = memory.buildGEP(this.builder,
-                    this.mapType(address.type), data, [tempValue(temps, address.index)], "");
-            },
-            is EirLoadPtr load -> {
-                temps[load.result] = memory.buildLoad(this.builder, this.mapType(load.type),
-                    tempValue(temps, load.address), "");
-            },
-            is EirStorePtr store -> {
-                memory.buildStore(this.builder, tempValue(temps, store.value),
-                    tempValue(temps, store.address));
-            },
-            is EirBoundsCheck check -> {
-                let length = this.runtime.payloadLength(tempValue(temps, check.array));
-                this.runtime.call(this.runtime.boundsCheck(), [tempValue(temps, check.index),
-                    length, this.message("array index out of bounds")], "");
-            },
-            is EirRangeCheck check -> {
-                this.runtime.call(this.runtime.rangeCheck(), [tempValue(temps, check.start),
-                    tempValue(temps, check.end), tempValue(temps, check.length),
-                    this.message(check.message)], "");
-            },
-            is EirConstString constant -> {
-                temps[constant.result] = this.runtime.stringLiteral(constant.bytes);
-            },
-            is EirArrayNew allocation -> {
-                temps[allocation.result] = this.allocateArray(allocation.type,
-                    tempValue(temps, allocation.size),
-                    this.finalizers.arrayFinalizer(elementTypeOf(allocation.type)));
-            },
-            is EirArrayLength length -> {
-                temps[length.result] = this.runtime.payloadLength(
-                    tempValue(temps, length.array));
-            },
-            is EirStringLength length -> {
-                temps[length.result] = this.runtime.payloadLength(
-                    tempValue(temps, length.value));
-            },
-            is EirStringConcat joined -> {
-                temps[joined.result] = this.runtime.call(this.runtime.stringConcat(),
-                    [tempValue(temps, joined.left), tempValue(temps, joined.right)], "");
-            },
-            is EirStringEqual compared -> {
-                temps[compared.result] = this.runtime.call(this.runtime.stringEqual(),
-                    [tempValue(temps, compared.left), tempValue(temps, compared.right)], "");
-            },
-            is EirStringIndexOf search -> {
-                temps[search.result] = this.runtime.call(this.runtime.stringIndexOf(),
-                    [tempValue(temps, search.haystack), tempValue(temps, search.needle)], "");
-            },
-            is EirStringSubstring part -> {
-                temps[part.result] = this.runtime.call(this.runtime.stringSubstring(),
-                    [tempValue(temps, part.value), tempValue(temps, part.start),
-                    tempValue(temps, part.end)], "");
-            },
-            is EirStringToBytes conversion -> {
-                let text = tempValue(temps, conversion.value);
-                let length = this.runtime.payloadLength(text);
-                // A byte owns nothing, so the bytes of a string need no element finalizer.
-                let array = this.allocateArray(conversion.type, length,
-                    this.runtime.nullPointer());
-                memory.buildMemCpy(this.builder, this.runtime.payloadData(array), 1,
-                    this.runtime.payloadData(text), 1, length);
-                temps[conversion.result] = array;
-            },
-            is EirStringFromBytes conversion -> {
-                let array = tempValue(temps, conversion.bytes);
-                let length = this.runtime.payloadLength(array);
-                let text = this.runtime.call(this.runtime.stringAllocate(), [length], "");
-                memory.buildMemCpy(this.builder, this.runtime.payloadData(text), 1,
-                    this.runtime.payloadData(array), 1, length);
-                temps[conversion.result] = text;
-            },
-            is EirIntToString conversion -> {
-                ulong signedness = 0;
-                if (conversion.signed) {
-                    signedness = 1;
-                }
-                temps[conversion.result] = this.runtime.call(this.runtime.intToString(),
-                    [tempValue(temps, conversion.value),
-                    this.context.int1Type().constInt(signedness, false)], "");
-            },
-            is EirCharToString conversion -> {
-                temps[conversion.result] = this.runtime.call(this.runtime.charToString(),
-                    [tempValue(temps, conversion.value)], "");
-            },
-            is EirDoubleToString conversion -> {
-                temps[conversion.result] = this.runtime.call(this.runtime.doubleToString(),
-                    [tempValue(temps, conversion.value)], "");
-            },
-            is EirBoolToString conversion -> {
-                temps[conversion.result] = instructions.buildSelect(this.builder,
-                    tempValue(temps, conversion.value), this.message("true"),
-                    this.message("false"), "");
-            },
-            is EirEnumToString conversion -> {
-                let named = conversion.enumType;
-                if (!(named is EnumType)) {
-                    return "Internal: the enum text of '{types.display(named)}' in "
-                        + "{function.symbol()}";
-                }
-                temps[conversion.result] = this.emitEnumName(named,
-                    tempValue(temps, conversion.value));
-            },
-            is EirJsonEscape escape -> {
-                temps[escape.result] = this.runtime.call(this.runtime.jsonEscape(),
-                    [tempValue(temps, escape.value)], "");
-            },
-            is EirPrint printed -> {
-                this.runtime.call(this.runtime.print(), [tempValue(temps, printed.value)], "");
-            },
-            is EirPanic aborted -> {
-                this.runtime.call(this.runtime.panic(), [tempValue(temps, aborted.value)], "");
-            },
-            default -> {
-                return "Internal: no emission for this instruction in {function.symbol()}";
-            },
-        }
-        return "";
-    }
-
-    // The reference the storage an address names currently holds.
-    loadReference(Value address) -> Value {
-        return memory.buildLoad(this.builder, this.context.pointerType(), address, "");
-    }
-
-    // Gives up the +1 the storage at an address holds and leaves the storage empty, which is what
-    // keeps the "null or one live reference" invariant a zeroed slot starts with: storage released
-    // when its scope ends is written again the next time around a loop, and that write releases
-    // whatever it finds there.
-    releaseStorage(Value address) {
-        this.runtime.call(this.runtime.release(), [this.loadReference(address)], "");
-        memory.buildStore(this.builder, this.context.pointerType().constNull(), address);
-    }
-
-    // A constant diagnostic message, as the string object the runtime guards expect.
-    message(string text) -> Value {
-        return this.runtime.stringLiteral(text.toBytes());
-    }
-
-    // A fresh array of the given length, whose header carries the finalizer that releases what its
-    // elements own.
-    allocateArray(Type arrayType, Value count, Value finalizer) -> Value {
-        let elementBytes = this.dataLayout().abiSizeOfType(
-            this.mapType(elementTypeOf(arrayType)));
-        return this.runtime.call(this.runtime.arrayAllocate(), [count,
-            this.context.int64Type().constInt(elementBytes, false), finalizer,
-            this.message("array size cannot be negative")], "");
-    }
-
-    // The member name the enum value spells, as selects folded from the last member back to the
-    // first so the earliest matching member wins. Assigned values may be sparse or negative, so
-    // the chain matches values rather than indexing a table.
-    emitEnumName(EnumType named, Value value) -> Value {
-        let memberType = this.mapType(named);
-        string[] names = named.memberNames();
-        long[] values = named.memberValues();
-        Value chosen = this.message("<invalid>");
-        for (long i = names.length - 1; i >= 0; i--) {
-            let matched = instructions.buildICmpEQ(this.builder, value,
-                memberType.constInt(values[i] as ulong, true), "");
-            chosen = instructions.buildSelect(this.builder, matched, this.message(names[i]),
-                chosen, "");
-        }
-        return chosen;
-    }
-
-    dataLayout() -> TargetData {
-        let layout = this.moduleLayout;
-        if (layout == null) {
-            panic("Internal: the module's data layout was not recorded before emission");
-        }
-        return layout;
-    }
-
-    emitBinary(EirBinaryOp op, Value left, Value right) -> Value {
-        return switch (op) {
-            Add -> instructions.buildAdd(this.builder, left, right, ""),
-            Sub -> instructions.buildSub(this.builder, left, right, ""),
-            Mul -> instructions.buildMul(this.builder, left, right, ""),
-            DivSigned -> instructions.buildSDiv(this.builder, left, right, ""),
-            DivUnsigned -> instructions.buildUDiv(this.builder, left, right, ""),
-            RemSigned -> instructions.buildSRem(this.builder, left, right, ""),
-            RemUnsigned -> instructions.buildURem(this.builder, left, right, ""),
-            FloatAdd -> instructions.buildFAdd(this.builder, left, right, ""),
-            FloatSub -> instructions.buildFSub(this.builder, left, right, ""),
-            FloatMul -> instructions.buildFMul(this.builder, left, right, ""),
-            FloatDiv -> instructions.buildFDiv(this.builder, left, right, ""),
-            FloatRem -> instructions.buildFRem(this.builder, left, right, ""),
-            And -> instructions.buildAnd(this.builder, left, right, ""),
-            Or -> instructions.buildOr(this.builder, left, right, ""),
-            Xor -> instructions.buildXor(this.builder, left, right, ""),
-            ShiftLeft -> instructions.buildShl(this.builder, left, right, ""),
-            ShiftRightSigned -> instructions.buildAShr(this.builder, left, right, ""),
-            ShiftRightUnsigned -> instructions.buildLShr(this.builder, left, right, ""),
-            CmpEq -> instructions.buildICmpEQ(this.builder, left, right, ""),
-            CmpNe -> instructions.buildICmpNE(this.builder, left, right, ""),
-            CmpLtSigned -> instructions.buildICmpSLT(this.builder, left, right, ""),
-            CmpLeSigned -> instructions.buildICmpSLE(this.builder, left, right, ""),
-            CmpGtSigned -> instructions.buildICmpSGT(this.builder, left, right, ""),
-            CmpGeSigned -> instructions.buildICmpSGE(this.builder, left, right, ""),
-            CmpLtUnsigned -> instructions.buildICmpULT(this.builder, left, right, ""),
-            CmpLeUnsigned -> instructions.buildICmpULE(this.builder, left, right, ""),
-            CmpGtUnsigned -> instructions.buildICmpUGT(this.builder, left, right, ""),
-            CmpGeUnsigned -> instructions.buildICmpUGE(this.builder, left, right, ""),
-            FloatCmpEq -> instructions.buildFCmpOEQ(this.builder, left, right, ""),
-            FloatCmpNe -> instructions.buildFCmpONE(this.builder, left, right, ""),
-            FloatCmpLt -> instructions.buildFCmpOLT(this.builder, left, right, ""),
-            FloatCmpLe -> instructions.buildFCmpOLE(this.builder, left, right, ""),
-            FloatCmpGt -> instructions.buildFCmpOGT(this.builder, left, right, ""),
-            FloatCmpGe -> instructions.buildFCmpOGE(this.builder, left, right, ""),
-        };
-    }
-
-    emitTerminator(EirFunction function, EirTerminator terminator, Value?[] temps,
-                           List<BasicBlock> blocks) -> string {
-        switch (terminator) {
-            is EirReturn returned -> {
-                if (returned.value < 0) {
-                    let ignored = instructions.buildRetVoid(this.builder);
-                } else {
-                    let ignored = instructions.buildRet(this.builder,
-                        tempValue(temps, returned.value));
-                }
-            },
-            is EirJump jump -> {
-                let ignored = instructions.buildBr(this.builder, blocks.get(jump.target));
-            },
-            is EirBranch branch -> {
-                let ignored = instructions.buildCondBr(this.builder,
-                    tempValue(temps, branch.condition), blocks.get(branch.thenTarget),
-                    blocks.get(branch.elseTarget));
-            },
-            is EirSwitch switched -> {
-                let scrutineeType = this.mapType(
-                    function.tempTypes().get(switched.value));
-                let instruction = instructions.buildSwitch(this.builder,
-                    tempValue(temps, switched.value), blocks.get(switched.defaultTarget),
-                    switched.caseValues.length as uint);
-                for (long i = 0; i < switched.caseValues.length; i++) {
-                    instructions.addCase(instruction,
-                        scrutineeType.constInt(switched.caseValues[i] as ulong, true),
-                        blocks.get(switched.caseTargets[i]));
-                }
-            },
-            is EirUnreachable ignored -> {
-                let unused = instructions.buildUnreachable(this.builder);
-            },
-        }
-        return "";
-    }
-
-    // The C entry point: record the process arguments in the ens globals and forward the user
-    // main's result.
-    emitEntryWrapper(EntryPoint entry) -> string {
-        let userMain = this.functionValues.get(entry.symbol());
-        if (userMain == null) {
-            return "Internal: the entry module never defined {entry.symbol()}";
-        }
-        let intType = this.context.int32Type();
-        let pointerType = this.context.pointerType();
-        let wrapperType = intType.functionType([intType, pointerType]);
-        let wrapper = this.module.addFunction("main", wrapperType);
-        let argcGlobal = globals.addGlobal(this.module, intType, "ens_argc");
-        globals.setInitializer(argcGlobal, intType.constInt(0, false));
-        let argvGlobal = globals.addGlobal(this.module, pointerType, "ens_argv");
-        globals.setInitializer(argvGlobal, pointerType.constNull());
-        this.builder.positionAtEnd(this.context.appendBasicBlock(wrapper, "entry"));
-        let storeArgc = memory.buildStore(this.builder, globals.getParam(wrapper, 0),
-            argcGlobal);
-        let storeArgv = memory.buildStore(this.builder, globals.getParam(wrapper, 1),
-            argvGlobal);
-        let called = instructions.buildCall(this.builder, this.calleeType(entry.symbol()),
-            userMain, [], "");
-        if (entry.returnsVoid()) {
-            let ignored = instructions.buildRet(this.builder, intType.constInt(0, false));
-        } else {
-            let ignored = instructions.buildRet(this.builder, called);
-        }
-        return "";
-    }
-
-    mapType(Type type) -> TypeRef {
-        return this.mapper.map(type);
-    }
+    return "";
 }
 
-// The element type of an array, for the allocation that sizes one element.
-elementTypeOf(Type arrayType) -> Type {
-    if (arrayType is ArrayType) {
-        return arrayType.element();
+// The C entry point: record the process arguments in the ens globals and forward the user
+// main's result.
+emitEntryWrapper(ModuleEmitter emitter, EntryPoint entry) -> string {
+    let userMain = emitter.functionValue(entry.symbol());
+    if (userMain == null) {
+        return "Internal: the entry module never defined {entry.symbol()}";
     }
-    panic("Internal: an array allocation has type '{types.display(arrayType)}'");
-}
-
-// Emission runs after the verifier proved def-before-use, so a missing temp is a bug.
-tempValue(Value?[] temps, long temp) -> Value {
-    let value = temps[temp];
-    if (value == null) {
-        panic("Internal: temp %{temp} was used before it was emitted");
+    let intType = emitter.context.int32Type();
+    let pointerType = emitter.context.pointerType();
+    let wrapperType = intType.functionType([intType, pointerType]);
+    let wrapper = emitter.module.addFunction("main", wrapperType);
+    let argcGlobal = globals.addGlobal(emitter.module, intType, "ens_argc");
+    globals.setInitializer(argcGlobal, intType.constInt(0, false));
+    let argvGlobal = globals.addGlobal(emitter.module, pointerType, "ens_argv");
+    globals.setInitializer(argvGlobal, pointerType.constNull());
+    emitter.builder.positionAtEnd(emitter.context.appendBasicBlock(wrapper, "entry"));
+    let storeArgc = memory.buildStore(emitter.builder, globals.getParam(wrapper, 0), argcGlobal);
+    let storeArgv = memory.buildStore(emitter.builder, globals.getParam(wrapper, 1), argvGlobal);
+    let called = instructions.buildCall(emitter.builder, emitter.calleeType(entry.symbol()),
+        userMain, [], "");
+    if (entry.returnsVoid()) {
+        let ignored = instructions.buildRet(emitter.builder, intType.constInt(0, false));
+    } else {
+        let ignored = instructions.buildRet(emitter.builder, called);
     }
-    return value;
+    return "";
 }
