@@ -55,7 +55,6 @@ void Document::analyze() {
                                              seeds, modules_, byPath_, &overrides);
     if (!ok) { analyzeSingleFileFallback(); return; }
 
-    ens::modules::insertPreludeModule(modules_, byPath_);
     ens::modules::analyzeModuleGraph(modules_, byPath_, *typeCtx_);
 
     auto it = byPath_.find(modPath);
@@ -64,19 +63,18 @@ void Document::analyze() {
     for (auto& m : modules_) moduleFiles_[m->modulePath] = m->absolutePath;
 }
 
-// Analyze just this buffer with no module resolution. Used when the file is outside any
-// source root or the graph could not be built.
+// Analyze just this buffer, resolving nothing but the implicitly imported standard-library
+// modules. Used when the file is outside any source root or the graph could not be built.
+// `moduleFiles_` stays empty, which marks the document as having no graph.
 void Document::analyzeSingleFileFallback() {
     modules_.clear();
     byPath_.clear();
     moduleFiles_.clear();
-    typeCtx_.reset();
+    typeCtx_ = std::make_unique<TypeContext>();
 
-    auto m = ens::modules::makeInMemoryModule(u"main", uri_, text_);
-    m->analyzer = std::make_unique<Analyzer>(*m->source, *m->sink);
-    m->analyzer->analyze(*m->rootNode);
-    openModule_ = m.get();
-    modules_.push_back(std::move(m));
+    openModule_ = ens::modules::analyzeStandaloneSource(u"main", uri_, text_,
+                                                        store_.stdlibRoot(), modules_, byPath_,
+                                                        *typeCtx_);
 }
 
 Document& DocumentStore::upsert(std::string uri, std::u16string text, int version) {
@@ -221,7 +219,6 @@ WorkspaceModules DocumentStore::buildWorkspaceModules(const fs::path& forFile) c
                                              workspace.modules, workspace.byPath, &overrides);
     if (!ok) return WorkspaceModules{};
 
-    ens::modules::insertPreludeModule(workspace.modules, workspace.byPath);
     ens::modules::analyzeModuleGraph(workspace.modules, workspace.byPath, *workspace.typeCtx);
     return workspace;
 }

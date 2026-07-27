@@ -13,7 +13,6 @@
 #include "semantic/Analyzer.h"
 #include "semantic/EscapeAnalyzer.h"
 #include "semantic/Literals.h"
-#include "semantic/Prelude.h"
 #include "semantic/ThrowsAnalyzer.h"
 #include "semantic/Symbol.h"
 #include "semantic/Type.h"
@@ -604,8 +603,6 @@ Compiler::BuildResult Compiler::build(const fs::path& source,
         isApplication = sourceFileDefinesMain(*it->second->rootNode);
     }
 
-    insertPreludeModule(program.modules, program.byPath);
-
     TypeContext sharedCtx;
     if (!runDriverAnalysis(program.modules, program.byPath, sharedCtx, explainArc)) {
         return result;
@@ -671,7 +668,6 @@ bool Compiler::check(const fs::path& source, const fs::path& overridesRoot,
                      const ens::packages::ResolvedPackages* packages) {
     LoadedProgram program;
     if (!loadProgram(source, overridesRoot, packages, program)) return false;
-    insertPreludeModule(program.modules, program.byPath);
 
     TypeContext sharedCtx;
     analyzeModuleGraph(program.modules, program.byPath, sharedCtx);
@@ -974,8 +970,6 @@ int Compiler::test(const fs::path& sourceDir, const fs::path& testsDir,
         }
     }
 
-    insertPreludeModule(modules, byPath);
-
     TypeContext sharedCtx;
     if (!runDriverAnalysis(modules, byPath, sharedCtx, explainArc)) {
         std::cerr << "ens test: the test build failed to compile\n";
@@ -1142,18 +1136,15 @@ bool Compiler::dumpCst(std::istream& source, const std::string& filename) {
 bool Compiler::analyzeCst(std::istream& source, const std::string& filename) {
     std::u16string u16code;
     if (!readStreamToU16(source, filename, u16code)) return false;
-    SourceFile sourceFile(filename, std::move(u16code));
 
-    DiagnosticSink sink;
-    Parser parser(sourceFile.getSource(), sink);
-    auto root = parser.parseSourceFile();
-    auto rootNode = SyntaxNode::makeRoot(root.get());
+    std::vector<std::unique_ptr<Module>> modules;
+    std::unordered_map<std::u16string, Module*> byPath;
+    TypeContext sharedCtx;
+    Module* buffer = analyzeStandaloneSource(u"main", filename, std::move(u16code),
+                                             findStdlibRoot(), modules, byPath, sharedCtx);
 
-    Analyzer analyzer(sourceFile, sink);
-    analyzer.analyze(*rootNode);
-
-    if (!sink.empty()) {
-        sink.printAll(sourceFile, std::cerr);
+    if (!buffer->sink->empty()) {
+        buffer->sink->printAll(*buffer->source, std::cerr);
     }
-    return !sink.hasErrors();
+    return !buffer->sink->hasErrors();
 }

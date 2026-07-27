@@ -23,24 +23,15 @@ using ModuleResolver = std::function<const Analyzer*(const std::u16string& modul
 
 class Analyzer {
 public:
-    // Owning-TypeContext form: used by the LSP and stdin compilation, where
-    // there is exactly one source file and no cross-file resolution.
-    Analyzer(const SourceFile& source, DiagnosticSink& sink);
-
-    // Shared-TypeContext form: used by the driver to compile a multi-file
-    // program. `modulePath` is the canonical key (e.g. u"engine.renderer") used
-    // when registering / looking up types in the shared context. `packagePrefix`
-    // is this module's workspace prefix, prepended to bare imports so a package's
+    // `modulePath` is the canonical key (e.g. u"engine.renderer") used when
+    // registering / looking up types in the shared context. `packagePrefix` is
+    // this module's workspace prefix, prepended to bare imports so a package's
     // sibling imports name the same canonical module as an external `@package` import.
     Analyzer(const SourceFile& source, DiagnosticSink& sink,
              TypeContext& sharedContext, std::u16string modulePath,
              std::u16string packagePrefix = {});
 
     ~Analyzer();
-
-    // Single-file convenience wrapper: collect → bind imports → analyze bodies,
-    // all in one call.
-    void analyze(const SyntaxNode& sourceFileRoot);
 
     // Multi-file pipeline: each driver step runs once per module before the
     // next step starts. `collectDeclarations` = registerNames + resolveSignatures;
@@ -49,7 +40,6 @@ public:
     void collectDeclarations(const SyntaxNode& sourceFileRoot);
     void registerNames(const SyntaxNode& sourceFileRoot);
     void resolveSignatures();
-    void bindImports(const ModuleResolver& resolver);
     void bindTypeImports(const ModuleResolver& resolver);
     void bindValueImports(const ModuleResolver& resolver);
     // Reports every struct declared in this module that contains itself by value,
@@ -61,7 +51,15 @@ public:
     void checkSignatureVisibility();
     void analyzeBodies();
 
-    void importPrelude();
+    // Brings the names of the implicitly imported modules that are visible here into
+    // this module's scope, as a named import of each would. Runs after every module
+    // registered its own names and before explicit imports bind, so a name declared
+    // here wins over the implicit one.
+    void bindImplicitImports(const ModuleResolver& resolver);
+
+    // Every top-level type this module declares, in source order, so another module's
+    // implicit import can bind the ones visible to it.
+    std::vector<std::pair<std::u16string, Type*>> topLevelTypes() const;
 
     void layoutOneClass(const ast::ClassDecl& classDecl);
     static void finalizeClassHierarchy(const std::vector<StructInfo*>& classes);
@@ -100,10 +98,6 @@ private:
     DiagnosticSink& sink;
     AnalysisResult analysis;
 
-    // When constructed in single-file mode the analyzer owns its TypeContext
-    // and `typeCtx` aliases it. In shared-context mode `typeCtx` aliases the
-    // driver-owned context and `ownedTypeCtx` stays empty.
-    std::unique_ptr<TypeContext> ownedTypeCtx;
     TypeContext& typeCtx;
     std::u16string modulePath_;
     std::u16string packagePrefix_;
@@ -180,13 +174,6 @@ private:
     std::optional<ast::SourceFile> astRoot;
 
     StructInfo* errorClassInfo_ = nullptr;
-
-    // In owning-TypeContext (single-file/LSP) mode the analyzer compiles the
-    // prelude into its own context here, so `Error` resolves without a driver.
-    // Empty in shared-context mode (the driver supplies a prelude module).
-    struct PreludeData;
-    std::unique_ptr<PreludeData> prelude_;
-    void bootstrapPrelude();
 
     Symbol* makeSymbol(SymbolKind k, std::u16string n, Type* t, uint32_t offset);
     Scope* pushScope();

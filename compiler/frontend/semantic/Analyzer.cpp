@@ -5,10 +5,8 @@
 #include <unordered_set>
 #include "../diagnostics/Diagnostic.h"
 #include "../diagnostics/DiagnosticSink.h"
-#include "../parser/Parser.h"
+#include "ImplicitImports.h"
 #include "Literals.h"
-#include "Prelude.h"
-#include "ThrowsAnalyzer.h"
 
 // Sentinel for a method known to need a vtable slot before final indices are assigned.
 static constexpr int VTSLOT_PENDING = -2;
@@ -80,34 +78,9 @@ static std::string typeKindWord(const Type* t) {
 // Construction / scaffolding
 // =========================================================
 
-struct Analyzer::PreludeData {
-    SourceFile source;
-    DiagnosticSink sink;
-    GreenElementPtr cstRoot;
-    std::unique_ptr<SyntaxNode> rootNode;
-    std::unique_ptr<Analyzer> analyzer;
-
-    PreludeData()
-        : source("<prelude>", std::u16string(kPreludeSource)) {}
-};
-
-Analyzer::Analyzer(const SourceFile& src, DiagnosticSink& s)
-    : source(src), sink(s),
-      ownedTypeCtx(std::make_unique<TypeContext>()),
-      typeCtx(*ownedTypeCtx),
-      modulePath_(u"main") {
-    auto scope = std::make_unique<Scope>(nullptr);
-    globalScope = scope.get();
-    currentScope = globalScope;
-    ownedScopes.push_back(std::move(scope));
-    registerBuiltins();
-    bootstrapPrelude();
-}
-
 Analyzer::Analyzer(const SourceFile& src, DiagnosticSink& s,
                    TypeContext& sharedContext, std::u16string mp, std::u16string packagePrefix)
     : source(src), sink(s),
-      ownedTypeCtx(),
       typeCtx(sharedContext),
       modulePath_(std::move(mp)),
       packagePrefix_(std::move(packagePrefix)) {
@@ -120,28 +93,40 @@ Analyzer::Analyzer(const SourceFile& src, DiagnosticSink& s,
 
 Analyzer::~Analyzer() = default;
 
-void Analyzer::bootstrapPrelude() {
-    // Compile the prelude into this analyzer's own TypeContext via a nested
-    // shared-context analyzer (which performs no bootstrap, breaking recursion),
-    prelude_ = std::make_unique<PreludeData>();
-    Parser parser(prelude_->source.getSource(), prelude_->sink);
-    prelude_->cstRoot = parser.parseSourceFile();
-    prelude_->rootNode = SyntaxNode::makeRoot(prelude_->cstRoot.get());
-    prelude_->analyzer = std::make_unique<Analyzer>(
-        prelude_->source, prelude_->sink, typeCtx, std::u16string(kPreludeModulePath));
-    prelude_->analyzer->collectDeclarations(*prelude_->rootNode);
-    prelude_->analyzer->analyzeBodies();
-    importPrelude();
+std::vector<std::pair<std::u16string, Type*>> Analyzer::topLevelTypes() const {
+    std::vector<std::pair<std::u16string, Type*>> out;
+    if (!astRoot) return out;
+    auto collect = [&](const std::optional<std::u16string>& name) {
+        if (!name) return;
+        Type* t = typeCtx.lookupNamedType(modulePath_, *name);
+        if (t && t->structInfo) out.emplace_back(*name, t);
+    };
+    for (auto& sd : astRoot->structs()) collect(sd.nameText());
+    for (auto& cd : astRoot->classes()) collect(cd.nameText());
+    for (auto& id : astRoot->interfaces()) collect(id.nameText());
+    for (auto& ed : astRoot->enums()) collect(ed.nameText());
+    for (auto& ed : astRoot->externalTypes()) collect(ed.nameText());
+    return out;
 }
 
-void Analyzer::importPrelude() {
-    Type* err = typeCtx.lookupNamedType(std::u16string(kPreludeModulePath), u"Error");
-    if (!err || !err->structInfo) return;
-    errorClassInfo_ = err->structInfo;
-    if (globalScope && !globalScope->lookupLocal(u"Error")) {
-        Symbol* s = makeSymbol(SymbolKind::Variable, std::u16string(u"Error"), err, 0);
-        globalScope->define(s);
+void Analyzer::bindImplicitImports(const ModuleResolver& resolver) {
+    for (std::u16string_view implicitPath : kImplicitImportPaths) {
+        std::u16string path(implicitPath);
+        if (path == modulePath_) continue;
+        const Analyzer* target = resolver(path);
+        if (!target) continue;
+        for (const auto& [name, type] : target->topLevelTypes()) {
+            if (!isTypeVisibleFrom(type)) continue;
+            if (globalScope->lookupLocal(name)) continue;
+            Symbol* sym = makeSymbol(SymbolKind::Variable, name, type, 0);
+            sym->isTypeName = true;
+            globalScope->define(sym);
+        }
     }
+    // The exception base class is compiler-known: catch matching, `throw`, and the
+    // checked-exception rules all resolve against it by module path, not by name.
+    Type* err = typeCtx.lookupNamedType(std::u16string(kCoreModulePath), u"Error");
+    if (err && err->structInfo) errorClassInfo_ = err->structInfo;
 }
 
 void Analyzer::registerBuiltins() {
@@ -493,22 +478,6 @@ Type* Analyzer::analyzeExprAdapt(const ast::Expression& expr, Type* target) {
 // =========================================================
 // Top-level pipeline
 // =========================================================
-
-void Analyzer::analyze(const SyntaxNode& root) {
-    collectDeclarations(root);
-    bindImports([](const std::u16string&) -> const Analyzer* { return nullptr; });
-    checkStructValueCycles();
-    analyzeBodies();
-    checkSignatureVisibility();
-    if (astRoot) {
-        ThrowsAnalyzer throwsAnalyzer(*astRoot, analysis, errorClassInfo_);
-        throwsAnalyzer.analyze();
-        throwsAnalyzer.validate(sink, source);
-    }
-    for (const auto& o : typeCtx.takeInstantiationOverflows()) {
-        sink.error({o.line, o.column, o.length}, o.message);
-    }
-}
 
 void Analyzer::collectDeclarations(const SyntaxNode& root) {
     registerNames(root);
@@ -877,11 +846,6 @@ std::u16string Analyzer::importTargetPath(const ast::ImportDecl& imp) const {
     std::u16string mp = imp.modulePath();
     if (imp.isPackage() || packagePrefix_.empty()) return mp;
     return packagePrefix_ + u"." + mp;
-}
-
-void Analyzer::bindImports(const ModuleResolver& resolver) {
-    bindTypeImports(resolver);
-    bindValueImports(resolver);
 }
 
 // Bind imported types and namespace aliases. Runs before signatures are resolved so
@@ -1863,8 +1827,8 @@ void Analyzer::finalizeClassHierarchy(const std::vector<StructInfo*>& classes) {
 }
 
 void Analyzer::collectFunctions(const ast::SourceFile& file) {
-    // Compiler-owned modules ($prelude, $ens_test_runner) are exempt from the
-    // entry-point placement rule.
+    // The compiler-owned $ens_test_runner module is exempt from the entry-point
+    // placement rule.
     bool mayDefineMain = modulePath_ == u"main" ||
                          (!modulePath_.empty() && modulePath_[0] == u'$');
     for (auto& fn : file.functions()) {

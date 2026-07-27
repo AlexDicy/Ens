@@ -2,8 +2,8 @@
 
 #include "ast/Declaration.h"
 #include "parser/Parser.h"
+#include "semantic/ImplicitImports.h"
 #include "semantic/Literals.h"
-#include "semantic/Prelude.h"
 #include "semantic/Symbol.h"
 #include "semantic/ThrowsAnalyzer.h"
 #include "semantic/Type.h"
@@ -144,11 +144,6 @@ std::unique_ptr<Module> makeInMemoryModule(const std::u16string& modulePath,
     return m;
 }
 
-std::unique_ptr<Module> loadPreludeModule() {
-    return makeInMemoryModule(std::u16string(kPreludeModulePath), "<prelude>",
-                              std::u16string(kPreludeSource));
-}
-
 bool isStdlibPath(const std::u16string& modulePath) {
     static const std::u16string prefix = u"std.";
     return modulePath == u"std" ||
@@ -206,6 +201,13 @@ std::u16string canonicalModulePath(const Workspace& ws, const fs::path& rel) {
     return ws.packagePrefix + u"." + mp;
 }
 
+// `std.a.b` -> `a/b.ens`, where a standard-library module sits inside the std package's
+// source folder.
+fs::path stdlibRelativePath(std::u16string_view modulePath) {
+    constexpr std::u16string_view prefix = u"std.";
+    return relativeFromModulePath(std::u16string(modulePath.substr(prefix.size())));
+}
+
 // Build the graph from explicit (base, rel) seeds, all belonging to `root`.
 bool buildModuleGraphFromSeeds(Workspace& root,
                                WorkspaceRegistry& registry,
@@ -229,6 +231,31 @@ bool buildModuleGraphFromSeeds(Workspace& root,
         queued.insert(canonical);
         work.push_back({ws, base, rel, canonical});
     };
+
+    // The implicitly imported modules load ahead of the seeds: their exported names are in
+    // scope in every module with no import written, so no compilation can do without them.
+    for (std::u16string_view implicitPath : kImplicitImportPaths) {
+        std::u16string canonical(implicitPath);
+        if (stdlibRoot.empty()) {
+            std::cerr << "ERROR: Cannot find the standard library. Every program needs it for "
+                      << "the names module '" << asAscii(canonical) << "' provides without an "
+                      << "import. Set ENS_STDLIB to the directory containing 'std/' (normally "
+                      << "<repo>/libs).\n";
+            return false;
+        }
+        Workspace* stdlib = registry.getOrLoad(stdlibRoot / "std", u"std");
+        fs::path rel = stdlibRelativePath(canonical);
+        fs::path absolute = stdlib->srcRoot / rel;
+        bool haveOverride = overrides && overrides->count(overrideKey(absolute)) > 0;
+        if (!haveOverride && !fs::exists(absolute)) {
+            std::cerr << "ERROR: Cannot find standard library module '" << asAscii(canonical)
+                      << "', which every program needs for the names it provides without an "
+                      << "import (looked for " << absolute.string() << "). Set ENS_STDLIB to "
+                      << "the directory containing 'std/' (normally <repo>/libs).\n";
+            return false;
+        }
+        enqueue(stdlib, stdlib->srcRoot, rel, canonical);
+    }
 
     for (const auto& seed : seeds) {
         enqueue(&root, seed.first, seed.second, canonicalModulePath(root, seed.second));
@@ -414,12 +441,37 @@ bool buildModuleGraph(const fs::path& sourceRoot,
     return buildModuleGraph(root, registry, stdlibRoot, seedRelatives, modulesOut, byPath, overrides);
 }
 
-void insertPreludeModule(std::vector<std::unique_ptr<Module>>& modules,
-                         std::unordered_map<std::u16string, Module*>& byPath) {
-    auto prelude = loadPreludeModule();
-    Module* raw = prelude.get();
-    modules.insert(modules.begin(), std::move(prelude));
-    byPath.emplace(std::u16string(kPreludeModulePath), raw);
+Module* analyzeStandaloneSource(const std::u16string& modulePath, const std::string& filename,
+                                std::u16string code, const fs::path& stdlibRoot,
+                                std::vector<std::unique_ptr<Module>>& modules,
+                                std::unordered_map<std::u16string, Module*>& byPath,
+                                TypeContext& sharedCtx) {
+    // The implicit imports are best-effort here: without a standard library the buffer still
+    // analyzes, only the names it would have provided stay unknown.
+    if (!stdlibRoot.empty()) {
+        WorkspaceRegistry registry;
+        Workspace* stdlib = registry.getOrLoad(stdlibRoot / "std", u"std");
+        for (std::u16string_view implicitPath : kImplicitImportPaths) {
+            std::u16string canonical(implicitPath);
+            fs::path rel = stdlibRelativePath(canonical);
+            if (!fs::exists(stdlib->srcRoot / rel)) continue;
+            auto loaded = loadModule(stdlib->srcRoot, rel, canonical);
+            if (!loaded) continue;
+            loaded->packagePrefix = stdlib->packagePrefix;
+            loaded->restrictNatives = stdlib->hasPackageManifest;
+            loaded->declaredNatives = stdlib->nativeNames;
+            loaded->manifestPath = stdlib->manifestPath;
+            byPath.emplace(canonical, loaded.get());
+            modules.push_back(std::move(loaded));
+        }
+    }
+
+    auto buffer = makeInMemoryModule(modulePath, filename, std::move(code));
+    Module* raw = buffer.get();
+    modules.push_back(std::move(buffer));
+    byPath.emplace(modulePath, raw);
+    analyzeModuleGraph(modules, byPath, sharedCtx);
+    return raw;
 }
 
 bool analyzeModuleGraph(std::vector<std::unique_ptr<Module>>& modules,
@@ -432,13 +484,13 @@ bool analyzeModuleGraph(std::vector<std::unique_ptr<Module>>& modules,
     }
 
     for (auto& m : modules) m->analyzer->registerNames(*m->rootNode);
-    for (auto& m : modules) m->analyzer->importPrelude();
 
     ModuleResolver resolver = [&](const std::u16string& path) -> const Analyzer* {
         auto it = byPath.find(path);
         if (it == byPath.end()) return nullptr;
         return it->second->analyzer.get();
     };
+    for (auto& m : modules) m->analyzer->bindImplicitImports(resolver);
     for (auto& m : modules) m->analyzer->bindTypeImports(resolver);
 
     for (auto& m : modules) m->analyzer->resolveSignatures();
@@ -447,7 +499,7 @@ bool analyzeModuleGraph(std::vector<std::unique_ptr<Module>>& modules,
 
     // Lay out classes whole-program, bases before derived, so a class can extend a class
     // in another module (inherited fields + virtual slots resolve across module
-    // boundaries). The prelude is modules[0], so it sorts first among roots.
+    // boundaries). The implicit imports load first, so they sort first among roots.
     {
         struct ClassItem { Analyzer* owner; ast::ClassDecl decl; StructInfo* info; };
         std::vector<ClassItem> items;

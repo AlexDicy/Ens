@@ -4,7 +4,7 @@
 #include "ast/Expression.h"
 #include "ast/Statement.h"
 #include "semantic/Literals.h"
-#include "semantic/Prelude.h"
+#include "semantic/ImplicitImports.h"
 #include "semantic/Symbol.h"
 #include "semantic/Type.h"
 #include "semantic/TypeContext.h"
@@ -3229,14 +3229,14 @@ struct CodeGenerator::Impl {
     // (_Unwind_Backtrace), which reads .eh_frame and works across glibc, musl,
     // and macOS, plus dlopen'd modules.
 
-    bool isPreludeModule() const { return modulePath == kPreludeModulePath; }
+    bool isCoreModule() const { return modulePath == kCoreModulePath; }
 
     // Error.getStackTrace()/getStackFrames() are recognized at the call site and lowered
-    // to the runtime; their prelude bodies are placeholders and never emitted.
+    // to the runtime; their bodies in @std.core are placeholders and never emitted.
     bool isInterceptedTraceMethod(Symbol* sym) const {
         if (!sym || !sym->methodOwner) return false;
         if (sym->methodOwner->name != u"Error" ||
-            sym->methodOwner->modulePath != kPreludeModulePath) return false;
+            sym->methodOwner->modulePath != kCoreModulePath) return false;
         return sym->name == u"getStackTrace" || sym->name == u"getStackFrames";
     }
 
@@ -3359,8 +3359,8 @@ struct CodeGenerator::Impl {
             llvm::Function::ExternalLinkage, "RtlCaptureStackBackTrace", module.get());
     }
 
-    // Single registry head, internal to the prelude module (only prelude-defined
-    // runtime functions touch it).
+    // Single registry head, internal to the core module (only the runtime functions
+    // defined there touch it).
     llvm::GlobalVariable* getSymtabHead() {
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         if (auto* g = module->getNamedGlobal("_ens_symtab_head")) return g;
@@ -3956,7 +3956,7 @@ struct CodeGenerator::Impl {
         builder->restoreIP(saved);
     }
 
-    void definePreludeRuntime() {
+    void defineTraceRuntime() {
         if (!module->getTargetTriple().isOSWindows()) defineUnwindCallback();
         defineResolveAddr();
         defineResolveLineEntry();
@@ -8166,12 +8166,12 @@ struct CodeGenerator::Impl {
         emitInstantiations(*sf);
 
         // Define a descriptor for every class declared here, even one only ever
-        // thrown or caught (e.g. the prelude's Error), so its definition exists.
+        // thrown or caught (e.g. @std.core's Error), so its definition exists.
         // Templates have no runtime identity; their instantiations emit their own.
         for (auto& cd : sf->classes()) {
             if (Type* t = analysis->typeOf(cd.node.greenNode())) {
                 if (t->structInfo && !t->structInfo->isTemplate) getOrEmitTypeDescriptor(t->structInfo);
-                if (t->structInfo && t->structInfo->name == u"StackFrame" && isPreludeModule())
+                if (t->structInfo && t->structInfo->name == u"StackFrame" && isCoreModule())
                     stackFrameType = t;
             }
         }
@@ -8193,7 +8193,7 @@ struct CodeGenerator::Impl {
 
         builder->SetCurrentDebugLocation(llvm::DebugLoc());
         emitCallSiteLineTable();
-        if (isPreludeModule()) definePreludeRuntime();
+        if (isCoreModule()) defineTraceRuntime();
         emitSymtabRegistration();
 
         // The unwinder reads .eh_frame; force it even on the nounwind runtime so a

@@ -61,7 +61,6 @@ std::unique_ptr<Module> loadModule(const fs::path& sourceRoot,
                                    const std::u16string& modulePath);
 std::unique_ptr<Module> makeInMemoryModule(const std::u16string& modulePath,
                                            const std::string& filename, std::u16string code);
-std::unique_ptr<Module> loadPreludeModule();
 
 // Canonical key for SourceOverrides: a normalized absolute path string. Build override
 // keys with this so they match the paths buildModuleGraph computes.
@@ -71,12 +70,13 @@ std::string overrideKey(const fs::path& absolute);
 // (see overrideKey). Lets the LSP analyze unsaved editor buffers.
 using SourceOverrides = std::unordered_map<std::string, std::u16string>;
 
-// Load the seed files and everything they transitively import. `@std` follows the stdlib
-// root; `@package` imports follow the owning workspace's dependencies into the package's
-// `src/`; bare paths stay within the importing module's workspace. Module paths are
-// package-qualified so the same file resolves to one module however it is reached. Returns
-// false if a file cannot be read. `registry` supplies the root and (lazily) every
-// dependency workspace and outlives the call.
+// Load the implicitly imported standard-library modules, the seed files, and everything they
+// transitively import. `@std` follows the stdlib root; `@package` imports follow the owning
+// workspace's dependencies into the package's `src/`; bare paths stay within the importing
+// module's workspace. Module paths are package-qualified so the same file resolves to one
+// module however it is reached. Returns false if a file cannot be read or the standard
+// library cannot be resolved, reporting the reason on stderr. `registry` supplies the root
+// and (lazily) every dependency workspace and outlives the call.
 bool buildModuleGraph(Workspace& root,
                       WorkspaceRegistry& registry,
                       const fs::path& stdlibRoot,
@@ -108,9 +108,15 @@ bool buildModuleGraph(const fs::path& sourceRoot,
                       const SourceOverrides* overrides = nullptr,
                       const fs::path& testsRoot = {});
 
-// Insert the prelude as modules[0] / byPath[$prelude].
-void insertPreludeModule(std::vector<std::unique_ptr<Module>>& modules,
-                         std::unordered_map<std::u16string, Module*>& byPath);
+// Analyze one in-memory source as module `modulePath`, alongside the implicitly imported
+// standard-library modules when `stdlibRoot` resolves them. For the callers that hold a
+// single buffer and no workspace: the CST debug tool and the language server's fallback
+// path. Returns the module the source was analyzed as; its diagnostics are in its own sink.
+Module* analyzeStandaloneSource(const std::u16string& modulePath, const std::string& filename,
+                                std::u16string code, const fs::path& stdlibRoot,
+                                std::vector<std::unique_ptr<Module>>& modules,
+                                std::unordered_map<std::u16string, Module*>& byPath,
+                                TypeContext& sharedCtx);
 
 // Run semantic analysis across the whole graph (name binding, signatures, imports,
 // whole-program class layout, bodies, and the checked-exception fixpoint), leaving each

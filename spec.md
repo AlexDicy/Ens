@@ -329,6 +329,10 @@ Importing a function by name (`import configure from engine.renderer;`) is an er
 
 Two modules may import each other: circular imports are allowed, and declarations resolve across the cycle like any other import.
 
+A short list of standard-library modules is imported implicitly, today just `@std.core`: its exported names `Error` and `StackFrame` are in scope in every module with no import written.
+A declaration of your own with one of those names takes precedence inside the module that declares it.
+Every other module of the standard library has to be imported.
+
 A program's entry point is the top-level function `main` in its **main module**: `src/main.ens` for a package or a folder of sources, or the compiled file itself for a single-file program.
 No other module may define a top-level `main`; the compiler rejects one wherever it is loaded from, including through an import of another package's main module.
 
@@ -502,7 +506,7 @@ A handler can read the trace from a caught error, either preformatted or as stru
 } catch (ParseError e) {
     Log.warn(e.getStackTrace());                // the trace as a string
 
-    StackFrame[] frames = e.stackFrames();   // or as structured frames
+    StackFrame[] frames = e.getStackFrames();   // or as structured frames
     StackFrame origin = frames[0];
     Log.warn("thrown by {origin.function} at {origin.file}:{origin.line}");
 }
@@ -1193,7 +1197,7 @@ The compiler performs **escape analysis** to elide retain/release pairs and larg
 
 ---
 
-The standard library is an external package, imported with `@`, and is opt-in: its exported declarations are visible only after they are imported. The `std.system` module wraps common operating system facilities and reports failures as exceptions. Import the module to call its functions through the `system` namespace, and import any types you use by name:
+The standard library is an external package, imported with `@`, and is opt-in apart from the implicitly imported `std.core`: its other exported declarations are visible only after they are imported. The `std.system` module wraps common operating system facilities and reports failures as exceptions. Import the module to call its functions through the `system` namespace, and import any types you use by name:
 
 ```ens
 import @std.system;
