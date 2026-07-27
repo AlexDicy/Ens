@@ -9,12 +9,13 @@
 // siblings, the way sema checked them: an identifier naming one resolves to a field of the
 // aggregate being filled rather than to a local slot.
 import FieldDeclarationNode from @ens.frontend.syntax.generated.nodes;
-import StructDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import MemberListNode from @ens.frontend.syntax.generated.nodes;
 import Span from @ens.frontend.support.source;
 import LocalBinding from @ens.sema.model.scopes;
 import PrimitiveKind from @ens.sema.model.types;
 import StructType from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
+import @ens.sema.model.types;
 import EirBinary from eir.model;
 import EirBinaryOp from eir.model;
 import EirBranch from eir.model;
@@ -25,27 +26,36 @@ import EirStoreSlot from eir.model;
 import LoweringContext from lower.context;
 import lower.arrays;
 import lower.ownership;
+import lower.records;
 import lower.stores;
-import lower.structs;
+import lower.weakfields;
 
-// True when the type is a struct that declares a default somewhere inside it, so filling a fresh
-// aggregate of it is more than zeroing.
+// True when the record declares a default somewhere inside it, so filling a fresh one of it is more
+// than zeroing. The walk descends into a struct field, whose storage is inline and needs its own
+// defaults, but stops at a class field: an object's defaults are applied where the object is
+// created, which is also what keeps a class holding one of itself from recursing forever.
 public declaresDefaults(Type type) -> bool {
-    if (!(type is StructType)) {
+    let fields = records.fieldsOf(type);
+    if (fields == null) {
         return false;
     }
-    let fields = type.fields();
     for (long i = 0; i < fields.length(); i++) {
-        if (fields.get(i).hasDefault() || declaresDefaults(fields.get(i).type())) {
+        let fieldType = fields.get(i).type();
+        if (fields.get(i).hasDefault()
+                || (fieldType is StructType && declaresDefaults(fieldType))) {
             return true;
         }
     }
     return false;
 }
 
-// Fills every field of a fresh aggregate from its declared defaults.
-public applyAll(LoweringContext lowering, long destination, StructType type, Span span) -> bool {
-    return applyOmitted(lowering, destination, type, new bool[type.fields().length()], span);
+// Fills every field of a fresh record from its declared defaults.
+public applyAll(LoweringContext lowering, long destination, Type type, Span span) -> bool {
+    let fields = records.fieldsOf(type);
+    if (fields == null) {
+        return true;
+    }
+    return applyOmitted(lowering, destination, type, new bool[fields.length()], span);
 }
 
 // Fills a slot declared without an initializer, which a struct with defaults still needs.
@@ -57,21 +67,21 @@ public applyToSlot(LoweringContext lowering, long slot, Type type, Span span) ->
 }
 
 // Fills the fields the caller did not write. The storage is fresh, so a write initializes it and
-// has nothing to release.
-public applyOmitted(LoweringContext lowering, long destination, StructType type, bool[] written,
+// has nothing to release, except a weak field, whose write always retires whatever entry it held.
+public applyOmitted(LoweringContext lowering, long destination, Type type, bool[] written,
                     Span span) -> bool {
     if (!declaresDefaults(type)) {
         return true;
     }
-    let owner = lowering.index().structFor(type);
+    let owner = lowering.index().recordFor(type);
     if (owner == null) {
-        lowering.internalError("struct '{type.name()}' has no declaration to read its field "
+        lowering.internalError("'{types.display(type)}' has no declaration to read its field "
             + "defaults from", span);
         return false;
     }
     let caller = lowering.enterModule(owner.context());
     lowering.pushFieldDefaults(destination, type);
-    bool filled = fill(lowering, destination, type, owner.declaration(), written, span);
+    bool filled = fill(lowering, destination, type, owner.members(), written, span);
     lowering.popFieldDefaults();
     let restored = lowering.enterModule(caller);
     return filled;
@@ -79,27 +89,35 @@ public applyOmitted(LoweringContext lowering, long destination, StructType type,
 
 // Walks the declaration in source order, which is the order the fields sit in and the order sema
 // brought them into scope, so a default may read a field declared before it.
-fill(LoweringContext lowering, long destination, StructType type, StructDeclarationNode node,
-     bool[] written, Span span) -> bool {
-    let body = node.body();
-    let fields = type.fields();
+fill(LoweringContext lowering, long destination, Type type, MemberListNode body, bool[] written,
+     Span span) -> bool {
+    let fields = records.fieldsOf(type);
+    if (fields == null) {
+        return true;
+    }
     for (long i = 0; i < body.membersCount(); i++) {
         let member = body.members(i);
         if (!(member is FieldDeclarationNode)) {
             continue;
         }
-        long index = structs.fieldIndexOf(type, member.name().text());
+        long index = records.fieldIndexOf(type, member.name().text());
         if (index < 0 || written[index]) {
             continue;
         }
-        let fieldType = fields.get(index).type();
+        let field = fields.get(index);
+        let fieldType = field.type();
         let defaultValue = member.defaultValue();
         if (defaultValue != null) {
             let operand = stores.lowerOperand(lowering, defaultValue.value(), fieldType);
             if (operand == null) {
                 return false;
             }
-            long fieldAddress = structs.fieldAddressAt(lowering, destination, fieldType, index);
+            long fieldAddress = records.fieldAddressIn(lowering, destination, type, fieldType,
+                index);
+            if (field.isWeak()) {
+                weakfields.store(lowering, fieldAddress, operand);
+                continue;
+            }
             if (!stores.initializeThroughAddress(lowering, fieldAddress, fieldType, operand)) {
                 lowering.internalError("the default of field '{member.name().text()}' borrows a "
                     + "struct with no storage to retain", defaultValue.value().span());
@@ -108,7 +126,7 @@ fill(LoweringContext lowering, long destination, StructType type, StructDeclarat
             continue;
         }
         if (fieldType is StructType && declaresDefaults(fieldType)) {
-            long nested = structs.fieldAddressAt(lowering, destination, fieldType, index);
+            long nested = records.fieldAddressIn(lowering, destination, type, fieldType, index);
             if (!applyAll(lowering, nested, fieldType, span)) {
                 return false;
             }
@@ -160,16 +178,20 @@ public fillArray(LoweringContext lowering, long array, Type elementType, long co
 }
 
 // The address of the sibling field an identifier inside a field default names, or -1 when no
-// default is being lowered or the name is not one of the struct's fields.
+// default is being lowered or the name is not one of the record's fields.
 public siblingFieldAddress(LoweringContext lowering, LocalBinding binding) -> long {
     let owner = lowering.fieldDefaultOwner();
     if (owner == null) {
         return -1;
     }
-    long index = structs.fieldIndexOf(owner, binding.name());
+    long index = records.fieldIndexOf(owner, binding.name());
     if (index < 0) {
         return -1;
     }
-    return structs.fieldAddressAt(lowering, lowering.fieldDefaultDestination(),
-        owner.fields().get(index).type(), index);
+    let fields = records.fieldsOf(owner);
+    if (fields == null) {
+        return -1;
+    }
+    return records.fieldAddressIn(lowering, lowering.fieldDefaultDestination(), owner,
+        fields.get(index).type(), index);
 }

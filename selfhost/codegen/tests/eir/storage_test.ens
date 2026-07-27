@@ -1,0 +1,150 @@
+// The storage half of ownership verification, over hand-built EIR: correct field ownership passes,
+// and each way a location's +1 can be mishandled reports its own violation. A weak field reached by
+// strong reference counting, and a strong field reached by the weak operations, are the two mistakes
+// that make an object either immortal or dead too early, so both get a test of their own.
+import @std.testing;
+import PrimitiveKind from @ens.sema.model.types;
+import ClassType from @ens.sema.model.types;
+import EirFunctionBuilder from eir.model;
+import EirParameter from eir.model;
+import EirConstInt from eir.model;
+import EirObjectFieldAddress from eir.model;
+import EirReleasePtr from eir.model;
+import EirRetainPtr from eir.model;
+import EirSlotAddress from eir.model;
+import EirStoreSlot from eir.model;
+import EirWeakLoad from eir.model;
+import EirWeakRelease from eir.model;
+import EirReturn from eir.model;
+import eir.storage;
+import support;
+
+// A class with a strong reference field at index 0 and a weak one at index 1.
+watcherClass() -> ClassType throws {
+    let analysis = try support.analyzeMain(
+        "class Node \{\n"
+        + "    protected int v;\n"
+        + "\}\n"
+        + "class Watcher \{\n"
+        + "    protected Node kept;\n"
+        + "    protected weak Node? seen;\n"
+        + "    protected constructor(this.kept);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return new Watcher(new Node()).kept.v;\n"
+        + "\}\n");
+    return try support.classNamed(analysis, "Watcher");
+}
+
+test "releasing the strong field and retiring the weak one balances" {
+    let watcher = try watcherClass();
+    let fields = watcher.fields();
+    let builder = new EirFunctionBuilder("cleanup", false, null,
+        [new EirParameter("object", watcher)], watcher);
+    long kept = builder.newTemp(fields.get(0).type());
+    builder.append(new EirObjectFieldAddress(kept, fields.get(0).type(), 0, 0));
+    builder.append(new EirReleasePtr(kept));
+    long seen = builder.newTemp(fields.get(1).type());
+    builder.append(new EirObjectFieldAddress(seen, fields.get(1).type(), 0, 1));
+    builder.append(new EirWeakRelease(seen));
+    builder.terminate(new EirReturn(-1));
+    try assertNoViolations(storage.verifyStorage(builder.finish()));
+}
+
+test "reference counting a weak field is reported" {
+    let watcher = try watcherClass();
+    let fields = watcher.fields();
+    let builder = new EirFunctionBuilder("overRelease", false, null,
+        [new EirParameter("object", watcher)], watcher);
+    long seen = builder.newTemp(fields.get(1).type());
+    builder.append(new EirObjectFieldAddress(seen, fields.get(1).type(), 0, 1));
+    builder.append(new EirRetainPtr(seen));
+    builder.terminate(new EirReturn(-1));
+    try assertMentions(storage.verifyStorage(builder.finish()),
+        "retain_ptr reaches the weak field 'seen'");
+}
+
+test "reading a strong field as if it were weak is reported" {
+    let watcher = try watcherClass();
+    let fields = watcher.fields();
+    let builder = new EirFunctionBuilder("wrongRead", false, null,
+        [new EirParameter("object", watcher)], watcher);
+    long kept = builder.newTemp(fields.get(0).type());
+    builder.append(new EirObjectFieldAddress(kept, fields.get(0).type(), 0, 0));
+    long value = builder.newTemp(fields.get(0).type());
+    builder.append(new EirWeakLoad(value, fields.get(0).type(), kept));
+    builder.terminate(new EirReturn(-1));
+    try assertMentions(storage.verifyStorage(builder.finish()),
+        "weak.load reaches the field 'kept'");
+}
+
+test "releasing one field twice with nothing written in between is reported" {
+    let watcher = try watcherClass();
+    let fields = watcher.fields();
+    let builder = new EirFunctionBuilder("twice", false, null,
+        [new EirParameter("object", watcher)], watcher);
+    long first = builder.newTemp(fields.get(0).type());
+    builder.append(new EirObjectFieldAddress(first, fields.get(0).type(), 0, 0));
+    builder.append(new EirReleasePtr(first));
+    long second = builder.newTemp(fields.get(0).type());
+    builder.append(new EirObjectFieldAddress(second, fields.get(0).type(), 0, 0));
+    builder.append(new EirReleasePtr(second));
+    builder.terminate(new EirReturn(-1));
+    try assertMentions(storage.verifyStorage(builder.finish()),
+        "the field 'kept' is released twice");
+}
+
+test "a write into the slot between two releases clears the earlier one" {
+    let store = try support.freshStore();
+    let stringType = store.stringType();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let builder = new EirFunctionBuilder("rewritten", false, null, [], intType);
+    long slot = builder.addSlot("text", stringType, true, false);
+    long first = builder.newTemp(stringType);
+    builder.append(new EirSlotAddress(first, stringType, slot));
+    builder.append(new EirReleasePtr(first));
+    long fresh = builder.newTemp(stringType);
+    builder.append(new EirConstInt(fresh, intType, 0));
+    builder.append(new EirStoreSlot(slot, fresh));
+    long second = builder.newTemp(stringType);
+    builder.append(new EirSlotAddress(second, stringType, slot));
+    builder.append(new EirReleasePtr(second));
+    long zero = builder.newTemp(intType);
+    builder.append(new EirConstInt(zero, intType, 0));
+    builder.terminate(new EirReturn(zero));
+    try assertNoViolations(storage.verifyStorage(builder.finish()));
+}
+
+test "counting a reference in storage that holds none is reported" {
+    let store = try support.freshStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let builder = new EirFunctionBuilder("countsAnInt", false, null, [], intType);
+    long slot = builder.addSlot("count", intType, false, false);
+    long address = builder.newTemp(intType);
+    builder.append(new EirSlotAddress(address, intType, slot));
+    builder.append(new EirReleasePtr(address));
+    long zero = builder.newTemp(intType);
+    builder.append(new EirConstInt(zero, intType, 0));
+    builder.terminate(new EirReturn(zero));
+    try assertMentions(storage.verifyStorage(builder.finish()), "which holds int and so owns no");
+}
+
+assertNoViolations(string[] violations) throws {
+    if (violations.length > 0) {
+        try testing.fail("expected no violations, got {violations.length}: {violations[0]}");
+    }
+}
+
+assertMentions(string[] violations, string fragment) throws {
+    for (let violation in violations) {
+        if (violation.indexOf(fragment) >= 0) {
+            return;
+        }
+    }
+    string seen = "none";
+    if (violations.length > 0) {
+        seen = violations[0];
+    }
+    try testing.fail("no violation mentions '{fragment}' ({violations.length} reported; "
+        + "first: {seen})");
+}

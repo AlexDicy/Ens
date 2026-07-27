@@ -1,0 +1,95 @@
+// The destructor every class carries in its object header. The runtime calls it once, when the last
+// strong reference goes away and before the allocation is freed, handing it the object.
+//
+// It runs the destructor the class declares for itself first, while every field is still readable,
+// then gives up what each field holds: a strong reference is released, a weak field stops watching,
+// and a struct field is walked into for the references inside it. A class whose fields hold nothing
+// and that declares no destructor still gets one, an empty function: what to release is not a
+// decision worth encoding in two places, and removing a call that does nothing is a job for a pass
+// that can see it does nothing.
+//
+// It is built straight from the class rather than from a declaration, so nothing here walks a
+// syntax tree and no expression lowering is involved.
+import ClassType from @ens.sema.model.types;
+import PrimitiveKind from @ens.sema.model.types;
+import StructType from @ens.sema.model.types;
+import Type from @ens.sema.model.types;
+import TypeStore from @ens.sema.model.types;
+import EirCall from eir.model;
+import EirCallee from eir.model;
+import EirFieldAddress from eir.model;
+import EirFunction from eir.model;
+import EirFunctionBuilder from eir.model;
+import EirObjectFieldAddress from eir.model;
+import EirParameter from eir.model;
+import EirReleasePtr from eir.model;
+import EirReturn from eir.model;
+import EirWeakRelease from eir.model;
+import ProgramIndex from lower.index;
+import lower.classes;
+import support.primitives;
+
+// Builds the destructor of one class. Returns null when the class is one code generation cannot lay
+// out, in which case nothing that touches it will lower either.
+public synthesize(ClassType classType, ProgramIndex index, TypeStore store) -> EirFunction? {
+    if (!primitives.isRepresentableClass(classType)) {
+        return null;
+    }
+    let voidType = store.primitive(PrimitiveKind.Void);
+    let builder = new EirFunctionBuilder(classes.destructorSymbol(classType), false, null,
+        [new EirParameter("object", classType)], voidType);
+    long object = 0;
+    callDeclaredDestructor(builder, classType, index, voidType, object);
+    let fields = classType.fields();
+    for (long i = 0; i < fields.length(); i++) {
+        let field = fields.get(i);
+        if (!field.isWeak() && !primitives.hasArcContent(field.type())) {
+            continue;
+        }
+        long address = builder.newTemp(field.type());
+        builder.append(new EirObjectFieldAddress(address, field.type(), object, i));
+        if (field.isWeak()) {
+            builder.append(new EirWeakRelease(address));
+        } else {
+            releaseStorage(builder, address, field.type());
+        }
+    }
+    builder.terminate(new EirReturn(-1));
+    return builder.finish();
+}
+
+callDeclaredDestructor(EirFunctionBuilder builder, ClassType classType, ProgramIndex index,
+                       Type voidType, long object) {
+    let declared = classes.declaredDestructor(classType);
+    if (declared == null) {
+        return;
+    }
+    let info = index.infoFor(declared.signature());
+    if (info == null) {
+        return;
+    }
+    let callee = new EirCallee(info.symbol(), classType, [], voidType);
+    builder.append(new EirCall(-1, voidType, callee, object, []));
+}
+
+// Gives up the references the storage at an address holds: a reference directly, a struct field by
+// field.
+releaseStorage(EirFunctionBuilder builder, long address, Type type) {
+    if (primitives.isReferenceType(type)) {
+        builder.append(new EirReleasePtr(address));
+        return;
+    }
+    if (!(type is StructType)) {
+        return;
+    }
+    let fields = type.fields();
+    for (long i = 0; i < fields.length(); i++) {
+        let field = fields.get(i);
+        if (!primitives.hasArcContent(field.type())) {
+            continue;
+        }
+        long fieldAddress = builder.newTemp(field.type());
+        builder.append(new EirFieldAddress(fieldAddress, field.type(), address, i));
+        releaseStorage(builder, fieldAddress, field.type());
+    }
+}

@@ -8,6 +8,9 @@ import StringType from @ens.sema.model.types;
 import ArrayType from @ens.sema.model.types;
 import StructType from @ens.sema.model.types;
 import EnumType from @ens.sema.model.types;
+import ClassType from @ens.sema.model.types;
+import OptionalType from @ens.sema.model.types;
+import NullType from @ens.sema.model.types;
 
 public isIntegerType(Type type) -> bool {
     if (type is PrimitiveType) {
@@ -76,8 +79,54 @@ public isStringType(Type type) -> bool {
     return type is StringType;
 }
 
+// The string a value of this type holds, looking through an optional, or null for anything else.
+public stringOf(Type type) -> StringType? {
+    if (type is OptionalType) {
+        return stringOf(type.inner());
+    }
+    if (type is StringType) {
+        return type;
+    }
+    return null;
+}
+
 public isArrayType(Type type) -> bool {
     return type is ArrayType;
+}
+
+// The array a value of this type holds, looking through an optional, or null for anything else.
+public arrayOf(Type type) -> ArrayType? {
+    if (type is OptionalType) {
+        return arrayOf(type.inner());
+    }
+    if (type is ArrayType) {
+        return type;
+    }
+    return null;
+}
+
+// The class a value of this type names, looking through an optional, or null for anything else.
+public classOf(Type type) -> ClassType? {
+    if (type is OptionalType) {
+        return classOf(type.inner());
+    }
+    if (type is ClassType) {
+        return type;
+    }
+    return null;
+}
+
+public isClassType(Type type) -> bool {
+    return classOf(type) != null;
+}
+
+public isNullType(Type type) -> bool {
+    return type is NullType;
+}
+
+// True when a value of this type may be absent, which for a reference means it may be null.
+public isOptionalType(Type type) -> bool {
+    return type is OptionalType;
 }
 
 public isStructType(Type type) -> bool {
@@ -94,9 +143,95 @@ public isIntegerLike(Type type) -> bool {
     return isIntegerType(type) || isEnumType(type);
 }
 
+// The referent a value of this type points at, looking through an optional, or null when the type
+// holds no reference. The null literal's own type answers itself: it is a reference that is always
+// absent, so retaining or releasing it is a runtime no-op and lowering needs no special case.
+public referenceOf(Type type) -> Type? {
+    if (type is OptionalType) {
+        return referenceOf(type.inner());
+    }
+    if (type is StringType || type is ArrayType || type is ClassType || type is NullType) {
+        return type;
+    }
+    return null;
+}
+
 // True for the refcounted reference types a value temp can own a +1 of.
 public isReferenceType(Type type) -> bool {
-    return type is StringType || type is ArrayType;
+    return referenceOf(type) != null;
+}
+
+// True when a value of the first type reaches the second with no machine operation, because both
+// name the same referent: narrowing an optional away, widening into one, or the null literal
+// reaching a nullable reference.
+public sameReferent(Type first, Type second) -> bool {
+    let left = referenceOf(first);
+    let right = referenceOf(second);
+    if (left == null || right == null) {
+        return false;
+    }
+    if (left is NullType || right is NullType) {
+        return true;
+    }
+    return left == right;
+}
+
+// The types code generation can represent: the machine primitives, enums, strings, arrays whose
+// elements it can represent, structs whose fields it can, class references, and an optional
+// reference, whose absence is the null pointer. Decimal has no machine mapping, an optional value
+// type would need a tag lowering does not build yet, and an interface needs dispatch tables.
+//
+// A class stops the walk at its reference: whether its own fields can be laid out is
+// isRepresentableClass's question, asked where an object is built or reached into rather than
+// wherever a reference to it travels, which is also what keeps a class holding itself from
+// recursing forever here.
+public isRepresentable(Type type) -> bool {
+    if (isNumericType(type) || isBoolType(type) || isEnumType(type) || isStringType(type)
+            || isNullType(type)) {
+        return true;
+    }
+    if (type is OptionalType) {
+        return isReferenceType(type) && isRepresentable(type.inner());
+    }
+    if (type is ClassType) {
+        return !type.isGeneric() && type.base() == null && type.interfaces().length == 0;
+    }
+    if (type is ArrayType) {
+        return isRepresentable(type.element());
+    }
+    if (type is StructType) {
+        if (type.isGeneric()) {
+            return false;
+        }
+        let fields = type.fields();
+        for (long i = 0; i < fields.length(); i++) {
+            if (fields.get(i).isWeak() || !isRepresentable(fields.get(i).type())) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+// True when a class's own payload can be laid out: every field is a type code generation
+// represents, and every weak field watches a class reference, which is the only thing a side-table
+// entry can point at.
+public isRepresentableClass(ClassType classType) -> bool {
+    if (!isRepresentable(classType)) {
+        return false;
+    }
+    let fields = classType.fields();
+    for (long i = 0; i < fields.length(); i++) {
+        let field = fields.get(i);
+        if (!isRepresentable(field.type())) {
+            return false;
+        }
+        if (field.isWeak() && classOf(field.type()) == null) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // True when copying a value of this type moves reference ownership: a reference itself, or a

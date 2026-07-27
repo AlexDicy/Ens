@@ -1,23 +1,29 @@
 // The program index: one pure pass over the analyzed program that pairs every function signature
-// with its defining module, its red declaration node, and its linker symbol, and every struct with
-// the declaration its field defaults and methods are read from. Lowering consults it to resolve
-// call targets and to reach a callee's defaults, and the driver walks its per-module lists to know
-// what to lower and emit.
+// with its defining module, its red declaration node, and its linker symbol, and every struct and
+// class with the member list its field defaults are read from. Lowering consults it to resolve call
+// targets and to reach a callee's defaults, and the driver walks its per-module lists to know what
+// to lower and emit.
 //
-// A struct's methods are not in its module's function table, so they reach the driver only from
-// here: each carries the struct as its receiver type, which becomes the receiver address its body
-// runs over.
+// A record's methods are not in its module's function table, so they reach the driver only from
+// here: each carries its struct or class as its receiver type, which becomes the storage its body
+// runs over. A class also reaches the driver as a class, because the destructor its objects carry is
+// a function the declaring module has to emit whether or not anything in that module creates one.
 import ProgramAnalysis from @ens.sema.pipeline;
 import ModuleContext from @ens.sema.context;
+import ClassType from @ens.sema.model.types;
 import Method from @ens.sema.model.types;
 import Signature from @ens.sema.model.types;
 import StructType from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
 import Visibility from @ens.sema.model.types;
+import @ens.sema.model.types;
+import ClassDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import MemberListNode from @ens.frontend.syntax.generated.nodes;
 import StructDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import GreenNode from @ens.frontend.syntax.green;
 import lower.symbols;
+import support.primitives;
 import List from @std.collections.list;
 import Map from @std.collections.map;
 
@@ -31,11 +37,12 @@ public final class FunctionInfo {
     bool externalFunction;
     bool builtinFunction;
     Type? methodReceiverType;
+    Method? declaringMethod;
     FunctionDeclarationNode? redDeclaration;
     string linkSymbol;
 
     public constructor(ModuleContext context, Signature signature, Visibility visibility,
-                bool isExternal, bool isBuiltin, Type? receiverType,
+                bool isExternal, bool isBuiltin, Type? receiverType, Method? method,
                 FunctionDeclarationNode? declaration, string symbol) {
         this.owningContext = context;
         this.functionSignature = signature;
@@ -43,6 +50,7 @@ public final class FunctionInfo {
         this.externalFunction = isExternal;
         this.builtinFunction = isBuiltin;
         this.methodReceiverType = receiverType;
+        this.declaringMethod = method;
         this.redDeclaration = declaration;
         this.linkSymbol = symbol;
     }
@@ -53,6 +61,17 @@ public final class FunctionInfo {
 
     public receiverType() -> Type? {
         return this.methodReceiverType;
+    }
+
+    // The record member this entry came from, or null for a free function.
+    public method() -> Method? {
+        return this.declaringMethod;
+    }
+
+    // True for a constructor, whose body may be nothing but the fields its parameters assign.
+    public isConstructor() -> bool {
+        let method = this.declaringMethod;
+        return method != null && method.isConstructor();
     }
 
     public signature() -> Signature {
@@ -86,32 +105,34 @@ public final class FunctionInfo {
     }
 }
 
-// One struct declaration of the program: the module that declares it and the red node whose
-// members carry the field defaults. A field default is checked in its declaring module, so
-// lowering one reads that module's side tables.
-public final class StructInfo {
+// One struct or class declaration of the program: the module that declares it and the member list
+// its field defaults are written in. A field default is checked in its declaring module, so lowering
+// one reads that module's side tables.
+public final class RecordInfo {
     ModuleContext owningContext;
-    StructDeclarationNode redDeclaration;
+    MemberListNode declaredMembers;
 
-    public constructor(this.owningContext, this.redDeclaration);
+    public constructor(this.owningContext, this.declaredMembers);
 
     public context() -> ModuleContext {
         return this.owningContext;
     }
 
-    public declaration() -> StructDeclarationNode {
-        return this.redDeclaration;
+    public members() -> MemberListNode {
+        return this.declaredMembers;
     }
 }
 
-// The functions one module defines and must emit.
+// The functions one module defines and must emit, and the classes whose destructors it owns.
 public final class ModuleFunctions {
     ModuleContext owningContext;
     List<FunctionInfo> lowerableFunctions;
+    List<ClassType> declaredClasses;
 
     public constructor(ModuleContext context) {
         this.owningContext = context;
         this.lowerableFunctions = new List<FunctionInfo>();
+        this.declaredClasses = new List<ClassType>();
     }
 
     public context() -> ModuleContext {
@@ -121,17 +142,21 @@ public final class ModuleFunctions {
     public functions() -> List<FunctionInfo> {
         return this.lowerableFunctions;
     }
+
+    public classes() -> List<ClassType> {
+        return this.declaredClasses;
+    }
 }
 
 public final class ProgramIndex {
     Map<Signature, FunctionInfo> infoBySignature;
-    Map<Type, StructInfo> structByType;
+    Map<Type, RecordInfo> recordByType;
     List<ModuleFunctions> moduleList;
     FunctionInfo? mainInfo;
 
     public constructor() {
         this.infoBySignature = new Map<Signature, FunctionInfo>();
-        this.structByType = new Map<Type, StructInfo>();
+        this.recordByType = new Map<Type, RecordInfo>();
         this.moduleList = new List<ModuleFunctions>();
         this.mainInfo = null;
     }
@@ -140,8 +165,8 @@ public final class ProgramIndex {
         return this.infoBySignature.get(signature);
     }
 
-    public structFor(Type structType) -> StructInfo? {
-        return this.structByType.get(structType);
+    public recordFor(Type recordType) -> RecordInfo? {
+        return this.recordByType.get(recordType);
     }
 
     public modules() -> List<ModuleFunctions> {
@@ -157,8 +182,8 @@ public final class ProgramIndex {
         this.infoBySignature.set(signature, info);
     }
 
-    public registerStruct(Type structType, StructInfo info) {
-        this.structByType.set(structType, info);
+    public registerRecord(Type recordType, RecordInfo info) {
+        this.recordByType.set(recordType, info);
     }
 
     public addModule(ModuleFunctions moduleFunctions) {
@@ -191,7 +216,7 @@ public buildIndex(ProgramAnalysis analysis) -> ProgramIndex {
             string symbol = symbols.linkName(signature, entry.visibility(), entry.isExternal(),
                 context.module().canonicalPath(), overloaded);
             let info = new FunctionInfo(context, signature, entry.visibility(),
-                entry.isExternal(), entry.isBuiltin(), null, declaration, symbol);
+                entry.isExternal(), entry.isBuiltin(), null, null, declaration, symbol);
             index.register(signature, info);
             if (!entry.isExternal() && !entry.isBuiltin() && !signature.isGeneric()
                     && declaration != null) {
@@ -202,15 +227,17 @@ public buildIndex(ProgramAnalysis analysis) -> ProgramIndex {
                 }
             }
         }
-        indexStructs(analysis, index, context, moduleFunctions);
+        indexRecords(analysis, index, context, moduleFunctions);
         index.addModule(moduleFunctions);
     }
     return index;
 }
 
-// The structs one module declares, with their methods. A generic struct is skipped: its
-// instantiations are the emittable types, and monomorphization does not exist yet.
-indexStructs(ProgramAnalysis analysis, ProgramIndex index, ModuleContext context,
+// The structs and classes one module declares, with their methods. A generic record is skipped: its
+// instantiations are the emittable types, and monomorphization does not exist yet. A class code
+// generation cannot lay out is registered but contributes no methods, so a program that only
+// imports the module declaring it still compiles and only a program that reaches into it fails.
+indexRecords(ProgramAnalysis analysis, ProgramIndex index, ModuleContext context,
              ModuleFunctions moduleFunctions) {
     let root = context.root();
     if (root == null) {
@@ -219,25 +246,35 @@ indexStructs(ProgramAnalysis analysis, ProgramIndex index, ModuleContext context
     string modulePath = context.module().canonicalPath();
     for (long i = 0; i < root.itemsCount(); i++) {
         let item = root.items(i);
-        if (!(item is StructDeclarationNode)) {
-            continue;
+        if (item is StructDeclarationNode) {
+            let declared = analysis.store().findDeclared(modulePath, item.name().text());
+            if (!(declared is StructType)) {
+                continue;
+            }
+            index.registerRecord(declared, new RecordInfo(context, item.body()));
+            if (!declared.isGeneric()) {
+                indexMethods(index, context, declared, declared.methods(), item.body(),
+                    moduleFunctions);
+            }
+        } else if (item is ClassDeclarationNode) {
+            let declared = analysis.store().findDeclared(modulePath, item.name().text());
+            if (!(declared is ClassType)) {
+                continue;
+            }
+            index.registerRecord(declared, new RecordInfo(context, item.body()));
+            if (!primitives.isRepresentableClass(declared)) {
+                continue;
+            }
+            moduleFunctions.classes().push(declared);
+            indexMethods(index, context, declared, declared.methods(), item.body(),
+                moduleFunctions);
         }
-        let declared = analysis.store().findDeclared(modulePath, item.name().text());
-        if (!(declared is StructType)) {
-            continue;
-        }
-        index.registerStruct(declared, new StructInfo(context, item));
-        if (declared.isGeneric()) {
-            continue;
-        }
-        indexMethods(index, context, declared, item, moduleFunctions);
     }
 }
 
-indexMethods(ProgramIndex index, ModuleContext context, StructType structType,
-             StructDeclarationNode node, ModuleFunctions moduleFunctions) {
-    let declarations = redMemberDeclarations(node);
-    let methods = structType.methods();
+indexMethods(ProgramIndex index, ModuleContext context, Type recordType, List<Method> methods,
+             MemberListNode body, ModuleFunctions moduleFunctions) {
+    let declarations = redMemberDeclarations(body);
     for (long i = 0; i < methods.length(); i++) {
         let method = methods.get(i);
         let signature = method.signature();
@@ -247,14 +284,27 @@ indexMethods(ProgramIndex index, ModuleContext context, StructType structType,
             declaration = declarations.get(declarationGreen);
         }
         string symbol = symbols.methodLinkName(context.module().canonicalPath(),
-            structType.name(), signature, overloadedIn(methods, method.name()));
+            nameOf(recordType), signature, overloadedIn(methods, method.name()));
         let info = new FunctionInfo(context, signature, method.visibility(), false, false,
-            structType, declaration, symbol);
+            recordType, method, declaration, symbol);
         index.register(signature, info);
-        if (!signature.isGeneric() && declaration != null && declaration.body() != null) {
+        if (signature.isGeneric() || declaration == null) {
+            continue;
+        }
+        if (declaration.body() != null || method.isConstructor()) {
             moduleFunctions.functions().push(info);
         }
     }
+}
+
+nameOf(Type recordType) -> string {
+    if (recordType is StructType) {
+        return recordType.name();
+    }
+    if (recordType is ClassType) {
+        return recordType.name();
+    }
+    return types.display(recordType);
 }
 
 // True when the struct declares more than one method under this name, which is what puts the
@@ -269,9 +319,8 @@ overloadedIn(List<Method> methods, string name) -> bool {
     return seen > 1;
 }
 
-redMemberDeclarations(StructDeclarationNode node) -> Map<GreenNode, FunctionDeclarationNode> {
+redMemberDeclarations(MemberListNode body) -> Map<GreenNode, FunctionDeclarationNode> {
     let declarations = new Map<GreenNode, FunctionDeclarationNode>();
-    let body = node.body();
     for (long i = 0; i < body.membersCount(); i++) {
         let member = body.members(i);
         if (member is FunctionDeclarationNode) {

@@ -1,0 +1,196 @@
+// The storage half of ownership verification, the companion to the value half in eir.ownership.
+// Every instruction that moves the +1 a LOCATION holds names that location through an address, so
+// this pass normalizes the address into a place and checks what the place is allowed to do.
+//
+// What it proves:
+//   - reference counting reaches only storage that actually holds a reference;
+//   - a weak field is reached only by the weak operations, and a strong reference field never is,
+//     which is the mistake that either leaks an object forever or frees a live one;
+//   - the same location is not released twice in a row inside one block with nothing written into
+//     it in between.
+//
+// What stays out of reach. Whether a location's +1 is released exactly once along every path is a
+// question about locations across the whole control-flow graph, and two element addresses through
+// different index temps are decidably neither the same place nor different ones, so the answer
+// would have to be conservative in a direction that reports working code. Nothing here crosses a
+// function boundary either: that a callee leaves its caller's storage alone is the calling
+// convention, assumed rather than proven.
+import EirFunction from eir.model;
+import EirBlock from eir.model;
+import EirCall from eir.model;
+import EirRetainPtr from eir.model;
+import EirReleasePtr from eir.model;
+import EirStorePtr from eir.model;
+import EirStoreSlot from eir.model;
+import EirWeakStore from eir.model;
+import EirWeakLoad from eir.model;
+import EirWeakRelease from eir.model;
+import Place from eir.place;
+import PlaceRelation from eir.place;
+import PlaceRoot from eir.place;
+import eir.place;
+import @ens.sema.model.types;
+import support.primitives;
+import List from @std.collections.list;
+
+// Verifies one function's storage-level ownership; the returned list is empty when it holds.
+export verifyStorage(EirFunction function) -> string[] {
+    let problems = new List<string>();
+    let blocks = function.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        checkBlock(function, blocks.get(b), problems);
+    }
+    return problems.toArray();
+}
+
+checkBlock(EirFunction function, EirBlock block, List<string> problems) {
+    let released = new List<Place>();
+    let instructions = block.instructions();
+    for (long i = 0; i < instructions.length(); i++) {
+        let instruction = instructions.get(i);
+        switch (instruction) {
+            is EirRetainPtr retain -> {
+                checkOwning(function, block, retain.address, "retain_ptr", problems);
+            },
+            is EirReleasePtr release -> {
+                checkOwning(function, block, release.address, "release_ptr", problems);
+                let named = place.placeOf(function, release.address);
+                if (named != null) {
+                    reportRepeatedRelease(function, block, named, released, problems);
+                    released.push(named);
+                }
+            },
+            is EirStorePtr store -> {
+                checkNotWeak(function, block, store.address, "store_ptr", problems);
+                released = forget(function, store.address, released);
+            },
+            // A write into a whole slot replaces everything inside it, references included.
+            is EirStoreSlot store -> {
+                released = forgetSlot(released, store.slot);
+            },
+            is EirWeakStore store -> {
+                checkWeak(function, block, store.address, "weak.store", problems);
+            },
+            is EirWeakLoad load -> {
+                checkWeak(function, block, load.address, "weak.load", problems);
+            },
+            is EirWeakRelease release -> {
+                checkWeak(function, block, release.address, "weak.release", problems);
+            },
+            // A callee may write any storage it was handed, so nothing released before a call is
+            // still known to be empty afterwards.
+            is EirCall ignored -> {
+                released = new List<Place>();
+            },
+            default -> { },
+        }
+    }
+}
+
+// Storage reference counting may reach: it holds a reference and it is not a weak field.
+checkOwning(EirFunction function, EirBlock block, long address, string what,
+            List<string> problems) {
+    checkNotWeak(function, block, address, what, problems);
+    let named = place.placeOf(function, address);
+    if (named == null) {
+        return;
+    }
+    let stored = place.typeOfPlace(function, named);
+    if (stored != null && primitives.referenceOf(stored) == null) {
+        report(function, block, problems, "{what} reaches "
+            + "{place.describe(function, address)}, which holds {types.display(stored)} and so "
+            + "owns no reference");
+    }
+}
+
+checkNotWeak(EirFunction function, EirBlock block, long address, string what,
+             List<string> problems) {
+    let named = place.placeOf(function, address);
+    if (named == null) {
+        return;
+    }
+    let field = place.finalFieldOf(function, named);
+    if (field != null && field.isWeak()) {
+        report(function, block, problems, "{what} reaches the weak field '{field.name()}', which "
+            + "watches an object without owning it; weak storage is written with weak.store and "
+            + "read with weak.load");
+    }
+}
+
+// Storage a weak operation may reach: a field declared weak.
+checkWeak(EirFunction function, EirBlock block, long address, string what,
+          List<string> problems) {
+    let named = place.placeOf(function, address);
+    if (named == null) {
+        return;
+    }
+    let field = place.finalFieldOf(function, named);
+    if (field == null) {
+        report(function, block, problems, "{what} reaches "
+            + "{place.describe(function, address)}, which is not a field, so nothing there was "
+            + "declared weak");
+        return;
+    }
+    if (!field.isWeak()) {
+        report(function, block, problems, "{what} reaches the field '{field.name()}', which owns "
+            + "a strong reference; only a field declared weak has a side-table entry to read");
+    }
+}
+
+reportRepeatedRelease(EirFunction function, EirBlock block, Place named, List<Place> released,
+                      List<string> problems) {
+    for (long i = 0; i < released.length(); i++) {
+        if (place.relate(released.get(i), named) == PlaceRelation.Same) {
+            report(function, block, problems, "the +1 held by "
+                + "{describePlace(function, named)} is released twice with nothing written into "
+                + "it in between, so the second release gives up a reference this function no "
+                + "longer holds");
+            return;
+        }
+    }
+}
+
+// A write into a location gives it a reference again, so an earlier release of it no longer
+// stands. Only the releases the write provably cannot have reached are kept, which keeps a place
+// the write may alias out of the double-release report.
+forget(EirFunction function, long address, List<Place> released) -> List<Place> {
+    let kept = new List<Place>();
+    let written = place.placeOf(function, address);
+    if (written == null) {
+        return kept;
+    }
+    for (long i = 0; i < released.length(); i++) {
+        if (place.relate(released.get(i), written) == PlaceRelation.Different) {
+            kept.push(released.get(i));
+        }
+    }
+    return kept;
+}
+
+forgetSlot(List<Place> released, long slot) -> List<Place> {
+    let kept = new List<Place>();
+    for (long i = 0; i < released.length(); i++) {
+        let named = released.get(i);
+        if (named.root() != PlaceRoot.Slot || named.rootId() != slot) {
+            kept.push(named);
+        }
+    }
+    return kept;
+}
+
+describePlace(EirFunction function, Place named) -> string {
+    if (named.steps().length() > 0) {
+        let field = place.finalFieldOf(function, named);
+        if (field != null) {
+            return "the field '{field.name()}'";
+        }
+    }
+    return switch (named.root()) {
+        Slot -> "${named.rootId()} '{function.slots().get(named.rootId()).name()}'",
+        default -> "the storage %{named.rootId()} names",
+    };
+}
+
+report(EirFunction function, EirBlock block, List<string> problems, string problem) {
+    problems.push("{function.symbol()}: {block.label()}: {problem}");
+}

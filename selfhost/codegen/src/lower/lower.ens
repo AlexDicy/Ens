@@ -27,8 +27,12 @@ import EirUnreachable from eir.model;
 import FunctionInfo from lower.index;
 import ProgramIndex from lower.index;
 import LoweringContext from lower.context;
+import Operand from lower.stores;
 import lower.ownership;
+import lower.records;
 import lower.statements;
+import lower.stores;
+import lower.weakfields;
 import support.primitives;
 
 public final class FunctionLowering {
@@ -61,14 +65,16 @@ public lowerFunction(FunctionInfo info, ProgramIndex index, TypeStore store)
         return new FunctionLowering(null, lowering.diagnostics());
     }
     let body = declaration.body();
-    if (body == null) {
+    if (body == null && !info.isConstructor()) {
         lowering.internalError("function '{signature.name()}' has no body to lower",
             signature.nameSpan());
         return new FunctionLowering(null, lowering.diagnostics());
     }
     lowering.pushScope();
     bindParameters(lowering, declaration, body);
-    statements.lowerBlock(lowering, body);
+    if (body != null) {
+        statements.lowerBlock(lowering, body);
+    }
     if (lowering.failed()) {
         return new FunctionLowering(null, lowering.diagnostics());
     }
@@ -89,7 +95,10 @@ public lowerFunction(FunctionInfo info, ProgramIndex index, TypeStore store)
 // the way it reads locals. A reference argument arrives borrowed and stays the caller's, so the
 // slot owns nothing; a struct argument is a copy this function may change, so it retains the
 // references it holds and releases them when the function ends.
-bindParameters(LoweringContext lowering, FunctionDeclarationNode declaration, BlockNode body) {
+//
+// A constructor parameter written 'this.field' also assigns that field, through the same barrier a
+// written assignment uses, because a field default may already occupy it.
+bindParameters(LoweringContext lowering, FunctionDeclarationNode declaration, BlockNode? body) {
     let signature = lowering.info().signature();
     Parameter[] parameters = signature.parameters();
     let parameterList = declaration.parameters();
@@ -102,12 +111,6 @@ bindParameters(LoweringContext lowering, FunctionDeclarationNode declaration, Bl
         if (!lowering.supportsValueType(parameter.type())) {
             lowering.unsupported("a parameter of type '{types.display(parameter.type())}'",
                 parameter.span());
-            return;
-        }
-        if (parameter.bindsField()) {
-            lowering.unsupported("a constructor parameter that assigns the field "
-                + "'{parameter.name()}' for you; write 'this.{parameter.name()} = "
-                + "{parameter.name()};' in the body instead", parameter.span());
             return;
         }
         if (i >= parameterList.parametersCount()) {
@@ -137,13 +140,57 @@ bindParameters(LoweringContext lowering, FunctionDeclarationNode declaration, Bl
             }
             ownership.trackSlot(lowering, slot, parameter.type());
         }
+        if (parameter.bindsField() && !bindField(lowering, parameter, slot, i + offset)) {
+            return;
+        }
     }
+}
+
+// Assigns the field a 'this.field' parameter names. The incoming value is borrowed, so the field
+// retains what it takes and gives up what it held, exactly as a written assignment would.
+bindField(LoweringContext lowering, Parameter parameter, long slot, long incoming) -> bool {
+    let receiverType = lowering.info().receiverType();
+    if (receiverType == null) {
+        lowering.internalError("a 'this.{parameter.name()}' parameter outside a constructor",
+            parameter.span());
+        return false;
+    }
+    let fields = records.fieldsOf(receiverType);
+    long index = records.fieldIndexOf(receiverType, parameter.name());
+    if (fields == null || index < 0) {
+        lowering.internalError("'{types.display(receiverType)}' has no field "
+            + "'{parameter.name()}' for its constructor parameter to assign", parameter.span());
+        return false;
+    }
+    let field = fields.get(index);
+    long destination = 0;
+    long address = records.fieldAddressIn(lowering, destination, receiverType, field.type(),
+        index);
+    long source = -1;
+    if (!primitives.isReferenceType(parameter.type())
+            && primitives.hasArcContent(parameter.type())) {
+        source = ownership.slotAddress(lowering, slot, parameter.type());
+    }
+    let operand = new Operand(incoming, false, source);
+    if (field.isWeak()) {
+        weakfields.store(lowering, address, operand);
+        return true;
+    }
+    if (!stores.assignThroughAddress(lowering, address, field.type(), operand)) {
+        lowering.internalError("the constructor parameter '{parameter.name()}' borrows a struct "
+            + "with no storage to retain", parameter.span());
+        return false;
+    }
+    return true;
 }
 
 // True when the body assigns to this binding. A reference parameter that is only read keeps its
 // caller's reference and pays no atomics; one that is written over has to own what it holds, so
 // its slot takes a reference of its own at entry and gives it up at the end.
-assignsTo(LoweringContext lowering, BlockNode body, LocalBinding binding) -> bool {
+assignsTo(LoweringContext lowering, BlockNode? body, LocalBinding binding) -> bool {
+    if (body == null) {
+        return false;
+    }
     return assignsWithin(lowering, body, binding);
 }
 

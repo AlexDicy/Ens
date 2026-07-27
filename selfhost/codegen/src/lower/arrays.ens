@@ -34,8 +34,9 @@ import lower.statements;
 import lower.stores;
 import support.primitives;
 
-// 'new T[a]', and 'new T[a][b]' which allocates every level. A trailing empty bracket leaves
-// inner slots null, which needs optionals lowering does not have yet.
+// 'new T[a]', and 'new T[a][b]' which allocates every level. A trailing empty bracket leaves the
+// slots of the last allocated level at the null the allocation zeroed them to, which is why the
+// element type there is an optional array.
 public lowerNew(LoweringContext lowering, NewExpressionNode node) -> long {
     let type = lowering.typeOf(node);
     if (type == null) {
@@ -50,19 +51,29 @@ public lowerNew(LoweringContext lowering, NewExpressionNode node) -> long {
             + "'{types.display(type)}'", node.span());
         return -1;
     }
-    for (long i = 0; i < node.dimensionsCount(); i++) {
-        if (node.dimensions(i).size() == null) {
-            lowering.unsupported("an array whose inner level is left unallocated",
-                node.span());
-            return -1;
-        }
+    long sized = sizedDimensions(node);
+    if (sized == 0) {
+        lowering.internalError("'new' allocates no array level", node.span());
+        return -1;
     }
-    return allocateLevel(lowering, node, 0, type);
+    return allocateLevel(lowering, node, 0, type, sized);
 }
 
-// Allocates one level and, when deeper levels remain, fills every slot with the level below.
-allocateLevel(LoweringContext lowering, NewExpressionNode node, long level, Type levelType)
-        -> long {
+// The leading dimensions that carry a size, which are the levels the allocation fills. A level
+// written empty leaves everything below it unallocated, so a size after an empty bracket would
+// describe a level nothing reaches.
+sizedDimensions(NewExpressionNode node) -> long {
+    long sized = 0;
+    while (sized < node.dimensionsCount() && node.dimensions(sized).size() != null) {
+        sized++;
+    }
+    return sized;
+}
+
+// Allocates one level and, when deeper allocated levels remain, fills every slot with the level
+// below.
+allocateLevel(LoweringContext lowering, NewExpressionNode node, long level, Type levelType,
+              long sized) -> long {
     if (!(levelType is ArrayType)) {
         lowering.internalError("array level {level} has type "
             + "'{types.display(levelType)}'", node.span());
@@ -81,7 +92,7 @@ allocateLevel(LoweringContext lowering, NewExpressionNode node, long level, Type
     let builder = lowering.builder();
     long array = builder.newTemp(levelType);
     builder.append(new EirArrayNew(array, levelType, count));
-    if (level + 1 >= node.dimensionsCount()) {
+    if (level + 1 >= sized) {
         if (!defaults.fillArray(lowering, array, levelType.element(), count, node.span())) {
             return -1;
         }
@@ -104,7 +115,7 @@ allocateLevel(LoweringContext lowering, NewExpressionNode node, long level, Type
     builder.append(new EirBinary(more, boolType, EirBinaryOp.CmpLtSigned, index, count));
     builder.terminate(new EirBranch(more, bodyBlock, exitBlock));
     builder.moveTo(bodyBlock);
-    long inner = allocateLevel(lowering, node, level + 1, elementType);
+    long inner = allocateLevel(lowering, node, level + 1, elementType, sized);
     if (inner < 0) {
         return -1;
     }
@@ -167,7 +178,7 @@ public lowerSubscript(LoweringContext lowering, SubscriptExpressionNode node) ->
     if (elementType == null) {
         return -1;
     }
-    return places.loadFrom(lowering, address, elementType);
+    return places.readFrom(lowering, address, elementType, node.span());
 }
 
 // The address of the element 'xs[i]' names, bounds checked.

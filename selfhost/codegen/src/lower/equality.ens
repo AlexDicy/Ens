@@ -1,0 +1,202 @@
+// Comparing two references. By default the answer is identity: both sides are the same pointer, so
+// one integer comparison decides it, and a null literal on either side is a presence check for
+// free.
+//
+// A class that declares 'equals' for itself asks for content instead, and then the comparison is
+// three-way: the same object is equal without calling anything, an absent reference on one side
+// only is not equal without calling anything, and otherwise the declared method answers. Both
+// operands arrive borrowed, so none of the branches has to give a reference up.
+import BinaryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import Method from @ens.sema.model.types;
+import PrimitiveKind from @ens.sema.model.types;
+import Type from @ens.sema.model.types;
+import @ens.sema.model.types;
+import EirBinary from eir.model;
+import EirBinaryOp from eir.model;
+import EirBranch from eir.model;
+import EirConstBool from eir.model;
+import EirConstNull from eir.model;
+import EirJump from eir.model;
+import EirLoadSlot from eir.model;
+import EirStoreSlot from eir.model;
+import EirUnary from eir.model;
+import EirUnaryOp from eir.model;
+import LoweringContext from lower.context;
+import lower.calls;
+import lower.classes;
+import lower.conversions;
+import support.primitives;
+
+// True when '==' over these two operand types compares references rather than values.
+public comparesReferences(Type left, Type right) -> bool {
+    if (!primitives.sameReferent(left, right)) {
+        return false;
+    }
+    if (isPresenceCheck(left, right)) {
+        return true;
+    }
+    let referent = primitives.referenceOf(left);
+    return referent != null && !primitives.isStringType(referent);
+}
+
+// True when one side is the null literal, which makes the comparison ask whether the other side is
+// there at all rather than what it holds.
+public isPresenceCheck(Type left, Type right) -> bool {
+    return primitives.isNullType(left) || primitives.isNullType(right);
+}
+
+public lower(LoweringContext lowering, BinaryExpressionNode binary, bool negated, Type resultType)
+        -> long {
+    let leftType = lowering.typeOf(binary.left());
+    let rightType = lowering.typeOf(binary.right());
+    if (leftType == null || rightType == null) {
+        return -1;
+    }
+    let common = comparisonType(leftType, rightType);
+    if (!lowering.supportsValueType(common)) {
+        lowering.unsupported("comparing '{types.display(leftType)}' with "
+            + "'{types.display(rightType)}'", binary.span());
+        return -1;
+    }
+    long left = classes.borrowedReference(lowering, binary.left(), common);
+    long right = classes.borrowedReference(lowering, binary.right(), common);
+    if (left < 0 || right < 0) {
+        return -1;
+    }
+    let declared = declaredEquals(lowering, common);
+    if (declared == null || isPresenceCheck(leftType, rightType)) {
+        return compareIdentity(lowering, left, right, negated, resultType);
+    }
+    return compareContents(lowering, left, right, declared, negated, resultType, binary);
+}
+
+// The type both operands compare at. A null literal takes the other side's type, and where the two
+// spellings differ the optional one wins, because it is the one that can hold either value.
+comparisonType(Type left, Type right) -> Type {
+    if (primitives.isNullType(left)) {
+        return right;
+    }
+    if (primitives.isNullType(right) || left == right || primitives.isOptionalType(left)) {
+        return left;
+    }
+    return right;
+}
+
+// The 'equals' a class declares for itself: one parameter of its own class, answering bool. A
+// declaration of any other shape is an ordinary method that '==' does not consult.
+declaredEquals(LoweringContext lowering, Type type) -> Method? {
+    let classType = primitives.classOf(type);
+    if (classType == null) {
+        return null;
+    }
+    let methods = classType.methods();
+    for (long i = 0; i < methods.length(); i++) {
+        let method = methods.get(i);
+        if (method.name() != "equals" || method.isConstructor() || method.isDestructor()) {
+            continue;
+        }
+        let signature = method.signature();
+        if (signature.parameters().length != 1 || signature.declaresThrows()) {
+            continue;
+        }
+        if (primitives.classOf(signature.parameters()[0].type()) != classType) {
+            continue;
+        }
+        if (!primitives.isBoolType(signature.returnType())) {
+            continue;
+        }
+        return method;
+    }
+    return null;
+}
+
+compareIdentity(LoweringContext lowering, long left, long right, bool negated, Type resultType)
+        -> long {
+    let builder = lowering.builder();
+    long temp = builder.newTemp(resultType);
+    let op = negated ? EirBinaryOp.CmpNe : EirBinaryOp.CmpEq;
+    builder.append(new EirBinary(temp, resultType, op, left, right));
+    return temp;
+}
+
+compareContents(LoweringContext lowering, long left, long right, Method declared, bool negated,
+                Type resultType, BinaryExpressionNode binary) -> long {
+    let info = lowering.index().infoFor(declared.signature());
+    if (info == null) {
+        lowering.internalError("the 'equals' of this class resolves to no indexed function",
+            binary.span());
+        return -1;
+    }
+    if (!calls.supportedCallee(lowering, info, "method 'equals'", binary.span())) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    long answer = builder.addSlot("equal", boolType, false, false);
+    long identical = compareIdentity(lowering, left, right, false, boolType);
+    long sameBlock = builder.newBlock("equals.same");
+    long testBlock = builder.newBlock("equals.test");
+    long absentBlock = builder.newBlock("equals.absent");
+    long callBlock = builder.newBlock("equals.call");
+    long endBlock = builder.newBlock("equals.end");
+    builder.terminate(new EirBranch(identical, sameBlock, testBlock));
+
+    builder.moveTo(sameBlock);
+    storeConstant(lowering, answer, boolType, true);
+    builder.terminate(new EirJump(endBlock));
+
+    builder.moveTo(testBlock);
+    long absent = eitherAbsent(lowering, left, right, boolType);
+    builder.terminate(new EirBranch(absent, absentBlock, callBlock));
+
+    builder.moveTo(absentBlock);
+    storeConstant(lowering, answer, boolType, false);
+    builder.terminate(new EirJump(endBlock));
+
+    builder.moveTo(callBlock);
+    let parameterType = declared.signature().parameters()[0].type();
+    long argument = conversions.convert(lowering, right, parameterType, binary.span());
+    if (argument < 0) {
+        return -1;
+    }
+    long produced = calls.emitCall(lowering, info, primitives.classOf(parameterType), left,
+        [argument]);
+    builder.append(new EirStoreSlot(answer, produced));
+    builder.terminate(new EirJump(endBlock));
+
+    builder.moveTo(endBlock);
+    long merged = builder.newTemp(boolType);
+    builder.append(new EirLoadSlot(merged, boolType, answer));
+    if (!negated) {
+        return merged;
+    }
+    long inverted = builder.newTemp(resultType);
+    builder.append(new EirUnary(inverted, resultType, EirUnaryOp.Not, merged));
+    return inverted;
+}
+
+eitherAbsent(LoweringContext lowering, long left, long right, Type boolType) -> long {
+    let builder = lowering.builder();
+    long leftAbsent = absentTest(lowering, left, boolType);
+    long rightAbsent = absentTest(lowering, right, boolType);
+    long either = builder.newTemp(boolType);
+    builder.append(new EirBinary(either, boolType, EirBinaryOp.Or, leftAbsent, rightAbsent));
+    return either;
+}
+
+absentTest(LoweringContext lowering, long value, Type boolType) -> long {
+    let builder = lowering.builder();
+    let valueType = builder.tempType(value);
+    long absent = builder.newTemp(valueType);
+    builder.append(new EirConstNull(absent, valueType));
+    long test = builder.newTemp(boolType);
+    builder.append(new EirBinary(test, boolType, EirBinaryOp.CmpEq, value, absent));
+    return test;
+}
+
+storeConstant(LoweringContext lowering, long slot, Type boolType, bool value) {
+    let builder = lowering.builder();
+    long constant = builder.newTemp(boolType);
+    builder.append(new EirConstBool(constant, boolType, value));
+    builder.append(new EirStoreSlot(slot, constant));
+}

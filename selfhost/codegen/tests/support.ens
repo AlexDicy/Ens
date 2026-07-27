@@ -12,6 +12,8 @@ import ProgramAnalysis from @ens.sema.pipeline;
 import @ens.sema.pipeline;
 import TypeStore from @ens.sema.model.types;
 import StructType from @ens.sema.model.types;
+import ClassType from @ens.sema.model.types;
+import @ens.sema.model.types;
 import Context from @ens.llvm.core;
 import Module from @ens.llvm.core;
 import Builder from @ens.llvm.core;
@@ -22,8 +24,10 @@ import EirFunction from eir.model;
 import eir.dump;
 import eir.verify;
 import eir.ownership;
+import eir.storage;
 import FunctionInfo from lower.index;
 import ProgramIndex from lower.index;
+import lower.destructors;
 import lower.index;
 import lower.lower;
 import FunctionLowering from lower.lower;
@@ -127,6 +131,31 @@ public structNamed(ProgramAnalysis analysis, string name) -> StructType throws {
     throw new TestFailure("no struct named '{name}'");
 }
 
+// The class type a test program declares, searched across its modules the way structNamed is.
+public classNamed(ProgramAnalysis analysis, string name) -> ClassType throws {
+    let contexts = analysis.contexts();
+    for (long i = 0; i < contexts.length(); i++) {
+        let found = analysis.store().findDeclared(contexts.get(i).module().canonicalPath(), name);
+        if (found is ClassType) {
+            return found;
+        }
+    }
+    throw new TestFailure("no class named '{name}'");
+}
+
+// Synthesizes one class's destructor, asserts every verifier is satisfied, and returns its dump.
+public destructorDump(string programText, string className) -> string throws {
+    let analysis = try analyzeMain(programText);
+    let programIndex = index.buildIndex(analysis);
+    let classType = try classNamed(analysis, className);
+    let synthesized = destructors.synthesize(classType, programIndex, analysis.store());
+    if (synthesized == null) {
+        throw new TestFailure("'{className}' has no destructor to synthesize");
+    }
+    try assertVerified(synthesized, className);
+    return dump.dumpFunction(synthesized);
+}
+
 public functionNamed(ProgramAnalysis analysis, ProgramIndex index, string name)
         -> FunctionInfo throws {
     let modules = index.modules();
@@ -140,6 +169,38 @@ public functionNamed(ProgramAnalysis analysis, ProgramIndex index, string name)
         }
     }
     throw new TestFailure("no lowerable function named '{name}'");
+}
+
+// Lowers one method of a named record, so a test can reach a constructor without colliding with the
+// constructors the standard library declares under the same name.
+public loweredMethodDump(string programText, string recordName, string methodName)
+        -> string throws {
+    let analysis = try analyzeMain(programText);
+    let programIndex = index.buildIndex(analysis);
+    let modules = programIndex.modules();
+    for (long m = 0; m < modules.length(); m++) {
+        let moduleFunctions = modules.get(m);
+        for (long i = 0; i < moduleFunctions.functions().length(); i++) {
+            let info = moduleFunctions.functions().get(i);
+            let receiver = info.receiverType();
+            if (info.signature().name() != methodName || receiver == null
+                    || types.display(receiver) != recordName) {
+                continue;
+            }
+            let outcome = lower.lowerFunction(info, programIndex, analysis.store());
+            let function = outcome.function();
+            if (function == null) {
+                string reason = "no diagnostics";
+                if (outcome.diagnostics().length > 0) {
+                    reason = outcome.diagnostics()[0].message();
+                }
+                throw new TestFailure("lowering '{recordName}.{methodName}' failed: {reason}");
+            }
+            try assertVerified(function, "{recordName}.{methodName}");
+            return dump.dumpFunction(function);
+        }
+    }
+    throw new TestFailure("no lowerable method '{recordName}.{methodName}'");
 }
 
 // Lowers one function of an accepted program, asserts the structural verifier is satisfied,
@@ -157,17 +218,27 @@ public loweredDump(string programText, string functionName) -> string throws {
         }
         throw new TestFailure("lowering '{functionName}' failed: {reason}");
     }
+    try assertVerified(function, functionName);
+    return dump.dumpFunction(function);
+}
+
+// Asserts the three verifiers accept a lowered function, showing the dump when one does not.
+assertVerified(EirFunction function, string described) throws {
     string[] violations = verify.verifyFunction(function);
     if (violations.length > 0) {
-        throw new TestFailure("the verifier rejected '{functionName}': {violations[0]}\n"
+        throw new TestFailure("the verifier rejected '{described}': {violations[0]}\n"
             + dump.dumpFunction(function));
     }
     string[] unbalanced = ownership.verifyOwnership(function);
     if (unbalanced.length > 0) {
-        throw new TestFailure("ownership does not balance in '{functionName}': "
+        throw new TestFailure("ownership does not balance in '{described}': "
             + "{unbalanced[0]}\n" + dump.dumpFunction(function));
     }
-    return dump.dumpFunction(function);
+    string[] unbalancedStorage = storage.verifyStorage(function);
+    if (unbalancedStorage.length > 0) {
+        throw new TestFailure("storage ownership does not balance in '{described}': "
+            + "{unbalancedStorage[0]}\n" + dump.dumpFunction(function));
+    }
 }
 
 // Lowers one function expecting failure, and returns the first diagnostic's message.

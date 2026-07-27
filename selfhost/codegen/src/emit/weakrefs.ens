@@ -1,0 +1,161 @@
+// The weak side table: the entry a weakly watched object grows on first use, and the three
+// operations that read and retire it. Each one is a function the Runtime toolkit defines once per
+// module, with the same internal linkage and insertion-point discipline as the rest of the runtime.
+//
+// An entry is 16 bytes, [object (8) | weak count (8)], and the object's header points at it from
+// payload - 8. Its lifetime is independent of the object's: whoever drops the last of the two frees
+// it. An object that dies nulls the entry's object field, which is what lets a read answer "gone"
+// instead of handing back memory that has been freed.
+import Runtime from emit.runtime;
+import RuntimeFunction from emit.runtime;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+
+// ptr ens_weak_init(ptr object): the object's side-table entry, created on first use, with one
+// more weak watcher counted. Null in, null out.
+public initializeEntry(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_weak_init", type);
+    if (known != null) {
+        return known;
+    }
+    let allocate = runtime.calloc();
+    let deallocate = runtime.free();
+    let definition = runtime.beginDefinition("ens_weak_init", type);
+    let object = runtime.parameter(definition, 0);
+    let emptyBlock = runtime.block(definition, "weak.init.empty");
+    let lookBlock = runtime.block(definition, "weak.init.look");
+    let createBlock = runtime.block(definition, "weak.init.create");
+    let publishedBlock = runtime.block(definition, "weak.init.published");
+    let lostBlock = runtime.block(definition, "weak.init.lost");
+    let countBlock = runtime.block(definition, "weak.init.count");
+    instructions.buildCondBr(runtime.builder, runtime.isNull(object), emptyBlock, lookBlock);
+
+    runtime.builder.positionAtEnd(emptyBlock);
+    instructions.buildRet(runtime.builder, runtime.nullPointer());
+
+    runtime.builder.positionAtEnd(lookBlock);
+    let sideSlot = runtime.offsetPointer(object, -8, "");
+    let existing = memory.buildLoad(runtime.builder, runtime.pointerType, sideSlot, "sidetable");
+    instructions.buildCondBr(runtime.builder, runtime.isNull(existing), createBlock, countBlock);
+
+    // Two threads may create an entry at once, so the winner is decided by the exchange and
+    // the loser frees what it built.
+    runtime.builder.positionAtEnd(createBlock);
+    let fresh = runtime.call(allocate, [runtime.int64(1), runtime.int64(16)], "fresh");
+    memory.buildStore(runtime.builder, object, fresh);
+    let exchanged = memory.buildAtomicCompareExchange(runtime.builder, sideSlot,
+        runtime.nullPointer(), fresh, memory.orderingAcquireRelease(),
+        memory.orderingAcquire());
+    let won = instructions.buildExtractValue(runtime.builder, exchanged, 1, "");
+    instructions.buildCondBr(runtime.builder, won, publishedBlock, lostBlock);
+
+    runtime.builder.positionAtEnd(publishedBlock);
+    instructions.buildBr(runtime.builder, countBlock);
+
+    runtime.builder.positionAtEnd(lostBlock);
+    runtime.call(deallocate, [fresh], "");
+    instructions.buildBr(runtime.builder, countBlock);
+
+    // Whichever path arrives here, the header now names the entry, so reading it back merges
+    // the three of them without a phi.
+    runtime.builder.positionAtEnd(countBlock);
+    let entry = memory.buildLoad(runtime.builder, runtime.pointerType, sideSlot, "entry");
+    memory.buildAtomicAdd(runtime.builder, runtime.offsetPointer(entry, 8, ""), runtime.int64(1),
+        memory.orderingMonotonic());
+    instructions.buildRet(runtime.builder, entry);
+    return runtime.endDefinition(definition);
+}
+
+// void ens_weak_release(ptr entry): one fewer weak watcher. The last watcher frees the entry
+// when the object it watched has already died.
+public releaseEntry(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_weak_release", type);
+    if (known != null) {
+        return known;
+    }
+    let deallocate = runtime.free();
+    let definition = runtime.beginDefinition("ens_weak_release", type);
+    let entry = runtime.parameter(definition, 0);
+    let dropBlock = runtime.block(definition, "weak.release.drop");
+    let lastBlock = runtime.block(definition, "weak.release.last");
+    let freeBlock = runtime.block(definition, "weak.release.free");
+    let doneBlock = runtime.block(definition, "weak.release.done");
+    instructions.buildCondBr(runtime.builder, runtime.isNull(entry), doneBlock, dropBlock);
+
+    runtime.builder.positionAtEnd(dropBlock);
+    let previous = memory.buildAtomicSub(runtime.builder, runtime.offsetPointer(entry, 8, ""),
+        runtime.int64(1), memory.orderingAcquireRelease());
+    let last = instructions.buildICmpEQ(runtime.builder, previous, runtime.int64(1), "");
+    instructions.buildCondBr(runtime.builder, last, lastBlock, doneBlock);
+
+    runtime.builder.positionAtEnd(lastBlock);
+    let watched = memory.buildLoad(runtime.builder, runtime.pointerType, entry, "watched");
+    memory.setOrdering(watched, memory.orderingAcquire());
+    memory.setAlignment(watched, 8);
+    instructions.buildCondBr(runtime.builder, runtime.isNull(watched), freeBlock, doneBlock);
+
+    runtime.builder.positionAtEnd(freeBlock);
+    runtime.call(deallocate, [entry], "");
+    instructions.buildBr(runtime.builder, doneBlock);
+
+    runtime.builder.positionAtEnd(doneBlock);
+    instructions.buildRetVoid(runtime.builder);
+    return runtime.endDefinition(definition);
+}
+
+// ptr ens_weak_load(ptr entry): the object the entry watches with one more owner, or null when
+// it is already gone. The upgrade is a compare-and-exchange on the strong count, so an object
+// whose last release is already running is reported dead rather than resurrected.
+public loadEntry(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_weak_load", type);
+    if (known != null) {
+        return known;
+    }
+    let definition = runtime.beginDefinition("ens_weak_load", type);
+    let entry = runtime.parameter(definition, 0);
+    let readBlock = runtime.block(definition, "weak.load.read");
+    let testBlock = runtime.block(definition, "weak.load.test");
+    let upgradeBlock = runtime.block(definition, "weak.load.upgrade");
+    let liveBlock = runtime.block(definition, "weak.load.live");
+    let deadBlock = runtime.block(definition, "weak.load.dead");
+    let countSlot = memory.buildAlloca(runtime.builder, runtime.int64Type, "count");
+    instructions.buildCondBr(runtime.builder, runtime.isNull(entry), deadBlock, readBlock);
+
+    runtime.builder.positionAtEnd(readBlock);
+    let watched = memory.buildLoad(runtime.builder, runtime.pointerType, entry, "watched");
+    memory.setOrdering(watched, memory.orderingAcquire());
+    memory.setAlignment(watched, 8);
+    instructions.buildCondBr(runtime.builder, runtime.isNull(watched), deadBlock, testBlock);
+
+    runtime.builder.positionAtEnd(testBlock);
+    let strongSlot = runtime.offsetPointer(watched, -24, "");
+    let observed = runtime.loadCount(strongSlot, memory.orderingMonotonic());
+    memory.buildStore(runtime.builder, observed, countSlot);
+    instructions.buildBr(runtime.builder, upgradeBlock);
+
+    runtime.builder.positionAtEnd(upgradeBlock);
+    let current = memory.buildLoad(runtime.builder, runtime.int64Type, countSlot, "current");
+    let gone = instructions.buildICmpEQ(runtime.builder, current, runtime.int64(0), "");
+    let bumpBlock = runtime.block(definition, "weak.load.bump");
+    instructions.buildCondBr(runtime.builder, gone, deadBlock, bumpBlock);
+
+    runtime.builder.positionAtEnd(bumpBlock);
+    let next = instructions.buildAdd(runtime.builder, current, runtime.int64(1), "");
+    let exchanged = memory.buildAtomicCompareExchange(runtime.builder, strongSlot, current, next,
+        memory.orderingAcquireRelease(), memory.orderingMonotonic());
+    memory.buildStore(runtime.builder,
+        instructions.buildExtractValue(runtime.builder, exchanged, 0, ""), countSlot);
+    let won = instructions.buildExtractValue(runtime.builder, exchanged, 1, "");
+    instructions.buildCondBr(runtime.builder, won, liveBlock, upgradeBlock);
+
+    runtime.builder.positionAtEnd(liveBlock);
+    instructions.buildRet(runtime.builder, watched);
+
+    runtime.builder.positionAtEnd(deadBlock);
+    instructions.buildRet(runtime.builder, runtime.nullPointer());
+    return runtime.endDefinition(definition);
+}
+

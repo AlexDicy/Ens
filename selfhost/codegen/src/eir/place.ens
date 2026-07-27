@@ -1,23 +1,27 @@
 // Normalizes an address temp into the place it names: a root plus a projection path. The walk
 // follows each address temp's single defining instruction, so it always terminates at a slot, at
-// an array value, or at an address that arrived as the function's receiver. A receiver is an
-// opaque root: nothing is known about its base, so identity questions across it answer unknown,
-// never different. The ownership verifier is the first consumer; later passes ask the same
-// questions through this module instead of re-tracing instructions.
+// an array value, at the object a class reference names, or at an address that arrived as the
+// function's receiver. A receiver is an opaque root: nothing is known about its base, so identity
+// questions across it answer unknown, never different. The ownership verifier is the first
+// consumer; later passes ask the same questions through this module instead of re-tracing
+// instructions.
 import Type from @ens.sema.model.types;
 import StructType from @ens.sema.model.types;
-import ArrayType from @ens.sema.model.types;
+import Field from @ens.sema.model.types;
 import EirFunction from eir.model;
 import EirInstruction from eir.model;
 import EirSlotAddress from eir.model;
 import EirFieldAddress from eir.model;
+import EirObjectFieldAddress from eir.model;
 import EirElementAddress from eir.model;
 import List from @std.collections.list;
+import support.primitives;
 
 export enum PlaceRoot {
     Slot,
     Receiver,
     Array,
+    Object,
 }
 
 // One projection step: a symbolic field index into a struct, or an element index held by a
@@ -49,8 +53,8 @@ export final class Place {
         return this.rootKind;
     }
 
-    // The slot id for a slot root, the receiver temp for a receiver root, the array temp for an
-    // array root.
+    // The slot id for a slot root, and otherwise the temp the root reached: the receiver, the
+    // array, or the class reference the object sits behind.
     export rootId() -> long {
         return this.rootValue;
     }
@@ -74,9 +78,9 @@ export placeOf(EirFunction function, long address) -> Place? {
 
 // How two places relate: Same only when they provably name one location, Different only when
 // they provably cannot, Unknown otherwise. A receiver root is opaque, so any question across
-// one that is not structurally identical stays Unknown; two distinct array temps may hold the
-// same array, so those stay Unknown too. A place that is a strict prefix of the other contains
-// it, which is neither same nor disjoint, so that is Unknown as well.
+// one that is not structurally identical stays Unknown; two distinct array or object temps may
+// hold the same reference, so those stay Unknown too. A place that is a strict prefix of the other
+// contains it, which is neither same nor disjoint, so that is Unknown as well.
 export relate(Place first, Place second) -> PlaceRelation {
     if (first.root() != second.root()) {
         if (first.root() == PlaceRoot.Receiver || second.root() == PlaceRoot.Receiver) {
@@ -120,6 +124,64 @@ export relate(Place first, Place second) -> PlaceRelation {
     return PlaceRelation.Unknown;
 }
 
+// The type of the storage a place names, or null when the walk cannot see it - which happens for a
+// place rooted at an opaque receiver whose type is unknown, or one whose steps do not match the
+// types along the path.
+export typeOfPlace(EirFunction function, Place named) -> Type? {
+    Type? current = rootTypeOf(function, named);
+    let steps = named.steps();
+    for (long i = 0; i < steps.length(); i++) {
+        current = stepThrough(current, steps.get(i));
+    }
+    return current;
+}
+
+// The declared field a place's last step names, or null when the place does not end in a field or
+// the walk cannot see the owner's type. This is what tells a storage check whether it is looking at
+// a weak field, which is reached by different operations than a strong one.
+export finalFieldOf(EirFunction function, Place named) -> Field? {
+    let steps = named.steps();
+    if (steps.length() == 0) {
+        return null;
+    }
+    Type? current = rootTypeOf(function, named);
+    for (long i = 0; i + 1 < steps.length(); i++) {
+        current = stepThrough(current, steps.get(i));
+    }
+    return fieldAt(current, steps.get(steps.length() - 1));
+}
+
+rootTypeOf(EirFunction function, Place named) -> Type? {
+    return switch (named.root()) {
+        Slot -> function.slots().get(named.rootId()).type(),
+        Receiver -> function.receiverType(),
+        default -> tempTypeOf(function, named.rootId()),
+    };
+}
+
+// The type one projection step reaches, or null when the step does not fit the current type.
+stepThrough(Type? current, PlaceStep step) -> Type? {
+    if (!step.isField()) {
+        return elementTypeAfterIndex(current);
+    }
+    let field = fieldAt(current, step);
+    if (field == null) {
+        return null;
+    }
+    return field.type();
+}
+
+fieldAt(Type? owner, PlaceStep step) -> Field? {
+    if (!step.isField()) {
+        return null;
+    }
+    let fields = fieldsOf(owner);
+    if (fields == null || step.value() < 0 || step.value() >= fields.length()) {
+        return null;
+    }
+    return fields.get(step.value());
+}
+
 // A readable spelling of the place an address temp names, for the dump: the slot's name, 'this'
 // for the receiver, or the array temp, followed by field names and [%index] steps. Returns ""
 // when the temp is not an address.
@@ -131,32 +193,19 @@ export describe(EirFunction function, long address) -> string {
     string text = switch (place.root()) {
         Slot -> function.slots().get(place.rootId()).name(),
         Receiver -> "this",
-        Array -> "%{place.rootId()}",
+        default -> "%{place.rootId()}",
     };
-    Type? current = switch (place.root()) {
-        Slot -> function.slots().get(place.rootId()).type(),
-        Receiver -> function.receiverType(),
-        Array -> tempTypeOf(function, place.rootId()),
-    };
+    Type? current = rootTypeOf(function, place);
     let steps = place.steps();
     for (long i = 0; i < steps.length(); i++) {
         let step = steps.get(i);
         if (step.isField()) {
-            string fieldName = "{step.value()}";
-            let owner = current;
-            if (owner != null && owner is StructType
-                    && step.value() < owner.fields().length()) {
-                let field = owner.fields().get(step.value());
-                fieldName = field.name();
-                current = field.type();
-            } else {
-                current = null;
-            }
-            text = text + "." + fieldName;
+            let field = fieldAt(current, step);
+            text = text + "." + (field == null ? "{step.value()}" : field.name());
         } else {
             text = text + "[%{step.value()}]";
-            current = elementTypeAfterIndex(current);
         }
+        current = stepThrough(current, step);
     }
     return text;
 }
@@ -166,7 +215,7 @@ resolvePlace(EirFunction function, List<AddressDefinition> definitions, long add
     let steps = new List<PlaceStep>();
     long current = address;
     while (true) {
-        if (function.receiverType() != null && current == 0) {
+        if (isOpaqueReceiver(function, current)) {
             return new Place(PlaceRoot.Receiver, current, reversed(steps));
         }
         let definition = definitionOf(definitions, current);
@@ -181,6 +230,10 @@ resolvePlace(EirFunction function, List<AddressDefinition> definitions, long add
                 steps.push(new PlaceStep(true, fieldAddress.fieldIndex));
                 current = fieldAddress.base;
             },
+            is EirObjectFieldAddress fieldAddress -> {
+                steps.push(new PlaceStep(true, fieldAddress.fieldIndex));
+                return new Place(PlaceRoot.Object, fieldAddress.object, reversed(steps));
+            },
             is EirElementAddress elementAddress -> {
                 steps.push(new PlaceStep(false, elementAddress.index));
                 return new Place(PlaceRoot.Array, elementAddress.array, reversed(steps));
@@ -190,6 +243,28 @@ resolvePlace(EirFunction function, List<AddressDefinition> definitions, long add
             },
         }
     }
+}
+
+// True for the receiver address a struct method runs over, which is an opaque root: its caller
+// owns the storage and nothing here knows where it lives. A class method's receiver is a
+// reference, not an address, so it is not one of these.
+export isOpaqueReceiver(EirFunction function, long temp) -> bool {
+    let receiverType = function.receiverType();
+    return temp == 0 && receiverType != null && primitives.classOf(receiverType) == null;
+}
+
+fieldsOf(Type? owner) -> List<Field>? {
+    if (owner == null) {
+        return null;
+    }
+    if (owner is StructType) {
+        return owner.fields();
+    }
+    let classType = primitives.classOf(owner);
+    if (classType != null) {
+        return classType.fields();
+    }
+    return null;
 }
 
 class AddressDefinition {
@@ -211,6 +286,9 @@ addressDefinitions(EirFunction function) -> List<AddressDefinition> {
                     definitions.push(new AddressDefinition(slotAddress.result, instruction));
                 },
                 is EirFieldAddress fieldAddress -> {
+                    definitions.push(new AddressDefinition(fieldAddress.result, instruction));
+                },
+                is EirObjectFieldAddress fieldAddress -> {
                     definitions.push(new AddressDefinition(fieldAddress.result, instruction));
                 },
                 is EirElementAddress elementAddress -> {
@@ -251,8 +329,9 @@ elementTypeAfterIndex(Type? arrayType) -> Type? {
     if (arrayType == null) {
         return null;
     }
-    if (arrayType is ArrayType) {
-        return arrayType.element();
+    let array = primitives.arrayOf(arrayType);
+    if (array != null) {
+        return array.element();
     }
     return null;
 }

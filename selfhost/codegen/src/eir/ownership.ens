@@ -10,11 +10,10 @@
 // function returns), a double release or a release of a reference the temp never owned, a use
 // after the +1 was handed on, and a temp whose ownership differs between two paths that join.
 //
-// What it does NOT prove: anything about the STORAGE side. Whether a slot, field, or element
-// whose +1 arrived through a store is released exactly once is a question about locations, and
-// two element addresses through different index temps may or may not be the same location, so
-// retain_ptr and release_ptr balance is out of reach here. Nor does it check the calling
-// convention itself: that a call returns +1 and takes its arguments at +0 is assumed, not
+// What it does NOT prove: anything about the STORAGE side. That is eir.storage's half, which asks
+// its questions through the places addresses normalize to; between them, whether a location's +1 is
+// released exactly once along every path is still out of reach for both. Nor does either check the
+// calling convention itself: that a call returns +1 and takes its arguments at +0 is assumed, not
 // proven.
 import EirFunction from eir.model;
 import EirBlock from eir.model;
@@ -26,7 +25,10 @@ import EirStoreSlot from eir.model;
 import EirStorePtr from eir.model;
 import EirLoadSlot from eir.model;
 import EirLoadPtr from eir.model;
+import EirCast from eir.model;
 import EirConstString from eir.model;
+import EirClassNew from eir.model;
+import EirWeakLoad from eir.model;
 import EirArrayNew from eir.model;
 import EirStringConcat from eir.model;
 import EirStringSubstring from eir.model;
@@ -40,6 +42,7 @@ import EirDoubleToString from eir.model;
 import EirJsonEscape from eir.model;
 import EirTerminator from eir.model;
 import EirReturn from eir.model;
+import eir.place;
 import eir.walk;
 import Type from @ens.sema.model.types;
 import @ens.sema.model.types;
@@ -265,6 +268,22 @@ class OwnershipVerifier {
                 this.consume(block, store.value, states, reporting,
                     "stored through %{store.address}");
             },
+            // A conversion between two spellings of one reference is a rename, so the +1 travels
+            // to the result rather than being duplicated or dropped.
+            is EirCast cast -> {
+                if (!this.isTracked(cast.result)) {
+                    return;
+                }
+                if (!this.isTracked(cast.operand)) {
+                    states.set(cast.result, Ownership.Borrowed);
+                    return;
+                }
+                let carried = states.get(cast.operand);
+                states.set(cast.result, carried);
+                if (carried == Ownership.Owned) {
+                    states.set(cast.operand, Ownership.Consumed);
+                }
+            },
             default -> {
                 long result = walk.resultOf(instruction);
                 if (!this.isTracked(result)) {
@@ -331,9 +350,17 @@ class OwnershipVerifier {
 
 // True for the instructions that hand their caller a fresh +1. The conversions that yield an
 // immortal string (a bool's or an enum member's name) are included: their release is a runtime
-// no-op, and treating every conversion alike keeps lowering free of special cases.
+// no-op, and treating every conversion alike keeps lowering free of special cases. The absent
+// reference is NOT one of them: it owns nothing, so a store of it retains first like any borrowed
+// value, and a null used only in a comparison needs no release afterwards.
 producesOwned(EirInstruction instruction) -> bool {
     switch (instruction) {
+        is EirClassNew ignored -> {
+            return true;
+        },
+        is EirWeakLoad ignored -> {
+            return true;
+        },
         is EirArrayNew ignored -> {
             return true;
         },
@@ -379,7 +406,7 @@ producesOwned(EirInstruction instruction) -> bool {
 // The temps holding addresses rather than values; ownership tracks values only.
 addressTemps(EirFunction function) -> bool[] {
     bool[] addresses = new bool[function.tempTypes().length() + 1];
-    if (function.receiverType() != null && function.tempTypes().length() > 0) {
+    if (function.tempTypes().length() > 0 && place.isOpaqueReceiver(function, 0)) {
         addresses[0] = true;
     }
     let blocks = function.blocks();

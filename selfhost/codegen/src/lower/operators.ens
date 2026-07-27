@@ -19,10 +19,13 @@ import EirConstInt from eir.model;
 import EirConstFloat from eir.model;
 import EirLoadSlot from eir.model;
 import EirStoreSlot from eir.model;
+import EirStorePtr from eir.model;
 import EirJump from eir.model;
 import EirBranch from eir.model;
 import LoweringContext from lower.context;
+import lower.equality;
 import lower.expressions;
+import lower.places;
 import lower.strings;
 import support.primitives;
 
@@ -72,13 +75,26 @@ public lowerPostfix(LoweringContext lowering, PostfixExpressionNode postfix) -> 
         postfix.operator().kind() == SyntaxKind.PlusPlus, false, postfix.span());
 }
 
-// '++'/'--' on a slot-backed location: load once, add or subtract one, store back. The
-// expression's value is the new value for the prefix form and the old one for postfix.
+// '++'/'--' on a location: read it once, add or subtract one, write it back. A local is read
+// through its slot; anything else is a place, whose address is computed once so a written index is
+// evaluated once too. The expression's value is the new value for the prefix form and the old one
+// for postfix.
 lowerIncrement(LoweringContext lowering, Expression operand, bool isIncrement, bool isPrefix,
                Span span) -> long {
+    let builder = lowering.builder();
     if (!(operand is IdentifierExpressionNode)) {
-        lowering.unsupported("'++' or '--' on this target", span);
-        return -1;
+        long address = places.lowerAddress(lowering, operand);
+        if (address < 0) {
+            if (!lowering.failed()) {
+                lowering.unsupported("'++' or '--' on this target", span);
+            }
+            return -1;
+        }
+        let placeType = builder.tempType(address);
+        long previous = places.loadFrom(lowering, address, placeType);
+        long stepped = stepBy(lowering, previous, placeType, isIncrement);
+        builder.append(new EirStorePtr(address, stepped));
+        return isPrefix ? stepped : previous;
     }
     let binding = lowering.result().bindingOf(operand.green());
     if (binding == null) {
@@ -90,12 +106,22 @@ lowerIncrement(LoweringContext lowering, Expression operand, bool isIncrement, b
         lowering.internalError("increment target has no storage slot", span);
         return -1;
     }
-    let builder = lowering.builder();
     let type = binding.type();
     long oldValue = builder.newTemp(type);
     builder.append(new EirLoadSlot(oldValue, type, slot));
-    long one = builder.newTemp(type);
+    long newValue = stepBy(lowering, oldValue, type, isIncrement);
+    builder.append(new EirStoreSlot(slot, newValue));
+    if (isPrefix) {
+        return newValue;
+    }
+    return oldValue;
+}
+
+// The value one step above or below another, at its own type.
+stepBy(LoweringContext lowering, long value, Type type, bool isIncrement) -> long {
+    let builder = lowering.builder();
     bool isFloat = primitives.isFloatType(type);
+    long one = builder.newTemp(type);
     if (isFloat) {
         builder.append(new EirConstFloat(one, type, 1.0, "1"));
     } else {
@@ -109,13 +135,9 @@ lowerIncrement(LoweringContext lowering, Expression operand, bool isIncrement, b
     } else if (!isIncrement) {
         op = EirBinaryOp.Sub;
     }
-    long newValue = builder.newTemp(type);
-    builder.append(new EirBinary(newValue, type, op, oldValue, one));
-    builder.append(new EirStoreSlot(slot, newValue));
-    if (isPrefix) {
-        return newValue;
-    }
-    return oldValue;
+    long stepped = builder.newTemp(type);
+    builder.append(new EirBinary(stepped, type, op, value, one));
+    return stepped;
 }
 
 public lowerBinary(LoweringContext lowering, BinaryExpressionNode binary) -> long {
@@ -136,9 +158,13 @@ public lowerBinary(LoweringContext lowering, BinaryExpressionNode binary) -> lon
         if (leftType == null || rightType == null) {
             return -1;
         }
-        if (primitives.isStringType(leftType) && primitives.isStringType(rightType)) {
-            return strings.lowerComparison(lowering, binary.left(), binary.right(),
-                operator == SyntaxKind.NotEquals, resultType);
+        bool negated = operator == SyntaxKind.NotEquals;
+        if (equality.comparesReferences(leftType, rightType)) {
+            return equality.lower(lowering, binary, negated, resultType);
+        }
+        if (primitives.stringOf(leftType) != null && primitives.stringOf(rightType) != null) {
+            return strings.lowerComparison(lowering, binary.left(), binary.right(), negated,
+                resultType);
         }
     }
     switch (operator) {

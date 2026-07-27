@@ -1,0 +1,316 @@
+// Golden lowering tests for classes: creating an object, the barriers a field read and write carry,
+// a method over its receiver, the fields a shorthand constructor assigns, and the weak operations.
+// The goldens pin exactly where each reference changes hands, so a leak or an extra release shows up
+// as a diff rather than as a fixture that happens to still print the right number.
+import @std.testing;
+import support;
+
+test "creating an object allocates, defaults its fields, then runs the constructor" {
+    let dumped = try support.loweredDump(
+        "class Box \{\n"
+        + "    protected int value = 7;\n"
+        + "    protected constructor(int initial) \{\n"
+        + "        this.value = initial;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let b = new Box(3);\n"
+        + "    return b.value;\n"
+        + "\}\n", "main");
+    try testing.assertEqual(dumped,
+        "func internal @ens.main() -> int \{\n"
+        + "  $0 b: Box zeroed\n"
+        + "b0.entry:\n"
+        + "  %0 = class.new @_dtor$main$Box: Box\n"
+        + "  %1 = const 7: int\n"
+        + "  %2 = object_field_addr %0, 0: &int  ; %0.value\n"
+        + "  store_ptr %2, %1\n"
+        + "  %3 = const 3: int\n"
+        + "  call @main$Box$constructor(this %0, %3)\n"
+        + "  store $0, %0\n"
+        + "  %4 = load $0: Box\n"
+        + "  %5 = object_field_addr %4, 0: &int  ; %4.value\n"
+        + "  %6 = load_ptr %5: int\n"
+        + "  %7 = slot_addr $0: &Box  ; b\n"
+        + "  release_ptr %7\n"
+        + "  ret %6\n"
+        + "\}\n");
+}
+
+test "a field write retains the new reference before releasing the old, and a read borrows" {
+    let dumped = try support.loweredDump(
+        "class Holder \{\n"
+        + "    protected string text;\n"
+        + "    protected constructor(this.text);\n"
+        + "\}\n"
+        + "replace(Holder h, string next) -> string \{\n"
+        + "    h.text = next;\n"
+        + "    return h.text;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let ignored = replace(new Holder(\"a\"), \"b\");\n"
+        + "    return 0;\n"
+        + "\}\n", "replace");
+    try testing.assertEqual(dumped,
+        "func internal @replace(%0: Holder, %1: string) -> string \{\n"
+        + "  $0 h: Holder borrowed\n"
+        + "  $1 next: string borrowed\n"
+        + "b0.entry:\n"
+        + "  store $0, %0\n"
+        + "  store $1, %1\n"
+        + "  %2 = load $0: Holder\n"
+        + "  %3 = object_field_addr %2, 0: &string  ; %2.text\n"
+        + "  %4 = load $1: string\n"
+        + "  retain %4\n"
+        + "  release_ptr %3\n"
+        + "  store_ptr %3, %4\n"
+        + "  %5 = load $0: Holder\n"
+        + "  %6 = object_field_addr %5, 0: &string  ; %5.text\n"
+        + "  %7 = load_ptr %6: string\n"
+        + "  retain %7\n"
+        + "  ret %7\n"
+        + "\}\n");
+}
+
+test "a method reads its fields through the reference in temp zero" {
+    let dumped = try support.loweredDump(
+        "class Box \{\n"
+        + "    protected int value;\n"
+        + "    protected constructor(this.value);\n"
+        + "    protected doubled() -> int \{\n"
+        + "        return this.value * 2;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return new Box(21).doubled();\n"
+        + "\}\n", "doubled");
+    try testing.assertEqual(dumped,
+        "func @main$Box$doubled(%0: Box) -> int \{\n"
+        + "b0.entry:\n"
+        + "  %1 = object_field_addr %0, 0: &int  ; %0.value\n"
+        + "  %2 = load_ptr %1: int\n"
+        + "  %3 = const 2: int\n"
+        + "  %4 = mul %2, %3: int\n"
+        + "  ret %4\n"
+        + "\}\n");
+}
+
+test "an object reached only for a method call is parked in a slot the scope releases" {
+    let dumped = try support.loweredDump(
+        "class Box \{\n"
+        + "    protected int value;\n"
+        + "    protected constructor(this.value);\n"
+        + "    protected doubled() -> int \{\n"
+        + "        return this.value * 2;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return new Box(21).doubled();\n"
+        + "\}\n", "main");
+    try testing.assertEqual(dumped,
+        "func internal @ens.main() -> int \{\n"
+        + "  $0 held: Box zeroed\n"
+        + "b0.entry:\n"
+        + "  %0 = class.new @_dtor$main$Box: Box\n"
+        + "  %1 = const 21: int\n"
+        + "  call @main$Box$constructor(this %0, %1)\n"
+        + "  %2 = slot_addr $0: &Box  ; held\n"
+        + "  release_ptr %2\n"
+        + "  store $0, %0\n"
+        + "  %3 = load $0: Box\n"
+        + "  %4 = call @main$Box$doubled(this %3): int\n"
+        + "  %5 = slot_addr $0: &Box  ; held\n"
+        + "  release_ptr %5\n"
+        + "  ret %4\n"
+        + "\}\n");
+}
+
+test "a shorthand constructor assigns each field through the reassignment barrier" {
+    let dumped = try support.loweredMethodDump(
+        "class Pair \{\n"
+        + "    protected string label = \"none\";\n"
+        + "    protected int count;\n"
+        + "    protected constructor(this.label, this.count = 2);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return new Pair(\"x\").count;\n"
+        + "\}\n", "Pair", "constructor");
+    try testing.assertEqual(dumped,
+        "func @main$Pair$constructor(%0: Pair, %1: string, %2: int) -> void \{\n"
+        + "  $0 label: string borrowed\n"
+        + "  $1 count: int\n"
+        + "b0.entry:\n"
+        + "  store $0, %1\n"
+        + "  %3 = object_field_addr %0, 0: &string  ; %0.label\n"
+        + "  retain %1\n"
+        + "  release_ptr %3\n"
+        + "  store_ptr %3, %1\n"
+        + "  store $1, %2\n"
+        + "  %4 = object_field_addr %0, 1: &int  ; %0.count\n"
+        + "  store_ptr %4, %2\n"
+        + "  ret\n"
+        + "\}\n");
+}
+
+test "a weak field is written through its side table and read by upgrading" {
+    let dumped = try support.loweredDump(
+        "class Node \{\n"
+        + "    protected int v;\n"
+        + "    protected constructor(this.v);\n"
+        + "\}\n"
+        + "class Watcher \{\n"
+        + "    protected weak Node? seen;\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "observe(Watcher w, Node n) -> bool \{\n"
+        + "    w.seen = n;\n"
+        + "    return w.seen == null;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let ignored = observe(new Watcher(), new Node(1));\n"
+        + "    return 0;\n"
+        + "\}\n", "observe");
+    try testing.assertEqual(dumped,
+        "func internal @observe(%0: Watcher, %1: Node) -> bool \{\n"
+        + "  $0 w: Watcher borrowed\n"
+        + "  $1 n: Node borrowed\n"
+        + "  $2 held: Node? zeroed\n"
+        + "b0.entry:\n"
+        + "  store $0, %0\n"
+        + "  store $1, %1\n"
+        + "  %2 = load $0: Watcher\n"
+        + "  %3 = object_field_addr %2, 0: &Node?  ; %2.seen\n"
+        + "  %4 = load $1: Node\n"
+        + "  %5 = reinterpret %4: Node?\n"
+        + "  weak.store %3, %5\n"
+        + "  %6 = load $0: Watcher\n"
+        + "  %7 = object_field_addr %6, 0: &Node?  ; %6.seen\n"
+        + "  %8 = weak.load %7: Node?\n"
+        + "  %9 = slot_addr $2: &Node?  ; held\n"
+        + "  release_ptr %9\n"
+        + "  store $2, %8\n"
+        + "  %10 = load $2: Node?\n"
+        + "  %11 = const null: null\n"
+        + "  %12 = reinterpret %11: Node?\n"
+        + "  %13 = cmp.eq %10, %12: bool\n"
+        + "  %14 = slot_addr $2: &Node?  ; held\n"
+        + "  release_ptr %14\n"
+        + "  ret %13\n"
+        + "\}\n");
+}
+
+test "a weak write releases a reference the value arrived owning" {
+    let dumped = try support.loweredDump(
+        "class Node \{\n"
+        + "    protected int v;\n"
+        + "    protected constructor(this.v);\n"
+        + "\}\n"
+        + "class Watcher \{\n"
+        + "    protected weak Node? seen;\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "watch(Watcher w) \{\n"
+        + "    w.seen = new Node(1);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    watch(new Watcher());\n"
+        + "    return 0;\n"
+        + "\}\n", "watch");
+    try testing.assertEqual(dumped,
+        "func internal @watch(%0: Watcher) -> void \{\n"
+        + "  $0 w: Watcher borrowed\n"
+        + "b0.entry:\n"
+        + "  store $0, %0\n"
+        + "  %1 = load $0: Watcher\n"
+        + "  %2 = object_field_addr %1, 0: &Node?  ; %1.seen\n"
+        + "  %3 = class.new @_dtor$main$Node: Node\n"
+        + "  %4 = const 1: int\n"
+        + "  call @main$Node$constructor(this %3, %4)\n"
+        + "  %5 = reinterpret %3: Node?\n"
+        + "  weak.store %2, %5\n"
+        + "  release %5\n"
+        + "  ret\n"
+        + "\}\n");
+}
+
+test "comparing two references compares the pointers and releases neither operand" {
+    let dumped = try support.loweredDump(
+        "class Box \{\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "same(Box? left, Box? right) -> bool \{\n"
+        + "    return left == right;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let ignored = same(new Box(), null);\n"
+        + "    return 0;\n"
+        + "\}\n", "same");
+    try testing.assertEqual(dumped,
+        "func internal @same(%0: Box?, %1: Box?) -> bool \{\n"
+        + "  $0 left: Box? borrowed\n"
+        + "  $1 right: Box? borrowed\n"
+        + "b0.entry:\n"
+        + "  store $0, %0\n"
+        + "  store $1, %1\n"
+        + "  %2 = load $0: Box?\n"
+        + "  %3 = load $1: Box?\n"
+        + "  %4 = cmp.eq %2, %3: bool\n"
+        + "  ret %4\n"
+        + "\}\n");
+}
+
+test "a class declaring equals compares content through a three-way merge" {
+    let dumped = try support.loweredDump(
+        "class Point \{\n"
+        + "    int x;\n"
+        + "    protected constructor(this.x);\n"
+        + "    override hash() -> long \{\n"
+        + "        return this.x;\n"
+        + "    \}\n"
+        + "    override equals(Point other) -> bool \{\n"
+        + "        return this.x == other.x;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "alike(Point left, Point right) -> bool \{\n"
+        + "    return left == right;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let ignored = alike(new Point(1), new Point(1));\n"
+        + "    return 0;\n"
+        + "\}\n", "alike");
+    try testing.assertEqual(dumped,
+        "func internal @alike(%0: Point, %1: Point) -> bool \{\n"
+        + "  $0 left: Point borrowed\n"
+        + "  $1 right: Point borrowed\n"
+        + "  $2 equal: bool\n"
+        + "b0.entry:\n"
+        + "  store $0, %0\n"
+        + "  store $1, %1\n"
+        + "  %2 = load $0: Point\n"
+        + "  %3 = load $1: Point\n"
+        + "  %4 = cmp.eq %2, %3: bool\n"
+        + "  br %4, b1.equals.same, b2.equals.test\n"
+        + "b1.equals.same:\n"
+        + "  %5 = const true: bool\n"
+        + "  store $2, %5\n"
+        + "  jump b5.equals.end\n"
+        + "b2.equals.test:\n"
+        + "  %6 = const null: Point\n"
+        + "  %7 = cmp.eq %2, %6: bool\n"
+        + "  %8 = const null: Point\n"
+        + "  %9 = cmp.eq %3, %8: bool\n"
+        + "  %10 = or %7, %9: bool\n"
+        + "  br %10, b3.equals.absent, b4.equals.call\n"
+        + "b3.equals.absent:\n"
+        + "  %11 = const false: bool\n"
+        + "  store $2, %11\n"
+        + "  jump b5.equals.end\n"
+        + "b4.equals.call:\n"
+        + "  %12 = call @main$Point$equals(this %2, %3): bool\n"
+        + "  store $2, %12\n"
+        + "  jump b5.equals.end\n"
+        + "b5.equals.end:\n"
+        + "  %13 = load $2: bool\n"
+        + "  ret %13\n"
+        + "\}\n");
+}
