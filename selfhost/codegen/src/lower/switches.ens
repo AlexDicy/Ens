@@ -18,7 +18,9 @@ import Span from @ens.frontend.support.source;
 import Type from @ens.sema.model.types;
 import EnumType from @ens.sema.model.types;
 import @ens.sema.model.types;
+import EirBranch from eir.model;
 import EirLoadSlot from eir.model;
+import EirOptionalPayload from eir.model;
 import EirStoreSlot from eir.model;
 import EirJump from eir.model;
 import EirSwitch from eir.model;
@@ -26,6 +28,7 @@ import EirUnreachable from eir.model;
 import LoweringContext from lower.context;
 import lower.expressions;
 import lower.literals;
+import lower.optionals;
 import lower.ownership;
 import lower.statements;
 import lower.typetests;
@@ -58,7 +61,9 @@ lowerSwitch(LoweringContext lowering, Expression scrutinee, List<SwitchArm> arms
     if (hasTypeArm(arms)) {
         return typetests.lowerTypeSwitch(lowering, scrutinee, arms, resultType, span);
     }
-    if (!primitives.isIntegerLike(scrutineeType)) {
+    let payloadType = primitives.taggedPayloadOf(scrutineeType);
+    bool tagged = payloadType != null && primitives.isIntegerLike(payloadType);
+    if (!primitives.isIntegerLike(scrutineeType) && !tagged) {
         lowering.unsupported("a switch over '{types.display(scrutineeType)}'", span);
         return -1;
     }
@@ -79,12 +84,17 @@ lowerSwitch(LoweringContext lowering, Expression scrutinee, List<SwitchArm> arms
     let caseTargets = new List<long>();
     let armBlocks = new List<long>();
     long defaultTarget = -1;
+    long nullTarget = -1;
     for (long a = 0; a < arms.length(); a++) {
         switch (arms.get(a)) {
             is ValueArmNode arm -> {
                 long block = builder.newBlock("switch.case");
                 armBlocks.push(block);
                 for (long i = 0; i < arm.labelsCount(); i++) {
+                    if (isNullLabel(lowering, arm.labels(i))) {
+                        nullTarget = block;
+                        continue;
+                    }
                     let label = integerLabelBits(lowering, arm.labels(i));
                     if (label == null) {
                         return -1;
@@ -111,6 +121,20 @@ lowerSwitch(LoweringContext lowering, Expression scrutinee, List<SwitchArm> arms
         defaultTarget = unreachableBlock;
     }
     long merge = builder.newBlock("switch.end");
+    if (tagged && payloadType != null) {
+        // An absent scrutinee takes the null arm, or the default when no arm names null; a
+        // present one switches over the payload.
+        if (nullTarget < 0) {
+            nullTarget = defaultTarget;
+        }
+        long present = optionals.presenceOf(lowering, scrutineeValue, scrutineeType);
+        long valueBlock = builder.newBlock("switch.present");
+        builder.terminate(new EirBranch(present, valueBlock, nullTarget));
+        builder.moveTo(valueBlock);
+        long payload = builder.newTemp(payloadType);
+        builder.append(new EirOptionalPayload(payload, payloadType, scrutineeValue));
+        scrutineeValue = payload;
+    }
     builder.terminate(new EirSwitch(scrutineeValue, caseValues.toArray(),
         caseTargets.toArray(), defaultTarget));
     if (unreachableBlock >= 0) {
@@ -157,6 +181,12 @@ public lowerArmBody(LoweringContext lowering, ArmBody body, Type? resultType, lo
                 lowering.info().signature().nameSpan());
         },
     }
+}
+
+// True for the 'null' label an optional scrutinee's arm may carry.
+isNullLabel(LoweringContext lowering, Expression label) -> bool {
+    let labelType = lowering.result().typeOf(label.green());
+    return labelType != null && primitives.isNullType(labelType);
 }
 
 // The constant an integer switch label names, as scrutinee-typed bits: a char literal's

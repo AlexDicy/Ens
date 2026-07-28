@@ -13,6 +13,7 @@ import Value from @ens.llvm.values;
 import @ens.llvm.instructions;
 import @ens.llvm.memory;
 import Runtime from emit.runtime;
+import RuntimeDefinition from emit.runtime;
 import RuntimeFunction from emit.runtime;
 import TypeMapper from emit.types;
 import lower.symbols;
@@ -60,7 +61,7 @@ public final class Finalizers {
         builder.positionAtEnd(bodyBlock);
         let element = memory.buildGEP(builder, this.mapper.map(elementType), data, [index],
             "element");
-        this.releaseAt(element, elementType);
+        this.releaseAt(definition, element, elementType);
         memory.buildStore(builder, instructions.buildAdd(builder, index, this.runtime.int64(1),
             ""), indexSlot);
         instructions.buildBr(builder, testBlock);
@@ -70,12 +71,31 @@ public final class Finalizers {
         return this.runtime.endDefinition(definition);
     }
 
-    // Releases what the storage at an address owns: a reference directly, a struct field by field.
-    releaseAt(Value address, Type type) {
+    // Releases what the storage at an address owns: a reference directly, a struct field by
+    // field, and a tagged optional's payload only when its tag says it is there.
+    releaseAt(RuntimeDefinition definition, Value address, Type type) {
         let builder = this.runtime.builder;
         if (primitives.isReferenceType(type)) {
             let held = memory.buildLoad(builder, this.runtime.pointerType, address, "");
             this.runtime.call(this.runtime.release(), [held], "");
+            return;
+        }
+        let payload = primitives.taggedPayloadOf(type);
+        if (payload != null) {
+            if (!primitives.hasArcContent(payload)) {
+                return;
+            }
+            let pairType = this.mapper.map(type);
+            let tagAddress = memory.buildStructGEP(builder, pairType, address, 0 as uint, "");
+            let present = memory.buildLoad(builder, this.runtime.int1Type, tagAddress, "");
+            let walkBlock = this.runtime.block(definition, "opt.walk");
+            let doneBlock = this.runtime.block(definition, "opt.done");
+            instructions.buildCondBr(builder, present, walkBlock, doneBlock);
+            builder.positionAtEnd(walkBlock);
+            this.releaseAt(definition,
+                memory.buildStructGEP(builder, pairType, address, 1 as uint, ""), payload);
+            instructions.buildBr(builder, doneBlock);
+            builder.positionAtEnd(doneBlock);
             return;
         }
         if (primitives.structOf(type) == null) {
@@ -92,7 +112,7 @@ public final class Finalizers {
                 continue;
             }
             let fieldAddress = memory.buildStructGEP(builder, structType, address, i as uint, "");
-            this.releaseAt(fieldAddress, field.type());
+            this.releaseAt(definition, fieldAddress, field.type());
         }
     }
 }

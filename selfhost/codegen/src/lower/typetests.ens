@@ -21,9 +21,12 @@ import OptionalType from @ens.sema.model.types;
 import PrimitiveKind from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
 import @ens.sema.model.types;
+import EirAbsentOptional from eir.model;
 import EirBinary from eir.model;
 import EirBinaryOp from eir.model;
 import EirBranch from eir.model;
+import EirConstBool from eir.model;
+import EirConstInt from eir.model;
 import EirConstNull from eir.model;
 import EirJump from eir.model;
 import EirLoadSlot from eir.model;
@@ -31,6 +34,7 @@ import EirStoreSlot from eir.model;
 import EirTypeTest from eir.model;
 import EirCheckedCast from eir.model;
 import EirUnreachable from eir.model;
+import EirWrapOptional from eir.model;
 import LoweringContext from lower.context;
 import lower.classes;
 import lower.conversions;
@@ -82,9 +86,7 @@ public lowerCheckedCast(LoweringContext lowering, CheckedCastExpressionNode cast
     }
     let target = resultType.inner();
     if (target is EnumType) {
-        lowering.unsupported("'as?' to a numeric enum, which produces an optional value type",
-            cast.span());
-        return -1;
+        return lowerEnumCast(lowering, cast, resultType, target);
     }
     if (!supportedScrutinee(lowering, cast.value(), cast.span())
             || !supportedTarget(lowering, target, cast.span())) {
@@ -100,6 +102,62 @@ public lowerCheckedCast(LoweringContext lowering, CheckedCastExpressionNode cast
     ownership.retainValue(lowering, result);
     expressions.releaseTemporary(lowering, cast.value(), value);
     return result;
+}
+
+// 'value as? Enum': the enum member with the value's number, as a present tagged optional, or
+// the absent one when no member carries it. The comparisons run at the enum's own width.
+lowerEnumCast(LoweringContext lowering, CheckedCastExpressionNode cast, Type resultType,
+              EnumType target) -> long {
+    let sourceType = lowering.typeOf(cast.value());
+    if (sourceType == null) {
+        return -1;
+    }
+    if (!primitives.isIntegerType(sourceType)) {
+        lowering.unsupported("'as?' from '{types.display(sourceType)}' to "
+            + "'{types.display(target)}'", cast.span());
+        return -1;
+    }
+    long value = expressions.lower(lowering, cast.value());
+    if (value < 0) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    long candidate = conversions.convert(lowering, value, target, cast.span());
+    if (candidate < 0) {
+        return -1;
+    }
+    long matched = builder.newTemp(boolType);
+    builder.append(new EirConstBool(matched, boolType, false));
+    long[] values = target.memberValues();
+    for (long i = 0; i < values.length; i++) {
+        long member = builder.newTemp(target);
+        builder.append(new EirConstInt(member, target, values[i]));
+        long hit = builder.newTemp(boolType);
+        builder.append(new EirBinary(hit, boolType, EirBinaryOp.CmpEq, candidate, member));
+        long folded = builder.newTemp(boolType);
+        builder.append(new EirBinary(folded, boolType, EirBinaryOp.Or, matched, hit));
+        matched = folded;
+    }
+    long slot = builder.addSlot("enumcast", resultType, false, false);
+    long wrapBlock = builder.newBlock("enumcast.match");
+    long missBlock = builder.newBlock("enumcast.miss");
+    long mergeBlock = builder.newBlock("enumcast.end");
+    builder.terminate(new EirBranch(matched, wrapBlock, missBlock));
+    builder.moveTo(wrapBlock);
+    long wrapped = builder.newTemp(resultType);
+    builder.append(new EirWrapOptional(wrapped, resultType, candidate));
+    builder.append(new EirStoreSlot(slot, wrapped));
+    builder.terminate(new EirJump(mergeBlock));
+    builder.moveTo(missBlock);
+    long absent = builder.newTemp(resultType);
+    builder.append(new EirAbsentOptional(absent, resultType));
+    builder.append(new EirStoreSlot(slot, absent));
+    builder.terminate(new EirJump(mergeBlock));
+    builder.moveTo(mergeBlock);
+    long merged = builder.newTemp(resultType);
+    builder.append(new EirLoadSlot(merged, resultType, slot));
+    return merged;
 }
 
 // A switch whose arms test the scrutinee's runtime type: the tests run in source order, a null

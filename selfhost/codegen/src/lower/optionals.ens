@@ -1,0 +1,532 @@
+// The optional operators: '??' picks the left value when it is present, and '?.' and '?[' reach
+// through a nullable receiver, yielding the absent result when the receiver is null. Every form
+// merges through one result slot the enclosing scope owns, so the value read back is borrowed
+// and each path settles its own references; a reference optional's presence is a null test and a
+// tagged optional's is its tag.
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import Expression from @ens.frontend.syntax.generated.nodes;
+import NullCoalesceExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SafeMemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SafeSubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
+import Span from @ens.frontend.support.source;
+import Method from @ens.sema.model.types;
+import OptionalType from @ens.sema.model.types;
+import PrimitiveKind from @ens.sema.model.types;
+import Type from @ens.sema.model.types;
+import @ens.sema.model.types;
+import EirAbsentOptional from eir.model;
+import EirArrayLength from eir.model;
+import EirBinary from eir.model;
+import EirBinaryOp from eir.model;
+import EirBranch from eir.model;
+import EirConstNull from eir.model;
+import EirFieldAddress from eir.model;
+import EirJump from eir.model;
+import EirLoadSlot from eir.model;
+import EirOptionalPayload from eir.model;
+import EirOptionalPresence from eir.model;
+import EirStringLength from eir.model;
+import LoweringContext from lower.context;
+import lower.arrays;
+import lower.calls;
+import lower.classes;
+import lower.conversions;
+import lower.expressions;
+import lower.ownership;
+import lower.places;
+import lower.records;
+import lower.stores;
+import lower.weakfields;
+import support.primitives;
+
+// The presence of an optional value as a bool: the tag of a tagged optional, a null test for a
+// reference. A value whose type sema already narrowed to non-optional is simply present.
+public presenceOf(LoweringContext lowering, long value, Type type) -> long {
+    let builder = lowering.builder();
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    if (primitives.taggedPayloadOf(type) != null) {
+        long present = builder.newTemp(boolType);
+        builder.append(new EirOptionalPresence(present, boolType, value));
+        return present;
+    }
+    long absent = builder.newTemp(type);
+    builder.append(new EirConstNull(absent, type));
+    long present = builder.newTemp(boolType);
+    builder.append(new EirBinary(present, boolType, EirBinaryOp.CmpNe, value, absent));
+    return present;
+}
+
+// 'left ?? right': the left value when present, the right otherwise, both converted to the
+// merged result type. The left owns its reference on both paths exactly once: the present path
+// hands it into the result slot and the absent path gives it up, where it is null anyway.
+public lowerCoalesce(LoweringContext lowering, NullCoalesceExpressionNode node) -> long {
+    let resultType = lowering.typeOf(node);
+    let leftType = lowering.typeOf(node.left());
+    if (resultType == null || leftType == null) {
+        return -1;
+    }
+    if (!lowering.supportsValueType(resultType) || !lowering.supportsValueType(leftType)) {
+        lowering.unsupported("'??' over '{types.display(leftType)}'", node.span());
+        return -1;
+    }
+    long left = expressions.lower(lowering, node.left());
+    if (left < 0) {
+        return -1;
+    }
+    bool leftOwned = places.producesOwnedValue(lowering, node.left());
+    let builder = lowering.builder();
+    long slot = resultSlot(lowering, resultType, "coalesce");
+    long present = presenceOf(lowering, left, leftType);
+    long presentBlock = builder.newBlock("coalesce.present");
+    long absentBlock = builder.newBlock("coalesce.absent");
+    long mergeBlock = builder.newBlock("coalesce.end");
+    builder.terminate(new EirBranch(present, presentBlock, absentBlock));
+
+    builder.moveTo(presentBlock);
+    long kept = conversions.convert(lowering, left, resultType, node.span());
+    if (kept < 0) {
+        return -1;
+    }
+    if (!stores.initializeSlot(lowering, slot, resultType,
+            new stores.Operand(kept, leftOwned, -1))) {
+        return -1;
+    }
+    builder.terminate(new EirJump(mergeBlock));
+
+    builder.moveTo(absentBlock);
+    if (leftOwned && primitives.isReferenceType(leftType)) {
+        ownership.releaseValue(lowering, left);
+    }
+    long right = expressions.lower(lowering, node.right());
+    if (right < 0) {
+        return -1;
+    }
+    long fallback = conversions.convert(lowering, right, resultType, node.span());
+    if (fallback < 0) {
+        return -1;
+    }
+    if (!stores.initializeSlot(lowering, slot, resultType, new stores.Operand(fallback,
+            places.producesOwnedValue(lowering, node.right()), -1))) {
+        return -1;
+    }
+    builder.terminate(new EirJump(mergeBlock));
+
+    builder.moveTo(mergeBlock);
+    long merged = builder.newTemp(resultType);
+    builder.append(new EirLoadSlot(merged, resultType, slot));
+    return merged;
+}
+
+// 'value?.member' as a read: null when the receiver is absent, the member's value otherwise,
+// widened into the expression's optional result type.
+public lowerSafeMember(LoweringContext lowering, SafeMemberExpressionNode node) -> long {
+    let resultType = lowering.typeOf(node);
+    let receiverType = lowering.typeOf(node.object());
+    if (resultType == null || receiverType == null) {
+        return -1;
+    }
+    if (primitives.taggedPayloadOf(receiverType) != null) {
+        return lowerTaggedSafeMember(lowering, node, receiverType, resultType);
+    }
+    if (!primitives.isReferenceType(receiverType)) {
+        lowering.unsupported("'?.' on '{types.display(receiverType)}'", node.span());
+        return -1;
+    }
+    long receiver = classes.borrowedReference(lowering, node.object(), receiverType);
+    if (receiver < 0) {
+        return -1;
+    }
+    let guard = beginGuard(lowering, receiver, receiverType, resultType, "safe");
+    long value = memberValue(lowering, node, receiver, receiverType, resultType);
+    if (value < 0) {
+        return -1;
+    }
+    return finishGuard(lowering, guard, value, memberIsOwned(lowering, node, receiverType),
+        node.span());
+}
+
+// '?.' through an optional struct: the tag guards, and a present payload is parked in a scratch
+// slot so the field reads out of real storage.
+lowerTaggedSafeMember(LoweringContext lowering, SafeMemberExpressionNode node,
+                      Type receiverType, Type resultType) -> long {
+    let payloadType = primitives.taggedPayloadOf(receiverType);
+    if (payloadType == null) {
+        return -1;
+    }
+    let structType = primitives.structOf(payloadType);
+    if (structType == null || primitives.hasArcContent(payloadType)) {
+        lowering.unsupported("'?.' on '{types.display(receiverType)}'", node.span());
+        return -1;
+    }
+    long index = records.fieldIndexOf(structType, node.member().text());
+    let fields = records.fieldsOf(structType);
+    if (index < 0 || fields == null) {
+        lowering.unsupported("reading '?.{node.member().text()}' on "
+            + "'{types.display(receiverType)}'", node.span());
+        return -1;
+    }
+    long receiver = expressions.lower(lowering, node.object());
+    if (receiver < 0) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    let guard = beginGuard(lowering, receiver, receiverType, resultType, "safe");
+    long payload = builder.newTemp(payloadType);
+    builder.append(new EirOptionalPayload(payload, payloadType, receiver));
+    long scratch = builder.addSlot("safepayload", payloadType, true, false);
+    if (!stores.initializeSlot(lowering, scratch, payloadType,
+            new stores.Operand(payload, false, -1))) {
+        return -1;
+    }
+    long base = ownership.slotAddress(lowering, scratch, payloadType);
+    let field = fields.get(index);
+    long address = builder.newTemp(field.type());
+    builder.append(new EirFieldAddress(address, field.type(), base, index));
+    long value = places.loadFrom(lowering, address, field.type());
+    return finishGuard(lowering, guard, value, false, node.span());
+}
+
+// 'value?[index]': the element when the receiver array is present, null otherwise.
+public lowerSafeSubscript(LoweringContext lowering, SafeSubscriptExpressionNode node) -> long {
+    let resultType = lowering.typeOf(node);
+    let receiverType = lowering.typeOf(node.object());
+    if (resultType == null || receiverType == null) {
+        return -1;
+    }
+    let arrayType = primitives.arrayOf(receiverType);
+    if (arrayType == null) {
+        lowering.unsupported("'?[' on '{types.display(receiverType)}'", node.span());
+        return -1;
+    }
+    long receiver = classes.borrowedReference(lowering, node.object(), receiverType);
+    if (receiver < 0) {
+        return -1;
+    }
+    let guard = beginGuard(lowering, receiver, receiverType, resultType, "safeindex");
+    let longType = lowering.store().primitive(PrimitiveKind.Long);
+    long index = expressions.lowerConverted(lowering, node.index(), longType);
+    if (index < 0) {
+        return -1;
+    }
+    long address = arrays.elementAddress(lowering, receiver, index, arrayType.element());
+    if (address < 0) {
+        return -1;
+    }
+    long element = places.loadFrom(lowering, address, arrayType.element());
+    return finishGuard(lowering, guard, element, false, node.span());
+}
+
+// 'value?.method(args)': the call runs only when the receiver is present, and its result - or
+// nothing, for a void method - merges as the optional the expression produces. A void safe call
+// yields no temp, exactly like a void call.
+public lowerSafeCall(LoweringContext lowering, CallExpressionNode call,
+                     SafeMemberExpressionNode callee, Method method) -> long {
+    let receiverType = lowering.typeOf(callee.object());
+    if (receiverType == null) {
+        return -1;
+    }
+    if (primitives.taggedPayloadOf(receiverType) != null) {
+        return lowerTaggedSafeCall(lowering, call, callee, method, receiverType);
+    }
+    if (!primitives.isReferenceType(receiverType)) {
+        lowering.unsupported("'?.' on '{types.display(receiverType)}'", call.span());
+        return -1;
+    }
+    let core = bareOf(lowering, receiverType);
+    let resolved = resolveReceiverMethod(lowering, core, method);
+    if (resolved == null) {
+        lowering.internalError("the safe call to '{method.name()}' resolves to no concrete "
+            + "method", call.span());
+        return -1;
+    }
+    let info = lowering.index().infoFor(resolved.signature());
+    if (info == null) {
+        lowering.internalError("the safe call to '{method.name()}' resolves to no indexed "
+            + "function", call.span());
+        return -1;
+    }
+    long dispatchSlot = -1;
+    Type? dispatchInterface = null;
+    if (primitives.interfaceOf(core) != null) {
+        dispatchSlot = lowering.tables().itableSlotOf(resolved.signature());
+        dispatchInterface = core;
+    } else if (!resolved.isConstructor()) {
+        dispatchSlot = lowering.tables().vtableSlotOf(resolved.signature());
+    }
+    string described = "method '{types.display(core)}.{method.name()}'";
+    if (dispatchSlot >= 0) {
+        if (!calls.supportedDispatchTarget(lowering, info, described, call.span())) {
+            return -1;
+        }
+    } else if (!calls.supportedCallee(lowering, info, described, call.span())) {
+        return -1;
+    }
+    long receiver = classes.borrowedReference(lowering, callee.object(), receiverType);
+    if (receiver < 0) {
+        return -1;
+    }
+    let returned = lowering.substituted(resolved.signature().returnType());
+    if (types.isVoidType(returned)) {
+        let builder = lowering.builder();
+        long present = presenceOf(lowering, receiver, receiverType);
+        long presentBlock = builder.newBlock("safecall.present");
+        long mergeBlock = builder.newBlock("safecall.end");
+        builder.terminate(new EirBranch(present, presentBlock, mergeBlock));
+        builder.moveTo(presentBlock);
+        let ignored = calls.lowerDispatchedCall(lowering, info, call, core, receiver,
+            dispatchSlot, dispatchInterface);
+        if (lowering.failed()) {
+            return -1;
+        }
+        if (!builder.terminated()) {
+            builder.terminate(new EirJump(mergeBlock));
+        }
+        builder.moveTo(mergeBlock);
+        return -1;
+    }
+    let resultType = lowering.typeOf(call);
+    if (resultType == null) {
+        return -1;
+    }
+    let guard = beginGuard(lowering, receiver, receiverType, resultType, "safecall");
+    long result = calls.lowerDispatchedCall(lowering, info, call, core, receiver, dispatchSlot,
+        dispatchInterface);
+    if (result < 0) {
+        return -1;
+    }
+    return finishGuard(lowering, guard, result, primitives.hasArcContent(returned),
+        call.span());
+}
+
+// '?.method(args)' through an optional struct: the tag guards, and the call runs over a scratch
+// copy of the present payload.
+lowerTaggedSafeCall(LoweringContext lowering, CallExpressionNode call,
+                    SafeMemberExpressionNode callee, Method method, Type receiverType) -> long {
+    let payloadType = primitives.taggedPayloadOf(receiverType);
+    if (payloadType == null) {
+        return -1;
+    }
+    let structType = primitives.structOf(payloadType);
+    if (structType == null || primitives.hasArcContent(payloadType)) {
+        lowering.unsupported("'?.' on '{types.display(receiverType)}'", call.span());
+        return -1;
+    }
+    let resolved = classes.resolveConcreteMethod(lowering, structType, method);
+    if (resolved == null) {
+        lowering.internalError("the safe call to '{method.name()}' resolves to no concrete "
+            + "method", call.span());
+        return -1;
+    }
+    let info = lowering.index().infoFor(resolved.signature());
+    if (info == null) {
+        lowering.internalError("the safe call to '{method.name()}' resolves to no indexed "
+            + "function", call.span());
+        return -1;
+    }
+    if (!calls.supportedCallee(lowering, info,
+            "method '{types.display(structType)}.{method.name()}'", call.span())) {
+        return -1;
+    }
+    long receiver = expressions.lower(lowering, callee.object());
+    if (receiver < 0) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    let returned = lowering.substituted(resolved.signature().returnType());
+    if (types.isVoidType(returned)) {
+        long present = presenceOf(lowering, receiver, receiverType);
+        long presentBlock = builder.newBlock("safecall.present");
+        long mergeBlock = builder.newBlock("safecall.end");
+        builder.terminate(new EirBranch(present, presentBlock, mergeBlock));
+        builder.moveTo(presentBlock);
+        long voidBase = taggedScratchAddress(lowering, receiver, payloadType);
+        if (voidBase < 0) {
+            return -1;
+        }
+        let ignored = calls.lowerDispatchedCall(lowering, info, call, structType, voidBase,
+            -1, null);
+        if (lowering.failed()) {
+            return -1;
+        }
+        if (!builder.terminated()) {
+            builder.terminate(new EirJump(mergeBlock));
+        }
+        builder.moveTo(mergeBlock);
+        return -1;
+    }
+    let resultType = lowering.typeOf(call);
+    if (resultType == null) {
+        return -1;
+    }
+    let guard = beginGuard(lowering, receiver, receiverType, resultType, "safecall");
+    long base = taggedScratchAddress(lowering, receiver, payloadType);
+    if (base < 0) {
+        return -1;
+    }
+    long result = calls.lowerDispatchedCall(lowering, info, call, structType, base, -1, null);
+    if (result < 0) {
+        return -1;
+    }
+    return finishGuard(lowering, guard, result, primitives.hasArcContent(returned),
+        call.span());
+}
+
+// The present payload parked in a scratch slot, so the method runs over addressable storage.
+taggedScratchAddress(LoweringContext lowering, long receiver, Type payloadType) -> long {
+    let builder = lowering.builder();
+    long payload = builder.newTemp(payloadType);
+    builder.append(new EirOptionalPayload(payload, payloadType, receiver));
+    long scratch = builder.addSlot("safepayload", payloadType, true, false);
+    if (!stores.initializeSlot(lowering, scratch, payloadType,
+            new stores.Operand(payload, false, -1))) {
+        return -1;
+    }
+    return ownership.slotAddress(lowering, scratch, payloadType);
+}
+
+// One guarded access: the result slot, the block layout, and the presence branch, positioned at
+// the start of the present path when it returns.
+final class SafeGuard {
+    protected long resultSlot;
+    protected long absentBlock;
+    protected long mergeBlock;
+    protected Type resultType;
+
+    protected constructor(this.resultSlot, this.absentBlock, this.mergeBlock, this.resultType);
+}
+
+beginGuard(LoweringContext lowering, long receiver, Type receiverType, Type resultType,
+           string name) -> SafeGuard {
+    let builder = lowering.builder();
+    long slot = resultSlot(lowering, resultType, name);
+    long present = presenceOf(lowering, receiver, receiverType);
+    long presentBlock = builder.newBlock(name + ".present");
+    long absentBlock = builder.newBlock(name + ".absent");
+    long mergeBlock = builder.newBlock(name + ".end");
+    builder.terminate(new EirBranch(present, presentBlock, absentBlock));
+    builder.moveTo(presentBlock);
+    return new SafeGuard(slot, absentBlock, mergeBlock, resultType);
+}
+
+// Stores the present path's value, fills the absent path with the absent result, and loads the
+// merged value, borrowed from the slot its scope owns.
+finishGuard(LoweringContext lowering, SafeGuard guard, long value, bool owned, Span span)
+        -> long {
+    let builder = lowering.builder();
+    long converted = conversions.convert(lowering, value, guard.resultType, span);
+    if (converted < 0) {
+        return -1;
+    }
+    if (!stores.initializeSlot(lowering, guard.resultSlot, guard.resultType,
+            new stores.Operand(converted, owned, -1))) {
+        return -1;
+    }
+    builder.terminate(new EirJump(guard.mergeBlock));
+
+    builder.moveTo(guard.absentBlock);
+    long absent = absentValue(lowering, guard.resultType);
+    if (!stores.initializeSlot(lowering, guard.resultSlot, guard.resultType,
+            new stores.Operand(absent, false, -1))) {
+        return -1;
+    }
+    builder.terminate(new EirJump(guard.mergeBlock));
+
+    builder.moveTo(guard.mergeBlock);
+    long merged = builder.newTemp(guard.resultType);
+    builder.append(new EirLoadSlot(merged, guard.resultType, guard.resultSlot));
+    return merged;
+}
+
+// The absent result: the zeroed pair for a tagged optional, null for a reference.
+absentValue(LoweringContext lowering, Type resultType) -> long {
+    let builder = lowering.builder();
+    if (primitives.taggedPayloadOf(resultType) != null) {
+        long absent = builder.newTemp(resultType);
+        builder.append(new EirAbsentOptional(absent, resultType));
+        return absent;
+    }
+    long absent = builder.newTemp(resultType);
+    builder.append(new EirConstNull(absent, resultType));
+    return absent;
+}
+
+resultSlot(LoweringContext lowering, Type resultType, string name) -> long {
+    long slot = lowering.builder().addSlot(name, resultType,
+        primitives.hasArcContent(resultType), false);
+    ownership.trackSlot(lowering, slot, resultType);
+    return slot;
+}
+
+// The member's value on the present path: a field's contents, a weak field's upgraded
+// reference, or a built-in length.
+memberValue(LoweringContext lowering, SafeMemberExpressionNode node, long receiver,
+            Type receiverType, Type resultType) -> long {
+    let core = bareOf(lowering, receiverType);
+    string name = node.member().text();
+    let builder = lowering.builder();
+    if (primitives.isStringType(core) && name == "length") {
+        let longType = lowering.store().primitive(PrimitiveKind.Long);
+        long length = builder.newTemp(longType);
+        builder.append(new EirStringLength(length, longType, receiver));
+        return length;
+    }
+    if (primitives.isArrayType(core) && name == "length") {
+        let longType = lowering.store().primitive(PrimitiveKind.Long);
+        long length = builder.newTemp(longType);
+        builder.append(new EirArrayLength(length, longType, receiver));
+        return length;
+    }
+    let classType = primitives.classOf(core);
+    if (classType == null || !lowering.supportsClassLayout(classType)) {
+        lowering.unsupported("reading '?.{name}' on '{types.display(receiverType)}'",
+            node.span());
+        return -1;
+    }
+    long index = records.fieldIndexOf(classType, name);
+    let fields = records.fieldsOf(classType);
+    if (index < 0 || fields == null) {
+        lowering.unsupported("reading '?.{name}' on '{types.display(receiverType)}'",
+            node.span());
+        return -1;
+    }
+    let field = fields.get(index);
+    long address = records.fieldAddressIn(lowering, receiver, classType, field.type(), index);
+    if (field.isWeak()) {
+        return weakfields.load(lowering, address, field.type());
+    }
+    return places.loadFrom(lowering, address, field.type());
+}
+
+// True when the member's value arrives owned: only a weak field's upgraded reference does.
+memberIsOwned(LoweringContext lowering, SafeMemberExpressionNode node, Type receiverType)
+        -> bool {
+    let classType = primitives.classOf(bareOf(lowering, receiverType));
+    if (classType == null) {
+        return false;
+    }
+    long index = records.fieldIndexOf(classType, node.member().text());
+    let fields = records.fieldsOf(classType);
+    if (index < 0 || fields == null) {
+        return false;
+    }
+    return fields.get(index).isWeak();
+}
+
+bareOf(LoweringContext lowering, Type type) -> Type {
+    if (type is OptionalType) {
+        return type.inner();
+    }
+    return type;
+}
+
+// The concrete method a safe call binds on its receiver's core type.
+resolveReceiverMethod(LoweringContext lowering, Type core, Method method) -> Method? {
+    let resolved = classes.resolveConcreteMethod(lowering, core, method);
+    if (resolved != null) {
+        return resolved;
+    }
+    if (primitives.interfaceOf(method.definingType()) != null) {
+        return classes.implementationOnClass(core, method);
+    }
+    return null;
+}

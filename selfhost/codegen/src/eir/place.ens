@@ -6,6 +6,7 @@
 // consumer; later passes ask the same questions through this module instead of re-tracing
 // instructions.
 import Type from @ens.sema.model.types;
+import OptionalType from @ens.sema.model.types;
 import StructType from @ens.sema.model.types;
 import Field from @ens.sema.model.types;
 import @ens.sema.model.types;
@@ -15,6 +16,7 @@ import EirSlotAddress from eir.model;
 import EirFieldAddress from eir.model;
 import EirObjectFieldAddress from eir.model;
 import EirElementAddress from eir.model;
+import EirOptionalPayloadAddress from eir.model;
 import List from @std.collections.list;
 import support.primitives;
 
@@ -25,16 +27,26 @@ export enum PlaceRoot {
     Object,
 }
 
-// One projection step: a symbolic field index into a struct, or an element index held by a
-// temp.
+export enum PlaceStepKind {
+    Field,
+    Element,
+    Payload,
+}
+
+// One projection step: a symbolic field index into a struct, an element index held by a temp,
+// or the payload of a tagged optional, which projects without an index.
 export final class PlaceStep {
-    bool field;
+    PlaceStepKind stepKind;
     long stepValue;
 
-    public constructor(this.field, this.stepValue);
+    public constructor(this.stepKind, this.stepValue);
+
+    export kind() -> PlaceStepKind {
+        return this.stepKind;
+    }
 
     export isField() -> bool {
-        return this.field;
+        return this.stepKind == PlaceStepKind.Field;
     }
 
     // The field index for a field step, the index temp for an element step.
@@ -105,14 +117,14 @@ export relate(Place first, Place second) -> PlaceRelation {
     for (long i = 0; i < shared; i++) {
         let a = firstSteps.get(i);
         let b = secondSteps.get(i);
-        if (a.isField() != b.isField()) {
+        if (a.kind() != b.kind()) {
             return PlaceRelation.Unknown;
         }
         if (a.isField()) {
             if (a.value() != b.value()) {
                 return PlaceRelation.Different;
             }
-        } else if (a.value() != b.value()) {
+        } else if (a.kind() == PlaceStepKind.Element && a.value() != b.value()) {
             exact = false;
         }
     }
@@ -162,8 +174,14 @@ rootTypeOf(EirFunction function, Place named) -> Type? {
 
 // The type one projection step reaches, or null when the step does not fit the current type.
 stepThrough(Type? current, PlaceStep step) -> Type? {
-    if (!step.isField()) {
+    if (step.kind() == PlaceStepKind.Element) {
         return elementTypeAfterIndex(current);
+    }
+    if (step.kind() == PlaceStepKind.Payload) {
+        if (current is OptionalType && !primitives.isReferenceType(current)) {
+            return current.inner();
+        }
+        return null;
     }
     let field = fieldAt(current, step);
     if (field == null) {
@@ -203,6 +221,8 @@ export describe(EirFunction function, long address) -> string {
         if (step.isField()) {
             let field = fieldAt(current, step);
             text = text + "." + (field == null ? "{step.value()}" : field.name());
+        } else if (step.kind() == PlaceStepKind.Payload) {
+            text = text + ".payload";
         } else {
             text = text + "[%{step.value()}]";
         }
@@ -228,16 +248,20 @@ resolvePlace(EirFunction function, List<AddressDefinition> definitions, long add
                 return new Place(PlaceRoot.Slot, slotAddress.slot, reversed(steps));
             },
             is EirFieldAddress fieldAddress -> {
-                steps.push(new PlaceStep(true, fieldAddress.fieldIndex));
+                steps.push(new PlaceStep(PlaceStepKind.Field, fieldAddress.fieldIndex));
                 current = fieldAddress.base;
             },
             is EirObjectFieldAddress fieldAddress -> {
-                steps.push(new PlaceStep(true, fieldAddress.fieldIndex));
+                steps.push(new PlaceStep(PlaceStepKind.Field, fieldAddress.fieldIndex));
                 return new Place(PlaceRoot.Object, fieldAddress.object, reversed(steps));
             },
             is EirElementAddress elementAddress -> {
-                steps.push(new PlaceStep(false, elementAddress.index));
+                steps.push(new PlaceStep(PlaceStepKind.Element, elementAddress.index));
                 return new Place(PlaceRoot.Array, elementAddress.array, reversed(steps));
+            },
+            is EirOptionalPayloadAddress payloadAddress -> {
+                steps.push(new PlaceStep(PlaceStepKind.Payload, 0));
+                current = payloadAddress.base;
             },
             default -> {
                 return null;
@@ -298,6 +322,10 @@ addressDefinitions(EirFunction function) -> List<AddressDefinition> {
                 },
                 is EirElementAddress elementAddress -> {
                     definitions.push(new AddressDefinition(elementAddress.result, instruction));
+                },
+                is EirOptionalPayloadAddress payloadAddress -> {
+                    definitions.push(new AddressDefinition(payloadAddress.result,
+                        instruction));
                 },
                 default -> { },
             }

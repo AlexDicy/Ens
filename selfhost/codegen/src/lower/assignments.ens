@@ -9,6 +9,7 @@ import SubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
 import AssignmentExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SyntaxKind from @ens.frontend.syntax.generated.kind;
 import Span from @ens.frontend.support.source;
+import OptionalType from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
 import @ens.sema.model.types;
 import EirBinaryOp from eir.model;
@@ -19,6 +20,7 @@ import EirStorePtr from eir.model;
 import LoweringContext from lower.context;
 import Operand from lower.stores;
 import lower.classes;
+import lower.conversions;
 import lower.expressions;
 import lower.places;
 import lower.stores;
@@ -60,33 +62,60 @@ public lower(LoweringContext lowering, AssignmentExpressionNode assignment) -> l
         }
         return operand.value();
     }
-    if (operator == SyntaxKind.PlusEquals && primitives.isStringType(targetType)) {
+    let computeType = compoundComputeType(targetType);
+    if (operator == SyntaxKind.PlusEquals && primitives.isStringType(computeType)) {
         long current = builder.newTemp(targetType);
         builder.append(new EirLoadSlot(current, targetType, slot));
-        long joined = strings.lowerAppend(lowering, current, assignment.value());
+        long narrowed = conversions.convert(lowering, current, computeType, assignment.span());
+        if (narrowed < 0) {
+            return -1;
+        }
+        long joined = strings.lowerAppend(lowering, narrowed, assignment.value());
         if (joined < 0) {
             return -1;
         }
-        if (!stores.assignSlot(lowering, slot, targetType, new Operand(joined, true, -1))) {
+        long widened = conversions.convert(lowering, joined, targetType, assignment.span());
+        if (widened < 0) {
+            return -1;
+        }
+        if (!stores.assignSlot(lowering, slot, targetType, new Operand(widened, true, -1))) {
             lowering.internalError("the joined text could not be stored", assignment.span());
             return -1;
         }
         return joined;
     }
-    long current = builder.newTemp(targetType);
-    builder.append(new EirLoadSlot(current, targetType, slot));
-    long operandValue = expressions.lowerConverted(lowering, assignment.value(), targetType);
+    long loaded = builder.newTemp(targetType);
+    builder.append(new EirLoadSlot(loaded, targetType, slot));
+    long current = conversions.convert(lowering, loaded, computeType, assignment.span());
+    if (current < 0) {
+        return -1;
+    }
+    long operandValue = expressions.lowerConverted(lowering, assignment.value(), computeType);
     if (operandValue < 0) {
         return -1;
     }
-    let op = compoundOperator(lowering, operator, targetType, assignment.span());
+    let op = compoundOperator(lowering, operator, computeType, assignment.span());
     if (op == null) {
         return -1;
     }
-    long combined = builder.newTemp(targetType);
-    builder.append(new EirBinary(combined, targetType, op, current, operandValue));
-    builder.append(new EirStoreSlot(slot, combined));
+    long combined = builder.newTemp(computeType);
+    builder.append(new EirBinary(combined, computeType, op, current, operandValue));
+    long stored = conversions.convert(lowering, combined, targetType, assignment.span());
+    if (stored < 0) {
+        return -1;
+    }
+    builder.append(new EirStoreSlot(slot, stored));
     return combined;
+}
+
+// The type a compound operator computes at: an optional target reads and writes its storage as
+// declared, but combines at the inner type, which sema proved present before admitting the
+// operator.
+compoundComputeType(Type targetType) -> Type {
+    if (targetType is OptionalType) {
+        return targetType.inner();
+    }
+    return targetType;
 }
 
 // Assigning through a place that is not a plain local: the address is computed once, then read
@@ -125,31 +154,48 @@ lowerThroughAddress(LoweringContext lowering, AssignmentExpressionNode assignmen
         }
         return operand.value();
     }
-    if (operator == SyntaxKind.PlusEquals && primitives.isStringType(targetType)) {
-        long joined = strings.lowerAppend(lowering,
-            places.loadFrom(lowering, address, targetType), assignment.value());
+    let computeType = compoundComputeType(targetType);
+    if (operator == SyntaxKind.PlusEquals && primitives.isStringType(computeType)) {
+        long narrowed = conversions.convert(lowering,
+            places.loadFrom(lowering, address, targetType), computeType, assignment.span());
+        if (narrowed < 0) {
+            return -1;
+        }
+        long joined = strings.lowerAppend(lowering, narrowed, assignment.value());
         if (joined < 0) {
             return -1;
         }
+        long widened = conversions.convert(lowering, joined, targetType, assignment.span());
+        if (widened < 0) {
+            return -1;
+        }
         if (!stores.assignThroughAddress(lowering, address, targetType,
-                new Operand(joined, true, -1))) {
+                new Operand(widened, true, -1))) {
             lowering.internalError("the joined text could not be stored", assignment.span());
             return -1;
         }
         return joined;
     }
-    long current = places.loadFrom(lowering, address, targetType);
-    long operandValue = expressions.lowerConverted(lowering, assignment.value(), targetType);
+    long current = conversions.convert(lowering,
+        places.loadFrom(lowering, address, targetType), computeType, assignment.span());
+    if (current < 0) {
+        return -1;
+    }
+    long operandValue = expressions.lowerConverted(lowering, assignment.value(), computeType);
     if (operandValue < 0) {
         return -1;
     }
-    let op = compoundOperator(lowering, operator, targetType, assignment.span());
+    let op = compoundOperator(lowering, operator, computeType, assignment.span());
     if (op == null) {
         return -1;
     }
-    long combined = builder.newTemp(targetType);
-    builder.append(new EirBinary(combined, targetType, op, current, operandValue));
-    builder.append(new EirStorePtr(address, combined));
+    long combined = builder.newTemp(computeType);
+    builder.append(new EirBinary(combined, computeType, op, current, operandValue));
+    long stored = conversions.convert(lowering, combined, targetType, assignment.span());
+    if (stored < 0) {
+        return -1;
+    }
+    builder.append(new EirStorePtr(address, stored));
     return combined;
 }
 

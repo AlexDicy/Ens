@@ -22,6 +22,8 @@ import EirConstBool from eir.model;
 import EirConstNull from eir.model;
 import EirJump from eir.model;
 import EirLoadSlot from eir.model;
+import EirOptionalPayload from eir.model;
+import EirOptionalPresence from eir.model;
 import EirStoreSlot from eir.model;
 import EirStringEqual from eir.model;
 import EirUnary from eir.model;
@@ -303,24 +305,23 @@ compareFieldsAt(LoweringContext lowering, long leftBase, long rightBase, Type ty
 }
 
 // One non-struct field's own '==': strings by content, classes by identity unless the class
-// declared 'equals', arrays by identity, and every value type by value.
+// declared 'equals', arrays by identity, tagged optionals null-aware, and every value type by
+// value.
 fieldEqual(LoweringContext lowering, long leftAddress, long rightAddress, Type fieldType,
            Span span) -> long {
-    if (fieldType is OptionalType) {
-        lowering.unsupported("comparing a struct whose field type is "
-            + "'{types.display(fieldType)}'", span);
-        return -1;
-    }
     let builder = lowering.builder();
     let boolType = lowering.store().primitive(PrimitiveKind.Bool);
     long left = places.loadFrom(lowering, leftAddress, fieldType);
     long right = places.loadFrom(lowering, rightAddress, fieldType);
+    if (primitives.taggedPayloadOf(fieldType) != null) {
+        return taggedPairEqual(lowering, left, right, fieldType, span);
+    }
     if (primitives.isStringType(fieldType)) {
         long equal = builder.newTemp(boolType);
         builder.append(new EirStringEqual(equal, boolType, left, right));
         return equal;
     }
-    if (primitives.classOf(fieldType) != null) {
+    if (primitives.classOf(fieldType) != null && !(fieldType is OptionalType)) {
         let declared = declaredEquals(lowering, fieldType);
         if (declared != null) {
             return compareContents(lowering, left, right, declared, false, boolType, span);
@@ -331,6 +332,158 @@ fieldEqual(LoweringContext lowering, long leftAddress, long rightAddress, Type f
         return compareIdentity(lowering, left, right, false, boolType);
     }
     let op = primitives.isFloatType(fieldType) ? EirBinaryOp.FloatCmpEq : EirBinaryOp.CmpEq;
+    long equal = builder.newTemp(boolType);
+    builder.append(new EirBinary(equal, boolType, op, left, right));
+    return equal;
+}
+
+// True when '==' over these two operand types involves a tagged optional, which the identity
+// and value comparisons cannot see through.
+public comparesTaggedOptionals(Type left, Type right) -> bool {
+    return primitives.taggedPayloadOf(left) != null
+        || primitives.taggedPayloadOf(right) != null;
+}
+
+// '==' with a tagged optional on either side: against null it is the inverted tag, against its
+// own type both tags must agree and a present pair's payloads must match, and against a plain
+// value presence and payload equality combine.
+public lowerTagged(LoweringContext lowering, BinaryExpressionNode binary, bool negated,
+                   Type resultType) -> long {
+    let leftType = lowering.typeOf(binary.left());
+    let rightType = lowering.typeOf(binary.right());
+    if (leftType == null || rightType == null) {
+        return -1;
+    }
+    long left = expressions.lower(lowering, binary.left());
+    if (left < 0) {
+        return -1;
+    }
+    long right = expressions.lower(lowering, binary.right());
+    if (right < 0) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    long equal = -1;
+    if (primitives.isNullType(rightType)) {
+        equal = presenceBit(lowering, left, false);
+    } else if (primitives.isNullType(leftType)) {
+        equal = presenceBit(lowering, right, false);
+    } else if (leftType == rightType) {
+        equal = taggedPairEqualValues(lowering, left, right, leftType, binary.span());
+    } else if (primitives.taggedPayloadOf(leftType) != null
+            && primitives.taggedPayloadOf(rightType) == null) {
+        equal = taggedAgainstPlain(lowering, left, leftType, right, rightType, binary.span());
+    } else if (primitives.taggedPayloadOf(rightType) != null) {
+        equal = taggedAgainstPlain(lowering, right, rightType, left, leftType, binary.span());
+    }
+    if (equal < 0) {
+        if (!lowering.failed()) {
+            lowering.unsupported("comparing '{types.display(leftType)}' with "
+                + "'{types.display(rightType)}'", binary.span());
+        }
+        return -1;
+    }
+    if (!negated) {
+        return equal;
+    }
+    long inverted = builder.newTemp(resultType);
+    builder.append(new EirUnary(inverted, resultType, EirUnaryOp.Not, equal));
+    return inverted;
+}
+
+// The presence tag, or its inverse for a null comparison.
+presenceBit(LoweringContext lowering, long value, bool wantPresent) -> long {
+    let builder = lowering.builder();
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    long present = builder.newTemp(boolType);
+    builder.append(new EirOptionalPresence(present, boolType, value));
+    if (wantPresent) {
+        return present;
+    }
+    long absent = builder.newTemp(boolType);
+    builder.append(new EirUnary(absent, boolType, EirUnaryOp.Not, present));
+    return absent;
+}
+
+// Two loaded pairs of one tagged type: equal when both are absent, or both present with equal
+// payloads.
+taggedPairEqualValues(LoweringContext lowering, long left, long right, Type optionalType,
+                      Span span) -> long {
+    let builder = lowering.builder();
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    let payloadType = primitives.taggedPayloadOf(optionalType);
+    if (payloadType == null) {
+        return -1;
+    }
+    long leftPresent = presenceBit(lowering, left, true);
+    long rightPresent = presenceBit(lowering, right, true);
+    long leftPayload = builder.newTemp(payloadType);
+    builder.append(new EirOptionalPayload(leftPayload, payloadType, left));
+    long rightPayload = builder.newTemp(payloadType);
+    builder.append(new EirOptionalPayload(rightPayload, payloadType, right));
+    long payloadEqual = payloadEquality(lowering, leftPayload, rightPayload, payloadType, span);
+    if (payloadEqual < 0) {
+        return -1;
+    }
+    long samePresence = builder.newTemp(boolType);
+    builder.append(new EirBinary(samePresence, boolType, EirBinaryOp.CmpEq, leftPresent,
+        rightPresent));
+    long leftAbsent = builder.newTemp(boolType);
+    builder.append(new EirUnary(leftAbsent, boolType, EirUnaryOp.Not, leftPresent));
+    long absentOrEqual = builder.newTemp(boolType);
+    builder.append(new EirBinary(absentOrEqual, boolType, EirBinaryOp.Or, leftAbsent,
+        payloadEqual));
+    long equal = builder.newTemp(boolType);
+    builder.append(new EirBinary(equal, boolType, EirBinaryOp.And, samePresence,
+        absentOrEqual));
+    return equal;
+}
+
+// The same comparison over the storage two addresses name, for a struct's optional field.
+taggedPairEqual(LoweringContext lowering, long left, long right, Type optionalType, Span span)
+        -> long {
+    return taggedPairEqualValues(lowering, left, right, optionalType, span);
+}
+
+// A tagged optional against a plain value: present, and the payload equal to the value at the
+// payload's type.
+taggedAgainstPlain(LoweringContext lowering, long tagged, Type taggedType, long plain,
+                   Type plainType, Span span) -> long {
+    let builder = lowering.builder();
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    let payloadType = primitives.taggedPayloadOf(taggedType);
+    if (payloadType == null) {
+        return -1;
+    }
+    long payload = builder.newTemp(payloadType);
+    builder.append(new EirOptionalPayload(payload, payloadType, tagged));
+    long converted = conversions.convert(lowering, plain, payloadType, span);
+    if (converted < 0) {
+        return -1;
+    }
+    long payloadEqual = payloadEquality(lowering, payload, converted, payloadType, span);
+    if (payloadEqual < 0) {
+        return -1;
+    }
+    long present = presenceBit(lowering, tagged, true);
+    long equal = builder.newTemp(boolType);
+    builder.append(new EirBinary(equal, boolType, EirBinaryOp.And, present, payloadEqual));
+    return equal;
+}
+
+// Payload '==': the machine comparison for the value shapes that have one.
+payloadEquality(LoweringContext lowering, long left, long right, Type payloadType, Span span)
+        -> long {
+    if (!primitives.isNumericType(payloadType) && !primitives.isBoolType(payloadType)
+            && !primitives.isEnumType(payloadType)) {
+        lowering.unsupported("comparing optional values of type "
+            + "'{types.display(payloadType)}?'", span);
+        return -1;
+    }
+    let builder = lowering.builder();
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    let op = primitives.isFloatType(payloadType) ? EirBinaryOp.FloatCmpEq : EirBinaryOp.CmpEq;
     long equal = builder.newTemp(boolType);
     builder.append(new EirBinary(equal, boolType, op, left, right));
     return equal;

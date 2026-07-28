@@ -9,14 +9,23 @@
 import Expression from @ens.frontend.syntax.generated.nodes;
 import Span from @ens.frontend.support.source;
 import EnumType from @ens.sema.model.types;
+import OptionalType from @ens.sema.model.types;
 import StructType from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
 import @ens.sema.model.types;
+import EirBranch from eir.model;
 import EirJsonEscape from eir.model;
+import EirJump from eir.model;
+import EirLoadSlot from eir.model;
+import EirOptionalPayloadAddress from eir.model;
+import EirStoreSlot from eir.model;
 import LoweringContext from lower.context;
+import lower.conversions;
+import lower.optionals;
 import lower.ownership;
 import lower.places;
 import lower.records;
+import lower.stores;
 import lower.strings;
 import lower.structs;
 import support.primitives;
@@ -71,20 +80,84 @@ renderField(LoweringContext lowering, long base, Type owner, long index, Span sp
     if (!rendersAsJson(fieldType)) {
         lowering.unsupported("converting '{types.display(owner)}' to text: its field "
             + "'{field.name()}' has type '{types.display(fieldType)}', and only integers, bool, "
-            + "char, float, double, string, enum, and nested structs of those render as JSON",
-            span);
+            + "char, float, double, string, enum, their nullable forms, and nested structs of "
+            + "those render as JSON", span);
         return -1;
     }
     long address = structs.fieldAddressAt(lowering, base, fieldType, index);
-    if (primitives.structOf(fieldType) != null) {
-        return renderAt(lowering, address, fieldType, span);
+    return renderValueAt(lowering, address, fieldType, span);
+}
+
+// The JSON value of the storage an address names, as a string the caller owns. An absent
+// nullable field renders as 'null' and a present one as its payload's own form.
+renderValueAt(LoweringContext lowering, long address, Type type, Span span) -> long {
+    let builder = lowering.builder();
+    let stringType = lowering.store().stringType();
+    let payloadType = primitives.taggedPayloadOf(type);
+    if (payloadType != null) {
+        long pair = places.loadFrom(lowering, address, type);
+        long present = optionals.presenceOf(lowering, pair, type);
+        long slot = ownership.defineMergeSlot(lowering, "jsonopt", stringType);
+        long presentBlock = builder.newBlock("json.opt.present");
+        long absentBlock = builder.newBlock("json.opt.absent");
+        long mergeBlock = builder.newBlock("json.opt.end");
+        builder.terminate(new EirBranch(present, presentBlock, absentBlock));
+        builder.moveTo(presentBlock);
+        long payloadAddress = builder.newTemp(payloadType);
+        builder.append(new EirOptionalPayloadAddress(payloadAddress, payloadType, address));
+        long rendered = renderValueAt(lowering, payloadAddress, payloadType, span);
+        if (rendered < 0) {
+            return -1;
+        }
+        if (!stores.assignSlot(lowering, slot, stringType,
+                new stores.Operand(rendered, true, -1))) {
+            return -1;
+        }
+        builder.terminate(new EirJump(mergeBlock));
+        builder.moveTo(absentBlock);
+        if (!storeNullText(lowering, slot, stringType)) {
+            return -1;
+        }
+        builder.terminate(new EirJump(mergeBlock));
+        builder.moveTo(mergeBlock);
+        return loadOwnedText(lowering, slot, stringType);
     }
-    long value = places.loadFrom(lowering, address, fieldType);
-    if (primitives.isStringType(fieldType)) {
+    if (type is OptionalType && primitives.isStringType(type.inner())) {
+        long value = places.loadFrom(lowering, address, type);
+        long present = optionals.presenceOf(lowering, value, type);
+        long slot = ownership.defineMergeSlot(lowering, "jsonopt", stringType);
+        long presentBlock = builder.newBlock("json.opt.present");
+        long absentBlock = builder.newBlock("json.opt.absent");
+        long mergeBlock = builder.newBlock("json.opt.end");
+        builder.terminate(new EirBranch(present, presentBlock, absentBlock));
+        builder.moveTo(presentBlock);
+        long narrowed = conversions.convert(lowering, value, lowering.store().stringType(),
+            span);
+        if (narrowed < 0) {
+            return -1;
+        }
+        if (!stores.assignSlot(lowering, slot, stringType,
+                new stores.Operand(escaped(lowering, narrowed), true, -1))) {
+            return -1;
+        }
+        builder.terminate(new EirJump(mergeBlock));
+        builder.moveTo(absentBlock);
+        if (!storeNullText(lowering, slot, stringType)) {
+            return -1;
+        }
+        builder.terminate(new EirJump(mergeBlock));
+        builder.moveTo(mergeBlock);
+        return loadOwnedText(lowering, slot, stringType);
+    }
+    if (primitives.structOf(type) != null) {
+        return renderAt(lowering, address, type, span);
+    }
+    long value = places.loadFrom(lowering, address, type);
+    if (primitives.isStringType(type)) {
         return escaped(lowering, value);
     }
-    if (primitives.isCharType(fieldType) || fieldType is EnumType) {
-        long text = strings.convertToString(lowering, value, fieldType, span);
+    if (primitives.isCharType(type) || type is EnumType) {
+        long text = strings.convertToString(lowering, value, type, span);
         if (text < 0) {
             return -1;
         }
@@ -92,14 +165,37 @@ renderField(LoweringContext lowering, long base, Type owner, long index, Span sp
         ownership.releaseValue(lowering, text);
         return quoted;
     }
-    return strings.convertToString(lowering, value, fieldType, span);
+    return strings.convertToString(lowering, value, type, span);
 }
 
 // The field types with a JSON form the code generator can build.
 rendersAsJson(Type type) -> bool {
+    let payload = primitives.taggedPayloadOf(type);
+    if (payload != null) {
+        return rendersAsJson(payload);
+    }
+    if (type is OptionalType) {
+        return primitives.isStringType(type.inner());
+    }
     return primitives.isNumericType(type) || primitives.isBoolType(type)
         || primitives.isStringType(type) || type is EnumType
         || primitives.structOf(type) != null;
+}
+
+// Fills a merge slot's arm with the literal 'null'.
+storeNullText(LoweringContext lowering, long slot, Type stringType) -> bool {
+    long absent = strings.literalText(lowering, "null");
+    return stores.assignSlot(lowering, slot, stringType, new stores.Operand(absent, false, -1));
+}
+
+// The merged text with a reference of its own, so the caller owns what it hands on while the
+// scope-owned slot keeps and later releases its copy.
+loadOwnedText(LoweringContext lowering, long slot, Type stringType) -> long {
+    let builder = lowering.builder();
+    long merged = builder.newTemp(stringType);
+    builder.append(new EirLoadSlot(merged, stringType, slot));
+    ownership.retainValue(lowering, merged);
+    return merged;
 }
 
 // The JSON string form of a string: quoted and escaped, as a fresh string the caller owns. The
