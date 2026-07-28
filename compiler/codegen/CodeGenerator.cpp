@@ -1030,6 +1030,12 @@ struct CodeGenerator::Impl {
                 llvm::Value* fieldAddr = builder->CreateStructGEP(st, thisVal, static_cast<unsigned>(idx),
                                                                   asAscii(*fname) + ".addr");
                 llvm::Value* paramVal = builder->CreateLoad(mapType(psym->type), values[psym]);
+                if (receiver->structInfo->fields[static_cast<size_t>(idx)].isWeak) {
+                    // The caller's +1 covers the call, so the field only starts
+                    // watching and gives no reference up.
+                    emitWeakFieldStore(fieldAddr, paramVal, /*ownedOperand*/ false);
+                    continue;
+                }
                 if (isReferenceType(psym->type)) {
                     emitRetain(paramVal);
                     // A field default may already occupy the slot.
@@ -1569,6 +1575,21 @@ struct CodeGenerator::Impl {
     void emitWeakRelease(llvm::Value* val) {
         if (!val || llvm::isa<llvm::ConstantPointerNull>(val)) return;
         builder->CreateCall(getOrDefineEnsWeakRelease(), { val });
+    }
+
+    // A weak field holds a side-table entry, not the object. The store points the
+    // field at the new object, stops watching whatever it watched, and takes no
+    // strong reference - so an operand that arrived owning a +1 is the store's to
+    // give up, the one place a store releases its own operand.
+    void emitWeakFieldStore(llvm::Value* slot, llvm::Value* val, bool ownedOperand) {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        llvm::Value* newEntry = emitWeakInit(val);
+        llvm::Value* oldEntry = builder->CreateLoad(ptrTy, slot, "weak.old");
+        emitWeakRelease(oldEntry);
+        builder->CreateStore(newEntry, slot);
+        if (ownedOperand) {
+            emitRelease(val);
+        }
     }
 
     bool classLetCanBorrow(Symbol* lhs, const ast::Expression& init) {
@@ -7413,15 +7434,7 @@ struct CodeGenerator::Impl {
         if (!val) return nullptr;
 
         if (isWeakField) {
-            auto* ptrTy = llvm::PointerType::get(ctx, 0);
-            llvm::Value* newSt = emitWeakInit(val);
-            llvm::Value* oldSt = builder->CreateLoad(ptrTy, lv);
-            emitWeakRelease(oldSt);
-            builder->CreateStore(newSt, lv);
-            // If RHS produced a fresh +1 (e.g., new T() or a call), release it. Weak doesn't retain strong ownership.
-            if (!borrowedSource) {
-                emitRelease(val);
-            }
+            emitWeakFieldStore(lv, val, !borrowedSource);
         } else if (isBorrowModeTarget) {
             builder->CreateStore(val, lv);
         } else if (moveSrc) {
