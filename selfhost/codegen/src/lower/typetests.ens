@@ -1,0 +1,284 @@
+// Runtime type tests: the 'is' operator, the 'as?' checked cast, and the switch whose arms test
+// types. All three read the scrutinee's runtime type and compare it against a class's parent
+// chain or an interface's conformance table; the comparison itself is one EIR instruction, and
+// the switch is the same test chained in source order, exactly the order the arms are written.
+//
+// Ownership: 'is' produces a bool and leaves the scrutinee alone. 'as?' hands back the same
+// pointer or null, and the result is retained like any other production the caller may bind, so
+// a failed cast of an owned temporary still releases it exactly once. A type switch borrows its
+// scrutinee for the whole statement, parking an owned one in a scope-owned slot, and every arm
+// binding borrows the same pointer at the arm's sharper type.
+import Expression from @ens.frontend.syntax.generated.nodes;
+import SwitchArm from @ens.frontend.syntax.generated.nodes;
+import TypeArmNode from @ens.frontend.syntax.generated.nodes;
+import ValueArmNode from @ens.frontend.syntax.generated.nodes;
+import DefaultArmNode from @ens.frontend.syntax.generated.nodes;
+import TypeTestExpressionNode from @ens.frontend.syntax.generated.nodes;
+import CheckedCastExpressionNode from @ens.frontend.syntax.generated.nodes;
+import Span from @ens.frontend.support.source;
+import EnumType from @ens.sema.model.types;
+import OptionalType from @ens.sema.model.types;
+import PrimitiveKind from @ens.sema.model.types;
+import Type from @ens.sema.model.types;
+import @ens.sema.model.types;
+import EirBinary from eir.model;
+import EirBinaryOp from eir.model;
+import EirBranch from eir.model;
+import EirConstNull from eir.model;
+import EirJump from eir.model;
+import EirLoadSlot from eir.model;
+import EirStoreSlot from eir.model;
+import EirTypeTest from eir.model;
+import EirCheckedCast from eir.model;
+import EirUnreachable from eir.model;
+import LoweringContext from lower.context;
+import lower.classes;
+import lower.conversions;
+import lower.expressions;
+import lower.ownership;
+import lower.switches;
+import support.primitives;
+import List from @std.collections.list;
+
+// 'value is Type' as a bool. A null value is simply not an instance, so nullable scrutinees need
+// nothing extra.
+public lowerTypeTest(LoweringContext lowering, TypeTestExpressionNode test) -> long {
+    let resultType = lowering.typeOf(test);
+    if (resultType == null) {
+        return -1;
+    }
+    let target = lowering.result().typeOf(test.target().green());
+    if (target == null) {
+        lowering.internalError("the target of 'is' has no recorded type", test.span());
+        return -1;
+    }
+    if (!supportedScrutinee(lowering, test.value(), test.span())
+            || !supportedTarget(lowering, target, test.span())) {
+        return -1;
+    }
+    long value = expressions.lower(lowering, test.value());
+    if (value < 0) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    long result = builder.newTemp(resultType);
+    builder.append(new EirTypeTest(result, resultType, value, target));
+    expressions.releaseTemporary(lowering, test.value(), value);
+    return result;
+}
+
+// 'value as? Type' as the value or null. The result borrows the same pointer, so it takes a
+// reference of its own before the value's own life ends.
+public lowerCheckedCast(LoweringContext lowering, CheckedCastExpressionNode cast) -> long {
+    let resultType = lowering.typeOf(cast);
+    if (resultType == null) {
+        return -1;
+    }
+    if (!(resultType is OptionalType)) {
+        lowering.internalError("'as?' has non-optional type '{types.display(resultType)}'",
+            cast.span());
+        return -1;
+    }
+    let target = resultType.inner();
+    if (target is EnumType) {
+        lowering.unsupported("'as?' to a numeric enum, which produces an optional value type",
+            cast.span());
+        return -1;
+    }
+    if (!supportedScrutinee(lowering, cast.value(), cast.span())
+            || !supportedTarget(lowering, target, cast.span())) {
+        return -1;
+    }
+    long value = expressions.lower(lowering, cast.value());
+    if (value < 0) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    long result = builder.newTemp(resultType);
+    builder.append(new EirCheckedCast(result, resultType, value, target));
+    ownership.retainValue(lowering, result);
+    expressions.releaseTemporary(lowering, cast.value(), value);
+    return result;
+}
+
+// A switch whose arms test the scrutinee's runtime type: the tests run in source order, a null
+// arm catches an absent nullable first, and a sealed hierarchy the arms cover exhaustively needs
+// no default, so the chain's miss end is unreachable.
+public lowerTypeSwitch(LoweringContext lowering, Expression scrutinee, List<SwitchArm> arms,
+                       Type? resultType, Span span) -> long {
+    let scrutineeType = lowering.typeOf(scrutinee);
+    if (scrutineeType == null) {
+        return -1;
+    }
+    if (!supportedScrutinee(lowering, scrutinee, span)) {
+        return -1;
+    }
+    if (resultType != null && !lowering.supportsValueType(resultType)) {
+        lowering.unsupported("a switch producing '{types.display(resultType)}'", span);
+        return -1;
+    }
+    long scrutineeValue = classes.borrowedReference(lowering, scrutinee, scrutineeType);
+    if (scrutineeValue < 0) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    long resultSlot = -1;
+    if (resultType != null) {
+        resultSlot = ownership.defineMergeSlot(lowering, "typeswitch", resultType);
+    }
+    let armBlocks = new List<long>();
+    long defaultBlock = -1;
+    long nullBlock = -1;
+    for (long a = 0; a < arms.length(); a++) {
+        switch (arms.get(a)) {
+            is TypeArmNode arm -> {
+                long block = builder.newBlock("typeswitch.arm");
+                armBlocks.push(block);
+            },
+            is DefaultArmNode arm -> {
+                long block = builder.newBlock("typeswitch.default");
+                armBlocks.push(block);
+                defaultBlock = block;
+            },
+            is ValueArmNode arm -> {
+                long block = builder.newBlock("typeswitch.null");
+                armBlocks.push(block);
+                nullBlock = block;
+            },
+        }
+    }
+    long missTarget = defaultBlock;
+    long unreachableBlock = -1;
+    if (missTarget < 0) {
+        unreachableBlock = builder.newBlock("typeswitch.unreachable");
+        missTarget = unreachableBlock;
+    }
+    if (scrutineeType is OptionalType) {
+        long nullTarget = nullBlock;
+        if (nullTarget < 0) {
+            nullTarget = missTarget;
+        }
+        long chainBlock = builder.newBlock("typeswitch.test");
+        builder.terminate(new EirBranch(absentTest(lowering, scrutineeValue), nullTarget,
+            chainBlock));
+        builder.moveTo(chainBlock);
+    }
+    if (!lowerTestChain(lowering, arms, armBlocks, scrutineeValue, missTarget, span)) {
+        return -1;
+    }
+    if (unreachableBlock >= 0) {
+        builder.moveTo(unreachableBlock);
+        builder.terminate(new EirUnreachable());
+    }
+    long merge = builder.newBlock("typeswitch.end");
+    for (long a = 0; a < arms.length(); a++) {
+        builder.moveTo(armBlocks.get(a));
+        let arm = arms.get(a);
+        if (arm is TypeArmNode) {
+            if (!bindArmValue(lowering, arm, scrutineeValue)) {
+                return -1;
+            }
+        }
+        let body = switches.armBodyOf(arm);
+        if (body != null) {
+            switches.lowerArmBody(lowering, body, resultType, resultSlot);
+        }
+        if (lowering.failed()) {
+            return -1;
+        }
+        if (!builder.terminated()) {
+            builder.terminate(new EirJump(merge));
+        }
+    }
+    builder.moveTo(merge);
+    if (resultType == null) {
+        return -1;
+    }
+    long temp = builder.newTemp(resultType);
+    builder.append(new EirLoadSlot(temp, resultType, resultSlot));
+    return temp;
+}
+
+// One test per type arm, in source order; a miss falls through to the next test and past the
+// last one to the default or the unreachable end.
+lowerTestChain(LoweringContext lowering, List<SwitchArm> arms, List<long> armBlocks,
+               long scrutineeValue, long missTarget, Span span) -> bool {
+    let builder = lowering.builder();
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    for (long a = 0; a < arms.length(); a++) {
+        let arm = arms.get(a);
+        if (!(arm is TypeArmNode)) {
+            continue;
+        }
+        let target = lowering.result().typeOf(arm.target().green());
+        if (target == null) {
+            lowering.internalError("a type arm's target has no recorded type",
+                arm.target().span());
+            return false;
+        }
+        if (!supportedTarget(lowering, target, arm.target().span())) {
+            return false;
+        }
+        long test = builder.newTemp(boolType);
+        builder.append(new EirTypeTest(test, boolType, scrutineeValue, target));
+        long next = builder.newBlock("typeswitch.next");
+        builder.terminate(new EirBranch(test, armBlocks.get(a), next));
+        builder.moveTo(next);
+    }
+    builder.terminate(new EirJump(missTarget));
+    return true;
+}
+
+// The arm's binding, when it declares one: a constant borrowing the scrutinee at the arm's type.
+bindArmValue(LoweringContext lowering, TypeArmNode arm, long scrutineeValue) -> bool {
+    let bindingToken = arm.binding();
+    if (bindingToken == null) {
+        return true;
+    }
+    let binding = lowering.result().bindingOf(arm.green());
+    if (binding == null) {
+        lowering.internalError("a type arm's binding was never recorded", arm.span());
+        return false;
+    }
+    long converted = conversions.convert(lowering, scrutineeValue, binding.type(), arm.span());
+    if (converted < 0) {
+        return false;
+    }
+    long slot = lowering.defineSlotAs(binding, bindingToken.text(), binding.type(), true);
+    lowering.builder().append(new EirStoreSlot(slot, converted));
+    return true;
+}
+
+// True when the scrutinee is a class-like value lowering can represent.
+supportedScrutinee(LoweringContext lowering, Expression value, Span span) -> bool {
+    let valueType = lowering.typeOf(value);
+    if (valueType == null) {
+        return false;
+    }
+    if (!primitives.isClassLike(valueType) || !lowering.supportsValueType(valueType)) {
+        lowering.unsupported("a runtime type test on '{types.display(valueType)}'", span);
+        return false;
+    }
+    return true;
+}
+
+// True when the tested-against type has a descriptor to compare with.
+supportedTarget(LoweringContext lowering, Type target, Span span) -> bool {
+    if (!primitives.isClassLike(target) || !primitives.isRepresentable(target)) {
+        lowering.unsupported("a runtime type test against '{types.display(target)}'", span);
+        return false;
+    }
+    return true;
+}
+
+// True when the value is an absent nullable reference.
+absentTest(LoweringContext lowering, long value) -> long {
+    let builder = lowering.builder();
+    let valueType = builder.tempType(value);
+    long absent = builder.newTemp(valueType);
+    builder.append(new EirConstNull(absent, valueType));
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    long test = builder.newTemp(boolType);
+    builder.append(new EirBinary(test, boolType, EirBinaryOp.CmpEq, value, absent));
+    return test;
+}

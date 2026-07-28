@@ -4,9 +4,11 @@
 //
 // A class that declares 'equals' for itself asks for content instead, and then the comparison is
 // three-way: the same object is equal without calling anything, an absent reference on one side
-// only is not equal without calling anything, and otherwise the declared method answers. Both
-// operands arrive borrowed, so none of the branches has to give a reference up.
+// only is not equal without calling anything, and otherwise the declared method answers. An
+// operand that produced its own reference gives it up once the answer is computed, so a weak
+// read's upgraded reference lives exactly as long as the comparison.
 import BinaryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ClassType from @ens.sema.model.types;
 import Method from @ens.sema.model.types;
 import PrimitiveKind from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
@@ -23,8 +25,8 @@ import EirUnary from eir.model;
 import EirUnaryOp from eir.model;
 import LoweringContext from lower.context;
 import lower.calls;
-import lower.classes;
 import lower.conversions;
+import lower.expressions;
 import support.primitives;
 
 // True when '==' over these two operand types compares references rather than values.
@@ -58,16 +60,27 @@ public lower(LoweringContext lowering, BinaryExpressionNode binary, bool negated
             + "'{types.display(rightType)}'", binary.span());
         return -1;
     }
-    long left = classes.borrowedReference(lowering, binary.left(), common);
-    long right = classes.borrowedReference(lowering, binary.right(), common);
-    if (left < 0 || right < 0) {
+    long left = expressions.lowerConverted(lowering, binary.left(), common);
+    if (left < 0) {
+        return -1;
+    }
+    long right = expressions.lowerConverted(lowering, binary.right(), common);
+    if (right < 0) {
         return -1;
     }
     let declared = declaredEquals(lowering, common);
+    long answer = -1;
     if (declared == null || isPresenceCheck(leftType, rightType)) {
-        return compareIdentity(lowering, left, right, negated, resultType);
+        answer = compareIdentity(lowering, left, right, negated, resultType);
+    } else {
+        answer = compareContents(lowering, left, right, declared, negated, resultType, binary);
     }
-    return compareContents(lowering, left, right, declared, negated, resultType, binary);
+    // A reference an operand produced was only compared, so it ends here; a weak read's upgraded
+    // reference in particular must not outlive the comparison, or it would keep the watched
+    // object alive past the answer.
+    expressions.releaseTemporary(lowering, binary.left(), left);
+    expressions.releaseTemporary(lowering, binary.right(), right);
+    return answer;
 }
 
 // The type both operands compare at. A null literal takes the other side's type, and where the two
@@ -82,30 +95,35 @@ comparisonType(Type left, Type right) -> Type {
     return right;
 }
 
-// The 'equals' a class declares for itself: one parameter of its own class, answering bool. A
-// declaration of any other shape is an ordinary method that '==' does not consult.
+// The 'equals' a class declares for itself or inherits: one parameter of the declaring class,
+// answering bool. A declaration of any other shape is an ordinary method that '==' does not
+// consult. Interface values compare by identity, so only a class receiver looks for one.
 declaredEquals(LoweringContext lowering, Type type) -> Method? {
-    let classType = primitives.classOf(type);
-    if (classType == null) {
-        return null;
-    }
-    let methods = classType.methods();
-    for (long i = 0; i < methods.length(); i++) {
-        let method = methods.get(i);
-        if (method.name() != "equals" || method.isConstructor() || method.isDestructor()) {
-            continue;
+    let current = primitives.classOf(type);
+    while (current != null) {
+        let methods = current.methods();
+        for (long i = 0; i < methods.length(); i++) {
+            let method = methods.get(i);
+            if (method.name() != "equals" || method.isConstructor() || method.isDestructor()) {
+                continue;
+            }
+            let signature = method.signature();
+            if (signature.parameters().length != 1 || signature.declaresThrows()) {
+                continue;
+            }
+            if (primitives.classOf(signature.parameters()[0].type()) != current) {
+                continue;
+            }
+            if (!primitives.isBoolType(signature.returnType())) {
+                continue;
+            }
+            return method;
         }
-        let signature = method.signature();
-        if (signature.parameters().length != 1 || signature.declaresThrows()) {
-            continue;
+        let base = current.base();
+        current = null;
+        if (base is ClassType) {
+            current = base;
         }
-        if (primitives.classOf(signature.parameters()[0].type()) != classType) {
-            continue;
-        }
-        if (!primitives.isBoolType(signature.returnType())) {
-            continue;
-        }
-        return method;
     }
     return null;
 }
@@ -160,7 +178,7 @@ compareContents(LoweringContext lowering, long left, long right, Method declared
         return -1;
     }
     long produced = calls.emitCall(lowering, info, primitives.classOf(parameterType), left,
-        [argument]);
+        [argument], lowering.tables().vtableSlotOf(declared.signature()), null);
     builder.append(new EirStoreSlot(answer, produced));
     builder.terminate(new EirJump(endBlock));
 

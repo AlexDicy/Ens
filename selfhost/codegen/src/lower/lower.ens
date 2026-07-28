@@ -13,9 +13,13 @@
 import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import BlockNode from @ens.frontend.syntax.generated.nodes;
 import AssignmentExpressionNode from @ens.frontend.syntax.generated.nodes;
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ExpressionStatementNode from @ens.frontend.syntax.generated.nodes;
 import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SuperExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SyntaxNode from @ens.frontend.syntax.node;
 import LocalBinding from @ens.sema.model.scopes;
+import ClassType from @ens.sema.model.types;
 import Parameter from @ens.sema.model.types;
 import TypeStore from @ens.sema.model.types;
 import @ens.sema.model.types;
@@ -24,10 +28,14 @@ import EirFunction from eir.model;
 import EirStoreSlot from eir.model;
 import EirReturn from eir.model;
 import EirUnreachable from eir.model;
+import DispatchTables from layout.vtables;
+import layout.vtables;
 import FunctionInfo from lower.index;
 import ProgramIndex from lower.index;
 import LoweringContext from lower.context;
 import Operand from lower.stores;
+import lower.calls;
+import lower.classes;
 import lower.ownership;
 import lower.records;
 import lower.statements;
@@ -52,9 +60,9 @@ public final class FunctionLowering {
 
 // Lowers one free function to EIR. The result carries either the function or the diagnostics
 // that explain why it could not be lowered.
-public lowerFunction(FunctionInfo info, ProgramIndex index, TypeStore store)
-        -> FunctionLowering {
-    let lowering = new LoweringContext(info, index, store);
+public lowerFunction(FunctionInfo info, ProgramIndex index, DispatchTables tables,
+                     TypeStore store) -> FunctionLowering {
+    let lowering = new LoweringContext(info, index, tables, store);
     let declaration = info.declaration();
     if (declaration == null) {
         return new FunctionLowering(null, lowering.diagnostics());
@@ -71,6 +79,9 @@ public lowerFunction(FunctionInfo info, ProgramIndex index, TypeStore store)
         return new FunctionLowering(null, lowering.diagnostics());
     }
     lowering.pushScope();
+    if (info.isConstructor() && !hasExplicitSuperCall(body)) {
+        chainImplicitSuper(lowering, declaration);
+    }
     bindParameters(lowering, declaration, body);
     if (body != null) {
         statements.lowerBlock(lowering, body);
@@ -89,6 +100,55 @@ public lowerFunction(FunctionInfo info, ProgramIndex index, TypeStore store)
     }
     lowering.popScope();
     return new FunctionLowering(builder.finish(), lowering.diagnostics());
+}
+
+// True when the constructor body chains to its base itself, with a top-level 'super(...)'.
+hasExplicitSuperCall(BlockNode? body) -> bool {
+    if (body == null) {
+        return false;
+    }
+    for (long i = 0; i < body.statementsCount(); i++) {
+        let statement = body.statements(i);
+        if (!(statement is ExpressionStatementNode)) {
+            continue;
+        }
+        let expression = statement.expression();
+        if (expression is CallExpressionNode && expression.callee() is SuperExpressionNode) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// A constructor that does not chain builds its base subobject first, before its own field
+// parameters and body run: the base constructor callable with no arguments, preferring a
+// zero-parameter one over one whose parameters all take defaults. A base with no constructor
+// leaves nothing to run.
+chainImplicitSuper(LoweringContext lowering, FunctionDeclarationNode declaration) {
+    let receiverType = lowering.info().receiverType();
+    if (receiverType == null || !(receiverType is ClassType)) {
+        return;
+    }
+    let base = vtables.baseClassOf(receiverType);
+    if (base == null) {
+        return;
+    }
+    let baseConstructor = classes.implicitConstructorOf(base);
+    if (baseConstructor == null) {
+        return;
+    }
+    let info = lowering.index().infoFor(baseConstructor.signature());
+    if (info == null) {
+        lowering.internalError("the implicit base constructor of '{base.name()}' resolves to "
+            + "no indexed function", lowering.info().signature().nameSpan());
+        return;
+    }
+    if (!calls.supportedCallee(lowering, info, "base constructor of '{base.name()}'",
+            lowering.info().signature().nameSpan())) {
+        return;
+    }
+    let ignored = calls.lowerInvocation(lowering, info, null, declaration.green(),
+        lowering.info().signature().nameSpan(), base, 0);
 }
 
 // Every parameter gets a slot holding its incoming temp, so the body reads parameters exactly

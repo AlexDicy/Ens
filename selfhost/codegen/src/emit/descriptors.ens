@@ -1,0 +1,243 @@
+// The type descriptors one emitted module holds: the globals behind runtime type identity. Every
+// class and interface has exactly one descriptor, defined in the module that declares it and
+// declared everywhere else, so descriptor pointers compare with plain equality program-wide.
+//
+// A descriptor is { name, parent, id, vtable, itables }: the type's name for diagnostics, the
+// base class's descriptor or null, a hash of the symbol, the virtual method table or null when
+// the type has no slots, and the flattened conformance table or null when it implements nothing.
+// The object header points at it from payload - 32, where ens_alloc stores it.
+//
+// One Descriptors belongs to one module: it caches the globals it has reached, hands the runtime
+// type helpers their layout, and defines the descriptors the module owns after the bodies are
+// emitted, so every function the tables point at is already declared at its real type.
+import Type from @ens.sema.model.types;
+import TypeRef from @ens.llvm.types;
+import Value from @ens.llvm.values;
+import @ens.llvm.globals;
+import @ens.llvm.memory;
+import DescriptorPlan from layout.descriptors;
+import DescriptorPlans from layout.descriptors;
+import ConformancePlan from layout.descriptors;
+import FunctionInfo from lower.index;
+import EirCallee from eir.model;
+import Runtime from emit.runtime;
+import RuntimeFunction from emit.runtime;
+import ModuleEmitter from emit.context;
+import emit.rtti;
+import emit.signatures;
+import Map from @std.collections.map;
+
+public final class Descriptors {
+    Runtime runtime;
+    DescriptorPlans plans;
+    Map<Type, Value> globals;
+    TypeRef? cachedDescriptorType;
+    TypeRef? cachedEntryType;
+
+    public constructor(Runtime runtime, DescriptorPlans plans) {
+        this.runtime = runtime;
+        this.plans = plans;
+        this.globals = new Map<Type, Value>();
+        this.cachedDescriptorType = null;
+        this.cachedEntryType = null;
+    }
+
+    // TypeDescriptor { ptr name; ptr parent; i32 id; ptr vtable; ptr itables }
+    public descriptorType() -> TypeRef {
+        let cached = this.cachedDescriptorType;
+        if (cached != null) {
+            return cached;
+        }
+        let created = this.runtime.context.namedStructType("TypeDescriptor");
+        created.setBody([this.runtime.pointerType, this.runtime.pointerType,
+            this.runtime.int32Type, this.runtime.pointerType, this.runtime.pointerType], false);
+        this.cachedDescriptorType = created;
+        return created;
+    }
+
+    // InterfaceEntry { ptr interface; ptr methods }
+    public entryType() -> TypeRef {
+        let cached = this.cachedEntryType;
+        if (cached != null) {
+            return cached;
+        }
+        let created = this.runtime.context.namedStructType("InterfaceEntry");
+        created.setBody([this.runtime.pointerType, this.runtime.pointerType], false);
+        this.cachedEntryType = created;
+        return created;
+    }
+
+    // The descriptor global of a class or interface, created as a declaration on first use; the
+    // module that owns the type fills its initializer in when it defines its descriptors.
+    public descriptorValue(Type type) -> Value {
+        let cached = this.globals.get(type);
+        if (cached != null) {
+            return cached;
+        }
+        let plan = this.plans.planFor(type);
+        if (plan == null) {
+            panic("Internal: no descriptor was planned for this type");
+        }
+        let global = globals.addGlobal(this.runtime.module, this.descriptorType(),
+            plan.symbol());
+        globals.setGlobalConstant(global, true);
+        this.globals.set(type, global);
+        return global;
+    }
+
+    // The descriptor pointer in a heap object's header.
+    public loadDescriptor(Value object) -> Value {
+        return memory.buildLoad(this.runtime.builder, this.runtime.pointerType,
+            this.runtime.offsetPointer(object, -32, ""), "descriptor");
+    }
+
+    public typeIs() -> RuntimeFunction {
+        return rtti.typeIs(this.runtime, this.descriptorType());
+    }
+
+    public conforms() -> RuntimeFunction {
+        return rtti.conforms(this.runtime, this.descriptorType(), this.entryType());
+    }
+
+    public itableLookup() -> RuntimeFunction {
+        return rtti.itableLookup(this.runtime, this.descriptorType(), this.entryType());
+    }
+
+    // Defines every descriptor the module owns. Runs after the bodies, so a table entry naming a
+    // function this module defines reuses its declaration.
+    public defineModuleDescriptors(ModuleEmitter emitter, string moduleName) {
+        let all = this.plans.all();
+        for (long i = 0; i < all.length(); i++) {
+            let plan = all.get(i);
+            if (plan.modulePath() == moduleName) {
+                this.define(emitter, plan);
+            }
+        }
+    }
+
+    define(ModuleEmitter emitter, DescriptorPlan plan) {
+        let global = this.descriptorValue(plan.type());
+        let name = this.nameConstant(plan);
+        Value parent = this.runtime.nullPointer();
+        let parentType = plan.parent();
+        if (parentType != null) {
+            parent = this.descriptorValue(parentType);
+        }
+        let typeId = this.runtime.int32Type.constInt(plan.typeId() as ulong, false);
+        let vtable = this.vtableConstant(emitter, plan);
+        let itables = this.conformancesConstant(emitter, plan);
+        globals.setInitializer(global, this.descriptorType().constNamedStruct([name, parent,
+            typeId, vtable, itables]));
+    }
+
+    // The type's name as a private NUL-terminated byte global.
+    nameConstant(DescriptorPlan plan) -> Value {
+        byte[] text = plan.name().toBytes();
+        let bytesType = this.runtime.int8Type.arrayType((text.length + 1) as ulong);
+        let bytes = new Value[text.length + 1];
+        for (long i = 0; i < bytes.length; i++) {
+            bytes[i] = this.runtime.int8Type.constInt(nameByte(text, i), false);
+        }
+        let global = globals.addGlobal(this.runtime.module, bytesType,
+            "_typename" + plan.symbol());
+        globals.setInitializer(global, this.runtime.int8Type.constArray(bytes));
+        globals.setGlobalConstant(global, true);
+        globals.setLinkage(global, globals.linkagePrivate());
+        return global;
+    }
+
+    // The virtual method table: slot i holds the most-derived implementation the plan resolved,
+    // and an abstract slot stays null. A class with no slots stores no table at all.
+    vtableConstant(ModuleEmitter emitter, DescriptorPlan plan) -> Value {
+        let entries = plan.vtable();
+        if (entries.length == 0) {
+            return this.runtime.nullPointer();
+        }
+        let values = new Value[entries.length];
+        for (long i = 0; i < values.length; i++) {
+            values[i] = this.implementationPointer(emitter, entries[i]);
+        }
+        return this.pointerTable("_vtable" + plan.symbol(), values);
+    }
+
+    // The flattened conformance table: one { interface, methods } entry per implemented
+    // interface, ending in a null entry the runtime scan stops at.
+    conformancesConstant(ModuleEmitter emitter, DescriptorPlan plan) -> Value {
+        let conformances = plan.conformances();
+        if (conformances.length == 0) {
+            return this.runtime.nullPointer();
+        }
+        let entries = new Value[conformances.length + 1];
+        for (long i = 0; i < entries.length; i++) {
+            entries[i] = this.conformanceEntry(emitter, plan, conformances, i);
+        }
+        let tableType = this.entryType().arrayType(entries.length as ulong);
+        let global = globals.addGlobal(this.runtime.module, tableType,
+            "_itables" + plan.symbol());
+        globals.setInitializer(global, this.entryType().constArray(entries));
+        globals.setGlobalConstant(global, true);
+        globals.setLinkage(global, globals.linkageInternal());
+        return global;
+    }
+
+    // Entry position of the conformance table: a conformance's { interface, methods } pair, and
+    // one past the last the null pair the runtime scan stops at.
+    conformanceEntry(ModuleEmitter emitter, DescriptorPlan plan, ConformancePlan[] conformances,
+                     long position) -> Value {
+        if (position == conformances.length) {
+            return this.entryType().constNamedStruct([this.runtime.nullPointer(),
+                this.runtime.nullPointer()]);
+        }
+        let conformance = conformances[position];
+        return this.entryType().constNamedStruct([
+            this.descriptorValue(conformance.interfaceType()),
+            this.itableConstant(emitter, plan, conformance, position),
+        ]);
+    }
+
+    itableConstant(ModuleEmitter emitter, DescriptorPlan plan, ConformancePlan conformance,
+                   long position) -> Value {
+        let implementations = conformance.implementations();
+        let values = new Value[implementations.length];
+        for (long i = 0; i < values.length; i++) {
+            values[i] = this.implementationPointer(emitter, implementations[i]);
+        }
+        return this.pointerTable("_itable{position}" + plan.symbol(), values);
+    }
+
+    implementationPointer(ModuleEmitter emitter, FunctionInfo? implementation) -> Value {
+        if (implementation == null) {
+            return this.runtime.nullPointer();
+        }
+        return functionPointer(emitter, implementation);
+    }
+
+    pointerTable(string name, Value[] values) -> Value {
+        let tableType = this.runtime.pointerType.arrayType(values.length as ulong);
+        let global = globals.addGlobal(this.runtime.module, tableType, name);
+        globals.setInitializer(global, this.runtime.pointerType.constArray(values));
+        globals.setGlobalConstant(global, true);
+        globals.setLinkage(global, globals.linkageInternal());
+        return global;
+    }
+}
+
+// The literal's byte at the index, and the NUL terminator one past the end.
+nameByte(byte[] text, long index) -> ulong {
+    if (index < text.length) {
+        return text[index] as ulong;
+    }
+    return 0;
+}
+
+// The address of one method, declared at its real signature when the module has not already.
+functionPointer(ModuleEmitter emitter, FunctionInfo info) -> Value {
+    let signature = info.signature();
+    let parameters = signature.parameters();
+    let parameterTypes = new Type[parameters.length];
+    for (long i = 0; i < parameterTypes.length; i++) {
+        parameterTypes[i] = parameters[i].type();
+    }
+    return signatures.calleeValue(emitter, new EirCallee(info.symbol(), info.receiverType(),
+        parameterTypes, signature.returnType()));
+}

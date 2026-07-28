@@ -1,9 +1,9 @@
 // The code-generation driver: from a checked ProgramAnalysis to one native object file per Ens
 // module. The pipeline is staged so the later passes slot in without reshaping this file:
-// indexing (and, later, monomorphization and layout) runs once over the program, lowering runs
-// per function as a pure step, the structural and ownership verifiers gate every lowered
-// function, and emission writes each module's object. Modules that define nothing are not
-// emitted.
+// indexing (and, later, monomorphization) runs once over the program, the layout stage assigns
+// the dispatch slots and plans every type descriptor, lowering runs per function as a pure step,
+// the structural and ownership verifiers gate every lowered function, and emission writes each
+// module's object. Modules that define nothing are not emitted.
 //
 // The stages run to completion program-wide before the next one starts, so a program with
 // problems in several modules reports all of them and a program that fails to lower writes no
@@ -21,6 +21,10 @@ import EirFunction from eir.model;
 import eir.verify;
 import eir.ownership;
 import eir.storage;
+import DispatchTables from layout.vtables;
+import DescriptorPlans from layout.descriptors;
+import layout.descriptors;
+import layout.vtables;
 import ProgramIndex from lower.index;
 import ModuleFunctions from lower.index;
 import lower.destructors;
@@ -67,31 +71,34 @@ export emitProgram(ProgramAnalysis analysis, string outputFolder, string filePre
         -> EmitResult {
     let problems = new List<FileDiagnostic>();
     let programIndex = index.buildIndex(analysis);
-    let lowered = lowerModules(programIndex, analysis, problems);
+    let tables = vtables.assignSlots(programIndex);
+    let plans = descriptors.planProgram(programIndex, tables);
+    let lowered = lowerModules(programIndex, tables, analysis, problems);
     if (problems.length() > 0) {
         return new EmitResult(new List<string>(), problems.toArray());
     }
-    let objects = emitModules(lowered, outputFolder, filePrefix, problems);
+    let objects = emitModules(lowered, plans, outputFolder, filePrefix, problems);
     return new EmitResult(objects, problems.toArray());
 }
 
 // Lowers and verifies every module that defines functions, reporting each module's problems
 // whatever the other modules did.
-lowerModules(ProgramIndex programIndex, ProgramAnalysis analysis, List<FileDiagnostic> problems)
-        -> List<LoweredModule> {
+lowerModules(ProgramIndex programIndex, DispatchTables tables, ProgramAnalysis analysis,
+             List<FileDiagnostic> problems) -> List<LoweredModule> {
     let lowered = new List<LoweredModule>();
     let modules = programIndex.modules();
     for (long m = 0; m < modules.length(); m++) {
         let moduleFunctions = modules.get(m);
         if (moduleFunctions.functions().length() == 0
-                && moduleFunctions.classes().length() == 0) {
+                && moduleFunctions.classes().length() == 0
+                && moduleFunctions.interfaces().length() == 0) {
             continue;
         }
         string filePath = moduleFunctions.context().module().filePath();
         let functions = new List<EirFunction>();
         for (long f = 0; f < moduleFunctions.functions().length(); f++) {
             let info = moduleFunctions.functions().get(f);
-            let outcome = lower.lowerFunction(info, programIndex, analysis.store());
+            let outcome = lower.lowerFunction(info, programIndex, tables, analysis.store());
             for (let diagnostic in outcome.diagnostics()) {
                 problems.push(diagnostic);
             }
@@ -136,15 +143,16 @@ checkLowered(EirFunction function, string filePath, Span span, List<FileDiagnost
 
 // Writes one object file per module. Only a program that lowered and verified cleanly gets here,
 // so a failed compile leaves no objects behind.
-emitModules(List<LoweredModule> lowered, string outputFolder, string filePrefix,
-            List<FileDiagnostic> problems) -> List<string> {
+emitModules(List<LoweredModule> lowered, DescriptorPlans plans, string outputFolder,
+            string filePrefix, List<FileDiagnostic> problems) -> List<string> {
     let objects = new List<string>();
     for (long m = 0; m < lowered.length(); m++) {
         let unit = lowered.get(m);
         string moduleName = unit.definitions.context().module().canonicalPath();
         string objectPath = outputFolder + "/" + filePrefix
             + symbols.sanitizeModulePath(moduleName) + ".obj";
-        string failure = emit.emitModule(moduleName, unit.functions, unit.entry, objectPath);
+        string failure = emit.emitModule(moduleName, unit.functions, unit.entry, plans,
+            objectPath);
         if (failure.length > 0) {
             problems.push(new FileDiagnostic(unit.definitions.context().module().filePath(),
                 "Internal: emission failed: " + failure, source.makeSpan(0, 0)));

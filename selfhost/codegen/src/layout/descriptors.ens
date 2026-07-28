@@ -1,0 +1,253 @@
+// Descriptor planning, the second half of the layout stage. For every class and interface it
+// decides everything emission writes into the type's descriptor global: the symbol other modules
+// reference it by, the parent link the runtime subtype walk follows, the hashed type id, the
+// implementation each vtable slot holds, and the flattened conformance table with one method
+// table per implemented interface.
+//
+// The runtime contract matches the reference compiler's: a descriptor is
+// { name, parent, id, vtable, itables }, an itables array is one { interface, methods } entry per
+// conformance ending in a null entry, and the object header points at the descriptor from
+// payload - 32. A descriptor is defined once, in the module that declares its type, so pointer
+// identity holds program-wide.
+import ClassType from @ens.sema.model.types;
+import DeclaredType from @ens.sema.model.types;
+import InterfaceType from @ens.sema.model.types;
+import Method from @ens.sema.model.types;
+import Type from @ens.sema.model.types;
+import @ens.sema.model.types;
+import DispatchTables from layout.vtables;
+import layout.vtables;
+import FunctionInfo from lower.index;
+import ProgramIndex from lower.index;
+import lower.symbols;
+import support.primitives;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+import Set from @std.collections.set;
+
+// One implemented interface and the class's implementation of each of its methods, indexed by
+// the interface's method slots. A null implementation is an abstract class's unimplemented slot.
+public final class ConformancePlan {
+    Type conformedInterface;
+    FunctionInfo?[] slotImplementations;
+
+    public constructor(this.conformedInterface, this.slotImplementations);
+
+    public interfaceType() -> Type {
+        return this.conformedInterface;
+    }
+
+    public implementations() -> FunctionInfo?[] {
+        return this.slotImplementations;
+    }
+}
+
+// Everything the descriptor global of one class or interface holds.
+public final class DescriptorPlan {
+    Type describedType;
+    string linkSymbol;
+    string shownName;
+    string owningModule;
+    long hashedTypeId;
+    Type? parentType;
+    FunctionInfo?[] vtableSlots;
+    ConformancePlan[] conformancePlans;
+
+    public constructor(this.describedType, this.linkSymbol, this.shownName, this.owningModule,
+                this.hashedTypeId, this.parentType, this.vtableSlots, this.conformancePlans);
+
+    public type() -> Type {
+        return this.describedType;
+    }
+
+    public symbol() -> string {
+        return this.linkSymbol;
+    }
+
+    public name() -> string {
+        return this.shownName;
+    }
+
+    public modulePath() -> string {
+        return this.owningModule;
+    }
+
+    public typeId() -> long {
+        return this.hashedTypeId;
+    }
+
+    public parent() -> Type? {
+        return this.parentType;
+    }
+
+    public vtable() -> FunctionInfo?[] {
+        return this.vtableSlots;
+    }
+
+    public conformances() -> ConformancePlan[] {
+        return this.conformancePlans;
+    }
+}
+
+// The planned descriptors of the whole program, queried by interned type.
+public final class DescriptorPlans {
+    Map<Type, DescriptorPlan> byType;
+    List<DescriptorPlan> ordered;
+
+    public constructor() {
+        this.byType = new Map<Type, DescriptorPlan>();
+        this.ordered = new List<DescriptorPlan>();
+    }
+
+    public planFor(Type type) -> DescriptorPlan? {
+        return this.byType.get(type);
+    }
+
+    public all() -> List<DescriptorPlan> {
+        return this.ordered;
+    }
+
+    public add(DescriptorPlan plan) {
+        this.byType.set(plan.type(), plan);
+        this.ordered.push(plan);
+    }
+}
+
+// Plans every class and interface descriptor of the indexed program.
+public planProgram(ProgramIndex index, DispatchTables tables) -> DescriptorPlans {
+    let plans = new DescriptorPlans();
+    let modules = index.modules();
+    for (long m = 0; m < modules.length(); m++) {
+        let interfaces = modules.get(m).interfaces();
+        for (long i = 0; i < interfaces.length(); i++) {
+            let interfaceType = interfaces.get(i);
+            string symbol = descriptorSymbol(interfaceType);
+            plans.add(new DescriptorPlan(interfaceType, symbol, interfaceType.name(),
+                interfaceType.modulePath(), typeIdOf(symbol), null, [], []));
+        }
+    }
+    for (long m = 0; m < modules.length(); m++) {
+        let classes = modules.get(m).classes();
+        for (long i = 0; i < classes.length(); i++) {
+            plans.add(planClass(classes.get(i), index, tables));
+        }
+    }
+    return plans;
+}
+
+planClass(ClassType classType, ProgramIndex index, DispatchTables tables) -> DescriptorPlan {
+    string symbol = descriptorSymbol(classType);
+    let vtable = new FunctionInfo?[tables.vtableSizeOf(classType)];
+    for (long slot = 0; slot < vtable.length; slot++) {
+        vtable[slot] = slotImplementation(classType, slot, index, tables);
+    }
+    return new DescriptorPlan(classType, symbol, classType.name(), classType.modulePath(),
+        typeIdOf(symbol), vtables.baseClassOf(classType), vtable,
+        planConformances(classType, index, tables));
+}
+
+// The implementation a class's vtable holds at one slot: the nearest declaration down the chain
+// wins, and an abstract declaration leaves the slot null.
+slotImplementation(ClassType classType, long slot, ProgramIndex index, DispatchTables tables)
+        -> FunctionInfo? {
+    ClassType? current = classType;
+    while (current != null) {
+        let methods = current.methods();
+        for (long i = 0; i < methods.length(); i++) {
+            let method = methods.get(i);
+            if (method.isConstructor() || method.isDestructor()) {
+                continue;
+            }
+            if (tables.vtableSlotOf(method.signature()) != slot) {
+                continue;
+            }
+            if (method.isAbstract()) {
+                return null;
+            }
+            return index.infoFor(method.signature());
+        }
+        current = vtables.baseClassOf(current);
+    }
+    return null;
+}
+
+// One entry per interface the class or a base implements, nearest declaration first, each
+// carrying the most-derived implementation of every interface method.
+planConformances(ClassType classType, ProgramIndex index, DispatchTables tables)
+        -> ConformancePlan[] {
+    let plans = new List<ConformancePlan>();
+    let seen = new Set<Type>();
+    ClassType? current = classType;
+    while (current != null) {
+        for (let implemented in current.interfaces()) {
+            if (!(implemented is InterfaceType) || !seen.add(implemented)) {
+                continue;
+            }
+            plans.push(new ConformancePlan(implemented,
+                interfaceImplementations(classType, implemented, index, tables)));
+        }
+        current = vtables.baseClassOf(current);
+    }
+    return plans.toArray();
+}
+
+interfaceImplementations(ClassType classType, InterfaceType interfaceType, ProgramIndex index,
+                         DispatchTables tables) -> FunctionInfo?[] {
+    let methods = interfaceType.methods();
+    let implementations = new FunctionInfo?[methods.length()];
+    for (long i = 0; i < methods.length(); i++) {
+        long slot = tables.itableSlotOf(methods.get(i).signature());
+        if (slot < 0 || slot >= implementations.length) {
+            continue;
+        }
+        implementations[slot] = implementationOf(classType, methods.get(i), index);
+    }
+    return implementations;
+}
+
+// The class's implementation of one interface method: the nearest declaration down the chain
+// with the same name and parameter types, or null while it is still abstract.
+implementationOf(ClassType classType, Method interfaceMethod, ProgramIndex index)
+        -> FunctionInfo? {
+    ClassType? current = classType;
+    while (current != null) {
+        let methods = current.methods();
+        for (long i = 0; i < methods.length(); i++) {
+            let method = methods.get(i);
+            if (method.isConstructor() || method.isDestructor()
+                    || method.name() != interfaceMethod.name()) {
+                continue;
+            }
+            if (!primitives.sameParameterTypes(method.signature(),
+                    interfaceMethod.signature())) {
+                continue;
+            }
+            if (method.isAbstract()) {
+                return null;
+            }
+            return index.infoFor(method.signature());
+        }
+        current = vtables.baseClassOf(current);
+    }
+    return null;
+}
+
+// The linker symbol of a type's descriptor: module-qualified so one type has one address
+// program-wide, and prefixed so it can never collide with a user symbol.
+public descriptorSymbol(DeclaredType declared) -> string {
+    return "_typedesc$" + symbols.sanitizeModulePath(declared.modulePath()) + "$"
+        + declared.name();
+}
+
+// FNV-1a over the descriptor symbol, folded away from zero so a zero id can mean "none".
+public typeIdOf(string symbol) -> long {
+    uint hash = 2166136261;
+    byte[] raw = symbol.toBytes();
+    for (long i = 0; i < raw.length; i++) {
+        hash = (hash ^ (raw[i] as uint)) * 16777619;
+    }
+    if (hash == 0) {
+        return 1;
+    }
+    return hash as long;
+}

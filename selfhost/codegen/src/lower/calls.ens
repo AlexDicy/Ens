@@ -8,6 +8,7 @@ import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
 import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
 import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
 import NamedArgumentNode from @ens.frontend.syntax.generated.nodes;
+import SuperExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ArgumentListNode from @ens.frontend.syntax.generated.nodes;
 import GreenNode from @ens.frontend.syntax.green;
 import Span from @ens.frontend.support.source;
@@ -33,12 +34,15 @@ public lower(LoweringContext lowering, CallExpressionNode call) -> long {
     if (intercepted != builtins.notIntercepted()) {
         return intercepted;
     }
+    let callee = call.callee();
+    if (callee is SuperExpressionNode) {
+        return lowerSuperConstructorCall(lowering, call, callee);
+    }
     // A constructor is recorded on the call, a method on the member the call names.
     let structConstructor = lowering.result().methodOf(call.green());
     if (structConstructor != null) {
         return structs.lowerConstructorCall(lowering, call, structConstructor);
     }
-    let callee = call.callee();
     if (callee is MemberExpressionNode) {
         let method = lowering.result().methodOf(callee.green());
         if (method != null) {
@@ -48,6 +52,9 @@ public lower(LoweringContext lowering, CallExpressionNode call) -> long {
             }
             if (primitives.classOf(receiverType) != null) {
                 return classes.lowerMethodCall(lowering, call, callee, method);
+            }
+            if (primitives.interfaceOf(receiverType) != null) {
+                return classes.lowerInterfaceCall(lowering, call, callee, method);
             }
             return structs.lowerMethodCall(lowering, call, callee, method);
         }
@@ -72,12 +79,45 @@ public lower(LoweringContext lowering, CallExpressionNode call) -> long {
     return lowerCall(lowering, info, call, null, -1);
 }
 
+// 'super(args)' as a constructor's chaining statement: the base constructor runs over the same
+// object this constructor was handed, always directly. A base with no constructor at all leaves
+// nothing to call.
+lowerSuperConstructorCall(LoweringContext lowering, CallExpressionNode call,
+                          SuperExpressionNode callee) -> long {
+    let baseConstructor = lowering.result().methodOf(callee.green());
+    if (baseConstructor == null) {
+        return -1;
+    }
+    let baseType = lowering.typeOf(callee);
+    if (baseType == null) {
+        return -1;
+    }
+    let info = lowering.index().infoFor(baseConstructor.signature());
+    if (info == null) {
+        lowering.internalError("the base constructor 'super(...)' names resolves to no indexed "
+            + "function", call.span());
+        return -1;
+    }
+    if (!supportedCallee(lowering, info, "base constructor", call.span())) {
+        return -1;
+    }
+    return lowerInvocation(lowering, info, call.arguments(), call.green(), call.span(),
+        baseType, 0);
+}
+
 // The arguments, the call, and the end of every reference an argument produced for the call. An
 // argument passes at +0, so a temporary the caller built for it is still the caller's to give up.
 public lowerCall(LoweringContext lowering, FunctionInfo info, CallExpressionNode call,
                  Type? receiverType, long receiver) -> long {
-    return lowerInvocation(lowering, info, call.arguments(), call.green(), call.span(),
-        receiverType, receiver);
+    return lowerDispatchedCall(lowering, info, call, receiverType, receiver, -1, null);
+}
+
+// The same call with its target read from the receiver's runtime type at a dispatch slot.
+public lowerDispatchedCall(LoweringContext lowering, FunctionInfo info, CallExpressionNode call,
+                           Type? receiverType, long receiver, long dispatchSlot,
+                           Type? dispatchInterface) -> long {
+    return lowerDispatchedInvocation(lowering, info, call.arguments(), call.green(), call.span(),
+        receiverType, receiver, dispatchSlot, dispatchInterface);
 }
 
 // The same walk over a written argument list that no call expression holds, which is how a class
@@ -85,12 +125,21 @@ public lowerCall(LoweringContext lowering, FunctionInfo info, CallExpressionNode
 // the node sema recorded the argument-to-parameter mapping on.
 public lowerInvocation(LoweringContext lowering, FunctionInfo info, ArgumentListNode? arguments,
                        GreenNode orderKey, Span span, Type? receiverType, long receiver) -> long {
+    return lowerDispatchedInvocation(lowering, info, arguments, orderKey, span, receiverType,
+        receiver, -1, null);
+}
+
+public lowerDispatchedInvocation(LoweringContext lowering, FunctionInfo info,
+                                 ArgumentListNode? arguments, GreenNode orderKey, Span span,
+                                 Type? receiverType, long receiver, long dispatchSlot,
+                                 Type? dispatchInterface) -> long {
     let temporaries = new List<long>();
     let values = lowerArguments(lowering, info, arguments, orderKey, span, temporaries);
     if (values == null) {
         return -1;
     }
-    long result = emitCall(lowering, info, receiverType, receiver, values);
+    long result = emitCall(lowering, info, receiverType, receiver, values, dispatchSlot,
+        dispatchInterface);
     for (long i = 0; i < temporaries.length(); i++) {
         ownership.releaseValue(lowering, temporaries.get(i));
     }
@@ -101,6 +150,18 @@ public lowerInvocation(LoweringContext lowering, FunctionInfo info, ArgumentList
 // diagnostic should read it, as in "function 'total'" or "method 'Rectangle.area'".
 public supportedCallee(LoweringContext lowering, FunctionInfo info, string described, Span span)
         -> bool {
+    return supportedTarget(lowering, info, described, span, false);
+}
+
+// The same shape check for a dynamically dispatched call, whose statically resolved target may
+// be an abstract or interface method with no body of its own.
+public supportedDispatchTarget(LoweringContext lowering, FunctionInfo info, string described,
+                               Span span) -> bool {
+    return supportedTarget(lowering, info, described, span, true);
+}
+
+supportedTarget(LoweringContext lowering, FunctionInfo info, string described, Span span,
+                bool dispatched) -> bool {
     let signature = info.signature();
     if (info.isExternal()) {
         lowering.unsupported("calling the external {described}", span);
@@ -115,7 +176,8 @@ public supportedCallee(LoweringContext lowering, FunctionInfo info, string descr
         return false;
     }
     let declaration = info.declaration();
-    if (declaration != null && declaration.body() == null && !info.isConstructor()) {
+    if (!dispatched && declaration != null && declaration.body() == null
+            && !info.isConstructor()) {
         lowering.unsupported("calling the {described}, which declares no body", span);
         return false;
     }
@@ -203,9 +265,10 @@ lowerArgument(LoweringContext lowering, Expression argument, Type parameterType,
 }
 
 // Emits the call and hands back its result temp, or -1 when the callee returns nothing. A method
-// takes the address of the storage it runs over; a free function passes -1 for its receiver.
+// takes the address of the storage it runs over; a free function passes -1 for its receiver. A
+// dispatch slot at 0 or above makes the call dynamic through the receiver's runtime type.
 public emitCall(LoweringContext lowering, FunctionInfo info, Type? receiverType, long receiver,
-                long[] arguments) -> long {
+                long[] arguments, long dispatchSlot, Type? dispatchInterface) -> long {
     let signature = info.signature();
     let returnType = signature.returnType();
     let builder = lowering.builder();
@@ -215,7 +278,8 @@ public emitCall(LoweringContext lowering, FunctionInfo info, Type? receiverType,
     if (!types.isVoidType(returnType)) {
         resultTemp = builder.newTemp(returnType);
     }
-    builder.append(new EirCall(resultTemp, returnType, callee, receiver, arguments));
+    builder.append(new EirCall(resultTemp, returnType, callee, receiver, arguments,
+        dispatchSlot, dispatchInterface));
     return resultTemp;
 }
 

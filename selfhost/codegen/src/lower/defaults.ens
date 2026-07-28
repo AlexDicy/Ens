@@ -12,10 +12,12 @@ import FieldDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import MemberListNode from @ens.frontend.syntax.generated.nodes;
 import Span from @ens.frontend.support.source;
 import LocalBinding from @ens.sema.model.scopes;
+import ClassType from @ens.sema.model.types;
 import PrimitiveKind from @ens.sema.model.types;
 import StructType from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
 import @ens.sema.model.types;
+import layout.vtables;
 import EirBinary from eir.model;
 import EirBinaryOp from eir.model;
 import EirBranch from eir.model;
@@ -29,6 +31,7 @@ import lower.ownership;
 import lower.records;
 import lower.stores;
 import lower.weakfields;
+import List from @std.collections.list;
 
 // True when the record declares a default somewhere inside it, so filling a fresh one of it is more
 // than zeroing. The walk descends into a struct field, whose storage is inline and needs its own
@@ -56,6 +59,43 @@ public applyAll(LoweringContext lowering, long destination, Type type, Span span
         return true;
     }
     return applyOmitted(lowering, destination, type, new bool[fields.length()], span);
+}
+
+// Fills every field of a fresh object from the declared defaults of its whole chain, base
+// classes first, the order the flattened fields sit in. Each class's defaults were written and
+// checked in its own module, so the walk rebinds per level while the destination and the field
+// indexes stay the concrete class's.
+public applyClassDefaults(LoweringContext lowering, long destination, ClassType classType,
+                          Span span) -> bool {
+    if (!declaresDefaults(classType)) {
+        return true;
+    }
+    let fields = classType.fields();
+    bool[] written = new bool[fields.length()];
+    let chain = new List<ClassType>();
+    ClassType? current = classType;
+    while (current != null) {
+        chain.push(current);
+        current = vtables.baseClassOf(current);
+    }
+    for (long i = chain.length() - 1; i >= 0; i--) {
+        let level = chain.get(i);
+        let owner = lowering.index().recordFor(level);
+        if (owner == null) {
+            lowering.internalError("'{level.name()}' has no declaration to read its field "
+                + "defaults from", span);
+            return false;
+        }
+        let caller = lowering.enterModule(owner.context());
+        lowering.pushFieldDefaults(destination, classType);
+        bool filled = fill(lowering, destination, classType, owner.members(), written, span);
+        lowering.popFieldDefaults();
+        let restored = lowering.enterModule(caller);
+        if (!filled) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // Fills a slot declared without an initializer, which a struct with defaults still needs.

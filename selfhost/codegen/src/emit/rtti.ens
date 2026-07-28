@@ -1,0 +1,142 @@
+// The runtime type-identity helpers: the parent-chain walk behind a class test, the conformance
+// scan behind an interface test, and the method-table lookup interface dispatch reads. Each one
+// is a function the Runtime toolkit defines once per module with internal linkage, like the rest
+// of the runtime.
+//
+// They read the descriptor layout the descriptors module emits: the parent link sits in field 1
+// and the conformance table in field 4 of a descriptor, and a conformance table is a sequence of
+// { interface, methods } entries ending in a null interface.
+import Runtime from emit.runtime;
+import RuntimeFunction from emit.runtime;
+import TypeRef from @ens.llvm.types;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+
+// i1 ens_type_is(ptr object, ptr target): true when the object is there and its type descriptor
+// is the target or descends from it.
+public typeIs(Runtime runtime, TypeRef descriptorType) -> RuntimeFunction {
+    let type = runtime.int1Type.functionType([runtime.pointerType, runtime.pointerType]);
+    let known = runtime.existing("ens_type_is", type);
+    if (known != null) {
+        return known;
+    }
+    let definition = runtime.beginDefinition("ens_type_is", type);
+    let builder = runtime.builder;
+    let object = runtime.parameter(definition, 0);
+    let target = runtime.parameter(definition, 1);
+    let walkBlock = runtime.block(definition, "typeis.walk");
+    let testBlock = runtime.block(definition, "typeis.test");
+    let compareBlock = runtime.block(definition, "typeis.compare");
+    let stepBlock = runtime.block(definition, "typeis.step");
+    let yesBlock = runtime.block(definition, "typeis.yes");
+    let noBlock = runtime.block(definition, "typeis.no");
+    let cursor = memory.buildAlloca(builder, runtime.pointerType, "cursor");
+    instructions.buildCondBr(builder, runtime.isNull(object), noBlock, walkBlock);
+
+    builder.positionAtEnd(walkBlock);
+    let descriptor = memory.buildLoad(builder, runtime.pointerType,
+        runtime.offsetPointer(object, -32, ""), "descriptor");
+    memory.buildStore(builder, descriptor, cursor);
+    instructions.buildBr(builder, testBlock);
+
+    builder.positionAtEnd(testBlock);
+    let current = memory.buildLoad(builder, runtime.pointerType, cursor, "current");
+    instructions.buildCondBr(builder, runtime.isNull(current), noBlock, compareBlock);
+
+    builder.positionAtEnd(compareBlock);
+    let matches = instructions.buildICmpEQ(builder, current, target, "");
+    instructions.buildCondBr(builder, matches, yesBlock, stepBlock);
+
+    builder.positionAtEnd(stepBlock);
+    let parentSlot = memory.buildStructGEP(builder, descriptorType, current, 1, "");
+    let parent = memory.buildLoad(builder, runtime.pointerType, parentSlot, "parent");
+    memory.buildStore(builder, parent, cursor);
+    instructions.buildBr(builder, testBlock);
+
+    builder.positionAtEnd(yesBlock);
+    instructions.buildRet(builder, runtime.int1Type.constInt(1, false));
+
+    builder.positionAtEnd(noBlock);
+    instructions.buildRet(builder, runtime.int1Type.constInt(0, false));
+    return runtime.endDefinition(definition);
+}
+
+// ptr ens_itable_lookup(ptr descriptor, ptr interface): the descriptor's method table for the
+// interface, or null when the type does not conform. Conformance tables are flattened per class,
+// so no parent walk is needed.
+public itableLookup(Runtime runtime, TypeRef descriptorType, TypeRef entryType)
+        -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([runtime.pointerType, runtime.pointerType]);
+    let known = runtime.existing("ens_itable_lookup", type);
+    if (known != null) {
+        return known;
+    }
+    let definition = runtime.beginDefinition("ens_itable_lookup", type);
+    let builder = runtime.builder;
+    let descriptor = runtime.parameter(definition, 0);
+    let target = runtime.parameter(definition, 1);
+    let testBlock = runtime.block(definition, "itable.test");
+    let compareBlock = runtime.block(definition, "itable.compare");
+    let stepBlock = runtime.block(definition, "itable.step");
+    let yesBlock = runtime.block(definition, "itable.yes");
+    let noBlock = runtime.block(definition, "itable.no");
+    let cursor = memory.buildAlloca(builder, runtime.pointerType, "cursor");
+    let tableSlot = memory.buildStructGEP(builder, descriptorType, descriptor, 4, "");
+    let table = memory.buildLoad(builder, runtime.pointerType, tableSlot, "conformances");
+    memory.buildStore(builder, table, cursor);
+    instructions.buildCondBr(builder, runtime.isNull(table), noBlock, testBlock);
+
+    builder.positionAtEnd(testBlock);
+    let entry = memory.buildLoad(builder, runtime.pointerType, cursor, "entry");
+    let declared = memory.buildLoad(builder, runtime.pointerType,
+        memory.buildStructGEP(builder, entryType, entry, 0, ""), "interface");
+    instructions.buildCondBr(builder, runtime.isNull(declared), noBlock, compareBlock);
+
+    builder.positionAtEnd(compareBlock);
+    let matches = instructions.buildICmpEQ(builder, declared, target, "");
+    instructions.buildCondBr(builder, matches, yesBlock, stepBlock);
+
+    builder.positionAtEnd(stepBlock);
+    let next = memory.buildGEP(builder, entryType, entry, [runtime.int64(1)], "next");
+    memory.buildStore(builder, next, cursor);
+    instructions.buildBr(builder, testBlock);
+
+    builder.positionAtEnd(yesBlock);
+    let heldEntry = memory.buildLoad(builder, runtime.pointerType, cursor, "found");
+    let methods = memory.buildLoad(builder, runtime.pointerType,
+        memory.buildStructGEP(builder, entryType, heldEntry, 1, ""), "methods");
+    instructions.buildRet(builder, methods);
+
+    builder.positionAtEnd(noBlock);
+    instructions.buildRet(builder, runtime.nullPointer());
+    return runtime.endDefinition(definition);
+}
+
+// i1 ens_conforms(ptr object, ptr interface): true when the object is there and its type
+// implements the interface.
+public conforms(Runtime runtime, TypeRef descriptorType, TypeRef entryType) -> RuntimeFunction {
+    let type = runtime.int1Type.functionType([runtime.pointerType, runtime.pointerType]);
+    let known = runtime.existing("ens_conforms", type);
+    if (known != null) {
+        return known;
+    }
+    let lookup = itableLookup(runtime, descriptorType, entryType);
+    let definition = runtime.beginDefinition("ens_conforms", type);
+    let builder = runtime.builder;
+    let object = runtime.parameter(definition, 0);
+    let target = runtime.parameter(definition, 1);
+    let lookBlock = runtime.block(definition, "conforms.look");
+    let noBlock = runtime.block(definition, "conforms.no");
+    instructions.buildCondBr(builder, runtime.isNull(object), noBlock, lookBlock);
+
+    builder.positionAtEnd(lookBlock);
+    let descriptor = memory.buildLoad(builder, runtime.pointerType,
+        runtime.offsetPointer(object, -32, ""), "descriptor");
+    let methods = runtime.call(lookup, [descriptor, target], "methods");
+    let found = instructions.buildICmpNE(builder, methods, runtime.nullPointer(), "");
+    instructions.buildRet(builder, found);
+
+    builder.positionAtEnd(noBlock);
+    instructions.buildRet(builder, runtime.int1Type.constInt(0, false));
+    return runtime.endDefinition(definition);
+}

@@ -9,8 +9,11 @@ import ArrayType from @ens.sema.model.types;
 import StructType from @ens.sema.model.types;
 import EnumType from @ens.sema.model.types;
 import ClassType from @ens.sema.model.types;
+import InterfaceType from @ens.sema.model.types;
 import OptionalType from @ens.sema.model.types;
 import NullType from @ens.sema.model.types;
+import Parameter from @ens.sema.model.types;
+import Signature from @ens.sema.model.types;
 
 public isIntegerType(Type type) -> bool {
     if (type is PrimitiveType) {
@@ -120,6 +123,23 @@ public isClassType(Type type) -> bool {
     return classOf(type) != null;
 }
 
+// The interface a value of this type names, looking through an optional, or null for anything else.
+public interfaceOf(Type type) -> InterfaceType? {
+    if (type is OptionalType) {
+        return interfaceOf(type.inner());
+    }
+    if (type is InterfaceType) {
+        return type;
+    }
+    return null;
+}
+
+// True for the types runtime type identity works over: a class or an interface, possibly nullable.
+// Both are the same object pointer, so converting between related ones moves no bits.
+public isClassLike(Type type) -> bool {
+    return classOf(type) != null || interfaceOf(type) != null;
+}
+
 public isNullType(Type type) -> bool {
     return type is NullType;
 }
@@ -150,7 +170,8 @@ public referenceOf(Type type) -> Type? {
     if (type is OptionalType) {
         return referenceOf(type.inner());
     }
-    if (type is StringType || type is ArrayType || type is ClassType || type is NullType) {
+    if (type is StringType || type is ArrayType || type is ClassType || type is InterfaceType
+            || type is NullType) {
         return type;
     }
     return null;
@@ -162,8 +183,10 @@ public isReferenceType(Type type) -> bool {
 }
 
 // True when a value of the first type reaches the second with no machine operation, because both
-// name the same referent: narrowing an optional away, widening into one, or the null literal
-// reaching a nullable reference.
+// name the same referent: narrowing an optional away, widening into one, the null literal reaching
+// a nullable reference, or a class-like value reaching another class-like spelling. An object is
+// prefix-compatible with its base and carries the same pointer under an interface, and sema admits
+// only the related conversions, so every class-like pair is a rename.
 public sameReferent(Type first, Type second) -> bool {
     let left = referenceOf(first);
     let right = referenceOf(second);
@@ -173,18 +196,22 @@ public sameReferent(Type first, Type second) -> bool {
     if (left is NullType || right is NullType) {
         return true;
     }
-    return left == right;
+    if (left == right) {
+        return true;
+    }
+    return isClassLike(left) && isClassLike(right);
 }
 
 // The types code generation can represent: the machine primitives, enums, strings, arrays whose
-// elements it can represent, structs whose fields it can, class references, and an optional
-// reference, whose absence is the null pointer. Decimal has no machine mapping, an optional value
-// type would need a tag lowering does not build yet, and an interface needs dispatch tables.
+// elements it can represent, structs whose fields it can, class and interface references, and an
+// optional reference, whose absence is the null pointer. Decimal has no machine mapping and an
+// optional value type would need a tag lowering does not build yet.
 //
 // A class stops the walk at its reference: whether its own fields can be laid out is
 // isRepresentableClass's question, asked where an object is built or reached into rather than
 // wherever a reference to it travels, which is also what keeps a class holding itself from
-// recursing forever here.
+// recursing forever here. Its base chain and implemented interfaces do have to be plain declared
+// types, because a generic ancestor's layout and tables wait for monomorphization.
 public isRepresentable(Type type) -> bool {
     if (isNumericType(type) || isBoolType(type) || isEnumType(type) || isStringType(type)
             || isNullType(type)) {
@@ -194,7 +221,22 @@ public isRepresentable(Type type) -> bool {
         return isReferenceType(type) && isRepresentable(type.inner());
     }
     if (type is ClassType) {
-        return !type.isGeneric() && type.base() == null && type.interfaces().length == 0;
+        if (type.isGeneric()) {
+            return false;
+        }
+        for (let implemented in type.interfaces()) {
+            if (!(implemented is InterfaceType) || implemented.isGeneric()) {
+                return false;
+            }
+        }
+        let base = type.base();
+        if (base == null) {
+            return true;
+        }
+        return base is ClassType && isRepresentable(base);
+    }
+    if (type is InterfaceType) {
+        return !type.isGeneric();
     }
     if (type is ArrayType) {
         return isRepresentable(type.element());
@@ -228,6 +270,23 @@ public isRepresentableClass(ClassType classType) -> bool {
             return false;
         }
         if (field.isWeak() && classOf(field.type()) == null) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// True when two signatures take exactly the same parameter types, which together with the name
+// identifies one method along a class chain: an override must repeat its base method's parameter
+// list, and overloads differ in it. Types are interned, so equality is reference identity.
+public sameParameterTypes(Signature first, Signature second) -> bool {
+    let left = first.parameters();
+    let right = second.parameters();
+    if (left.length != right.length) {
+        return false;
+    }
+    for (long i = 0; i < left.length; i++) {
+        if (left[i].type() != right[i].type()) {
             return false;
         }
     }

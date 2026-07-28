@@ -10,13 +10,17 @@ import Expression from @ens.frontend.syntax.generated.nodes;
 import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
 import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
 import NewExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SuperExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ClassType from @ens.sema.model.types;
 import Field from @ens.sema.model.types;
+import InterfaceType from @ens.sema.model.types;
 import Method from @ens.sema.model.types;
+import Signature from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
 import @ens.sema.model.types;
 import EirClassNew from eir.model;
 import EirLoadSlot from eir.model;
+import layout.vtables;
 import LoweringContext from lower.context;
 import lower.calls;
 import lower.conversions;
@@ -47,8 +51,9 @@ public destructorSymbol(ClassType classType) -> string {
 }
 
 // 'new C(args)': a zeroed object whose header names its destructor, then the declared field
-// defaults, then the constructor over the same reference. A class with no constructor is complete
-// once its defaults are in place.
+// defaults of the whole chain, then the constructor over the same reference. A class declaring no
+// constructor of its own still runs the nearest inherited one callable with no arguments; only a
+// chain with no constructor at all is complete once its defaults are in place.
 public lowerNew(LoweringContext lowering, NewExpressionNode node) -> long {
     let type = lowering.typeOf(node);
     if (type == null) {
@@ -62,10 +67,13 @@ public lowerNew(LoweringContext lowering, NewExpressionNode node) -> long {
     let builder = lowering.builder();
     long object = builder.newTemp(type);
     builder.append(new EirClassNew(object, type, destructorSymbol(classType)));
-    if (!defaults.applyAll(lowering, object, classType, node.span())) {
+    if (!defaults.applyClassDefaults(lowering, object, classType, node.span())) {
         return -1;
     }
     let initializer = lowering.result().methodOf(node.green());
+    if (initializer == null) {
+        initializer = inheritedConstructor(classType);
+    }
     if (initializer == null) {
         return object;
     }
@@ -85,6 +93,52 @@ public lowerNew(LoweringContext lowering, NewExpressionNode node) -> long {
         return -1;
     }
     return object;
+}
+
+// The constructor a class with none of its own runs: the nearest one up the chain callable with
+// no arguments, a zero-parameter one preferred over one whose parameters all take defaults.
+inheritedConstructor(ClassType classType) -> Method? {
+    let current = vtables.baseClassOf(classType);
+    while (current != null) {
+        let found = implicitConstructorOf(current);
+        if (found != null) {
+            return found;
+        }
+        current = vtables.baseClassOf(current);
+    }
+    return null;
+}
+
+// The constructor an implicit call binds on one class, or null when the class declares none that
+// takes no arguments.
+public implicitConstructorOf(ClassType classType) -> Method? {
+    Method? fallback = null;
+    let methods = classType.methods();
+    for (long i = 0; i < methods.length(); i++) {
+        let method = methods.get(i);
+        if (!method.isConstructor()) {
+            continue;
+        }
+        if (method.signature().parameters().length == 0) {
+            return method;
+        }
+        if (fallback == null && requiredParameterCount(method.signature()) == 0) {
+            fallback = method;
+        }
+    }
+    return fallback;
+}
+
+requiredParameterCount(Signature signature) -> long {
+    let parameters = signature.parameters();
+    long required = 0;
+    for (long i = 0; i < parameters.length; i++) {
+        if (parameters[i].hasDefault()) {
+            break;
+        }
+        required++;
+    }
+    return required;
 }
 
 // 'value.field' as an address, or -1 when the base names no class field.
@@ -160,7 +214,9 @@ public lowerFieldRead(LoweringContext lowering, MemberExpressionNode member, Fie
 }
 
 // 'value.method(args)': the method runs over the reference the receiver expression names, which is
-// the same pointer the object was allocated at.
+// the same pointer the object was allocated at. A method with a vtable slot dispatches through the
+// receiver's runtime type; a 'super.' receiver stays a direct call to the inherited
+// implementation, which is what bypassing an override means.
 public lowerMethodCall(LoweringContext lowering, CallExpressionNode call,
                        MemberExpressionNode member, Method method) -> long {
     let receiverType = lowering.typeOf(member.object());
@@ -179,15 +235,64 @@ public lowerMethodCall(LoweringContext lowering, CallExpressionNode call,
             + "indexed function", call.span());
         return -1;
     }
-    if (!calls.supportedCallee(lowering, info,
-            "method '{classType.name()}.{method.name()}'", call.span())) {
+    long dispatchSlot = -1;
+    if (!method.isConstructor() && !(member.object() is SuperExpressionNode)) {
+        dispatchSlot = lowering.tables().vtableSlotOf(method.signature());
+    }
+    string described = "method '{classType.name()}.{method.name()}'";
+    if (dispatchSlot >= 0) {
+        if (!calls.supportedDispatchTarget(lowering, info, described, call.span())) {
+            return -1;
+        }
+    } else if (!calls.supportedCallee(lowering, info, described, call.span())) {
         return -1;
     }
     long object = borrowedReference(lowering, member.object(), receiverType);
     if (object < 0) {
         return -1;
     }
-    return calls.lowerCall(lowering, info, call, classType, object);
+    return calls.lowerDispatchedCall(lowering, info, call, classType, object, dispatchSlot,
+        null);
+}
+
+// 'value.method(args)' on an interface-typed receiver: the implementation is read from the
+// runtime type's method table for the interface that declared the method.
+public lowerInterfaceCall(LoweringContext lowering, CallExpressionNode call,
+                          MemberExpressionNode member, Method method) -> long {
+    let receiverType = lowering.typeOf(member.object());
+    if (receiverType == null) {
+        return -1;
+    }
+    let interfaceType = primitives.interfaceOf(receiverType);
+    if (interfaceType == null || interfaceType.isGeneric()) {
+        lowering.unsupported("calling the method '{method.name()}' on "
+            + "'{types.display(receiverType)}'", call.span());
+        return -1;
+    }
+    let info = lowering.index().infoFor(method.signature());
+    if (info == null) {
+        lowering.internalError("the interface method "
+            + "'{interfaceType.name()}.{method.name()}' resolves to no indexed function",
+            call.span());
+        return -1;
+    }
+    if (!calls.supportedDispatchTarget(lowering, info,
+            "interface method '{interfaceType.name()}.{method.name()}'", call.span())) {
+        return -1;
+    }
+    long dispatchSlot = lowering.tables().itableSlotOf(method.signature());
+    if (dispatchSlot < 0) {
+        lowering.internalError("the interface method "
+            + "'{interfaceType.name()}.{method.name()}' has no slot in its method table",
+            call.span());
+        return -1;
+    }
+    long object = borrowedReference(lowering, member.object(), receiverType);
+    if (object < 0) {
+        return -1;
+    }
+    return calls.lowerDispatchedCall(lowering, info, call, interfaceType, object, dispatchSlot,
+        interfaceType);
 }
 
 // A bare 'this' inside a class method: the reference the method was handed, which is temp 0.
