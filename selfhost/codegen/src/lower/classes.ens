@@ -12,7 +12,9 @@ import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
 import NewExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SuperExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ClassType from @ens.sema.model.types;
+import DeclaredType from @ens.sema.model.types;
 import Field from @ens.sema.model.types;
+import InstantiationType from @ens.sema.model.types;
 import InterfaceType from @ens.sema.model.types;
 import Method from @ens.sema.model.types;
 import Signature from @ens.sema.model.types;
@@ -21,6 +23,7 @@ import @ens.sema.model.types;
 import EirClassNew from eir.model;
 import EirLoadSlot from eir.model;
 import layout.vtables;
+import mono.substitution;
 import LoweringContext from lower.context;
 import lower.calls;
 import lower.conversions;
@@ -35,8 +38,11 @@ import lower.weakfields;
 import support.primitives;
 
 // The user destructor a class declares, or null when it declares none.
-public declaredDestructor(ClassType classType) -> Method? {
-    let methods = classType.methods();
+public declaredDestructor(Type classType) -> Method? {
+    let methods = types.methodsOf(classType);
+    if (methods == null) {
+        return null;
+    }
     for (long i = 0; i < methods.length(); i++) {
         if (methods.get(i).isDestructor()) {
             return methods.get(i);
@@ -45,9 +51,80 @@ public declaredDestructor(ClassType classType) -> Method? {
     return null;
 }
 
-// The linker symbol of the destructor an object of this class stores in its header.
-public destructorSymbol(ClassType classType) -> string {
-    return symbols.destructorLinkName(classType.modulePath(), classType.name());
+// The linker symbol of the destructor an object of this class stores in its header. An
+// instantiation's is named by its module-independent instantiation name; a declared class's by
+// its module and name.
+public destructorSymbol(Type classType) -> string {
+    if (classType is InstantiationType) {
+        return symbols.instanceDestructorLinkName(classType);
+    }
+    let authority = types.authorityOf(classType);
+    if (authority != null) {
+        return symbols.destructorLinkName(authority.modulePath(), authority.name());
+    }
+    return "_dtor$" + types.display(classType);
+}
+
+// The concrete method a recorded resolution reaches once the receiver's type is substituted.
+// Sema checks a template's body once, so a call inside one records the template's own method, or
+// a generic base's; the instance the call targets exists only per instantiation. The mapping is
+// positional - an instantiation's methods are filled parallel to its template's - so overloads
+// that collapse to one parameter list after substitution still resolve to the right one.
+public resolveConcreteMethod(LoweringContext lowering, Type receiver, Method recorded)
+        -> Method? {
+    let definingType = recorded.definingType();
+    if (receiver == definingType) {
+        return recorded;
+    }
+    let authority = types.authorityOf(definingType);
+    Type? current = receiver;
+    while (current != null) {
+        if (current == definingType) {
+            return recorded;
+        }
+        if (types.authorityOf(current) == authority) {
+            let definingMethods = types.methodsOf(definingType);
+            let currentMethods = types.methodsOf(current);
+            if (definingMethods == null || currentMethods == null) {
+                return null;
+            }
+            for (long i = 0; i < definingMethods.length(); i++) {
+                if (definingMethods.get(i) == recorded && i < currentMethods.length()) {
+                    return currentMethods.get(i);
+                }
+            }
+            return null;
+        }
+        current = types.baseOf(current);
+    }
+    return null;
+}
+
+// The class's own implementation of an interface-declared method, found the way a conformance
+// table is built: the nearest declaration down the chain with the method's name and parameter
+// types. Null when no class in the chain declares one, which for the built-in contracts (hash)
+// means the synthesized behavior stands in.
+public implementationOnClass(Type receiver, Method interfaceMethod) -> Method? {
+    Type? current = receiver;
+    while (current != null) {
+        let methods = types.methodsOf(current);
+        if (methods == null) {
+            return null;
+        }
+        for (long i = 0; i < methods.length(); i++) {
+            let method = methods.get(i);
+            if (method.isConstructor() || method.isDestructor()
+                    || method.name() != interfaceMethod.name()) {
+                continue;
+            }
+            if (primitives.sameParameterTypes(method.signature(),
+                    interfaceMethod.signature())) {
+                return method;
+            }
+        }
+        current = types.baseOf(current);
+    }
+    return null;
 }
 
 // 'new C(args)': a zeroed object whose header names its destructor, then the declared field
@@ -70,8 +147,10 @@ public lowerNew(LoweringContext lowering, NewExpressionNode node) -> long {
     if (!defaults.applyClassDefaults(lowering, object, classType, node.span())) {
         return -1;
     }
-    let initializer = lowering.result().methodOf(node.green());
-    if (initializer == null) {
+    Method? initializer = lowering.result().methodOf(node.green());
+    if (initializer != null) {
+        initializer = resolveConcreteMethod(lowering, classType, initializer);
+    } else {
         initializer = inheritedConstructor(classType);
     }
     if (initializer == null) {
@@ -79,11 +158,11 @@ public lowerNew(LoweringContext lowering, NewExpressionNode node) -> long {
     }
     let info = lowering.index().infoFor(initializer.signature());
     if (info == null) {
-        lowering.internalError("the constructor of '{classType.name()}' resolves to no indexed "
-            + "function", node.span());
+        lowering.internalError("the constructor of '{types.display(classType)}' resolves to no "
+            + "indexed function", node.span());
         return -1;
     }
-    if (!calls.supportedCallee(lowering, info, "constructor of '{classType.name()}'",
+    if (!calls.supportedCallee(lowering, info, "constructor of '{types.display(classType)}'",
             node.span())) {
         return -1;
     }
@@ -97,7 +176,7 @@ public lowerNew(LoweringContext lowering, NewExpressionNode node) -> long {
 
 // The constructor a class with none of its own runs: the nearest one up the chain callable with
 // no arguments, a zero-parameter one preferred over one whose parameters all take defaults.
-inheritedConstructor(ClassType classType) -> Method? {
+inheritedConstructor(Type classType) -> Method? {
     let current = vtables.baseClassOf(classType);
     while (current != null) {
         let found = implicitConstructorOf(current);
@@ -111,9 +190,12 @@ inheritedConstructor(ClassType classType) -> Method? {
 
 // The constructor an implicit call binds on one class, or null when the class declares none that
 // takes no arguments.
-public implicitConstructorOf(ClassType classType) -> Method? {
+public implicitConstructorOf(Type classType) -> Method? {
     Method? fallback = null;
-    let methods = classType.methods();
+    let methods = types.methodsOf(classType);
+    if (methods == null) {
+        return null;
+    }
     for (long i = 0; i < methods.length(); i++) {
         let method = methods.get(i);
         if (!method.isConstructor()) {
@@ -159,12 +241,15 @@ public lowerFieldAddress(LoweringContext lowering, MemberExpressionNode member) 
         lowering.unsupported("reaching into a '{types.display(classType)}'", member.span());
         return -1;
     }
+    let fields = records.fieldsOf(classType);
+    if (fields == null) {
+        return -1;
+    }
     long object = borrowedReference(lowering, member.object(), objectType);
     if (object < 0) {
         return -1;
     }
-    return records.fieldAddressIn(lowering, object, classType,
-        classType.fields().get(index).type(), index);
+    return records.fieldAddressIn(lowering, object, classType, fields.get(index).type(), index);
 }
 
 // The field a member expression names on a class, or null when it names something else.
@@ -172,11 +257,11 @@ public fieldOf(LoweringContext lowering, Expression node) -> Field? {
     if (!(node is MemberExpressionNode)) {
         return null;
     }
-    let objectType = lowering.result().typeOf(node.object().green());
-    if (objectType == null) {
+    let recordedType = lowering.result().typeOf(node.object().green());
+    if (recordedType == null) {
         return null;
     }
-    let classType = primitives.classOf(objectType);
+    let classType = primitives.classOf(lowering.substituted(recordedType));
     if (classType == null) {
         return null;
     }
@@ -184,7 +269,11 @@ public fieldOf(LoweringContext lowering, Expression node) -> Field? {
     if (index < 0) {
         return null;
     }
-    return classType.fields().get(index);
+    let fields = records.fieldsOf(classType);
+    if (fields == null) {
+        return null;
+    }
+    return fields.get(index);
 }
 
 // True when an expression names a weak field, which is read and written by its own operations
@@ -229,17 +318,26 @@ public lowerMethodCall(LoweringContext lowering, CallExpressionNode call,
             + "'{types.display(receiverType)}'", call.span());
         return -1;
     }
-    let info = lowering.index().infoFor(method.signature());
+    Method? resolved = resolveConcreteMethod(lowering, classType, method);
+    if (resolved == null && primitives.interfaceOf(method.definingType()) != null) {
+        resolved = implementationOnClass(classType, method);
+    }
+    if (resolved == null) {
+        lowering.internalError("the method '{types.display(classType)}.{method.name()}' "
+            + "resolves to no concrete method", call.span());
+        return -1;
+    }
+    let info = lowering.index().infoFor(resolved.signature());
     if (info == null) {
-        lowering.internalError("the method '{classType.name()}.{method.name()}' resolves to no "
-            + "indexed function", call.span());
+        lowering.internalError("the method '{types.display(classType)}.{method.name()}' "
+            + "resolves to no indexed function", call.span());
         return -1;
     }
     long dispatchSlot = -1;
-    if (!method.isConstructor() && !(member.object() is SuperExpressionNode)) {
-        dispatchSlot = lowering.tables().vtableSlotOf(method.signature());
+    if (!resolved.isConstructor() && !(member.object() is SuperExpressionNode)) {
+        dispatchSlot = lowering.tables().vtableSlotOf(resolved.signature());
     }
-    string described = "method '{classType.name()}.{method.name()}'";
+    string described = "method '{types.display(classType)}.{method.name()}'";
     if (dispatchSlot >= 0) {
         if (!calls.supportedDispatchTarget(lowering, info, described, call.span())) {
             return -1;
@@ -264,27 +362,35 @@ public lowerInterfaceCall(LoweringContext lowering, CallExpressionNode call,
         return -1;
     }
     let interfaceType = primitives.interfaceOf(receiverType);
-    if (interfaceType == null || interfaceType.isGeneric()) {
+    if (interfaceType == null
+            || (interfaceType is DeclaredType && interfaceType.isGeneric())) {
         lowering.unsupported("calling the method '{method.name()}' on "
             + "'{types.display(receiverType)}'", call.span());
         return -1;
     }
-    let info = lowering.index().infoFor(method.signature());
+    let resolved = resolveConcreteMethod(lowering, interfaceType, method);
+    if (resolved == null) {
+        lowering.internalError("the interface method "
+            + "'{types.display(interfaceType)}.{method.name()}' resolves to no concrete method",
+            call.span());
+        return -1;
+    }
+    let info = lowering.index().infoFor(resolved.signature());
     if (info == null) {
         lowering.internalError("the interface method "
-            + "'{interfaceType.name()}.{method.name()}' resolves to no indexed function",
+            + "'{types.display(interfaceType)}.{method.name()}' resolves to no indexed function",
             call.span());
         return -1;
     }
     if (!calls.supportedDispatchTarget(lowering, info,
-            "interface method '{interfaceType.name()}.{method.name()}'", call.span())) {
+            "interface method '{types.display(interfaceType)}.{method.name()}'", call.span())) {
         return -1;
     }
-    long dispatchSlot = lowering.tables().itableSlotOf(method.signature());
+    long dispatchSlot = lowering.tables().itableSlotOf(resolved.signature());
     if (dispatchSlot < 0) {
         lowering.internalError("the interface method "
-            + "'{interfaceType.name()}.{method.name()}' has no slot in its method table",
-            call.span());
+            + "'{types.display(interfaceType)}.{method.name()}' has no slot in its method "
+            + "table", call.span());
         return -1;
     }
     long object = borrowedReference(lowering, member.object(), receiverType);

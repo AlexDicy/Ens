@@ -17,11 +17,13 @@ import @ens.sema.model.types;
 import EirFieldAddress from eir.model;
 import LoweringContext from lower.context;
 import lower.calls;
+import lower.classes;
 import lower.defaults;
 import lower.ownership;
 import lower.places;
 import lower.records;
 import lower.stores;
+import support.primitives;
 
 // The address of one field inside the struct another address names.
 public fieldAddressAt(LoweringContext lowering, long base, Type fieldType, long index) -> long {
@@ -45,18 +47,22 @@ public lowerFieldAddress(LoweringContext lowering, MemberExpressionNode member) 
     if (objectType == null) {
         return -1;
     }
-    if (!(objectType is StructType)) {
+    if (primitives.structOf(objectType) == null) {
         return -1;
     }
     long index = records.fieldIndexOf(objectType, member.member().text());
     if (index < 0) {
         return -1;
     }
+    let fields = records.fieldsOf(objectType);
+    if (fields == null) {
+        return -1;
+    }
     long base = addressOf(lowering, member.object(), objectType);
     if (base < 0) {
         return -1;
     }
-    return fieldAddressAt(lowering, base, objectType.fields().get(index).type(), index);
+    return fieldAddressAt(lowering, base, fields.get(index).type(), index);
 }
 
 // The address of the storage a struct expression names. An expression that is not a place has no
@@ -91,7 +97,7 @@ public lowerLiteral(LoweringContext lowering, StructLiteralExpressionNode node) 
     if (type == null) {
         return -1;
     }
-    if (!(type is StructType)) {
+    if (primitives.structOf(type) == null) {
         lowering.internalError("a struct literal has type '{types.display(type)}'", node.span());
         return -1;
     }
@@ -100,13 +106,16 @@ public lowerLiteral(LoweringContext lowering, StructLiteralExpressionNode node) 
         return -1;
     }
     long destination = scratchAddress(lowering, "structlit", type);
-    let fields = type.fields();
+    let fields = records.fieldsOf(type);
+    if (fields == null) {
+        return -1;
+    }
     bool[] written = new bool[fields.length()];
     for (long i = 0; i < node.fieldsCount(); i++) {
         let entry = node.fields(i);
         long index = records.fieldIndexOf(type, entry.name().text());
         if (index < 0) {
-            lowering.internalError("struct '{type.name()}' has no field "
+            lowering.internalError("struct '{types.display(type)}' has no field "
                 + "'{entry.name().text()}'", entry.name().span());
             return -1;
         }
@@ -137,7 +146,7 @@ public lowerConstructorCall(LoweringContext lowering, CallExpressionNode call, M
     if (type == null) {
         return -1;
     }
-    if (!(type is StructType)) {
+    if (primitives.structOf(type) == null) {
         lowering.unsupported("creating a '{types.display(type)}'", call.span());
         return -1;
     }
@@ -145,13 +154,20 @@ public lowerConstructorCall(LoweringContext lowering, CallExpressionNode call, M
         lowering.unsupported("building a '{types.display(type)}'", call.span());
         return -1;
     }
-    let info = lowering.index().infoFor(method.signature());
-    if (info == null) {
-        lowering.internalError("the constructor of '{type.name()}' resolves to no indexed "
-            + "function", call.span());
+    let resolved = classes.resolveConcreteMethod(lowering, type, method);
+    if (resolved == null) {
+        lowering.internalError("the constructor of '{types.display(type)}' resolves to no "
+            + "concrete method", call.span());
         return -1;
     }
-    if (!calls.supportedCallee(lowering, info, "constructor of '{type.name()}'", call.span())) {
+    let info = lowering.index().infoFor(resolved.signature());
+    if (info == null) {
+        lowering.internalError("the constructor of '{types.display(type)}' resolves to no "
+            + "indexed function", call.span());
+        return -1;
+    }
+    if (!calls.supportedCallee(lowering, info, "constructor of '{types.display(type)}'",
+            call.span())) {
         return -1;
     }
     long destination = scratchAddress(lowering, "structctor", type);
@@ -173,19 +189,25 @@ public lowerMethodCall(LoweringContext lowering, CallExpressionNode call,
     if (receiverType == null) {
         return -1;
     }
-    if (!(receiverType is StructType)) {
+    if (primitives.structOf(receiverType) == null) {
         lowering.unsupported("calling the method '{method.name()}' on "
             + "'{types.display(receiverType)}'", call.span());
         return -1;
     }
-    let info = lowering.index().infoFor(method.signature());
+    let resolved = classes.resolveConcreteMethod(lowering, receiverType, method);
+    if (resolved == null) {
+        lowering.internalError("the method '{types.display(receiverType)}.{method.name()}' "
+            + "resolves to no concrete method", call.span());
+        return -1;
+    }
+    let info = lowering.index().infoFor(resolved.signature());
     if (info == null) {
-        lowering.internalError("the method '{receiverType.name()}.{method.name()}' resolves to "
-            + "no indexed function", call.span());
+        lowering.internalError("the method '{types.display(receiverType)}.{method.name()}' "
+            + "resolves to no indexed function", call.span());
         return -1;
     }
     if (!calls.supportedCallee(lowering, info,
-            "method '{receiverType.name()}.{method.name()}'", call.span())) {
+            "method '{types.display(receiverType)}.{method.name()}'", call.span())) {
         return -1;
     }
     long receiver = addressOf(lowering, member.object(), receiverType);
@@ -201,15 +223,22 @@ public lowerMethodCall(LoweringContext lowering, CallExpressionNode call,
 // The 'toString' a struct declares for itself, called over the address of the storage the
 // expression names. An interpolation hole and an explicit '.toString()' reach the same method
 // through the same call, and its 'string' result arrives owned.
-public lowerDeclaredToString(LoweringContext lowering, Expression node, StructType type,
+public lowerDeclaredToString(LoweringContext lowering, Expression node, Type type,
                              Method method) -> long {
-    let info = lowering.index().infoFor(method.signature());
-    if (info == null) {
-        lowering.internalError("the method '{type.name()}.toString' resolves to no indexed "
-            + "function", node.span());
+    let resolved = classes.resolveConcreteMethod(lowering, type, method);
+    if (resolved == null) {
+        lowering.internalError("the method '{types.display(type)}.toString' resolves to no "
+            + "concrete method", node.span());
         return -1;
     }
-    if (!calls.supportedCallee(lowering, info, "method '{type.name()}.toString'", node.span())) {
+    let info = lowering.index().infoFor(resolved.signature());
+    if (info == null) {
+        lowering.internalError("the method '{types.display(type)}.toString' resolves to no "
+            + "indexed function", node.span());
+        return -1;
+    }
+    if (!calls.supportedCallee(lowering, info, "method '{types.display(type)}.toString'",
+            node.span())) {
         return -1;
     }
     long receiver = addressOf(lowering, node, type);

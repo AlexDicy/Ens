@@ -1,11 +1,14 @@
 // Dispatch slot assignment, the first half of the layout stage. It runs once over the indexed
-// program, before any function lowers, and decides which method calls dispatch dynamically.
+// program, after the monomorphization closure and before any function lowers, and decides which
+// method calls dispatch dynamically.
 //
 // A class method gets a vtable slot only when something forces the indirection: it is abstract,
 // or some class overrides it. Everything else stays a direct call, so "overridable by default"
 // costs nothing until a program actually overrides. An override shares its base method's slot,
 // and a subclass extends its base's table, so a derived table is prefix-compatible with the
-// base's exactly as the flattened fields are.
+// base's exactly as the flattened fields are. A generic instantiation is a class like any other
+// here: its substituted methods take their own slots, composed with whatever its base chain -
+// concrete or instantiated - assigned.
 //
 // An interface method's slot is its position in the interface's declaration order, the index a
 // conformance table is built and consulted by.
@@ -44,7 +47,7 @@ public final class DispatchTables {
     }
 
     // The number of vtable slots a class's descriptor carries, its base's included.
-    public vtableSizeOf(ClassType classType) -> long {
+    public vtableSizeOf(Type classType) -> long {
         let size = this.tableSizes.get(classType);
         if (size == null) {
             return 0;
@@ -66,7 +69,7 @@ public final class DispatchTables {
         this.methodSlots.set(signature, slot);
     }
 
-    public setVtableSize(ClassType classType, long size) {
+    public setVtableSize(Type classType, long size) {
         this.tableSizes.set(classType, size);
     }
 
@@ -94,13 +97,22 @@ public assignSlots(ProgramIndex index) -> DispatchTables {
         for (long i = 0; i < interfaces.length(); i++) {
             assignInterfaceSlots(interfaces.get(i), tables);
         }
+        let instantiations = modules.get(m).instantiations();
+        for (long i = 0; i < instantiations.length(); i++) {
+            if (primitives.interfaceOf(instantiations.get(i)) != null) {
+                assignInterfaceSlots(instantiations.get(i), tables);
+            }
+        }
     }
     return tables;
 }
 
 // Marks the methods that need a slot: every abstract method, and both ends of every override.
-markForcedSlots(ClassType classType, Set<Signature> pending) {
-    let methods = classType.methods();
+markForcedSlots(Type classType, Set<Signature> pending) {
+    let methods = types.methodsOf(classType);
+    if (methods == null) {
+        return;
+    }
     for (long i = 0; i < methods.length(); i++) {
         let method = methods.get(i);
         if (method.isConstructor() || method.isDestructor()) {
@@ -122,13 +134,16 @@ markForcedSlots(ClassType classType, Set<Signature> pending) {
 
 // Gives every marked method of one class its slot: the base method's when it overrides one, and
 // a fresh index at the end of the table otherwise.
-assignClassSlots(ClassType classType, Set<Signature> pending, DispatchTables tables) {
+assignClassSlots(Type classType, Set<Signature> pending, DispatchTables tables) {
     long size = 0;
     let base = baseClassOf(classType);
     if (base != null) {
         size = tables.vtableSizeOf(base);
     }
-    let methods = classType.methods();
+    let methods = types.methodsOf(classType);
+    if (methods == null) {
+        return;
+    }
     for (long i = 0; i < methods.length(); i++) {
         let method = methods.get(i);
         if (method.isConstructor() || method.isDestructor()
@@ -149,8 +164,11 @@ assignClassSlots(ClassType classType, Set<Signature> pending, DispatchTables tab
     tables.setVtableSize(classType, size);
 }
 
-assignInterfaceSlots(InterfaceType interfaceType, DispatchTables tables) {
-    let methods = interfaceType.methods();
+assignInterfaceSlots(Type interfaceType, DispatchTables tables) {
+    let methods = types.methodsOf(interfaceType);
+    if (methods == null) {
+        return;
+    }
     for (long i = 0; i < methods.length(); i++) {
         tables.setInterfaceSlot(methods.get(i).signature(), i);
     }
@@ -159,10 +177,13 @@ assignInterfaceSlots(InterfaceType interfaceType, DispatchTables tables) {
 // The nearest method up the base chain that this method overrides, matched by name and exact
 // parameter types, or null when the chain declares none (an interface implementation or a
 // replaced built-in behavior carries the marker without a base method).
-public declaringBaseMethod(ClassType classType, Method method) -> Method? {
+public declaringBaseMethod(Type classType, Method method) -> Method? {
     let current = baseClassOf(classType);
     while (current != null) {
-        let methods = current.methods();
+        let methods = types.methodsOf(current);
+        if (methods == null) {
+            return null;
+        }
         for (long i = 0; i < methods.length(); i++) {
             let candidate = methods.get(i);
             if (candidate.isConstructor() || candidate.isDestructor()
@@ -178,27 +199,33 @@ public declaringBaseMethod(ClassType classType, Method method) -> Method? {
     return null;
 }
 
-// The base as the plain class it must be here: every indexed class is representable, and a
-// representable class's whole chain is non-generic.
-public baseClassOf(ClassType classType) -> ClassType? {
-    let base = classType.base();
-    if (base is ClassType) {
-        return base;
+// The base as the class-shaped type it must be here: a declared class or a filled instantiation
+// of a generic one.
+public baseClassOf(Type classType) -> Type? {
+    let base = types.baseOf(classType);
+    if (base == null) {
+        return null;
     }
-    return null;
+    return primitives.classOf(base);
 }
 
-// Every indexed class, base classes before their subclasses.
-classesBaseFirst(ProgramIndex index) -> List<ClassType> {
-    let all = new List<ClassType>();
+// Every indexed class - declared or instantiated - base classes before their subclasses.
+classesBaseFirst(ProgramIndex index) -> List<Type> {
+    let all = new List<Type>();
     let modules = index.modules();
     for (long m = 0; m < modules.length(); m++) {
         let classes = modules.get(m).classes();
         for (long i = 0; i < classes.length(); i++) {
             all.push(classes.get(i));
         }
+        let instantiations = modules.get(m).instantiations();
+        for (long i = 0; i < instantiations.length(); i++) {
+            if (primitives.classOf(instantiations.get(i)) != null) {
+                all.push(instantiations.get(i));
+            }
+        }
     }
-    let ordered = new List<ClassType>();
+    let ordered = new List<Type>();
     long depth = 0;
     while (ordered.length() < all.length()) {
         for (long i = 0; i < all.length(); i++) {
@@ -211,7 +238,7 @@ classesBaseFirst(ProgramIndex index) -> List<ClassType> {
     return ordered;
 }
 
-chainDepthOf(ClassType classType) -> long {
+chainDepthOf(Type classType) -> long {
     long depth = 0;
     let current = baseClassOf(classType);
     while (current != null) {

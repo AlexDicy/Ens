@@ -22,6 +22,8 @@ import FileDiagnostic from @ens.sema.support.diagnostics;
 import EirFunctionBuilder from eir.model;
 import EirParameter from eir.model;
 import DispatchTables from layout.vtables;
+import Substitution from mono.substitution;
+import mono.substitution;
 import FunctionInfo from lower.index;
 import ProgramIndex from lower.index;
 import support.primitives;
@@ -73,6 +75,7 @@ public final class LoweringContext {
     ModuleContext currentModule;
     SemaResult currentResult;
     string currentFile;
+    Substitution? currentSubstitution;
 
     List<FileDiagnostic> problems;
     bool lowerFailed;
@@ -83,14 +86,17 @@ public final class LoweringContext {
         this.programIndex = index;
         this.dispatchTables = tables;
         this.typeStore = store;
+        this.currentSubstitution = info.substitution();
         let signature = info.signature();
         Parameter[] parameters = signature.parameters();
         let eirParameters = new EirParameter[parameters.length];
         for (long i = 0; i < eirParameters.length; i++) {
-            eirParameters[i] = new EirParameter(parameters[i].name(), parameters[i].type());
+            eirParameters[i] = new EirParameter(parameters[i].name(),
+                substitution.apply(store, info.substitution(), parameters[i].type()));
         }
         this.functionBuilder = new EirFunctionBuilder(info.symbol(), info.internalLinkage(),
-            info.receiverType(), eirParameters, signature.returnType());
+            info.receiverType(), eirParameters,
+            substitution.apply(store, info.substitution(), signature.returnType()));
         this.slotsByBinding = new Map<LocalBinding, long>();
         this.loops = new List<LoopTargets>();
         this.scopes = new List<OwnedScope>();
@@ -144,6 +150,24 @@ public final class LoweringContext {
         return previous;
     }
 
+    // Lowers under another owner's substitution - a callee's default expression belongs to the
+    // callee's declaration - until the returned one is passed back.
+    public enterSubstitution(Substitution? active) -> Substitution? {
+        let previous = this.currentSubstitution;
+        this.currentSubstitution = active;
+        return previous;
+    }
+
+    // The type with the active substitution applied: concrete for ordinary code, and the
+    // instance's concrete form for a type recorded inside a template body.
+    public substituted(Type type) -> Type {
+        return substitution.apply(this.typeStore, this.currentSubstitution, type);
+    }
+
+    public substitutedAll(Type[] typeList) -> Type[] {
+        return substitution.applyAll(this.typeStore, this.currentSubstitution, typeList);
+    }
+
     public unsupported(string what, Span span) {
         this.problems.push(new FileDiagnostic(this.currentFile,
             "The self-hosted code generator does not support {what} yet.", span));
@@ -159,15 +183,16 @@ public final class LoweringContext {
         let recorded = this.currentResult.typeOf(node.green());
         if (recorded == null) {
             this.internalError("expression has no recorded type", node.span());
+            return null;
         }
-        return recorded;
+        return this.substituted(recorded);
     }
 
     public supportsValueType(Type type) -> bool {
         return primitives.isRepresentable(type);
     }
 
-    public supportsClassLayout(ClassType classType) -> bool {
+    public supportsClassLayout(Type classType) -> bool {
         return primitives.isRepresentableClass(classType);
     }
 
@@ -180,7 +205,8 @@ public final class LoweringContext {
     // owns, so it is neither zeroed nor released. A struct starts zeroed whether or not it holds
     // references, because a field the program never writes still has to read as zero.
     public defineSlotAs(LocalBinding binding, string name, Type type, bool borrowing) -> long {
-        bool zeroed = (primitives.hasArcContent(type) || type is StructType) && !borrowing;
+        bool zeroed = (primitives.hasArcContent(type) || primitives.structOf(type) != null)
+            && !borrowing;
         long slot = this.functionBuilder.addSlot(name, type, zeroed, borrowing);
         this.slotsByBinding.set(binding, slot);
         return slot;

@@ -1,0 +1,134 @@
+// Lowering generic instances: a function body lowered once per type-argument tuple, a class
+// method lowered under its instantiation's substitution, calls targeting the planned instances,
+// foreach driving a user iterable through the iterator protocol, and bounded calls resolving
+// against the concrete argument.
+import @std.testing;
+import MemoryFileLoader from support;
+import support;
+
+test "a generic function lowers one body per type-argument tuple" {
+    string program =
+        "identity<T>(T value) -> T \{\n"
+        + "    return value;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let text = identity<string>(\"x\");\n"
+        + "    return identity<int>(7);\n"
+        + "\}\n";
+    let intInstance = try support.loweredSymbolDump(program, "main$identity__int__");
+    try testing.assertTrue(intInstance.indexOf("@main$identity__int__(%0: int) -> int") >= 0,
+        "the int instance should carry concrete types: {intInstance}");
+    let stringInstance = try support.loweredSymbolDump(program, "main$identity__string__");
+    try testing.assertTrue(
+        stringInstance.indexOf("@main$identity__string__(%0: string) -> string") >= 0,
+        "the string instance should carry concrete types: {stringInstance}");
+    try testing.assertTrue(stringInstance.indexOf("retain") >= 0,
+        "the string instance should own its returned reference: {stringInstance}");
+    let caller = try support.loweredDump(program, "main");
+    try testing.assertTrue(caller.indexOf("call @main$identity__int__(") >= 0,
+        "the call should target the planned instance: {caller}");
+}
+
+test "a generic class method lowers under its instantiation's substitution" {
+    string program =
+        "class Box<T> \{\n"
+        + "    T inner;\n"
+        + "    protected constructor(this.inner);\n"
+        + "    protected unwrap() -> T \{\n"
+        + "        return this.inner;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return new Box<int>(41).unwrap() + 1;\n"
+        + "\}\n";
+    let unwrap = try support.loweredSymbolDump(program, "Box__int___unwrap");
+    try testing.assertTrue(unwrap.indexOf("@Box__int___unwrap(%0: Box<int>) -> int") >= 0,
+        "the method should run over the instantiation at its concrete types: {unwrap}");
+    try testing.assertTrue(unwrap.indexOf(": &int") >= 0,
+        "the field projection should be typed at the substituted field type: {unwrap}");
+    let caller = try support.loweredDump(program, "main");
+    try testing.assertTrue(caller.indexOf("call @Box__int___constructor(") >= 0,
+        "the constructor call should target the instance: {caller}");
+    try testing.assertTrue(caller.indexOf("call @Box__int___unwrap(") >= 0,
+        "the method call should target the instance: {caller}");
+}
+
+test "foreach over a user iterable drives makeIterator, hasNext, and next" {
+    string program =
+        "import Iterable from @std.collections.iterator;\n"
+        + "import Iterator from @std.collections.iterator;\n"
+        + "class CountUp implements Iterator<int> \{\n"
+        + "    int current;\n"
+        + "    int limit;\n"
+        + "    protected constructor(this.current, this.limit);\n"
+        + "    override hasNext() -> bool \{\n"
+        + "        return this.current <= this.limit;\n"
+        + "    \}\n"
+        + "    override next() -> int \{\n"
+        + "        int value = this.current;\n"
+        + "        this.current = this.current + 1;\n"
+        + "        return value;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Range implements Iterable<int> \{\n"
+        + "    int low;\n"
+        + "    int high;\n"
+        + "    protected constructor(this.low, this.high);\n"
+        + "    override makeIterator() -> Iterator<int> \{\n"
+        + "        return new CountUp(this.low, this.high);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    int total = 0;\n"
+        + "    for (let n in new Range(1, 3)) \{\n"
+        + "        total = total + n;\n"
+        + "    \}\n"
+        + "    return total;\n"
+        + "\}\n";
+    let loader = new MemoryFileLoader();
+    loader.add("/stdlib/std/src/collections/iterator.ens",
+        "export interface Iterator<T> \{\n"
+        + "    hasNext() -> bool;\n"
+        + "    next() -> T;\n"
+        + "\}\n"
+        + "export interface Iterable<T> \{\n"
+        + "    makeIterator() -> Iterator<T>;\n"
+        + "\}\n");
+    loader.add("/src/main.ens", program);
+    let analysis = try support.analyzeLoaded(loader);
+    let dumped = try support.loweredLoadedDump(analysis, "main");
+    try testing.assertTrue(dumped.indexOf("makeIterator") >= 0,
+        "the loop should open with makeIterator: {dumped}");
+    try testing.assertTrue(dumped.indexOf("itable[Iterator<int>, 0]") >= 0,
+        "hasNext should dispatch through the iterator's method table: {dumped}");
+    try testing.assertTrue(dumped.indexOf("itable[Iterator<int>, 1]") >= 0,
+        "next should dispatch through the iterator's method table: {dumped}");
+    try testing.assertTrue(dumped.indexOf("foreach.cond") >= 0,
+        "the loop should test hasNext each pass: {dumped}");
+}
+
+test "a bounded hash call on a concrete value type folds the synthesized hash" {
+    let loader = new MemoryFileLoader();
+    loader.add("/stdlib/std/src/hash.ens",
+        "export interface Hashable \{\n"
+        + "    hash() -> long;\n"
+        + "\}\n");
+    loader.add("/src/main.ens",
+        "import Hashable from @std.hash;\n"
+        + "hashOf<T: Hashable>(T value) -> long \{\n"
+        + "    return value.hash();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let byValue = hashOf<int>(4);\n"
+        + "    let byText = hashOf<string>(\"x\");\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = try support.analyzeLoaded(loader);
+    let intInstance = try support.loweredLoadedSymbolDump(analysis, "main$hashOf__int__");
+    try testing.assertTrue(intInstance.indexOf("= hash %") >= 0,
+        "an int hashes as a widened leaf: {intInstance}");
+    let stringInstance = try support.loweredLoadedSymbolDump(analysis,
+        "main$hashOf__string__");
+    try testing.assertTrue(stringInstance.indexOf("= hash %") >= 0,
+        "a string hashes as a leaf the emitter folds: {stringInstance}");
+}

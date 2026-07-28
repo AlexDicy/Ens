@@ -1,0 +1,151 @@
+// The synthesized 'hash()' behind the '@std.hash' Hashable contract. Every Ens type satisfies
+// the contract; a class or struct that declares its own conforming 'hash() -> long' answers
+// through it, and everything else hashes by its contents the way the reference compiler does:
+// integers and enums by value, floats by bit pattern, strings by an FNV-1a fold of their bytes,
+// references by identity, and structs by folding their fields' hashes.
+//
+// Aggregates fold here in lowering, so emission only ever sees one leaf instruction; a class
+// field that declared its own hash is called mid-fold like any method.
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import Expression from @ens.frontend.syntax.generated.nodes;
+import Span from @ens.frontend.support.source;
+import InterfaceType from @ens.sema.model.types;
+import Method from @ens.sema.model.types;
+import PrimitiveKind from @ens.sema.model.types;
+import Type from @ens.sema.model.types;
+import @ens.sema.model.types;
+import EirBinary from eir.model;
+import EirBinaryOp from eir.model;
+import EirConstInt from eir.model;
+import EirHashValue from eir.model;
+import LoweringContext from lower.context;
+import lower.calls;
+import lower.classes;
+import lower.expressions;
+import lower.places;
+import lower.records;
+import lower.structs;
+import support.primitives;
+
+// True when the recorded method is the Hashable contract itself, which a bounded type parameter
+// resolves calls against; the concrete receiver decides what actually answers.
+public isHashableContract(Method method) -> bool {
+    if (method.name() != "hash") {
+        return false;
+    }
+    let authority = types.authorityOf(method.definingType());
+    if (!(authority is InterfaceType)) {
+        return false;
+    }
+    return authority.name() == "Hashable" && authority.modulePath() == "std.hash";
+}
+
+// 'value.hash()' where no declaration answers: the synthesized content hash.
+public lowerSynthesizedHash(LoweringContext lowering, CallExpressionNode call,
+                            Expression receiver, Type receiverType) -> long {
+    if (primitives.structOf(receiverType) != null) {
+        long address = structs.addressOf(lowering, receiver, receiverType);
+        if (address < 0) {
+            return -1;
+        }
+        return hashAt(lowering, address, receiverType, call.span());
+    }
+    if (!lowering.supportsValueType(receiverType)) {
+        lowering.unsupported("hashing a '{types.display(receiverType)}'", call.span());
+        return -1;
+    }
+    long value = expressions.lower(lowering, receiver);
+    if (value < 0) {
+        return -1;
+    }
+    long hashed = hashLeaf(lowering, value);
+    expressions.releaseTemporary(lowering, receiver, value);
+    return hashed;
+}
+
+// The FNV-1a fold of a struct's fields, each by its own hash: nested structs recurse in place,
+// a class field with a declared conforming hash is asked, and every other field is a leaf.
+hashAt(LoweringContext lowering, long base, Type structType, Span span) -> long {
+    let builder = lowering.builder();
+    let longType = lowering.store().primitive(PrimitiveKind.Long);
+    long hash = builder.newTemp(longType);
+    builder.append(new EirConstInt(hash, longType, -3750763034362895579));
+    let fields = records.fieldsOf(structType);
+    if (fields == null) {
+        return hash;
+    }
+    for (long i = 0; i < fields.length(); i++) {
+        let fieldType = fields.get(i).type();
+        long fieldAddress = structs.fieldAddressAt(lowering, base, fieldType, i);
+        long fieldHash = -1;
+        if (primitives.structOf(fieldType) != null) {
+            fieldHash = hashAt(lowering, fieldAddress, fieldType, span);
+        } else {
+            long value = places.loadFrom(lowering, fieldAddress, fieldType);
+            fieldHash = hashFieldValue(lowering, value, fieldType, span);
+        }
+        if (fieldHash < 0) {
+            return -1;
+        }
+        long mixed = builder.newTemp(longType);
+        builder.append(new EirBinary(mixed, longType, EirBinaryOp.Xor, hash, fieldHash));
+        long prime = builder.newTemp(longType);
+        builder.append(new EirConstInt(prime, longType, 1099511628211));
+        long folded = builder.newTemp(longType);
+        builder.append(new EirBinary(folded, longType, EirBinaryOp.Mul, mixed, prime));
+        hash = folded;
+    }
+    return hash;
+}
+
+// One loaded field's hash: a class that declared its own conforming hash answers, everything
+// else is a leaf the emitter folds by shape.
+hashFieldValue(LoweringContext lowering, long value, Type fieldType, Span span) -> long {
+    let classType = primitives.classOf(fieldType);
+    if (classType != null) {
+        let declared = declaredHashOf(classType);
+        if (declared != null) {
+            let info = lowering.index().infoFor(declared.signature());
+            if (info == null || !calls.supportedDispatchTarget(lowering, info,
+                    "method 'hash'", span)) {
+                return -1;
+            }
+            return calls.emitCall(lowering, info, classType, value, [],
+                lowering.tables().vtableSlotOf(declared.signature()), null);
+        }
+    }
+    return hashLeaf(lowering, value);
+}
+
+hashLeaf(LoweringContext lowering, long value) -> long {
+    let builder = lowering.builder();
+    let longType = lowering.store().primitive(PrimitiveKind.Long);
+    long hashed = builder.newTemp(longType);
+    builder.append(new EirHashValue(hashed, longType, value));
+    return hashed;
+}
+
+// The conforming 'hash() -> long' a class declares or inherits, or null when the synthesized
+// identity hash stands in.
+declaredHashOf(Type classType) -> Method? {
+    Type? current = classType;
+    while (current != null) {
+        let methods = types.methodsOf(current);
+        if (methods == null) {
+            return null;
+        }
+        for (long i = 0; i < methods.length(); i++) {
+            let method = methods.get(i);
+            if (method.isConstructor() || method.isDestructor() || method.name() != "hash") {
+                continue;
+            }
+            let signature = method.signature();
+            if (signature.parameters().length != 0 || signature.declaresThrows()) {
+                continue;
+            }
+            return method;
+        }
+        current = types.baseOf(current);
+    }
+    return null;
+}

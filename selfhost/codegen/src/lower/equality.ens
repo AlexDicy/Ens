@@ -8,8 +8,10 @@
 // operand that produced its own reference gives it up once the answer is computed, so a weak
 // read's upgraded reference lives exactly as long as the comparison.
 import BinaryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import Span from @ens.frontend.support.source;
 import ClassType from @ens.sema.model.types;
 import Method from @ens.sema.model.types;
+import OptionalType from @ens.sema.model.types;
 import PrimitiveKind from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
 import @ens.sema.model.types;
@@ -21,12 +23,16 @@ import EirConstNull from eir.model;
 import EirJump from eir.model;
 import EirLoadSlot from eir.model;
 import EirStoreSlot from eir.model;
+import EirStringEqual from eir.model;
 import EirUnary from eir.model;
 import EirUnaryOp from eir.model;
 import LoweringContext from lower.context;
 import lower.calls;
 import lower.conversions;
 import lower.expressions;
+import lower.places;
+import lower.records;
+import lower.structs;
 import support.primitives;
 
 // True when '==' over these two operand types compares references rather than values.
@@ -73,7 +79,8 @@ public lower(LoweringContext lowering, BinaryExpressionNode binary, bool negated
     if (declared == null || isPresenceCheck(leftType, rightType)) {
         answer = compareIdentity(lowering, left, right, negated, resultType);
     } else {
-        answer = compareContents(lowering, left, right, declared, negated, resultType, binary);
+        answer = compareContents(lowering, left, right, declared, negated, resultType,
+            binary.span());
     }
     // A reference an operand produced was only compared, so it ends here; a weak read's upgraded
     // reference in particular must not outlive the comparison, or it would keep the watched
@@ -99,9 +106,12 @@ comparisonType(Type left, Type right) -> Type {
 // answering bool. A declaration of any other shape is an ordinary method that '==' does not
 // consult. Interface values compare by identity, so only a class receiver looks for one.
 declaredEquals(LoweringContext lowering, Type type) -> Method? {
-    let current = primitives.classOf(type);
+    Type? current = primitives.classOf(type);
     while (current != null) {
-        let methods = current.methods();
+        let methods = types.methodsOf(current);
+        if (methods == null) {
+            return null;
+        }
         for (long i = 0; i < methods.length(); i++) {
             let method = methods.get(i);
             if (method.name() != "equals" || method.isConstructor() || method.isDestructor()) {
@@ -119,11 +129,7 @@ declaredEquals(LoweringContext lowering, Type type) -> Method? {
             }
             return method;
         }
-        let base = current.base();
-        current = null;
-        if (base is ClassType) {
-            current = base;
-        }
+        current = types.baseOf(current);
     }
     return null;
 }
@@ -138,14 +144,14 @@ compareIdentity(LoweringContext lowering, long left, long right, bool negated, T
 }
 
 compareContents(LoweringContext lowering, long left, long right, Method declared, bool negated,
-                Type resultType, BinaryExpressionNode binary) -> long {
+                Type resultType, Span span) -> long {
     let info = lowering.index().infoFor(declared.signature());
     if (info == null) {
         lowering.internalError("the 'equals' of this class resolves to no indexed function",
-            binary.span());
+            span);
         return -1;
     }
-    if (!calls.supportedCallee(lowering, info, "method 'equals'", binary.span())) {
+    if (!calls.supportedCallee(lowering, info, "method 'equals'", span)) {
         return -1;
     }
     let builder = lowering.builder();
@@ -173,7 +179,7 @@ compareContents(LoweringContext lowering, long left, long right, Method declared
 
     builder.moveTo(callBlock);
     let parameterType = declared.signature().parameters()[0].type();
-    long argument = conversions.convert(lowering, right, parameterType, binary.span());
+    long argument = conversions.convert(lowering, right, parameterType, span);
     if (argument < 0) {
         return -1;
     }
@@ -217,4 +223,115 @@ storeConstant(LoweringContext lowering, long slot, Type boolType, bool value) {
     long constant = builder.newTemp(boolType);
     builder.append(new EirConstBool(constant, boolType, value));
     builder.append(new EirStoreSlot(slot, constant));
+}
+
+// True when '==' over these two operand types compares struct contents memberwise.
+public comparesStructValues(Type left, Type right) -> bool {
+    return left == right && primitives.structOf(left) != null;
+}
+
+// Memberwise '==' over two same-type struct values: fields compare in declaration order by their
+// own '==' semantics, short-circuiting to unequal at the first difference. Both operands are
+// reached through their addresses, so nested structs compare where they sit.
+public lowerStructValues(LoweringContext lowering, BinaryExpressionNode binary, bool negated,
+                         Type resultType) -> long {
+    let type = lowering.typeOf(binary.left());
+    if (type == null) {
+        return -1;
+    }
+    long leftBase = structs.addressOf(lowering, binary.left(), type);
+    if (leftBase < 0) {
+        return -1;
+    }
+    long rightBase = structs.addressOf(lowering, binary.right(), type);
+    if (rightBase < 0) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    long answer = builder.addSlot("structeq", boolType, false, false);
+    long differBlock = builder.newBlock("struct.eq.differ");
+    long endBlock = builder.newBlock("struct.eq.end");
+    if (!compareFieldsAt(lowering, leftBase, rightBase, type, differBlock, binary.span())) {
+        return -1;
+    }
+    storeConstant(lowering, answer, boolType, true);
+    builder.terminate(new EirJump(endBlock));
+    builder.moveTo(differBlock);
+    storeConstant(lowering, answer, boolType, false);
+    builder.terminate(new EirJump(endBlock));
+    builder.moveTo(endBlock);
+    long merged = builder.newTemp(boolType);
+    builder.append(new EirLoadSlot(merged, boolType, answer));
+    if (!negated) {
+        return merged;
+    }
+    long inverted = builder.newTemp(resultType);
+    builder.append(new EirUnary(inverted, resultType, EirUnaryOp.Not, merged));
+    return inverted;
+}
+
+// Compares every field of the structs two addresses name, continuing on the equal path and
+// jumping to 'differBlock' at the first difference. Nested structs recurse into the same exit.
+compareFieldsAt(LoweringContext lowering, long leftBase, long rightBase, Type type,
+                long differBlock, Span span) -> bool {
+    let fields = records.fieldsOf(type);
+    if (fields == null) {
+        return true;
+    }
+    let builder = lowering.builder();
+    for (long i = 0; i < fields.length(); i++) {
+        let fieldType = fields.get(i).type();
+        long leftAddress = structs.fieldAddressAt(lowering, leftBase, fieldType, i);
+        long rightAddress = structs.fieldAddressAt(lowering, rightBase, fieldType, i);
+        if (primitives.structOf(fieldType) != null) {
+            if (!compareFieldsAt(lowering, leftAddress, rightAddress, fieldType, differBlock,
+                    span)) {
+                return false;
+            }
+            continue;
+        }
+        long equal = fieldEqual(lowering, leftAddress, rightAddress, fieldType, span);
+        if (equal < 0) {
+            return false;
+        }
+        long next = builder.newBlock("struct.eq.next");
+        builder.terminate(new EirBranch(equal, next, differBlock));
+        builder.moveTo(next);
+    }
+    return true;
+}
+
+// One non-struct field's own '==': strings by content, classes by identity unless the class
+// declared 'equals', arrays by identity, and every value type by value.
+fieldEqual(LoweringContext lowering, long leftAddress, long rightAddress, Type fieldType,
+           Span span) -> long {
+    if (fieldType is OptionalType) {
+        lowering.unsupported("comparing a struct whose field type is "
+            + "'{types.display(fieldType)}'", span);
+        return -1;
+    }
+    let builder = lowering.builder();
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    long left = places.loadFrom(lowering, leftAddress, fieldType);
+    long right = places.loadFrom(lowering, rightAddress, fieldType);
+    if (primitives.isStringType(fieldType)) {
+        long equal = builder.newTemp(boolType);
+        builder.append(new EirStringEqual(equal, boolType, left, right));
+        return equal;
+    }
+    if (primitives.classOf(fieldType) != null) {
+        let declared = declaredEquals(lowering, fieldType);
+        if (declared != null) {
+            return compareContents(lowering, left, right, declared, false, boolType, span);
+        }
+        return compareIdentity(lowering, left, right, false, boolType);
+    }
+    if (primitives.isReferenceType(fieldType)) {
+        return compareIdentity(lowering, left, right, false, boolType);
+    }
+    let op = primitives.isFloatType(fieldType) ? EirBinaryOp.FloatCmpEq : EirBinaryOp.CmpEq;
+    long equal = builder.newTemp(boolType);
+    builder.append(new EirBinary(equal, boolType, op, left, right));
+    return equal;
 }

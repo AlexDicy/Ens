@@ -13,11 +13,15 @@ import MemberListNode from @ens.frontend.syntax.generated.nodes;
 import Span from @ens.frontend.support.source;
 import LocalBinding from @ens.sema.model.scopes;
 import ClassType from @ens.sema.model.types;
+import InstantiationType from @ens.sema.model.types;
 import PrimitiveKind from @ens.sema.model.types;
 import StructType from @ens.sema.model.types;
+import Substitution from mono.substitution;
+import mono.substitution;
 import Type from @ens.sema.model.types;
 import @ens.sema.model.types;
 import layout.vtables;
+import support.primitives;
 import EirBinary from eir.model;
 import EirBinaryOp from eir.model;
 import EirBranch from eir.model;
@@ -45,11 +49,20 @@ public declaresDefaults(Type type) -> bool {
     for (long i = 0; i < fields.length(); i++) {
         let fieldType = fields.get(i).type();
         if (fields.get(i).hasDefault()
-                || (fieldType is StructType && declaresDefaults(fieldType))) {
+                || (primitives.structOf(fieldType) != null && declaresDefaults(fieldType))) {
             return true;
         }
     }
     return false;
+}
+
+// The substitution one record level's default expressions lower under: the instantiation's own
+// for a generic level, none for a plain one.
+levelSubstitution(Type level) -> Substitution? {
+    if (level is InstantiationType) {
+        return substitution.forInstantiation(level);
+    }
+    return null;
 }
 
 // Fills every field of a fresh record from its declared defaults.
@@ -65,15 +78,18 @@ public applyAll(LoweringContext lowering, long destination, Type type, Span span
 // classes first, the order the flattened fields sit in. Each class's defaults were written and
 // checked in its own module, so the walk rebinds per level while the destination and the field
 // indexes stay the concrete class's.
-public applyClassDefaults(LoweringContext lowering, long destination, ClassType classType,
+public applyClassDefaults(LoweringContext lowering, long destination, Type classType,
                           Span span) -> bool {
     if (!declaresDefaults(classType)) {
         return true;
     }
-    let fields = classType.fields();
+    let fields = records.fieldsOf(classType);
+    if (fields == null) {
+        return true;
+    }
     bool[] written = new bool[fields.length()];
-    let chain = new List<ClassType>();
-    ClassType? current = classType;
+    let chain = new List<Type>();
+    Type? current = classType;
     while (current != null) {
         chain.push(current);
         current = vtables.baseClassOf(current);
@@ -82,14 +98,16 @@ public applyClassDefaults(LoweringContext lowering, long destination, ClassType 
         let level = chain.get(i);
         let owner = lowering.index().recordFor(level);
         if (owner == null) {
-            lowering.internalError("'{level.name()}' has no declaration to read its field "
-                + "defaults from", span);
+            lowering.internalError("'{types.display(level)}' has no declaration to read its "
+                + "field defaults from", span);
             return false;
         }
         let caller = lowering.enterModule(owner.context());
+        let callerSubstitution = lowering.enterSubstitution(levelSubstitution(level));
         lowering.pushFieldDefaults(destination, classType);
         bool filled = fill(lowering, destination, classType, owner.members(), written, span);
         lowering.popFieldDefaults();
+        let ignored = lowering.enterSubstitution(callerSubstitution);
         let restored = lowering.enterModule(caller);
         if (!filled) {
             return false;
@@ -100,7 +118,7 @@ public applyClassDefaults(LoweringContext lowering, long destination, ClassType 
 
 // Fills a slot declared without an initializer, which a struct with defaults still needs.
 public applyToSlot(LoweringContext lowering, long slot, Type type, Span span) -> bool {
-    if (!(type is StructType) || !declaresDefaults(type)) {
+    if (primitives.structOf(type) == null || !declaresDefaults(type)) {
         return true;
     }
     return applyAll(lowering, ownership.slotAddress(lowering, slot, type), type, span);
@@ -120,9 +138,11 @@ public applyOmitted(LoweringContext lowering, long destination, Type type, bool[
         return false;
     }
     let caller = lowering.enterModule(owner.context());
+    let callerSubstitution = lowering.enterSubstitution(levelSubstitution(type));
     lowering.pushFieldDefaults(destination, type);
     bool filled = fill(lowering, destination, type, owner.members(), written, span);
     lowering.popFieldDefaults();
+    let ignored = lowering.enterSubstitution(callerSubstitution);
     let restored = lowering.enterModule(caller);
     return filled;
 }
@@ -165,7 +185,7 @@ fill(LoweringContext lowering, long destination, Type type, MemberListNode body,
             }
             continue;
         }
-        if (fieldType is StructType && declaresDefaults(fieldType)) {
+        if (primitives.structOf(fieldType) != null && declaresDefaults(fieldType)) {
             long nested = records.fieldAddressIn(lowering, destination, type, fieldType, index);
             if (!applyAll(lowering, nested, fieldType, span)) {
                 return false;
@@ -180,7 +200,7 @@ fill(LoweringContext lowering, long destination, Type type, MemberListNode body,
 // default stays at the zero the allocation left it at.
 public fillArray(LoweringContext lowering, long array, Type elementType, long count, Span span)
         -> bool {
-    if (!(elementType is StructType) || !declaresDefaults(elementType)) {
+    if (primitives.structOf(elementType) == null || !declaresDefaults(elementType)) {
         return true;
     }
     let builder = lowering.builder();

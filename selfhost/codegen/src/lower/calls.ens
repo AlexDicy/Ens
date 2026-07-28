@@ -18,11 +18,13 @@ import Type from @ens.sema.model.types;
 import @ens.sema.model.types;
 import EirCallee from eir.model;
 import EirCall from eir.model;
+import mono.substitution;
 import FunctionInfo from lower.index;
 import LoweringContext from lower.context;
 import lower.builtins;
 import lower.classes;
 import lower.expressions;
+import lower.hashes;
 import lower.ownership;
 import lower.places;
 import lower.structs;
@@ -50,6 +52,11 @@ public lower(LoweringContext lowering, CallExpressionNode call) -> long {
             if (receiverType == null) {
                 return -1;
             }
+            if (hashes.isHashableContract(method)
+                    && classes.implementationOnClass(receiverType, method) == null) {
+                return hashes.lowerSynthesizedHash(lowering, call, callee.object(),
+                    receiverType);
+            }
             if (primitives.classOf(receiverType) != null) {
                 return classes.lowerMethodCall(lowering, call, callee, method);
             }
@@ -63,6 +70,9 @@ public lower(LoweringContext lowering, CallExpressionNode call) -> long {
     if (signature == null) {
         lowering.unsupported("this call", call.span());
         return -1;
+    }
+    if (signature.isGeneric()) {
+        return lowerGenericCall(lowering, call, signature);
     }
     let info = lowering.index().infoFor(signature);
     if (info == null) {
@@ -79,17 +89,48 @@ public lower(LoweringContext lowering, CallExpressionNode call) -> long {
     return lowerCall(lowering, info, call, null, -1);
 }
 
+// A call to a generic function targets the instance at the call's concrete type arguments. The
+// written arguments may mention the enclosing template's parameters, so they map through the
+// active substitution first; the closure planned every combination reachable this way, so a
+// missing instance is a closure bug.
+lowerGenericCall(LoweringContext lowering, CallExpressionNode call, Signature signature)
+        -> long {
+    let written = lowering.result().callTypeArgumentsOf(call.green());
+    if (written == null) {
+        lowering.internalError("the generic call to '{signature.name()}' has no recorded type "
+            + "arguments", call.span());
+        return -1;
+    }
+    Type[] arguments = lowering.substitutedAll(written);
+    let info = lowering.index().functionInstance(signature, arguments);
+    if (info == null) {
+        lowering.internalError("the call to '{signature.name()}' names an instance the "
+            + "monomorphization closure never planned", call.span());
+        return -1;
+    }
+    if (!supportedCallee(lowering, info, "function '{signature.name()}'", call.span())) {
+        return -1;
+    }
+    return lowerCall(lowering, info, call, null, -1);
+}
+
 // 'super(args)' as a constructor's chaining statement: the base constructor runs over the same
 // object this constructor was handed, always directly. A base with no constructor at all leaves
 // nothing to call.
 lowerSuperConstructorCall(LoweringContext lowering, CallExpressionNode call,
                           SuperExpressionNode callee) -> long {
-    let baseConstructor = lowering.result().methodOf(callee.green());
-    if (baseConstructor == null) {
+    let recorded = lowering.result().methodOf(callee.green());
+    if (recorded == null) {
         return -1;
     }
     let baseType = lowering.typeOf(callee);
     if (baseType == null) {
+        return -1;
+    }
+    let baseConstructor = classes.resolveConcreteMethod(lowering, baseType, recorded);
+    if (baseConstructor == null) {
+        lowering.internalError("the base constructor 'super(...)' names resolves to no "
+            + "concrete method", call.span());
         return -1;
     }
     let info = lowering.index().infoFor(baseConstructor.signature());
@@ -167,7 +208,7 @@ supportedTarget(LoweringContext lowering, FunctionInfo info, string described, S
         lowering.unsupported("calling the external {described}", span);
         return false;
     }
-    if (signature.isGeneric()) {
+    if (signature.isGeneric() && info.substitution() == null) {
         lowering.unsupported("calling the generic {described}", span);
         return false;
     }
@@ -182,17 +223,25 @@ supportedTarget(LoweringContext lowering, FunctionInfo info, string described, S
         return false;
     }
     for (let parameter in signature.parameters()) {
-        if (!lowering.supportsValueType(parameter.type())) {
-            lowering.unsupported("passing a '{types.display(parameter.type())}' argument", span);
+        let parameterType = calleeType(lowering, info, parameter.type());
+        if (!lowering.supportsValueType(parameterType)) {
+            lowering.unsupported("passing a '{types.display(parameterType)}' argument", span);
             return false;
         }
     }
-    let returnType = signature.returnType();
+    let returnType = calleeType(lowering, info, signature.returnType());
     if (!types.isVoidType(returnType) && !lowering.supportsValueType(returnType)) {
         lowering.unsupported("a call returning '{types.display(returnType)}'", span);
         return false;
     }
     return true;
+}
+
+// A type from the callee's declared signature, concrete under the callee's own substitution. An
+// instantiation method's signature is already substituted; a generic function instance keeps its
+// template's signature and closes it here.
+calleeType(LoweringContext lowering, FunctionInfo info, Type declared) -> Type {
+    return substitution.apply(lowering.store(), info.substitution(), declared);
 }
 
 // The argument temps in parameter order: each written argument converted to its parameter's type,
@@ -219,7 +268,7 @@ lowerArguments(LoweringContext lowering, FunctionInfo info, ArgumentListNode? ar
             return null;
         }
         long value = lowerArgument(lowering, writtenArguments.get(i),
-            parameters[parameterIndex].type(), temporaries);
+            calleeType(lowering, info, parameters[parameterIndex].type()), temporaries);
         if (value < 0) {
             return null;
         }
@@ -230,8 +279,8 @@ lowerArguments(LoweringContext lowering, FunctionInfo info, ArgumentListNode? ar
         if (filled[j]) {
             continue;
         }
-        long value = lowerDefaultArgument(lowering, info, j, parameters[j].type(), span,
-            temporaries);
+        long value = lowerDefaultArgument(lowering, info, j,
+            calleeType(lowering, info, parameters[j].type()), span, temporaries);
         if (value < 0) {
             return null;
         }
@@ -270,10 +319,10 @@ lowerArgument(LoweringContext lowering, Expression argument, Type parameterType,
 public emitCall(LoweringContext lowering, FunctionInfo info, Type? receiverType, long receiver,
                 long[] arguments, long dispatchSlot, Type? dispatchInterface) -> long {
     let signature = info.signature();
-    let returnType = signature.returnType();
+    let returnType = calleeType(lowering, info, signature.returnType());
     let builder = lowering.builder();
-    let callee = new EirCallee(info.symbol(), receiverType, parameterTypesOf(signature),
-        returnType);
+    let callee = new EirCallee(info.symbol(), receiverType,
+        parameterTypesOf(lowering, info, signature), returnType);
     long resultTemp = -1;
     if (!types.isVoidType(returnType)) {
         resultTemp = builder.newTemp(returnType);
@@ -283,13 +332,13 @@ public emitCall(LoweringContext lowering, FunctionInfo info, Type? receiverType,
     return resultTemp;
 }
 
-parameterTypesOf(Signature signature) -> Type[] {
+parameterTypesOf(LoweringContext lowering, FunctionInfo info, Signature signature) -> Type[] {
     Parameter[] parameters = signature.parameters();
-    let declared = new Type[parameters.length];
-    for (long i = 0; i < declared.length; i++) {
-        declared[i] = parameters[i].type();
+    let declared = new List<Type>();
+    for (long i = 0; i < parameters.length; i++) {
+        declared.push(calleeType(lowering, info, parameters[i].type()));
     }
-    return declared;
+    return declared.toArray();
 }
 
 public calleeSignatureOf(LoweringContext lowering, CallExpressionNode call) -> Signature? {
@@ -329,7 +378,9 @@ lowerDefaultArgument(LoweringContext lowering, FunctionInfo callee, long paramet
         return -1;
     }
     let caller = lowering.enterModule(callee.context());
+    let callerSubstitution = lowering.enterSubstitution(callee.substitution());
     long value = lowerArgument(lowering, defaultValue.value(), parameterType, temporaries);
+    let ignoredSubstitution = lowering.enterSubstitution(callerSubstitution);
     let ignored = lowering.enterModule(caller);
     return value;
 }

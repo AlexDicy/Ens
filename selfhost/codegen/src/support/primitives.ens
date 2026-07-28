@@ -9,11 +9,13 @@ import ArrayType from @ens.sema.model.types;
 import StructType from @ens.sema.model.types;
 import EnumType from @ens.sema.model.types;
 import ClassType from @ens.sema.model.types;
+import InstantiationType from @ens.sema.model.types;
 import InterfaceType from @ens.sema.model.types;
 import OptionalType from @ens.sema.model.types;
 import NullType from @ens.sema.model.types;
 import Parameter from @ens.sema.model.types;
 import Signature from @ens.sema.model.types;
+import @ens.sema.model.types;
 
 public isIntegerType(Type type) -> bool {
     if (type is PrimitiveType) {
@@ -108,12 +110,17 @@ public arrayOf(Type type) -> ArrayType? {
     return null;
 }
 
-// The class a value of this type names, looking through an optional, or null for anything else.
-public classOf(Type type) -> ClassType? {
+// The class a value of this type names - a declared class or an instantiation of a generic one -
+// looking through an optional, or null for anything else. The result is always class-shaped:
+// query it through the sema accessors (fieldsOf, methodsOf, baseOf, interfacesOf).
+public classOf(Type type) -> Type? {
     if (type is OptionalType) {
         return classOf(type.inner());
     }
     if (type is ClassType) {
+        return type;
+    }
+    if (type is InstantiationType && type.template() is ClassType) {
         return type;
     }
     return null;
@@ -123,15 +130,36 @@ public isClassType(Type type) -> bool {
     return classOf(type) != null;
 }
 
-// The interface a value of this type names, looking through an optional, or null for anything else.
-public interfaceOf(Type type) -> InterfaceType? {
+// The interface a value of this type names - declared or an instantiation of a generic one -
+// looking through an optional, or null for anything else.
+public interfaceOf(Type type) -> Type? {
     if (type is OptionalType) {
         return interfaceOf(type.inner());
     }
     if (type is InterfaceType) {
         return type;
     }
+    if (type is InstantiationType && type.template() is InterfaceType) {
+        return type;
+    }
     return null;
+}
+
+// The struct a value of this type is - a declared struct or an instantiation of a generic one -
+// or null for anything else.
+public structOf(Type type) -> Type? {
+    if (type is StructType) {
+        return type;
+    }
+    if (type is InstantiationType && type.template() is StructType) {
+        return type;
+    }
+    return null;
+}
+
+// The name a record-shaped type reads as in a diagnostic or symbol description.
+public recordName(Type type) -> string {
+    return types.display(type);
 }
 
 // True for the types runtime type identity works over: a class or an interface, possibly nullable.
@@ -150,7 +178,7 @@ public isOptionalType(Type type) -> bool {
 }
 
 public isStructType(Type type) -> bool {
-    return type is StructType;
+    return structOf(type) != null;
 }
 
 public isEnumType(Type type) -> bool {
@@ -172,6 +200,9 @@ public referenceOf(Type type) -> Type? {
     }
     if (type is StringType || type is ArrayType || type is ClassType || type is InterfaceType
             || type is NullType) {
+        return type;
+    }
+    if (type is InstantiationType && !(type.template() is StructType)) {
         return type;
     }
     return null;
@@ -224,16 +255,7 @@ public isRepresentable(Type type) -> bool {
         if (type.isGeneric()) {
             return false;
         }
-        for (let implemented in type.interfaces()) {
-            if (!(implemented is InterfaceType) || implemented.isGeneric()) {
-                return false;
-            }
-        }
-        let base = type.base();
-        if (base == null) {
-            return true;
-        }
-        return base is ClassType && isRepresentable(base);
+        return representableChain(type);
     }
     if (type is InterfaceType) {
         return !type.isGeneric();
@@ -245,25 +267,68 @@ public isRepresentable(Type type) -> bool {
         if (type.isGeneric()) {
             return false;
         }
-        let fields = type.fields();
-        for (long i = 0; i < fields.length(); i++) {
-            if (fields.get(i).isWeak() || !isRepresentable(fields.get(i).type())) {
+        return representableFields(type);
+    }
+    if (type is InstantiationType) {
+        for (let argument in type.arguments()) {
+            if (!isRepresentable(argument)) {
                 return false;
             }
         }
-        return true;
+        let template = type.template();
+        if (template is InterfaceType) {
+            return true;
+        }
+        if (template is ClassType) {
+            return representableChain(type);
+        }
+        if (template is StructType) {
+            return representableFields(type);
+        }
+        return false;
     }
     return false;
 }
 
-// True when a class's own payload can be laid out: every field is a type code generation
-// represents, and every weak field watches a class reference, which is the only thing a side-table
-// entry can point at.
-public isRepresentableClass(ClassType classType) -> bool {
-    if (!isRepresentable(classType)) {
+// True when the type's own implemented interfaces and base chain are shapes code generation can
+// dispatch over. A class stops the walk at its reference; only the chain is examined here.
+representableChain(Type type) -> bool {
+    for (let implemented in types.interfacesOf(type)) {
+        if (interfaceOf(implemented) == null || !isRepresentable(implemented)) {
+            return false;
+        }
+    }
+    let base = types.baseOf(type);
+    if (base == null) {
+        return true;
+    }
+    return classOf(base) != null && isRepresentable(base);
+}
+
+representableFields(Type type) -> bool {
+    let fields = types.fieldsOf(type);
+    if (fields == null) {
         return false;
     }
-    let fields = classType.fields();
+    for (long i = 0; i < fields.length(); i++) {
+        if (fields.get(i).isWeak() || !isRepresentable(fields.get(i).type())) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// True when a class's own payload can be laid out: every field is a type code generation
+// represents, and every weak field watches a class reference, which is the only thing a side-table
+// entry can point at. The class may be declared or an instantiation of a generic one.
+public isRepresentableClass(Type classType) -> bool {
+    if (classOf(classType) == null || !isRepresentable(classType)) {
+        return false;
+    }
+    let fields = types.fieldsOf(classType);
+    if (fields == null) {
+        return false;
+    }
     for (long i = 0; i < fields.length(); i++) {
         let field = fields.get(i);
         if (!isRepresentable(field.type())) {
@@ -299,8 +364,12 @@ public hasArcContent(Type type) -> bool {
     if (isReferenceType(type)) {
         return true;
     }
-    if (type is StructType) {
-        let fields = type.fields();
+    let struck = structOf(type);
+    if (struck != null) {
+        let fields = types.fieldsOf(struck);
+        if (fields == null) {
+            return false;
+        }
         for (long i = 0; i < fields.length(); i++) {
             if (hasArcContent(fields.get(i).type())) {
                 return true;

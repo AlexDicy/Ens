@@ -26,6 +26,7 @@ import eir.verify;
 import eir.ownership;
 import eir.storage;
 import layout.vtables;
+import mono.closure;
 import FunctionInfo from lower.index;
 import ProgramIndex from lower.index;
 import lower.destructors;
@@ -127,6 +128,18 @@ public freshStore() -> TypeStore throws {
     return analysis.store();
 }
 
+// The full stage-A index: the concrete declarations plus everything the monomorphization
+// closure planned, registered the way the driver registers it.
+public indexProgram(ProgramAnalysis analysis) -> ProgramIndex throws {
+    let programIndex = index.buildIndex(analysis);
+    let plan = closure.close(analysis, programIndex);
+    if (plan.problems().length() > 0) {
+        try testing.fail("the closure reported: " + plan.problems().get(0).message());
+    }
+    closure.apply(plan, programIndex);
+    return programIndex;
+}
+
 // The struct type a test program declares, searched across its modules so a test does not have to
 // spell the module's canonical path.
 public structNamed(ProgramAnalysis analysis, string name) -> StructType throws {
@@ -155,7 +168,7 @@ public classNamed(ProgramAnalysis analysis, string name) -> ClassType throws {
 // Synthesizes one class's destructor, asserts every verifier is satisfied, and returns its dump.
 public destructorDump(string programText, string className) -> string throws {
     let analysis = try analyzeMain(programText);
-    let programIndex = index.buildIndex(analysis);
+    let programIndex = try indexProgram(analysis);
     let classType = try classNamed(analysis, className);
     let synthesized = destructors.synthesize(classType, programIndex, analysis.store());
     if (synthesized == null) {
@@ -185,7 +198,7 @@ public functionNamed(ProgramAnalysis analysis, ProgramIndex index, string name)
 public loweredMethodDump(string programText, string recordName, string methodName)
         -> string throws {
     let analysis = try analyzeMain(programText);
-    let programIndex = index.buildIndex(analysis);
+    let programIndex = try indexProgram(analysis);
     let modules = programIndex.modules();
     for (long m = 0; m < modules.length(); m++) {
         let moduleFunctions = modules.get(m);
@@ -217,7 +230,12 @@ public loweredMethodDump(string programText, string recordName, string methodNam
 // and returns its textual dump.
 public loweredDump(string programText, string functionName) -> string throws {
     let analysis = try analyzeMain(programText);
-    let programIndex = index.buildIndex(analysis);
+    return try loweredLoadedDump(analysis, functionName);
+}
+
+// The same over an already analyzed program, for tests that load several modules.
+public loweredLoadedDump(ProgramAnalysis analysis, string functionName) -> string throws {
+    let programIndex = try indexProgram(analysis);
     let info = try functionNamed(analysis, programIndex, functionName);
     let outcome = lower.lowerFunction(info, programIndex, vtables.assignSlots(programIndex),
         analysis.store());
@@ -231,6 +249,41 @@ public loweredDump(string programText, string functionName) -> string throws {
     }
     try assertVerified(function, functionName);
     return dump.dumpFunction(function);
+}
+
+// Lowers the function with the given linker symbol - the way a generic instance is named - and
+// returns its dump after all three verifiers accept it.
+public loweredSymbolDump(string programText, string symbol) -> string throws {
+    let analysis = try analyzeMain(programText);
+    return try loweredLoadedSymbolDump(analysis, symbol);
+}
+
+// The same over an already analyzed program.
+public loweredLoadedSymbolDump(ProgramAnalysis analysis, string symbol) -> string throws {
+    let programIndex = try indexProgram(analysis);
+    let modules = programIndex.modules();
+    for (long m = 0; m < modules.length(); m++) {
+        let moduleFunctions = modules.get(m);
+        for (long i = 0; i < moduleFunctions.functions().length(); i++) {
+            let info = moduleFunctions.functions().get(i);
+            if (info.symbol() != symbol) {
+                continue;
+            }
+            let outcome = lower.lowerFunction(info, programIndex,
+                vtables.assignSlots(programIndex), analysis.store());
+            let function = outcome.function();
+            if (function == null) {
+                string reason = "no diagnostics";
+                if (outcome.diagnostics().length > 0) {
+                    reason = outcome.diagnostics()[0].message();
+                }
+                throw new TestFailure("lowering '{symbol}' failed: {reason}");
+            }
+            try assertVerified(function, symbol);
+            return dump.dumpFunction(function);
+        }
+    }
+    throw new TestFailure("no lowerable function with symbol '{symbol}'");
 }
 
 // Asserts the three verifiers accept a lowered function, showing the dump when one does not.
@@ -255,7 +308,7 @@ assertVerified(EirFunction function, string described) throws {
 // Lowers one function expecting failure, and returns the first diagnostic's message.
 public loweringFailure(string programText, string functionName) -> string throws {
     let analysis = try analyzeMain(programText);
-    let programIndex = index.buildIndex(analysis);
+    let programIndex = try indexProgram(analysis);
     let info = try functionNamed(analysis, programIndex, functionName);
     let outcome = lower.lowerFunction(info, programIndex, vtables.assignSlots(programIndex),
         analysis.store());

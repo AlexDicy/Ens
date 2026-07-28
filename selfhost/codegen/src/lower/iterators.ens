@@ -1,0 +1,208 @@
+// 'for (x in value)' over an object: the value's 'makeIterator()' runs once, then 'hasNext()'
+// gates each pass and 'next()' yields the element. Resolution is structural over the checked
+// types, the way the reference compiler lowers it - sema already proved the value iterable - so
+// a class receiver finds the three methods down its chain and dispatches through its vtable
+// where an override forces it, while an interface-typed receiver reads them from the interface's
+// own method table.
+//
+// The iterator lives in a slot the loop's scope owns; each 'next()' result lands in the element
+// binding's slot through the ordinary store barrier, which gives up the previous element first.
+import ForEachStatementNode from @ens.frontend.syntax.generated.nodes;
+import Span from @ens.frontend.support.source;
+import Method from @ens.sema.model.types;
+import PrimitiveKind from @ens.sema.model.types;
+import Type from @ens.sema.model.types;
+import @ens.sema.model.types;
+import EirBranch from eir.model;
+import EirJump from eir.model;
+import EirLoadSlot from eir.model;
+import FunctionInfo from lower.index;
+import LoweringContext from lower.context;
+import lower.calls;
+import lower.classes;
+import lower.conversions;
+import lower.ownership;
+import lower.statements;
+import lower.stores;
+import support.primitives;
+
+// One resolved iteration method: the entry to call and how to dispatch it.
+final class IterationCall {
+    protected FunctionInfo info;
+    protected Method method;
+    protected long dispatchSlot;
+    protected Type? dispatchInterface;
+
+    protected constructor(this.info, this.method, this.dispatchSlot, this.dispatchInterface);
+}
+
+public lowerForEach(LoweringContext lowering, ForEachStatementNode loop, Type iterableType) {
+    if (!primitives.isClassLike(iterableType) || primitives.isOptionalType(iterableType)) {
+        lowering.unsupported("iterating '{types.display(iterableType)}'", loop.span());
+        return;
+    }
+    let makeIterator = resolveCall(lowering, iterableType, "makeIterator", loop.span());
+    if (makeIterator == null) {
+        return;
+    }
+    let iteratorType = makeIterator.method.signature().returnType();
+    let hasNext = resolveCall(lowering, iteratorType, "hasNext", loop.span());
+    let next = resolveCall(lowering, iteratorType, "next", loop.span());
+    if (hasNext == null || next == null) {
+        return;
+    }
+    let binding = lowering.result().bindingOf(loop.green());
+    if (binding == null) {
+        lowering.internalError("the loop variable '{loop.name().text()}' has no binding",
+            loop.name().span());
+        return;
+    }
+    let bindingType = lowering.substituted(binding.type());
+    if (!lowering.supportsValueType(bindingType)) {
+        lowering.unsupported("a loop variable of type '{types.display(bindingType)}'",
+            loop.name().span());
+        return;
+    }
+    let builder = lowering.builder();
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    long receiver = classes.borrowedReference(lowering, loop.iterable(), iterableType);
+    if (receiver < 0) {
+        return;
+    }
+    long iterator = calls.emitCall(lowering, makeIterator.info, iterableType, receiver, [],
+        makeIterator.dispatchSlot, makeIterator.dispatchInterface);
+    if (iterator < 0) {
+        return;
+    }
+    long iteratorSlot = builder.addSlot("iterator", iteratorType, true, false);
+    if (!stores.initializeSlot(lowering, iteratorSlot, iteratorType,
+            new stores.Operand(iterator, true, -1))) {
+        return;
+    }
+    ownership.trackSlot(lowering, iteratorSlot, iteratorType);
+    long elementSlot = lowering.defineSlot(binding, binding.name(), bindingType);
+    ownership.trackSlot(lowering, elementSlot, bindingType);
+    long conditionBlock = builder.newBlock("foreach.cond");
+    long bodyBlock = builder.newBlock("foreach.body");
+    long exitBlock = builder.newBlock("foreach.end");
+    builder.terminate(new EirJump(conditionBlock));
+    builder.moveTo(conditionBlock);
+    long conditionIterator = builder.newTemp(iteratorType);
+    builder.append(new EirLoadSlot(conditionIterator, iteratorType, iteratorSlot));
+    long more = calls.emitCall(lowering, hasNext.info, iteratorType, conditionIterator, [],
+        hasNext.dispatchSlot, hasNext.dispatchInterface);
+    if (more < 0) {
+        return;
+    }
+    builder.terminate(new EirBranch(more, bodyBlock, exitBlock));
+    builder.moveTo(bodyBlock);
+    long bodyIterator = builder.newTemp(iteratorType);
+    builder.append(new EirLoadSlot(bodyIterator, iteratorType, iteratorSlot));
+    long element = calls.emitCall(lowering, next.info, iteratorType, bodyIterator, [],
+        next.dispatchSlot, next.dispatchInterface);
+    if (element < 0) {
+        return;
+    }
+    long converted = conversions.convert(lowering, element, bindingType, loop.name().span());
+    if (converted < 0) {
+        return;
+    }
+    if (!stores.assignSlot(lowering, elementSlot, bindingType,
+            new stores.Operand(converted, true, -1))) {
+        return;
+    }
+    lowering.pushLoop(exitBlock, conditionBlock);
+    statements.lowerBlock(lowering, loop.body());
+    if (!lowering.failed() && !builder.terminated()) {
+        builder.terminate(new EirJump(conditionBlock));
+    }
+    lowering.popLoop();
+    if (lowering.failed()) {
+        return;
+    }
+    builder.moveTo(exitBlock);
+}
+
+// Finds one zero-parameter iteration method on the receiver's type and decides its dispatch: an
+// interface receiver reads the method table entry, a class receiver takes the vtable slot its
+// override discipline assigned, or calls directly when nothing forces the indirection.
+resolveCall(LoweringContext lowering, Type receiverType, string name, Span span)
+        -> IterationCall? {
+    let interfaceType = primitives.interfaceOf(receiverType);
+    if (interfaceType != null) {
+        let found = zeroArgumentMethod(interfaceType, name);
+        if (found == null) {
+            lowering.internalError("'{types.display(receiverType)}' declares no '{name}()' to "
+                + "iterate with", span);
+            return null;
+        }
+        let info = lowering.index().infoFor(found.signature());
+        if (info == null) {
+            lowering.internalError("the iteration method "
+                + "'{types.display(receiverType)}.{name}' resolves to no indexed function",
+                span);
+            return null;
+        }
+        if (!calls.supportedDispatchTarget(lowering, info,
+                "iteration method '{types.display(receiverType)}.{name}'", span)) {
+            return null;
+        }
+        long slot = lowering.tables().itableSlotOf(found.signature());
+        if (slot < 0) {
+            lowering.internalError("the iteration method "
+                + "'{types.display(receiverType)}.{name}' has no slot in its method table",
+                span);
+            return null;
+        }
+        return new IterationCall(info, found, slot, interfaceType);
+    }
+    let classType = primitives.classOf(receiverType);
+    if (classType == null || !lowering.supportsClassLayout(classType)) {
+        lowering.unsupported("iterating '{types.display(receiverType)}'", span);
+        return null;
+    }
+    Type? current = classType;
+    while (current != null) {
+        let found = zeroArgumentMethod(current, name);
+        if (found != null) {
+            let info = lowering.index().infoFor(found.signature());
+            if (info == null) {
+                lowering.internalError("the iteration method "
+                    + "'{types.display(current)}.{name}' resolves to no indexed function", span);
+                return null;
+            }
+            long slot = lowering.tables().vtableSlotOf(found.signature());
+            if (slot >= 0) {
+                if (!calls.supportedDispatchTarget(lowering, info,
+                        "iteration method '{types.display(current)}.{name}'", span)) {
+                    return null;
+                }
+            } else if (!calls.supportedCallee(lowering, info,
+                    "iteration method '{types.display(current)}.{name}'", span)) {
+                return null;
+            }
+            return new IterationCall(info, found, slot, null);
+        }
+        current = types.baseOf(current);
+    }
+    lowering.internalError("'{types.display(receiverType)}' declares no '{name}()' to iterate "
+        + "with", span);
+    return null;
+}
+
+zeroArgumentMethod(Type owner, string name) -> Method? {
+    let methods = types.methodsOf(owner);
+    if (methods == null) {
+        return null;
+    }
+    for (long i = 0; i < methods.length(); i++) {
+        let method = methods.get(i);
+        if (method.isConstructor() || method.isDestructor() || method.name() != name) {
+            continue;
+        }
+        if (method.signature().parameters().length == 0) {
+            return method;
+        }
+    }
+    return null;
+}
