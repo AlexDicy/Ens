@@ -3231,13 +3231,13 @@ struct CodeGenerator::Impl {
 
     bool isCoreModule() const { return modulePath == kCoreModulePath; }
 
-    // Error.getStackTrace()/getStackFrames() are recognized at the call site and lowered
+    // Error.stackTrace()/stackFrames() are recognized at the call site and lowered
     // to the runtime; their bodies in @std.core are placeholders and never emitted.
     bool isInterceptedTraceMethod(Symbol* sym) const {
         if (!sym || !sym->methodOwner) return false;
         if (sym->methodOwner->name != u"Error" ||
             sym->methodOwner->modulePath != kCoreModulePath) return false;
-        return sym->name == u"getStackTrace" || sym->name == u"getStackFrames";
+        return sym->name == u"stackTrace" || sym->name == u"stackFrames";
     }
 
     // std.ffi.fromCString is recognized at the call site and lowered to a strlen-and-copy of the
@@ -7007,7 +7007,7 @@ struct CodeGenerator::Impl {
                     builder->CreateGEP(llvm::Type::getInt8Ty(ctx), recv,
                         llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), 8)), "frames");
                 return builder->CreateCall(
-                    methodSym->name == u"getStackTrace" ? formatTraceFn() : symbolicateFn(),
+                    methodSym->name == u"stackTrace" ? formatTraceFn() : symbolicateFn(),
                     { frames }, "trace.result");
             }
             if (methodSym) {

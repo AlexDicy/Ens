@@ -87,6 +87,9 @@ Ens code (selfhost, libs, tests):
 - Group related fields with no blank lines inside a group, one blank line between groups.
 - Soft 100-column limit; prefer `switch` over if/else chains when dispatching on one value.
 - Full words for identifiers; American English everywhere.
+- No `get` prefix on a method that always returns a value: `stackTrace()`, not `getStackTrace()`.
+  Keep the prefix only where the thing asked for may legitimately not be there, which the return type shows: `system.getEnvironmentVariable(name) -> string?`.
+  The `ens.llvm` binding is exempt because its names mirror the C API it wraps.
 - Programs and libraries split into `src/` plus a sibling `tests/` folder (`ens test <package folder>` runs them); library sources must not define `main()`.
 
 C++ code: match the surrounding style of the file you are in.

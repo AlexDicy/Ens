@@ -745,7 +745,7 @@ std::u16string buildRunnerSource(const std::vector<DiscoveredTest>& tests) {
         appendAscii(out, ");\n    fflush(null);\n    return true;\n} catch (Error e) {\n    print(\"FAIL \" + ");
         out += t.rawLiteral;
         appendAscii(out, " + \": \" + e.message);\n"
-                         "    for (let frame in e.getStackFrames()) {\n"
+                         "    for (let frame in e.stackFrames()) {\n"
                          "        if (frame.file == \"$ens_test_runner.ens\") { break; }\n"
                          "        print(\"  at \" + frame.function + \" (\" + frame.file + \":\" + frame.line + \")\");\n"
                          "    }\n"
