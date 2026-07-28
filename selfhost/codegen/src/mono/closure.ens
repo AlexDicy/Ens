@@ -1,0 +1,453 @@
+// The monomorphization closure, the pipeline's first stage. Starting from the program's concrete
+// code - every module's checked tree - it walks each body's instantiation requests, assigns every
+// concrete generic instantiation and generic function instance exactly one home module (the
+// module declaring its template), and cascades through the template bodies each discovery brings
+// in, to a fixpoint. The result is a deterministic plan: which instances exist, where each one's
+// single definition lives, and the work list each home module lowers and emits. Every other
+// module references an instance's symbols as external declarations, so module emission order can
+// never matter and no re-emission pass exists.
+//
+// Discovery depth is capped: a chain that only ever deepens is a polymorphically recursive
+// generic, which can never finish instantiating.
+import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import GreenNode from @ens.frontend.syntax.green;
+import SyntaxNode from @ens.frontend.syntax.node;
+import Span from @ens.frontend.support.source;
+import @ens.frontend.support.source;
+import ModuleContext from @ens.sema.context;
+import ProgramAnalysis from @ens.sema.pipeline;
+import SemaResult from @ens.sema.result;
+import FileDiagnostic from @ens.sema.support.diagnostics;
+import ArrayType from @ens.sema.model.types;
+import ClassType from @ens.sema.model.types;
+import InstantiationType from @ens.sema.model.types;
+import InterfaceType from @ens.sema.model.types;
+import Method from @ens.sema.model.types;
+import OptionalType from @ens.sema.model.types;
+import Signature from @ens.sema.model.types;
+import StructType from @ens.sema.model.types;
+import Type from @ens.sema.model.types;
+import TypeStore from @ens.sema.model.types;
+import @ens.sema.model.types;
+import BodyRequests from mono.requests;
+import CallRequest from mono.requests;
+import mono.requests;
+import Substitution from mono.substitution;
+import mono.substitution;
+import FunctionInfo from lower.index;
+import ModuleFunctions from lower.index;
+import ProgramIndex from lower.index;
+import RecordInfo from lower.index;
+import lower.index;
+import lower.symbols;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+import Set from @std.collections.set;
+
+// One reached instantiation and the module that owns its definition.
+public final class PlannedInstantiation {
+    InstantiationType plannedType;
+    ModuleContext homeContext;
+    RecordInfo? templateRecord;
+
+    public constructor(this.plannedType, this.homeContext, this.templateRecord);
+
+    public type() -> InstantiationType {
+        return this.plannedType;
+    }
+
+    public home() -> ModuleContext {
+        return this.homeContext;
+    }
+
+    public record() -> RecordInfo? {
+        return this.templateRecord;
+    }
+}
+
+// One generic function instance: the template it specializes, the concrete arguments, and the
+// entry the home module lowers.
+public final class PlannedFunctionInstance {
+    Signature templateSignature;
+    Type[] instanceArguments;
+    FunctionInfo instanceInfo;
+
+    public constructor(this.templateSignature, this.instanceArguments, this.instanceInfo);
+
+    public template() -> Signature {
+        return this.templateSignature;
+    }
+
+    public arguments() -> Type[] {
+        return this.instanceArguments;
+    }
+
+    public info() -> FunctionInfo {
+        return this.instanceInfo;
+    }
+}
+
+public final class MonoPlan {
+    List<FileDiagnostic> planProblems;
+    List<PlannedInstantiation> plannedInstantiations;
+    List<FunctionInfo> plannedMembers;
+    List<PlannedFunctionInstance> plannedFunctions;
+
+    public constructor() {
+        this.planProblems = new List<FileDiagnostic>();
+        this.plannedInstantiations = new List<PlannedInstantiation>();
+        this.plannedMembers = new List<FunctionInfo>();
+        this.plannedFunctions = new List<PlannedFunctionInstance>();
+    }
+
+    public problems() -> List<FileDiagnostic> {
+        return this.planProblems;
+    }
+
+    public instantiations() -> List<PlannedInstantiation> {
+        return this.plannedInstantiations;
+    }
+
+    // The methods of every planned instantiation, in discovery order.
+    public members() -> List<FunctionInfo> {
+        return this.plannedMembers;
+    }
+
+    public functions() -> List<PlannedFunctionInstance> {
+        return this.plannedFunctions;
+    }
+}
+
+// Computes the plan for an analyzed program over its concrete index.
+public close(ProgramAnalysis analysis, ProgramIndex index) -> MonoPlan {
+    let closure = new Closure(analysis, index);
+    return closure.run();
+}
+
+// Registers the plan's work into the index: each instantiation joins its home module, each
+// instance function becomes resolvable at its call sites, and each entry with a body joins its
+// home module's lowering list.
+public apply(MonoPlan plan, ProgramIndex index) {
+    let modulesByContext = new Map<ModuleContext, ModuleFunctions>();
+    let modules = index.modules();
+    for (long m = 0; m < modules.length(); m++) {
+        modulesByContext.set(modules.get(m).context(), modules.get(m));
+    }
+    for (long i = 0; i < plan.instantiations().length(); i++) {
+        let planned = plan.instantiations().get(i);
+        let home = modulesByContext.get(planned.home());
+        if (home != null) {
+            home.instantiations().push(planned.type());
+        }
+        let record = planned.record();
+        if (record != null) {
+            index.registerRecord(planned.type(), record);
+        }
+    }
+    for (long i = 0; i < plan.members().length(); i++) {
+        let member = plan.members().get(i);
+        index.register(member.signature(), member);
+        let declaration = member.declaration();
+        bool lowerable = member.isConstructor()
+            || (declaration != null && declaration.body() != null);
+        if (lowerable) {
+            let home = modulesByContext.get(member.context());
+            if (home != null) {
+                home.functions().push(member);
+            }
+        }
+    }
+    for (long i = 0; i < plan.functions().length(); i++) {
+        let planned = plan.functions().get(i);
+        index.registerFunctionInstance(planned.template(), planned.arguments(),
+            planned.info());
+        let home = modulesByContext.get(planned.info().context());
+        if (home != null) {
+            home.functions().push(planned.info());
+        }
+    }
+}
+
+// A generic function instance under construction is identified by template and arguments.
+class InstanceKey {
+    Signature keyTemplate;
+    Type[] keyArguments;
+
+    protected constructor(Signature template, Type[] arguments) {
+        this.keyTemplate = template;
+        this.keyArguments = arguments;
+    }
+
+    override hash() -> long {
+        long combined = this.keyTemplate.hash();
+        for (let argument in this.keyArguments) {
+            combined = combined * 31 + argument.hash();
+        }
+        return combined;
+    }
+
+    override equals(InstanceKey other) -> bool {
+        if (this.keyTemplate != other.keyTemplate) {
+            return false;
+        }
+        if (this.keyArguments.length != other.keyArguments.length) {
+            return false;
+        }
+        for (long i = 0; i < this.keyArguments.length; i++) {
+            if (this.keyArguments[i] != other.keyArguments[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+final class Closure {
+    ProgramAnalysis analysis;
+    ProgramIndex index;
+    TypeStore store;
+    MonoPlan plan;
+    Map<string, ModuleContext> contextsByPath;
+    Set<InstantiationType> seenInstantiations;
+    Set<InstanceKey> seenFunctions;
+    Set<GreenNode> reportedOverflows;
+    Map<GreenNode, BodyRequests> requestCache;
+
+    protected constructor(ProgramAnalysis analysis, ProgramIndex index) {
+        this.analysis = analysis;
+        this.index = index;
+        this.store = analysis.store();
+        this.plan = new MonoPlan();
+        this.contextsByPath = new Map<string, ModuleContext>();
+        this.seenInstantiations = new Set<InstantiationType>();
+        this.seenFunctions = new Set<InstanceKey>();
+        this.reportedOverflows = new Set<GreenNode>();
+        this.requestCache = new Map<GreenNode, BodyRequests>();
+    }
+
+    protected run() -> MonoPlan {
+        let contexts = this.analysis.contexts();
+        for (long i = 0; i < contexts.length(); i++) {
+            this.contextsByPath.set(contexts.get(i).module().canonicalPath(), contexts.get(i));
+        }
+        for (long i = 0; i < contexts.length(); i++) {
+            let context = contexts.get(i);
+            let root = context.root();
+            if (root == null) {
+                continue;
+            }
+            this.harvest(this.requestsFor(context.result(), root), null, 0);
+        }
+        return this.plan;
+    }
+
+    requestsFor(SemaResult result, SyntaxNode root) -> BodyRequests {
+        let cached = this.requestCache.get(root.green());
+        if (cached != null) {
+            return cached;
+        }
+        let scanned = requests.collect(result, root);
+        this.requestCache.set(root.green(), scanned);
+        return scanned;
+    }
+
+    // Applies the scan's raw requests under one substitution. With none - the whole-file walk
+    // over concrete code - a request that still mentions a type parameter belongs to a template
+    // body and is served per instance instead.
+    harvest(BodyRequests found, Substitution? active, long depth) {
+        let mentioned = found.types();
+        for (long i = 0; i < mentioned.length(); i++) {
+            this.requestType(substitution.apply(this.store, active, mentioned.get(i)), depth);
+        }
+        let calls = found.calls();
+        for (long i = 0; i < calls.length(); i++) {
+            let call = calls.get(i);
+            Type[] arguments = substitution.applyAll(this.store, active, call.arguments());
+            bool open = false;
+            for (let argument in arguments) {
+                if (substitution.containsTypeParameter(argument)) {
+                    open = true;
+                }
+            }
+            if (open) {
+                continue;
+            }
+            this.requestFunction(call, arguments, depth);
+        }
+    }
+
+    // Requests every concrete instantiation a type mentions, including the arguments of an
+    // instantiation that is itself still open.
+    requestType(Type type, long depth) {
+        switch (type) {
+            is OptionalType optional -> {
+                this.requestType(optional.inner(), depth);
+            },
+            is ArrayType array -> {
+                this.requestType(array.element(), depth);
+            },
+            is InstantiationType instantiation -> {
+                if (!substitution.containsTypeParameter(instantiation)) {
+                    this.requestInstantiation(instantiation, depth);
+                }
+                for (let argument in instantiation.arguments()) {
+                    this.requestType(argument, depth);
+                }
+            },
+            default -> { },
+        }
+    }
+
+    requestInstantiation(InstantiationType instantiation, long depth) {
+        if (!this.seenInstantiations.add(instantiation)) {
+            return;
+        }
+        let template = instantiation.template();
+        if (depth > cascadeLimit()) {
+            this.reportOverflow(template.declaration(), template.name(), template.filePath(),
+                source.makeSpan(0, 0));
+            return;
+        }
+        let home = this.contextsByPath.get(template.modulePath());
+        if (home == null) {
+            this.plan.problems().push(new FileDiagnostic(template.filePath(),
+                "Internal: the instantiation '{types.display(instantiation)}' has no home "
+                + "module: '{template.modulePath()}' is not part of the program.",
+                source.makeSpan(0, 0)));
+            return;
+        }
+        RecordInfo? record = this.index.recordFor(template);
+        this.plan.instantiations().push(new PlannedInstantiation(instantiation, home, record));
+        if (template is InterfaceType) {
+            this.planMethods(instantiation, template.methods(), home, null, depth);
+            return;
+        }
+        if (template is ClassType) {
+            this.planRecordInstantiation(instantiation, template.methods(), home, record,
+                depth);
+        } else if (template is StructType) {
+            this.planRecordInstantiation(instantiation, template.methods(), home, record,
+                depth);
+        }
+        let base = types.baseOf(instantiation);
+        if (base != null) {
+            this.requestType(base, depth + 1);
+        }
+        for (let implemented in types.interfacesOf(instantiation)) {
+            this.requestType(implemented, depth + 1);
+        }
+        let fields = types.fieldsOf(instantiation);
+        if (fields != null) {
+            for (long i = 0; i < fields.length(); i++) {
+                this.requestType(fields.get(i).type(), depth + 1);
+            }
+        }
+    }
+
+    planRecordInstantiation(InstantiationType instantiation, List<Method> templateMethods,
+                            ModuleContext home, RecordInfo? record, long depth) {
+        if (record == null) {
+            this.plan.problems().push(new FileDiagnostic(
+                instantiation.template().filePath(),
+                "Internal: the template of '{types.display(instantiation)}' has no indexed "
+                + "member list.", source.makeSpan(0, 0)));
+            return;
+        }
+        this.planMethods(instantiation, templateMethods, home, record, depth);
+        this.harvest(this.requestsFor(record.context().result(), record.members()),
+            substitution.forInstantiation(instantiation), depth + 1);
+    }
+
+    // Builds the instance entry of every method, parallel to the template's list so each takes
+    // its body from the matching template declaration. Passing no record plans an interface's
+    // methods, which have no bodies and serve call resolution only.
+    planMethods(InstantiationType instantiation, List<Method> templateMethods,
+                ModuleContext home, RecordInfo? record, long depth) {
+        Map<GreenNode, FunctionDeclarationNode> declarations =
+            new Map<GreenNode, FunctionDeclarationNode>();
+        if (record != null) {
+            declarations = index.redMemberDeclarations(record.members());
+        }
+        let instanceMethods = instantiation.methods();
+        let active = substitution.forInstantiation(instantiation);
+        for (long i = 0; i < instanceMethods.length(); i++) {
+            let method = instanceMethods.get(i);
+            if (i >= templateMethods.length()) {
+                break;
+            }
+            let templateMethod = templateMethods.get(i);
+            let signature = method.signature();
+            FunctionDeclarationNode? declaration = null;
+            let declarationGreen = signature.declaration();
+            if (declarationGreen != null) {
+                declaration = declarations.get(declarationGreen);
+            }
+            string symbol = symbols.instanceMethodLinkName(instantiation, method.name(),
+                templateMethod.signature(),
+                overloadedIn(instanceMethods, method.name()));
+            let info = new FunctionInfo(home, signature, method.visibility(), false, false,
+                instantiation, method, declaration, symbol, active);
+            this.plan.members().push(info);
+            for (let parameter in signature.parameters()) {
+                this.requestType(parameter.type(), depth + 1);
+            }
+            this.requestType(signature.returnType(), depth + 1);
+        }
+    }
+
+    requestFunction(CallRequest call, Type[] arguments, long depth) {
+        if (!this.seenFunctions.add(new InstanceKey(call.callee(), arguments))) {
+            return;
+        }
+        let templateInfo = this.index.infoFor(call.callee());
+        if (templateInfo == null || templateInfo.isBuiltin() || templateInfo.isExternal()) {
+            return;
+        }
+        let declaration = templateInfo.declaration();
+        let owner = call.callee().declaration();
+        if (declaration == null || owner == null) {
+            this.plan.problems().push(new FileDiagnostic(
+                templateInfo.context().module().filePath(),
+                "Internal: the generic function '{call.callee().name()}' has no declaration "
+                + "to instantiate.", call.callee().nameSpan()));
+            return;
+        }
+        if (depth > cascadeLimit()) {
+            this.reportOverflow(owner, call.callee().name(),
+                templateInfo.context().module().filePath(), call.callee().nameSpan());
+            return;
+        }
+        let home = templateInfo.context();
+        string symbol = symbols.genericInstanceLinkName(home.module().canonicalPath(),
+            call.callee().name(), arguments);
+        let active = substitution.forFunction(owner, arguments);
+        let info = new FunctionInfo(home, call.callee(), templateInfo.visibility(), false,
+            false, null, null, declaration, symbol, active);
+        this.plan.functions().push(new PlannedFunctionInstance(call.callee(), arguments,
+            info));
+        this.harvest(this.requestsFor(home.result(), declaration), active, depth + 1);
+    }
+
+    reportOverflow(GreenNode declaration, string name, string filePath, Span span) {
+        if (!this.reportedOverflows.add(declaration)) {
+            return;
+        }
+        this.plan.problems().push(new FileDiagnostic(filePath,
+            "Instantiating '{name}' never finishes: each call needs a deeper instantiation. "
+            + "Break the recursive type argument.", span));
+    }
+}
+
+overloadedIn(List<Method> methods, string name) -> bool {
+    long seen = 0;
+    for (long i = 0; i < methods.length(); i++) {
+        if (methods.get(i).name() == name) {
+            seen++;
+        }
+    }
+    return seen > 1;
+}
+
+cascadeLimit() -> long {
+    return 200;
+}

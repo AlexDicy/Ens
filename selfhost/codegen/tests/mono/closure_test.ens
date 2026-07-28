@@ -1,0 +1,243 @@
+// The monomorphization closure: which instances a program reaches, the one home module each
+// instantiation gets, the adopted instantiation mangling, and the cascade through generic bodies
+// that only turn concrete when another module instantiates them.
+import @std.testing;
+import MemoryFileLoader from support;
+import support;
+import @ens.sema.model.types;
+import MonoPlan from mono.closure;
+import PlannedFunctionInstance from mono.closure;
+import PlannedInstantiation from mono.closure;
+import mono.closure;
+import FunctionInfo from lower.index;
+import lower.index;
+
+planFor(string text) -> MonoPlan throws {
+    let analysis = try support.analyzeMain(text);
+    let programIndex = index.buildIndex(analysis);
+    return closure.close(analysis, programIndex);
+}
+
+planForLoaded(MemoryFileLoader loader) -> MonoPlan throws {
+    let analysis = try support.analyzeLoaded(loader);
+    let programIndex = index.buildIndex(analysis);
+    return closure.close(analysis, programIndex);
+}
+
+functionInstanceNamed(MonoPlan plan, string symbol) -> PlannedFunctionInstance? {
+    for (long i = 0; i < plan.functions().length(); i++) {
+        if (plan.functions().get(i).info().symbol() == symbol) {
+            return plan.functions().get(i);
+        }
+    }
+    return null;
+}
+
+memberNamed(MonoPlan plan, string symbol) -> FunctionInfo? {
+    for (long i = 0; i < plan.members().length(); i++) {
+        if (plan.members().get(i).symbol() == symbol) {
+            return plan.members().get(i);
+        }
+    }
+    return null;
+}
+
+instantiationDisplayed(MonoPlan plan, string displayed) -> PlannedInstantiation? {
+    for (long i = 0; i < plan.instantiations().length(); i++) {
+        if (types.display(plan.instantiations().get(i).type()) == displayed) {
+            return plan.instantiations().get(i);
+        }
+    }
+    return null;
+}
+
+assertClean(MonoPlan plan) throws {
+    if (plan.problems().length() > 0) {
+        try testing.fail("the closure reported: " + plan.problems().get(0).message());
+    }
+}
+
+test "a generic function called at two types plans two instances in its module" {
+    let plan = try planFor(
+        "identity<T>(T value) -> T \{\n"
+        + "    return value;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let ignored = identity<string>(\"x\");\n"
+        + "    return identity<int>(0);\n"
+        + "\}\n");
+    try assertClean(plan);
+    try testing.assertEqual(plan.functions().length(), 2);
+    let intInstance = functionInstanceNamed(plan, "main$identity__int__");
+    let stringInstance = functionInstanceNamed(plan, "main$identity__string__");
+    try testing.assertTrue(intInstance != null, "no instance 'main$identity__int__'");
+    try testing.assertTrue(stringInstance != null, "no instance 'main$identity__string__'");
+    if (intInstance != null) {
+        try testing.assertEqual(intInstance.info().context().module().canonicalPath(), "main");
+        try testing.assertTrue(!intInstance.info().internalLinkage(),
+            "an instance must have external linkage");
+    }
+}
+
+test "a concrete instance discovered only through another module's cascade is planned in its declaring module" {
+    let loader = new MemoryFileLoader();
+    loader.add("/src/leaf.ens",
+        "public identity<T>(T value) -> T \{\n"
+        + "    return value;\n"
+        + "\}\n");
+    loader.add("/src/zsink.ens",
+        "public sink<T>(T value) -> T \{\n"
+        + "    return value;\n"
+        + "\}\n");
+    loader.add("/src/relay.ens",
+        "import leaf;\n"
+        + "import zsink;\n"
+        + "public relay<T>(T value) -> T \{\n"
+        + "    T once = leaf.identity<T>(value);\n"
+        + "    return zsink.sink<T>(once);\n"
+        + "\}\n");
+    loader.add("/src/main.ens",
+        "import relay;\n"
+        + "main() -> int \{\n"
+        + "    return relay.relay<int>(30);\n"
+        + "\}\n");
+    let plan = try planForLoaded(loader);
+    try assertClean(plan);
+    let relayInstance = functionInstanceNamed(plan, "relay$relay__int__");
+    let leafInstance = functionInstanceNamed(plan, "leaf$identity__int__");
+    let sinkInstance = functionInstanceNamed(plan, "zsink$sink__int__");
+    try testing.assertTrue(relayInstance != null, "no instance 'relay$relay__int__'");
+    try testing.assertTrue(leafInstance != null, "no instance 'leaf$identity__int__'");
+    try testing.assertTrue(sinkInstance != null, "no instance 'zsink$sink__int__'");
+    if (leafInstance != null) {
+        try testing.assertEqual(leafInstance.info().context().module().canonicalPath(), "leaf");
+    }
+    if (sinkInstance != null) {
+        try testing.assertEqual(sinkInstance.info().context().module().canonicalPath(),
+            "zsink");
+    }
+}
+
+test "a generic class used from two modules is planned once, homed where it is declared" {
+    let loader = new MemoryFileLoader();
+    loader.add("/src/box.ens",
+        "public class Box<T> \{\n"
+        + "    T inner;\n"
+        + "    public constructor(this.inner);\n"
+        + "    public unwrap() -> T \{\n"
+        + "        return this.inner;\n"
+        + "    \}\n"
+        + "\}\n");
+    loader.add("/src/other.ens",
+        "import Box from box;\n"
+        + "public otherBox() -> int \{\n"
+        + "    return new Box<int>(2).unwrap();\n"
+        + "\}\n");
+    loader.add("/src/main.ens",
+        "import Box from box;\n"
+        + "import other;\n"
+        + "main() -> int \{\n"
+        + "    return new Box<int>(1).unwrap() + other.otherBox();\n"
+        + "\}\n");
+    let plan = try planForLoaded(loader);
+    try assertClean(plan);
+    let planned = instantiationDisplayed(plan, "Box<int>");
+    try testing.assertTrue(planned != null, "'Box<int>' is not planned");
+    if (planned != null) {
+        try testing.assertEqual(planned.home().module().canonicalPath(), "box");
+    }
+    long boxCount = 0;
+    for (long i = 0; i < plan.instantiations().length(); i++) {
+        if (types.display(plan.instantiations().get(i).type()) == "Box<int>") {
+            boxCount++;
+        }
+    }
+    try testing.assertEqual(boxCount, 1);
+    let constructorInfo = memberNamed(plan, "Box__int___constructor");
+    let unwrapInfo = memberNamed(plan, "Box__int___unwrap");
+    try testing.assertTrue(constructorInfo != null, "no member 'Box__int___constructor'");
+    try testing.assertTrue(unwrapInfo != null, "no member 'Box__int___unwrap'");
+    if (unwrapInfo != null) {
+        try testing.assertEqual(unwrapInfo.context().module().canonicalPath(), "box");
+        try testing.assertTrue(unwrapInfo.substitution() != null,
+            "an instance method must carry its substitution");
+    }
+}
+
+test "generic bases and nested type arguments join the plan" {
+    let plan = try planFor(
+        "abstract class Source<T> \{\n"
+        + "    protected abstract read() -> T;\n"
+        + "\}\n"
+        + "class Constant<T> extends Source<T> \{\n"
+        + "    T value;\n"
+        + "    protected constructor(this.value);\n"
+        + "    override read() -> T \{\n"
+        + "        return this.value;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Wrapper<T> \{\n"
+        + "    T item;\n"
+        + "    protected constructor(this.item);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Source<int> source = new Constant<int>(5);\n"
+        + "    let nested = new Wrapper<Wrapper<int>>(new Wrapper<int>(1));\n"
+        + "    return source.read();\n"
+        + "\}\n");
+    try assertClean(plan);
+    try testing.assertTrue(instantiationDisplayed(plan, "Constant<int>") != null,
+        "'Constant<int>' is not planned");
+    try testing.assertTrue(instantiationDisplayed(plan, "Source<int>") != null,
+        "the generic base 'Source<int>' is not planned");
+    try testing.assertTrue(instantiationDisplayed(plan, "Wrapper<Wrapper<int>>") != null,
+        "'Wrapper<Wrapper<int>>' is not planned");
+    try testing.assertTrue(instantiationDisplayed(plan, "Wrapper<int>") != null,
+        "the nested argument 'Wrapper<int>' is not planned");
+}
+
+test "a generic body's own instantiations are reached through the instance cascade" {
+    let plan = try planFor(
+        "class Cell<T> \{\n"
+        + "    T kept;\n"
+        + "    protected constructor(this.kept);\n"
+        + "\}\n"
+        + "wrap<T>(T value) -> int \{\n"
+        + "    let cell = new Cell<T>(value);\n"
+        + "    return 1;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return wrap<string>(\"x\");\n"
+        + "\}\n");
+    try assertClean(plan);
+    try testing.assertTrue(functionInstanceNamed(plan, "main$wrap__string__") != null,
+        "no instance 'main$wrap__string__'");
+    try testing.assertTrue(instantiationDisplayed(plan, "Cell<string>") != null,
+        "'Cell<string>' is not planned through the cascade");
+}
+
+test "polymorphic recursion in a generic function reports instead of never finishing" {
+    let plan = try planFor(
+        "class Box<T> \{\n"
+        + "    T inner;\n"
+        + "    protected constructor(this.inner);\n"
+        + "\}\n"
+        + "grow<T>(T value, int steps) -> int \{\n"
+        + "    if (steps <= 0) \{\n"
+        + "        return 0;\n"
+        + "    \}\n"
+        + "    return grow<Box<T>>(new Box<T>(value), steps - 1);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return grow<int>(1, 3);\n"
+        + "\}\n");
+    try testing.assertTrue(plan.problems().length() > 0,
+        "the closure must report the unbounded cascade");
+    bool worded = false;
+    for (long i = 0; i < plan.problems().length(); i++) {
+        if (plan.problems().get(i).message().indexOf("never finishes") >= 0) {
+            worded = true;
+        }
+    }
+    try testing.assertTrue(worded, "the report must say the instantiation never finishes");
+}

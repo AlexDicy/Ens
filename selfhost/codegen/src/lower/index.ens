@@ -24,6 +24,7 @@ import InterfaceDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import MemberListNode from @ens.frontend.syntax.generated.nodes;
 import StructDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import GreenNode from @ens.frontend.syntax.green;
+import Substitution from mono.substitution;
 import lower.symbols;
 import support.primitives;
 import List from @std.collections.list;
@@ -42,10 +43,12 @@ public final class FunctionInfo {
     Method? declaringMethod;
     FunctionDeclarationNode? redDeclaration;
     string linkSymbol;
+    Substitution? instanceSubstitution;
 
     public constructor(ModuleContext context, Signature signature, Visibility visibility,
                 bool isExternal, bool isBuiltin, Type? receiverType, Method? method,
-                FunctionDeclarationNode? declaration, string symbol) {
+                FunctionDeclarationNode? declaration, string symbol,
+                Substitution? substitution = null) {
         this.owningContext = context;
         this.functionSignature = signature;
         this.functionVisibility = visibility;
@@ -55,6 +58,7 @@ public final class FunctionInfo {
         this.declaringMethod = method;
         this.redDeclaration = declaration;
         this.linkSymbol = symbol;
+        this.instanceSubstitution = substitution;
     }
 
     public context() -> ModuleContext {
@@ -100,12 +104,20 @@ public final class FunctionInfo {
         return this.linkSymbol;
     }
 
+    // The type-argument assignment a generic instance lowers its template body under, or null for
+    // ordinary code.
+    public substitution() -> Substitution? {
+        return this.instanceSubstitution;
+    }
+
     // Internal linkage keeps a private function's bare name from colliding across modules. A
     // method is always external: its symbol already carries its module and record, and its
-    // address travels in the dispatch tables other modules' descriptors reference.
+    // address travels in the dispatch tables other modules' descriptors reference. A generic
+    // instance is always external: its home module defines it once for the whole program.
     public internalLinkage() -> bool {
         return this.functionVisibility == Visibility.Private && !this.externalFunction
-            && !this.builtinFunction && this.methodReceiverType == null;
+            && !this.builtinFunction && this.methodReceiverType == null
+            && this.instanceSubstitution == null;
     }
 }
 
@@ -134,12 +146,14 @@ public final class ModuleFunctions {
     List<FunctionInfo> lowerableFunctions;
     List<ClassType> declaredClasses;
     List<InterfaceType> declaredInterfaces;
+    List<Type> homedInstantiations;
 
     public constructor(ModuleContext context) {
         this.owningContext = context;
         this.lowerableFunctions = new List<FunctionInfo>();
         this.declaredClasses = new List<ClassType>();
         this.declaredInterfaces = new List<InterfaceType>();
+        this.homedInstantiations = new List<Type>();
     }
 
     public context() -> ModuleContext {
@@ -157,16 +171,59 @@ public final class ModuleFunctions {
     public interfaces() -> List<InterfaceType> {
         return this.declaredInterfaces;
     }
+
+    // The generic instantiations whose one definition this module owns, because it declares their
+    // templates: their methods, destructors, and descriptors emit here and nowhere else.
+    public instantiations() -> List<Type> {
+        return this.homedInstantiations;
+    }
+}
+
+// One generic function instance, identified by its template's signature and its concrete type
+// arguments; signatures and types are interned, so identity comparison is enough.
+class FunctionInstanceKey {
+    Signature keyTemplate;
+    Type[] keyArguments;
+
+    protected constructor(Signature template, Type[] arguments) {
+        this.keyTemplate = template;
+        this.keyArguments = arguments;
+    }
+
+    override hash() -> long {
+        long combined = this.keyTemplate.hash();
+        for (let argument in this.keyArguments) {
+            combined = combined * 31 + argument.hash();
+        }
+        return combined;
+    }
+
+    override equals(FunctionInstanceKey other) -> bool {
+        if (this.keyTemplate != other.keyTemplate) {
+            return false;
+        }
+        if (this.keyArguments.length != other.keyArguments.length) {
+            return false;
+        }
+        for (long i = 0; i < this.keyArguments.length; i++) {
+            if (this.keyArguments[i] != other.keyArguments[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
 }
 
 public final class ProgramIndex {
     Map<Signature, FunctionInfo> infoBySignature;
+    Map<FunctionInstanceKey, FunctionInfo> instanceByKey;
     Map<Type, RecordInfo> recordByType;
     List<ModuleFunctions> moduleList;
     FunctionInfo? mainInfo;
 
     public constructor() {
         this.infoBySignature = new Map<Signature, FunctionInfo>();
+        this.instanceByKey = new Map<FunctionInstanceKey, FunctionInfo>();
         this.recordByType = new Map<Type, RecordInfo>();
         this.moduleList = new List<ModuleFunctions>();
         this.mainInfo = null;
@@ -174,6 +231,16 @@ public final class ProgramIndex {
 
     public infoFor(Signature signature) -> FunctionInfo? {
         return this.infoBySignature.get(signature);
+    }
+
+    // The planned instance of a generic function at these concrete type arguments, or null when
+    // the monomorphization closure never discovered the combination.
+    public functionInstance(Signature template, Type[] arguments) -> FunctionInfo? {
+        return this.instanceByKey.get(new FunctionInstanceKey(template, arguments));
+    }
+
+    public registerFunctionInstance(Signature template, Type[] arguments, FunctionInfo info) {
+        this.instanceByKey.set(new FunctionInstanceKey(template, arguments), info);
     }
 
     public recordFor(Type recordType) -> RecordInfo? {
@@ -341,7 +408,7 @@ overloadedIn(List<Method> methods, string name) -> bool {
     return seen > 1;
 }
 
-redMemberDeclarations(MemberListNode body) -> Map<GreenNode, FunctionDeclarationNode> {
+public redMemberDeclarations(MemberListNode body) -> Map<GreenNode, FunctionDeclarationNode> {
     let declarations = new Map<GreenNode, FunctionDeclarationNode>();
     for (long i = 0; i < body.membersCount(); i++) {
         let member = body.members(i);
