@@ -1876,12 +1876,16 @@ struct CodeGenerator::Impl {
                                 llvm::Value* fieldAddr = builder->CreateStructGEP(
                                     st, base, static_cast<unsigned>(i), asAscii(fi.name) + ".addr");
                                 bool borrowed = !expressionProducesOwnedRef(*dvExpr);
-                                if (borrowed && isReferenceType(fi.type)) {
-                                    emitRetain(v);
-                                }
-                                builder->CreateStore(v, fieldAddr);
-                                if (borrowed && structHasClassFields(fi.type)) {
-                                    emitStructFieldRetain(fi.type, fieldAddr);
+                                if (fi.isWeak) {
+                                    emitWeakFieldStore(fieldAddr, v, !borrowed);
+                                } else {
+                                    if (borrowed && isReferenceType(fi.type)) {
+                                        emitRetain(v);
+                                    }
+                                    builder->CreateStore(v, fieldAddr);
+                                    if (borrowed && structHasClassFields(fi.type)) {
+                                        emitStructFieldRetain(fi.type, fieldAddr);
+                                    }
                                 }
                                 wrote = true;
                             }
