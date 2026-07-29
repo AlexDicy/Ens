@@ -1,0 +1,150 @@
+// The compile-link-run machinery every verification shares: an analyzed module graph goes
+// through the self-hosted pipeline into object files, the hidden 'ens link-objects' bridge links
+// them, and the program runs with each stream captured into its own scratch file.
+import @std.system;
+import SystemError from @std.system;
+import List from @std.collections.list;
+import FileDiagnostic from @ens.sema.support.diagnostics;
+import GraphResult from @ens.sema.program.graph;
+import ProgramAnalysis from @ens.sema.pipeline;
+import @ens.sema.pipeline;
+import @ens.codegen.driver;
+import Manifest from manifest;
+
+// Compiles the graph through sema and the self-hosted code generator and links the result to
+// '<scratch>/<prefix>.exe'. Returns "" on success, or a description of the first failing step.
+public compileAndLink(Manifest manifest, GraphResult graphResult, string prefix)
+        -> string throws {
+    string upstream = upstreamProblems(graphResult);
+    if (upstream.length > 0) {
+        return upstream;
+    }
+    let analysis = pipeline.analyzeProgram(graphResult);
+    string semaProblems = analysisProblems(analysis);
+    if (semaProblems.length > 0) {
+        return semaProblems;
+    }
+
+    let emitted = driver.emitProgram(analysis, manifest.scratch, prefix + ".");
+    if (!emitted.succeeded()) {
+        return "codegen failed: " + firstDiagnostics(emitted.diagnostics());
+    }
+    if (emitted.objects().length() == 0) {
+        return "codegen produced no object files";
+    }
+
+    string programPath = executablePath(manifest, prefix);
+    string linkCommand = "\"{manifest.ensDriver}\" link-objects";
+    for (long i = 0; i < emitted.objects().length(); i++) {
+        linkCommand = linkCommand + " \"" + emitted.objects().get(i) + "\"";
+    }
+    linkCommand = linkCommand + " --output \"{programPath}\"";
+    long linked = try shellExit(manifest.windowsShell, linkCommand);
+    if (linked != 0) {
+        return "ens link-objects exited {linked}";
+    }
+    if (!system.exists(programPath)) {
+        return "ens link-objects did not write {programPath}";
+    }
+    return "";
+}
+
+public executablePath(Manifest manifest, string prefix) -> string {
+    return manifest.scratch + "/" + prefix + ".exe";
+}
+
+// One program run with each stream captured into its own file, so stdout and stderr are asserted
+// independently the way the reference runner asserts them.
+public class CapturedRun {
+    public long exitCode;
+    public string stdoutText;
+    public string stderrText;
+
+    public constructor(this.exitCode, this.stdoutText, this.stderrText);
+}
+
+public runCaptured(Manifest manifest, string prefix) -> CapturedRun throws {
+    string programPath = executablePath(manifest, prefix);
+    string stdoutPath = manifest.scratch + "/" + prefix + ".stdout";
+    string stderrPath = manifest.scratch + "/" + prefix + ".stderr";
+    long exitCode = try shellExit(manifest.windowsShell,
+        "\"{programPath}\" > \"{stdoutPath}\" 2> \"{stderrPath}\"");
+    return new CapturedRun(exitCode, readOrEmpty(stdoutPath), readOrEmpty(stderrPath));
+}
+
+// Graph or parse diagnostics mean the fixture never reached sema; both are semacheck-level
+// regressions when the C++ compiler accepts the fixture.
+upstreamProblems(GraphResult graphResult) -> string {
+    FileDiagnostic[] graphDiagnostics = graphResult.diagnostics();
+    if (graphDiagnostics.length > 0) {
+        return "the module graph reported {graphDiagnostics.length} problem(s); first: "
+            + graphDiagnostics[0].message();
+    }
+    for (let loaded in graphResult.modules()) {
+        let parseDiagnostics = loaded.parseResult().diagnostics();
+        if (parseDiagnostics.length > 0) {
+            return "{loaded.filePath()} has {parseDiagnostics.length} parse problem(s); "
+                + "first: {parseDiagnostics[0].message()}";
+        }
+    }
+    return "";
+}
+
+// A runnable fixture must be clean through every sema stage; a diagnostic here is a
+// semacheck-level bug, not a codegen failure.
+analysisProblems(ProgramAnalysis analysis) -> string {
+    let merged = new List<FileDiagnostic>();
+    appendAll(merged, analysis.declareDiagnostics());
+    appendAll(merged, analysis.linkDiagnostics());
+    appendAll(merged, analysis.signatureDiagnostics());
+    appendAll(merged, analysis.layoutDiagnostics());
+    appendAll(merged, analysis.checkDiagnostics());
+    appendAll(merged, analysis.bodyDiagnostics());
+    appendAll(merged, analysis.exceptionDiagnostics());
+    if (merged.length() > 0) {
+        return "sema reported {merged.length()} diagnostic(s) on an accepted fixture "
+            + "(a semacheck-level bug); first: {merged.get(0).message()}";
+    }
+    return "";
+}
+
+appendAll(List<FileDiagnostic> sink, FileDiagnostic[] diagnostics) {
+    for (let diagnostic in diagnostics) {
+        sink.push(diagnostic);
+    }
+}
+
+firstDiagnostics(FileDiagnostic[] diagnostics) -> string {
+    string described = "";
+    long shown = diagnostics.length;
+    if (shown > 3) {
+        shown = 3;
+    }
+    for (long i = 0; i < shown; i++) {
+        if (i > 0) {
+            described = described + "; ";
+        }
+        described = described + "{diagnostics[i].file()}: {diagnostics[i].message()}";
+    }
+    if (diagnostics.length > shown) {
+        described = described + "; and {diagnostics.length - shown} more";
+    }
+    return described;
+}
+
+// Runs a command and returns its exit code. The command is a quoted program followed by quoted
+// arguments. The Windows interpreter (cmd) strips the first and last quote of the line before
+// running it, so the whole command is wrapped in one more pair of quotes there; a POSIX shell
+// needs no such wrapping.
+public shellExit(bool windowsShell, string command) -> long throws {
+    if (windowsShell) {
+        return try system.run("\"" + command + "\"");
+    }
+    return try system.run(command);
+}
+
+public readOrEmpty(string path) -> string {
+    return try system.readAllText(path);
+} catch (SystemError error) {
+    return "";
+}

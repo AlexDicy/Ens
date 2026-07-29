@@ -508,7 +508,10 @@ task("test")
                 os.cp(path.join(llvm_bin, "LLVM-C.dll"), path.join(check_dir, "LLVM-C.dll"))
             end
 
-            -- list every candidate fixture; the harness reads each for its directives.
+            -- list every candidate fixture; the harness reads each for its directives. A folder
+            -- fixture also lists its '*_test.ens' files relative to its source folder, because
+            -- the standard library has no directory enumeration yet; the harness narrows them by
+            -- the fixture's own @ens-test arguments.
             local lines = {
                 "platform " .. (on_windows and "windows" or "posix"),
                 "ens " .. ens_exe,
@@ -534,7 +537,17 @@ task("test")
                     directive = src_main_ens
                 end
                 if directive then
-                    table.insert(lines, "fixture tests/" .. path.basename(sub) .. " " .. directive)
+                    local label = "tests/" .. path.basename(sub)
+                    table.insert(lines, "fixture " .. label .. " " .. directive)
+                    local source_root = path.directory(directive)
+                    local test_files = {}
+                    for _, tf in ipairs(os.files(path.join(source_root, "**_test.ens"))) do
+                        table.insert(test_files, (path.relative(tf, source_root):gsub("\\", "/")))
+                    end
+                    table.sort(test_files)
+                    for _, tf in ipairs(test_files) do
+                        table.insert(lines, "testfile " .. label .. " " .. tf)
+                    end
                 end
             end
             io.writefile(manifest, table.concat(lines, "\n") .. "\n")
