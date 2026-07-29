@@ -543,8 +543,8 @@ task("test")
             -- environment for the shared library to load. The fixtures it runs inherit the
             -- same controlled variables the reference runner sets, so the getenv-based ffi
             -- fixture stays hermetic here too.
-            env.ENS_FROMCSTRING_PRESENT = "hermetic"
-            env.ENS_FROMCSTRING_ABSENT = nil
+            env.ENS_TEST_FROMCSTRING_PRESENT = "hermetic"
+            env.ENS_TEST_FROMCSTRING_ABSENT = nil
             local run_rc = execMerged(harness_exe, {manifest}, log, {envs = env})
             local out = (io.readfile(log) or ""):gsub("[\r\n]+$", "")
             if run_rc == 0 then
@@ -1591,8 +1591,8 @@ task("test")
             -- to a known value, and its unset counterpart cleared, so the fixture never depends on
             -- ambient variables such as PATH.
             local fixture_env = os.getenvs()
-            fixture_env.ENS_FROMCSTRING_PRESENT = "hermetic"
-            fixture_env.ENS_FROMCSTRING_ABSENT = nil
+            fixture_env.ENS_TEST_FROMCSTRING_PRESENT = "hermetic"
+            fixture_env.ENS_TEST_FROMCSTRING_ABSENT = nil
             local run_rc = execSplit(exe_file, {}, stdout_file, stderr_file, {envs = fixture_env})
             local why = compareRun(run_rc, captured(stdout_file), captured(stderr_file))
 
