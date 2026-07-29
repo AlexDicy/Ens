@@ -10,6 +10,7 @@
 // scope. The releases themselves are emitted by lower.ownership.
 import Expression from @ens.frontend.syntax.generated.nodes;
 import Span from @ens.frontend.support.source;
+import LineIndex from @ens.frontend.support.source;
 import ModuleContext from @ens.sema.context;
 import SemaResult from @ens.sema.result;
 import LocalBinding from @ens.sema.model.scopes;
@@ -26,6 +27,7 @@ import Substitution from mono.substitution;
 import mono.substitution;
 import FunctionInfo from lower.index;
 import ProgramIndex from lower.index;
+import lower.throwing;
 import support.primitives;
 import List from @std.collections.list;
 import Map from @std.collections.map;
@@ -76,6 +78,14 @@ public final class LoweringContext {
     SemaResult currentResult;
     string currentFile;
     Substitution? currentSubstitution;
+    Map<string, LineIndex> lineIndexes;
+
+    Type? errorClass;
+    List<long> unwindProtected;
+    long errorDispatchSlot;
+    long errorDispatchBlock;
+    bool catchBodyActive;
+    long catchBodySlot;
 
     List<FileDiagnostic> problems;
     bool lowerFailed;
@@ -104,6 +114,13 @@ public final class LoweringContext {
         this.currentModule = info.context();
         this.currentResult = info.context().result();
         this.currentFile = info.context().module().filePath();
+        this.lineIndexes = new Map<string, LineIndex>();
+        this.errorClass = throwing.errorClassOf(store);
+        this.unwindProtected = new List<long>();
+        this.errorDispatchSlot = -1;
+        this.errorDispatchBlock = -1;
+        this.catchBodyActive = false;
+        this.catchBodySlot = -1;
         this.problems = new List<FileDiagnostic>();
         this.lowerFailed = false;
     }
@@ -166,6 +183,85 @@ public final class LoweringContext {
 
     public substitutedAll(Type[] typeList) -> Type[] {
         return substitution.applyAll(this.typeStore, this.currentSubstitution, typeList);
+    }
+
+    // The 1-based source line the span starts on, in whichever module is being lowered.
+    public lineAt(Span span) -> long {
+        let cached = this.lineIndexes.get(this.currentFile);
+        if (cached != null) {
+            return cached.positionAt(span.start).line;
+        }
+        let built = new LineIndex(this.currentModule.module().source());
+        this.lineIndexes.set(this.currentFile, built);
+        return built.positionAt(span.start).line;
+    }
+
+    // The class every thrown value extends, or null when the standard library is malformed.
+    public errorType() -> Type? {
+        return this.errorClass;
+    }
+
+    // Marks a value temp whose +1 is in flight across a possibly-unwinding call, so every unwind
+    // edge inside the window releases it; the holder unprotects it when it consumes the value.
+    public protectValue(long temp) {
+        this.unwindProtected.push(temp);
+    }
+
+    public unprotectValue(long temp) {
+        let kept = new List<long>();
+        while (this.unwindProtected.length() > 0) {
+            long top = this.unwindProtected.pop();
+            if (top == temp) {
+                break;
+            }
+            kept.push(top);
+        }
+        while (kept.length() > 0) {
+            this.unwindProtected.push(kept.pop());
+        }
+    }
+
+    // The protected temps, oldest first.
+    public protectedValues() -> long[] {
+        return this.unwindProtected.toArray();
+    }
+
+    // The slot and block the function's catch clauses read an in-flight error from.
+    public setDispatch(long slot, long block) {
+        this.errorDispatchSlot = slot;
+        this.errorDispatchBlock = block;
+    }
+
+    public hasDispatch() -> bool {
+        return this.errorDispatchBlock >= 0;
+    }
+
+    public dispatchSlot() -> long {
+        return this.errorDispatchSlot;
+    }
+
+    public dispatchBlock() -> long {
+        return this.errorDispatchBlock;
+    }
+
+    // Marks that a catch clause's body is being lowered, whose throws propagate to the caller
+    // rather than back into the dispatch, and whose bound error 'rethrow' re-raises.
+    public beginCatchBody(long bindingSlot) {
+        this.catchBodyActive = true;
+        this.catchBodySlot = bindingSlot;
+    }
+
+    public endCatchBody() {
+        this.catchBodyActive = false;
+        this.catchBodySlot = -1;
+    }
+
+    public inCatchBody() -> bool {
+        return this.catchBodyActive;
+    }
+
+    public catchBindingSlot() -> long {
+        return this.catchBodySlot;
     }
 
     public unsupported(string what, Span span) {

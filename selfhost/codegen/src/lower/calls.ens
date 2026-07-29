@@ -19,17 +19,20 @@ import Type from @ens.sema.model.types;
 import @ens.sema.model.types;
 import EirCallee from eir.model;
 import EirCall from eir.model;
+import EirTryCall from eir.model;
 import mono.substitution;
 import FunctionInfo from lower.index;
 import LoweringContext from lower.context;
 import lower.builtins;
 import lower.classes;
+import lower.exceptions;
 import lower.expressions;
 import lower.hashes;
 import lower.optionals;
 import lower.ownership;
 import lower.places;
 import lower.structs;
+import lower.throwing;
 import support.primitives;
 import List from @std.collections.list;
 
@@ -190,8 +193,9 @@ public lowerDispatchedInvocation(LoweringContext lowering, FunctionInfo info,
         return -1;
     }
     long result = emitCall(lowering, info, receiverType, receiver, values, dispatchSlot,
-        dispatchInterface);
+        dispatchInterface, span);
     for (long i = 0; i < temporaries.length(); i++) {
+        lowering.unprotectValue(temporaries.get(i));
         ownership.releaseValue(lowering, temporaries.get(i));
     }
     return result;
@@ -220,10 +224,6 @@ supportedTarget(LoweringContext lowering, FunctionInfo info, string described, S
     }
     if (signature.isGeneric() && info.substitution() == null) {
         lowering.unsupported("calling the generic {described}", span);
-        return false;
-    }
-    if (signature.declaresThrows()) {
-        lowering.unsupported("calling the throwing {described}", span);
         return false;
     }
     let declaration = info.declaration();
@@ -300,7 +300,8 @@ lowerArguments(LoweringContext lowering, FunctionInfo info, ArgumentListNode? ar
 }
 
 // One argument at its parameter's type. A reference the argument produced is remembered so the call
-// site gives it up afterwards; a struct it produced goes into storage the enclosing scope releases,
+// site gives it up afterwards, and protected so an unwind out of a later argument or the call
+// itself releases it too; a struct it produced goes into storage the enclosing scope releases,
 // because a struct's +1 lives in its fields and only an address reaches them.
 lowerArgument(LoweringContext lowering, Expression argument, Type parameterType,
               List<long> temporaries) -> long {
@@ -314,6 +315,7 @@ lowerArgument(LoweringContext lowering, Expression argument, Type parameterType,
             return -1;
         }
         temporaries.push(value);
+        lowering.protectValue(value);
         return value;
     }
     long address = structs.addressOf(lowering, argument, parameterType);
@@ -326,19 +328,40 @@ lowerArgument(LoweringContext lowering, Expression argument, Type parameterType,
 // Emits the call and hands back its result temp, or -1 when the callee returns nothing. A method
 // takes the address of the storage it runs over; a free function passes -1 for its receiver. A
 // dispatch slot at 0 or above makes the call dynamic through the receiver's runtime type.
+//
+// A callee whose contract can raise ends the block instead: the call becomes the terminator, its
+// unwind edge gets the cleanup owed at exactly this point, and lowering continues in the normal
+// successor.
 public emitCall(LoweringContext lowering, FunctionInfo info, Type? receiverType, long receiver,
-                long[] arguments, long dispatchSlot, Type? dispatchInterface) -> long {
+                long[] arguments, long dispatchSlot, Type? dispatchInterface, Span span) -> long {
     let signature = info.signature();
     let returnType = calleeType(lowering, info, signature.returnType());
     let builder = lowering.builder();
     let callee = new EirCallee(info.symbol(), receiverType,
-        parameterTypesOf(lowering, info, signature), returnType);
+        parameterTypesOf(lowering, info, signature), returnType, throwing.abiThrows(info));
     long resultTemp = -1;
     if (!types.isVoidType(returnType)) {
         resultTemp = builder.newTemp(returnType);
     }
-    builder.append(new EirCall(resultTemp, returnType, callee, receiver, arguments,
-        dispatchSlot, dispatchInterface));
+    long line = lowering.lineAt(span);
+    if (!throwing.contractThrows(info)) {
+        builder.append(new EirCall(resultTemp, returnType, callee, receiver, arguments,
+            dispatchSlot, dispatchInterface, line));
+        return resultTemp;
+    }
+    let errorType = lowering.errorType();
+    if (errorType == null) {
+        lowering.internalError("the standard library declares no Error class", span);
+        return -1;
+    }
+    long error = builder.newTemp(errorType);
+    long normalBlock = builder.newBlock("try.ok");
+    long unwindBlock = builder.newBlock("try.unwind");
+    builder.terminate(new EirTryCall(resultTemp, returnType, callee, receiver, arguments,
+        dispatchSlot, dispatchInterface, error, normalBlock, unwindBlock, line));
+    builder.moveTo(unwindBlock);
+    exceptions.emitUnwindPath(lowering, error, span);
+    builder.moveTo(normalBlock);
     return resultTemp;
 }
 

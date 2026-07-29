@@ -1,0 +1,213 @@
+// Golden dumps for the exception lowering: a throw captures its trace and hands the owned error
+// on, a call to a throwing target becomes the block's terminator with the site's cleanup
+// materialized on its unwind edge, catch clauses dispatch on the runtime type with an owned
+// binding, rethrow re-raises the caught error, and the trace accessors lower to reads of the
+// captured trace. All three verifiers gate every dump.
+import @std.testing;
+import support;
+
+test "a throw captures the trace onto the owned error and propagates it" {
+    let dumped = try support.loweredDump(
+        "risky() -> int throws \{\n"
+        + "    throw new Error(\"boom\");\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n", "risky");
+    try testing.assertEqual(dumped,
+        "func internal @risky() -> int throws \{\n"
+        + "b0.entry:\n"
+        + "  %0 = class.new @_dtor$std.core$Error: Error\n"
+        + "  %1 = const \"boom\": string\n"
+        + "  call @std.core$Error$constructor(this %0, %1)\n"
+        + "  capture_trace %0, line 2\n"
+        + "  propagate %0\n"
+        + "\}\n");
+}
+
+test "a throwing call terminates its block and releases the owned local on the unwind edge" {
+    let dumped = try support.loweredDump(
+        "risky() -> int throws \{\n"
+        + "    throw new Error(\"boom\");\n"
+        + "\}\n"
+        + "relay() -> int throws \{\n"
+        + "    let held = \"a\" + \"b\";\n"
+        + "    return try risky();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n", "relay");
+    try testing.assertEqual(dumped,
+        "func internal @relay() -> int throws \{\n"
+        + "  $0 held: string zeroed\n"
+        + "b0.entry:\n"
+        + "  %0 = const \"a\": string\n"
+        + "  retain %0\n"
+        + "  %1 = const \"b\": string\n"
+        + "  retain %1\n"
+        + "  %2 = str.concat %0, %1: string\n"
+        + "  release %0\n"
+        + "  release %1\n"
+        + "  store $0, %2\n"
+        + "  %3 = try_call @risky(): int, error %4, to b1.try.ok, unwind b2.try.unwind\n"
+        + "b1.try.ok:\n"
+        + "  %6 = slot_addr $0: &string  ; held\n"
+        + "  release_ptr %6\n"
+        + "  ret %3\n"
+        + "b2.try.unwind:\n"
+        + "  %5 = slot_addr $0: &string  ; held\n"
+        + "  release_ptr %5\n"
+        + "  propagate %4\n"
+        + "\}\n");
+}
+
+test "an owned argument temporary is released on a later argument's unwind edge" {
+    let dumped = try support.loweredDump(
+        "consume(string a, int n) -> int \{\n"
+        + "    return n;\n"
+        + "\}\n"
+        + "boom() -> int throws \{\n"
+        + "    throw new Error(\"x\");\n"
+        + "\}\n"
+        + "mix() -> int throws \{\n"
+        + "    return consume(\"p\" + \"q\", try boom());\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n", "mix");
+    try testing.assertEqual(dumped,
+        "func internal @mix() -> int throws \{\n"
+        + "b0.entry:\n"
+        + "  %0 = const \"p\": string\n"
+        + "  retain %0\n"
+        + "  %1 = const \"q\": string\n"
+        + "  retain %1\n"
+        + "  %2 = str.concat %0, %1: string\n"
+        + "  release %0\n"
+        + "  release %1\n"
+        + "  %3 = try_call @boom(): int, error %4, to b1.try.ok, unwind b2.try.unwind\n"
+        + "b1.try.ok:\n"
+        + "  %5 = call @consume(%2, %3): int\n"
+        + "  release %2\n"
+        + "  ret %5\n"
+        + "b2.try.unwind:\n"
+        + "  release %2\n"
+        + "  propagate %4\n"
+        + "\}\n");
+}
+
+test "catch clauses dispatch on the runtime type, bind the error owned, and rethrow re-raises" {
+    let dumped = try support.loweredDump(
+        "class NetError extends Error \{\n"
+        + "    protected constructor(string m) \{\n"
+        + "        super(m);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "risky(int n) -> int throws \{\n"
+        + "    if (n < 0) \{\n"
+        + "        throw new NetError(\"neg\");\n"
+        + "    \}\n"
+        + "    if (n == 0) \{\n"
+        + "        throw new Error(\"zero\");\n"
+        + "    \}\n"
+        + "    return n;\n"
+        + "\}\n"
+        + "handle(int n) -> int throws \{\n"
+        + "    return try risky(n);\n"
+        + "\} catch (NetError e) \{\n"
+        + "    return 0;\n"
+        + "\} catch (Error e) \{\n"
+        + "    rethrow;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n", "handle");
+    try testing.assertEqual(dumped,
+        "func internal @handle(%0: int) -> int throws \{\n"
+        + "  $0 err.dispatch: Error zeroed\n"
+        + "  $1 n: int\n"
+        + "  $2 e: NetError zeroed\n"
+        + "  $3 e: Error zeroed\n"
+        + "b0.entry:\n"
+        + "  store $1, %0\n"
+        + "  %1 = load $1: int\n"
+        + "  %2 = try_call @risky(%1): int, error %3, to b2.try.ok, unwind b3.try.unwind\n"
+        + "b1.catch.dispatch:\n"
+        + "  %5 = slot_addr $0: &Error  ; err.dispatch\n"
+        + "  %6 = load_ptr %5: Error\n"
+        + "  retain %6\n"
+        + "  %7 = type_test %6 is NetError: bool\n"
+        + "  br %7, b4.catch.body, b5.catch.next\n"
+        + "b2.try.ok:\n"
+        + "  %4 = slot_addr $0: &Error  ; err.dispatch\n"
+        + "  release_ptr %4\n"
+        + "  ret %2\n"
+        + "b3.try.unwind:\n"
+        + "  store $0, %3\n"
+        + "  jump b1.catch.dispatch\n"
+        + "b4.catch.body:\n"
+        + "  %8 = reinterpret %6: NetError\n"
+        + "  store $2, %8\n"
+        + "  %9 = const 0: int\n"
+        + "  %10 = slot_addr $2: &NetError  ; e\n"
+        + "  release_ptr %10\n"
+        + "  %11 = slot_addr $0: &Error  ; err.dispatch\n"
+        + "  release_ptr %11\n"
+        + "  ret %9\n"
+        + "b5.catch.next:\n"
+        + "  %12 = type_test %6 is Error: bool\n"
+        + "  br %12, b6.catch.body, b7.catch.next\n"
+        + "b6.catch.body:\n"
+        + "  store $3, %6\n"
+        + "  %13 = slot_addr $3: &Error  ; e\n"
+        + "  %14 = load_ptr %13: Error\n"
+        + "  retain %14\n"
+        + "  %15 = slot_addr $3: &Error  ; e\n"
+        + "  release_ptr %15\n"
+        + "  %16 = slot_addr $0: &Error  ; err.dispatch\n"
+        + "  release_ptr %16\n"
+        + "  propagate %14\n"
+        + "b7.catch.next:\n"
+        + "  %17 = slot_addr $0: &Error  ; err.dispatch\n"
+        + "  release_ptr %17\n"
+        + "  propagate %6\n"
+        + "\}\n");
+}
+
+test "the trace accessors lower to reads of the captured trace" {
+    let dumped = try support.loweredDump(
+        "describe(Error e) -> string \{\n"
+        + "    return e.stackTrace();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n", "describe");
+    try testing.assertEqual(dumped,
+        "func internal @describe(%0: Error) -> string \{\n"
+        + "  $0 e: Error borrowed\n"
+        + "b0.entry:\n"
+        + "  store $0, %0\n"
+        + "  %1 = load $0: Error\n"
+        + "  %2 = error_trace %1 formatted: string\n"
+        + "  ret %2\n"
+        + "\}\n");
+}
+
+test "an override that drops the throws marker still carries its root's error slot" {
+    let dumped = try support.loweredMethodDump(
+        "public class Base \{\n"
+        + "    public m() -> int throws \{\n"
+        + "        throw new Error(\"x\");\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class Sub extends Base \{\n"
+        + "    public override m() -> int \{\n"
+        + "        return 1;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n", "Sub", "m");
+    try testing.assertTrue(dumped.indexOf("-> int throws") >= 0,
+        "the override lost its root's error slot: {dumped}");
+}

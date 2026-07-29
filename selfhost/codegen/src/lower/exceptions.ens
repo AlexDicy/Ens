@@ -1,0 +1,193 @@
+// The paths an in-flight error takes: the materialized cleanup on a throwing call's unwind edge,
+// the throw that raises and the rethrow that re-raises, and the catch dispatch that tries the
+// clauses in source order. Every path releases exactly what is owned where it leaves - the
+// in-flight temps a call site holds, then the scopes the error escapes - and hands the error's
+// +1 on, into the dispatch slot when the function has clauses to try, to the caller otherwise.
+import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import ThrowStatementNode from @ens.frontend.syntax.generated.nodes;
+import RethrowStatementNode from @ens.frontend.syntax.generated.nodes;
+import BlockNode from @ens.frontend.syntax.generated.nodes;
+import Span from @ens.frontend.support.source;
+import LocalBinding from @ens.sema.model.scopes;
+import PrimitiveKind from @ens.sema.model.types;
+import Type from @ens.sema.model.types;
+import @ens.sema.model.types;
+import EirBranch from eir.model;
+import EirCaptureTrace from eir.model;
+import EirJump from eir.model;
+import EirLoadPtr from eir.model;
+import EirPropagate from eir.model;
+import EirRelease from eir.model;
+import EirReturn from eir.model;
+import EirStoreSlot from eir.model;
+import EirTypeTest from eir.model;
+import EirUnreachable from eir.model;
+import LoweringContext from lower.context;
+import lower.conversions;
+import lower.expressions;
+import lower.ownership;
+import lower.places;
+import lower.statements;
+import support.primitives;
+
+// The unwind edge out of one throwing call: releases the in-flight temps the call site holds and
+// everything the error escapes, then routes it. The error temp arrives owned.
+public emitUnwindPath(LoweringContext lowering, long error, Span span) {
+    releaseProtected(lowering);
+    routeError(lowering, error, span);
+}
+
+// 'throw expression;': the error is owned, carries a trace captured here, and leaves.
+public lowerThrow(LoweringContext lowering, ThrowStatementNode thrown) {
+    let value = thrown.value();
+    let thrownType = lowering.typeOf(value);
+    if (thrownType == null) {
+        return;
+    }
+    if (primitives.classOf(thrownType) == null) {
+        lowering.internalError("'throw' of '{types.display(thrownType)}', which is not an "
+            + "error object", thrown.span());
+        return;
+    }
+    long error = expressions.lower(lowering, value);
+    if (error < 0) {
+        return;
+    }
+    if (!places.producesOwnedValue(lowering, value)) {
+        ownership.retainValue(lowering, error);
+    }
+    lowering.builder().append(new EirCaptureTrace(error, lowering.lineAt(thrown.span())));
+    routeError(lowering, error, thrown.span());
+}
+
+// 'rethrow;': the caught error leaves again with its original trace. Its +1 is taken from the
+// catch binding before the scopes release, so the binding's own release cannot free it.
+public lowerRethrow(LoweringContext lowering, RethrowStatementNode rethrown) {
+    let builder = lowering.builder();
+    long slot = lowering.catchBindingSlot();
+    if (!lowering.inCatchBody() || slot < 0) {
+        lowering.internalError("'rethrow' outside a catch clause", rethrown.span());
+        return;
+    }
+    let slotType = builder.slotType(slot);
+    long address = ownership.slotAddress(lowering, slot, slotType);
+    long error = builder.newTemp(slotType);
+    builder.append(new EirLoadPtr(error, slotType, address));
+    ownership.retainValue(lowering, error);
+    ownership.releaseAllScopes(lowering);
+    builder.terminate(new EirPropagate(error));
+}
+
+// The catch dispatch: reads the error the unwind edges parked, tries each clause's type against
+// its runtime type in source order, and propagates when nothing matches - or ends an impossible
+// path, when sema proved the clauses exhaustive for a function that does not throw.
+public lowerCatchClauses(LoweringContext lowering, FunctionDeclarationNode declaration) {
+    let builder = lowering.builder();
+    let errorType = lowering.errorType();
+    if (errorType == null) {
+        lowering.internalError("the standard library declares no Error class",
+            declaration.span());
+        return;
+    }
+    builder.moveTo(lowering.dispatchBlock());
+    long address = ownership.slotAddress(lowering, lowering.dispatchSlot(), errorType);
+    long error = builder.newTemp(errorType);
+    builder.append(new EirLoadPtr(error, errorType, address));
+    ownership.retainValue(lowering, error);
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    for (long i = 0; i < declaration.catchClausesCount(); i++) {
+        let clause = declaration.catchClauses(i);
+        let binding = lowering.result().bindingOf(clause.green());
+        if (binding == null) {
+            lowering.internalError("a catch clause has no recorded binding", clause.span());
+            return;
+        }
+        let clauseType = lowering.substituted(binding.type());
+        if (primitives.classOf(clauseType) == null) {
+            lowering.internalError("a catch clause catches '{types.display(clauseType)}', "
+                + "which is not an error class", clause.span());
+            return;
+        }
+        long matched = builder.newTemp(boolType);
+        builder.append(new EirTypeTest(matched, boolType, error, clauseType));
+        long bodyBlock = builder.newBlock("catch.body");
+        long nextBlock = builder.newBlock("catch.next");
+        builder.terminate(new EirBranch(matched, bodyBlock, nextBlock));
+        builder.moveTo(bodyBlock);
+        lowerCatchBody(lowering, clause.name().text(), binding, clauseType, error,
+            clause.span(), clause.body());
+        if (lowering.failed()) {
+            return;
+        }
+        builder.moveTo(nextBlock);
+    }
+    if (builder.isThrowing()) {
+        ownership.releaseAllScopes(lowering);
+        builder.terminate(new EirPropagate(error));
+        return;
+    }
+    builder.terminate(new EirUnreachable());
+}
+
+// One clause's body: the matched error transfers into the clause's owned binding, and a body
+// that runs off its end returns, releasing the binding and the function scope with it. Inside
+// the body, throws and unwinding calls propagate to the caller rather than re-entering the
+// dispatch.
+lowerCatchBody(LoweringContext lowering, string name, LocalBinding binding, Type clauseType,
+               long error, Span span, BlockNode body) {
+    let builder = lowering.builder();
+    lowering.pushScope();
+    long converted = conversions.convert(lowering, error, clauseType, span);
+    if (converted < 0) {
+        return;
+    }
+    long slot = lowering.defineSlot(binding, name, clauseType);
+    builder.append(new EirStoreSlot(slot, converted));
+    ownership.trackSlot(lowering, slot, clauseType);
+    lowering.beginCatchBody(slot);
+    statements.lowerBlock(lowering, body);
+    lowering.endCatchBody();
+    if (!lowering.failed() && !builder.terminated()) {
+        let returnType = lowering.substituted(lowering.info().signature().returnType());
+        if (types.isVoidType(returnType)) {
+            ownership.releaseAllScopes(lowering);
+            builder.terminate(new EirReturn(-1));
+        } else {
+            builder.terminate(new EirUnreachable());
+        }
+    }
+    lowering.popScope();
+}
+
+// Releases the in-flight owned temps a call site holds, newest first, without forgetting them:
+// the normal path back from the call still owns and releases the same values.
+public releaseProtected(LoweringContext lowering) {
+    long[] held = lowering.protectedValues();
+    for (long i = held.length - 1; i >= 0; i--) {
+        lowering.builder().append(new EirRelease(held[i]));
+    }
+}
+
+// Hands an owned error on: into the dispatch slot when this function's clauses get to try it,
+// to the caller's slot otherwise. The scopes the error escapes release first; the dispatch keeps
+// the function scope alive because the clauses still read the parameters.
+routeError(LoweringContext lowering, long error, Span span) {
+    let builder = lowering.builder();
+    if (lowering.hasDispatch() && !lowering.inCatchBody()) {
+        let errorType = lowering.errorType();
+        if (errorType == null) {
+            lowering.internalError("the standard library declares no Error class", span);
+            return;
+        }
+        ownership.releaseScopesAbove(lowering, 1);
+        long converted = conversions.convert(lowering, error, errorType, span);
+        if (converted < 0) {
+            return;
+        }
+        builder.append(new EirStoreSlot(lowering.dispatchSlot(), converted));
+        builder.terminate(new EirJump(lowering.dispatchBlock()));
+        return;
+    }
+    ownership.releaseAllScopes(lowering);
+    builder.terminate(new EirPropagate(error));
+}

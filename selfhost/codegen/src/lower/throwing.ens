@@ -1,0 +1,108 @@
+// Which callables report through a trailing error-slot parameter, and which call sites must
+// check it. The two questions are distinct: the slot follows the ROOT declaration of a method's
+// dispatch contract, so every implementation sharing a vtable slot or an interface method table
+// entry has the same ABI, while the check follows the static target's contract - its declared
+// throws list when it names types, its converged outward throw set otherwise - which is exactly
+// where sema requires the 'try'.
+import Method from @ens.sema.model.types;
+import Signature from @ens.sema.model.types;
+import Type from @ens.sema.model.types;
+import TypeStore from @ens.sema.model.types;
+import @ens.sema.model.types;
+import FunctionInfo from lower.index;
+import layout.vtables;
+import support.primitives;
+
+// True when the callable's ABI carries the trailing error-slot parameter.
+public abiThrows(FunctionInfo info) -> bool {
+    let signature = info.signature();
+    let receiver = info.receiverType();
+    let method = info.method();
+    if (receiver == null || method == null) {
+        return signature.declaresThrows();
+    }
+    if (method.isConstructor() || method.isDestructor()) {
+        return signature.declaresThrows();
+    }
+    if (primitives.classOf(receiver) == null) {
+        return signature.declaresThrows();
+    }
+    let root = rootDeclaration(receiver, method);
+    if (root.signature().declaresThrows()) {
+        return true;
+    }
+    return implementsThrowingInterfaceMethod(receiver, method);
+}
+
+// The topmost base-chain declaration this method overrides, or the method itself.
+rootDeclaration(Type receiver, Method method) -> Method {
+    Method current = method;
+    Type owner = receiver;
+    while (true) {
+        let above = vtables.declaringBaseMethod(owner, current);
+        if (above == null) {
+            return current;
+        }
+        current = above;
+        owner = above.definingType();
+    }
+}
+
+// True when some interface implemented anywhere on the receiver's chain declares this method
+// with 'throws': the method table entry is called at the interface method's ABI, so the
+// implementation has to carry the slot even when it cannot throw itself.
+implementsThrowingInterfaceMethod(Type receiver, Method method) -> bool {
+    Type? current = receiver;
+    while (current != null) {
+        for (let implemented in types.interfacesOf(current)) {
+            let required = types.methodsOf(implemented);
+            if (required == null) {
+                continue;
+            }
+            for (long i = 0; i < required.length(); i++) {
+                let candidate = required.get(i);
+                if (candidate.name() != method.name()) {
+                    continue;
+                }
+                if (primitives.sameParameterTypes(candidate.signature(), method.signature())
+                        && candidate.signature().declaresThrows()) {
+                    return true;
+                }
+            }
+        }
+        current = vtables.baseClassOf(current);
+    }
+    return false;
+}
+
+// True when a call to this target can actually raise, which is where sema requires 'try' and
+// lowering builds the unwind edge. The contract is judged at the static target: its declared
+// list when it names types, its recorded outward set otherwise.
+public contractThrows(FunctionInfo info) -> bool {
+    let signature = info.signature();
+    if (signature.declaresThrows() && signature.throwsTypes().length > 0) {
+        return true;
+    }
+    let declaration = signature.declaration();
+    if (declaration == null) {
+        return false;
+    }
+    let thrown = info.context().result().throwsSetOf(declaration);
+    return thrown != null && thrown.length > 0;
+}
+
+// The base class of every thrown value, the type an in-flight error travels at.
+public errorClassOf(TypeStore store) -> Type? {
+    return store.findDeclared("std.core", "Error");
+}
+
+// True for the two Error accessors the compiler intercepts: their placeholder bodies are never
+// emitted, and a call to either lowers to the trace runtime instead.
+public isInterceptedTraceMethod(Type owner, Method method) -> bool {
+    let authority = types.authorityOf(owner);
+    if (authority == null || authority.name() != "Error"
+            || authority.modulePath() != "std.core") {
+        return false;
+    }
+    return method.name() == "stackTrace" || method.name() == "stackFrames";
+}

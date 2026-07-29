@@ -21,6 +21,7 @@ import Signature from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
 import @ens.sema.model.types;
 import EirClassNew from eir.model;
+import EirErrorTrace from eir.model;
 import EirLoadSlot from eir.model;
 import layout.vtables;
 import mono.substitution;
@@ -34,6 +35,7 @@ import lower.places;
 import lower.records;
 import lower.stores;
 import lower.symbols;
+import lower.throwing;
 import lower.weakfields;
 import support.primitives;
 
@@ -166,8 +168,12 @@ public lowerNew(LoweringContext lowering, NewExpressionNode node) -> long {
             node.span())) {
         return -1;
     }
+    // The fresh object is owned here and nowhere else yet, so an argument that unwinds must
+    // release it; its zeroed and defaulted fields make the destructor safe to run early.
+    lowering.protectValue(object);
     let ignored = calls.lowerInvocation(lowering, info, node.arguments(), node.green(),
         node.span(), classType, object);
+    lowering.unprotectValue(object);
     if (lowering.failed()) {
         return -1;
     }
@@ -318,6 +324,9 @@ public lowerMethodCall(LoweringContext lowering, CallExpressionNode call,
             + "'{types.display(receiverType)}'", call.span());
         return -1;
     }
+    if (throwing.isInterceptedTraceMethod(method.definingType(), method)) {
+        return lowerTraceRead(lowering, call, member, method, receiverType);
+    }
     Method? resolved = resolveConcreteMethod(lowering, classType, method);
     if (resolved == null && primitives.interfaceOf(method.definingType()) != null) {
         resolved = implementationOnClass(classType, method);
@@ -351,6 +360,26 @@ public lowerMethodCall(LoweringContext lowering, CallExpressionNode call,
     }
     return calls.lowerDispatchedCall(lowering, info, call, classType, object, dispatchSlot,
         null);
+}
+
+// 'e.stackTrace()' and 'e.stackFrames()': the placeholder bodies the standard library writes are
+// never emitted; the call reads the trace the error captured when it was thrown, symbolicated
+// into text or frames by the runtime.
+lowerTraceRead(LoweringContext lowering, CallExpressionNode call, MemberExpressionNode member,
+               Method method, Type receiverType) -> long {
+    let resultType = lowering.typeOf(call);
+    if (resultType == null) {
+        return -1;
+    }
+    long object = borrowedReference(lowering, member.object(), receiverType);
+    if (object < 0) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    long result = builder.newTemp(resultType);
+    builder.append(new EirErrorTrace(result, resultType, object,
+        method.name() == "stackFrames"));
+    return result;
 }
 
 // 'value.method(args)' on an interface-typed receiver: the implementation is read from the

@@ -36,10 +36,12 @@ import LoweringContext from lower.context;
 import Operand from lower.stores;
 import lower.calls;
 import lower.classes;
+import lower.exceptions;
 import lower.ownership;
 import lower.records;
 import lower.statements;
 import lower.stores;
+import lower.throwing;
 import lower.weakfields;
 import support.primitives;
 
@@ -68,17 +70,30 @@ public lowerFunction(FunctionInfo info, ProgramIndex index, DispatchTables table
         return new FunctionLowering(null, lowering.diagnostics());
     }
     let signature = info.signature();
-    if (signature.declaresThrows() || declaration.catchClausesCount() > 0) {
-        lowering.unsupported("a throwing function", signature.nameSpan());
-        return new FunctionLowering(null, lowering.diagnostics());
-    }
     let body = declaration.body();
     if (body == null && !info.isConstructor()) {
         lowering.internalError("function '{signature.name()}' has no body to lower",
             signature.nameSpan());
         return new FunctionLowering(null, lowering.diagnostics());
     }
+    let builder = lowering.builder();
+    if (throwing.abiThrows(info)) {
+        builder.setThrowing();
+    }
+    builder.setTrace(traceNameOf(info), fileNameOf(info.context().module().filePath()),
+        lowering.lineAt(signature.nameSpan()), info == index.entryFunction());
     lowering.pushScope();
+    if (declaration.catchClausesCount() > 0) {
+        let errorType = lowering.errorType();
+        if (errorType == null) {
+            lowering.internalError("the standard library declares no Error class",
+                signature.nameSpan());
+            return new FunctionLowering(null, lowering.diagnostics());
+        }
+        long dispatchSlot = builder.addSlot("err.dispatch", errorType, true, false);
+        ownership.trackSlot(lowering, dispatchSlot, errorType);
+        lowering.setDispatch(dispatchSlot, builder.newBlock("catch.dispatch"));
+    }
     if (info.isConstructor() && !hasExplicitSuperCall(body)) {
         chainImplicitSuper(lowering, declaration);
     }
@@ -89,7 +104,6 @@ public lowerFunction(FunctionInfo info, ProgramIndex index, DispatchTables table
     if (lowering.failed()) {
         return new FunctionLowering(null, lowering.diagnostics());
     }
-    let builder = lowering.builder();
     if (!builder.terminated()) {
         if (signature.isNoreturn() || !types.isVoidType(signature.returnType())) {
             builder.terminate(new EirUnreachable());
@@ -98,8 +112,36 @@ public lowerFunction(FunctionInfo info, ProgramIndex index, DispatchTables table
             builder.terminate(new EirReturn(-1));
         }
     }
+    if (declaration.catchClausesCount() > 0) {
+        exceptions.lowerCatchClauses(lowering, declaration);
+        if (lowering.failed()) {
+            return new FunctionLowering(null, lowering.diagnostics());
+        }
+    }
     lowering.popScope();
     return new FunctionLowering(builder.finish(), lowering.diagnostics());
+}
+
+// The function as a stack trace prints it: a method by its record and name, a free function by
+// its name alone.
+traceNameOf(FunctionInfo info) -> string {
+    let receiver = info.receiverType();
+    if (receiver == null) {
+        return info.signature().name();
+    }
+    return types.display(receiver) + "." + info.signature().name();
+}
+
+// The file a stack trace names: the path's last segment.
+fileNameOf(string path) -> string {
+    byte[] raw = path.toBytes();
+    long start = 0;
+    for (long i = 0; i < raw.length; i++) {
+        if (raw[i] == '/' || raw[i] == '\\') {
+            start = i + 1;
+        }
+    }
+    return path.substring(start, path.length);
 }
 
 // True when the constructor body chains to its base itself, with a top-level 'super(...)'.
