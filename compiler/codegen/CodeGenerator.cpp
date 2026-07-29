@@ -2409,11 +2409,16 @@ struct CodeGenerator::Impl {
             if (op0 == SyntaxKind::AmpAmp || op0 == SyntaxKind::PipePipe)
                 return emitLogicalShortCircuit(e, op0 == SyntaxKind::AmpAmp);
         }
-        llvm::Value* L = emitExpr(*leftE);
-        llvm::Value* R = emitExpr(*rightE);
-        if (!L || !R) return nullptr;
         ::Type* leftType = typeOf(leftE->node);
         ::Type* rightType = typeOf(rightE->node);
+        llvm::Value* L = emitExpr(*leftE);
+        // The left value is already owned while the right operand runs, and that operand may
+        // throw, so it waits out the right side inside the cleanup frame.
+        OwnedTempGuard heldLeft = expressionProducesOwnedRef(*leftE)
+            ? protectOwnedTemp(L, leftType) : OwnedTempGuard{};
+        llvm::Value* R = emitExpr(*rightE);
+        endOwnedTempProtection(heldLeft);
+        if (!L || !R) return nullptr;
         auto opTok = e.operatorToken();
         SyntaxKind op = opTok ? opTok->kind() : SyntaxKind::Invalid;
         return emitBinaryValue(op, L, leftType, &*leftE, R, rightType, &*rightE,
@@ -6030,7 +6035,11 @@ struct CodeGenerator::Impl {
                     "Convert it with '.toString()' first.");
                 return nullptr;
             }
+            // The accumulator owns the text built so far while the next hole runs, so a hole
+            // that throws releases it instead of leaking it.
+            OwnedTempGuard heldAcc = protectOwnedTemp(acc, typeOf(e.node));
             llvm::Value* hs = emitToString(holes[i], holeType);
+            endOwnedTempProtection(heldAcc);
             if (!hs) return nullptr;
             llvm::Value* joined = builder->CreateCall(concatFn, { acc, hs }, "interp.h");
             builder->CreateCall(releaseFn, { acc });
@@ -6067,7 +6076,11 @@ struct CodeGenerator::Impl {
         for (size_t i = 0; i < elems.size(); ++i) {
             const ast::Expression& src = elems[i];
             bool borrowed = !expressionProducesOwnedRef(src);
+            // The array under construction is owned here and nowhere else yet; its remaining
+            // slots read null, so releasing it from an element that throws is safe.
+            OwnedTempGuard heldArray = protectOwnedTemp(arrPtr, arrT);
             llvm::Value* v = emitExprConverted(src, elemT);
+            endOwnedTempProtection(heldArray);
             if (!v) return nullptr;
             llvm::Value* slot = builder->CreateGEP(
                 elemTy, data, llvm::ConstantInt::get(i64, static_cast<int64_t>(i)),
@@ -6743,6 +6756,39 @@ struct CodeGenerator::Impl {
         return temp;
     }
 
+    // A protection window over an owned temporary the current expression still holds. While a
+    // later operand or argument runs, the value lives in a cleanup-frame slot, so an exception
+    // out of that operand releases it instead of leaking it; closing the window takes the slot
+    // back out (or clears it, when the operand left entries of its own on top) and leaves the
+    // normal path to release the value exactly once.
+    struct OwnedTempGuard {
+        llvm::Value* slot = nullptr;
+        size_t depth = 0;
+    };
+
+    OwnedTempGuard protectOwnedTemp(llvm::Value* v, ::Type* type) {
+        OwnedTempGuard guard;
+        if (!v || !throwTargetSlot || cleanupStack.empty()) return guard;
+        if (!isReferenceType(type)) return guard;
+        guard.slot = createZeroedEntryAlloca(currentFunction, llvm::PointerType::get(ctx, 0),
+                                            "inflight.tmp");
+        guard.depth = cleanupStack.size();
+        builder->CreateStore(v, guard.slot);
+        cleanupStack.back().push_back({ guard.slot, type });
+        return guard;
+    }
+
+    void endOwnedTempProtection(const OwnedTempGuard& guard) {
+        if (!guard.slot) return;
+        if (guard.depth == cleanupStack.size() && !cleanupStack.back().empty() &&
+            cleanupStack.back().back().alloca == guard.slot) {
+            cleanupStack.back().pop_back();
+            return;
+        }
+        builder->CreateStore(llvm::ConstantPointerNull::get(llvm::PointerType::get(ctx, 0)),
+                             guard.slot);
+    }
+
     // An owned temporary passed by value (a `new`/call result, not bound to a
     // local) is borrowed by the callee; the caller must release it. Track it so
     // both normal scope exit and an exception unwind free it exactly once.
@@ -6952,7 +6998,13 @@ struct CodeGenerator::Impl {
                 std::vector<llvm::Value*> args;
                 args.reserve(e.arguments().size() + 1);
                 args.push_back(heapPtr);
-                if (!appendCallArgs(ctorSym, e.arguments(), e.node.greenNode(), args)) return nullptr;
+                // The fresh object is owned here and nowhere else yet, so an argument that
+                // throws must release it; its zeroed and defaulted fields make its destructor
+                // safe to run before the constructor did.
+                OwnedTempGuard fresh = protectOwnedTemp(heapPtr, t);
+                bool argsOk = appendCallArgs(ctorSym, e.arguments(), e.node.greenNode(), args);
+                endOwnedTempProtection(fresh);
+                if (!argsOk) return nullptr;
                 builder->CreateCall(fn, args);
             }
         } else {
