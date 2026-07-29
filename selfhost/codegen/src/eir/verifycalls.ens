@@ -1,8 +1,11 @@
-// The call instruction: its result type follows the callee's return type, a method passes the
-// storage it runs over - a struct's address, or a class reference - and every argument matches the
-// parameter it fills.
+// The call instruction and the try-call terminator: the result type follows the callee's return
+// type, a method passes the storage it runs over - a struct's address, or a class reference -
+// and every argument matches the parameter it fills. A try call additionally names a throwing
+// callee and an error temp typed at an error class.
 import EirBlock from eir.model;
 import EirCall from eir.model;
+import EirCallee from eir.model;
+import EirTryCall from eir.model;
 import VerificationContext from eir.verifycontext;
 import eir.verifyoperands;
 import Type from @ens.sema.model.types;
@@ -10,50 +13,77 @@ import @ens.sema.model.types;
 import support.primitives;
 
 public checkCall(VerificationContext verification, EirBlock block, EirCall call) {
-    if (call.result >= 0) {
-        verifyoperands.checkResultType(verification, block, call.result, call.type);
-        if (call.type != call.callee.returnType()) {
+    checkCallShape(verification, block, call.result, call.type, call.callee, call.receiver,
+        call.arguments, call.dispatchSlot, call.dispatchInterface);
+}
+
+public checkTryCall(VerificationContext verification, EirBlock block, EirTryCall call) {
+    checkCallShape(verification, block, call.result, call.type, call.callee, call.receiver,
+        call.arguments, call.dispatchSlot, call.dispatchInterface);
+    if (!call.callee.throwing()) {
+        verification.report("{block.label()}: try_call to @{call.callee.symbol()}, whose ABI "
+            + "carries no error slot to check");
+    }
+    if (!verification.validTemp(call.errorResult)) {
+        verification.report("{block.label()}: try_call defines the invalid error temp "
+            + "%{call.errorResult}");
+        return;
+    }
+    if (!primitives.isClassLike(verification.typeOf(call.errorResult))) {
+        verification.report("{block.label()}: try_call error %{call.errorResult} has type "
+            + "{types.display(verification.typeOf(call.errorResult))}, which is not an error "
+            + "object's");
+    }
+}
+
+checkCallShape(VerificationContext verification, EirBlock block, long result, Type type,
+               EirCallee callee, long receiver, long[] arguments, long dispatchSlot,
+               Type? dispatchInterface) {
+    if (result >= 0) {
+        verifyoperands.checkResultType(verification, block, result, type);
+        if (type != callee.returnType()) {
             verification.report("{block.label()}: call result type "
-                + "{types.display(call.type)} disagrees with callee "
-                + "@{call.callee.symbol()} returning "
-                + "{types.display(call.callee.returnType())}");
+                + "{types.display(type)} disagrees with callee "
+                + "@{callee.symbol()} returning "
+                + "{types.display(callee.returnType())}");
         }
     }
-    let receiverType = call.callee.receiverType();
+    let receiverType = callee.receiverType();
     if (receiverType != null) {
-        if (call.receiver < 0) {
-            verification.report("{block.label()}: call to @{call.callee.symbol()} passes no "
+        if (receiver < 0) {
+            verification.report("{block.label()}: call to @{callee.symbol()} passes no "
                 + "receiver but the callee is a method on "
                 + "{types.display(receiverType)}");
         } else {
-            verifyoperands.checkOperand(verification, block, call.receiver);
+            verifyoperands.checkOperand(verification, block, receiver);
             if (!primitives.isClassLike(receiverType)) {
-                verifyoperands.checkIsAddress(verification, block, call.receiver,
-                    "the receiver of @{call.callee.symbol()}");
-            } else if (verification.isAddress(call.receiver)) {
-                verification.report("{block.label()}: @{call.callee.symbol()} runs over the "
-                    + "object a class reference names, but %{call.receiver} is an address");
+                verifyoperands.checkIsAddress(verification, block, receiver,
+                    "the receiver of @{callee.symbol()}");
+            } else if (verification.isAddress(receiver)) {
+                verification.report("{block.label()}: @{callee.symbol()} runs over the "
+                    + "object a class reference names, but %{receiver} is an address");
             }
         }
-    } else if (call.receiver >= 0) {
-        verification.report("{block.label()}: call to @{call.callee.symbol()} passes a "
+    } else if (receiver >= 0) {
+        verification.report("{block.label()}: call to @{callee.symbol()} passes a "
             + "receiver but the callee takes none");
     }
-    checkDispatch(verification, block, call, receiverType);
-    Type[] parameterTypes = call.callee.parameterTypes();
-    if (call.arguments.length != parameterTypes.length) {
-        verification.report("{block.label()}: call to @{call.callee.symbol()} passes "
-            + "{call.arguments.length} argument(s) for "
+    checkDispatch(verification, block, callee, receiver, receiverType, dispatchSlot,
+        dispatchInterface);
+    Type[] parameterTypes = callee.parameterTypes();
+    if (arguments.length != parameterTypes.length) {
+        verification.report("{block.label()}: call to @{callee.symbol()} passes "
+            + "{arguments.length} argument(s) for "
             + "{parameterTypes.length} parameter(s)");
         return;
     }
-    for (long i = 0; i < call.arguments.length; i++) {
-        verifyoperands.checkOperand(verification, block, call.arguments[i]);
-        if (verification.validTemp(call.arguments[i])
-                && verification.typeOf(call.arguments[i]) != parameterTypes[i]) {
+    for (long i = 0; i < arguments.length; i++) {
+        verifyoperands.checkOperand(verification, block, arguments[i]);
+        if (verification.validTemp(arguments[i])
+                && verification.typeOf(arguments[i]) != parameterTypes[i]) {
             verification.report("{block.label()}: argument {i + 1} of "
-                + "@{call.callee.symbol()} has type "
-                + "{types.display(verification.typeOf(call.arguments[i]))} "
+                + "@{callee.symbol()} has type "
+                + "{types.display(verification.typeOf(arguments[i]))} "
                 + "but the parameter takes "
                 + "{types.display(parameterTypes[i])}");
         }
@@ -62,25 +92,24 @@ public checkCall(VerificationContext verification, EirBlock block, EirCall call)
 
 // A dynamic call reads its target from the receiver's runtime type, so it needs a class-like
 // receiver, and a method-table dispatch names the interface whose table it consults.
-checkDispatch(VerificationContext verification, EirBlock block, EirCall call,
-              Type? receiverType) {
-    let dispatchInterface = call.dispatchInterface;
-    if (dispatchInterface != null && call.dispatchSlot < 0) {
-        verification.report("{block.label()}: call to @{call.callee.symbol()} names the "
+checkDispatch(VerificationContext verification, EirBlock block, EirCallee callee, long receiver,
+              Type? receiverType, long dispatchSlot, Type? dispatchInterface) {
+    if (dispatchInterface != null && dispatchSlot < 0) {
+        verification.report("{block.label()}: call to @{callee.symbol()} names the "
             + "interface {types.display(dispatchInterface)} but no slot in its method table");
         return;
     }
-    if (call.dispatchSlot < 0) {
+    if (dispatchSlot < 0) {
         return;
     }
-    if (call.receiver < 0 || receiverType == null || !primitives.isClassLike(receiverType)) {
-        verification.report("{block.label()}: call to @{call.callee.symbol()} dispatches "
-            + "through slot {call.dispatchSlot} but has no class-like receiver to read the "
+    if (receiver < 0 || receiverType == null || !primitives.isClassLike(receiverType)) {
+        verification.report("{block.label()}: call to @{callee.symbol()} dispatches "
+            + "through slot {dispatchSlot} but has no class-like receiver to read the "
             + "runtime type from");
         return;
     }
     if (dispatchInterface != null && primitives.interfaceOf(dispatchInterface) == null) {
-        verification.report("{block.label()}: call to @{call.callee.symbol()} dispatches "
+        verification.report("{block.label()}: call to @{callee.symbol()} dispatches "
             + "through the method table of {types.display(dispatchInterface)}, which is not an "
             + "interface");
     }

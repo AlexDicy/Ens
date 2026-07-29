@@ -1,0 +1,226 @@
+// The exception surface of EIR over hand-built functions: a throwing call with materialized
+// unwind cleanup balances and dumps as written, and each way an unwind path can go wrong - a
+// result read where the call unwound, an owned value never released on the unwind path, an
+// error propagated without ownership or without a slot to write - reports its own violation.
+import @std.testing;
+import PrimitiveKind from @ens.sema.model.types;
+import EirFunctionBuilder from eir.model;
+import EirParameter from eir.model;
+import EirCallee from eir.model;
+import EirConstInt from eir.model;
+import EirConstString from eir.model;
+import EirCaptureTrace from eir.model;
+import EirErrorTrace from eir.model;
+import EirRetain from eir.model;
+import EirRelease from eir.model;
+import EirReturn from eir.model;
+import EirTryCall from eir.model;
+import EirPropagate from eir.model;
+import eir.dump;
+import eir.ownership;
+import eir.verify;
+import support;
+
+test "a throwing call with materialized unwind cleanup balances and dumps as written" {
+    let analysis = try support.analyzeMain("main() \{\}");
+    let store = analysis.store();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let stringType = store.stringType();
+    let errorType = try support.classNamed(analysis, "Error");
+    let builder = new EirFunctionBuilder("thrower", false, null, [], intType);
+    builder.setThrowing();
+    long held = builder.newTemp(stringType);
+    builder.append(new EirConstString(held, stringType, "held".toBytes()));
+    builder.append(new EirRetain(held));
+    let callee = new EirCallee("risky", null, [], store.primitive(PrimitiveKind.Void), true);
+    long error = builder.newTemp(errorType);
+    long okBlock = builder.newBlock("ok");
+    long unwindBlock = builder.newBlock("unwind");
+    builder.terminate(new EirTryCall(-1, store.primitive(PrimitiveKind.Void), callee, -1, [],
+        -1, null, error, okBlock, unwindBlock, 5));
+    builder.moveTo(okBlock);
+    builder.append(new EirRelease(held));
+    long zero = builder.newTemp(intType);
+    builder.append(new EirConstInt(zero, intType, 0));
+    builder.terminate(new EirReturn(zero));
+    builder.moveTo(unwindBlock);
+    builder.append(new EirRelease(held));
+    builder.terminate(new EirPropagate(error));
+    let function = builder.finish();
+    try assertNoViolations(verify.verifyFunction(function));
+    try assertNoViolations(ownership.verifyOwnership(function));
+    try testing.assertEqual(dump.dumpFunction(function),
+        "func @thrower() -> int throws \{\n"
+        + "b0.entry:\n"
+        + "  %0 = const \"held\": string\n"
+        + "  retain %0\n"
+        + "  try_call @risky(), error %1, to b1.ok, unwind b2.unwind\n"
+        + "b1.ok:\n"
+        + "  release %0\n"
+        + "  %2 = const 0: int\n"
+        + "  ret %2\n"
+        + "b2.unwind:\n"
+        + "  release %0\n"
+        + "  propagate %1\n"
+        + "\}\n");
+}
+
+test "a try call's result does not exist on the unwind path" {
+    let analysis = try support.analyzeMain("main() \{\}");
+    let store = analysis.store();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let errorType = try support.classNamed(analysis, "Error");
+    let builder = new EirFunctionBuilder("misread", false, null, [], intType);
+    builder.setThrowing();
+    let callee = new EirCallee("risky", null, [], intType, true);
+    long result = builder.newTemp(intType);
+    long error = builder.newTemp(errorType);
+    long okBlock = builder.newBlock("ok");
+    long unwindBlock = builder.newBlock("unwind");
+    builder.terminate(new EirTryCall(result, intType, callee, -1, [], -1, null, error,
+        okBlock, unwindBlock, 3));
+    builder.moveTo(okBlock);
+    builder.terminate(new EirReturn(result));
+    builder.moveTo(unwindBlock);
+    builder.append(new EirRelease(error));
+    builder.terminate(new EirReturn(result));
+    try assertMentions(verify.verifyFunction(builder.finish()),
+        "%{result} is used before it is definitely defined");
+}
+
+test "an owned value not released on the unwind path is a leak where the error propagates" {
+    let analysis = try support.analyzeMain("main() \{\}");
+    let store = analysis.store();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let stringType = store.stringType();
+    let errorType = try support.classNamed(analysis, "Error");
+    let builder = new EirFunctionBuilder("leaky", false, null, [], intType);
+    builder.setThrowing();
+    long held = builder.newTemp(stringType);
+    builder.append(new EirConstString(held, stringType, "held".toBytes()));
+    builder.append(new EirRetain(held));
+    let callee = new EirCallee("risky", null, [], store.primitive(PrimitiveKind.Void), true);
+    long error = builder.newTemp(errorType);
+    long okBlock = builder.newBlock("ok");
+    long unwindBlock = builder.newBlock("unwind");
+    builder.terminate(new EirTryCall(-1, store.primitive(PrimitiveKind.Void), callee, -1, [],
+        -1, null, error, okBlock, unwindBlock, 5));
+    builder.moveTo(okBlock);
+    builder.append(new EirRelease(held));
+    long zero = builder.newTemp(intType);
+    builder.append(new EirConstInt(zero, intType, 0));
+    builder.terminate(new EirReturn(zero));
+    builder.moveTo(unwindBlock);
+    builder.terminate(new EirPropagate(error));
+    try assertMentions(ownership.verifyOwnership(builder.finish()),
+        "%{held} still owns a reference where the error propagates");
+}
+
+test "propagating a borrowed error and propagating without a slot are both reported" {
+    let analysis = try support.analyzeMain("main() \{\}");
+    let store = analysis.store();
+    let errorType = try support.classNamed(analysis, "Error");
+    let voidType = store.primitive(PrimitiveKind.Void);
+
+    let borrowed = new EirFunctionBuilder("reborrow", false, null,
+        [new EirParameter("error", errorType)], voidType);
+    borrowed.setThrowing();
+    borrowed.terminate(new EirPropagate(0));
+    try assertMentions(ownership.verifyOwnership(borrowed.finish()),
+        "%0 is propagated without owning a reference");
+
+    let slotless = new EirFunctionBuilder("slotless", false, null,
+        [new EirParameter("error", errorType)], voidType);
+    slotless.append(new EirRetain(0));
+    slotless.terminate(new EirPropagate(0));
+    try assertMentions(verify.verifyFunction(slotless.finish()),
+        "propagate in a function whose ABI has no error slot");
+}
+
+test "a try call must name a callee whose ABI carries the error slot" {
+    let analysis = try support.analyzeMain("main() \{\}");
+    let store = analysis.store();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let errorType = try support.classNamed(analysis, "Error");
+    let builder = new EirFunctionBuilder("checked", false, null, [], intType);
+    builder.setThrowing();
+    let callee = new EirCallee("plain", null, [], intType, false);
+    long result = builder.newTemp(intType);
+    long error = builder.newTemp(errorType);
+    long okBlock = builder.newBlock("ok");
+    long unwindBlock = builder.newBlock("unwind");
+    builder.terminate(new EirTryCall(result, intType, callee, -1, [], -1, null, error,
+        okBlock, unwindBlock, 3));
+    builder.moveTo(okBlock);
+    builder.terminate(new EirReturn(result));
+    builder.moveTo(unwindBlock);
+    builder.append(new EirRelease(error));
+    long zero = builder.newTemp(intType);
+    builder.append(new EirConstInt(zero, intType, 0));
+    builder.terminate(new EirReturn(zero));
+    try assertMentions(verify.verifyFunction(builder.finish()),
+        "whose ABI carries no error slot to check");
+}
+
+test "capturing a trace onto a non-error value and a mistyped trace read are both reported" {
+    let analysis = try support.analyzeMain("main() \{\}");
+    let store = analysis.store();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let errorType = try support.classNamed(analysis, "Error");
+
+    let wrongTarget = new EirFunctionBuilder("badcapture", false, null, [], intType);
+    long number = wrongTarget.newTemp(intType);
+    wrongTarget.append(new EirConstInt(number, intType, 4));
+    wrongTarget.append(new EirCaptureTrace(number, 7));
+    wrongTarget.terminate(new EirReturn(number));
+    try assertMentions(verify.verifyFunction(wrongTarget.finish()),
+        "which is not an error object");
+
+    let wrongType = new EirFunctionBuilder("badtrace", false, null,
+        [new EirParameter("error", errorType)], intType);
+    long read = wrongType.newTemp(intType);
+    wrongType.append(new EirErrorTrace(read, intType, 0, false));
+    wrongType.terminate(new EirReturn(read));
+    try assertMentions(verify.verifyFunction(wrongType.finish()),
+        "asks for text but is typed");
+}
+
+test "the formatted trace an error yields is owned and dumps as an error_trace read" {
+    let analysis = try support.analyzeMain("main() \{\}");
+    let store = analysis.store();
+    let stringType = store.stringType();
+    let errorType = try support.classNamed(analysis, "Error");
+    let builder = new EirFunctionBuilder("readtrace", false, null,
+        [new EirParameter("error", errorType)], stringType);
+    builder.append(new EirCaptureTrace(0, 9));
+    long text = builder.newTemp(stringType);
+    builder.append(new EirErrorTrace(text, stringType, 0, false));
+    builder.terminate(new EirReturn(text));
+    let function = builder.finish();
+    try assertNoViolations(verify.verifyFunction(function));
+    try assertNoViolations(ownership.verifyOwnership(function));
+    let dumped = dump.dumpFunction(function);
+    try testing.assertTrue(dumped.indexOf("capture_trace %0, line 9") >= 0,
+        "the capture is missing from the dump: {dumped}");
+    try testing.assertTrue(dumped.indexOf("%1 = error_trace %0 formatted: string") >= 0,
+        "the trace read is missing from the dump: {dumped}");
+}
+
+assertNoViolations(string[] violations) throws {
+    if (violations.length > 0) {
+        try testing.fail("expected no violations, got: {violations[0]}");
+    }
+}
+
+assertMentions(string[] violations, string fragment) throws {
+    for (let violation in violations) {
+        if (violation.indexOf(fragment) >= 0) {
+            return;
+        }
+    }
+    string first = "<none>";
+    if (violations.length > 0) {
+        first = violations[0];
+    }
+    try testing.fail("no violation mentions '{fragment}'; first was: {first}");
+}

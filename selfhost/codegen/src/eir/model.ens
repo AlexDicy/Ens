@@ -145,15 +145,19 @@ export enum EirCastOp {
 // The callee of a call: its linker symbol and the sema types its LLVM function type derives
 // from. Parameter types list every parameter after default filling, in parameter order. A
 // method callee additionally names its receiver's type, passed by address before the
-// parameters.
+// parameters. A throwing callee's ABI carries one more trailing parameter, the address of the
+// caller's error slot; whether a given call site checks that slot is the call's own shape.
 export final class EirCallee {
     string calleeSymbol;
     Type? calleeReceiverType;
     Type[] calleeParameterTypes;
     Type calleeReturnType;
+    bool calleeThrows;
 
     public constructor(this.calleeSymbol, this.calleeReceiverType, this.calleeParameterTypes,
-                this.calleeReturnType);
+                this.calleeReturnType, bool throwing = false) {
+        this.calleeThrows = throwing;
+    }
 
     export symbol() -> string {
         return this.calleeSymbol;
@@ -169,6 +173,10 @@ export final class EirCallee {
 
     export returnType() -> Type {
         return this.calleeReturnType;
+    }
+
+    export throwing() -> bool {
+        return this.calleeThrows;
     }
 }
 
@@ -258,6 +266,9 @@ export final class EirStoreSlot extends EirInstruction {
 // dynamic: the target is read from the receiver's runtime type, at that slot of its vtable, or
 // of its method table for dispatchInterface when one is named. The slot is symbolic; the
 // descriptor layout belongs to emission.
+//
+// line is the call's 1-based source line, or -1 when the call never appears in a stack trace;
+// emission marks each lined call site so a captured return address resolves back to it.
 export final class EirCall extends EirInstruction {
     public long result;
     public Type type;
@@ -266,9 +277,12 @@ export final class EirCall extends EirInstruction {
     public long[] arguments;
     public long dispatchSlot;
     public Type? dispatchInterface;
+    public long line;
 
     public constructor(this.result, this.type, this.callee, this.receiver, this.arguments,
-                this.dispatchSlot, this.dispatchInterface);
+                this.dispatchSlot, this.dispatchInterface, long line = -1) {
+        this.line = line;
+    }
 }
 
 // Takes over the +1 a reference-typed value temp does not yet own: the value was just loaded
@@ -431,12 +445,16 @@ export final class EirCheckedCast extends EirInstruction {
     public constructor(this.result, this.type, this.value, this.target);
 }
 
-// Aborts the program when index is outside the array's bounds.
+// Aborts the program when index is outside the array's bounds. line is the subscript's source
+// line, printed as the innermost frame of the panic's stack trace.
 export final class EirBoundsCheck extends EirInstruction {
     public long array;
     public long index;
+    public long line;
 
-    public constructor(this.array, this.index);
+    public constructor(this.array, this.index, long line = -1) {
+        this.line = line;
+    }
 }
 
 // Aborts the program with the message unless 0 <= start <= end <= length.
@@ -445,8 +463,11 @@ export final class EirRangeCheck extends EirInstruction {
     public long end;
     public long length;
     public string message;
+    public long line;
 
-    public constructor(this.start, this.end, this.length, this.message);
+    public constructor(this.start, this.end, this.length, this.message, long line = -1) {
+        this.line = line;
+    }
 }
 
 // An immortal string literal. The bytes are the decoded UTF-8 contents.
@@ -660,11 +681,36 @@ export final class EirPrint extends EirInstruction {
     public constructor(this.value);
 }
 
-// Writes "panic: " and the string to standard error, then exits with code 134.
+// Writes "panic: " and the string to standard error with a stack trace captured here, then
+// exits with code 134.
 export final class EirPanic extends EirInstruction {
     public long value;
+    public long line;
 
-    public constructor(this.value);
+    public constructor(this.value, long line = -1) {
+        this.line = line;
+    }
+}
+
+// Captures the current stack into the error object's trace, releasing whatever trace it carried
+// before. line is the throw's source line, the innermost frame of the captured trace.
+export final class EirCaptureTrace extends EirInstruction {
+    public long error;
+    public long line;
+
+    public constructor(this.error, this.line);
+}
+
+// The trace an error carries, symbolicated lazily: as the formatted text when structured is
+// false, and as the StackFrame array when it is true. The result is a fresh value the caller
+// owns.
+export final class EirErrorTrace extends EirInstruction {
+    public long result;
+    public Type type;
+    public long error;
+    public bool structured;
+
+    public constructor(this.result, this.type, this.error, this.structured);
 }
 
 export sealed abstract class EirTerminator {
@@ -706,6 +752,38 @@ export final class EirUnreachable extends EirTerminator {
     public constructor();
 }
 
+// A call whose callee may throw, so the block ends here: the callee reports through the error
+// slot the caller passes, and control continues at normalTarget when the slot stays null or at
+// unwindTarget when it does not. The call fields mirror EirCall's. result is defined only along
+// the normal edge; errorResult holds the thrown error, owned, only along the unwind edge. The
+// unwind block carries the cleanup lowering materialized for exactly this site.
+export final class EirTryCall extends EirTerminator {
+    public long result;
+    public Type type;
+    public EirCallee callee;
+    public long receiver;
+    public long[] arguments;
+    public long dispatchSlot;
+    public Type? dispatchInterface;
+    public long errorResult;
+    public long normalTarget;
+    public long unwindTarget;
+    public long line;
+
+    public constructor(this.result, this.type, this.callee, this.receiver, this.arguments,
+                this.dispatchSlot, this.dispatchInterface, this.errorResult, this.normalTarget,
+                this.unwindTarget, this.line);
+}
+
+// Hands a thrown error to the caller: writes it into the error slot the caller passed and
+// returns the zero of the function's return type. The error's +1 transfers to the caller, and
+// every other owned value must have been released before this point.
+export final class EirPropagate extends EirTerminator {
+    public long error;
+
+    public constructor(this.error);
+}
+
 export final class EirBlock {
     string blockLabel;
     List<EirInstruction> blockInstructions;
@@ -737,6 +815,12 @@ export final class EirBlock {
 // One lowered function. When the function is a method, temp 0 is the receiver's address and
 // the parameters follow it; otherwise the first parameters().length temps are the parameters.
 // Every temp's type is recorded in tempTypes, indexed by temp id. Block 0 is the entry block.
+//
+// A throwing function's ABI carries one more trailing parameter, the address of its caller's
+// error slot; the slot never appears as a temp, because EirPropagate is the only thing that
+// writes it. The trace fields describe the function as a stack trace prints it - its display
+// name, its file, and the line it is declared on - with an empty name meaning the function
+// never appears in a trace; traceEntry marks the program entry, where a captured trace stops.
 export final class EirFunction {
     string functionSymbol;
     bool internal;
@@ -746,10 +830,17 @@ export final class EirFunction {
     List<EirSlot> functionSlots;
     List<EirBlock> functionBlocks;
     List<Type> functionTempTypes;
+    bool functionThrows;
+    string functionTraceName;
+    string functionTraceFile;
+    long functionTraceLine;
+    bool functionTraceEntry;
 
     public constructor(string symbol, bool internalLinkage, Type? receiverType,
                 EirParameter[] parameters, Type returnType, List<EirSlot> slots,
-                List<EirBlock> blocks, List<Type> tempTypes) {
+                List<EirBlock> blocks, List<Type> tempTypes, bool throwing = false,
+                string traceName = "", string traceFile = "", long traceLine = -1,
+                bool traceEntry = false) {
         this.functionSymbol = symbol;
         this.internal = internalLinkage;
         this.functionReceiverType = receiverType;
@@ -758,6 +849,11 @@ export final class EirFunction {
         this.functionSlots = slots;
         this.functionBlocks = blocks;
         this.functionTempTypes = tempTypes;
+        this.functionThrows = throwing;
+        this.functionTraceName = traceName;
+        this.functionTraceFile = traceFile;
+        this.functionTraceLine = traceLine;
+        this.functionTraceEntry = traceEntry;
     }
 
     export symbol() -> string {
@@ -801,6 +897,26 @@ export final class EirFunction {
     export tempTypes() -> List<Type> {
         return this.functionTempTypes;
     }
+
+    export throwing() -> bool {
+        return this.functionThrows;
+    }
+
+    export traceName() -> string {
+        return this.functionTraceName;
+    }
+
+    export traceFile() -> string {
+        return this.functionTraceFile;
+    }
+
+    export traceLine() -> long {
+        return this.functionTraceLine;
+    }
+
+    export isEntryPoint() -> bool {
+        return this.functionTraceEntry;
+    }
 }
 
 // Builds one function. Temp numbering and block labels are builder-local, so lowering different
@@ -815,6 +931,11 @@ export final class EirFunctionBuilder {
     List<EirBlock> blocks;
     List<Type> tempTypes;
     long currentBlock;
+    bool throwingFunction;
+    string functionTraceName;
+    string functionTraceFile;
+    long functionTraceLine;
+    bool functionTraceEntry;
 
     public constructor(string symbol, bool internalLinkage, Type? receiverType,
                 EirParameter[] parameters, Type returnType) {
@@ -826,6 +947,11 @@ export final class EirFunctionBuilder {
         this.slots = new List<EirSlot>();
         this.blocks = new List<EirBlock>();
         this.tempTypes = new List<Type>();
+        this.throwingFunction = false;
+        this.functionTraceName = "";
+        this.functionTraceFile = "";
+        this.functionTraceLine = -1;
+        this.functionTraceEntry = false;
         if (receiverType != null) {
             this.tempTypes.push(receiverType);
         }
@@ -833,6 +959,23 @@ export final class EirFunctionBuilder {
             this.tempTypes.push(parameter.type());
         }
         this.currentBlock = this.newBlock("entry");
+    }
+
+    // Marks the function as reporting through a trailing error-slot parameter.
+    public setThrowing() {
+        this.throwingFunction = true;
+    }
+
+    public isThrowing() -> bool {
+        return this.throwingFunction;
+    }
+
+    // Records how a stack trace prints this function, and whether it is the program entry.
+    public setTrace(string name, string file, long line, bool entryPoint) {
+        this.functionTraceName = name;
+        this.functionTraceFile = file;
+        this.functionTraceLine = line;
+        this.functionTraceEntry = entryPoint;
     }
 
     public newTemp(Type type) -> long {
@@ -884,6 +1027,8 @@ export final class EirFunctionBuilder {
 
     public finish() -> EirFunction {
         return new EirFunction(this.symbol, this.internal, this.receiverType, this.parameters,
-            this.returnType, this.slots, this.blocks, this.tempTypes);
+            this.returnType, this.slots, this.blocks, this.tempTypes, this.throwingFunction,
+            this.functionTraceName, this.functionTraceFile, this.functionTraceLine,
+            this.functionTraceEntry);
     }
 }

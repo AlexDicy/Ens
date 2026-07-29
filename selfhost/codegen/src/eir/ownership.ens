@@ -40,8 +40,11 @@ import EirBoolToString from eir.model;
 import EirEnumToString from eir.model;
 import EirDoubleToString from eir.model;
 import EirJsonEscape from eir.model;
+import EirErrorTrace from eir.model;
 import EirTerminator from eir.model;
 import EirReturn from eir.model;
+import EirTryCall from eir.model;
+import EirPropagate from eir.model;
 import eir.place;
 import eir.walk;
 import Type from @ens.sema.model.types;
@@ -148,6 +151,7 @@ class OwnershipVerifier {
                     continue;
                 }
                 let exitStates = this.transferBlock(blocks.get(b), entryStates.get(b), false);
+                let terminator = blocks.get(b).terminator();
                 for (let successor in walk.successorsOf(blocks.get(b))) {
                     if (successor < 0 || successor >= blockCount) {
                         continue;
@@ -157,6 +161,21 @@ class OwnershipVerifier {
                         let merged = join(target.get(i), exitStates.get(i));
                         if (merged != target.get(i)) {
                             target.set(i, merged);
+                            changed = true;
+                        }
+                    }
+                    // A terminator's definitions arrive owned, but only along their own edge: a
+                    // try call's result where it returned, its error where it unwound.
+                    if (terminator == null) {
+                        continue;
+                    }
+                    for (let defined in walk.terminatorDefsFor(terminator, successor)) {
+                        if (!this.isTracked(defined)) {
+                            continue;
+                        }
+                        let merged = join(target.get(defined), Ownership.Owned);
+                        if (merged != target.get(defined)) {
+                            target.set(defined, merged);
                             changed = true;
                         }
                     }
@@ -320,17 +339,39 @@ class OwnershipVerifier {
         switch (terminator) {
             is EirReturn returned -> {
                 this.consume(block, returned.value, states, reporting, "returned");
+                this.checkNothingOwned(block, states, reporting, "the function returns");
+            },
+            // The error's +1 transfers into the caller's slot; everything else must already have
+            // been given up, exactly as at a return.
+            is EirPropagate propagated -> {
+                this.consume(block, propagated.error, states, reporting, "propagated");
+                this.checkNothingOwned(block, states, reporting, "the error propagates");
+            },
+            is EirTryCall call -> {
                 if (!reporting) {
                     return;
                 }
-                for (long i = 0; i < this.tempCount; i++) {
-                    if (this.isTracked(i) && states.get(i) == Ownership.Owned) {
-                        this.report("{block.label()}: %{i} still owns a reference where the "
-                            + "function returns, which leaks it");
+                for (let used in walk.terminatorUsesOf(call)) {
+                    if (this.isTracked(used) && states.get(used) == Ownership.Consumed) {
+                        this.report("{block.label()}: %{used} is used after its reference "
+                            + "was given up");
                     }
                 }
             },
             default -> { },
+        }
+    }
+
+    // Reports every temp still owning a reference where control leaves the function.
+    checkNothingOwned(EirBlock block, List<Ownership> states, bool reporting, string where) {
+        if (!reporting) {
+            return;
+        }
+        for (long i = 0; i < this.tempCount; i++) {
+            if (this.isTracked(i) && states.get(i) == Ownership.Owned) {
+                this.report("{block.label()}: %{i} still owns a reference where {where}, "
+                    + "which leaks it");
+            }
         }
     }
 
@@ -395,6 +436,9 @@ producesOwned(EirInstruction instruction) -> bool {
             return true;
         },
         is EirCall ignored -> {
+            return true;
+        },
+        is EirErrorTrace ignored -> {
             return true;
         },
         default -> {
