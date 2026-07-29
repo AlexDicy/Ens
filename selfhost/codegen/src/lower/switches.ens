@@ -17,15 +17,21 @@ import SyntaxKind from @ens.frontend.syntax.generated.kind;
 import Span from @ens.frontend.support.source;
 import Type from @ens.sema.model.types;
 import EnumType from @ens.sema.model.types;
+import PrimitiveKind from @ens.sema.model.types;
 import @ens.sema.model.types;
+import EirBinary from eir.model;
+import EirBinaryOp from eir.model;
 import EirBranch from eir.model;
+import EirConstNull from eir.model;
 import EirLoadSlot from eir.model;
 import EirOptionalPayload from eir.model;
 import EirStoreSlot from eir.model;
+import EirStringEqual from eir.model;
 import EirJump from eir.model;
 import EirSwitch from eir.model;
 import EirUnreachable from eir.model;
 import LoweringContext from lower.context;
+import lower.classes;
 import lower.expressions;
 import lower.literals;
 import lower.optionals;
@@ -60,6 +66,9 @@ lowerSwitch(LoweringContext lowering, Expression scrutinee, List<SwitchArm> arms
     }
     if (hasTypeArm(arms)) {
         return typetests.lowerTypeSwitch(lowering, scrutinee, arms, resultType, span);
+    }
+    if (isStringScrutinee(scrutineeType)) {
+        return lowerStringSwitch(lowering, scrutinee, scrutineeType, arms, resultType, span);
     }
     let payloadType = primitives.taggedPayloadOf(scrutineeType);
     bool tagged = payloadType != null && primitives.isIntegerLike(payloadType);
@@ -162,6 +171,128 @@ lowerSwitch(LoweringContext lowering, Expression scrutinee, List<SwitchArm> arms
     long temp = builder.newTemp(resultType);
     builder.append(new EirLoadSlot(temp, resultType, resultSlot));
     return temp;
+}
+
+// A switch over a string or string? scrutinee: a chain of content comparisons in source order,
+// with a null arm caught by a pointer test before the chain runs. The scrutinee is borrowed for
+// the whole statement - an owned one parks in a scope-owned slot - so every arm compares the
+// same reference and it is given up exactly once.
+lowerStringSwitch(LoweringContext lowering, Expression scrutinee, Type scrutineeType,
+                  List<SwitchArm> arms, Type? resultType, Span span) -> long {
+    if (resultType != null && !lowering.supportsValueType(resultType)) {
+        lowering.unsupported("a switch producing '{types.display(resultType)}'", span);
+        return -1;
+    }
+    long scrutineeValue = classes.borrowedReference(lowering, scrutinee, scrutineeType);
+    if (scrutineeValue < 0) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    long resultSlot = -1;
+    if (resultType != null) {
+        resultSlot = ownership.defineMergeSlot(lowering, "switch", resultType);
+    }
+    let armBlocks = new List<long>();
+    let labelExpressions = new List<Expression>();
+    let labelTargets = new List<long>();
+    long defaultTarget = -1;
+    long nullTarget = -1;
+    for (long a = 0; a < arms.length(); a++) {
+        switch (arms.get(a)) {
+            is ValueArmNode arm -> {
+                long block = builder.newBlock("switch.case");
+                armBlocks.push(block);
+                for (long i = 0; i < arm.labelsCount(); i++) {
+                    if (isNullLabel(lowering, arm.labels(i))) {
+                        nullTarget = block;
+                        continue;
+                    }
+                    labelExpressions.push(arm.labels(i));
+                    labelTargets.push(block);
+                }
+            },
+            is DefaultArmNode arm -> {
+                long block = builder.newBlock("switch.default");
+                armBlocks.push(block);
+                defaultTarget = block;
+            },
+            is TypeArmNode arm -> {
+                lowering.internalError("a type arm reached the string switch lowering",
+                    arm.span());
+                return -1;
+            },
+        }
+    }
+    long unreachableBlock = -1;
+    if (defaultTarget < 0) {
+        unreachableBlock = builder.newBlock("switch.unreachable");
+        defaultTarget = unreachableBlock;
+    }
+    long merge = builder.newBlock("switch.end");
+    if (primitives.isOptionalType(scrutineeType)) {
+        long absent = builder.newTemp(scrutineeType);
+        builder.append(new EirConstNull(absent, scrutineeType));
+        long isAbsent = builder.newTemp(boolType);
+        builder.append(new EirBinary(isAbsent, boolType, EirBinaryOp.CmpEq, scrutineeValue,
+            absent));
+        long chainBlock = builder.newBlock("switch.chain");
+        long absentTarget = nullTarget;
+        if (absentTarget < 0) {
+            absentTarget = defaultTarget;
+        }
+        builder.terminate(new EirBranch(isAbsent, absentTarget, chainBlock));
+        builder.moveTo(chainBlock);
+    }
+    for (long i = 0; i < labelExpressions.length(); i++) {
+        long label = expressions.lower(lowering, labelExpressions.get(i));
+        if (label < 0) {
+            return -1;
+        }
+        long matched = builder.newTemp(boolType);
+        builder.append(new EirStringEqual(matched, boolType, scrutineeValue, label));
+        long next = builder.newBlock("switch.next");
+        builder.terminate(new EirBranch(matched, labelTargets.get(i), next));
+        builder.moveTo(next);
+    }
+    builder.terminate(new EirJump(defaultTarget));
+    if (unreachableBlock >= 0) {
+        builder.moveTo(unreachableBlock);
+        builder.terminate(new EirUnreachable());
+    }
+    for (long a = 0; a < arms.length(); a++) {
+        let body = armBodyOf(arms.get(a));
+        if (body == null) {
+            continue;
+        }
+        builder.moveTo(armBlocks.get(a));
+        lowerArmBody(lowering, body, resultType, resultSlot);
+        if (lowering.failed()) {
+            return -1;
+        }
+        if (!builder.terminated()) {
+            builder.terminate(new EirJump(merge));
+        }
+    }
+    builder.moveTo(merge);
+    if (resultType == null) {
+        return -1;
+    }
+    long temp = builder.newTemp(resultType);
+    builder.append(new EirLoadSlot(temp, resultType, resultSlot));
+    return temp;
+}
+
+// True for a string or string? scrutinee, which dispatches by content comparison.
+isStringScrutinee(Type scrutineeType) -> bool {
+    if (primitives.isStringType(scrutineeType)) {
+        return true;
+    }
+    if (!primitives.isOptionalType(scrutineeType)) {
+        return false;
+    }
+    let referent = primitives.referenceOf(scrutineeType);
+    return referent != null && primitives.isStringType(referent);
 }
 
 public lowerArmBody(LoweringContext lowering, ArmBody body, Type? resultType, long resultSlot) {

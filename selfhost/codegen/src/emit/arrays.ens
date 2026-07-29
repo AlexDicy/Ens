@@ -1,14 +1,18 @@
-// Array allocation and length. An array's header carries the finalizer that releases what its
-// elements own, so an allocation asks the finalizers for the one its element type needs and the
-// module's data layout for the size of one element.
+// Array allocation, length, and the slice copy. An array's header carries the finalizer that
+// releases what its elements own, so an allocation asks the finalizers for the one its element
+// type needs and the module's data layout for the size of one element.
 import EirArrayNew from eir.model;
 import EirArrayLength from eir.model;
+import EirArraySlice from eir.model;
 import Type from @ens.sema.model.types;
 import ArrayType from @ens.sema.model.types;
 import @ens.sema.model.types;
 import Value from @ens.llvm.values;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
 import ModuleEmitter from emit.context;
 import EmissionFrame from emit.context;
+import support.primitives;
 
 public emitArrayNew(ModuleEmitter emitter, EmissionFrame frame, EirArrayNew allocation) {
     frame.define(allocation.result, allocateArray(emitter, allocation.type,
@@ -18,6 +22,50 @@ public emitArrayNew(ModuleEmitter emitter, EmissionFrame frame, EirArrayNew allo
 
 public emitArrayLength(ModuleEmitter emitter, EmissionFrame frame, EirArrayLength length) {
     frame.define(length.result, emitter.runtime.payloadLength(frame.value(length.array)));
+}
+
+// The range's elements copied into a fresh array, with each copied reference retained so the
+// slice owns its elements alongside the source.
+public emitArraySlice(ModuleEmitter emitter, EmissionFrame frame, EirArraySlice sliced) {
+    let runtime = emitter.runtime;
+    let builder = emitter.builder;
+    let element = elementTypeOf(sliced.type);
+    let elementType = emitter.mapType(element);
+    let start = frame.value(sliced.start);
+    let count = instructions.buildSub(builder, frame.value(sliced.end), start, "slice.count");
+    let result = allocateArray(emitter, sliced.type, count,
+        emitter.finalizers.arrayFinalizer(element));
+    let elementBytes = emitter.dataLayout().abiSizeOfType(elementType);
+    let bytes = instructions.buildMul(builder, count,
+        runtime.int64(elementBytes as long), "slice.bytes");
+    let destination = runtime.payloadData(result);
+    let source = memory.buildGEP(builder, elementType,
+        runtime.payloadData(frame.value(sliced.array)), [start], "slice.source");
+    memory.buildMemCpy(builder, destination, 1, source, 1, bytes);
+    if (primitives.isReferenceType(element)) {
+        let index = memory.buildAlloca(builder, runtime.int64Type, "slice.i");
+        memory.buildStore(builder, runtime.int64(0), index);
+        let test = emitter.context.appendBasicBlock(frame.declared(), "slice.retain.test");
+        let body = emitter.context.appendBasicBlock(frame.declared(), "slice.retain.body");
+        let done = emitter.context.appendBasicBlock(frame.declared(), "slice.retain.done");
+        instructions.buildBr(builder, test);
+
+        builder.positionAtEnd(test);
+        let position = memory.buildLoad(builder, runtime.int64Type, index, "i.cur");
+        instructions.buildCondBr(builder,
+            instructions.buildICmpSLT(builder, position, count, ""), body, done);
+
+        builder.positionAtEnd(body);
+        let held = memory.buildLoad(builder, runtime.pointerType,
+            memory.buildGEP(builder, elementType, destination, [position], ""), "element");
+        runtime.call(runtime.retain(), [held], "");
+        memory.buildStore(builder,
+            instructions.buildAdd(builder, position, runtime.int64(1), ""), index);
+        instructions.buildBr(builder, test);
+
+        builder.positionAtEnd(done);
+    }
+    frame.define(sliced.result, result);
 }
 
 // A fresh array of the given length, whose header carries the finalizer that releases what its
