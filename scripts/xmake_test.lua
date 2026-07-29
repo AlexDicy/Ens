@@ -1,11 +1,19 @@
--- compile each tests/*.ens with the ens compiler and verify the exit code (and stdout)
--- following the test source header:
+-- compile each tests/*.ens with the ens compiler and verify the exit code, the standard output
+-- and the standard error against the directives in the test source header:
 --     // @exit 12
 --     // @stdout Hello!
+--     // @stdout-contains Hello
+--     // @stderr panic: boom
+--     // @stderr-contains panic:
+-- @stdout and @stderr give one exact line each and accumulate: every directive of the kind,
+-- joined with newlines, must equal the whole stream (trailing newlines trimmed). @stdout-contains
+-- and @stderr-contains each name a substring the stream must contain. Both streams are captured
+-- separately, so what the runtime reports on stderr - a panic, an unhandled exception - is
+-- asserted with the @stderr directives and never appears in stdout.
 -- use @expect-error instead to assert the compiler reports a specific diagnostic.
 --     // @expect-error Undefined function 'testFunction'
 -- a folder test's main.ens may use @ens-test (optionally with extra arguments) to run
--- `ens test <folder> ...` instead of compile+run, asserting on its output.
+-- `ens test <folder> ...` instead of compile+run, asserting on its two streams the same way.
 -- the token {dir} in the extra arguments expands to the folder's absolute path.
 --     // @ens-test --filter needle
 -- tests run in parallel; set ENS_TEST_JOBS to override the worker count (default: cpu count).
@@ -245,6 +253,26 @@ task("test")
             local rc = os.execv(program, argv, options)
             logfile:close()
             return rc
+        end
+
+        -- run a program with each stream captured into its own file, so stdout and stderr are
+        -- asserted independently. `opt` may add os.execv options such as curdir or stdin.
+        local function execSplit(program, argv, outpath, errpath, opt)
+            local outfile = io.open(outpath, "w")
+            local errfile = io.open(errpath, "w")
+            local options = {try = true, stdout = outfile, stderr = errfile}
+            for key, value in pairs(opt or {}) do
+                options[key] = value
+            end
+            local rc = os.execv(program, argv, options)
+            outfile:close()
+            errfile:close()
+            return rc
+        end
+
+        -- a captured stream with its trailing newlines trimmed, the form the directives compare.
+        local function captured(logpath)
+            return ((io.readfile(logpath) or ""):gsub("[\r\n]+$", ""))
         end
 
         -- the corpus round-trip harness: build the driver exe fresh from its own workspace (it
@@ -1434,11 +1462,14 @@ task("test")
             local ens_file = job.ens_file
             local exe_file    = path.join(out_dir, name .. ".exe")
             local stdout_file = path.join(out_dir, name .. ".stdout")
+            local stderr_file = path.join(out_dir, name .. ".stderr")
             local compile_log = path.join(out_dir, name .. ".compile.log")
 
             local expected_exit     = 0
             local expected_stdout   = nil   -- list of lines; joined with "\n" for an exact match
             local expected_contains = {}    -- substrings that must each appear in stdout
+            local expected_stderr   = nil   -- the same, for the standard error stream
+            local expected_stderr_contains = {}
             local expected_error    = nil
             local ens_test_args     = job.ens_test_args   -- @ens-test: run `ens test` on the folder instead
             local content = (ens_file and io.readfile(ens_file)) or ""
@@ -1452,6 +1483,15 @@ task("test")
                     if expected_stdout == nil then expected_stdout = {} end
                     table.insert(expected_stdout, stdout_str)
                 end
+                local err_contains_str = line:match("^%s*//%s*@stderr%-contains%s+(.*)$")
+                if err_contains_str then
+                    table.insert(expected_stderr_contains, err_contains_str)
+                end
+                local stderr_str = line:match("^%s*//%s*@stderr%s+(.*)$")
+                if stderr_str then
+                    if expected_stderr == nil then expected_stderr = {} end
+                    table.insert(expected_stderr, stderr_str)
+                end
                 local error_str = line:match("^%s*//%s*@expect%-error%s+(.*)$")
                 if error_str then expected_error = error_str end
                 local enstest_str = line:match("^%s*//%s*@ens%-test%s*(.*)$")
@@ -1463,48 +1503,61 @@ task("test")
                 end
             end
 
-            -- compare a process result against the @exit/@stdout/@stdout-contains directives.
-            local function compareRun(run_rc, actual_stdout)
+            -- compare a process result against the @exit directive and, per stream, its exact-line
+            -- and contains directives.
+            local function compareRun(run_rc, actual_stdout, actual_stderr)
                 local why = {}
                 if run_rc ~= expected_exit then
                     table.insert(why, string.format("exit=%s expected=%s",
                         tostring(run_rc), tostring(expected_exit)))
                 end
-                if expected_stdout ~= nil then
-                    local joined = table.concat(expected_stdout, "\n")
-                    if actual_stdout ~= joined then
-                        table.insert(why, string.format("stdout=%q expected=%q",
-                            actual_stdout, joined))
+                local streams = {
+                    {label = "stdout", actual = actual_stdout,
+                     lines = expected_stdout, contains = expected_contains},
+                    {label = "stderr", actual = actual_stderr,
+                     lines = expected_stderr, contains = expected_stderr_contains},
+                }
+                for _, stream in ipairs(streams) do
+                    if stream.lines ~= nil then
+                        local joined = table.concat(stream.lines, "\n")
+                        if stream.actual ~= joined then
+                            table.insert(why, string.format("%s=%q expected=%q",
+                                stream.label, stream.actual, joined))
+                        end
                     end
-                end
-                for _, sub in ipairs(expected_contains) do
-                    if not actual_stdout:find(sub, 1, true) then
-                        table.insert(why, string.format("stdout missing %q", sub))
+                    for _, sub in ipairs(stream.contains) do
+                        if not stream.actual:find(sub, 1, true) then
+                            table.insert(why, string.format("%s missing %q", stream.label, sub))
+                        end
                     end
                 end
                 return why
             end
 
-            -- @ens-test: invoke `ens test` on the folder and assert on its combined output.
+            -- @ens-test: invoke `ens test` on the folder and assert on its two streams.
             if ens_test_args ~= nil then
                 os.tryrm(stdout_file)
+                os.tryrm(stderr_file)
                 local argv = {"test", job.source}
                 for _, a in ipairs(ens_test_args) do
                     table.insert(argv, (a:gsub("{dir}", (job.source:gsub("\\", "/")))))
                 end
-                local run_rc = execMerged(ens_exe, argv, stdout_file)
-                local actual_stdout = (io.readfile(stdout_file) or ""):gsub("[\r\n]+$", "")
-                local why = compareRun(run_rc, actual_stdout)
+                local run_rc = execSplit(ens_exe, argv, stdout_file, stderr_file)
+                local actual_stdout = captured(stdout_file)
+                local actual_stderr = captured(stderr_file)
+                local why = compareRun(run_rc, actual_stdout, actual_stderr)
                 if #why == 0 then
                     return {name = name, ok = true}
                 end
                 local short = table.concat(why, "; ")
                 return {name = name, ok = false, short = short,
-                    full = string.format("%s: %s\n%s", name, short, actual_stdout)}
+                    full = string.format("%s: %s\nstdout:\n%s\nstderr:\n%s",
+                        name, short, actual_stdout, actual_stderr)}
             end
 
             os.tryrm(exe_file)
             os.tryrm(stdout_file)
+            os.tryrm(stderr_file)
 
             local compile_rc = execMerged(ens_exe,
                 {"build", job.source, "--output", exe_file}, compile_log)
@@ -1540,10 +1593,8 @@ task("test")
             local fixture_env = os.getenvs()
             fixture_env.ENS_FROMCSTRING_PRESENT = "hermetic"
             fixture_env.ENS_FROMCSTRING_ABSENT = nil
-            local run_rc = execMerged(exe_file, {}, stdout_file, {envs = fixture_env})
-            local actual_stdout = (io.readfile(stdout_file) or ""):gsub("[\r\n]+$", "")
-
-            local why = compareRun(run_rc, actual_stdout)
+            local run_rc = execSplit(exe_file, {}, stdout_file, stderr_file, {envs = fixture_env})
+            local why = compareRun(run_rc, captured(stdout_file), captured(stderr_file))
 
             if #why == 0 then
                 return {name = name, ok = true}

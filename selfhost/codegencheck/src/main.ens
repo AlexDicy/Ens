@@ -1,10 +1,10 @@
 // The codegen differential harness. It gates the self-hosted code generator against the runnable
 // test fixtures: every runnable fixture that is not on the checked-in skip list is compiled by
 // the self-hosted pipeline (module graph, sema, codegen), linked through the hidden
-// 'ens link-objects' bridge, run, and compared against its own '@exit' and '@stdout' directives,
-// which the C++ suite already validates. The harness also drives the spike (a small Ens program
-// that builds an LLVM module returning 42 and emits an object file) through linking and
-// execution, keeping the emit-link-run plumbing proven independently of the code generator.
+// 'ens link-objects' bridge, run, and compared against its own '@exit', '@stdout' and '@stderr'
+// directives, which the C++ suite already validates. The harness also drives the spike (a small
+// Ens program that builds an LLVM module returning 42 and emits an object file) through linking
+// and execution, keeping the emit-link-run plumbing proven independently of the code generator.
 //
 // The skip list may only shrink: every runnable fixture must be either codegen-verified or
 // listed, and every listed name must still be a runnable fixture. A runnable fixture that fails
@@ -287,45 +287,64 @@ verifyFixture(Manifest manifest, Fixture fixture) -> string {
         return "ens link-objects did not write {programPath}";
     }
 
-    // Standard error joins standard output through one redirection, the way the reference
-    // runner merges the two streams, so a panic's report is comparable output too.
+    // Each stream lands in its own file, so the directives assert on them independently the way
+    // the reference runner does.
     string stdoutPath = manifest.scratch + "/" + prefix + ".stdout";
+    string stderrPath = manifest.scratch + "/" + prefix + ".stderr";
     long ran = try shellExit(manifest.windowsShell,
-        "\"{programPath}\" > \"{stdoutPath}\" 2>&1");
+        "\"{programPath}\" > \"{stdoutPath}\" 2> \"{stderrPath}\"");
     if (ran != directives.expectedExit) {
         return "the program exited {ran}, expected {directives.expectedExit}";
     }
-    if (directives.expectsStdout || directives.stdoutContains.length() > 0) {
-        string actual = normalizedOutput(readOrEmpty(stdoutPath));
-        if (directives.expectsStdout) {
-            string expected = joinedLines(directives.stdoutLines);
-            if (actual != expected) {
-                return "stdout was '{actual}', expected '{expected}'";
-            }
+    string outReport = streamProblem("stdout", normalizedOutput(readOrEmpty(stdoutPath)),
+        directives.expectsStdout, directives.stdoutLines, directives.stdoutContains);
+    if (outReport.length > 0) {
+        return outReport;
+    }
+    return streamProblem("stderr", normalizedOutput(readOrEmpty(stderrPath)),
+        directives.expectsStderr, directives.stderrLines, directives.stderrContains);
+} catch (SystemError e) {
+    return "could not run: {e.message}";
+}
+
+// Compares one captured stream against its exact-line and substring directives. Returns "" when
+// the stream matches, or a description of the first mismatch.
+streamProblem(string label, string actual, bool exact, List<string> lines,
+    List<string> contains) -> string {
+    if (exact) {
+        string expected = joinedLines(lines);
+        if (actual != expected) {
+            return "{label} was '{actual}', expected '{expected}'";
         }
-        for (long i = 0; i < directives.stdoutContains.length(); i++) {
-            if (actual.indexOf(directives.stdoutContains.get(i)) < 0) {
-                return "stdout is missing '{directives.stdoutContains.get(i)}'";
-            }
+    }
+    for (long i = 0; i < contains.length(); i++) {
+        if (actual.indexOf(contains.get(i)) < 0) {
+            return "{label} is missing '{contains.get(i)}'";
         }
     }
     return "";
-} catch (SystemError e) {
-    return "could not run: {e.message}";
 }
 
 // The fixture's ground-truth directives, the same lines the C++ test runner asserts.
 class Directives {
     protected long expectedExit;
+
     protected bool expectsStdout;
     protected List<string> stdoutLines;
     protected List<string> stdoutContains;
+
+    protected bool expectsStderr;
+    protected List<string> stderrLines;
+    protected List<string> stderrContains;
 
     protected constructor() {
         this.expectedExit = 0;
         this.expectsStdout = false;
         this.stdoutLines = new List<string>();
         this.stdoutContains = new List<string>();
+        this.expectsStderr = false;
+        this.stderrLines = new List<string>();
+        this.stderrContains = new List<string>();
     }
 }
 
@@ -345,6 +364,12 @@ readDirectives(string text) -> Directives {
         } else if (startsWith(comment, "@stdout ")) {
             directives.expectsStdout = true;
             directives.stdoutLines.push(comment.substring("@stdout ".length, comment.length));
+        } else if (startsWith(comment, "@stderr-contains ")) {
+            directives.stderrContains.push(
+                comment.substring("@stderr-contains ".length, comment.length));
+        } else if (startsWith(comment, "@stderr ")) {
+            directives.expectsStderr = true;
+            directives.stderrLines.push(comment.substring("@stderr ".length, comment.length));
         }
     }
     return directives;
@@ -526,8 +551,8 @@ endsWith(string text, string suffix) -> bool {
         && text.substring(text.length - suffix.length, text.length) == suffix;
 }
 
-// True when a fixture is a runnable program: it asserts an exit code or stdout and is not an
-// expect-error case (which the compiler must reject rather than run).
+// True when a fixture is a runnable program: it asserts an exit code or a stream's contents and
+// is not an expect-error case (which the compiler must reject rather than run).
 isRunnableFixture(string text) -> bool {
     bool asserts = false;
     string[] lines = splitLines(text);
@@ -536,7 +561,8 @@ isRunnableFixture(string text) -> bool {
         if (startsWith(comment, "@expect-error")) {
             return false;
         }
-        if (startsWith(comment, "@exit") || startsWith(comment, "@stdout")) {
+        if (startsWith(comment, "@exit") || startsWith(comment, "@stdout")
+                || startsWith(comment, "@stderr")) {
             asserts = true;
         }
     }
