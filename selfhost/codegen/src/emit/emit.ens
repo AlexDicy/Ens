@@ -56,12 +56,15 @@ export final class EntryPoint {
 
 // Emits one module's functions and the descriptors it owns as a native object file for the host
 // target. The core module additionally defines the trace runtime every other module declares;
-// stackFrameType carries the class its symbolication builds. Returns "" on success and a
-// description of the failure otherwise.
+// stackFrameType carries the class its symbolication builds, and errorType the class whose
+// payload the entry wrapper reads. Returns "" on success and a description of the failure
+// otherwise.
 public emitModule(string moduleName, List<EirFunction> functions, EntryPoint? entry,
-                  DescriptorPlans plans, Type? stackFrameType, string objectPath) -> string {
+                  DescriptorPlans plans, Type? stackFrameType, Type? errorType,
+                  string objectPath) -> string {
     let emitter = new ModuleEmitter(moduleName, plans);
     emitter.rememberStackFrameType(stackFrameType);
+    emitter.rememberErrorType(errorType);
     target.initializeHostTarget();
     string triple = target.hostTargetTriple();
     let resolved = target.targetFromTriple(triple);
@@ -184,6 +187,12 @@ emitEntryWrapper(ModuleEmitter emitter, EntryPoint entry) -> string {
 
     // "Unhandled exception <Type>: <message>" and the captured trace, on standard error.
     builder.positionAtEnd(uncaught);
+    let errorType = emitter.errorType();
+    if (errorType == null) {
+        return "Internal: the entry wrapper reports uncaught exceptions but the program "
+            + "declares no std.core Error class";
+    }
+    let errorLayout = emitter.classLayout(errorType);
     let runtime = emitter.runtime;
     let write = runtime.fputs();
     let stream = runtime.standardError();
@@ -196,13 +205,14 @@ emitEntryWrapper(ModuleEmitter emitter, EntryPoint entry) -> string {
     runtime.call(write, [typeName, stream], "");
     runtime.call(write, [globals.buildGlobalString(builder, ": ", ".uncaught.colon"),
         stream], "");
-    // Error's message sits first in its payload and its captured frames second.
-    let message = memory.buildLoad(builder, pointerType, error, "message");
+    // Error's fields flatten first into every subclass: its message, then its captured frames.
+    let message = memory.buildLoad(builder, pointerType,
+        memory.buildStructGEP(builder, errorLayout, error, 0, "message.slot"), "message");
     runtime.call(write, [runtime.payloadData(message), stream], "");
     runtime.call(write, [globals.buildGlobalString(builder, "\n", ".uncaught.newline"),
         stream], "");
     let frames = memory.buildLoad(builder, pointerType,
-        runtime.offsetPointer(error, 8, "frames.slot"), "frames");
+        memory.buildStructGEP(builder, errorLayout, error, 1, "frames.slot"), "frames");
     let trace = runtime.call(runtime.formatTrace(), [frames], "trace.text");
     runtime.call(write, [runtime.payloadData(trace), stream], "");
     runtime.call(runtime.release(), [error], "");
