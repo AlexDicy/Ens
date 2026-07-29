@@ -231,6 +231,9 @@ struct CodeGenerator::Impl {
     // path branches to catch dispatch (vs. cleanup-and-return to the caller).
     llvm::Value* throwTargetSlot = nullptr;
     bool unwindToDispatch = false;
+    // A slot for calls whose callee's ABI carries an error slot although this function has none
+    // to route through; created on demand, never read.
+    llvm::Value* errorScratchSlot = nullptr;
     // The alloca holding the in-flight exception while emitting a catch body
     // (used by `rethrow`); null outside catch bodies.
     llvm::Value* currentCatchVarSlot = nullptr;
@@ -877,6 +880,7 @@ struct CodeGenerator::Impl {
         byPointerParams.clear();
         incomingErrorSlot = nullptr;
         localErrorSlot = nullptr;
+        errorScratchSlot = nullptr;
         catchDispatchBB = nullptr;
         currentHasCatch = !fn.catchClauses().empty();
         paramCleanupWatermark = 0;
@@ -1101,6 +1105,7 @@ struct CodeGenerator::Impl {
         byPointerParams.clear();
         incomingErrorSlot = nullptr;
         localErrorSlot = nullptr;
+        errorScratchSlot = nullptr;
         catchDispatchBB = nullptr;
         currentHasCatch = false;
         paramCleanupWatermark = 0;
@@ -2102,7 +2107,7 @@ struct CodeGenerator::Impl {
         llvm::Function* fn = getOrDeclareExternalFunction(m.symbol, receiverT);
         if (!fn) return nullptr;
         std::vector<llvm::Value*> args{ receiver };
-        if (m.symbol->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);
+        if (m.symbol->abiThrows) args.push_back(errorSlotForCall());
         llvm::Value* result;
         if (m.iface && m.itableSlot >= 0) {
             result = builder->CreateCall(fn->getFunctionType(),
@@ -2960,7 +2965,7 @@ struct CodeGenerator::Impl {
                     llvm::Function* fn = getOrDeclareExternalFunction(sym, t);
                     if (!fn) return llvm::ConstantInt::get(i64Ty, 0);
                     std::vector<llvm::Value*> args{ v };
-                    if (sym->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);
+                    if (sym->abiThrows) args.push_back(errorSlotForCall());
                     llvm::Value* result = (vslot >= 0)
                         ? builder->CreateCall(fn->getFunctionType(), loadVtableSlot(v, vslot), args)
                         : builder->CreateCall(fn, args);
@@ -2979,7 +2984,7 @@ struct CodeGenerator::Impl {
                     llvm::Function* fn = getOrDeclareExternalFunction(sym, t);
                     if (!fn) return llvm::ConstantInt::get(i64Ty, 0);
                     std::vector<llvm::Value*> args{ slot };
-                    if (sym->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);
+                    if (sym->abiThrows) args.push_back(errorSlotForCall());
                     llvm::Value* result = builder->CreateCall(fn, args);
                     emitThrowsCheck(sym);
                     return result;
@@ -6535,6 +6540,19 @@ struct CodeGenerator::Impl {
         }
     }
 
+    // The slot a call to a throwing-ABI callee reports through. A caller that can route an error
+    // reports through its own; one that cannot - the callee carries the slot only because the
+    // root of its dispatch contract declares 'throws', so it never writes it - passes a scratch
+    // slot instead, because the argument itself is part of the callee's ABI.
+    llvm::Value* errorSlotForCall() {
+        if (throwTargetSlot) return throwTargetSlot;
+        if (!errorScratchSlot) {
+            errorScratchSlot = createZeroedEntryAlloca(
+                currentFunction, llvm::PointerType::get(ctx, 0), "err.scratch");
+        }
+        return errorScratchSlot;
+    }
+
     // After a call to a function that may throw (its slot was passed as the
     // trailing arg), branch to the error path if the slot is now non-null.
     void emitThrowsCheck(const Symbol* callee) {
@@ -7202,7 +7220,7 @@ struct CodeGenerator::Impl {
                 std::vector<llvm::Value*> args;
                 args.push_back(receiver);
                 if (!appendCallArgs(methodSym, e.arguments(), e.node.greenNode(), args)) return nullptr;
-                if (methodSym->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);
+                if (methodSym->abiThrows) args.push_back(errorSlotForCall());
                 llvm::Value* result;
                 if (iface && islot >= 0) {
                     result = builder->CreateCall(fn->getFunctionType(),
@@ -7232,7 +7250,7 @@ struct CodeGenerator::Impl {
                     }
                     std::vector<llvm::Value*> args;
                     if (!appendCallArgs(fnSym, e.arguments(), e.node.greenNode(), args)) return nullptr;
-                    if (fnSym->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);
+                    if (fnSym->abiThrows) args.push_back(errorSlotForCall());
                     llvm::Value* result = builder->CreateCall(fn, args);
                     emitThrowsCheck(fnSym);
                     return result;
@@ -7287,7 +7305,7 @@ struct CodeGenerator::Impl {
                 std::vector<llvm::Value*> args;
                 args.push_back(receiver);
                 if (!appendCallArgs(methodSym, e.arguments(), e.node.greenNode(), args)) return nullptr;
-                if (methodSym->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);
+                if (methodSym->abiThrows) args.push_back(errorSlotForCall());
                 llvm::Value* callRes;
                 if (iface && islot >= 0) {
                     callRes = builder->CreateCall(fn->getFunctionType(),
@@ -7339,7 +7357,7 @@ struct CodeGenerator::Impl {
         }
         std::vector<llvm::Value*> args;
         if (!appendCallArgs(sym, e.arguments(), e.node.greenNode(), args)) return nullptr;
-        if (sym->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);
+        if (sym->abiThrows) args.push_back(errorSlotForCall());
         llvm::Value* result = builder->CreateCall(fn, args);
         emitThrowsCheck(sym);
         return result;
@@ -7390,7 +7408,7 @@ struct CodeGenerator::Impl {
         bool ok = fn && appendCallArgs(sym, e.arguments(), e.node.greenNode(), args);
         llvm::Value* result = nullptr;
         if (ok) {
-            if (sym->abiThrows && throwTargetSlot) args.push_back(throwTargetSlot);
+            if (sym->abiThrows) args.push_back(errorSlotForCall());
             result = builder->CreateCall(fn, args);
         }
 

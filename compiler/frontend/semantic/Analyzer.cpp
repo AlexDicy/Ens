@@ -1261,6 +1261,24 @@ static StructInfo* baseSubclassAuthority(StructInfo* base) {
     return base->templateOf ? base->templateOf : base;
 }
 
+// True when an interface implemented anywhere on the class's chain declares this method with
+// 'throws'. Calls through that interface use its method-table entry at the interface method's
+// ABI, so the implementation carries the error slot even when it drops 'throws' itself.
+static bool implementsThrowingInterfaceMethod(StructInfo* si, const MethodInfo& mi) {
+    std::unordered_set<StructInfo*> seen;
+    for (StructInfo* s = si; s && seen.insert(s).second; s = s->baseInfo) {
+        for (Type* ifaceT : s->implementedInterfaces) {
+            StructInfo* iface = ifaceT ? ifaceT->structInfo : nullptr;
+            if (!iface) continue;
+            int i = iface->findMethodIndexBySignature(mi.name, mi.symbol);
+            if (i < 0) continue;
+            Symbol* declared = iface->methods[static_cast<size_t>(i)].symbol;
+            if (declared && declared->declaredThrows) return true;
+        }
+    }
+    return false;
+}
+
 void Analyzer::resolveClassBases(const ast::SourceFile& file) {
     auto classes = file.classes();
 
@@ -1810,7 +1828,9 @@ void Analyzer::finalizeClassHierarchy(const std::vector<StructInfo*>& classes) {
         }
     }
 
-    // ABI throws-ness is uniform across a vtable slot
+    // ABI throws-ness is uniform across a dispatch contract: every implementation reached through
+    // one vtable slot, or through one interface's method-table entry, carries the trailing error
+    // slot exactly when the declaration that rooted the contract declares 'throws'.
     for (StructInfo* si : order) {
         for (auto& mi : si->methods) {
             if (mi.isConstructor || mi.isDestructor || !mi.symbol) continue;
@@ -1821,7 +1841,8 @@ void Analyzer::finalizeClassHierarchy(const std::vector<StructInfo*>& classes) {
                 if (i >= 0) { root = s; ri = i; }
             }
             Symbol* rootSym = (root && ri >= 0) ? root->methods[ri].symbol : nullptr;
-            mi.symbol->abiThrows = rootSym ? rootSym->declaredThrows : mi.symbol->declaredThrows;
+            bool rootThrows = rootSym ? rootSym->declaredThrows : mi.symbol->declaredThrows;
+            mi.symbol->abiThrows = rootThrows || implementsThrowingInterfaceMethod(si, mi);
         }
     }
 }
