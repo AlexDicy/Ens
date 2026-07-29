@@ -6807,14 +6807,16 @@ struct CodeGenerator::Impl {
                              guard.slot);
     }
 
-    // An owned temporary passed by value (a `new`/call result, not bound to a
-    // local) is borrowed by the callee; the caller must release it. Track it so
-    // both normal scope exit and an exception unwind free it exactly once.
+    // An owned temporary passed by value (a `new`/call result or a fresh struct, not bound to a
+    // local) is borrowed by the callee, which retains what it keeps; the caller still has to
+    // release it. Track it so both normal scope exit and an exception unwind free it exactly
+    // once. `v` is the value itself, so a receiver reached through its address is not tracked
+    // here - materializing that address registered it already.
     void trackOwnedArgTemp(llvm::Value* v, const ast::Expression& a, ::Type* paramT) {
-        if (!paramT || !isReferenceType(paramT) || cleanupStack.empty()) return;
+        if (!paramT || !v || cleanupStack.empty()) return;
+        if (!isReferenceType(paramT) && !valueHoldsReferences(paramT)) return;
         if (!expressionProducesOwnedRef(a)) return;
-        auto* slot = createZeroedEntryAlloca(currentFunction, llvm::PointerType::get(ctx, 0),
-                                             "arg.tmp");
+        auto* slot = createZeroedEntryAlloca(currentFunction, v->getType(), "arg.tmp");
         builder->CreateStore(v, slot);
         cleanupStack.back().push_back({ slot, paramT });
     }
@@ -7185,7 +7187,7 @@ struct CodeGenerator::Impl {
                 ::Type* objType = typeOf(obj->node);
                 llvm::Value* recv = isReferenceType(objType) ? emitExpr(*obj) : emitLValue(*obj);
                 if (!recv) return nullptr;
-                trackOwnedArgTemp(recv, *obj, objType);
+                if (isReferenceType(objType)) trackOwnedArgTemp(recv, *obj, objType);
                 auto* ptrTy = llvm::PointerType::get(ctx, 0);
                 llvm::Value* frames = builder->CreateLoad(ptrTy,
                     builder->CreateGEP(llvm::Type::getInt8Ty(ctx), recv,
@@ -7216,7 +7218,7 @@ struct CodeGenerator::Impl {
                     ? emitExpr(*obj)
                     : emitRecordAddress(*obj, objType);
                 if (!receiver) return nullptr;
-                trackOwnedArgTemp(receiver, *obj, objType);
+                if (isReferenceType(objType)) trackOwnedArgTemp(receiver, *obj, objType);
                 std::vector<llvm::Value*> args;
                 args.push_back(receiver);
                 if (!appendCallArgs(methodSym, e.arguments(), e.node.greenNode(), args)) return nullptr;
