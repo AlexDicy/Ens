@@ -1,0 +1,85 @@
+// The surface the stack-trace side tables need: block addresses as constants, anonymous struct
+// constants, the appending llvm.global_ctors global, and walking a module's functions to mark
+// their unwind tables.
+import @std.testing;
+import analysis;
+import blocks;
+import core;
+import instructions;
+import globals;
+import support;
+
+test "a block address in an appending llvm.global_ctors global verifies" {
+    let context = core.createContext();
+    let module = context.createModule("globals_ctors");
+    let i32 = context.int32Type();
+    let pointer = context.pointerType();
+    let voidType = context.voidType();
+
+    let marked = module.addFunction("marked", i32.functionType([]));
+    let builder = context.createBuilder();
+    builder.positionAtEnd(context.appendBasicBlock(marked, "entry"));
+    let site = context.appendBasicBlock(marked, "call.site");
+    let entered = instructions.buildBr(builder, site);
+    builder.positionAtEnd(site);
+    let done = instructions.buildRet(builder, i32.constInt(0, false));
+
+    let address = blocks.blockAddress(marked, site);
+    let marker = globals.addGlobal(module, pointer, "_marker");
+    globals.setInitializer(marker, address);
+    globals.setGlobalConstant(marker, true);
+    globals.setLinkage(marker, globals.linkagePrivate());
+
+    let register = module.addFunction("_register", voidType.functionType([]));
+    builder.positionAtEnd(context.appendBasicBlock(register, "entry"));
+    let returned = instructions.buildRetVoid(builder);
+
+    let entry = context.constStruct([i32.constInt(65535, false), register, pointer.constNull()],
+        false);
+    let entryType = context.structType([i32, pointer, pointer], false);
+    let tableType = entryType.arrayType(1);
+    let ctors = globals.addGlobal(module, tableType, "llvm.global_ctors");
+    globals.setInitializer(ctors, entryType.constArray([entry]));
+    globals.setLinkage(ctors, globals.linkageAppending());
+
+    try support.assertVerifies(module);
+    string text = analysis.moduleText(module);
+    try testing.assertTrue(text.indexOf("blockaddress(@marked,") >= 0,
+        "the printed IR carries no block address: {text}");
+    try testing.assertTrue(text.indexOf("appending global") >= 0,
+        "llvm.global_ctors is not appending: {text}");
+    builder.dispose();
+    context.dispose();
+}
+
+test "walking the module visits definitions and skips declarations" {
+    let context = core.createContext();
+    let module = context.createModule("globals_walk");
+    let i32 = context.int32Type();
+    let declared = module.addFunction("elsewhere", i32.functionType([]));
+    let defined = module.addFunction("here", i32.functionType([]));
+    let builder = context.createBuilder();
+    builder.positionAtEnd(context.appendBasicBlock(defined, "entry"));
+    let returned = instructions.buildRet(builder, i32.constInt(1, false));
+
+    long definitions = 0;
+    long declarations = 0;
+    let current = globals.firstFunction(module);
+    while (current != null) {
+        if (globals.isDeclaration(current)) {
+            declarations++;
+        } else {
+            definitions++;
+            globals.addFunctionAttributeValued(context, current, "uwtable", 2);
+        }
+        current = globals.nextFunction(current);
+    }
+    try testing.assertEqual(definitions, 1);
+    try testing.assertEqual(declarations, 1);
+    try support.assertVerifies(module);
+    string text = analysis.moduleText(module);
+    try testing.assertTrue(text.indexOf("uwtable") >= 0,
+        "the unwind-table attribute was not applied: {text}");
+    builder.dispose();
+    context.dispose();
+}
