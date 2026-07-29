@@ -6722,6 +6722,7 @@ struct CodeGenerator::Impl {
         auto fn = ast::FuncDecl::cast(*rootNode);
         if (!fn) return true;
         auto params = fn->parameters();
+        ScopedModuleBinding bind = bindCalleeModule(sym);
         for (size_t i = userArgs.size(); i < params.size(); ++i) {
             auto dv = params[i].defaultValue();
             if (!dv) return false;
@@ -6739,6 +6740,23 @@ struct CodeGenerator::Impl {
             }
         }
         return true;
+    }
+
+    // A callee's default-argument expressions are green nodes owned by the module that declares
+    // the callee, so their analysis facts (types, enum constants, resolved calls) live in that
+    // module's AnalysisResult. Bind to it while emitting them; the binding is a no-op for a
+    // same-module callee and in single-module callers with no resolver.
+    ScopedModuleBinding bindCalleeModule(Symbol* sym) {
+        const AnalysisResult* declAnalysis = nullptr;
+        const SourceFile* declSource = nullptr;
+        if (sym && moduleResolver) {
+            const std::u16string& owner =
+                sym->methodOwner ? sym->methodOwner->modulePath : sym->modulePath;
+            CodeGenerator::ModuleAnalysis ma = moduleResolver(owner);
+            declAnalysis = ma.analysis;
+            declSource = ma.source;
+        }
+        return ScopedModuleBinding(*this, declAnalysis, declSource);
     }
 
     // Named-argument form: arguments evaluate in source order and are passed in
@@ -6769,6 +6787,7 @@ struct CodeGenerator::Impl {
             auto rootNode = SyntaxNode::makeRoot(sym->funcDeclCst);
             if (auto fn = ast::FuncDecl::cast(*rootNode)) {
                 auto params = fn->parameters();
+                ScopedModuleBinding bind = bindCalleeModule(sym);
                 for (size_t j = 0; j < nParams && j < params.size(); ++j) {
                     if (filled[j]) continue;
                     auto dv = params[j].defaultValue();
