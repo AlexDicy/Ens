@@ -1,0 +1,178 @@
+// Foreign calls: an external declaration's arguments in declaration order, with numeric
+// arguments converted to their declared widths, an out argument passing the address of the local
+// the C function writes back to, and a temporary released once the call has run. Marshalling to
+// the C shapes - a string or array argument travels as its data pointer, a declared string
+// result lifts into an owned Ens string - belongs to emission; lowering keeps the declared sema
+// types on the instruction so emission can read them.
+import Expression from @ens.frontend.syntax.generated.nodes;
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import OutArgumentNode from @ens.frontend.syntax.generated.nodes;
+import NamedArgumentNode from @ens.frontend.syntax.generated.nodes;
+import Parameter from @ens.sema.model.types;
+import Signature from @ens.sema.model.types;
+import Type from @ens.sema.model.types;
+import @ens.sema.model.types;
+import EirForeignCall from eir.model;
+import EirCStringLift from eir.model;
+import FunctionInfo from lower.index;
+import LoweringContext from lower.context;
+import lower.expressions;
+import lower.ownership;
+import lower.places;
+import support.primitives;
+import List from @std.collections.list;
+
+// Lowers a call to an external function. Foreign calls never unwind, so the owned temporaries
+// the arguments produce are simply released after the call.
+public lowerCall(LoweringContext lowering, FunctionInfo info, CallExpressionNode call) -> long {
+    let signature = info.signature();
+    Parameter[] parameters = signature.parameters();
+    let arguments = call.arguments();
+    if (arguments.argumentsCount() != parameters.length) {
+        lowering.internalError("the foreign call to '{signature.name()}' passes "
+            + "{arguments.argumentsCount()} argument(s) for {parameters.length} parameter(s)",
+            call.span());
+        return -1;
+    }
+    let values = new List<long>();
+    let declaredTypes = new List<Type>();
+    let outFlags = new List<bool>();
+    let temporaries = new List<long>();
+    for (long i = 0; i < parameters.length; i++) {
+        let parameterType = parameters[i].type();
+        if (!lowering.supportsValueType(parameterType)) {
+            lowering.unsupported("passing a '{types.display(parameterType)}' argument to the "
+                + "external function '{signature.name()}'", call.span());
+            return -1;
+        }
+        declaredTypes.push(parameterType);
+        switch (arguments.arguments(i)) {
+            is OutArgumentNode out -> {
+                long address = lowerOutArgument(lowering, out, parameterType);
+                if (address < 0) {
+                    return -1;
+                }
+                values.push(address);
+                outFlags.push(true);
+            },
+            is NamedArgumentNode named -> {
+                long value = lowerValueArgument(lowering, named.value(), parameterType,
+                    temporaries);
+                if (value < 0) {
+                    return -1;
+                }
+                values.push(value);
+                outFlags.push(false);
+            },
+            is Expression plain -> {
+                long value = lowerValueArgument(lowering, plain, parameterType, temporaries);
+                if (value < 0) {
+                    return -1;
+                }
+                values.push(value);
+                outFlags.push(false);
+            },
+            default -> {
+                lowering.internalError("the foreign call to '{signature.name()}' has an "
+                    + "argument of no known form", call.span());
+                return -1;
+            },
+        }
+    }
+    let returnType = signature.returnType();
+    if (!types.isVoidType(returnType) && !lowering.supportsValueType(returnType)) {
+        lowering.unsupported("a foreign call returning '{types.display(returnType)}'",
+            call.span());
+        return -1;
+    }
+    let builder = lowering.builder();
+    long result = -1;
+    if (!types.isVoidType(returnType)) {
+        result = builder.newTemp(returnType);
+    }
+    builder.append(new EirForeignCall(result, returnType, info.symbol(), values.toArray(),
+        declaredTypes.toArray(), outFlags.toArray()));
+    for (long i = 0; i < temporaries.length(); i++) {
+        ownership.releaseValue(lowering, temporaries.get(i));
+    }
+    return result;
+}
+
+// True for the '@std.ffi.fromCString' pseudo-generic, which is intercepted before generic
+// dispatch: its type parameter only admits any external type, so no instance ever exists.
+public isCStringIntrinsic(LoweringContext lowering, Signature signature) -> bool {
+    if (signature.name() != "fromCString") {
+        return false;
+    }
+    let info = lowering.index().infoFor(signature);
+    return info != null && info.context().module().canonicalPath() == "std.ffi";
+}
+
+// The intercepted '@std.ffi.fromCString(handle)': the handle's bytes as an owned string?.
+public lowerCStringLift(LoweringContext lowering, CallExpressionNode call) -> long {
+    let resultType = lowering.typeOf(call);
+    if (resultType == null) {
+        return -1;
+    }
+    let arguments = call.arguments();
+    if (arguments.argumentsCount() != 1) {
+        lowering.internalError("'fromCString' reached lowering with "
+            + "{arguments.argumentsCount()} argument(s)", call.span());
+        return -1;
+    }
+    Expression? handleExpression = null;
+    switch (arguments.arguments(0)) {
+        is NamedArgumentNode named -> {
+            handleExpression = named.value();
+        },
+        is Expression plain -> {
+            handleExpression = plain;
+        },
+        default -> { },
+    }
+    if (handleExpression == null) {
+        lowering.internalError("'fromCString' takes no 'out' argument", call.span());
+        return -1;
+    }
+    long handle = expressions.lower(lowering, handleExpression);
+    if (handle < 0) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    long result = builder.newTemp(resultType);
+    builder.append(new EirCStringLift(result, resultType, handle));
+    return result;
+}
+
+// An 'out' argument is the address of the named local's slot; the C function writes the value
+// back through it.
+lowerOutArgument(LoweringContext lowering, OutArgumentNode out, Type parameterType) -> long {
+    let binding = lowering.result().bindingOf(out.green());
+    if (binding == null) {
+        lowering.internalError("the out argument '{out.name().text()}' has no recorded "
+            + "binding", out.span());
+        return -1;
+    }
+    let slot = lowering.slotFor(binding);
+    if (slot == null) {
+        lowering.internalError("the out argument '{out.name().text()}' has no storage slot",
+            out.span());
+        return -1;
+    }
+    return ownership.slotAddress(lowering, slot, parameterType);
+}
+
+// A plain argument at its declared type. A reference the argument produced is the caller's to
+// give up once the call has run; the C side never keeps it.
+lowerValueArgument(LoweringContext lowering, Expression argument, Type parameterType,
+                   List<long> temporaries) -> long {
+    long value = expressions.lowerConverted(lowering, argument, parameterType);
+    if (value < 0) {
+        return -1;
+    }
+    if (primitives.isReferenceType(parameterType)
+            && places.producesOwnedValue(lowering, argument)) {
+        temporaries.push(value);
+    }
+    return value;
+}

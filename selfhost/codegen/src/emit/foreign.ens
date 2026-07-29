@@ -1,0 +1,125 @@
+// Foreign calls: the declaration under the exact C name, the marshalling the declared sema types
+// imply - a string or array argument passes its data pointer, an out argument the address the C
+// function writes back through, a declared string result lifts into an owned Ens string - and
+// the three std.system bridges that are compiler-defined rather than real C symbols.
+import EirForeignCall from eir.model;
+import EirCStringLift from eir.model;
+import Type from @ens.sema.model.types;
+import @ens.sema.model.types;
+import TypeRef from @ens.llvm.types;
+import Value from @ens.llvm.values;
+import @ens.llvm.globals;
+import @ens.llvm.instructions;
+import ModuleEmitter from emit.context;
+import EmissionFrame from emit.context;
+import RuntimeFunction from emit.runtime;
+import emit.system;
+import support.primitives;
+import List from @std.collections.list;
+
+public emitForeignCall(ModuleEmitter emitter, EmissionFrame frame, EirForeignCall call)
+        -> string {
+    let target = resolveTarget(emitter, call);
+    let arguments = new List<Value>();
+    for (long i = 0; i < call.arguments.length; i++) {
+        let value = frame.value(call.arguments[i]);
+        if (call.outFlags[i]) {
+            arguments.push(value);
+        } else {
+            arguments.push(marshalled(emitter, value, call.parameterTypes[i]));
+        }
+    }
+    let produced = emitter.runtime.call(target, arguments.toArray(), "");
+    if (call.result < 0) {
+        return "";
+    }
+    if (returnsText(call.type)) {
+        frame.define(call.result, emitter.runtime.call(emitter.runtime.stringFromCString(),
+            [produced], "lifted"));
+        return "";
+    }
+    frame.define(call.result, produced);
+    return "";
+}
+
+public emitCStringLift(ModuleEmitter emitter, EmissionFrame frame, EirCStringLift lifted) {
+    frame.define(lifted.result, emitter.runtime.call(emitter.runtime.stringFromCString(),
+        [frame.value(lifted.handle)], "lifted"));
+}
+
+// The function a foreign call runs: the three std.system bridges are defined by the compiler
+// wherever they are referenced, everything else is declared under its C name. Each call site
+// keeps its own declared signature, so a user redeclaration of a symbol the runtime also uses -
+// strlen, say, at a narrower return type - never perturbs the other's calls.
+resolveTarget(ModuleEmitter emitter, EirForeignCall call) -> RuntimeFunction {
+    if (call.symbol == "ens_arguments") {
+        return system.argumentsRuntime(emitter, call.type);
+    }
+    if (call.symbol == "ens_run_process") {
+        return system.runProcessRuntime(emitter);
+    }
+    if (call.symbol == "ens_path_exists") {
+        return system.pathExistsRuntime(emitter);
+    }
+    let type = foreignType(emitter, call);
+    let found = globals.getNamedFunction(emitter.runtime.module, call.symbol);
+    if (found != null) {
+        return new RuntimeFunction(found, type);
+    }
+    return new RuntimeFunction(emitter.runtime.module.addFunction(call.symbol, type), type);
+}
+
+// The LLVM type of the C function: pointers where the declaration says string, array, handle, or
+// out, and the mapped machine type everywhere else.
+foreignType(ModuleEmitter emitter, EirForeignCall call) -> TypeRef {
+    let parameters = new List<TypeRef>();
+    for (long i = 0; i < call.parameterTypes.length; i++) {
+        if (call.outFlags[i] || passesPointer(call.parameterTypes[i])) {
+            parameters.push(emitter.context.pointerType());
+        } else {
+            parameters.push(emitter.mapType(call.parameterTypes[i]));
+        }
+    }
+    TypeRef returned = emitter.context.voidType();
+    if (!types.isVoidType(call.type)) {
+        if (returnsText(call.type) || primitives.externalOf(call.type) != null) {
+            returned = emitter.context.pointerType();
+        } else {
+            returned = emitter.mapType(call.type);
+        }
+    }
+    return returned.functionType(parameters.toArray());
+}
+
+// True when the declared parameter crosses the boundary as a pointer: a string or an array as
+// its data, a handle as itself.
+passesPointer(Type declared) -> bool {
+    return primitives.isStringType(declared) || stringOptional(declared)
+        || primitives.isArrayType(declared) || primitives.externalOf(declared) != null;
+}
+
+// A string or array argument crosses the boundary as its data pointer; everything else passes
+// as its machine value.
+marshalled(ModuleEmitter emitter, Value value, Type declared) -> Value {
+    if (primitives.isStringType(declared) || stringOptional(declared)) {
+        return emitter.runtime.payloadData(value);
+    }
+    if (primitives.isArrayType(declared)) {
+        return emitter.runtime.payloadData(value);
+    }
+    return value;
+}
+
+// True when the declared result is a string or string?, which arrives as a C pointer and lifts
+// into an owned Ens string.
+returnsText(Type declared) -> bool {
+    return primitives.isStringType(declared) || stringOptional(declared);
+}
+
+stringOptional(Type declared) -> bool {
+    if (!primitives.isOptionalType(declared)) {
+        return false;
+    }
+    let referent = primitives.referenceOf(declared);
+    return referent != null && primitives.isStringType(referent);
+}

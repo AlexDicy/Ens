@@ -1,0 +1,140 @@
+// The std.system bridges the compiler defines instead of linking: the recorded process
+// arguments as a string[], the child process runner over the C library's system(), and the
+// existence probe over access(). Each is defined once per referencing module with internal
+// linkage; the argc and argv globals they read are defined by the entry module's wrapper and
+// declared everywhere else.
+import ArrayType from @ens.sema.model.types;
+import Type from @ens.sema.model.types;
+import Value from @ens.llvm.values;
+import @ens.llvm.globals;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import ModuleEmitter from emit.context;
+import Runtime from emit.runtime;
+import RuntimeFunction from emit.runtime;
+
+// ptr ens_arguments(): the process arguments as an owned string[], one lifted copy per argv
+// entry. resultType is the declared string[] type, whose element finalizer releases the copies.
+public argumentsRuntime(ModuleEmitter emitter, Type resultType) -> RuntimeFunction {
+    let runtime = emitter.runtime;
+    let type = runtime.pointerType.functionType([]);
+    let known = runtime.existing("ens_arguments", type);
+    if (known != null) {
+        return known;
+    }
+    Value finalizer = runtime.nullPointer();
+    if (resultType is ArrayType) {
+        finalizer = emitter.finalizers.arrayFinalizer(resultType.element());
+    }
+    let allocate = runtime.alloc();
+    let lift = runtime.stringFromCString();
+    let definition = runtime.beginDefinition("ens_arguments", type);
+    let builder = runtime.builder;
+    let count = instructions.buildSExt(builder,
+        memory.buildLoad(builder, runtime.int32Type, argcGlobal(runtime), "argc"),
+        runtime.int64Type, "count");
+    let vector = memory.buildLoad(builder, runtime.pointerType, argvGlobal(runtime), "argv");
+    let bytes = instructions.buildAdd(builder, runtime.int64(8),
+        instructions.buildMul(builder, count, runtime.int64(8), ""), "bytes");
+    let result = runtime.call(allocate, [bytes, finalizer, runtime.nullPointer()], "arguments");
+    memory.buildStore(builder, count, result);
+    let data = runtime.payloadData(result);
+    let index = memory.buildAlloca(builder, runtime.int64Type, "i");
+    memory.buildStore(builder, runtime.int64(0), index);
+
+    let test = runtime.block(definition, "fill.test");
+    let body = runtime.block(definition, "fill.body");
+    let done = runtime.block(definition, "done");
+    instructions.buildBr(builder, test);
+
+    builder.positionAtEnd(test);
+    let position = memory.buildLoad(builder, runtime.int64Type, index, "i.cur");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, position, count, ""), body, done);
+
+    builder.positionAtEnd(body);
+    let raw = memory.buildLoad(builder, runtime.pointerType,
+        memory.buildGEP(builder, runtime.pointerType, vector, [position], ""), "argv.i");
+    let lifted = runtime.call(lift, [raw], "argument");
+    memory.buildStore(builder, lifted,
+        memory.buildGEP(builder, runtime.pointerType, data, [position], ""));
+    memory.buildStore(builder, instructions.buildAdd(builder, position, runtime.int64(1), ""),
+        index);
+    instructions.buildBr(builder, test);
+
+    builder.positionAtEnd(done);
+    instructions.buildRet(builder, result);
+    return runtime.endDefinition(definition);
+}
+
+// i32 ens_run_process(ptr command): the C library's system(), with the POSIX wait status
+// normalized to the child's exit code; Windows already reports the exit code directly.
+public runProcessRuntime(ModuleEmitter emitter) -> RuntimeFunction {
+    let runtime = emitter.runtime;
+    let type = runtime.int32Type.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_run_process", type);
+    if (known != null) {
+        return known;
+    }
+    let shell = runtime.libc("system", type);
+    let definition = runtime.beginDefinition("ens_run_process", type);
+    let builder = runtime.builder;
+    let status = runtime.call(shell, [runtime.parameter(definition, 0)], "status");
+    if (runtime.onWindows()) {
+        instructions.buildRet(builder, status);
+        return runtime.endDefinition(definition);
+    }
+    let signal = instructions.buildAnd(builder, status, runtime.int32(127), "signal");
+    let exited = instructions.buildICmpEQ(builder, signal, runtime.int32(0), "exited");
+    let signaled = instructions.buildAnd(builder,
+        instructions.buildICmpNE(builder, signal, runtime.int32(0), ""),
+        instructions.buildICmpNE(builder, signal, runtime.int32(127), ""), "signaled");
+    let exitCode = instructions.buildAnd(builder,
+        instructions.buildLShr(builder, status, runtime.int32(8), ""),
+        runtime.int32(255), "exit.code");
+    let signalCode = instructions.buildAdd(builder, signal, runtime.int32(128), "signal.code");
+    let normalized = instructions.buildSelect(builder, exited, exitCode,
+        instructions.buildSelect(builder, signaled, signalCode, status, ""), "normalized");
+    let failed = instructions.buildICmpEQ(builder, status, runtime.int32(-1), "failed");
+    instructions.buildRet(builder,
+        instructions.buildSelect(builder, failed, status, normalized, ""));
+    return runtime.endDefinition(definition);
+}
+
+// i32 ens_path_exists(ptr path): access(path, 0), which answers 0 exactly when the path exists.
+public pathExistsRuntime(ModuleEmitter emitter) -> RuntimeFunction {
+    let runtime = emitter.runtime;
+    let type = runtime.int32Type.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_path_exists", type);
+    if (known != null) {
+        return known;
+    }
+    string probeName = "access";
+    if (runtime.onWindows()) {
+        probeName = "_access";
+    }
+    let probe = runtime.libc(probeName,
+        runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type]));
+    let definition = runtime.beginDefinition("ens_path_exists", type);
+    let status = runtime.call(probe, [runtime.parameter(definition, 0), runtime.int32(0)],
+        "status");
+    instructions.buildRet(runtime.builder, status);
+    return runtime.endDefinition(definition);
+}
+
+// The argument globals the entry wrapper writes: defined there, declared here.
+argcGlobal(Runtime runtime) -> Value {
+    let found = globals.getNamedGlobal(runtime.module, "ens_argc");
+    if (found != null) {
+        return found;
+    }
+    return globals.addGlobal(runtime.module, runtime.int32Type, "ens_argc");
+}
+
+argvGlobal(Runtime runtime) -> Value {
+    let found = globals.getNamedGlobal(runtime.module, "ens_argv");
+    if (found != null) {
+        return found;
+    }
+    return globals.addGlobal(runtime.module, runtime.pointerType, "ens_argv");
+}
