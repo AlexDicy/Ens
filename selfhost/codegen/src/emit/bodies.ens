@@ -62,6 +62,7 @@ import EirPrint from eir.model;
 import EirPanic from eir.model;
 import EirCaptureTrace from eir.model;
 import EirErrorTrace from eir.model;
+import EirTryCall from eir.model;
 import BasicBlock from @ens.llvm.blocks;
 import @ens.llvm.memory;
 import @ens.llvm.globals;
@@ -72,6 +73,7 @@ import emit.arc;
 import emit.arrays;
 import emit.calls;
 import emit.classes;
+import emit.exceptions;
 import emit.operators;
 import emit.optionals;
 import emit.terminators;
@@ -85,12 +87,16 @@ public emitFunction(ModuleEmitter emitter, EirFunction function) -> string {
     if (declared == null) {
         return "Internal: function '{function.symbol()}' was never declared";
     }
+    if (function.traceName().length > 0) {
+        emitter.traces.record(declared, function.traceName(), function.traceFile(),
+            function.traceLine(), function.isEntryPoint());
+    }
     let blocks = new List<BasicBlock>();
     for (long i = 0; i < function.blocks().length(); i++) {
         blocks.push(emitter.context.appendBasicBlock(declared,
             function.blocks().get(i).label()));
     }
-    let frame = new EmissionFrame(function, blocks);
+    let frame = new EmissionFrame(function, declared, blocks);
     for (long i = 0; i < function.entryTempCount(); i++) {
         frame.define(i, globals.getParam(declared, i as uint));
     }
@@ -103,6 +109,12 @@ public emitFunction(ModuleEmitter emitter, EirFunction function) -> string {
         if (slot.startsZeroed()) {
             memory.buildStore(emitter.builder, slotType.constNull(), storage);
         }
+    }
+    if (callsThrowingCallee(function)) {
+        let pointerType = emitter.context.pointerType();
+        let scratch = memory.buildAlloca(emitter.builder, pointerType, "err.scratch");
+        memory.buildStore(emitter.builder, pointerType.constNull(), scratch);
+        frame.defineErrorScratch(scratch);
     }
     for (long b = 0; b < function.blocks().length(); b++) {
         let block = function.blocks().get(b);
@@ -285,11 +297,31 @@ emitInstruction(ModuleEmitter emitter, EmissionFrame frame, EirInstruction instr
             calls.emitPanic(emitter, frame, aborted);
         },
         is EirCaptureTrace captured -> {
-            return "Internal: capture_trace is not emitted yet";
+            return exceptions.emitCaptureTrace(emitter, frame, captured);
         },
         is EirErrorTrace trace -> {
-            return "Internal: error_trace is not emitted yet";
+            return exceptions.emitErrorTrace(emitter, frame, trace);
         },
     }
     return "";
+}
+
+// True when some call in the function targets a slot-carrying callee, so the body needs the one
+// scratch slot every such call passes and checks.
+callsThrowingCallee(EirFunction function) -> bool {
+    let blocks = function.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        let block = blocks.get(b);
+        let instructions = block.instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (instruction is EirCall && instruction.callee.throwing()) {
+                return true;
+            }
+        }
+        if (block.terminator() is EirTryCall) {
+            return true;
+        }
+    }
+    return false;
 }

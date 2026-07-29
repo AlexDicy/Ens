@@ -1,0 +1,121 @@
+// The error channel's emission: a try call passes the function's scratch error slot and branches
+// on what came back, propagate writes the caller's slot and returns zero, a trace is captured
+// onto an error object at its throw and read back lazily, and the aborts behind panic and the
+// checked accesses capture at their site so the printed trace starts on the failing line.
+import EirTryCall from eir.model;
+import EirPropagate from eir.model;
+import EirCaptureTrace from eir.model;
+import EirErrorTrace from eir.model;
+import @ens.sema.model.types;
+import Value from @ens.llvm.values;
+import @ens.llvm.globals;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import ModuleEmitter from emit.context;
+import EmissionFrame from emit.context;
+import emit.calls;
+import support.primitives;
+
+// Marks the next call's site with the line a captured return address resolves to. A function
+// that never appears in a trace marks nothing.
+public markSite(ModuleEmitter emitter, EmissionFrame frame, long line) {
+    if (line < 0 || frame.function().traceName().length == 0) {
+        return;
+    }
+    emitter.traces.markCallSite(emitter.runtime, frame.declared(), line);
+}
+
+// "panic: message", the trace captured here, and exit 134.
+public abortWith(ModuleEmitter emitter, EmissionFrame frame, Value message, long line) {
+    markSite(emitter, frame, line);
+    let trace = emitter.runtime.call(emitter.runtime.captureTrace(),
+        [emitter.runtime.int32Type.constInt(64, false)], "trace");
+    emitter.runtime.call(emitter.runtime.panic(), [message, trace], "");
+}
+
+public emitTryCall(ModuleEmitter emitter, EmissionFrame frame, EirTryCall call) -> string {
+    let scratch = frame.errorScratch();
+    if (scratch == null) {
+        return "Internal: a try call has no error scratch slot in {frame.symbol()}";
+    }
+    markSite(emitter, frame, call.line);
+    let produced = calls.performCall(emitter, frame, call.callee, call.receiver,
+        call.arguments, call.dispatchSlot, call.dispatchInterface, scratch);
+    let builder = emitter.builder;
+    let pointerType = emitter.context.pointerType();
+    let error = memory.buildLoad(builder, pointerType, scratch, "err");
+    memory.buildStore(builder, pointerType.constNull(), scratch);
+    let thrown = instructions.buildICmpNE(builder, error, pointerType.constNull(), "thrown");
+    instructions.buildCondBr(builder, thrown, frame.blockAt(call.unwindTarget),
+        frame.blockAt(call.normalTarget));
+    if (call.result >= 0) {
+        frame.define(call.result, produced);
+    }
+    frame.define(call.errorResult, error);
+    return "";
+}
+
+// Writes the owned error into the slot this function's caller passed, and returns the zero of
+// the return type, which the caller never reads.
+public emitPropagate(ModuleEmitter emitter, EmissionFrame frame, EirPropagate propagated)
+        -> string {
+    let function = frame.function();
+    if (!function.throwing()) {
+        return "Internal: propagate in the slotless function {frame.symbol()}";
+    }
+    let incoming = globals.getParam(frame.declared(), function.entryTempCount() as uint);
+    memory.buildStore(emitter.builder, frame.value(propagated.error), incoming);
+    if (types.isVoidType(function.returnType())) {
+        instructions.buildRetVoid(emitter.builder);
+    } else {
+        instructions.buildRet(emitter.builder,
+            emitter.mapType(function.returnType()).constNull());
+    }
+    return "";
+}
+
+// Swaps the trace captured here into the error's frames field, releasing whatever capture a
+// rethrown object already carried.
+public emitCaptureTrace(ModuleEmitter emitter, EmissionFrame frame, EirCaptureTrace captured)
+        -> string {
+    let slot = framesField(emitter, frame, captured.error);
+    if (slot == null) {
+        return "Internal: capture_trace onto a non-class value in {frame.symbol()}";
+    }
+    let builder = emitter.builder;
+    let old = memory.buildLoad(builder, emitter.context.pointerType(), slot, "frames.old");
+    emitter.runtime.call(emitter.runtime.release(), [old], "");
+    markSite(emitter, frame, captured.line);
+    let trace = emitter.runtime.call(emitter.runtime.captureTrace(),
+        [emitter.runtime.int32Type.constInt(64, false)], "trace");
+    memory.buildStore(builder, trace, slot);
+    return "";
+}
+
+// Reads the error's captured frames and symbolicates them, into text or StackFrame values.
+public emitErrorTrace(ModuleEmitter emitter, EmissionFrame frame, EirErrorTrace trace)
+        -> string {
+    let slot = framesField(emitter, frame, trace.error);
+    if (slot == null) {
+        return "Internal: error_trace reads a non-class value in {frame.symbol()}";
+    }
+    let frames = memory.buildLoad(emitter.builder, emitter.context.pointerType(), slot,
+        "frames");
+    let reader = emitter.runtime.formatTrace();
+    if (trace.structured) {
+        reader = emitter.runtime.symbolicate();
+    }
+    frame.define(trace.result, emitter.runtime.call(reader, [frames], "trace.value"));
+    return "";
+}
+
+// The address of the error's frames field: Error's fields flatten first into every subclass, so
+// the field index is stable across the whole hierarchy.
+framesField(ModuleEmitter emitter, EmissionFrame frame, long error) -> Value? {
+    let classType = primitives.classOf(frame.tempType(error));
+    if (classType == null) {
+        return null;
+    }
+    return memory.buildStructGEP(emitter.builder, emitter.classLayout(classType),
+        frame.value(error), 1, "frames.slot");
+}

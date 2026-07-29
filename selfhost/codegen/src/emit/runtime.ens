@@ -264,7 +264,7 @@ public final class Runtime {
         instructions.buildCondBr(this.builder, negative, negativeBlock, allocateBlock);
 
         this.builder.positionAtEnd(negativeBlock);
-        this.call(abort, [this.parameter(definition, 3)], "");
+        this.call(abort, [this.parameter(definition, 3), this.nullPointer()], "");
         instructions.buildUnreachable(this.builder);
 
         this.builder.positionAtEnd(allocateBlock);
@@ -333,6 +333,16 @@ public final class Runtime {
         return strings.jsonText(this);
     }
 
+    // ptr ens_string_from_cstr(ptr bytes): an owned copy of a NUL-terminated C string, or null
+    // for a null pointer.
+    public stringFromCString() -> RuntimeFunction {
+        return strings.liftCString(this);
+    }
+
+    public onWindows() -> bool {
+        return this.windowsTarget;
+    }
+
     // The immortal payload pointer for a string literal, one read-only global per distinct
     // contents. The count sentinel makes retain and release no-ops, so the literal is never freed.
     public stringLiteral(byte[] utf8) -> Value {
@@ -381,17 +391,19 @@ public final class Runtime {
         return this.endDefinition(definition);
     }
 
-    // void ens_panic(ptr message): "panic: " and the message on standard error, then exit 134. The
-    // message is a string object, so a literal from stringLiteral and a string the program built
-    // both work.
+    // void ens_panic(ptr message, ptr trace): "panic: " and the message on standard error, then
+    // the formatted trace, then exit 134. The message is a string object, so a literal from
+    // stringLiteral and a string the program built both work; the trace is the capture the panic
+    // site took, or null when there is none to print.
     public panic() -> RuntimeFunction {
-        let type = this.voidType.functionType([this.pointerType]);
+        let type = this.voidType.functionType([this.pointerType, this.pointerType]);
         let known = this.existing("ens_panic", type);
         if (known != null) {
             return known;
         }
         let write = this.fputs();
         let quit = this.exit();
+        let format = this.formatTrace();
         let definition = this.beginDefinition("ens_panic", type);
         globals.addFunctionAttribute(this.context, definition.function, "noreturn");
         let stream = this.standardError();
@@ -400,69 +412,33 @@ public final class Runtime {
         this.call(write, [this.payloadData(this.parameter(definition, 0)), stream], "");
         this.call(write, [globals.buildGlobalString(this.builder, "\n", ".panic.newline"),
             stream], "");
+        let formatted = this.call(format, [this.parameter(definition, 1)], "trace.text");
+        this.call(write, [this.payloadData(formatted), stream], "");
         this.call(quit, [this.int32(134)], "");
         instructions.buildUnreachable(this.builder);
         return this.endDefinition(definition);
     }
 
-    // void ens_bounds_check(i64 index, i64 length, ptr message): panics unless the index addresses
-    // an element.
-    public boundsCheck() -> RuntimeFunction {
-        let type = this.voidType.functionType([this.int64Type, this.int64Type, this.pointerType]);
-        let known = this.existing("ens_bounds_check", type);
-        if (known != null) {
-            return known;
-        }
-        let abort = this.panic();
-        let definition = this.beginDefinition("ens_bounds_check", type);
-        let index = this.parameter(definition, 0);
-        let length = this.parameter(definition, 1);
-        let failBlock = this.block(definition, "bounds.fail");
-        let okBlock = this.block(definition, "bounds.ok");
-        let negative = instructions.buildICmpSLT(this.builder, index, this.int64(0), "");
-        let past = instructions.buildICmpSGE(this.builder, index, length, "");
-        let outside = instructions.buildOr(this.builder, negative, past, "");
-        instructions.buildCondBr(this.builder, outside, failBlock, okBlock);
+    // ---- The trace runtime, defined once in the core module and declared everywhere else ----
 
-        this.builder.positionAtEnd(failBlock);
-        this.call(abort, [this.parameter(definition, 2)], "");
-        instructions.buildUnreachable(this.builder);
-
-        this.builder.positionAtEnd(okBlock);
-        instructions.buildRetVoid(this.builder);
-        return this.endDefinition(definition);
+    // ptr ens_capture_trace(i32 maxDepth): the resolvable return addresses of the current stack,
+    // innermost first, as an owned long[].
+    public captureTrace() -> RuntimeFunction {
+        return this.libc("ens_capture_trace",
+            this.pointerType.functionType([this.int32Type]));
     }
 
-    // void ens_range_check(i64 start, i64 end, i64 length, ptr message): panics unless
-    // 0 <= start <= end <= length.
-    public rangeCheck() -> RuntimeFunction {
-        let type = this.voidType.functionType([this.int64Type, this.int64Type, this.int64Type,
-            this.pointerType]);
-        let known = this.existing("ens_range_check", type);
-        if (known != null) {
-            return known;
-        }
-        let abort = this.panic();
-        let definition = this.beginDefinition("ens_range_check", type);
-        let start = this.parameter(definition, 0);
-        let end = this.parameter(definition, 1);
-        let length = this.parameter(definition, 2);
-        let failBlock = this.block(definition, "range.fail");
-        let okBlock = this.block(definition, "range.ok");
-        let negative = instructions.buildICmpSLT(this.builder, start, this.int64(0), "");
-        let inverted = instructions.buildICmpSGT(this.builder, start, end, "");
-        let past = instructions.buildICmpSGT(this.builder, end, length, "");
-        let outside = instructions.buildOr(this.builder,
-            instructions.buildOr(this.builder, negative, inverted, ""), past, "");
-        instructions.buildCondBr(this.builder, outside, failBlock, okBlock);
+    // ptr ens_format_trace(ptr frames): one "  at name (file:line)" text line per captured frame,
+    // as an owned string; a null capture formats as the empty string.
+    public formatTrace() -> RuntimeFunction {
+        return this.libc("ens_format_trace",
+            this.pointerType.functionType([this.pointerType]));
+    }
 
-        this.builder.positionAtEnd(failBlock);
-        this.call(abort, [this.parameter(definition, 3)], "");
-        instructions.buildUnreachable(this.builder);
-
-        this.builder.positionAtEnd(okBlock);
-        instructions.buildRetVoid(this.builder);
-        return this.endDefinition(definition);
+    // ptr ens_symbolicate(ptr frames): the captured frames as an owned StackFrame[].
+    public symbolicate() -> RuntimeFunction {
+        return this.libc("ens_symbolicate",
+            this.pointerType.functionType([this.pointerType]));
     }
 
     // ---- The C library ----
@@ -470,6 +446,14 @@ public final class Runtime {
     public calloc() -> RuntimeFunction {
         return this.libc("calloc", this.pointerType.functionType([this.int64Type,
             this.int64Type]));
+    }
+
+    public malloc() -> RuntimeFunction {
+        return this.libc("malloc", this.pointerType.functionType([this.int64Type]));
+    }
+
+    public strlen() -> RuntimeFunction {
+        return this.libc("strlen", this.int64Type.functionType([this.pointerType]));
     }
 
     public free() -> RuntimeFunction {
@@ -508,7 +492,7 @@ public final class Runtime {
 
     // The standard error stream: Windows reaches it through __acrt_iob_func(2), Darwin through the
     // __stderrp global, and other systems through the stderr global.
-    standardError() -> Value {
+    public standardError() -> Value {
         if (this.windowsTarget) {
             let stream = this.libc("__acrt_iob_func",
                 this.pointerType.functionType([this.int32Type]));

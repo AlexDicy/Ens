@@ -1,56 +1,79 @@
 // The calls emission makes: a call to a function the program declares, direct or dispatched, and
 // the two runtime primitives that consume a string - the print that writes a line and the panic
-// that aborts. A method's receiver is passed as the address of the storage it runs over, ahead
-// of the arguments.
+// that aborts with the trace captured at its site. A method's receiver is passed as the address
+// of the storage it runs over, ahead of the arguments; a throwing callee additionally receives
+// the caller's scratch error slot as its trailing argument.
 //
 // A dispatched call reads its target out of the receiver's runtime type: the descriptor sits in
 // the object header, a virtual call indexes its vtable, and an interface call looks the
 // interface's method table up in its conformances first. The call itself is then built exactly
 // like a direct one, at the type the statically resolved callee declares.
 import EirCall from eir.model;
+import EirCallee from eir.model;
 import EirPrint from eir.model;
 import EirPanic from eir.model;
+import Type from @ens.sema.model.types;
 import Value from @ens.llvm.values;
 import @ens.llvm.instructions;
 import @ens.llvm.memory;
 import ModuleEmitter from emit.context;
 import EmissionFrame from emit.context;
+import emit.exceptions;
 import emit.signatures;
+import List from @std.collections.list;
 
-public emitCall(ModuleEmitter emitter, EmissionFrame frame, EirCall call) {
-    long offset = 0;
-    if (call.receiver >= 0) {
-        offset = 1;
+public emitCall(ModuleEmitter emitter, EmissionFrame frame, EirCall call) -> string {
+    exceptions.markSite(emitter, frame, call.line);
+    Value? errorSlot = null;
+    if (call.callee.throwing()) {
+        errorSlot = frame.errorScratch();
+        if (errorSlot == null) {
+            return "Internal: a call to the throwing @{call.callee.symbol()} has no error "
+                + "scratch slot in {frame.symbol()}";
+        }
     }
-    let argumentValues = new Value[call.arguments.length + offset];
-    for (long i = 0; i < argumentValues.length; i++) {
-        argumentValues[i] = i < offset ? frame.value(call.receiver)
-            : frame.value(call.arguments[i - offset]);
-    }
-    Value produced;
-    if (call.dispatchSlot >= 0) {
-        let target = dispatchTarget(emitter, frame, call);
-        produced = instructions.buildCall(emitter.builder,
-            signatures.calleeType(emitter, call.callee), target, argumentValues, "");
-    } else {
-        let callee = signatures.calleeValue(emitter, call.callee);
-        produced = instructions.buildCall(emitter.builder,
-            emitter.calleeType(call.callee.symbol()), callee, argumentValues, "");
-    }
+    let produced = performCall(emitter, frame, call.callee, call.receiver, call.arguments,
+        call.dispatchSlot, call.dispatchInterface, errorSlot);
     if (call.result >= 0) {
         frame.define(call.result, produced);
     }
+    return "";
+}
+
+// Builds one call: the receiver ahead of the arguments, the error slot behind them when the
+// callee's ABI carries one, at the target the dispatch fields select.
+public performCall(ModuleEmitter emitter, EmissionFrame frame, EirCallee callee, long receiver,
+                   long[] arguments, long dispatchSlot, Type? dispatchInterface,
+                   Value? errorSlot) -> Value {
+    let argumentValues = new List<Value>();
+    if (receiver >= 0) {
+        argumentValues.push(frame.value(receiver));
+    }
+    for (let argument in arguments) {
+        argumentValues.push(frame.value(argument));
+    }
+    if (errorSlot != null) {
+        argumentValues.push(errorSlot);
+    }
+    if (dispatchSlot >= 0) {
+        let target = dispatchTarget(emitter, frame, receiver, dispatchSlot, dispatchInterface);
+        return instructions.buildCall(emitter.builder,
+            signatures.calleeType(emitter, callee), target, argumentValues.toArray(), "");
+    }
+    let direct = signatures.calleeValue(emitter, callee);
+    return instructions.buildCall(emitter.builder, emitter.calleeType(callee.symbol()), direct,
+        argumentValues.toArray(), "");
 }
 
 // The function pointer a dispatched call runs: slot dispatchSlot of the receiver's vtable, or of
 // its method table for the named interface.
-dispatchTarget(ModuleEmitter emitter, EmissionFrame frame, EirCall call) -> Value {
+dispatchTarget(ModuleEmitter emitter, EmissionFrame frame, long receiver, long dispatchSlot,
+               Type? dispatchInterface) -> Value {
     let descriptors = emitter.descriptors;
     let builder = emitter.builder;
     let pointerType = emitter.context.pointerType();
-    let descriptor = descriptors.loadDescriptor(frame.value(call.receiver));
+    let descriptor = descriptors.loadDescriptor(frame.value(receiver));
     Value table;
-    let dispatchInterface = call.dispatchInterface;
     if (dispatchInterface != null) {
         table = emitter.runtime.call(descriptors.itableLookup(),
             [descriptor, descriptors.descriptorValue(dispatchInterface)], "itable");
@@ -60,7 +83,7 @@ dispatchTarget(ModuleEmitter emitter, EmissionFrame frame, EirCall call) -> Valu
         table = memory.buildLoad(builder, pointerType, tableSlot, "vtable");
     }
     let functionSlot = memory.buildGEP(builder, pointerType, table,
-        [emitter.runtime.int64(call.dispatchSlot)], "");
+        [emitter.runtime.int64(dispatchSlot)], "");
     return memory.buildLoad(builder, pointerType, functionSlot, "target");
 }
 
@@ -69,5 +92,5 @@ public emitPrint(ModuleEmitter emitter, EmissionFrame frame, EirPrint printed) {
 }
 
 public emitPanic(ModuleEmitter emitter, EmissionFrame frame, EirPanic aborted) {
-    emitter.runtime.call(emitter.runtime.panic(), [frame.value(aborted.value)], "");
+    exceptions.abortWith(emitter, frame, frame.value(aborted.value), aborted.line);
 }

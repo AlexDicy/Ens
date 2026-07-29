@@ -512,7 +512,11 @@ task("test")
             io.writefile(manifest, table.concat(lines, "\n") .. "\n")
 
             -- the harness runs the spike as a child, so it needs the same library-path
-            -- environment for the shared library to load.
+            -- environment for the shared library to load. The fixtures it runs inherit the
+            -- same controlled variables the reference runner sets, so the getenv-based ffi
+            -- fixture stays hermetic here too.
+            env.ENS_FROMCSTRING_PRESENT = "hermetic"
+            env.ENS_FROMCSTRING_ABSENT = nil
             local run_rc = execMerged(harness_exe, {manifest}, log, {envs = env})
             local out = (io.readfile(log) or ""):gsub("[\r\n]+$", "")
             if run_rc == 0 then

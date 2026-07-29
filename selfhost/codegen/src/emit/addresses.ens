@@ -11,9 +11,12 @@ import EirLoadPtr from eir.model;
 import EirStorePtr from eir.model;
 import EirBoundsCheck from eir.model;
 import EirRangeCheck from eir.model;
+import Value from @ens.llvm.values;
+import @ens.llvm.instructions;
 import @ens.llvm.memory;
 import ModuleEmitter from emit.context;
 import EmissionFrame from emit.context;
+import emit.exceptions;
 
 public emitLoadSlot(ModuleEmitter emitter, EmissionFrame frame, EirLoadSlot load) -> string {
     let slot = frame.slotAt(load.slot);
@@ -65,14 +68,39 @@ public emitStorePtr(ModuleEmitter emitter, EmissionFrame frame, EirStorePtr stor
     memory.buildStore(emitter.builder, frame.value(store.value), frame.value(store.address));
 }
 
+// The guards run inline at the site rather than in a runtime helper, so the abort's captured
+// trace starts at the failing access, not inside a helper frame the symbol table cannot name.
 public emitBoundsCheck(ModuleEmitter emitter, EmissionFrame frame, EirBoundsCheck check) {
+    let builder = emitter.builder;
+    let index = frame.value(check.index);
     let length = emitter.runtime.payloadLength(frame.value(check.array));
-    emitter.runtime.call(emitter.runtime.boundsCheck(), [frame.value(check.index), length,
-        emitter.message("array index out of bounds")], "");
+    let negative = instructions.buildICmpSLT(builder, index, emitter.runtime.int64(0), "");
+    let past = instructions.buildICmpSGE(builder, index, length, "");
+    let outside = instructions.buildOr(builder, negative, past, "");
+    abortWhen(emitter, frame, outside, "array index out of bounds", check.line, "bounds");
 }
 
 public emitRangeCheck(ModuleEmitter emitter, EmissionFrame frame, EirRangeCheck check) {
-    emitter.runtime.call(emitter.runtime.rangeCheck(), [frame.value(check.start),
-        frame.value(check.end), frame.value(check.length),
-        emitter.message(check.message)], "");
+    let builder = emitter.builder;
+    let start = frame.value(check.start);
+    let end = frame.value(check.end);
+    let negative = instructions.buildICmpSLT(builder, start, emitter.runtime.int64(0), "");
+    let inverted = instructions.buildICmpSGT(builder, start, end, "");
+    let past = instructions.buildICmpSGT(builder, end, frame.value(check.length), "");
+    let outside = instructions.buildOr(builder,
+        instructions.buildOr(builder, negative, inverted, ""), past, "");
+    abortWhen(emitter, frame, outside, check.message, check.line, "range");
+}
+
+// Branches to a fresh abort block when the condition holds, and continues in a fresh block
+// otherwise.
+abortWhen(ModuleEmitter emitter, EmissionFrame frame, Value outside, string message, long line,
+          string label) {
+    let failBlock = emitter.context.appendBasicBlock(frame.declared(), "{label}.fail");
+    let okBlock = emitter.context.appendBasicBlock(frame.declared(), "{label}.ok");
+    instructions.buildCondBr(emitter.builder, outside, failBlock, okBlock);
+    emitter.builder.positionAtEnd(failBlock);
+    exceptions.abortWith(emitter, frame, emitter.message(message), line);
+    instructions.buildUnreachable(emitter.builder);
+    emitter.builder.positionAtEnd(okBlock);
 }

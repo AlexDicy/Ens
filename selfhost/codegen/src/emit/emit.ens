@@ -11,13 +11,17 @@
 // one instruction in emit.runtime.
 //
 // The module that defines the program entry also gets the C 'main' wrapper: it records argc and
-// argv in the ens argument globals and forwards the user main's result, with 0 standing in when
-// user main returns void.
+// argv in the ens argument globals and forwards the user main's result. A throwing main is
+// passed the root error slot; an error that reaches it is reported on standard error, with its
+// type, its message, and its trace, and the process exits 1.
 import EirFunction from eir.model;
+import Type from @ens.sema.model.types;
 import DescriptorPlans from layout.descriptors;
 import ModuleEmitter from emit.context;
 import emit.bodies;
 import emit.signatures;
+import emit.traceruntime;
+import Value from @ens.llvm.values;
 import @ens.llvm.instructions;
 import @ens.llvm.memory;
 import @ens.llvm.globals;
@@ -26,13 +30,15 @@ import TargetMachine from @ens.llvm.target;
 import @ens.llvm.target;
 import List from @std.collections.list;
 
-// The entry-point shape the wrapper forwards: the user main's symbol and whether it produces
-// the process exit code itself or leaves the wrapper to return 0.
+// The entry-point shape the wrapper forwards: the user main's symbol, whether it produces the
+// process exit code itself or leaves the wrapper to return 0, and whether it reports through an
+// error slot the wrapper owns.
 export final class EntryPoint {
     string entrySymbol;
     bool voidResult;
+    bool throwsResult;
 
-    public constructor(this.entrySymbol, this.voidResult);
+    public constructor(this.entrySymbol, this.voidResult, this.throwsResult);
 
     export symbol() -> string {
         return this.entrySymbol;
@@ -41,13 +47,20 @@ export final class EntryPoint {
     export returnsVoid() -> bool {
         return this.voidResult;
     }
+
+    export throwing() -> bool {
+        return this.throwsResult;
+    }
 }
 
 // Emits one module's functions and the descriptors it owns as a native object file for the host
-// target. Returns "" on success and a description of the failure otherwise.
+// target. The core module additionally defines the trace runtime every other module declares;
+// stackFrameType carries the class its symbolication builds. Returns "" on success and a
+// description of the failure otherwise.
 public emitModule(string moduleName, List<EirFunction> functions, EntryPoint? entry,
-                  DescriptorPlans plans, string objectPath) -> string {
+                  DescriptorPlans plans, Type? stackFrameType, string objectPath) -> string {
     let emitter = new ModuleEmitter(moduleName, plans);
+    emitter.rememberStackFrameType(stackFrameType);
     target.initializeHostTarget();
     string triple = target.hostTargetTriple();
     let resolved = target.targetFromTriple(triple);
@@ -83,6 +96,11 @@ emitInto(ModuleEmitter emitter, TargetMachine machine, List<EirFunction> functio
         }
     }
     emitter.descriptors.defineModuleDescriptors(emitter, emitter.name());
+    if (emitter.name() == "std.core") {
+        traceruntime.defineTraceRuntime(emitter);
+    }
+    emitter.traces.emitRegistration(emitter.runtime);
+    forceUnwindTables(emitter);
     string verdict = analysis.verify(emitter.module);
     if (verdict.length > 0) {
         return "module '{emitter.name()}' failed LLVM verification: {verdict}";
@@ -92,6 +110,18 @@ emitInto(ModuleEmitter emitter, TargetMachine machine, List<EirFunction> functio
         return "could not write the object file {objectPath}: {written}";
     }
     return "";
+}
+
+// Every defined function gets asynchronous unwind tables, so the stack capture can walk through
+// every frame - the nounwind runtime included.
+forceUnwindTables(ModuleEmitter emitter) {
+    let current = globals.firstFunction(emitter.module);
+    while (current != null) {
+        if (!globals.isDeclaration(current)) {
+            globals.addFunctionAttributeValued(emitter.context, current, "uwtable", 2);
+        }
+        current = globals.nextFunction(current);
+    }
 }
 
 // The C entry point: record the process arguments in the ens globals and forward the user
@@ -112,12 +142,59 @@ emitEntryWrapper(ModuleEmitter emitter, EntryPoint entry) -> string {
     emitter.builder.positionAtEnd(emitter.context.appendBasicBlock(wrapper, "entry"));
     let storeArgc = memory.buildStore(emitter.builder, globals.getParam(wrapper, 0), argcGlobal);
     let storeArgv = memory.buildStore(emitter.builder, globals.getParam(wrapper, 1), argvGlobal);
-    let called = instructions.buildCall(emitter.builder, emitter.calleeType(entry.symbol()),
-        userMain, [], "");
-    if (entry.returnsVoid()) {
-        let ignored = instructions.buildRet(emitter.builder, intType.constInt(0, false));
-    } else {
-        let ignored = instructions.buildRet(emitter.builder, called);
+    if (!entry.throwing()) {
+        let called = instructions.buildCall(emitter.builder, emitter.calleeType(entry.symbol()),
+            userMain, [], "");
+        if (entry.returnsVoid()) {
+            let ignored = instructions.buildRet(emitter.builder, intType.constInt(0, false));
+        } else {
+            let ignored = instructions.buildRet(emitter.builder, called);
+        }
+        return "";
     }
+
+    let builder = emitter.builder;
+    let slot = memory.buildAlloca(builder, pointerType, "err.slot");
+    memory.buildStore(builder, pointerType.constNull(), slot);
+    let called = instructions.buildCall(builder, emitter.calleeType(entry.symbol()), userMain,
+        [slot], "");
+    let error = memory.buildLoad(builder, pointerType, slot, "err");
+    let thrown = instructions.buildICmpNE(builder, error, pointerType.constNull(), "thrown");
+    let uncaught = emitter.context.appendBasicBlock(wrapper, "uncaught");
+    let finished = emitter.context.appendBasicBlock(wrapper, "ok");
+    instructions.buildCondBr(builder, thrown, uncaught, finished);
+
+    builder.positionAtEnd(finished);
+    if (entry.returnsVoid()) {
+        let ignored = instructions.buildRet(builder, intType.constInt(0, false));
+    } else {
+        let ignored = instructions.buildRet(builder, called);
+    }
+
+    // "Unhandled exception <Type>: <message>" and the captured trace, on standard error.
+    builder.positionAtEnd(uncaught);
+    let runtime = emitter.runtime;
+    let write = runtime.fputs();
+    let stream = runtime.standardError();
+    let descriptor = emitter.descriptors.loadDescriptor(error);
+    let typeName = memory.buildLoad(builder, pointerType,
+        memory.buildStructGEP(builder, emitter.descriptors.descriptorType(), descriptor, 0, ""),
+        "type.name");
+    runtime.call(write, [globals.buildGlobalString(builder, "Unhandled exception ",
+        ".uncaught.prefix"), stream], "");
+    runtime.call(write, [typeName, stream], "");
+    runtime.call(write, [globals.buildGlobalString(builder, ": ", ".uncaught.colon"),
+        stream], "");
+    // Error's message sits first in its payload and its captured frames second.
+    let message = memory.buildLoad(builder, pointerType, error, "message");
+    runtime.call(write, [runtime.payloadData(message), stream], "");
+    runtime.call(write, [globals.buildGlobalString(builder, "\n", ".uncaught.newline"),
+        stream], "");
+    let frames = memory.buildLoad(builder, pointerType,
+        runtime.offsetPointer(error, 8, "frames.slot"), "frames");
+    let trace = runtime.call(runtime.formatTrace(), [frames], "trace.text");
+    runtime.call(write, [runtime.payloadData(trace), stream], "");
+    runtime.call(runtime.release(), [error], "");
+    let ignored = instructions.buildRet(builder, intType.constInt(1, false));
     return "";
 }

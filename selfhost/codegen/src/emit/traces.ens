@@ -1,0 +1,177 @@
+// The per-module side tables lazy stack-trace symbolication reads: one symbol entry per defined
+// function that can appear in a trace, and one line marker per call site that can produce a
+// captured return address. A call site is marked by starting a fresh block at the call, whose
+// block address is the marker: a captured return address then resolves to the greatest marker
+// at or below it, which is exactly its own call.
+//
+// The tables become three private constant arrays and a chunk describing them, registered into
+// the runtime's chunk list by a global constructor, so statically linked modules and dynamically
+// loaded ones land in the same list.
+import Value from @ens.llvm.values;
+import TypeRef from @ens.llvm.types;
+import BasicBlock from @ens.llvm.blocks;
+import @ens.llvm.blocks;
+import @ens.llvm.core;
+import @ens.llvm.globals;
+import @ens.llvm.instructions;
+import Runtime from emit.runtime;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+
+// One defined function: where it starts, how a trace prints it, and whether it is the program
+// entry, where a captured trace stops walking.
+class SymbolRecord {
+    protected Value function;
+    protected string name;
+    protected string file;
+    protected long line;
+    protected bool entry;
+
+    protected constructor(this.function, this.name, this.file, this.line, this.entry);
+}
+
+// One marked call site: the address the marker block starts at and the call's source line.
+class MarkerRecord {
+    protected Value address;
+    protected long line;
+
+    protected constructor(this.address, this.line);
+}
+
+public final class TraceTables {
+    List<SymbolRecord> symbols;
+    List<MarkerRecord> markers;
+    Map<string, Value> texts;
+
+    public constructor() {
+        this.symbols = new List<SymbolRecord>();
+        this.markers = new List<MarkerRecord>();
+        this.texts = new Map<string, Value>();
+    }
+
+    // Records one defined function's symbol entry.
+    public record(Value function, string name, string file, long line, bool entry) {
+        this.symbols.push(new SymbolRecord(function, name, file, line, entry));
+    }
+
+    // Ends the current block at a call site and positions into a fresh one, recording the new
+    // block's address as the site's line marker. The call must be the block's first instruction.
+    public markCallSite(Runtime runtime, Value function, long line) {
+        let site = runtime.context.appendBasicBlock(function, "call.site");
+        instructions.buildBr(runtime.builder, site);
+        runtime.builder.positionAtEnd(site);
+        this.markers.push(new MarkerRecord(blocks.blockAddress(function, site), line));
+    }
+
+    // The symbol-entry struct shape the runtime reads: function start, name, file, declaration
+    // line, and the entry flag.
+    public symbolEntryType(Runtime runtime) -> TypeRef {
+        return runtime.context.structType([runtime.pointerType, runtime.pointerType,
+            runtime.pointerType, runtime.int32Type, runtime.int32Type], false);
+    }
+
+    // The line-marker struct shape: the marker address and the call's line.
+    public markerEntryType(Runtime runtime) -> TypeRef {
+        return runtime.context.structType([runtime.pointerType, runtime.int32Type], false);
+    }
+
+    // The chunk one module registers: the next link, its symbol entries, and its line markers.
+    public chunkType(Runtime runtime) -> TypeRef {
+        return runtime.context.structType([runtime.pointerType, runtime.pointerType,
+            runtime.int64Type, runtime.pointerType, runtime.int64Type], false);
+    }
+
+    // Emits the module's tables and the constructor that registers them at load. A module whose
+    // functions never appear in a trace registers nothing.
+    public emitRegistration(Runtime runtime) {
+        if (this.symbols.length() == 0) {
+            return;
+        }
+        let entryType = this.symbolEntryType(runtime);
+        let entries = new List<Value>();
+        for (long i = 0; i < this.symbols.length(); i++) {
+            let symbol = this.symbols.get(i);
+            long entryFlag = 0;
+            if (symbol.entry) {
+                entryFlag = 1;
+            }
+            entries.push(runtime.context.constStruct([symbol.function,
+                this.text(runtime, symbol.name), this.text(runtime, symbol.file),
+                runtime.int32Type.constInt(symbol.line as ulong, true),
+                runtime.int32Type.constInt(entryFlag as ulong, false)], false));
+        }
+        let entriesGlobal = constantTable(runtime,
+            entryType.arrayType(entries.length() as ulong),
+            entryType.constArray(entries.toArray()), "_ens_symtab");
+
+        let markerType = this.markerEntryType(runtime);
+        let lines = new List<Value>();
+        for (long i = 0; i < this.markers.length(); i++) {
+            let marker = this.markers.get(i);
+            lines.push(runtime.context.constStruct([marker.address,
+                runtime.int32Type.constInt(marker.line as ulong, true)], false));
+        }
+        let linesGlobal = constantTable(runtime, markerType.arrayType(lines.length() as ulong),
+            markerType.constArray(lines.toArray()), "_ens_linetab");
+
+        let chunkType = this.chunkType(runtime);
+        let chunk = globals.addGlobal(runtime.module, chunkType, "_ens_symtab_chunk");
+        globals.setInitializer(chunk, chunkType.constNamedStruct([runtime.nullPointer(),
+            entriesGlobal, runtime.int64(entries.length()), linesGlobal,
+            runtime.int64(lines.length())]));
+        globals.setLinkage(chunk, globals.linkagePrivate());
+
+        let register = runtime.libc("ens_symtab_register",
+            runtime.voidType.functionType([runtime.pointerType]));
+        let saved = runtime.builder.insertBlock();
+        let initializer = runtime.module.addFunction("_ens_register_symtab",
+            runtime.voidType.functionType([]));
+        globals.setLinkage(initializer, globals.linkageInternal());
+        globals.addFunctionAttribute(runtime.context, initializer, "nounwind");
+        runtime.builder.positionAtEnd(runtime.context.appendBasicBlock(initializer, "entry"));
+        runtime.call(register, [chunk], "");
+        instructions.buildRetVoid(runtime.builder);
+        if (saved != null) {
+            runtime.builder.positionAtEnd(saved);
+        }
+        appendGlobalConstructor(runtime, initializer);
+    }
+
+    // A NUL-terminated private text constant, one per distinct contents.
+    text(Runtime runtime, string contents) -> Value {
+        let known = this.texts.get(contents);
+        if (known != null) {
+            return known;
+        }
+        let data = runtime.context.constString(contents, true);
+        let holder = globals.addGlobal(runtime.module,
+            runtime.int8Type.arrayType((contents.length + 1) as ulong), ".trace.text");
+        globals.setInitializer(holder, data);
+        globals.setGlobalConstant(holder, true);
+        globals.setLinkage(holder, globals.linkagePrivate());
+        globals.setUnnamedAddress(holder, globals.unnamedAddressGlobal());
+        this.texts.set(contents, holder);
+        return holder;
+    }
+}
+
+constantTable(Runtime runtime, TypeRef arrayType, Value contents, string name) -> Value {
+    let table = globals.addGlobal(runtime.module, arrayType, name);
+    globals.setInitializer(table, contents);
+    globals.setGlobalConstant(table, true);
+    globals.setLinkage(table, globals.linkagePrivate());
+    return table;
+}
+
+// Appends the initializer to llvm.global_ctors at the default priority, so the loader runs it
+// before main whether the module was linked statically or loaded dynamically.
+appendGlobalConstructor(Runtime runtime, Value initializer) {
+    let entryType = runtime.context.structType([runtime.int32Type, runtime.pointerType,
+        runtime.pointerType], false);
+    let entry = runtime.context.constStruct([runtime.int32Type.constInt(65535, false),
+        initializer, runtime.nullPointer()], false);
+    let table = globals.addGlobal(runtime.module, entryType.arrayType(1),
+        "llvm.global_ctors");
+    globals.setInitializer(table, entryType.constArray([entry]));
+    globals.setLinkage(table, globals.linkageAppending());
+}
