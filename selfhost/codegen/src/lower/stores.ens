@@ -5,7 +5,6 @@
 // from itself never drops to zero in between.
 import Expression from @ens.frontend.syntax.generated.nodes;
 import Type from @ens.sema.model.types;
-import StructType from @ens.sema.model.types;
 import EirStoreSlot from eir.model;
 import EirStorePtr from eir.model;
 import LoweringContext from lower.context;
@@ -36,25 +35,50 @@ public final class Operand {
     }
 }
 
-// Lowers an expression for storage at the given type. A borrowed struct is reached through its
-// address, because retaining the references it holds needs one.
+// Lowers an expression for storage at the given type. A borrowed value holding references behind
+// a tag or inside fields - a struct, or a tagged optional whose payload has any - is reached
+// through its address, because retaining what it holds needs one; the value is read at the
+// storage's own type and converted, so a narrowed or widened read takes the same seam as every
+// other conversion. An expression that names no storage parks its value instead.
 public lowerOperand(LoweringContext lowering, Expression source, Type type) -> Operand? {
     bool owned = places.producesOwnedValue(lowering, source);
-    if (!owned && primitives.structOf(type) != null && primitives.hasArcContent(type)) {
+    if (!owned && primitives.hasArcContent(type) && !primitives.isReferenceType(type)) {
         long address = places.lowerAddress(lowering, source);
         if (address >= 0) {
-            return new Operand(places.loadFrom(lowering, address, type), false, address);
+            long value = places.readFrom(lowering, address, type, source.span());
+            if (value < 0) {
+                return null;
+            }
+            return new Operand(value, false, address);
         }
     }
     long value = expressions.lowerConverted(lowering, source, type);
     if (value < 0) {
         return null;
     }
+    return operandFor(lowering, value, owned, type);
+}
+
+// Wraps an already lowered value as an operand. A borrowed value whose references sit behind
+// storage is parked in a slot of its own, so the barriers have storage to retain from. The slot
+// borrows: whoever produced the value keeps its references, and the barrier taking the operand
+// adds the +1 it needs.
+public operandFor(LoweringContext lowering, long value, bool owned, Type type) -> Operand {
+    if (!owned && primitives.hasArcContent(type) && !primitives.isReferenceType(type)) {
+        let builder = lowering.builder();
+        long slot = builder.addSlot("parked", type, false, true);
+        builder.append(new EirStoreSlot(slot, value));
+        return new Operand(value, false, ownership.slotAddress(lowering, slot, type));
+    }
     return new Operand(value, owned, -1);
 }
 
-// Retains what the operand holds when it does not own it yet, so a location can keep it.
-retainForStorage(LoweringContext lowering, Operand operand, Type type) -> bool {
+// Gives the operand its own +1 on whatever its value holds, so a location or the caller can keep
+// it: an owned value already comes with one, a reference is retained directly, and a struct's or
+// tagged optional's content is retained through the storage it was read from, at that storage's
+// own type - which may sit above or below the operand's type by one optional conversion that
+// never changes which references the value carries.
+public takeOwnership(LoweringContext lowering, Operand operand, Type type) -> bool {
     if (operand.owned() || !primitives.hasArcContent(type)) {
         return true;
     }
@@ -65,13 +89,14 @@ retainForStorage(LoweringContext lowering, Operand operand, Type type) -> bool {
     if (operand.address() < 0) {
         return false;
     }
-    ownership.retainAt(lowering, operand.address(), type);
+    ownership.retainAt(lowering, operand.address(),
+        lowering.builder().tempType(operand.address()));
     return true;
 }
 
 // Writes into storage that holds nothing yet.
 public initializeSlot(LoweringContext lowering, long slot, Type type, Operand operand) -> bool {
-    if (!retainForStorage(lowering, operand, type)) {
+    if (!takeOwnership(lowering, operand, type)) {
         return false;
     }
     lowering.builder().append(new EirStoreSlot(slot, operand.value()));
@@ -80,7 +105,7 @@ public initializeSlot(LoweringContext lowering, long slot, Type type, Operand op
 
 // Writes over storage that may already hold a reference.
 public assignSlot(LoweringContext lowering, long slot, Type type, Operand operand) -> bool {
-    if (!retainForStorage(lowering, operand, type)) {
+    if (!takeOwnership(lowering, operand, type)) {
         return false;
     }
     ownership.releaseSlotContents(lowering, slot, type);
@@ -91,7 +116,7 @@ public assignSlot(LoweringContext lowering, long slot, Type type, Operand operan
 // Writes over the storage an address names.
 public assignThroughAddress(LoweringContext lowering, long address, Type type, Operand operand)
         -> bool {
-    if (!retainForStorage(lowering, operand, type)) {
+    if (!takeOwnership(lowering, operand, type)) {
         return false;
     }
     ownership.releaseAt(lowering, address, type);
@@ -102,7 +127,7 @@ public assignThroughAddress(LoweringContext lowering, long address, Type type, O
 // Writes into storage an address names that holds nothing yet.
 public initializeThroughAddress(LoweringContext lowering, long address, Type type,
                                 Operand operand) -> bool {
-    if (!retainForStorage(lowering, operand, type)) {
+    if (!takeOwnership(lowering, operand, type)) {
         return false;
     }
     lowering.builder().append(new EirStorePtr(address, operand.value()));

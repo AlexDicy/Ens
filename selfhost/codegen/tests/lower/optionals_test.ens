@@ -59,6 +59,119 @@ test "a safe member read guards on the receiver and wraps the value member" {
         "the absent path should produce the absent pair: {dumped}");
 }
 
+test "a borrowed optional-of-struct read from a class field retains through the field's address" {
+    let dumped = try support.loweredDump(
+        "class Probe \{\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "struct Cell \{\n"
+        + "    protected Probe probe;\n"
+        + "\}\n"
+        + "class Holder \{\n"
+        + "    protected Cell? cell;\n"
+        + "    protected constructor(this.cell);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let holder = new Holder(\{probe: new Probe()\});\n"
+        + "    Cell? copied = holder.cell;\n"
+        + "    return 0;\n"
+        + "\}\n", "main");
+    try testing.assertTrue(dumped.indexOf("load_ptr") >= 0,
+        "the field read should load through the field's address: {dumped}");
+    try testing.assertTrue(dumped.indexOf("opt.arc") >= 0,
+        "the retain should guard on the pair's presence tag: {dumped}");
+    try testing.assertTrue(dumped.indexOf("retain_ptr") >= 0,
+        "the present payload's reference should be retained in place: {dumped}");
+    try testing.assertTrue(dumped.indexOf("parked") < 0,
+        "a field read has storage of its own and needs no parking: {dumped}");
+}
+
+test "a narrowed read of an optional-of-struct steps into the payload before loading" {
+    let dumped = try support.loweredDump(
+        "struct Cell \{\n"
+        + "    protected string label;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Cell? cell = \{label: \"x\"\};\n"
+        + "    if (cell != null) \{\n"
+        + "        Cell present = cell;\n"
+        + "    \}\n"
+        + "    return 0;\n"
+        + "\}\n", "main");
+    long unwrapped = dumped.indexOf("opt.payload_addr");
+    try testing.assertTrue(unwrapped >= 0,
+        "the narrowed read should project the payload's address: {dumped}");
+    let afterUnwrap = dumped.substring(unwrapped, dumped.length);
+    try testing.assertTrue(afterUnwrap.indexOf(": Cell\n") >= 0,
+        "the load through the projected address should read the payload type: {dumped}");
+    try testing.assertTrue(afterUnwrap.indexOf("retain_ptr") >= 0,
+        "the copy should retain through the projected address: {dumped}");
+}
+
+test "a borrowed struct with no storage of its own is parked so its references can be retained" {
+    let dumped = try support.loweredDump(
+        "struct Cell \{\n"
+        + "    protected string label;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Cell a = \{label: \"a\"\};\n"
+        + "    Cell b = \{label: \"b\"\};\n"
+        + "    Cell chosen = true ? a : b;\n"
+        + "    return 0;\n"
+        + "\}\n", "main");
+    try testing.assertTrue(dumped.indexOf("parked: Cell borrowed") >= 0,
+        "the merged value should be parked in a borrowing slot: {dumped}");
+    long merged = dumped.indexOf("ternary.end");
+    try testing.assertTrue(merged >= 0,
+        "the arms should merge before the parking: {dumped}");
+    let afterMerge = dumped.substring(merged, dumped.length);
+    try testing.assertTrue(afterMerge.indexOf("retain_ptr") >= 0,
+        "the retain should walk the parked storage: {dumped}");
+}
+
+test "a narrowed return retains the payload it hands out before the scopes release" {
+    let dumped = try support.loweredDump(
+        "struct Cell \{\n"
+        + "    protected string label;\n"
+        + "\}\n"
+        + "lastOf(Cell? cell) -> Cell \{\n"
+        + "    if (cell == null) \{\n"
+        + "        return \{label: \"fallback\"\};\n"
+        + "    \}\n"
+        + "    return cell;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let ignored = lastOf(null);\n"
+        + "    return 0;\n"
+        + "\}\n", "lastOf");
+    long unwrapped = dumped.indexOf("opt.payload_addr");
+    try testing.assertTrue(unwrapped >= 0,
+        "the narrowed return should project the payload's address: {dumped}");
+    let afterUnwrap = dumped.substring(unwrapped, dumped.length);
+    long retained = afterUnwrap.indexOf("retain_ptr");
+    try testing.assertTrue(retained >= 0,
+        "the returned payload should be retained through the projected address: {dumped}");
+    try testing.assertTrue(
+        afterUnwrap.substring(retained, afterUnwrap.length).indexOf("release_ptr") >= 0,
+        "the parameter's scope should release only after the retain: {dumped}");
+}
+
+test "a safe member read through an optional of a reference-holding struct owns its scratch copy" {
+    let dumped = try support.loweredDump(
+        "struct Cell \{\n"
+        + "    protected string label;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Cell? maybe = \{label: \"x\"\};\n"
+        + "    string? read = maybe?.label;\n"
+        + "    return 0;\n"
+        + "\}\n", "main");
+    try testing.assertTrue(dumped.indexOf("safepayload") >= 0,
+        "the present payload should be parked in the scratch slot: {dumped}");
+    try testing.assertTrue(dumped.indexOf("retain_ptr") >= 0,
+        "the scratch copy should retain the references the payload holds: {dumped}");
+}
+
 test "a generic lookup returning V? wraps its found value per instance" {
     string program =
         "class Store<V> \{\n"
