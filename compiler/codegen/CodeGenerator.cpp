@@ -721,7 +721,11 @@ struct CodeGenerator::Impl {
 
     bool paramIsByPointer(Symbol* sym, size_t i) {
         if (!sym || i >= sym->paramTypes.size()) return false;
-        if (!structHasClassFields(sym->paramTypes[i])) return false;
+        // Only a struct passes by pointer; the optionals the walks also cover keep the ABI they
+        // have.
+        ::Type* pt = sym->paramTypes[i] ? subst(sym->paramTypes[i]) : nullptr;
+        if (!pt || !pt->isStruct()) return false;
+        if (!valueHoldsReferences(pt)) return false;
         if (!sym->escapeInfo.analyzed) return false;
         if (i >= sym->escapeInfo.params.size()) return false;
         if (sym->escapeInfo.params[i] != EscapeKind::NoEscape) return false;
@@ -965,7 +969,7 @@ struct CodeGenerator::Impl {
 
             if (byPointer) {
                 byPointerParams.insert(psym);
-            } else if (structHasClassFields(psym->type)) {
+            } else if (valueHoldsReferences(psym->type)) {
                 emitStructFieldRetain(psym->type, alloca);
                 cleanupStack.back().push_back({ alloca, psym->type });
             } else if (isReferenceType(psym->type) && psym->reassigned) {
@@ -1041,11 +1045,11 @@ struct CodeGenerator::Impl {
                     // A field default may already occupy the slot.
                     llvm::Value* previous = builder->CreateLoad(ptrTy, fieldAddr, asAscii(*fname) + ".old");
                     emitRelease(previous);
-                } else if (structHasClassFields(psym->type)) {
+                } else if (valueHoldsReferences(psym->type)) {
                     emitStructFieldRelease(psym->type, fieldAddr);
                 }
                 builder->CreateStore(paramVal, fieldAddr);
-                if (structHasClassFields(psym->type)) {
+                if (valueHoldsReferences(psym->type)) {
                     emitStructFieldRetain(psym->type, fieldAddr);
                 }
             }
@@ -1619,7 +1623,7 @@ struct CodeGenerator::Impl {
 
     bool isStructBorrowMode(Symbol* sym, const ast::Expression& init) {
         if (!sym || sym->kind != SymbolKind::Variable) return false;
-        if (!structHasClassFields(sym->type)) return false;
+        if (!valueHoldsReferences(sym->type)) return false;
         if (sym->localEscape != EscapeKind::NoEscape) return false;
         if (sym->reassigned) return false;
         if (sym->structFieldsMutated) return false;
@@ -1632,7 +1636,7 @@ struct CodeGenerator::Impl {
         }
         Symbol* src = symbolOf(id->node);
         if (!src) return false;
-        if (!structHasClassFields(src->type)) return false;
+        if (!valueHoldsReferences(src->type)) return false;
         if (src->reassigned) return false;
         return true;
     }
@@ -1724,7 +1728,7 @@ struct CodeGenerator::Impl {
             Symbol* moveSrc = !elideClassRetain && isReferenceType(sym->type)
                 ? moveSourceSymbol(*init) : nullptr;
             bool needsClassRetain = isReferenceType(sym->type) && borrowedSource && !elideClassRetain && !moveSrc;
-            bool needsStructRetain = structHasClassFields(sym->type) && borrowedSource && !elideStructRetain;
+            bool needsStructRetain = valueHoldsReferences(sym->type) && borrowedSource && !elideStructRetain;
             llvm::Value* v = emitExpr(*init);
             if (v) {
                 setLocationFromNode(s.node);
@@ -1805,7 +1809,7 @@ struct CodeGenerator::Impl {
             Symbol* moveSrc = !elideClassRetain && isReferenceType(sym->type)
                 ? moveSourceSymbol(*init) : nullptr;
             bool needsClassRetain = isReferenceType(sym->type) && borrowedSource && !elideClassRetain && !moveSrc;
-            bool needsStructRetain = structHasClassFields(sym->type) && borrowedSource && !elideStructRetain;
+            bool needsStructRetain = valueHoldsReferences(sym->type) && borrowedSource && !elideStructRetain;
             llvm::Value* v = emitExprConverted(*init, sym->type);
             if (v) {
                 if (needsClassRetain) {
@@ -1883,7 +1887,7 @@ struct CodeGenerator::Impl {
                                         emitRetain(v);
                                     }
                                     builder->CreateStore(v, fieldAddr);
-                                    if (borrowed && structHasClassFields(fi.type)) {
+                                    if (borrowed && valueHoldsReferences(fi.type)) {
                                         emitStructFieldRetain(fi.type, fieldAddr);
                                     }
                                 }
@@ -2147,7 +2151,7 @@ struct CodeGenerator::Impl {
         llvm::Type* bindTy = mapType(elemSym->type);
         llvm::Value* elemAlloca = createEntryAlloca(currentFunction, bindTy, asAscii(elemSym->name));
         values[elemSym] = elemAlloca;
-        bool elemOwned = isReferenceType(elemSym->type) || structHasClassFields(elemSym->type);
+        bool elemOwned = isReferenceType(elemSym->type) || valueHoldsReferences(elemSym->type);
         if (elemOwned) {
             builder->CreateStore(llvm::Constant::getNullValue(bindTy), elemAlloca);
             if (!cleanupStack.empty()) cleanupStack.back().push_back({ elemAlloca, elemSym->type });
@@ -2176,7 +2180,7 @@ struct CodeGenerator::Impl {
         if (isReferenceType(elemSym->type)) {
             llvm::Value* previous = builder->CreateLoad(ptrTy, elemAlloca, "foreach.elem.old");
             emitRelease(previous);
-        } else if (structHasClassFields(elemSym->type)) {
+        } else if (valueHoldsReferences(elemSym->type)) {
             emitStructFieldRelease(elemSym->type, elemAlloca);
         }
         builder->CreateStore(elemVal, elemAlloca);
@@ -2208,7 +2212,7 @@ struct CodeGenerator::Impl {
             ::Type* retType = typeOf(v->node);
             bool borrowedSource = !expressionProducesOwnedRef(*v);
             bool needsClassRetain = isReferenceType(retType) && borrowedSource;
-            bool needsStructRetain = structHasClassFields(retType) && borrowedSource;
+            bool needsStructRetain = valueHoldsReferences(retType) && borrowedSource;
 
             llvm::Value* val = emitExprConverted(*v, currentReturnType);
             if (!val) { builder->CreateUnreachable(); return; }
@@ -4662,7 +4666,7 @@ struct CodeGenerator::Impl {
         bool hasOwning = false;
         for (auto& f : t->structInfo->fields) {
             if (!f.type) continue;
-            if (f.isWeak || isReferenceType(f.type) || structHasClassFields(f.type)) {
+            if (f.isWeak || isReferenceType(f.type) || valueHoldsReferences(f.type)) {
                 hasOwning = true;
                 break;
             }
@@ -5729,7 +5733,7 @@ struct CodeGenerator::Impl {
             llvm::MaybeAlign(1), dataBytes);
 
         bool slotIsClass = isReferenceType(elem);
-        if (slotIsClass || structHasClassFields(elem)) {
+        if (slotIsClass || valueHoldsReferences(elem)) {
             auto* loopCond = llvm::BasicBlock::Create(ctx, "slice.retain.cond", currentFunction);
             auto* loopBody = llvm::BasicBlock::Create(ctx, "slice.retain.body", currentFunction);
             auto* loopEnd  = llvm::BasicBlock::Create(ctx, "slice.retain.end",  currentFunction);
@@ -5764,7 +5768,7 @@ struct CodeGenerator::Impl {
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         if (!elem) return llvm::ConstantPointerNull::get(ptrTy);
 
-        bool needsWalk = isReferenceType(elem) || structHasClassFields(elem);
+        bool needsWalk = isReferenceType(elem) || valueHoldsReferences(elem);
         if (!needsWalk) return llvm::ConstantPointerNull::get(ptrTy);
 
         std::string name = "_dtor_" + mangleTypeForName(elem) + "_array";
@@ -5802,7 +5806,7 @@ struct CodeGenerator::Impl {
         if (isReferenceType(elem)) {
             llvm::Value* val = builder->CreateLoad(ptrTy, slot, "slot.val");
             builder->CreateCall(getOrDefineEnsRelease(), { val });
-        } else if (structHasClassFields(elem)) {
+        } else if (valueHoldsReferences(elem)) {
             emitStructFieldRelease(elem, slot);
         }
         llvm::Value* next = builder->CreateAdd(idx, llvm::ConstantInt::get(i64, 1));
@@ -5898,7 +5902,7 @@ struct CodeGenerator::Impl {
                 i8Ty, arrPtr, llvm::ConstantInt::get(i64Ty, 8), "arr.data");
             llvm::Type* elemTy = mapType(elem);
             bool elemIsClass = isReferenceType(elem);
-            bool elemIsStructWithClass = structHasClassFields(elem);
+            bool elemIsStructWithClass = valueHoldsReferences(elem);
             auto elements = al->elements();
             for (size_t i = 0; i < elements.size(); ++i) {
                 const ast::Expression& src = elements[i];
@@ -5931,7 +5935,7 @@ struct CodeGenerator::Impl {
 
         builder->CreateStore(arrPtr, slotAlloca);
 
-        if ((isReferenceType(elem) || structHasClassFields(elem)) && !cleanupStack.empty()) {
+        if ((isReferenceType(elem) || valueHoldsReferences(elem)) && !cleanupStack.empty()) {
             cleanupStack.back().push_back({ slotAlloca, arrayType, /*isStackArray*/ true });
         }
     }
@@ -6058,7 +6062,7 @@ struct CodeGenerator::Impl {
         llvm::Value* data = emitArrayDataPtr(arrPtr);
         llvm::Type* elemTy = mapType(elemT);
         bool elemIsClass = isReferenceType(elemT);
-        bool elemIsStructWithClass = structHasClassFields(elemT);
+        bool elemIsStructWithClass = valueHoldsReferences(elemT);
 
         for (size_t i = 0; i < elems.size(); ++i) {
             const ast::Expression& src = elems[i];
@@ -6117,7 +6121,7 @@ struct CodeGenerator::Impl {
             if (isReferenceType(fieldT)) {
                 if (borrowed) emitRetain(v);
                 builder->CreateStore(v, slot);
-            } else if (structHasClassFields(fieldT)) {
+            } else if (valueHoldsReferences(fieldT)) {
                 builder->CreateStore(v, slot);
                 if (borrowed) emitStructFieldRetain(fieldT, slot);
             } else {
@@ -6284,26 +6288,84 @@ struct CodeGenerator::Impl {
         }
     }
 
-    // True when the struct holds an ARC-managed reference directly or inside a
-    // by-value struct field, so copies retain and scope exits release through
-    // the whole tree. The visited set guards a by-value cycle (a compile error).
-    bool structHasClassFields(::Type* t) {
+    // True when a value of this type holds an ARC-managed reference inside it: a struct with a
+    // reference field directly or inside a by-value struct field, or a tagged optional whose
+    // payload holds one. Copies retain and scope exits release through the whole tree. The value
+    // itself is never a reference; `isReferenceType` answers that. The visited set guards a
+    // by-value cycle (a compile error).
+    bool valueHoldsReferences(::Type* t) {
         std::unordered_set<StructInfo*> visited;
-        return structHasClassFieldsImpl(t, visited);
+        return valueHoldsReferencesImpl(t, visited);
     }
 
-    bool structHasClassFieldsImpl(::Type* t, std::unordered_set<StructInfo*>& visited) {
-        if (!t || !t->isStruct() || !t->structInfo) return false;
+    bool valueHoldsReferencesImpl(::Type* t, std::unordered_set<StructInfo*>& visited) {
+        if (!t) return false;
+        if (::Type* payload = taggedOptionalPayload(t)) {
+            return valueHoldsReferencesImpl(payload, visited);
+        }
+        if (!t->isStruct() || !t->structInfo) return false;
         if (!visited.insert(t->structInfo).second) return false;
         for (auto& f : t->structInfo->fields) {
             if (isReferenceType(f.type)) return true;
             ::Type* ft = f.type ? subst(f.type) : nullptr;
-            if (ft && ft->isStruct() && structHasClassFieldsImpl(ft, visited)) return true;
+            if (ft && valueHoldsReferencesImpl(ft, visited)) return true;
         }
         return false;
     }
 
+    // The payload type of a tagged optional, or null for anything else.
+    ::Type* taggedOptionalPayload(::Type* t) {
+        if (!isValueTypeOptional(t)) return nullptr;
+        return subst(subst(t)->inner);
+    }
+
+    // The payload an ARC walk over a tagged optional must visit, or null when the optional owns
+    // nothing.
+    ::Type* arcOptionalPayload(::Type* t) {
+        ::Type* payload = taggedOptionalPayload(t);
+        if (!payload) return nullptr;
+        return valueHoldsReferences(payload) ? payload : nullptr;
+    }
+
+    // A tagged optional owns its payload's references only while its tag says the payload is
+    // there, so the walk runs under the tag; an absent pair is zeroed and owns nothing.
+    void emitOptionalPayloadWalk(::Type* optType, ::Type* payload, llvm::Value* optAddr,
+                                 bool retaining) {
+        auto* layout = llvm::cast<llvm::StructType>(mapType(optType));
+        llvm::Function* owner = builder->GetInsertBlock()->getParent();
+        llvm::Value* presentAddr = builder->CreateStructGEP(layout, optAddr, 0, "opt.present.addr");
+        llvm::Value* present = builder->CreateLoad(llvm::Type::getInt1Ty(ctx), presentAddr,
+                                                  "opt.present");
+        auto* walkBB = llvm::BasicBlock::Create(ctx, "opt.arc", owner);
+        auto* doneBB = llvm::BasicBlock::Create(ctx, "opt.arc.end", owner);
+        builder->CreateCondBr(present, walkBB, doneBB);
+        builder->SetInsertPoint(walkBB);
+        llvm::Value* payloadAddr = builder->CreateStructGEP(layout, optAddr, 1, "opt.payload.addr");
+        if (retaining) emitStructFieldRetain(payload, payloadAddr);
+        else emitStructFieldRelease(payload, payloadAddr);
+        builder->CreateBr(doneBB);
+        builder->SetInsertPoint(doneBB);
+    }
+
+    // The same walk over a tagged optional held as a value rather than in storage.
+    void emitOptionalPayloadWalkOnValue(::Type* payload, llvm::Value* optVal) {
+        llvm::Function* owner = builder->GetInsertBlock()->getParent();
+        llvm::Value* present = builder->CreateExtractValue(optVal, { 0 }, "opt.present");
+        auto* walkBB = llvm::BasicBlock::Create(ctx, "opt.arc", owner);
+        auto* doneBB = llvm::BasicBlock::Create(ctx, "opt.arc.end", owner);
+        builder->CreateCondBr(present, walkBB, doneBB);
+        builder->SetInsertPoint(walkBB);
+        llvm::Value* payloadVal = builder->CreateExtractValue(optVal, { 1 }, "opt.payload");
+        emitStructFieldRetainOnValue(payload, payloadVal);
+        builder->CreateBr(doneBB);
+        builder->SetInsertPoint(doneBB);
+    }
+
     void emitStructFieldRetain(::Type* t, llvm::Value* base) {
+        if (::Type* payload = arcOptionalPayload(t)) {
+            emitOptionalPayloadWalk(t, payload, base, /*retaining*/ true);
+            return;
+        }
         if (!t || !t->structInfo) return;
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         llvm::StructType* layout = mapStructType(t);
@@ -6316,7 +6378,7 @@ struct CodeGenerator::Impl {
                                                                   asAscii(f.name) + ".addr");
                 llvm::Value* fieldVal = builder->CreateLoad(ptrTy, fieldAddr);
                 builder->CreateCall(retainFn, { fieldVal });
-            } else if (structHasClassFields(f.type)) {
+            } else if (valueHoldsReferences(f.type)) {
                 llvm::Value* fieldAddr = builder->CreateStructGEP(layout, base, static_cast<unsigned>(i),
                                                                   asAscii(f.name) + ".addr");
                 emitStructFieldRetain(f.type, fieldAddr);
@@ -6325,6 +6387,10 @@ struct CodeGenerator::Impl {
     }
 
     void emitStructFieldRetainOnValue(::Type* t, llvm::Value* aggVal) {
+        if (::Type* payload = arcOptionalPayload(t)) {
+            emitOptionalPayloadWalkOnValue(payload, aggVal);
+            return;
+        }
         if (!t || !t->structInfo) return;
         auto* retainFn = getOrDefineEnsRetain();
         for (size_t i = 0; i < t->structInfo->fields.size(); ++i) {
@@ -6333,7 +6399,7 @@ struct CodeGenerator::Impl {
             if (isReferenceType(f.type)) {
                 llvm::Value* fieldVal = builder->CreateExtractValue(aggVal, { static_cast<unsigned>(i) });
                 builder->CreateCall(retainFn, { fieldVal });
-            } else if (structHasClassFields(f.type)) {
+            } else if (valueHoldsReferences(f.type)) {
                 llvm::Value* sub = builder->CreateExtractValue(aggVal, { static_cast<unsigned>(i) });
                 emitStructFieldRetainOnValue(f.type, sub);
             }
@@ -6341,6 +6407,10 @@ struct CodeGenerator::Impl {
     }
 
     void emitStructFieldRelease(::Type* t, llvm::Value* base) {
+        if (::Type* payload = arcOptionalPayload(t)) {
+            emitOptionalPayloadWalk(t, payload, base, /*retaining*/ false);
+            return;
+        }
         if (!t || !t->structInfo) return;
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         llvm::StructType* layout = mapStructType(t);
@@ -6359,7 +6429,7 @@ struct CodeGenerator::Impl {
                                                                   asAscii(f.name) + ".addr");
                 llvm::Value* fieldVal = builder->CreateLoad(ptrTy, fieldAddr);
                 builder->CreateCall(releaseFn, { fieldVal });
-            } else if (structHasClassFields(f.type)) {
+            } else if (valueHoldsReferences(f.type)) {
                 llvm::Value* fieldAddr = builder->CreateStructGEP(layout, base, static_cast<unsigned>(i),
                                                                   asAscii(f.name) + ".addr");
                 emitStructFieldRelease(f.type, fieldAddr);
@@ -6369,7 +6439,7 @@ struct CodeGenerator::Impl {
 
     void registerOwnedLocal(llvm::Value* alloca, ::Type* type) {
         if (cleanupStack.empty()) return;
-        if (isReferenceType(type) || structHasClassFields(type)) {
+        if (isReferenceType(type) || valueHoldsReferences(type)) {
             // In a function with an error path, an initializer that throws would
             // unwind before this slot is stored; pre-null so its release no-ops.
             if (throwTargetSlot) {
@@ -6396,7 +6466,7 @@ struct CodeGenerator::Impl {
             if (ol.isStackArray) {
                 if (!ol.type || !ol.type->isArray() || !ol.type->inner) continue;
                 ::Type* elem = ol.type->inner;
-                if (!isReferenceType(elem) && !structHasClassFields(elem)) continue;
+                if (!isReferenceType(elem) && !valueHoldsReferences(elem)) continue;
                 llvm::Value* arrPtr = builder->CreateLoad(ptrTy, ol.alloca);
                 llvm::Value* dtor = getOrEmitArrayDtor(elem);
                 if (auto* dtorFn = llvm::dyn_cast<llvm::Function>(dtor)) {
@@ -6407,7 +6477,7 @@ struct CodeGenerator::Impl {
                 llvm::Value* val = builder->CreateLoad(ptrTy, ol.alloca);
                 builder->CreateCall(releaseFn, { val });
                 builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), ol.alloca);
-            } else if (structHasClassFields(ol.type)) {
+            } else if (valueHoldsReferences(ol.type)) {
                 emitStructFieldRelease(ol.type, ol.alloca);
                 builder->CreateStore(llvm::Constant::getNullValue(mapType(ol.type)), ol.alloca);
             }
@@ -6647,7 +6717,7 @@ struct CodeGenerator::Impl {
         if (!val || !type) return nullptr;
         auto* temp = createZeroedEntryAlloca(currentFunction, mapType(type), "record.tmp");
         builder->CreateStore(val, temp);
-        if (structHasClassFields(type) && expressionProducesOwnedRef(e) && !cleanupStack.empty()) {
+        if (valueHoldsReferences(type) && expressionProducesOwnedRef(e) && !cleanupStack.empty()) {
             cleanupStack.back().push_back({ temp, type });
         }
         return temp;
@@ -6667,7 +6737,7 @@ struct CodeGenerator::Impl {
         llvm::Value* val = emitExpr(e);
         if (!val) return nullptr;
         builder->CreateStore(val, temp);
-        if (structHasClassFields(paramType) && !cleanupStack.empty()) {
+        if (valueHoldsReferences(paramType) && !cleanupStack.empty()) {
             cleanupStack.back().push_back({ temp, paramType });
         }
         return temp;
@@ -7438,7 +7508,7 @@ struct CodeGenerator::Impl {
 
         ::Type* targetType = typeOf(target->node);
         bool isClass = isReferenceType(targetType);
-        bool isStructWithClass = structHasClassFields(targetType);
+        bool isStructWithClass = valueHoldsReferences(targetType);
         bool borrowedSource = !expressionProducesOwnedRef(*value);
 
         const FieldInfo* fi = targetFieldInfo(*target);
