@@ -1,0 +1,124 @@
+// The pass pipeline and its invariants: a function through every pass verifies at each stage,
+// and the weak-upgrade guard catches a pass that reroutes how an upgraded reference is given up,
+// which is the M3 lesson held as a check rather than a memory.
+import @std.testing;
+import PrimitiveKind from @ens.sema.model.types;
+import Type from @ens.sema.model.types;
+import TypeStore from @ens.sema.model.types;
+import EirFunction from eir.model;
+import EirFunctionBuilder from eir.model;
+import EirConstInt from eir.model;
+import EirRelease from eir.model;
+import EirReturn from eir.model;
+import EirSlotAddress from eir.model;
+import EirStoreSlot from eir.model;
+import EirWeakLoad from eir.model;
+import passes.weakguard;
+import support;
+
+test "the whole pipeline verifies at every stage and prunes the dead weight" {
+    let program = try support.lowerWholeProgram(
+        "pick(bool a, bool b) -> int \{\n"
+        + "    if (a) \{\n"
+        + "        if (b) \{\n"
+        + "            return 1;\n"
+        + "        \}\n"
+        + "    \}\n"
+        + "    return 2;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return pick(true, false);\n"
+        + "\}\n");
+    let optimized = try support.optimizedDump(program, "pick");
+    try testing.assertTrue(optimized.indexOf("b4.if.end") < 0,
+        "the empty merge block must be pruned");
+}
+
+test "an unchanged weak upgrade satisfies the guard" {
+    let pair = try watcherPair();
+    let function = buildWatcher(pair, true, false);
+    try testing.assertEqual(weakguard.check(function, function).length, 0);
+}
+
+test "dropping a weak upgrade's release trips the guard" {
+    let pair = try watcherPair();
+    let before = buildWatcher(pair, true, false);
+    let after = buildWatcher(pair, false, false);
+    string[] problems = weakguard.check(before, after);
+    try testing.assertTrue(problems.length > 0, "the guard must fire");
+    try testing.assertTrue(problems[0].indexOf("changed how the weak upgrade") >= 0,
+        "unexpected report: {problems[0]}");
+}
+
+test "parking a weak upgrade in a slot instead of releasing it trips the guard" {
+    let pair = try watcherPair();
+    let before = buildWatcher(pair, true, false);
+    let after = buildWatcher(pair, false, true);
+    string[] problems = weakguard.check(before, after);
+    try testing.assertTrue(problems.length > 0, "the guard must fire");
+    try testing.assertTrue(problems[0].indexOf("changed how the weak upgrade") >= 0,
+        "unexpected report: {problems[0]}");
+}
+
+test "removing a weak upgrade but keeping its release trips the guard" {
+    let pair = try watcherPair();
+    let before = buildWatcher(pair, true, false);
+    let after = buildReleaseWithoutUpgrade(pair);
+    string[] problems = weakguard.check(before, after);
+    try testing.assertTrue(problems.length > 0, "the guard must fire");
+    try testing.assertTrue(problems[0].indexOf("kept instructions consuming") >= 0,
+        "unexpected report: {problems[0]}");
+}
+
+// The types the hand-built watcher functions share: a nullable class and int.
+class WatcherTypes {
+    protected Type optionalBox;
+    protected Type intType;
+
+    protected constructor(this.optionalBox, this.intType);
+}
+
+watcherPair() -> WatcherTypes throws {
+    let analysis = try support.analyzeMain(
+        "class Box \{\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "main() \{\}\n");
+    let store = analysis.store();
+    let box = try support.classNamed(analysis, "Box");
+    return new WatcherTypes(store.optionalOf(box), store.primitive(PrimitiveKind.Int));
+}
+
+// A function that upgrades a weak slot: with the upgraded reference released, or dropped on the
+// floor, or parked in a second slot the way the M3 bug parked owned operands.
+buildWatcher(WatcherTypes types, bool released, bool parked) -> EirFunction {
+    let builder = new EirFunctionBuilder("watcher", false, null, [], types.intType);
+    long seen = builder.addSlot("seen", types.optionalBox, true, false);
+    long address = builder.newTemp(types.optionalBox);
+    builder.append(new EirSlotAddress(address, types.optionalBox, seen));
+    long upgraded = builder.newTemp(types.optionalBox);
+    builder.append(new EirWeakLoad(upgraded, types.optionalBox, address));
+    if (released) {
+        builder.append(new EirRelease(upgraded));
+    }
+    if (parked) {
+        long park = builder.addSlot("parked", types.optionalBox, true, false);
+        builder.append(new EirStoreSlot(park, upgraded));
+    }
+    long result = builder.newTemp(types.intType);
+    builder.append(new EirConstInt(result, types.intType, 0));
+    builder.terminate(new EirReturn(result));
+    return builder.finish();
+}
+
+buildReleaseWithoutUpgrade(WatcherTypes types) -> EirFunction {
+    let builder = new EirFunctionBuilder("watcher", false, null, [], types.intType);
+    long ignored = builder.addSlot("seen", types.optionalBox, true, false);
+    long address = builder.newTemp(types.optionalBox);
+    long upgraded = builder.newTemp(types.optionalBox);
+    builder.append(new EirRelease(upgraded));
+    long result = builder.newTemp(types.intType);
+    builder.append(new EirConstInt(result, types.intType, 0));
+    builder.terminate(new EirReturn(result));
+    return builder.finish();
+}

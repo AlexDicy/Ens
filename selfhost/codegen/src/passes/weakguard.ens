@@ -1,0 +1,121 @@
+// The weak-upgrade invariant, held as a check between passes: no pass may extend a weak
+// upgrade's lifetime. A weak.load hands back an owned reference precisely because the watched
+// object may die the moment that reference is given up, so moving its release later, parking it
+// in longer-lived storage, or rerouting its consumption changes when a watched object dies -
+// which is observable behavior, not bookkeeping. The passes only ever delete or replace
+// instructions in place and never touch a weak upgrade, so the check is exact: every weak.load
+// that survives a pass must keep exactly the consumers it had, and one a pass deletes must take
+// all of its consumers with it.
+import EirFunction from eir.model;
+import EirInstruction from eir.model;
+import EirWeakLoad from eir.model;
+import EirRelease from eir.model;
+import EirStoreSlot from eir.model;
+import EirStorePtr from eir.model;
+import EirWeakStore from eir.model;
+import EirCast from eir.model;
+import EirReturn from eir.model;
+import EirPropagate from eir.model;
+import eir.dump;
+import List from @std.collections.list;
+import StringBuilder from @std.text.stringbuilder;
+
+// Compares the weak upgrades of a function before and after one pass; the returned list is
+// empty when the invariant holds.
+public check(EirFunction before, EirFunction after) -> string[] {
+    let problems = new List<string>();
+    let upgrades = weakLoadResults(before);
+    let survivors = weakLoadResults(after);
+    for (long i = 0; i < upgrades.length(); i++) {
+        long upgraded = upgrades.get(i);
+        bool survives = false;
+        for (long j = 0; j < survivors.length(); j++) {
+            if (survivors.get(j) == upgraded) {
+                survives = true;
+            }
+        }
+        if (!survives) {
+            if (consumersText(after, upgraded).length > 0) {
+                problems.push("{before.symbol()}: a pass removed the weak upgrade %{upgraded} "
+                    + "but kept instructions consuming its reference");
+            }
+            continue;
+        }
+        string expected = consumersText(before, upgraded);
+        string actual = consumersText(after, upgraded);
+        if (expected != actual) {
+            problems.push("{before.symbol()}: a pass changed how the weak upgrade %{upgraded} "
+                + "is given up, which moves when the watched object dies; expected "
+                + "[{expected}], got [{actual}]");
+        }
+    }
+    return problems.toArray();
+}
+
+weakLoadResults(EirFunction function) -> List<long> {
+    let results = new List<long>();
+    let blocks = function.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        let instructions = blocks.get(b).instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (instruction is EirWeakLoad) {
+                results.push(instruction.result);
+            }
+        }
+    }
+    return results;
+}
+
+// The instructions that give up the upgraded reference, in the order the blocks hold them.
+consumersText(EirFunction function, long upgraded) -> string {
+    let out = new StringBuilder();
+    let blocks = function.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        let instructions = blocks.get(b).instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (consumes(instruction, upgraded)) {
+                appendConsumer(out, dump.instructionText(instruction));
+            }
+        }
+        let terminator = blocks.get(b).terminator();
+        if (terminator is EirReturn && terminator.value == upgraded) {
+            appendConsumer(out, "ret %{upgraded}");
+        }
+        if (terminator is EirPropagate && terminator.error == upgraded) {
+            appendConsumer(out, "propagate %{upgraded}");
+        }
+    }
+    return out.toString();
+}
+
+consumes(EirInstruction instruction, long upgraded) -> bool {
+    switch (instruction) {
+        is EirRelease release -> {
+            return release.value == upgraded;
+        },
+        is EirStoreSlot store -> {
+            return store.value == upgraded;
+        },
+        is EirStorePtr store -> {
+            return store.value == upgraded;
+        },
+        is EirWeakStore store -> {
+            return store.value == upgraded;
+        },
+        is EirCast cast -> {
+            return cast.operand == upgraded;
+        },
+        default -> {
+            return false;
+        },
+    }
+}
+
+appendConsumer(StringBuilder out, string text) {
+    if (out.length() > 0) {
+        out.append("; ");
+    }
+    out.append(text);
+}

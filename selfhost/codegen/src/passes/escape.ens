@@ -1,0 +1,80 @@
+// Escape analysis: the read-only prepass of the optimization pipeline. It computes, for every
+// function of the lowered program, whether each incoming position escapes the call and whether
+// the storage behind it is written, iterating the per-function scans to a fixpoint so a fact
+// established in a callee sharpens every caller. The monomorphization closure already made the
+// call graph complete - every callee a call names is in the list - so the fixpoint starts
+// optimistic and only actual events turn a fact on.
+import EirFunction from eir.model;
+import Type from @ens.sema.model.types;
+import DescriptorPlans from layout.descriptors;
+import FunctionFacts from passes.facts;
+import ProgramFacts from passes.facts;
+import RootFacts from passes.roots;
+import passes.roots;
+import support.primitives;
+import List from @std.collections.list;
+
+// The facts of the whole lowered program.
+public analyze(List<EirFunction> functions, DescriptorPlans plans) -> ProgramFacts {
+    let facts = new ProgramFacts(plans);
+    for (long i = 0; i < functions.length(); i++) {
+        facts.add(new FunctionFacts(functions.get(i)));
+    }
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (long i = 0; i < functions.length(); i++) {
+            if (analyzeFunction(functions.get(i), facts)) {
+                changed = true;
+            }
+        }
+    }
+    return facts;
+}
+
+// Rescans one function's positions; true when a fact changed. Positions whose type carries no
+// references are skipped: nothing behind an int can escape or dangle.
+analyzeFunction(EirFunction function, ProgramFacts facts) -> bool {
+    let own = facts.factsFor(function.symbol());
+    if (own == null) {
+        return false;
+    }
+    bool changed = false;
+    for (long position = 0; position < own.positionCount(); position++) {
+        if (!primitives.hasArcContent(positionType(function, position))) {
+            continue;
+        }
+        let seen = roots.analyzePosition(function, facts, position);
+        let recorded = own.at(position);
+        if (seen.escapes() && recorded.markEscapes()) {
+            changed = true;
+        }
+        bool mutated = seen.writesStorage() || reassigned(function, facts, position, seen);
+        if (mutated && recorded.markMutates()) {
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+positionType(EirFunction function, long position) -> Type {
+    let receiverType = function.receiverType();
+    if (receiverType != null) {
+        if (position == 0) {
+            return receiverType;
+        }
+        return function.parameters()[position - 1].type();
+    }
+    return function.parameters()[position].type();
+}
+
+// A position bound to a slot counts as mutated when anything beyond the entry binding stores
+// that slot whole: replacing a parameter wholesale writes the storage a caller would share just
+// as writing one of its fields does.
+reassigned(EirFunction function, ProgramFacts facts, long position, RootFacts seen) -> bool {
+    let own = facts.factsFor(function.symbol());
+    if (own == null || own.slotOf(position) < 0) {
+        return false;
+    }
+    return seen.slotStores() > 1;
+}

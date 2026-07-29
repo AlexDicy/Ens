@@ -1,0 +1,181 @@
+// The escape prepass: for each incoming position of every lowered function, whether a reference
+// arriving there can outlive the call and whether the storage behind it is written. These facts
+// license every elision the passes make, so each test pins one way a fact turns on - or provably
+// stays off.
+import @std.testing;
+import TestFailure from @std.testing;
+import ParameterFacts from passes.facts;
+import LoweredProgram from support;
+import support;
+
+test "a returned parameter escapes and a read-only one does not" {
+    let program = try support.lowerWholeProgram(
+        "class Box \{\n"
+        + "    protected int v;\n"
+        + "    protected constructor(this.v);\n"
+        + "\}\n"
+        + "pass(Box b) -> Box \{\n"
+        + "    return b;\n"
+        + "\}\n"
+        + "read(Box b) -> int \{\n"
+        + "    return b.v;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return read(pass(new Box(3)));\n"
+        + "\}\n");
+    try testing.assertTrue((try factsOf(program, "pass", 0)).escapes(),
+        "a returned parameter must escape");
+    try testing.assertTrue(!(try factsOf(program, "read", 0)).escapes(),
+        "a parameter only read must not escape");
+}
+
+test "storing a parameter into a field escapes the value, not the holder" {
+    let program = try support.lowerWholeProgram(
+        "class Box \{\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "class Holder \{\n"
+        + "    protected Box? kept;\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "keep(Holder h, Box b) \{\n"
+        + "    h.kept = b;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    keep(new Holder(), new Box());\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try testing.assertTrue(!(try factsOf(program, "keep", 0)).escapes(),
+        "the holder written into must not escape");
+    try testing.assertTrue((try factsOf(program, "keep", 1)).escapes(),
+        "the stored value must escape");
+}
+
+test "an escape in a callee reaches the caller's facts through the fixpoint" {
+    let program = try support.lowerWholeProgram(
+        "class Box \{\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "class Holder \{\n"
+        + "    protected Box? kept;\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "keep(Holder h, Box b) \{\n"
+        + "    h.kept = b;\n"
+        + "\}\n"
+        + "keepIndirect(Holder h, Box b) \{\n"
+        + "    keep(h, b);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    keepIndirect(new Holder(), new Box());\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try testing.assertTrue((try factsOf(program, "keepIndirect", 1)).escapes(),
+        "an argument handed to an escaping callee position must escape");
+    try testing.assertTrue(!(try factsOf(program, "keepIndirect", 0)).escapes(),
+        "the holder stays local through the call chain");
+}
+
+test "writing behind a struct parameter marks it mutated and reads do not" {
+    let program = try support.lowerWholeProgram(
+        "struct Named \{\n"
+        + "    protected string label;\n"
+        + "    protected int n;\n"
+        + "\}\n"
+        + "rename(Named p) -> int \{\n"
+        + "    p.label = \"other\";\n"
+        + "    return p.n;\n"
+        + "\}\n"
+        + "look(Named p) -> int \{\n"
+        + "    return p.n;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Named p = \{label: \"a\", n: 2\};\n"
+        + "    return rename(p) + look(p);\n"
+        + "\}\n");
+    try testing.assertTrue((try factsOf(program, "rename", 0)).mutates(),
+        "a field write behind the parameter is a mutation");
+    try testing.assertTrue(!(try factsOf(program, "look", 0)).mutates(),
+        "a parameter only read is not mutated");
+}
+
+test "reassigning a parameter wholesale counts as mutation" {
+    let program = try support.lowerWholeProgram(
+        "class Box \{\n"
+        + "    protected int v;\n"
+        + "    protected constructor(this.v);\n"
+        + "\}\n"
+        + "swap(Box b) -> int \{\n"
+        + "    b = new Box(9);\n"
+        + "    return b.v;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return swap(new Box(1));\n"
+        + "\}\n");
+    try testing.assertTrue((try factsOf(program, "swap", 0)).mutates(),
+        "replacing the parameter writes the storage behind it");
+}
+
+test "a dynamically dispatched call is conservative about receiver and arguments" {
+    let program = try support.lowerWholeProgram(
+        "class Box \{\n"
+        + "    protected int v;\n"
+        + "    protected constructor(this.v);\n"
+        + "\}\n"
+        + "class Animal \{\n"
+        + "    protected constructor();\n"
+        + "    protected speak(Box b) -> int \{\n"
+        + "        return b.v;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Dog extends Animal \{\n"
+        + "    protected constructor();\n"
+        + "    override speak(Box b) -> int \{\n"
+        + "        return b.v + 1;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "poke(Animal a, Box b) -> int \{\n"
+        + "    return a.speak(b);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return poke(new Dog(), new Box(1));\n"
+        + "\}\n");
+    try testing.assertTrue((try factsOf(program, "poke", 0)).escapes(),
+        "a dynamic call's receiver is assumed to escape");
+    try testing.assertTrue((try factsOf(program, "poke", 1)).escapes(),
+        "a dynamic call's argument is assumed to escape");
+}
+
+test "a struct method's receiver facts distinguish writers from readers" {
+    let program = try support.lowerWholeProgram(
+        "struct Counter \{\n"
+        + "    protected string label;\n"
+        + "    protected int n;\n"
+        + "    protected bump() \{\n"
+        + "        this.n = this.n + 1;\n"
+        + "    \}\n"
+        + "    protected peek() -> int \{\n"
+        + "        return this.n;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Counter c = \{label: \"c\", n: 1\};\n"
+        + "    c.bump();\n"
+        + "    return c.peek() - 2;\n"
+        + "\}\n");
+    try testing.assertTrue((try factsOf(program, "main$Counter$bump", 0)).mutates(),
+        "writing this.n mutates the receiver");
+    try testing.assertTrue(!(try factsOf(program, "main$Counter$peek", 0)).mutates(),
+        "reading this.n does not mutate the receiver");
+}
+
+factsOf(LoweredProgram program, string symbol, long position) -> ParameterFacts throws {
+    let facts = support.passContext(program).facts().factsFor(symbol);
+    if (facts == null) {
+        throw new TestFailure("no facts for '{symbol}'");
+    }
+    if (position >= facts.positionCount()) {
+        throw new TestFailure("'{symbol}' has only {facts.positionCount()} position(s)");
+    }
+    return facts.at(position);
+}

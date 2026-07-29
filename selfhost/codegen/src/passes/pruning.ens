@@ -1,0 +1,219 @@
+// Cleanup pruning: the last pass. Lowering materializes a block for every scope edge and every
+// unwind path whether or not anything ends up inside it, so the graph reaching emission carries
+// empty blocks whose only job is to jump somewhere else. This pass threads every edge past those
+// forwarders, folds a branch whose arms agree into a jump, and drops the blocks nothing reaches
+// anymore. Labels are kept as lowering named them, so a pruned dump still reads like the
+// function it came from.
+import EirFunction from eir.model;
+import EirBlock from eir.model;
+import EirTerminator from eir.model;
+import EirJump from eir.model;
+import EirBranch from eir.model;
+import EirSwitch from eir.model;
+import EirTryCall from eir.model;
+import eir.walk;
+import List from @std.collections.list;
+
+public run(EirFunction function) -> EirFunction {
+    let blocks = function.blocks();
+    long count = blocks.length();
+    if (count == 0) {
+        return function;
+    }
+    long[] forwarded = new long[count];
+    for (long b = 0; b < count; b++) {
+        forwarded[b] = resolveForwarding(blocks, b);
+    }
+    let threaded = new List<EirTerminator>();
+    for (long b = 0; b < count; b++) {
+        threaded.push(threadTargets(terminatorOf(blocks.get(b)), forwarded));
+    }
+    bool[] reached = reachable(threaded, count);
+    long[] remap = new long[count];
+    long kept = 0;
+    for (long b = 0; b < count; b++) {
+        if (reached[b]) {
+            remap[b] = kept;
+            kept++;
+        } else {
+            remap[b] = -1;
+        }
+    }
+    let rebuilt = new List<EirBlock>();
+    for (long b = 0; b < count; b++) {
+        if (!reached[b]) {
+            continue;
+        }
+        let source = blocks.get(b);
+        let block = new EirBlock(source.label());
+        let instructions = source.instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            block.instructions().push(instructions.get(i));
+        }
+        block.setTerminator(remapTargets(threaded.get(b), remap));
+        rebuilt.push(block);
+    }
+    return new EirFunction(function.symbol(), function.internalLinkage(),
+        function.receiverType(), function.parameters(), function.returnType(),
+        function.slots(), rebuilt, function.tempTypes(), function.throwing(),
+        function.traceName(), function.traceFile(), function.traceLine(),
+        function.isEntryPoint());
+}
+
+// The block an edge to this one may go to directly: follows jump-only empty blocks to the end
+// of the chain, stopping if the chain loops back on itself.
+resolveForwarding(List<EirBlock> blocks, long start) -> long {
+    long current = start;
+    bool[] visited = new bool[blocks.length()];
+    while (current >= 0 && current < blocks.length() && !visited[current]) {
+        visited[current] = true;
+        let block = blocks.get(current);
+        if (block.instructions().length() > 0) {
+            return current;
+        }
+        let terminator = block.terminator();
+        if (!(terminator is EirJump)) {
+            return current;
+        }
+        current = terminator.target;
+    }
+    return current;
+}
+
+terminatorOf(EirBlock block) -> EirTerminator {
+    let terminator = block.terminator();
+    if (terminator == null) {
+        panic("Internal: pruning reached a block with no terminator");
+    }
+    return terminator;
+}
+
+// The terminator with every target threaded past forwarders. A branch whose arms then agree
+// becomes a jump, and a switch whose every case agrees with its default does too. A try call
+// keeps its original edges when threading would merge the normal and unwind paths, because its
+// result exists only on one of them.
+threadTargets(EirTerminator terminator, long[] forwarded) -> EirTerminator {
+    switch (terminator) {
+        is EirJump jump -> {
+            long target = forwarded[jump.target];
+            if (target == jump.target) {
+                return jump;
+            }
+            return new EirJump(target);
+        },
+        is EirBranch branch -> {
+            long thenTarget = forwarded[branch.thenTarget];
+            long elseTarget = forwarded[branch.elseTarget];
+            if (thenTarget == elseTarget) {
+                return new EirJump(thenTarget);
+            }
+            if (thenTarget == branch.thenTarget && elseTarget == branch.elseTarget) {
+                return branch;
+            }
+            return new EirBranch(branch.condition, thenTarget, elseTarget);
+        },
+        is EirSwitch switched -> {
+            long defaultTarget = forwarded[switched.defaultTarget];
+            let caseTargets = new long[switched.caseTargets.length];
+            bool allAgree = true;
+            bool changed = defaultTarget != switched.defaultTarget;
+            for (long i = 0; i < switched.caseTargets.length; i++) {
+                caseTargets[i] = forwarded[switched.caseTargets[i]];
+                if (caseTargets[i] != switched.caseTargets[i]) {
+                    changed = true;
+                }
+                if (caseTargets[i] != defaultTarget) {
+                    allAgree = false;
+                }
+            }
+            if (allAgree) {
+                return new EirJump(defaultTarget);
+            }
+            if (!changed) {
+                return switched;
+            }
+            return new EirSwitch(switched.value, switched.caseValues, caseTargets,
+                defaultTarget);
+        },
+        is EirTryCall call -> {
+            long normalTarget = forwarded[call.normalTarget];
+            long unwindTarget = forwarded[call.unwindTarget];
+            if (normalTarget == unwindTarget) {
+                return call;
+            }
+            if (normalTarget == call.normalTarget && unwindTarget == call.unwindTarget) {
+                return call;
+            }
+            return new EirTryCall(call.result, call.type, call.callee, call.receiver,
+                call.arguments, call.dispatchSlot, call.dispatchInterface, call.errorResult,
+                normalTarget, unwindTarget, call.line);
+        },
+        default -> {
+            return terminator;
+        },
+    }
+}
+
+reachable(List<EirTerminator> terminators, long count) -> bool[] {
+    bool[] reached = new bool[count];
+    let pending = new List<long>();
+    pending.push(0);
+    reached[0] = true;
+    while (pending.length() > 0) {
+        long current = pending.pop();
+        for (let successor in walk.successorsOfTerminator(terminators.get(current))) {
+            if (successor >= 0 && successor < count && !reached[successor]) {
+                reached[successor] = true;
+                pending.push(successor);
+            }
+        }
+    }
+    return reached;
+}
+
+// The terminator with every target renumbered to the kept blocks' indices.
+remapTargets(EirTerminator terminator, long[] remap) -> EirTerminator {
+    switch (terminator) {
+        is EirJump jump -> {
+            if (remap[jump.target] == jump.target) {
+                return jump;
+            }
+            return new EirJump(remap[jump.target]);
+        },
+        is EirBranch branch -> {
+            if (remap[branch.thenTarget] == branch.thenTarget
+                    && remap[branch.elseTarget] == branch.elseTarget) {
+                return branch;
+            }
+            return new EirBranch(branch.condition, remap[branch.thenTarget],
+                remap[branch.elseTarget]);
+        },
+        is EirSwitch switched -> {
+            bool changed = remap[switched.defaultTarget] != switched.defaultTarget;
+            let caseTargets = new long[switched.caseTargets.length];
+            for (long i = 0; i < switched.caseTargets.length; i++) {
+                caseTargets[i] = remap[switched.caseTargets[i]];
+                if (caseTargets[i] != switched.caseTargets[i]) {
+                    changed = true;
+                }
+            }
+            if (!changed) {
+                return switched;
+            }
+            return new EirSwitch(switched.value, switched.caseValues, caseTargets,
+                remap[switched.defaultTarget]);
+        },
+        is EirTryCall call -> {
+            if (remap[call.normalTarget] == call.normalTarget
+                    && remap[call.unwindTarget] == call.unwindTarget) {
+                return call;
+            }
+            return new EirTryCall(call.result, call.type, call.callee, call.receiver,
+                call.arguments, call.dispatchSlot, call.dispatchInterface, call.errorResult,
+                remap[call.normalTarget], remap[call.unwindTarget], call.line);
+        },
+        default -> {
+            return terminator;
+        },
+    }
+}

@@ -1,0 +1,167 @@
+// The whole-program facts the optimization passes consume. For every lowered function they
+// record what it may do with each incoming position - the receiver when there is one, then the
+// parameters: whether a reference arriving there can outlive the call, and whether the storage
+// an incoming address names can be written. passes.escape computes them once over the naive EIR
+// of the whole program; afterwards they are read-only values every pass receives, so the passes
+// stay pure functions with no shared mutable state.
+import EirFunction from eir.model;
+import EirInstruction from eir.model;
+import EirStoreSlot from eir.model;
+import DescriptorPlans from layout.descriptors;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+
+// What one function may do with one incoming position.
+public final class ParameterFacts {
+    bool escapesCall;
+    bool mutatesStorage;
+
+    public constructor() {
+        this.escapesCall = false;
+        this.mutatesStorage = false;
+    }
+
+    // True when a reference arriving at this position may outlive the call: stored beyond the
+    // callee's own frame, returned, thrown, or handed to a call that lets it escape.
+    public escapes() -> bool {
+        return this.escapesCall;
+    }
+
+    // True when the storage behind this position may be written: the parameter reassigned, a
+    // field or element behind it stored, or its address handed to a call that writes it.
+    public mutates() -> bool {
+        return this.mutatesStorage;
+    }
+
+    // Records an escape; true when that changed the fact.
+    public markEscapes() -> bool {
+        if (this.escapesCall) {
+            return false;
+        }
+        this.escapesCall = true;
+        return true;
+    }
+
+    public markMutates() -> bool {
+        if (this.mutatesStorage) {
+            return false;
+        }
+        this.mutatesStorage = true;
+        return true;
+    }
+}
+
+// One function's per-position facts, plus the slot each entry temp is bound to, which is how a
+// scan finds the storage a parameter lives in.
+public final class FunctionFacts {
+    EirFunction factsFunction;
+    List<ParameterFacts> positions;
+    long[] positionSlots;
+
+    public constructor(EirFunction function) {
+        this.factsFunction = function;
+        this.positions = new List<ParameterFacts>();
+        for (long i = 0; i < function.entryTempCount(); i++) {
+            this.positions.push(new ParameterFacts());
+        }
+        this.positionSlots = bindingSlots(function);
+    }
+
+    public function() -> EirFunction {
+        return this.factsFunction;
+    }
+
+    public positionCount() -> long {
+        return this.positions.length();
+    }
+
+    public at(long position) -> ParameterFacts {
+        return this.positions.get(position);
+    }
+
+    // The slot the entry temp at a position is stored into by the entry block, or -1 when it is
+    // used directly, the way a class method uses its receiver.
+    public slotOf(long position) -> long {
+        if (position < 0 || position >= this.positionSlots.length) {
+            return -1;
+        }
+        return this.positionSlots[position];
+    }
+}
+
+// The facts of every function in the program, keyed by linker symbol, beside the descriptor
+// plans the layout stage produced. Together they are everything a pass may know beyond the
+// function it is rewriting.
+public final class ProgramFacts {
+    Map<string, FunctionFacts> bySymbol;
+    DescriptorPlans descriptorPlans;
+
+    public constructor(DescriptorPlans plans) {
+        this.bySymbol = new Map<string, FunctionFacts>();
+        this.descriptorPlans = plans;
+    }
+
+    public add(FunctionFacts facts) {
+        this.bySymbol.set(facts.function().symbol(), facts);
+    }
+
+    public factsFor(string symbol) -> FunctionFacts? {
+        return this.bySymbol.get(symbol);
+    }
+
+    public plans() -> DescriptorPlans {
+        return this.descriptorPlans;
+    }
+
+    // Whether a value handed to this callee position may outlive the call. Unknown callees and
+    // dynamic dispatch answer yes: when nothing is known, everything is assumed.
+    public argumentEscapes(string symbol, long dispatchSlot, long position) -> bool {
+        let found = this.lookedUp(symbol, dispatchSlot, position);
+        if (found == null) {
+            return true;
+        }
+        return found.escapes();
+    }
+
+    // Whether the storage behind an address handed to this callee position may be written.
+    public argumentMutates(string symbol, long dispatchSlot, long position) -> bool {
+        let found = this.lookedUp(symbol, dispatchSlot, position);
+        if (found == null) {
+            return true;
+        }
+        return found.mutates();
+    }
+
+    lookedUp(string symbol, long dispatchSlot, long position) -> ParameterFacts? {
+        if (dispatchSlot >= 0) {
+            return null;
+        }
+        let facts = this.bySymbol.get(symbol);
+        if (facts == null || position < 0 || position >= facts.positionCount()) {
+            return null;
+        }
+        return facts.at(position);
+    }
+}
+
+// The slot each entry temp is bound to: the first entry-block store of that temp into a slot.
+// Lowering binds every parameter this way before the body runs.
+bindingSlots(EirFunction function) -> long[] {
+    long count = function.entryTempCount();
+    long[] bound = new long[count];
+    for (long i = 0; i < count; i++) {
+        bound[i] = -1;
+    }
+    if (function.blocks().length() == 0) {
+        return bound;
+    }
+    let entry = function.blocks().get(0).instructions();
+    for (long i = 0; i < entry.length(); i++) {
+        let instruction = entry.get(i);
+        if (instruction is EirStoreSlot && instruction.value >= 0 && instruction.value < count
+                && bound[instruction.value] < 0) {
+            bound[instruction.value] = instruction.slot;
+        }
+    }
+    return bound;
+}

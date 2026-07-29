@@ -1,0 +1,277 @@
+// What one function does with everything reachable from one root - an incoming position or a
+// local slot. The scan closes over the copies the body makes (loads out of an aliased slot,
+// stores into another slot, the casts that rename a reference) and then reports whether a
+// reference reachable from the root may outlive the function and whether storage behind the
+// root is written. Calls are answered by the callee's own facts, so the whole-program fixpoint
+// in passes.escape converges to what the program actually does rather than assuming the worst.
+import EirFunction from eir.model;
+import EirInstruction from eir.model;
+import EirTerminator from eir.model;
+import EirLoadSlot from eir.model;
+import EirStoreSlot from eir.model;
+import EirCast from eir.model;
+import EirCheckedCast from eir.model;
+import EirStorePtr from eir.model;
+import EirWeakStore from eir.model;
+import EirWeakRelease from eir.model;
+import EirCall from eir.model;
+import EirForeignCall from eir.model;
+import EirCallee from eir.model;
+import EirReturn from eir.model;
+import EirPropagate from eir.model;
+import EirTryCall from eir.model;
+import Place from eir.place;
+import PlaceRoot from eir.place;
+import eir.place;
+import ProgramFacts from passes.facts;
+import support.primitives;
+
+// What a scan found reachable from its root.
+public final class RootFacts {
+    public bool escapesFunction;
+    public bool storageWritten;
+    public long seedSlotStores;
+
+    public constructor() {
+        this.escapesFunction = false;
+        this.storageWritten = false;
+        this.seedSlotStores = 0;
+    }
+
+    // True when a reference reachable from the root may outlive this function.
+    public escapes() -> bool {
+        return this.escapesFunction;
+    }
+
+    // True when storage behind the root is written through an address.
+    public writesStorage() -> bool {
+        return this.storageWritten;
+    }
+
+    // How many whole-slot stores reach the root's own slot. The entry binding is one; anything
+    // beyond it is a reassignment.
+    public slotStores() -> long {
+        return this.seedSlotStores;
+    }
+}
+
+// The facts for one incoming position: the receiver at 0 when the function has one, then the
+// parameters.
+public analyzePosition(EirFunction function, ProgramFacts facts, long position) -> RootFacts {
+    long seedSlot = -1;
+    let own = facts.factsFor(function.symbol());
+    if (own != null) {
+        seedSlot = own.slotOf(position);
+    }
+    bool receiverAddress = position == 0 && place.isOpaqueReceiver(function, 0);
+    return analyze(function, facts, position, seedSlot, receiverAddress);
+}
+
+// The facts for one local slot root, which is how stack promotion asks whether an allocation
+// bound to a local can outlive the frame.
+public analyzeSlot(EirFunction function, ProgramFacts facts, long slot) -> RootFacts {
+    return analyze(function, facts, -1, slot, false);
+}
+
+analyze(EirFunction function, ProgramFacts facts, long seedTemp, long seedSlot,
+        bool receiverAddress) -> RootFacts {
+    let found = new RootFacts();
+    long tempCount = function.tempTypes().length();
+    long slotCount = function.slots().length();
+    bool[] aliasTemp = new bool[tempCount + 1];
+    bool[] aliasSlot = new bool[slotCount + 1];
+    if (seedTemp >= 0 && seedTemp < tempCount && !receiverAddress) {
+        aliasTemp[seedTemp] = true;
+    }
+    if (seedSlot >= 0 && seedSlot < slotCount) {
+        aliasSlot[seedSlot] = true;
+    }
+    closeOverCopies(function, aliasTemp, aliasSlot);
+    let blocks = function.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        let instructions = blocks.get(b).instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            scanInstruction(function, facts, instructions.get(i), aliasTemp, aliasSlot,
+                seedSlot, receiverAddress, found);
+        }
+        let terminator = blocks.get(b).terminator();
+        if (terminator != null) {
+            scanTerminator(function, facts, terminator, aliasTemp, aliasSlot, seedSlot,
+                receiverAddress, found);
+        }
+    }
+    return found;
+}
+
+// Adds every temp and slot a copy of the root can reach: loads out of aliased slots, stores into
+// further slots, and the casts that rename a reference without changing what it points at.
+closeOverCopies(EirFunction function, bool[] aliasTemp, bool[] aliasSlot) {
+    let blocks = function.blocks();
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (long b = 0; b < blocks.length(); b++) {
+            let instructions = blocks.get(b).instructions();
+            for (long i = 0; i < instructions.length(); i++) {
+                let instruction = instructions.get(i);
+                switch (instruction) {
+                    is EirLoadSlot load -> {
+                        if (aliasSlot[load.slot] && !aliasTemp[load.result]) {
+                            aliasTemp[load.result] = true;
+                            changed = true;
+                        }
+                    },
+                    is EirCast cast -> {
+                        if (aliasTemp[cast.operand] && !aliasTemp[cast.result]) {
+                            aliasTemp[cast.result] = true;
+                            changed = true;
+                        }
+                    },
+                    is EirCheckedCast cast -> {
+                        if (aliasTemp[cast.value] && !aliasTemp[cast.result]) {
+                            aliasTemp[cast.result] = true;
+                            changed = true;
+                        }
+                    },
+                    is EirStoreSlot store -> {
+                        if (aliasTemp[store.value] && !aliasSlot[store.slot]) {
+                            aliasSlot[store.slot] = true;
+                            changed = true;
+                        }
+                    },
+                    default -> { },
+                }
+            }
+        }
+    }
+}
+
+scanInstruction(EirFunction function, ProgramFacts facts, EirInstruction instruction,
+                bool[] aliasTemp, bool[] aliasSlot, long seedSlot, bool receiverAddress,
+                RootFacts found) {
+    switch (instruction) {
+        is EirStoreSlot store -> {
+            if (store.slot == seedSlot && seedSlot >= 0) {
+                found.seedSlotStores++;
+            }
+        },
+        is EirStorePtr store -> {
+            if (aliasTemp[store.value]) {
+                found.escapesFunction = true;
+            }
+            if (writesSeed(function, store.address, seedSlot, receiverAddress)) {
+                found.storageWritten = true;
+            }
+        },
+        is EirWeakStore store -> {
+            if (aliasTemp[store.value]) {
+                found.escapesFunction = true;
+            }
+            if (writesSeed(function, store.address, seedSlot, receiverAddress)) {
+                found.storageWritten = true;
+            }
+        },
+        is EirWeakRelease release -> {
+            if (writesSeed(function, release.address, seedSlot, receiverAddress)) {
+                found.storageWritten = true;
+            }
+        },
+        is EirCall call -> {
+            scanCall(function, facts, call.callee, call.receiver, call.arguments,
+                call.dispatchSlot, aliasTemp, seedSlot, receiverAddress, found);
+        },
+        is EirForeignCall call -> {
+            for (long i = 0; i < call.arguments.length; i++) {
+                long argument = call.arguments[i];
+                if (aliasTemp[argument]) {
+                    found.escapesFunction = true;
+                }
+                if (rootsAtSeed(function, argument, seedSlot, receiverAddress)) {
+                    found.escapesFunction = true;
+                    found.storageWritten = true;
+                }
+            }
+        },
+        default -> { },
+    }
+}
+
+scanTerminator(EirFunction function, ProgramFacts facts, EirTerminator terminator,
+               bool[] aliasTemp, bool[] aliasSlot, long seedSlot, bool receiverAddress,
+               RootFacts found) {
+    switch (terminator) {
+        is EirReturn returned -> {
+            if (returned.value >= 0 && aliasTemp[returned.value]) {
+                found.escapesFunction = true;
+            }
+        },
+        is EirPropagate propagated -> {
+            if (aliasTemp[propagated.error]) {
+                found.escapesFunction = true;
+            }
+        },
+        is EirTryCall call -> {
+            scanCall(function, facts, call.callee, call.receiver, call.arguments,
+                call.dispatchSlot, aliasTemp, seedSlot, receiverAddress, found);
+        },
+        default -> { },
+    }
+}
+
+// One call site: a value alias handed to the callee escapes when the callee's facts say that
+// position escapes, and an address rooted at the seed additionally mutates when the callee
+// writes through that position.
+scanCall(EirFunction function, ProgramFacts facts, EirCallee callee, long receiver,
+         long[] arguments, long dispatchSlot, bool[] aliasTemp, long seedSlot,
+         bool receiverAddress, RootFacts found) {
+    long offset = 0;
+    if (callee.receiverType() != null) {
+        offset = 1;
+        scanCallOperand(function, facts, callee, receiver, dispatchSlot, 0, aliasTemp,
+            seedSlot, receiverAddress, found);
+    }
+    for (long i = 0; i < arguments.length; i++) {
+        scanCallOperand(function, facts, callee, arguments[i], dispatchSlot, i + offset,
+            aliasTemp, seedSlot, receiverAddress, found);
+    }
+}
+
+scanCallOperand(EirFunction function, ProgramFacts facts, EirCallee callee, long operand,
+                long dispatchSlot, long position, bool[] aliasTemp, long seedSlot,
+                bool receiverAddress, RootFacts found) {
+    if (operand < 0) {
+        return;
+    }
+    if (aliasTemp[operand]
+            && facts.argumentEscapes(callee.symbol(), dispatchSlot, position)) {
+        found.escapesFunction = true;
+    }
+    if (rootsAtSeed(function, operand, seedSlot, receiverAddress)) {
+        if (facts.argumentEscapes(callee.symbol(), dispatchSlot, position)) {
+            found.escapesFunction = true;
+        }
+        if (facts.argumentMutates(callee.symbol(), dispatchSlot, position)) {
+            found.storageWritten = true;
+        }
+    }
+}
+
+// True when an address temp names storage inside the seed: the seed slot itself or, for a
+// receiver root, the storage the receiver address arrived naming.
+writesSeed(EirFunction function, long address, long seedSlot, bool receiverAddress) -> bool {
+    return rootsAtSeed(function, address, seedSlot, receiverAddress);
+}
+
+rootsAtSeed(EirFunction function, long temp, long seedSlot, bool receiverAddress) -> bool {
+    let named = place.placeOf(function, temp);
+    if (named == null) {
+        return false;
+    }
+    if (named.root() == PlaceRoot.Slot) {
+        return named.rootId() == seedSlot;
+    }
+    if (named.root() == PlaceRoot.Receiver) {
+        return receiverAddress;
+    }
+    return false;
+}

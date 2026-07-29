@@ -1,0 +1,90 @@
+// The optimization pipeline: the D stage between the verified naive lowering and emission. The
+// cross-function facts are computed once by the read-only prepass in 'plan'; each function then
+// runs through the passes in a fixed order, every pass a pure step that takes a verified
+// function and hands back a fresh one. A pass never mutates the function it was given - shared
+// instruction objects are replaced, not edited - so the input stays valid, which is what lets a
+// harness dump and verify both sides of every stage.
+//
+// With verifyEachPass on, the structural, ownership, and storage verifiers and the weak-upgrade
+// guard run after every pass, so a pass that breaks an invariant is caught at the pass, named,
+// rather than at emission. The tests always run that way; the driver keeps it behind a flag and
+// re-verifies once after the whole pipeline instead.
+import EirFunction from eir.model;
+import DescriptorPlans from layout.descriptors;
+import ProgramFacts from passes.facts;
+import passes.escape;
+import passes.pruning;
+import passes.weakguard;
+import eir.ownership;
+import eir.storage;
+import eir.verify;
+import List from @std.collections.list;
+
+// Everything the passes may know beyond the function they rewrite, computed once per program.
+public final class PassContext {
+    ProgramFacts programFacts;
+
+    public constructor(this.programFacts);
+
+    public facts() -> ProgramFacts {
+        return this.programFacts;
+    }
+
+    public plans() -> DescriptorPlans {
+        return this.programFacts.plans();
+    }
+}
+
+// One function's trip through the pipeline: the rewritten function, and the violations found
+// when verification between passes was on.
+public final class PassOutcome {
+    EirFunction rewrittenFunction;
+    string[] foundProblems;
+
+    public constructor(this.rewrittenFunction, this.foundProblems);
+
+    public function() -> EirFunction {
+        return this.rewrittenFunction;
+    }
+
+    public problems() -> string[] {
+        return this.foundProblems;
+    }
+}
+
+// The read-only prepass over the whole lowered program.
+public planProgram(List<EirFunction> functions, DescriptorPlans plans) -> PassContext {
+    return new PassContext(escape.analyze(functions, plans));
+}
+
+// Runs one function through every pass in order.
+public runFunction(EirFunction function, PassContext context, bool verifyEachPass)
+        -> PassOutcome {
+    let problems = new List<string>();
+    EirFunction current = function;
+    current = checked("cleanup pruning", current, pruning.run(current), verifyEachPass,
+        problems);
+    return new PassOutcome(current, problems.toArray());
+}
+
+// Verifies one pass's output against everything a pass must preserve, tagging each violation
+// with the pass that introduced it.
+checked(string passName, EirFunction before, EirFunction after, bool verifyEachPass,
+        List<string> problems) -> EirFunction {
+    if (!verifyEachPass) {
+        return after;
+    }
+    for (let violation in verify.verifyFunction(after)) {
+        problems.push("after the {passName} pass: {violation}");
+    }
+    for (let violation in ownership.verifyOwnership(after)) {
+        problems.push("after the {passName} pass: {violation}");
+    }
+    for (let violation in storage.verifyStorage(after)) {
+        problems.push("after the {passName} pass: {violation}");
+    }
+    for (let violation in weakguard.check(before, after)) {
+        problems.push("after the {passName} pass: {violation}");
+    }
+    return after;
+}

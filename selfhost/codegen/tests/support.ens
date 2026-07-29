@@ -13,6 +13,7 @@ import @ens.sema.pipeline;
 import TypeStore from @ens.sema.model.types;
 import StructType from @ens.sema.model.types;
 import ClassType from @ens.sema.model.types;
+import InstantiationType from @ens.sema.model.types;
 import @ens.sema.model.types;
 import Context from @ens.llvm.core;
 import Module from @ens.llvm.core;
@@ -25,8 +26,13 @@ import eir.dump;
 import eir.verify;
 import eir.ownership;
 import eir.storage;
+import DescriptorPlans from layout.descriptors;
+import layout.descriptors;
 import layout.vtables;
 import mono.closure;
+import PassContext from passes.optimize;
+import passes.optimize;
+import List from @std.collections.list;
 import FunctionInfo from lower.index;
 import ProgramIndex from lower.index;
 import lower.destructors;
@@ -309,6 +315,99 @@ assertVerified(EirFunction function, string described) throws {
         throw new TestFailure("storage ownership does not balance in '{described}': "
             + "{unbalancedStorage[0]}\n" + dump.dumpFunction(function));
     }
+}
+
+// The whole program lowered the way the driver lowers it: every function and synthesized
+// destructor of every module, each verified, beside the descriptor plans the passes consume.
+public class LoweredProgram {
+    public ProgramAnalysis analysis;
+    public List<EirFunction> functions;
+    public DescriptorPlans plans;
+
+    public constructor(this.analysis, this.functions, this.plans);
+}
+
+public lowerWholeProgram(string programText) -> LoweredProgram throws {
+    return try lowerLoadedProgram(try analyzeMain(programText));
+}
+
+public lowerLoadedProgram(ProgramAnalysis analysis) -> LoweredProgram throws {
+    let programIndex = try indexProgram(analysis);
+    let tables = vtables.assignSlots(programIndex);
+    let plans = descriptors.planProgram(programIndex, tables);
+    let functions = new List<EirFunction>();
+    let modules = programIndex.modules();
+    for (long m = 0; m < modules.length(); m++) {
+        let moduleFunctions = modules.get(m);
+        for (long i = 0; i < moduleFunctions.functions().length(); i++) {
+            let info = moduleFunctions.functions().get(i);
+            let outcome = lower.lowerFunction(info, programIndex, tables, analysis.store());
+            let function = outcome.function();
+            if (function == null) {
+                string reason = "no diagnostics";
+                if (outcome.diagnostics().length > 0) {
+                    reason = outcome.diagnostics()[0].message();
+                }
+                throw new TestFailure("lowering '{info.symbol()}' failed: {reason}");
+            }
+            try assertVerified(function, info.symbol());
+            functions.push(function);
+        }
+        for (long c = 0; c < moduleFunctions.classes().length(); c++) {
+            let finalizer = destructors.synthesize(moduleFunctions.classes().get(c),
+                programIndex, analysis.store());
+            if (finalizer != null) {
+                try assertVerified(finalizer, finalizer.symbol());
+                functions.push(finalizer);
+            }
+        }
+        for (long c = 0; c < moduleFunctions.instantiations().length(); c++) {
+            let instantiation = moduleFunctions.instantiations().get(c);
+            bool classInstance = instantiation is ClassType
+                || (instantiation is InstantiationType && instantiation.template() is ClassType);
+            if (!classInstance) {
+                continue;
+            }
+            let finalizer = destructors.synthesize(instantiation, programIndex,
+                analysis.store());
+            if (finalizer != null) {
+                try assertVerified(finalizer, finalizer.symbol());
+                functions.push(finalizer);
+            }
+        }
+    }
+    return new LoweredProgram(analysis, functions, plans);
+}
+
+// The pass context the pipeline computes over a lowered program.
+public passContext(LoweredProgram program) -> PassContext {
+    return optimize.planProgram(program.functions, program.plans);
+}
+
+public functionBySymbol(LoweredProgram program, string symbol) -> EirFunction throws {
+    for (long i = 0; i < program.functions.length(); i++) {
+        if (program.functions.get(i).symbol() == symbol) {
+            return program.functions.get(i);
+        }
+    }
+    throw new TestFailure("no lowered function with symbol '{symbol}'");
+}
+
+// Runs one function through the whole pipeline with verification between every pass, and
+// returns the optimized dump.
+public optimizedDump(LoweredProgram program, string symbol) -> string throws {
+    let outcome = optimize.runFunction(try functionBySymbol(program, symbol),
+        passContext(program), true);
+    if (outcome.problems().length > 0) {
+        throw new TestFailure("the pipeline broke '{symbol}': {outcome.problems()[0]}\n"
+            + dump.dumpFunction(outcome.function()));
+    }
+    return dump.dumpFunction(outcome.function());
+}
+
+// Asserts the three verifiers accept a pass's output, the way the pipeline does between passes.
+public assertOptimized(EirFunction function, string described) throws {
+    try assertVerified(function, described);
 }
 
 // Lowers one function expecting failure, and returns the first diagnostic's message.
