@@ -4839,6 +4839,12 @@ Type* Analyzer::analyzeBinaryOperands(const SyntaxNode& diagNode, SyntaxKind op,
         case SyntaxKind::Gt:
         case SyntaxKind::LtEq:
         case SyntaxKind::GtEq: {
+            if (l->isString() && r->isString()) {
+                errorAtNode(diagNode, "Operator '" + opText + "' cannot be applied to 'string' "
+                    "and 'string'; it compares numbers. Order strings with 'compareTo', as in "
+                    "'left.compareTo(right) " + opText + " 0'.");
+                return typeCtx.getPrimitive(TypeKind::Bool);
+            }
             if (!l->isNumeric() || !r->isNumeric()) {
                 errorAtNode(diagNode, "'" + opText + "' compares numbers, got '" +
                     l->toString() + "' and '" + r->toString() + "'.");
@@ -5433,27 +5439,39 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                 }
                 // Records may declare their own toBytes: fall through to resolution.
             }
-            // String search builtins: indexOf(string) -> long, contains(string) -> bool.
+            // String builtins over one other string: indexOf -> long, contains -> bool,
+            // compareTo -> int.
+            auto checkStringArgument = [&](const std::string& name) {
+                if (args.size() != 1) {
+                    errorAtNode(expr.node, "'" + name + "' expects 1 argument (a string), got " +
+                        std::to_string(args.size()) + ".");
+                    for (auto& a : args) analyzeExpr(a);
+                    return;
+                }
+                Type* argT = analyzeExpr(args[0]);
+                if (!argT->isError() && !argT->isString()) {
+                    errorAtNode(args[0].node, "'" + name + "' expects a string argument, got '" +
+                        argT->toString() + "'.");
+                }
+            };
             if (memberName && (*memberName == u"indexOf" || *memberName == u"contains")) {
                 Type* recvT = analyzeExpr(*objExpr);
                 if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }
                 if (recvT->isString()) {
                     bool isIndexOf = *memberName == u"indexOf";
-                    std::string name = isIndexOf ? "indexOf" : "contains";
-                    if (args.size() != 1) {
-                        errorAtNode(expr.node, "'" + name + "' expects 1 argument (a string), got " +
-                            std::to_string(args.size()) + ".");
-                        for (auto& a : args) analyzeExpr(a);
-                    } else {
-                        Type* argT = analyzeExpr(args[0]);
-                        if (!argT->isError() && !argT->isString()) {
-                            errorAtNode(args[0].node, "'" + name + "' expects a string argument, got '" +
-                                argT->toString() + "'.");
-                        }
-                    }
+                    checkStringArgument(isIndexOf ? "indexOf" : "contains");
                     return typeCtx.getPrimitive(isIndexOf ? TypeKind::Long : TypeKind::Bool);
                 }
                 // Records may declare their own indexOf/contains: fall through to resolution.
+            }
+            if (memberName && *memberName == u"compareTo") {
+                Type* recvT = analyzeExpr(*objExpr);
+                if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }
+                if (recvT->isString()) {
+                    checkStringArgument("compareTo");
+                    return typeCtx.getPrimitive(TypeKind::Int);
+                }
+                // Records may declare their own compareTo: fall through to resolution.
             }
             // Range builtins: string.substring(start, end) -> string and
             // array slice(start, end) -> T[], both half-open ranges.

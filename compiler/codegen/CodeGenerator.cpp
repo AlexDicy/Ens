@@ -4979,6 +4979,41 @@ struct CodeGenerator::Impl {
         return fn;
     }
 
+    // i32 ens_string_compare(a, b): -1, 0 or 1 as a sorts before, with, or
+    // after b. The shared bytes decide first; when one string is a prefix of
+    // the other the shorter one sorts first.
+    llvm::Function* getOrDefineEnsStringCompare() {
+        if (auto* existing = module->getFunction("ens_string_compare")) return existing;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(i32Ty, { ptrTy, ptrTy }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+            "ens_string_compare", module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+
+        auto savedIP = builder->saveIP();
+        builder->SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", fn));
+        llvm::Value* la = emitStringLength(fn->getArg(0));
+        llvm::Value* lb = emitStringLength(fn->getArg(1));
+        llvm::Value* shorter = builder->CreateSelect(
+            builder->CreateICmpSLT(la, lb), la, lb, "cmp.shared");
+        llvm::Value* diff = builder->CreateCall(getOrDeclareMemcmp(),
+            { emitStringDataPtr(fn->getArg(0)), emitStringDataPtr(fn->getArg(1)), shorter },
+            "cmp.bytes");
+        auto* zero = llvm::ConstantInt::get(i32Ty, 0);
+        auto* below = llvm::ConstantInt::getSigned(i32Ty, -1);
+        auto* above = llvm::ConstantInt::get(i32Ty, 1);
+        llvm::Value* byteOrder = builder->CreateSelect(builder->CreateICmpSLT(diff, zero), below,
+            builder->CreateSelect(builder->CreateICmpSGT(diff, zero), above, zero), "cmp.byte");
+        llvm::Value* lengthOrder = builder->CreateSelect(builder->CreateICmpSLT(la, lb), below,
+            builder->CreateSelect(builder->CreateICmpSGT(la, lb), above, zero), "cmp.length");
+        builder->CreateRet(builder->CreateSelect(
+            builder->CreateICmpEQ(diff, zero), lengthOrder, byteOrder, "cmp.order"));
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
     // i64 ens_string_index_of(haystack, needle): byte offset of the first
     // occurrence of needle in haystack, -1 when absent. An empty needle
     // matches at offset 0.
@@ -5643,6 +5678,19 @@ struct CodeGenerator::Impl {
                 llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), 0), "str.contains");
         }
         return index;
+    }
+
+    // string.compareTo(other) -> int: -1, 0 or 1 by byte order.
+    llvm::Value* emitStringCompare(const ast::Expression& obj, const ast::Expression& otherArg) {
+        llvm::Value* left = emitExpr(obj);
+        if (!left) return nullptr;
+        llvm::Value* right = emitExpr(otherArg);
+        if (!right) return nullptr;
+        llvm::Value* order = builder->CreateCall(getOrDefineEnsStringCompare(),
+            { left, right }, "str.compare");
+        releaseIfOwnedTemp(left, obj);
+        releaseIfOwnedTemp(right, otherArg);
+        return order;
     }
 
     // string.fromBytes(byte[]): a fresh string copy of the bytes plus a NUL.
@@ -7143,6 +7191,10 @@ struct CodeGenerator::Impl {
                     !methodSymbolOf(member.node) && recvT && recvT->isString() &&
                     e.arguments().size() == 1) {
                     return emitStringSearch(*obj, e.arguments()[0], *memberName == u"contains");
+                }
+                if (memberName && *memberName == u"compareTo" && !methodSymbolOf(member.node) &&
+                    recvT && recvT->isString() && e.arguments().size() == 1) {
+                    return emitStringCompare(*obj, e.arguments()[0]);
                 }
                 if (memberName && *memberName == u"substring" && !methodSymbolOf(member.node) &&
                     recvT && recvT->isString() && e.arguments().size() == 2) {

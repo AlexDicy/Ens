@@ -1104,6 +1104,10 @@ The accepted escapes are `\n`, `\r`, `\t`, `\b`, `\f`, `\0`, `\\`, `\"`, `\'`, `
 - `s.substring(start, end)` returns the bytes in the half-open range `[start, end)` as a new string.
   Offsets are byte offsets, like `length` and `indexOf`.
   An invalid range (a negative start, a start past the end, or an end past the length) aborts the program.
+- `s.compareTo(other)` returns an `int` that is negative when `s` sorts before `other`, zero when they hold the same bytes, and positive when `s` sorts after `other`.
+  The order is the order of the UTF-8 bytes, and a string that is a prefix of another sorts before it.
+  Only the sign of the result is meaningful.
+  Strings have no `<`, `<=`, `>` or `>=` operators; write the comparison against `compareTo` instead.
 
 ```ens
 let greeting = "Hello, " + name + "!";
@@ -1115,6 +1119,7 @@ let back = string.fromBytes(raw);   // string
 let at = greeting.indexOf("llo");   // 2
 let has = greeting.contains("!");   // true
 let word = greeting.substring(0, 5); // "Hello"
+if (name.compareTo("world") < 0) { /* name sorts first */ }
 ```
 
 **Interpolation** embeds expressions in a string with `{ }`. Each hole is converted to text the way `.toString()` would, then the literal parts and holes are joined into one new string. Write `\{` and `\}` for literal braces.
@@ -1225,6 +1230,7 @@ The collection modules build on hashing and iteration:
 - `List<T>` from `@std.collections.list` is a growable array: `push(value)`, `pop()` removing and returning the last value, `get(index)`, `set(index, value)`, and `length()`, plus `toArray()` returning a fresh right-sized `T[]` holding the current contents. Iterating a list yields its values in insertion order.
 - `Map<K, V>` from `@std.collections.map` maps keys to values: `set(key, value)` inserts or overwrites, `get(key)` returns `V?` (`null` when absent), plus `contains(key)`, `remove(key)`, `length()`, and `keys()` / `values()` snapshots. Iterating a map yields `Pair<K, V>` entries (from `@std.collections.pair`) with `key` and `value` fields.
 - `Set<T>` from `@std.collections.set` stores each value once: `add(value)` returns whether the value was new, plus `contains(value)`, `remove(value)`, `length()`, and `items()`. Iterating a set yields its values.
+- `sort(values)` from `@std.collections.sorting` puts a `List<string>` in ascending order in place, by the order `compareTo` defines. The sort is stable.
 
 ```ens
 import Map from @std.collections.map;
