@@ -207,9 +207,9 @@ task("test")
         end
 
         -- the bootstrap fixpoint: the self-hosted driver compiles itself twice with identical
-        -- objects. Its stages push the whole selfhost corpus through the self-hosted pipeline
-        -- two times over, so it runs only when named explicitly: `xmake test bootstrap`.
-        if wanted ~= nil and want("bootstrap") then
+        -- objects, pushing the whole selfhost corpus through the self-hosted pipeline both
+        -- times.
+        if want("bootstrap") then
             table.insert(jobs, {
                 name = "bootstrap",
                 bootstrap = true,
