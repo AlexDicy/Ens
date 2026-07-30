@@ -1266,7 +1266,12 @@ The `@std.path` module works on paths as text, with `/` separating the parts on 
 `join(base, relative)` puts one separator between two parts, and gives back the relative part alone when the base is empty.
 `parentFolder(path)` returns the folder one level up: `""` when the path names no folder, and `/` at the root.
 `fileName(path)` returns the last part of the path.
+`extension(path)` returns the text after the last `.` of that last part without the dot, and `stem(path)` returns the part before it, so `notes.txt` reads as `notes` and `txt`.
+A name with no `.`, and one whose only `.` starts it the way a hidden file is named, has no extension and is its own stem.
 `normalize(path)` drops the `.` parts and the repeated separators, and resolves every `..` that has a part before it to remove.
+`isAbsolute(path)` reports whether the path names a place on its own, which a path starting at a root does, and so does one starting at a drive letter the way Windows writes one.
+`absolute(path, workingDirectory)` reads a relative path against that folder and normalizes the result, leaving an already absolute path only normalized.
+The folder is given rather than read from the running program, which is what keeps every function in this module a rule about text.
 
 ---
 
@@ -1313,6 +1318,20 @@ Keys are matched with `==` and bucketed with `hash()`: strings by contents, valu
 A map or set keyed by a base class or an interface therefore finds the entry a derived key stored, because the key's own class decides how it is matched and bucketed; two keys of different run-time classes never match.
 Struct keys are supported and match by content: their fields compare with `==` and hash by content, so a key rebuilt from equal field values finds the entry stored under the original.
 A struct key that declares its own `equals` and `hash` is matched and bucketed by that pair instead, so a field the pair ignores does not change which entry a key finds.
+
+The `@std.text.strings` module takes text apart and puts it back together.
+`split(text, separator)` returns the parts between the occurrences of the separator, so two neighboring separators give an empty part and text holding none gives one part.
+`lines(text)` splits on `\n` and drops a trailing `\r` from each line, so text written with either line ending reads the same.
+`joined(parts, separator)` puts the separator between neighboring parts and nothing before the first or after the last.
+`parseInteger(text)` returns the `long` the text spells, or `null` when it spells anything else: at most one leading `-` or `+`, then nothing but digits, and a value a `long` can hold, so surrounding whitespace and a value too large are refused rather than guessed at.
+
+```ens
+import @std.text.strings;
+
+string[] fields = strings.split("name,age,city", ",");
+long? count = strings.parseInteger("42");
+print(strings.joined(fields, " | "));
+```
 
 `StringBuilder` from `@std.text.stringbuilder` accumulates text in a growable buffer, so building a string piece by piece stays linear where repeated `+` on immutable strings would re-copy the whole prefix.
 `append(value)` accepts a string, an integer, or a `bool`; `length()` returns the number of bytes written so far; `toString()` returns the accumulated text and leaves the builder usable.
