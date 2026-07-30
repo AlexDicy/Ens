@@ -1,0 +1,153 @@
+// The type-shape predicates over types that name themselves. A type argument is a name, and what a
+// name was declared to hold lives in the declaration graph, which carries cycles as soon as a class
+// conforms at its own type - so these pin that the predicates answer rather than walk forever, and
+// that an argument no code generation can hold is still refused however deeply it is nested.
+import @std.testing;
+import TestFailure from @std.testing;
+import ProgramAnalysis from @ens.sema.pipeline;
+import Type from @ens.sema.model.types;
+import @ens.sema.model.types;
+import ProgramIndex from lower.index;
+import lower.index;
+import support;
+import support.primitives;
+
+// One program carrying every way a type argument leads back to the type that wrote it: a class
+// conforming at itself, two classes conforming at each other, a class extending a generic base at
+// its own type, and a struct whose field holds a generic class over the struct.
+selfReferentialProgram() -> string {
+    return "public interface Same<T> \{\n"
+        + "    matches(T other) -> bool;\n"
+        + "\}\n"
+        + "public class Node implements Same<Node> \{\n"
+        + "    protected int id;\n"
+        + "    protected constructor(this.id);\n"
+        + "    public override matches(Node other) -> bool \{\n"
+        + "        return this.id == other.id;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class Alpha implements Same<Beta> \{\n"
+        + "    protected constructor();\n"
+        + "    public override matches(Beta other) -> bool \{\n"
+        + "        return true;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class Beta implements Same<Alpha> \{\n"
+        + "    protected constructor();\n"
+        + "    public override matches(Alpha other) -> bool \{\n"
+        + "        return false;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class Holder<T> \{\n"
+        + "    protected int depth;\n"
+        + "    protected constructor(this.depth);\n"
+        + "    public level() -> int \{\n"
+        + "        return this.depth;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class SelfHeld extends Holder<SelfHeld> \{\n"
+        + "    protected constructor() \{\n"
+        + "        super(0);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public struct Cell \{\n"
+        + "    Holder<Cell>? held = null;\n"
+        + "    int count = 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let node = new Node(1);\n"
+        + "    let alpha = new Alpha();\n"
+        + "    let beta = new Beta();\n"
+        + "    Cell cell = \{held: new Holder<Cell>(0), count: 0\};\n"
+        + "    if (node.matches(node) && alpha.matches(beta) && !beta.matches(alpha)) \{\n"
+        + "        return new SelfHeld().level() + cell.count;\n"
+        + "    \}\n"
+        + "    return 1;\n"
+        + "\}\n";
+}
+
+// 'decimal' has no machine form, so an instantiation holding one cannot be built at any depth.
+decimalArgumentProgram() -> string {
+    return "public class Box<T> \{\n"
+        + "    protected T value;\n"
+        + "    protected constructor(this.value);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Box<decimal>? one = null;\n"
+        + "    Box<Box<decimal>>? two = null;\n"
+        + "    return one == null && two == null ? 0 : 1;\n"
+        + "\}\n";
+}
+
+// The planned instantiation a program reaches, found by the way it displays.
+instantiationDisplayed(ProgramAnalysis analysis, string displayed) -> Type throws {
+    let programIndex = try support.indexProgram(analysis);
+    let modules = programIndex.modules();
+    for (long m = 0; m < modules.length(); m++) {
+        let instantiations = modules.get(m).instantiations();
+        for (long i = 0; i < instantiations.length(); i++) {
+            if (types.display(instantiations.get(i)) == displayed) {
+                return instantiations.get(i);
+            }
+        }
+    }
+    throw new TestFailure("no planned instantiation displays as '{displayed}'");
+}
+
+test "a class conforming at its own type has a shape and a layout" {
+    let analysis = try support.analyzeMain(selfReferentialProgram());
+    let node = try support.classNamed(analysis, "Node");
+    try testing.assertTrue(primitives.isRepresentable(node),
+        "a class naming itself in its conformance is still one reference");
+    try testing.assertTrue(primitives.isRepresentableClass(node),
+        "its fields say nothing about its conformance, so it lays out");
+}
+
+test "two classes conforming at each other both have a shape" {
+    let analysis = try support.analyzeMain(selfReferentialProgram());
+    try testing.assertTrue(
+        primitives.isRepresentable(try support.classNamed(analysis, "Alpha")),
+        "a conformance cycle is not a shape problem");
+    try testing.assertTrue(
+        primitives.isRepresentable(try support.classNamed(analysis, "Beta")),
+        "a conformance cycle is not a shape problem");
+}
+
+test "a class extending a generic base at its own type has a shape" {
+    let analysis = try support.analyzeMain(selfReferentialProgram());
+    let selfHeld = try support.classNamed(analysis, "SelfHeld");
+    try testing.assertTrue(primitives.isRepresentable(selfHeld),
+        "the base's type argument names the class the base is under");
+    try testing.assertTrue(primitives.isRepresentableClass(selfHeld),
+        "the flattened fields are plain integers");
+}
+
+test "a struct holding a generic class over itself has a shape" {
+    let analysis = try support.analyzeMain(selfReferentialProgram());
+    try testing.assertTrue(
+        primitives.isRepresentable(try support.structNamed(analysis, "Cell")),
+        "the field is a reference, so the struct's own layout is finite");
+}
+
+test "the interface instantiation naming its implementer has a shape" {
+    let analysis = try support.analyzeMain(selfReferentialProgram());
+    try testing.assertTrue(
+        primitives.isRepresentable(try instantiationDisplayed(analysis, "Same<Node>")),
+        "an interface reference is one pointer whatever its arguments name");
+}
+
+test "the whole self-referential program lowers and verifies" {
+    let program = try support.lowerWholeProgram(selfReferentialProgram());
+    try testing.assertTrue(program.functions.length() > 0,
+        "the program should have lowered functions");
+}
+
+test "an instantiation over an argument with no machine form has no shape" {
+    let analysis = try support.analyzeMain(decimalArgumentProgram());
+    try testing.assertTrue(
+        !primitives.isRepresentable(try instantiationDisplayed(analysis, "Box<decimal>")),
+        "'decimal' has no machine form, so 'Box<decimal>' cannot be built");
+    try testing.assertTrue(
+        !primitives.isRepresentable(try instantiationDisplayed(analysis, "Box<Box<decimal>>")),
+        "the argument scan has to reach through the nested instantiation");
+}
