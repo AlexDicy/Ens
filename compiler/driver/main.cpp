@@ -649,12 +649,13 @@ int runCstTool(bool analyze, int argc, char* argv[]) {
     return ok ? 0 : 1;
 }
 
-// Hidden bridge for the codegen differential harness: link caller-supplied object files into an
-// executable through the same lld path and default libraries a normal build uses. It exists so
-// the harness can run emitted objects before a self-hosted driver can link them itself.
+// Hidden bridge for the codegen differential harness and the self-hosted driver: link
+// caller-supplied object files into an executable through the same lld path and default
+// libraries a normal build uses. Each --library adds one logical library name resolved by
+// platform convention, the way a manifest's native declaration reaches a normal build's link.
 int runLinkObjects(int argc, char* argv[]) {
     ParsedCommand arguments;
-    int rc = parseCommand(argc, argv, 2, {"--output", "--target"}, {},
+    int rc = parseCommand(argc, argv, 2, {"--output", "--target", "--library"}, {},
                           std::numeric_limits<size_t>::max(), false, "link-objects", arguments);
     if (rc != 0) return rc;
 
@@ -674,7 +675,13 @@ int runLinkObjects(int argc, char* argv[]) {
         objectPaths.push_back(positional);
     }
 
-    if (!Linker::link(objectPaths, {}, {}, output, std::cerr, arguments.option("--target"))) {
+    std::vector<std::string> libraries;
+    for (const auto& [key, value] : arguments.valued) {
+        if (key == "--library") libraries.push_back(value);
+    }
+
+    if (!Linker::link(objectPaths, libraries, {}, output, std::cerr,
+                      arguments.option("--target"))) {
         return 1;
     }
     return 0;

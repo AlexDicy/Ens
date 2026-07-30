@@ -206,6 +206,16 @@ task("test")
             })
         end
 
+        -- the bootstrap fixpoint: the self-hosted driver compiles itself twice with identical
+        -- objects. Its stages push the whole selfhost corpus through the self-hosted pipeline
+        -- two times over, so it runs only when named explicitly: `xmake test bootstrap`.
+        if wanted ~= nil and want("bootstrap") then
+            table.insert(jobs, {
+                name = "bootstrap",
+                bootstrap = true,
+            })
+        end
+
         -- the ens.llvm binding's own unit tests: build small LLVM modules through the binding and
         -- assert the LLVM verifier accepts them. They link the native LLVM-C library, so the job
         -- points the linker and loader at the local LLVM package the same way codegencheck does.
@@ -225,6 +235,17 @@ task("test")
                 name = "selfhost_codegen",
                 llvm_tests = true,
                 source = path.join(os.projectdir(), "selfhost", "codegen"),
+            })
+        end
+
+        -- the self-hosted driver's unit tests: argument parsing, stdlib discovery, native
+        -- library mapping, and diagnostic formatting. The package pulls in ens.codegen and with
+        -- it the native ens.llvm binding, so the job carries the same LLVM plumbing.
+        if want("selfhost_driver") then
+            table.insert(jobs, {
+                name = "selfhost_driver",
+                llvm_tests = true,
+                source = path.join(os.projectdir(), "selfhost", "driver"),
             })
         end
 
@@ -383,7 +404,7 @@ task("test")
                 end
             end
             for _, pkg in ipairs({"corpus", "frontend", "sema", "semacheck", "syntaxgen",
-                              "llvm", "codegen", "codegencheck"}) do
+                              "llvm", "codegen", "codegencheck", "driver"}) do
                 local src = path.join(os.projectdir(), "selfhost", pkg, "src")
                 local seeds = {}
                 for _, f in ipairs(os.files(path.join(src, "**.ens"))) do
@@ -404,32 +425,16 @@ task("test")
                 full = string.format("%s:\n%s", name, out)}
         end
 
-        -- the code-generation differential harness: build the harness and the spike, drive the
-        -- spike from object emission through linking and execution, and enforce the skip-list
-        -- anti-rot rule over the runnable fixtures. The spike links the ens.llvm native binding,
-        -- so the build has to point the linker at the local LLVM library and the run has to make
-        -- the shared library loadable. That plumbing differs by host and is set up here.
-        local function run_codegencheck(job)
-            local name = job.name
+        -- find the local LLVM library the compiler builds against (on Windows the dll plus its
+        -- import library, on Linux/macOS the shared object) and build the environment a process
+        -- linking or loading it needs: on Windows lld-link reads LIB (and finds nothing else
+        -- once LIB is set, so the MSVC and SDK folders must be added too) and the loader
+        -- searches PATH; on Linux/macOS the ens linker turns LIBRARY_PATH into -L and -rpath,
+        -- and the loader honors LD_LIBRARY_PATH / DYLD_LIBRARY_PATH. A machine without the
+        -- library cannot build the compiler either, so a clear hard failure is the right
+        -- outcome: returns env, llvm_bin or nil, nil, message.
+        local function llvmEnvironment()
             local on_windows = is_host("windows")
-            local exe_suffix = on_windows and ".exe" or ""
-            local check_dir = path.join(os.projectdir(), "build", "codegencheck")
-            local harness_exe = path.join(check_dir, "codegencheck" .. exe_suffix)
-            local spike_exe = path.join(check_dir, "spike" .. exe_suffix)
-            local manifest = path.join(check_dir, "manifest.txt")
-            local scratch = path.join(check_dir, "scratch")
-            local log = path.join(out_dir, name .. ".log")
-            local check_src = path.join(os.projectdir(), "selfhost", "codegencheck")
-            local spike_src = path.join(check_src, "spike")
-            local skiplist = path.join(check_src, "skiplist.txt")
-
-            os.tryrm(check_dir)
-            os.mkdir(check_dir)
-            os.mkdir(scratch)
-
-            -- find the local LLVM library the compiler builds against: on Windows the dll plus its
-            -- import library, on Linux/macOS the shared object. A machine without it cannot build
-            -- the compiler either, so a clear hard failure is the right outcome.
             local packages = path.join(global.directory(), "packages", "l")
             local llvm_lib, llvm_bin, looked
             if on_windows then
@@ -454,15 +459,9 @@ task("test")
                 end
             end
             if not llvm_lib then
-                return {name = name, ok = false, short = "no LLVM library",
-                    full = string.format("%s: could not find %s under %s; install the LLVM "
-                        .. "package the compiler builds against", name, looked, packages)}
+                return nil, nil, string.format("could not find %s under %s; install the LLVM "
+                    .. "package the compiler builds against", looked, packages)
             end
-
-            -- build-time linker search paths and run-time library paths. On Windows lld-link reads
-            -- LIB (and finds nothing else once LIB is set, so the MSVC and SDK folders must be
-            -- added too); on Linux/macOS the ens linker turns LIBRARY_PATH into -L and -rpath, and
-            -- the loader honors LD_LIBRARY_PATH / DYLD_LIBRARY_PATH.
             local env = os.getenvs()
             if on_windows then
                 local msvc = toolchain.load("msvc", {plat = plat, arch = arch})
@@ -484,6 +483,37 @@ task("test")
                 else
                     env.LD_LIBRARY_PATH = prepend(env.LD_LIBRARY_PATH, llvm_lib)
                 end
+            end
+            return env, llvm_bin, nil
+        end
+
+        -- the code-generation differential harness: build the harness and the spike, drive the
+        -- spike from object emission through linking and execution, and enforce the skip-list
+        -- anti-rot rule over the runnable fixtures. The spike links the ens.llvm native binding,
+        -- so the build has to point the linker at the local LLVM library and the run has to make
+        -- the shared library loadable.
+        local function run_codegencheck(job)
+            local name = job.name
+            local on_windows = is_host("windows")
+            local exe_suffix = on_windows and ".exe" or ""
+            local check_dir = path.join(os.projectdir(), "build", "codegencheck")
+            local harness_exe = path.join(check_dir, "codegencheck" .. exe_suffix)
+            local spike_exe = path.join(check_dir, "spike" .. exe_suffix)
+            local manifest = path.join(check_dir, "manifest.txt")
+            local scratch = path.join(check_dir, "scratch")
+            local log = path.join(out_dir, name .. ".log")
+            local check_src = path.join(os.projectdir(), "selfhost", "codegencheck")
+            local spike_src = path.join(check_src, "spike")
+            local skiplist = path.join(check_src, "skiplist.txt")
+
+            os.tryrm(check_dir)
+            os.mkdir(check_dir)
+            os.mkdir(scratch)
+
+            local env, llvm_bin, env_error = llvmEnvironment()
+            if not env then
+                return {name = name, ok = false, short = "no LLVM library",
+                    full = string.format("%s: %s", name, env_error)}
             end
 
             -- the harness itself links the native LLVM binding through ens.codegen, so its
@@ -572,57 +602,11 @@ task("test")
         -- way as the codegen harness.
         local function run_llvm_tests(job)
             local name = job.name
-            local on_windows = is_host("windows")
             local log = path.join(out_dir, name .. ".log")
-            local packages = path.join(global.directory(), "packages", "l")
-            local llvm_lib, llvm_bin, looked
-            if on_windows then
-                looked = "bin/LLVM-C.dll with lib/LLVM-C.lib"
-                for _, dll in ipairs(os.files(path.join(packages, "*", "*", "*", "bin",
-                        "LLVM-C.dll"))) do
-                    local bindir = path.directory(dll)
-                    local libdir = path.join(path.directory(bindir), "lib")
-                    if os.isfile(path.join(libdir, "LLVM-C.lib")) then
-                        llvm_bin = bindir
-                        llvm_lib = libdir
-                        break
-                    end
-                end
-            else
-                local pattern = is_host("macosx") and "libLLVM*.dylib" or "libLLVM*.so*"
-                looked = "lib/" .. pattern
-                local matches = os.files(path.join(packages, "*", "*", "*", "lib", pattern))
-                table.sort(matches)
-                if #matches > 0 then
-                    llvm_lib = path.directory(matches[1])
-                end
-            end
-            if not llvm_lib then
+            local env, llvm_bin, env_error = llvmEnvironment()
+            if not env then
                 return {name = name, ok = false, short = "no LLVM library",
-                    full = string.format("%s: could not find %s under %s; install the LLVM "
-                        .. "package the compiler builds against", name, looked, packages)}
-            end
-            local env = os.getenvs()
-            if on_windows then
-                local msvc = toolchain.load("msvc", {plat = plat, arch = arch})
-                local msvc_lib = ""
-                if msvc then
-                    local envs = msvc:runenvs()
-                    if envs and envs.LIB then msvc_lib = envs.LIB end
-                end
-                env.LIB = msvc_lib .. ";" .. llvm_lib
-                env.PATH = llvm_bin .. ";" .. (env.PATH or "")
-            else
-                local function prepend(current, dir)
-                    if current and #current > 0 then return dir .. ":" .. current end
-                    return dir
-                end
-                env.LIBRARY_PATH = prepend(env.LIBRARY_PATH, llvm_lib)
-                if is_host("macosx") then
-                    env.DYLD_LIBRARY_PATH = prepend(env.DYLD_LIBRARY_PATH, llvm_lib)
-                else
-                    env.LD_LIBRARY_PATH = prepend(env.LD_LIBRARY_PATH, llvm_lib)
-                end
+                    full = string.format("%s: %s", name, env_error)}
             end
             local run_rc = execMerged(ens_exe, {"test", job.source}, log, {envs = env})
             local out = (io.readfile(log) or ""):gsub("[\r\n]+$", "")
@@ -632,6 +616,125 @@ task("test")
             return {name = name, ok = false,
                 short = string.format("ens test exit %s", tostring(run_rc)),
                 full = string.format("%s:\n%s", name, out)}
+        end
+
+        -- the bootstrap fixpoint: the self-hosted driver compiles itself, twice, with identical
+        -- output. Stage 1 builds the driver package with the reference compiler (boot1), stage 2
+        -- has boot1 compile the same package through the self-hosted pipeline (stage2/ensc plus
+        -- one object per module), stage 3 has stage2's ensc compile the same sources again. The
+        -- gate holds when the two stages' objects hold the same modules with identical bytes;
+        -- the executables are compared as a note only, because linker output may carry
+        -- timestamps.
+        local function run_bootstrap(job)
+            local name = job.name
+            local on_windows = is_host("windows")
+            local exe_suffix = on_windows and ".exe" or ""
+            local boot_dir = path.join(os.projectdir(), "build", "bootstrap")
+            local stage2_dir = path.join(boot_dir, "stage2")
+            local stage3_dir = path.join(boot_dir, "stage3")
+            local boot1 = path.join(boot_dir, "boot1" .. exe_suffix)
+            local boot2 = path.join(stage2_dir, "ensc" .. exe_suffix)
+            local boot3 = path.join(stage3_dir, "ensc" .. exe_suffix)
+            local log = path.join(out_dir, name .. ".log")
+            local driver_src = path.join(os.projectdir(), "selfhost", "driver")
+            local libs = path.join(os.projectdir(), "libs")
+
+            os.tryrm(boot_dir)
+            os.mkdir(boot_dir)
+            os.mkdir(stage2_dir)
+            os.mkdir(stage3_dir)
+
+            local env, llvm_bin, env_error = llvmEnvironment()
+            if not env then
+                return {name = name, ok = false, short = "no LLVM library",
+                    full = string.format("%s: %s", name, env_error)}
+            end
+            -- boot1 and stage2's ensc load the LLVM shared library at run time; the Windows
+            -- loader searches each executable's own folder first.
+            if on_windows then
+                os.cp(path.join(llvm_bin, "LLVM-C.dll"), path.join(boot_dir, "LLVM-C.dll"))
+                os.cp(path.join(llvm_bin, "LLVM-C.dll"), path.join(stage2_dir, "LLVM-C.dll"))
+            end
+
+            local seconds = {}
+            local function staged(stage, program, argv, produced)
+                local started = os.mclock()
+                local rc = execMerged(program, argv, log, {envs = env})
+                table.insert(seconds, (os.mclock() - started) / 1000.0)
+                if rc ~= 0 or not os.isfile(produced) then
+                    return string.format("%s failed (exit %s)\n%s", stage, tostring(rc),
+                        (io.readfile(log) or ""):gsub("[\r\n]+$", ""))
+                end
+                return nil
+            end
+
+            local failed = staged("stage 1 (ens builds boot1)", ens_exe,
+                    {"build", driver_src, "--output", boot1}, boot1)
+                or staged("stage 2 (boot1 compiles the driver)", boot1,
+                    {driver_src, "--output", boot2, "--stdlib", libs, "--ens", ens_exe,
+                     "--objects", stage2_dir}, boot2)
+                or staged("stage 3 (boot2 compiles the driver)", boot2,
+                    {driver_src, "--output", boot3, "--stdlib", libs, "--ens", ens_exe,
+                     "--objects", stage3_dir}, boot3)
+            if failed then
+                return {name = name, ok = false, short = failed:match("^[^\n]+"),
+                    full = string.format("%s: %s", name, failed)}
+            end
+
+            -- the fixpoint: the two stages' objects, module by module in name order.
+            local function objectNames(folder)
+                local names = {}
+                for _, f in ipairs(os.files(path.join(folder, "*.obj"))) do
+                    table.insert(names, path.filename(f))
+                end
+                table.sort(names)
+                return names
+            end
+            local function readBytes(file)
+                local handle = io.open(file, "rb")
+                if not handle then return "" end
+                local bytes = handle:read("*a")
+                handle:close()
+                return bytes or ""
+            end
+            local names2 = objectNames(stage2_dir)
+            local names3 = objectNames(stage3_dir)
+            local present = {}
+            for _, n in ipairs(names2) do present[n] = true end
+            for _, n in ipairs(names3) do
+                if not present[n] then
+                    return {name = name, ok = false,
+                        short = string.format("stage 3 emitted %s, stage 2 did not", n),
+                        full = string.format("%s: stage 3 emitted %s, stage 2 did not", name, n)}
+                end
+                present[n] = nil
+            end
+            for _, n in ipairs(names2) do
+                if present[n] then
+                    return {name = name, ok = false,
+                        short = string.format("stage 2 emitted %s, stage 3 did not", n),
+                        full = string.format("%s: stage 2 emitted %s, stage 3 did not", name, n)}
+                end
+            end
+            local total_bytes = 0
+            for _, n in ipairs(names2) do
+                local bytes2 = readBytes(path.join(stage2_dir, n))
+                local bytes3 = readBytes(path.join(stage3_dir, n))
+                total_bytes = total_bytes + #bytes2
+                if bytes2 ~= bytes3 then
+                    return {name = name, ok = false,
+                        short = string.format("fixpoint failed at %s", n),
+                        full = string.format("%s: %s differs between stage 2 (%d bytes) and "
+                            .. "stage 3 (%d bytes); the pipeline is not deterministic or the "
+                            .. "two compilers disagree", name, n, #bytes2, #bytes3)}
+                end
+            end
+            local executables = readBytes(boot2) == readBytes(boot3) and "identical"
+                or "differ (not gating: linker output)"
+            local note = string.format("stages %.0fs/%.0fs/%.0fs; fixpoint over %d modules, "
+                .. "%.1f MB; executables %s", seconds[1] or 0, seconds[2] or 0,
+                seconds[3] or 0, #names2, total_bytes / (1024 * 1024), executables)
+            return {name = name, ok = true, note = note}
         end
 
         -- the driver's command-line surface, exercised end to end against real fixtures.
@@ -1469,6 +1572,7 @@ task("test")
             if job.cli_git then return run_cli_git(job) end
             if job.cli_artifact then return run_cli_artifact(job) end
             if job.codegencheck then return run_codegencheck(job) end
+            if job.bootstrap then return run_bootstrap(job) end
             if job.llvm_tests then return run_llvm_tests(job) end
             local name = job.name
             local ens_file = job.ens_file

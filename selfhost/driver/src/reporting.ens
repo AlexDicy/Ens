@@ -1,0 +1,116 @@
+// Turning the pipeline's diagnostics into the driver's output: one line per problem, ordered by
+// (file, offset), each position resolved to its 1-based line and column so an editor can jump
+// to it.
+import LineIndex from @ens.frontend.support.source;
+import Source from @ens.frontend.support.source;
+import FileDiagnostic from @ens.sema.support.diagnostics;
+import FileError from @ens.sema.support.loader;
+import FileLoader from @ens.sema.support.loader;
+import GraphResult from @ens.sema.program.graph;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+
+// The sources a build touched, so a diagnostic's offset maps back to a line. Graph modules
+// register the text they were parsed from; any other named file (a manifest, most often) is
+// read on demand and cached.
+public class SourceCatalog {
+    FileLoader loader;
+    Map<string, Source> sources;
+    Map<string, LineIndex> lineIndexes;
+
+    public constructor(FileLoader loader) {
+        this.loader = loader;
+        this.sources = new Map<string, Source>();
+        this.lineIndexes = new Map<string, LineIndex>();
+    }
+
+    public addGraph(GraphResult graph) {
+        for (let loaded in graph.modules()) {
+            this.sources.set(loaded.filePath(), loaded.source());
+        }
+    }
+
+    public add(Source source) {
+        this.sources.set(source.path(), source);
+    }
+
+    public lineIndexFor(string file) -> LineIndex? {
+        let cached = this.lineIndexes.get(file);
+        if (cached != null) {
+            return cached;
+        }
+        let source = this.sourceFor(file);
+        if (source == null) {
+            return null;
+        }
+        let built = new LineIndex(source);
+        this.lineIndexes.set(file, built);
+        return built;
+    }
+
+    sourceFor(string file) -> Source? {
+        let known = this.sources.get(file);
+        if (known != null) {
+            return known;
+        }
+        string? text = this.readOrNull(file);
+        if (text == null) {
+            return null;
+        }
+        let read = new Source(file, text);
+        this.sources.set(file, read);
+        return read;
+    }
+
+    readOrNull(string file) -> string? {
+        return try this.loader.readText(file);
+    } catch (FileError error) {
+        return null;
+    }
+}
+
+// Every diagnostic as its output line, ordered by (file, offset).
+public formatAll(List<FileDiagnostic> diagnostics, SourceCatalog catalog) -> string[] {
+    FileDiagnostic[] ordered = sortedDiagnostics(diagnostics);
+    string[] lines = new string[ordered.length];
+    for (long i = 0; i < lines.length; i++) {
+        lines[i] = formatDiagnostic(ordered[i], catalog);
+    }
+    return lines;
+}
+
+// "<file>:<line>:<column>: error: <message>", or without the position when the file's text is
+// out of reach.
+public formatDiagnostic(FileDiagnostic diagnostic, SourceCatalog catalog) -> string {
+    let index = catalog.lineIndexFor(diagnostic.file());
+    if (index == null) {
+        return "{diagnostic.file()}: error: {diagnostic.message()}";
+    }
+    let position = index.positionAt(diagnostic.span().start);
+    return "{diagnostic.file()}:{position.line}:{position.column}: error: "
+        + diagnostic.message();
+}
+
+// Stable sort by (file, span start): equal positions keep their report order, so one run's
+// output is one deterministic text.
+public sortedDiagnostics(List<FileDiagnostic> diagnostics) -> FileDiagnostic[] {
+    FileDiagnostic[] items = diagnostics.toArray();
+    for (long i = 1; i < items.length; i++) {
+        let current = items[i];
+        long j = i - 1;
+        while (j >= 0 && isAfter(items[j], current)) {
+            items[j + 1] = items[j];
+            j--;
+        }
+        items[j + 1] = current;
+    }
+    return items;
+}
+
+isAfter(FileDiagnostic left, FileDiagnostic right) -> bool {
+    int fileOrder = left.file().compareTo(right.file());
+    if (fileOrder != 0) {
+        return fileOrder > 0;
+    }
+    return left.span().start > right.span().start;
+}
