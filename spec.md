@@ -89,7 +89,7 @@ A struct field may have any type, including a non-nullable one such as a class, 
 A struct with such a field has no default value of its own, so it cannot be an array element or a field left without a default, though it can still be built with a literal or a constructor wherever a value is needed.
 
 Two values of the same struct type compare with `==` and `!=` field by field, in declaration order, stopping at the first field that differs.
-Each field compares by its own `==`: primitives and enums by value (so IEEE rules hold, and a `float` or `double` field that is `NaN` never equals itself), strings by content, class and array fields by reference identity unless the class opted into content equality, a nested struct memberwise unless it declared its own equality, and a nullable field null-aware (both `null` are equal, one `null` is unequal, otherwise the inner values compare).
+Each field compares by its own `==`: primitives and enums by value (so IEEE rules hold, and a `float` or `double` field that is `NaN` never equals itself), strings by content, class and array fields by reference identity unless the two objects' run-time class opted into content equality, a nested struct memberwise unless it declared its own equality, and a nullable field null-aware (both `null` are equal, one `null` is unequal, otherwise the inner values compare).
 Comparing two different struct types is an error, and so is comparing structs whose type has a field with no `==` of its own, such as an `external` handle; the error names the offending field.
 A struct customizes equality by declaring `equals(S other) -> bool` - a method taking a single parameter of the struct's own type `S` - which then decides `==` and `!=` for that struct everywhere it is compared, including as a field of another struct, as an array element and as a collection key.
 Such an `equals` replaces the memberwise comparison the language provides, so it is written `override`, and it must be paired with an `override hash() -> long`: a struct that declares one must declare the other, exactly as a class must, so equal values always hash equally.
@@ -1262,6 +1262,11 @@ A declared `hash` decides the hashing of its type everywhere the value appears, 
 The `Hashable` interface from `@std.hash` names the hashing contract for generic bounds, and every type satisfies it.
 Because the language calls `hash` and `equals` wherever the type is used, both follow their type's visibility when unmarked and may not be marked less visible than the type itself.
 
+For a class, which implementation runs is decided by the value's type at run time, not by the type written in the source.
+An object of a class that declares `hash` and `equals` keeps them when it is held in a variable, field, array or collection typed as a base class or as an interface, so two such objects that are equal as their own class stay equal and hash alike where the code holding them only knows the base type.
+Because a class's `equals` takes its own class, two objects compare by content only when their run-time types are the same one; objects of different run-time types are never equal, even when one class inherits the other's `equals`.
+A class that declares neither method - including a base class whose subclasses declare them - keeps identity equality and the identity hash for objects of exactly that class.
+
 The collection modules build on hashing and iteration:
 
 - `List<T>` from `@std.collections.list` is a growable array: `push(value)`, `pop()` removing and returning the last value, `get(index)`, `set(index, value)`, and `length()`, plus `toArray()` returning a fresh right-sized `T[]` holding the current contents. Iterating a list yields its values in insertion order.
@@ -1285,7 +1290,8 @@ for (let entry in ages) {
 }
 ```
 
-Keys are matched with `==` and bucketed with `hash()`: strings by contents, value types by value, and classes by identity - unless the key class declares `equals` (with its paired `hash`), in which case its keys match by content.
+Keys are matched with `==` and bucketed with `hash()`: strings by contents, value types by value, and classes by identity - unless a key's run-time class declares `equals` (with its paired `hash`), in which case that key matches by content.
+A map or set keyed by a base class or an interface therefore finds the entry a derived key stored, because the key's own class decides how it is matched and bucketed; two keys of different run-time classes never match.
 Struct keys are supported and match by content: their fields compare with `==` and hash by content, so a key rebuilt from equal field values finds the entry stored under the original.
 A struct key that declares its own `equals` and `hash` is matched and bucketed by that pair instead, so a field the pair ignores does not change which entry a key finds.
 

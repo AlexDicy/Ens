@@ -1,9 +1,10 @@
 // The synthesized 'hash()' behind the '@std.hash' Hashable contract. Every Ens type satisfies
-// the contract; a class or struct that declares its own conforming 'hash() -> long' answers
-// through it, and everything else hashes by its contents: integers and enums by value, floats by
-// bit pattern, strings by an FNV-1a fold of their bytes, references by identity, structs by
-// folding their fields' hashes, and an optional by its payload's hash while it is present and by
-// -1 once it is absent, whatever its inner type.
+// the contract; a struct that declares its own conforming 'hash() -> long' answers through it, a
+// reference answers through the 'hash' its runtime type declared, and everything else hashes by
+// its contents: integers and enums by value, floats by bit pattern, strings by an FNV-1a fold of
+// their bytes, references with no declaration by identity, structs by folding their fields'
+// hashes, and an optional by its payload's hash while it is present and by -1 once it is absent,
+// whatever its inner type.
 //
 // Aggregates fold here in lowering, so emission only ever sees one leaf instruction; a class that
 // declared its own hash is called mid-fold like any method.
@@ -19,12 +20,14 @@ import EirBinary from eir.model;
 import EirBinaryOp from eir.model;
 import EirBranch from eir.model;
 import EirConstInt from eir.model;
+import EirDynamicHash from eir.model;
 import EirHashValue from eir.model;
 import EirJump from eir.model;
 import EirLoadSlot from eir.model;
 import EirOptionalPayload from eir.model;
 import EirStoreSlot from eir.model;
 import LoweringContext from lower.context;
+import layout.behaviors;
 import lower.calls;
 import lower.conversions;
 import lower.expressions;
@@ -76,20 +79,38 @@ public lowerSynthesizedHash(LoweringContext lowering, CallExpressionNode call,
     return hashed;
 }
 
-// One loaded value's hash: an optional answers through its presence, a class that declared its own
-// conforming hash answers through it, and everything else folds as a leaf.
+// One loaded value's hash: an optional answers through its presence, a reference whose runtime type
+// declared a conforming hash answers through it, and everything else folds as a leaf.
 hashOfValue(LoweringContext lowering, long value, Type type, Span span) -> long {
     if (primitives.isOptionalType(type)) {
         return hashOfOptional(lowering, value, type, span);
     }
-    let classType = primitives.classOf(type);
-    if (classType != null) {
-        let declared = declaredHashOf(classType);
-        if (declared != null) {
-            return callDeclaredHash(lowering, classType, declared, value, span);
-        }
+    if (primitives.isClassLike(type)) {
+        return hashOfReference(lowering, value, type, span);
     }
     return hashLeaf(lowering, value);
+}
+
+// A reference's hash: identity unless some runtime type it can hold declares 'hash'. When only one
+// runtime type is possible its declaration answers without anything being looked up; otherwise the
+// runtime type decides, and one that declared none still hashes by identity.
+hashOfReference(LoweringContext lowering, long value, Type type, Span span) -> long {
+    if (!behaviors.subtreeDeclares(lowering.index(), type, "hash")) {
+        return hashLeaf(lowering, value);
+    }
+    if (!behaviors.isOnlyRuntimeType(type)) {
+        let builder = lowering.builder();
+        let longType = lowering.store().primitive(PrimitiveKind.Long);
+        long hashed = builder.newTemp(longType);
+        builder.append(new EirDynamicHash(hashed, longType, value));
+        return hashed;
+    }
+    let classType = primitives.classOf(type);
+    let declared = behaviors.declaredBehavior(type, "hash");
+    if (classType == null || declared == null) {
+        return hashLeaf(lowering, value);
+    }
+    return callDeclaredHash(lowering, classType, declared, value, span);
 }
 
 // An optional hashes as its payload does when its presence says it holds one, and as -1 whatever
@@ -239,31 +260,6 @@ public declaredStructHash(Type structType) -> Method? {
         if (!method.isConstructor() && method.name() == "hash") {
             return method;
         }
-    }
-    return null;
-}
-
-// The conforming 'hash() -> long' a class declares or inherits, or null when the synthesized
-// identity hash stands in.
-declaredHashOf(Type classType) -> Method? {
-    Type? current = classType;
-    while (current != null) {
-        let methods = types.methodsOf(current);
-        if (methods == null) {
-            return null;
-        }
-        for (long i = 0; i < methods.length(); i++) {
-            let method = methods.get(i);
-            if (method.isConstructor() || method.isDestructor() || method.name() != "hash") {
-                continue;
-            }
-            let signature = method.signature();
-            if (signature.parameters().length != 0 || signature.declaresThrows()) {
-                continue;
-            }
-            return method;
-        }
-        current = types.baseOf(current);
     }
     return null;
 }

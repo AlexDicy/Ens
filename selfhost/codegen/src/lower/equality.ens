@@ -2,14 +2,16 @@
 // one integer comparison decides it, and a null literal on either side is a presence check for
 // free.
 //
-// A class that declares 'equals' for itself asks for content instead, and then the comparison is
+// A value whose runtime type declares 'equals' asks for content instead, and then the comparison is
 // three-way: the same object is equal without calling anything, an absent reference on one side
-// only is not equal without calling anything, and otherwise the declared method answers. An
-// operand that produced its own reference gives it up once the answer is computed, so a weak
-// read's upgraded reference lives exactly as long as the comparison.
+// only is not equal without calling anything, and otherwise the declared method answers. Which
+// declaration that is follows the runtime type, so unless the static type admits exactly one
+// runtime type the comparison goes through the runtime helper, which also settles two objects of
+// different runtime types as unequal. An operand that produced its own reference gives it up once
+// the answer is computed, so a weak read's upgraded reference lives exactly as long as the
+// comparison.
 import BinaryExpressionNode from @ens.frontend.syntax.generated.nodes;
 import Span from @ens.frontend.support.source;
-import ClassType from @ens.sema.model.types;
 import Method from @ens.sema.model.types;
 import PrimitiveKind from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
@@ -19,6 +21,7 @@ import EirBinaryOp from eir.model;
 import EirBranch from eir.model;
 import EirConstBool from eir.model;
 import EirConstNull from eir.model;
+import EirDynamicEquals from eir.model;
 import EirJump from eir.model;
 import EirLoadSlot from eir.model;
 import EirOptionalPayload from eir.model;
@@ -28,6 +31,7 @@ import EirStringEqual from eir.model;
 import EirUnary from eir.model;
 import EirUnaryOp from eir.model;
 import LoweringContext from lower.context;
+import layout.behaviors;
 import lower.calls;
 import lower.conversions;
 import lower.expressions;
@@ -83,12 +87,11 @@ public lower(LoweringContext lowering, BinaryExpressionNode binary, bool negated
     if (right < 0) {
         return -1;
     }
-    let declared = declaredEquals(lowering, common);
     long answer = -1;
-    if (declared == null || isPresenceCheck(leftType, rightType)) {
+    if (isPresenceCheck(leftType, rightType)) {
         answer = compareIdentity(lowering, left, right, negated, resultType);
     } else {
-        answer = compareContents(lowering, left, right, declared, negated, resultType,
+        answer = compareReferences(lowering, left, right, common, negated, resultType,
             binary.span());
     }
     // A reference an operand produced was only compared, so it ends here; a weak read's upgraded
@@ -111,36 +114,35 @@ comparisonType(Type left, Type right) -> Type {
     return right;
 }
 
-// The 'equals' a class declares for itself or inherits: one parameter of the declaring class,
-// answering bool. A declaration of any other shape is an ordinary method that '==' does not
-// consult. Interface values compare by identity, so only a class receiver looks for one.
-declaredEquals(LoweringContext lowering, Type type) -> Method? {
-    Type? current = primitives.classOf(type);
-    while (current != null) {
-        let methods = types.methodsOf(current);
-        if (methods == null) {
-            return null;
-        }
-        for (long i = 0; i < methods.length(); i++) {
-            let method = methods.get(i);
-            if (method.name() != "equals" || method.isConstructor() || method.isDestructor()) {
-                continue;
-            }
-            let signature = method.signature();
-            if (signature.parameters().length != 1 || signature.declaresThrows()) {
-                continue;
-            }
-            if (primitives.classOf(signature.parameters()[0].type()) != current) {
-                continue;
-            }
-            if (!primitives.isBoolType(signature.returnType())) {
-                continue;
-            }
-            return method;
-        }
-        current = types.baseOf(current);
+// '==' over two references of one static type. Identity answers unless some runtime type the
+// operands can hold declares 'equals'. When only one runtime type is possible, both operands carry
+// the same descriptor by construction, so its declaration answers without anything being looked up;
+// otherwise the runtime types decide, and they have to match for a declaration to run at all.
+compareReferences(LoweringContext lowering, long left, long right, Type type, bool negated,
+                  Type resultType, Span span) -> long {
+    if (!behaviors.subtreeDeclares(lowering.index(), type, "equals")) {
+        return compareIdentity(lowering, left, right, negated, resultType);
     }
-    return null;
+    if (!behaviors.isOnlyRuntimeType(type)) {
+        return compareRuntimeTypes(lowering, left, right, negated, resultType);
+    }
+    let declared = behaviors.declaredBehavior(type, "equals");
+    if (declared == null) {
+        return compareIdentity(lowering, left, right, negated, resultType);
+    }
+    return compareContents(lowering, left, right, declared, negated, resultType, span);
+}
+
+compareRuntimeTypes(LoweringContext lowering, long left, long right, bool negated,
+                    Type resultType) -> long {
+    let builder = lowering.builder();
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    long equal = builder.newTemp(boolType);
+    builder.append(new EirDynamicEquals(equal, boolType, left, right));
+    if (!negated) {
+        return equal;
+    }
+    return negate(lowering, equal, resultType);
 }
 
 compareIdentity(LoweringContext lowering, long left, long right, bool negated, Type resultType)
@@ -384,12 +386,8 @@ fieldEqual(LoweringContext lowering, long leftAddress, long rightAddress, Type f
         builder.append(new EirStringEqual(equal, boolType, left, right));
         return equal;
     }
-    if (primitives.classOf(fieldType) != null) {
-        let declared = declaredEquals(lowering, fieldType);
-        if (declared != null) {
-            return compareContents(lowering, left, right, declared, false, boolType, span);
-        }
-        return compareIdentity(lowering, left, right, false, boolType);
+    if (primitives.isClassLike(fieldType)) {
+        return compareReferences(lowering, left, right, fieldType, false, boolType, span);
     }
     if (primitives.isReferenceType(fieldType)) {
         return compareIdentity(lowering, left, right, false, boolType);

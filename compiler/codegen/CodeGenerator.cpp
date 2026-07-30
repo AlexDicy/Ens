@@ -2822,9 +2822,11 @@ struct CodeGenerator::Impl {
                 if (!leftNull && !rightNull) {
                     ::Type* lc = subst(leftType);
                     if (lc && lc->isOptional() && lc->inner) lc = subst(lc->inner);
-                    Symbol* eqSym = (lc && lc->isClass()) ? declaredConformingEquals(lc) : nullptr;
-                    if (eqSym) {
-                        llvm::Value* eq = emitClassContentEquality(lc, eqSym, L, R);
+                    ReferenceEquality shape = referenceEqualityOf(lc);
+                    if (shape != ReferenceEquality::Identity) {
+                        llvm::Value* eq = shape == ReferenceEquality::Dynamic
+                            ? emitDynamicEquality(L, R)
+                            : emitClassContentEquality(lc, declaredConformingEquals(lc), L, R);
                         if (!eq) return nullptr;
                         if (isReferenceType(leftType) && leftE)   releaseIfOwnedTemp(L, *leftE);
                         if (isReferenceType(rightType) && rightE) releaseIfOwnedTemp(R, *rightE);
@@ -3369,8 +3371,10 @@ struct CodeGenerator::Impl {
             case TypeKind::String:
                 return builder->CreateCall(getOrDefineEnsStringEq(), { a, b }, "fld.streq");
             case TypeKind::Class: {
-                if (Symbol* eqSym = declaredConformingEquals(core)) {
-                    return emitClassContentEquality(core, eqSym, a, b);
+                ReferenceEquality shape = referenceEqualityOf(core);
+                if (shape == ReferenceEquality::Dynamic) return emitDynamicEquality(a, b);
+                if (shape == ReferenceEquality::Declared) {
+                    return emitClassContentEquality(core, declaredConformingEquals(core), a, b);
                 }
                 return builder->CreateICmpEQ(a, b, "fld.refeq");
             }
@@ -3447,6 +3451,12 @@ struct CodeGenerator::Impl {
             case TypeKind::String:
                 return builder->CreateCall(getOrDefineEnsHashString(), { v }, "hash.str");
             case TypeKind::Class: {
+                if (!subtreeDeclaresBehavior(t->structInfo, u"hash")) {
+                    return builder->CreatePtrToInt(v, i64Ty, "hash.identity");
+                }
+                if (!isOnlyRuntimeType(t->structInfo)) {
+                    return builder->CreateCall(getOrDefineEnsDynamicHash(), { v }, "hash.dynamic");
+                }
                 if (Symbol* sym = declaredConformingHash(t)) {
                     int vslot = -1;
                     if (StructInfo* decl = t->structInfo->classDeclaringMethod(u"hash"))
@@ -7999,22 +8009,18 @@ struct CodeGenerator::Impl {
             }
             Symbol* methodSym = methodSymbolOf(member.node);
             if (methodSym && isHashableHashMethod(methodSym)) {
-                // hash() resolved through the Hashable bound: bind to the
-                // concrete receiver's own hash() or synthesize one inline. An
+                // hash() resolved through the Hashable bound answers exactly as
+                // `.hash()` written on the concrete receiver does. An
                 // interface-typed receiver dispatches through its itable below.
                 auto obj = member.object();
                 if (!obj) return nullptr;
                 ::Type* objType = typeOf(obj->node);
                 if (!objType || !objType->isInterface()) {
-                    if (Symbol* declared = declaredConformingHash(objType)) {
-                        methodSym = declared;
-                    } else {
-                        llvm::Value* recv = emitExpr(*obj);
-                        if (!recv) return nullptr;
-                        llvm::Value* h = emitBuiltinHashOf(recv, objType, e.node.startOffset());
-                        if (isReferenceType(objType)) releaseIfOwnedTemp(recv, *obj);
-                        return h;
-                    }
+                    llvm::Value* recv = emitExpr(*obj);
+                    if (!recv) return nullptr;
+                    llvm::Value* h = emitBuiltinHashOf(recv, objType, e.node.startOffset());
+                    if (isReferenceType(objType)) releaseIfOwnedTemp(recv, *obj);
+                    return h;
                 }
             }
             if (methodSym && isInterceptedTraceMethod(methodSym)) {
