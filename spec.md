@@ -323,6 +323,9 @@ Allows `new Renderer();`
 
 In both cases, the path is `/src/engine/renderer.ens` and the file contains a public `Renderer` class.
 
+Source files are UTF-8 text.
+A byte order mark at the very start of a file is accepted and skipped; the same bytes anywhere else in the file are an error.
+
 A module's private declarations never leave its file; `public` declarations are visible to every module in the same package, and `export` declarations also to the packages that consume it.
 Types (classes and structs) may be brought into scope by name as above, but free functions are always called through their module namespace, never imported by name: write `import engine.renderer;` then call `renderer.configure()`.
 Importing a function by name (`import configure from engine.renderer;`) is an error.
