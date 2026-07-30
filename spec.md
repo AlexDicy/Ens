@@ -1228,6 +1228,8 @@ writeGreeting() -> int throws {
 
 `system.exists(path)` reports whether a file or directory exists at the path, without throwing: only a missing path reports `false`.
 
+`system.writeError(message)` writes `message` and a newline to standard error, the stream a program reports its problems on, the way `print` writes to standard output.
+
 `system.runCaptured(program, arguments, stdoutPath, stderrPath)` runs `program` with `arguments`, waits for it to finish, writes what it sent to its standard output and its standard error into the two files, and returns its exit code.
 No command interpreter takes part, so every argument reaches the program exactly as written, whatever spaces or quotes it holds, and nothing is expanded on the way.
 A program that could not be started reports the exit code `127`, the code a shell reports for the same failure; a `SystemError` says the two files could not be opened for writing.

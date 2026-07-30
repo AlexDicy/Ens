@@ -1745,6 +1745,33 @@ struct CodeGenerator::Impl {
             builder->CreateSelect(signaled, signalCode, status), "normalized");
     }
 
+    // void ens_write_error(char* text): the text and a newline on standard error,
+    // the stream std.system.writeError() reports on.
+    llvm::Function* defineWriteErrorRuntime() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), { ptrTy }, false);
+        llvm::Function* fn = module->getFunction("ens_write_error");
+        if (!fn) {
+            fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "ens_write_error", module.get());
+        }
+        if (!fn->empty()) return fn;
+
+        auto savedIP = builder->saveIP();
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        builder->SetInsertPoint(entry);
+
+        llvm::Value* stream = getStderr();
+        auto fputs = getOrDeclareFputs();
+        builder->CreateCall(fputs, { fn->getArg(0), stream });
+        builder->CreateCall(fputs,
+            { builder->CreateGlobalString("\n", ".writeerror.nl"), stream });
+        builder->CreateRetVoid();
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
     llvm::Function* definePathExistsRuntime() {
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         auto* i32Ty = llvm::Type::getInt32Ty(ctx);
@@ -7912,6 +7939,7 @@ struct CodeGenerator::Impl {
         if (sym && sym->name == u"ens_run_process") defineRunProcessRuntime();
         if (sym && sym->name == u"ens_run_process_captured") defineRunProcessCapturedRuntime();
         if (sym && sym->name == u"ens_path_exists") definePathExistsRuntime();
+        if (sym && sym->name == u"ens_write_error") defineWriteErrorRuntime();
         llvm::Function* fn = getOrDeclareExternalFunction(sym, /*receiver*/ nullptr);
         if (!fn) {
             error(e.node.startOffset(), "Internal: external callee has no LLVM function");
