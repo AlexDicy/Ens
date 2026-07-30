@@ -1457,9 +1457,11 @@ bool Analyzer::overrideSignaturesCompatible(const MethodInfo& base, Symbol* der)
 
 // The reserved contracts a class uses to become a content-matched key:
 // `hash() -> long` for bucketing and `equals(C other) -> bool` for the final
-// match. A method carrying either name must match its signature exactly.
+// match. A method carrying either name must match its signature exactly, and
+// neither may fail: the language takes a hash and compares for equality where a
+// caller has nowhere to write a `try`.
 static bool hashSignatureConforms(const Symbol* sym) {
-    return sym && sym->paramTypes.empty() && sym->returnType &&
+    return sym && sym->paramTypes.empty() && !sym->declaredThrows && sym->returnType &&
         sym->returnType->kind == TypeKind::Long;
 }
 
@@ -2046,7 +2048,14 @@ void Analyzer::checkFieldMethodCollision(StructInfo* owner, const std::u16string
 // match the synthesized contract so the type stays usable as a hashed key.
 void Analyzer::checkHashMethodSignature(const ast::FuncDecl& fn, Symbol* sym, bool isConstructor) {
     if (isConstructor || !sym || sym->name != u"hash") return;
-    if (!hashSignatureConforms(sym)) {
+    if (fn.isThrows()) {
+        errorAtNode(fn.throwsToken().value_or(fn.node),
+            "A method named 'hash' cannot be marked 'throws'; a value's hash is taken where "
+            "there is no room for a 'try', such as when it is used as a Map or Set key. "
+            "Remove 'throws', or rename the method.");
+    }
+    if (!sym->paramTypes.empty() || !sym->returnType ||
+            sym->returnType->kind != TypeKind::Long) {
         errorAtNode(fn.node, "A method named 'hash' must have the signature 'hash() -> long'; "
             "it defines how values of this type hash when used as keys (for example in a Map or Set).");
     }
