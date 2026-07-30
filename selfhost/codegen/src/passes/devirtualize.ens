@@ -1,0 +1,218 @@
+// Devirtualization: a dispatched call whose receiver's exact runtime type is locally provable
+// goes direct. The layout stage already made never-overridden methods direct at lowering, so the
+// dispatched calls left are the genuinely overridden ones; this pass resolves the ones whose
+// receiver was born from 'new' in the same function - used straight, renamed by an upcast, or
+// read back out of a local slot whose every store carries the same exact class - and swaps in
+// the implementation that class's descriptor plan holds for the slot. Everything else keeps its
+// table read: a parameter, a field read, or a slot fed two different classes proves nothing.
+import EirFunction from eir.model;
+import EirBlock from eir.model;
+import EirInstruction from eir.model;
+import EirCall from eir.model;
+import EirTryCall from eir.model;
+import EirCallee from eir.model;
+import EirClassNew from eir.model;
+import EirCast from eir.model;
+import EirCastOp from eir.model;
+import EirLoadSlot from eir.model;
+import EirStoreSlot from eir.model;
+import EirTakeSlot from eir.model;
+import EirSlotAddress from eir.model;
+import EirReleasePtr from eir.model;
+import Type from @ens.sema.model.types;
+import DescriptorPlans from layout.descriptors;
+import passes.scan;
+import List from @std.collections.list;
+
+public run(EirFunction function, DescriptorPlans plans) -> EirFunction {
+    if (!anyDispatchedCall(function)) {
+        return function;
+    }
+    let defs = scan.definitionsOf(function);
+    let users = scan.usersOf(function);
+    let blocks = new List<EirBlock>();
+    bool changed = false;
+    for (long b = 0; b < function.blocks().length(); b++) {
+        let source = function.blocks().get(b);
+        let block = new EirBlock(source.label());
+        let instructions = source.instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (instruction is EirCall && instruction.dispatchSlot >= 0) {
+                string target = directTarget(function, plans, defs, users, instruction.receiver,
+                    instruction.dispatchSlot, instruction.dispatchInterface);
+                if (target.length > 0) {
+                    block.instructions().push(new EirCall(instruction.result,
+                        instruction.type, retargeted(instruction.callee, target),
+                        instruction.receiver, instruction.arguments, -1, null,
+                        instruction.line));
+                    changed = true;
+                    continue;
+                }
+            }
+            block.instructions().push(instruction);
+        }
+        let terminator = source.terminator();
+        if (terminator != null) {
+            block.setTerminator(terminator);
+            if (terminator is EirTryCall && terminator.dispatchSlot >= 0) {
+                string target = directTarget(function, plans, defs, users, terminator.receiver,
+                    terminator.dispatchSlot, terminator.dispatchInterface);
+                if (target.length > 0) {
+                    block.setTerminator(new EirTryCall(terminator.result, terminator.type,
+                        retargeted(terminator.callee, target), terminator.receiver,
+                        terminator.arguments, -1, null, terminator.errorResult,
+                        terminator.normalTarget, terminator.unwindTarget, terminator.line));
+                    changed = true;
+                }
+            }
+        }
+        blocks.push(block);
+    }
+    if (!changed) {
+        return function;
+    }
+    return new EirFunction(function.symbol(), function.internalLinkage(),
+        function.receiverType(), function.parameters(), function.returnType(),
+        function.slots(), blocks, function.tempTypes(), function.throwing(),
+        function.traceName(), function.traceFile(), function.traceLine(),
+        function.isEntryPoint());
+}
+
+anyDispatchedCall(EirFunction function) -> bool {
+    let blocks = function.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        let instructions = blocks.get(b).instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (instruction is EirCall && instruction.dispatchSlot >= 0) {
+                return true;
+            }
+        }
+        let terminator = blocks.get(b).terminator();
+        if (terminator is EirTryCall && terminator.dispatchSlot >= 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The implementation symbol for the receiver's proven exact type at this table slot, or "" when
+// nothing is proven. The dispatch table would load exactly this address, so the swap changes the
+// call's spelling and nothing else; the receiver ABI and the slot ABI are already one.
+directTarget(EirFunction function, DescriptorPlans plans, EirInstruction?[] defs,
+             List<List<EirInstruction>> users, long receiver,
+             long dispatchSlot, Type? dispatchInterface) -> string {
+    let exact = exactTypeOf(function, defs, users, receiver, 0);
+    if (exact == null) {
+        return "";
+    }
+    let plan = plans.planFor(exact);
+    if (plan == null) {
+        return "";
+    }
+    if (dispatchInterface == null) {
+        let table = plan.vtable();
+        if (dispatchSlot >= table.length) {
+            return "";
+        }
+        let implementation = table[dispatchSlot];
+        if (implementation == null) {
+            return "";
+        }
+        return implementation.symbol();
+    }
+    for (let conformance in plan.conformances()) {
+        if (conformance.interfaceType() != dispatchInterface) {
+            continue;
+        }
+        let methods = conformance.implementations();
+        if (dispatchSlot >= methods.length) {
+            return "";
+        }
+        let implementation = methods[dispatchSlot];
+        if (implementation == null) {
+            return "";
+        }
+        return implementation.symbol();
+    }
+    return "";
+}
+
+// The exact class a value provably holds at runtime: born from 'new' here, renamed by casts, or
+// read out of a slot everything stored into agrees on.
+exactTypeOf(EirFunction function, EirInstruction?[] defs, List<List<EirInstruction>> users,
+            long value, long depth) -> Type? {
+    if (depth > 16 || value < 0 || value >= defs.length) {
+        return null;
+    }
+    let definition = defs[value];
+    if (definition == null) {
+        return null;
+    }
+    switch (definition) {
+        is EirClassNew allocation -> {
+            return allocation.type;
+        },
+        is EirCast cast -> {
+            if (cast.op != EirCastOp.Reinterpret) {
+                return null;
+            }
+            return exactTypeOf(function, defs, users, cast.operand, depth + 1);
+        },
+        is EirLoadSlot load -> {
+            return exactSlotType(function, defs, users, load.slot, depth + 1);
+        },
+        default -> {
+            return null;
+        },
+    }
+}
+
+// The exact class every store into a slot carries, when the slot is written only whole and every
+// written value proves the same class; a take leaves null behind, so a taken slot proves
+// nothing, and an address consumed by anything but the cleanup releases could write anything.
+exactSlotType(EirFunction function, EirInstruction?[] defs, List<List<EirInstruction>> users,
+              long slot, long depth) -> Type? {
+    Type? agreed = null;
+    let blocks = function.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        let instructions = blocks.get(b).instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (instruction is EirTakeSlot && instruction.slot == slot) {
+                return null;
+            }
+            if (instruction is EirSlotAddress && instruction.slot == slot) {
+                let consumers = users.get(instruction.result);
+                for (long u = 0; u < consumers.length(); u++) {
+                    if (!(consumers.get(u) is EirReleasePtr)) {
+                        return null;
+                    }
+                }
+                continue;
+            }
+            if (!(instruction is EirStoreSlot)) {
+                continue;
+            }
+            if (instruction.slot != slot) {
+                continue;
+            }
+            let stored = exactTypeOf(function, defs, users, instruction.value, depth + 1);
+            if (stored == null) {
+                return null;
+            }
+            if (agreed == null) {
+                agreed = stored;
+            } else if (agreed != stored) {
+                return null;
+            }
+        }
+    }
+    return agreed;
+}
+
+retargeted(EirCallee callee, string symbol) -> EirCallee {
+    return new EirCallee(symbol, callee.receiverType(), callee.parameterTypes(),
+        callee.returnType(), callee.throwing(), callee.byAddressParameters());
+}
