@@ -175,6 +175,31 @@ static void printPromotionsForStmt(const ast::Statement& s,
         }
         return;
     }
+    if (auto f = s.asFor()) {
+        if (auto init = f->init()) printPromotionsForStmt(*init, analysis, os);
+        if (auto body = f->body()) {
+            for (auto& child : body->statements()) printPromotionsForStmt(child, analysis, os);
+        }
+        return;
+    }
+    if (auto fe = s.asForEach()) {
+        if (auto body = fe->body()) {
+            for (auto& child : body->statements()) printPromotionsForStmt(child, analysis, os);
+        }
+        return;
+    }
+    if (auto sw = s.asSwitch()) {
+        for (auto& arm : sw->arms()) {
+            if (auto bn = arm.bodyBlockNode()) {
+                if (auto blk = ast::Block::cast(*bn)) {
+                    for (auto& child : blk->statements()) {
+                        printPromotionsForStmt(child, analysis, os);
+                    }
+                }
+            }
+        }
+        return;
+    }
 }
 
 static void printPromotionsForFunction(const ast::FuncDecl& fn,
