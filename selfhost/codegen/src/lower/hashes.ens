@@ -2,10 +2,11 @@
 // the contract; a class or struct that declares its own conforming 'hash() -> long' answers
 // through it, and everything else hashes by its contents: integers and enums by value, floats by
 // bit pattern, strings by an FNV-1a fold of their bytes, references by identity, structs by
-// folding their fields' hashes, and an optional by its payload's hash when it is present.
+// folding their fields' hashes, and an optional by its payload's hash while it is present and by
+// -1 once it is absent, whatever its inner type.
 //
-// Aggregates fold here in lowering, so emission only ever sees one leaf instruction; a class
-// field that declared its own hash is called mid-fold like any method.
+// Aggregates fold here in lowering, so emission only ever sees one leaf instruction; a class that
+// declared its own hash is called mid-fold like any method.
 import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
 import Expression from @ens.frontend.syntax.generated.nodes;
 import Span from @ens.frontend.support.source;
@@ -76,19 +77,27 @@ public lowerSynthesizedHash(LoweringContext lowering, CallExpressionNode call,
     return hashed;
 }
 
-// One loaded value's hash: a tagged optional's tag guards it, everything else folds as a leaf.
+// One loaded value's hash: an optional answers through its presence, a class that declared its own
+// conforming hash answers through it, and everything else folds as a leaf.
 hashOfValue(LoweringContext lowering, long value, Type type, Span span) -> long {
-    if (primitives.taggedPayloadOf(type) != null) {
+    if (primitives.isOptionalType(type)) {
         return hashOfOptional(lowering, value, type, span);
+    }
+    let classType = primitives.classOf(type);
+    if (classType != null) {
+        let declared = declaredHashOf(classType);
+        if (declared != null) {
+            return callDeclaredHash(lowering, classType, declared, value, span);
+        }
     }
     return hashLeaf(lowering, value);
 }
 
-// A tagged optional hashes as its payload does when the tag says present, and as -1 whatever its
-// inner type when it is absent, so an absent value never reads a payload that holds nothing. The
-// two paths merge through a slot, the phi-free form every branching value in lowering uses.
+// An optional hashes as its payload does when its presence says it holds one, and as -1 whatever
+// its inner type when it is absent, so an absent value never reads a payload that holds nothing.
+// The two paths merge through a slot, the phi-free form every branching value in lowering uses.
 hashOfOptional(LoweringContext lowering, long value, Type optionalType, Span span) -> long {
-    let payloadType = primitives.taggedPayloadOf(optionalType);
+    let payloadType = payloadTypeOf(optionalType);
     if (payloadType == null) {
         return -1;
     }
@@ -121,8 +130,19 @@ hashOfOptional(LoweringContext lowering, long value, Type optionalType, Span spa
     return merged;
 }
 
+// What an optional holds while it is present: a tagged optional's payload, or the referent a
+// nullable reference points at, which is the same pointer under its non-optional name.
+payloadTypeOf(Type optionalType) -> Type? {
+    let tagged = primitives.taggedPayloadOf(optionalType);
+    if (tagged != null) {
+        return tagged;
+    }
+    return primitives.referenceOf(optionalType);
+}
+
 // The present payload's hash: a struct folds its fields over a scratch copy of the payload, so it
-// reads out of real storage, and everything else is a leaf.
+// reads out of real storage, a reference hashes exactly as its non-optional spelling does, and
+// everything else is a leaf.
 hashOfPayload(LoweringContext lowering, long value, Type payloadType, Span span) -> long {
     if (primitives.structOf(payloadType) != null) {
         long base = optionals.taggedScratchAddress(lowering, value, payloadType);
@@ -132,6 +152,13 @@ hashOfPayload(LoweringContext lowering, long value, Type payloadType, Span span)
             return -1;
         }
         return hashAt(lowering, base, payloadType, span);
+    }
+    if (primitives.isReferenceType(payloadType)) {
+        long referent = conversions.convert(lowering, value, payloadType, span);
+        if (referent < 0) {
+            return -1;
+        }
+        return hashOfValue(lowering, referent, payloadType, span);
     }
     let builder = lowering.builder();
     long payload = builder.newTemp(payloadType);
@@ -158,7 +185,7 @@ hashAt(LoweringContext lowering, long base, Type structType, Span span) -> long 
             fieldHash = hashAt(lowering, fieldAddress, fieldType, span);
         } else {
             long value = places.loadFrom(lowering, fieldAddress, fieldType);
-            fieldHash = hashFieldValue(lowering, value, fieldType, span);
+            fieldHash = hashOfValue(lowering, value, fieldType, span);
         }
         if (fieldHash < 0) {
             return -1;
@@ -174,23 +201,15 @@ hashAt(LoweringContext lowering, long base, Type structType, Span span) -> long 
     return hash;
 }
 
-// One loaded field's hash: a class that declared its own conforming hash answers, and everything
-// else hashes as the value it is.
-hashFieldValue(LoweringContext lowering, long value, Type fieldType, Span span) -> long {
-    let classType = primitives.classOf(fieldType);
-    if (classType != null) {
-        let declared = declaredHashOf(classType);
-        if (declared != null) {
-            let info = lowering.index().infoFor(declared.signature());
-            if (info == null || !calls.supportedDispatchTarget(lowering, info,
-                    "method 'hash'", span)) {
-                return -1;
-            }
-            return calls.emitCall(lowering, info, classType, value, [],
-                lowering.tables().vtableSlotOf(declared.signature()), null, span);
-        }
+// The 'hash' a class declared for itself, dispatched like any other method call.
+callDeclaredHash(LoweringContext lowering, Type classType, Method declared, long value, Span span)
+        -> long {
+    let info = lowering.index().infoFor(declared.signature());
+    if (info == null || !calls.supportedDispatchTarget(lowering, info, "method 'hash'", span)) {
+        return -1;
     }
-    return hashOfValue(lowering, value, fieldType, span);
+    return calls.emitCall(lowering, info, classType, value, [],
+        lowering.tables().vtableSlotOf(declared.signature()), null, span);
 }
 
 hashLeaf(LoweringContext lowering, long value) -> long {

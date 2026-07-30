@@ -3213,6 +3213,37 @@ struct CodeGenerator::Impl {
         }
     }
 
+    // Synthesized hash of an optional, tagged pair and nullable reference alike:
+    // presence decides, so a present value hashes exactly as its non-optional
+    // spelling does and an absent one folds -1 whatever the inner type. The
+    // branch is what keeps an absent value's payload from being read at all.
+    llvm::Value* emitOptionalHash(llvm::Value* v, ::Type* t, uint32_t offset) {
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        bool tagged = isValueTypeOptional(t);
+        llvm::Value* present = tagged
+            ? builder->CreateExtractValue(v, {0}, "hash.present")
+            : builder->CreateICmpNE(v,
+                llvm::ConstantPointerNull::get(llvm::PointerType::get(ctx, 0)), "hash.present");
+        llvm::BasicBlock* entryBB = builder->GetInsertBlock();
+        auto* presentBB = llvm::BasicBlock::Create(ctx, "hash.present", currentFunction);
+        auto* endBB = llvm::BasicBlock::Create(ctx, "hash.end", currentFunction);
+        builder->CreateCondBr(present, presentBB, endBB);
+
+        builder->SetInsertPoint(presentBB);
+        llvm::Value* payload = tagged
+            ? builder->CreateExtractValue(v, {1}, "hash.val") : v;
+        llvm::Value* payloadHash = emitBuiltinHashOf(payload, t->inner, offset);
+        if (!payloadHash) return nullptr;
+        llvm::BasicBlock* payloadBB = builder->GetInsertBlock();
+        builder->CreateBr(endBB);
+
+        builder->SetInsertPoint(endBB);
+        auto* phi = builder->CreatePHI(i64Ty, 2, "hash.opt");
+        phi->addIncoming(llvm::ConstantInt::get(i64Ty, -1), entryBB);
+        phi->addIncoming(payloadHash, payloadBB);
+        return phi;
+    }
+
     // Synthesized hash of a value: identity for reference types, contents for
     // value types (FNV-1a fold for structs and string bytes).
     llvm::Value* emitBuiltinHashOf(llvm::Value* v, ::Type* t, uint32_t offset) {
@@ -3285,16 +3316,8 @@ struct CodeGenerator::Impl {
                 }
                 return hash;
             }
-            case TypeKind::Optional: {
-                if (!isValueTypeOptional(t)) {
-                    return builder->CreatePtrToInt(v, i64Ty, "hash.identity");
-                }
-                llvm::Value* present = builder->CreateExtractValue(v, {0}, "hash.present");
-                llvm::Value* innerHash = emitBuiltinHashOf(
-                    builder->CreateExtractValue(v, {1}, "hash.val"), t->inner, offset);
-                return builder->CreateSelect(present, innerHash,
-                    llvm::ConstantInt::get(i64Ty, -1), "hash.opt");
-            }
+            case TypeKind::Optional:
+                return emitOptionalHash(v, t, offset);
             default:
                 error(offset, "Internal: cannot synthesize hash for type '" + t->toString() + "'");
                 return llvm::ConstantInt::get(i64Ty, 0);
