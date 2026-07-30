@@ -1,0 +1,172 @@
+// The two resolvers behind every trace: one maps a captured return address to the symbol entry of
+// the function containing it, the other to the marked call site whose line it belongs to. Both are
+// a linear scan over the registered chunks for the greatest recorded start at or below the address
+// - function starts for the symbols, marked call-site block addresses for the lines. Traces are
+// rare and short, so no index is built.
+import @ens.llvm.globals;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import Runtime from emit.runtime;
+import emit.traceruntime;
+import emit.traceshapes;
+
+// ptr ens_resolve_addr(i64 addr): the symbol entry with the greatest function start at or below
+// the address, or null when no registered function covers it.
+public defineResolveAddress(Runtime runtime) {
+    let resolver = runtime.libc("ens_resolve_addr",
+        runtime.pointerType.functionType([runtime.int64Type]));
+    globals.setLinkage(resolver.function, globals.linkageInternal());
+    let saved = traceruntime.beginExportedBody(runtime, resolver);
+    let builder = runtime.builder;
+    let entryType = traceshapes.symbolEntryType(runtime);
+    let chunkShape = traceshapes.chunkType(runtime);
+    let address = globals.getParam(resolver.function, 0);
+
+    let best = memory.buildAlloca(builder, runtime.pointerType, "best");
+    let bestStart = memory.buildAlloca(builder, runtime.int64Type, "best.start");
+    let chunkCursor = memory.buildAlloca(builder, runtime.pointerType, "chunk");
+    let index = memory.buildAlloca(builder, runtime.int64Type, "i");
+    memory.buildStore(builder, runtime.nullPointer(), best);
+    memory.buildStore(builder, runtime.int64(0), bestStart);
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.pointerType,
+        traceruntime.head(runtime), "head"), chunkCursor);
+
+    let chunkTest = traceruntime.block(runtime, resolver, "chunk.test");
+    let chunkBody = traceruntime.block(runtime, resolver, "chunk.body");
+    let entryTest = traceruntime.block(runtime, resolver, "entry.test");
+    let entryBody = traceruntime.block(runtime, resolver, "entry.body");
+    let keep = traceruntime.block(runtime, resolver, "entry.keep");
+    let entryNext = traceruntime.block(runtime, resolver, "entry.next");
+    let chunkNext = traceruntime.block(runtime, resolver, "chunk.next");
+    let done = traceruntime.block(runtime, resolver, "done");
+    instructions.buildBr(builder, chunkTest);
+
+    builder.positionAtEnd(chunkTest);
+    let chunk = memory.buildLoad(builder, runtime.pointerType, chunkCursor, "chunk.cur");
+    instructions.buildCondBr(builder, runtime.isNull(chunk), done, chunkBody);
+
+    builder.positionAtEnd(chunkBody);
+    let entries = memory.buildLoad(builder, runtime.pointerType,
+        memory.buildStructGEP(builder, chunkShape, chunk, 1, ""), "entries");
+    let count = memory.buildLoad(builder, runtime.int64Type,
+        memory.buildStructGEP(builder, chunkShape, chunk, 2, ""), "count");
+    memory.buildStore(builder, runtime.int64(0), index);
+    instructions.buildBr(builder, entryTest);
+
+    builder.positionAtEnd(entryTest);
+    let position = memory.buildLoad(builder, runtime.int64Type, index, "i.cur");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, position, count, ""), entryBody, chunkNext);
+
+    builder.positionAtEnd(entryBody);
+    let entry = memory.buildGEP(builder, entryType, entries, [position], "entry");
+    let start = instructions.buildPtrToInt(builder,
+        memory.buildLoad(builder, runtime.pointerType,
+            memory.buildStructGEP(builder, entryType, entry, 0, ""), "fn"),
+        runtime.int64Type, "start");
+    let below = instructions.buildICmpULE(builder, start, address, "");
+    let above = instructions.buildICmpUGT(builder, start,
+        memory.buildLoad(builder, runtime.int64Type, bestStart, ""), "");
+    instructions.buildCondBr(builder, instructions.buildAnd(builder, below, above, ""), keep,
+        entryNext);
+
+    builder.positionAtEnd(keep);
+    memory.buildStore(builder, entry, best);
+    memory.buildStore(builder, start, bestStart);
+    instructions.buildBr(builder, entryNext);
+
+    builder.positionAtEnd(entryNext);
+    memory.buildStore(builder, instructions.buildAdd(builder, position, runtime.int64(1), ""),
+        index);
+    instructions.buildBr(builder, entryTest);
+
+    builder.positionAtEnd(chunkNext);
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.pointerType,
+        memory.buildStructGEP(builder, chunkShape, chunk, 0, ""), "next"), chunkCursor);
+    instructions.buildBr(builder, chunkTest);
+
+    builder.positionAtEnd(done);
+    instructions.buildRet(builder, memory.buildLoad(builder, runtime.pointerType, best, ""));
+    traceruntime.finishBody(runtime, saved);
+}
+
+// ptr ens_resolve_lineentry(i64 addr): the line marker with the greatest marked call-site
+// address at or below the captured address, or null; the caller falls back to the function's
+// declaration line.
+public defineResolveLine(Runtime runtime) {
+    let resolver = runtime.libc("ens_resolve_lineentry",
+        runtime.pointerType.functionType([runtime.int64Type]));
+    globals.setLinkage(resolver.function, globals.linkageInternal());
+    let saved = traceruntime.beginExportedBody(runtime, resolver);
+    let builder = runtime.builder;
+    let markerType = traceshapes.markerEntryType(runtime);
+    let chunkShape = traceshapes.chunkType(runtime);
+    let address = globals.getParam(resolver.function, 0);
+
+    let best = memory.buildAlloca(builder, runtime.pointerType, "best");
+    let bestStart = memory.buildAlloca(builder, runtime.int64Type, "best.start");
+    let chunkCursor = memory.buildAlloca(builder, runtime.pointerType, "chunk");
+    let index = memory.buildAlloca(builder, runtime.int64Type, "i");
+    memory.buildStore(builder, runtime.nullPointer(), best);
+    memory.buildStore(builder, runtime.int64(0), bestStart);
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.pointerType,
+        traceruntime.head(runtime), "head"), chunkCursor);
+
+    let chunkTest = traceruntime.block(runtime, resolver, "chunk.test");
+    let chunkBody = traceruntime.block(runtime, resolver, "chunk.body");
+    let markTest = traceruntime.block(runtime, resolver, "mark.test");
+    let markBody = traceruntime.block(runtime, resolver, "mark.body");
+    let keep = traceruntime.block(runtime, resolver, "mark.keep");
+    let markNext = traceruntime.block(runtime, resolver, "mark.next");
+    let chunkNext = traceruntime.block(runtime, resolver, "chunk.next");
+    let done = traceruntime.block(runtime, resolver, "done");
+    instructions.buildBr(builder, chunkTest);
+
+    builder.positionAtEnd(chunkTest);
+    let chunk = memory.buildLoad(builder, runtime.pointerType, chunkCursor, "chunk.cur");
+    instructions.buildCondBr(builder, runtime.isNull(chunk), done, chunkBody);
+
+    builder.positionAtEnd(chunkBody);
+    let markers = memory.buildLoad(builder, runtime.pointerType,
+        memory.buildStructGEP(builder, chunkShape, chunk, 3, ""), "markers");
+    let count = memory.buildLoad(builder, runtime.int64Type,
+        memory.buildStructGEP(builder, chunkShape, chunk, 4, ""), "count");
+    memory.buildStore(builder, runtime.int64(0), index);
+    instructions.buildBr(builder, markTest);
+
+    builder.positionAtEnd(markTest);
+    let position = memory.buildLoad(builder, runtime.int64Type, index, "i.cur");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, position, count, ""), markBody, chunkNext);
+
+    builder.positionAtEnd(markBody);
+    let marker = memory.buildGEP(builder, markerType, markers, [position], "marker");
+    let start = instructions.buildPtrToInt(builder,
+        memory.buildLoad(builder, runtime.pointerType,
+            memory.buildStructGEP(builder, markerType, marker, 0, ""), "site"),
+        runtime.int64Type, "start");
+    let below = instructions.buildICmpULE(builder, start, address, "");
+    let above = instructions.buildICmpUGT(builder, start,
+        memory.buildLoad(builder, runtime.int64Type, bestStart, ""), "");
+    instructions.buildCondBr(builder, instructions.buildAnd(builder, below, above, ""), keep,
+        markNext);
+
+    builder.positionAtEnd(keep);
+    memory.buildStore(builder, marker, best);
+    memory.buildStore(builder, start, bestStart);
+    instructions.buildBr(builder, markNext);
+
+    builder.positionAtEnd(markNext);
+    memory.buildStore(builder, instructions.buildAdd(builder, position, runtime.int64(1), ""),
+        index);
+    instructions.buildBr(builder, markTest);
+
+    builder.positionAtEnd(chunkNext);
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.pointerType,
+        memory.buildStructGEP(builder, chunkShape, chunk, 0, ""), "next"), chunkCursor);
+    instructions.buildBr(builder, chunkTest);
+
+    builder.positionAtEnd(done);
+    instructions.buildRet(builder, memory.buildLoad(builder, runtime.pointerType, best, ""));
+    traceruntime.finishBody(runtime, saved);
+}

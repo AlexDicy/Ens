@@ -1,0 +1,149 @@
+// A captured trace as text: one "  at name (file:line)" line per frame the tables resolve, with a
+// truncation note when the walk never reached the program entry.
+import Value from @ens.llvm.values;
+import TypeRef from @ens.llvm.types;
+import BasicBlock from @ens.llvm.blocks;
+import Builder from @ens.llvm.core;
+import @ens.llvm.globals;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import Runtime from emit.runtime;
+import RuntimeFunction from emit.runtime;
+import emit.traceruntime;
+import emit.traceshapes;
+
+// ptr ens_format_trace(ptr frames): the formatted lines as an owned string; a null capture formats
+// as the empty string.
+public defineFormat(Runtime runtime) {
+    let format = runtime.formatTrace();
+    let saved = traceruntime.beginExportedBody(runtime, format);
+    let builder = runtime.builder;
+    let entryType = traceshapes.symbolEntryType(runtime);
+    let markerType = traceshapes.markerEntryType(runtime);
+    let resolveAddress = runtime.libc("ens_resolve_addr",
+        runtime.pointerType.functionType([runtime.int64Type]));
+    let resolveLine = runtime.libc("ens_resolve_lineentry",
+        runtime.pointerType.functionType([runtime.int64Type]));
+    let print = runtime.snprintf();
+    let lift = runtime.stringFromCString();
+    let release = runtime.free();
+    let frames = globals.getParam(format.function, 0);
+
+    let empty = traceruntime.block(runtime, format, "empty");
+    let have = traceruntime.block(runtime, format, "have");
+    instructions.buildCondBr(builder, runtime.isNull(frames), empty, have);
+
+    builder.positionAtEnd(empty);
+    instructions.buildRet(builder, runtime.stringLiteral("".toBytes()));
+
+    builder.positionAtEnd(have);
+    let count = runtime.payloadLength(frames);
+    let data = runtime.payloadData(frames);
+    let buffer = runtime.call(runtime.malloc(), [runtime.int64(8192)], "buffer");
+    memory.buildStore(builder, runtime.int8(0), buffer);
+    let written = memory.buildAlloca(builder, runtime.int64Type, "written");
+    let index = memory.buildAlloca(builder, runtime.int64Type, "i");
+    let sawEntry = memory.buildAlloca(builder, runtime.int1Type, "saw.entry");
+    let line = memory.buildAlloca(builder, runtime.int32Type, "line");
+    memory.buildStore(builder, runtime.int64(0), written);
+    memory.buildStore(builder, runtime.int64(0), index);
+    memory.buildStore(builder, runtime.int1Type.constInt(0, false), sawEntry);
+    let pattern = globals.buildGlobalString(builder, "  at %s (%s:%d)\n", ".trace.pattern");
+
+    let frameTest = traceruntime.block(runtime, format, "frame.test");
+    let frameBody = traceruntime.block(runtime, format, "frame.body");
+    let fromMarker = traceruntime.block(runtime, format, "frame.markedline");
+    let append = traceruntime.block(runtime, format, "frame.append");
+    let frameNext = traceruntime.block(runtime, format, "frame.next");
+    let after = traceruntime.block(runtime, format, "after");
+    let truncated = traceruntime.block(runtime, format, "truncated");
+    let finish = traceruntime.block(runtime, format, "finish");
+    instructions.buildBr(builder, frameTest);
+
+    builder.positionAtEnd(frameTest);
+    let position = memory.buildLoad(builder, runtime.int64Type, index, "i.cur");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, position, count, ""), frameBody, after);
+
+    builder.positionAtEnd(frameBody);
+    let address = memory.buildLoad(builder, runtime.int64Type,
+        memory.buildGEP(builder, runtime.int64Type, data, [position], ""), "address");
+    let entry = runtime.call(resolveAddress, [address], "entry");
+    let setup = appendSetup(runtime, format, builder, entryType, markerType, resolveLine, entry,
+        address, sawEntry, line, fromMarker, append);
+    instructions.buildCondBr(builder, runtime.isNull(entry), frameNext, setup);
+
+    builder.positionAtEnd(fromMarker);
+    let marker = runtime.call(resolveLine, [address], "marker");
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.int32Type,
+        memory.buildStructGEP(builder, markerType, marker, 1, ""), ""), line);
+    instructions.buildBr(builder, append);
+
+    builder.positionAtEnd(append);
+    let used = memory.buildLoad(builder, runtime.int64Type, written, "used");
+    let cursor = memory.buildGEP(builder, runtime.int8Type, buffer, [used], "cursor");
+    let room = instructions.buildSub(builder, runtime.int64(8192), used, "room");
+    let name = memory.buildLoad(builder, runtime.pointerType,
+        memory.buildStructGEP(builder, entryType, entry, 1, ""), "name");
+    let file = memory.buildLoad(builder, runtime.pointerType,
+        memory.buildStructGEP(builder, entryType, entry, 2, ""), "file");
+    let added = runtime.call(print, [cursor, room, pattern, name, file,
+        memory.buildLoad(builder, runtime.int32Type, line, "")], "added");
+    let grown = instructions.buildAdd(builder, used,
+        instructions.buildSExt(builder, added, runtime.int64Type, ""), "grown");
+    let over = instructions.buildICmpSGT(builder, grown, runtime.int64(8191), "");
+    memory.buildStore(builder,
+        instructions.buildSelect(builder, over, runtime.int64(8191), grown, ""), written);
+    instructions.buildBr(builder, frameNext);
+
+    builder.positionAtEnd(frameNext);
+    memory.buildStore(builder, instructions.buildAdd(builder, position, runtime.int64(1), ""),
+        index);
+    instructions.buildBr(builder, frameTest);
+
+    builder.positionAtEnd(after);
+    let nonEmpty = instructions.buildICmpSGT(builder, count, runtime.int64(0), "");
+    let missedEntry = instructions.buildICmpEQ(builder,
+        memory.buildLoad(builder, runtime.int1Type, sawEntry, ""),
+        runtime.int1Type.constInt(0, false), "");
+    instructions.buildCondBr(builder,
+        instructions.buildAnd(builder, nonEmpty, missedEntry, ""), truncated, finish);
+
+    builder.positionAtEnd(truncated);
+    let tailUsed = memory.buildLoad(builder, runtime.int64Type, written, "used");
+    runtime.call(print, [memory.buildGEP(builder, runtime.int8Type, buffer, [tailUsed], ""),
+        instructions.buildSub(builder, runtime.int64(8192), tailUsed, ""),
+        globals.buildGlobalString(builder, "  ... (trace truncated)\n", ".trace.cut")], "");
+    instructions.buildBr(builder, finish);
+
+    builder.positionAtEnd(finish);
+    let text = runtime.call(lift, [buffer], "text");
+    runtime.call(release, [buffer], "");
+    instructions.buildRet(builder, text);
+    traceruntime.finishBody(runtime, saved);
+}
+
+// The shared per-frame setup of the format walk: remembers whether the program entry's frame was
+// reached and seeds the line from the declaration, then routes to the marker's line when one
+// covers the address. Returns the block the resolved-entry branch should take.
+appendSetup(Runtime runtime, RuntimeFunction format, Builder builder, TypeRef entryType,
+            TypeRef markerType, RuntimeFunction resolveLine, Value entry, Value address,
+            Value sawEntry, Value line, BasicBlock fromMarker, BasicBlock append)
+        -> BasicBlock {
+    let setup = traceruntime.block(runtime, format, "frame.setup");
+    let held = builder.insertBlock();
+    builder.positionAtEnd(setup);
+    let entryFlag = memory.buildLoad(builder, runtime.int32Type,
+        memory.buildStructGEP(builder, entryType, entry, 4, ""), "is.entry");
+    let sawNow = instructions.buildICmpNE(builder, entryFlag, runtime.int32(0), "");
+    let sawBefore = memory.buildLoad(builder, runtime.int1Type, sawEntry, "");
+    memory.buildStore(builder, instructions.buildOr(builder, sawBefore, sawNow, ""), sawEntry);
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.int32Type,
+        memory.buildStructGEP(builder, entryType, entry, 3, ""), ""), line);
+    let marker = runtime.call(resolveLine, [address], "marker");
+    instructions.buildCondBr(builder, runtime.isNull(marker), append, fromMarker);
+    if (held != null) {
+        builder.positionAtEnd(held);
+    }
+    return setup;
+}

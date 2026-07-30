@@ -1,0 +1,160 @@
+// The platform stack capture: walk the frames, keep the return addresses the symbol table
+// resolves, stop after the program entry's frame. Windows fills a buffer through
+// RtlCaptureStackBackTrace; everywhere else the unwinder walks frame by frame through a callback.
+import Value from @ens.llvm.values;
+import @ens.llvm.globals;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import Runtime from emit.runtime;
+import emit.traceruntime;
+import emit.traceshapes;
+
+// ptr ens_capture_trace(i32 maxDepth): the kept return addresses as an owned long[].
+public defineCapture(Runtime runtime) {
+    let capture = runtime.captureTrace();
+    let saved = traceruntime.beginExportedBody(runtime, capture);
+    let builder = runtime.builder;
+    let entryType = traceshapes.symbolEntryType(runtime);
+    let resolveAddress = runtime.libc("ens_resolve_addr",
+        runtime.pointerType.functionType([runtime.int64Type]));
+    let allocate = runtime.alloc();
+    let requested = globals.getParam(capture.function, 0);
+
+    // The walk buffer holds at most 64 addresses, the depth every capture site asks for.
+    let buffer = memory.buildAlloca(builder, runtime.int64Type.arrayType(64), "buffer");
+    let overCap = instructions.buildICmpSGT(builder, requested,
+        runtime.int32Type.constInt(64, true), "");
+    let clamped = instructions.buildSelect(builder, overCap,
+        runtime.int32Type.constInt(64, true), requested, "depth");
+
+    Value walked;
+    long skip = 0;
+    if (runtime.onWindows()) {
+        // USHORT RtlCaptureStackBackTrace(ULONG skip, ULONG count, PVOID* out, PULONG hash):
+        // skipping one frame drops this function's own.
+        let rtl = runtime.libc("RtlCaptureStackBackTrace",
+            runtime.context.int16Type().functionType([runtime.int32Type, runtime.int32Type,
+                runtime.pointerType, runtime.pointerType]));
+        let filled = runtime.call(rtl, [runtime.int32(1), clamped, buffer,
+            runtime.nullPointer()], "filled");
+        walked = instructions.buildZExt(builder, filled, runtime.int64Type, "n");
+    } else {
+        let callback = defineUnwindCallback(runtime);
+        let backtrace = runtime.libc("_Unwind_Backtrace",
+            runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
+        let stateType = runtime.context.structType([runtime.pointerType, runtime.int32Type,
+            runtime.int32Type], false);
+        let state = memory.buildAlloca(builder, stateType, "state");
+        memory.buildStore(builder, buffer,
+            memory.buildStructGEP(builder, stateType, state, 0, ""));
+        memory.buildStore(builder, runtime.int32(0),
+            memory.buildStructGEP(builder, stateType, state, 1, ""));
+        memory.buildStore(builder, clamped,
+            memory.buildStructGEP(builder, stateType, state, 2, ""));
+        runtime.call(backtrace, [callback, state], "");
+        walked = instructions.buildSExt(builder,
+            memory.buildLoad(builder, runtime.int32Type,
+                memory.buildStructGEP(builder, stateType, state, 1, ""), ""),
+            runtime.int64Type, "n");
+        // The unwinder reports the capture frame itself first.
+        skip = 1;
+    }
+
+    // Over-allocate at the walk's capacity; the kept count becomes the length.
+    let trace = runtime.call(allocate, [runtime.int64(8 + 64 * 8), runtime.nullPointer(),
+        runtime.nullPointer()], "trace");
+    let data = runtime.payloadData(trace);
+    let index = memory.buildAlloca(builder, runtime.int64Type, "i");
+    let kept = memory.buildAlloca(builder, runtime.int64Type, "kept");
+    memory.buildStore(builder, runtime.int64(skip), index);
+    memory.buildStore(builder, runtime.int64(0), kept);
+
+    let walkTest = traceruntime.block(runtime, capture, "walk.test");
+    let walkBody = traceruntime.block(runtime, capture, "walk.body");
+    let keep = traceruntime.block(runtime, capture, "walk.keep");
+    let walkNext = traceruntime.block(runtime, capture, "walk.next");
+    let done = traceruntime.block(runtime, capture, "done");
+    instructions.buildBr(builder, walkTest);
+
+    builder.positionAtEnd(walkTest);
+    let position = memory.buildLoad(builder, runtime.int64Type, index, "i.cur");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, position, walked, ""), walkBody, done);
+
+    builder.positionAtEnd(walkBody);
+    let address = memory.buildLoad(builder, runtime.int64Type,
+        memory.buildGEP(builder, runtime.int64Type, buffer, [position], ""), "address");
+    let entry = runtime.call(resolveAddress, [address], "entry");
+    instructions.buildCondBr(builder, runtime.isNull(entry), walkNext, keep);
+
+    builder.positionAtEnd(keep);
+    let slot = memory.buildLoad(builder, runtime.int64Type, kept, "kept.cur");
+    memory.buildStore(builder, address,
+        memory.buildGEP(builder, runtime.int64Type, data, [slot], ""));
+    memory.buildStore(builder, instructions.buildAdd(builder, slot, runtime.int64(1), ""),
+        kept);
+    let entryFlag = memory.buildLoad(builder, runtime.int32Type,
+        memory.buildStructGEP(builder, entryType, entry, 4, ""), "is.entry");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpNE(builder, entryFlag, runtime.int32(0), ""), done, walkNext);
+
+    builder.positionAtEnd(walkNext);
+    memory.buildStore(builder, instructions.buildAdd(builder, position, runtime.int64(1), ""),
+        index);
+    instructions.buildBr(builder, walkTest);
+
+    builder.positionAtEnd(done);
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.int64Type, kept, ""), trace);
+    instructions.buildRet(builder, trace);
+    traceruntime.finishBody(runtime, saved);
+}
+
+// The _Unwind_Backtrace callback: stores each frame's instruction pointer until the buffer is
+// full. Only non-Windows captures walk this way.
+defineUnwindCallback(Runtime runtime) -> Value {
+    let existing = globals.getNamedFunction(runtime.module, "ens_unwind_cb");
+    if (existing != null) {
+        return existing;
+    }
+    let stateType = runtime.context.structType([runtime.pointerType, runtime.int32Type,
+        runtime.int32Type], false);
+    let getIp = runtime.libc("_Unwind_GetIP",
+        runtime.int64Type.functionType([runtime.pointerType]));
+    let callbackType = runtime.int32Type.functionType([runtime.pointerType,
+        runtime.pointerType]);
+    let callback = runtime.module.addFunction("ens_unwind_cb", callbackType);
+    globals.setLinkage(callback, globals.linkageInternal());
+    globals.addFunctionAttribute(runtime.context, callback, "nounwind");
+    let saved = runtime.builder.insertBlock();
+    runtime.builder.positionAtEnd(runtime.context.appendBasicBlock(callback, "entry"));
+    let builder = runtime.builder;
+    let context = globals.getParam(callback, 0);
+    let state = globals.getParam(callback, 1);
+    let indexSlot = memory.buildStructGEP(builder, stateType, state, 1, "");
+    let index = memory.buildLoad(builder, runtime.int32Type, indexSlot, "index");
+    let limit = memory.buildLoad(builder, runtime.int32Type,
+        memory.buildStructGEP(builder, stateType, state, 2, ""), "limit");
+    let full = runtime.context.appendBasicBlock(callback, "full");
+    let store = runtime.context.appendBasicBlock(callback, "store");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSGE(builder, index, limit, ""), full, store);
+
+    builder.positionAtEnd(full);
+    // 5 is _URC_END_OF_STACK, which stops the walk.
+    instructions.buildRet(builder, runtime.int32(5));
+
+    builder.positionAtEnd(store);
+    let ip = runtime.call(getIp, [context], "ip");
+    let buffer = memory.buildLoad(builder, runtime.pointerType,
+        memory.buildStructGEP(builder, stateType, state, 0, ""), "buffer");
+    let wide = instructions.buildSExt(builder, index, runtime.int64Type, "");
+    memory.buildStore(builder, ip,
+        memory.buildGEP(builder, runtime.int64Type, buffer, [wide], ""));
+    memory.buildStore(builder,
+        instructions.buildAdd(builder, index, runtime.int32(1), ""), indexSlot);
+    instructions.buildRet(builder, runtime.int32(0));
+    if (saved != null) {
+        runtime.builder.positionAtEnd(saved);
+    }
+    return callback;
+}
