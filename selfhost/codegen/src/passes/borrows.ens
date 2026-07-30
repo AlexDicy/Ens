@@ -1,0 +1,588 @@
+// Borrow and move rewriting: the retain/release elisions the caller-side convention licenses,
+// applied as one pure rewrite over a verified function.
+//
+// A LET-BORROW is a local slot that only ever holds what a never-reassigned parameter already
+// holds. The caller keeps that object alive past this whole call, so the local needs no
+// reference of its own: the slot flips to borrowing, the retain feeding each of its stores is
+// dropped, and the releases of its storage disappear. The elision is invisible to destruction
+// order - the parameter's reference outlives every window the local's reference covered.
+//
+// A MOVE is the last read of an owning slot feeding a retain: the copy takes a new +1 while the
+// slot's own +1 waits for a cleanup nothing else needs. The load-and-retain becomes a take,
+// which hands the slot's +1 to the copy and leaves null behind for the cleanup that still runs.
+// A take is never introduced inside a loop: the slot refills next time around, and the reference
+// compiler keeps those pairs too, so destruction timing stays observably the same.
+//
+// Weak upgrades sit naturally outside both rewrites: a borrow's sources are parameter slots and
+// an upgrade arrives owned, never borrowed, so no retain of one is ever elided; and a move only
+// transfers an upgrade's +1, which can shorten the watched object's life but never extend it.
+import EirFunction from eir.model;
+import EirBlock from eir.model;
+import EirInstruction from eir.model;
+import EirSlot from eir.model;
+import EirSlotAddress from eir.model;
+import EirLoadSlot from eir.model;
+import EirTakeSlot from eir.model;
+import EirStoreSlot from eir.model;
+import EirRetain from eir.model;
+import EirReleasePtr from eir.model;
+import EirCast from eir.model;
+import EirCastOp from eir.model;
+import eir.walk;
+import support.primitives;
+import List from @std.collections.list;
+
+public run(EirFunction function) -> EirFunction {
+    return rewriteMoves(elideBorrows(function));
+}
+
+// One round's findings: the slots to flip and the instructions to drop. Rounds repeat because a
+// flipped slot becomes a valid source for the next candidate.
+final class BorrowRound {
+    protected bool[] flips;
+    protected List<EirInstruction> dropped;
+
+    protected constructor(this.flips, this.dropped);
+}
+
+elideBorrows(EirFunction function) -> EirFunction {
+    EirFunction current = function;
+    let round = planRound(current);
+    while (round != null) {
+        current = applyRound(current, round);
+        round = planRound(current);
+    }
+    return current;
+}
+
+planRound(EirFunction function) -> BorrowRound? {
+    let defs = definitionsOf(function);
+    let users = usersOf(function);
+    bool[] terminatorUsed = terminatorUses(function);
+    bool[] flips = new bool[function.slots().length() + 1];
+    let dropped = new List<EirInstruction>();
+    bool found = false;
+    for (long x = 0; x < function.slots().length(); x++) {
+        let slot = function.slots().get(x);
+        if (slot.borrows() || !primitives.isReferenceType(slot.type())) {
+            continue;
+        }
+        let drops = planSlot(function, x, defs, users, terminatorUsed);
+        if (drops == null) {
+            continue;
+        }
+        flips[x] = true;
+        found = true;
+        for (long i = 0; i < drops.length(); i++) {
+            dropped.push(drops.get(i));
+        }
+    }
+    if (!found) {
+        return null;
+    }
+    return new BorrowRound(flips, dropped);
+}
+
+// Decides whether one slot can borrow, and if so which instructions go: the retain feeding each
+// of its stores, and the address-and-release pairs that gave up what it will no longer own.
+planSlot(EirFunction function, long x, EirInstruction?[] defs, List<List<EirInstruction>> users,
+         bool[] terminatorUsed) -> List<EirInstruction>? {
+    let drops = new List<EirInstruction>();
+    let blocks = function.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        let instructions = blocks.get(b).instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (instruction is EirTakeSlot && instruction.slot == x) {
+                return null;
+            }
+            if (!(instruction is EirSlotAddress)) {
+                continue;
+            }
+            if (instruction.slot != x) {
+                continue;
+            }
+            if (terminatorUsed[instruction.result]) {
+                return null;
+            }
+            let consumers = users.get(instruction.result);
+            for (long u = 0; u < consumers.length(); u++) {
+                if (!(consumers.get(u) is EirReleasePtr)) {
+                    return null;
+                }
+            }
+            drops.push(instruction);
+            for (long u = 0; u < consumers.length(); u++) {
+                drops.push(consumers.get(u));
+            }
+        }
+    }
+    bool stored = false;
+    for (long b = 0; b < blocks.length(); b++) {
+        let instructions = blocks.get(b).instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (!(instruction is EirStoreSlot)) {
+                continue;
+            }
+            if (instruction.slot != x) {
+                continue;
+            }
+            stored = true;
+            long value = instruction.value;
+            if (!sourceOk(function, defs, value, 0) || terminatorUsed[value]) {
+                return null;
+            }
+            let retain = pairedRetain(instructions, i, value, drops);
+            if (retain == null) {
+                return null;
+            }
+            let consumers = users.get(value);
+            for (long u = 0; u < consumers.length(); u++) {
+                let consumer = consumers.get(u);
+                if (consumer == retain) {
+                    continue;
+                }
+                if (consumer is EirStoreSlot && consumer.slot == x) {
+                    continue;
+                }
+                return null;
+            }
+            drops.push(retain);
+        }
+    }
+    if (!stored) {
+        return null;
+    }
+    return drops;
+}
+
+// The retain that gave this store its +1: scanning back from the store, past only the
+// address-and-release instructions already marked to go.
+pairedRetain(List<EirInstruction> instructions, long storeIndex, long value,
+             List<EirInstruction> drops) -> EirRetain? {
+    long j = storeIndex - 1;
+    while (j >= 0) {
+        let candidate = instructions.get(j);
+        if (candidate is EirRetain && candidate.value == value) {
+            return candidate;
+        }
+        if (!isMarked(drops, candidate)) {
+            return null;
+        }
+        j--;
+    }
+    return null;
+}
+
+// True when a stored value provably outlives this function: it was read out of a borrowing slot
+// whose own contents are caller-owned, through nothing but the casts that rename a reference.
+sourceOk(EirFunction function, EirInstruction?[] defs, long value, long depth) -> bool {
+    if (depth > 32 || value < 0 || value >= defs.length) {
+        return false;
+    }
+    let definition = defs[value];
+    if (definition == null) {
+        return false;
+    }
+    switch (definition) {
+        is EirLoadSlot load -> {
+            return sourceSlotOk(function, defs, load.slot, depth + 1);
+        },
+        is EirCast cast -> {
+            if (cast.op != EirCastOp.Reinterpret) {
+                return false;
+            }
+            return sourceOk(function, defs, cast.operand, depth + 1);
+        },
+        default -> {
+            return false;
+        },
+    }
+}
+
+// A slot whose contents the caller owns for the whole call: a borrowing slot, never reached
+// through an address, whose every store is the entry binding of a parameter or is itself sourced
+// this way - which is what makes a chain of borrows collapse over the rounds.
+sourceSlotOk(EirFunction function, EirInstruction?[] defs, long slot, long depth) -> bool {
+    if (depth > 32) {
+        return false;
+    }
+    let described = function.slots().get(slot);
+    if (!described.borrows()) {
+        return false;
+    }
+    let blocks = function.blocks();
+    bool stored = false;
+    for (long b = 0; b < blocks.length(); b++) {
+        let instructions = blocks.get(b).instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (instruction is EirSlotAddress && instruction.slot == slot) {
+                return false;
+            }
+            if (instruction is EirTakeSlot && instruction.slot == slot) {
+                return false;
+            }
+            if (!(instruction is EirStoreSlot)) {
+                continue;
+            }
+            if (instruction.slot != slot) {
+                continue;
+            }
+            stored = true;
+            long value = instruction.value;
+            if (value < function.entryTempCount() && defs[value] == null) {
+                continue;
+            }
+            if (!sourceOk(function, defs, value, depth + 1)) {
+                return false;
+            }
+        }
+    }
+    return stored;
+}
+
+applyRound(EirFunction function, BorrowRound round) -> EirFunction {
+    let slots = new List<EirSlot>();
+    for (long i = 0; i < function.slots().length(); i++) {
+        let slot = function.slots().get(i);
+        if (round.flips[i]) {
+            slots.push(new EirSlot(slot.name(), slot.type(), slot.startsZeroed(), true));
+        } else {
+            slots.push(slot);
+        }
+    }
+    let blocks = new List<EirBlock>();
+    for (long b = 0; b < function.blocks().length(); b++) {
+        let source = function.blocks().get(b);
+        let block = new EirBlock(source.label());
+        let instructions = source.instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            if (!isMarked(round.dropped, instructions.get(i))) {
+                block.instructions().push(instructions.get(i));
+            }
+        }
+        let terminator = source.terminator();
+        if (terminator != null) {
+            block.setTerminator(terminator);
+        }
+        blocks.push(block);
+    }
+    return new EirFunction(function.symbol(), function.internalLinkage(),
+        function.receiverType(), function.parameters(), function.returnType(), slots, blocks,
+        function.tempTypes(), function.throwing(), function.traceName(), function.traceFile(),
+        function.traceLine(), function.isEntryPoint());
+}
+
+// One planned move: this load becomes a take and this retain goes.
+final class MoveCandidate {
+    protected EirLoadSlot load;
+    protected EirRetain retain;
+
+    protected constructor(this.load, this.retain);
+}
+
+rewriteMoves(EirFunction function) -> EirFunction {
+    let defs = definitionsOf(function);
+    let users = usersOf(function);
+    bool[] cyclic = cyclicBlocks(function);
+    let moves = new List<MoveCandidate>();
+    let blocks = function.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        if (cyclic[b]) {
+            continue;
+        }
+        let instructions = blocks.get(b).instructions();
+        for (long k = 0; k < instructions.length(); k++) {
+            let instruction = instructions.get(k);
+            if (!(instruction is EirRetain)) {
+                continue;
+            }
+            let load = movableLoad(function, defs, users, instruction.value);
+            if (load == null) {
+                continue;
+            }
+            long loadIndex = indexIn(instructions, load);
+            if (loadIndex < 0 || loadIndex >= k) {
+                continue;
+            }
+            if (alreadyPlanned(moves, load.slot)
+                    || slotLiveAfter(function, users, b, loadIndex + 1, load.slot)) {
+                continue;
+            }
+            moves.push(new MoveCandidate(load, instruction));
+        }
+    }
+    if (moves.length() == 0) {
+        return function;
+    }
+    let rebuilt = new List<EirBlock>();
+    for (long b = 0; b < blocks.length(); b++) {
+        let source = blocks.get(b);
+        let block = new EirBlock(source.label());
+        let instructions = source.instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            let move = moveFor(moves, instruction);
+            if (move == null) {
+                block.instructions().push(instruction);
+            } else if (instruction == move.load) {
+                block.instructions().push(new EirTakeSlot(move.load.result, move.load.type,
+                    move.load.slot));
+            }
+        }
+        let terminator = source.terminator();
+        if (terminator != null) {
+            block.setTerminator(terminator);
+        }
+        rebuilt.push(block);
+    }
+    return new EirFunction(function.symbol(), function.internalLinkage(),
+        function.receiverType(), function.parameters(), function.returnType(),
+        function.slots(), rebuilt, function.tempTypes(), function.throwing(),
+        function.traceName(), function.traceFile(), function.traceLine(),
+        function.isEntryPoint());
+}
+
+// The load a retained value came out of an owning slot by, through renaming casts, or null when
+// the retain is not the copy-out shape a move replaces. The temps below the retained one must
+// feed exactly the next chain member: after the rewrite the chain transfers an owned reference
+// step by step, so a second reader of an intermediate would read after the transfer.
+movableLoad(EirFunction function, EirInstruction?[] defs, List<List<EirInstruction>> users,
+            long value) -> EirLoadSlot? {
+    long current = value;
+    long depth = 0;
+    while (depth < 32) {
+        depth++;
+        if (current < 0 || current >= defs.length) {
+            return null;
+        }
+        let definition = defs[current];
+        if (definition == null) {
+            return null;
+        }
+        if (current != value && users.get(current).length() != 1) {
+            return null;
+        }
+        switch (definition) {
+            is EirLoadSlot load -> {
+                let slot = function.slots().get(load.slot);
+                if (slot.borrows() || !primitives.isReferenceType(slot.type())) {
+                    return null;
+                }
+                return load;
+            },
+            is EirCast cast -> {
+                if (cast.op != EirCastOp.Reinterpret) {
+                    return null;
+                }
+                current = cast.operand;
+            },
+            default -> {
+                return null;
+            },
+        }
+    }
+    return null;
+}
+
+alreadyPlanned(List<MoveCandidate> moves, long slot) -> bool {
+    for (long i = 0; i < moves.length(); i++) {
+        if (moves.get(i).load.slot == slot) {
+            return true;
+        }
+    }
+    return false;
+}
+
+moveFor(List<MoveCandidate> moves, EirInstruction instruction) -> MoveCandidate? {
+    for (long i = 0; i < moves.length(); i++) {
+        if (moves.get(i).load == instruction || moves.get(i).retain == instruction) {
+            return moves.get(i);
+        }
+    }
+    return null;
+}
+
+indexIn(List<EirInstruction> instructions, EirInstruction target) -> long {
+    for (long i = 0; i < instructions.length(); i++) {
+        if (instructions.get(i) == target) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Whether the slot is read again - beyond the cleanup that only releases it - after this point
+// on some path, before anything overwrites it.
+slotLiveAfter(EirFunction function, List<List<EirInstruction>> users, long block, long start,
+              long slot) -> bool {
+    let instructions = function.blocks().get(block).instructions();
+    for (long i = start; i < instructions.length(); i++) {
+        let instruction = instructions.get(i);
+        if (readsSlot(instruction, slot, users)) {
+            return true;
+        }
+        if (instruction is EirStoreSlot && instruction.slot == slot) {
+            return false;
+        }
+    }
+    return liveOutOf(function, users, slot)[block];
+}
+
+readsSlot(EirInstruction instruction, long slot, List<List<EirInstruction>> users) -> bool {
+    if (instruction is EirLoadSlot && instruction.slot == slot) {
+        return true;
+    }
+    if (instruction is EirTakeSlot && instruction.slot == slot) {
+        return true;
+    }
+    if (instruction is EirSlotAddress && instruction.slot == slot) {
+        let consumers = users.get(instruction.result);
+        for (long u = 0; u < consumers.length(); u++) {
+            if (!(consumers.get(u) is EirReleasePtr)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Backward liveness of one slot at block exits, with the cleanup releases not counting as reads.
+liveOutOf(EirFunction function, List<List<EirInstruction>> users, long slot) -> bool[] {
+    let blocks = function.blocks();
+    long count = blocks.length();
+    // 0 none, 1 reads first, 2 overwrites first
+    long[] firstEffect = new long[count];
+    for (long b = 0; b < count; b++) {
+        let instructions = blocks.get(b).instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (readsSlot(instruction, slot, users)) {
+                firstEffect[b] = 1;
+                break;
+            }
+            if (instruction is EirStoreSlot && instruction.slot == slot) {
+                firstEffect[b] = 2;
+                break;
+            }
+        }
+    }
+    bool[] liveOut = new bool[count];
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (long b = 0; b < count; b++) {
+            bool live = false;
+            for (let successor in walk.successorsOf(blocks.get(b))) {
+                if (successor < 0 || successor >= count) {
+                    continue;
+                }
+                if (firstEffect[successor] == 1
+                        || (firstEffect[successor] == 0 && liveOut[successor])) {
+                    live = true;
+                }
+            }
+            if (live && !liveOut[b]) {
+                liveOut[b] = true;
+                changed = true;
+            }
+        }
+    }
+    return liveOut;
+}
+
+// The blocks that can run more than once: anything on a path from itself back to itself.
+cyclicBlocks(EirFunction function) -> bool[] {
+    let blocks = function.blocks();
+    long count = blocks.length();
+    bool[] cyclic = new bool[count];
+    for (long b = 0; b < count; b++) {
+        bool[] seen = new bool[count];
+        let pending = new List<long>();
+        for (let successor in walk.successorsOf(blocks.get(b))) {
+            if (successor >= 0 && successor < count && !seen[successor]) {
+                seen[successor] = true;
+                pending.push(successor);
+            }
+        }
+        while (pending.length() > 0) {
+            long current = pending.pop();
+            if (current == b) {
+                cyclic[b] = true;
+                break;
+            }
+            for (let successor in walk.successorsOf(blocks.get(current))) {
+                if (successor >= 0 && successor < count && !seen[successor]) {
+                    seen[successor] = true;
+                    pending.push(successor);
+                }
+            }
+        }
+        if (seen[b]) {
+            cyclic[b] = true;
+        }
+    }
+    return cyclic;
+}
+
+definitionsOf(EirFunction function) -> EirInstruction?[] {
+    let defs = new EirInstruction?[function.tempTypes().length()];
+    let blocks = function.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        let instructions = blocks.get(b).instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            long result = walk.resultOf(instructions.get(i));
+            if (result >= 0 && result < defs.length) {
+                defs[result] = instructions.get(i);
+            }
+        }
+    }
+    return defs;
+}
+
+usersOf(EirFunction function) -> List<List<EirInstruction>> {
+    let users = new List<List<EirInstruction>>();
+    for (long i = 0; i < function.tempTypes().length(); i++) {
+        users.push(new List<EirInstruction>());
+    }
+    let blocks = function.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        let instructions = blocks.get(b).instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            for (let used in walk.usesOf(instructions.get(i))) {
+                if (used >= 0 && used < users.length()) {
+                    users.get(used).push(instructions.get(i));
+                }
+            }
+        }
+    }
+    return users;
+}
+
+terminatorUses(EirFunction function) -> bool[] {
+    bool[] used = new bool[function.tempTypes().length() + 1];
+    let blocks = function.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        let terminator = blocks.get(b).terminator();
+        if (terminator == null) {
+            continue;
+        }
+        for (let value in walk.terminatorUsesOf(terminator)) {
+            if (value >= 0 && value < used.length) {
+                used[value] = true;
+            }
+        }
+    }
+    return used;
+}
+
+isMarked(List<EirInstruction> marked, EirInstruction instruction) -> bool {
+    for (long i = 0; i < marked.length(); i++) {
+        if (marked.get(i) == instruction) {
+            return true;
+        }
+    }
+    return false;
+}

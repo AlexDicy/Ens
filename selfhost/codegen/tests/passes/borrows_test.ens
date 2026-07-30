@@ -1,0 +1,251 @@
+// Borrow and move rewriting: a local fed only by parameters flips to a borrowing slot with its
+// retain/release pairs gone, the last read of an owning slot becomes a take, and every shape the
+// pass cannot prove safe comes back byte-identical. Each golden pins the transformation as a
+// visible diff against the naive dump.
+import @std.testing;
+import eir.dump;
+import passes.borrows;
+import support;
+
+test "a let holding only a parameter borrows it" {
+    let program = try support.lowerWholeProgram(
+        "class Box \{\n"
+        + "    protected int v;\n"
+        + "    protected constructor(this.v = 0);\n"
+        + "\}\n"
+        + "readViaLet(Box b) -> int \{\n"
+        + "    let x = b;\n"
+        + "    return x.v;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return readViaLet(new Box());\n"
+        + "\}\n");
+    let before = try support.functionBySymbol(program, "readViaLet");
+    let after = borrows.run(before);
+    try support.assertOptimized(after, "readViaLet");
+    try testing.assertTrue(dump.dumpFunction(before).indexOf("retain %1") >= 0,
+        "the naive lowering retains the copy");
+    try testing.assertEqual(dump.dumpFunction(after),
+        "func internal @readViaLet(%0: Box) -> int \{\n"
+        + "  $0 b: Box borrowed\n"
+        + "  $1 x: Box borrowed\n"
+        + "b0.entry:\n"
+        + "  store $0, %0\n"
+        + "  %1 = load $0: Box\n"
+        + "  store $1, %1\n"
+        + "  %2 = load $1: Box\n"
+        + "  %3 = object_field_addr %2, 0: &int  ; %2.v\n"
+        + "  %4 = load_ptr %3: int\n"
+        + "  ret %4\n"
+        + "\}\n");
+}
+
+test "a local reassigned from another parameter stays a borrow" {
+    let program = try support.lowerWholeProgram(
+        "class Box \{\n"
+        + "    protected int v;\n"
+        + "    protected constructor(this.v = 0);\n"
+        + "\}\n"
+        + "useBoth(Box a, Box b) -> int \{\n"
+        + "    let x = a;\n"
+        + "    x = b;\n"
+        + "    return x.v;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return useBoth(new Box(), new Box());\n"
+        + "\}\n");
+    let before = try support.functionBySymbol(program, "useBoth");
+    let after = borrows.run(before);
+    try support.assertOptimized(after, "useBoth");
+    try testing.assertEqual(dump.dumpFunction(after),
+        "func internal @useBoth(%0: Box, %1: Box) -> int \{\n"
+        + "  $0 a: Box borrowed\n"
+        + "  $1 b: Box borrowed\n"
+        + "  $2 x: Box borrowed\n"
+        + "b0.entry:\n"
+        + "  store $0, %0\n"
+        + "  store $1, %1\n"
+        + "  %2 = load $0: Box\n"
+        + "  store $2, %2\n"
+        + "  %3 = load $1: Box\n"
+        + "  store $2, %3\n"
+        + "  %5 = load $2: Box\n"
+        + "  %6 = object_field_addr %5, 0: &int  ; %5.v\n"
+        + "  %7 = load_ptr %6: int\n"
+        + "  ret %7\n"
+        + "\}\n");
+}
+
+test "a copy of an owned local that stays in use is not touched" {
+    let program = try support.lowerWholeProgram(
+        "class Box \{\n"
+        + "    protected int v;\n"
+        + "    protected constructor(this.v = 0);\n"
+        + "\}\n"
+        + "readLocal() -> int \{\n"
+        + "    let a = new Box();\n"
+        + "    let x = a;\n"
+        + "    return x.v + a.v;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return readLocal();\n"
+        + "\}\n");
+    let before = try support.functionBySymbol(program, "readLocal");
+    let after = borrows.run(before);
+    try testing.assertEqual(dump.dumpFunction(after), dump.dumpFunction(before));
+}
+
+test "a reassigned parameter is no borrow source" {
+    let program = try support.lowerWholeProgram(
+        "class Box \{\n"
+        + "    protected int v;\n"
+        + "    protected constructor(this.v = 0);\n"
+        + "\}\n"
+        + "readSwapped(Box b) -> int \{\n"
+        + "    b = new Box();\n"
+        + "    let x = b;\n"
+        + "    return x.v + b.v;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return readSwapped(new Box());\n"
+        + "\}\n");
+    let before = try support.functionBySymbol(program, "readSwapped");
+    let after = borrows.run(before);
+    try testing.assertEqual(dump.dumpFunction(after), dump.dumpFunction(before));
+}
+
+test "the last read of an owning slot becomes a take" {
+    let program = try support.lowerWholeProgram(
+        "class Box \{\n"
+        + "    protected int v;\n"
+        + "    protected constructor(this.v = 0);\n"
+        + "\}\n"
+        + "moveOut() -> int \{\n"
+        + "    Box? x = null;\n"
+        + "    \{\n"
+        + "        let z = new Box();\n"
+        + "        x = z;\n"
+        + "    \}\n"
+        + "    if (x == null) \{\n"
+        + "        return 1;\n"
+        + "    \}\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return moveOut();\n"
+        + "\}\n");
+    let before = try support.functionBySymbol(program, "moveOut");
+    let after = borrows.run(before);
+    try support.assertOptimized(after, "moveOut");
+    string beforeDump = dump.dumpFunction(before);
+    try testing.assertTrue(beforeDump.indexOf("take") < 0,
+        "the naive lowering copies with a retain");
+    try testing.assertEqual(dump.dumpFunction(after),
+        "func internal @moveOut() -> int \{\n"
+        + "  $0 x: Box? zeroed\n"
+        + "  $1 z: Box zeroed\n"
+        + "b0.entry:\n"
+        + "  %0 = const null: null\n"
+        + "  %1 = reinterpret %0: Box?\n"
+        + "  retain %1\n"
+        + "  store $0, %1\n"
+        + "  %2 = class.new @_dtor$main$Box: Box\n"
+        + "  %3 = const 0: int\n"
+        + "  call @main$Box$constructor(this %2, %3)\n"
+        + "  store $1, %2\n"
+        + "  %4 = take $1: Box\n"
+        + "  %5 = reinterpret %4: Box?\n"
+        + "  %6 = slot_addr $0: &Box?  ; x\n"
+        + "  release_ptr %6\n"
+        + "  store $0, %5\n"
+        + "  %7 = slot_addr $1: &Box  ; z\n"
+        + "  release_ptr %7\n"
+        + "  %8 = load $0: Box?\n"
+        + "  %9 = const null: null\n"
+        + "  %10 = reinterpret %9: Box?\n"
+        + "  %11 = cmp.eq %8, %10: bool\n"
+        + "  br %11, b1.if.then, b2.if.end\n"
+        + "b1.if.then:\n"
+        + "  %12 = const 1: int\n"
+        + "  %13 = slot_addr $0: &Box?  ; x\n"
+        + "  release_ptr %13\n"
+        + "  ret %12\n"
+        + "b2.if.end:\n"
+        + "  %14 = const 0: int\n"
+        + "  %15 = slot_addr $0: &Box?  ; x\n"
+        + "  release_ptr %15\n"
+        + "  ret %14\n"
+        + "\}\n");
+}
+
+test "a slot read again after the copy is not moved" {
+    let program = try support.lowerWholeProgram(
+        "class Box \{\n"
+        + "    protected int v;\n"
+        + "    protected constructor(this.v = 0);\n"
+        + "\}\n"
+        + "keepUsing() -> int \{\n"
+        + "    let z = new Box();\n"
+        + "    Box? y = z;\n"
+        + "    if (y == null) \{\n"
+        + "        return z.v;\n"
+        + "    \}\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return keepUsing();\n"
+        + "\}\n");
+    let before = try support.functionBySymbol(program, "keepUsing");
+    let after = borrows.run(before);
+    try testing.assertEqual(dump.dumpFunction(after), dump.dumpFunction(before));
+}
+
+test "a copy inside a loop is not moved" {
+    let program = try support.lowerWholeProgram(
+        "class Box \{\n"
+        + "    protected int v;\n"
+        + "    protected constructor(this.v = 0);\n"
+        + "\}\n"
+        + "loopCopy(int n) -> int \{\n"
+        + "    Box? last = null;\n"
+        + "    for (int i = 0; i < n; i++) \{\n"
+        + "        let z = new Box();\n"
+        + "        last = z;\n"
+        + "    \}\n"
+        + "    if (last == null) \{\n"
+        + "        return 1;\n"
+        + "    \}\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return loopCopy(3);\n"
+        + "\}\n");
+    let before = try support.functionBySymbol(program, "loopCopy");
+    let after = borrows.run(before);
+    try testing.assertEqual(dump.dumpFunction(after), dump.dumpFunction(before));
+}
+
+test "moving a slot that holds a weak upgrade transfers it without tripping the guard" {
+    let program = try support.lowerWholeProgram(
+        "class Node \{\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "class Watcher \{\n"
+        + "    protected weak Node? seen;\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "observe(Watcher w) -> bool \{\n"
+        + "    let n = w.seen;\n"
+        + "    let m = n;\n"
+        + "    return m != null;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let ignored = observe(new Watcher());\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let optimized = try support.optimizedDump(program, "observe");
+    try testing.assertTrue(optimized.indexOf("weak.load") >= 0,
+        "the upgrade itself stays");
+    try testing.assertTrue(optimized.indexOf("take") >= 0,
+        "the copy takes the upgraded reference: {optimized}");
+}
