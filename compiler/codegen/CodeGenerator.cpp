@@ -2643,6 +2643,10 @@ struct CodeGenerator::Impl {
         return unwrapIfNarrowedValueOptional(v, sym->type, e.node);
     }
 
+    // A class receiver is the reference itself, so `this` is that pointer. A struct receiver
+    // arrives as the address of the caller's storage, so `this` as a value is the aggregate
+    // that address holds; the address paths (`this.field`, a method on `this`) read the
+    // pointer through `emitStorageLValue` instead.
     llvm::Value* emitThis(const ast::ThisExpression& e) {
         Symbol* sym = symbolOf(e.node);
         if (!sym) {
@@ -2654,7 +2658,12 @@ struct CodeGenerator::Impl {
             error(e.node.startOffset(), "Internal: 'this' has no LLVM value");
             return nullptr;
         }
-        return builder->CreateLoad(llvm::PointerType::get(ctx, 0), it->second, "this");
+        llvm::Value* self = builder->CreateLoad(llvm::PointerType::get(ctx, 0), it->second, "this");
+        ::Type* recvType = subst(sym->type);
+        if (recvType && recvType->isStruct()) {
+            return builder->CreateLoad(mapType(recvType), self, "this.val");
+        }
+        return self;
     }
 
     // `super` evaluates to the same object pointer as `this`; the base-vs-derived distinction
