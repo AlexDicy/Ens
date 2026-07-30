@@ -141,6 +141,15 @@ Type* TypeContext::lookupEnum(const std::u16string& modulePath, const std::u16st
     return it == enumCache.end() ? nullptr : it->second;
 }
 
+std::vector<StructInfo*> TypeContext::registeredClasses() const {
+    std::vector<StructInfo*> classes;
+    classes.reserve(ownedStructs.size());
+    for (const auto& info : ownedStructs) {
+        if (info->declKind == DeclKind::Class && !info->isInterface) classes.push_back(info.get());
+    }
+    return classes;
+}
+
 Type* TypeContext::lookupNamedType(const std::u16string& modulePath, const std::u16string& name) const {
     if (Type* t = lookupStruct(modulePath, name)) return t;
     if (Type* t = lookupClass(modulePath, name)) return t;

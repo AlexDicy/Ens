@@ -57,6 +57,12 @@ public:
     // All class/struct instantiations created so far (for monomorphized codegen).
     const std::vector<Type*>& classInstantiations() const { return instantiationList_; }
 
+    // Every class registered anywhere in the program, interfaces excluded and
+    // instantiations included, in registration order. Codegen asks whole-program
+    // questions of it, such as which classes a value of an interface type can
+    // hold at run time.
+    std::vector<StructInfo*> registeredClasses() const;
+
     // The Type that owns an instantiation's StructInfo.
     Type* typeForInstance(StructInfo* inst) const {
         auto it = instanceTypes_.find(inst);

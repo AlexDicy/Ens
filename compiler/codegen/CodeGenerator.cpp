@@ -150,6 +150,7 @@ struct CodeGenerator::Impl {
     std::unordered_map<::Type*, llvm::DIType*> diStructTypeCache;
     std::unordered_map<::Type*, llvm::DIType*> diClassPointerCache;
     std::unordered_map<StructInfo*, llvm::GlobalVariable*> descriptorCache;
+    std::unordered_map<StructInfo*, std::vector<StructInfo*>> runtimeTypeCache;
     std::unordered_map<std::string, llvm::Constant*> stringLiteralCache;
     llvm::StructType* typeDescriptorTy = nullptr;
     llvm::StructType* interfaceEntryTy = nullptr;
@@ -3064,20 +3065,103 @@ struct CodeGenerator::Impl {
         return sym && sym->name == u"hash" && isHashableOwner(sym->methodOwner);
     }
 
+    // True when a method declared on `owner` has exactly the signature of the
+    // behavior the language itself calls under that name, so the declaration
+    // replaces the built-in one instead of being an ordinary overload. A
+    // `throws` declaration never qualifies: the language calls these where there
+    // is no room for a `try`.
+    static bool declaresLanguageBehavior(const StructInfo* owner, const MethodInfo& mi) {
+        Symbol* sym = mi.symbol;
+        if (!sym || mi.isConstructor || mi.isDestructor || sym->abiThrows) return false;
+        if (mi.name == u"hash") {
+            return sym->paramTypes.empty() && sym->returnType &&
+                   sym->returnType->kind == TypeKind::Long;
+        }
+        if (mi.name == u"equals") {
+            if (sym->paramTypes.size() != 1 || !sym->returnType ||
+                sym->returnType->kind != TypeKind::Bool) return false;
+            ::Type* p = sym->paramTypes[0];
+            return p && p->isClass() && p->structInfo == owner;
+        }
+        if (mi.name == u"toString") {
+            return sym->paramTypes.empty() && sym->returnType &&
+                   sym->returnType->kind == TypeKind::String;
+        }
+        return false;
+    }
+
+    // The declaration a class carries for one of those behaviors: the nearest
+    // one down its chain, an abstract one included so the caller can dispatch it
+    // through the vtable. Null when no class in the chain declares one, and for
+    // an interface, whose methods only ever describe what implementers carry.
+    const MethodInfo* declaredClassBehavior(StructInfo* si, const std::u16string& name) {
+        for (StructInfo* s = si; s && !s->isInterface; s = s->baseInfo) {
+            for (const auto& mi : s->methods) {
+                if (mi.name == name && declaresLanguageBehavior(s, mi)) return &mi;
+            }
+        }
+        return nullptr;
+    }
+
+    // The classes a value of this static type can hold at run time: the class
+    // itself and everything extending it. Subclass edges are fixed once analysis
+    // finishes, so the answer is memoized; an instantiation defers to its
+    // template, which over-approximates its instances and never misses one.
+    const std::vector<StructInfo*>& runtimeTypesOf(StructInfo* si) {
+        auto cached = runtimeTypeCache.find(si);
+        if (cached != runtimeTypeCache.end()) return cached->second;
+        std::vector<StructInfo*> found;
+        std::vector<StructInfo*> pending{ si };
+        std::unordered_set<StructInfo*> seen;
+        while (!pending.empty()) {
+            StructInfo* cur = pending.back();
+            pending.pop_back();
+            if (!cur || !seen.insert(cur).second) continue;
+            found.push_back(cur);
+            StructInfo* authority = cur->templateOf ? cur->templateOf : cur;
+            for (StructInfo* sub : authority->directSubclasses) pending.push_back(sub);
+        }
+        return runtimeTypeCache.emplace(si, std::move(found)).first->second;
+    }
+
+    // Whether any runtime type a value of this static type can hold declares
+    // `name` for itself. False means the built-in behavior answers for every
+    // such value, so the emitted code never has to consult a descriptor.
+    bool subtreeDeclaresBehavior(StructInfo* si, const std::u16string& name) {
+        if (!si) return false;
+        if (si->isInterface) {
+            if (!typeCtx) return false;
+            for (StructInfo* c : typeCtx->registeredClasses()) {
+                if (c->isSubclassOrConforms(si) && declaredClassBehavior(c, name)) return true;
+            }
+            return false;
+        }
+        for (StructInfo* sub : runtimeTypesOf(si)) {
+            if (declaredClassBehavior(sub, name)) return true;
+        }
+        return false;
+    }
+
+    // True when `si` is the only runtime type a value of that static type can
+    // hold, so two such values always carry the same descriptor and a declared
+    // implementation can be reached without loading one.
+    bool isOnlyRuntimeType(StructInfo* si) {
+        return si && !si->isInterface && runtimeTypesOf(si).size() == 1;
+    }
+
     // The receiver type's own conforming `hash() -> long`, or null when the
     // compiler should synthesize the hash inline.
     Symbol* declaredConformingHash(::Type* t) {
         if (!t) return nullptr;
         t = subst(t);
         if (!t->hasRecordLayout() || !t->structInfo) return nullptr;
-        StructInfo* decl = nullptr;
         if (t->isClass()) {
-            decl = t->structInfo->classDeclaringMethod(u"hash");
-        } else if (t->structInfo->findMethodIndex(u"hash") >= 0) {
-            decl = t->structInfo;
+            const MethodInfo* mi = declaredClassBehavior(t->structInfo, u"hash");
+            return mi ? mi->symbol : nullptr;
         }
-        if (!decl || isHashableOwner(decl)) return nullptr;
-        Symbol* sym = decl->methods[decl->findMethodIndex(u"hash")].symbol;
+        int i = t->structInfo->findMethodIndex(u"hash");
+        if (i < 0) return nullptr;
+        Symbol* sym = t->structInfo->methods[static_cast<size_t>(i)].symbol;
         if (!sym || !sym->paramTypes.empty() || !sym->returnType ||
             sym->returnType->kind != TypeKind::Long) return nullptr;
         return sym;
@@ -3091,17 +3175,22 @@ struct CodeGenerator::Impl {
         if (!t) return nullptr;
         t = subst(t);
         if (!t->isClass() || !t->structInfo) return nullptr;
-        for (StructInfo* s = t->structInfo; s; s = s->baseInfo) {
-            for (auto& m : s->methods) {
-                Symbol* sym = m.symbol;
-                if (!sym || m.name != u"equals" || sym->paramTypes.size() != 1 ||
-                    !sym->returnType || sym->returnType->kind != TypeKind::Bool ||
-                    sym->abiThrows) continue;
-                ::Type* p = sym->paramTypes[0];
-                if (p && p->isClass() && p->structInfo == sym->methodOwner) return sym;
-            }
-        }
-        return nullptr;
+        const MethodInfo* mi = declaredClassBehavior(t->structInfo, u"equals");
+        return mi ? mi->symbol : nullptr;
+    }
+
+    // How '==' compares two references of one static type.
+    enum class ReferenceEquality {
+        Identity,  // no runtime type it can hold declares `equals`
+        Declared,  // one possible runtime type, so its declaration answers directly
+        Dynamic,   // the runtime types decide, and they must match to be equal
+    };
+
+    ReferenceEquality referenceEqualityOf(::Type* t) {
+        if (!t || !t->isClass() || !t->structInfo) return ReferenceEquality::Identity;
+        if (!subtreeDeclaresBehavior(t->structInfo, u"equals")) return ReferenceEquality::Identity;
+        return isOnlyRuntimeType(t->structInfo) ? ReferenceEquality::Declared
+                                               : ReferenceEquality::Dynamic;
     }
 
     // A struct type's own conforming `equals(S other) -> bool`, or null when the
@@ -3143,6 +3232,13 @@ struct CodeGenerator::Impl {
             args.push_back(other);
         }
         return builder->CreateCall(fn, args, "struct.eq.call");
+    }
+
+    // '==' over two references whose runtime types decide the comparison. The
+    // helper carries the whole rule, so nothing about the operands' static type
+    // is baked in here. The caller negates the result for '!='.
+    llvm::Value* emitDynamicEquality(llvm::Value* recv, llvm::Value* other) {
+        return builder->CreateCall(getOrDefineEnsDynamicEquals(), { recv, other }, "eq.dynamic");
     }
 
     // '==' over two class references whose class declares `equals`: an identity
@@ -4907,14 +5003,26 @@ struct CodeGenerator::Impl {
     }
 
     // TypeDescriptor { const char* name; TypeDescriptor* parent; uint32_t id;
-    //                  void** vtable; InterfaceEntry* itables; }
+    //                  void** vtable; InterfaceEntry* itables;
+    //                  long (*hash)(void*); bool (*equals)(void*, void*);
+    //                  String* (*toString)(void*); }
+    // The three trailing slots hold the implementation the type declared for a
+    // method the language itself calls, so the choice between it and the
+    // built-in behavior follows the runtime type. A null slot means the type
+    // declared none and the built-in behavior stands in.
     llvm::StructType* getTypeDescriptorTy() {
         if (typeDescriptorTy) return typeDescriptorTy;
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         auto* i32 = llvm::Type::getInt32Ty(ctx);
-        typeDescriptorTy = llvm::StructType::create(ctx, { ptrTy, ptrTy, i32, ptrTy, ptrTy }, "TypeDescriptor");
+        typeDescriptorTy = llvm::StructType::create(ctx,
+            { ptrTy, ptrTy, i32, ptrTy, ptrTy, ptrTy, ptrTy, ptrTy }, "TypeDescriptor");
         return typeDescriptorTy;
     }
+
+    // Field indices of the descriptor's language-called method slots.
+    static constexpr unsigned kDescHashSlot = 5;
+    static constexpr unsigned kDescEqualsSlot = 6;
+    static constexpr unsigned kDescToStringSlot = 7;
 
     // One conformance record: the implemented interface's descriptor plus the
     // class's method table for it. A class's `itables` array ends with a null
@@ -4985,8 +5093,24 @@ struct CodeGenerator::Impl {
         if (!vtable) vtable = llvm::ConstantPointerNull::get(ptrTy);
         llvm::Constant* itables = emitConformanceTable(si, symName);
         gv->setInitializer(llvm::ConstantStruct::get(descTy,
-            { nameStr, parent, llvm::ConstantInt::get(i32, si->typeId), vtable, itables }));
+            { nameStr, parent, llvm::ConstantInt::get(i32, si->typeId), vtable, itables,
+              behaviorSlot(si, u"hash"), behaviorSlot(si, u"equals"),
+              behaviorSlot(si, u"toString") }));
         return gv;
+    }
+
+    // The address of the implementation the type carries for a behavior the
+    // language calls, or null when it carries none, which the runtime reads as
+    // "use the built-in behavior". An abstract declaration leaves the slot null:
+    // an abstract class is never the runtime type of a value.
+    llvm::Constant* behaviorSlot(StructInfo* si, const std::u16string& name) {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* none = llvm::ConstantPointerNull::get(ptrTy);
+        if (si->isInterface) return none;
+        const MethodInfo* mi = declaredClassBehavior(si, name);
+        if (!mi || mi->isAbstract || !mi->symbol) return none;
+        llvm::Function* fn = getOrDeclareExternalFunction(mi->symbol, nullptr);
+        return fn ? static_cast<llvm::Constant*>(fn) : none;
     }
 
     // The method table a class exposes for one implemented interface: slot i
@@ -7201,6 +7325,111 @@ struct CodeGenerator::Impl {
         b.CreateRet(llvm::ConstantInt::getTrue(ctx));
         b.SetInsertPoint(no);
         b.CreateRet(llvm::ConstantInt::getFalse(ctx));
+        return fn;
+    }
+
+    // Internal helper: '==' decided by the runtime types of two references.
+    // Identity settles it first and a null on either side is unequal; then the
+    // two descriptors have to name the same type, because a class's `equals`
+    // takes its own class, and that type's declaration answers. A runtime type
+    // that declared none compares by identity, which has already failed.
+    llvm::Function* getOrDefineEnsDynamicEquals() {
+        if (auto* existing = module->getFunction("ens_dynamic_equals")) return existing;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i1 = llvm::Type::getInt1Ty(ctx);
+        auto* i32 = llvm::Type::getInt32Ty(ctx);
+        auto* i64 = llvm::Type::getInt64Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(i1, { ptrTy, ptrTy }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                          "ens_dynamic_equals", module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+
+        llvm::IRBuilder<> b(ctx);
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* present = llvm::BasicBlock::Create(ctx, "present", fn);
+        auto* sameType = llvm::BasicBlock::Create(ctx, "sametype", fn);
+        auto* call = llvm::BasicBlock::Create(ctx, "call", fn);
+        auto* yes = llvm::BasicBlock::Create(ctx, "yes", fn);
+        auto* no = llvm::BasicBlock::Create(ctx, "no", fn);
+        llvm::Value* left = fn->getArg(0);
+        llvm::Value* right = fn->getArg(1);
+        auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy);
+
+        b.SetInsertPoint(entry);
+        b.CreateCondBr(b.CreateICmpEQ(left, right, "same"), yes, present);
+
+        b.SetInsertPoint(present);
+        llvm::Value* anyNull = b.CreateOr(b.CreateICmpEQ(left, nullPtr),
+                                         b.CreateICmpEQ(right, nullPtr), "anynull");
+        b.CreateCondBr(anyNull, no, sameType);
+
+        b.SetInsertPoint(sameType);
+        auto descriptorOf = [&](llvm::Value* object, const char* name) {
+            llvm::Value* slot = b.CreateGEP(llvm::Type::getInt8Ty(ctx), object,
+                llvm::ConstantInt::getSigned(i64, -32));
+            return b.CreateLoad(ptrTy, slot, name);
+        };
+        llvm::Value* leftDesc = descriptorOf(left, "left.desc");
+        llvm::Value* rightDesc = descriptorOf(right, "right.desc");
+        b.CreateCondBr(b.CreateICmpEQ(leftDesc, rightDesc, "sametype"), call, no);
+
+        b.SetInsertPoint(call);
+        llvm::Value* slotAddr = b.CreateGEP(getTypeDescriptorTy(), leftDesc,
+            { llvm::ConstantInt::get(i32, 0), llvm::ConstantInt::get(i32, kDescEqualsSlot) },
+            "equals.addr");
+        llvm::Value* declared = b.CreateLoad(ptrTy, slotAddr, "equals");
+        auto* dispatch = llvm::BasicBlock::Create(ctx, "dispatch", fn);
+        b.CreateCondBr(b.CreateICmpEQ(declared, nullPtr), no, dispatch);
+
+        b.SetInsertPoint(dispatch);
+        b.CreateRet(b.CreateCall(fnTy, declared, { left, right }, "declared.eq"));
+
+        b.SetInsertPoint(yes);
+        b.CreateRet(llvm::ConstantInt::getTrue(ctx));
+        b.SetInsertPoint(no);
+        b.CreateRet(llvm::ConstantInt::getFalse(ctx));
+        return fn;
+    }
+
+    // Internal helper: the hash of a reference decided by its runtime type - the
+    // `hash` that type declared, or the identity hash when it declared none.
+    llvm::Function* getOrDefineEnsDynamicHash() {
+        if (auto* existing = module->getFunction("ens_dynamic_hash")) return existing;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32 = llvm::Type::getInt32Ty(ctx);
+        auto* i64 = llvm::Type::getInt64Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(i64, { ptrTy }, false);
+        auto* declaredTy = llvm::FunctionType::get(i64, { ptrTy }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                          "ens_dynamic_hash", module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+
+        llvm::IRBuilder<> b(ctx);
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* lookup = llvm::BasicBlock::Create(ctx, "lookup", fn);
+        auto* dispatch = llvm::BasicBlock::Create(ctx, "dispatch", fn);
+        auto* identity = llvm::BasicBlock::Create(ctx, "identity", fn);
+        llvm::Value* object = fn->getArg(0);
+        auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy);
+
+        b.SetInsertPoint(entry);
+        b.CreateCondBr(b.CreateICmpEQ(object, nullPtr, "absent"), identity, lookup);
+
+        b.SetInsertPoint(lookup);
+        llvm::Value* descSlot = b.CreateGEP(llvm::Type::getInt8Ty(ctx), object,
+            llvm::ConstantInt::getSigned(i64, -32));
+        llvm::Value* desc = b.CreateLoad(ptrTy, descSlot, "desc");
+        llvm::Value* slotAddr = b.CreateGEP(getTypeDescriptorTy(), desc,
+            { llvm::ConstantInt::get(i32, 0), llvm::ConstantInt::get(i32, kDescHashSlot) },
+            "hash.addr");
+        llvm::Value* declared = b.CreateLoad(ptrTy, slotAddr, "hash");
+        b.CreateCondBr(b.CreateICmpEQ(declared, nullPtr), identity, dispatch);
+
+        b.SetInsertPoint(dispatch);
+        b.CreateRet(b.CreateCall(declaredTy, declared, { object }, "declared.hash"));
+
+        b.SetInsertPoint(identity);
+        b.CreateRet(b.CreatePtrToInt(object, i64, "hash.identity"));
         return fn;
     }
 

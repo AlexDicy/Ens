@@ -1,0 +1,159 @@
+// The three methods the language itself calls on a value - 'hash', 'equals' and 'toString' - and
+// the whole-program facts about who declares them. A type carries its own implementation of each
+// in its type descriptor, so which one runs follows the value's runtime type rather than the type
+// written in the source.
+//
+// A declaration only stands in for the built-in behavior when its signature is exactly the one the
+// language calls. Anything else - another parameter list, another return type, 'throws' - is an
+// ordinary method the language never reaches for.
+//
+// The facts here are what lets lowering ask the runtime type only where it can matter: when no
+// class a static type's values can hold declares one of these, the built-in behavior answers for
+// every such value and the emitted code never loads a descriptor.
+import ClassType from @ens.sema.model.types;
+import Method from @ens.sema.model.types;
+import PrimitiveKind from @ens.sema.model.types;
+import PrimitiveType from @ens.sema.model.types;
+import Type from @ens.sema.model.types;
+import @ens.sema.model.types;
+import ProgramIndex from lower.index;
+import support.primitives;
+import List from @std.collections.list;
+import Set from @std.collections.set;
+
+// True when a method declared on 'owner' has exactly the signature of the behavior the language
+// calls under its name. 'throws' never qualifies: these run where there is no room for a 'try'.
+public declaresBehavior(Type owner, Method method, string name) -> bool {
+    if (method.name() != name || method.isConstructor() || method.isDestructor()) {
+        return false;
+    }
+    let signature = method.signature();
+    if (signature.declaresThrows()) {
+        return false;
+    }
+    let parameters = signature.parameters();
+    if (name == "equals") {
+        return parameters.length == 1 && primitives.isBoolType(signature.returnType())
+            && primitives.classOf(parameters[0].type()) == owner;
+    }
+    if (parameters.length != 0) {
+        return false;
+    }
+    if (name == "hash") {
+        return isLong(signature.returnType());
+    }
+    return primitives.isStringType(signature.returnType());
+}
+
+isLong(Type type) -> bool {
+    return type is PrimitiveType && type.kind() == PrimitiveKind.Long;
+}
+
+// The declaration a class carries for one of those behaviors: the nearest one down its chain, an
+// abstract one included so a caller can still dispatch it through the vtable. Null when no class
+// in the chain declares one, and for an interface, whose methods only describe what its
+// implementers carry.
+public declaredBehavior(Type classType, string name) -> Method? {
+    Type? current = primitives.classOf(classType);
+    while (current != null) {
+        let methods = types.methodsOf(current);
+        if (methods == null) {
+            return null;
+        }
+        for (long i = 0; i < methods.length(); i++) {
+            if (declaresBehavior(current, methods.get(i), name)) {
+                return methods.get(i);
+            }
+        }
+        current = types.baseOf(current);
+    }
+    return null;
+}
+
+// The classes a value of this class type can hold at run time: the class itself and everything
+// that extends it. Subclass links are fixed once the program is analyzed; a generic base records
+// its subclasses on its template, so an instantiation reads its template's list, which
+// over-approximates its own instances and never misses one.
+public runtimeTypesOf(Type classType) -> List<Type> {
+    let found = new List<Type>();
+    let seen = new Set<Type>();
+    let pending = new List<Type>();
+    pending.push(classType);
+    while (pending.length() > 0) {
+        let current = pending.pop();
+        if (!seen.add(current)) {
+            continue;
+        }
+        found.push(current);
+        let authority = types.authorityOf(current);
+        if (authority is ClassType) {
+            for (let subclass in authority.directSubclasses()) {
+                pending.push(subclass);
+            }
+        }
+    }
+    return found;
+}
+
+// True when some runtime type a value of this static type can hold declares 'name' for itself.
+// False means the built-in behavior answers for every such value, so the emitted code can stay
+// the plain pointer comparison or identity hash it was before descriptors carried these slots.
+public subtreeDeclares(ProgramIndex index, Type type, string name) -> bool {
+    let interfaceType = primitives.interfaceOf(type);
+    if (interfaceType != null) {
+        return someImplementerDeclares(index, interfaceType, name);
+    }
+    let classType = primitives.classOf(type);
+    if (classType == null) {
+        return false;
+    }
+    let candidates = runtimeTypesOf(classType);
+    for (long i = 0; i < candidates.length(); i++) {
+        if (declaredBehavior(candidates.get(i), name) != null) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// True when this class is the only runtime type a value of that static type can hold, so two such
+// values always carry the same descriptor and a declared implementation is reachable without
+// loading one. An interface never qualifies: its values are always some other type.
+public isOnlyRuntimeType(Type type) -> bool {
+    if (primitives.interfaceOf(type) != null) {
+        return false;
+    }
+    let classType = primitives.classOf(type);
+    if (classType == null) {
+        return false;
+    }
+    return runtimeTypesOf(classType).length() == 1;
+}
+
+// Every class the program declares, instantiations included, asked whether it conforms. A class
+// template stands in for all of its instances, which conform exactly as it does.
+someImplementerDeclares(ProgramIndex index, Type interfaceType, string name) -> bool {
+    let modules = index.modules();
+    for (long m = 0; m < modules.length(); m++) {
+        let classes = modules.get(m).classes();
+        for (long c = 0; c < classes.length(); c++) {
+            if (conformingDeclarer(classes.get(c), interfaceType, name)) {
+                return true;
+            }
+        }
+        let instantiations = modules.get(m).instantiations();
+        for (long i = 0; i < instantiations.length(); i++) {
+            if (conformingDeclarer(instantiations.get(i), interfaceType, name)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+conformingDeclarer(Type candidate, Type interfaceType, string name) -> bool {
+    if (primitives.classOf(candidate) == null) {
+        return false;
+    }
+    return types.conformsTo(candidate, interfaceType) && declaredBehavior(candidate, name) != null;
+}

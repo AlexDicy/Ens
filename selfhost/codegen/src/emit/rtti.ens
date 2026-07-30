@@ -1,11 +1,12 @@
 // The runtime type-identity helpers: the parent-chain walk behind a class test, the conformance
-// scan behind an interface test, and the method-table lookup interface dispatch reads. Each one
-// is a function the Runtime toolkit defines once per module with internal linkage, like the rest
-// of the runtime.
+// scan behind an interface test, the method-table lookup interface dispatch reads, and the two
+// that read a value's own 'hash' and 'equals' off its runtime type. Each one is a function the
+// Runtime toolkit defines once per module with internal linkage, like the rest of the runtime.
 //
-// They read the descriptor layout the descriptors module emits: the parent link sits in field 1
-// and the conformance table in field 4 of a descriptor, and a conformance table is a sequence of
-// { interface, methods } entries ending in a null interface.
+// They read the descriptor layout the descriptors module emits: the parent link sits in field 1,
+// the conformance table in field 4, and the declared 'hash' and 'equals' in fields 5 and 6 of a
+// descriptor, and a conformance table is a sequence of { interface, methods } entries ending in a
+// null interface.
 import Runtime from emit.runtime;
 import RuntimeFunction from emit.runtime;
 import TypeRef from @ens.llvm.types;
@@ -109,6 +110,93 @@ public itableLookup(Runtime runtime, TypeRef descriptorType, TypeRef entryType)
 
     builder.positionAtEnd(noBlock);
     instructions.buildRet(builder, runtime.nullPointer());
+    return runtime.endDefinition(definition);
+}
+
+// i1 ens_dynamic_equals(ptr left, ptr right): '==' decided by the two values' runtime types.
+// Identity settles it first and a reference that is not there is equal to nothing but itself; then
+// the two descriptors have to name the same type, because a class's 'equals' takes its own class,
+// and that type's declaration answers. A runtime type that declared none compares by identity,
+// which has already failed.
+public dynamicEquals(Runtime runtime, TypeRef descriptorType) -> RuntimeFunction {
+    let type = runtime.int1Type.functionType([runtime.pointerType, runtime.pointerType]);
+    let known = runtime.existing("ens_dynamic_equals", type);
+    if (known != null) {
+        return known;
+    }
+    let definition = runtime.beginDefinition("ens_dynamic_equals", type);
+    let builder = runtime.builder;
+    let left = runtime.parameter(definition, 0);
+    let right = runtime.parameter(definition, 1);
+    let presentBlock = runtime.block(definition, "dyneq.present");
+    let sameTypeBlock = runtime.block(definition, "dyneq.sametype");
+    let lookBlock = runtime.block(definition, "dyneq.look");
+    let callBlock = runtime.block(definition, "dyneq.call");
+    let yesBlock = runtime.block(definition, "dyneq.yes");
+    let noBlock = runtime.block(definition, "dyneq.no");
+    let identical = instructions.buildICmpEQ(builder, left, right, "");
+    instructions.buildCondBr(builder, identical, yesBlock, presentBlock);
+
+    builder.positionAtEnd(presentBlock);
+    let absent = instructions.buildOr(builder, runtime.isNull(left), runtime.isNull(right), "");
+    instructions.buildCondBr(builder, absent, noBlock, sameTypeBlock);
+
+    builder.positionAtEnd(sameTypeBlock);
+    let leftType = memory.buildLoad(builder, runtime.pointerType,
+        runtime.offsetPointer(left, -32, ""), "left.type");
+    let rightType = memory.buildLoad(builder, runtime.pointerType,
+        runtime.offsetPointer(right, -32, ""), "right.type");
+    let sameType = instructions.buildICmpEQ(builder, leftType, rightType, "");
+    instructions.buildCondBr(builder, sameType, lookBlock, noBlock);
+
+    builder.positionAtEnd(lookBlock);
+    let declared = memory.buildLoad(builder, runtime.pointerType,
+        memory.buildStructGEP(builder, descriptorType, leftType, 6, ""), "declared");
+    instructions.buildCondBr(builder, runtime.isNull(declared), noBlock, callBlock);
+
+    builder.positionAtEnd(callBlock);
+    instructions.buildRet(builder,
+        instructions.buildCall(builder, type, declared, [left, right], "equal"));
+
+    builder.positionAtEnd(yesBlock);
+    instructions.buildRet(builder, runtime.int1Type.constInt(1, false));
+
+    builder.positionAtEnd(noBlock);
+    instructions.buildRet(builder, runtime.int1Type.constInt(0, false));
+    return runtime.endDefinition(definition);
+}
+
+// i64 ens_dynamic_hash(ptr object): the hash the value's runtime type declared for itself, or the
+// identity hash when it declared none. A reference that is not there hashes as its own null
+// pointer, which is what the identity hash of an absent reference already was.
+public dynamicHash(Runtime runtime, TypeRef descriptorType) -> RuntimeFunction {
+    let type = runtime.int64Type.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_dynamic_hash", type);
+    if (known != null) {
+        return known;
+    }
+    let definition = runtime.beginDefinition("ens_dynamic_hash", type);
+    let builder = runtime.builder;
+    let object = runtime.parameter(definition, 0);
+    let lookBlock = runtime.block(definition, "dynhash.look");
+    let callBlock = runtime.block(definition, "dynhash.call");
+    let identityBlock = runtime.block(definition, "dynhash.identity");
+    instructions.buildCondBr(builder, runtime.isNull(object), identityBlock, lookBlock);
+
+    builder.positionAtEnd(lookBlock);
+    let descriptor = memory.buildLoad(builder, runtime.pointerType,
+        runtime.offsetPointer(object, -32, ""), "descriptor");
+    let declared = memory.buildLoad(builder, runtime.pointerType,
+        memory.buildStructGEP(builder, descriptorType, descriptor, 5, ""), "declared");
+    instructions.buildCondBr(builder, runtime.isNull(declared), identityBlock, callBlock);
+
+    builder.positionAtEnd(callBlock);
+    instructions.buildRet(builder,
+        instructions.buildCall(builder, type, declared, [object], "hashed"));
+
+    builder.positionAtEnd(identityBlock);
+    instructions.buildRet(builder,
+        instructions.buildPtrToInt(builder, object, runtime.int64Type, "identity"));
     return runtime.endDefinition(definition);
 }
 
