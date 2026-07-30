@@ -5014,6 +5014,129 @@ struct CodeGenerator::Impl {
         return fn;
     }
 
+    // i1 ens_string_starts_with(text, part) / ens_string_ends_with(text, part):
+    // the part fits in the text and its bytes are the text's first (or last)
+    // bytes. An empty part always matches.
+    llvm::Function* getOrDefineEnsStringAffix(bool atEnd) {
+        const char* name = atEnd ? "ens_string_ends_with" : "ens_string_starts_with";
+        if (auto* existing = module->getFunction(name)) return existing;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(llvm::Type::getInt1Ty(ctx), { ptrTy, ptrTy }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, name,
+            module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+
+        auto savedIP = builder->saveIP();
+        auto* entry   = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* bytesBB = llvm::BasicBlock::Create(ctx, "affix.bytes", fn);
+        auto* missBB  = llvm::BasicBlock::Create(ctx, "affix.missing", fn);
+
+        builder->SetInsertPoint(entry);
+        llvm::Value* textLen = emitStringLength(fn->getArg(0));
+        llvm::Value* partLen = emitStringLength(fn->getArg(1));
+        builder->CreateCondBr(builder->CreateICmpSLE(partLen, textLen), bytesBB, missBB);
+
+        builder->SetInsertPoint(bytesBB);
+        llvm::Value* at = emitStringDataPtr(fn->getArg(0));
+        if (atEnd) {
+            at = builder->CreateGEP(i8Ty, at, builder->CreateSub(textLen, partLen), "affix.at");
+        }
+        llvm::Value* diff = builder->CreateCall(getOrDeclareMemcmp(),
+            { at, emitStringDataPtr(fn->getArg(1)), partLen }, "affix.memcmp");
+        builder->CreateRet(builder->CreateICmpEQ(diff, llvm::ConstantInt::get(i32Ty, 0)));
+
+        builder->SetInsertPoint(missBB);
+        builder->CreateRet(llvm::ConstantInt::getFalse(ctx));
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    // ptr ens_string_trim(text, i1 trailing): a fresh string without the
+    // leading whitespace, and without the trailing whitespace when trailing is
+    // set. Whitespace is a space or one of the ASCII layout controls, tab
+    // through carriage return.
+    llvm::Function* getOrDefineEnsStringTrim() {
+        if (auto* existing = module->getFunction("ens_string_trim")) return existing;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+        auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(ptrTy, { ptrTy, i1Ty }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+            "ens_string_trim", module.get());
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+
+        auto savedIP = builder->saveIP();
+        auto* entry     = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* leadTest  = llvm::BasicBlock::Create(ctx, "trim.lead.test", fn);
+        auto* leadStep  = llvm::BasicBlock::Create(ctx, "trim.lead.step", fn);
+        auto* trailTest = llvm::BasicBlock::Create(ctx, "trim.trail.test", fn);
+        auto* trailStep = llvm::BasicBlock::Create(ctx, "trim.trail.step", fn);
+        auto* doneBB    = llvm::BasicBlock::Create(ctx, "trim.done", fn);
+
+        builder->SetInsertPoint(entry);
+        llvm::Value* data = emitStringDataPtr(fn->getArg(0));
+        llvm::Value* beginSlot = builder->CreateAlloca(i64Ty, nullptr, "begin");
+        llvm::Value* endSlot = builder->CreateAlloca(i64Ty, nullptr, "end");
+        builder->CreateStore(llvm::ConstantInt::get(i64Ty, 0), beginSlot);
+        builder->CreateStore(emitStringLength(fn->getArg(0)), endSlot);
+        // The byte read is always inside the payload: the allocation reserves
+        // the terminating NUL, and an exhausted range reads the position the
+        // cursor stopped at rather than one before it.
+        auto whitespaceAt = [&](llvm::Value* index) {
+            llvm::Value* byte = builder->CreateLoad(i8Ty,
+                builder->CreateGEP(i8Ty, data, index, "trim.at"), "trim.byte");
+            llvm::Value* space = builder->CreateICmpEQ(byte,
+                llvm::ConstantInt::get(i8Ty, 0x20));
+            llvm::Value* control = builder->CreateAnd(
+                builder->CreateICmpUGE(byte, llvm::ConstantInt::get(i8Ty, 0x09)),
+                builder->CreateICmpULE(byte, llvm::ConstantInt::get(i8Ty, 0x0D)));
+            return builder->CreateOr(space, control, "trim.space");
+        };
+        builder->CreateBr(leadTest);
+
+        builder->SetInsertPoint(leadTest);
+        llvm::Value* begin = builder->CreateLoad(i64Ty, beginSlot, "begin.load");
+        llvm::Value* leadEnd = builder->CreateLoad(i64Ty, endSlot, "end.load");
+        builder->CreateCondBr(builder->CreateAnd(builder->CreateICmpSLT(begin, leadEnd),
+            whitespaceAt(begin)), leadStep, trailTest);
+
+        builder->SetInsertPoint(leadStep);
+        builder->CreateStore(builder->CreateAdd(begin, llvm::ConstantInt::get(i64Ty, 1)),
+            beginSlot);
+        builder->CreateBr(leadTest);
+
+        builder->SetInsertPoint(trailTest);
+        llvm::Value* trailBegin = builder->CreateLoad(i64Ty, beginSlot, "begin.load");
+        llvm::Value* trailEnd = builder->CreateLoad(i64Ty, endSlot, "end.load");
+        llvm::Value* notEmpty = builder->CreateICmpSGT(trailEnd, trailBegin, "trim.notempty");
+        llvm::Value* last = builder->CreateSelect(notEmpty,
+            builder->CreateSub(trailEnd, llvm::ConstantInt::get(i64Ty, 1)), trailBegin,
+            "trim.last");
+        builder->CreateCondBr(builder->CreateAnd(fn->getArg(1),
+            builder->CreateAnd(notEmpty, whitespaceAt(last))), trailStep, doneBB);
+
+        builder->SetInsertPoint(trailStep);
+        builder->CreateStore(builder->CreateSub(trailEnd, llvm::ConstantInt::get(i64Ty, 1)),
+            endSlot);
+        builder->CreateBr(trailTest);
+
+        builder->SetInsertPoint(doneBB);
+        llvm::Value* from = builder->CreateLoad(i64Ty, beginSlot, "begin.load");
+        llvm::Value* count = builder->CreateSub(
+            builder->CreateLoad(i64Ty, endSlot, "end.load"), from, "trim.len");
+        llvm::Value* result = emitStringAlloc(count);
+        builder->CreateMemCpy(emitStringDataPtr(result), llvm::MaybeAlign(1),
+            builder->CreateGEP(i8Ty, data, from, "trim.from"), llvm::MaybeAlign(1), count);
+        builder->CreateRet(result);
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
     // i64 ens_string_index_of(haystack, needle): byte offset of the first
     // occurrence of needle in haystack, -1 when absent. An empty needle
     // matches at offset 0.
@@ -5691,6 +5814,32 @@ struct CodeGenerator::Impl {
         releaseIfOwnedTemp(left, obj);
         releaseIfOwnedTemp(right, otherArg);
         return order;
+    }
+
+    // string.startsWith(prefix) and string.endsWith(suffix) -> bool.
+    llvm::Value* emitStringAffix(const ast::Expression& obj, const ast::Expression& partArg,
+                                 bool atEnd) {
+        llvm::Value* text = emitExpr(obj);
+        if (!text) return nullptr;
+        llvm::Value* part = emitExpr(partArg);
+        if (!part) return nullptr;
+        llvm::Value* found = builder->CreateCall(getOrDefineEnsStringAffix(atEnd),
+            { text, part }, atEnd ? "str.endswith" : "str.startswith");
+        releaseIfOwnedTemp(text, obj);
+        releaseIfOwnedTemp(part, partArg);
+        return found;
+    }
+
+    // string.trim() and string.trimStart() -> string: a fresh copy without the
+    // whitespace at the edges the member names.
+    llvm::Value* emitStringTrim(const ast::Expression& obj, bool trailing) {
+        llvm::Value* text = emitExpr(obj);
+        if (!text) return nullptr;
+        llvm::Value* trimmed = builder->CreateCall(getOrDefineEnsStringTrim(),
+            { text, trailing ? llvm::ConstantInt::getTrue(ctx) : llvm::ConstantInt::getFalse(ctx) },
+            "str.trim");
+        releaseIfOwnedTemp(text, obj);
+        return trimmed;
     }
 
     // string.fromBytes(byte[]): a fresh string copy of the bytes plus a NUL.
@@ -7195,6 +7344,17 @@ struct CodeGenerator::Impl {
                 if (memberName && *memberName == u"compareTo" && !methodSymbolOf(member.node) &&
                     recvT && recvT->isString() && e.arguments().size() == 1) {
                     return emitStringCompare(*obj, e.arguments()[0]);
+                }
+                if (memberName && (*memberName == u"startsWith" || *memberName == u"endsWith") &&
+                    !methodSymbolOf(member.node) && recvT && recvT->isString() &&
+                    e.arguments().size() == 1) {
+                    return emitStringAffix(*obj, e.arguments()[0],
+                        *memberName == u"endsWith");
+                }
+                if (memberName && (*memberName == u"trim" || *memberName == u"trimStart") &&
+                    !methodSymbolOf(member.node) && recvT && recvT->isString() &&
+                    e.arguments().empty()) {
+                    return emitStringTrim(*obj, *memberName == u"trim");
                 }
                 if (memberName && *memberName == u"substring" && !methodSymbolOf(member.node) &&
                     recvT && recvT->isString() && e.arguments().size() == 2) {

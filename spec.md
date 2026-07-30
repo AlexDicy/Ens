@@ -1101,6 +1101,9 @@ The accepted escapes are `\n`, `\r`, `\t`, `\b`, `\f`, `\0`, `\\`, `\"`, `\'`, `
 - `s.toBytes()` returns the UTF-8 bytes as a `byte[]`, and `string.fromBytes(bytes)` builds a string from a `byte[]` by interpreting it as UTF-8.
 - `s.contains(needle)` reports whether `needle` occurs in `s`.
   `s.indexOf(needle)` returns the byte offset of the first occurrence as a `long`, or `-1` when absent; an empty needle is found at offset `0`.
+- `s.startsWith(prefix)` and `s.endsWith(suffix)` report whether the first or last bytes of `s` are exactly that part; an empty part always matches, and a part longer than `s` never does.
+- `s.trim()` returns `s` without the whitespace at either end, and `s.trimStart()` returns it without the whitespace at the start only.
+  Whitespace is a space or one of the ASCII layout controls: tab, line feed, vertical tab, form feed, and carriage return.
 - `s.substring(start, end)` returns the bytes in the half-open range `[start, end)` as a new string.
   Offsets are byte offsets, like `length` and `indexOf`.
   An invalid range (a negative start, a start past the end, or an end past the length) aborts the program.
@@ -1119,6 +1122,8 @@ let back = string.fromBytes(raw);   // string
 let at = greeting.indexOf("llo");   // 2
 let has = greeting.contains("!");   // true
 let word = greeting.substring(0, 5); // "Hello"
+let intro = greeting.startsWith("Hello"); // true
+let clean = "  spaced  ".trim();    // "spaced"
 if (name.compareTo("world") < 0) { /* name sorts first */ }
 ```
 

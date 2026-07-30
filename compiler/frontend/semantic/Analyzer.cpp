@@ -5473,6 +5473,28 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                 }
                 // Records may declare their own compareTo: fall through to resolution.
             }
+            if (memberName && (*memberName == u"startsWith" || *memberName == u"endsWith")) {
+                Type* recvT = analyzeExpr(*objExpr);
+                if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }
+                if (recvT->isString()) {
+                    checkStringArgument(*memberName == u"startsWith" ? "startsWith" : "endsWith");
+                    return typeCtx.getPrimitive(TypeKind::Bool);
+                }
+                // Records may declare their own startsWith/endsWith: fall through to resolution.
+            }
+            if (memberName && (*memberName == u"trim" || *memberName == u"trimStart")) {
+                Type* recvT = analyzeExpr(*objExpr);
+                if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }
+                if (recvT->isString()) {
+                    std::string name = *memberName == u"trim" ? "trim" : "trimStart";
+                    if (!args.empty()) {
+                        errorAtNode(expr.node, "'" + name + "' takes no arguments.");
+                        for (auto& a : args) analyzeExpr(a);
+                    }
+                    return typeCtx.getPrimitive(TypeKind::String);
+                }
+                // Records may declare their own trim/trimStart: fall through to resolution.
+            }
             // Range builtins: string.substring(start, end) -> string and
             // array slice(start, end) -> T[], both half-open ranges.
             auto checkRangeArguments = [&](const std::string& name) {

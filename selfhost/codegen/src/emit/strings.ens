@@ -168,6 +168,128 @@ orderOf(Runtime runtime, Value below, Value above) -> Value {
         "");
 }
 
+// i1 ens_string_starts_with(ptr text, ptr prefix): the prefix fits and its bytes are the first
+// bytes of the text. An empty prefix always matches.
+public startsWithString(Runtime runtime) -> RuntimeFunction {
+    return affixRuntime(runtime, "ens_string_starts_with", false);
+}
+
+// i1 ens_string_ends_with(ptr text, ptr suffix): the suffix fits and its bytes are the last bytes
+// of the text. An empty suffix always matches.
+public endsWithString(Runtime runtime) -> RuntimeFunction {
+    return affixRuntime(runtime, "ens_string_ends_with", true);
+}
+
+// The shared shape of the two edge tests: a part longer than the text never matches, and otherwise
+// the part's bytes are compared at the start or at the last position it fits.
+affixRuntime(Runtime runtime, string name, bool atEnd) -> RuntimeFunction {
+    let type = runtime.int1Type.functionType([runtime.pointerType, runtime.pointerType]);
+    let known = runtime.existing(name, type);
+    if (known != null) {
+        return known;
+    }
+    let compare = runtime.memcmp();
+    let definition = runtime.beginDefinition(name, type);
+    let builder = runtime.builder;
+    let text = runtime.parameter(definition, 0);
+    let part = runtime.parameter(definition, 1);
+    let textLength = runtime.payloadLength(text);
+    let partLength = runtime.payloadLength(part);
+    let bytesBlock = runtime.block(definition, "affix.bytes");
+    let missingBlock = runtime.block(definition, "affix.missing");
+    let fits = instructions.buildICmpSLE(builder, partLength, textLength, "fits");
+    instructions.buildCondBr(builder, fits, bytesBlock, missingBlock);
+
+    builder.positionAtEnd(bytesBlock);
+    Value offset = runtime.int64(0);
+    if (atEnd) {
+        offset = instructions.buildSub(builder, textLength, partLength, "offset");
+    }
+    let difference = runtime.call(compare, [elementAt(runtime, runtime.payloadData(text), offset),
+        runtime.payloadData(part), partLength], "bytes");
+    instructions.buildRet(builder,
+        instructions.buildICmpEQ(builder, difference, runtime.int32(0), ""));
+
+    builder.positionAtEnd(missingBlock);
+    instructions.buildRet(builder, runtime.int1Type.constInt(0, false));
+    return runtime.endDefinition(definition);
+}
+
+// ptr ens_string_trim(ptr text, i1 trailing): an owned copy without the whitespace at the start,
+// and without the whitespace at the end when trailing is set.
+public trimString(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([runtime.pointerType, runtime.int1Type]);
+    let known = runtime.existing("ens_string_trim", type);
+    if (known != null) {
+        return known;
+    }
+    let copy = copySubstring(runtime);
+    let definition = runtime.beginDefinition("ens_string_trim", type);
+    let builder = runtime.builder;
+    let text = runtime.parameter(definition, 0);
+    let trailing = runtime.parameter(definition, 1);
+    let data = runtime.payloadData(text);
+    let beginSlot = memory.buildAlloca(builder, runtime.int64Type, "begin");
+    let endSlot = memory.buildAlloca(builder, runtime.int64Type, "end");
+    memory.buildStore(builder, runtime.int64(0), beginSlot);
+    memory.buildStore(builder, runtime.payloadLength(text), endSlot);
+    let leadTest = runtime.block(definition, "trim.lead.test");
+    let leadStep = runtime.block(definition, "trim.lead.step");
+    let trailTest = runtime.block(definition, "trim.trail.test");
+    let trailStep = runtime.block(definition, "trim.trail.step");
+    let doneBlock = runtime.block(definition, "trim.done");
+    instructions.buildBr(builder, leadTest);
+
+    // The byte read is always inside the payload: the allocation reserves the terminating NUL, and
+    // an exhausted range reads the position the cursor stopped at rather than one before it.
+    builder.positionAtEnd(leadTest);
+    let begin = memory.buildLoad(builder, runtime.int64Type, beginSlot, "begin");
+    let leadEnd = memory.buildLoad(builder, runtime.int64Type, endSlot, "end");
+    let moreLead = instructions.buildAnd(builder,
+        instructions.buildICmpSLT(builder, begin, leadEnd, ""),
+        whitespaceAt(runtime, data, begin), "");
+    instructions.buildCondBr(builder, moreLead, leadStep, trailTest);
+
+    builder.positionAtEnd(leadStep);
+    memory.buildStore(builder, instructions.buildAdd(builder, begin, runtime.int64(1), ""),
+        beginSlot);
+    instructions.buildBr(builder, leadTest);
+
+    builder.positionAtEnd(trailTest);
+    let trailBegin = memory.buildLoad(builder, runtime.int64Type, beginSlot, "begin");
+    let trailEnd = memory.buildLoad(builder, runtime.int64Type, endSlot, "end");
+    let notEmpty = instructions.buildICmpSGT(builder, trailEnd, trailBegin, "");
+    let last = instructions.buildSelect(builder, notEmpty,
+        instructions.buildSub(builder, trailEnd, runtime.int64(1), ""), trailBegin, "last");
+    let moreTrail = instructions.buildAnd(builder, trailing,
+        instructions.buildAnd(builder, notEmpty, whitespaceAt(runtime, data, last), ""), "");
+    instructions.buildCondBr(builder, moreTrail, trailStep, doneBlock);
+
+    builder.positionAtEnd(trailStep);
+    memory.buildStore(builder, instructions.buildSub(builder, trailEnd, runtime.int64(1), ""),
+        endSlot);
+    instructions.buildBr(builder, trailTest);
+
+    builder.positionAtEnd(doneBlock);
+    instructions.buildRet(builder, runtime.call(copy, [text,
+        memory.buildLoad(builder, runtime.int64Type, beginSlot, "begin"),
+        memory.buildLoad(builder, runtime.int64Type, endSlot, "end")], "trimmed"));
+    return runtime.endDefinition(definition);
+}
+
+// True when the byte at the index is a space or one of the ASCII layout controls, tab through
+// carriage return.
+whitespaceAt(Runtime runtime, Value data, Value index) -> Value {
+    let builder = runtime.builder;
+    let value = memory.buildLoad(builder, runtime.int8Type, elementAt(runtime, data, index),
+        "byte");
+    let space = instructions.buildICmpEQ(builder, value, runtime.int8(0x20), "");
+    let control = instructions.buildAnd(builder,
+        instructions.buildICmpUGE(builder, value, runtime.int8(0x09), ""),
+        instructions.buildICmpULE(builder, value, runtime.int8(0x0D), ""), "");
+    return instructions.buildOr(builder, space, control, "");
+}
+
 // i64 ens_hash_string(ptr text): the FNV-1a fold of the string's bytes, matching the reference
 // compiler's synthesized string hash. Null hashes to 0.
 public hashText(Runtime runtime) -> RuntimeFunction {
