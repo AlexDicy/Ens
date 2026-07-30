@@ -1758,8 +1758,8 @@ struct CodeGenerator::Impl {
             builder->CreateAdd(environmentCount, one), "envp");
         emitBlockVector(fn, envp, llvm::ConstantInt::get(i64Ty, 0), fn->getArg(4),
             environmentCount, "envp");
-        llvm::Value* outputFd = emitStreamDescriptor(outSlot, "out.fd");
-        llvm::Value* errorsFd = emitStreamDescriptor(errSlot, "err.fd");
+        llvm::Value* outputFd = emitStreamDescriptor(fn, outSlot, "out.fd");
+        llvm::Value* errorsFd = emitStreamDescriptor(fn, errSlot, "err.fd");
 
         llvm::Value* child = builder->CreateCall(forkProcess, {}, "child");
         builder->CreateCondBr(
@@ -1840,17 +1840,34 @@ struct CodeGenerator::Impl {
     }
 
     // The file descriptor a captured stream writes to, or -1 when the stream is
-    // inherited and the child should leave it alone.
-    llvm::Value* emitStreamDescriptor(llvm::Value* slot, const char* label) {
+    // inherited and the child should leave it alone. An inherited stream has no file
+    // to ask, which is why this branches rather than choosing between two values it
+    // would both have to compute.
+    llvm::Value* emitStreamDescriptor(llvm::Function* fn, llvm::Value* slot,
+                                      const char* label) {
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         auto* i32Ty = llvm::Type::getInt32Ty(ctx);
         llvm::FunctionCallee fileNumber = libcFn("fileno",
             llvm::FunctionType::get(i32Ty, { ptrTy }, false));
+        auto* fileBB = llvm::BasicBlock::Create(ctx, std::string(label) + ".file", fn);
+        auto* inheritBB = llvm::BasicBlock::Create(ctx, std::string(label) + ".inherit", fn);
+        auto* readyBB = llvm::BasicBlock::Create(ctx, std::string(label) + ".ready", fn);
+        llvm::Value* descriptorSlot = builder->CreateAlloca(i32Ty, nullptr, label);
         llvm::Value* file = builder->CreateLoad(ptrTy, slot, "stream");
-        return builder->CreateSelect(
+        builder->CreateCondBr(
             builder->CreateICmpEQ(file, llvm::ConstantPointerNull::get(ptrTy)),
-            llvm::ConstantInt::getSigned(i32Ty, -1),
-            builder->CreateCall(fileNumber, { file }, label), label);
+            inheritBB, fileBB);
+
+        builder->SetInsertPoint(fileBB);
+        builder->CreateStore(builder->CreateCall(fileNumber, { file }, "fd"), descriptorSlot);
+        builder->CreateBr(readyBB);
+
+        builder->SetInsertPoint(inheritBB);
+        builder->CreateStore(llvm::ConstantInt::getSigned(i32Ty, -1), descriptorSlot);
+        builder->CreateBr(readyBB);
+
+        builder->SetInsertPoint(readyBB);
+        return builder->CreateLoad(i32Ty, descriptorSlot, "fd.ready");
     }
 
     void emitRedirect(llvm::Function* fn, llvm::Value* descriptor, int target,
