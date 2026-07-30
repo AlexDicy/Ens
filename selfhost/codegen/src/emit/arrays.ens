@@ -7,6 +7,7 @@ import EirArraySlice from eir.model;
 import Type from @ens.sema.model.types;
 import ArrayType from @ens.sema.model.types;
 import @ens.sema.model.types;
+import TypeRef from @ens.llvm.types;
 import Value from @ens.llvm.values;
 import @ens.llvm.instructions;
 import @ens.llvm.memory;
@@ -14,10 +15,57 @@ import ModuleEmitter from emit.context;
 import EmissionFrame from emit.context;
 import support.primitives;
 
-public emitArrayNew(ModuleEmitter emitter, EmissionFrame frame, EirArrayNew allocation) {
+public emitArrayNew(ModuleEmitter emitter, EmissionFrame frame, EirArrayNew allocation)
+        -> string {
+    if (allocation.onStack()) {
+        return emitStackArray(emitter, frame, allocation);
+    }
     frame.define(allocation.result, allocateArray(emitter, allocation.type,
         frame.value(allocation.size),
         emitter.finalizers.arrayFinalizer(elementTypeOf(allocation.type))));
+    return "";
+}
+
+// The frame shape a stack-pinned array lives in: the 32-byte object header, the length, and the
+// elements, exactly the heap layout, so element access and length work unchanged and the
+// immortal count makes any reference counting that still reaches it a no-op.
+public stackArrayType(ModuleEmitter emitter, EirArrayNew allocation) -> TypeRef {
+    let context = emitter.context;
+    let elements = emitter.mapType(elementTypeOf(allocation.type))
+        .arrayType(allocation.stackLength as ulong);
+    return context.structType([context.pointerType(), context.int64Type(),
+        context.pointerType(), context.pointerType(), context.int64Type(), elements], false);
+}
+
+// Writes the header, the length, and a zeroed element region into the storage reserved at
+// entry; a reservation inside a loop is re-zeroed each time around, so every execution starts
+// from the state a fresh heap allocation would have.
+emitStackArray(ModuleEmitter emitter, EmissionFrame frame, EirArrayNew allocation) -> string {
+    let storage = frame.stackArray(allocation.result);
+    if (storage == null) {
+        return "Internal: no frame storage reserved for the stack array %{allocation.result} "
+            + "in {frame.symbol()}";
+    }
+    let runtime = emitter.runtime;
+    let builder = emitter.builder;
+    let shape = stackArrayType(emitter, allocation);
+    memory.buildStore(builder, runtime.nullPointer(),
+        memory.buildStructGEP(builder, shape, storage, 0, ""));
+    memory.buildStore(builder, runtime.immortalCountValue(),
+        memory.buildStructGEP(builder, shape, storage, 1, ""));
+    memory.buildStore(builder, runtime.nullPointer(),
+        memory.buildStructGEP(builder, shape, storage, 2, ""));
+    memory.buildStore(builder, runtime.nullPointer(),
+        memory.buildStructGEP(builder, shape, storage, 3, ""));
+    let payload = memory.buildStructGEP(builder, shape, storage, 4, "");
+    memory.buildStore(builder, runtime.int64(allocation.stackLength), payload);
+    let elementBytes = emitter.dataLayout().abiSizeOfType(
+        emitter.mapType(elementTypeOf(allocation.type)));
+    let data = memory.buildStructGEP(builder, shape, storage, 5, "");
+    memory.buildMemSet(builder, data, runtime.int8Type.constInt(0, false),
+        runtime.int64(allocation.stackLength * (elementBytes as long)), 8);
+    frame.define(allocation.result, payload);
+    return "";
 }
 
 public emitArrayLength(ModuleEmitter emitter, EmissionFrame frame, EirArrayLength length) {

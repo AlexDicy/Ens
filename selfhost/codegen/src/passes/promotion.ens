@@ -1,0 +1,256 @@
+// Stack promotion: a heap array bound to a local that provably cannot outlive the frame becomes
+// a frame reservation. The allocation keeps a heap array's exact layout behind an immortal
+// header, so element access and length are untouched and any reference counting that still
+// reaches the value is a dynamic no-op; the slot flips to borrowing and its releases go, because
+// frame storage is not given back, it just ends.
+//
+// The proof is the whole-program escape scan rooted at the slot: nothing reachable from it is
+// stored beyond the frame, returned, thrown, or handed to a callee that would keep it. The
+// length must be a compile-time constant small enough to sit on the stack, and the elements must
+// hold no references - releasing element references at every scope exit is a rewrite this pass
+// deliberately does not attempt.
+import EirFunction from eir.model;
+import EirBlock from eir.model;
+import EirInstruction from eir.model;
+import EirSlot from eir.model;
+import EirSlotAddress from eir.model;
+import EirStoreSlot from eir.model;
+import EirTakeSlot from eir.model;
+import EirLoadSlot from eir.model;
+import EirArrayNew from eir.model;
+import EirArrayLength from eir.model;
+import EirArraySlice from eir.model;
+import EirBoundsCheck from eir.model;
+import EirElementAddress from eir.model;
+import EirConstInt from eir.model;
+import EirCast from eir.model;
+import EirCastOp from eir.model;
+import EirReleasePtr from eir.model;
+import Type from @ens.sema.model.types;
+import ProgramFacts from passes.facts;
+import passes.roots;
+import passes.scan;
+import support.primitives;
+import List from @std.collections.list;
+
+// The most frame bytes one promoted array may claim.
+promotionByteLimit() -> long {
+    return 16384;
+}
+
+public run(EirFunction function, ProgramFacts facts) -> EirFunction {
+    let defs = scan.definitionsOf(function);
+    let users = scan.usersOf(function);
+    bool[] terminatorUsed = scan.terminatorUses(function);
+    bool[] flips = new bool[function.slots().length() + 1];
+    let dropped = new List<EirInstruction>();
+    let promoted = new List<EirArrayNew>();
+    let lengths = new List<long>();
+    bool found = false;
+    for (long x = 0; x < function.slots().length(); x++) {
+        let allocation = promotable(function, facts, x, defs, users, terminatorUsed, dropped);
+        if (allocation == null) {
+            continue;
+        }
+        long length = constantLength(defs, allocation.size);
+        flips[x] = true;
+        found = true;
+        promoted.push(allocation);
+        lengths.push(length);
+    }
+    if (!found) {
+        return function;
+    }
+    return apply(function, flips, dropped, promoted, lengths);
+}
+
+// Decides one slot, collecting the release cleanup to drop along the way. The answer is the
+// allocation to pin, or null.
+promotable(EirFunction function, ProgramFacts facts, long x, EirInstruction?[] defs,
+           List<List<EirInstruction>> users, bool[] terminatorUsed,
+           List<EirInstruction> dropped) -> EirArrayNew? {
+    let slot = function.slots().get(x);
+    if (slot.borrows()) {
+        return null;
+    }
+    let arrayType = primitives.arrayOf(slot.type());
+    if (arrayType == null || !plainElement(arrayType.element())) {
+        return null;
+    }
+    EirArrayNew? allocation = null;
+    long stores = 0;
+    let cleanup = new List<EirInstruction>();
+    let blocks = function.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        let instructions = blocks.get(b).instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (instruction is EirTakeSlot && instruction.slot == x) {
+                return null;
+            }
+            if (instruction is EirSlotAddress && instruction.slot == x) {
+                if (terminatorUsed[instruction.result]) {
+                    return null;
+                }
+                let consumers = users.get(instruction.result);
+                for (long u = 0; u < consumers.length(); u++) {
+                    if (!(consumers.get(u) is EirReleasePtr)) {
+                        return null;
+                    }
+                }
+                cleanup.push(instruction);
+                for (long u = 0; u < consumers.length(); u++) {
+                    cleanup.push(consumers.get(u));
+                }
+                continue;
+            }
+            if (!(instruction is EirStoreSlot)) {
+                continue;
+            }
+            if (instruction.slot != x) {
+                continue;
+            }
+            stores++;
+            let definition = defs[instruction.value];
+            if (definition is EirArrayNew && !definition.onStack()) {
+                allocation = definition;
+            } else {
+                return null;
+            }
+        }
+    }
+    if (stores != 1 || allocation == null) {
+        return null;
+    }
+    long length = constantLength(defs, allocation.size);
+    if (length < 0) {
+        return null;
+    }
+    if (!allowedAllocationUses(users, terminatorUsed, allocation, x)) {
+        return null;
+    }
+    if (roots.analyzeSlot(function, facts, x).escapes()) {
+        return null;
+    }
+    for (long i = 0; i < cleanup.length(); i++) {
+        dropped.push(cleanup.get(i));
+    }
+    return allocation;
+}
+
+// Elements a promoted array may hold: fixed-size values that own nothing, whose byte size is
+// known to be at most eight so the length cap bounds the frame bytes.
+plainElement(Type element) -> bool {
+    return !primitives.hasArcContent(element) && primitives.structOf(element) == null
+        && primitives.taggedPayloadOf(element) == null
+        && primitives.referenceOf(element) == null;
+}
+
+// The compile-time length, or -1: a constant within the frame budget at eight bytes an element,
+// reached through the widening casts a size expression takes on its way to the allocation.
+constantLength(EirInstruction?[] defs, long size) -> long {
+    long current = size;
+    long depth = 0;
+    while (depth < 8) {
+        depth++;
+        if (current < 0 || current >= defs.length) {
+            return -1;
+        }
+        let definition = defs[current];
+        if (definition is EirConstInt) {
+            long length = definition.bits;
+            if (length < 0 || length * 8 > promotionByteLimit()) {
+                return -1;
+            }
+            return length;
+        }
+        if (!(definition is EirCast)) {
+            return -1;
+        }
+        if (definition.op != EirCastOp.SignExtend && definition.op != EirCastOp.ZeroExtend
+                && definition.op != EirCastOp.Reinterpret) {
+            return -1;
+        }
+        current = definition.operand;
+    }
+    return -1;
+}
+
+// The allocation temp itself may feed only the binding store and reads of the array.
+allowedAllocationUses(List<List<EirInstruction>> users, bool[] terminatorUsed,
+                      EirArrayNew allocation, long x) -> bool {
+    if (terminatorUsed[allocation.result]) {
+        return false;
+    }
+    let consumers = users.get(allocation.result);
+    for (long u = 0; u < consumers.length(); u++) {
+        let consumer = consumers.get(u);
+        if (consumer is EirStoreSlot && consumer.slot == x) {
+            continue;
+        }
+        if (consumer is EirElementAddress && consumer.array == allocation.result) {
+            continue;
+        }
+        if (consumer is EirBoundsCheck && consumer.array == allocation.result) {
+            continue;
+        }
+        if (consumer is EirArrayLength) {
+            continue;
+        }
+        if (consumer is EirArraySlice && consumer.array == allocation.result) {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+apply(EirFunction function, bool[] flips, List<EirInstruction> dropped,
+      List<EirArrayNew> promoted, List<long> lengths) -> EirFunction {
+    let slots = new List<EirSlot>();
+    for (long i = 0; i < function.slots().length(); i++) {
+        let slot = function.slots().get(i);
+        if (flips[i]) {
+            slots.push(new EirSlot(slot.name(), slot.type(), slot.startsZeroed(), true));
+        } else {
+            slots.push(slot);
+        }
+    }
+    let blocks = new List<EirBlock>();
+    for (long b = 0; b < function.blocks().length(); b++) {
+        let source = function.blocks().get(b);
+        let block = new EirBlock(source.label());
+        let instructions = source.instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            long pinned = pinnedIndex(promoted, instruction);
+            if (pinned >= 0) {
+                let allocation = promoted.get(pinned);
+                block.instructions().push(new EirArrayNew(allocation.result, allocation.type,
+                    allocation.size, lengths.get(pinned)));
+                continue;
+            }
+            if (!scan.contains(dropped, instruction)) {
+                block.instructions().push(instruction);
+            }
+        }
+        let terminator = source.terminator();
+        if (terminator != null) {
+            block.setTerminator(terminator);
+        }
+        blocks.push(block);
+    }
+    return new EirFunction(function.symbol(), function.internalLinkage(),
+        function.receiverType(), function.parameters(), function.returnType(), slots, blocks,
+        function.tempTypes(), function.throwing(), function.traceName(), function.traceFile(),
+        function.traceLine(), function.isEntryPoint());
+}
+
+pinnedIndex(List<EirArrayNew> promoted, EirInstruction instruction) -> long {
+    for (long i = 0; i < promoted.length(); i++) {
+        if (promoted.get(i) == instruction) {
+            return i;
+        }
+    }
+    return -1;
+}

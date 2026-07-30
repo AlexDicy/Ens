@@ -1,0 +1,118 @@
+// Stack promotion: a constant-length primitive array bound to a frame-local slot becomes a
+// stack reservation with its releases gone, and everything the pass cannot prove - an escaping
+// array, reference elements, a runtime length - stays a heap allocation byte for byte.
+import @std.testing;
+import eir.dump;
+import passes.promotion;
+import LoweredProgram from support;
+import support;
+
+test "a local primitive array is pinned to the frame" {
+    let program = try support.lowerWholeProgram(
+        "sum() -> int \{\n"
+        + "    int[] a = new int[5];\n"
+        + "    a[0] = 40;\n"
+        + "    a[1] = 2;\n"
+        + "    return a[0] + a[1];\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return sum() - 42;\n"
+        + "\}\n");
+    let before = try support.functionBySymbol(program, "sum");
+    let after = promotion.run(before, support.passContext(program).facts());
+    try support.assertOptimized(after, "sum");
+    string beforeDump = dump.dumpFunction(before);
+    string afterDump = dump.dumpFunction(after);
+    try testing.assertTrue(beforeDump.indexOf("release_ptr") >= 0,
+        "the naive lowering releases the heap array at scope end");
+    try testing.assertTrue(afterDump.indexOf("stack 5") >= 0,
+        "the allocation is pinned: {afterDump}");
+    try testing.assertTrue(afterDump.indexOf("release_ptr") < 0,
+        "frame storage is not released: {afterDump}");
+    try testing.assertTrue(afterDump.indexOf("a: int[] borrowed") >= 0,
+        "the slot owns nothing anymore: {afterDump}");
+}
+
+test "an array literal is pinned to the frame" {
+    let program = try support.lowerWholeProgram(
+        "sum() -> int \{\n"
+        + "    int[] b = [1, 2, 3, 4];\n"
+        + "    return b[0] + b[3];\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return sum() - 5;\n"
+        + "\}\n");
+    let before = try support.functionBySymbol(program, "sum");
+    let after = promotion.run(before, support.passContext(program).facts());
+    try support.assertOptimized(after, "sum");
+    try testing.assertTrue(dump.dumpFunction(after).indexOf("stack 4") >= 0,
+        "the literal's backing array is pinned");
+}
+
+test "an array that escapes by return stays on the heap" {
+    let program = try support.lowerWholeProgram(
+        "build() -> int[] \{\n"
+        + "    int[] a = new int[3];\n"
+        + "    return a;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return build().length as int - 3;\n"
+        + "\}\n");
+    let before = try support.functionBySymbol(program, "build");
+    let after = promotion.run(before, support.passContext(program).facts());
+    try testing.assertEqual(dump.dumpFunction(after), dump.dumpFunction(before));
+}
+
+test "an array with reference elements stays on the heap" {
+    let program = try support.lowerWholeProgram(
+        "class Box \{\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "count() -> int \{\n"
+        + "    Box?[] xs = new Box?[2];\n"
+        + "    xs[0] = new Box();\n"
+        + "    return xs.length as int;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return count() - 2;\n"
+        + "\}\n");
+    let before = try support.functionBySymbol(program, "count");
+    let after = promotion.run(before, support.passContext(program).facts());
+    try testing.assertEqual(dump.dumpFunction(after), dump.dumpFunction(before));
+}
+
+test "a runtime-sized array stays on the heap" {
+    let program = try support.lowerWholeProgram(
+        "build(int n) -> int \{\n"
+        + "    int[] a = new int[n];\n"
+        + "    return a.length as int;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return build(3) - 3;\n"
+        + "\}\n");
+    let before = try support.functionBySymbol(program, "build");
+    let after = promotion.run(before, support.passContext(program).facts());
+    try testing.assertEqual(dump.dumpFunction(after), dump.dumpFunction(before));
+}
+
+test "an array handed to a callee that keeps it stays on the heap" {
+    let program = try support.lowerWholeProgram(
+        "class Keeper \{\n"
+        + "    protected int[]? held;\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "stash(Keeper k, int[] xs) \{\n"
+        + "    k.held = xs;\n"
+        + "\}\n"
+        + "give(Keeper k) -> int \{\n"
+        + "    int[] a = new int[4];\n"
+        + "    stash(k, a);\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return give(new Keeper());\n"
+        + "\}\n");
+    let before = try support.functionBySymbol(program, "give");
+    let after = promotion.run(before, support.passContext(program).facts());
+    try testing.assertEqual(dump.dumpFunction(after), dump.dumpFunction(before));
+}
