@@ -5060,6 +5060,15 @@ void parameterInfoOf(Symbol* sym, std::vector<std::u16string>& names, std::vecto
 
 }  // namespace
 
+// True for a written argument that names no type of its own: an empty array
+// literal, whose element type has to come from somewhere, and a `{...}` literal,
+// which never names its struct. An overloaded call learns nothing from such an
+// argument and types it once it has chosen the parameter it reaches.
+static bool argumentNeedsTargetType(const ast::Expression& arg) {
+    if (auto al = arg.asArrayLiteral()) return al->elements().empty();
+    return arg.asStructLiteral().has_value();
+}
+
 Analyzer::CallShape Analyzer::analyzeCallShape(const std::vector<ast::Expression>& args) {
     CallShape shape;
     for (auto& a : args) {
@@ -5078,19 +5087,25 @@ Analyzer::CallShape Analyzer::analyzeCallShape(const std::vector<ast::Expression
                     break;
                 }
             }
+            if (argumentNeedsTargetType(*value)) {
+                shape.named.push_back({*argName, *value, a.node, typeCtx.getError(), true});
+                continue;
+            }
             Type* t = analyzeExpr(*value);
             analysis.setType(a.node.greenNode(), t);
             if (t->isError()) shape.hasErrorArg = true;
-            shape.named.push_back({*argName, *value, a.node, t});
+            shape.named.push_back({*argName, *value, a.node, t, false});
         } else {
             if (!shape.named.empty() && !shape.malformed) {
                 errorAtNode(a.node, "Positional arguments must come before named arguments.");
                 shape.malformed = true;
             }
-            Type* t = analyzeExpr(a);
-            if (t->isError()) shape.hasErrorArg = true;
+            bool needsTarget = argumentNeedsTargetType(a);
+            Type* t = needsTarget ? typeCtx.getError() : analyzeExpr(a);
+            if (t->isError() && !needsTarget) shape.hasErrorArg = true;
             shape.positional.push_back(a);
             shape.positionalTypes.push_back(t);
+            shape.positionalNeedsTarget.push_back(needsTarget);
         }
     }
     return shape;
@@ -5272,29 +5287,38 @@ Analyzer::OverloadChoice Analyzer::resolveOverloadedCall(
 Type* Analyzer::checkResolvedCallArguments(const CallShape& shape, const OverloadChoice& choice,
                                            const GreenElement* callNode) {
     Symbol* sym = choice.symbol;
-    auto checkOne = [&](const ast::Expression& valueExpr, Type* argT, int paramIdx,
-                        const std::string& argLabel, const SyntaxNode& diagNode) {
+    auto checkOne = [&](const ast::Expression& valueExpr, Type* argT, bool needsTarget,
+                        int paramIdx, const std::string& argLabel, const SyntaxNode& diagNode) {
         if (paramIdx < 0 || paramIdx >= static_cast<int>(sym->paramTypes.size())) return;
         Type* paramT = sym->paramTypes[paramIdx];
-        if (!paramT || paramT->isError() || !argT || argT->isError()) return;
-        tryAdaptIntegerLiteral(valueExpr, paramT);
-        tryAdaptCharLiteral(valueExpr, paramT);
-        Type* updated = analysis.typeOf(valueExpr.node.greenNode());
-        Type* finalT = updated ? updated : argT;
+        Type* finalT = argT;
+        if (needsTarget) {
+            finalT = analyzeExprAdapt(valueExpr, paramT);
+        } else {
+            if (!paramT || paramT->isError() || !argT || argT->isError()) return;
+            tryAdaptIntegerLiteral(valueExpr, paramT);
+            tryAdaptCharLiteral(valueExpr, paramT);
+            Type* updated = analysis.typeOf(valueExpr.node.greenNode());
+            if (updated) finalT = updated;
+        }
+        if (!paramT || paramT->isError() || !finalT || finalT->isError()) return;
         if (!paramT->assignableFrom(finalT)) {
             errorAtNode(diagNode, "Argument " + argLabel + ": expected '" +
                 paramT->toString() + "', got '" + finalT->toString() + "'");
         }
     };
     for (size_t i = 0; i < shape.positional.size() && i < choice.argParamIndex.size(); ++i) {
-        checkOne(shape.positional[i], shape.positionalTypes[i], choice.argParamIndex[i],
-                 std::to_string(i + 1), shape.positional[i].node);
+        bool needsTarget = i < shape.positionalNeedsTarget.size()
+            && shape.positionalNeedsTarget[i];
+        checkOne(shape.positional[i], shape.positionalTypes[i], needsTarget,
+                 choice.argParamIndex[i], std::to_string(i + 1), shape.positional[i].node);
     }
     for (size_t k = 0; k < shape.named.size(); ++k) {
         size_t i = shape.positional.size() + k;
         if (i >= choice.argParamIndex.size()) break;
-        checkOne(shape.named[k].value, shape.named[k].type, choice.argParamIndex[i],
-                 "'" + asciiOf(shape.named[k].name) + "'", shape.named[k].node);
+        checkOne(shape.named[k].value, shape.named[k].type, shape.named[k].needsTarget,
+                 choice.argParamIndex[i], "'" + asciiOf(shape.named[k].name) + "'",
+                 shape.named[k].node);
     }
     if (!shape.named.empty() && callNode) {
         analysis.setCallArgOrder(callNode, choice.argParamIndex);

@@ -277,10 +277,12 @@ private:
         ast::Expression value;
         SyntaxNode node;        // the NamedArgument node, for diagnostics
         Type* type = nullptr;
+        bool needsTarget = false;  // a literal only its parameter can type
     };
     struct CallShape {
         std::vector<ast::Expression> positional;
         std::vector<Type*> positionalTypes;
+        std::vector<bool> positionalNeedsTarget;
         std::vector<NamedArgInfo> named;
         bool malformed = false;   // bad named-argument usage, already reported
         bool hasErrorArg = false; // an argument failed to type; suppress selection noise
