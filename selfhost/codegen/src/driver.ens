@@ -10,7 +10,8 @@
 //
 // The stages run to completion program-wide before the next one starts, so a program with
 // problems in several modules reports all of them and a program that fails to lower writes no
-// object files at all.
+// object files at all. Each stage works one module at a time and hands back that module's own
+// results and problems; the stage folds them in module order once every module is done.
 import ProgramAnalysis from @ens.sema.pipeline;
 import FileDiagnostic from @ens.sema.support.diagnostics;
 import PrimitiveType from @ens.sema.model.types;
@@ -30,6 +31,7 @@ import layout.descriptors;
 import layout.vtables;
 import ProgramIndex from lower.index;
 import ModuleFunctions from lower.index;
+import FunctionInfo from lower.index;
 import MonoPlan from mono.closure;
 import mono.closure;
 import PassContext from passes.optimize;
@@ -62,14 +64,25 @@ export final class EmitResult {
     }
 }
 
-// One module's lowered functions and its entry wrapper, waiting for the whole program to lower
-// before anything is written.
+// One module's lowered functions, its entry wrapper, and the problems its own stage found,
+// waiting for the whole program to lower before anything is written. Every stage produces one of
+// these per module without reading any other module's, so the modules of a stage are independent
+// work and the stage folds their problems once they are all done.
 final class LoweredModule {
     protected ModuleFunctions definitions;
     protected List<EirFunction> functions;
     protected EntryPoint? entry;
+    protected List<FileDiagnostic> problems;
 
-    protected constructor(this.definitions, this.functions, this.entry);
+    protected constructor(this.definitions, this.functions, this.entry, this.problems);
+}
+
+// The objects one emission run wrote, up to the first module that failed to emit.
+final class EmittedObjects {
+    protected List<string> paths;
+    protected List<FileDiagnostic> problems;
+
+    protected constructor(this.paths, this.problems);
 }
 
 // Compiles the analyzed program into object files under outputFolder, one per module that
@@ -77,7 +90,6 @@ final class LoweredModule {
 // clean; codegen diagnostics after a clean analysis describe unsupported constructs or bugs.
 export emitProgram(ProgramAnalysis analysis, string outputFolder, string filePrefix,
                    bool verifyBetweenPasses = false) -> EmitResult {
-    let problems = new List<FileDiagnostic>();
     let programIndex = index.buildIndex(analysis);
     let plan = closure.close(analysis, programIndex);
     if (plan.problems().length() > 0) {
@@ -86,25 +98,38 @@ export emitProgram(ProgramAnalysis analysis, string outputFolder, string filePre
     closure.apply(plan, programIndex);
     let tables = vtables.assignSlots(programIndex);
     let plans = descriptors.planProgram(programIndex, tables);
-    let lowered = lowerModules(programIndex, tables, analysis, problems);
-    if (problems.length() > 0) {
-        return new EmitResult(new List<string>(), problems.toArray());
+    let lowered = lowerModules(programIndex, tables, analysis);
+    let loweringProblems = gathered(lowered);
+    if (loweringProblems.length() > 0) {
+        return new EmitResult(new List<string>(), loweringProblems.toArray());
     }
-    let optimized = optimizeModules(lowered, plans, verifyBetweenPasses, problems);
-    if (problems.length() > 0) {
-        return new EmitResult(new List<string>(), problems.toArray());
+    let optimized = optimizeModules(lowered, plans, verifyBetweenPasses);
+    let optimizationProblems = gathered(optimized);
+    if (optimizationProblems.length() > 0) {
+        return new EmitResult(new List<string>(), optimizationProblems.toArray());
     }
     let stackFrame = analysis.store().findDeclared("std.core", "StackFrame");
     let errorClass = analysis.store().findDeclared("std.core", "Error");
-    let objects = emitModules(optimized, plans, stackFrame, errorClass, outputFolder,
-        filePrefix, problems);
-    return new EmitResult(objects, problems.toArray());
+    let emitted = emitModules(optimized, plans, stackFrame, errorClass, outputFolder,
+        filePrefix);
+    return new EmitResult(emitted.paths, emitted.problems.toArray());
 }
 
-// Lowers and verifies every module that defines functions, reporting each module's problems
-// whatever the other modules did.
-lowerModules(ProgramIndex programIndex, DispatchTables tables, ProgramAnalysis analysis,
-             List<FileDiagnostic> problems) -> List<LoweredModule> {
+// Every module's problems in module order, which is the order the stages ran in.
+gathered(List<LoweredModule> modules) -> List<FileDiagnostic> {
+    let problems = new List<FileDiagnostic>();
+    for (long m = 0; m < modules.length(); m++) {
+        for (long p = 0; p < modules.get(m).problems.length(); p++) {
+            problems.push(modules.get(m).problems.get(p));
+        }
+    }
+    return problems;
+}
+
+// Lowers and verifies every module that defines functions, each on its own, so a program with
+// problems in several modules reports all of them.
+lowerModules(ProgramIndex programIndex, DispatchTables tables,
+             ProgramAnalysis analysis) -> List<LoweredModule> {
     let lowered = new List<LoweredModule>();
     let modules = programIndex.modules();
     for (long m = 0; m < modules.length(); m++) {
@@ -115,55 +140,73 @@ lowerModules(ProgramIndex programIndex, DispatchTables tables, ProgramAnalysis a
                 && moduleFunctions.instantiations().length() == 0) {
             continue;
         }
-        string filePath = moduleFunctions.context().module().filePath();
-        let functions = new List<EirFunction>();
-        for (long f = 0; f < moduleFunctions.functions().length(); f++) {
-            let info = moduleFunctions.functions().get(f);
-            let outcome = lower.lowerFunction(info, programIndex, tables, analysis.store());
-            for (let diagnostic in outcome.diagnostics()) {
-                problems.push(diagnostic);
-            }
-            let function = outcome.function();
-            if (function == null) {
-                continue;
-            }
-            checkLowered(function, filePath, info.signature().nameSpan(), problems);
-            functions.push(function);
-        }
-        for (long c = 0; c < moduleFunctions.classes().length(); c++) {
-            let classType = moduleFunctions.classes().get(c);
-            let finalizer = destructors.synthesize(classType, programIndex, analysis.store());
-            if (finalizer == null) {
-                continue;
-            }
-            checkLowered(finalizer, filePath, source.makeSpan(0, 0), problems);
-            functions.push(finalizer);
-        }
-        for (long c = 0; c < moduleFunctions.instantiations().length(); c++) {
-            let instantiation = moduleFunctions.instantiations().get(c);
-            if (primitives.classOf(instantiation) == null) {
-                continue;
-            }
-            let finalizer = destructors.synthesize(instantiation, programIndex,
-                analysis.store());
-            if (finalizer == null) {
-                continue;
-            }
-            checkLowered(finalizer, filePath, source.makeSpan(0, 0), problems);
-            functions.push(finalizer);
-        }
-        let entry = entryPointFor(programIndex, moduleFunctions, problems);
-        lowered.push(new LoweredModule(moduleFunctions, functions, entry));
+        lowered.push(lowerModule(moduleFunctions, programIndex, tables, analysis));
     }
     return lowered;
+}
+
+// One module's lowered functions: every function it defines, the destructor of every class and
+// class instantiation it owns, and the entry wrapper when the program's entry lives here.
+lowerModule(ModuleFunctions moduleFunctions, ProgramIndex programIndex, DispatchTables tables,
+            ProgramAnalysis analysis) -> LoweredModule {
+    string filePath = moduleFunctions.context().module().filePath();
+    let functions = new List<EirFunction>();
+    let problems = new List<FileDiagnostic>();
+    for (long f = 0; f < moduleFunctions.functions().length(); f++) {
+        let info = moduleFunctions.functions().get(f);
+        let outcome = lower.lowerFunction(info, programIndex, tables, analysis.store());
+        appendAll(problems, outcome.diagnostics());
+        let function = outcome.function();
+        if (function == null) {
+            continue;
+        }
+        appendAll(problems, checkLowered(function, filePath, info.signature().nameSpan()));
+        functions.push(function);
+    }
+    for (long c = 0; c < moduleFunctions.classes().length(); c++) {
+        let finalizer = destructors.synthesize(moduleFunctions.classes().get(c), programIndex,
+            analysis.store());
+        if (finalizer == null) {
+            continue;
+        }
+        appendAll(problems, checkLowered(finalizer, filePath, source.makeSpan(0, 0)));
+        functions.push(finalizer);
+    }
+    for (long c = 0; c < moduleFunctions.instantiations().length(); c++) {
+        let instantiation = moduleFunctions.instantiations().get(c);
+        if (primitives.classOf(instantiation) == null) {
+            continue;
+        }
+        let finalizer = destructors.synthesize(instantiation, programIndex, analysis.store());
+        if (finalizer == null) {
+            continue;
+        }
+        appendAll(problems, checkLowered(finalizer, filePath, source.makeSpan(0, 0)));
+        functions.push(finalizer);
+    }
+    EntryPoint? entry = null;
+    let candidate = entryFunctionOf(programIndex, moduleFunctions);
+    if (candidate != null) {
+        let signature = candidate.signature();
+        string rejected = unsupportedEntryShape(signature);
+        if (rejected.length > 0) {
+            problems.push(new FileDiagnostic(filePath,
+                "Internal: the program entry 'main' reached code generation although {rejected}; "
+                + "the signature phase must reject such an entry point.", signature.nameSpan()));
+        } else {
+            entry = new EntryPoint(candidate.symbol(), types.isVoidType(signature.returnType()),
+                signature.declaresThrows());
+        }
+    }
+    return new LoweredModule(moduleFunctions, functions, entry, problems);
 }
 
 // Runs every lowered function through the optimization pipeline, with the cross-function facts
 // computed once over the whole program. The optimized functions are re-verified - after every
 // pass when verifyBetweenPasses is on, once at the end otherwise - so a broken pass is caught
 // here, before emission ever sees its output.
-optimizeModules(List<LoweredModule> lowered, DescriptorPlans plans, bool verifyBetweenPasses,
-                List<FileDiagnostic> problems) -> List<LoweredModule> {
+optimizeModules(List<LoweredModule> lowered, DescriptorPlans plans,
+                bool verifyBetweenPasses) -> List<LoweredModule> {
     let everything = new List<EirFunction>();
     for (long m = 0; m < lowered.length(); m++) {
         let functions = lowered.get(m).functions;
@@ -174,30 +217,37 @@ optimizeModules(List<LoweredModule> lowered, DescriptorPlans plans, bool verifyB
     let context = optimize.planProgram(everything, plans);
     let optimized = new List<LoweredModule>();
     for (long m = 0; m < lowered.length(); m++) {
-        let unit = lowered.get(m);
-        string filePath = unit.definitions.context().module().filePath();
-        let functions = new List<EirFunction>();
-        for (long f = 0; f < unit.functions.length(); f++) {
-            let outcome = optimize.runFunction(unit.functions.get(f), context,
-                verifyBetweenPasses);
-            for (let violation in outcome.problems()) {
-                problems.push(new FileDiagnostic(filePath,
-                    "Internal: an optimization pass broke its function: {violation}",
-                    source.makeSpan(0, 0)));
-            }
-            if (!verifyBetweenPasses) {
-                checkOptimized(outcome.function(), filePath, problems);
-            }
-            functions.push(outcome.function());
-        }
-        optimized.push(new LoweredModule(unit.definitions, functions, unit.entry));
+        optimized.push(optimizeModule(lowered.get(m), context, verifyBetweenPasses));
     }
     return optimized;
 }
 
+// One module's functions after the pipeline, with the problems its own passes and verifiers
+// reported.
+optimizeModule(LoweredModule unit, PassContext context,
+               bool verifyBetweenPasses) -> LoweredModule {
+    string filePath = unit.definitions.context().module().filePath();
+    let functions = new List<EirFunction>();
+    let problems = new List<FileDiagnostic>();
+    for (long f = 0; f < unit.functions.length(); f++) {
+        let outcome = optimize.runFunction(unit.functions.get(f), context, verifyBetweenPasses);
+        for (let violation in outcome.problems()) {
+            problems.push(new FileDiagnostic(filePath,
+                "Internal: an optimization pass broke its function: {violation}",
+                source.makeSpan(0, 0)));
+        }
+        if (!verifyBetweenPasses) {
+            appendAll(problems, checkOptimized(outcome.function(), filePath));
+        }
+        functions.push(outcome.function());
+    }
+    return new LoweredModule(unit.definitions, functions, unit.entry, problems);
+}
+
 // Gates one optimized function on the three verifiers, so a pass bug surfaces as a diagnostic
 // here rather than as a miscompile.
-checkOptimized(EirFunction function, string filePath, List<FileDiagnostic> problems) {
+checkOptimized(EirFunction function, string filePath) -> List<FileDiagnostic> {
+    let problems = new List<FileDiagnostic>();
     for (let violation in verify.verifyFunction(function)) {
         problems.push(new FileDiagnostic(filePath,
             "Internal: optimization produced malformed EIR: {violation}", source.makeSpan(0, 0)));
@@ -212,11 +262,13 @@ checkOptimized(EirFunction function, string filePath, List<FileDiagnostic> probl
             "Internal: optimization produced unbalanced storage ownership: {violation}",
             source.makeSpan(0, 0)));
     }
+    return problems;
 }
 
 // Gates one lowered function on the three verifiers: its shape, the ownership its value temps
 // carry, and the ownership the storage it reaches holds.
-checkLowered(EirFunction function, string filePath, Span span, List<FileDiagnostic> problems) {
+checkLowered(EirFunction function, string filePath, Span span) -> List<FileDiagnostic> {
+    let problems = new List<FileDiagnostic>();
     for (let violation in verify.verifyFunction(function)) {
         problems.push(new FileDiagnostic(filePath,
             "Internal: lowering produced malformed EIR: {violation}", span));
@@ -229,14 +281,16 @@ checkLowered(EirFunction function, string filePath, Span span, List<FileDiagnost
         problems.push(new FileDiagnostic(filePath,
             "Internal: lowering produced unbalanced storage ownership: {violation}", span));
     }
+    return problems;
 }
 
 // Writes one object file per module. Only a program that lowered and verified cleanly gets here,
-// so a failed compile leaves no objects behind.
+// so a failed compile leaves no objects behind. Emission stops at the first module that fails,
+// because a module that cannot be emitted means the compiler is broken, not the program.
 emitModules(List<LoweredModule> lowered, DescriptorPlans plans, Type? stackFrame,
-            Type? errorClass, string outputFolder, string filePrefix,
-            List<FileDiagnostic> problems) -> List<string> {
+            Type? errorClass, string outputFolder, string filePrefix) -> EmittedObjects {
     let objects = new List<string>();
+    let problems = new List<FileDiagnostic>();
     for (long m = 0; m < lowered.length(); m++) {
         let unit = lowered.get(m);
         string moduleName = unit.definitions.context().module().canonicalPath();
@@ -251,26 +305,28 @@ emitModules(List<LoweredModule> lowered, DescriptorPlans plans, Type? stackFrame
         }
         objects.push(objectPath);
     }
-    return objects;
+    return new EmittedObjects(objects, problems);
 }
 
-// The C 'main' wrapper belongs to the module that defines the user entry function.
-entryPointFor(ProgramIndex programIndex, ModuleFunctions moduleFunctions,
-              List<FileDiagnostic> problems) -> EntryPoint? {
+appendAll(List<FileDiagnostic> problems, FileDiagnostic[] found) {
+    for (let diagnostic in found) {
+        problems.push(diagnostic);
+    }
+}
+
+appendAll(List<FileDiagnostic> problems, List<FileDiagnostic> found) {
+    for (long i = 0; i < found.length(); i++) {
+        problems.push(found.get(i));
+    }
+}
+
+// The program's entry function when this module defines it.
+entryFunctionOf(ProgramIndex programIndex, ModuleFunctions moduleFunctions) -> FunctionInfo? {
     let entry = programIndex.entryFunction();
     if (entry == null || entry.context() != moduleFunctions.context()) {
         return null;
     }
-    let signature = entry.signature();
-    string rejected = unsupportedEntryShape(signature);
-    if (rejected.length > 0) {
-        problems.push(new FileDiagnostic(entry.context().module().filePath(),
-            "Internal: the program entry 'main' reached code generation although {rejected}; "
-            + "the signature phase must reject such an entry point.", signature.nameSpan()));
-        return null;
-    }
-    return new EntryPoint(entry.symbol(), types.isVoidType(signature.returnType()),
-        signature.declaresThrows());
+    return entry;
 }
 
 // Describes the first way an entry signature departs from the shape the wrapper can call - no
