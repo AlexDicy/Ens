@@ -1,14 +1,13 @@
-// The std.system bridges that look at the file system: what a path names, one directory created,
-// and the names directly inside a folder. Windows answers through the wide entry points, so a name
-// outside the system code page survives; elsewhere the C library's directory streams answer, which
-// also spares this code the layout of a 'struct stat'.
-import Value from @ens.llvm.values;
+// The std.system bridges that ask about one path: what it names, and one directory created at it.
+// Windows answers through the wide entry points, so a path naming anything outside the system code
+// page still reaches the file system; elsewhere the C library answers, and opening the path as a
+// directory is what tells the two kinds apart, which spares this code the layout of a
+// 'struct stat'.
 import TypeRef from @ens.llvm.types;
 import @ens.llvm.instructions;
-import @ens.llvm.memory;
 import Runtime from emit.runtime;
 import RuntimeFunction from emit.runtime;
-import StringCollector from emit.stringlists;
+import emit.directories;
 import emit.widetext;
 
 // i32 ens_path_kind(ptr path): 0 when nothing is there, 1 for a file, 2 for a directory.
@@ -60,8 +59,8 @@ windowsPathKind(Runtime runtime, TypeRef type) -> RuntimeFunction {
 posixPathKind(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let reachable = runtime.libc("access",
         runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type]));
-    let openFolder = openFolderFunction(runtime);
-    let closeFolder = closeFolderFunction(runtime);
+    let openFolder = directories.openFolderFunction(runtime);
+    let closeFolder = directories.closeFolderFunction(runtime);
     let definition = runtime.beginDefinition("ens_path_kind", type);
     let builder = runtime.builder;
     let probeBlock = runtime.block(definition, "kind.probe");
@@ -136,201 +135,4 @@ windowsCreateDirectory(Runtime runtime, TypeRef type) -> RuntimeFunction {
     builder.positionAtEnd(failedBlock);
     instructions.buildRet(builder, runtime.int32(-1));
     return runtime.endDefinition(definition);
-}
-
-// ptr ens_list_directory(ptr folder): the names directly inside the folder as an owned string[],
-// without the two entries naming the folder itself and its parent, or null when the folder could
-// not be read. The finalizer is the string array's, which releases every name.
-public listDirectoryRuntime(Runtime runtime, Value finalizer) -> RuntimeFunction {
-    let type = runtime.pointerType.functionType([runtime.pointerType]);
-    let known = runtime.existing("ens_list_directory", type);
-    if (known != null) {
-        return known;
-    }
-    if (runtime.onWindows()) {
-        return windowsListDirectory(runtime, type, finalizer);
-    }
-    return posixListDirectory(runtime, type, finalizer);
-}
-
-windowsListDirectory(Runtime runtime, TypeRef type, Value finalizer) -> RuntimeFunction {
-    let findFirst = runtime.libc("FindFirstFileW",
-        runtime.pointerType.functionType([runtime.pointerType, runtime.pointerType]));
-    let findNext = runtime.libc("FindNextFileW",
-        runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
-    let findClose = runtime.libc("FindClose",
-        runtime.int32Type.functionType([runtime.pointerType]));
-    let widen = widetext.wideFromUtf8(runtime);
-    let narrow = widetext.utf8FromWide(runtime);
-    let lift = runtime.stringFromCString();
-    let measure = runtime.strlen();
-    let copy = runtime.memcpy();
-    let allocate = runtime.malloc();
-    let release = runtime.free();
-    let definition = runtime.beginDefinition("ens_list_directory", type);
-    let builder = runtime.builder;
-    let patternBlock = runtime.block(definition, "list.pattern");
-    let searchBlock = runtime.block(definition, "list.search");
-    let openedBlock = runtime.block(definition, "list.opened");
-    let bodyBlock = runtime.block(definition, "list.body");
-    let liftBlock = runtime.block(definition, "list.lift");
-    let keptBlock = runtime.block(definition, "list.kept");
-    let nextBlock = runtime.block(definition, "list.next");
-    let doneBlock = runtime.block(definition, "list.done");
-    let unreadableBlock = runtime.block(definition, "list.unreadable");
-
-    // The folder with "/*" after it, the pattern that matches everything directly inside it.
-    let folder = runtime.parameter(definition, 0);
-    let length = runtime.call(measure, [folder], "folder.length");
-    let pattern = runtime.call(allocate, [instructions.buildAdd(builder, length, runtime.int64(3),
-        "")], "pattern");
-    instructions.buildCondBr(builder, runtime.isNull(pattern), unreadableBlock, patternBlock);
-
-    builder.positionAtEnd(patternBlock);
-    runtime.call(copy, [pattern, folder, length], "");
-    let tail = memory.buildGEP(builder, runtime.int8Type, pattern, [length], "pattern.tail");
-    memory.buildStore(builder, runtime.int8('/'), tail);
-    memory.buildStore(builder, runtime.int8('*'),
-        memory.buildGEP(builder, runtime.int8Type, tail, [runtime.int64(1)], ""));
-    memory.buildStore(builder, runtime.int8(0),
-        memory.buildGEP(builder, runtime.int8Type, tail, [runtime.int64(2)], ""));
-    let wide = runtime.call(widen, [pattern, runtime.int32(-1)], "pattern.wide");
-    runtime.call(release, [pattern], "");
-    instructions.buildCondBr(builder, runtime.isNull(wide), unreadableBlock, searchBlock);
-
-    // WIN32_FIND_DATAW is 592 bytes and names the entry at offset 44.
-    builder.positionAtEnd(searchBlock);
-    let found = memory.buildAlloca(builder, runtime.int8Type.arrayType(592 as ulong), "found");
-    let search = runtime.call(findFirst, [wide, found], "search");
-    runtime.call(release, [wide], "");
-    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder,
-        instructions.buildPtrToInt(builder, search, runtime.int64Type, ""), runtime.int64(-1), ""),
-        unreadableBlock, openedBlock);
-
-    builder.positionAtEnd(openedBlock);
-    let collected = new StringCollector(runtime);
-    instructions.buildBr(builder, bodyBlock);
-
-    builder.positionAtEnd(bodyBlock);
-    let name = memory.buildGEP(builder, runtime.int8Type, found, [runtime.int64(44)],
-        "entry.name");
-    instructions.buildCondBr(builder, dotEntry(runtime, name, runtime.int16Type), nextBlock,
-        liftBlock);
-
-    builder.positionAtEnd(liftBlock);
-    let text = runtime.call(narrow, [name], "entry.text");
-    instructions.buildCondBr(builder, runtime.isNull(text), nextBlock, keptBlock);
-
-    builder.positionAtEnd(keptBlock);
-    collected.push(definition, runtime.call(lift, [text], "entry.string"));
-    runtime.call(release, [text], "");
-    instructions.buildBr(builder, nextBlock);
-
-    builder.positionAtEnd(nextBlock);
-    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder,
-        runtime.call(findNext, [search, found], "more"), runtime.int32(0), ""),
-        doneBlock, bodyBlock);
-
-    builder.positionAtEnd(doneBlock);
-    runtime.call(findClose, [search], "");
-    instructions.buildRet(builder, collected.list(finalizer));
-
-    builder.positionAtEnd(unreadableBlock);
-    instructions.buildRet(builder, runtime.nullPointer());
-    return runtime.endDefinition(definition);
-}
-
-posixListDirectory(Runtime runtime, TypeRef type, Value finalizer) -> RuntimeFunction {
-    let openFolder = openFolderFunction(runtime);
-    let readFolder = runtime.libc(entryPointName(runtime, "readdir"),
-        runtime.pointerType.functionType([runtime.pointerType]));
-    let closeFolder = closeFolderFunction(runtime);
-    let lift = runtime.stringFromCString();
-    let definition = runtime.beginDefinition("ens_list_directory", type);
-    let builder = runtime.builder;
-    let openedBlock = runtime.block(definition, "list.opened");
-    let testBlock = runtime.block(definition, "list.test");
-    let bodyBlock = runtime.block(definition, "list.body");
-    let keptBlock = runtime.block(definition, "list.kept");
-    let doneBlock = runtime.block(definition, "list.done");
-    let unreadableBlock = runtime.block(definition, "list.unreadable");
-    let stream = runtime.call(openFolder, [runtime.parameter(definition, 0)], "folder");
-    instructions.buildCondBr(builder, runtime.isNull(stream), unreadableBlock, openedBlock);
-
-    builder.positionAtEnd(openedBlock);
-    let collected = new StringCollector(runtime);
-    instructions.buildBr(builder, testBlock);
-
-    builder.positionAtEnd(testBlock);
-    let entry = runtime.call(readFolder, [stream], "entry");
-    instructions.buildCondBr(builder, runtime.isNull(entry), doneBlock, bodyBlock);
-
-    builder.positionAtEnd(bodyBlock);
-    let name = memory.buildGEP(builder, runtime.int8Type, entry,
-        [runtime.int64(entryNameOffset(runtime))], "entry.name");
-    instructions.buildCondBr(builder, dotEntry(runtime, name, runtime.int8Type), testBlock,
-        keptBlock);
-
-    builder.positionAtEnd(keptBlock);
-    collected.push(definition, runtime.call(lift, [name], "entry.string"));
-    instructions.buildBr(builder, testBlock);
-
-    builder.positionAtEnd(doneBlock);
-    runtime.call(closeFolder, [stream], "");
-    instructions.buildRet(builder, collected.list(finalizer));
-
-    builder.positionAtEnd(unreadableBlock);
-    instructions.buildRet(builder, runtime.nullPointer());
-    return runtime.endDefinition(definition);
-}
-
-// Where a 'struct dirent' holds the entry's name. Every record is padded to an eight-byte multiple,
-// so the three characters read below stay inside the record even for the shortest name.
-entryNameOffset(Runtime runtime) -> long {
-    if (runtime.onDarwin()) {
-        return 21;
-    }
-    return 19;
-}
-
-// The name a directory entry point links under. On Darwin the form carrying a 64-bit inode - the
-// one the offset above describes - is the plain name on arm64 and the '$INODE64' name on x86_64,
-// where the plain name still reaches the smaller, older record.
-entryPointName(Runtime runtime, string name) -> string {
-    if (runtime.onDarwin() && runtime.targetTriple.contains("x86_64")) {
-        return name + "$INODE64";
-    }
-    return name;
-}
-
-openFolderFunction(Runtime runtime) -> RuntimeFunction {
-    return runtime.libc(entryPointName(runtime, "opendir"),
-        runtime.pointerType.functionType([runtime.pointerType]));
-}
-
-closeFolderFunction(Runtime runtime) -> RuntimeFunction {
-    return runtime.libc("closedir", runtime.int32Type.functionType([runtime.pointerType]));
-}
-
-// True when a directory entry names the folder itself or its parent, the two entries every
-// enumeration hands back and no caller asked for.
-dotEntry(Runtime runtime, Value name, TypeRef characterType) -> Value {
-    let builder = runtime.builder;
-    let dot = characterType.constInt('.' as ulong, false);
-    let end = characterType.constInt(0, false);
-    let first = characterAt(runtime, name, characterType, 0);
-    let second = characterAt(runtime, name, characterType, 1);
-    let third = characterAt(runtime, name, characterType, 2);
-    let parent = instructions.buildAnd(builder,
-        instructions.buildICmpEQ(builder, second, dot, ""),
-        instructions.buildICmpEQ(builder, third, end, ""), "");
-    return instructions.buildAnd(builder, instructions.buildICmpEQ(builder, first, dot, ""),
-        instructions.buildOr(builder, instructions.buildICmpEQ(builder, second, end, ""), parent,
-            ""), "dot.entry");
-}
-
-characterAt(Runtime runtime, Value name, TypeRef characterType, long index) -> Value {
-    let builder = runtime.builder;
-    return memory.buildLoad(builder, characterType, memory.buildGEP(builder, characterType, name,
-        [runtime.int64(index)], ""), "");
 }

@@ -1,106 +1,13 @@
-// The two platform halves of the spawn bridge. Both are handed the stack slots holding the capture
-// files - null in a slot means that stream stays with this process - and both leave the child's exit
-// code in the status slot before branching to the block that closes what was opened.
+// The POSIX half of the spawn bridge: the argument and environment vectors point into the NUL
+// separated blocks the caller built, and the child takes only the streams and the environment it
+// was given before it execs.
 import Value from @ens.llvm.values;
 import BasicBlock from @ens.llvm.blocks;
 import @ens.llvm.instructions;
 import @ens.llvm.memory;
 import Runtime from emit.runtime;
 import RuntimeDefinition from emit.runtime;
-import RuntimeFunction from emit.runtime;
 import emit.system;
-import emit.widetext;
-
-// The child's standard handles come from the capture files where there are any and from this
-// process's own handles where a stream is inherited, and CreateProcessW starts the command line
-// without a shell. Both the command line and the environment block cross as UTF-16, so an argument
-// or a variable holding text outside the system code page survives. STARTUPINFOW and
-// PROCESS_INFORMATION are raw byte blocks here, so their fields are written at their documented x64
-// offsets.
-public windowsSpawn(Runtime runtime, RuntimeDefinition definition, Value outSlot, Value errSlot,
-                    Value statusSlot, BasicBlock closeBlock) {
-    let builder = runtime.builder;
-    let standardHandle = standardHandleFunction(runtime);
-    let createProcess = runtime.libc("CreateProcessW", runtime.int32Type.functionType([
-        runtime.pointerType, runtime.pointerType, runtime.pointerType, runtime.pointerType,
-        runtime.int32Type, runtime.int32Type, runtime.pointerType, runtime.pointerType,
-        runtime.pointerType, runtime.pointerType]));
-    let waitForOne = runtime.libc("WaitForSingleObject",
-        runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type]));
-    let exitCodeOf = runtime.libc("GetExitCodeProcess",
-        runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
-    let closeHandle = runtime.libc("CloseHandle",
-        runtime.int32Type.functionType([runtime.pointerType]));
-    let widen = widetext.wideFromUtf8(runtime);
-    let release = runtime.free();
-    let noCommandBlock = runtime.block(definition, "spawn.no.command");
-    let startBlock = runtime.block(definition, "spawn.start");
-    let failedBlock = runtime.block(definition, "spawn.failed");
-    let waitBlock = runtime.block(definition, "spawn.wait");
-
-    let wideCommand = runtime.call(widen, [runtime.parameter(definition, 3), runtime.int32(-1)],
-        "command.wide");
-    instructions.buildCondBr(builder, runtime.isNull(wideCommand), noCommandBlock, startBlock);
-
-    builder.positionAtEnd(noCommandBlock);
-    memory.buildStore(builder, runtime.int64(127), statusSlot);
-    instructions.buildBr(builder, closeBlock);
-
-    builder.positionAtEnd(startBlock);
-    let wideEnvironment = runtime.call(widen, [runtime.parameter(definition, 4),
-        instructions.buildTrunc(builder, runtime.parameter(definition, 6), runtime.int32Type,
-            "environment.bytes")], "environment.wide");
-    // CREATE_UNICODE_ENVIRONMENT, which only an environment block of this process's own making
-    // needs.
-    let flags = instructions.buildSelect(builder, runtime.isNull(wideEnvironment),
-        runtime.int32(0), runtime.int32(0x400), "flags");
-
-    let startup = memory.buildAlloca(builder, runtime.int8Type.arrayType(104 as ulong), "startup");
-    let process = memory.buildAlloca(builder, runtime.int8Type.arrayType(24 as ulong), "process");
-    for (long offset = 0; offset < 104; offset = offset + 8) {
-        memory.buildStore(builder, runtime.int64(0), fieldAt(runtime, startup, offset));
-    }
-    for (long offset = 0; offset < 24; offset = offset + 8) {
-        memory.buildStore(builder, runtime.int64(0), fieldAt(runtime, process, offset));
-    }
-    memory.buildStore(builder, runtime.int32(104), fieldAt(runtime, startup, 0));
-    // dwFlags = STARTF_USESTDHANDLES.
-    memory.buildStore(builder, runtime.int32(0x100), fieldAt(runtime, startup, 60));
-    memory.buildStore(builder, runtime.call(standardHandle, [runtime.int32(-10)], "stdin.handle"),
-        fieldAt(runtime, startup, 80));
-    let outHandle = streamHandle(runtime, definition, outSlot, -11, "stdout.handle");
-    let errHandle = streamHandle(runtime, definition, errSlot, -12, "stderr.handle");
-    memory.buildStore(builder, outHandle, fieldAt(runtime, startup, 88));
-    memory.buildStore(builder, errHandle, fieldAt(runtime, startup, 96));
-
-    let started = runtime.call(createProcess, [runtime.nullPointer(), wideCommand,
-        runtime.nullPointer(), runtime.nullPointer(), runtime.int32(1), flags, wideEnvironment,
-        runtime.nullPointer(), startup, process], "started");
-    runtime.call(release, [wideCommand], "");
-    runtime.call(release, [wideEnvironment], "");
-    instructions.buildCondBr(builder,
-        instructions.buildICmpEQ(builder, started, runtime.int32(0), ""), failedBlock, waitBlock);
-
-    builder.positionAtEnd(failedBlock);
-    memory.buildStore(builder, runtime.int64(127), statusSlot);
-    instructions.buildBr(builder, closeBlock);
-
-    builder.positionAtEnd(waitBlock);
-    let child = memory.buildLoad(builder, runtime.pointerType, fieldAt(runtime, process, 0),
-        "child");
-    let thread = memory.buildLoad(builder, runtime.pointerType, fieldAt(runtime, process, 8),
-        "child.thread");
-    runtime.call(waitForOne, [child, runtime.int32(0xFFFFFFFF)], "");
-    let codeSlot = memory.buildAlloca(builder, runtime.int32Type, "exit.code");
-    memory.buildStore(builder, runtime.int32(0), codeSlot);
-    runtime.call(exitCodeOf, [child, codeSlot], "");
-    runtime.call(closeHandle, [thread], "");
-    runtime.call(closeHandle, [child], "");
-    memory.buildStore(builder, instructions.buildZExt(builder,
-        memory.buildLoad(builder, runtime.int32Type, codeSlot, "code"), runtime.int64Type, ""),
-        statusSlot);
-    instructions.buildBr(builder, closeBlock);
-}
 
 // The argument and environment vectors point into the NUL separated blocks; the child aims a
 // captured stream at the file the parent opened, leaves an inherited one alone, takes the
@@ -193,39 +100,6 @@ public normalizedStatus(Runtime runtime, Value status) -> Value {
         instructions.buildSelect(builder, signaled, signalCode, status, ""), "normalized");
 }
 
-// The handle a child stream reads or writes: the capture file's when this call opened one, and this
-// process's own standard handle otherwise.
-streamHandle(Runtime runtime, RuntimeDefinition definition, Value slot, long standard,
-             string label) -> Value {
-    let builder = runtime.builder;
-    let fileNumber = runtime.libc("_fileno", runtime.int32Type.functionType([runtime.pointerType]));
-    let osHandle = runtime.libc("_get_osfhandle",
-        runtime.int64Type.functionType([runtime.int32Type]));
-    let fileBlock = runtime.block(definition, label + ".file");
-    let inheritBlock = runtime.block(definition, label + ".inherit");
-    let readyBlock = runtime.block(definition, label + ".ready");
-    let handleSlot = memory.buildAlloca(builder, runtime.int64Type, label);
-    let file = memory.buildLoad(builder, runtime.pointerType, slot, "stream");
-    instructions.buildCondBr(builder, runtime.isNull(file), inheritBlock, fileBlock);
-
-    builder.positionAtEnd(fileBlock);
-    memory.buildStore(builder, runtime.call(osHandle,
-        [runtime.call(fileNumber, [file], "fd")], "handle"), handleSlot);
-    instructions.buildBr(builder, readyBlock);
-
-    builder.positionAtEnd(inheritBlock);
-    memory.buildStore(builder, runtime.call(standardHandleFunction(runtime),
-        [runtime.int32(standard)], "std.handle"), handleSlot);
-    instructions.buildBr(builder, readyBlock);
-
-    builder.positionAtEnd(readyBlock);
-    return memory.buildLoad(builder, runtime.int64Type, handleSlot, "handle.ready");
-}
-
-standardHandleFunction(Runtime runtime) -> RuntimeFunction {
-    return runtime.libc("GetStdHandle", runtime.int64Type.functionType([runtime.int32Type]));
-}
-
 // The file descriptor a captured stream writes to, or -1 when the stream is inherited and the child
 // leaves it alone. An inherited stream has no file to ask, which is why this branches rather than
 // choosing between two values it would both have to compute.
@@ -307,10 +181,4 @@ blockVector(Runtime runtime, RuntimeDefinition definition, Value vector, Value o
     memory.buildStore(builder, runtime.nullPointer(), memory.buildGEP(builder,
         runtime.pointerType, vector, [instructions.buildAdd(builder, offset, count, "")],
         "vector.end"));
-}
-
-// The address of the field the byte offset names inside a raw structure block.
-fieldAt(Runtime runtime, Value block, long offset) -> Value {
-    return memory.buildGEP(runtime.builder, runtime.int8Type, block, [runtime.int64(offset)],
-        "field");
 }
