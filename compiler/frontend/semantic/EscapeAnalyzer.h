@@ -62,9 +62,11 @@ private:
     void scanParen(const ast::ParenExpression& e);
     void scanNew(const ast::NewExpression& e);
     void scanArrayLiteral(const ast::ArrayLiteralExpression& e);
+    void scanStructLiteral(const ast::StructLiteralExpression& e);
 
     int paramIndexOfSymbol(Symbol* sym) const;
     Symbol* aliasRoot(Symbol* sym) const;
+    Symbol* bindingAliasSource(const ast::Expression& init) const;
 
     void markSymbolEscape(Symbol* sym);
     void markSymbolReassigned(Symbol* sym);

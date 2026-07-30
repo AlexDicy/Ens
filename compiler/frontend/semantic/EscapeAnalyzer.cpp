@@ -97,16 +97,31 @@ void EscapeAnalyzer::scanBlock(const ast::Block& b) {
     }
 }
 
+// The symbol a binding's initializer names, seen through parentheses the way the borrow and move
+// decisions already see it. A binding that aliases one symbol shares its escape fate through the
+// alias chain; an initializer that names no single symbol cannot be tracked that way, so what it
+// references has to be treated as escaping instead.
+Symbol* EscapeAnalyzer::bindingAliasSource(const ast::Expression& init) const {
+    if (auto id = init.asIdent()) {
+        auto* info = analysis.find(id->node.greenNode());
+        return info ? info->resolvedSymbol : nullptr;
+    }
+    if (auto p = init.asParen()) {
+        if (auto inner = p->inner()) return bindingAliasSource(*inner);
+    }
+    return nullptr;
+}
+
 void EscapeAnalyzer::scanLetStmt(const ast::LetStatement& s) {
     Symbol* letSym = nullptr;
     if (auto* info = analysis.find(s.node.greenNode())) letSym = info->resolvedSymbol;
 
     if (auto init = s.initializer()) {
         if (letSym) {
-            if (auto id = init->asIdent()) {
-                auto* iinfo = analysis.find(id->node.greenNode());
-                Symbol* src = iinfo ? iinfo->resolvedSymbol : nullptr;
-                if (src) letSym->aliasOf = src;
+            if (Symbol* src = bindingAliasSource(*init)) {
+                letSym->aliasOf = src;
+            } else {
+                markEscapeIfRef(*init);
             }
             updateBorrowMode(letSym, *init);
         }
@@ -120,10 +135,10 @@ void EscapeAnalyzer::scanTypedVarDecl(const ast::TypedVarDeclStatement& s) {
 
     if (auto init = s.initializer()) {
         if (letSym) {
-            if (auto id = init->asIdent()) {
-                auto* iinfo = analysis.find(id->node.greenNode());
-                Symbol* src = iinfo ? iinfo->resolvedSymbol : nullptr;
-                if (src) letSym->aliasOf = src;
+            if (Symbol* src = bindingAliasSource(*init)) {
+                letSym->aliasOf = src;
+            } else {
+                markEscapeIfRef(*init);
             }
             updateBorrowMode(letSym, *init);
         }
@@ -215,6 +230,7 @@ void EscapeAnalyzer::scanExpression(const ast::Expression& e) {
     if (auto p = e.asParen()) { scanParen(*p); return; }
     if (auto n = e.asNew()) { scanNew(*n); return; }
     if (auto al = e.asArrayLiteral()) { scanArrayLiteral(*al); return; }
+    if (auto sl = e.asStructLiteral()) { scanStructLiteral(*sl); return; }
     if (auto tr = e.asTry()) { if (auto op = tr->operand()) scanExpression(*op); return; }
     if (auto sw = e.asSwitch()) { scanSwitchArms(sw->scrutinee(), sw->arms()); return; }
     if (auto p = e.asPrefix()) { if (auto op = p->operand()) scanExpression(*op); return; }
@@ -390,6 +406,17 @@ void EscapeAnalyzer::scanArrayLiteral(const ast::ArrayLiteralExpression& e) {
     for (auto& el : e.elements()) {
         markEscapeIfRef(el);
         scanExpression(el);
+    }
+}
+
+// A struct literal copies each field value into a value the analyzer cannot name, so a reference
+// it stores travels wherever that value goes. Treated like an array literal's elements.
+void EscapeAnalyzer::scanStructLiteral(const ast::StructLiteralExpression& e) {
+    for (auto& field : e.fields()) {
+        if (auto value = field.value()) {
+            markEscapeIfRef(*value);
+            scanExpression(*value);
+        }
     }
 }
 
