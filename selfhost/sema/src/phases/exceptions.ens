@@ -53,12 +53,15 @@ import StringBuilder from @std.text.stringbuilder;
 public check(List<ModuleContext> contexts) -> FileDiagnostic[] {
     let collected = new List<FileDiagnostic>();
     let registry = new ThrowsRegistry();
+    let slots = new ErrorSlotPlan();
     let workers = new List<ModuleExceptions>();
     for (long i = 0; i < contexts.length(); i++) {
         let worker = new ModuleExceptions(contexts.get(i), registry, collected);
         worker.collect();
+        worker.contributeConformances(slots);
         workers.push(worker);
     }
+    slots.resolve();
     bool changed = true;
     while (changed) {
         changed = false;
@@ -70,7 +73,7 @@ public check(List<ModuleContext> contexts) -> FileDiagnostic[] {
     }
     for (long i = 0; i < workers.length(); i++) {
         workers.get(i).validate();
-        workers.get(i).record();
+        workers.get(i).record(slots);
     }
     return diagnostics.sorted(collected);
 }
@@ -175,6 +178,88 @@ public strayMembers(ThrowSet thrown, ThrowSet allowed) -> ThrowSet {
     return strays;
 }
 
+// Which callables carry the trailing error-slot parameter in their machine interface. One
+// dispatch-table entry has one interface, so the fact belongs to an override family - the root
+// declaration the slot is assigned at, plus everything that overrides it - and the family is
+// decided over the WHOLE program: a class that satisfies a throwing interface method with a
+// method it only inherits puts the slot on the base's declaration too, which no view of that
+// base's own file can see.
+class ErrorSlotPlan {
+    List<ClassType> conformingClasses;
+    Map<GreenNode, bool> carryingFamilies;
+
+    protected constructor() {
+        this.conformingClasses = new List<ClassType>();
+        this.carryingFamilies = new Map<GreenNode, bool>();
+    }
+
+    // Every class the program declares, whose interface conformances the resolution reads.
+    protected add(ClassType classType) {
+        this.conformingClasses.push(classType);
+    }
+
+    // Marks the family of every method that answers a throwing interface method, wherever that
+    // method is declared. Runs once, after all modules have contributed.
+    protected resolve() {
+        for (long i = 0; i < this.conformingClasses.length(); i++) {
+            let classType = this.conformingClasses.get(i);
+            Type? level = classType;
+            while (level != null) {
+                for (let implemented in types.interfacesOf(level)) {
+                    this.markConformance(classType, implemented);
+                }
+                level = types.baseOf(level);
+            }
+        }
+    }
+
+    markConformance(ClassType classType, Type implemented) {
+        let required = types.methodsOf(implemented);
+        if (required == null) {
+            return;
+        }
+        for (long i = 0; i < required.length(); i++) {
+            let candidate = required.get(i);
+            if (!candidate.signature().declaresThrows()) {
+                continue;
+            }
+            let provided = findDeclaring(classType, candidate);
+            if (provided == null) {
+                continue;
+            }
+            let owner = types.authorityOf(provided.definingType());
+            if (owner == null) {
+                continue;
+            }
+            let root = rootDeclarationOf(owner, provided).signature().declaration();
+            if (root != null) {
+                this.carryingFamilies.set(root, true);
+            }
+        }
+    }
+
+    // True when the callable's machine interface carries the trailing error-slot parameter. A
+    // method follows its family: the root declaration's own 'throws' marker, or the program-wide
+    // conformance the resolution recorded. Everything else follows its own marker.
+    protected carries(Signature signature, Method? method, DeclaredType? owner) -> bool {
+        if (method == null || owner == null || !(owner is ClassType)) {
+            return signature.declaresThrows();
+        }
+        if (method.isConstructor() || method.isDestructor()) {
+            return signature.declaresThrows();
+        }
+        let root = rootDeclarationOf(owner, method);
+        if (root.signature().declaresThrows()) {
+            return true;
+        }
+        let declaration = root.signature().declaration();
+        if (declaration == null) {
+            return signature.declaresThrows();
+        }
+        return this.carryingFamilies.get(declaration) ?? false;
+    }
+}
+
 class FunctionItem {
     protected FunctionDeclarationNode declaration;
     protected Signature signature;
@@ -249,6 +334,17 @@ class ModuleExceptions {
                     this.testItems.push(declaration);
                 },
                 default -> { },
+            }
+        }
+    }
+
+    // Hands this module's classes to the program-wide error-slot plan, which reads their
+    // conformances after every module has collected.
+    protected contributeConformances(ErrorSlotPlan slots) {
+        for (long i = 0; i < this.typeItems.length(); i++) {
+            let declared = this.typeItems.get(i).declared;
+            if (declared is ClassType) {
+                slots.add(declared);
             }
         }
     }
@@ -721,13 +817,13 @@ class ModuleExceptions {
 
     // ---- Recording ----
 
-    protected record() {
+    protected record(ErrorSlotPlan slots) {
         for (long i = 0; i < this.functionItems.length(); i++) {
             let item = this.functionItems.get(i);
             this.result.setThrowsSet(item.declaration.green(),
                 this.registry.outwardFor(item.declaration.green()).members().toArray());
             this.result.setAbiThrows(item.declaration.green(),
-                abiCarriesErrorSlot(item.signature, item.method, item.owner));
+                slots.carries(item.signature, item.method, item.owner));
         }
         for (long i = 0; i < this.testItems.length(); i++) {
             let test = this.testItems.get(i);
@@ -738,24 +834,8 @@ class ModuleExceptions {
     }
 }
 
-// Whether the callable's machine interface carries the trailing error-slot parameter. The slot
-// follows the ROOT of a class method's dispatch contract - the topmost base-chain declaration,
-// or a throwing interface method implemented anywhere on the chain - so every implementation
-// sharing a dispatch table entry has one ABI. Everything else follows its own 'throws' marker.
-abiCarriesErrorSlot(Signature signature, Method? method, DeclaredType? owner) -> bool {
-    if (method == null || owner == null || !(owner is ClassType)) {
-        return signature.declaresThrows();
-    }
-    if (method.isConstructor() || method.isDestructor()) {
-        return signature.declaresThrows();
-    }
-    if (rootDeclarationOf(owner, method).signature().declaresThrows()) {
-        return true;
-    }
-    return implementsThrowingInterfaceMethod(owner, method);
-}
-
-// The topmost base-chain declaration the method overrides, or the method itself.
+// The topmost base-chain declaration the method overrides, or the method itself: the declaration
+// a dispatch-table slot is assigned at, which is why the whole family shares its ABI.
 rootDeclarationOf(DeclaredType owner, Method method) -> Method {
     Method root = method;
     Type? current = types.baseOf(owner);
@@ -767,31 +847,6 @@ rootDeclarationOf(DeclaredType owner, Method method) -> Method {
         current = types.baseOf(current);
     }
     return root;
-}
-
-// True when an interface implemented anywhere on the chain declares this method with 'throws':
-// the method table entry is called at the interface method's ABI, so the implementation carries
-// the slot even when it cannot throw itself.
-implementsThrowingInterfaceMethod(DeclaredType owner, Method method) -> bool {
-    Type? current = owner;
-    while (current != null) {
-        for (let implemented in types.interfacesOf(current)) {
-            let required = types.methodsOf(implemented);
-            if (required == null) {
-                continue;
-            }
-            for (long i = 0; i < required.length(); i++) {
-                let candidate = required.get(i);
-                if (candidate.name() == method.name()
-                        && types.sameParameterTypes(candidate.signature(), method.signature())
-                        && candidate.signature().declaresThrows()) {
-                    return true;
-                }
-            }
-        }
-        current = types.baseOf(current);
-    }
-    return false;
 }
 
 methodDeclaredBy(List<Method> methods, GreenNode green) -> Method? {
