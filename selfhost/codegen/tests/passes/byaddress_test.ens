@@ -1,0 +1,170 @@
+// By-pointer struct parameters: a read-only struct parameter's ABI flips to an address with the
+// entry copy's atomics gone, call sites pass the storage they already have, chains of such calls
+// hand the same address down, and anything mutated or escaping keeps the ABI it had.
+import @std.testing;
+import EirFunction from eir.model;
+import eir.dump;
+import passes.byaddress;
+import LoweredProgram from support;
+import support;
+
+test "a read-only struct parameter passes by address with no entry atomics" {
+    let program = try pairProgram(
+        "total(Pair p) -> int \{\n"
+        + "    return p.n;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Pair p = \{label: \"a\", n: 2\};\n"
+        + "    return total(p) - 2;\n"
+        + "\}\n");
+    let before = try support.functionBySymbol(program, "total");
+    let after = try rewritten(program, "total");
+    try support.assertOptimized(after, "total");
+    try testing.assertTrue(dump.dumpFunction(before).indexOf("retain_ptr") >= 0,
+        "the naive entry copy retains the label");
+    try testing.assertEqual(dump.dumpFunction(after),
+        "func internal @total(%0: &Pair) -> int \{\n"
+        + "  $0 p: Pair borrowed\n"
+        + "b0.entry:\n"
+        + "  %8 = load_ptr %0: Pair\n"
+        + "  store $0, %8\n"
+        + "  %3 = slot_addr $0: &Pair  ; p\n"
+        + "  %4 = field_addr %3, 1: &int  ; p.n\n"
+        + "  %5 = load_ptr %4: int\n"
+        + "  ret %5\n"
+        + "\}\n");
+}
+
+test "a call site passes the address of the storage it loaded from" {
+    let program = try pairProgram(
+        "total(Pair p) -> int \{\n"
+        + "    return p.n;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Pair p = \{label: \"a\", n: 2\};\n"
+        + "    return total(p) - 2;\n"
+        + "\}\n");
+    let after = try rewritten(program, "ens.main");
+    try support.assertOptimized(after, "ens.main");
+    try testing.assertEqual(dump.dumpFunction(after),
+        "func internal @ens.main() -> int \{\n"
+        + "  $0 p: Pair zeroed\n"
+        + "  $1 structlit: Pair zeroed\n"
+        + "b0.entry:\n"
+        + "  %0 = slot_addr $1: &Pair  ; structlit\n"
+        + "  %1 = const \"a\": string\n"
+        + "  %2 = field_addr %0, 0: &string  ; structlit.label\n"
+        + "  retain %1\n"
+        + "  store_ptr %2, %1\n"
+        + "  %3 = const 2: int\n"
+        + "  %4 = field_addr %0, 1: &int  ; structlit.n\n"
+        + "  store_ptr %4, %3\n"
+        + "  %5 = load_ptr %0: Pair\n"
+        + "  store $0, %5\n"
+        + "  %12 = slot_addr $0: &Pair  ; p\n"
+        + "  %7 = call @total(%12): int\n"
+        + "  %8 = const 2: int\n"
+        + "  %9 = sub %7, %8: int\n"
+        + "  %10 = slot_addr $0: &Pair  ; p\n"
+        + "  %11 = field_addr %10, 0: &string  ; p.label\n"
+        + "  release_ptr %11\n"
+        + "  ret %9\n"
+        + "\}\n");
+}
+
+test "a chained call hands its own by-address copy down by address" {
+    let program = try pairProgram(
+        "inner(Pair p) -> int \{\n"
+        + "    return p.n;\n"
+        + "\}\n"
+        + "outer(Pair p) -> int \{\n"
+        + "    return inner(p);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Pair p = \{label: \"a\", n: 2\};\n"
+        + "    return outer(p) - 2;\n"
+        + "\}\n");
+    let after = try rewritten(program, "outer");
+    try support.assertOptimized(after, "outer");
+    string afterDump = dump.dumpFunction(after);
+    try testing.assertTrue(afterDump.indexOf("%0: &Pair") >= 0,
+        "outer itself takes the pair by address: {afterDump}");
+    try testing.assertTrue(afterDump.indexOf("slot_addr $0") >= 0,
+        "outer passes its copy's address to inner: {afterDump}");
+    try testing.assertTrue(afterDump.indexOf("retain_ptr") < 0,
+        "no entry copy retains remain: {afterDump}");
+}
+
+test "a mutated struct parameter keeps its ABI" {
+    let program = try pairProgram(
+        "bump(Pair p) -> int \{\n"
+        + "    p.n = 5;\n"
+        + "    return p.n;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Pair p = \{label: \"a\", n: 2\};\n"
+        + "    return bump(p) - 5;\n"
+        + "\}\n");
+    let before = try support.functionBySymbol(program, "bump");
+    let after = try rewritten(program, "bump");
+    try testing.assertEqual(dump.dumpFunction(after), dump.dumpFunction(before));
+}
+
+test "returning the struct is a bit copy, so the parameter still passes by address" {
+    let program = try pairProgram(
+        "give(Pair p) -> Pair \{\n"
+        + "    return p;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Pair p = \{label: \"a\", n: 2\};\n"
+        + "    return give(p).n - 2;\n"
+        + "\}\n");
+    let after = try rewritten(program, "give");
+    try support.assertOptimized(after, "give");
+    try testing.assertTrue(dump.dumpFunction(after).indexOf("%0: &Pair") >= 0,
+        "the returned copy owns its own references either way");
+}
+
+test "a struct parameter of a dispatched method keeps its ABI" {
+    let program = try support.lowerWholeProgram(
+        "struct Pair \{\n"
+        + "    protected string label;\n"
+        + "    protected int n;\n"
+        + "\}\n"
+        + "interface Measured \{\n"
+        + "    measure(Pair p) -> int;\n"
+        + "\}\n"
+        + "class Ruler implements Measured \{\n"
+        + "    protected constructor();\n"
+        + "    override measure(Pair p) -> int \{\n"
+        + "        return p.n;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "use(Measured m, Pair p) -> int \{\n"
+        + "    return m.measure(p);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Pair p = \{label: \"a\", n: 2\};\n"
+        + "    return use(new Ruler(), p) - 2;\n"
+        + "\}\n");
+    let before = try support.functionBySymbol(program, "main$Ruler$measure");
+    let after = try rewritten(program, "main$Ruler$measure");
+    try testing.assertEqual(dump.dumpFunction(after), dump.dumpFunction(before));
+}
+
+// A single-file program over one reference-holding struct.
+pairProgram(string body) -> LoweredProgram throws {
+    return try support.lowerWholeProgram(
+        "struct Pair \{\n"
+        + "    protected string label;\n"
+        + "    protected int n;\n"
+        + "\}\n"
+        + body);
+}
+
+// Runs only the by-address pass over one naive function, under the whole program's plan.
+rewritten(LoweredProgram program, string symbol) -> EirFunction throws {
+    let context = support.passContext(program);
+    return byaddress.run(try support.functionBySymbol(program, symbol), context.facts(),
+        context.addressPlan());
+}

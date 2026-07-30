@@ -1,0 +1,672 @@
+// By-pointer struct parameters. A struct parameter that holds references costs every call a
+// copy whose reference fields are retained at entry and released at exit. When the callee
+// provably neither lets the struct escape nor writes behind it - the whole-program facts - the
+// ABI changes: the caller passes the address of storage it already has, and the callee copies
+// once into a borrowing slot, whose fields the caller's own references keep alive for the whole
+// call. Every atomic of the entry copy disappears.
+//
+// The decision is whole-program: a symbol's flags are fixed in 'decide' before any function is
+// rewritten, and every call site follows them, so definition and callers can never disagree on
+// the ABI. Functions reachable through a dispatch table keep their ABI: a table slot has one
+// calling convention for every implementation.
+//
+// At a call site the argument's address is the storage it was loaded from when that is provably
+// unclobbered between the load and the call; otherwise the value is parked in a fresh borrowing
+// slot and its address passes instead, so argument evaluation order and value semantics never
+// change.
+import EirFunction from eir.model;
+import EirBlock from eir.model;
+import EirInstruction from eir.model;
+import EirTerminator from eir.model;
+import EirParameter from eir.model;
+import EirCallee from eir.model;
+import EirSlot from eir.model;
+import EirCall from eir.model;
+import EirTryCall from eir.model;
+import EirForeignCall from eir.model;
+import EirLoadSlot from eir.model;
+import EirLoadPtr from eir.model;
+import EirStoreSlot from eir.model;
+import EirStorePtr from eir.model;
+import EirWeakStore from eir.model;
+import EirSlotAddress from eir.model;
+import EirFieldAddress from eir.model;
+import EirRetainPtr from eir.model;
+import EirReleasePtr from eir.model;
+import Type from @ens.sema.model.types;
+import OptionalType from @ens.sema.model.types;
+import @ens.sema.model.types;
+import Place from eir.place;
+import PlaceRoot from eir.place;
+import eir.place;
+import eir.walk;
+import DescriptorPlans from layout.descriptors;
+import FunctionFacts from passes.facts;
+import ProgramFacts from passes.facts;
+import support.primitives;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+
+// Which parameters of which symbols pass by address, decided once for the whole program.
+public final class ByAddressPlan {
+    Map<string, bool[]> flagsBySymbol;
+
+    public constructor() {
+        this.flagsBySymbol = new Map<string, bool[]>();
+    }
+
+    public record(string symbol, bool[] flags) {
+        this.flagsBySymbol.set(symbol, flags);
+    }
+
+    public remove(string symbol) {
+        this.flagsBySymbol.remove(symbol);
+    }
+
+    public flagsFor(string symbol) -> bool[]? {
+        return this.flagsBySymbol.get(symbol);
+    }
+}
+
+// Decides the plan over the naive program: for each function, each struct parameter whose facts
+// allow the borrow and whose entry copy has the flat shape the rewrite replaces.
+public decide(List<EirFunction> functions, ProgramFacts facts) -> ByAddressPlan {
+    let plan = new ByAddressPlan();
+    let dispatched = dispatchedSymbols(facts.plans());
+    for (long f = 0; f < functions.length(); f++) {
+        let function = functions.get(f);
+        if (dispatched.contains(function.symbol())) {
+            continue;
+        }
+        let own = facts.factsFor(function.symbol());
+        if (own == null) {
+            continue;
+        }
+        let flags = decideFunction(function, own);
+        if (flags != null) {
+            plan.record(function.symbol(), flags);
+        }
+    }
+    // A dynamic call site names its root's symbol; whatever the tables hold must keep the ABI
+    // the slot was assigned with.
+    for (long f = 0; f < functions.length(); f++) {
+        let blocks = functions.get(f).blocks();
+        for (long b = 0; b < blocks.length(); b++) {
+            let instructions = blocks.get(b).instructions();
+            for (long i = 0; i < instructions.length(); i++) {
+                let instruction = instructions.get(i);
+                if (instruction is EirCall && instruction.dispatchSlot >= 0) {
+                    plan.remove(instruction.callee.symbol());
+                }
+            }
+            let terminator = blocks.get(b).terminator();
+            if (terminator is EirTryCall && terminator.dispatchSlot >= 0) {
+                plan.remove(terminator.callee.symbol());
+            }
+        }
+    }
+    return plan;
+}
+
+decideFunction(EirFunction function, FunctionFacts own) -> bool[]? {
+    long offset = 0;
+    if (function.receiverType() != null) {
+        offset = 1;
+    }
+    let parameters = function.parameters();
+    let flags = new bool[parameters.length];
+    bool found = false;
+    for (long i = 0; i < parameters.length; i++) {
+        let parameterType = parameters[i].type();
+        if (primitives.structOf(parameterType) == null
+                || !primitives.hasArcContent(parameterType)
+                || parameterType is OptionalType
+                || !flatArcStruct(parameterType)) {
+            continue;
+        }
+        long position = i + offset;
+        if (position >= own.positionCount() || own.at(position).escapes()
+                || own.at(position).mutates()) {
+            continue;
+        }
+        long slot = own.slotOf(position);
+        if (slot < 0 || entryChain(function, position, slot) == null) {
+            continue;
+        }
+        flags[i] = true;
+        found = true;
+    }
+    if (!found) {
+        return null;
+    }
+    return flags;
+}
+
+// True when every reference the struct holds sits in a field reached by a flat address chain: a
+// reference directly or inside a nested struct. A tagged optional payload takes a branching walk
+// the entry-chain rewrite does not match.
+flatArcStruct(Type type) -> bool {
+    let structType = primitives.structOf(type);
+    if (structType == null) {
+        return false;
+    }
+    let fields = types.fieldsOf(structType);
+    if (fields == null) {
+        return false;
+    }
+    for (long i = 0; i < fields.length(); i++) {
+        let fieldType = fields.get(i).type();
+        if (!primitives.hasArcContent(fieldType)) {
+            continue;
+        }
+        if (primitives.isReferenceType(fieldType)) {
+            continue;
+        }
+        if (primitives.structOf(fieldType) != null && !(fieldType is OptionalType)
+                && flatArcStruct(fieldType)) {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+// The entry copy a parameter binding makes: the binding store and the contiguous run of
+// address-and-retain instructions right after it, whose address temps nothing else consumes.
+// Null when the shape is not there to replace.
+entryChain(EirFunction function, long position, long slot) -> List<EirInstruction>? {
+    if (function.blocks().length() == 0) {
+        return null;
+    }
+    let entry = function.blocks().get(0).instructions();
+    long bindIndex = -1;
+    for (long i = 0; i < entry.length(); i++) {
+        let instruction = entry.get(i);
+        if (instruction is EirStoreSlot && instruction.slot == slot
+                && instruction.value == position) {
+            bindIndex = i;
+            break;
+        }
+    }
+    if (bindIndex < 0) {
+        return null;
+    }
+    let chain = new List<EirInstruction>();
+    chain.push(entry.get(bindIndex));
+    bool[] chainTemp = new bool[function.tempTypes().length() + 1];
+    bool retained = false;
+    for (long i = bindIndex + 1; i < entry.length(); i++) {
+        let instruction = entry.get(i);
+        if (instruction is EirSlotAddress && instruction.slot == slot) {
+            chainTemp[instruction.result] = true;
+            chain.push(instruction);
+            continue;
+        }
+        if (instruction is EirFieldAddress && chainTemp[instruction.base]) {
+            chainTemp[instruction.result] = true;
+            chain.push(instruction);
+            continue;
+        }
+        if (instruction is EirRetainPtr && chainTemp[instruction.address]) {
+            retained = true;
+            chain.push(instruction);
+            continue;
+        }
+        break;
+    }
+    if (!retained) {
+        return null;
+    }
+    // Address instructions after the last retain are the body's first reads, not the copy's.
+    while (chain.length() > 1 && !(chain.get(chain.length() - 1) is EirRetainPtr)) {
+        let trimmed = chain.pop();
+        long result = walk.resultOf(trimmed);
+        if (result >= 0 && result < chainTemp.length) {
+            chainTemp[result] = false;
+        }
+    }
+    // The chain's address temps must feed nothing outside it, or dropping it would orphan a use.
+    for (long b = 0; b < function.blocks().length(); b++) {
+        let instructions = function.blocks().get(b).instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (contains(chain, instruction)) {
+                continue;
+            }
+            for (let used in walk.usesOf(instruction)) {
+                if (used >= 0 && used < chainTemp.length && chainTemp[used]) {
+                    return null;
+                }
+            }
+        }
+        let terminator = function.blocks().get(b).terminator();
+        if (terminator == null) {
+            continue;
+        }
+        for (let used in walk.terminatorUsesOf(terminator)) {
+            if (used >= 0 && used < chainTemp.length && chainTemp[used]) {
+                return null;
+            }
+        }
+    }
+    return chain;
+}
+
+// Rewrites one function: its own entry when its parameters are planned, then every call site of
+// a planned callee.
+public run(EirFunction function, ProgramFacts facts, ByAddressPlan plan) -> EirFunction {
+    EirFunction current = function;
+    let flags = plan.flagsFor(function.symbol());
+    if (flags != null) {
+        current = rewriteEntry(current, facts, flags);
+    }
+    return rewriteCallSites(current, plan);
+}
+
+rewriteEntry(EirFunction function, ProgramFacts facts, bool[] flags) -> EirFunction {
+    let own = facts.factsFor(function.symbol());
+    if (own == null) {
+        return function;
+    }
+    long offset = 0;
+    if (function.receiverType() != null) {
+        offset = 1;
+    }
+    EirFunction current = function;
+    for (long i = 0; i < flags.length; i++) {
+        if (flags[i]) {
+            current = rewriteParameter(current, i, i + offset, own.slotOf(i + offset));
+        }
+    }
+    return current;
+}
+
+// One parameter's rewrite: mark it by-address, replace the binding copy's retain chain with one
+// whole-value read through the incoming address, flip the slot to borrowing, and drop the
+// releases of storage that no longer owns anything.
+rewriteParameter(EirFunction function, long parameterIndex, long position, long slot)
+        -> EirFunction {
+    let chain = entryChain(function, position, slot);
+    if (chain == null || slot < 0) {
+        return function;
+    }
+    let existing = function.parameters();
+    let parameters = new EirParameter[existing.length];
+    for (long i = 0; i < parameters.length; i++) {
+        parameters[i] = existing[i];
+    }
+    parameters[parameterIndex] = new EirParameter(existing[parameterIndex].name(),
+        existing[parameterIndex].type(), true);
+    let slots = new List<EirSlot>();
+    for (long i = 0; i < function.slots().length(); i++) {
+        let described = function.slots().get(i);
+        if (i == slot) {
+            slots.push(new EirSlot(described.name(), described.type(),
+                described.startsZeroed(), true));
+        } else {
+            slots.push(described);
+        }
+    }
+    let dropped = releaseChains(function, slot);
+    for (long i = 0; i < chain.length(); i++) {
+        dropped.push(chain.get(i));
+    }
+    let tempTypes = clonedTempTypes(function);
+    let parameterType = function.parameters()[parameterIndex].type();
+    long copied = tempTypes.length();
+    tempTypes.push(parameterType);
+    let blocks = new List<EirBlock>();
+    for (long b = 0; b < function.blocks().length(); b++) {
+        let source = function.blocks().get(b);
+        let block = new EirBlock(source.label());
+        let instructions = source.instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (instruction == chain.get(0)) {
+                block.instructions().push(new EirLoadPtr(copied, parameterType, position));
+                block.instructions().push(new EirStoreSlot(slot, copied));
+                continue;
+            }
+            if (!contains(dropped, instruction)) {
+                block.instructions().push(instruction);
+            }
+        }
+        let terminator = source.terminator();
+        if (terminator != null) {
+            block.setTerminator(terminator);
+        }
+        blocks.push(block);
+    }
+    return new EirFunction(function.symbol(), function.internalLinkage(),
+        function.receiverType(), parameters, function.returnType(), slots, blocks, tempTypes,
+        function.throwing(), function.traceName(), function.traceFile(), function.traceLine(),
+        function.isEntryPoint());
+}
+
+// The scope-exit releases of the parameter's storage, with the address chains that feed only
+// them: everything rooted at the slot that gives references up. The retains other copies make
+// through the same storage stay, because their releases run through the copies' own storage.
+releaseChains(EirFunction function, long slot) -> List<EirInstruction> {
+    let dropped = new List<EirInstruction>();
+    let blocks = function.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        let instructions = blocks.get(b).instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (!(instruction is EirReleasePtr)) {
+                continue;
+            }
+            if (rootsAtSlot(function, instruction.address, slot)) {
+                dropped.push(instruction);
+            }
+        }
+    }
+    // Address instructions feeding only dropped consumers go with them, innermost first.
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (long b = 0; b < blocks.length(); b++) {
+            let instructions = blocks.get(b).instructions();
+            for (long i = 0; i < instructions.length(); i++) {
+                let instruction = instructions.get(i);
+                if (contains(dropped, instruction) || !walk.producesAddress(instruction)) {
+                    continue;
+                }
+                long result = walk.resultOf(instruction);
+                if (!rootsAtSlot(function, result, slot)) {
+                    continue;
+                }
+                if (onlyDroppedUsers(function, result, dropped)) {
+                    dropped.push(instruction);
+                    changed = true;
+                }
+            }
+        }
+    }
+    return dropped;
+}
+
+onlyDroppedUsers(EirFunction function, long temp, List<EirInstruction> dropped) -> bool {
+    bool anyUser = false;
+    let blocks = function.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        let instructions = blocks.get(b).instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            for (let used in walk.usesOf(instruction)) {
+                if (used != temp) {
+                    continue;
+                }
+                anyUser = true;
+                if (!contains(dropped, instruction)) {
+                    return false;
+                }
+            }
+        }
+        let terminator = blocks.get(b).terminator();
+        if (terminator == null) {
+            continue;
+        }
+        for (let used in walk.terminatorUsesOf(terminator)) {
+            if (used == temp) {
+                return false;
+            }
+        }
+    }
+    return anyUser;
+}
+
+rootsAtSlot(EirFunction function, long temp, long slot) -> bool {
+    let named = place.placeOf(function, temp);
+    return named != null && named.root() == PlaceRoot.Slot && named.rootId() == slot;
+}
+
+// Rewrites every direct call to a planned callee: each flagged argument becomes an address, the
+// storage it was loaded from when that provably still holds the same value at the call, or a
+// fresh borrowing slot the value is parked in otherwise.
+rewriteCallSites(EirFunction function, ByAddressPlan plan) -> EirFunction {
+    if (!anyPlannedCall(function, plan)) {
+        return function;
+    }
+    let tempTypes = clonedTempTypes(function);
+    let slots = new List<EirSlot>();
+    for (long i = 0; i < function.slots().length(); i++) {
+        slots.push(function.slots().get(i));
+    }
+    let blocks = new List<EirBlock>();
+    for (long b = 0; b < function.blocks().length(); b++) {
+        let source = function.blocks().get(b);
+        let block = new EirBlock(source.label());
+        let instructions = source.instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (instruction is EirCall && instruction.dispatchSlot < 0) {
+                let flags = plan.flagsFor(instruction.callee.symbol());
+                if (flags != null) {
+                    let arguments = rewriteArguments(function, instructions, i,
+                        instruction.arguments, flags, tempTypes, slots, block);
+                    block.instructions().push(new EirCall(instruction.result,
+                        instruction.type, flaggedCallee(instruction.callee, flags),
+                        instruction.receiver, arguments, instruction.dispatchSlot,
+                        instruction.dispatchInterface, instruction.line));
+                    continue;
+                }
+            }
+            block.instructions().push(instruction);
+        }
+        let terminator = source.terminator();
+        if (terminator != null) {
+            block.setTerminator(terminator);
+            if (terminator is EirTryCall && terminator.dispatchSlot < 0) {
+                let flags = plan.flagsFor(terminator.callee.symbol());
+                if (flags != null) {
+                    let arguments = rewriteArguments(function, source.instructions(),
+                        source.instructions().length(), terminator.arguments, flags,
+                        tempTypes, slots, block);
+                    block.setTerminator(new EirTryCall(terminator.result, terminator.type,
+                        flaggedCallee(terminator.callee, flags), terminator.receiver,
+                        arguments, terminator.dispatchSlot, terminator.dispatchInterface,
+                        terminator.errorResult, terminator.normalTarget,
+                        terminator.unwindTarget, terminator.line));
+                }
+            }
+        }
+        blocks.push(block);
+    }
+    return sweepDeadLoads(new EirFunction(function.symbol(), function.internalLinkage(),
+        function.receiverType(), function.parameters(), function.returnType(), slots, blocks,
+        tempTypes, function.throwing(), function.traceName(), function.traceFile(),
+        function.traceLine(), function.isEntryPoint()));
+}
+
+// Argument rewriting replaces a loaded struct value with the storage's address, which can leave
+// the load itself unread; a dead whole-struct load is a copy the emitted code would still make,
+// so it goes.
+sweepDeadLoads(EirFunction function) -> EirFunction {
+    bool[] used = new bool[function.tempTypes().length() + 1];
+    let blocks = function.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        let instructions = blocks.get(b).instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            for (let value in walk.usesOf(instructions.get(i))) {
+                if (value >= 0 && value < used.length) {
+                    used[value] = true;
+                }
+            }
+        }
+        let terminator = blocks.get(b).terminator();
+        if (terminator == null) {
+            continue;
+        }
+        for (let value in walk.terminatorUsesOf(terminator)) {
+            if (value >= 0 && value < used.length) {
+                used[value] = true;
+            }
+        }
+    }
+    bool dead = false;
+    for (long b = 0; b < blocks.length(); b++) {
+        let instructions = blocks.get(b).instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (instruction is EirLoadSlot && !used[instruction.result]
+                    && primitives.structOf(instruction.type) != null) {
+                dead = true;
+            }
+        }
+    }
+    if (!dead) {
+        return function;
+    }
+    let rebuilt = new List<EirBlock>();
+    for (long b = 0; b < blocks.length(); b++) {
+        let source = blocks.get(b);
+        let block = new EirBlock(source.label());
+        let instructions = source.instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (instruction is EirLoadSlot && !used[instruction.result]
+                    && primitives.structOf(instruction.type) != null) {
+                continue;
+            }
+            block.instructions().push(instruction);
+        }
+        let terminator = source.terminator();
+        if (terminator != null) {
+            block.setTerminator(terminator);
+        }
+        rebuilt.push(block);
+    }
+    return new EirFunction(function.symbol(), function.internalLinkage(),
+        function.receiverType(), function.parameters(), function.returnType(),
+        function.slots(), rebuilt, function.tempTypes(), function.throwing(),
+        function.traceName(), function.traceFile(), function.traceLine(),
+        function.isEntryPoint());
+}
+
+anyPlannedCall(EirFunction function, ByAddressPlan plan) -> bool {
+    let blocks = function.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        let instructions = blocks.get(b).instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (instruction is EirCall && instruction.dispatchSlot < 0
+                    && plan.flagsFor(instruction.callee.symbol()) != null) {
+                return true;
+            }
+        }
+        let terminator = blocks.get(b).terminator();
+        if (terminator is EirTryCall && terminator.dispatchSlot < 0
+                && plan.flagsFor(terminator.callee.symbol()) != null) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The argument list with every flagged position turned into an address, appending whatever the
+// address needs to the block being rebuilt.
+rewriteArguments(EirFunction function, List<EirInstruction> instructions, long callIndex,
+                 long[] arguments, bool[] flags, List<Type> tempTypes, List<EirSlot> slots,
+                 EirBlock block) -> long[] {
+    let rewritten = new long[arguments.length];
+    for (long i = 0; i < arguments.length; i++) {
+        rewritten[i] = arguments[i];
+        if (i >= flags.length || !flags[i]) {
+            continue;
+        }
+        long argument = arguments[i];
+        let source = cleanSourceSlot(function, instructions, callIndex, argument);
+        Type argumentType = tempTypes.get(argument);
+        long address = tempTypes.length();
+        tempTypes.push(argumentType);
+        if (source >= 0) {
+            block.instructions().push(new EirSlotAddress(address, argumentType, source));
+        } else {
+            long parked = slots.length();
+            slots.push(new EirSlot("byaddr.arg", argumentType, false, true));
+            block.instructions().push(new EirStoreSlot(parked, argument));
+            block.instructions().push(new EirSlotAddress(address, argumentType, parked));
+        }
+        rewritten[i] = address;
+    }
+    return rewritten;
+}
+
+// The slot an argument was loaded from, when nothing between the load and the call can have
+// written it: no store into it, no write through an address rooted at it, and no foreign call.
+// Calls in between cannot reach a local slot whose address they were never given.
+cleanSourceSlot(EirFunction function, List<EirInstruction> instructions, long callIndex,
+                long argument) -> long {
+    long loadIndex = -1;
+    long slot = -1;
+    for (long i = 0; i < callIndex && i < instructions.length(); i++) {
+        let instruction = instructions.get(i);
+        if (instruction is EirLoadSlot && instruction.result == argument) {
+            loadIndex = i;
+            slot = instruction.slot;
+        }
+    }
+    if (loadIndex < 0) {
+        return -1;
+    }
+    for (long i = loadIndex + 1; i < callIndex && i < instructions.length(); i++) {
+        let instruction = instructions.get(i);
+        if (instruction is EirStoreSlot && instruction.slot == slot) {
+            return -1;
+        }
+        if (instruction is EirForeignCall) {
+            return -1;
+        }
+        if (instruction is EirStorePtr && rootsAtSlot(function, instruction.address, slot)) {
+            return -1;
+        }
+        if (instruction is EirWeakStore && rootsAtSlot(function, instruction.address, slot)) {
+            return -1;
+        }
+    }
+    return slot;
+}
+
+flaggedCallee(EirCallee callee, bool[] flags) -> EirCallee {
+    return new EirCallee(callee.symbol(), callee.receiverType(), callee.parameterTypes(),
+        callee.returnType(), callee.throwing(), flags);
+}
+
+dispatchedSymbols(DescriptorPlans plans) -> Map<string, bool> {
+    let dispatched = new Map<string, bool>();
+    let all = plans.all();
+    for (long p = 0; p < all.length(); p++) {
+        let plan = all.get(p);
+        for (let implementation in plan.vtable()) {
+            if (implementation != null) {
+                dispatched.set(implementation.symbol(), true);
+            }
+        }
+        for (let conformance in plan.conformances()) {
+            for (let implementation in conformance.implementations()) {
+                if (implementation != null) {
+                    dispatched.set(implementation.symbol(), true);
+                }
+            }
+        }
+    }
+    return dispatched;
+}
+
+clonedTempTypes(EirFunction function) -> List<Type> {
+    let tempTypes = new List<Type>();
+    for (long i = 0; i < function.tempTypes().length(); i++) {
+        tempTypes.push(function.tempTypes().get(i));
+    }
+    return tempTypes;
+}
+
+contains(List<EirInstruction> marked, EirInstruction instruction) -> bool {
+    for (long i = 0; i < marked.length(); i++) {
+        if (marked.get(i) == instruction) {
+            return true;
+        }
+    }
+    return false;
+}
