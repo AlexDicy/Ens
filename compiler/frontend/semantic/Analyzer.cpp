@@ -266,6 +266,12 @@ std::string Analyzer::invisibleTypeMessage(const std::u16string& name, const Typ
 
 namespace {
 
+std::string reservedDecimalMessage() {
+    return "'decimal' is a reserved word and not a usable type yet. Use 'double' for "
+           "fractional values, or hold the value in an integer scaled by hand (for example a "
+           "'long' count of cents) when it has to be exact.";
+}
+
 bool isIntegerLiteralKind(SyntaxKind k, bool allowLong) {
     return k == SyntaxKind::IntLiteral || (allowLong && k == SyntaxKind::LongLiteral);
 }
@@ -2695,7 +2701,13 @@ Type* Analyzer::lookupTypeByName(const std::u16string& qualifier,
                                  const std::u16string& name,
                                  const SyntaxNode& diagNode) {
     if (qualifier.empty()) {
-        if (Type* prim = typeCtx.primitiveFromName(name)) return prim;
+        if (Type* prim = typeCtx.primitiveFromName(name)) {
+            if (prim->kind == TypeKind::Decimal) {
+                errorAtNode(diagNode, reservedDecimalMessage());
+                return typeCtx.getError();
+            }
+            return prim;
+        }
         for (auto it = typeParamScope_.rbegin(); it != typeParamScope_.rend(); ++it) {
             if (it->first == name) return it->second;
         }
