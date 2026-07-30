@@ -31,6 +31,7 @@ import LoweringContext from lower.context;
 import lower.calls;
 import lower.conversions;
 import lower.expressions;
+import lower.optionals;
 import lower.places;
 import lower.records;
 import lower.structs;
@@ -476,6 +477,10 @@ taggedPairEqualValues(LoweringContext lowering, long left, long right, Type opti
     }
     long leftPresent = presenceBit(lowering, left, true);
     long rightPresent = presenceBit(lowering, right, true);
+    if (primitives.structOf(payloadType) != null) {
+        return guardedStructPayloads(lowering, left, right, leftPresent, rightPresent,
+            payloadType, span);
+    }
     long leftPayload = builder.newTemp(payloadType);
     builder.append(new EirOptionalPayload(leftPayload, payloadType, left));
     long rightPayload = builder.newTemp(payloadType);
@@ -504,6 +509,48 @@ taggedPairEqual(LoweringContext lowering, long left, long right, Type optionalTy
     return taggedPairEqualValues(lowering, left, right, optionalType, span);
 }
 
+// '==' over two optionals holding a struct, presence first: differing presence settles it, two
+// absent values are equal without either payload being read, and only two present payloads
+// compare. The branch is what keeps a struct payload out of the comparison, which matters because
+// comparing one reads its reference fields and may run a declared 'equals' over storage holding
+// nothing. The two paths merge through a slot, the phi-free form every branching value uses.
+guardedStructPayloads(LoweringContext lowering, long left, long right, long leftPresent,
+                      long rightPresent, Type payloadType, Span span) -> long {
+    let builder = lowering.builder();
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    long samePresence = builder.newTemp(boolType);
+    builder.append(new EirBinary(samePresence, boolType, EirBinaryOp.CmpEq, leftPresent,
+        rightPresent));
+    long bothPresent = builder.newTemp(boolType);
+    builder.append(new EirBinary(bothPresent, boolType, EirBinaryOp.And, samePresence,
+        leftPresent));
+    long answer = builder.addSlot("optstructeq", boolType, false, false);
+    builder.append(new EirStoreSlot(answer, samePresence));
+    long payloadBlock = builder.newBlock("optstructeq.payload");
+    long endBlock = builder.newBlock("optstructeq.end");
+    builder.terminate(new EirBranch(bothPresent, payloadBlock, endBlock));
+
+    builder.moveTo(payloadBlock);
+    long leftBase = optionals.taggedScratchAddress(lowering, left, payloadType);
+    long rightBase = optionals.taggedScratchAddress(lowering, right, payloadType);
+    if (leftBase < 0 || rightBase < 0) {
+        lowering.internalError("a compared payload borrows a value with no storage to retain",
+            span);
+        return -1;
+    }
+    long payloadEqual = structsEqualAt(lowering, leftBase, rightBase, payloadType, span);
+    if (payloadEqual < 0) {
+        return -1;
+    }
+    builder.append(new EirStoreSlot(answer, payloadEqual));
+    builder.terminate(new EirJump(endBlock));
+
+    builder.moveTo(endBlock);
+    long merged = builder.newTemp(boolType);
+    builder.append(new EirLoadSlot(merged, boolType, answer));
+    return merged;
+}
+
 // A tagged optional against a plain value: present, and the payload equal to the value at the
 // payload's type.
 taggedAgainstPlain(LoweringContext lowering, long tagged, Type taggedType, long plain,
@@ -513,6 +560,15 @@ taggedAgainstPlain(LoweringContext lowering, long tagged, Type taggedType, long 
     let payloadType = primitives.taggedPayloadOf(taggedType);
     if (payloadType == null) {
         return -1;
+    }
+    // A plain struct is a present optional of its own type, so wrapping it makes this the
+    // pair comparison, presence guard and all.
+    if (primitives.structOf(payloadType) != null) {
+        long wrapped = conversions.convert(lowering, plain, taggedType, span);
+        if (wrapped < 0) {
+            return -1;
+        }
+        return taggedPairEqualValues(lowering, tagged, wrapped, taggedType, span);
     }
     long payload = builder.newTemp(payloadType);
     builder.append(new EirOptionalPayload(payload, payloadType, tagged));
