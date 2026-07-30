@@ -6349,16 +6349,25 @@ struct CodeGenerator::Impl {
 
         auto* i8Ty  = llvm::Type::getInt8Ty(ctx);
         auto* i64Ty = llvm::Type::getInt64Ty(ctx);
-        // Use a fixed-size i8 array so the alloca claims the exact byte width.
-        auto* storageTy = llvm::ArrayType::get(i8Ty, totalBytes);
-        llvm::Value* arrPtr = createEntryAlloca(currentFunction, storageTy,
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        // The reservation carries a heap array's exact layout behind the 32-byte object header,
+        // so length and element access are untouched, and the header's immortal count makes any
+        // reference counting that still reaches the value a dynamic no-op instead of a write
+        // below the reservation. Same shape as an immortal string literal's object.
+        auto* dataTy = llvm::ArrayType::get(i8Ty, totalBytes - 8);
+        auto* storageTy = llvm::StructType::get(ctx, { ptrTy, i64Ty, ptrTy, ptrTy, i64Ty, dataTy });
+        llvm::Value* storage = createEntryAlloca(currentFunction, storageTy,
             asAscii(sym->name) + ".stack");
 
         // make sure to zero out slots for each loop tieration
-        builder->CreateMemSet(arrPtr, llvm::ConstantInt::get(i8Ty, 0),
-                              llvm::ConstantInt::get(i64Ty, totalBytes),
+        builder->CreateMemSet(storage, llvm::ConstantInt::get(i8Ty, 0),
+                              llvm::ConstantInt::get(i64Ty, 32 + totalBytes),
                               llvm::Align(8));
+        builder->CreateStore(llvm::ConstantInt::get(i64Ty, kImmortalRefcount),
+                             builder->CreateStructGEP(storageTy, storage, 1, "arr.stack.rc"));
 
+        llvm::Value* arrPtr = builder->CreateStructGEP(storageTy, storage, 4,
+            asAscii(sym->name) + ".payload");
         builder->CreateStore(llvm::ConstantInt::get(i64Ty, count), arrPtr);
 
         if (auto al = init.asArrayLiteral()) {
