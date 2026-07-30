@@ -1,16 +1,18 @@
 // The std.system bridges the compiler defines instead of linking: the recorded process
-// arguments as a string[], the child process runner over the C library's system(), and the
-// existence probe over access(). Each is defined once per referencing module with internal
-// linkage; the argc and argv globals they read are defined by the entry module's wrapper and
-// declared everywhere else.
+// arguments as a string[], the child process runner over the C library's system(), the capturing
+// runner that starts a program with no shell in between, and the existence probe over access().
+// Each is defined once per referencing module with internal linkage; the argc and argv globals
+// they read are defined by the entry module's wrapper and declared everywhere else.
 import ArrayType from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
 import Value from @ens.llvm.values;
+import BasicBlock from @ens.llvm.blocks;
 import @ens.llvm.globals;
 import @ens.llvm.instructions;
 import @ens.llvm.memory;
 import ModuleEmitter from emit.context;
 import Runtime from emit.runtime;
+import RuntimeDefinition from emit.runtime;
 import RuntimeFunction from emit.runtime;
 
 // ptr ens_arguments(): the process arguments as an owned string[], one lifted copy per argv
@@ -84,6 +86,18 @@ public runProcessRuntime(ModuleEmitter emitter) -> RuntimeFunction {
         instructions.buildRet(builder, status);
         return runtime.endDefinition(definition);
     }
+    let normalized = normalizedStatus(runtime, status);
+    let failed = instructions.buildICmpEQ(builder, status, runtime.int32(-1), "failed");
+    instructions.buildRet(builder,
+        instructions.buildSelect(builder, failed, status, normalized, ""));
+    return runtime.endDefinition(definition);
+}
+
+// The exit code a POSIX wait status stands for: the low seven bits name the signal that ended the
+// child, so a child that exited carries its code eight bits up and one that was killed reports
+// 128 plus its signal, the way a shell reports it.
+normalizedStatus(Runtime runtime, Value status) -> Value {
+    let builder = runtime.builder;
     let signal = instructions.buildAnd(builder, status, runtime.int32(127), "signal");
     let exited = instructions.buildICmpEQ(builder, signal, runtime.int32(0), "exited");
     let signaled = instructions.buildAnd(builder,
@@ -93,12 +107,242 @@ public runProcessRuntime(ModuleEmitter emitter) -> RuntimeFunction {
         instructions.buildLShr(builder, status, runtime.int32(8), ""),
         runtime.int32(255), "exit.code");
     let signalCode = instructions.buildAdd(builder, signal, runtime.int32(128), "signal.code");
-    let normalized = instructions.buildSelect(builder, exited, exitCode,
+    return instructions.buildSelect(builder, exited, exitCode,
         instructions.buildSelect(builder, signaled, signalCode, status, ""), "normalized");
-    let failed = instructions.buildICmpEQ(builder, status, runtime.int32(-1), "failed");
+}
+
+// i64 ens_run_process_captured(ptr program, ptr argumentBlock, i64 count, ptr commandLine,
+// ptr stdoutPath, ptr stderrPath): runs the program with no shell in between, waits for it, and
+// writes its two streams into the two files. A POSIX target execs an argument vector built from
+// the NUL separated block; a Windows target hands the joined command line to CreateProcess, the
+// only shape Win32 accepts. Returns the program's exit code, 127 when it could not be started, or
+// -1 when the two files could not be opened for writing.
+public runCapturedRuntime(ModuleEmitter emitter) -> RuntimeFunction {
+    let runtime = emitter.runtime;
+    let type = runtime.int64Type.functionType([runtime.pointerType, runtime.pointerType,
+        runtime.int64Type, runtime.pointerType, runtime.pointerType, runtime.pointerType]);
+    let known = runtime.existing("ens_run_process_captured", type);
+    if (known != null) {
+        return known;
+    }
+    let openFile = runtime.libc("fopen",
+        runtime.pointerType.functionType([runtime.pointerType, runtime.pointerType]));
+    let closeFile = runtime.libc("fclose",
+        runtime.int32Type.functionType([runtime.pointerType]));
+    let definition = runtime.beginDefinition("ens_run_process_captured", type);
+    let builder = runtime.builder;
+    let openErrorBlock = runtime.block(definition, "open.error");
+    let noOutputBlock = runtime.block(definition, "open.no.output");
+    let noErrorsBlock = runtime.block(definition, "open.no.errors");
+    let readyBlock = runtime.block(definition, "ready");
+    let closeBlock = runtime.block(definition, "close");
+    let statusSlot = memory.buildAlloca(builder, runtime.int64Type, "status");
+    let mode = globals.buildGlobalString(builder, "wb", ".mode.write");
+    let output = runtime.call(openFile, [runtime.parameter(definition, 4), mode], "out.file");
+    instructions.buildCondBr(builder, runtime.isNull(output), noOutputBlock, openErrorBlock);
+
+    builder.positionAtEnd(openErrorBlock);
+    let errors = runtime.call(openFile, [runtime.parameter(definition, 5), mode], "err.file");
+    instructions.buildCondBr(builder, runtime.isNull(errors), noErrorsBlock, readyBlock);
+
+    builder.positionAtEnd(noOutputBlock);
+    instructions.buildRet(builder, runtime.int64(-1));
+
+    builder.positionAtEnd(noErrorsBlock);
+    runtime.call(closeFile, [output], "");
+    instructions.buildRet(builder, runtime.int64(-1));
+
+    builder.positionAtEnd(readyBlock);
+    if (runtime.onWindows()) {
+        emitWindowsSpawn(runtime, definition, output, errors, statusSlot, closeBlock);
+    } else {
+        emitPosixSpawn(runtime, definition, output, errors, statusSlot, closeBlock);
+    }
+
+    builder.positionAtEnd(closeBlock);
+    runtime.call(closeFile, [output], "");
+    runtime.call(closeFile, [errors], "");
     instructions.buildRet(builder,
-        instructions.buildSelect(builder, failed, status, normalized, ""));
+        memory.buildLoad(builder, runtime.int64Type, statusSlot, "status"));
     return runtime.endDefinition(definition);
+}
+
+// The Windows half: the two files become the child's standard handles through a STARTUPINFOA, and
+// CreateProcess starts the command line. Both structures are raw byte blocks here, so the fields
+// are written at their documented x64 offsets - cb and dwFlags as words, the handles as pointers.
+emitWindowsSpawn(Runtime runtime, RuntimeDefinition definition, Value output, Value errors,
+                 Value statusSlot, BasicBlock closeBlock) {
+    let builder = runtime.builder;
+    let fileNumber = runtime.libc("_fileno",
+        runtime.int32Type.functionType([runtime.pointerType]));
+    let osHandle = runtime.libc("_get_osfhandle",
+        runtime.int64Type.functionType([runtime.int32Type]));
+    let createProcess = runtime.libc("CreateProcessA",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType,
+            runtime.pointerType, runtime.pointerType, runtime.int32Type, runtime.int32Type,
+            runtime.pointerType, runtime.pointerType, runtime.pointerType, runtime.pointerType]));
+    let waitForOne = runtime.libc("WaitForSingleObject",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type]));
+    let exitCodeOf = runtime.libc("GetExitCodeProcess",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
+    let closeHandle = runtime.libc("CloseHandle",
+        runtime.int32Type.functionType([runtime.pointerType]));
+    let failedBlock = runtime.block(definition, "spawn.failed");
+    let waitBlock = runtime.block(definition, "spawn.wait");
+
+    // STARTUPINFOA is 104 bytes and PROCESS_INFORMATION 24; both start out zeroed.
+    let startup = memory.buildAlloca(builder, runtime.int8Type.arrayType(104), "startup");
+    let process = memory.buildAlloca(builder, runtime.int8Type.arrayType(24), "process");
+    for (long offset = 0; offset < 104; offset = offset + 8) {
+        memory.buildStore(builder, runtime.int64(0), fieldAt(runtime, startup, offset));
+    }
+    for (long offset = 0; offset < 24; offset = offset + 8) {
+        memory.buildStore(builder, runtime.int64(0), fieldAt(runtime, process, offset));
+    }
+    memory.buildStore(builder, runtime.int32(104), fieldAt(runtime, startup, 0));
+    // dwFlags = STARTF_USESTDHANDLES.
+    memory.buildStore(builder, runtime.int32(0x100), fieldAt(runtime, startup, 60));
+    memory.buildStore(builder, runtime.call(osHandle, [runtime.int32(0)], "stdin.handle"),
+        fieldAt(runtime, startup, 80));
+    memory.buildStore(builder, handleOfFile(runtime, fileNumber, osHandle, output),
+        fieldAt(runtime, startup, 88));
+    memory.buildStore(builder, handleOfFile(runtime, fileNumber, osHandle, errors),
+        fieldAt(runtime, startup, 96));
+
+    let started = runtime.call(createProcess, [runtime.nullPointer(),
+        runtime.parameter(definition, 3), runtime.nullPointer(), runtime.nullPointer(),
+        runtime.int32(1), runtime.int32(0), runtime.nullPointer(), runtime.nullPointer(),
+        startup, process], "started");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, started, runtime.int32(0), ""), failedBlock, waitBlock);
+
+    builder.positionAtEnd(failedBlock);
+    memory.buildStore(builder, runtime.int64(127), statusSlot);
+    instructions.buildBr(builder, closeBlock);
+
+    builder.positionAtEnd(waitBlock);
+    let child = memory.buildLoad(builder, runtime.pointerType, fieldAt(runtime, process, 0),
+        "child");
+    let thread = memory.buildLoad(builder, runtime.pointerType, fieldAt(runtime, process, 8),
+        "child.thread");
+    runtime.call(waitForOne, [child, runtime.int32(0xFFFFFFFF)], "");
+    let codeSlot = memory.buildAlloca(builder, runtime.int32Type, "exit.code");
+    memory.buildStore(builder, runtime.int32(0), codeSlot);
+    runtime.call(exitCodeOf, [child, codeSlot], "");
+    runtime.call(closeHandle, [thread], "");
+    runtime.call(closeHandle, [child], "");
+    memory.buildStore(builder, instructions.buildZExt(builder,
+        memory.buildLoad(builder, runtime.int32Type, codeSlot, "code"), runtime.int64Type, ""),
+        statusSlot);
+    instructions.buildBr(builder, closeBlock);
+}
+
+// The POSIX half: the argument vector points into the NUL separated block, the child aims its two
+// streams at the files the parent already opened and execs, and the parent normalizes the wait
+// status the way the shell runner does.
+emitPosixSpawn(Runtime runtime, RuntimeDefinition definition, Value output, Value errors,
+               Value statusSlot, BasicBlock closeBlock) {
+    let builder = runtime.builder;
+    let fileNumber = runtime.libc("fileno",
+        runtime.int32Type.functionType([runtime.pointerType]));
+    let duplicate = runtime.libc("dup2",
+        runtime.int32Type.functionType([runtime.int32Type, runtime.int32Type]));
+    let forkProcess = runtime.libc("fork", runtime.int32Type.functionType([]));
+    let execProgram = runtime.libc("execvp",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
+    let exitChild = runtime.libc("_exit", runtime.voidType.functionType([runtime.int32Type]));
+    let waitForChild = runtime.libc("waitpid",
+        runtime.int32Type.functionType([runtime.int32Type, runtime.pointerType,
+            runtime.int32Type]));
+    let measure = runtime.strlen();
+    let fillTestBlock = runtime.block(definition, "argv.test");
+    let fillBodyBlock = runtime.block(definition, "argv.body");
+    let startBlock = runtime.block(definition, "spawn.start");
+    let childBlock = runtime.block(definition, "spawn.child");
+    let parentBlock = runtime.block(definition, "spawn.parent");
+    let failedBlock = runtime.block(definition, "spawn.failed");
+    let waitBlock = runtime.block(definition, "spawn.wait");
+
+    let program = runtime.parameter(definition, 0);
+    let count = runtime.parameter(definition, 2);
+    let vector = memory.buildArrayAlloca(builder, runtime.pointerType,
+        instructions.buildAdd(builder, count, runtime.int64(2), ""), "argv");
+    memory.buildStore(builder, program, vector);
+    let indexSlot = memory.buildAlloca(builder, runtime.int64Type, "i");
+    memory.buildStore(builder, runtime.int64(0), indexSlot);
+    let cursorSlot = memory.buildAlloca(builder, runtime.pointerType, "cursor");
+    memory.buildStore(builder, runtime.parameter(definition, 1), cursorSlot);
+    let outputFd = runtime.call(fileNumber, [output], "out.fd");
+    let errorsFd = runtime.call(fileNumber, [errors], "err.fd");
+    instructions.buildBr(builder, fillTestBlock);
+
+    // The block holds the arguments one after another, each NUL terminated, so every slot points
+    // straight into it and the cursor walks past one NUL per argument.
+    builder.positionAtEnd(fillTestBlock);
+    let index = memory.buildLoad(builder, runtime.int64Type, indexSlot, "i.cur");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, index, count, ""), fillBodyBlock, startBlock);
+
+    builder.positionAtEnd(fillBodyBlock);
+    let cursor = memory.buildLoad(builder, runtime.pointerType, cursorSlot, "cursor.cur");
+    memory.buildStore(builder, cursor, slotAt(runtime, vector,
+        instructions.buildAdd(builder, index, runtime.int64(1), "")));
+    let used = instructions.buildAdd(builder, runtime.call(measure, [cursor], "arg.len"),
+        runtime.int64(1), "");
+    memory.buildStore(builder, memory.buildGEP(builder, runtime.int8Type, cursor, [used], ""),
+        cursorSlot);
+    memory.buildStore(builder, instructions.buildAdd(builder, index, runtime.int64(1), ""),
+        indexSlot);
+    instructions.buildBr(builder, fillTestBlock);
+
+    builder.positionAtEnd(startBlock);
+    memory.buildStore(builder, runtime.nullPointer(), slotAt(runtime, vector,
+        instructions.buildAdd(builder, count, runtime.int64(1), "")));
+    let child = runtime.call(forkProcess, [], "child");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, child, runtime.int32(0), ""), childBlock, parentBlock);
+
+    builder.positionAtEnd(childBlock);
+    runtime.call(duplicate, [outputFd, runtime.int32(1)], "");
+    runtime.call(duplicate, [errorsFd, runtime.int32(2)], "");
+    runtime.call(execProgram, [program, vector], "");
+    runtime.call(exitChild, [runtime.int32(127)], "");
+    instructions.buildUnreachable(builder);
+
+    builder.positionAtEnd(parentBlock);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, child, runtime.int32(0), ""), failedBlock, waitBlock);
+
+    builder.positionAtEnd(failedBlock);
+    memory.buildStore(builder, runtime.int64(127), statusSlot);
+    instructions.buildBr(builder, closeBlock);
+
+    builder.positionAtEnd(waitBlock);
+    let waitedSlot = memory.buildAlloca(builder, runtime.int32Type, "wait.status");
+    memory.buildStore(builder, runtime.int32(0), waitedSlot);
+    runtime.call(waitForChild, [child, waitedSlot, runtime.int32(0)], "");
+    let waited = memory.buildLoad(builder, runtime.int32Type, waitedSlot, "wait.cur");
+    memory.buildStore(builder,
+        instructions.buildSExt(builder, normalizedStatus(runtime, waited), runtime.int64Type, ""),
+        statusSlot);
+    instructions.buildBr(builder, closeBlock);
+}
+
+// The address of the field the byte offset names inside a raw structure block.
+fieldAt(Runtime runtime, Value block, long offset) -> Value {
+    return memory.buildGEP(runtime.builder, runtime.int8Type, block, [runtime.int64(offset)],
+        "field");
+}
+
+// The address of one pointer slot of an argument vector.
+slotAt(Runtime runtime, Value vector, Value index) -> Value {
+    return memory.buildGEP(runtime.builder, runtime.pointerType, vector, [index], "");
+}
+
+// The handle the operating system knows a standard C stream by.
+handleOfFile(Runtime runtime, RuntimeFunction fileNumber, RuntimeFunction osHandle,
+             Value file) -> Value {
+    return runtime.call(osHandle, [runtime.call(fileNumber, [file], "fd")], "handle");
 }
 
 // i32 ens_path_exists(ptr path): access(path, 0), which answers 0 exactly when the path exists.

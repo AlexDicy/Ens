@@ -513,7 +513,6 @@ task("test")
             -- the standard library has no directory enumeration yet; the harness narrows them by
             -- the fixture's own @ens-test arguments.
             local lines = {
-                "platform " .. (on_windows and "windows" or "posix"),
                 "ens " .. ens_exe,
                 "spike " .. spike_exe,
                 "stdlib " .. (path.join(os.projectdir(), "libs"):gsub("\\", "/")),

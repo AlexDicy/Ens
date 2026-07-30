@@ -1468,30 +1468,281 @@ struct CodeGenerator::Impl {
         if (module->getTargetTriple().isOSWindows()) {
             builder->CreateRet(rawStatus);
         } else {
-            llvm::Value* signal = builder->CreateAnd(
-                rawStatus, llvm::ConstantInt::get(i32Ty, 0x7f), "signal");
-            llvm::Value* exited = builder->CreateICmpEQ(
-                signal, llvm::ConstantInt::get(i32Ty, 0), "exited");
-            llvm::Value* signaled = builder->CreateAnd(
-                builder->CreateICmpNE(signal, llvm::ConstantInt::get(i32Ty, 0)),
-                builder->CreateICmpNE(signal, llvm::ConstantInt::get(i32Ty, 0x7f)),
-                "signaled");
-            llvm::Value* exitCode = builder->CreateAnd(
-                builder->CreateLShr(rawStatus, llvm::ConstantInt::get(i32Ty, 8)),
-                llvm::ConstantInt::get(i32Ty, 0xff), "exit.code");
-            llvm::Value* signalCode = builder->CreateAdd(
-                signal, llvm::ConstantInt::get(i32Ty, 128), "signal.code");
-            llvm::Value* normalized = builder->CreateSelect(
-                exited, exitCode,
-                builder->CreateSelect(signaled, signalCode, rawStatus),
-                "normalized");
             llvm::Value* failed = builder->CreateICmpEQ(
                 rawStatus, llvm::ConstantInt::getSigned(i32Ty, -1), "failed");
-            builder->CreateRet(builder->CreateSelect(failed, rawStatus, normalized));
+            builder->CreateRet(builder->CreateSelect(failed, rawStatus,
+                normalizedWaitStatus(rawStatus)));
         }
 
         builder->restoreIP(savedIP);
         return fn;
+    }
+
+    // i64 ens_run_process_captured(program, argumentBlock, count, commandLine,
+    // stdoutPath, stderrPath): runs the program with no shell in between, waits
+    // for it, and writes its two streams into the two files. A POSIX target
+    // execs an argument vector built from the NUL separated block; Windows hands
+    // the joined command line to
+    // CreateProcess, the only shape Win32 accepts. Returns the child's exit
+    // code, 127 when the program could not be started at all, or -1 when the two
+    // files could not be opened for writing.
+    llvm::Function* defineRunProcessCapturedRuntime() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8Ty  = llvm::Type::getInt8Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(i64Ty,
+            { ptrTy, ptrTy, i64Ty, ptrTy, ptrTy, ptrTy }, false);
+        llvm::Function* fn = module->getFunction("ens_run_process_captured");
+        if (!fn) {
+            fn = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage,
+                "ens_run_process_captured", module.get());
+        }
+        if (!fn->empty()) return fn;
+
+        auto savedIP = builder->saveIP();
+        auto* entry     = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* openError = llvm::BasicBlock::Create(ctx, "open.error", fn);
+        auto* noOutput  = llvm::BasicBlock::Create(ctx, "open.no.output", fn);
+        auto* noErrors  = llvm::BasicBlock::Create(ctx, "open.no.errors", fn);
+        auto* ready     = llvm::BasicBlock::Create(ctx, "ready", fn);
+        auto* closeBB   = llvm::BasicBlock::Create(ctx, "close", fn);
+
+        auto* fileTy = llvm::FunctionType::get(ptrTy, { ptrTy, ptrTy }, false);
+        llvm::FunctionCallee openFile = module->getOrInsertFunction("fopen", fileTy);
+        llvm::FunctionCallee closeFile = module->getOrInsertFunction("fclose",
+            llvm::FunctionType::get(i32Ty, { ptrTy }, false));
+
+        builder->SetInsertPoint(entry);
+        llvm::Value* statusSlot = builder->CreateAlloca(i64Ty, nullptr, "status");
+        llvm::Value* mode = builder->CreateGlobalString("wb", ".mode.write");
+        llvm::Value* output = builder->CreateCall(openFile, { fn->getArg(4), mode }, "out.file");
+        builder->CreateCondBr(
+            builder->CreateICmpEQ(output, llvm::ConstantPointerNull::get(ptrTy)),
+            noOutput, openError);
+
+        builder->SetInsertPoint(openError);
+        llvm::Value* errors = builder->CreateCall(openFile, { fn->getArg(5), mode }, "err.file");
+        builder->CreateCondBr(
+            builder->CreateICmpEQ(errors, llvm::ConstantPointerNull::get(ptrTy)),
+            noErrors, ready);
+
+        builder->SetInsertPoint(noOutput);
+        builder->CreateRet(llvm::ConstantInt::getSigned(i64Ty, -1));
+
+        builder->SetInsertPoint(noErrors);
+        builder->CreateCall(closeFile, { output });
+        builder->CreateRet(llvm::ConstantInt::getSigned(i64Ty, -1));
+
+        builder->SetInsertPoint(ready);
+        if (module->getTargetTriple().isOSWindows()) {
+            emitWindowsSpawn(fn, output, errors, statusSlot, closeBB);
+        } else {
+            emitPosixSpawn(fn, output, errors, statusSlot, closeBB);
+        }
+
+        builder->SetInsertPoint(closeBB);
+        builder->CreateCall(closeFile, { output });
+        builder->CreateCall(closeFile, { errors });
+        builder->CreateRet(builder->CreateLoad(i64Ty, statusSlot, "status.load"));
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    // The Windows half of the capturing runner: the two files become the child's
+    // standard handles through a STARTUPINFOA, and CreateProcess starts the
+    // command line without a shell. The structures are raw byte blocks, so the
+    // fields are written at their documented x64 offsets.
+    void emitWindowsSpawn(llvm::Function* fn, llvm::Value* output, llvm::Value* errors,
+                          llvm::Value* statusSlot, llvm::BasicBlock* closeBB) {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8Ty  = llvm::Type::getInt8Ty(ctx);
+        llvm::FunctionCallee fileNumber = module->getOrInsertFunction("_fileno",
+            llvm::FunctionType::get(i32Ty, { ptrTy }, false));
+        llvm::FunctionCallee osHandle = module->getOrInsertFunction("_get_osfhandle",
+            llvm::FunctionType::get(i64Ty, { i32Ty }, false));
+        llvm::FunctionCallee createProcess = module->getOrInsertFunction("CreateProcessA",
+            llvm::FunctionType::get(i32Ty, { ptrTy, ptrTy, ptrTy, ptrTy, i32Ty, i32Ty, ptrTy,
+                ptrTy, ptrTy, ptrTy }, false));
+        llvm::FunctionCallee waitForOne = module->getOrInsertFunction("WaitForSingleObject",
+            llvm::FunctionType::get(i32Ty, { ptrTy, i32Ty }, false));
+        llvm::FunctionCallee exitCodeOf = module->getOrInsertFunction("GetExitCodeProcess",
+            llvm::FunctionType::get(i32Ty, { ptrTy, ptrTy }, false));
+        llvm::FunctionCallee closeHandle = module->getOrInsertFunction("CloseHandle",
+            llvm::FunctionType::get(i32Ty, { ptrTy }, false));
+
+        auto* spawnFailed = llvm::BasicBlock::Create(ctx, "spawn.failed", fn);
+        auto* waitBB = llvm::BasicBlock::Create(ctx, "spawn.wait", fn);
+
+        // STARTUPINFOA is 104 bytes and PROCESS_INFORMATION 24; both start zeroed.
+        llvm::Value* startup = builder->CreateAlloca(llvm::ArrayType::get(i8Ty, 104), nullptr,
+            "startup");
+        llvm::Value* process = builder->CreateAlloca(llvm::ArrayType::get(i8Ty, 24), nullptr,
+            "process");
+        auto fieldAt = [&](llvm::Value* base, long offset) {
+            return builder->CreateGEP(i8Ty, base, llvm::ConstantInt::get(i64Ty, offset), "field");
+        };
+        for (long offset = 0; offset < 104; offset += 8) {
+            builder->CreateStore(llvm::ConstantInt::get(i64Ty, 0), fieldAt(startup, offset));
+        }
+        for (long offset = 0; offset < 24; offset += 8) {
+            builder->CreateStore(llvm::ConstantInt::get(i64Ty, 0), fieldAt(process, offset));
+        }
+        auto handleOfFile = [&](llvm::Value* file) {
+            return builder->CreateCall(osHandle,
+                { builder->CreateCall(fileNumber, { file }, "fd") }, "handle");
+        };
+        builder->CreateStore(llvm::ConstantInt::get(i32Ty, 104), fieldAt(startup, 0));
+        // dwFlags = STARTF_USESTDHANDLES.
+        builder->CreateStore(llvm::ConstantInt::get(i32Ty, 0x100), fieldAt(startup, 60));
+        builder->CreateStore(builder->CreateCall(osHandle,
+            { llvm::ConstantInt::get(i32Ty, 0) }, "stdin.handle"), fieldAt(startup, 80));
+        builder->CreateStore(handleOfFile(output), fieldAt(startup, 88));
+        builder->CreateStore(handleOfFile(errors), fieldAt(startup, 96));
+
+        llvm::Value* started = builder->CreateCall(createProcess,
+            { llvm::ConstantPointerNull::get(ptrTy), fn->getArg(3),
+              llvm::ConstantPointerNull::get(ptrTy), llvm::ConstantPointerNull::get(ptrTy),
+              llvm::ConstantInt::get(i32Ty, 1), llvm::ConstantInt::get(i32Ty, 0),
+              llvm::ConstantPointerNull::get(ptrTy), llvm::ConstantPointerNull::get(ptrTy),
+              startup, process }, "started");
+        builder->CreateCondBr(
+            builder->CreateICmpEQ(started, llvm::ConstantInt::get(i32Ty, 0)),
+            spawnFailed, waitBB);
+
+        builder->SetInsertPoint(spawnFailed);
+        builder->CreateStore(llvm::ConstantInt::get(i64Ty, 127), statusSlot);
+        builder->CreateBr(closeBB);
+
+        builder->SetInsertPoint(waitBB);
+        llvm::Value* child = builder->CreateLoad(ptrTy, fieldAt(process, 0), "child");
+        llvm::Value* thread = builder->CreateLoad(ptrTy, fieldAt(process, 8), "child.thread");
+        builder->CreateCall(waitForOne, { child, llvm::ConstantInt::get(i32Ty, 0xFFFFFFFF) });
+        llvm::Value* codeSlot = builder->CreateAlloca(i32Ty, nullptr, "exit.code");
+        builder->CreateStore(llvm::ConstantInt::get(i32Ty, 0), codeSlot);
+        builder->CreateCall(exitCodeOf, { child, codeSlot });
+        builder->CreateCall(closeHandle, { thread });
+        builder->CreateCall(closeHandle, { child });
+        builder->CreateStore(builder->CreateZExt(
+            builder->CreateLoad(i32Ty, codeSlot, "code"), i64Ty, "code.wide"), statusSlot);
+        builder->CreateBr(closeBB);
+    }
+
+    // The POSIX half: the argument vector is built from the Ens string array,
+    // the child points its two streams at the already open files and execs, and
+    // the parent normalizes the wait status the way ens_run_process does.
+    void emitPosixSpawn(llvm::Function* fn, llvm::Value* output, llvm::Value* errors,
+                        llvm::Value* statusSlot, llvm::BasicBlock* closeBB) {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8Ty  = llvm::Type::getInt8Ty(ctx);
+        llvm::FunctionCallee fileNumber = module->getOrInsertFunction("fileno",
+            llvm::FunctionType::get(i32Ty, { ptrTy }, false));
+        llvm::FunctionCallee duplicate = module->getOrInsertFunction("dup2",
+            llvm::FunctionType::get(i32Ty, { i32Ty, i32Ty }, false));
+        llvm::FunctionCallee forkProcess = module->getOrInsertFunction("fork",
+            llvm::FunctionType::get(i32Ty, {}, false));
+        llvm::FunctionCallee execProgram = module->getOrInsertFunction("execvp",
+            llvm::FunctionType::get(i32Ty, { ptrTy, ptrTy }, false));
+        llvm::FunctionCallee exitChild = module->getOrInsertFunction("_exit",
+            llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), { i32Ty }, false));
+        llvm::FunctionCallee waitForChild = module->getOrInsertFunction("waitpid",
+            llvm::FunctionType::get(i32Ty, { i32Ty, ptrTy, i32Ty }, false));
+
+        auto* fillTest = llvm::BasicBlock::Create(ctx, "argv.test", fn);
+        auto* fillBody = llvm::BasicBlock::Create(ctx, "argv.body", fn);
+        auto* spawnBB  = llvm::BasicBlock::Create(ctx, "spawn.start", fn);
+        auto* childBB  = llvm::BasicBlock::Create(ctx, "spawn.child", fn);
+        auto* parentBB = llvm::BasicBlock::Create(ctx, "spawn.parent", fn);
+        auto* forkFail = llvm::BasicBlock::Create(ctx, "spawn.failed", fn);
+        auto* waitBB   = llvm::BasicBlock::Create(ctx, "spawn.wait", fn);
+
+        llvm::Value* count = fn->getArg(2);
+        llvm::Value* one = llvm::ConstantInt::get(i64Ty, 1);
+        llvm::Value* slots = builder->CreateAdd(count, llvm::ConstantInt::get(i64Ty, 2), "slots");
+        llvm::Value* argv = builder->CreateAlloca(ptrTy, slots, "argv");
+        builder->CreateStore(fn->getArg(0), argv);
+        llvm::Value* indexSlot = builder->CreateAlloca(i64Ty, nullptr, "i");
+        builder->CreateStore(llvm::ConstantInt::get(i64Ty, 0), indexSlot);
+        llvm::Value* cursorSlot = builder->CreateAlloca(ptrTy, nullptr, "cursor");
+        builder->CreateStore(fn->getArg(1), cursorSlot);
+        llvm::Value* outputFd = builder->CreateCall(fileNumber, { output }, "out.fd");
+        llvm::Value* errorsFd = builder->CreateCall(fileNumber, { errors }, "err.fd");
+        builder->CreateBr(fillTest);
+
+        // The block holds the arguments one after another, each NUL terminated, so
+        // every slot points straight into it and the cursor walks past one NUL per
+        // argument.
+        builder->SetInsertPoint(fillTest);
+        llvm::Value* index = builder->CreateLoad(i64Ty, indexSlot, "i.load");
+        builder->CreateCondBr(builder->CreateICmpSLT(index, count), fillBody, spawnBB);
+
+        builder->SetInsertPoint(fillBody);
+        llvm::Value* cursor = builder->CreateLoad(ptrTy, cursorSlot, "cursor.load");
+        builder->CreateStore(cursor,
+            builder->CreateGEP(ptrTy, argv, builder->CreateAdd(index, one), "argv.slot"));
+        llvm::Value* used = builder->CreateAdd(
+            builder->CreateCall(getOrDeclareStrlen(), { cursor }, "arg.len"), one);
+        builder->CreateStore(builder->CreateGEP(i8Ty, cursor, used, "cursor.next"), cursorSlot);
+        builder->CreateStore(builder->CreateAdd(index, one), indexSlot);
+        builder->CreateBr(fillTest);
+
+        builder->SetInsertPoint(spawnBB);
+        builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy),
+            builder->CreateGEP(ptrTy, argv, builder->CreateAdd(count, one), "argv.end"));
+        llvm::Value* child = builder->CreateCall(forkProcess, {}, "child");
+        builder->CreateCondBr(
+            builder->CreateICmpEQ(child, llvm::ConstantInt::get(i32Ty, 0)), childBB, parentBB);
+
+        builder->SetInsertPoint(childBB);
+        builder->CreateCall(duplicate, { outputFd, llvm::ConstantInt::get(i32Ty, 1) });
+        builder->CreateCall(duplicate, { errorsFd, llvm::ConstantInt::get(i32Ty, 2) });
+        builder->CreateCall(execProgram, { fn->getArg(0), argv });
+        builder->CreateCall(exitChild, { llvm::ConstantInt::get(i32Ty, 127) });
+        builder->CreateUnreachable();
+
+        builder->SetInsertPoint(parentBB);
+        builder->CreateCondBr(
+            builder->CreateICmpSLT(child, llvm::ConstantInt::get(i32Ty, 0)), forkFail, waitBB);
+
+        builder->SetInsertPoint(forkFail);
+        builder->CreateStore(llvm::ConstantInt::get(i64Ty, 127), statusSlot);
+        builder->CreateBr(closeBB);
+
+        builder->SetInsertPoint(waitBB);
+        llvm::Value* waitedSlot = builder->CreateAlloca(i32Ty, nullptr, "wait.status");
+        builder->CreateStore(llvm::ConstantInt::get(i32Ty, 0), waitedSlot);
+        builder->CreateCall(waitForChild, { child, waitedSlot,
+            llvm::ConstantInt::get(i32Ty, 0) });
+        llvm::Value* waited = builder->CreateLoad(i32Ty, waitedSlot, "wait.load");
+        builder->CreateStore(builder->CreateSExt(normalizedWaitStatus(waited), i64Ty,
+            "status.wide"), statusSlot);
+        builder->CreateBr(closeBB);
+    }
+
+    // The exit code a POSIX wait status stands for: the low seven bits name the
+    // signal that ended the child, so a child that exited carries its code eight
+    // bits up and one that was killed reports 128 plus its signal, as a shell does.
+    llvm::Value* normalizedWaitStatus(llvm::Value* status) {
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        llvm::Value* signal = builder->CreateAnd(status,
+            llvm::ConstantInt::get(i32Ty, 0x7f), "signal");
+        llvm::Value* exited = builder->CreateICmpEQ(signal,
+            llvm::ConstantInt::get(i32Ty, 0), "exited");
+        llvm::Value* signaled = builder->CreateAnd(
+            builder->CreateICmpNE(signal, llvm::ConstantInt::get(i32Ty, 0)),
+            builder->CreateICmpNE(signal, llvm::ConstantInt::get(i32Ty, 0x7f)), "signaled");
+        llvm::Value* exitCode = builder->CreateAnd(
+            builder->CreateLShr(status, llvm::ConstantInt::get(i32Ty, 8)),
+            llvm::ConstantInt::get(i32Ty, 0xff), "exit.code");
+        llvm::Value* signalCode = builder->CreateAdd(signal,
+            llvm::ConstantInt::get(i32Ty, 128), "signal.code");
+        return builder->CreateSelect(exited, exitCode,
+            builder->CreateSelect(signaled, signalCode, status), "normalized");
     }
 
     llvm::Function* definePathExistsRuntime() {
@@ -7642,6 +7893,7 @@ struct CodeGenerator::Impl {
         if (sym && sym->name == u"ens_arguments")
             return builder->CreateCall(defineArgsRuntime(), {});
         if (sym && sym->name == u"ens_run_process") defineRunProcessRuntime();
+        if (sym && sym->name == u"ens_run_process_captured") defineRunProcessCapturedRuntime();
         if (sym && sym->name == u"ens_path_exists") definePathExistsRuntime();
         llvm::Function* fn = getOrDeclareExternalFunction(sym, /*receiver*/ nullptr);
         if (!fn) {

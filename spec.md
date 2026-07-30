@@ -1225,6 +1225,17 @@ writeGreeting() -> int throws {
 
 `system.exists(path)` reports whether a file or directory exists at the path, without throwing: only a missing path reports `false`.
 
+`system.runCaptured(program, arguments, stdoutPath, stderrPath)` runs `program` with `arguments`, waits for it to finish, writes what it sent to its standard output and its standard error into the two files, and returns its exit code.
+No command interpreter takes part, so every argument reaches the program exactly as written, whatever spaces or quotes it holds, and nothing is expanded on the way.
+A program that could not be started reports the exit code `127`, the code a shell reports for the same failure; a `SystemError` says the two files could not be opened for writing.
+
+```ens
+import @std.system;
+
+int status = try system.runCaptured("git", ["commit", "-m", "a message with spaces"],
+    "build/git.out", "build/git.err");
+```
+
 ---
 
 Every value has a `hash()` method returning a `long`. Value types (primitives, enums, strings, structs) hash by their contents, so equal values hash equally; classes and arrays hash by identity, matching how `==` compares them. A class can declare its own `hash() -> long` to control its hashing (a method named `hash` must have exactly that signature), paired with `equals(C other) -> bool` - a method taking a single parameter of the class's own type `C` - to control equality. When a class declares such an `equals`, `==` and `!=` on that class compare by content - an identity and null check first, then `equals` - rather than by reference identity; the method must return `bool` and cannot be `throws`. Both `hash` and `equals` are written with `override`, since they replace a class's built-in identity hash and equality. The two are a matched pair: a class that declares one must declare the other, so equal instances always hash equally. The `Hashable` interface from `@std.hash` names the hashing contract for generic bounds, and every type satisfies it.
