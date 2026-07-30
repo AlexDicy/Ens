@@ -1236,6 +1236,12 @@ int status = try system.runCaptured("git", ["commit", "-m", "a message with spac
     "build/git.out", "build/git.err");
 ```
 
+The `@std.path` module works on paths as text, with `/` separating the parts on every platform, and never looks at the file system.
+`join(base, relative)` puts one separator between two parts, and gives back the relative part alone when the base is empty.
+`parentFolder(path)` returns the folder one level up: `""` when the path names no folder, and `/` at the root.
+`fileName(path)` returns the last part of the path.
+`normalize(path)` drops the `.` parts and the repeated separators, and resolves every `..` that has a part before it to remove.
+
 ---
 
 Every value has a `hash()` method returning a `long`. Value types (primitives, enums, strings, structs) hash by their contents, so equal values hash equally; classes and arrays hash by identity, matching how `==` compares them. A class can declare its own `hash() -> long` to control its hashing (a method named `hash` must have exactly that signature), paired with `equals(C other) -> bool` - a method taking a single parameter of the class's own type `C` - to control equality. When a class declares such an `equals`, `==` and `!=` on that class compare by content - an identity and null check first, then `equals` - rather than by reference identity; the method must return `bool` and cannot be `throws`. Both `hash` and `equals` are written with `override`, since they replace a class's built-in identity hash and equality. The two are a matched pair: a class that declares one must declare the other, so equal instances always hash equally. The `Hashable` interface from `@std.hash` names the hashing contract for generic bounds, and every type satisfies it.
