@@ -2155,6 +2155,18 @@ struct CodeGenerator::Impl {
         return list;
     }
 
+    // The name a directory entry point links under. On Darwin the form carrying a
+    // 64-bit inode - the one the entry offset below describes - is the plain name on
+    // arm64 and the `$INODE64` name on x86_64, where the plain name still reaches the
+    // smaller, older record.
+    std::string directoryEntryPoint(const char* name) {
+        const llvm::Triple& triple = module->getTargetTriple();
+        if (triple.isOSDarwin() && triple.getArch() == llvm::Triple::x86_64) {
+            return std::string(name) + "$INODE64";
+        }
+        return name;
+    }
+
     // True when a directory entry names the folder itself or its parent, the two
     // entries every enumeration hands back and no caller wants.
     llvm::Value* emitIsDotEntry(llvm::Value* name, llvm::Type* charTy) {
@@ -2219,7 +2231,7 @@ struct CodeGenerator::Impl {
             auto* folder = llvm::BasicBlock::Create(ctx, "kind.directory", fn);
             llvm::FunctionCallee reachable = libcFn("access",
                 llvm::FunctionType::get(i32Ty, { ptrTy, i32Ty }, false));
-            llvm::FunctionCallee openFolder = libcFn("opendir",
+            llvm::FunctionCallee openFolder = libcFn(directoryEntryPoint("opendir").c_str(),
                 llvm::FunctionType::get(ptrTy, { ptrTy }, false));
             llvm::FunctionCallee closeFolder = libcFn("closedir",
                 llvm::FunctionType::get(i32Ty, { ptrTy }, false));
@@ -2499,9 +2511,9 @@ struct CodeGenerator::Impl {
             auto* bodyBB = llvm::BasicBlock::Create(ctx, "list.body", fn);
             auto* keptBB = llvm::BasicBlock::Create(ctx, "list.kept", fn);
             auto* doneBB = llvm::BasicBlock::Create(ctx, "list.done", fn);
-            llvm::FunctionCallee openFolder = libcFn("opendir",
+            llvm::FunctionCallee openFolder = libcFn(directoryEntryPoint("opendir").c_str(),
                 llvm::FunctionType::get(ptrTy, { ptrTy }, false));
-            llvm::FunctionCallee readFolder = libcFn("readdir",
+            llvm::FunctionCallee readFolder = libcFn(directoryEntryPoint("readdir").c_str(),
                 llvm::FunctionType::get(ptrTy, { ptrTy }, false));
             llvm::FunctionCallee closeFolder = libcFn("closedir",
                 llvm::FunctionType::get(i32Ty, { ptrTy }, false));
