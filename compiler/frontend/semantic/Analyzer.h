@@ -215,7 +215,7 @@ private:
                                    bool isConstructor, const char* behavior);
     void checkStructAbstractMarker(const ast::FuncDecl& fn, const Type* owner,
                                    const std::u16string& memberName, bool isConstructor);
-    void checkHashEqualsPairing(const ast::ClassDecl& cd, StructInfo* si);
+    void checkHashEqualsPairing(const SyntaxNode& diag, StructInfo* si);
     void checkStructEquatable(Type* structT, const SyntaxNode& node);
     bool findNonComparableField(Type* structT, std::vector<StructInfo*>& visiting,
                                 std::string& fieldPath, Type*& leaf);

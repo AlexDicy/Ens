@@ -202,9 +202,7 @@ compareContents(LoweringContext lowering, long left, long right, Method declared
     if (!negated) {
         return merged;
     }
-    long inverted = builder.newTemp(resultType);
-    builder.append(new EirUnary(inverted, resultType, EirUnaryOp.Not, merged));
-    return inverted;
+    return negate(lowering, merged, resultType);
 }
 
 eitherAbsent(LoweringContext lowering, long left, long right, Type boolType) -> long {
@@ -233,14 +231,54 @@ storeConstant(LoweringContext lowering, long slot, Type boolType, bool value) {
     builder.append(new EirStoreSlot(slot, constant));
 }
 
-// True when '==' over these two operand types compares struct contents memberwise.
+// The '!=' spelling of an equality bit already computed.
+negate(LoweringContext lowering, long equal, Type resultType) -> long {
+    let builder = lowering.builder();
+    long inverted = builder.newTemp(resultType);
+    builder.append(new EirUnary(inverted, resultType, EirUnaryOp.Not, equal));
+    return inverted;
+}
+
+// True when '==' over these two operand types compares struct values.
 public comparesStructValues(Type left, Type right) -> bool {
     return left == right && primitives.structOf(left) != null;
 }
 
-// Memberwise '==' over two same-type struct values: fields compare in declaration order by their
-// own '==' semantics, short-circuiting to unequal at the first difference. Both operands are
-// reached through their addresses, so nested structs compare where they sit.
+// The 'equals' a struct declares for itself: one parameter of the struct's own type, answering
+// bool. A struct has no base type, so only its own methods are consulted, and a declaration of
+// any other shape is an ordinary method that '==' does not consult.
+public declaredStructEquals(Type type) -> Method? {
+    let structType = primitives.structOf(type);
+    if (structType == null) {
+        return null;
+    }
+    let methods = types.methodsOf(structType);
+    if (methods == null) {
+        return null;
+    }
+    for (long i = 0; i < methods.length(); i++) {
+        let method = methods.get(i);
+        if (method.isConstructor() || method.name() != "equals") {
+            continue;
+        }
+        let signature = method.signature();
+        if (signature.parameters().length != 1 || signature.declaresThrows()) {
+            continue;
+        }
+        if (primitives.structOf(signature.parameters()[0].type()) != structType) {
+            continue;
+        }
+        if (primitives.isBoolType(signature.returnType())) {
+            return method;
+        }
+    }
+    return null;
+}
+
+// '==' over two same-type struct values: the struct's own 'equals' when it declares one, and
+// otherwise memberwise, fields comparing in declaration order by their own '==' semantics and
+// short-circuiting to unequal at the first difference. Both operands are reached through their
+// addresses, so a declaration runs in place and nested structs compare where they sit.
 public lowerStructValues(LoweringContext lowering, BinaryExpressionNode binary, bool negated,
                          Type resultType) -> long {
     let type = lowering.typeOf(binary.left());
@@ -255,12 +293,27 @@ public lowerStructValues(LoweringContext lowering, BinaryExpressionNode binary, 
     if (rightBase < 0) {
         return -1;
     }
+    long equal = structsEqualAt(lowering, leftBase, rightBase, type, binary.span());
+    if (equal < 0 || !negated) {
+        return equal;
+    }
+    return negate(lowering, equal, resultType);
+}
+
+// '==' over the structs two addresses name: the struct's own 'equals' when it declares one,
+// otherwise the memberwise walk merged through a slot.
+structsEqualAt(LoweringContext lowering, long leftBase, long rightBase, Type type, Span span)
+        -> long {
+    let declared = declaredStructEquals(type);
+    if (declared != null) {
+        return structs.lowerDeclaredEquals(lowering, type, declared, leftBase, rightBase, span);
+    }
     let builder = lowering.builder();
     let boolType = lowering.store().primitive(PrimitiveKind.Bool);
     long answer = builder.addSlot("structeq", boolType, false, false);
     long differBlock = builder.newBlock("struct.eq.differ");
     long endBlock = builder.newBlock("struct.eq.end");
-    if (!compareFieldsAt(lowering, leftBase, rightBase, type, differBlock, binary.span())) {
+    if (!compareFieldsAt(lowering, leftBase, rightBase, type, differBlock, span)) {
         return -1;
     }
     storeConstant(lowering, answer, boolType, true);
@@ -271,16 +324,12 @@ public lowerStructValues(LoweringContext lowering, BinaryExpressionNode binary, 
     builder.moveTo(endBlock);
     long merged = builder.newTemp(boolType);
     builder.append(new EirLoadSlot(merged, boolType, answer));
-    if (!negated) {
-        return merged;
-    }
-    long inverted = builder.newTemp(resultType);
-    builder.append(new EirUnary(inverted, resultType, EirUnaryOp.Not, merged));
-    return inverted;
+    return merged;
 }
 
 // Compares every field of the structs two addresses name, continuing on the equal path and
-// jumping to 'differBlock' at the first difference. Nested structs recurse into the same exit.
+// jumping to 'differBlock' at the first difference. A nested struct that folds memberwise
+// recurses into the same exit; one that declared 'equals' answers with a single bit.
 compareFieldsAt(LoweringContext lowering, long leftBase, long rightBase, Type type,
                 long differBlock, Span span) -> bool {
     let fields = records.fieldsOf(type);
@@ -292,7 +341,7 @@ compareFieldsAt(LoweringContext lowering, long leftBase, long rightBase, Type ty
         let fieldType = fields.get(i).type();
         long leftAddress = structs.fieldAddressAt(lowering, leftBase, fieldType, i);
         long rightAddress = structs.fieldAddressAt(lowering, rightBase, fieldType, i);
-        if (primitives.structOf(fieldType) != null) {
+        if (primitives.structOf(fieldType) != null && declaredStructEquals(fieldType) == null) {
             if (!compareFieldsAt(lowering, leftAddress, rightAddress, fieldType, differBlock,
                     span)) {
                 return false;
@@ -310,12 +359,18 @@ compareFieldsAt(LoweringContext lowering, long leftBase, long rightBase, Type ty
     return true;
 }
 
-// One non-struct field's own '==': strings by content, classes by identity unless the class
-// declared 'equals', arrays by identity, tagged optionals null-aware, and every value type by
-// value. A nullable field compares exactly as the non-optional spelling does, absence and all:
-// the content comparisons already answer for a reference that is not there.
+// One field's own '==': a struct that declared 'equals' through that declaration, strings by
+// content, classes by identity unless the class declared 'equals', arrays by identity, tagged
+// optionals null-aware, and every value type by value. A nullable field compares exactly as the
+// non-optional spelling does, absence and all: the content comparisons already answer for a
+// reference that is not there.
 fieldEqual(LoweringContext lowering, long leftAddress, long rightAddress, Type fieldType,
            Span span) -> long {
+    let declaredStruct = declaredStructEquals(fieldType);
+    if (declaredStruct != null) {
+        return structs.lowerDeclaredEquals(lowering, fieldType, declaredStruct, leftAddress,
+            rightAddress, span);
+    }
     let builder = lowering.builder();
     let boolType = lowering.store().primitive(PrimitiveKind.Bool);
     long left = places.loadFrom(lowering, leftAddress, fieldType);
@@ -369,8 +424,6 @@ public lowerTagged(LoweringContext lowering, BinaryExpressionNode binary, bool n
     if (right < 0) {
         return -1;
     }
-    let builder = lowering.builder();
-    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
     long equal = -1;
     if (primitives.isNullType(rightType)) {
         equal = presenceBit(lowering, left, false);
@@ -394,9 +447,7 @@ public lowerTagged(LoweringContext lowering, BinaryExpressionNode binary, bool n
     if (!negated) {
         return equal;
     }
-    long inverted = builder.newTemp(resultType);
-    builder.append(new EirUnary(inverted, resultType, EirUnaryOp.Not, equal));
-    return inverted;
+    return negate(lowering, equal, resultType);
 }
 
 // The presence tag, or its inverse for a null comparison.

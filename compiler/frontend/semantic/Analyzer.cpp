@@ -1122,6 +1122,7 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             checkNoreturnPlacement(m, /*isConstructor=*/isCtor, /*isDestructor=*/false);
             resolveMethodParams(m, t, sym);
             checkHashMethodSignature(m, sym, isCtor);
+            checkEqualsMethodSignature(m, sym, isCtor);
             checkToStringMethodSignature(m, sym, isCtor);
             const char* behavior = builtinBehaviorReplaced(t, mname, sym);
             checkStructOverrideMarker(m, t, mname, sym, isCtor, behavior);
@@ -1150,6 +1151,7 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             t->structInfo->methods.push_back(std::move(mi));
         }
         markOverloadedMethods(t->structInfo);
+        checkHashEqualsPairing(sd.node, t->structInfo);
         t->structInfo->membersCollected = true;
         popTypeParams(tpCount);
     }
@@ -1465,12 +1467,13 @@ static bool hashSignatureConforms(const Symbol* sym) {
         sym->returnType->kind == TypeKind::Long;
 }
 
-// A single parameter of the owner's own class type marks an equality method even when
-// the rest of its shape is wrong; those near misses get their own diagnostics.
+// A single parameter of the owner's own type marks an equality method even when the rest
+// of its shape is wrong; those near misses get their own diagnostics. A struct declares
+// one exactly as a class does, replacing the memberwise comparison instead of identity.
 static bool equalsSignatureIntent(const Symbol* sym) {
     if (!sym || sym->paramTypes.size() != 1) return false;
     Type* p = sym->paramTypes[0];
-    return p && p->isClass() && p->structInfo == sym->methodOwner;
+    return p && (p->isClass() || p->isStruct()) && p->structInfo == sym->methodOwner;
 }
 
 static bool equalsSignatureConforms(const Symbol* sym) {
@@ -1707,7 +1710,7 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
         }
     }
     markOverloadedMethods(si);
-    checkHashEqualsPairing(cd, si);
+    checkHashEqualsPairing(cd.node, si);
 
     // --- The class must provide every method of every interface it implements,
     // either declared here (abstract counts) or inherited from a base class. ---
@@ -2061,15 +2064,12 @@ void Analyzer::checkHashMethodSignature(const ast::FuncDecl& fn, Symbol* sym, bo
     }
 }
 
-// `equals` opts a class into content-based '==' and '!=' only when it takes a
-// single parameter of the class's own type; that shape is an unambiguous
-// equality method. Other methods named `equals` (a no-argument token accessor,
-// for instance) are ordinary and untouched. A same-class `equals` must return
-// `bool` and cannot fail.
+// `equals` takes over '==' and '!=' only when it takes a single parameter of the
+// declaring type's own type; that shape is an unambiguous equality method. Other
+// methods named `equals` (a no-argument token accessor, for instance) are
+// ordinary and untouched. A same-type `equals` must return `bool` and cannot fail.
 void Analyzer::checkEqualsMethodSignature(const ast::FuncDecl& fn, Symbol* sym, bool isConstructor) {
-    if (isConstructor || !sym || sym->name != u"equals" || sym->paramTypes.size() != 1) return;
-    Type* p = sym->paramTypes[0];
-    if (!p || !p->isClass() || p->structInfo != sym->methodOwner) return;
+    if (isConstructor || !sym || sym->name != u"equals" || !equalsSignatureIntent(sym)) return;
     if (fn.isThrows()) {
         errorAtNode(fn.throwsToken().value_or(fn.node),
             "A method named 'equals' cannot be marked 'throws'; equality comparison must not fail.");
@@ -2108,8 +2108,8 @@ void Analyzer::checkToStringMethodSignature(const ast::FuncDecl& fn, Symbol* sym
 
 // The behavior a member takes over from the language, or null for an ordinary
 // member: a struct's text form, and the hash and equality a value is keyed by. A
-// struct's `equals` is ordinary because `==` on a struct stays memberwise, and a
-// class has no text form of its own to replace.
+// class has no text form of its own to replace, and what an `equals` replaces
+// differs by kind: a struct's memberwise comparison, a class's identity.
 const char* Analyzer::builtinBehaviorReplaced(const Type* owner,
                                               const std::u16string& memberName,
                                               const Symbol* sym) const {
@@ -2117,6 +2117,7 @@ const char* Analyzer::builtinBehaviorReplaced(const Type* owner,
     if (owner->isStruct()) {
         if (memberName == u"toString") return "text form";
         if (memberName == u"hash") return "content hash";
+        if (memberName == u"equals" && equalsSignatureIntent(sym)) return "memberwise equality";
         return nullptr;
     }
     if (owner->isClass() && !owner->isInterface()) {
@@ -2151,8 +2152,9 @@ Visibility Analyzer::builtinReplacementVisibility(
 
 // A struct inherits nothing, so `override` on a struct member marks a method that
 // replaces a built-in behavior, and the behaviors a struct has of its own - its text
-// form and its content hash - must carry the marker exactly as a class's `hash` and
-// `equals` do. A near-miss shape gets its own signature diagnostic instead.
+// form, its content hash, its memberwise equality - must carry the marker exactly as a
+// class's `hash` and `equals` do. A near-miss shape gets its own signature diagnostic
+// instead.
 void Analyzer::checkStructOverrideMarker(const ast::FuncDecl& fn, const Type* owner,
                                          const std::u16string& memberName, Symbol* sym,
                                          bool isConstructor, const char* behavior) {
@@ -2166,14 +2168,15 @@ void Analyzer::checkStructOverrideMarker(const ast::FuncDecl& fn, const Type* ow
         if (!behavior) {
             errorAtNode(fn.node, "Method '" + asciiOf(memberName) + "' of '" + ownerName +
                 "' is marked 'override' but structs do not inherit, so there is nothing to "
-                "override; only 'toString' and 'hash' replace a built-in behavior of a struct. "
-                "Remove 'override'.");
+                "override; only 'toString', 'hash', and 'equals' replace a built-in behavior "
+                "of a struct. Remove 'override'.");
         }
         return;
     }
     if (!behavior) return;
-    bool conforms = memberName == u"hash" ? hashSignatureConforms(sym)
-                                          : toStringSignatureConforms(sym);
+    bool conforms = memberName == u"hash"   ? hashSignatureConforms(sym)
+                  : memberName == u"equals" ? equalsSignatureConforms(sym)
+                                            : toStringSignatureConforms(sym);
     if (conforms) {
         errorAtNode(fn.node, "Method '" + asciiOf(memberName) + "' overrides the built-in " +
             behavior + " of struct '" + ownerName + "'; mark it 'override'.");
@@ -2193,10 +2196,10 @@ void Analyzer::checkStructAbstractMarker(const ast::FuncDecl& fn, const Type* ow
 }
 
 // `hash` and `equals` are a matched pair: equal values must hash equally, or
-// keyed collections silently misbehave. A class that customizes one must
-// customize the other, here or in a base class. Reported once, on the class
-// that first supplies a conforming half without its counterpart.
-void Analyzer::checkHashEqualsPairing(const ast::ClassDecl& cd, StructInfo* si) {
+// keyed collections silently misbehave. A class or struct that customizes one
+// must customize the other, for a class here or in a base class. Reported once,
+// on the type that first supplies a conforming half without its counterpart.
+void Analyzer::checkHashEqualsPairing(const SyntaxNode& diag, StructInfo* si) {
     if (!si) return;
     auto conformingHash = [](StructInfo* s) {
         for (auto& m : s->methods)
@@ -2227,14 +2230,17 @@ void Analyzer::checkHashEqualsPairing(const ast::ClassDecl& cd, StructInfo* si) 
         if (equalsIntent(s)) equalsAnywhere = true;
         if (hashNamed(s)) hashAnywhere = true;
     }
+    bool isStruct = si->declKind == DeclKind::Struct;
+    std::string kind = isStruct ? "Struct" : "Class";
+    std::string article = isStruct ? "A struct" : "A class";
     if (ownHash && !equalsAnywhere) {
-        errorAtNode(cd.node, "Class '" + asciiOf(si->name) + "' defines 'hash' but not 'equals'. "
-            "A class that customizes one must customize both, so equal values hash equally. "
+        errorAtNode(diag, kind + " '" + asciiOf(si->name) + "' defines 'hash' but not 'equals'. " +
+            article + " that customizes one must customize both, so equal values hash equally. "
             "Add an 'equals(" + asciiOf(si->name) + " other) -> bool' method.");
     }
     if (ownEquals && !hashAnywhere) {
-        errorAtNode(cd.node, "Class '" + asciiOf(si->name) + "' defines 'equals' but not 'hash'. "
-            "A class that customizes one must customize both, so equal values hash equally. "
+        errorAtNode(diag, kind + " '" + asciiOf(si->name) + "' defines 'equals' but not 'hash'. " +
+            article + " that customizes one must customize both, so equal values hash equally. "
             "Add a 'hash() -> long' method.");
     }
 }

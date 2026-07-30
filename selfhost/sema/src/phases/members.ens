@@ -143,8 +143,9 @@ public memberVisibility(MemberModifiers modifiers, Visibility defaultVisibility,
 }
 
 // The behavior a member takes over from the language, or null for an ordinary member: a struct's
-// text form, and the hash and equality a value is keyed by. A struct's 'equals' is ordinary
-// because '==' on a struct stays memberwise, and a class has no text form of its own to replace.
+// text form, and the hash and equality a value is keyed by. A class has no text form of its own
+// to replace, and what an 'equals' replaces differs by kind: a struct's memberwise comparison, a
+// class's identity.
 public builtinBehaviorReplaced(DeclaredType owner, string memberName,
                                Signature signature) -> string? {
     if (owner is StructType) {
@@ -153,6 +154,9 @@ public builtinBehaviorReplaced(DeclaredType owner, string memberName,
         }
         if (memberName == "hash") {
             return "content hash";
+        }
+        if (memberName == "equals" && equalsIntent(signature, owner)) {
+            return "memberwise equality";
         }
         return null;
     }
@@ -455,9 +459,9 @@ public checkToStringSignature(Reporter reporter, FunctionDeclarationNode declara
 }
 
 // A struct inherits nothing, so 'override' on a struct member marks a method that replaces a
-// built-in behavior, and the behaviors a struct has of its own - its text form and its content
-// hash - must carry the marker exactly as a class's 'hash' and 'equals' do. A near-miss shape
-// gets its own signature diagnostic instead.
+// built-in behavior, and the behaviors a struct has of its own - its text form, its content
+// hash, its memberwise equality - must carry the marker exactly as a class's 'hash' and 'equals'
+// do. A near-miss shape gets its own signature diagnostic instead.
 public checkStructOverrideMarker(Reporter reporter, StructType owner, string memberName,
                                  Signature signature, MemberModifiers modifiers,
                                  bool isConstructor, string? behavior) {
@@ -471,9 +475,9 @@ public checkStructOverrideMarker(Reporter reporter, StructType owner, string mem
     if (modifiers.declaresOverride) {
         if (behavior == null) {
             reporter.report("Method '{memberName}' of '{owner.name()}' is marked 'override' but "
-                + "structs do not inherit, so there is nothing to override; only 'toString' and "
-                + "'hash' replace a built-in behavior of a struct. Remove 'override'.",
-                signature.nameSpan());
+                + "structs do not inherit, so there is nothing to override; only 'toString', "
+                + "'hash', and 'equals' replace a built-in behavior of a struct. Remove "
+                + "'override'.", signature.nameSpan());
         }
         return;
     }
@@ -483,6 +487,9 @@ public checkStructOverrideMarker(Reporter reporter, StructType owner, string mem
     bool conforms = toStringSignatureConforms(signature);
     if (memberName == "hash") {
         conforms = hashSignatureConforms(signature);
+    }
+    if (memberName == "equals") {
+        conforms = equalsSignatureConforms(signature, owner);
     }
     if (conforms) {
         reporter.report("Method '{memberName}' overrides the built-in {behavior} of struct "
@@ -540,6 +547,67 @@ public checkEqualsSignature(Reporter reporter, FunctionDeclarationNode declarati
         reporter.report("A method named 'equals' that takes a '{types.display(owner)}' must "
             + "return 'bool'; it defines when two instances compare as equal (for example as "
             + "Map or Set keys).", signature.nameSpan());
+    }
+}
+
+// 'hash' and 'equals' are a matched pair: equal values must hash equally, or keyed collections
+// silently misbehave. A class or a struct that customizes one must customize the other, for a
+// class here or in a base class. Reported once, on the type that first supplies a conforming half
+// without its counterpart; a struct has no base chain, so the walk stops at itself.
+public checkHashEqualsPairing(Reporter reporter, DeclaredType owner, Span at) {
+    let own = types.methodsOf(owner);
+    if (own == null) {
+        return;
+    }
+    bool ownHash = false;
+    bool ownEquals = false;
+    for (long i = 0; i < own.length(); i++) {
+        let method = own.get(i);
+        if (method.name() == "hash" && hashSignatureConforms(method.signature())) {
+            ownHash = true;
+        }
+        if (method.name() == "equals" && equalsSignatureConforms(method.signature(), owner)) {
+            ownEquals = true;
+        }
+    }
+    if (!ownHash && !ownEquals) {
+        return;
+    }
+    bool hashAnywhere = false;
+    bool equalsAnywhere = false;
+    Type? current = owner;
+    while (current != null) {
+        let methods = types.methodsOf(current);
+        if (methods == null) {
+            break;
+        }
+        for (long i = 0; i < methods.length(); i++) {
+            let method = methods.get(i);
+            if (method.name() == "hash") {
+                hashAnywhere = true;
+            }
+            if (method.name() == "equals"
+                    && equalsIntent(method.signature(), method.definingType())) {
+                equalsAnywhere = true;
+            }
+        }
+        current = types.baseOf(current);
+    }
+    string kind = "Class";
+    string article = "A class";
+    if (owner is StructType) {
+        kind = "Struct";
+        article = "A struct";
+    }
+    if (ownHash && !equalsAnywhere) {
+        reporter.report("{kind} '{owner.name()}' defines 'hash' but not 'equals'. {article} that "
+            + "customizes one must customize both, so equal values hash equally. Add an "
+            + "'equals({owner.name()} other) -> bool' method.", at);
+    }
+    if (ownEquals && !hashAnywhere) {
+        reporter.report("{kind} '{owner.name()}' defines 'equals' but not 'hash'. {article} that "
+            + "customizes one must customize both, so equal values hash equally. Add a "
+            + "'hash() -> long' method.", at);
     }
 }
 

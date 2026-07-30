@@ -2975,6 +2975,36 @@ struct CodeGenerator::Impl {
         return builder->CreateExtractValue(v, {1}, "opt.narrowed");
     }
 
+    // `==` over one pair of optionals, presence first: differing presence settles it,
+    // two absent values are equal without either payload being read, and only two
+    // present payloads compare. The branch is what keeps an absent payload out of the
+    // comparison, which matters because a struct payload's comparison reads its
+    // reference fields and may run a declared `equals` over storage holding nothing.
+    // `presB` is a true constant when the other side is a plain value.
+    template <typename ComparePayloads>
+    llvm::Value* emitGuardedOptionalEquality(llvm::Value* presA, llvm::Value* presB,
+                                             ComparePayloads comparePayloads) {
+        auto* i1 = llvm::Type::getInt1Ty(ctx);
+        llvm::Value* samePresence = builder->CreateICmpEQ(presA, presB, "opt.same.presence");
+        llvm::Value* bothPresent = builder->CreateAnd(samePresence, presA, "opt.both.present");
+        llvm::BasicBlock* entryBB = builder->GetInsertBlock();
+        auto* payloadBB = llvm::BasicBlock::Create(ctx, "opt.eq.payload", currentFunction);
+        auto* endBB = llvm::BasicBlock::Create(ctx, "opt.eq.end", currentFunction);
+        builder->CreateCondBr(bothPresent, payloadBB, endBB);
+
+        builder->SetInsertPoint(payloadBB);
+        llvm::Value* payloadEq = comparePayloads();
+        if (!payloadEq) return nullptr;
+        llvm::BasicBlock* payloadEnd = builder->GetInsertBlock();
+        builder->CreateBr(endBB);
+
+        builder->SetInsertPoint(endBB);
+        auto* phi = builder->CreatePHI(i1, 2, "opt.eq");
+        phi->addIncoming(samePresence, entryBB);
+        phi->addIncoming(payloadEq, payloadEnd);
+        return phi;
+    }
+
     // `==` over tagged value-type Optionals. Returns the equality bit; the
     // caller negates for `!=`. Covers optional-vs-null, optional-vs-optional,
     // and optional-vs-plain-value.
@@ -3000,32 +3030,28 @@ struct CodeGenerator::Impl {
             return builder->CreateNot(present, "opt.isnull");
         }
         if (leftOpt && rightOpt) {
-            ::Type* inner = subst(leftType)->inner;
+            ::Type* inner = subst(subst(leftType)->inner);
             llvm::Value* presL = builder->CreateExtractValue(L, {0}, "opt.l.present");
             llvm::Value* presR = builder->CreateExtractValue(R, {0}, "opt.r.present");
-            llvm::Value* valEq = innerEquals(builder->CreateExtractValue(L, {1}),
-                                             builder->CreateExtractValue(R, {1}), subst(inner));
-            if (!valEq) return nullptr;
-            llvm::Value* samePresence = builder->CreateICmpEQ(presL, presR, "opt.same.presence");
-            llvm::Value* absentOrEqual = builder->CreateOr(
-                builder->CreateNot(presL), valEq, "opt.absent.or.eq");
-            return builder->CreateAnd(samePresence, absentOrEqual, "opt.eq");
+            return emitGuardedOptionalEquality(presL, presR, [&] {
+                return innerEquals(builder->CreateExtractValue(L, {1}, "opt.l.val"),
+                                   builder->CreateExtractValue(R, {1}, "opt.r.val"), inner);
+            });
         }
         ::Type* optT = leftOpt ? leftType : rightType;
         ::Type* plainT = leftOpt ? rightType : leftType;
         llvm::Value* optV = leftOpt ? L : R;
         llvm::Value* plainV = leftOpt ? R : L;
-        ::Type* inner = subst(optT)->inner;
+        ::Type* inner = subst(subst(optT)->inner);
         if (inner && plainT && !plainT->equals(inner) &&
             (plainT->isInteger() || plainT->isFloat()) &&
             (inner->isInteger() || inner->isFloat())) {
             plainV = emitNumericConversion(plainV, plainT, inner);
         }
         llvm::Value* present = builder->CreateExtractValue(optV, {0}, "opt.present");
-        llvm::Value* valEq = innerEquals(builder->CreateExtractValue(optV, {1}),
-                                         plainV, subst(inner));
-        if (!valEq) return nullptr;
-        return builder->CreateAnd(present, valEq, "opt.eq");
+        return emitGuardedOptionalEquality(present, llvm::ConstantInt::getTrue(ctx), [&] {
+            return innerEquals(builder->CreateExtractValue(optV, {1}, "opt.val"), plainV, inner);
+        });
     }
 
     // The abstract hash() contract from std.hash; calls resolved through it
@@ -3078,6 +3104,47 @@ struct CodeGenerator::Impl {
         return nullptr;
     }
 
+    // A struct type's own conforming `equals(S other) -> bool`, or null when the
+    // struct compares memberwise. A struct has no base type, so only its own
+    // methods are consulted; the signature must match exactly, so an ordinary
+    // overload named `equals` leaves the memberwise comparison in place.
+    Symbol* declaredStructEquals(::Type* t) {
+        if (!t) return nullptr;
+        t = subst(t);
+        if (!t->isStruct() || !t->structInfo) return nullptr;
+        for (auto& m : t->structInfo->methods) {
+            Symbol* sym = m.symbol;
+            if (!sym || m.name != u"equals" || sym->paramTypes.size() != 1 ||
+                !sym->returnType || sym->returnType->kind != TypeKind::Bool ||
+                sym->abiThrows) continue;
+            ::Type* p = sym->paramTypes[0];
+            if (p && p->isStruct() && p->structInfo == sym->methodOwner) return sym;
+        }
+        return nullptr;
+    }
+
+    // '==' over two struct values whose struct declares `equals`: the method runs
+    // over the address of a copy of the left value, exactly as a struct method
+    // reaches its receiver anywhere else, and the right value is its one argument
+    // under whatever ABI that parameter has. The caller negates for '!='.
+    llvm::Value* emitStructContentEquality(::Type* structT, Symbol* eqSym,
+                                           llvm::Value* recv, llvm::Value* other) {
+        llvm::Function* fn = getOrDeclareExternalFunction(eqSym, structT);
+        if (!fn) return nullptr;
+        llvm::Type* layout = mapType(structT);
+        auto* recvSlot = createEntryAlloca(currentFunction, layout, "eq.recv");
+        builder->CreateStore(recv, recvSlot);
+        std::vector<llvm::Value*> args{ recvSlot };
+        if (paramIsByPointer(eqSym, 0)) {
+            auto* otherSlot = createEntryAlloca(currentFunction, layout, "eq.other");
+            builder->CreateStore(other, otherSlot);
+            args.push_back(otherSlot);
+        } else {
+            args.push_back(other);
+        }
+        return builder->CreateCall(fn, args, "struct.eq.call");
+    }
+
     // '==' over two class references whose class declares `equals`: an identity
     // fast path (also covering both-null), then a null guard, then equals().
     // The caller negates the result for '!='.
@@ -3123,12 +3190,17 @@ struct CodeGenerator::Impl {
         return phi;
     }
 
-    // Memberwise '==' over two struct values: compares fields in declaration
-    // order, short-circuiting to false at the first difference. Nested struct
-    // fields recurse; the caller negates the result for '!='.
+    // '==' over two struct values: the struct's own `equals` when it declares one,
+    // otherwise memberwise, comparing fields in declaration order and
+    // short-circuiting to false at the first difference. Nested struct fields
+    // recurse through here, so a declaration answers for a field, an array element
+    // and an optional's payload alike; the caller negates the result for '!='.
     llvm::Value* emitStructEquality(::Type* structT, llvm::Value* L, llvm::Value* R,
                                     uint32_t offset) {
         structT = subst(structT);
+        if (Symbol* eqSym = declaredStructEquals(structT)) {
+            return emitStructContentEquality(structT, eqSym, L, R);
+        }
         if (!structT->structInfo || structT->structInfo->fields.empty()) {
             return llvm::ConstantInt::getTrue(ctx);
         }
@@ -3175,14 +3247,11 @@ struct CodeGenerator::Impl {
             ::Type* inner = subst(ft->inner);
             llvm::Value* presA = builder->CreateExtractValue(a, {0}, "opt.a.present");
             llvm::Value* presB = builder->CreateExtractValue(b, {0}, "opt.b.present");
-            llvm::Value* valEq = emitFieldEquality(
-                builder->CreateExtractValue(a, {1}, "opt.a.val"),
-                builder->CreateExtractValue(b, {1}, "opt.b.val"), inner, structDesc, fieldName, offset);
-            if (!valEq) return nullptr;
-            llvm::Value* samePresence = builder->CreateICmpEQ(presA, presB, "opt.same.presence");
-            llvm::Value* absentOrEqual = builder->CreateOr(
-                builder->CreateNot(presA), valEq, "opt.absent.or.eq");
-            return builder->CreateAnd(samePresence, absentOrEqual, "opt.fld.eq");
+            return emitGuardedOptionalEquality(presA, presB, [&] {
+                return emitFieldEquality(builder->CreateExtractValue(a, {1}, "opt.a.val"),
+                                         builder->CreateExtractValue(b, {1}, "opt.b.val"),
+                                         inner, structDesc, fieldName, offset);
+            });
         }
         ::Type* core = ft;
         if (core->isOptional() && core->inner) core = subst(core->inner);

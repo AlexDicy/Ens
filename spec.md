@@ -13,7 +13,7 @@ An unmarked top-level declaration is visible only within its file, and an unmark
 Top-level `protected` is not allowed.
 Struct fields follow their struct's visibility; a field that writes its own modifier, such as `private`, opts out.
 Class members never follow their class: they stay private unless marked.
-The one exception is a method that replaces a behavior the language already provides for its type: a struct's `toString` and `hash`, and a class's `hash` and `equals`.
+The one exception is a method that replaces a behavior the language already provides for its type: a struct's `toString`, `hash`, and `equals`, and a class's `hash` and `equals`.
 The language calls such a method wherever the type is used, so it follows its type's visibility when unmarked and may not be marked less visible than its type.
 Interface members carry no visibility of their own: they always follow the interface, and writing a visibility modifier on an interface member is an error.
 Enum cases follow their enum.
@@ -89,9 +89,11 @@ A struct field may have any type, including a non-nullable one such as a class, 
 A struct with such a field has no default value of its own, so it cannot be an array element or a field left without a default, though it can still be built with a literal or a constructor wherever a value is needed.
 
 Two values of the same struct type compare with `==` and `!=` field by field, in declaration order, stopping at the first field that differs.
-Each field compares by its own `==`: primitives and enums by value (so IEEE rules hold, and a `float` or `double` field that is `NaN` never equals itself), strings by content, class and array fields by reference identity unless the class opted into content equality, a nested struct memberwise, and a nullable field null-aware (both `null` are equal, one `null` is unequal, otherwise the inner values compare).
+Each field compares by its own `==`: primitives and enums by value (so IEEE rules hold, and a `float` or `double` field that is `NaN` never equals itself), strings by content, class and array fields by reference identity unless the class opted into content equality, a nested struct memberwise unless it declared its own equality, and a nullable field null-aware (both `null` are equal, one `null` is unequal, otherwise the inner values compare).
 Comparing two different struct types is an error, and so is comparing structs whose type has a field with no `==` of its own, such as an `external` handle; the error names the offending field.
-A struct does not customize equality: a method named `equals` on a struct is an ordinary method, and `==` stays memberwise.
+A struct customizes equality by declaring `equals(S other) -> bool` - a method taking a single parameter of the struct's own type `S` - which then decides `==` and `!=` for that struct everywhere it is compared, including as a field of another struct, as an array element and as a collection key.
+Such an `equals` replaces the memberwise comparison the language provides, so it is written `override`, and it must be paired with an `override hash() -> long`: a struct that declares one must declare the other, exactly as a class must, so equal values always hash equally.
+A method named `equals` whose single parameter is some other type is an ordinary method, and `==` on that struct stays memberwise.
 
 A struct serializes to a JSON string through `.toString()` and in interpolation holes, honoring the default-serialization promise.
 The form is a JSON object listing every field, including private and protected ones, in declaration order: `{"field": value, ...}`.
@@ -172,8 +174,8 @@ class Square extends Shape {
 ```
 
 Methods are overridable by default. An override must be marked `override` and must match a method declared in a base class; this catches typos and accidental shadowing. Mark a method or a class `final` to forbid overriding or extending it.
-`override` on a method that overrides nothing is an error, so the marker always names something real: a base or interface method, or a behavior the language provides for the type, which for a struct means only `toString` and `hash`.
-The marker is required for both of those, so a struct that declares a `toString` or a `hash` always writes it as an `override`.
+`override` on a method that overrides nothing is an error, so the marker always names something real: a base or interface method, or a behavior the language provides for the type, which for a struct means only `toString`, `hash`, and `equals`.
+The marker is required for all three, so a struct that declares a `toString`, a `hash`, or an `equals` always writes it as an `override`.
 
 `super.method(...)` calls the base class's implementation, bypassing any override. A constructor may call `super(...)` as its first statement to run the base constructor; if it does not, the base class must be constructible with no arguments. `protected` members (see above) are reachable from subclasses.
 
@@ -1251,8 +1253,14 @@ The `@std.path` module works on paths as text, with `/` separating the parts on 
 
 Every value has a `hash()` method returning a `long`. Value types (primitives, enums, strings, structs) hash by their contents, so equal values hash equally; classes and arrays hash by identity, matching how `==` compares them.
 An optional hashes as its payload does while it is present and as one fixed value once it is absent, so every absent value hashes equally whatever its type.
-A class can declare its own `hash() -> long` to control its hashing (a method named `hash` must have exactly that signature and, like `equals`, cannot be `throws`, because the language takes a value's hash where there is no room for a `try`), paired with `equals(C other) -> bool` - a method taking a single parameter of the class's own type `C` - to control equality. When a class declares such an `equals`, `==` and `!=` on that class compare by content - an identity and null check first, then `equals` - rather than by reference identity; the method must return `bool` and cannot be `throws`. Both `hash` and `equals` are written with `override`, since they replace a class's built-in identity hash and equality. The two are a matched pair: a class that declares one must declare the other, so equal instances always hash equally. The `Hashable` interface from `@std.hash` names the hashing contract for generic bounds, and every type satisfies it.
-Because the language calls `hash` and `equals` wherever the class is used, both follow the class's visibility when unmarked and may not be marked less visible than the class itself.
+A class or a struct can declare its own `hash() -> long` to control its hashing, paired with `equals(T other) -> bool` - a method taking a single parameter of the declaring type `T` itself - to control equality.
+A method named `hash` must have exactly that signature, and neither `hash` nor `equals` can be `throws`, because the language takes a value's hash and compares two values where there is no room for a `try`; `equals` must return `bool`.
+When a class declares such an `equals`, `==` and `!=` on that class compare by content - an identity and null check first, then `equals` - rather than by reference identity; when a struct declares one, `==` and `!=` call it instead of comparing the fields.
+Both `hash` and `equals` are written with `override`, since they replace behavior the language provides: a class's identity hash and equality, a struct's content hash and memberwise equality.
+The two are a matched pair: a type that declares one must declare the other, so equal values always hash equally.
+A declared `hash` decides the hashing of its type everywhere the value appears, including as a field of an enclosing struct, as an array element, and behind a `Hashable` bound; a declared `equals` decides `==` the same way.
+The `Hashable` interface from `@std.hash` names the hashing contract for generic bounds, and every type satisfies it.
+Because the language calls `hash` and `equals` wherever the type is used, both follow their type's visibility when unmarked and may not be marked less visible than the type itself.
 
 The collection modules build on hashing and iteration:
 
@@ -1277,7 +1285,9 @@ for (let entry in ages) {
 }
 ```
 
-Keys are matched with `==` and bucketed with `hash()`: strings by contents, value types by value, and classes by identity - unless the key class declares `equals` (with its paired `hash`), in which case its keys match by content. Struct keys are supported and match by content: their fields compare with `==` and hash by content, so a key rebuilt from equal field values finds the entry stored under the original.
+Keys are matched with `==` and bucketed with `hash()`: strings by contents, value types by value, and classes by identity - unless the key class declares `equals` (with its paired `hash`), in which case its keys match by content.
+Struct keys are supported and match by content: their fields compare with `==` and hash by content, so a key rebuilt from equal field values finds the entry stored under the original.
+A struct key that declares its own `equals` and `hash` is matched and bucketed by that pair instead, so a field the pair ignores does not change which entry a key finds.
 
 `StringBuilder` from `@std.text.stringbuilder` accumulates text in a growable buffer, so building a string piece by piece stays linear where repeated `+` on immutable strings would re-copy the whole prefix.
 `append(value)` accepts a string, an integer, or a `bool`; `length()` returns the number of bytes written so far; `toString()` returns the accumulated text and leaves the builder usable.
