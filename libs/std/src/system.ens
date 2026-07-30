@@ -1,12 +1,14 @@
-import StringBuilder from @std.text.stringbuilder;
+import List from @std.collections.list;
+import @std.collections.sorting;
+import @std.process;
 
 external type CFile;
 
-// The compiler defines the five 'ens_' bridges wherever they are referenced. The process bridge
-// takes the arguments twice over: a POSIX target builds an argument vector out of the NUL
-// separated block, and a Windows target passes the joined command line on, because one string is
-// the only shape Win32 accepts. Building both here keeps the quoting rules in Ens instead of in
-// two code generators.
+// The compiler defines the 'ens_' bridges wherever they are referenced. The spawn bridge takes the
+// arguments twice over: a POSIX target builds an argument vector out of the NUL separated block,
+// and a Windows target passes the joined command line on, because one string is the only shape
+// Win32 accepts. Building both here keeps the quoting rules in Ens instead of in two code
+// generators.
 external from libc {
     fopen(string path, string mode) -> CFile?;
     fread(byte[] buffer, ulong size, ulong count, CFile stream) -> ulong;
@@ -15,10 +17,18 @@ external from libc {
     feof(CFile stream) -> int;
     fclose(CFile stream) -> int;
     getenv(string name) -> string?;
+    getcwd(byte[] buffer, int size) -> string?;
+    remove(string path) -> int;
+    rmdir(string path) -> int;
     ens_run_process(string command) -> int;
-    ens_run_process_captured(string program, byte[] argumentBlock, long count,
-                             string commandLine, string stdoutPath, string stderrPath) -> long;
-    ens_path_exists(string path) -> int;
+    ens_spawn_process(string program, byte[] argumentBlock, long argumentCount,
+                      string commandLine, byte[] environmentBlock, long environmentCount,
+                      long environmentBytes, string stdoutPath, string stderrPath) -> long;
+    ens_path_kind(string path) -> int;
+    ens_list_directory(string folder) -> string[]?;
+    ens_create_directory(string path) -> int;
+    ens_executable_path(byte[] buffer, long capacity) -> long;
+    ens_environment() -> string[];
     ens_write_error(string message);
     exit(int code);
     ens_arguments() -> string[];
@@ -64,7 +74,138 @@ export openFile(string path, string mode) -> File throws {
 
 // Reports whether a file or directory exists at `path`, without throwing.
 export exists(string path) -> bool {
-    return ens_path_exists(path) == 0;
+    return ens_path_kind(path) != 0;
+}
+
+// Reports whether `path` names a file rather than a directory. A missing path reports false, so
+// this never throws.
+export isFile(string path) -> bool {
+    return ens_path_kind(path) == 1;
+}
+
+export isDirectory(string path) -> bool {
+    return ens_path_kind(path) == 2;
+}
+
+// The names of everything directly inside `folder`, without '.' and '..' and without the folder in
+// front of them, in ascending order by their bytes so a walk over a tree visits the same names in
+// the same order however the file system enumerates them.
+export listDirectory(string folder) -> string[] throws {
+    string[]? found = ens_list_directory(folder);
+    if (found == null) {
+        throw new SystemError("could not read the folder '{folder}'");
+    }
+    let names = new List<string>();
+    for (let name in found) {
+        names.push(name);
+    }
+    sorting.sort(names);
+    return names.toArray();
+}
+
+// Creates the directory `path` names, and every parent of it that is missing. A path that is
+// already a directory is left alone.
+export createDirectory(string path) throws {
+    if (path.length == 0) {
+        throw new SystemError("could not create a folder: no path was given");
+    }
+    byte[] raw = path.toBytes();
+    for (long i = 1; i < raw.length; i++) {
+        if (raw[i] == '/') {
+            createLevel(path.substring(0, i));
+        }
+    }
+    createLevel(path);
+    if (ens_path_kind(path) != 2) {
+        throw new SystemError("could not create the folder '{path}'");
+    }
+}
+
+// Creates one level of a path when nothing is there yet. A root - a lone '/', a drive letter, or
+// the start of a network share - is left alone, because no call creates one.
+createLevel(string level) {
+    if (level.length == 0 || level == "/" || driveRoot(level)) {
+        return;
+    }
+    if (ens_path_kind(level) == 2) {
+        return;
+    }
+    let created = ens_create_directory(level);
+}
+
+driveRoot(string level) -> bool {
+    return level.length == 2 && level.endsWith(":");
+}
+
+// Removes the file `path` names. A directory is refused, because removing one is
+// 'removeDirectory'.
+export removeFile(string path) throws {
+    if (ens_path_kind(path) == 2) {
+        throw new SystemError("could not remove the file '{path}': it is a folder, so remove it "
+            + "with removeDirectory");
+    }
+    if (remove(path) != 0) {
+        throw new SystemError("could not remove the file '{path}'");
+    }
+}
+
+// Removes the directory `path` names, which has to be empty already: removing what is inside it
+// first is the caller's to decide.
+export removeDirectory(string path) throws {
+    if (rmdir(path) != 0) {
+        throw new SystemError("could not remove the folder '{path}'");
+    }
+}
+
+// The directory the program was started in, with '/' between its parts, or "." when the operating
+// system would not report it. It is read, never written: a program that wants to work somewhere
+// else joins that folder onto the paths it uses.
+export currentDirectory() -> string {
+    long capacity = 4096;
+    while (capacity <= 65536) {
+        byte[] buffer = new byte[capacity];
+        string? folder = getcwd(buffer, capacity as int);
+        if (folder != null) {
+            return withSlashes(folder);
+        }
+        capacity = capacity * 8;
+    }
+    return ".";
+}
+
+// The path of the running program itself, with '/' between its parts, or "" when the operating
+// system would not report it.
+export executablePath() -> string {
+    long capacity = 4096;
+    while (capacity <= 65536) {
+        byte[] buffer = new byte[capacity];
+        long written = ens_executable_path(buffer, capacity);
+        if (written > 0) {
+            return withSlashes(string.fromBytes(buffer.slice(0, written)));
+        }
+        capacity = capacity * 8;
+    }
+    return "";
+}
+
+// The environment this process inherited, as 'NAME=VALUE' entries in ascending order by their
+// bytes. It is a snapshot: nothing here changes the environment, and a child is given the
+// variables it should see at the moment it is started.
+export environment() -> string[] {
+    let entries = new List<string>();
+    for (let entry in ens_environment()) {
+        entries.push(entry);
+    }
+    sorting.sort(entries);
+    return entries.toArray();
+}
+
+export getEnvironmentVariable(string name) -> string? {
+    return getenv(name);
+}
+
+export arguments() -> string[] {
+    return ens_arguments();
 }
 
 export readAllBytes(string path) -> byte[] throws {
@@ -130,6 +271,7 @@ export writeError(string message) {
     ens_write_error(message);
 }
 
+// Runs `command` through the operating system's command interpreter and returns its exit code.
 export run(string command) -> int throws {
     let status = ens_run_process(command);
     if (status == -1) {
@@ -138,90 +280,78 @@ export run(string command) -> int throws {
     return status;
 }
 
-// Runs `program` with `arguments`, waits for it to finish, and writes everything it sent to its
-// standard output and standard error into the two files. No shell takes part, so an argument
-// reaches the program exactly as written here, spaces, quotes and all. Returns the program's exit
-// code, or 127 when it could not be started.
+// Runs `program` with `arguments` and waits for it to finish, leaving both output streams with
+// this process so what the program writes appears as it is written. No shell takes part, so an
+// argument reaches the program exactly as written here, spaces, quotes and all. Returns the
+// program's exit code, or 127 when it could not be started.
+export run(string program, string[] arguments) -> int throws {
+    return try started(program, arguments, inherited(), "", "");
+}
+
+// The same, with `environmentOverrides` - 'NAME=VALUE' entries - applied over the environment this
+// process inherited, so the child keeps every variable it is not given a new value for.
+export run(string program, string[] arguments, string[] environmentOverrides) -> int throws {
+    return try started(program, arguments, environmentOverrides, "", "");
+}
+
+// Runs `program` with `arguments` and writes everything it sent to its standard output and
+// standard error into the two files. An empty path leaves that stream with this process instead of
+// capturing it. Returns the program's exit code, or 127 when it could not be started.
 export runCaptured(string program, string[] arguments, string stdoutPath,
                    string stderrPath) -> int throws {
-    long status = ens_run_process_captured(program, argumentBlock(arguments), arguments.length,
-        commandLineOf(program, arguments), stdoutPath, stderrPath);
+    return try started(program, arguments, inherited(), stdoutPath, stderrPath);
+}
+
+// The same, with `environmentOverrides` applied over the inherited environment.
+export runCaptured(string program, string[] arguments, string[] environmentOverrides,
+                   string stdoutPath, string stderrPath) -> int throws {
+    return try started(program, arguments, environmentOverrides, stdoutPath, stderrPath);
+}
+
+// No overrides, which hands the child the environment this process inherited.
+inherited() -> string[] {
+    return [];
+}
+
+started(string program, string[] arguments, string[] environmentOverrides, string stdoutPath,
+        string stderrPath) -> int throws {
+    string[] variables = inherited();
+    if (environmentOverrides.length > 0) {
+        variables = process.mergedEnvironment(ens_environment(), environmentOverrides);
+    }
+    byte[] block = process.environmentBlock(variables);
+    long status = ens_spawn_process(program, process.argumentBlock(arguments), arguments.length,
+        process.commandLineOf(program, arguments), block, variables.length, block.length,
+        stdoutPath, stderrPath);
     if (status < 0) {
         throw new SystemError("could not capture the output of '{program}' into "
-            + "'{stdoutPath}' and '{stderrPath}'");
+            + capturedInto(stdoutPath, stderrPath));
     }
     return status as int;
 }
 
-// Every argument's bytes with a NUL after each of them, which is the block a C argument vector
-// points into. An argument holding a NUL byte cannot cross into a C string and is cut there.
-argumentBlock(string[] arguments) -> byte[] {
-    long total = 0;
-    for (long i = 0; i < arguments.length; i++) {
-        total = total + arguments[i].length + 1;
+// The capture files a spawn was asked for, for the message when they could not be opened.
+capturedInto(string stdoutPath, string stderrPath) -> string {
+    if (stdoutPath.length == 0) {
+        return "'{stderrPath}'";
     }
-    byte[] block = new byte[total];
-    long at = 0;
-    for (long i = 0; i < arguments.length; i++) {
-        byte[] raw = arguments[i].toBytes();
-        for (long b = 0; b < raw.length; b++) {
-            block[at] = raw[b];
-            at = at + 1;
-        }
-        block[at] = 0;
-        at = at + 1;
+    if (stderrPath.length == 0) {
+        return "'{stdoutPath}'";
     }
-    return block;
+    return "'{stdoutPath}' and '{stderrPath}'";
 }
 
-// The program and its arguments as one command line, each part quoted so that a program started
-// with it splits the parts back into exactly these values. This is the form Win32 takes; a POSIX
-// target runs the argument vector instead and never reads it.
-commandLineOf(string program, string[] arguments) -> string {
-    let line = new StringBuilder();
-    line.append(quoted(program));
-    for (long i = 0; i < arguments.length; i++) {
-        line.append(" ");
-        line.append(quoted(arguments[i]));
-    }
-    return line.toString();
-}
-
-// One part in double quotes. A backslash is literal except where it would escape the closing
-// quote, so a run of backslashes before a quote or at the very end is doubled.
-quoted(string value) -> string {
-    let part = new StringBuilder();
-    part.appendByte('"');
-    byte[] raw = value.toBytes();
-    long backslashes = 0;
+// A path the operating system reported, with its separators as '/', the separator every '@std'
+// path function reads and writes.
+withSlashes(string path) -> string {
+    byte[] raw = path.toBytes();
+    byte[] parts = new byte[raw.length];
     for (long i = 0; i < raw.length; i++) {
         if (raw[i] == '\\') {
-            backslashes = backslashes + 1;
-            continue;
-        }
-        if (raw[i] == '"') {
-            appendBackslashes(part, backslashes * 2 + 1);
+            parts[i] = '/';
         } else {
-            appendBackslashes(part, backslashes);
+            parts[i] = raw[i];
         }
-        part.appendByte(raw[i]);
-        backslashes = 0;
     }
-    appendBackslashes(part, backslashes * 2);
-    part.appendByte('"');
-    return part.toString();
-}
-
-appendBackslashes(StringBuilder part, long count) {
-    for (long i = 0; i < count; i++) {
-        part.appendByte('\\');
-    }
-}
-
-export getEnvironmentVariable(string name) -> string? {
-    return getenv(name);
-}
-
-export arguments() -> string[] {
-    return ens_arguments();
+    return string.fromBytes(parts);
 }

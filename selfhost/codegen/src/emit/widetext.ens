@@ -1,0 +1,98 @@
+// The UTF-16 conversions the Windows halves of the std.system bridges need. An Ens string holds
+// UTF-8 and the wide entry points of the operating system take and give UTF-16, so a path or a
+// variable naming anything outside the system code page still crosses intact. Every copy is
+// allocated with malloc and freed by the bridge that asked for it.
+import Value from @ens.llvm.values;
+import @ens.llvm.instructions;
+import Runtime from emit.runtime;
+import RuntimeFunction from emit.runtime;
+
+// ptr ens_wide_from_utf8(ptr text, i32 bytes): a UTF-16 copy of the text, or null when it could not
+// be converted. `bytes` is -1 for a NUL terminated string, or an exact byte count, which carries
+// the terminators inside a whole environment block over as well.
+public wideFromUtf8(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([runtime.pointerType, runtime.int32Type]);
+    let known = runtime.existing("ens_wide_from_utf8", type);
+    if (known != null) {
+        return known;
+    }
+    let widen = runtime.libc("MultiByteToWideChar", runtime.int32Type.functionType([
+        runtime.int32Type, runtime.int32Type, runtime.pointerType, runtime.int32Type,
+        runtime.pointerType, runtime.int32Type]));
+    let allocate = runtime.malloc();
+    let definition = runtime.beginDefinition("ens_wide_from_utf8", type);
+    let builder = runtime.builder;
+    let sizedBlock = runtime.block(definition, "wide.sized");
+    let convertBlock = runtime.block(definition, "wide.convert");
+    let noneBlock = runtime.block(definition, "wide.none");
+    let text = runtime.parameter(definition, 0);
+    let bytes = runtime.parameter(definition, 1);
+    let characters = runtime.call(widen, [utf8CodePage(runtime), runtime.int32(0), text, bytes,
+        runtime.nullPointer(), runtime.int32(0)], "characters");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLE(builder, characters, runtime.int32(0), ""),
+        noneBlock, sizedBlock);
+
+    builder.positionAtEnd(sizedBlock);
+    let wide = runtime.call(allocate, [instructions.buildMul(builder,
+        instructions.buildSExt(builder, characters, runtime.int64Type, ""), runtime.int64(2), "")],
+        "wide");
+    instructions.buildCondBr(builder, runtime.isNull(wide), noneBlock, convertBlock);
+
+    builder.positionAtEnd(convertBlock);
+    runtime.call(widen, [utf8CodePage(runtime), runtime.int32(0), text, bytes, wide, characters],
+        "");
+    instructions.buildRet(builder, wide);
+
+    builder.positionAtEnd(noneBlock);
+    instructions.buildRet(builder, runtime.nullPointer());
+    return runtime.endDefinition(definition);
+}
+
+// ptr ens_utf8_from_wide(ptr text): a NUL terminated UTF-8 copy of the UTF-16 text, or null when it
+// could not be converted.
+public utf8FromWide(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_utf8_from_wide", type);
+    if (known != null) {
+        return known;
+    }
+    let narrow = narrowFunction(runtime);
+    let allocate = runtime.malloc();
+    let definition = runtime.beginDefinition("ens_utf8_from_wide", type);
+    let builder = runtime.builder;
+    let sizedBlock = runtime.block(definition, "utf8.sized");
+    let convertBlock = runtime.block(definition, "utf8.convert");
+    let noneBlock = runtime.block(definition, "utf8.none");
+    let text = runtime.parameter(definition, 0);
+    let bytes = runtime.call(narrow, [utf8CodePage(runtime), runtime.int32(0), text,
+        runtime.int32(-1), runtime.nullPointer(), runtime.int32(0), runtime.nullPointer(),
+        runtime.nullPointer()], "bytes");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLE(builder, bytes, runtime.int32(0), ""), noneBlock, sizedBlock);
+
+    builder.positionAtEnd(sizedBlock);
+    let narrowed = runtime.call(allocate,
+        [instructions.buildSExt(builder, bytes, runtime.int64Type, "")], "narrowed");
+    instructions.buildCondBr(builder, runtime.isNull(narrowed), noneBlock, convertBlock);
+
+    builder.positionAtEnd(convertBlock);
+    runtime.call(narrow, [utf8CodePage(runtime), runtime.int32(0), text, runtime.int32(-1),
+        narrowed, bytes, runtime.nullPointer(), runtime.nullPointer()], "");
+    instructions.buildRet(builder, narrowed);
+
+    builder.positionAtEnd(noneBlock);
+    instructions.buildRet(builder, runtime.nullPointer());
+    return runtime.endDefinition(definition);
+}
+
+// i32 WideCharToMultiByte(codePage, flags, text, characters, buffer, bytes, default, usedDefault).
+public narrowFunction(Runtime runtime) -> RuntimeFunction {
+    return runtime.libc("WideCharToMultiByte", runtime.int32Type.functionType([runtime.int32Type,
+        runtime.int32Type, runtime.pointerType, runtime.int32Type, runtime.pointerType,
+        runtime.int32Type, runtime.pointerType, runtime.pointerType]));
+}
+
+public utf8CodePage(Runtime runtime) -> Value {
+    return runtime.int32(65001);
+}

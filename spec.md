@@ -1229,18 +1229,37 @@ writeGreeting() -> int throws {
 ```
 
 `system.exists(path)` reports whether a file or directory exists at the path, without throwing: only a missing path reports `false`.
+`system.isFile(path)` and `system.isDirectory(path)` answer the same way for one kind each, so a missing path reports `false` from both.
+
+`system.listDirectory(folder)` returns the names of everything directly inside `folder`: the names alone, without the folder in front of them and without the `.` and `..` entries, in ascending order by their bytes.
+A walk over a tree therefore visits the same names in the same order whatever order the file system enumerates them in.
+A folder that could not be read raises a `SystemError`.
+
+`system.createDirectory(path)` creates the directory the path names together with every parent of it that is missing, and leaves a directory that is already there alone.
+`system.removeFile(path)` removes one file and refuses a directory; `system.removeDirectory(path)` removes one directory, which has to be empty already, because what to do with what is inside it is the caller's decision.
+Each of the three raises a `SystemError` when it does not succeed.
+
+`system.currentDirectory()` returns the directory the program was started in, and `system.executablePath()` the path of the running program itself, both with `/` between their parts on every platform, so the `@std.path` functions read them as they are.
+Neither can be changed: a program builds the paths it works with rather than moving itself somewhere else.
+
+`system.environment()` returns the variables the program inherited as `NAME=VALUE` entries in ascending order by their bytes, and `system.getEnvironmentVariable(name)` returns one variable's value, or `null` when it is not set.
+The environment cannot be changed either; a program that wants a child to see something else passes it when it starts that child.
 
 `system.writeError(message)` writes `message` and a newline to standard error, the stream a program reports its problems on, the way `print` writes to standard output.
 
-`system.runCaptured(program, arguments, stdoutPath, stderrPath)` runs `program` with `arguments`, waits for it to finish, writes what it sent to its standard output and its standard error into the two files, and returns its exit code.
-No command interpreter takes part, so every argument reaches the program exactly as written, whatever spaces or quotes it holds, and nothing is expanded on the way.
-A program that could not be started reports the exit code `127`, the code a shell reports for the same failure; a `SystemError` says the two files could not be opened for writing.
+`system.run(command)` runs one command line through the operating system's command interpreter.
+`system.run(program, arguments)` starts `program` with `arguments` and waits for it, leaving both output streams with the running program, so what the child writes appears where it would have appeared as it is written.
+`system.runCaptured(program, arguments, stdoutPath, stderrPath)` writes what the child sent to its standard output and its standard error into the two files instead, and an empty path leaves that one stream alone, so one call can capture one stream and pass the other through.
+Both have a further form taking a `string[]` of `NAME=VALUE` overrides after the arguments: those entries are laid over the environment the program inherited, replacing the entries naming the same variable and leaving every other variable in place, so a child never loses the search path it needs to find the programs it runs.
+No command interpreter takes part in these forms, so every argument reaches the program exactly as written, whatever spaces or quotes it holds, and nothing is expanded on the way.
+Each returns the child's exit code; a program that could not be started reports `127`, the code a shell reports for the same failure, and a capture file that could not be opened for writing raises a `SystemError`.
 
 ```ens
 import @std.system;
 
 int status = try system.runCaptured("git", ["commit", "-m", "a message with spaces"],
     "build/git.out", "build/git.err");
+int built = try system.run("make", ["all"], ["CC=clang"]);
 ```
 
 The `@std.path` module works on paths as text, with `/` separating the parts on every platform, and never looks at the file system.

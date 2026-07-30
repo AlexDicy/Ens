@@ -1,0 +1,135 @@
+// The std.system bridges that start another program: the shell runner over the C library's system(),
+// and the spawn that starts a program with no shell in between. The spawn opens only the capture
+// files it was given a path for, so an empty path leaves that stream with this process, and closes
+// only what it opened.
+import Value from @ens.llvm.values;
+import @ens.llvm.globals;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import Runtime from emit.runtime;
+import RuntimeFunction from emit.runtime;
+import emit.spawn;
+
+// i32 ens_run_process(ptr command): the C library's system(), with the POSIX wait status normalized
+// to the child's exit code; Windows already reports the exit code directly.
+public runProcessRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int32Type.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_run_process", type);
+    if (known != null) {
+        return known;
+    }
+    let shell = runtime.libc("system", type);
+    let definition = runtime.beginDefinition("ens_run_process", type);
+    let builder = runtime.builder;
+    let status = runtime.call(shell, [runtime.parameter(definition, 0)], "status");
+    if (runtime.onWindows()) {
+        instructions.buildRet(builder, status);
+        return runtime.endDefinition(definition);
+    }
+    let normalized = spawn.normalizedStatus(runtime, status);
+    let failed = instructions.buildICmpEQ(builder, status, runtime.int32(-1), "failed");
+    instructions.buildRet(builder,
+        instructions.buildSelect(builder, failed, status, normalized, ""));
+    return runtime.endDefinition(definition);
+}
+
+// i64 ens_spawn_process(ptr program, ptr argumentBlock, i64 argumentCount, ptr commandLine,
+// ptr environmentBlock, i64 environmentCount, i64 environmentBytes, ptr stdoutPath,
+// ptr stderrPath): runs the program with no shell in between and waits for it. An empty stdout or
+// stderr path leaves that stream with this process; a path captures the stream into that file. An
+// empty environment block hands this process's environment on unchanged. A POSIX target execs an
+// argument vector built from the NUL separated block; a Windows target hands the joined command line
+// to CreateProcessW, the only shape Win32 accepts. Returns the child's exit code, 127 when it could
+// not be started at all, or -1 when a capture file could not be opened for writing.
+public spawnProcessRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int64Type.functionType([runtime.pointerType, runtime.pointerType,
+        runtime.int64Type, runtime.pointerType, runtime.pointerType, runtime.int64Type,
+        runtime.int64Type, runtime.pointerType, runtime.pointerType]);
+    let known = runtime.existing("ens_spawn_process", type);
+    if (known != null) {
+        return known;
+    }
+    let openFile = runtime.libc("fopen",
+        runtime.pointerType.functionType([runtime.pointerType, runtime.pointerType]));
+    let closeFile = runtime.libc("fclose", runtime.int32Type.functionType([runtime.pointerType]));
+    let definition = runtime.beginDefinition("ens_spawn_process", type);
+    let builder = runtime.builder;
+    let openOutBlock = runtime.block(definition, "open.out");
+    let checkErrBlock = runtime.block(definition, "check.err");
+    let openErrBlock = runtime.block(definition, "open.err");
+    let openFailedBlock = runtime.block(definition, "open.failed");
+    let readyBlock = runtime.block(definition, "ready");
+    let closeBlock = runtime.block(definition, "close");
+    let closeOutBlock = runtime.block(definition, "close.out");
+    let closeErrCheckBlock = runtime.block(definition, "close.err.check");
+    let closeErrBlock = runtime.block(definition, "close.err");
+    let doneBlock = runtime.block(definition, "close.done");
+
+    let statusSlot = memory.buildAlloca(builder, runtime.int64Type, "status");
+    let outSlot = memory.buildAlloca(builder, runtime.pointerType, "out.file");
+    let errSlot = memory.buildAlloca(builder, runtime.pointerType, "err.file");
+    memory.buildStore(builder, runtime.int64(0), statusSlot);
+    memory.buildStore(builder, runtime.nullPointer(), outSlot);
+    memory.buildStore(builder, runtime.nullPointer(), errSlot);
+    let mode = globals.buildGlobalString(builder, "wb", ".mode.write");
+    instructions.buildCondBr(builder, emptyPath(runtime, runtime.parameter(definition, 7)),
+        checkErrBlock, openOutBlock);
+
+    builder.positionAtEnd(openOutBlock);
+    let output = runtime.call(openFile, [runtime.parameter(definition, 7), mode], "out.opened");
+    memory.buildStore(builder, output, outSlot);
+    instructions.buildCondBr(builder, runtime.isNull(output), openFailedBlock, checkErrBlock);
+
+    builder.positionAtEnd(checkErrBlock);
+    instructions.buildCondBr(builder, emptyPath(runtime, runtime.parameter(definition, 8)),
+        readyBlock, openErrBlock);
+
+    builder.positionAtEnd(openErrBlock);
+    let errors = runtime.call(openFile, [runtime.parameter(definition, 8), mode], "err.opened");
+    memory.buildStore(builder, errors, errSlot);
+    instructions.buildCondBr(builder, runtime.isNull(errors), openFailedBlock, readyBlock);
+
+    builder.positionAtEnd(openFailedBlock);
+    memory.buildStore(builder, runtime.int64(-1), statusSlot);
+    instructions.buildBr(builder, closeBlock);
+
+    builder.positionAtEnd(readyBlock);
+    if (runtime.onWindows()) {
+        spawn.windowsSpawn(runtime, definition, outSlot, errSlot, statusSlot, closeBlock);
+    } else {
+        spawn.posixSpawn(runtime, definition, outSlot, errSlot, statusSlot, closeBlock);
+    }
+
+    // Only the streams this call opened are closed; an inherited one belongs to this process and
+    // outlives the child.
+    builder.positionAtEnd(closeBlock);
+    let openedOut = memory.buildLoad(builder, runtime.pointerType, outSlot, "out.cur");
+    instructions.buildCondBr(builder, runtime.isNull(openedOut), closeErrCheckBlock,
+        closeOutBlock);
+
+    builder.positionAtEnd(closeOutBlock);
+    runtime.call(closeFile, [openedOut], "");
+    instructions.buildBr(builder, closeErrCheckBlock);
+
+    builder.positionAtEnd(closeErrCheckBlock);
+    let openedErr = memory.buildLoad(builder, runtime.pointerType, errSlot, "err.cur");
+    instructions.buildCondBr(builder, runtime.isNull(openedErr), doneBlock, closeErrBlock);
+
+    builder.positionAtEnd(closeErrBlock);
+    runtime.call(closeFile, [openedErr], "");
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(doneBlock);
+    instructions.buildRet(builder,
+        memory.buildLoad(builder, runtime.int64Type, statusSlot, "status"));
+    return runtime.endDefinition(definition);
+}
+
+// A path is empty exactly when its first byte is the terminator, which is how a caller asks for a
+// stream to be left alone.
+emptyPath(Runtime runtime, Value path) -> Value {
+    let builder = runtime.builder;
+    return instructions.buildICmpEQ(builder,
+        memory.buildLoad(builder, runtime.int8Type, path, "path.first"),
+        runtime.int8(0), "path.empty");
+}

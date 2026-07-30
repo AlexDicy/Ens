@@ -1,0 +1,144 @@
+// The shapes a spawned process needs its inputs in: the NUL separated blocks a C argument vector
+// and a Win32 environment block point into, the merge of an inherited environment with a caller's
+// overrides, and the one command line Win32 accepts. Everything here is package-internal and
+// reached through '@std.system'; nothing touches the operating system, so every function is a rule
+// about the values handed to it.
+import StringBuilder from @std.text.stringbuilder;
+import List from @std.collections.list;
+import @std.collections.sorting;
+
+// Every value's bytes with a NUL after each of them, which is the block a C argument vector points
+// into. A value holding a NUL byte cannot cross into a C string and is cut there.
+public argumentBlock(string[] arguments) -> byte[] {
+    return separatedBlock(arguments, 0);
+}
+
+// The same shape for environment entries, closed by the extra NUL a Win32 environment block ends
+// with. An empty environment gives an empty block, which a spawn reads as "inherit unchanged".
+public environmentBlock(string[] variables) -> byte[] {
+    if (variables.length == 0) {
+        return new byte[0];
+    }
+    return separatedBlock(variables, 1);
+}
+
+separatedBlock(string[] values, long trailing) -> byte[] {
+    long total = trailing;
+    for (long i = 0; i < values.length; i++) {
+        total = total + values[i].length + 1;
+    }
+    byte[] block = new byte[total];
+    long at = 0;
+    for (long i = 0; i < values.length; i++) {
+        byte[] raw = values[i].toBytes();
+        for (long b = 0; b < raw.length; b++) {
+            block[at] = raw[b];
+            at = at + 1;
+        }
+        block[at] = 0;
+        at = at + 1;
+    }
+    return block;
+}
+
+// The inherited environment with the overrides applied over it, in order, so the child sees one
+// entry per name and keeps everything it was not given a new value for. Names match without
+// regard to case, the way Windows matches them, so an override reaches the inherited entry however
+// that entry spells its name.
+public mergedEnvironment(string[] inherited, string[] overrides) -> string[] {
+    let merged = new List<string>();
+    for (let entry in inherited) {
+        if (!overriddenName(overrides, nameOf(entry))) {
+            merged.push(entry);
+        }
+    }
+    for (let entry in overrides) {
+        merged.push(entry);
+    }
+    sorting.sort(merged);
+    return merged.toArray();
+}
+
+// The name an environment entry sets, which is everything before the first '='. An entry with no
+// '=' names itself.
+public nameOf(string entry) -> string {
+    long separator = entry.indexOf("=");
+    if (separator < 0) {
+        return entry;
+    }
+    return entry.substring(0, separator);
+}
+
+overriddenName(string[] overrides, string name) -> bool {
+    for (let entry in overrides) {
+        if (sameName(nameOf(entry), name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+sameName(string left, string right) -> bool {
+    if (left.length != right.length) {
+        return false;
+    }
+    byte[] first = left.toBytes();
+    byte[] second = right.toBytes();
+    for (long i = 0; i < first.length; i++) {
+        if (lowered(first[i]) != lowered(second[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+lowered(byte value) -> byte {
+    if (value >= 'A' && value <= 'Z') {
+        return (value + ('a' - 'A')) as byte;
+    }
+    return value;
+}
+
+// The program and its arguments as one command line, each part quoted so that a program started
+// with it splits the parts back into exactly these values. This is the form Win32 takes; a POSIX
+// target runs the argument vector instead and never reads it.
+public commandLineOf(string program, string[] arguments) -> string {
+    let line = new StringBuilder();
+    line.append(quoted(program));
+    for (long i = 0; i < arguments.length; i++) {
+        line.append(" ");
+        line.append(quoted(arguments[i]));
+    }
+    return line.toString();
+}
+
+// One part in double quotes. A backslash is literal except where it would escape the closing
+// quote, so a run of backslashes before a quote or at the very end is doubled.
+quoted(string value) -> string {
+    let part = new StringBuilder();
+    part.appendByte('"');
+    byte[] raw = value.toBytes();
+    long backslashes = 0;
+    for (long i = 0; i < raw.length; i++) {
+        if (raw[i] == '\\') {
+            backslashes = backslashes + 1;
+            continue;
+        }
+        if (raw[i] == '"') {
+            appendBackslashes(part, backslashes * 2 + 1);
+        } else {
+            appendBackslashes(part, backslashes);
+        }
+        part.appendByte(raw[i]);
+        backslashes = 0;
+    }
+    appendBackslashes(part, backslashes * 2);
+    part.appendByte('"');
+    return part.toString();
+}
+
+appendBackslashes(StringBuilder part, long count) {
+    for (long i = 0; i < count; i++) {
+        part.appendByte('\\');
+    }
+}

@@ -1365,47 +1365,58 @@ struct CodeGenerator::Impl {
         return ensArgGlobal("ens_argv", ptrTy, llvm::ConstantPointerNull::get(ptrTy), define);
     }
 
+    // void _dtor_string_array(arr): release each string element. Mirrors the generic
+    // reference-element array dtor without needing an element type, and is shared by
+    // every bridge that hands an owned string[] back to Ens.
+    llvm::Function* getOrDefineStringArrayDtor() {
+        if (auto* existing = module->getFunction("_dtor_string_array")) return existing;
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8Ty  = llvm::Type::getInt8Ty(ctx);
+        auto* eight = llvm::ConstantInt::get(i64Ty, 8);
+        auto* one   = llvm::ConstantInt::get(i64Ty, 1);
+        auto* dtor = llvm::Function::Create(
+            llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), { ptrTy }, false),
+            llvm::Function::InternalLinkage, "_dtor_string_array", module.get());
+        dtor->addFnAttr(llvm::Attribute::NoUnwind);
+
+        auto savedIP = builder->saveIP();
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", dtor);
+        auto* cond  = llvm::BasicBlock::Create(ctx, "loop.cond", dtor);
+        auto* body  = llvm::BasicBlock::Create(ctx, "loop.body", dtor);
+        auto* end   = llvm::BasicBlock::Create(ctx, "loop.end", dtor);
+        builder->SetInsertPoint(entry);
+        llvm::Value* arr = dtor->getArg(0);
+        llvm::Value* len = builder->CreateLoad(i64Ty, arr, "len");
+        llvm::Value* data = builder->CreateGEP(i8Ty, arr, eight, "data");
+        llvm::Value* iSlot = builder->CreateAlloca(i64Ty, nullptr, "i");
+        builder->CreateStore(llvm::ConstantInt::get(i64Ty, 0), iSlot);
+        builder->CreateBr(cond);
+        builder->SetInsertPoint(cond);
+        llvm::Value* i = builder->CreateLoad(i64Ty, iSlot, "i.load");
+        builder->CreateCondBr(builder->CreateICmpSLT(i, len), body, end);
+        builder->SetInsertPoint(body);
+        llvm::Value* slot = builder->CreateGEP(ptrTy, data, i, "slot");
+        builder->CreateCall(getOrDefineEnsRelease(), { builder->CreateLoad(ptrTy, slot, "elem") });
+        builder->CreateStore(builder->CreateAdd(i, one), iSlot);
+        builder->CreateBr(cond);
+        builder->SetInsertPoint(end);
+        builder->CreateRetVoid();
+        builder->restoreIP(savedIP);
+        return dtor;
+    }
+
     llvm::Function* defineArgsRuntime() {
         if (auto* existing = module->getFunction("ens_arguments")) return existing;
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         auto* i32Ty = llvm::Type::getInt32Ty(ctx);
         auto* i64Ty = llvm::Type::getInt64Ty(ctx);
         auto* i8Ty  = llvm::Type::getInt8Ty(ctx);
-        auto* voidTy = llvm::Type::getVoidTy(ctx);
         auto* eight = llvm::ConstantInt::get(i64Ty, 8);
         auto* one   = llvm::ConstantInt::get(i64Ty, 1);
 
+        auto* dtor = getOrDefineStringArrayDtor();
         auto savedIP = builder->saveIP();
-
-        // void _dtor_args_array(arr): release each string element. Mirrors the
-        // generic reference-element array dtor without needing an element type.
-        auto* dtor = llvm::Function::Create(
-            llvm::FunctionType::get(voidTy, { ptrTy }, false),
-            llvm::Function::InternalLinkage, "_dtor_args_array", module.get());
-        dtor->addFnAttr(llvm::Attribute::NoUnwind);
-        {
-            auto* entry = llvm::BasicBlock::Create(ctx, "entry", dtor);
-            auto* cond  = llvm::BasicBlock::Create(ctx, "loop.cond", dtor);
-            auto* body  = llvm::BasicBlock::Create(ctx, "loop.body", dtor);
-            auto* end   = llvm::BasicBlock::Create(ctx, "loop.end", dtor);
-            builder->SetInsertPoint(entry);
-            llvm::Value* arr = dtor->getArg(0);
-            llvm::Value* len = builder->CreateLoad(i64Ty, arr, "len");
-            llvm::Value* data = builder->CreateGEP(i8Ty, arr, eight, "data");
-            llvm::Value* iSlot = builder->CreateAlloca(i64Ty, nullptr, "i");
-            builder->CreateStore(llvm::ConstantInt::get(i64Ty, 0), iSlot);
-            builder->CreateBr(cond);
-            builder->SetInsertPoint(cond);
-            llvm::Value* i = builder->CreateLoad(i64Ty, iSlot, "i.load");
-            builder->CreateCondBr(builder->CreateICmpSLT(i, len), body, end);
-            builder->SetInsertPoint(body);
-            llvm::Value* slot = builder->CreateGEP(ptrTy, data, i, "slot");
-            builder->CreateCall(getOrDefineEnsRelease(), { builder->CreateLoad(ptrTy, slot, "elem") });
-            builder->CreateStore(builder->CreateAdd(i, one), iSlot);
-            builder->CreateBr(cond);
-            builder->SetInsertPoint(end);
-            builder->CreateRetVoid();
-        }
 
         // string[] ens_arguments(): allocate argc slots and wrap each C string.
         auto* fn = llvm::Function::Create(
@@ -1479,106 +1490,190 @@ struct CodeGenerator::Impl {
         return fn;
     }
 
-    // i64 ens_run_process_captured(program, argumentBlock, count, commandLine,
-    // stdoutPath, stderrPath): runs the program with no shell in between, waits
-    // for it, and writes its two streams into the two files. A POSIX target
-    // execs an argument vector built from the NUL separated block; Windows hands
-    // the joined command line to
-    // CreateProcess, the only shape Win32 accepts. Returns the child's exit
-    // code, 127 when the program could not be started at all, or -1 when the two
-    // files could not be opened for writing.
-    llvm::Function* defineRunProcessCapturedRuntime() {
+    // i64 ens_spawn_process(program, argumentBlock, argumentCount, commandLine,
+    // environmentBlock, environmentCount, environmentBytes, stdoutPath,
+    // stderrPath): runs the program with no shell in between and waits for it. An
+    // empty stdout or stderr path leaves that stream with this process; a path
+    // captures the stream into that file. An empty environment block hands this
+    // process's environment on unchanged. A POSIX target execs an argument vector
+    // built from the NUL separated block; Windows hands the joined command line to
+    // CreateProcessW, the only shape Win32 accepts. Returns the child's exit code,
+    // 127 when the program could not be started at all, or -1 when a capture file
+    // could not be opened for writing.
+    llvm::Function* defineSpawnProcessRuntime() {
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         auto* i32Ty = llvm::Type::getInt32Ty(ctx);
         auto* i64Ty = llvm::Type::getInt64Ty(ctx);
         auto* i8Ty  = llvm::Type::getInt8Ty(ctx);
         auto* fnTy = llvm::FunctionType::get(i64Ty,
-            { ptrTy, ptrTy, i64Ty, ptrTy, ptrTy, ptrTy }, false);
-        llvm::Function* fn = module->getFunction("ens_run_process_captured");
+            { ptrTy, ptrTy, i64Ty, ptrTy, ptrTy, i64Ty, i64Ty, ptrTy, ptrTy }, false);
+        llvm::Function* fn = module->getFunction("ens_spawn_process");
         if (!fn) {
             fn = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage,
-                "ens_run_process_captured", module.get());
+                "ens_spawn_process", module.get());
         }
         if (!fn->empty()) return fn;
 
         auto savedIP = builder->saveIP();
-        auto* entry     = llvm::BasicBlock::Create(ctx, "entry", fn);
-        auto* openError = llvm::BasicBlock::Create(ctx, "open.error", fn);
-        auto* noOutput  = llvm::BasicBlock::Create(ctx, "open.no.output", fn);
-        auto* noErrors  = llvm::BasicBlock::Create(ctx, "open.no.errors", fn);
-        auto* ready     = llvm::BasicBlock::Create(ctx, "ready", fn);
-        auto* closeBB   = llvm::BasicBlock::Create(ctx, "close", fn);
+        auto* entry      = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* openOut    = llvm::BasicBlock::Create(ctx, "open.out", fn);
+        auto* checkErr   = llvm::BasicBlock::Create(ctx, "check.err", fn);
+        auto* openErr    = llvm::BasicBlock::Create(ctx, "open.err", fn);
+        auto* ready      = llvm::BasicBlock::Create(ctx, "ready", fn);
+        auto* openFailed = llvm::BasicBlock::Create(ctx, "open.failed", fn);
+        auto* closeBB    = llvm::BasicBlock::Create(ctx, "close", fn);
 
         auto* fileTy = llvm::FunctionType::get(ptrTy, { ptrTy, ptrTy }, false);
-        llvm::FunctionCallee openFile = module->getOrInsertFunction("fopen", fileTy);
-        llvm::FunctionCallee closeFile = module->getOrInsertFunction("fclose",
+        llvm::FunctionCallee openFile = libcFn("fopen", fileTy);
+        llvm::FunctionCallee closeFile = libcFn("fclose",
             llvm::FunctionType::get(i32Ty, { ptrTy }, false));
+        auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy);
+
+        // A path is empty exactly when its first byte is the terminator, which is
+        // how a caller asks for the stream to be left alone.
+        auto isEmptyPath = [&](llvm::Value* path) {
+            return builder->CreateICmpEQ(builder->CreateLoad(i8Ty, path, "path.first"),
+                llvm::ConstantInt::get(i8Ty, 0), "path.empty");
+        };
 
         builder->SetInsertPoint(entry);
         llvm::Value* statusSlot = builder->CreateAlloca(i64Ty, nullptr, "status");
+        llvm::Value* outSlot = builder->CreateAlloca(ptrTy, nullptr, "out.file");
+        llvm::Value* errSlot = builder->CreateAlloca(ptrTy, nullptr, "err.file");
+        builder->CreateStore(llvm::ConstantInt::get(i64Ty, 0), statusSlot);
+        builder->CreateStore(nullPtr, outSlot);
+        builder->CreateStore(nullPtr, errSlot);
         llvm::Value* mode = builder->CreateGlobalString("wb", ".mode.write");
-        llvm::Value* output = builder->CreateCall(openFile, { fn->getArg(4), mode }, "out.file");
-        builder->CreateCondBr(
-            builder->CreateICmpEQ(output, llvm::ConstantPointerNull::get(ptrTy)),
-            noOutput, openError);
+        builder->CreateCondBr(isEmptyPath(fn->getArg(7)), checkErr, openOut);
 
-        builder->SetInsertPoint(openError);
-        llvm::Value* errors = builder->CreateCall(openFile, { fn->getArg(5), mode }, "err.file");
-        builder->CreateCondBr(
-            builder->CreateICmpEQ(errors, llvm::ConstantPointerNull::get(ptrTy)),
-            noErrors, ready);
+        builder->SetInsertPoint(openOut);
+        llvm::Value* output = builder->CreateCall(openFile, { fn->getArg(7), mode }, "out.opened");
+        builder->CreateStore(output, outSlot);
+        builder->CreateCondBr(builder->CreateICmpEQ(output, nullPtr), openFailed, checkErr);
 
-        builder->SetInsertPoint(noOutput);
-        builder->CreateRet(llvm::ConstantInt::getSigned(i64Ty, -1));
+        builder->SetInsertPoint(checkErr);
+        builder->CreateCondBr(isEmptyPath(fn->getArg(8)), ready, openErr);
 
-        builder->SetInsertPoint(noErrors);
-        builder->CreateCall(closeFile, { output });
-        builder->CreateRet(llvm::ConstantInt::getSigned(i64Ty, -1));
+        builder->SetInsertPoint(openErr);
+        llvm::Value* errors = builder->CreateCall(openFile, { fn->getArg(8), mode }, "err.opened");
+        builder->CreateStore(errors, errSlot);
+        builder->CreateCondBr(builder->CreateICmpEQ(errors, nullPtr), openFailed, ready);
+
+        builder->SetInsertPoint(openFailed);
+        builder->CreateStore(llvm::ConstantInt::getSigned(i64Ty, -1), statusSlot);
+        builder->CreateBr(closeBB);
 
         builder->SetInsertPoint(ready);
         if (module->getTargetTriple().isOSWindows()) {
-            emitWindowsSpawn(fn, output, errors, statusSlot, closeBB);
+            emitWindowsSpawn(fn, outSlot, errSlot, statusSlot, closeBB);
         } else {
-            emitPosixSpawn(fn, output, errors, statusSlot, closeBB);
+            emitPosixSpawn(fn, outSlot, errSlot, statusSlot, closeBB);
         }
 
+        // Only the streams this call opened are closed; an inherited one belongs
+        // to this process and outlives the child.
         builder->SetInsertPoint(closeBB);
-        builder->CreateCall(closeFile, { output });
-        builder->CreateCall(closeFile, { errors });
+        auto* closeErrCheck = llvm::BasicBlock::Create(ctx, "close.err.check", fn);
+        auto* closeOutBB = llvm::BasicBlock::Create(ctx, "close.out", fn);
+        auto* closeErrBB = llvm::BasicBlock::Create(ctx, "close.err", fn);
+        auto* doneBB = llvm::BasicBlock::Create(ctx, "close.done", fn);
+        llvm::Value* openedOut = builder->CreateLoad(ptrTy, outSlot, "out.load");
+        builder->CreateCondBr(builder->CreateICmpEQ(openedOut, nullPtr),
+            closeErrCheck, closeOutBB);
+
+        builder->SetInsertPoint(closeOutBB);
+        builder->CreateCall(closeFile, { openedOut });
+        builder->CreateBr(closeErrCheck);
+
+        builder->SetInsertPoint(closeErrCheck);
+        llvm::Value* openedErr = builder->CreateLoad(ptrTy, errSlot, "err.load");
+        builder->CreateCondBr(builder->CreateICmpEQ(openedErr, nullPtr), doneBB, closeErrBB);
+
+        builder->SetInsertPoint(closeErrBB);
+        builder->CreateCall(closeFile, { openedErr });
+        builder->CreateBr(doneBB);
+
+        builder->SetInsertPoint(doneBB);
         builder->CreateRet(builder->CreateLoad(i64Ty, statusSlot, "status.load"));
 
         builder->restoreIP(savedIP);
         return fn;
     }
 
-    // The Windows half of the capturing runner: the two files become the child's
-    // standard handles through a STARTUPINFOA, and CreateProcess starts the
-    // command line without a shell. The structures are raw byte blocks, so the
-    // fields are written at their documented x64 offsets.
-    void emitWindowsSpawn(llvm::Function* fn, llvm::Value* output, llvm::Value* errors,
+    // The Windows half of the spawn: the child's standard handles come from the
+    // capture files where there are any and from this process's own handles where a
+    // stream is inherited, and CreateProcessW starts the command line without a
+    // shell. Both the command line and the environment block cross as UTF-16, so an
+    // argument or a variable holding text outside the system code page survives. The
+    // structures are raw byte blocks, so the fields are written at their documented
+    // x64 offsets.
+    void emitWindowsSpawn(llvm::Function* fn, llvm::Value* outSlot, llvm::Value* errSlot,
                           llvm::Value* statusSlot, llvm::BasicBlock* closeBB) {
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         auto* i32Ty = llvm::Type::getInt32Ty(ctx);
         auto* i64Ty = llvm::Type::getInt64Ty(ctx);
         auto* i8Ty  = llvm::Type::getInt8Ty(ctx);
-        llvm::FunctionCallee fileNumber = module->getOrInsertFunction("_fileno",
+        auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy);
+        llvm::FunctionCallee fileNumber = libcFn("_fileno",
             llvm::FunctionType::get(i32Ty, { ptrTy }, false));
-        llvm::FunctionCallee osHandle = module->getOrInsertFunction("_get_osfhandle",
+        llvm::FunctionCallee osHandle = libcFn("_get_osfhandle",
             llvm::FunctionType::get(i64Ty, { i32Ty }, false));
-        llvm::FunctionCallee createProcess = module->getOrInsertFunction("CreateProcessA",
+        llvm::FunctionCallee standardHandle = libcFn("GetStdHandle",
+            llvm::FunctionType::get(i64Ty, { i32Ty }, false));
+        llvm::FunctionCallee createProcess = libcFn("CreateProcessW",
             llvm::FunctionType::get(i32Ty, { ptrTy, ptrTy, ptrTy, ptrTy, i32Ty, i32Ty, ptrTy,
                 ptrTy, ptrTy, ptrTy }, false));
-        llvm::FunctionCallee waitForOne = module->getOrInsertFunction("WaitForSingleObject",
+        llvm::FunctionCallee waitForOne = libcFn("WaitForSingleObject",
             llvm::FunctionType::get(i32Ty, { ptrTy, i32Ty }, false));
-        llvm::FunctionCallee exitCodeOf = module->getOrInsertFunction("GetExitCodeProcess",
+        llvm::FunctionCallee exitCodeOf = libcFn("GetExitCodeProcess",
             llvm::FunctionType::get(i32Ty, { ptrTy, ptrTy }, false));
-        llvm::FunctionCallee closeHandle = module->getOrInsertFunction("CloseHandle",
+        llvm::FunctionCallee closeHandle = libcFn("CloseHandle",
             llvm::FunctionType::get(i32Ty, { ptrTy }, false));
 
+        auto* noCommand = llvm::BasicBlock::Create(ctx, "spawn.no.command", fn);
+        auto* startBB = llvm::BasicBlock::Create(ctx, "spawn.start", fn);
         auto* spawnFailed = llvm::BasicBlock::Create(ctx, "spawn.failed", fn);
         auto* waitBB = llvm::BasicBlock::Create(ctx, "spawn.wait", fn);
 
-        // STARTUPINFOA is 104 bytes and PROCESS_INFORMATION 24; both start zeroed.
+        // The handle a child stream reads or writes: the capture file's when this
+        // call opened one, and this process's own standard handle otherwise.
+        auto handleOfStream = [&](llvm::Value* slot, int standard, const char* label) {
+            auto* fileBB = llvm::BasicBlock::Create(ctx, std::string(label) + ".file", fn);
+            auto* inheritBB = llvm::BasicBlock::Create(ctx, std::string(label) + ".inherit", fn);
+            auto* joinBB = llvm::BasicBlock::Create(ctx, std::string(label) + ".ready", fn);
+            llvm::Value* handleSlot = builder->CreateAlloca(i64Ty, nullptr, label);
+            llvm::Value* file = builder->CreateLoad(ptrTy, slot, "stream");
+            builder->CreateCondBr(builder->CreateICmpEQ(file, nullPtr), inheritBB, fileBB);
+            builder->SetInsertPoint(fileBB);
+            builder->CreateStore(builder->CreateCall(osHandle,
+                { builder->CreateCall(fileNumber, { file }, "fd") }, "handle"), handleSlot);
+            builder->CreateBr(joinBB);
+            builder->SetInsertPoint(inheritBB);
+            builder->CreateStore(builder->CreateCall(standardHandle,
+                { llvm::ConstantInt::getSigned(i32Ty, standard) }, "std.handle"), handleSlot);
+            builder->CreateBr(joinBB);
+            builder->SetInsertPoint(joinBB);
+            return builder->CreateLoad(i64Ty, handleSlot, "handle.ready");
+        };
+
+        llvm::Value* wideCommand = builder->CreateCall(defineWideFromUtf8Runtime(),
+            { fn->getArg(3), llvm::ConstantInt::getSigned(i32Ty, -1) }, "command.wide");
+        builder->CreateCondBr(builder->CreateICmpEQ(wideCommand, nullPtr), noCommand, startBB);
+
+        builder->SetInsertPoint(noCommand);
+        builder->CreateStore(llvm::ConstantInt::get(i64Ty, 127), statusSlot);
+        builder->CreateBr(closeBB);
+
+        builder->SetInsertPoint(startBB);
+        llvm::Value* wideEnvironment = builder->CreateCall(defineWideFromUtf8Runtime(),
+            { fn->getArg(4), builder->CreateTrunc(fn->getArg(6), i32Ty, "env.bytes") },
+            "environment.wide");
+        // CREATE_UNICODE_ENVIRONMENT, needed only when an environment block is given.
+        llvm::Value* flags = builder->CreateSelect(
+            builder->CreateICmpEQ(wideEnvironment, nullPtr),
+            llvm::ConstantInt::get(i32Ty, 0), llvm::ConstantInt::get(i32Ty, 0x400), "flags");
+
+        // STARTUPINFOW is 104 bytes and PROCESS_INFORMATION 24; both start zeroed.
         llvm::Value* startup = builder->CreateAlloca(llvm::ArrayType::get(i8Ty, 104), nullptr,
             "startup");
         llvm::Value* process = builder->CreateAlloca(llvm::ArrayType::get(i8Ty, 24), nullptr,
@@ -1592,24 +1687,21 @@ struct CodeGenerator::Impl {
         for (long offset = 0; offset < 24; offset += 8) {
             builder->CreateStore(llvm::ConstantInt::get(i64Ty, 0), fieldAt(process, offset));
         }
-        auto handleOfFile = [&](llvm::Value* file) {
-            return builder->CreateCall(osHandle,
-                { builder->CreateCall(fileNumber, { file }, "fd") }, "handle");
-        };
         builder->CreateStore(llvm::ConstantInt::get(i32Ty, 104), fieldAt(startup, 0));
         // dwFlags = STARTF_USESTDHANDLES.
         builder->CreateStore(llvm::ConstantInt::get(i32Ty, 0x100), fieldAt(startup, 60));
-        builder->CreateStore(builder->CreateCall(osHandle,
-            { llvm::ConstantInt::get(i32Ty, 0) }, "stdin.handle"), fieldAt(startup, 80));
-        builder->CreateStore(handleOfFile(output), fieldAt(startup, 88));
-        builder->CreateStore(handleOfFile(errors), fieldAt(startup, 96));
+        builder->CreateStore(builder->CreateCall(standardHandle,
+            { llvm::ConstantInt::getSigned(i32Ty, -10) }, "stdin.handle"), fieldAt(startup, 80));
+        llvm::Value* outHandle = handleOfStream(outSlot, -11, "stdout.handle");
+        llvm::Value* errHandle = handleOfStream(errSlot, -12, "stderr.handle");
+        builder->CreateStore(outHandle, fieldAt(startup, 88));
+        builder->CreateStore(errHandle, fieldAt(startup, 96));
 
         llvm::Value* started = builder->CreateCall(createProcess,
-            { llvm::ConstantPointerNull::get(ptrTy), fn->getArg(3),
-              llvm::ConstantPointerNull::get(ptrTy), llvm::ConstantPointerNull::get(ptrTy),
-              llvm::ConstantInt::get(i32Ty, 1), llvm::ConstantInt::get(i32Ty, 0),
-              llvm::ConstantPointerNull::get(ptrTy), llvm::ConstantPointerNull::get(ptrTy),
-              startup, process }, "started");
+            { nullPtr, wideCommand, nullPtr, nullPtr, llvm::ConstantInt::get(i32Ty, 1), flags,
+              wideEnvironment, nullPtr, startup, process }, "started");
+        builder->CreateCall(getOrDeclareFree(), { wideCommand });
+        builder->CreateCall(getOrDeclareFree(), { wideEnvironment });
         builder->CreateCondBr(
             builder->CreateICmpEQ(started, llvm::ConstantInt::get(i32Ty, 0)),
             spawnFailed, waitBB);
@@ -1632,76 +1724,60 @@ struct CodeGenerator::Impl {
         builder->CreateBr(closeBB);
     }
 
-    // The POSIX half: the argument vector is built from the Ens string array,
-    // the child points its two streams at the already open files and execs, and
-    // the parent normalizes the wait status the way ens_run_process does.
-    void emitPosixSpawn(llvm::Function* fn, llvm::Value* output, llvm::Value* errors,
+    // The POSIX half: the argument and environment vectors point into the NUL
+    // separated blocks, the child aims a captured stream at the file the parent
+    // opened and leaves an inherited one alone, takes the environment as its own,
+    // and execs; the parent normalizes the wait status the way ens_run_process does.
+    void emitPosixSpawn(llvm::Function* fn, llvm::Value* outSlot, llvm::Value* errSlot,
                         llvm::Value* statusSlot, llvm::BasicBlock* closeBB) {
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         auto* i32Ty = llvm::Type::getInt32Ty(ctx);
         auto* i64Ty = llvm::Type::getInt64Ty(ctx);
-        auto* i8Ty  = llvm::Type::getInt8Ty(ctx);
-        llvm::FunctionCallee fileNumber = module->getOrInsertFunction("fileno",
-            llvm::FunctionType::get(i32Ty, { ptrTy }, false));
-        llvm::FunctionCallee duplicate = module->getOrInsertFunction("dup2",
-            llvm::FunctionType::get(i32Ty, { i32Ty, i32Ty }, false));
-        llvm::FunctionCallee forkProcess = module->getOrInsertFunction("fork",
+        llvm::FunctionCallee forkProcess = libcFn("fork",
             llvm::FunctionType::get(i32Ty, {}, false));
-        llvm::FunctionCallee execProgram = module->getOrInsertFunction("execvp",
+        llvm::FunctionCallee execProgram = libcFn("execvp",
             llvm::FunctionType::get(i32Ty, { ptrTy, ptrTy }, false));
-        llvm::FunctionCallee exitChild = module->getOrInsertFunction("_exit",
+        llvm::FunctionCallee exitChild = libcFn("_exit",
             llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), { i32Ty }, false));
-        llvm::FunctionCallee waitForChild = module->getOrInsertFunction("waitpid",
+        llvm::FunctionCallee waitForChild = libcFn("waitpid",
             llvm::FunctionType::get(i32Ty, { i32Ty, ptrTy, i32Ty }, false));
 
-        auto* fillTest = llvm::BasicBlock::Create(ctx, "argv.test", fn);
-        auto* fillBody = llvm::BasicBlock::Create(ctx, "argv.body", fn);
-        auto* spawnBB  = llvm::BasicBlock::Create(ctx, "spawn.start", fn);
         auto* childBB  = llvm::BasicBlock::Create(ctx, "spawn.child", fn);
         auto* parentBB = llvm::BasicBlock::Create(ctx, "spawn.parent", fn);
         auto* forkFail = llvm::BasicBlock::Create(ctx, "spawn.failed", fn);
         auto* waitBB   = llvm::BasicBlock::Create(ctx, "spawn.wait", fn);
 
-        llvm::Value* count = fn->getArg(2);
         llvm::Value* one = llvm::ConstantInt::get(i64Ty, 1);
-        llvm::Value* slots = builder->CreateAdd(count, llvm::ConstantInt::get(i64Ty, 2), "slots");
-        llvm::Value* argv = builder->CreateAlloca(ptrTy, slots, "argv");
+        llvm::Value* argumentCount = fn->getArg(2);
+        llvm::Value* environmentCount = fn->getArg(5);
+        llvm::Value* argv = builder->CreateAlloca(ptrTy,
+            builder->CreateAdd(argumentCount, llvm::ConstantInt::get(i64Ty, 2)), "argv");
         builder->CreateStore(fn->getArg(0), argv);
-        llvm::Value* indexSlot = builder->CreateAlloca(i64Ty, nullptr, "i");
-        builder->CreateStore(llvm::ConstantInt::get(i64Ty, 0), indexSlot);
-        llvm::Value* cursorSlot = builder->CreateAlloca(ptrTy, nullptr, "cursor");
-        builder->CreateStore(fn->getArg(1), cursorSlot);
-        llvm::Value* outputFd = builder->CreateCall(fileNumber, { output }, "out.fd");
-        llvm::Value* errorsFd = builder->CreateCall(fileNumber, { errors }, "err.fd");
-        builder->CreateBr(fillTest);
+        emitBlockVector(fn, argv, one, fn->getArg(1), argumentCount, "argv");
+        llvm::Value* envp = builder->CreateAlloca(ptrTy,
+            builder->CreateAdd(environmentCount, one), "envp");
+        emitBlockVector(fn, envp, llvm::ConstantInt::get(i64Ty, 0), fn->getArg(4),
+            environmentCount, "envp");
+        llvm::Value* outputFd = emitStreamDescriptor(outSlot, "out.fd");
+        llvm::Value* errorsFd = emitStreamDescriptor(errSlot, "err.fd");
 
-        // The block holds the arguments one after another, each NUL terminated, so
-        // every slot points straight into it and the cursor walks past one NUL per
-        // argument.
-        builder->SetInsertPoint(fillTest);
-        llvm::Value* index = builder->CreateLoad(i64Ty, indexSlot, "i.load");
-        builder->CreateCondBr(builder->CreateICmpSLT(index, count), fillBody, spawnBB);
-
-        builder->SetInsertPoint(fillBody);
-        llvm::Value* cursor = builder->CreateLoad(ptrTy, cursorSlot, "cursor.load");
-        builder->CreateStore(cursor,
-            builder->CreateGEP(ptrTy, argv, builder->CreateAdd(index, one), "argv.slot"));
-        llvm::Value* used = builder->CreateAdd(
-            builder->CreateCall(getOrDeclareStrlen(), { cursor }, "arg.len"), one);
-        builder->CreateStore(builder->CreateGEP(i8Ty, cursor, used, "cursor.next"), cursorSlot);
-        builder->CreateStore(builder->CreateAdd(index, one), indexSlot);
-        builder->CreateBr(fillTest);
-
-        builder->SetInsertPoint(spawnBB);
-        builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy),
-            builder->CreateGEP(ptrTy, argv, builder->CreateAdd(count, one), "argv.end"));
         llvm::Value* child = builder->CreateCall(forkProcess, {}, "child");
         builder->CreateCondBr(
             builder->CreateICmpEQ(child, llvm::ConstantInt::get(i32Ty, 0)), childBB, parentBB);
 
         builder->SetInsertPoint(childBB);
-        builder->CreateCall(duplicate, { outputFd, llvm::ConstantInt::get(i32Ty, 1) });
-        builder->CreateCall(duplicate, { errorsFd, llvm::ConstantInt::get(i32Ty, 2) });
+        emitRedirect(fn, outputFd, 1, "child.out");
+        emitRedirect(fn, errorsFd, 2, "child.err");
+        auto* takeEnvBB = llvm::BasicBlock::Create(ctx, "child.environment", fn);
+        auto* execBB = llvm::BasicBlock::Create(ctx, "child.exec", fn);
+        builder->CreateCondBr(builder->CreateICmpSGT(environmentCount,
+            llvm::ConstantInt::get(i64Ty, 0)), takeEnvBB, execBB);
+
+        builder->SetInsertPoint(takeEnvBB);
+        builder->CreateStore(envp, environGlobal());
+        builder->CreateBr(execBB);
+
+        builder->SetInsertPoint(execBB);
         builder->CreateCall(execProgram, { fn->getArg(0), argv });
         builder->CreateCall(exitChild, { llvm::ConstantInt::get(i32Ty, 127) });
         builder->CreateUnreachable();
@@ -1723,6 +1799,82 @@ struct CodeGenerator::Impl {
         builder->CreateStore(builder->CreateSExt(normalizedWaitStatus(waited), i64Ty,
             "status.wide"), statusSlot);
         builder->CreateBr(closeBB);
+    }
+
+    // Fills a pointer vector from a NUL separated block: the block holds the values
+    // one after another, each NUL terminated, so every slot points straight into it
+    // and the cursor walks past one terminator per value. The slot after the last
+    // one is left null, which is where a C vector ends.
+    void emitBlockVector(llvm::Function* fn, llvm::Value* vector, llvm::Value* offset,
+                         llvm::Value* block, llvm::Value* count, const char* label) {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8Ty  = llvm::Type::getInt8Ty(ctx);
+        llvm::Value* one = llvm::ConstantInt::get(i64Ty, 1);
+        auto* testBB = llvm::BasicBlock::Create(ctx, std::string(label) + ".test", fn);
+        auto* bodyBB = llvm::BasicBlock::Create(ctx, std::string(label) + ".body", fn);
+        auto* doneBB = llvm::BasicBlock::Create(ctx, std::string(label) + ".done", fn);
+        llvm::Value* indexSlot = builder->CreateAlloca(i64Ty, nullptr, "index");
+        llvm::Value* cursorSlot = builder->CreateAlloca(ptrTy, nullptr, "cursor");
+        builder->CreateStore(llvm::ConstantInt::get(i64Ty, 0), indexSlot);
+        builder->CreateStore(block, cursorSlot);
+        builder->CreateBr(testBB);
+
+        builder->SetInsertPoint(testBB);
+        llvm::Value* index = builder->CreateLoad(i64Ty, indexSlot, "index.load");
+        builder->CreateCondBr(builder->CreateICmpSLT(index, count), bodyBB, doneBB);
+
+        builder->SetInsertPoint(bodyBB);
+        llvm::Value* cursor = builder->CreateLoad(ptrTy, cursorSlot, "cursor.load");
+        builder->CreateStore(cursor, builder->CreateGEP(ptrTy, vector,
+            builder->CreateAdd(offset, index), "slot"));
+        llvm::Value* used = builder->CreateAdd(
+            builder->CreateCall(getOrDeclareStrlen(), { cursor }, "value.len"), one);
+        builder->CreateStore(builder->CreateGEP(i8Ty, cursor, used, "cursor.next"), cursorSlot);
+        builder->CreateStore(builder->CreateAdd(index, one), indexSlot);
+        builder->CreateBr(testBB);
+
+        builder->SetInsertPoint(doneBB);
+        builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy),
+            builder->CreateGEP(ptrTy, vector, builder->CreateAdd(offset, count), "vector.end"));
+    }
+
+    // The file descriptor a captured stream writes to, or -1 when the stream is
+    // inherited and the child should leave it alone.
+    llvm::Value* emitStreamDescriptor(llvm::Value* slot, const char* label) {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        llvm::FunctionCallee fileNumber = libcFn("fileno",
+            llvm::FunctionType::get(i32Ty, { ptrTy }, false));
+        llvm::Value* file = builder->CreateLoad(ptrTy, slot, "stream");
+        return builder->CreateSelect(
+            builder->CreateICmpEQ(file, llvm::ConstantPointerNull::get(ptrTy)),
+            llvm::ConstantInt::getSigned(i32Ty, -1),
+            builder->CreateCall(fileNumber, { file }, label), label);
+    }
+
+    void emitRedirect(llvm::Function* fn, llvm::Value* descriptor, int target,
+                      const char* label) {
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        llvm::FunctionCallee duplicate = libcFn("dup2",
+            llvm::FunctionType::get(i32Ty, { i32Ty, i32Ty }, false));
+        auto* redirectBB = llvm::BasicBlock::Create(ctx, std::string(label) + ".redirect", fn);
+        auto* keepBB = llvm::BasicBlock::Create(ctx, std::string(label) + ".keep", fn);
+        builder->CreateCondBr(builder->CreateICmpSGE(descriptor,
+            llvm::ConstantInt::get(i32Ty, 0)), redirectBB, keepBB);
+        builder->SetInsertPoint(redirectBB);
+        builder->CreateCall(duplicate, { descriptor, llvm::ConstantInt::get(i32Ty, target) });
+        builder->CreateBr(keepBB);
+        builder->SetInsertPoint(keepBB);
+    }
+
+    // The `environ` the C library keeps its environment in, which a child takes as
+    // its own before it execs.
+    llvm::GlobalVariable* environGlobal() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        if (auto* found = module->getGlobalVariable("environ")) return found;
+        return new llvm::GlobalVariable(*module, ptrTy, /*isConstant=*/false,
+            llvm::GlobalValue::ExternalLinkage, /*init=*/nullptr, "environ");
     }
 
     // The exit code a POSIX wait status stands for: the low seven bits name the
@@ -1773,28 +1925,704 @@ struct CodeGenerator::Impl {
         return fn;
     }
 
-    llvm::Function* definePathExistsRuntime() {
+    // The bridge functions the module defines rather than links, one per referencing
+    // module. The text crossing them is UTF-8, the encoding an Ens string holds, so
+    // the Windows halves convert to and from UTF-16 and call the wide entry points.
+
+    // ptr ens_wide_from_utf8(ptr text, i32 bytes): a malloc'd UTF-16 copy of the
+    // text, or null when it could not be converted. `bytes` is -1 for a NUL
+    // terminated string, or an exact byte count, which converts embedded NULs too
+    // and so carries a whole environment block over.
+    llvm::Function* defineWideFromUtf8Runtime() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(ptrTy, { ptrTy, i32Ty }, false);
+        llvm::Function* fn = module->getFunction("ens_wide_from_utf8");
+        if (!fn) {
+            fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                "ens_wide_from_utf8", module.get());
+            fn->addFnAttr(llvm::Attribute::NoUnwind);
+        }
+        if (!fn->empty()) return fn;
+
+        auto savedIP = builder->saveIP();
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* sized = llvm::BasicBlock::Create(ctx, "wide.sized", fn);
+        auto* convert = llvm::BasicBlock::Create(ctx, "wide.convert", fn);
+        auto* none = llvm::BasicBlock::Create(ctx, "wide.none", fn);
+        llvm::FunctionCallee widen = libcFn("MultiByteToWideChar",
+            llvm::FunctionType::get(i32Ty,
+                { i32Ty, i32Ty, ptrTy, i32Ty, ptrTy, i32Ty }, false));
+        auto* utf8Page = llvm::ConstantInt::get(i32Ty, 65001);
+        auto* noFlags = llvm::ConstantInt::get(i32Ty, 0);
+        auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy);
+
+        builder->SetInsertPoint(entry);
+        llvm::Value* characters = builder->CreateCall(widen,
+            { utf8Page, noFlags, fn->getArg(0), fn->getArg(1), nullPtr,
+              llvm::ConstantInt::get(i32Ty, 0) }, "characters");
+        builder->CreateCondBr(builder->CreateICmpSLE(characters,
+            llvm::ConstantInt::get(i32Ty, 0)), none, sized);
+
+        builder->SetInsertPoint(sized);
+        llvm::Value* wide = builder->CreateCall(getOrDeclareMalloc(),
+            { builder->CreateMul(builder->CreateSExt(characters, i64Ty, "characters.wide"),
+                llvm::ConstantInt::get(i64Ty, 2)) }, "wide");
+        builder->CreateCondBr(builder->CreateICmpEQ(wide, nullPtr), none, convert);
+
+        builder->SetInsertPoint(convert);
+        builder->CreateCall(widen, { utf8Page, noFlags, fn->getArg(0), fn->getArg(1),
+            wide, characters });
+        builder->CreateRet(wide);
+
+        builder->SetInsertPoint(none);
+        builder->CreateRet(nullPtr);
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    // ptr ens_utf8_from_wide(ptr text): a malloc'd, NUL terminated UTF-8 copy of the
+    // UTF-16 text, or null when it could not be converted.
+    llvm::Function* defineUtf8FromWideRuntime() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(ptrTy, { ptrTy }, false);
+        llvm::Function* fn = module->getFunction("ens_utf8_from_wide");
+        if (!fn) {
+            fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                "ens_utf8_from_wide", module.get());
+            fn->addFnAttr(llvm::Attribute::NoUnwind);
+        }
+        if (!fn->empty()) return fn;
+
+        auto savedIP = builder->saveIP();
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* sized = llvm::BasicBlock::Create(ctx, "utf8.sized", fn);
+        auto* convert = llvm::BasicBlock::Create(ctx, "utf8.convert", fn);
+        auto* none = llvm::BasicBlock::Create(ctx, "utf8.none", fn);
+        llvm::FunctionCallee narrow = libcFn("WideCharToMultiByte",
+            llvm::FunctionType::get(i32Ty,
+                { i32Ty, i32Ty, ptrTy, i32Ty, ptrTy, i32Ty, ptrTy, ptrTy }, false));
+        auto* utf8Page = llvm::ConstantInt::get(i32Ty, 65001);
+        auto* noFlags = llvm::ConstantInt::get(i32Ty, 0);
+        auto* wholeString = llvm::ConstantInt::getSigned(i32Ty, -1);
+        auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy);
+
+        builder->SetInsertPoint(entry);
+        llvm::Value* bytes = builder->CreateCall(narrow,
+            { utf8Page, noFlags, fn->getArg(0), wholeString, nullPtr,
+              llvm::ConstantInt::get(i32Ty, 0), nullPtr, nullPtr }, "bytes");
+        builder->CreateCondBr(builder->CreateICmpSLE(bytes,
+            llvm::ConstantInt::get(i32Ty, 0)), none, sized);
+
+        builder->SetInsertPoint(sized);
+        llvm::Value* text = builder->CreateCall(getOrDeclareMalloc(),
+            { builder->CreateSExt(bytes, i64Ty, "bytes.wide") }, "text");
+        builder->CreateCondBr(builder->CreateICmpEQ(text, nullPtr), none, convert);
+
+        builder->SetInsertPoint(convert);
+        builder->CreateCall(narrow, { utf8Page, noFlags, fn->getArg(0), wholeString, text,
+            bytes, nullPtr, nullPtr });
+        builder->CreateRet(text);
+
+        builder->SetInsertPoint(none);
+        builder->CreateRet(nullPtr);
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    // ptr ens_string_list(ptr strings, i64 count, ptr finalizer): an owned string[]
+    // holding the counted strings, whose finalizer releases every one of them.
+    llvm::Function* defineStringListRuntime() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8Ty  = llvm::Type::getInt8Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(ptrTy, { ptrTy, i64Ty, ptrTy }, false);
+        llvm::Function* fn = module->getFunction("ens_string_list");
+        if (!fn) {
+            fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                "ens_string_list", module.get());
+            fn->addFnAttr(llvm::Attribute::NoUnwind);
+        }
+        if (!fn->empty()) return fn;
+
+        auto savedIP = builder->saveIP();
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* fill = llvm::BasicBlock::Create(ctx, "list.fill", fn);
+        auto* empty = llvm::BasicBlock::Create(ctx, "list.empty", fn);
+        auto* eight = llvm::ConstantInt::get(i64Ty, 8);
+        auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy);
+
+        builder->SetInsertPoint(entry);
+        llvm::Value* count = fn->getArg(1);
+        llvm::Value* slotBytes = builder->CreateMul(count, eight, "slot.bytes");
+        llvm::Value* list = builder->CreateCall(getOrDefineEnsAlloc(),
+            { builder->CreateAdd(eight, slotBytes, "payload"), fn->getArg(2), nullPtr }, "list");
+        builder->CreateCondBr(builder->CreateICmpEQ(list, nullPtr), empty, fill);
+
+        builder->SetInsertPoint(fill);
+        builder->CreateStore(count, list);
+        builder->CreateCall(getOrDeclareMemcpy(),
+            { builder->CreateGEP(i8Ty, list, eight, "data"), fn->getArg(0), slotBytes });
+        builder->CreateRet(list);
+
+        builder->SetInsertPoint(empty);
+        builder->CreateRet(nullPtr);
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    // A doubling malloc'd buffer of pointers, for a bridge that collects strings
+    // before it can know how many there will be.
+    struct PointerBuffer {
+        llvm::Value* buffer;
+        llvm::Value* count;
+        llvm::Value* capacity;
+    };
+
+    PointerBuffer emitPointerBuffer() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        PointerBuffer collected;
+        collected.buffer = builder->CreateAlloca(ptrTy, nullptr, "collected");
+        collected.count = builder->CreateAlloca(i64Ty, nullptr, "collected.count");
+        collected.capacity = builder->CreateAlloca(i64Ty, nullptr, "collected.capacity");
+        builder->CreateStore(builder->CreateCall(getOrDeclareMalloc(),
+            { llvm::ConstantInt::get(i64Ty, 8 * 16) }, "slots"), collected.buffer);
+        builder->CreateStore(llvm::ConstantInt::get(i64Ty, 0), collected.count);
+        builder->CreateStore(llvm::ConstantInt::get(i64Ty, 16), collected.capacity);
+        return collected;
+    }
+
+    void emitPointerPush(llvm::Function* fn, const PointerBuffer& collected,
+                         llvm::Value* value) {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* growBB = llvm::BasicBlock::Create(ctx, "collect.grow", fn);
+        auto* storeBB = llvm::BasicBlock::Create(ctx, "collect.store", fn);
+        llvm::Value* count = builder->CreateLoad(i64Ty, collected.count, "count");
+        llvm::Value* capacity = builder->CreateLoad(i64Ty, collected.capacity, "capacity");
+        builder->CreateCondBr(builder->CreateICmpEQ(count, capacity), growBB, storeBB);
+
+        builder->SetInsertPoint(growBB);
+        llvm::Value* grown = builder->CreateMul(capacity,
+            llvm::ConstantInt::get(i64Ty, 2), "capacity.grown");
+        builder->CreateStore(grown, collected.capacity);
+        builder->CreateStore(builder->CreateCall(
+            libcFn("realloc", llvm::FunctionType::get(ptrTy, { ptrTy, i64Ty }, false)),
+            { builder->CreateLoad(ptrTy, collected.buffer, "slots"),
+              builder->CreateMul(grown, llvm::ConstantInt::get(i64Ty, 8)) }, "slots.grown"),
+            collected.buffer);
+        builder->CreateBr(storeBB);
+
+        builder->SetInsertPoint(storeBB);
+        builder->CreateStore(value, builder->CreateGEP(ptrTy,
+            builder->CreateLoad(ptrTy, collected.buffer, "slots"), count, "slot"));
+        builder->CreateStore(builder->CreateAdd(count,
+            llvm::ConstantInt::get(i64Ty, 1)), collected.count);
+    }
+
+    llvm::Value* emitCollectedList(const PointerBuffer& collected) {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        llvm::Value* slots = builder->CreateLoad(ptrTy, collected.buffer, "slots");
+        llvm::Value* list = builder->CreateCall(defineStringListRuntime(),
+            { slots, builder->CreateLoad(i64Ty, collected.count, "count"),
+              getOrDefineStringArrayDtor() }, "list");
+        builder->CreateCall(getOrDeclareFree(), { slots });
+        return list;
+    }
+
+    // True when a directory entry names the folder itself or its parent, the two
+    // entries every enumeration hands back and no caller wants.
+    llvm::Value* emitIsDotEntry(llvm::Value* name, llvm::Type* charTy) {
+        auto* dot = llvm::ConstantInt::get(charTy, '.');
+        auto* end = llvm::ConstantInt::get(charTy, 0);
+        auto at = [&](long index) {
+            return builder->CreateLoad(charTy, builder->CreateGEP(charTy, name,
+                llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), index), "name.at"), "name.ch");
+        };
+        llvm::Value* first = builder->CreateICmpEQ(at(0), dot);
+        llvm::Value* second = at(1);
+        llvm::Value* third = at(2);
+        llvm::Value* parent = builder->CreateAnd(builder->CreateICmpEQ(second, dot),
+            builder->CreateICmpEQ(third, end));
+        return builder->CreateAnd(first,
+            builder->CreateOr(builder->CreateICmpEQ(second, end), parent), "dot.entry");
+    }
+
+    // i32 ens_path_kind(ptr path): 0 when nothing is there, 1 for a file, 2 for a
+    // directory.
+    llvm::Function* definePathKindRuntime() {
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         auto* i32Ty = llvm::Type::getInt32Ty(ctx);
         auto* fnTy = llvm::FunctionType::get(i32Ty, { ptrTy }, false);
-        llvm::Function* fn = module->getFunction("ens_path_exists");
+        llvm::Function* fn = module->getFunction("ens_path_kind");
         if (!fn) {
             fn = llvm::Function::Create(
-                fnTy, llvm::Function::ExternalLinkage, "ens_path_exists", module.get());
+                fnTy, llvm::Function::ExternalLinkage, "ens_path_kind", module.get());
+        }
+        if (!fn->empty()) return fn;
+
+        auto savedIP = builder->saveIP();
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* missing = llvm::BasicBlock::Create(ctx, "kind.missing", fn);
+        auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy);
+        builder->SetInsertPoint(entry);
+
+        if (module->getTargetTriple().isOSWindows()) {
+            auto* probe = llvm::BasicBlock::Create(ctx, "kind.probe", fn);
+            auto* classify = llvm::BasicBlock::Create(ctx, "kind.classify", fn);
+            llvm::FunctionCallee attributesOf = libcFn("GetFileAttributesW",
+                llvm::FunctionType::get(i32Ty, { ptrTy }, false));
+            llvm::Value* wide = builder->CreateCall(defineWideFromUtf8Runtime(),
+                { fn->getArg(0), llvm::ConstantInt::getSigned(i32Ty, -1) }, "path.wide");
+            builder->CreateCondBr(builder->CreateICmpEQ(wide, nullPtr), missing, probe);
+
+            builder->SetInsertPoint(probe);
+            llvm::Value* attributes = builder->CreateCall(attributesOf, { wide }, "attributes");
+            builder->CreateCall(getOrDeclareFree(), { wide });
+            builder->CreateCondBr(builder->CreateICmpEQ(attributes,
+                llvm::ConstantInt::getSigned(i32Ty, -1)), missing, classify);
+
+            builder->SetInsertPoint(classify);
+            llvm::Value* directory = builder->CreateICmpNE(
+                builder->CreateAnd(attributes, llvm::ConstantInt::get(i32Ty, 0x10)),
+                llvm::ConstantInt::get(i32Ty, 0), "directory");
+            builder->CreateRet(builder->CreateSelect(directory,
+                llvm::ConstantInt::get(i32Ty, 2), llvm::ConstantInt::get(i32Ty, 1)));
+        } else {
+            auto* probe = llvm::BasicBlock::Create(ctx, "kind.probe", fn);
+            auto* plain = llvm::BasicBlock::Create(ctx, "kind.file", fn);
+            auto* folder = llvm::BasicBlock::Create(ctx, "kind.directory", fn);
+            llvm::FunctionCallee reachable = libcFn("access",
+                llvm::FunctionType::get(i32Ty, { ptrTy, i32Ty }, false));
+            llvm::FunctionCallee openFolder = libcFn("opendir",
+                llvm::FunctionType::get(ptrTy, { ptrTy }, false));
+            llvm::FunctionCallee closeFolder = libcFn("closedir",
+                llvm::FunctionType::get(i32Ty, { ptrTy }, false));
+            llvm::Value* status = builder->CreateCall(reachable,
+                { fn->getArg(0), llvm::ConstantInt::get(i32Ty, 0) }, "status");
+            builder->CreateCondBr(builder->CreateICmpEQ(status,
+                llvm::ConstantInt::get(i32Ty, 0)), probe, missing);
+
+            builder->SetInsertPoint(probe);
+            llvm::Value* stream = builder->CreateCall(openFolder, { fn->getArg(0) }, "folder");
+            builder->CreateCondBr(builder->CreateICmpEQ(stream, nullPtr), plain, folder);
+
+            builder->SetInsertPoint(folder);
+            builder->CreateCall(closeFolder, { stream });
+            builder->CreateRet(llvm::ConstantInt::get(i32Ty, 2));
+
+            builder->SetInsertPoint(plain);
+            builder->CreateRet(llvm::ConstantInt::get(i32Ty, 1));
+        }
+
+        builder->SetInsertPoint(missing);
+        builder->CreateRet(llvm::ConstantInt::get(i32Ty, 0));
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    // i32 ens_create_directory(ptr path): 0 when the one level the path names was
+    // created, -1 when it was not. Every parent is the caller's to create first.
+    llvm::Function* defineCreateDirectoryRuntime() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(i32Ty, { ptrTy }, false);
+        llvm::Function* fn = module->getFunction("ens_create_directory");
+        if (!fn) {
+            fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "ens_create_directory", module.get());
         }
         if (!fn->empty()) return fn;
 
         auto savedIP = builder->saveIP();
         auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
         builder->SetInsertPoint(entry);
+        auto* created = llvm::ConstantInt::get(i32Ty, 0);
+        auto* refused = llvm::ConstantInt::getSigned(i32Ty, -1);
 
-        auto* accessTy = llvm::FunctionType::get(i32Ty, { ptrTy, i32Ty }, false);
-        const char* accessName =
-            module->getTargetTriple().isOSWindows() ? "_access" : "access";
-        llvm::FunctionCallee accessFn = module->getOrInsertFunction(accessName, accessTy);
-        llvm::Value* status = builder->CreateCall(
-            accessFn, { fn->getArg(0), llvm::ConstantInt::get(i32Ty, 0) }, "status");
-        builder->CreateRet(status);
+        if (module->getTargetTriple().isOSWindows()) {
+            auto* create = llvm::BasicBlock::Create(ctx, "create.wide", fn);
+            auto* failed = llvm::BasicBlock::Create(ctx, "create.failed", fn);
+            llvm::FunctionCallee createDirectory = libcFn("CreateDirectoryW",
+                llvm::FunctionType::get(i32Ty, { ptrTy, ptrTy }, false));
+            llvm::Value* wide = builder->CreateCall(defineWideFromUtf8Runtime(),
+                { fn->getArg(0), llvm::ConstantInt::getSigned(i32Ty, -1) }, "path.wide");
+            builder->CreateCondBr(builder->CreateICmpEQ(wide,
+                llvm::ConstantPointerNull::get(ptrTy)), failed, create);
+
+            builder->SetInsertPoint(create);
+            llvm::Value* ok = builder->CreateCall(createDirectory,
+                { wide, llvm::ConstantPointerNull::get(ptrTy) }, "created");
+            builder->CreateCall(getOrDeclareFree(), { wide });
+            builder->CreateRet(builder->CreateSelect(
+                builder->CreateICmpEQ(ok, llvm::ConstantInt::get(i32Ty, 0)), refused, created));
+
+            builder->SetInsertPoint(failed);
+            builder->CreateRet(refused);
+        } else {
+            llvm::FunctionCallee makeDirectory = libcFn("mkdir",
+                llvm::FunctionType::get(i32Ty, { ptrTy, i32Ty }, false));
+            llvm::Value* status = builder->CreateCall(makeDirectory,
+                { fn->getArg(0), llvm::ConstantInt::get(i32Ty, 0777) }, "status");
+            builder->CreateRet(builder->CreateSelect(
+                builder->CreateICmpEQ(status, llvm::ConstantInt::get(i32Ty, 0)),
+                created, refused));
+        }
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    // i64 ens_executable_path(ptr buffer, i64 capacity): the number of bytes of the
+    // running program's own path written into the buffer, or -1 when the operating
+    // system would not report it or the buffer is too small for it.
+    llvm::Function* defineExecutablePathRuntime() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(i64Ty, { ptrTy, i64Ty }, false);
+        llvm::Function* fn = module->getFunction("ens_executable_path");
+        if (!fn) {
+            fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "ens_executable_path", module.get());
+        }
+        if (!fn->empty()) return fn;
+
+        auto savedIP = builder->saveIP();
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* unknown = llvm::BasicBlock::Create(ctx, "path.unknown", fn);
+        auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy);
+        auto* refused = llvm::ConstantInt::getSigned(i64Ty, -1);
+        const llvm::Triple& triple = module->getTargetTriple();
+        builder->SetInsertPoint(entry);
+
+        if (triple.isOSWindows()) {
+            auto* named = llvm::BasicBlock::Create(ctx, "path.named", fn);
+            auto* narrowed = llvm::BasicBlock::Create(ctx, "path.narrowed", fn);
+            auto* tooSmall = llvm::BasicBlock::Create(ctx, "path.too.small", fn);
+            llvm::FunctionCallee moduleFileName = libcFn("GetModuleFileNameW",
+                llvm::FunctionType::get(i32Ty, { ptrTy, ptrTy, i32Ty }, false));
+            llvm::FunctionCallee narrow = libcFn("WideCharToMultiByte",
+                llvm::FunctionType::get(i32Ty,
+                    { i32Ty, i32Ty, ptrTy, i32Ty, ptrTy, i32Ty, ptrTy, ptrTy }, false));
+            // The longest path Windows accepts is 32767 characters plus a terminator.
+            auto* room = llvm::ConstantInt::get(i32Ty, 32768);
+            llvm::Value* wide = builder->CreateCall(getOrDeclareMalloc(),
+                { llvm::ConstantInt::get(i64Ty, 65536) }, "wide");
+            builder->CreateCondBr(builder->CreateICmpEQ(wide, nullPtr), unknown, named);
+
+            builder->SetInsertPoint(named);
+            llvm::Value* characters = builder->CreateCall(moduleFileName,
+                { nullPtr, wide, room }, "characters");
+            llvm::Value* reported = builder->CreateAnd(
+                builder->CreateICmpSGT(characters, llvm::ConstantInt::get(i32Ty, 0)),
+                builder->CreateICmpSLT(characters, room), "reported");
+            builder->CreateCondBr(reported, narrowed, tooSmall);
+
+            builder->SetInsertPoint(tooSmall);
+            builder->CreateCall(getOrDeclareFree(), { wide });
+            builder->CreateBr(unknown);
+
+            builder->SetInsertPoint(narrowed);
+            llvm::Value* bytes = builder->CreateCall(narrow,
+                { llvm::ConstantInt::get(i32Ty, 65001), llvm::ConstantInt::get(i32Ty, 0), wide,
+                  llvm::ConstantInt::getSigned(i32Ty, -1), fn->getArg(0),
+                  builder->CreateTrunc(fn->getArg(1), i32Ty, "capacity"), nullPtr, nullPtr },
+                "bytes");
+            builder->CreateCall(getOrDeclareFree(), { wide });
+            // The count includes the terminator, which an Ens string does not carry.
+            builder->CreateRet(builder->CreateSelect(
+                builder->CreateICmpSLE(bytes, llvm::ConstantInt::get(i32Ty, 1)), refused,
+                builder->CreateSub(builder->CreateSExt(bytes, i64Ty, "bytes.wide"),
+                    llvm::ConstantInt::get(i64Ty, 1))));
+        } else if (triple.isOSDarwin()) {
+            auto* named = llvm::BasicBlock::Create(ctx, "path.named", fn);
+            llvm::FunctionCallee executablePath = libcFn("_NSGetExecutablePath",
+                llvm::FunctionType::get(i32Ty, { ptrTy, ptrTy }, false));
+            llvm::Value* roomSlot = builder->CreateAlloca(i32Ty, nullptr, "room");
+            builder->CreateStore(builder->CreateTrunc(fn->getArg(1), i32Ty, "capacity"), roomSlot);
+            llvm::Value* status = builder->CreateCall(executablePath,
+                { fn->getArg(0), roomSlot }, "status");
+            builder->CreateCondBr(builder->CreateICmpEQ(status,
+                llvm::ConstantInt::get(i32Ty, 0)), named, unknown);
+
+            builder->SetInsertPoint(named);
+            builder->CreateRet(builder->CreateCall(getOrDeclareStrlen(),
+                { fn->getArg(0) }, "length"));
+        } else {
+            llvm::FunctionCallee readLink = libcFn("readlink",
+                llvm::FunctionType::get(i64Ty, { ptrTy, ptrTy, i64Ty }, false));
+            llvm::Value* written = builder->CreateCall(readLink,
+                { builder->CreateGlobalString("/proc/self/exe", ".self.exe"), fn->getArg(0),
+                  fn->getArg(1) }, "written");
+            llvm::Value* fits = builder->CreateAnd(
+                builder->CreateICmpSGT(written, llvm::ConstantInt::get(i64Ty, 0)),
+                builder->CreateICmpSLT(written, fn->getArg(1)), "fits");
+            builder->CreateRet(builder->CreateSelect(fits, written, refused));
+        }
+
+        builder->SetInsertPoint(unknown);
+        builder->CreateRet(refused);
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    // ptr ens_list_directory(ptr folder): the names directly inside the folder as an
+    // owned string[], without the entries naming the folder itself and its parent, or
+    // null when the folder could not be read.
+    llvm::Function* defineListDirectoryRuntime() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i16Ty = llvm::Type::getInt16Ty(ctx);
+        auto* i8Ty  = llvm::Type::getInt8Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(ptrTy, { ptrTy }, false);
+        llvm::Function* fn = module->getFunction("ens_list_directory");
+        if (!fn) {
+            fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "ens_list_directory", module.get());
+        }
+        if (!fn->empty()) return fn;
+
+        auto savedIP = builder->saveIP();
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* unreadable = llvm::BasicBlock::Create(ctx, "list.unreadable", fn);
+        auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy);
+        builder->SetInsertPoint(entry);
+
+        if (module->getTargetTriple().isOSWindows()) {
+            auto* patterned = llvm::BasicBlock::Create(ctx, "list.patterned", fn);
+            auto* searchBB = llvm::BasicBlock::Create(ctx, "list.search", fn);
+            auto* opened = llvm::BasicBlock::Create(ctx, "list.opened", fn);
+            auto* bodyBB = llvm::BasicBlock::Create(ctx, "list.body", fn);
+            auto* liftBB = llvm::BasicBlock::Create(ctx, "list.lift", fn);
+            auto* keptBB = llvm::BasicBlock::Create(ctx, "list.kept", fn);
+            auto* nextBB = llvm::BasicBlock::Create(ctx, "list.next", fn);
+            auto* doneBB = llvm::BasicBlock::Create(ctx, "list.done", fn);
+            llvm::FunctionCallee findFirst = libcFn("FindFirstFileW",
+                llvm::FunctionType::get(ptrTy, { ptrTy, ptrTy }, false));
+            llvm::FunctionCallee findNext = libcFn("FindNextFileW",
+                llvm::FunctionType::get(i32Ty, { ptrTy, ptrTy }, false));
+            llvm::FunctionCallee findClose = libcFn("FindClose",
+                llvm::FunctionType::get(i32Ty, { ptrTy }, false));
+
+            // The folder with "/*" after it, which is the pattern that matches
+            // everything directly inside it.
+            llvm::Value* length = builder->CreateCall(getOrDeclareStrlen(),
+                { fn->getArg(0) }, "folder.len");
+            llvm::Value* pattern = builder->CreateCall(getOrDeclareMalloc(),
+                { builder->CreateAdd(length, llvm::ConstantInt::get(i64Ty, 3)) }, "pattern");
+            builder->CreateCondBr(builder->CreateICmpEQ(pattern, nullPtr),
+                unreadable, patterned);
+
+            builder->SetInsertPoint(patterned);
+            builder->CreateCall(getOrDeclareMemcpy(), { pattern, fn->getArg(0), length });
+            llvm::Value* tail = builder->CreateGEP(i8Ty, pattern, length, "pattern.tail");
+            builder->CreateStore(llvm::ConstantInt::get(i8Ty, '/'), tail);
+            builder->CreateStore(llvm::ConstantInt::get(i8Ty, '*'),
+                builder->CreateGEP(i8Ty, tail, llvm::ConstantInt::get(i64Ty, 1), "pattern.star"));
+            builder->CreateStore(llvm::ConstantInt::get(i8Ty, 0),
+                builder->CreateGEP(i8Ty, tail, llvm::ConstantInt::get(i64Ty, 2), "pattern.end"));
+            llvm::Value* wide = builder->CreateCall(defineWideFromUtf8Runtime(),
+                { pattern, llvm::ConstantInt::getSigned(i32Ty, -1) }, "pattern.wide");
+            builder->CreateCall(getOrDeclareFree(), { pattern });
+            builder->CreateCondBr(builder->CreateICmpEQ(wide, nullPtr), unreadable, searchBB);
+
+            // WIN32_FIND_DATAW is 592 bytes and names the entry at offset 44.
+            builder->SetInsertPoint(searchBB);
+            llvm::Value* found = builder->CreateAlloca(llvm::ArrayType::get(i8Ty, 592),
+                nullptr, "found");
+            llvm::Value* search = builder->CreateCall(findFirst, { wide, found }, "search");
+            builder->CreateCall(getOrDeclareFree(), { wide });
+            builder->CreateCondBr(builder->CreateICmpEQ(
+                builder->CreatePtrToInt(search, i64Ty, "search.value"),
+                llvm::ConstantInt::getSigned(i64Ty, -1)), unreadable, opened);
+
+            builder->SetInsertPoint(opened);
+            PointerBuffer collected = emitPointerBuffer();
+            builder->CreateBr(bodyBB);
+
+            builder->SetInsertPoint(bodyBB);
+            llvm::Value* name = builder->CreateGEP(i8Ty, found,
+                llvm::ConstantInt::get(i64Ty, 44), "entry.name");
+            builder->CreateCondBr(emitIsDotEntry(name, i16Ty), nextBB, liftBB);
+
+            builder->SetInsertPoint(liftBB);
+            llvm::Value* text = builder->CreateCall(defineUtf8FromWideRuntime(),
+                { name }, "entry.text");
+            builder->CreateCondBr(builder->CreateICmpEQ(text, nullPtr), nextBB, keptBB);
+
+            builder->SetInsertPoint(keptBB);
+            emitPointerPush(fn, collected, builder->CreateCall(
+                getOrDefineEnsStringFromCStr(), { text }, "entry.string"));
+            builder->CreateCall(getOrDeclareFree(), { text });
+            builder->CreateBr(nextBB);
+
+            builder->SetInsertPoint(nextBB);
+            builder->CreateCondBr(builder->CreateICmpEQ(
+                builder->CreateCall(findNext, { search, found }, "more"),
+                llvm::ConstantInt::get(i32Ty, 0)), doneBB, bodyBB);
+
+            builder->SetInsertPoint(doneBB);
+            builder->CreateCall(findClose, { search });
+            builder->CreateRet(emitCollectedList(collected));
+        } else {
+            auto* opened = llvm::BasicBlock::Create(ctx, "list.opened", fn);
+            auto* testBB = llvm::BasicBlock::Create(ctx, "list.test", fn);
+            auto* bodyBB = llvm::BasicBlock::Create(ctx, "list.body", fn);
+            auto* keptBB = llvm::BasicBlock::Create(ctx, "list.kept", fn);
+            auto* doneBB = llvm::BasicBlock::Create(ctx, "list.done", fn);
+            llvm::FunctionCallee openFolder = libcFn("opendir",
+                llvm::FunctionType::get(ptrTy, { ptrTy }, false));
+            llvm::FunctionCallee readFolder = libcFn("readdir",
+                llvm::FunctionType::get(ptrTy, { ptrTy }, false));
+            llvm::FunctionCallee closeFolder = libcFn("closedir",
+                llvm::FunctionType::get(i32Ty, { ptrTy }, false));
+            // A dirent names the entry at offset 21 on Darwin and 19 elsewhere.
+            long nameOffset = module->getTargetTriple().isOSDarwin() ? 21 : 19;
+
+            llvm::Value* stream = builder->CreateCall(openFolder, { fn->getArg(0) }, "folder");
+            builder->CreateCondBr(builder->CreateICmpEQ(stream, nullPtr), unreadable, opened);
+
+            builder->SetInsertPoint(opened);
+            PointerBuffer collected = emitPointerBuffer();
+            builder->CreateBr(testBB);
+
+            builder->SetInsertPoint(testBB);
+            llvm::Value* found = builder->CreateCall(readFolder, { stream }, "entry");
+            builder->CreateCondBr(builder->CreateICmpEQ(found, nullPtr), doneBB, bodyBB);
+
+            builder->SetInsertPoint(bodyBB);
+            llvm::Value* name = builder->CreateGEP(i8Ty, found,
+                llvm::ConstantInt::get(i64Ty, nameOffset), "entry.name");
+            builder->CreateCondBr(emitIsDotEntry(name, i8Ty), testBB, keptBB);
+
+            builder->SetInsertPoint(keptBB);
+            emitPointerPush(fn, collected, builder->CreateCall(
+                getOrDefineEnsStringFromCStr(), { name }, "entry.string"));
+            builder->CreateBr(testBB);
+
+            builder->SetInsertPoint(doneBB);
+            builder->CreateCall(closeFolder, { stream });
+            builder->CreateRet(emitCollectedList(collected));
+        }
+
+        builder->SetInsertPoint(unreadable);
+        builder->CreateRet(nullPtr);
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    // ptr ens_environment(): the variables this process inherited as an owned
+    // string[] of 'NAME=VALUE' entries.
+    llvm::Function* defineEnvironmentRuntime() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i16Ty = llvm::Type::getInt16Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(ptrTy, {}, false);
+        llvm::Function* fn = module->getFunction("ens_environment");
+        if (!fn) {
+            fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "ens_environment", module.get());
+        }
+        if (!fn->empty()) return fn;
+
+        auto savedIP = builder->saveIP();
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* testBB = llvm::BasicBlock::Create(ctx, "environment.test", fn);
+        auto* bodyBB = llvm::BasicBlock::Create(ctx, "environment.body", fn);
+        auto* doneBB = llvm::BasicBlock::Create(ctx, "environment.done", fn);
+        auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy);
+        auto* one = llvm::ConstantInt::get(i64Ty, 1);
+        builder->SetInsertPoint(entry);
+        PointerBuffer collected = emitPointerBuffer();
+
+        if (module->getTargetTriple().isOSWindows()) {
+            auto* keptBB = llvm::BasicBlock::Create(ctx, "environment.kept", fn);
+            auto* nextBB = llvm::BasicBlock::Create(ctx, "environment.next", fn);
+            llvm::FunctionCallee environmentStrings = libcFn("GetEnvironmentStringsW",
+                llvm::FunctionType::get(ptrTy, {}, false));
+            llvm::FunctionCallee freeEnvironmentStrings = libcFn("FreeEnvironmentStringsW",
+                llvm::FunctionType::get(i32Ty, { ptrTy }, false));
+            llvm::FunctionCallee wideLength = libcFn("lstrlenW",
+                llvm::FunctionType::get(i32Ty, { ptrTy }, false));
+
+            llvm::Value* block = builder->CreateCall(environmentStrings, {}, "environment");
+            llvm::Value* cursorSlot = builder->CreateAlloca(ptrTy, nullptr, "cursor");
+            builder->CreateStore(block, cursorSlot);
+            builder->CreateCondBr(builder->CreateICmpEQ(block, nullPtr), doneBB, testBB);
+
+            // The block holds the entries one after another, each NUL terminated,
+            // and one more terminator closes it.
+            builder->SetInsertPoint(testBB);
+            llvm::Value* cursor = builder->CreateLoad(ptrTy, cursorSlot, "cursor.load");
+            builder->CreateCondBr(builder->CreateICmpEQ(
+                builder->CreateLoad(i16Ty, cursor, "cursor.first"),
+                llvm::ConstantInt::get(i16Ty, 0)), doneBB, bodyBB);
+
+            builder->SetInsertPoint(bodyBB);
+            llvm::Value* text = builder->CreateCall(defineUtf8FromWideRuntime(),
+                { cursor }, "entry.text");
+            builder->CreateCondBr(builder->CreateICmpEQ(text, nullPtr), nextBB, keptBB);
+
+            builder->SetInsertPoint(keptBB);
+            emitPointerPush(fn, collected, builder->CreateCall(
+                getOrDefineEnsStringFromCStr(), { text }, "entry.string"));
+            builder->CreateCall(getOrDeclareFree(), { text });
+            builder->CreateBr(nextBB);
+
+            builder->SetInsertPoint(nextBB);
+            llvm::Value* characters = builder->CreateAdd(builder->CreateSExt(
+                builder->CreateCall(wideLength, { cursor }, "entry.len"), i64Ty, "entry.wide"),
+                one);
+            builder->CreateStore(builder->CreateGEP(i16Ty, cursor, characters, "cursor.next"),
+                cursorSlot);
+            builder->CreateBr(testBB);
+
+            builder->SetInsertPoint(doneBB);
+            auto* releaseBB = llvm::BasicBlock::Create(ctx, "environment.release", fn);
+            auto* listBB = llvm::BasicBlock::Create(ctx, "environment.list", fn);
+            builder->CreateCondBr(builder->CreateICmpEQ(block, nullPtr), listBB, releaseBB);
+
+            builder->SetInsertPoint(releaseBB);
+            builder->CreateCall(freeEnvironmentStrings, { block });
+            builder->CreateBr(listBB);
+
+            builder->SetInsertPoint(listBB);
+            builder->CreateRet(emitCollectedList(collected));
+        } else {
+            llvm::Value* base = builder->CreateLoad(ptrTy, environGlobal(), "environ");
+            llvm::Value* indexSlot = builder->CreateAlloca(i64Ty, nullptr, "index");
+            builder->CreateStore(llvm::ConstantInt::get(i64Ty, 0), indexSlot);
+            builder->CreateCondBr(builder->CreateICmpEQ(base, nullPtr), doneBB, testBB);
+
+            builder->SetInsertPoint(testBB);
+            llvm::Value* index = builder->CreateLoad(i64Ty, indexSlot, "index.load");
+            llvm::Value* text = builder->CreateLoad(ptrTy,
+                builder->CreateGEP(ptrTy, base, index, "entry.slot"), "entry.text");
+            builder->CreateCondBr(builder->CreateICmpEQ(text, nullPtr), doneBB, bodyBB);
+
+            builder->SetInsertPoint(bodyBB);
+            emitPointerPush(fn, collected, builder->CreateCall(
+                getOrDefineEnsStringFromCStr(), { text }, "entry.string"));
+            builder->CreateStore(builder->CreateAdd(index, one), indexSlot);
+            builder->CreateBr(testBB);
+
+            builder->SetInsertPoint(doneBB);
+            builder->CreateRet(emitCollectedList(collected));
+        }
 
         builder->restoreIP(savedIP);
         return fn;
@@ -8273,8 +9101,12 @@ struct CodeGenerator::Impl {
         if (sym && sym->name == u"ens_arguments")
             return builder->CreateCall(defineArgsRuntime(), {});
         if (sym && sym->name == u"ens_run_process") defineRunProcessRuntime();
-        if (sym && sym->name == u"ens_run_process_captured") defineRunProcessCapturedRuntime();
-        if (sym && sym->name == u"ens_path_exists") definePathExistsRuntime();
+        if (sym && sym->name == u"ens_spawn_process") defineSpawnProcessRuntime();
+        if (sym && sym->name == u"ens_path_kind") definePathKindRuntime();
+        if (sym && sym->name == u"ens_list_directory") defineListDirectoryRuntime();
+        if (sym && sym->name == u"ens_create_directory") defineCreateDirectoryRuntime();
+        if (sym && sym->name == u"ens_executable_path") defineExecutablePathRuntime();
+        if (sym && sym->name == u"ens_environment") defineEnvironmentRuntime();
         if (sym && sym->name == u"ens_write_error") defineWriteErrorRuntime();
         llvm::Function* fn = getOrDeclareExternalFunction(sym, /*receiver*/ nullptr);
         if (!fn) {
