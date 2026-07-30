@@ -2920,17 +2920,23 @@ struct CodeGenerator::Impl {
         return result;
     }
 
+    // Whether a slot of declared type `physicalT` holds the tagged {present, value} form while
+    // flow narrowing typed the expression reading it as the bare inner, so the read wants only
+    // the value component. An assignment target is recorded at its declared type, so a store
+    // still lands on the whole pair.
+    bool readsNarrowedValueOptional(::Type* physicalT, const SyntaxNode& node) {
+        if (!isValueTypeOptional(physicalT)) return false;
+        ::Type* exprT = typeOf(node);
+        return exprT && !exprT->isOptional() && !exprT->isError();
+    }
+
     // Loads through a slot whose declared type is a value-type Optional yield
     // the whole tagged struct; when flow narrowing typed the expression as the
     // bare inner, unwrap to the value component.
     llvm::Value* unwrapIfNarrowedValueOptional(llvm::Value* v, ::Type* physicalT,
                                                const SyntaxNode& node) {
-        if (!v || !isValueTypeOptional(physicalT)) return v;
-        ::Type* exprT = typeOf(node);
-        if (exprT && !exprT->isOptional() && !exprT->isError()) {
-            return builder->CreateExtractValue(v, {1}, "opt.narrowed");
-        }
-        return v;
+        if (!v || !readsNarrowedValueOptional(physicalT, node)) return v;
+        return builder->CreateExtractValue(v, {1}, "opt.narrowed");
     }
 
     // `==` over tagged value-type Optionals. Returns the equality bit; the
@@ -8095,12 +8101,27 @@ struct CodeGenerator::Impl {
         return val;
     }
 
+    // The address of the storage an expression names. It arrives at the type the expression was
+    // recorded at, which is what every reader of the address expects: narrowing sharpens a tagged
+    // optional to its payload while the whole {present, value} pair stays in the slot, so the
+    // address steps into the payload narrowing proved present.
     llvm::Value* emitLValue(const ast::Expression& e) {
+        ::Type* storageType = nullptr;
+        llvm::Value* addr = emitStorageLValue(e, storageType);
+        if (!addr || !readsNarrowedValueOptional(storageType, e.node)) return addr;
+        llvm::StructType* st = llvm::cast<llvm::StructType>(mapType(storageType));
+        return builder->CreateStructGEP(st, addr, 1, "opt.payload.addr");
+    }
+
+    // The address of the expression's storage at that storage's own declared type, reported in
+    // `storageType` so the caller can tell a narrowed read from a whole-slot access.
+    llvm::Value* emitStorageLValue(const ast::Expression& e, ::Type*& storageType) {
         if (auto id = e.asIdent()) {
             Symbol* sym = symbolOf(id->node);
             if (!sym) return nullptr;
             auto it = values.find(sym);
             if (it == values.end()) return nullptr;
+            storageType = sym->type;
             if (byPointerParams.count(sym)) {
                 return builder->CreateLoad(llvm::PointerType::get(ctx, 0), it->second,
                                            asAscii(sym->name) + ".byptr");
@@ -8112,6 +8133,7 @@ struct CodeGenerator::Impl {
             if (!sym) return nullptr;
             auto it = values.find(sym);
             if (it == values.end()) return nullptr;
+            storageType = sym->type;
             return builder->CreateLoad(llvm::PointerType::get(ctx, 0), it->second, "this");
         }
         if (auto m = e.asMember()) {
@@ -8133,6 +8155,7 @@ struct CodeGenerator::Impl {
                 error(e.node.startOffset(), "Internal: field not found in struct");
                 return nullptr;
             }
+            storageType = objType->structInfo->fields[static_cast<size_t>(idx)].type;
             llvm::StructType* st = mapStructType(objType);
             return builder->CreateStructGEP(st, objAddr, static_cast<unsigned>(idx),
                                             asAscii(*memberName) + ".addr");
@@ -8149,6 +8172,7 @@ struct CodeGenerator::Impl {
             llvm::Value* arrPtr = emitExpr(*obj);
             llvm::Value* idxVal = emitExpr(*idx);
             if (!arrPtr || !idxVal) return nullptr;
+            storageType = objType->inner;
             return emitArraySubscriptAddr(arrPtr, idxVal, objType->inner);
         }
         error(e.node.startOffset(), "Cannot get address of this expression");
@@ -8187,8 +8211,11 @@ struct CodeGenerator::Impl {
                   asAscii(memberName) + "'");
             return nullptr;
         }
+        // A read loads the whole slot and unwraps the value itself, so it wants the field's own
+        // storage rather than the payload address `emitLValue` would hand a caller.
         ast::Expression wrapper{e.node};
-        llvm::Value* addr = emitLValue(wrapper);
+        ::Type* storageType = nullptr;
+        llvm::Value* addr = emitStorageLValue(wrapper, storageType);
         if (!addr) return nullptr;
         const FieldInfo* fi = memberFieldInfo(e);
         auto memberName = e.memberText().value_or(std::u16string{});
@@ -8197,7 +8224,7 @@ struct CodeGenerator::Impl {
             llvm::Value* stPtr = builder->CreateLoad(ptrTy, addr, asAscii(memberName) + ".st");
             return builder->CreateCall(getOrDefineEnsWeakLoad(), { stPtr });
         }
-        ::Type* physicalType = fi ? fi->type : typeOf(e.node);
+        ::Type* physicalType = storageType ? storageType : typeOf(e.node);
         llvm::Value* v = builder->CreateLoad(mapType(physicalType), addr,
                                              asAscii(memberName) + ".load");
         return unwrapIfNarrowedValueOptional(v, physicalType, e.node);
