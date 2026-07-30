@@ -7261,18 +7261,19 @@ struct CodeGenerator::Impl {
                              guard.slot);
     }
 
-    // An owned temporary passed by value (a `new`/call result or a fresh struct, not bound to a
-    // local) is borrowed by the callee, which retains what it keeps; the caller still has to
-    // release it. Track it so both normal scope exit and an exception unwind free it exactly
-    // once. `v` is the value itself, so a receiver reached through its address is not tracked
-    // here - materializing that address registered it already.
-    void trackOwnedArgTemp(llvm::Value* v, const ast::Expression& a, ::Type* paramT) {
-        if (!paramT || !v || cleanupStack.empty()) return;
-        if (!isReferenceType(paramT) && !valueHoldsReferences(paramT)) return;
-        if (!expressionProducesOwnedRef(a)) return;
-        auto* slot = createZeroedEntryAlloca(currentFunction, v->getType(), "arg.tmp");
+    // An owned temporary, meaning what a `new`, a call result or a fresh struct produced without
+    // binding it to a local, is only borrowed by whoever consumes it: a callee retains what it
+    // keeps, and a member or element read borrows out of the receiver. Park it in a cleanup-frame
+    // slot so the value outlives the use and both normal scope exit and an exception unwind free
+    // it exactly once. `v` is the value itself, so a receiver reached through its address is not
+    // parked here - materializing that address registered it already.
+    void parkOwnedTemp(llvm::Value* v, const ast::Expression& e, ::Type* type) {
+        if (!type || !v || cleanupStack.empty()) return;
+        if (!isReferenceType(type) && !valueHoldsReferences(type)) return;
+        if (!expressionProducesOwnedRef(e)) return;
+        auto* slot = createZeroedEntryAlloca(currentFunction, v->getType(), "held.tmp");
         builder->CreateStore(v, slot);
-        cleanupStack.back().push_back({ slot, paramT });
+        cleanupStack.back().push_back({ slot, type });
     }
 
     // Emit one user-supplied argument, converting it to the (already concrete)
@@ -7304,7 +7305,7 @@ struct CodeGenerator::Impl {
             bool byPointer = sym && paramIsByPointer(sym, i);
             llvm::Value* v = emitUserCallArg(a, paramT, byPointer);
             if (!v) return false;
-            if (!byPointer) trackOwnedArgTemp(v, a, paramT);
+            if (!byPointer) parkOwnedTemp(v, a, paramT);
             out.push_back(v);
         }
         if (!sym || !sym->funcDeclCst) return true;
@@ -7368,7 +7369,7 @@ struct CodeGenerator::Impl {
             ::Type* paramT = subst(sym->paramTypes[j]);
             bool byPointer = paramIsByPointer(sym, static_cast<size_t>(j));
             llvm::Value* v = emitUserCallArg(value, paramT, byPointer);
-            if (!byPointer && v) trackOwnedArgTemp(v, value, paramT);
+            if (!byPointer && v) parkOwnedTemp(v, value, paramT);
             if (!v) return false;
             slots[j] = v;
             filled[j] = true;
@@ -7656,7 +7657,7 @@ struct CodeGenerator::Impl {
                 ::Type* objType = typeOf(obj->node);
                 llvm::Value* recv = isReferenceType(objType) ? emitExpr(*obj) : emitLValue(*obj);
                 if (!recv) return nullptr;
-                if (isReferenceType(objType)) trackOwnedArgTemp(recv, *obj, objType);
+                if (isReferenceType(objType)) parkOwnedTemp(recv, *obj, objType);
                 auto* ptrTy = llvm::PointerType::get(ctx, 0);
                 llvm::Value* frames = builder->CreateLoad(ptrTy,
                     builder->CreateGEP(llvm::Type::getInt8Ty(ctx), recv,
@@ -7687,7 +7688,7 @@ struct CodeGenerator::Impl {
                     ? emitExpr(*obj)
                     : emitRecordAddress(*obj, objType);
                 if (!receiver) return nullptr;
-                if (isReferenceType(objType)) trackOwnedArgTemp(receiver, *obj, objType);
+                if (isReferenceType(objType)) parkOwnedTemp(receiver, *obj, objType);
                 std::vector<llvm::Value*> args;
                 args.push_back(receiver);
                 if (!appendCallArgs(methodSym, e.arguments(), e.node.greenNode(), args)) return nullptr;
@@ -7755,6 +7756,7 @@ struct CodeGenerator::Impl {
                 }
                 llvm::Value* recv = emitExpr(*obj);
                 if (!recv) return nullptr;
+                parkOwnedTemp(recv, *obj, recvType);
                 llvm::Value* present = emitOptionalPresence(recv, recvType, "safecall.present");
 
                 auto* nullBB    = llvm::BasicBlock::Create(ctx, "safecall.null",    currentFunction);
@@ -8148,6 +8150,7 @@ struct CodeGenerator::Impl {
                 ? emitExpr(*obj)
                 : emitRecordAddress(*obj, objType);
             if (!objAddr) return nullptr;
+            if (isReferenceType(objType)) parkOwnedTemp(objAddr, *obj, objType);
             auto memberName = m->memberText();
             if (!memberName) return nullptr;
             int idx = objType->structInfo->findFieldIndex(*memberName);
@@ -8172,6 +8175,7 @@ struct CodeGenerator::Impl {
             llvm::Value* arrPtr = emitExpr(*obj);
             llvm::Value* idxVal = emitExpr(*idx);
             if (!arrPtr || !idxVal) return nullptr;
+            parkOwnedTemp(arrPtr, *obj, objType);
             storageType = objType->inner;
             return emitArraySubscriptAddr(arrPtr, idxVal, objType->inner);
         }
@@ -8194,7 +8198,9 @@ struct CodeGenerator::Impl {
             if (memberName == u"length") {
                 llvm::Value* arrPtr = emitExpr(*obj);
                 if (!arrPtr) return nullptr;
-                return emitArrayLength(arrPtr);
+                llvm::Value* length = emitArrayLength(arrPtr);
+                releaseIfOwnedTemp(arrPtr, *obj);
+                return length;
             }
             error(e.node.startOffset(), "Internal: unsupported array member '" +
                   asAscii(memberName) + "'");
@@ -8205,7 +8211,9 @@ struct CodeGenerator::Impl {
             if (memberName == u"length") {
                 llvm::Value* strPtr = emitExpr(*obj);
                 if (!strPtr) return nullptr;
-                return emitStringLength(strPtr);
+                llvm::Value* length = emitStringLength(strPtr);
+                releaseIfOwnedTemp(strPtr, *obj);
+                return length;
             }
             error(e.node.startOffset(), "Internal: unsupported string member '" +
                   asAscii(memberName) + "'");
@@ -8242,6 +8250,7 @@ struct CodeGenerator::Impl {
         llvm::Value* arrPtr = emitExpr(*obj);
         llvm::Value* idxVal = emitExpr(*idx);
         if (!arrPtr || !idxVal) return nullptr;
+        parkOwnedTemp(arrPtr, *obj, objType);
         llvm::Value* slot = emitArraySubscriptAddr(arrPtr, idxVal, objType->inner);
         llvm::Value* v = builder->CreateLoad(mapType(objType->inner), slot, "arr.elem");
         return unwrapIfNarrowedValueOptional(v, objType->inner, e.node);
@@ -8291,6 +8300,7 @@ struct CodeGenerator::Impl {
 
         llvm::Value* recv = emitExpr(*obj);
         if (!recv) return nullptr;
+        parkOwnedTemp(recv, *obj, recvType);
         llvm::Value* present = emitOptionalPresence(recv, recvType, "safesub.present");
 
         auto* nullBB    = llvm::BasicBlock::Create(ctx, "safesub.null",    currentFunction);
@@ -8336,6 +8346,7 @@ struct CodeGenerator::Impl {
 
         llvm::Value* recv = emitExpr(*obj);
         if (!recv) return nullptr;
+        parkOwnedTemp(recv, *obj, recvType);
         llvm::Value* present = emitOptionalPresence(recv, recvType, "safe.present");
 
         auto* nullBB    = llvm::BasicBlock::Create(ctx, "safe.null",    currentFunction);
