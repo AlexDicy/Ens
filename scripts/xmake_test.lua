@@ -180,6 +180,17 @@ task("test")
             })
         end
 
+        -- the packaging library's tests: sha256 against the digests NIST publishes, the content
+        -- store's layout and publishing, ens.lock round-tripping byte for byte, and the byte-exact
+        -- edits an override makes to ens.overrides.
+        if want("selfhost_packages") then
+            table.insert(jobs, {
+                name = "selfhost_packages",
+                source = path.join(os.projectdir(), "selfhost", "packages"),
+                ens_test_args = {},
+            })
+        end
+
         -- the corpus round-trip harness parses every .ens file in the real source trees and
         -- asserts the front end is lossless and clean over all of them.
         if want("corpus_roundtrip") then
@@ -622,8 +633,8 @@ task("test")
                 end
             end
             for _, pkg in ipairs({"corpus", "frontend", "sema", "semacheck", "syntaxgen",
-                              "llvm", "codegen", "codegencheck", "host", "cli", "link", "build",
-                              "driver"}) do
+                              "llvm", "codegen", "codegencheck", "host", "cli", "packages",
+                              "link", "build", "driver"}) do
                 local src = path.join(os.projectdir(), "selfhost", pkg, "src")
                 local seeds = {}
                 for _, f in ipairs(os.files(path.join(src, "**.ens"))) do

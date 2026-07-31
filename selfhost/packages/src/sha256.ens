@@ -1,0 +1,234 @@
+// SHA-256, as FIPS 180-4 specifies it. A digest is a value one caller holds and feeds: the message
+// arrives in as many pieces as the caller has it in, never gathered into one buffer first, so a
+// whole tree hashes through a single digest without ever being in memory at once.
+//
+// Asking for the answer leaves the digest as it was, so a caller may ask twice and may keep feeding
+// afterwards.
+import StringBuilder from @std.text.stringbuilder;
+
+export final class Sha256 {
+    uint[] words;
+    byte[] block;
+    long filled;
+    ulong fed;
+
+    uint[] constants;
+    uint[] schedule;
+
+    export constructor() {
+        this.words = startingWords();
+        this.block = new byte[64];
+        this.filled = 0;
+        this.fed = 0;
+        this.constants = roundConstants();
+        this.schedule = new uint[64];
+    }
+
+    // Feeds the next part of the message.
+    export update(byte[] data) {
+        this.fed = this.fed + (data.length as ulong);
+        long at = 0;
+        while (this.filled > 0 && at < data.length) {
+            this.block[this.filled] = data[at];
+            this.filled++;
+            at++;
+            if (this.filled == 64) {
+                this.compress(this.words, this.block, 0);
+                this.filled = 0;
+            }
+        }
+        while (data.length - at >= 64) {
+            this.compress(this.words, data, at);
+            at = at + 64;
+        }
+        while (at < data.length) {
+            this.block[this.filled] = data[at];
+            this.filled++;
+            at++;
+        }
+    }
+
+    // Feeds the message's next part as the bytes the text is written in.
+    export update(string text) {
+        this.update(text.toBytes());
+    }
+
+    // The digest of everything fed so far: 32 bytes, the first one first.
+    export digest() -> byte[] {
+        uint[] finished = [this.words[0], this.words[1], this.words[2], this.words[3],
+            this.words[4], this.words[5], this.words[6], this.words[7]];
+        byte[] tail = new byte[64];
+        for (long i = 0; i < this.filled; i++) {
+            tail[i] = this.block[i];
+        }
+
+        // A message ends with a single one bit, then zeros, then its own length in bits. The length
+        // needs the last eight bytes of a block, so a message ending too near the end of one takes a
+        // further block of its own.
+        long at = this.filled;
+        tail[at] = 0x80;
+        at++;
+        for (long i = at; i < 64; i++) {
+            tail[i] = 0;
+        }
+        if (at > 56) {
+            this.compress(finished, tail, 0);
+            for (long i = 0; i < 56; i++) {
+                tail[i] = 0;
+            }
+        }
+        writeBigEndian(tail, 56, this.fed * 8);
+        this.compress(finished, tail, 0);
+
+        byte[] answer = new byte[32];
+        for (long i = 0; i < 8; i++) {
+            uint word = finished[i];
+            answer[i * 4] = shiftedRight(word, 24) as byte;
+            answer[i * 4 + 1] = shiftedRight(word, 16) as byte;
+            answer[i * 4 + 2] = shiftedRight(word, 8) as byte;
+            answer[i * 4 + 3] = word as byte;
+        }
+        return answer;
+    }
+
+    // The same digest written as 64 lowercase hex digits.
+    export hex() -> string {
+        return hexOf(this.digest());
+    }
+
+    // One 64-byte block of the message, folded into the eight words that carry the answer. `at` is
+    // where the block starts in `data`, so a caller feeding a large buffer folds it in place.
+    compress(uint[] words, byte[] data, long at) {
+        for (long i = 0; i < 16; i++) {
+            this.schedule[i] = wordAt(data, at + i * 4);
+        }
+        for (long i = 16; i < 64; i++) {
+            uint early = this.schedule[i - 15];
+            uint late = this.schedule[i - 2];
+            uint mixEarly = rotatedRight(early, 7) ^ rotatedRight(early, 18)
+                ^ shiftedRight(early, 3);
+            uint mixLate = rotatedRight(late, 17) ^ rotatedRight(late, 19)
+                ^ shiftedRight(late, 10);
+            this.schedule[i] = this.schedule[i - 16] + mixEarly + this.schedule[i - 7] + mixLate;
+        }
+
+        uint a = words[0];
+        uint b = words[1];
+        uint c = words[2];
+        uint d = words[3];
+        uint e = words[4];
+        uint f = words[5];
+        uint g = words[6];
+        uint h = words[7];
+        for (long i = 0; i < 64; i++) {
+            uint spreadLate = rotatedRight(e, 6) ^ rotatedRight(e, 11) ^ rotatedRight(e, 25);
+            uint choice = g ^ (e & (f ^ g));
+            uint carried = h + spreadLate + choice + this.constants[i] + this.schedule[i];
+            uint spreadEarly = rotatedRight(a, 2) ^ rotatedRight(a, 13) ^ rotatedRight(a, 22);
+            uint majority = (a & b) ^ (a & c) ^ (b & c);
+            h = g;
+            g = f;
+            f = e;
+            e = d + carried;
+            d = c;
+            c = b;
+            b = a;
+            a = carried + spreadEarly + majority;
+        }
+
+        words[0] = words[0] + a;
+        words[1] = words[1] + b;
+        words[2] = words[2] + c;
+        words[3] = words[3] + d;
+        words[4] = words[4] + e;
+        words[5] = words[5] + f;
+        words[6] = words[6] + g;
+        words[7] = words[7] + h;
+    }
+}
+
+// The digest of the bytes, as 64 lowercase hex digits.
+export ofBytes(byte[] data) -> string {
+    let digest = new Sha256();
+    digest.update(data);
+    return digest.hex();
+}
+
+// The digest of the bytes the text is written in.
+export ofText(string text) -> string {
+    return ofBytes(text.toBytes());
+}
+
+// Bytes written as lowercase hex digits, two to a byte.
+export hexOf(byte[] data) -> string {
+    let builder = new StringBuilder();
+    for (let value in data) {
+        builder.append(hexDigit(value / 16));
+        builder.append(hexDigit(value % 16));
+    }
+    return builder.toString();
+}
+
+hexDigit(byte value) -> string {
+    return switch (value) {
+        0 -> "0", 1 -> "1", 2 -> "2", 3 -> "3", 4 -> "4", 5 -> "5", 6 -> "6", 7 -> "7",
+        8 -> "8", 9 -> "9", 10 -> "a", 11 -> "b", 12 -> "c", 13 -> "d", 14 -> "e",
+        default -> "f",
+    };
+}
+
+// Four bytes as one word, the first byte most significant, which is the order SHA-256 reads and
+// writes every number in.
+wordAt(byte[] data, long at) -> uint {
+    return shiftedLeft(data[at] as uint, 24) | shiftedLeft(data[at + 1] as uint, 16)
+        | shiftedLeft(data[at + 2] as uint, 8) | (data[at + 3] as uint);
+}
+
+writeBigEndian(byte[] data, long at, ulong value) {
+    for (long i = 0; i < 8; i++) {
+        data[at + i] = shiftedRight(value, ((7 - i) * 8) as ulong) as byte;
+    }
+}
+
+rotatedRight(uint value, uint bits) -> uint {
+    return shiftedRight(value, bits) | shiftedLeft(value, 32 - bits);
+}
+
+shiftedRight(uint value, uint bits) -> uint {
+    return value >> bits;
+}
+
+shiftedLeft(uint value, uint bits) -> uint {
+    return value << bits;
+}
+
+shiftedRight(ulong value, ulong bits) -> ulong {
+    return value >> bits;
+}
+
+// The eight words a digest starts from: the fractional halves of the square roots of the first eight
+// primes.
+startingWords() -> uint[] {
+    return [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+            0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+}
+
+// One constant per round: the fractional halves of the cube roots of the first sixty-four primes.
+roundConstants() -> uint[] {
+    return [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+            0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+            0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+            0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+            0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+            0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+            0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+            0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+            0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+            0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+            0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2];
+}
