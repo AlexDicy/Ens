@@ -1277,6 +1277,9 @@ A name with no `.`, and one whose only `.` starts it the way a hidden file is na
 `isAbsolute(path)` reports whether the path names a place on its own, which a path starting at a root does, and so does one starting at a drive letter the way Windows writes one.
 `absolute(path, workingDirectory)` reads a relative path against that folder and normalizes the result, leaving an already absolute path only normalized.
 The folder is given rather than read from the running program, which is what keeps every function in this module a rule about text.
+Because every function here works in `/` form, `fromNative(text, platform)` is the conversion at the boundary, where a path written the way an operating system writes one arrives.
+On `"windows"` it turns each `\` into `/`; on every other platform it gives the text back unchanged, because `\` is an ordinary character in a name there and converting it would name a different file.
+The platform is named by the caller rather than read from the running program, so either platform's answer can be asked for anywhere.
 
 ---
 
