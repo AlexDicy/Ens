@@ -369,6 +369,16 @@ task("test")
             })
         end
 
+        -- the override subcommands of the Ens-written command: the byte-exact edits each form makes
+        -- to ens.overrides, the folder it refuses, what 'list' says about a target that works and one
+        -- that does not, and a build resolving through the redirection.
+        if want("cli_overriding") then
+            table.insert(jobs, {
+                name = "cli_overriding",
+                cli_overriding = true,
+            })
+        end
+
         -- the version multiplexer, driven end to end against a second toolchain installed in a
         -- scratch folder: the hop, the command line it forwards, the exit code it propagates, both
         -- ways of suppressing it, and the guard that stops a delegate delegating again.
@@ -2064,6 +2074,167 @@ task("test")
                 full = string.format("%s:\n%s", name, table.concat(failures, "\n"))}
         end
 
+        -- `ens override`: the three forms driven against a scratch workspace, with every edit
+        -- checked byte for byte, and a build proving the redirection reaches every member of the
+        -- workspace it was written beside.
+        local function run_cli_overriding(job)
+            local name = job.name
+            local root = path.join(os.projectdir(), "build", "cli", "ensoverride")
+            os.tryrm(root)
+            local ws_dir = path.join(root, "ws")
+            os.mkdir(path.join(ws_dir, "app", "src"))
+            os.mkdir(path.join(root, "json", "src"))
+            os.mkdir(path.join(root, "wrong"))
+            local log = path.join(out_dir, name .. ".log")
+            local failures = {}
+
+            local env, native_libraries, env_error = llvmEnvironment()
+            if not env then
+                return {name = name, ok = false, short = "no LLVM library",
+                    full = string.format("%s: %s", name, env_error)}
+            end
+            env.ENS_STDLIB = path.join(os.projectdir(), "libs")
+
+            io.writefile(path.join(ws_dir, "ens.package"),
+                'workspace {\n    member "app";\n}\n')
+            io.writefile(path.join(ws_dir, "app", "ens.package"),
+                'package demo.app {\n    ens "0.1";\n\n    dependency acme.json "1.0";\n}\n')
+            io.writefile(path.join(ws_dir, "app", "src", "main.ens"),
+                'import @acme.json.parse;\n\nmain() -> int {\n    print(parse.tag());\n'
+                .. '    return 0;\n}\n')
+            io.writefile(path.join(root, "json", "ens.package"),
+                'package acme.json {\n    ens "0.1";\n}\n')
+            io.writefile(path.join(root, "json", "src", "parse.ens"),
+                'export tag() -> string {\n    return "json override";\n}\n')
+            io.writefile(path.join(root, "wrong", "ens.package"),
+                'package acme.other {\n    ens "0.1";\n}\n')
+
+            local overrides_file = path.join(ws_dir, "ens.overrides")
+            local in_ws = {curdir = ws_dir, envs = env}
+
+            -- run the command and assert its exit code and the fragments its output must carry; a
+            -- fragment prefixed '!' must not appear.
+            local function run(argv, opt, expected_rc, ...)
+                local rc = execMerged(seed_exe, argv, log, opt)
+                local out = io.readfile(log) or ""
+                local label = table.concat(argv, " ")
+                if expected_rc ~= nil and rc ~= expected_rc then
+                    table.insert(failures, string.format("ens %s: exit=%s expected=%s\n%s",
+                        label, tostring(rc), tostring(expected_rc), out))
+                end
+                for _, fragment in ipairs({...}) do
+                    if fragment:sub(1, 1) == "!" then
+                        if out:find(fragment:sub(2), 1, true) then
+                            table.insert(failures, string.format("ens %s: output must not carry "
+                                .. "%q\n%s", label, fragment:sub(2), out))
+                        end
+                    elseif not out:find(fragment, 1, true) then
+                        table.insert(failures, string.format("ens %s: output missing %q\n%s",
+                            label, fragment, out))
+                    end
+                end
+                return rc, out
+            end
+
+            -- the whole file, so an edit that changed anything but the declaration it was about
+            -- fails here.
+            local function expect_file(label, expected)
+                local actual = (io.readfile(overrides_file) or ""):gsub("\r\n", "\n")
+                if actual ~= expected then
+                    table.insert(failures, string.format("%s: ens.overrides is %q, expected %q",
+                        label, actual, expected))
+                end
+            end
+
+            -- with nothing redirected, the dependency has no source at all
+            run({"override", "list"}, in_ws, 0, "No packages are overridden")
+            run({"build"}, in_ws, 1, "No source for package 'acme.json'")
+
+            -- add writes the file, list says the folder works, and the build resolves through it
+            run({"override", "add", "acme.json", "../json"}, in_ws, 0,
+                "Added the override for package 'acme.json': ../json")
+            expect_file("add", 'overrides {\n    override acme.json "../json";\n}\n')
+            run({"override", "list"}, in_ws, 0, "acme.json -> ../json", "!not usable")
+            run({"build"}, in_ws, 0, "demo.app: built")
+            local built = path.join(ws_dir, "app.exe")
+            if os.isfile(built) then
+                local rc = execMerged(built, {}, log, {envs = env})
+                local out = captured(log)
+                if rc ~= 0 or out ~= "json override" then
+                    table.insert(failures, string.format("app.exe: exit=%s stdout=%q",
+                        tostring(rc), out))
+                end
+            else
+                table.insert(failures, string.format("expected executable %s", built))
+            end
+
+            -- a folder declaring another package is refused, naming what it found, and the file is
+            -- left as it was
+            run({"override", "add", "acme.json", "../wrong"}, in_ws, 1,
+                "declares package 'acme.other' instead")
+            expect_file("refused", 'overrides {\n    override acme.json "../json";\n}\n')
+
+            -- edits are targeted: comments, blank lines and other declarations survive byte-exact
+            io.writefile(overrides_file, '// local checkouts\noverrides {\n'
+                .. '    override acme.json "../wrong";  // wrong on purpose\n'
+                .. '\n'
+                .. '    override beta.tools "../missing";\n}\n')
+            run({"override", "add", "acme.json", "../json"}, in_ws, 0,
+                "Replaced the override for package 'acme.json': now ../json")
+            expect_file("replace", '// local checkouts\noverrides {\n'
+                .. '    override acme.json "../json";  // wrong on purpose\n'
+                .. '\n'
+                .. '    override beta.tools "../missing";\n}\n')
+
+            -- list reports a valid target and an invalid one, with the reason for the invalid one
+            local _, listed = run({"override", "list"}, in_ws, 0, "acme.json -> ../json",
+                "beta.tools -> ../missing", "not usable", "there is no ens.package manifest at")
+            if listed:find("acme.json -> ../json (", 1, true) then
+                table.insert(failures, string.format("a usable override was reported with a "
+                    .. "reason:\n%s", listed))
+            end
+
+            run({"override", "remove", "beta.tools"}, in_ws, 0,
+                "Removed the override for package 'beta.tools'")
+            expect_file("remove", '// local checkouts\noverrides {\n'
+                .. '    override acme.json "../json";  // wrong on purpose\n'
+                .. '\n}\n')
+
+            -- a folder is read from where the command ran and written down relative to the
+            -- workspace, so running from a subfolder still records one path
+            os.mkdir(path.join(ws_dir, "notes"))
+            run({"override", "add", "acme.json", "../../json"},
+                {curdir = path.join(ws_dir, "notes"), envs = env}, 0, "now ../json")
+            expect_file("from a subfolder", '// local checkouts\noverrides {\n'
+                .. '    override acme.json "../json";  // wrong on purpose\n'
+                .. '\n}\n')
+
+            -- state and usage problems, each one saying what to do instead
+            run({"override", "remove", "nope.pkg"}, in_ws, 1,
+                "package 'nope.pkg' is not overridden", "ens override list")
+            run({"override", "add", "not/a/name!", "../json"}, in_ws, 2, "is not a package name")
+            run({"override", "add", "acme.json"}, in_ws, 2, "ens override add")
+            run({"override", "wat"}, in_ws, 2, "unknown command 'wat'")
+            run({"override"}, in_ws, 2, "ens override")
+            run({"override", "list"}, {curdir = root, envs = env}, 2,
+                "no ens.package manifest was found")
+
+            -- a file that is not an overrides file is reported rather than overwritten
+            local plain = path.join(root, "plain")
+            os.mkdir(plain)
+            io.writefile(path.join(plain, "ens.package"), 'package demo.plain {\n    ens "0.1";\n}\n')
+            io.writefile(path.join(plain, "ens.overrides"), 'workspace {\n    member "x";\n}\n')
+            run({"override", "list"}, {curdir = plain, envs = env}, 1,
+                "does not hold an overrides declaration")
+
+            if #failures == 0 then
+                return {name = name, ok = true}
+            end
+            return {name = name, ok = false,
+                short = string.format("%d CLI assertion(s) failed", #failures),
+                full = string.format("%s:\n%s", name, table.concat(failures, "\n"))}
+        end
+
         -- version delegation: `ens` handing a whole invocation to another toolchain. A copy of the
         -- built command is installed as toolchain 9.9 in a scratch folder, which is what makes the
         -- mechanism observable while only one real version exists - the copy answers 'ens 0.1', so
@@ -2272,6 +2443,7 @@ task("test")
             if job.cli_build then return run_cli_build(job) end
             if job.cli_runtest then return run_cli_runtest(job) end
             if job.cli_toolchain then return run_cli_toolchain(job) end
+            if job.cli_overriding then return run_cli_overriding(job) end
             if job.cli_core then return run_cli_core(job) end
             if job.cli_workspace then return run_cli_workspace(job) end
             if job.cli_override then return run_cli_override(job) end
