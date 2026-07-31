@@ -1,0 +1,158 @@
+// What changed between the lock a build read and the lock it resolved, and whether anything did.
+//
+// A build keeps the lock current, so it has to be able to say what it would change and, when it is
+// told not to change anything, why it would have to. Both come from comparing two locks as values,
+// which is why nothing here reads or writes a file.
+//
+// Whether the two differ at all is decided by rendering both: rendering settles every order a lock
+// has a choice about, so two locks recording the same thing render identically and a difference in
+// the bytes is a difference in what was recorded. The summary is then about naming that difference
+// rather than finding it.
+import @std.collections.sorting;
+import List from @std.collections.list;
+import Set from @std.collections.set;
+import Lockfile from lockfile;
+import LockPackage from lockfile;
+import LockArtifact from lockfile;
+import LockRequirement from lockfile;
+import lockfile;
+
+// The difference between two locks, in the order a reader would look for it.
+export final class LockChange {
+    string[] entries;
+
+    protected constructor(this.entries);
+
+    export changes() -> string[] {
+        return this.entries;
+    }
+
+    export any() -> bool {
+        return this.entries.length > 0;
+    }
+
+    // "locked alex.json 1.0, updated beta.utils 1.0 -> 1.1", which is what a build says out loud
+    // after it has rewritten the lock, and what it says it would have had to do when it may not.
+    export summary() -> string {
+        string listed = "";
+        for (long i = 0; i < this.entries.length; i++) {
+            if (i > 0) {
+                listed = listed + ", ";
+            }
+            listed = listed + this.entries[i];
+        }
+        return listed;
+    }
+}
+
+// Whether the two locks record the same thing.
+export same(Lockfile before, Lockfile after) -> bool {
+    return lockfile.render(before) == lockfile.render(after);
+}
+
+// What turning `before` into `after` amounts to, package by package in name order.
+export compare(Lockfile before, Lockfile after) -> LockChange {
+    let entries = new List<string>();
+    for (let name in packageNames(before, after)) {
+        let was = before.find(name);
+        let now = after.find(name);
+        if (was == null && now != null) {
+            entries.push("locked {name} {now.version()}");
+            continue;
+        }
+        if (was != null && now == null) {
+            entries.push("removed {name} {was.version()}");
+            continue;
+        }
+        if (was != null && now != null) {
+            describe(was, now, entries);
+        }
+    }
+    if (!sameArtifacts(before.rootArtifacts(), after.rootArtifacts())) {
+        entries.push("updated the prebuilt libraries recorded for this build");
+    }
+    if (entries.length() == 0 && !same(before, after)) {
+        entries.push("updated what the lock records");
+    }
+    return new LockChange(entries.toArray());
+}
+
+// What changed about a package the lock already recorded. Its version is what a reader looks for
+// first, so a change to anything else is only reported when the version stayed as it was.
+describe(LockPackage was, LockPackage now, List<string> entries) {
+    if (was.version() != now.version()) {
+        entries.push("updated {now.packageName()} {was.version()} -> {now.version()}");
+        return;
+    }
+    if (was.url() != now.url() || was.commit() != now.commit()
+            || was.content() != now.content()) {
+        entries.push("updated {now.packageName()} {now.version()}, which now comes from elsewhere");
+        return;
+    }
+    if (!sameRequirements(was.requirements(), now.requirements())) {
+        entries.push("updated what {now.packageName()} {now.version()} requires");
+        return;
+    }
+    if (!sameArtifacts(was.artifacts(), now.artifacts())) {
+        entries.push("updated the prebuilt libraries {now.packageName()} {now.version()} binds");
+    }
+}
+
+// Every package either lock records, in name order.
+packageNames(Lockfile before, Lockfile after) -> string[] {
+    let seen = new Set<string>();
+    let names = new List<string>();
+    for (let locked in before.packages()) {
+        if (seen.add(locked.packageName())) {
+            names.push(locked.packageName());
+        }
+    }
+    for (let locked in after.packages()) {
+        if (seen.add(locked.packageName())) {
+            names.push(locked.packageName());
+        }
+    }
+    sorting.sort(names);
+    return names.toArray();
+}
+
+sameRequirements(LockRequirement[] was, LockRequirement[] now) -> bool {
+    return sameLines(requirementLines(was), requirementLines(now));
+}
+
+sameArtifacts(LockArtifact[] was, LockArtifact[] now) -> bool {
+    return sameLines(artifactLines(was), artifactLines(now));
+}
+
+// One line per entry, in one settled order, so two lists holding the same entries compare equal
+// however they were gathered.
+requirementLines(LockRequirement[] entries) -> string[] {
+    let lines = new List<string>();
+    for (let required in entries) {
+        lines.push(required.packageName() + " " + required.version());
+    }
+    sorting.sort(lines);
+    return lines.toArray();
+}
+
+artifactLines(LockArtifact[] entries) -> string[] {
+    let lines = new List<string>();
+    for (let artifact in entries) {
+        lines.push(artifact.library() + " " + artifact.platform() + " " + artifact.url() + " "
+            + artifact.digest());
+    }
+    sorting.sort(lines);
+    return lines.toArray();
+}
+
+sameLines(string[] was, string[] now) -> bool {
+    if (was.length != now.length) {
+        return false;
+    }
+    for (long i = 0; i < was.length; i++) {
+        if (was[i] != now[i]) {
+            return false;
+        }
+    }
+    return true;
+}

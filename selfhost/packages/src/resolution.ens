@@ -1,0 +1,683 @@
+// Settling where every package a build depends on comes from, before a line of it is compiled.
+//
+// It runs in rounds. A round decides, from everything required so far, which version of each package
+// the build uses; the packages whose chosen version is not yet in the cache are then brought in, each
+// one on its own, and what they require joins the set for the next round. A round's work is therefore
+// a set of independent tasks over a set of requirements nothing is changing underneath them, which is
+// what lets a fetch of one package eventually happen at the same time as a fetch of another.
+//
+// The lock is the last thing settled, because it records what the rounds came to. A build keeps it
+// current: it says what changed and rewrites it, unless it was told the lock may not change, in which
+// case what it would have had to change is the reason it stops.
+import @std.system;
+import SystemError from @std.system;
+import @std.path;
+import @std.collections.sorting;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+import Set from @std.collections.set;
+import FileLoader from @ens.sema.support.loader;
+import ManifestSurvey from @ens.sema.program.workspace;
+import NativeInfo from @ens.sema.program.workspace;
+import PackageSources from @ens.sema.program.workspace;
+import @ens.sema.program.workspace;
+import Environment from @ens.host.environment;
+import ContentStore from store;
+import store;
+import Progress from progress;
+import Lockfile from lockfile;
+import LockPackage from lockfile;
+import LockRequirement from lockfile;
+import LockArtifact from lockfile;
+import lockfile;
+import lockdiff;
+import Requirement from requirements;
+import RequirementSet from requirements;
+import PackageChoice from requirements;
+import Selection from requirements;
+import requirements;
+import Version from versions;
+import versions;
+import git;
+import hashing;
+import overrides;
+
+// How a build was told to settle what it depends on.
+export final class ResolutionRequest {
+    string rootFolder;
+    bool offlineOnly;
+    bool lockedOnly;
+
+    export constructor(this.rootFolder, this.offlineOnly, this.lockedOnly);
+
+    // The folder holding the manifest the build is rooted at, which is where the lock lives.
+    export root() -> string {
+        return this.rootFolder;
+    }
+
+    export offline() -> bool {
+        return this.offlineOnly;
+    }
+
+    export locked() -> bool {
+        return this.lockedOnly;
+    }
+}
+
+// What resolving came to: where the packages are, what stopped it, and what to tell whoever ran it.
+export final class Resolution {
+    PackageSources resolvedSources;
+    string[] problems;
+    string[] noteLines;
+
+    protected constructor(this.resolvedSources, this.problems, this.noteLines);
+
+    // The folder each resolved package sits in, for the module graph to load it from.
+    export sources() -> PackageSources {
+        return this.resolvedSources;
+    }
+
+    export failures() -> string[] {
+        return this.problems;
+    }
+
+    // What was fetched and what the lock now records, which a build says out loud.
+    export notes() -> string[] {
+        return this.noteLines;
+    }
+
+    export succeeded() -> bool {
+        return this.problems.length == 0;
+    }
+}
+
+// Nothing to resolve, which is what a build with no manifest above it amounts to.
+export nothing() -> Resolution {
+    string[] none = [];
+    return new Resolution(workspace.noPackageSources(), none, none);
+}
+
+// Settles every package the build at the request's root depends on.
+export resolve(FileLoader loader, Environment environment, ResolutionRequest request,
+               Progress progress) -> Resolution {
+    if (!loader.exists(workspace.manifestFilePath(request.root()))) {
+        return nothing();
+    }
+    return new Resolver(loader, environment, request, progress).run();
+}
+
+// One package the build settled on, as everything that needs it reads it.
+final class Settled {
+    protected string version;
+    protected string url;
+    protected string commit;
+    protected string digest;
+    protected string folder;
+    protected LockRequirement[] requires;
+    protected LockArtifact[] artifacts;
+    protected bool usable;
+
+    protected constructor(string version, string url, string commit, string digest, string folder,
+                LockRequirement[] requires, LockArtifact[] artifacts, bool usable) {
+        this.version = version;
+        this.url = url;
+        this.commit = commit;
+        this.digest = digest;
+        this.folder = folder;
+        this.requires = requires;
+        this.artifacts = artifacts;
+        this.usable = usable;
+    }
+}
+
+// What bringing one package in came to: what the build now knows about it, what it in turn requires,
+// what is worth telling whoever ran the command, and what stopped it. Bringing a package in answers
+// with this rather than writing anything down, which is what makes the packages of one round
+// independent of each other.
+final class Brought {
+    protected Settled settled;
+    protected Requirement[] added;
+    protected string[] notes;
+    protected string problem;
+
+    protected constructor(this.settled, this.added, this.notes, this.problem);
+}
+
+// One resolution as it happens. It is the only thing here that changes, and it lives no longer than
+// the resolve that made it: what comes out of it is a value.
+final class Resolver {
+    FileLoader loader;
+    Environment environment;
+    ResolutionRequest request;
+    Progress progress;
+
+    Lockfile previous;
+    bool hadLock;
+    ManifestSurvey? rootSurvey;
+    Map<string, string> overrideFolders;
+
+    RequirementSet gathered;
+    Map<string, Settled> settledPackages;
+    Set<string> pinned;
+
+    List<string> problems;
+    List<string> notes;
+
+    protected constructor(FileLoader loader, Environment environment, ResolutionRequest request,
+                Progress progress) {
+        this.loader = loader;
+        this.environment = environment;
+        this.request = request;
+        this.progress = progress;
+        this.previous = lockfile.empty();
+        this.hadLock = false;
+        this.rootSurvey = null;
+        this.overrideFolders = new Map<string, string>();
+        this.gathered = requirements.empty();
+        this.settledPackages = new Map<string, Settled>();
+        this.pinned = new Set<string>();
+        this.problems = new List<string>();
+        this.notes = new List<string>();
+    }
+
+    protected run() -> Resolution {
+        let reading = lockfile.read(this.request.root());
+        if (reading.failure().length > 0) {
+            return this.refused(reading.failure());
+        }
+        this.previous = reading.lock();
+        this.hadLock = reading.found();
+        this.rootSurvey = workspace.surveyManifest(this.loader, this.request.root());
+        this.readOverrides();
+        this.collectLocal();
+        this.bringEverything();
+        if (this.problems.length() == 0) {
+            this.reconcileLock();
+        }
+        return new Resolution(this.sources(), this.problems.toArray(), this.notes.toArray());
+    }
+
+    // The rounds. Each one decides the whole set's answer and then brings in whatever that answer
+    // asks for that is not there yet, so a package reached through another package settles in the
+    // round after the one that reached it. Bringing a package in touches nothing the other packages
+    // of its round can see; what they each learned is folded in once they have all answered.
+    bringEverything() {
+        for (long round = 0; round < roundLimit(); round++) {
+            this.addLockPins();
+            if (this.reportDisagreements()) {
+                return;
+            }
+            PackageChoice[] batch = this.outstanding(requirements.select(this.gathered));
+            if (batch.length == 0) {
+                return;
+            }
+            this.progress.step("settling {batch.length} package(s)");
+            let brought = new List<Brought>();
+            for (let choice in batch) {
+                brought.push(this.bring(choice));
+            }
+            bool anyRefused = false;
+            for (long i = 0; i < brought.length(); i++) {
+                let one = brought.get(i);
+                this.settledPackages.set(batch[i].packageName(), one.settled);
+                this.gathered = this.gathered.with(one.added);
+                for (let note in one.notes) {
+                    this.notes.push(note);
+                }
+                anyRefused = anyRefused || one.problem.length > 0;
+            }
+            // A package this round could not bring in may be explained by what the round itself
+            // discovered - a second requirement naming another repository, say - so the enlarged set
+            // is asked before the refusal is reported.
+            if (anyRefused) {
+                this.reportDisagreements();
+                for (long i = 0; i < brought.length(); i++) {
+                    string problem = brought.get(i).problem;
+                    if (problem.length > 0) {
+                        this.problems.push(problem);
+                    }
+                }
+                return;
+            }
+        }
+        this.problems.push("Internal: resolving what this build depends on did not settle after "
+            + "{roundLimit()} rounds");
+    }
+
+    // Reports everything about the requirements themselves that has no answer, and whether there
+    // was any.
+    reportDisagreements() -> bool {
+        string[] failures = requirements.select(this.gathered).failures();
+        for (let problem in failures) {
+            this.problems.push(problem);
+        }
+        return failures.length > 0;
+    }
+
+    // The packages the selection asks for that are not there at that version yet.
+    outstanding(Selection selection) -> PackageChoice[] {
+        let wanted = new List<PackageChoice>();
+        for (let choice in selection.packages()) {
+            let already = this.settledPackages.get(choice.packageName());
+            if (already == null || already.version != choice.version().written()) {
+                wanted.push(choice);
+            }
+        }
+        return wanted.toArray();
+    }
+
+    // A version the lock already records counts as one more requirement, so a build that resolved a
+    // package once never quietly steps back to a lower version of it, and a lock that still
+    // satisfies every requirement reproduces exactly.
+    addLockPins() {
+        for (let name in this.gathered.names()) {
+            if (!this.pinned.add(name)) {
+                continue;
+            }
+            Requirement[] mine = this.gathered.forPackage(name);
+            string url = firstUrl(mine);
+            if (url.length == 0) {
+                continue;
+            }
+            let locked = this.previous.find(name);
+            if (locked == null || locked.url() != url) {
+                continue;
+            }
+            let recorded = versions.parse(locked.version());
+            if (recorded == null || !versions.sameMajor(recorded, mine[0].version())) {
+                continue;
+            }
+            this.gathered = this.gathered.with([new Requirement(name, recorded, url,
+                lockfile.filePath(this.request.root()))]);
+        }
+    }
+
+    // Brings one package's chosen version in: from the cache when the lock already pins what it
+    // holds, and from its repository otherwise.
+    bring(PackageChoice choice) -> Brought {
+        string name = choice.packageName();
+        string version = choice.version().written();
+        let cache = store.locate(this.environment);
+        if (cache == null) {
+            return unusable(version, choice.url(), store.missingRootMessage(this.environment));
+        }
+        let locked = this.previous.find(name);
+        bool pinnedHere = locked != null && locked.version() == version
+            && locked.url() == choice.url();
+        if (pinnedHere && locked != null) {
+            string stored = cache.treeFolder(locked.content());
+            if (this.loader.exists(workspace.manifestFilePath(stored))) {
+                string[] silent = [];
+                return this.fromTree(choice, stored, locked.commit(), locked.content(), silent);
+            }
+        }
+
+        let fetched = git.fetch(cache, name, choice.url(), version, this.request.offline(),
+            this.progress);
+        let said = new List<string>();
+        if (fetched.leftBehind().length > 0) {
+            said.push(fetched.leftBehind());
+        }
+        if (!fetched.succeeded()) {
+            return withNotes(said.toArray(),
+                unusable(version, choice.url(), fetched.failure()));
+        }
+        if (pinnedHere && locked != null && fetched.digest() != locked.content()) {
+            return withNotes(said.toArray(), unusable(version, choice.url(), "the files of "
+                + "package '{name}' {version} fetched from {choice.url()} are not the files "
+                + "ens.lock records: the lock has {locked.content()} and what was fetched hashes "
+                + "to {fetched.digest()}. "
+                + "The tag '{fetched.tag()}' may have been moved since the lock was written, or its "
+                + "content changed; if the new content is meant, delete ens.lock and build again to "
+                + "record it afresh"));
+        }
+        said.push("Fetched {name} {version} from {choice.url()} (tag {fetched.tag()})");
+        return this.fromTree(choice, fetched.folder(), fetched.commit(), fetched.digest(),
+            said.toArray());
+    }
+
+    // What the fetched tree provides: the package itself at its root, or the member of a workspace
+    // that declares it. Problems inside the package's own sources surface later, when the build
+    // loads it; all that matters here is that the package is there and what it requires.
+    fromTree(PackageChoice choice, string treeRoot, string commit, string digest,
+             string[] said) -> Brought {
+        string name = choice.packageName();
+        string version = choice.version().written();
+        let survey = workspace.surveyManifest(this.loader, treeRoot);
+        if (survey == null) {
+            return withNotes(said, unusable(version, choice.url(), "the tag of package '{name}' "
+                + "{version} at {choice.url()} has no ens.package manifest, so there is no package "
+                + "to take from it"));
+        }
+        if (survey.isPackage()) {
+            if (survey.packageName() != name) {
+                return withNotes(said, unusable(version, choice.url(), "the tag of package "
+                    + "'{name}' {version} at {choice.url()} declares package "
+                    + "'{survey.packageName()}' instead, and the names have to match exactly"));
+            }
+            string[] noMembers = [];
+            return this.provided(choice, treeRoot, commit, digest, treeRoot, survey, noMembers,
+                said);
+        }
+        if (survey.isWorkspace()) {
+            return this.fromWorkspaceTree(choice, treeRoot, commit, digest, survey, said);
+        }
+        return withNotes(said, unusable(version, choice.url(), "the ens.package at the tag of "
+            + "package '{name}' {version} at {choice.url()} declares neither a package nor a "
+            + "workspace, so '{name}' cannot be taken from it"));
+    }
+
+    fromWorkspaceTree(PackageChoice choice, string treeRoot, string commit, string digest,
+                      ManifestSurvey root, string[] said) -> Brought {
+        string name = choice.packageName();
+        string version = choice.version().written();
+        let memberNames = new List<string>();
+        string folder = "";
+        ManifestSurvey? found = null;
+        for (let listed in root.members()) {
+            string memberFolder = path.normalize(path.join(treeRoot, listed));
+            let member = workspace.surveyManifest(this.loader, memberFolder);
+            if (member == null || !member.isPackage()) {
+                continue;
+            }
+            memberNames.push(member.packageName());
+            if (member.packageName() == name) {
+                folder = memberFolder;
+                found = member;
+            }
+        }
+        if (found == null) {
+            return withNotes(said, unusable(version, choice.url(), "the tag of package '{name}' "
+                + "{version} at {choice.url()} holds a workspace, and none of its members declares "
+                + "package '{name}'; it declares " + declaredList(memberNames.toArray())));
+        }
+        return this.provided(choice, treeRoot, commit, digest, folder, found,
+            memberNames.toArray(), said);
+    }
+
+    // A package found in the fetched tree: what the lock records about it, and what it adds to the
+    // build's requirements.
+    provided(PackageChoice choice, string treeRoot, string commit, string digest, string folder,
+             ManifestSurvey manifest, string[] memberNames, string[] said) -> Brought {
+        let recorded = new List<LockRequirement>();
+        let added = new List<Requirement>();
+        string manifestPath = workspace.manifestFilePath(folder);
+        for (let dependency in manifest.requirements()) {
+            if (!dependency.hasVersion() || contains(memberNames, dependency.packageName())) {
+                continue;
+            }
+            recorded.push(new LockRequirement(dependency.packageName(), dependency.version()));
+            if (this.overrideFolders.get(dependency.packageName()) != null) {
+                continue;
+            }
+            let required = this.requirementOf(dependency.packageName(), dependency.version(),
+                dependency.hasSource(), dependency.url(), manifestPath);
+            if (required != null) {
+                added.push(required);
+            }
+        }
+        return new Brought(new Settled(choice.version().written(), choice.url(), commit, digest,
+            folder, recorded.toArray(), artifactsOf(manifest.natives()), true), added.toArray(),
+            said, "");
+    }
+
+    // The requirements the checkout itself states: the root package's, or every member's when the
+    // root is a workspace, and every overridden package's on top, because an override redirects
+    // where a package comes from without changing what it requires.
+    collectLocal() {
+        let survey = this.rootSurvey;
+        if (survey == null) {
+            return;
+        }
+        if (survey.isWorkspace()) {
+            this.collectMembers(survey);
+        } else if (survey.isPackage()) {
+            this.scan(survey, workspace.manifestFilePath(this.request.root()),
+                workspace.enclosingMemberNames(this.loader, this.request.root()));
+        }
+        for (let name in this.overrideFolders.keys()) {
+            string? folder = this.overrideFolders.get(name);
+            if (folder == null) {
+                continue;
+            }
+            let target = workspace.surveyManifest(this.loader, folder);
+            if (target == null || !target.isPackage()) {
+                continue;
+            }
+            this.scan(target, workspace.manifestFilePath(folder),
+                workspace.enclosingMemberNames(this.loader, folder));
+        }
+    }
+
+    collectMembers(ManifestSurvey root) {
+        let folders = new List<string>();
+        let names = new List<string>();
+        let surveys = new List<ManifestSurvey>();
+        for (let listed in root.members()) {
+            string memberFolder = path.normalize(path.join(this.request.root(), listed));
+            let member = workspace.surveyManifest(this.loader, memberFolder);
+            if (member == null || !member.isPackage()) {
+                continue;
+            }
+            folders.push(memberFolder);
+            names.push(member.packageName());
+            surveys.push(member);
+        }
+        string[] memberNames = names.toArray();
+        for (long i = 0; i < surveys.length(); i++) {
+            this.scan(surveys.get(i), workspace.manifestFilePath(folders.get(i)), memberNames);
+        }
+    }
+
+    // One manifest's dependencies as requirements. A package the checkout already provides - a
+    // member of the enclosing workspace, or one an override redirects - is not required of anywhere
+    // else, so it states no requirement here.
+    scan(ManifestSurvey manifest, string manifestPath, string[] memberNames) {
+        for (let dependency in manifest.requirements()) {
+            if (contains(memberNames, dependency.packageName())
+                    || this.overrideFolders.get(dependency.packageName()) != null
+                    || !dependency.hasVersion()) {
+                continue;
+            }
+            let required = this.requirementOf(dependency.packageName(), dependency.version(),
+                dependency.hasSource(), dependency.url(), manifestPath);
+            if (required != null) {
+                this.gathered = this.gathered.with([required]);
+            }
+        }
+    }
+
+    // One dependency declaration as a requirement, or null when it states none a build can act on.
+    requirementOf(string name, string version, bool hasSource, string url,
+                  string manifestPath) -> Requirement? {
+        let parsed = versions.parse(version);
+        if (parsed == null) {
+            if (hasSource) {
+                this.problems.push("{manifestPath} requires version \"{version}\" of package "
+                    + "'{name}', which is not a version; a version is dotted numerals, such as "
+                    + "\"2.0\"");
+            }
+            return null;
+        }
+        string source = "";
+        if (hasSource) {
+            source = url;
+        }
+        return new Requirement(name, parsed, source, manifestPath);
+    }
+
+    readOverrides() {
+        let file = try overrides.read(this.request.root());
+        for (let entry in file.survey().overrides()) {
+            this.overrideFolders.set(entry.packageName(),
+                overrides.resolved(this.request.root(), entry.folder()));
+        }
+    } catch (SystemError error) {
+        this.problems.push("'{overrides.filePath(this.request.root())}' could not be read: "
+            + error.message);
+    }
+
+    // The lock this resolution amounts to, and what writing it would change.
+    reconcileLock() {
+        let resolved = this.newLock();
+        if (resolved.packages().length == 0) {
+            this.dropLock();
+            return;
+        }
+        if (this.hadLock && lockdiff.same(this.previous, resolved)) {
+            return;
+        }
+        string summary = lockdiff.compare(this.previous, resolved).summary();
+        if (this.request.locked()) {
+            this.problems.push("ens.lock no longer matches what this build requires ({summary}), "
+                + "and '--locked' does not allow it to change; run the command without '--locked' "
+                + "to bring the lock up to date");
+            return;
+        }
+        try lockfile.write(this.request.root(), resolved);
+        this.notes.push("Updated ens.lock: " + summary);
+    } catch (SystemError error) {
+        this.problems.push("'{lockfile.filePath(this.request.root())}' could not be written: "
+            + error.message);
+    }
+
+    // A lock with nothing to record is no lock: a build that no longer depends on a git-sourced
+    // package has nothing to reproduce.
+    dropLock() {
+        if (!this.hadLock) {
+            return;
+        }
+        if (this.request.locked()) {
+            this.problems.push("this build no longer depends on any git-sourced package, so "
+                + "ens.lock would be removed, and '--locked' does not allow it to change; run the "
+                + "command without '--locked' to bring the lock up to date");
+            return;
+        }
+        try system.removeFile(lockfile.filePath(this.request.root()));
+        this.notes.push("Removed ens.lock: this build no longer depends on any git-sourced "
+            + "package");
+    } catch (SystemError error) {
+        this.problems.push("'{lockfile.filePath(this.request.root())}' could not be removed: "
+            + error.message);
+    }
+
+    newLock() -> Lockfile {
+        string rootName = "";
+        LockArtifact[] rootArtifacts = [];
+        let survey = this.rootSurvey;
+        if (survey != null && survey.isPackage()) {
+            rootName = survey.packageName();
+            rootArtifacts = artifactsOf(survey.natives());
+        }
+        let recorded = new List<LockPackage>();
+        for (let name in sortedKeys(this.settledPackages)) {
+            let settled = this.settledPackages.get(name);
+            if (settled == null || !settled.usable) {
+                continue;
+            }
+            recorded.push(new LockPackage(name, settled.version, settled.url, settled.commit,
+                settled.digest, settled.requires, settled.artifacts));
+        }
+        return new Lockfile(rootName, rootArtifacts, recorded.toArray());
+    }
+
+    sources() -> PackageSources {
+        let folders = new Map<string, string>();
+        for (let name in sortedKeys(this.settledPackages)) {
+            let settled = this.settledPackages.get(name);
+            if (settled != null && settled.usable) {
+                folders.set(name, settled.folder);
+            }
+        }
+        return new PackageSources(folders);
+    }
+
+    refused(string problem) -> Resolution {
+        string[] none = [];
+        return new Resolution(workspace.noPackageSources(), [problem], none);
+    }
+}
+
+// The prebuilt libraries a manifest's native declarations bind, one entry per platform binding.
+artifactsOf(NativeInfo[] natives) -> LockArtifact[] {
+    let found = new List<LockArtifact>();
+    for (let native in natives) {
+        for (let binding in native.bindings()) {
+            if (binding.isArtifact()) {
+                found.push(new LockArtifact(native.name(), binding.platform(), binding.url(),
+                    hashing.canonical(binding.checksum())));
+            }
+        }
+    }
+    return found.toArray();
+}
+
+// A package that could not be settled, so the round after this one does not ask for it again.
+unusable(string version, string url, string problem) -> Brought {
+    LockRequirement[] noRequirements = [];
+    LockArtifact[] noArtifacts = [];
+    Requirement[] nothingAdded = [];
+    string[] nothingSaid = [];
+    return new Brought(new Settled(version, url, "", "", "", noRequirements, noArtifacts, false),
+        nothingAdded, nothingSaid, problem);
+}
+
+// The same outcome with lines to pass on in front of it, for a refusal that had something to say
+// before it happened.
+withNotes(string[] said, Brought outcome) -> Brought {
+    return new Brought(outcome.settled, outcome.added, said, outcome.problem);
+}
+
+firstUrl(Requirement[] mine) -> string {
+    for (let requirement in mine) {
+        if (requirement.url().length > 0) {
+            return requirement.url();
+        }
+    }
+    return "";
+}
+
+contains(string[] names, string name) -> bool {
+    for (let known in names) {
+        if (known == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+sortedKeys(Map<string, Settled> settled) -> string[] {
+    let names = new List<string>();
+    for (let name in settled.keys()) {
+        names.push(name);
+    }
+    sorting.sort(names);
+    return names.toArray();
+}
+
+// "'a', 'b' and 'c'", or "no members at all", for a workspace that does not hold what was asked of
+// it.
+declaredList(string[] names) -> string {
+    if (names.length == 0) {
+        return "no members at all";
+    }
+    string listed = "";
+    for (long i = 0; i < names.length; i++) {
+        if (i > 0) {
+            if (i == names.length - 1) {
+                listed = listed + " and ";
+            } else {
+                listed = listed + ", ";
+            }
+        }
+        listed = listed + "'" + names[i] + "'";
+    }
+    return listed;
+}
+
+// How many rounds of settling are enough. A round either reaches a package for the first time or
+// raises one's version, and a checkout states finitely many of both, so this is only ever reached by
+// a mistake in the resolving itself.
+roundLimit() -> long {
+    return 64;
+}

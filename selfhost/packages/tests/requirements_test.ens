@@ -1,0 +1,153 @@
+// What a set of requirements comes to. A build's whole choice of versions is a function of the set,
+// so every rule of it - the highest version wins, one repository per package, no span of majors - is
+// checked here as a value rather than through a fetch.
+import @std.testing;
+import @std.text.strings;
+import List from @std.collections.list;
+import Requirement from requirements;
+import RequirementSet from requirements;
+import requirements;
+import versions;
+
+// One requirement, with the version taken as read: a test that wrote an unparsable one would be
+// testing the parser instead.
+required(string name, string version, string url, string requirer) -> Requirement {
+    let parsed = versions.parse(version);
+    if (parsed == null) {
+        panic("the test wrote '{version}', which is not a version");
+    }
+    return new Requirement(name, parsed, url, requirer);
+}
+
+setOf(Requirement[] entries) -> RequirementSet {
+    return requirements.empty().with(entries);
+}
+
+// "name version url" per chosen package, in the order the selection settled them.
+chosen(RequirementSet set) -> string {
+    let lines = new List<string>();
+    for (let choice in requirements.select(set).packages()) {
+        lines.push(choice.packageName() + " " + choice.version().written() + " " + choice.url());
+    }
+    return strings.joined(lines.toArray(), "; ");
+}
+
+test "adding to a set makes another set and leaves the first as it was" {
+    let first = setOf([required("a.one", "1.0", "https://host/one.git", "/app/ens.package")]);
+    let second = first.with([required("a.two", "2.0", "https://host/two.git", "/app/ens.package")]);
+    try testing.assertEqual(first.count(), 1);
+    try testing.assertEqual(second.count(), 2);
+}
+
+test "the packages of a set are named in one settled order whatever order they arrived in" {
+    let forward = setOf([
+        required("z.last", "1.0", "https://host/z.git", "/app/ens.package"),
+        required("a.first", "1.0", "https://host/a.git", "/app/ens.package"),
+        required("m.middle", "1.0", "https://host/m.git", "/app/ens.package"),
+    ]);
+    let backward = setOf([
+        required("m.middle", "1.0", "https://host/m.git", "/app/ens.package"),
+        required("a.first", "1.0", "https://host/a.git", "/app/ens.package"),
+        required("z.last", "1.0", "https://host/z.git", "/app/ens.package"),
+    ]);
+    try testing.assertEqual(strings.joined(forward.names(), " "), "a.first m.middle z.last");
+    try testing.assertEqual(strings.joined(forward.names(), " "),
+        strings.joined(backward.names(), " "));
+}
+
+test "the highest version required is the one the build uses" {
+    let set = setOf([
+        required("beta.utils", "1.0", "https://host/u.git", "/app/ens.package"),
+        required("beta.utils", "1.10", "https://host/u.git", "/dep/ens.package"),
+        required("beta.utils", "1.9", "https://host/u.git", "/other/ens.package"),
+    ]);
+    try testing.assertEqual(chosen(set), "beta.utils 1.10 https://host/u.git");
+    try testing.assertEqual(requirements.select(set).failures().length, 0);
+}
+
+test "a package no requirement names a repository for is left to be resolved elsewhere" {
+    let set = setOf([required("local.thing", "1.0", "", "/app/ens.package")]);
+    try testing.assertEqual(chosen(set), "");
+    try testing.assertEqual(requirements.select(set).failures().length, 0);
+}
+
+test "one requirement naming a repository settles it for the requirements that name none" {
+    let set = setOf([
+        required("beta.utils", "1.0", "", "/app/ens.package"),
+        required("beta.utils", "1.2", "https://host/u.git", "/dep/ens.package"),
+    ]);
+    try testing.assertEqual(chosen(set), "beta.utils 1.2 https://host/u.git");
+}
+
+test "two repositories for one package is a disagreement naming both requirers" {
+    let set = setOf([
+        required("beta.utils", "1.0", "https://host/u.git", "/app/ens.package"),
+        required("beta.utils", "1.0", "https://host/other.git", "/dep/ens.package"),
+    ]);
+    string[] failures = requirements.select(set).failures();
+    try testing.assertEqual(failures.length, 1);
+    try testing.assertTrue(failures[0].indexOf(
+        "package 'beta.utils' is required from two different repositories") >= 0);
+    try testing.assertTrue(failures[0].indexOf("/app/ens.package names https://host/u.git") >= 0);
+    try testing.assertTrue(failures[0].indexOf(
+        "/dep/ens.package names https://host/other.git") >= 0);
+    try testing.assertTrue(failures[0].indexOf("one of the two 'from' clauses has to change") >= 0);
+    try testing.assertEqual(chosen(set), "");
+}
+
+test "requirements spanning majors are refused, naming both requirers and both versions" {
+    let set = setOf([
+        required("beta.utils", "1.1", "https://host/u.git", "/app/ens.package"),
+        required("beta.utils", "2.0", "https://host/u.git", "/dep/ens.package"),
+    ]);
+    string[] failures = requirements.select(set).failures();
+    try testing.assertEqual(failures.length, 1);
+    try testing.assertTrue(failures[0].indexOf(
+        "the requirements on package 'beta.utils' span major versions") >= 0);
+    try testing.assertTrue(failures[0].indexOf("/app/ens.package requires \"1.1\"") >= 0);
+    try testing.assertTrue(failures[0].indexOf("/dep/ens.package requires \"2.0\"") >= 0);
+    try testing.assertTrue(failures[0].indexOf("one of the two requirements has to change") >= 0);
+}
+
+test "a span of majors is reported once however many requirements are on the package" {
+    let set = setOf([
+        required("beta.utils", "1.1", "https://host/u.git", "/app/ens.package"),
+        required("beta.utils", "2.0", "https://host/u.git", "/dep/ens.package"),
+        required("beta.utils", "3.0", "https://host/u.git", "/third/ens.package"),
+    ]);
+    try testing.assertEqual(requirements.select(set).failures().length, 1);
+}
+
+test "a lock pinning a version is one more requirement, so nothing steps back quietly" {
+    let set = setOf([
+        required("alex.json", "1.0", "https://host/j.git", "/app/ens.package"),
+        required("alex.json", "1.4", "https://host/j.git", "/app/ens.lock"),
+    ]);
+    try testing.assertEqual(chosen(set), "alex.json 1.4 https://host/j.git");
+}
+
+test "several packages settle independently and the disagreements of one do not hide the other" {
+    let set = setOf([
+        required("a.good", "1.0", "https://host/a.git", "/app/ens.package"),
+        required("b.split", "1.0", "https://host/b.git", "/app/ens.package"),
+        required("b.split", "2.0", "https://host/b.git", "/dep/ens.package"),
+        required("c.good", "3.1", "https://host/c.git", "/app/ens.package"),
+    ]);
+    let selection = requirements.select(set);
+    try testing.assertEqual(selection.failures().length, 1);
+    try testing.assertEqual(chosen(set),
+        "a.good 1.0 https://host/a.git; b.split 2.0 https://host/b.git; "
+        + "c.good 3.1 https://host/c.git");
+    let found = selection.find("c.good");
+    try testing.assertTrue(found != null);
+    if (found != null) {
+        try testing.assertEqual(found.version().written(), "3.1");
+    }
+    try testing.assertTrue(selection.find("nobody.asked") == null);
+}
+
+test "an empty set asks for nothing and reports nothing" {
+    let selection = requirements.select(requirements.empty());
+    try testing.assertEqual(selection.packages().length, 0);
+    try testing.assertEqual(selection.failures().length, 0);
+}

@@ -1,0 +1,207 @@
+// What a build requires of the packages it does not hold itself, and what those requirements come to.
+//
+// A requirement is a fact a manifest stated, so the set of them only ever grows: a package that is
+// fetched states more of them, and they join the set rather than changing anything already in it.
+// Deciding what to fetch is then a function of the whole set, which is why it is written here as one:
+// nothing has to be resolved in the order it was discovered, and a set that grew in two orders comes
+// to the same answer either way.
+import @std.collections.sorting;
+import List from @std.collections.list;
+import Set from @std.collections.set;
+import Version from versions;
+import versions;
+
+// One package required at one version, by one manifest.
+export final class Requirement {
+    string requiredName;
+    Version requiredVersion;
+    string sourceUrl;
+    string requirer;
+
+    export constructor(this.requiredName, this.requiredVersion, this.sourceUrl, this.requirer);
+
+    export packageName() -> string {
+        return this.requiredName;
+    }
+
+    export version() -> Version {
+        return this.requiredVersion;
+    }
+
+    // The repository the declaration names, or empty text when it names none.
+    export url() -> string {
+        return this.sourceUrl;
+    }
+
+    // What stated the requirement, named the way a reader of a disagreement can go and look at it:
+    // a manifest's path, or the lock file.
+    export statedBy() -> string {
+        return this.requirer;
+    }
+}
+
+// Every requirement a build has gathered so far. Adding to it makes another set rather than changing
+// this one, so a set handed to something else can never be added to behind its back.
+export final class RequirementSet {
+    Requirement[] gathered;
+
+    export constructor(this.gathered);
+
+    export all() -> Requirement[] {
+        return this.gathered;
+    }
+
+    export count() -> long {
+        return this.gathered.length;
+    }
+
+    export with(Requirement[] more) -> RequirementSet {
+        let joined = new List<Requirement>();
+        for (let requirement in this.gathered) {
+            joined.push(requirement);
+        }
+        for (let requirement in more) {
+            joined.push(requirement);
+        }
+        return new RequirementSet(joined.toArray());
+    }
+
+    // The packages required, in name order, so everything derived from the set is in one settled
+    // order whatever order the requirements arrived in.
+    export names() -> string[] {
+        let seen = new Set<string>();
+        let names = new List<string>();
+        for (let requirement in this.gathered) {
+            if (seen.add(requirement.packageName())) {
+                names.push(requirement.packageName());
+            }
+        }
+        sorting.sort(names);
+        return names.toArray();
+    }
+
+    export forPackage(string packageName) -> Requirement[] {
+        let mine = new List<Requirement>();
+        for (let requirement in this.gathered) {
+            if (requirement.packageName() == packageName) {
+                mine.push(requirement);
+            }
+        }
+        return mine.toArray();
+    }
+}
+
+export empty() -> RequirementSet {
+    Requirement[] none = [];
+    return new RequirementSet(none);
+}
+
+// What one package's requirements came to: where it comes from and which version the build uses.
+export final class PackageChoice {
+    string chosenName;
+    string chosenUrl;
+    Version chosenVersion;
+
+    protected constructor(this.chosenName, this.chosenUrl, this.chosenVersion);
+
+    export packageName() -> string {
+        return this.chosenName;
+    }
+
+    export url() -> string {
+        return this.chosenUrl;
+    }
+
+    export version() -> Version {
+        return this.chosenVersion;
+    }
+}
+
+// What the whole set comes to: one choice per package that names a repository, in name order, and
+// every disagreement that has to be settled before any of it can be fetched.
+export final class Selection {
+    PackageChoice[] chosen;
+    string[] problems;
+
+    protected constructor(this.chosen, this.problems);
+
+    export packages() -> PackageChoice[] {
+        return this.chosen;
+    }
+
+    export failures() -> string[] {
+        return this.problems;
+    }
+
+    export find(string packageName) -> PackageChoice? {
+        for (let choice in this.chosen) {
+            if (choice.packageName() == packageName) {
+                return choice;
+            }
+        }
+        return null;
+    }
+}
+
+// The version of each package the build uses, and every reason it could not decide one. A package
+// nothing names a repository for is left out: where it comes from is settled somewhere else, and a
+// build that finds it nowhere is told so when its imports are resolved.
+export select(RequirementSet requirements) -> Selection {
+    let chosen = new List<PackageChoice>();
+    let problems = new List<string>();
+    for (let name in requirements.names()) {
+        Requirement[] mine = requirements.forPackage(name);
+        string url = agreedUrl(name, mine, problems);
+        reportMajorSpan(name, mine, problems);
+        if (url.length == 0) {
+            continue;
+        }
+        Version highest = mine[0].version();
+        for (let requirement in mine) {
+            highest = versions.higher(highest, requirement.version());
+        }
+        chosen.push(new PackageChoice(name, url, highest));
+    }
+    return new Selection(chosen.toArray(), problems.toArray());
+}
+
+// The one repository every requirement on the package names. Two different ones cannot both be the
+// package, so it is a disagreement between the two manifests rather than a choice to make.
+agreedUrl(string name, Requirement[] mine, List<string> problems) -> string {
+    string url = "";
+    string namedBy = "";
+    for (let requirement in mine) {
+        if (requirement.url().length == 0) {
+            continue;
+        }
+        if (url.length == 0) {
+            url = requirement.url();
+            namedBy = requirement.statedBy();
+            continue;
+        }
+        if (requirement.url() != url) {
+            problems.push("package '{name}' is required from two different repositories: "
+                + "{namedBy} names {url} and {requirement.statedBy()} names {requirement.url()}. "
+                + "Every package in one build has to agree on where a dependency comes from, so one "
+                + "of the two 'from' clauses has to change");
+            return "";
+        }
+    }
+    return url;
+}
+
+// Requirements spanning major versions have no answer: a build links one copy of a package, and two
+// major versions of it are not the same package used two ways.
+reportMajorSpan(string name, Requirement[] mine, List<string> problems) {
+    for (let requirement in mine) {
+        if (versions.sameMajor(mine[0].version(), requirement.version())) {
+            continue;
+        }
+        problems.push("the requirements on package '{name}' span major versions: "
+            + "{mine[0].statedBy()} requires \"{mine[0].version().written()}\" and "
+            + "{requirement.statedBy()} requires \"{requirement.version().written()}\". Different "
+            + "major versions are not interchangeable, so one of the two requirements has to "
+            + "change");
+        return;
+    }
+}
