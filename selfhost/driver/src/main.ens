@@ -1,8 +1,8 @@
 // The `ens` command: read the command line, settle the invocation, and run the one thing it names.
 //
-// The working folder is read once, here, into the invocation every part of a build then reads from;
-// nothing anywhere changes it. Exit codes are the same for every command: 0 it worked, 1 the work
-// failed, 2 the command line asked for something it cannot have.
+// The working folder and the environment are read once, here, into the values every part of a build
+// then reads from; nothing anywhere changes either of them. Exit codes are the same for every
+// command: 0 it worked, 1 the work failed, 2 the command line asked for something it cannot have.
 import @std.system;
 import FileLoader from @ens.sema.support.loader;
 import SystemFileLoader from @ens.sema.support.loader;
@@ -15,7 +15,10 @@ import @ens.build.stdlib;
 import @ens.build.version;
 import BuildTarget from @ens.build.target;
 import @ens.build.target;
+import Environment from @ens.build.environment;
 import Reporter from @ens.build.report;
+import ToolchainRequest from @ens.build.toolchain;
+import @ens.build.toolchain;
 import commands;
 import cst;
 import options;
@@ -23,7 +26,8 @@ import options;
 main() -> int {
     let application = commands.application();
     string[] argv = system.arguments();
-    let invocation = parse.commandLine(application, argv.slice(1, argv.length));
+    string[] forwarded = argv.slice(1, argv.length);
+    let invocation = parse.commandLine(application, forwarded);
 
     let problem = invocation.problem();
     if (problem != null) {
@@ -38,10 +42,13 @@ main() -> int {
         print(versionLine());
         return 0;
     }
-    return dispatch(invocation);
+    let environment = new Environment(system.environment(), system.platform());
+    return dispatch(invocation, environment, forwarded);
 }
 
-dispatch(Invocation invocation) -> int {
+// `forwarded` is the command line as it arrived, after this program's own name, which a command
+// handing the work to another toolchain passes on unchanged.
+dispatch(Invocation invocation, Environment environment, string[] forwarded) -> int {
     switch (invocation.command()) {
         "version" -> {
             print(versionLine());
@@ -54,10 +61,10 @@ dispatch(Invocation invocation) -> int {
             return cst.analyzeFile(invocation.positionals()[0]);
         },
         "build" -> {
-            return compile(invocation, true);
+            return compile(invocation, environment, forwarded, true);
         },
         "check" -> {
-            return compile(invocation, false);
+            return compile(invocation, environment, forwarded, false);
         },
         default -> {
             system.writeError("Internal: the command '{invocation.command()}' is declared but "
@@ -67,9 +74,9 @@ dispatch(Invocation invocation) -> int {
     }
 }
 
-// Runs a build or a check: resolve what was named, settle the options, then hand both to the build
-// package.
-compile(Invocation invocation, bool emit) -> int {
+// Runs a build or a check: resolve what was named, settle the options, see whether another toolchain
+// should be doing this at all, then hand the work to the build package.
+compile(Invocation invocation, Environment environment, string[] forwarded, bool emit) -> int {
     FileLoader loader = new SystemFileLoader();
     string workingFolder = system.currentDirectory();
     string named = "";
@@ -86,6 +93,7 @@ compile(Invocation invocation, bool emit) -> int {
         system.writeError("ens: " + settled.failure());
         return 2;
     }
+    let reporter = new Reporter(given);
 
     let resolution = target.resolve(loader, workingFolder, named);
     let resolved = resolution.target();
@@ -94,10 +102,17 @@ compile(Invocation invocation, bool emit) -> int {
         return 2;
     }
 
+    // Which toolchain does the work is settled before anything is looked for on this machine,
+    // because a toolchain that takes the work over brings its own standard library with it.
+    let handed = toolchain.hand(environment, toolchainRequest(invocation, environment),
+        resolved.governingVersion(), forwarded, reporter);
+    if (handed.finished()) {
+        return handed.exitCode();
+    }
+
     string stdlibRoot = given.stdlibRoot();
     if (stdlibRoot.length == 0) {
-        stdlibRoot = stdlib.findRoot(loader, system.getEnvironmentVariable("ENS_STDLIB"),
-            resolved.root());
+        stdlibRoot = stdlib.findRoot(loader, environment.value("ENS_STDLIB"), resolved.root());
     }
     if (stdlibRoot.length == 0) {
         system.writeError("ens: " + stdlib.missingMessage());
@@ -105,11 +120,17 @@ compile(Invocation invocation, bool emit) -> int {
     }
 
     let built = given.withStdlibRoot(stdlibRoot);
-    let reporter = new Reporter(built);
     if (emit) {
         return build.run(loader, built, resolved, reporter);
     }
     return check.run(loader, built, resolved, reporter);
+}
+
+// What the command line and the environment said about which toolchain does the work. The option
+// wins over the variable, because it was written for this one run.
+toolchainRequest(Invocation invocation, Environment environment) -> ToolchainRequest {
+    return new ToolchainRequest(invocation.value("toolchain") ?? "",
+        environment.value("ENS_TOOLCHAIN"));
 }
 
 versionLine() -> string {

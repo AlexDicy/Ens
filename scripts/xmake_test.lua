@@ -338,6 +338,16 @@ task("test")
             })
         end
 
+        -- the version multiplexer, driven end to end against a second toolchain installed in a
+        -- scratch folder: the hop, the command line it forwards, the exit code it propagates, both
+        -- ways of suppressing it, and the guard that stops a delegate delegating again.
+        if want("cli_toolchain") then
+            table.insert(jobs, {
+                name = "cli_toolchain",
+                cli_toolchain = true,
+            })
+        end
+
         -- surface any requested names that matched no test, so typos don't pass silently.
         if wanted ~= nil then
             local unknown = {}
@@ -1839,12 +1849,202 @@ task("test")
                 full = string.format("%s:\n%s", name, table.concat(failures, "\n"))}
         end
 
+        -- version delegation: `ens` handing a whole invocation to another toolchain. A copy of the
+        -- built command is installed as toolchain 9.9 in a scratch folder, which is what makes the
+        -- mechanism observable while only one real version exists - the copy answers 'ens 0.1', so
+        -- it would hand the work straight back if the loop guard let it.
+        local function run_cli_toolchain(job)
+            local name = job.name
+            local root = path.join(os.projectdir(), "build", "cli", "enstoolchain")
+            os.tryrm(root)
+            os.mkdir(root)
+            local log = path.join(out_dir, name .. ".log")
+            local failures = {}
+
+            local env, native_libraries, env_error = llvmEnvironment()
+            if not env then
+                return {name = name, ok = false, short = "no LLVM library",
+                    full = string.format("%s: %s", name, env_error)}
+            end
+
+            local toolchains = path.join(root, "toolchains")
+            local installed_dir = path.join(toolchains, "9.9")
+            local installed_exe = path.join(installed_dir, "ens" .. exe_suffix)
+            os.mkdir(installed_dir)
+            os.cp(seed_exe, installed_exe)
+            -- the copy loads LLVM and the linker bridge at run time, and on Windows the loader
+            -- looks beside the executable first.
+            placeNativeLibraries(native_libraries, installed_dir)
+            local empty = path.join(root, "empty")
+            os.mkdir(empty)
+
+            -- run a command and assert its exit code and the fragments its output must carry; a
+            -- fragment prefixed '!' must not appear. `vars` are the environment variables this one
+            -- run adds, and ENS_TOOLCHAIN is cleared first so a variable set in the shell running
+            -- the suite cannot decide the answer.
+            local function run(program, argv, vars, expected_rc, ...)
+                local envs = {}
+                for key, value in pairs(env) do envs[key] = value end
+                envs.ENS_TOOLCHAIN = nil
+                for key, value in pairs(vars or {}) do envs[key] = value end
+                local rc = execMerged(program, argv, log, {envs = envs})
+                local out = io.readfile(log) or ""
+                local label = path.filename(program) .. " " .. table.concat(argv, " ")
+                if expected_rc ~= nil and rc ~= expected_rc then
+                    table.insert(failures, string.format("%s: exit=%s expected=%s\n%s",
+                        label, tostring(rc), tostring(expected_rc), out))
+                end
+                for _, fragment in ipairs({...}) do
+                    if fragment:sub(1, 1) == "!" then
+                        if out:find(fragment:sub(2), 1, true) then
+                            table.insert(failures, string.format("%s: output must not carry %q\n%s",
+                                label, fragment:sub(2), out))
+                        end
+                    elseif not out:find(fragment, 1, true) then
+                        table.insert(failures, string.format("%s: output missing %q\n%s",
+                            label, fragment, out))
+                    end
+                end
+                return rc, out
+            end
+
+            local function run_program(exe, expected_rc, expected_stdout)
+                if not os.isfile(exe) then
+                    table.insert(failures, string.format("expected executable %s", exe))
+                    return
+                end
+                local rc = execMerged(exe, {}, log)
+                local out = captured(log)
+                if rc ~= expected_rc or out ~= expected_stdout then
+                    table.insert(failures, string.format("%s: exit=%s stdout=%q",
+                        path.filename(exe), tostring(rc), out))
+                end
+            end
+
+            -- the fixtures: a package written for 9.9 in a folder whose name holds a space, so a hop
+            -- that mangled the command line could not build it; a library written for 9.9, whose
+            -- refusal of --output is a usage exit code to propagate; and one that does not compile,
+            -- whose failure is the other exit code.
+            local pkg = path.join(root, "spaced pkg")
+            os.mkdir(path.join(pkg, "src"))
+            io.writefile(path.join(pkg, "ens.package"),
+                'package demo.spaced {\n    ens "9.9";\n}\n')
+            io.writefile(path.join(pkg, "src", "main.ens"),
+                'main() -> int {\n    print("built by a delegate");\n    return 0;\n}\n')
+            local library = path.join(root, "library")
+            os.mkdir(path.join(library, "src"))
+            io.writefile(path.join(library, "ens.package"),
+                'package demo.library {\n    ens "9.9";\n}\n')
+            io.writefile(path.join(library, "src", "greet.ens"),
+                'export greet() -> string {\n    return "hi";\n}\n')
+            local broken = path.join(root, "broken")
+            os.mkdir(path.join(broken, "src"))
+            io.writefile(path.join(broken, "ens.package"),
+                'package demo.broken {\n    ens "9.9";\n}\n')
+            io.writefile(path.join(broken, "src", "main.ens"),
+                'main() -> int {\n    return missing();\n}\n')
+
+            local hello = path.join(tests_dir, "hello.ens")
+            local chains = {ENS_TOOLCHAINS = toolchains}
+            local nothing_installed = {ENS_TOOLCHAINS = empty}
+            -- every path the command prints is written with '/', whatever this machine writes
+            local function slashed(p) return (p:gsub("\\", "/")) end
+            -- the hop always names the program it hands the work to, so that name appearing is the
+            -- hop having happened and its absence is the work having stayed here
+            local hopped_to = slashed(installed_exe)
+            local not_hopped = "!" .. hopped_to
+
+            -- the hop: the package is built by the toolchain installed as the version it is written
+            -- for, and the command line reaches it exactly as it was written here, spaces and all
+            local spaced_out = path.join(root, "spaced out.exe")
+            run(seed_exe, {"build", pkg, "--output", spaced_out, "-v"}, chains, 0,
+                "written for Ens 9.9", hopped_to, "built")
+            run_program(spaced_out, 0, "built by a delegate")
+
+            -- the exit code of the toolchain that did the work is this command's own
+            run(seed_exe, {"check", broken, "-v"}, chains, 1, hopped_to,
+                "Undefined function 'missing'")
+            run(seed_exe, {"build", library, "--output", path.join(root, "library.exe"), "-v"},
+                chains, 2, hopped_to, "builds as a library")
+
+            -- '--toolchain' asks for one by name, whatever the build root says, and answers for a
+            -- name that is not installed instead of ignoring it
+            local by_option = path.join(root, "by option.exe")
+            run(seed_exe, {"build", hello, "--output", by_option, "--toolchain", "9.9", "-v"},
+                chains, 0, "'--toolchain 9.9'", hopped_to, "built")
+            run_program(by_option, 0, "Hello, world!")
+            run(seed_exe, {"build", hello, "--toolchain", "9.9"}, nothing_installed, 2,
+                "'--toolchain 9.9'", "holds no toolchain at all", "ask for 'local'",
+                slashed(path.join(empty, "9.9", "ens" .. exe_suffix)))
+
+            -- both ways of keeping the work here
+            run(seed_exe, {"build", pkg, "--output", path.join(root, "kept.exe"), "-v",
+                "--toolchain", "local"}, chains, 0, "built", not_hopped)
+            run(seed_exe, {"build", pkg, "--output", path.join(root, "pinned.exe"), "-v"},
+                {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "local"}, 0, "built", not_hopped)
+
+            -- ENS_TOOLCHAIN is the option's environment spelling, and the option wins over it
+            run(seed_exe, {"build", hello, "--output", path.join(root, "by variable.exe"), "-v"},
+                {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "9.9"}, 0, "ENS_TOOLCHAIN=9.9",
+                hopped_to, "built")
+            run(seed_exe, {"build", hello, "--output", path.join(root, "overridden.exe"), "-v",
+                "--toolchain", "local"}, {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "9.9"}, 0,
+                "built", not_hopped)
+
+            -- a version declared but not installed is what a manifest's declaration has always
+            -- been: a statement, not a requirement. It builds here, and says so only when asked.
+            local anyway = path.join(root, "anyway.exe")
+            run(seed_exe, {"build", pkg, "--output", anyway, "-v"}, nothing_installed, 0,
+                "written for Ens 9.9", "holds no toolchain at all", "this toolchain is building it",
+                "built")
+            run_program(anyway, 0, "built by a delegate")
+            run(seed_exe, {"build", pkg, "--output", path.join(root, "quiet.exe")},
+                nothing_installed, 0, "built", "!9.9")
+
+            -- the loop guard, from the delegate's side: the copy sees the very declaration that
+            -- reached it and asks for 9.9 outright, and still does the work itself
+            run(installed_exe, {"build", pkg, "--output", path.join(root, "guarded.exe"), "-v",
+                "--toolchain", "9.9"}, {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "local"}, 0,
+                "ENS_TOOLCHAIN=local", "built", not_hopped)
+
+            -- and from outside: one hop is all there is, however the chain starts
+            local _, chained = run(installed_exe, {"build", pkg, "--output",
+                path.join(root, "once.exe"), "-v"}, chains, 0, "built")
+            local hops = 0
+            local at = 1
+            while true do
+                local found = chained:find(hopped_to, at, true)
+                if not found then
+                    break
+                end
+                hops = hops + 1
+                at = found + 1
+            end
+            if hops ~= 1 then
+                table.insert(failures, string.format("the work was handed on %d time(s), and one "
+                    .. "hop is all there is:\n%s", hops, chained))
+            end
+
+            -- the commands that never delegate, however the environment is set
+            run(seed_exe, {"version"}, {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "9.9"}, 0,
+                "ens 0.1")
+            run(seed_exe, {"help", "build"}, chains, 0, "--toolchain <version>")
+
+            if #failures == 0 then
+                return {name = name, ok = true}
+            end
+            return {name = name, ok = false,
+                short = string.format("%d delegation assertion(s) failed", #failures),
+                full = string.format("%s:\n%s", name, table.concat(failures, "\n"))}
+        end
+
         -- run a single test: compile, optionally run, and compare against the header.
         -- returns { name = ..., ok = bool, short = <fail reason>, full = <detailed report> }.
         local function run_one(job)
             if job.corpus then return run_corpus(job) end
             if job.semacheck then return run_semacheck(job) end
             if job.cli_build then return run_cli_build(job) end
+            if job.cli_toolchain then return run_cli_toolchain(job) end
             if job.cli_core then return run_cli_core(job) end
             if job.cli_workspace then return run_cli_workspace(job) end
             if job.cli_override then return run_cli_override(job) end
