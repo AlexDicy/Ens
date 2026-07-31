@@ -41,7 +41,10 @@ If the spec, the C++ compiler, and the self-hosted compiler disagree, that is a 
 - The packaging tests (`cli_git`, `cli_artifact`) shell out to the system `git` and `curl`; both must be on PATH.
 - `xmake test` uses the binary of the currently configured mode.
   Never run `xmake f -m release` to "fix" staleness; rebuild instead.
-  If linking fails with unresolved LLVM symbols, put the LLVM package's `bin` folder (containing `clang++.exe`) on PATH, run `xmake f -c -m <current mode>`, then `xmake build ens`.
+  If linking fails with unresolved LLVM symbols, put the LLVM package's `bin` folder (containing `clang++.exe`) on PATH, run `xmake f -c -m <current mode> -p windows -a x64`, then `xmake build ens`.
+  Pass the platform and architecture explicitly: with `clang++` on PATH and no `-p`/`-a`, xmake detects `mingw/x86_64` and then refuses the packages.
+  Building without that `bin` folder on PATH re-resolves the linker to MSVC `link.exe`, which silently ignores `-lLLVMCGData` and leaves unresolved LLVM CGData symbols.
+  That choice is written into the config, so later builds keep failing even once PATH is fixed until the reconfigure above is rerun.
 - Run only one build/test session at a time; concurrent xmake invocations collide.
 
 ### Test conventions
