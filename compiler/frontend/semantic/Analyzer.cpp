@@ -303,6 +303,54 @@ const ast::LiteralExpression* asIntLiteralChild(const ast::Expression& e) {
     return asIntegerLiteralChild(e, /*allowLong=*/false);
 }
 
+// A floating-point literal carries no type of its own only when it is written without a
+// suffix. `1.0f` names float and `1.0d` names double, exactly as `5L` names long, so
+// neither adapts.
+bool isUnsuffixedFloatText(std::u16string_view text) {
+    if (text.empty()) return false;
+    char16_t last = text.back();
+    return last != u'f' && last != u'F' && last != u'd' && last != u'D';
+}
+
+const ast::LiteralExpression* asFloatLiteralChild(const ast::Expression& e) {
+    auto accept = [](const ast::LiteralExpression& lit) -> bool {
+        if (lit.literalKind() != SyntaxKind::DoubleLiteral) return false;
+        auto tok = lit.token();
+        return tok && isUnsuffixedFloatText(tok->tokenText());
+    };
+    if (auto lit = e.asLiteral()) {
+        if (!accept(*lit)) return nullptr;
+        static thread_local std::optional<ast::LiteralExpression> hold;
+        hold = lit;
+        return &*hold;
+    }
+    if (auto pre = e.asPrefix()) {
+        auto op = pre->operatorToken();
+        if (!op) return nullptr;
+        if (op->kind() != SyntaxKind::Plus && op->kind() != SyntaxKind::Minus) return nullptr;
+        auto operand = pre->operand();
+        if (!operand) return nullptr;
+        if (auto lit = operand->asLiteral()) {
+            if (!accept(*lit)) return nullptr;
+            static thread_local std::optional<ast::LiteralExpression> hold;
+            hold = lit;
+            return &*hold;
+        }
+    }
+    return nullptr;
+}
+
+std::string floatLimitString(Type* target) {
+    if (!target) return "";
+    switch (target->kind) {
+        case TypeKind::Float:  return "about 3.4e38";
+        case TypeKind::Double: return "about 1.8e308";
+        default:
+            assert(false && "floatLimitString called on non-floating-point type");
+            return "";
+    }
+}
+
 bool literalIsNegative(const ast::Expression& e) {
     if (auto pre = e.asPrefix()) {
         if (auto op = pre->operatorToken()) return op->kind() == SyntaxKind::Minus;
@@ -397,6 +445,36 @@ void Analyzer::tryAdaptCharLiteral(const ast::Expression& src, Type* target) {
     analysis.setType(lit->node.greenNode(), target);
 }
 
+// An unsuffixed floating-point literal takes the surrounding floating-point type when the
+// magnitude is one that type holds. Rounding to the nearest value the type has is part of
+// the conversion, so a literal like 0.1 adapts even though no binary float represents it
+// exactly; only a magnitude that would become infinity is refused.
+void Analyzer::tryAdaptFloatLiteral(const ast::Expression& src, Type* target) {
+    if (!target || target->isError()) return;
+    if (!target->isFloat() || target->kind == TypeKind::Decimal) return;
+    const ast::LiteralExpression* lit = asFloatLiteralChild(src);
+    if (!lit) return;
+
+    auto tok = lit->token();
+    if (!tok) return;
+    std::u16string text(tok->tokenText());
+    double magnitude = parseFloatLiteralMagnitude(text);
+    bool negative = literalIsNegative(src);
+
+    if (!floatMagnitudeFits(magnitude, target->kind == TypeKind::Float)) {
+        std::string num = (negative ? std::string("-") : std::string("")) + asciiOf(text);
+        std::string hint = target->kind == TypeKind::Float
+            ? "; 'double' reaches further." : ".";
+        errorAtNode(src.node, "Literal " + num + " is too large for '" + target->toString() +
+            "', which holds " + floatLimitString(target) + " at most" + hint);
+        analysis.setType(src.node.greenNode(), typeCtx.getError());
+        return;
+    }
+
+    analysis.setType(src.node.greenNode(), target);
+    analysis.setType(lit->node.greenNode(), target);
+}
+
 void Analyzer::tryAdaptIntegerLiteral(const ast::Expression& src, Type* target) {
     if (!target || target->isError()) return;
     if (!target->isInteger()) return;
@@ -477,6 +555,7 @@ Type* Analyzer::analyzeExprAdapt(const ast::Expression& expr, Type* target) {
     if (!target || target->isError() || t->isError()) return t;
     tryAdaptIntegerLiteral(expr, target);
     tryAdaptCharLiteral(expr, target);
+    tryAdaptFloatLiteral(expr, target);
     Type* updated = analysis.typeOf(expr.node.greenNode());
     return updated ? updated : t;
 }
@@ -4803,6 +4882,8 @@ Type* Analyzer::analyzeBinaryOperands(const SyntaxNode& diagNode, SyntaxKind op,
     auto tryAdaptOperands = [&]() {
         tryAdaptIntegerLiteral(left, r);
         tryAdaptIntegerLiteral(right, l);
+        tryAdaptFloatLiteral(left, r);
+        tryAdaptFloatLiteral(right, l);
         Type* lu = analysis.typeOf(left.node.greenNode());
         Type* ru = analysis.typeOf(right.node.greenNode());
         if (lu) l = lu;
@@ -5057,8 +5138,9 @@ std::vector<Symbol*> overloadChainOf(Symbol* head) {
     return chain;
 }
 
-// How well an argument fits a parameter. Untyped integer and char literals
-// adapt to any integer type their value fits, as they do for assignments.
+// How well an argument fits a parameter. Untyped integer, char, and floating-point
+// literals adapt to any type of their own family their value fits, as they do for
+// assignments.
 int conversionRank(const ast::Expression& arg, Type* argT, Type* paramT) {
     if (!argT || !paramT) return kRankNone;
     if (argT->isError() || paramT->isError()) return kRankExact;
@@ -5076,6 +5158,16 @@ int conversionRank(const ast::Expression& arg, Type* argT, Type* paramT) {
             if (auto tok = lit->token()) {
                 uint32_t cp = parseCharLiteralCodepoint(tok->tokenText());
                 if (literalFitsTarget(/*negative*/ false, cp, paramT)) {
+                    return argT->widensTo(paramT) ? kRankConvert : kRankLiteral;
+                }
+            }
+        }
+    }
+    if (paramT->isFloat() && paramT->kind != TypeKind::Decimal) {
+        if (const ast::LiteralExpression* lit = asFloatLiteralChild(arg)) {
+            if (auto tok = lit->token()) {
+                double magnitude = parseFloatLiteralMagnitude(tok->tokenText());
+                if (floatMagnitudeFits(magnitude, paramT->kind == TypeKind::Float)) {
                     return argT->widensTo(paramT) ? kRankConvert : kRankLiteral;
                 }
             }
@@ -5339,6 +5431,7 @@ Type* Analyzer::checkResolvedCallArguments(const CallShape& shape, const Overloa
             if (!paramT || paramT->isError() || !argT || argT->isError()) return;
             tryAdaptIntegerLiteral(valueExpr, paramT);
             tryAdaptCharLiteral(valueExpr, paramT);
+            tryAdaptFloatLiteral(valueExpr, paramT);
             Type* updated = analysis.typeOf(valueExpr.node.greenNode());
             if (updated) finalT = updated;
         }
@@ -6008,6 +6101,7 @@ Type* Analyzer::analyzeGenericCall(const ast::CallExpression& expr, Symbol* sym,
     for (size_t i = 0; i < n; ++i) {
         Type* paramT = typeCtx.substitute(sym->paramTypes[i], sym, typeArgs);
         tryAdaptIntegerLiteral(args[i], paramT);
+        tryAdaptFloatLiteral(args[i], paramT);
         Type* argT = argTypes[i];
         if (paramT && argT && !paramT->isError() && !argT->isError() &&
             !paramT->assignableFrom(argT)) {
@@ -6884,6 +6978,8 @@ Type* Analyzer::analyzeTernary(const ast::TernaryExpression& expr) {
     // Adapt polymorphic int literal in one branch toward the other branch's type.
     if (thenE) tryAdaptIntegerLiteral(*thenE, elseT);
     if (elseE) tryAdaptIntegerLiteral(*elseE, thenT);
+    if (thenE) tryAdaptFloatLiteral(*thenE, elseT);
+    if (elseE) tryAdaptFloatLiteral(*elseE, thenT);
     if (thenE) { Type* upd = analysis.typeOf(thenE->node.greenNode()); if (upd) thenT = upd; }
     if (elseE) { Type* upd = analysis.typeOf(elseE->node.greenNode()); if (upd) elseT = upd; }
     if (Type* unified = unifyValueTypes(thenT, elseT)) return unified;
@@ -7447,6 +7543,7 @@ Type* Analyzer::analyzeSwitchArms(const std::optional<ast::Expression>& scrutine
         if (!t || t->isError()) return typeCtx.getError();
         if (!result) { result = t; continue; }
         tryAdaptIntegerLiteral(ve, result);
+        tryAdaptFloatLiteral(ve, result);
         if (Type* u = analysis.typeOf(ve.node.greenNode())) t = u;
         if (Type* unified = unifyValueTypes(result, t)) { result = unified; continue; }
         errorAtNode(diagNode, "Switch arms produce incompatible types '" + result->toString() +
@@ -7457,7 +7554,10 @@ Type* Analyzer::analyzeSwitchArms(const std::optional<ast::Expression>& scrutine
         errorAtNode(diagNode, "A switch used as a value must produce a value in every arm.");
         return typeCtx.getError();
     }
-    for (auto& ve : valueExprs) tryAdaptIntegerLiteral(ve, result);
+    for (auto& ve : valueExprs) {
+        tryAdaptIntegerLiteral(ve, result);
+        tryAdaptFloatLiteral(ve, result);
+    }
     return result ? result : typeCtx.getError();
 }
 

@@ -13,6 +13,22 @@
 // Returns false if the text is malformed or the magnitude overflows 64 bits.
 bool parseIntegerLiteralMagnitude(std::u16string_view text, uint64_t& out);
 
+// Parses the text of a `FloatLiteral` or `DoubleLiteral` token (decimal digits, an
+// optional fraction, an optional `e` exponent, `_` separators among the integral and
+// fractional digits, and an optional trailing `f`/`F`/`d`/`D` type suffix). The text
+// does NOT include a leading `+`/`-`, the parser places those as a separate
+// `PrefixExpression` over the literal.
+//
+// Returns the magnitude, saturated to infinity when it is larger than a `double` holds
+// and flushed to zero when it is smaller, so this never fails and never throws.
+double parseFloatLiteralMagnitude(std::u16string_view text);
+
+// True when the magnitude is one the type can hold, which for a floating-point type
+// means it does not overflow to infinity. A value that is representable in magnitude
+// but not exactly, such as 0.1, fits: the conversion rounds to the nearest value the
+// type has. `isFloat` selects the 32-bit type's limit over the 64-bit one's.
+bool floatMagnitudeFits(double magnitude, bool isFloat);
+
 // Decodes a `CharLiteral` token's text (still surrounded by single quotes,
 // possibly containing an escape sequence or a surrogate pair) into a Unicode
 // codepoint. Recognised escapes: \n \t \r \b \f \0 \\ \' \" \uXXXX, any other

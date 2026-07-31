@@ -1,7 +1,10 @@
 #include "Literals.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <limits>
 #include <string>
 
 bool parseIntegerLiteralMagnitude(std::u16string_view text, uint64_t& out) {
@@ -35,6 +38,31 @@ bool parseIntegerLiteralMagnitude(std::u16string_view text, uint64_t& out) {
     }
     out = v;
     return true;
+}
+
+double parseFloatLiteralMagnitude(std::u16string_view text) {
+    std::string s;
+    s.reserve(text.size());
+    for (char16_t c : text) {
+        if (c == u'_') continue;  // digit grouping, not part of the value
+        s.push_back(static_cast<char>(c));
+    }
+    if (!s.empty()) {
+        char last = s.back();
+        if (last == 'f' || last == 'F' || last == 'd' || last == 'D') s.pop_back();
+    }
+    if (s.empty()) return 0.0;
+    // strtod saturates and flushes rather than throwing, which std::stod does for a
+    // magnitude outside the range of a double.
+    return std::strtod(s.c_str(), nullptr);
+}
+
+bool floatMagnitudeFits(double magnitude, bool isFloat) {
+    // A magnitude too large for a double already arrives as infinity, and infinity
+    // compares greater than the float limit too, so one test covers both types.
+    if (std::isinf(magnitude)) return false;
+    if (!isFloat) return true;
+    return magnitude <= static_cast<double>(std::numeric_limits<float>::max());
 }
 
 static int hexDigitValue(char16_t c) {

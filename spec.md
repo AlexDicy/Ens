@@ -812,6 +812,23 @@ long n = 5;              // OK - 5 fits in long
 byte big = 300;          // error: 300 does not fit in 'byte' (range -128..127)
 ```
 
+Floating-point literals follow the same rule in their own family: one written without a type suffix adapts to the surrounding type when that type is `float` or `double`, and with no context it defaults to `double`.
+Rounding to the nearest value the type has is part of the conversion, so `float ratio = 0.1;` is accepted even though no binary floating-point type holds a tenth exactly.
+Only a magnitude the type cannot hold at all, one that would become infinity, produces an error; a magnitude too small to tell apart from zero rounds to zero.
+A suffix names the type and leaves nothing to adapt, so `1.0f` is a `float` and `1.0d` a `double`, just as `5L` is a `long`.
+
+In both families a literal takes its type from what it sits against, and the surrounding type does not reach through an operator into its operands.
+So `uint mask = 1 + 4;` and `float ratio = 1.0 + 2.0;` are both errors; give one operand the type you want, as in `float ratio = 1.0f + 2.0;` or `uint mask = (1 as uint) + 4;`, and the other adapts to it.
+
+```ens
+float ratio = 0.5;       // OK - the literal adapts to float
+float tenth = 0.1;       // OK - rounds to the nearest float
+double wide = 0.5;       // OK - a literal with no other context is a double
+float suffixed = 1.0f;   // OK - written as a float outright
+float tooBig = 3.5e38;   // error: too large for 'float', which holds about 3.4e38 at most
+float viaOperator = 1.0 + 2.0;  // error: the operands are doubles, and their sum is a double
+```
+
 ---
 
 `let` and a typed declaration both introduce a mutable binding. `const` introduces an immutable one: it must be initialized, and assigning to it again, or passing it as `out`, is a compile error. Like `let`, a `const` may infer its type or state it explicitly.

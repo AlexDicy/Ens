@@ -2227,6 +2227,7 @@ class BodyChecker implements NoreturnCalls {
         }
         this.adaptIntegerLiteral(node, target);
         this.adaptCharLiteral(node, target);
+        this.adaptFloatLiteral(node, target);
         let updated = this.result.typeOf(node.green());
         if (updated != null) {
             return updated;
@@ -2263,6 +2264,42 @@ class BodyChecker implements NoreturnCalls {
             this.reporter.report("Literal {sign}{literal.value().text()} does not fit in "
                 + "'{types.display(target)}' (range "
                 + "{literalvalues.integerRange(target.kind())})", node.span());
+            this.result.setType(node.green(), this.store.errorType());
+            return;
+        }
+        this.result.setType(node.green(), target);
+        this.result.setType(literal.green(), target);
+    }
+
+    // Retypes an unsuffixed floating-point literal to the floating-point target its magnitude
+    // fits, and rejects the literal outright when the magnitude is one the target cannot hold.
+    adaptFloatLiteral(Expression node, Type target) {
+        if (target is PrimitiveType) {
+            this.adaptFloatLiteralTo(node, target);
+        }
+    }
+
+    adaptFloatLiteralTo(Expression node, PrimitiveType target) {
+        if (target.kind() != PrimitiveKind.Float && target.kind() != PrimitiveKind.Double) {
+            return;
+        }
+        let literal = floatLiteralOf(node);
+        if (literal == null) {
+            return;
+        }
+        double magnitude = literalvalues.floatMagnitude(literal.value().text());
+        if (!literalvalues.floatMagnitudeFits(magnitude, target.kind())) {
+            string sign = "";
+            if (isNegativeLiteral(node)) {
+                sign = "-";
+            }
+            string hint = ".";
+            if (target.kind() == PrimitiveKind.Float) {
+                hint = "; 'double' reaches further.";
+            }
+            this.reporter.report("Literal {sign}{literal.value().text()} is too large for "
+                + "'{types.display(target)}', which holds "
+                + "{literalvalues.floatLimit(target.kind())} at most{hint}", node.span());
             this.result.setType(node.green(), this.store.errorType());
             return;
         }
@@ -2474,6 +2511,8 @@ class BodyChecker implements NoreturnCalls {
     adaptOperands(Expression leftNode, Expression rightNode, Type left, Type right) -> Type[] {
         this.adaptIntegerLiteral(leftNode, right);
         this.adaptIntegerLiteral(rightNode, left);
+        this.adaptFloatLiteral(leftNode, right);
+        this.adaptFloatLiteral(rightNode, left);
         Type adaptedLeft = left;
         Type adaptedRight = right;
         let updatedLeft = this.result.typeOf(leftNode.green());
@@ -2890,6 +2929,8 @@ class BodyChecker implements NoreturnCalls {
         }
         this.adaptIntegerLiteral(node.thenValue(), elseType);
         this.adaptIntegerLiteral(node.elseValue(), thenType);
+        this.adaptFloatLiteral(node.thenValue(), elseType);
+        this.adaptFloatLiteral(node.elseValue(), thenType);
         let updatedThen = this.result.typeOf(node.thenValue().green());
         if (updatedThen != null) {
             thenType = updatedThen;
@@ -3763,7 +3804,12 @@ class BodyChecker implements NoreturnCalls {
             return new ArgumentValue(name, analyzed, false, false,
                 literalvalues.charCodepoint(value.value().text()), true, value.span());
         }
-        return new ArgumentValue(name, analyzed, false, false, 0, false, value.span());
+        let plain = new ArgumentValue(name, analyzed, false, false, 0, false, value.span());
+        let floatLiteral = floatLiteralOf(value);
+        if (floatLiteral != null) {
+            plain.markFloatLiteral(literalvalues.floatMagnitude(floatLiteral.value().text()));
+        }
+        return plain;
     }
 
     // Final argument checking against the chosen candidate: adapt untyped literals to the
@@ -3787,6 +3833,7 @@ class BodyChecker implements NoreturnCalls {
             } else if (value != null) {
                 this.adaptIntegerLiteral(value, parameterType);
                 this.adaptCharLiteral(value, parameterType);
+                this.adaptFloatLiteral(value, parameterType);
                 let updated = this.result.typeOf(value.green());
                 if (updated != null) {
                     finalType = updated;
@@ -4559,6 +4606,7 @@ class BodyChecker implements NoreturnCalls {
                 Type parameterType = this.store.substitute(parameters[i].type(), owner,
                     resolvedArguments);
                 this.adaptIntegerLiteral(argument, parameterType);
+                this.adaptFloatLiteral(argument, parameterType);
                 Type actual = argumentTypes.get(i);
                 let updated = this.result.typeOf(argument.green());
                 if (updated != null) {
@@ -5106,6 +5154,7 @@ class BodyChecker implements NoreturnCalls {
                 continue;
             }
             this.adaptIntegerLiteral(expression, unified);
+            this.adaptFloatLiteral(expression, unified);
             Type adapted = this.recordedType(expression);
             if (!(adapted is ErrorType)) {
                 analyzed = adapted;
@@ -5125,6 +5174,7 @@ class BodyChecker implements NoreturnCalls {
         }
         for (long i = 0; i < valueExpressions.length(); i++) {
             this.adaptIntegerLiteral(valueExpressions.get(i), unified);
+            this.adaptFloatLiteral(valueExpressions.get(i), unified);
         }
         return unified;
     }
@@ -5732,6 +5782,41 @@ isNegativeLiteral(Expression node) -> bool {
         return node.operator().kind() == SyntaxKind.Minus;
     }
     return false;
+}
+
+// The unsuffixed floating-point literal a value is written as, behind an optional sign. A
+// suffix names the type, so '1.0f' is a float and '1.0d' a double the way '5L' is a long, and
+// neither adapts.
+floatLiteralOf(Expression node) -> LiteralExpressionNode? {
+    if (node is LiteralExpressionNode) {
+        if (isUnsuffixedFloatLiteral(node)) {
+            return node;
+        }
+        return null;
+    }
+    if (node is PrefixExpressionNode) {
+        SyntaxKind operator = node.operator().kind();
+        if (operator != SyntaxKind.Plus && operator != SyntaxKind.Minus) {
+            return null;
+        }
+        let operand = node.operand();
+        if (operand is LiteralExpressionNode && isUnsuffixedFloatLiteral(operand)) {
+            return operand;
+        }
+    }
+    return null;
+}
+
+isUnsuffixedFloatLiteral(LiteralExpressionNode literal) -> bool {
+    if (literal.value().kind() != SyntaxKind.DoubleLiteral) {
+        return false;
+    }
+    byte[] raw = literal.value().text().toBytes();
+    if (raw.length == 0) {
+        return false;
+    }
+    byte last = raw[raw.length - 1];
+    return last != 'f' && last != 'F' && last != 'd' && last != 'D';
 }
 
 // ---- The canonical fill loop ----

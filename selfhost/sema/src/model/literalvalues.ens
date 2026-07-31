@@ -1,5 +1,6 @@
-// Literal value readers for expression checking: the magnitude of an integer literal, the
-// codepoint of a character literal, and the range table untyped literals adapt against.
+// Literal value readers for expression checking: the magnitude of an integer or floating-point
+// literal, the codepoint of a character literal, and the range tables untyped literals adapt
+// against.
 import PrimitiveKind from model.types;
 import StringBuilder from @std.text.stringbuilder;
 
@@ -222,6 +223,127 @@ fitsSigned(bool negative, ulong magnitude, ulong positiveLimit) -> bool {
         return magnitude <= positiveLimit + 1;
     }
     return magnitude <= positiveLimit;
+}
+
+// The magnitude of a floating-point literal token, with underscore separators and a trailing
+// 'f'/'F'/'d'/'D' type suffix ignored. The sign is never part of the text: the parser places it
+// as a prefix over the literal. Digits that fit a 64-bit integer and a scale within the
+// exactly-representable powers of ten convert without rounding drift; wider values fall back to
+// stepwise scaling, and a magnitude beyond what a double holds scales up to infinity, which is
+// how the fitting check below recognizes it.
+//
+// This is the single reader both the fitting check and code generation use, so a literal the
+// checker accepts can never emit as a value the checker would have refused.
+export floatMagnitude(string text) -> double {
+    byte[] raw = text.toBytes();
+    ulong mantissa = 0;
+    long digitCount = 0;
+    long fractionDigits = 0;
+    bool inFraction = false;
+    long exponent = 0;
+    bool exponentNegative = false;
+    bool inExponent = false;
+    for (long i = 0; i < raw.length; i++) {
+        byte value = raw[i];
+        if (value == '_' || value == 'f' || value == 'F' || value == 'd' || value == 'D'
+                || value == '+') {
+            continue;
+        }
+        if (value == '.') {
+            inFraction = true;
+            continue;
+        }
+        if (value == 'e' || value == 'E') {
+            inExponent = true;
+            continue;
+        }
+        if (value == '-') {
+            exponentNegative = true;
+            continue;
+        }
+        if (value < '0' || value > '9') {
+            continue;
+        }
+        long digit = value - '0';
+        if (inExponent) {
+            if (exponent < 100000) {
+                exponent = exponent * 10 + digit;
+            }
+            continue;
+        }
+        if (digitCount < 19) {
+            mantissa = mantissa * 10 + (digit as ulong);
+            digitCount++;
+            if (inFraction) {
+                fractionDigits++;
+            }
+        } else if (!inFraction) {
+            fractionDigits--;
+        }
+    }
+    if (exponentNegative) {
+        exponent = 0 - exponent;
+    }
+    return scaleByPowersOfTen(mantissa as double, exponent - fractionDigits);
+}
+
+scaleByPowersOfTen(double value, long scale) -> double {
+    double scaled = value;
+    long remaining = scale;
+    while (remaining > 0) {
+        long step = remaining;
+        if (step > 22) {
+            step = 22;
+        }
+        scaled = scaled * powerOfTen(step);
+        remaining = remaining - step;
+    }
+    while (remaining < 0) {
+        long step = 0 - remaining;
+        if (step > 22) {
+            step = 22;
+        }
+        scaled = scaled / powerOfTen(step);
+        remaining = remaining + step;
+    }
+    return scaled;
+}
+
+// Powers of ten up to 10^22 are exactly representable in a double.
+powerOfTen(long power) -> double {
+    double result = 1.0;
+    for (long i = 0; i < power; i++) {
+        result = result * 10.0;
+    }
+    return result;
+}
+
+// True when a floating-point literal's magnitude is one the kind holds. Rounding to the nearest
+// value the kind has is part of the conversion, so a magnitude like 0.1 fits even though no
+// binary floating-point type represents it exactly; only one that would become infinity does not.
+public floatMagnitudeFits(double magnitude, PrimitiveKind kind) -> bool {
+    if (isInfinite(magnitude)) {
+        return false;
+    }
+    if (kind == PrimitiveKind.Float) {
+        // The largest value a 32-bit float holds.
+        return magnitude <= 3.4028234663852886e38;
+    }
+    return kind == PrimitiveKind.Double;
+}
+
+// Halving leaves only zero and infinity unchanged, and a magnitude is never negative.
+isInfinite(double value) -> bool {
+    return value > 0.0 && value * 0.5 == value;
+}
+
+// The largest value the kind holds, as it reads in a diagnostic.
+public floatLimit(PrimitiveKind kind) -> string {
+    return switch (kind) {
+        Float -> "about 3.4e38",
+        Double -> "about 1.8e308",
+        default -> "",
+    };
 }
 
 // The kind's value range as it reads in a diagnostic.
