@@ -151,12 +151,15 @@ task("test")
             })
         end
 
-        -- the self-hosted semantic layer's tests run the same way.
+        -- the self-hosted semantic layer's tests. This one suite is still compiled by ens-ref:
+        -- the seed miscompiles it at every optimization level above 0, in the EIR move rewrite of
+        -- the borrow-rewriting pass, and the run ends in an access violation partway through.
+        -- Moving this job onto the seed waits on that pass.
         if want("selfhost_sema") then
             table.insert(jobs, {
                 name = "selfhost_sema",
                 source = path.join(os.projectdir(), "selfhost", "sema"),
-                ens_test_args = {},
+                reference_tests = true,
             })
         end
 
@@ -278,8 +281,8 @@ task("test")
         if want("selfhost_llvm") then
             table.insert(jobs, {
                 name = "selfhost_llvm",
-                llvm_tests = true,
                 source = path.join(os.projectdir(), "selfhost", "llvm"),
+                ens_test_args = {},
             })
         end
 
@@ -289,8 +292,8 @@ task("test")
         if want("selfhost_codegen") then
             table.insert(jobs, {
                 name = "selfhost_codegen",
-                llvm_tests = true,
                 source = path.join(os.projectdir(), "selfhost", "codegen"),
+                ens_test_args = {},
             })
         end
 
@@ -300,8 +303,8 @@ task("test")
         if want("selfhost_link") then
             table.insert(jobs, {
                 name = "selfhost_link",
-                llvm_tests = true,
                 source = path.join(os.projectdir(), "selfhost", "link"),
+                ens_test_args = {},
             })
         end
 
@@ -312,8 +315,8 @@ task("test")
         if want("selfhost_build") then
             table.insert(jobs, {
                 name = "selfhost_build",
-                llvm_tests = true,
                 source = path.join(os.projectdir(), "selfhost", "build"),
+                ens_test_args = {},
             })
         end
 
@@ -323,8 +326,8 @@ task("test")
         if want("selfhost_driver") then
             table.insert(jobs, {
                 name = "selfhost_driver",
-                llvm_tests = true,
                 source = path.join(os.projectdir(), "selfhost", "driver"),
+                ens_test_args = {},
             })
         end
 
@@ -335,6 +338,16 @@ task("test")
             table.insert(jobs, {
                 name = "cli_build",
                 cli_build = true,
+            })
+        end
+
+        -- the two commands that build something only in order to run it: the arguments `run` hands
+        -- a program, the code it propagates, the folder neither of them leaves behind, and the
+        -- rules `test` applies to what it discovers.
+        if want("cli_runtest") then
+            table.insert(jobs, {
+                name = "cli_runtest",
+                cli_runtest = true,
             })
         end
 
@@ -722,19 +735,17 @@ task("test")
                 full = string.format("%s:\n%s", name, out)}
         end
 
-        -- the unit tests of the packages that bind a native library. Their builds need the library
-        -- on the linker path and their runs need it loadable, set up the same way as the codegen
-        -- harness.
-        local function run_llvm_tests(job)
+        -- a `ens test` job the seed cannot compile yet, run by ens-ref instead.
+        local function run_reference_tests(job)
             local name = job.name
             local log = path.join(out_dir, name .. ".log")
-            local env, native_libraries, env_error = llvmEnvironment()
+            local env, _, env_error = llvmEnvironment()
             if not env then
-                return {name = name, ok = false, short = "no LLVM library",
+                return {name = name, ok = false, short = "no LLVM environment",
                     full = string.format("%s: %s", name, env_error)}
             end
             local run_rc = execMerged(ref_exe, {"test", job.source}, log, {envs = env})
-            local out = (io.readfile(log) or ""):gsub("[\r\n]+$", "")
+            local out = captured(log)
             if run_rc == 0 then
                 return {name = name, ok = true, note = out:match("(%d+/%d+ tests passed)")}
             end
@@ -1839,6 +1850,221 @@ task("test")
                 full = string.format("%s:\n%s", name, table.concat(failures, "\n"))}
         end
 
+        -- `ens run` and `ens test`: the two commands that build something only in order to run it.
+        -- Both work in a folder under the system's temp directory and remove it afterwards, which
+        -- this job points at a scratch folder of its own so it can assert nothing is left there.
+        local function run_cli_runtest(job)
+            local name = job.name
+            local root = path.join(os.projectdir(), "build", "cli", "ensruntest")
+            os.tryrm(root)
+            os.mkdir(root)
+            local temp = path.join(root, "temp")
+            os.mkdir(temp)
+            local log = path.join(out_dir, name .. ".log")
+            local failures = {}
+
+            local base = llvmEnvironment()
+            base.TMP = temp
+            base.TEMP = temp
+            base.TMPDIR = temp
+
+            -- run the command and assert its exit code and the fragments its output must carry; a
+            -- fragment prefixed '!' must not appear.
+            local function run(argv, opt, expected_rc, ...)
+                local options = {envs = base}
+                for key, value in pairs(opt or {}) do options[key] = value end
+                local rc = execMerged(seed_exe, argv, log, options)
+                local out = io.readfile(log) or ""
+                local label = table.concat(argv, " ")
+                if expected_rc ~= nil and rc ~= expected_rc then
+                    table.insert(failures, string.format("ens %s: exit=%s expected=%s\n%s",
+                        label, tostring(rc), tostring(expected_rc), out))
+                end
+                for _, fragment in ipairs({...}) do
+                    if fragment:sub(1, 1) == "!" then
+                        if out:find(fragment:sub(2), 1, true) then
+                            table.insert(failures, string.format("ens %s: output must not carry "
+                                .. "%q\n%s", label, fragment:sub(2), out))
+                        end
+                    elseif not out:find(fragment, 1, true) then
+                        table.insert(failures, string.format("ens %s: output missing %q\n%s",
+                            label, fragment, out))
+                    end
+                end
+                return rc, out
+            end
+
+            -- nothing may be left under the temp directory once a command has finished.
+            local function assertTempEmpty(after)
+                local left = {}
+                for _, entry in ipairs(os.dirs(path.join(temp, "*"))) do
+                    table.insert(left, path.filename(entry))
+                end
+                for _, entry in ipairs(os.files(path.join(temp, "*"))) do
+                    table.insert(left, path.filename(entry))
+                end
+                if #left > 0 then
+                    table.insert(failures, string.format("%s left %s under the temp folder",
+                        after, table.concat(left, ", ")))
+                    os.tryrm(path.join(temp, "*"))
+                end
+            end
+
+            local function writePackage(folder, manifest, files)
+                os.mkdir(path.join(folder, "src"))
+                io.writefile(path.join(folder, "ens.package"), manifest)
+                for relative, text in pairs(files) do
+                    local file = path.join(folder, relative)
+                    os.mkdir(path.directory(file))
+                    io.writefile(file, text)
+                end
+            end
+
+            -- a program that echoes its arguments and ends with the code the first one names
+            local echo = path.join(root, "echo")
+            writePackage(echo, 'package demo.echo {\n    ens "0.1";\n}\n', {
+                ["src/main.ens"] = 'import @std.system;\n\nmain() -> int {\n'
+                    .. '    string[] argv = system.arguments();\n'
+                    .. '    for (long i = 1; i < argv.length; i++) {\n'
+                    .. '        print("argument {i}: {argv[i]}");\n    }\n'
+                    .. '    if (argv.length > 1) {\n'
+                    .. '        return parsed(argv[1]);\n    }\n    return 0;\n}\n\n'
+                    .. 'parsed(string text) -> int {\n'
+                    .. '    if (text == "7") {\n        return 7;\n    }\n    return 0;\n}\n',
+            })
+
+            run({"run", echo}, nil, 0, "!argument 1")
+            assertTempEmpty("ens run")
+            run({"run", echo, "--", "one", "two three"}, nil, 0,
+                "argument 1: one", "argument 2: two three")
+            assertTempEmpty("ens run with arguments")
+            run({"run", echo, "--", "7"}, nil, 7, "argument 1: 7")
+            run({"run", path.join(tests_dir, "hello.ens")}, nil, 0, "Hello, world!")
+            run({"run", echo, "-v"}, nil, 0, "building echo for", "running")
+
+            -- a target with no main() is a usage problem, not a build failure
+            run({"run", path.join(tests_dir, "pkg_import_dep")}, nil, 2, "is not a program to run",
+                "does not define main()")
+
+            -- a program that does not compile fails the work rather than the command line
+            local broken = path.join(root, "broken")
+            writePackage(broken, 'package demo.broken {\n    ens "0.1";\n}\n', {
+                ["src/main.ens"] = 'main() -> int {\n    return missing();\n}\n',
+            })
+            run({"run", broken}, nil, 1, "did not compile, so it did not run")
+            assertTempEmpty("a failed ens run")
+
+            -- '--target' asks for a machine this command cannot run what it builds on
+            run({"run", echo, "--target", "aarch64-unknown-linux-gnu"}, nil, 2,
+                "runs what it builds", "drop '--target'")
+
+            -- a workspace root runs its one program, and says so when there is none or several
+            local one = path.join(root, "one")
+            os.mkdir(one)
+            io.writefile(path.join(one, "ens.package"),
+                'workspace {\n    member "app";\n    member "lib";\n}\n')
+            writePackage(path.join(one, "app"), 'package one.app {\n    ens "0.1";\n}\n', {
+                ["src/main.ens"] = 'main() -> int {\n    print("the one program");\n    return 0;\n}\n',
+            })
+            writePackage(path.join(one, "lib"), 'package one.lib {\n    ens "0.1";\n}\n', {
+                ["src/greet.ens"] = 'export greet() -> string {\n    return "hi";\n}\n',
+            })
+            run({"run", one}, nil, 0, "the one program")
+
+            local none = path.join(root, "none")
+            os.mkdir(none)
+            io.writefile(path.join(none, "ens.package"), 'workspace {\n    member "lib";\n}\n')
+            writePackage(path.join(none, "lib"), 'package none.lib {\n    ens "0.1";\n}\n', {
+                ["src/greet.ens"] = 'export greet() -> string {\n    return "hi";\n}\n',
+            })
+            run({"run", none}, nil, 2, "holds no program to run")
+
+            local several = path.join(root, "several")
+            os.mkdir(several)
+            io.writefile(path.join(several, "ens.package"),
+                'workspace {\n    member "first";\n    member "second";\n}\n')
+            for _, member in ipairs({"first", "second"}) do
+                writePackage(path.join(several, member),
+                    'package several.' .. member .. ' {\n    ens "0.1";\n}\n', {
+                    ["src/main.ens"] = 'main() -> int {\n    return 0;\n}\n',
+                })
+            end
+            run({"run", several}, nil, 2, "more than one program to run", "'several.first'",
+                "'several.second'")
+
+            -- a package whose tests pass, fail, and are narrowed by a filter
+            local suite = path.join(root, "suite")
+            writePackage(suite, 'package demo.suite {\n    ens "0.1";\n}\n', {
+                ["src/math.ens"] = 'export twice(long n) -> long {\n    return n * 2;\n}\n',
+                ["tests/math_test.ens"] = 'import @std.testing;\nimport math;\n\n'
+                    .. 'test "twice a small number" {\n'
+                    .. '    try testing.assertEqual(math.twice(2), 4L);\n}\n\n'
+                    .. 'test "twice zero" {\n'
+                    .. '    try testing.assertEqual(math.twice(0), 0L);\n}\n',
+            })
+            run({"test", suite}, nil, 0, "PASS twice a small number", "PASS twice zero",
+                "2/2 tests passed")
+            assertTempEmpty("ens test")
+            run({"test", suite, "--filter", "zero"}, nil, 0, "PASS twice zero",
+                "1/1 tests passed", "!twice a small")
+            run({"test", suite, "--filter", "unicorn"}, nil, 0, "has 'unicorn' in its description",
+                "2 tests are there in all")
+            assertTempEmpty("a filter that matched nothing")
+
+            local failing = path.join(root, "failing")
+            writePackage(failing, 'package demo.failing {\n    ens "0.1";\n}\n', {
+                ["src/math.ens"] = 'export twice(long n) -> long {\n    return n * 3;\n}\n',
+                ["tests/math_test.ens"] = 'import @std.testing;\nimport math;\n\n'
+                    .. 'test "twice a small number" {\n'
+                    .. '    try testing.assertEqual(math.twice(2), 4L);\n}\n',
+            })
+            run({"test", failing}, nil, 1, "FAIL twice a small number", "0/1 tests passed")
+
+            -- two test files of the same name would be imported as one module
+            local collide = path.join(root, "collide")
+            writePackage(collide, 'package demo.collide {\n    ens "0.1";\n}\n', {
+                ["src/math.ens"] = 'export one() -> long {\n    return 1;\n}\n',
+                ["tests/lex/scan_test.ens"] = 'test "lexing" {\n}\n',
+                ["tests/parse/scan_test.ens"] = 'test "parsing" {\n}\n',
+            })
+            run({"test", collide}, nil, 2, "lex/scan_test.ens", "parse/scan_test.ens",
+                "'scan_test'")
+
+            -- only the runner may be the program's entry point
+            local entry = path.join(root, "entry")
+            writePackage(entry, 'package demo.entry {\n    ens "0.1";\n}\n', {
+                ["src/math.ens"] = 'export one() -> long {\n    return 1;\n}\n',
+                ["tests/math_test.ens"] = 'test "counting" {\n}\n\n'
+                    .. 'main() -> int {\n    return 0;\n}\n',
+            })
+            run({"test", entry}, nil, 2, "math_test.ens", "defines main()")
+
+            -- a folder holding no tests, and a '--tests' folder that is not there
+            local bare = path.join(root, "bare")
+            writePackage(bare, 'package demo.bare {\n    ens "0.1";\n}\n', {
+                ["src/math.ens"] = 'export one() -> long {\n    return 1;\n}\n',
+            })
+            run({"test", bare}, nil, 0, "there are no tests in", "_test.ens")
+            run({"test", suite, "--tests", path.join(root, "nowhere")}, nil, 2, "is not a folder")
+
+            -- '--tests' names where the tests of one target live
+            run({"test", suite, "--tests", path.join(suite, "tests")}, nil, 0, "2/2 tests passed")
+
+            -- a file is not a folder of tests, and a workspace root tests its members
+            run({"test", path.join(tests_dir, "hello.ens")}, nil, 2, "is one file",
+                "folder the tests live in")
+            run({"test", one, "--tests", path.join(suite, "tests")}, nil, 2,
+                "'--tests' names one folder of tests")
+            run({"test", one}, nil, 0, "there are no tests in")
+
+            if #failures == 0 then
+                return {name = name, ok = true}
+            end
+            return {name = name, ok = false,
+                short = string.format("%d CLI assertion(s) failed", #failures),
+                full = string.format("%s:\n%s", name, table.concat(failures, "\n"))}
+        end
+
         -- version delegation: `ens` handing a whole invocation to another toolchain. A copy of the
         -- built command is installed as toolchain 9.9 in a scratch folder, which is what makes the
         -- mechanism observable while only one real version exists - the copy answers 'ens 0.1', so
@@ -2034,6 +2260,7 @@ task("test")
             if job.corpus then return run_corpus(job) end
             if job.semacheck then return run_semacheck(job) end
             if job.cli_build then return run_cli_build(job) end
+            if job.cli_runtest then return run_cli_runtest(job) end
             if job.cli_toolchain then return run_cli_toolchain(job) end
             if job.cli_core then return run_cli_core(job) end
             if job.cli_workspace then return run_cli_workspace(job) end
@@ -2042,7 +2269,7 @@ task("test")
             if job.cli_artifact then return run_cli_artifact(job) end
             if job.codegencheck then return run_codegencheck(job) end
             if job.bootstrap then return run_bootstrap(job) end
-            if job.llvm_tests then return run_llvm_tests(job) end
+            if job.reference_tests then return run_reference_tests(job) end
             local name = job.name
             local ens_file = job.ens_file
             local exe_file    = path.join(out_dir, name .. ".exe")
@@ -2119,7 +2346,11 @@ task("test")
                 return why
             end
 
-            -- @ens-test: invoke `ens test` on the folder and assert on its two streams.
+            -- `ens test` on a folder, asserting its two streams: the unit tests of every selfhost
+            -- package and of the standard library, and the @ens-test fixtures. The seed command runs
+            -- them, so the self-hosted sema and code generator see every one of those tests. Its
+            -- builds link through ens-lld and some of the suites bind native libraries, so the job
+            -- carries the same linker and loader environment the codegen harness does.
             if ens_test_args ~= nil then
                 os.tryrm(stdout_file)
                 os.tryrm(stderr_file)
@@ -2127,12 +2358,18 @@ task("test")
                 for _, a in ipairs(ens_test_args) do
                     table.insert(argv, (a:gsub("{dir}", (job.source:gsub("\\", "/")))))
                 end
-                local run_rc = execSplit(ref_exe, argv, stdout_file, stderr_file)
+                local env, _, env_error = llvmEnvironment()
+                if not env then
+                    return {name = name, ok = false, short = "no LLVM environment",
+                        full = string.format("%s: %s", name, env_error)}
+                end
+                local run_rc = execSplit(seed_exe, argv, stdout_file, stderr_file, {envs = env})
                 local actual_stdout = captured(stdout_file)
                 local actual_stderr = captured(stderr_file)
                 local why = compareRun(run_rc, actual_stdout, actual_stderr)
                 if #why == 0 then
-                    return {name = name, ok = true}
+                    return {name = name, ok = true,
+                        note = actual_stdout:match("(%d+/%d+ tests passed)")}
                 end
                 local short = table.concat(why, "; ")
                 return {name = name, ok = false, short = short,

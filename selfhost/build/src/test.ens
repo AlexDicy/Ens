@@ -1,0 +1,220 @@
+// Running a target's tests: find them, build them into one program with a runner around them, run
+// that program, and answer with what it came to. The program is built in a folder of its own that is
+// removed afterwards, so a test run leaves the tree it was pointed at as it found it.
+//
+// The run's streams belong to the command, so a result appears the moment the test that produced it
+// finishes rather than at the end. Nothing here reads the results back: what the runner says is what
+// a reader sees, and the code it ends with is all this needs.
+import @std.system;
+import SystemError from @std.system;
+import @std.path;
+import List from @std.collections.list;
+import FileLoader from @ens.sema.support.loader;
+import BuildOptions from options;
+import BuildTarget from target;
+import TargetKind from target;
+import WorkspaceMember from target;
+import target;
+import Environment from environment;
+import Reporter from report;
+import report;
+import Loaded from program;
+import program;
+import BuildOutcome from build;
+import UnitReport from build;
+import build;
+import platform;
+import scratch;
+import TestPlan from testing.discovery;
+import testing.discovery;
+import RunnerOverlay from testing.runner;
+import testing.runner;
+
+// Runs the target's tests and answers with the exit code: 0 every test passed, 1 some of them
+// failed, 2 the command line asked for something it cannot have or a run did not finish.
+export run(FileLoader loader, BuildOptions options, Environment environment, BuildTarget resolved,
+           string namedTests, string filter, Reporter reporter) -> int {
+    string unrunnable = platform.unrunnableTriple(options.targetTriple());
+    if (unrunnable.length > 0) {
+        reporter.problem(unrunnable);
+        return 2;
+    }
+    if (resolved.kind() == TargetKind.File) {
+        reporter.problem("'{resolved.root()}' is one file, and a test run reads a folder of test "
+            + "files; name the folder the tests live in, or the package that holds them");
+        return 2;
+    }
+    if (resolved.kind() == TargetKind.Workspace) {
+        return runWorkspace(loader, options, environment, resolved, namedTests, filter, reporter);
+    }
+    return runSuite(loader, options, environment, resolved.sourceFolder(),
+        discoveryRootOf(resolved, namedTests), resolved.artifactName(), filter, reporter, 1, 1);
+}
+
+// Where a target's tests are read from: the folder '--tests' named, else the target's own tests
+// folder, else its sources.
+discoveryRootOf(BuildTarget resolved, string namedTests) -> string {
+    if (namedTests.length > 0) {
+        return namedTests;
+    }
+    if (resolved.testsFolder().length > 0) {
+        return resolved.testsFolder();
+    }
+    return resolved.sourceFolder();
+}
+
+// Tests every member of a workspace, each one against its own tests. Every member is tested even
+// after one of them has failures, because a test run is asked in order to see them all.
+runWorkspace(FileLoader loader, BuildOptions options, Environment environment,
+             BuildTarget resolved, string namedTests, string filter, Reporter reporter) -> int {
+    if (namedTests.length > 0) {
+        reporter.problem("'--tests' names one folder of tests, and a workspace root tests every "
+            + "one of its members against its own; name the member folder to test one, or drop "
+            + "'--tests' and let each member use the folder it keeps its tests in");
+        return 2;
+    }
+    WorkspaceMember[] members = target.memberOrder(resolved.members()).members();
+    if (members.length == 0) {
+        reporter.note("this workspace lists no members, so there is nothing to test");
+        return 0;
+    }
+    int worst = 0;
+    for (long i = 0; i < members.length; i++) {
+        string source = path.join(members[i].folder(), "src");
+        int code = runSuite(loader, options, environment, source,
+            memberTestsFolder(members[i], source), members[i].packageName(), filter, reporter,
+            i + 1, members.length);
+        if (code > worst) {
+            worst = code;
+        }
+    }
+    return worst;
+}
+
+// Where a member keeps its tests: its own 'tests' folder, or its sources when it has none.
+memberTestsFolder(WorkspaceMember member, string source) -> string {
+    string tests = path.join(member.folder(), "tests");
+    if (system.isDirectory(tests)) {
+        return tests;
+    }
+    return source;
+}
+
+// Runs one suite: everything from what is under the discovery root to what the run came to.
+runSuite(FileLoader loader, BuildOptions options, Environment environment, string sourceFolder,
+         string discoveryRoot, string label, string filter, Reporter reporter, long index,
+         long total) -> int {
+    string announced = report.progress(index, total, label);
+    if (!system.isDirectory(discoveryRoot)) {
+        reporter.problem("{announced}: '{discoveryRoot}' is not a folder, so there are no tests to "
+            + "read from it");
+        return 2;
+    }
+    reporter.step("{announced}: reading the tests in {discoveryRoot}");
+
+    let plan = discovery.plan(loader, discoveryRoot, filter);
+    if (plan.usageProblem().length > 0) {
+        reporter.problem("{announced}: " + plan.usageProblem());
+        return 2;
+    }
+    if (plan.nothingToRun().length > 0) {
+        reporter.note("{announced}: " + plan.nothingToRun());
+        return 0;
+    }
+    reporter.step("{announced}: running {plan.tests().length} of {plan.discoveredCount()} test(s)");
+
+    let folder = scratch.create(environment, "ens-test");
+    if (folder.failure().length > 0) {
+        reporter.problem("{announced}: " + folder.failure());
+        return 2;
+    }
+    int code = runIn(loader, options, folder.folder(), sourceFolder, discoveryRoot, plan, announced,
+        reporter);
+    string leftBehind = scratch.discard(folder.folder());
+    if (leftBehind.length > 0) {
+        reporter.problem("{announced}: " + leftBehind);
+    }
+    return code;
+}
+
+// Builds the suite into the folder and runs it there.
+runIn(FileLoader loader, BuildOptions options, string folder, string sourceFolder,
+      string discoveryRoot, TestPlan plan, string announced, Reporter reporter) -> int {
+    string suite = path.join(folder, platform.executableNamed("tests", options.targetTriple()));
+    let built = compile(loader, options, sourceFolder, discoveryRoot, plan, suite);
+    reporter.explanation(built.explanation());
+    if (built.outcome() != BuildOutcome.BuiltExecutable) {
+        reporter.problems(built.problems());
+        reporter.problem("{announced}: the tests did not compile, so none of them ran");
+        return 2;
+    }
+    reporter.step("{announced}: running {suite}");
+    return started(suite, announced, reporter);
+}
+
+// Runs the built suite with the streams this command was given, so every result appears as the test
+// that produced it finishes.
+started(string suite, string announced, Reporter reporter) -> int {
+    let outcome = runner.outcomeOf(try system.run(suite, noArguments()));
+    if (outcome.failure().length > 0) {
+        reporter.problem("{announced}: " + outcome.failure());
+    }
+    return outcome.exitCode();
+} catch (SystemError error) {
+    reporter.problem("{announced}: the tests were built but could not be run: {error.message}");
+    return 2;
+}
+
+// Compiles the tests and the runner around them into one program. Only the runner may be the
+// program's entry point: a module that brings a second main() into the graph could not be linked,
+// and the linker's account of that is no help to whoever wrote the test.
+compile(FileLoader loader, BuildOptions options, string sourceFolder, string discoveryRoot,
+        TestPlan plan, string suite) -> UnitReport {
+    let unit = program.seededUnit(sourceFolder, testsRootOf(sourceFolder, discoveryRoot),
+        seedsOf(plan), runner.modulePath(), "tests");
+    FileLoader overlay = new RunnerOverlay(loader, path.join(discoveryRoot, runner.fileName()),
+        runner.source(plan.tests()));
+    let loaded = program.load(overlay, options, unit);
+    string second = secondEntryPoint(loaded);
+    if (second.length > 0) {
+        return build.failedUnit([second], loaded.moduleCount());
+    }
+    return build.finishUnit(options, loaded, "tests", suite, build.discoverToolchain(options));
+}
+
+// The tests root a graph of this suite reads: the discovery folder when it is not the source folder
+// itself, and empty text when it is.
+testsRootOf(string sourceFolder, string discoveryRoot) -> string {
+    if (path.normalize(discoveryRoot) == path.normalize(sourceFolder)) {
+        return "";
+    }
+    return discoveryRoot;
+}
+
+// The files the graph starts from: every test file, then the runner that calls into them.
+seedsOf(TestPlan plan) -> string[] {
+    let seeds = new List<string>();
+    for (let file in plan.testFiles()) {
+        seeds.push(file);
+    }
+    seeds.push(runner.fileName());
+    return seeds.toArray();
+}
+
+// A module other than the runner that defines main(), which is what would give the suite two entry
+// points, or empty text when the runner is the only one.
+secondEntryPoint(Loaded loaded) -> string {
+    for (let modulePath in loaded.entryModules()) {
+        if (modulePath != loaded.entryModule()) {
+            return "the module '{modulePath}' defines main(), and a test run builds its own entry "
+                + "point around the tests, so there would be two; keep main() out of the modules "
+                + "the tests reach";
+        }
+    }
+    return "";
+}
+
+noArguments() -> string[] {
+    string[] none = [];
+    return none;
+}

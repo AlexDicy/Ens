@@ -1,0 +1,151 @@
+// Building a program in order to run it. The artifact goes into a folder of its own that is removed
+// afterwards, so running a program leaves the tree it was built from as it was found, and the code
+// the program ends with becomes this command's own.
+//
+// Everything written after '--' reaches the program exactly as it was written: no shell takes part,
+// and the streams belong to the command, so a program that reads input or writes as it goes behaves
+// as it would if it had been started by hand.
+import @std.system;
+import SystemError from @std.system;
+import @std.path;
+import List from @std.collections.list;
+import FileLoader from @ens.sema.support.loader;
+import BuildOptions from options;
+import BuildTarget from target;
+import TargetKind from target;
+import WorkspaceMember from target;
+import target;
+import Environment from environment;
+import Reporter from report;
+import report;
+import Unit from program;
+import program;
+import BuildOutcome from build;
+import build;
+import platform;
+import scratch;
+
+// Builds the program the target names and runs it, answering with the code it ended with. A command
+// line that cannot be acted on answers 2, and work that failed answers 1.
+export run(FileLoader loader, BuildOptions options, Environment environment, BuildTarget resolved,
+           string[] programArguments, Reporter reporter) -> int {
+    string unrunnable = platform.unrunnableTriple(options.targetTriple());
+    if (unrunnable.length > 0) {
+        reporter.problem(unrunnable);
+        return 2;
+    }
+    let chosen = application(loader, resolved);
+    let unit = chosen.unit();
+    if (unit == null) {
+        reporter.problem(chosen.failure());
+        return 2;
+    }
+
+    let folder = scratch.create(environment, "ens-run");
+    if (folder.failure().length > 0) {
+        reporter.problem(folder.failure());
+        return 2;
+    }
+    int code = runIn(loader, options, folder.folder(), unit, chosen.artifactStem(),
+        programArguments, reporter);
+    string leftBehind = scratch.discard(folder.folder());
+    if (leftBehind.length > 0) {
+        reporter.problem(leftBehind);
+    }
+    return code;
+}
+
+// The program the target names, or why it names none.
+final class Application {
+    Unit? chosen;
+    string stem;
+    string problem;
+
+    protected constructor(this.chosen, this.stem, this.problem);
+
+    protected unit() -> Unit? {
+        return this.chosen;
+    }
+
+    protected artifactStem() -> string {
+        return this.stem;
+    }
+
+    protected failure() -> string {
+        return this.problem;
+    }
+}
+
+// Which of the target's programs to run. A file, a folder and a package each hold at most one, so
+// the only choice is at a workspace root: exactly one of its members must be an application.
+application(FileLoader loader, BuildTarget resolved) -> Application {
+    if (resolved.kind() == TargetKind.Workspace) {
+        return workspaceApplication(loader, resolved);
+    }
+    if (!program.definesEntryFile(loader, mainModuleOf(resolved))) {
+        return refused("'{resolved.root()}' is not a program to run: its main module does not "
+            + "define main(). A program's main module is the file named on the command line, or "
+            + "'main.ens' in the folder or package it names");
+    }
+    return new Application(program.unitOf(resolved), resolved.artifactName(), "");
+}
+
+workspaceApplication(FileLoader loader, BuildTarget resolved) -> Application {
+    let found = new List<WorkspaceMember>();
+    let named = new List<string>();
+    for (let member in target.memberOrder(resolved.members()).members()) {
+        if (program.definesEntryFile(loader, path.join(member.folder(), "src/main.ens"))) {
+            found.push(member);
+            named.push(member.packageName());
+        }
+    }
+    if (found.length() == 0) {
+        return refused("the workspace at '{resolved.root()}' holds no program to run: no member's "
+            + "'src/main.ens' defines main(). Name the member folder of the program you meant");
+    }
+    if (found.length() > 1) {
+        return refused("the workspace at '{resolved.root()}' holds more than one program to run: "
+            + report.quotedNames(named.toArray())
+            + ". Name the member folder of the one you meant");
+    }
+    let only = found.get(0);
+    return new Application(program.memberUnit(only), target.artifactStem(only.packageName()), "");
+}
+
+// The file that has to define main() for the target to be a program. A target's entry file is named
+// relative to the folder its modules are read from, and a target with none reads 'main.ens' there.
+mainModuleOf(BuildTarget resolved) -> string {
+    if (resolved.entryFile().length > 0) {
+        return path.join(resolved.sourceFolder(), resolved.entryFile());
+    }
+    return path.join(resolved.sourceFolder(), "main.ens");
+}
+
+// Builds the program into the folder and runs it there.
+runIn(FileLoader loader, BuildOptions options, string folder, Unit unit, string artifactStem,
+      string[] programArguments, Reporter reporter) -> int {
+    string artifact = path.join(folder,
+        platform.executableNamed(artifactStem, options.targetTriple()));
+    reporter.step("building {unit.label()} for {options.targetTriple()}");
+    let built = build.buildUnit(loader, options, unit, artifactStem, artifact,
+        build.discoverToolchain(options));
+    reporter.explanation(built.explanation());
+    if (built.outcome() != BuildOutcome.BuiltExecutable) {
+        reporter.problems(built.problems());
+        reporter.problem("'{unit.label()}' did not compile, so it did not run");
+        return 1;
+    }
+    reporter.step("running {artifact}");
+    return started(artifact, programArguments, reporter);
+}
+
+started(string artifact, string[] programArguments, Reporter reporter) -> int {
+    return try system.run(artifact, programArguments);
+} catch (SystemError error) {
+    reporter.problem("'{artifact}' was built but could not be run: {error.message}");
+    return 1;
+}
+
+refused(string problem) -> Application {
+    return new Application(null, "", problem);
+}

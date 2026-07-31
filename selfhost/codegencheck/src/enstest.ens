@@ -1,19 +1,16 @@
 // Verifies an '@ens-test' fixture: the harness plays a test run over the self-hosted pipeline. It
 // discovers the fixture's tests and synthesizes its runner the way the command does - both come
 // from '@ens.build.testing', so there is one description of what a test run is - then compiles and
-// runs the result and maps the run to the driver's observable contract: the runner's stdout echoed
-// verbatim, its stderr passed through, and an exit code outside {0, 1} reported as an aborted run
-// naming the test that was running.
+// runs the result and maps the run to what the command would have shown: the runner's two streams as
+// it wrote them, and the code the command's own contract gives what the runner ended with.
 import @std.system;
 import SystemError from @std.system;
 import List from @std.collections.list;
-import @std.text.strings;
 import @std.path;
 import FileLoader from @ens.sema.support.loader;
 import SystemFileLoader from @ens.sema.support.loader;
 import @ens.sema.program.graph;
 import @ens.build.paths;
-import DiscoveredTest from @ens.build.testing.discovery;
 import TestPlan from @ens.build.testing.discovery;
 import @ens.build.testing.discovery;
 import RunnerOverlay from @ens.build.testing.runner;
@@ -22,19 +19,9 @@ import Manifest from manifest;
 import Fixture from manifest;
 import Directives from directives;
 import directives;
-import CapturedRun from build;
 import Environment from build;
 import build;
 import text;
-
-// What the driver's test subcommand would have shown: its exit code and its two streams.
-class DriverOutcome {
-    protected long exitCode;
-    protected string stdoutText;
-    protected string stderrText;
-
-    protected constructor(this.exitCode, this.stdoutText, this.stderrText);
-}
 
 // Runs the fixture's test suite the way 'ens test <folder> <arguments>' runs it and compares the
 // outcome against the fixture's directives. Returns "" when the fixture verifies, or a description
@@ -54,10 +41,10 @@ public verify(Manifest manifest, Environment environment, Fixture fixture,
     FileLoader tree = new SystemFileLoader();
     let plan = discovery.plan(tree, discoveryRoot, asked.filter);
     if (plan.usageProblem().length > 0) {
-        return compare(parsed, new DriverOutcome(2, "", plan.usageProblem() + "\n"));
+        return directives.compareRun(parsed, 2, "", reported(plan.usageProblem()));
     }
     if (plan.nothingToRun().length > 0) {
-        return compare(parsed, new DriverOutcome(0, plan.nothingToRun(), ""));
+        return directives.compareRun(parsed, 0, plan.nothingToRun(), "");
     }
 
     let graphResult = graph.buildGraph(overlayOver(tree, discoveryRoot, plan), sourceRoot,
@@ -69,14 +56,11 @@ public verify(Manifest manifest, Environment environment, Fixture fixture,
     }
 
     let ran = try build.runCaptured(manifest, prefix);
-    return compare(parsed, driverOutcomeOf(ran, plan.tests()));
+    let outcome = runner.outcomeOf(ran.exitCode as int);
+    return directives.compareRun(parsed, outcome.exitCode(), ran.stdoutText,
+        ran.stderrText + reported(outcome.failure()));
 } catch (SystemError e) {
     return "could not run: {e.message}";
-}
-
-compare(Directives parsed, DriverOutcome outcome) -> string {
-    return directives.compareRun(parsed, outcome.exitCode, outcome.stdoutText,
-        outcome.stderrText);
 }
 
 // The runner over the tree the tests were read from, exactly as the command injects it.
@@ -93,39 +77,6 @@ seedsOf(TestPlan plan) -> string[] {
     }
     seeds.push(runner.fileName());
     return seeds.toArray();
-}
-
-// The driver echoes the runner's captured stdout verbatim and lets its stderr through; an exit
-// code other than 0 (all passed) and 1 (some failed) means the run aborted partway, so the
-// driver reports the test that was running on stderr and maps a negative code (a hard crash) to
-// 2 and any other abnormal code to 1.
-driverOutcomeOf(CapturedRun ran, DiscoveredTest[] tests) -> DriverOutcome {
-    if (ran.exitCode == 0 || ran.exitCode == 1) {
-        return new DriverOutcome(ran.exitCode, ran.stdoutText, ran.stderrText);
-    }
-    string report = abortReport(tests, ran.stdoutText, ran.exitCode);
-    long mapped = 1;
-    if (ran.exitCode < 0) {
-        mapped = 2;
-    }
-    return new DriverOutcome(mapped, ran.stdoutText, ran.stderrText + report);
-}
-
-// Names the test that was running when the runner died: each completed test printed exactly one
-// line beginning "PASS " or "FAIL ", so the crasher is the next test after those.
-abortReport(DiscoveredTest[] tests, string runnerStdout, long exitCode) -> string {
-    long reported = 0;
-    for (let line in strings.lines(runnerStdout)) {
-        if (line.startsWith("PASS ") || line.startsWith("FAIL ")) {
-            reported++;
-        }
-    }
-    string report = "The test run ended unexpectedly (exit code {exitCode})";
-    if (reported < tests.length) {
-        report = report + " while running test '{tests[reported].description()}' "
-            + "({tests[reported].file()})";
-    }
-    return report + ". {reported} of {tests.length} tests had reported a result.\n";
 }
 
 // What the command line asked for: a filter, a tests folder, or a token neither of those.
@@ -154,6 +105,14 @@ readArguments(string[] arguments, string sourceRoot) -> Arguments {
         }
     }
     return new Arguments(filter, testsRoot, "");
+}
+
+// A line the command writes on its error stream.
+reported(string problem) -> string {
+    if (problem.length == 0) {
+        return "";
+    }
+    return problem + "\n";
 }
 
 // Every '\{dir\}' in an @ens-test argument expands to the fixture's source folder.
