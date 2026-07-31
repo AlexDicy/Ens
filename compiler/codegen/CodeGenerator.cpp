@@ -30,6 +30,7 @@
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
 
+#include <cstdlib>
 #include <filesystem>
 #include <optional>
 #include <unordered_map>
@@ -4132,12 +4133,19 @@ struct CodeGenerator::Impl {
         return static_cast<long long>(magnitude);
     }
 
+    // Underscores group a literal's digits for the reader and are not part of its value; a
+    // trailing suffix names the width. strtod saturates a magnitude the type cannot hold to
+    // infinity and flushes a tiny one to zero, where stod would throw and take the compiler
+    // down with no diagnostic at all.
     static double parseDoubleText(std::u16string_view text) {
-        std::string s; s.reserve(text.size());
-        for (char16_t c : text) s.push_back(static_cast<char>(c));
+        std::string s;
+        s.reserve(text.size());
+        for (char16_t c : text) {
+            if (c != u'_') s.push_back(static_cast<char>(c));
+        }
         if (!s.empty() && (s.back() == 'f' || s.back() == 'F' || s.back() == 'd' || s.back() == 'D'))
             s.pop_back();
-        return std::stod(s);
+        return s.empty() ? 0.0 : std::strtod(s.c_str(), nullptr);
     }
 
     llvm::Value* emitLiteral(const ast::LiteralExpression& e) {
