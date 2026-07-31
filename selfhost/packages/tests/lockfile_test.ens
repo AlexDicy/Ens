@@ -1,0 +1,193 @@
+// The lock file, whose one hard promise is that it reads back as what was written. Nothing else can
+// be relied on if that does not hold: a build compares a lock against what it resolved, so a lock
+// that came back different from how it went in would make every build rewrite it.
+import @std.testing;
+import TestFailure from @std.testing;
+import @std.path;
+import Lockfile from lockfile;
+import LockPackage from lockfile;
+import LockRequirement from lockfile;
+import LockArtifact from lockfile;
+import lockfile;
+import support;
+
+test "a lock recording nothing is still a lock, and reads back as one" {
+    string text = lockfile.render(lockfile.empty());
+    try testing.assertEqual(text, "lock 1\n");
+    let reading = lockfile.parse("ens.lock", text);
+    try testing.assertEqual(reading.failure(), "");
+    try testing.assertTrue(reading.found(), "the text was there to read");
+    try testing.assertEqual(reading.lock().packages().length, 0);
+    try testing.assertEqual(reading.lock().rootName(), "");
+    try testing.assertEqual(lockfile.render(reading.lock()), text);
+}
+
+test "everything a lock records survives being written and read back" {
+    string written = lockfile.render(sample());
+    try testing.assertEqual(written,
+        "lock 1\n"
+        + "root demo.app\n"
+        + "artifact zlib windows https://example.com/z.lib sha256:" + digits("a") + "\n"
+        + "package acme.json 1.4\n"
+        + "source https://example.com/json.git 1111111111111111111111111111111111111111\n"
+        + "content sha256:" + digits("b") + "\n"
+        + "require acme.text 2.0\n"
+        + "artifact fastpath linux https://example.com/fast.a sha256:" + digits("c") + "\n"
+        + "artifact fastpath windows https://example.com/fast.lib sha256:" + digits("d") + "\n"
+        + "package acme.text 2.1\n"
+        + "source https://example.com/text.git 2222222222222222222222222222222222222222\n"
+        + "content sha256:" + digits("e") + "\n");
+
+    let reading = lockfile.parse("ens.lock", written);
+    try testing.assertEqual(reading.failure(), "");
+    try testing.assertEqual(lockfile.render(reading.lock()), written);
+
+    let json = try recorded(reading.lock(), "acme.json");
+    try testing.assertEqual(json.version(), "1.4");
+    try testing.assertEqual(json.url(), "https://example.com/json.git");
+    try testing.assertEqual(json.commit(), "1111111111111111111111111111111111111111");
+    try testing.assertEqual(json.content(), "sha256:" + digits("b"));
+    try testing.assertEqual(json.requirements().length, 1);
+    try testing.assertEqual(json.requirements()[0].packageName(), "acme.text");
+    try testing.assertEqual(json.requirements()[0].version(), "2.0");
+    try testing.assertEqual(json.artifacts().length, 2);
+    try testing.assertEqual(json.artifacts()[0].library(), "fastpath");
+    try testing.assertEqual(json.artifacts()[0].platform(), "linux");
+    try testing.assertEqual(reading.lock().rootArtifacts().length, 1);
+    try testing.assertEqual(reading.lock().rootArtifacts()[0].url(),
+        "https://example.com/z.lib");
+    try testing.assertTrue(reading.lock().find("acme.none") == null,
+        "the lock found a package it never recorded");
+}
+
+// A build resolves in whatever order it reached things; the file it writes must not show that, or a
+// lock under version control would churn on every build.
+test "the order a lock was built in does not reach the file" {
+    LockRequirement[] none = [];
+    LockArtifact[] noArtifacts = [];
+    let text = new LockPackage("acme.text", "2.1", "https://example.com/text.git",
+        "2222222222222222222222222222222222222222", "sha256:" + digits("e"), none, noArtifacts);
+    let json = new LockPackage("acme.json", "1.4", "https://example.com/json.git",
+        "1111111111111111111111111111111111111111", "sha256:" + digits("b"),
+        [new LockRequirement("acme.text", "2.0"), new LockRequirement("acme.bits", "1.0")],
+        noArtifacts);
+
+    let oneWay = new Lockfile("demo.app", noArtifacts, [json, text]);
+    let another = new Lockfile("demo.app", noArtifacts, [text, json]);
+    try testing.assertEqual(lockfile.render(oneWay), lockfile.render(another));
+
+    // Requirements settle too, whichever order the resolution reached them in.
+    try assertMentions(lockfile.render(oneWay), "require acme.bits 1.0\nrequire acme.text 2.0\n");
+}
+
+test "a lock file that is not one is refused, saying what to do about it" {
+    try assertRefused("", "records nothing at all");
+    try assertRefused("\n\n", "records nothing at all");
+    try assertRefused("lock 2\n", "its first line should be 'lock 1'");
+    try assertRefused("package acme.json 1.0\n", "its first line should be 'lock 1'");
+    try assertRefused("lock 1\nfrobnicate acme.json\n",
+        "at line 2: 'frobnicate acme.json'");
+    try assertRefused("lock 1\npackage acme.json\n", "at line 2: 'package acme.json'");
+    try assertRefused("lock 1\ncontent sha256:abc\n", "at line 2: 'content sha256:abc'");
+    try assertRefused("lock 1\nroot demo.app\nsource a b\n", "at line 3: 'source a b'");
+
+    // Every one of them says the same thing about what a lock file is.
+    let reading = lockfile.parse("/w/ens.lock", "lock 2\n");
+    try assertMentions(reading.failure(), "'/w/ens.lock'");
+    try assertMentions(reading.failure(), "never edited by hand");
+    try assertMentions(reading.failure(), "delete it and build again");
+    try testing.assertTrue(reading.found(), "a file that was there read as absent");
+    try testing.assertEqual(reading.lock().packages().length, 0);
+}
+
+// The root's own artifacts belong to no fetched package, so they are recorded under the root and
+// come back there.
+test "an artifact before any package belongs to the root, and after one belongs to it" {
+    let reading = lockfile.parse("ens.lock", "lock 1\n"
+        + "root demo.app\n"
+        + "artifact zlib windows https://example.com/z.lib sha256:" + digits("a") + "\n"
+        + "package acme.json 1.4\n"
+        + "source u c\n"
+        + "content sha256:" + digits("b") + "\n"
+        + "artifact fastpath linux https://example.com/fast.a sha256:" + digits("c") + "\n");
+    try testing.assertEqual(reading.failure(), "");
+    try testing.assertEqual(reading.lock().rootArtifacts().length, 1);
+    try testing.assertEqual(reading.lock().rootArtifacts()[0].library(), "zlib");
+    let json = try recorded(reading.lock(), "acme.json");
+    try testing.assertEqual(json.artifacts().length, 1);
+    try testing.assertEqual(json.artifacts()[0].library(), "fastpath");
+}
+
+test "a tree with no lock file reads as an empty lock that was not there" {
+    string root = try support.scratch("lock-absent");
+    let reading = lockfile.read(root);
+    try testing.assertFalse(reading.found(), "a lock file was found where none was written");
+    try testing.assertEqual(reading.failure(), "");
+    try testing.assertEqual(reading.lock().packages().length, 0);
+    try support.removeTree(root);
+}
+
+test "a lock goes to the file beside the manifest and comes back the same" {
+    string root = try support.scratch("lock-write");
+    try testing.assertEqual(lockfile.filePath(root), path.join(root, "ens.lock"));
+    try lockfile.write(root, sample());
+
+    let reading = lockfile.read(root);
+    try testing.assertTrue(reading.found(), "the lock file was not found");
+    try testing.assertEqual(reading.failure(), "");
+    try testing.assertEqual(lockfile.render(reading.lock()), lockfile.render(sample()));
+
+    // Writing again over a lock that is already there leaves the same file.
+    try lockfile.write(root, reading.lock());
+    try testing.assertEqual(lockfile.render(lockfile.read(root).lock()),
+        lockfile.render(sample()));
+    try support.removeTree(root);
+}
+
+sample() -> Lockfile {
+    LockRequirement[] none = [];
+    LockArtifact[] noArtifacts = [];
+    let json = new LockPackage("acme.json", "1.4", "https://example.com/json.git",
+        "1111111111111111111111111111111111111111", "sha256:" + digits("b"),
+        [new LockRequirement("acme.text", "2.0")],
+        [new LockArtifact("fastpath", "windows", "https://example.com/fast.lib",
+             "sha256:" + digits("d")),
+         new LockArtifact("fastpath", "linux", "https://example.com/fast.a",
+             "sha256:" + digits("c"))]);
+    let text = new LockPackage("acme.text", "2.1", "https://example.com/text.git",
+        "2222222222222222222222222222222222222222", "sha256:" + digits("e"), none, noArtifacts);
+    return new Lockfile("demo.app",
+        [new LockArtifact("zlib", "windows", "https://example.com/z.lib",
+            "sha256:" + digits("a"))],
+        [json, text]);
+}
+
+// A digest's 64 hex digits, all the same one, so a test reads as what it is checking rather than as
+// a wall of hex.
+digits(string digit) -> string {
+    string text = "";
+    for (long i = 0; i < 64; i++) {
+        text = text + digit;
+    }
+    return text;
+}
+
+// The package the lock records under that name, failing the test when it records none.
+recorded(Lockfile lock, string name) -> LockPackage throws {
+    let locked = lock.find(name);
+    if (locked == null) {
+        throw new TestFailure("the lock records no package named '{name}'");
+    }
+    return locked;
+}
+
+assertRefused(string text, string fragment) throws {
+    let reading = lockfile.parse("ens.lock", text);
+    try testing.assertTrue(reading.failure().length > 0,
+        "this was accepted as a lock file: '{text}'");
+    try assertMentions(reading.failure(), fragment);
+}
+
+assertMentions(string text, string fragment) throws {
+    try testing.assertTrue(text.indexOf(fragment) >= 0, "'{fragment}' is missing from: {text}");
+}

@@ -1,0 +1,442 @@
+// `ens.lock`: what a build resolved, written down beside the root manifest so a later build reaches
+// the same packages without asking the network again, and so a tag that moved or content that
+// changed is noticed instead of quietly used.
+//
+// The file is written by a build and never edited by hand, which is what lets its shape be this
+// plain: one keyword to a line, one space between words, and a rendering that settles every order it
+// has a choice about. A lock therefore reads back as exactly the lock that was written, and two
+// builds that resolved the same thing write the same bytes whatever order they resolved it in.
+//
+// Nothing that the build already knows where to find is recorded: a workspace's own members and a
+// package an override redirects have no source to pin down.
+import @std.system;
+import SystemError from @std.system;
+import @std.path;
+import @std.text.strings;
+import @std.collections.sorting;
+import List from @std.collections.list;
+import StringBuilder from @std.text.stringbuilder;
+
+// What one locked package requires of another.
+export final class LockRequirement {
+    string requiredName;
+    string requiredVersion;
+
+    export constructor(this.requiredName, this.requiredVersion);
+
+    export packageName() -> string {
+        return this.requiredName;
+    }
+
+    export version() -> string {
+        return this.requiredVersion;
+    }
+}
+
+// A prebuilt native library a package binds on one platform, with the digest the download is checked
+// against, so the exact native code a build links is reviewable in one place.
+export final class LockArtifact {
+    string libraryName;
+    string platformName;
+    string sourceUrl;
+    string fileDigest;
+
+    export constructor(this.libraryName, this.platformName, this.sourceUrl, this.fileDigest);
+
+    export library() -> string {
+        return this.libraryName;
+    }
+
+    export platform() -> string {
+        return this.platformName;
+    }
+
+    export url() -> string {
+        return this.sourceUrl;
+    }
+
+    export digest() -> string {
+        return this.fileDigest;
+    }
+}
+
+// One fetched package: the version that was chosen, where it came from, what it held, and what it
+// requires of others.
+export final class LockPackage {
+    string lockedName;
+    string lockedVersion;
+    string sourceUrl;
+    string sourceCommit;
+    string contentDigest;
+    LockRequirement[] lockedRequirements;
+    LockArtifact[] lockedArtifacts;
+
+    export constructor(this.lockedName, this.lockedVersion, this.sourceUrl, this.sourceCommit,
+                this.contentDigest, this.lockedRequirements, this.lockedArtifacts);
+
+    export packageName() -> string {
+        return this.lockedName;
+    }
+
+    export version() -> string {
+        return this.lockedVersion;
+    }
+
+    export url() -> string {
+        return this.sourceUrl;
+    }
+
+    export commit() -> string {
+        return this.sourceCommit;
+    }
+
+    // The digest of everything the fetch brought in, which is what a later build checks the cached
+    // copy against.
+    export content() -> string {
+        return this.contentDigest;
+    }
+
+    export requirements() -> LockRequirement[] {
+        return this.lockedRequirements;
+    }
+
+    export artifacts() -> LockArtifact[] {
+        return this.lockedArtifacts;
+    }
+}
+
+export final class Lockfile {
+    string rootPackage;
+    LockArtifact[] rootArtifactList;
+    LockPackage[] lockedPackages;
+
+    export constructor(this.rootPackage, this.rootArtifactList, this.lockedPackages);
+
+    // The package the build was rooted at, empty when the root declares none.
+    export rootName() -> string {
+        return this.rootPackage;
+    }
+
+    // The artifacts the root itself binds, which belong to no fetched package.
+    export rootArtifacts() -> LockArtifact[] {
+        return this.rootArtifactList;
+    }
+
+    export packages() -> LockPackage[] {
+        return this.lockedPackages;
+    }
+
+    export find(string name) -> LockPackage? {
+        for (let locked in this.lockedPackages) {
+            if (locked.packageName() == name) {
+                return locked;
+            }
+        }
+        return null;
+    }
+}
+
+// A lock that records nothing, which is what a tree with no lock file amounts to.
+export empty() -> Lockfile {
+    LockArtifact[] noArtifacts = [];
+    LockPackage[] noPackages = [];
+    return new Lockfile("", noArtifacts, noPackages);
+}
+
+// What a lock file said, or the reason it says nothing a build can use.
+export final class LockReading {
+    bool wasThere;
+    Lockfile contents;
+    string problem;
+
+    protected constructor(this.wasThere, this.contents, this.problem);
+
+    // Whether a lock file was there at all. Its absence is not a problem: the first build that
+    // resolves anything writes one.
+    export found() -> bool {
+        return this.wasThere;
+    }
+
+    export lock() -> Lockfile {
+        return this.contents;
+    }
+
+    export failure() -> string {
+        return this.problem;
+    }
+}
+
+export filePath(string folder) -> string {
+    return path.join(folder, "ens.lock");
+}
+
+// The lock beside the given root manifest, as it reads.
+export read(string folder) -> LockReading {
+    return readFile(filePath(folder));
+}
+
+readFile(string file) -> LockReading {
+    if (!system.isFile(file)) {
+        return new LockReading(false, empty(), "");
+    }
+    return parse(file, try system.readAllText(file));
+} catch (SystemError error) {
+    return new LockReading(true, empty(), machineOwned(file, "could not be read"));
+}
+
+// A lock file's text as the lock it records. `file` names the file only so a problem can be reported
+// against it; nothing here reads anything.
+export parse(string file, string text) -> LockReading {
+    let draft = new Draft();
+    bool sawHeader = false;
+    long number = 0;
+    for (let line in strings.lines(text)) {
+        number++;
+        string[] parts = words(line);
+        if (parts.length == 0) {
+            continue;
+        }
+        if (!sawHeader) {
+            if (parts.length != 2 || parts[0] != "lock" || parts[1] != "1") {
+                return refused(machineOwned(file, "is not written in a lock format this "
+                    + "version of ens understands: its first line should be 'lock 1'"));
+            }
+            sawHeader = true;
+            continue;
+        }
+        if (!draft.take(parts)) {
+            return refused(machineOwned(file, "has a line ens does not understand at line "
+                + "{number}: '{line}'"));
+        }
+    }
+    if (!sawHeader) {
+        return refused(machineOwned(file, "records nothing at all"));
+    }
+    return new LockReading(true, draft.finished(), "");
+}
+
+// The lock as its file reads: every order it has a choice about settled, so the same lock always
+// writes the same bytes and a lock under version control changes only when what it records does.
+export render(Lockfile lock) -> string {
+    let out = new StringBuilder();
+    out.append("lock 1\n");
+    if (lock.rootName().length > 0) {
+        out.append("root " + lock.rootName() + "\n");
+        appendSorted(out, artifactLines(lock.rootArtifacts()));
+    }
+    let blocks = new List<string>();
+    for (let locked in lock.packages()) {
+        blocks.push(packageBlock(locked));
+    }
+    appendSorted(out, blocks);
+    return out.toString();
+}
+
+export write(string folder, Lockfile lock) throws {
+    try system.writeAllText(filePath(folder), render(lock));
+}
+
+// One package's lines as one block, so sorting the blocks by their bytes settles the file's order:
+// the package's name leads the block and no name holds a space, so a block sorts by the name it
+// starts with.
+packageBlock(LockPackage locked) -> string {
+    let out = new StringBuilder();
+    out.append("package " + locked.packageName() + " " + locked.version() + "\n");
+    out.append("source " + locked.url() + " " + locked.commit() + "\n");
+    out.append("content " + locked.content() + "\n");
+    let requirements = new List<string>();
+    for (let required in locked.requirements()) {
+        requirements.push("require " + required.packageName() + " " + required.version() + "\n");
+    }
+    appendSorted(out, requirements);
+    appendSorted(out, artifactLines(locked.artifacts()));
+    return out.toString();
+}
+
+artifactLines(LockArtifact[] artifacts) -> List<string> {
+    let lines = new List<string>();
+    for (let artifact in artifacts) {
+        lines.push("artifact " + artifact.library() + " " + artifact.platform() + " "
+            + artifact.url() + " " + artifact.digest() + "\n");
+    }
+    return lines;
+}
+
+appendSorted(StringBuilder out, List<string> lines) {
+    sorting.sort(lines);
+    for (long i = 0; i < lines.length(); i++) {
+        out.append(lines.get(i));
+    }
+}
+
+// The words of a line. One space separates the words of a line the build wrote, and anything else
+// between them is one of the ways a file that was edited by hand stops reading as a lock.
+words(string line) -> string[] {
+    let found = new List<string>();
+    for (let part in strings.split(line, " ")) {
+        if (part.length > 0) {
+            found.push(part);
+        }
+    }
+    return found.toArray();
+}
+
+refused(string problem) -> LockReading {
+    return new LockReading(true, empty(), problem);
+}
+
+// Every problem a lock file has is the same problem: it is not what a build wrote. So every message
+// ends the same way, with the one thing a reader should do about it.
+machineOwned(string file, string what) -> string {
+    return "'{file}' {what}. An ens.lock file is written by the build and never edited by hand, so "
+        + "delete it and build again to have it written afresh";
+}
+
+// A lock being read, line by line. It is the one mutable thing here and it lives no longer than the
+// reading that made it: what comes out of it is a value.
+class Draft {
+    protected string rootName;
+    protected bool inRoot;
+    protected List<LockArtifact> rootArtifacts;
+    protected List<LockPackage> packages;
+    protected PackageDraft? current;
+
+    protected constructor() {
+        this.rootName = "";
+        this.inRoot = false;
+        this.rootArtifacts = new List<LockArtifact>();
+        this.packages = new List<LockPackage>();
+        this.current = null;
+    }
+
+    // Reads one line's words in, answering false for a line the format has no place for.
+    protected take(string[] parts) -> bool {
+        switch (parts[0]) {
+            "root" -> {
+                return this.takeRoot(parts);
+            },
+            "package" -> {
+                return this.takePackage(parts);
+            },
+            "source" -> {
+                return this.takeSource(parts);
+            },
+            "content" -> {
+                return this.takeContent(parts);
+            },
+            "require" -> {
+                return this.takeRequirement(parts);
+            },
+            "artifact" -> {
+                return this.takeArtifact(parts);
+            },
+            default -> {
+                return false;
+            },
+        }
+    }
+
+    protected finished() -> Lockfile {
+        this.close();
+        return new Lockfile(this.rootName, this.rootArtifacts.toArray(), this.packages.toArray());
+    }
+
+    takeRoot(string[] parts) -> bool {
+        if (parts.length != 2) {
+            return false;
+        }
+        this.close();
+        this.rootName = parts[1];
+        this.inRoot = true;
+        return true;
+    }
+
+    takePackage(string[] parts) -> bool {
+        if (parts.length != 3) {
+            return false;
+        }
+        this.close();
+        this.inRoot = false;
+        this.current = new PackageDraft(parts[1], parts[2]);
+        return true;
+    }
+
+    takeSource(string[] parts) -> bool {
+        let locked = this.current;
+        if (parts.length != 3 || locked == null) {
+            return false;
+        }
+        locked.url = parts[1];
+        locked.commit = parts[2];
+        return true;
+    }
+
+    takeContent(string[] parts) -> bool {
+        let locked = this.current;
+        if (parts.length != 2 || locked == null) {
+            return false;
+        }
+        locked.content = parts[1];
+        return true;
+    }
+
+    takeRequirement(string[] parts) -> bool {
+        let locked = this.current;
+        if (parts.length != 3 || locked == null) {
+            return false;
+        }
+        locked.requirements.push(new LockRequirement(parts[1], parts[2]));
+        return true;
+    }
+
+    takeArtifact(string[] parts) -> bool {
+        if (parts.length != 5) {
+            return false;
+        }
+        let artifact = new LockArtifact(parts[1], parts[2], parts[3], parts[4]);
+        let locked = this.current;
+        if (locked != null) {
+            locked.artifacts.push(artifact);
+            return true;
+        }
+        if (this.inRoot) {
+            this.rootArtifacts.push(artifact);
+            return true;
+        }
+        return false;
+    }
+
+    // Finishes the package being read, if there is one.
+    close() {
+        let locked = this.current;
+        if (locked != null) {
+            this.packages.push(locked.finished());
+            this.current = null;
+        }
+    }
+}
+
+class PackageDraft {
+    protected string name;
+    protected string version;
+    protected string url;
+    protected string commit;
+    protected string content;
+    protected List<LockRequirement> requirements;
+    protected List<LockArtifact> artifacts;
+
+    protected constructor(string name, string version) {
+        this.name = name;
+        this.version = version;
+        this.url = "";
+        this.commit = "";
+        this.content = "";
+        this.requirements = new List<LockRequirement>();
+        this.artifacts = new List<LockArtifact>();
+    }
+
+    protected finished() -> LockPackage {
+        return new LockPackage(this.name, this.version, this.url, this.commit, this.content,
+            this.requirements.toArray(), this.artifacts.toArray());
+    }
+}
