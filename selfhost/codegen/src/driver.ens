@@ -5,8 +5,13 @@
 // the optimization passes rewrite each function with cross-function facts computed once, and
 // emission writes each module's object. Modules that define nothing are not emitted.
 //
-// The optimized output is re-verified before emission; verifyBetweenPasses additionally runs the
-// verifiers after every single pass, which is how the tests run and how a broken pass is named.
+// The settings decide how the program is compiled: at optimization level None the pipeline is
+// skipped entirely, at every other level it runs, and the target triple they name decides the
+// object format and the system the emitted runtime calls belong to.
+//
+// The optimized output is re-verified before emission whatever the level, so an unoptimized build
+// is never an unchecked one; settings that ask for verification after every single pass are how
+// the tests run and how a broken pass is named.
 //
 // The stages run to completion program-wide before the next one starts, so a program with
 // problems in several modules reports all of them and a program that fails to lower writes no
@@ -34,6 +39,7 @@ import ModuleFunctions from lower.index;
 import FunctionInfo from lower.index;
 import MonoPlan from mono.closure;
 import mono.closure;
+import CodegenSettings from settings;
 import PassContext from passes.optimize;
 import passes.optimize;
 import lower.destructors;
@@ -49,8 +55,11 @@ import Map from @std.collections.map;
 export final class EmitResult {
     List<string> objectFiles;
     FileDiagnostic[] emitDiagnostics;
+    string[] arcAccount;
 
-    public constructor(this.objectFiles, this.emitDiagnostics);
+    public constructor(this.objectFiles, this.emitDiagnostics, string[] explanation = []) {
+        this.arcAccount = explanation;
+    }
 
     export objects() -> List<string> {
         return this.objectFiles;
@@ -58,6 +67,12 @@ export final class EmitResult {
 
     export diagnostics() -> FileDiagnostic[] {
         return this.emitDiagnostics;
+    }
+
+    // What the optimization pipeline elided and why, when the settings asked for it; nothing
+    // otherwise.
+    export arcExplanation() -> string[] {
+        return this.arcAccount;
     }
 
     export succeeded() -> bool {
@@ -90,7 +105,7 @@ final class EmittedObjects {
 // defines functions, named filePrefix plus the sanitized module path. The analysis must be
 // clean; codegen diagnostics after a clean analysis describe unsupported constructs or bugs.
 export emitProgram(ProgramAnalysis analysis, string outputFolder, string filePrefix,
-                   bool verifyBetweenPasses = false) -> EmitResult {
+                   CodegenSettings settings) -> EmitResult {
     let programIndex = index.buildIndex(analysis);
     let plan = closure.close(analysis, programIndex);
     if (plan.problems().length() > 0) {
@@ -108,16 +123,16 @@ export emitProgram(ProgramAnalysis analysis, string outputFolder, string filePre
     if (collisions.length() > 0) {
         return new EmitResult(new List<string>(), collisions.toArray());
     }
-    let optimized = optimizeModules(lowered, plans, verifyBetweenPasses);
-    let optimizationProblems = gathered(optimized);
+    let pipeline = optimizeModules(lowered, plans, settings);
+    let optimizationProblems = gathered(pipeline.modules);
     if (optimizationProblems.length() > 0) {
         return new EmitResult(new List<string>(), optimizationProblems.toArray());
     }
     let stackFrame = analysis.store().findDeclared("std.core", "StackFrame");
     let errorClass = analysis.store().findDeclared("std.core", "Error");
-    let emitted = emitModules(optimized, plans, stackFrame, errorClass, outputFolder,
-        filePrefix);
-    return new EmitResult(emitted.paths, emitted.problems.toArray());
+    let emitted = emitModules(pipeline.modules, plans, stackFrame, errorClass, outputFolder,
+        filePrefix, settings);
+    return new EmitResult(emitted.paths, emitted.problems.toArray(), pipeline.account.toArray());
 }
 
 // Every defined function must own its linker symbol program-wide: the passes key their
@@ -231,12 +246,27 @@ lowerModule(ModuleFunctions moduleFunctions, ProgramIndex programIndex, Dispatch
     return new LoweredModule(moduleFunctions, functions, entry, problems);
 }
 
+// What the optimization stage produced: every module as the pipeline left it, and the account of
+// what it elided when the build asked for one.
+final class OptimizedProgram {
+    protected List<LoweredModule> modules;
+    protected List<string> account;
+
+    protected constructor(this.modules, this.account);
+}
+
 // Runs every lowered function through the optimization pipeline, with the cross-function facts
-// computed once over the whole program. The optimized functions are re-verified - after every
-// pass when verifyBetweenPasses is on, once at the end otherwise - so a broken pass is caught
-// here, before emission ever sees its output.
+// computed once over the whole program. The optimized functions are re-verified - after every pass
+// when the settings ask for that, once at the end otherwise - so a broken pass is caught here,
+// before emission ever sees its output.
+//
+// Optimization level None skips the whole stage, prepass included: the naive lowering the
+// verifiers already accepted is what gets emitted.
 optimizeModules(List<LoweredModule> lowered, DescriptorPlans plans,
-                bool verifyBetweenPasses) -> List<LoweredModule> {
+                CodegenSettings settings) -> OptimizedProgram {
+    if (!settings.optimizesEir()) {
+        return new OptimizedProgram(lowered, new List<string>());
+    }
     let everything = new List<EirFunction>();
     for (long m = 0; m < lowered.length(); m++) {
         let functions = lowered.get(m).functions;
@@ -246,32 +276,57 @@ optimizeModules(List<LoweredModule> lowered, DescriptorPlans plans,
     }
     let context = optimize.planProgram(everything, plans);
     let optimized = new List<LoweredModule>();
+    let account = new List<string>();
+    long elided = 0;
     for (long m = 0; m < lowered.length(); m++) {
-        optimized.push(optimizeModule(lowered.get(m), context, verifyBetweenPasses));
+        let unit = optimizeModule(lowered.get(m), context, settings);
+        optimized.push(unit.module);
+        for (long i = 0; i < unit.account.length(); i++) {
+            account.push(unit.account.get(i));
+        }
+        elided = elided + unit.elided;
     }
-    return optimized;
+    if (settings.explainsArc()) {
+        account.push("{elided} reference operation(s) elided across the program");
+    }
+    return new OptimizedProgram(optimized, account);
 }
 
-// One module's functions after the pipeline, with the problems its own passes and verifiers
-// reported.
+// One module after the pipeline: its optimized functions with the problems its own passes and
+// verifiers reported, and its share of the account.
+final class OptimizedModule {
+    protected LoweredModule module;
+    protected List<string> account;
+    protected long elided;
+
+    protected constructor(this.module, this.account, this.elided);
+}
+
 optimizeModule(LoweredModule unit, PassContext context,
-               bool verifyBetweenPasses) -> LoweredModule {
+               CodegenSettings settings) -> OptimizedModule {
     string filePath = unit.definitions.context().module().filePath();
     let functions = new List<EirFunction>();
     let problems = new List<FileDiagnostic>();
+    let account = new List<string>();
+    long elided = 0;
     for (long f = 0; f < unit.functions.length(); f++) {
-        let outcome = optimize.runFunction(unit.functions.get(f), context, verifyBetweenPasses);
+        let outcome = optimize.runFunction(unit.functions.get(f), context, settings);
         for (let violation in outcome.problems()) {
             problems.push(new FileDiagnostic(filePath,
                 "Internal: an optimization pass broke its function: {violation}",
                 source.makeSpan(0, 0)));
         }
-        if (!verifyBetweenPasses) {
+        if (!settings.verifiesAfterEachPass()) {
             appendAll(problems, checkOptimized(outcome.function(), filePath));
         }
+        for (let line in outcome.account()) {
+            account.push(line);
+        }
+        elided = elided + outcome.elidedOperations();
         functions.push(outcome.function());
     }
-    return new LoweredModule(unit.definitions, functions, unit.entry, problems);
+    return new OptimizedModule(new LoweredModule(unit.definitions, functions, unit.entry,
+        problems), account, elided);
 }
 
 // Gates one optimized function on the three verifiers, so a pass bug surfaces as a diagnostic
@@ -318,16 +373,17 @@ checkLowered(EirFunction function, string filePath, Span span) -> List<FileDiagn
 // so a failed compile leaves no objects behind. Emission stops at the first module that fails,
 // because a module that cannot be emitted means the compiler is broken, not the program.
 emitModules(List<LoweredModule> lowered, DescriptorPlans plans, Type? stackFrame,
-            Type? errorClass, string outputFolder, string filePrefix) -> EmittedObjects {
+            Type? errorClass, string outputFolder, string filePrefix,
+            CodegenSettings settings) -> EmittedObjects {
     let objects = new List<string>();
     let problems = new List<FileDiagnostic>();
     for (long m = 0; m < lowered.length(); m++) {
         let unit = lowered.get(m);
         string moduleName = unit.definitions.context().module().canonicalPath();
         string objectPath = outputFolder + "/" + filePrefix
-            + symbols.sanitizeModulePath(moduleName) + ".obj";
+            + symbols.sanitizeModulePath(moduleName) + settings.objectExtension();
         string failure = emit.emitModule(moduleName, unit.functions, unit.entry, plans,
-            stackFrame, errorClass, objectPath);
+            stackFrame, errorClass, objectPath, settings);
         if (failure.length > 0) {
             problems.push(new FileDiagnostic(unit.definitions.context().module().filePath(),
                 "Internal: emission failed: " + failure, source.makeSpan(0, 0)));

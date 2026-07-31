@@ -5,18 +5,23 @@
 // instruction objects are replaced, not edited - so the input stays valid, which is what lets a
 // harness dump and verify both sides of every stage.
 //
-// With verifyEachPass on, the structural, ownership, and storage verifiers and the weak-upgrade
-// guard run after every pass, so a pass that breaks an invariant is caught at the pass, named,
-// rather than at emission. The tests always run that way; the driver keeps it behind a flag and
+// When the settings ask for verification after every pass, the structural, ownership, and storage
+// verifiers and the weak-upgrade guard run after each one, so a pass that breaks an invariant is
+// caught at the pass, named, rather than at emission. The tests always run that way; a build
 // re-verifies once after the whole pipeline instead.
+//
+// The settings also name the passes to leave out, which is how a suspected pass bug is bisected,
+// and ask for the account of what each pass elided.
 import EirFunction from eir.model;
 import DescriptorPlans from layout.descriptors;
+import CodegenSettings from settings;
 import ProgramFacts from passes.facts;
 import ByAddressPlan from passes.byaddress;
 import passes.borrows;
 import passes.byaddress;
 import passes.devirtualize;
 import passes.escape;
+import passes.explain;
 import passes.promotion;
 import passes.pruning;
 import passes.weakguard;
@@ -24,6 +29,12 @@ import eir.ownership;
 import eir.storage;
 import eir.verify;
 import List from @std.collections.list;
+
+// The passes of the pipeline, in the order they run. A build names one of these to leave it out.
+export passNames() -> string[] {
+    return ["borrow-rewriting", "by-address-parameters", "stack-promotion", "devirtualization",
+        "cleanup-pruning"];
+}
 
 // Everything the passes may know beyond the function they rewrite, computed once per program.
 public final class PassContext {
@@ -45,13 +56,17 @@ public final class PassContext {
     }
 }
 
-// One function's trip through the pipeline: the rewritten function, and the violations found
-// when verification between passes was on.
+// One function's trip through the pipeline: the rewritten function, the violations found when
+// verification between passes was on, and the account of what the passes elided when the build
+// asked for one.
 public final class PassOutcome {
     EirFunction rewrittenFunction;
     string[] foundProblems;
+    string[] accountLines;
+    long elided;
 
-    public constructor(this.rewrittenFunction, this.foundProblems);
+    public constructor(this.rewrittenFunction, this.foundProblems, this.accountLines,
+                this.elided);
 
     public function() -> EirFunction {
         return this.rewrittenFunction;
@@ -59,6 +74,17 @@ public final class PassOutcome {
 
     public problems() -> string[] {
         return this.foundProblems;
+    }
+
+    // The lines explaining this function, its own symbol first, or nothing when the build asked
+    // for no explanation or the function had nothing to explain.
+    public account() -> string[] {
+        return this.accountLines;
+    }
+
+    // How many reference-counting operations the passes took out of this function.
+    public elidedOperations() -> long {
+        return this.elided;
     }
 }
 
@@ -68,43 +94,102 @@ public planProgram(List<EirFunction> functions, DescriptorPlans plans) -> PassCo
     return new PassContext(facts, byaddress.decide(functions, facts));
 }
 
-// Runs one function through every pass in order.
-public runFunction(EirFunction function, PassContext context, bool verifyEachPass)
-        -> PassOutcome {
-    let problems = new List<string>();
-    EirFunction current = function;
-    current = checked("borrow and move rewriting", current, borrows.run(current),
-        verifyEachPass, problems);
-    current = checked("by-address struct parameters", current,
-        byaddress.run(current, context.facts(), context.addressPlan()), verifyEachPass,
-        problems);
-    current = checked("stack promotion", current, promotion.run(current, context.facts()),
-        verifyEachPass, problems);
-    current = checked("devirtualization", current,
-        devirtualize.run(current, context.plans()), verifyEachPass, problems);
-    current = checked("cleanup pruning", current, pruning.run(current), verifyEachPass,
-        problems);
-    return new PassOutcome(current, problems.toArray());
+// Runs one function through every pass the settings leave enabled, in order.
+public runFunction(EirFunction function, PassContext context,
+                   CodegenSettings settings) -> PassOutcome {
+    let run = new Run(function, context, settings);
+    if (settings.runsPass("borrow-rewriting")) {
+        run.step("borrow-rewriting", borrows.run(run.current));
+    }
+    if (settings.runsPass("by-address-parameters")) {
+        run.step("by-address-parameters",
+            byaddress.run(run.current, context.facts(), context.addressPlan()));
+    }
+    if (settings.runsPass("stack-promotion")) {
+        run.step("stack-promotion", promotion.run(run.current, context.facts()));
+    }
+    if (settings.runsPass("devirtualization")) {
+        run.step("devirtualization", devirtualize.run(run.current, context.plans()));
+    }
+    if (settings.runsPass("cleanup-pruning")) {
+        run.step("cleanup-pruning", pruning.run(run.current));
+    }
+    return run.outcome();
 }
 
-// Verifies one pass's output against everything a pass must preserve, tagging each violation
-// with the pass that introduced it.
-checked(string passName, EirFunction before, EirFunction after, bool verifyEachPass,
-        List<string> problems) -> EirFunction {
-    if (!verifyEachPass) {
-        return after;
+// One function's way through the pipeline: the function as the last pass left it, the violations
+// the verifiers found, and the elisions the account names. It lives no longer than the call that
+// made it, so two functions running through the pipeline never see each other.
+final class Run {
+    protected EirFunction current;
+    PassContext context;
+    CodegenSettings settings;
+
+    List<string> problems;
+    List<string> account;
+    long operations;
+    long elided;
+
+    protected constructor(EirFunction function, PassContext context, CodegenSettings settings) {
+        this.current = function;
+        this.context = context;
+        this.settings = settings;
+        this.problems = new List<string>();
+        this.account = new List<string>();
+        this.operations = 0;
+        this.elided = 0;
+        if (settings.explainsArc()) {
+            this.operations = explain.referenceOperations(function);
+            for (let line in explain.incomingLines(function,
+                    context.facts().factsFor(function.symbol()))) {
+                this.account.push(line);
+            }
+        }
     }
-    for (let violation in verify.verifyFunction(after)) {
-        problems.push("after the {passName} pass: {violation}");
+
+    // Takes one pass's output as the function from here on, verifying it against everything a
+    // pass must preserve when the settings ask for that, and noting what it elided.
+    protected step(string passName, EirFunction after) {
+        if (this.settings.verifiesAfterEachPass()) {
+            this.verify(passName, after);
+        }
+        if (this.settings.explainsArc()) {
+            long remaining = explain.referenceOperations(after);
+            string line = explain.elisionLine(passName, this.operations, remaining);
+            if (line.length > 0) {
+                this.account.push(line);
+            }
+            this.elided = this.elided + this.operations - remaining;
+            this.operations = remaining;
+        }
+        this.current = after;
     }
-    for (let violation in ownership.verifyOwnership(after)) {
-        problems.push("after the {passName} pass: {violation}");
+
+    verify(string passName, EirFunction after) {
+        for (let violation in verify.verifyFunction(after)) {
+            this.problems.push("after the {passName} pass: {violation}");
+        }
+        for (let violation in ownership.verifyOwnership(after)) {
+            this.problems.push("after the {passName} pass: {violation}");
+        }
+        for (let violation in storage.verifyStorage(after)) {
+            this.problems.push("after the {passName} pass: {violation}");
+        }
+        for (let violation in weakguard.check(this.current, after)) {
+            this.problems.push("after the {passName} pass: {violation}");
+        }
     }
-    for (let violation in storage.verifyStorage(after)) {
-        problems.push("after the {passName} pass: {violation}");
+
+    protected outcome() -> PassOutcome {
+        string[] lines = [];
+        if (this.account.length() > 0) {
+            let headed = new List<string>();
+            headed.push(this.current.symbol());
+            for (long i = 0; i < this.account.length(); i++) {
+                headed.push(this.account.get(i));
+            }
+            lines = headed.toArray();
+        }
+        return new PassOutcome(this.current, this.problems.toArray(), lines, this.elided);
     }
-    for (let violation in weakguard.check(before, after)) {
-        problems.push("after the {passName} pass: {violation}");
-    }
-    return after;
 }
