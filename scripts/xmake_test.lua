@@ -391,6 +391,16 @@ task("test")
             })
         end
 
+        -- the prebuilt native libraries a manifest binds instead of naming a library: downloaded
+        -- once over a file:// URL, checked against its digest, reused from the cache under
+        -- '--offline', refused when the digest does not match, and recorded in ens.lock.
+        if want("cli_prebuilt") then
+            table.insert(jobs, {
+                name = "cli_prebuilt",
+                cli_prebuilt = true,
+            })
+        end
+
         -- the version multiplexer, driven end to end against a second toolchain installed in a
         -- scratch folder: the hop, the command line it forwards, the exit code it propagates, both
         -- ways of suppressing it, and the guard that stops a delegate delegating again.
@@ -2677,6 +2687,197 @@ task("test")
                 full = string.format("%s:\n%s", name, table.concat(failures, "\n"))}
         end
 
+        -- prebuilt native libraries, driven over file:// URLs and a scratch cache. The library is a
+        -- valid empty static archive, so every platform's linker accepts it.
+        local function run_cli_prebuilt(job)
+            local name = job.name
+            local root = path.join(os.projectdir(), "build", "cli", "ensprebuilt")
+            os.tryrm(root)
+            os.mkdir(root)
+            local log = path.join(out_dir, name .. ".log")
+            local failures = {}
+
+            local env, native_libraries, env_error = llvmEnvironment()
+            if not env then
+                return {name = name, ok = false, short = "no LLVM library",
+                    full = string.format("%s: %s", name, env_error)}
+            end
+            env.ENS_STDLIB = path.join(os.projectdir(), "libs")
+
+            local cache = path.join(root, "cache")
+            local cold = path.join(root, "cold")
+
+            local function withCache(cache_dir)
+                local envs = {}
+                for key, value in pairs(env) do envs[key] = value end
+                envs.ENS_CACHE = cache_dir
+                return envs
+            end
+
+            local function run(argv, opt, expected_rc, ...)
+                local rc = execMerged(seed_exe, argv, log, opt)
+                local out = io.readfile(log) or ""
+                local label = table.concat(argv, " ")
+                if expected_rc ~= nil and rc ~= expected_rc then
+                    table.insert(failures, string.format("ens %s: exit=%s expected=%s\n%s",
+                        label, tostring(rc), tostring(expected_rc), out))
+                end
+                for _, fragment in ipairs({...}) do
+                    if fragment:sub(1, 1) == "!" then
+                        if out:find(fragment:sub(2), 1, true) then
+                            table.insert(failures, string.format("ens %s: output must not carry "
+                                .. "%q\n%s", label, fragment:sub(2), out))
+                        end
+                    elseif not out:find(fragment, 1, true) then
+                        table.insert(failures, string.format("ens %s: output missing %q\n%s",
+                            label, fragment, out))
+                    end
+                end
+                return rc, out
+            end
+
+            local function run_program(exe, expected_rc, expected_stdout)
+                if not os.isfile(exe) then
+                    table.insert(failures, string.format("expected executable %s", exe))
+                    return
+                end
+                local rc = execMerged(exe, {}, log, {envs = env})
+                local out = captured(log)
+                if rc ~= expected_rc or out ~= expected_stdout then
+                    table.insert(failures, string.format("%s: exit=%s stdout=%q",
+                        path.filename(exe), tostring(rc), out))
+                end
+            end
+
+            local files = path.join(root, "files")
+            os.mkdir(files)
+            local lib_file = path.join(files, "extras.lib")
+            io.writefile(lib_file, "!<arch>\n", {encoding = "binary"})
+            local good = "sha256:" .. hash.sha256(lib_file)
+            local wrong = "sha256:" .. string.rep("0123456789abcdef", 4)
+            local url_lib = "file:///" .. (path.absolute(lib_file):gsub("\\", "/"))
+
+            local function binding(native_name, digest)
+                return "    native " .. native_name .. " {\n"
+                    .. '        windows artifact "' .. url_lib .. '" hash "' .. digest .. '";\n'
+                    .. '        linux artifact "' .. url_lib .. '" hash "' .. digest .. '";\n'
+                    .. '        macos artifact "' .. url_lib .. '" hash "' .. digest .. '";\n'
+                    .. "    }\n"
+            end
+
+            -- the happy path: downloaded, checked, cached, and handed to the linker
+            local app = path.join(root, "app")
+            os.mkdir(path.join(app, "src"))
+            io.writefile(path.join(app, "ens.package"),
+                "package demo.prebuilt {\n" .. '    ens "0.1";\n\n'
+                .. binding("extras", good) .. "}\n")
+            io.writefile(path.join(app, "src", "main.ens"),
+                'main() -> int {\n    print("prebuilt linked");\n    return 0;\n}\n')
+            local in_app = {curdir = app, envs = withCache(cache)}
+            run({"build", "."}, in_app, 0, "prebuilt: built")
+            run_program(path.join(app, "prebuilt.exe"), 0, "prebuilt linked")
+            local stored = path.join(cache, "artifacts", good:gsub("^sha256:", ""), "extras.lib")
+            if not os.isfile(stored) then
+                table.insert(failures, "the downloaded library is not in the cache")
+            end
+
+            -- a cached library needs no network, even with the file it came from gone
+            os.mv(files, files .. ".away")
+            run({"build", ".", "--offline"}, in_app, 0, "prebuilt: built")
+            run({"build", ".", "--offline"}, {curdir = app, envs = withCache(cold)}, 1,
+                "'--offline' forbids downloading the prebuilt library for native 'extras'",
+                "without '--offline'")
+            os.mv(files .. ".away", files)
+
+            -- a digest that does not match is refused, naming both digests, and nothing is cached
+            local bad = path.join(root, "bad")
+            os.mkdir(path.join(bad, "src"))
+            io.writefile(path.join(bad, "ens.package"),
+                "package demo.badhash {\n" .. '    ens "0.1";\n\n'
+                .. binding("extras", wrong) .. "}\n")
+            io.writefile(path.join(bad, "src", "main.ens"),
+                'main() -> int {\n    return 0;\n}\n')
+            run({"build", "."}, {curdir = bad, envs = withCache(cache)}, 1,
+                "hashes to " .. good, "manifest declares " .. wrong, "will not be used",
+                "put the new hash in the manifest")
+            if os.isdir(path.join(cache, "artifacts", wrong:gsub("^sha256:", ""))) then
+                table.insert(failures, "a library whose digest did not match was cached anyway")
+            end
+
+            -- a digest written in capitals is the same digest
+            local capitals = path.join(root, "capitals")
+            os.mkdir(path.join(capitals, "src"))
+            io.writefile(path.join(capitals, "ens.package"),
+                "package demo.capitals {\n" .. '    ens "0.1";\n\n'
+                .. binding("extras", "sha256:" .. hash.sha256(lib_file):upper()) .. "}\n")
+            io.writefile(path.join(capitals, "src", "main.ens"),
+                'main() -> int {\n    print("capitals linked");\n    return 0;\n}\n')
+            run({"build", "."}, {curdir = capitals, envs = withCache(cache)}, 0,
+                "capitals: built")
+            run_program(path.join(capitals, "capitals.exe"), 0, "capitals linked")
+
+            -- the lock records the bindings of the build's own package and of every fetched one,
+            -- flattened per platform, so the exact native code a build links reads in one place
+            local function gitdir_of(dir)
+                return path.absolute(dir) .. ".gitdir"
+            end
+            local function git(dir, ...)
+                os.iorunv("git", table.join({"--git-dir", gitdir_of(dir), "--work-tree",
+                    path.absolute(dir), "-c", "user.name=ens", "-c", "user.email=ens@test",
+                    "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false",
+                    "-c", "core.autocrlf=false"}, {...}), {curdir = dir})
+            end
+            local dep_dir = path.join(root, "repos", "dep")
+            os.mkdir(path.join(dep_dir, "src"))
+            os.iorunv("git", {"init", "--bare", "-q", "-b", "main", gitdir_of(dep_dir)})
+            io.writefile(path.join(dep_dir, "ens.package"),
+                "package art.dep {\n" .. '    ens "0.1";\n\n'
+                .. binding("depextras", good) .. "}\n")
+            io.writefile(path.join(dep_dir, "src", "dep.ens"),
+                'export tag() -> string {\n    return "dep with a prebuilt library";\n}\n')
+            git(dep_dir, "add", "-A")
+            git(dep_dir, "commit", "-q", "-m", "1.0")
+            git(dep_dir, "tag", "1.0")
+            local url_dep = "file:///" .. (gitdir_of(dep_dir):gsub("\\", "/"))
+
+            local recorded = path.join(root, "recorded")
+            os.mkdir(path.join(recorded, "src"))
+            io.writefile(path.join(recorded, "ens.package"),
+                "package demo.lockapp {\n" .. '    ens "0.1";\n\n'
+                .. '    dependency art.dep "1.0" from "' .. url_dep .. '";\n\n'
+                .. binding("extras", good) .. "}\n")
+            io.writefile(path.join(recorded, "src", "main.ens"),
+                'import @art.dep.dep;\n\nmain() -> int {\n    print(dep.tag());\n'
+                .. '    return 0;\n}\n')
+            run({"build", "."}, {curdir = recorded, envs = withCache(cache)}, 0,
+                "Fetched art.dep 1.0", "Updated ens.lock: locked art.dep 1.0")
+            run_program(path.join(recorded, "lockapp.exe"), 0, "dep with a prebuilt library")
+            local lock = ((io.readfile(path.join(recorded, "ens.lock")) or ""):gsub("\r\n", "\n"))
+            local own = "root demo.lockapp\n"
+                .. "artifact extras linux " .. url_lib .. " " .. good .. "\n"
+                .. "artifact extras macos " .. url_lib .. " " .. good .. "\n"
+                .. "artifact extras windows " .. url_lib .. " " .. good .. "\n"
+            if not lock:find(own, 1, true) then
+                table.insert(failures, string.format(
+                    "ens.lock is missing the build's own prebuilt lines:\n%s", lock))
+            end
+            local theirs = "artifact depextras linux " .. url_lib .. " " .. good
+                .. "\nartifact depextras macos " .. url_lib .. " " .. good
+                .. "\nartifact depextras windows " .. url_lib .. " " .. good .. "\n"
+            if not (lock:find("package art.dep 1.0\n", 1, true)
+                    and lock:find(theirs, 1, true)) then
+                table.insert(failures, string.format(
+                    "ens.lock is missing the fetched package's prebuilt lines:\n%s", lock))
+            end
+
+            if #failures == 0 then
+                return {name = name, ok = true}
+            end
+            return {name = name, ok = false,
+                short = string.format("%d CLI assertion(s) failed", #failures),
+                full = string.format("%s:\n%s", name, table.concat(failures, "\n"))}
+        end
+
         -- version delegation: `ens` handing a whole invocation to another toolchain. A copy of the
         -- built command is installed as toolchain 9.9 in a scratch folder, which is what makes the
         -- mechanism observable while only one real version exists - the copy answers 'ens 0.1', so
@@ -2887,6 +3088,7 @@ task("test")
             if job.cli_toolchain then return run_cli_toolchain(job) end
             if job.cli_overriding then return run_cli_overriding(job) end
             if job.cli_dependencies then return run_cli_dependencies(job) end
+            if job.cli_prebuilt then return run_cli_prebuilt(job) end
             if job.cli_core then return run_cli_core(job) end
             if job.cli_workspace then return run_cli_workspace(job) end
             if job.cli_override then return run_cli_override(job) end
