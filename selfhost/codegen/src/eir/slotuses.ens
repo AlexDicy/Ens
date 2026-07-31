@@ -1,0 +1,368 @@
+// Who still needs what a slot holds, at the point its reference moves out of it.
+//
+// A slot that owns a reference keeps alive more than its own later reads. Every value read out of
+// it borrows that one +1 rather than taking one of its own, and so does every interior address
+// reached through such a value: while the slot holds the reference they are all valid, and the
+// moment it gives that reference up they may all be gone. Moving a slot's +1 out is therefore only
+// safe past the last use of every one of them, not merely past the last read of the slot.
+//
+// Two things are deliberately not uses of the reference. Releasing the slot's own storage gives
+// the reference up rather than reading it, and finds nothing in a slot whose reference has already
+// moved out. And a value read out of the slot at a point that cannot run before the move borrows
+// what a later write left there, not what moved out.
+//
+// The move rewrite asks these questions before it takes a slot's reference, and the take verifier
+// asks the same ones of what the rewrite produced.
+import EirBlock from eir.model;
+import EirFunction from eir.model;
+import EirInstruction from eir.model;
+import EirLoadSlot from eir.model;
+import EirStoreSlot from eir.model;
+import EirTakeSlot from eir.model;
+import EirSlotAddress from eir.model;
+import EirReleasePtr from eir.model;
+import eir.ownership;
+import eir.walk;
+import support.primitives;
+import List from @std.collections.list;
+
+// One slot's picture around one move: the temps that borrow what it holds there, the addresses of
+// it that reach further than a release, and where its own reads leave each block live. Computed
+// fresh from the function it describes and never shared beyond the call that asked for it.
+public final class SlotUses {
+    EirFunction function;
+    long slot;
+    long block;
+    long index;
+
+    bool[] borrowing;
+    bool[] addresses;
+    bool[] escaping;
+    bool[] liveOut;
+    bool[] reached;
+
+    protected constructor(this.function, this.slot, this.block, this.index, this.borrowing,
+                this.addresses, this.escaping, this.liveOut, this.reached);
+
+    // True when what the slot holds is still needed at or after the move: either the slot is read
+    // again, or a reference already borrowed out of it is still in use.
+    public contentsNeeded() -> bool {
+        return this.readAgain() || this.borrowStillUsed() >= 0;
+    }
+
+    // Whether the slot itself is read again from the move on, on some path, before anything writes
+    // it again.
+    public readAgain() -> bool {
+        let instructions = this.function.blocks().get(this.block).instructions();
+        for (long i = this.firstInstruction(); i < instructions.length(); i++) {
+            if (i == this.index) {
+                continue;
+            }
+            let instruction = instructions.get(i);
+            if (readsSlot(instruction, this.slot, this.escaping)) {
+                return true;
+            }
+            if (instruction is EirStoreSlot && instruction.slot == this.slot) {
+                return false;
+            }
+        }
+        return this.liveOut[this.block];
+    }
+
+    // The first temp borrowing what the slot holds that is still used at or after the move, or -1
+    // when none is.
+    public borrowStillUsed() -> long {
+        let blocks = this.function.blocks();
+        for (long b = 0; b < blocks.length(); b++) {
+            if (b != this.block && !this.reached[b]) {
+                continue;
+            }
+            let instructions = blocks.get(b).instructions();
+            long first = 0;
+            if (b == this.block) {
+                first = this.firstInstruction();
+            }
+            for (long i = first; i < instructions.length(); i++) {
+                long borrowed = this.borrowUsedBy(instructions.get(i));
+                if (borrowed >= 0) {
+                    return borrowed;
+                }
+            }
+            let terminator = blocks.get(b).terminator();
+            if (terminator == null) {
+                continue;
+            }
+            for (let used in walk.terminatorUsesOf(terminator)) {
+                if (this.borrows(used)) {
+                    return used;
+                }
+            }
+        }
+        return -1;
+    }
+
+    // Whether the temp holds a reference the slot keeps alive, or an address inside one.
+    public borrows(long temp) -> bool {
+        return temp >= 0 && temp < this.borrowing.length && this.borrowing[temp];
+    }
+
+    // Where the move's own block starts counting. A block a path can reach again runs its whole
+    // instruction list after the move as well as before it.
+    firstInstruction() -> long {
+        if (this.reached[this.block]) {
+            return 0;
+        }
+        return this.index + 1;
+    }
+
+    // The borrowed temp one instruction uses, or -1. Giving up what the slot's own storage holds
+    // is no use of the reference that storage held.
+    borrowUsedBy(EirInstruction instruction) -> long {
+        if (instruction is EirReleasePtr && this.namesSlot(instruction.address)) {
+            return -1;
+        }
+        for (let used in walk.usesOf(instruction)) {
+            if (this.borrows(used)) {
+                return used;
+            }
+        }
+        return -1;
+    }
+
+    namesSlot(long temp) -> bool {
+        return temp >= 0 && temp < this.addresses.length && this.addresses[temp];
+    }
+}
+
+// One slot's picture around the instruction at `index` in `block` that moves its reference out:
+// the load a take is about to replace, or the take itself.
+public forMove(EirFunction function, long slot, long block, long index) -> SlotUses {
+    bool[] addresses = slotAddresses(function, slot);
+    bool[] escaping = escapingAddresses(function, addresses);
+    bool[] reaching = blocksReaching(function, block);
+    return new SlotUses(function, slot, block, index,
+        borrowedTemps(function, slot, block, index, reaching), addresses, escaping,
+        liveOutOf(function, slot, escaping), blocksReachedFrom(function, block));
+}
+
+// The temps holding the address of the slot itself.
+slotAddresses(EirFunction function, long slot) -> bool[] {
+    bool[] addresses = new bool[function.tempTypes().length() + 1];
+    let blocks = function.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        let instructions = blocks.get(b).instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (instruction is EirSlotAddress && instruction.slot == slot
+                    && instruction.result >= 0 && instruction.result < addresses.length) {
+                addresses[instruction.result] = true;
+            }
+        }
+    }
+    return addresses;
+}
+
+// The addresses of the slot that reach further than giving up what it holds. A release of the
+// slot's storage empties it; every other reader of the address reads the reference there,
+// terminators included.
+escapingAddresses(EirFunction function, bool[] addresses) -> bool[] {
+    bool[] escaping = new bool[addresses.length];
+    let blocks = function.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        let instructions = blocks.get(b).instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (instruction is EirReleasePtr) {
+                continue;
+            }
+            for (let used in walk.usesOf(instruction)) {
+                if (used >= 0 && used < addresses.length && addresses[used]) {
+                    escaping[used] = true;
+                }
+            }
+        }
+        let terminator = blocks.get(b).terminator();
+        if (terminator == null) {
+            continue;
+        }
+        for (let used in walk.terminatorUsesOf(terminator)) {
+            if (used >= 0 && used < addresses.length && addresses[used]) {
+                escaping[used] = true;
+            }
+        }
+    }
+    return escaping;
+}
+
+// Every temp that borrows what the slot holds at the move: what a read of the slot that can run
+// before the move yields, and what renaming, interior addressing, and reading through such an
+// address yield from those in turn. A temp that arrives owning a +1 of its own - a call's result,
+// a fresh string, a weak upgrade - borrows nothing, so the walk stops there.
+borrowedTemps(EirFunction function, long slot, long block, long index,
+              bool[] reaching) -> bool[] {
+    long count = function.tempTypes().length();
+    bool[] borrowing = new bool[count + 1];
+    let blocks = function.blocks();
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (long b = 0; b < blocks.length(); b++) {
+            let instructions = blocks.get(b).instructions();
+            for (long i = 0; i < instructions.length(); i++) {
+                let instruction = instructions.get(i);
+                long result = walk.resultOf(instruction);
+                if (result < 0 || result >= count || borrowing[result]) {
+                    continue;
+                }
+                bool starts = readsBeforeMove(b, i, block, index, reaching)
+                    && startsBorrow(instruction, slot);
+                if (!starts && !carriesBorrow(function, instruction, borrowing)) {
+                    continue;
+                }
+                borrowing[result] = true;
+                changed = true;
+            }
+        }
+    }
+    return borrowing;
+}
+
+// Whether the instruction at that position can run before the move: earlier in the move's own
+// block, or in a block a path leads from to the move's.
+readsBeforeMove(long b, long i, long block, long index, bool[] reaching) -> bool {
+    if (b == block) {
+        return reaching[block] || i < index;
+    }
+    return reaching[b];
+}
+
+startsBorrow(EirInstruction instruction, long slot) -> bool {
+    if (instruction is EirLoadSlot && instruction.slot == slot) {
+        return true;
+    }
+    return instruction is EirSlotAddress && instruction.slot == slot;
+}
+
+// True when the instruction hands on a reference, or an address inside one, that it was given
+// rather than producing one of its own.
+carriesBorrow(EirFunction function, EirInstruction instruction, bool[] borrowing) -> bool {
+    if (ownership.producesOwned(instruction)) {
+        return false;
+    }
+    long result = walk.resultOf(instruction);
+    if (!walk.producesAddress(instruction)
+            && !primitives.isReferenceType(function.tempTypes().get(result))) {
+        return false;
+    }
+    for (let used in walk.usesOf(instruction)) {
+        if (used >= 0 && used < borrowing.length && borrowing[used]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Backward liveness of the slot's own reads at block exits, with a release of its storage not
+// counting as a read.
+liveOutOf(EirFunction function, long slot, bool[] escaping) -> bool[] {
+    let blocks = function.blocks();
+    long count = blocks.length();
+    // 0 none, 1 reads first, 2 writes first
+    long[] firstEffect = new long[count + 1];
+    for (long b = 0; b < count; b++) {
+        let instructions = blocks.get(b).instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (readsSlot(instruction, slot, escaping)) {
+                firstEffect[b] = 1;
+                break;
+            }
+            if (instruction is EirStoreSlot && instruction.slot == slot) {
+                firstEffect[b] = 2;
+                break;
+            }
+        }
+    }
+    bool[] liveOut = new bool[count + 1];
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (long b = 0; b < count; b++) {
+            bool live = false;
+            for (let successor in walk.successorsOf(blocks.get(b))) {
+                if (successor < 0 || successor >= count) {
+                    continue;
+                }
+                if (firstEffect[successor] == 1
+                        || (firstEffect[successor] == 0 && liveOut[successor])) {
+                    live = true;
+                }
+            }
+            if (live && !liveOut[b]) {
+                liveOut[b] = true;
+                changed = true;
+            }
+        }
+    }
+    return liveOut;
+}
+
+readsSlot(EirInstruction instruction, long slot, bool[] escaping) -> bool {
+    if (instruction is EirLoadSlot && instruction.slot == slot) {
+        return true;
+    }
+    if (instruction is EirTakeSlot && instruction.slot == slot) {
+        return true;
+    }
+    if (instruction is EirSlotAddress && instruction.slot == slot) {
+        return instruction.result >= 0 && instruction.result < escaping.length
+            && escaping[instruction.result];
+    }
+    return false;
+}
+
+// The blocks a path leaving this block can reach, itself included only when it lies on a cycle.
+blocksReachedFrom(EirFunction function, long block) -> bool[] {
+    let blocks = function.blocks();
+    long count = blocks.length();
+    bool[] reached = new bool[count + 1];
+    let pending = new List<long>();
+    pushSuccessors(blocks.get(block), count, reached, pending);
+    while (pending.length() > 0) {
+        pushSuccessors(blocks.get(pending.pop()), count, reached, pending);
+    }
+    return reached;
+}
+
+pushSuccessors(EirBlock from, long count, bool[] reached, List<long> pending) {
+    for (let successor in walk.successorsOf(from)) {
+        if (successor >= 0 && successor < count && !reached[successor]) {
+            reached[successor] = true;
+            pending.push(successor);
+        }
+    }
+}
+
+// The blocks a path leads from to this one, itself included only when it lies on a cycle.
+blocksReaching(EirFunction function, long block) -> bool[] {
+    let blocks = function.blocks();
+    long count = blocks.length();
+    bool[] reaching = new bool[count + 1];
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (long b = 0; b < count; b++) {
+            if (reaching[b]) {
+                continue;
+            }
+            for (let successor in walk.successorsOf(blocks.get(b))) {
+                if (successor == block || (successor >= 0 && successor < count
+                        && reaching[successor])) {
+                    reaching[b] = true;
+                    changed = true;
+                }
+            }
+        }
+    }
+    return reaching;
+}

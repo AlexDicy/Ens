@@ -7,9 +7,11 @@
 // dropped, and the releases of its storage disappear. The elision is invisible to destruction
 // order - the parameter's reference outlives every window the local's reference covered.
 //
-// A MOVE is the last read of an owning slot feeding a retain: the copy takes a new +1 while the
-// slot's own +1 waits for a cleanup nothing else needs. The load-and-retain becomes a take,
-// which hands the slot's +1 to the copy and leaves null behind for the cleanup that still runs.
+// A MOVE is a retain fed by the last use of what an owning slot holds: the copy takes a new +1
+// while the slot's own +1 waits for a cleanup nothing else needs. The load-and-retain becomes a
+// take, which hands the slot's +1 to the copy and leaves null behind for the cleanup that still
+// runs. Last use of the contents, not merely last read of the slot: a reference read out of the
+// slot earlier and used later is kept alive by that same +1, so eir.slotuses is asked about both.
 // A take is never introduced inside a loop: the slot refills next time around, and the reference
 // compiler keeps those pairs too, so destruction timing stays observably the same.
 //
@@ -28,6 +30,7 @@ import EirRetain from eir.model;
 import EirReleasePtr from eir.model;
 import EirCast from eir.model;
 import EirCastOp from eir.model;
+import eir.slotuses;
 import eir.walk;
 import passes.scan;
 import support.primitives;
@@ -308,8 +311,10 @@ rewriteMoves(EirFunction function) -> EirFunction {
             if (loadIndex < 0 || loadIndex >= k) {
                 continue;
             }
-            if (alreadyPlanned(moves, load.slot)
-                    || slotLiveAfter(function, users, b, loadIndex + 1, load.slot)) {
+            if (alreadyPlanned(moves, load.slot)) {
+                continue;
+            }
+            if (slotuses.forMove(function, load.slot, b, loadIndex).contentsNeeded()) {
                 continue;
             }
             moves.push(new MoveCandidate(load, instruction));
@@ -413,85 +418,6 @@ indexIn(List<EirInstruction> instructions, EirInstruction target) -> long {
         }
     }
     return -1;
-}
-
-// Whether the slot is read again - beyond the cleanup that only releases it - after this point
-// on some path, before anything overwrites it.
-slotLiveAfter(EirFunction function, List<List<EirInstruction>> users, long block, long start,
-              long slot) -> bool {
-    let instructions = function.blocks().get(block).instructions();
-    for (long i = start; i < instructions.length(); i++) {
-        let instruction = instructions.get(i);
-        if (readsSlot(instruction, slot, users)) {
-            return true;
-        }
-        if (instruction is EirStoreSlot && instruction.slot == slot) {
-            return false;
-        }
-    }
-    return liveOutOf(function, users, slot)[block];
-}
-
-readsSlot(EirInstruction instruction, long slot, List<List<EirInstruction>> users) -> bool {
-    if (instruction is EirLoadSlot && instruction.slot == slot) {
-        return true;
-    }
-    if (instruction is EirTakeSlot && instruction.slot == slot) {
-        return true;
-    }
-    if (instruction is EirSlotAddress && instruction.slot == slot) {
-        let consumers = users.get(instruction.result);
-        for (long u = 0; u < consumers.length(); u++) {
-            if (!(consumers.get(u) is EirReleasePtr)) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-// Backward liveness of one slot at block exits, with the cleanup releases not counting as reads.
-liveOutOf(EirFunction function, List<List<EirInstruction>> users, long slot) -> bool[] {
-    let blocks = function.blocks();
-    long count = blocks.length();
-    // 0 none, 1 reads first, 2 overwrites first
-    long[] firstEffect = new long[count];
-    for (long b = 0; b < count; b++) {
-        let instructions = blocks.get(b).instructions();
-        for (long i = 0; i < instructions.length(); i++) {
-            let instruction = instructions.get(i);
-            if (readsSlot(instruction, slot, users)) {
-                firstEffect[b] = 1;
-                break;
-            }
-            if (instruction is EirStoreSlot && instruction.slot == slot) {
-                firstEffect[b] = 2;
-                break;
-            }
-        }
-    }
-    bool[] liveOut = new bool[count];
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (long b = 0; b < count; b++) {
-            bool live = false;
-            for (let successor in walk.successorsOf(blocks.get(b))) {
-                if (successor < 0 || successor >= count) {
-                    continue;
-                }
-                if (firstEffect[successor] == 1
-                        || (firstEffect[successor] == 0 && liveOut[successor])) {
-                    live = true;
-                }
-            }
-            if (live && !liveOut[b]) {
-                liveOut[b] = true;
-                changed = true;
-            }
-        }
-    }
-    return liveOut;
 }
 
 // The blocks that can run more than once: anything on a path from itself back to itself.
