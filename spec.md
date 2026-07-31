@@ -1242,6 +1242,10 @@ Every missing parent above it is still created the lenient way; only the directo
 `system.removeFile(path)` removes one file and refuses a directory; `system.removeDirectory(path)` removes one directory, which has to be empty already, because what to do with what is inside it is the caller's decision.
 Each of the four raises a `SystemError` when it does not succeed, and `createNewDirectory` raises one for a path where a file of that name is already there, since no folder can be claimed at that name.
 
+`system.move(from, to)` moves the file or folder `from` names, together with everything under it, to `to`, and answers whether this call is the one that moved it: `true` when it did, and `false` when something was already at `to`.
+The move happens in one step, so no other program ever sees half of it and two programs racing for the same name get different answers; that is also why both paths have to be on the same volume, since a move across volumes would have to copy.
+A move that failed for any other reason raises a `SystemError`.
+
 `system.currentDirectory()` returns the directory the program was started in, and `system.executablePath()` the path of the running program itself, both with `/` between their parts on every platform, so the `@std.path` functions read them as they are.
 Neither can be changed: a program builds the paths it works with rather than moving itself somewhere else.
 
