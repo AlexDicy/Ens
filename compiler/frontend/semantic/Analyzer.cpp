@@ -4969,6 +4969,13 @@ Type* Analyzer::analyzePrefix(const ast::PrefixExpression& expr) {
                 return typeCtx.getError();
             }
             return t;
+        case SyntaxKind::Tilde:
+            if (!t->isInteger()) {
+                errorAtNode(expr.node, "'~' flips the bits of an integer, got '" +
+                    t->toString() + "'.");
+                return typeCtx.getError();
+            }
+            return t;
         case SyntaxKind::PlusPlus:
         case SyntaxKind::MinusMinus:
             return analyzeIncDec(expr.node, *operand, t,

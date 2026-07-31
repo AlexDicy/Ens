@@ -4217,7 +4217,10 @@ struct CodeGenerator::Impl {
                 if (!v) return nullptr;
                 return flt ? builder->CreateFNeg(v) : builder->CreateNeg(v);
             }
-            case SyntaxKind::Bang: {
+            // A logical negation of a bool and a bitwise complement of an integer are
+            // the same instruction: every bit of the operand's own width flipped.
+            case SyntaxKind::Bang:
+            case SyntaxKind::Tilde: {
                 llvm::Value* v = emitExpr(*operand);
                 if (!v) return nullptr;
                 return builder->CreateNot(v);

@@ -892,13 +892,17 @@ The shift operators `<<` and `>>` move a value's bits by a distance, and `>>` ke
 A shift produces the type of the value it shifts, so the distance must be that same integer type, and an untyped literal distance adapts to it.
 The distance never decides the result, so an untyped literal on the left of a shift stays `int` and shifting by a `uint` distance is written `(1 as uint) << spread`.
 
+The unary `~` flips every bit of an integer and produces the operand's own type; it sits with the other prefix operators and rejects anything that is not an integer.
+
 ```ens
 uint flags = 0x12345678;
 uint low = flags & 0xFF;        // 0x78: the literal adapts to uint
 uint top = flags >> 24;         // 0x12: the distance adapts to uint
+uint flipped = ~flags;          // 0xEDCBA987
 
 byte mask = 0x0F;
 byte bits = mask & 300;         // error: 300 does not fit in 'byte' (range 0..255)
+bool ready = ~true;             // error: '~' flips the bits of an integer, got 'bool'
 ```
 
 The logical operators `&&` and `||` require `bool` operands and short-circuit: the right side is evaluated only when it can change the result, so `a != null && a.ready()` is safe.

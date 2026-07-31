@@ -83,6 +83,7 @@ static constexpr std::pair<SyntaxKind, std::string_view> KIND_NAMES[] = {
     {SyntaxKind::Caret,             "Caret"},
     {SyntaxKind::Eq,                "Eq"},
     {SyntaxKind::Bang,              "Bang"},
+    {SyntaxKind::Tilde,             "Tilde"},
     {SyntaxKind::Question,          "Question"},
     {SyntaxKind::QuestionDot,       "QuestionDot"},
     {SyntaxKind::EqEq,              "EqEq"},

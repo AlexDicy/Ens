@@ -33,7 +33,7 @@ enum class SyntaxKind : uint16_t {
     LParen, RParen, LBrace, RBrace, LBracket, RBracket,
     Semi, Comma, Dot, Ellipsis, Colon, Arrow, At,
     Plus, Minus, Star, Slash, Percent, Caret,
-    Eq, Bang, Question, QuestionDot,
+    Eq, Bang, Tilde, Question, QuestionDot,
     EqEq, NotEq, Lt, Gt, LtEq, GtEq,
     AmpAmp, PipePipe,
     Amp, Pipe,

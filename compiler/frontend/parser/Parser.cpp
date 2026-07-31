@@ -1637,6 +1637,7 @@ void Parser::parsePrefix() {
         }
         case SyntaxKind::Minus:
         case SyntaxKind::Bang:
+        case SyntaxKind::Tilde:
         case SyntaxKind::PlusPlus:
         case SyntaxKind::MinusMinus: {
             builder.startNode(SyntaxKind::PrefixExpr);

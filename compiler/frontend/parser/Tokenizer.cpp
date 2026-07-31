@@ -379,6 +379,7 @@ LexedToken Tokenizer::lexOperator(uint32_t startPos, int startLine, int startCol
         case u'^': return consume(1, SyntaxKind::Caret);
         case u'=': return consume(1, SyntaxKind::Eq);
         case u'!': return consume(1, SyntaxKind::Bang);
+        case u'~': return consume(1, SyntaxKind::Tilde);
         case u'?': return consume(1, SyntaxKind::Question);
         case u'<': return consume(1, SyntaxKind::Lt);
         case u'>': return consume(1, SyntaxKind::Gt);
