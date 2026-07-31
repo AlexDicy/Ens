@@ -102,6 +102,19 @@ target("ens")
     add_deps("ens-frontend", "ens-codegen")
 
 
+-- The linker bridge the Ens-written compiler links through: one C entry point over lld's C++
+-- drivers, shipped as a shared library beside LLVM-C so it outlives the C++ compiler.
+target("ens-lld")
+    set_kind("shared")
+    set_languages("cxx17")
+    set_toolchains("@llvm")
+    add_rules("link-llvm-libs")
+    add_files("runtime/lld/ens_lld.cpp")
+    add_packages("libllvm", "libxml2")
+    -- fix to have the flag appear later compared to add_links(...) for GNU ld
+    add_shflags("-lLLVMCGData", { force = true })
+
+
 target("ens-lsp")
     set_kind("binary")
     set_languages("cxx20")
