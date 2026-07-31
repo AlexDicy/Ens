@@ -1,0 +1,174 @@
+// The link line of each flavor, pinned argument by argument. Building a line is a pure function of
+// the request and the toolchain, so the Linux and macOS lines are verified wherever these tests run
+// and not only on those systems.
+import @std.testing;
+import Toolchain from toolchain;
+import ElfRuntime from toolchain;
+import MacosSdk from toolchain;
+import toolchain;
+import LinkRequest from request;
+import argv;
+import expect;
+
+test "the COFF line puts the objects before the output and brings the static C runtime" {
+    let request = new LinkRequest(["build/app.main.obj", "build/app.helpers.obj"],
+        ["zlib", "user32"], ["vendor/fast.lib"], "build/app.exe", "x86_64-pc-windows-msvc");
+    try expect.arguments(argv.argumentsFor(request, toolchain.bareToolchain()), [
+        "lld-link",
+        "/nologo",
+        "/subsystem:console",
+        "build/app.main.obj",
+        "build/app.helpers.obj",
+        "vendor/fast.lib",
+        "/out:build/app.exe",
+        "/defaultlib:libcmt",
+        "/defaultlib:oldnames",
+        "/defaultlib:kernel32",
+        "zlib.lib",
+        "user32.lib",
+    ]);
+}
+
+test "the COFF line never names a C runtime twice" {
+    let request = new LinkRequest(["build/app.main.obj"], ["msvcrt", "libcmt", "ws2_32"], [],
+        "build/app.exe", "x86_64-pc-windows-msvc");
+    try expect.arguments(argv.argumentsFor(request, toolchain.bareToolchain()), [
+        "lld-link",
+        "/nologo",
+        "/subsystem:console",
+        "build/app.main.obj",
+        "/out:build/app.exe",
+        "/defaultlib:libcmt",
+        "/defaultlib:oldnames",
+        "/defaultlib:kernel32",
+        "ws2_32.lib",
+    ]);
+}
+
+test "the ELF line brackets the objects with the C runtime and follows them with the unwinder" {
+    let request = new LinkRequest(["build/app.main.o"], ["z", "m"], ["vendor/libfast.a"],
+        "build/app", "x86_64-unknown-linux-gnu");
+    let machine = new Toolchain(["/opt/llvm/lib"], "/lib64/ld-linux-x86-64.so.2",
+        new ElfRuntime("/usr/lib/x86_64-linux-gnu/Scrt1.o", "/usr/lib/x86_64-linux-gnu/crti.o",
+            "/usr/lib/x86_64-linux-gnu/crtn.o", "/usr/lib/llvm/libunwind.a"),
+        new MacosSdk("", ""));
+    try expect.arguments(argv.argumentsFor(request, machine), [
+        "ld.lld",
+        "--eh-frame-hdr",
+        "-dynamic-linker",
+        "/lib64/ld-linux-x86-64.so.2",
+        "-o",
+        "build/app",
+        "-L/opt/llvm/lib",
+        "-rpath",
+        "/opt/llvm/lib",
+        "/usr/lib/x86_64-linux-gnu/Scrt1.o",
+        "/usr/lib/x86_64-linux-gnu/crti.o",
+        "-L/usr/lib/x86_64-linux-gnu",
+        "build/app.main.o",
+        "vendor/libfast.a",
+        "-lz",
+        "-lm",
+        "/usr/lib/llvm/libunwind.a",
+        "-lc",
+        "/usr/lib/x86_64-linux-gnu/crtn.o",
+    ]);
+}
+
+test "an ELF machine with no C compiler links without an entry point and asks for libgcc_s" {
+    let request = new LinkRequest(["build/app.main.o"], ["z"], [], "build/app",
+        "aarch64-unknown-linux-gnu");
+    try expect.arguments(argv.argumentsFor(request, toolchain.bareToolchain()), [
+        "ld.lld",
+        "--eh-frame-hdr",
+        "-o",
+        "build/app",
+        "build/app.main.o",
+        "-lz",
+        "-lgcc_s",
+    ]);
+}
+
+test "an ELF machine with no crti or crtn still starts through the C runtime" {
+    let request = new LinkRequest(["build/app.main.o"], [], [], "build/app",
+        "x86_64-unknown-linux-gnu");
+    let machine = new Toolchain([], "", new ElfRuntime("/usr/lib/Scrt1.o", "", "",
+        "/usr/lib/libgcc_eh.a"), new MacosSdk("", ""));
+    try expect.arguments(argv.argumentsFor(request, machine), [
+        "ld.lld",
+        "--eh-frame-hdr",
+        "-o",
+        "build/app",
+        "/usr/lib/Scrt1.o",
+        "-L/usr/lib",
+        "build/app.main.o",
+        "/usr/lib/libgcc_eh.a",
+        "-lc",
+    ]);
+}
+
+test "the Mach-O line names the platform version and the SDK it was built against" {
+    let request = new LinkRequest(["build/app.main.o"], ["z", "System"], ["vendor/libfast.a"],
+        "build/app", "arm64-apple-macosx14.0");
+    let machine = new Toolchain(["/opt/homebrew/lib"], "", new ElfRuntime("", "", "", ""),
+        new MacosSdk("/SDKs/MacOSX14.4.sdk", "14.4"));
+    try expect.arguments(argv.argumentsFor(request, machine), [
+        "ld64.lld",
+        "-arch",
+        "arm64",
+        "-platform_version",
+        "macos",
+        "14.0",
+        "14.4",
+        "-syslibroot",
+        "/SDKs/MacOSX14.4.sdk",
+        "build/app.main.o",
+        "vendor/libfast.a",
+        "-o",
+        "build/app",
+        "-L/opt/homebrew/lib",
+        "-rpath",
+        "/opt/homebrew/lib",
+        "-lSystem",
+        "-lz",
+    ]);
+}
+
+test "a Mach-O link with no SDK reports the deployment target as the SDK version" {
+    let request = new LinkRequest(["build/app.main.o"], [], [], "build/app",
+        "x86_64-apple-darwin");
+    try expect.arguments(argv.argumentsFor(request, toolchain.bareToolchain()), [
+        "ld64.lld",
+        "-arch",
+        "x86_64",
+        "-platform_version",
+        "macos",
+        "11.0",
+        "11.0",
+        "build/app.main.o",
+        "-o",
+        "build/app",
+        "-lSystem",
+    ]);
+}
+
+test "every library folder becomes both a search path and a runtime path" {
+    let request = new LinkRequest(["build/app.main.o"], [], [], "build/app",
+        "x86_64-unknown-linux-gnu");
+    let machine = new Toolchain(["/first/lib", "/second/lib"], "", new ElfRuntime("", "", "", ""),
+        new MacosSdk("", ""));
+    try expect.arguments(argv.argumentsFor(request, machine), [
+        "ld.lld",
+        "--eh-frame-hdr",
+        "-o",
+        "build/app",
+        "-L/first/lib",
+        "-rpath",
+        "/first/lib",
+        "-L/second/lib",
+        "-rpath",
+        "/second/lib",
+        "build/app.main.o",
+        "-lgcc_s",
+    ]);
+}

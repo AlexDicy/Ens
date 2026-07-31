@@ -1,0 +1,169 @@
+// Looking around the machine for what a link line needs from it. This is the only part of linking
+// that reads the environment or runs a program; everything it finds becomes a Toolchain value, so
+// the line itself is built from values alone.
+//
+// The flavor decides what is worth asking for. A COFF link needs nothing: lld-link reads LIB by
+// itself and brings its own C runtime. An ELF link needs the startup objects and the unwinder of
+// whichever C compiler the machine has, plus the loader for the target architecture. A Mach-O link
+// needs the system SDK.
+import @std.system;
+import SystemError from @std.system;
+import @std.path;
+import @std.text.strings;
+import List from @std.collections.list;
+import LinkerFlavor from flavor;
+import Toolchain from toolchain;
+import ElfRuntime from toolchain;
+import MacosSdk from toolchain;
+import toolchain;
+import triple;
+
+// Everything this machine contributes to a link for the given target. `probePath` is a path prefix
+// the probes write their captured output to; nothing is left behind. Nothing here fails: a question
+// the machine cannot answer leaves its part of the toolchain empty, and the link line then simply
+// says less.
+export discover(LinkerFlavor selectedFlavor, string targetTriple, string probePath) -> Toolchain {
+    let discovered = switch (selectedFlavor) {
+        LinkerFlavor.Coff -> toolchain.bareToolchain(),
+        LinkerFlavor.Elf -> elfToolchain(targetTriple, probePath),
+        LinkerFlavor.MachO -> machoToolchain(probePath),
+    };
+    removeProbeFiles(probePath);
+    return discovered;
+}
+
+// The folders a LIBRARY_PATH value names, in the order it names them, with empty entries dropped.
+// Unset gives none, which leaves an ordinary link untouched. The separator is ':', the one the C
+// compilers that read this variable use.
+export searchPathsFrom(string? libraryPath) -> string[] {
+    let folders = new List<string>();
+    if (libraryPath == null) {
+        return folders.toArray();
+    }
+    for (let folder in strings.split(libraryPath, ":")) {
+        if (folder.length > 0) {
+            folders.push(folder);
+        }
+    }
+    return folders.toArray();
+}
+
+// The version an SDK folder's name spells out: 'MacOSX14.0.sdk' is 14.0. Empty when the name carries
+// no version, and the link then reports the deployment target as the SDK version.
+export sdkVersionFromRoot(string root) -> string {
+    string name = path.fileName(root);
+    if (!name.startsWith("MacOSX") || !name.endsWith(".sdk")) {
+        return "";
+    }
+    string version = name.substring(6, name.length - 4);
+    byte[] raw = version.toBytes();
+    if (raw.length == 0) {
+        return "";
+    }
+    for (long i = 0; i < raw.length; i++) {
+        if (raw[i] != '.' && (raw[i] < '0' || raw[i] > '9')) {
+            return "";
+        }
+    }
+    return version;
+}
+
+elfToolchain(string targetTriple, string probePath) -> Toolchain {
+    return new Toolchain(searchPathsFrom(system.getEnvironmentVariable("LIBRARY_PATH")),
+        firstExistingFile(triple.dynamicLinkerCandidates(targetTriple)), elfRuntime(probePath),
+        new MacosSdk("", ""));
+}
+
+machoToolchain(string probePath) -> Toolchain {
+    return new Toolchain(searchPathsFrom(system.getEnvironmentVariable("LIBRARY_PATH")), "",
+        new ElfRuntime("", "", "", ""), macosSdk(probePath));
+}
+
+// The C runtime pieces of the first of cc, clang and gcc this machine can run. One compiler answers
+// every question, so a machine with several of them never ends up mixing two C runtimes.
+elfRuntime(string probePath) -> ElfRuntime {
+    for (let compiler in ["cc", "clang", "gcc"]) {
+        let startupObject = compilerFile(compiler, "Scrt1.o", probePath);
+        if (startupObject == null) {
+            continue;
+        }
+        return new ElfRuntime(startupObject,
+            compilerFile(compiler, "crti.o", probePath) ?? "",
+            compilerFile(compiler, "crtn.o", probePath) ?? "",
+            unwinderArchive(compiler, probePath));
+    }
+    return new ElfRuntime("", "", "", "");
+}
+
+// The static unwinder to link, preferring LLVM's over GCC's. Empty when the compiler ships neither,
+// and the link falls back to the shared libgcc_s.
+unwinderArchive(string compiler, string probePath) -> string {
+    for (let archive in ["libunwind.a", "libgcc_eh.a"]) {
+        string found = compilerFile(compiler, archive, probePath) ?? "";
+        if (found.length > 0) {
+            return found;
+        }
+    }
+    return "";
+}
+
+// Where the C compiler keeps one of its own files, as it reports it: null when the compiler could not
+// be run at all, so the next candidate gets a turn, and empty when it ran but has no such file -
+// which it says by echoing the name back unchanged.
+compilerFile(string compiler, string fileName, string probePath) -> string? {
+    let printed = printedByProgram(compiler, ["-print-file-name=" + fileName], probePath);
+    if (printed == null) {
+        return null;
+    }
+    if (printed == fileName || !system.isFile(printed)) {
+        return "";
+    }
+    return printed;
+}
+
+// The macOS SDK to link against: the one SDKROOT names, else the one xcrun selects. Empty when
+// neither answers, and the link then reaches the system libraries by their absolute paths.
+macosSdk(string probePath) -> MacosSdk {
+    string root = system.getEnvironmentVariable("SDKROOT") ?? "";
+    if (root.length == 0) {
+        root = printedByProgram("xcrun", ["--show-sdk-path"], probePath) ?? "";
+    }
+    if (root.length == 0 || !system.isDirectory(root)) {
+        return new MacosSdk("", "");
+    }
+    return new MacosSdk(root, sdkVersionFromRoot(root));
+}
+
+// What a program printed on its standard output, trimmed: null when it could not be run or reported
+// failure, so a machine that lacks the program is never mistaken for one that answered with nothing.
+printedByProgram(string program, string[] arguments, string probePath) -> string? {
+    long status = try system.runCaptured(program, arguments, probePath + ".out",
+        probePath + ".err");
+    if (status != 0) {
+        return null;
+    }
+    string printed = try system.readAllText(probePath + ".out");
+    return printed.trim();
+} catch (SystemError error) {
+    return null;
+}
+
+firstExistingFile(string[] candidates) -> string {
+    for (let candidate in candidates) {
+        if (system.isFile(candidate)) {
+            return candidate;
+        }
+    }
+    return "";
+}
+
+removeProbeFiles(string probePath) {
+    removeQuietly(probePath + ".out");
+    removeQuietly(probePath + ".err");
+}
+
+removeQuietly(string file) {
+    if (system.isFile(file)) {
+        try system.removeFile(file);
+    }
+} catch (SystemError error) { }

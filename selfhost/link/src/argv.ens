@@ -1,0 +1,142 @@
+// The argument vector a link runs under, built from the request and what the machine contributed.
+// This is a pure function of those two values: the same request and the same toolchain always give
+// the same line, whichever machine builds it, which is what lets every platform's line be pinned by
+// a test wherever the tests happen to run.
+import LinkerFlavor from flavor;
+import flavor;
+import Toolchain from toolchain;
+import LinkRequest from request;
+import triple;
+import List from @std.collections.list;
+import @std.path;
+
+// The whole vector, the linker's own name first, the way lld reads argument zero.
+export argumentsFor(LinkRequest request, Toolchain toolchain) -> string[] {
+    let selected = flavor.flavorOf(request.triple());
+    let arguments = new List<string>();
+    arguments.push(flavor.linkerName(selected));
+    switch (selected) {
+        LinkerFlavor.Coff -> {
+            appendCoff(arguments, request);
+        },
+        LinkerFlavor.Elf -> {
+            appendElf(arguments, request, toolchain);
+        },
+        LinkerFlavor.MachO -> {
+            appendMachO(arguments, request, toolchain);
+        },
+    }
+    return arguments.toArray();
+}
+
+// The COFF line. lld-link finds its libraries through LIB, which the machine already sets, so the
+// toolchain contributes nothing here. The default libraries are the static C runtime, the POSIX
+// aliases the standard library calls (rmdir), and kernel32 for the stack walker a trace captures
+// through.
+appendCoff(List<string> arguments, LinkRequest request) {
+    arguments.push("/nologo");
+    arguments.push("/subsystem:console");
+    appendAll(arguments, request.objects());
+    appendAll(arguments, request.libraryFiles());
+    arguments.push("/out:" + request.output());
+    arguments.push("/defaultlib:libcmt");
+    arguments.push("/defaultlib:oldnames");
+    arguments.push("/defaultlib:kernel32");
+    for (let library in request.libraries()) {
+        if (library == "msvcrt" || library == "libcmt") {
+            continue;
+        }
+        arguments.push(library + ".lib");
+    }
+}
+
+// The ELF line. The startup objects bracket the program's own objects the way a C compiler driver
+// brackets them, and the unwinder follows the libraries so a thrown exception finds its personality
+// routine.
+appendElf(List<string> arguments, LinkRequest request, Toolchain toolchain) {
+    arguments.push("--eh-frame-hdr");
+    if (toolchain.dynamicLinker().length > 0) {
+        arguments.push("-dynamic-linker");
+        arguments.push(toolchain.dynamicLinker());
+    }
+    arguments.push("-o");
+    arguments.push(request.output());
+    appendSearchPaths(arguments, toolchain);
+
+    let runtime = toolchain.elfRuntime();
+    bool startsThroughCRuntime = runtime.startupObject().length > 0;
+    if (startsThroughCRuntime) {
+        arguments.push(runtime.startupObject());
+        if (runtime.initObject().length > 0) {
+            arguments.push(runtime.initObject());
+        }
+        arguments.push("-L" + path.parentFolder(runtime.startupObject()));
+    }
+
+    appendAll(arguments, request.objects());
+    appendAll(arguments, request.libraryFiles());
+    for (let library in request.libraries()) {
+        arguments.push("-l" + library);
+    }
+    if (runtime.unwinderArchive().length > 0) {
+        arguments.push(runtime.unwinderArchive());
+    } else {
+        arguments.push("-lgcc_s");
+    }
+    if (startsThroughCRuntime) {
+        arguments.push("-lc");
+        if (runtime.finiObject().length > 0) {
+            arguments.push(runtime.finiObject());
+        }
+    }
+}
+
+// The Mach-O line. The platform version tells the linker which system the program targets and which
+// SDK it was built against; libSystem carries the whole C runtime on this platform, so it is always
+// linked and never named twice.
+appendMachO(List<string> arguments, LinkRequest request, Toolchain toolchain) {
+    string deploymentTarget = triple.macosDeploymentTarget(request.triple());
+    let sdk = toolchain.macosSdk();
+    string sdkVersion = deploymentTarget;
+    if (sdk.version().length > 0) {
+        sdkVersion = sdk.version();
+    }
+    arguments.push("-arch");
+    arguments.push(triple.architectureOf(request.triple()));
+    arguments.push("-platform_version");
+    arguments.push("macos");
+    arguments.push(deploymentTarget);
+    arguments.push(sdkVersion);
+    if (sdk.root().length > 0) {
+        arguments.push("-syslibroot");
+        arguments.push(sdk.root());
+    }
+    appendAll(arguments, request.objects());
+    appendAll(arguments, request.libraryFiles());
+    arguments.push("-o");
+    arguments.push(request.output());
+    appendSearchPaths(arguments, toolchain);
+    arguments.push("-lSystem");
+    for (let library in request.libraries()) {
+        if (library == "System") {
+            continue;
+        }
+        arguments.push("-l" + library);
+    }
+}
+
+// Each discovered folder as both a search path and a runtime path, so a program that links a shared
+// library found this way also loads it when it runs.
+appendSearchPaths(List<string> arguments, Toolchain toolchain) {
+    for (let folder in toolchain.librarySearchPaths()) {
+        arguments.push("-L" + folder);
+        arguments.push("-rpath");
+        arguments.push(folder);
+    }
+}
+
+appendAll(List<string> arguments, string[] values) {
+    for (let value in values) {
+        arguments.push(value);
+    }
+}
