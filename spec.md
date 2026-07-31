@@ -1237,8 +1237,10 @@ A walk over a tree therefore visits the same names in the same order whatever or
 A folder that could not be read raises a `SystemError`.
 
 `system.createDirectory(path)` creates the directory the path names together with every parent of it that is missing, and leaves a directory that is already there alone.
+`system.createNewDirectory(path)` creates it the same way but answers whether this call is the one that created it: `true` when it did, and `false` when a directory was already there.
+Every missing parent above it is still created the lenient way; only the directory the path itself names is claimed, so two programs asking for the same name at the same instant get different answers and exactly one of them may treat the folder as its own.
 `system.removeFile(path)` removes one file and refuses a directory; `system.removeDirectory(path)` removes one directory, which has to be empty already, because what to do with what is inside it is the caller's decision.
-Each of the three raises a `SystemError` when it does not succeed.
+Each of the four raises a `SystemError` when it does not succeed, and `createNewDirectory` raises one for a path where a file of that name is already there, since no folder can be claimed at that name.
 
 `system.currentDirectory()` returns the directory the program was started in, and `system.executablePath()` the path of the running program itself, both with `/` between their parts on every platform, so the `@std.path` functions read them as they are.
 Neither can be changed: a program builds the paths it works with rather than moving itself somewhere else.

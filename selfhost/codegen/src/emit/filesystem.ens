@@ -5,6 +5,7 @@
 // 'struct stat'.
 import TypeRef from @ens.llvm.types;
 import @ens.llvm.instructions;
+import @ens.llvm.memory;
 import Runtime from emit.runtime;
 import RuntimeFunction from emit.runtime;
 import emit.directories;
@@ -89,8 +90,11 @@ posixPathKind(Runtime runtime, TypeRef type) -> RuntimeFunction {
     return runtime.endDefinition(definition);
 }
 
-// i32 ens_create_directory(ptr path): 0 when the one level the path names was created, -1 when it
-// was not. Every parent above it is the caller's to create first.
+// i32 ens_create_directory(ptr path): 0 when this call created the one level the path names, 1 when
+// something was there already, -1 when it could not be created. Every parent above it is the caller's
+// to create first. The three answers are what the operating system itself reports, so a caller can
+// tell creating a directory from finding one, which is how a name is claimed by exactly one of two
+// programs asking at the same instant.
 public createDirectoryRuntime(Runtime runtime) -> RuntimeFunction {
     let type = runtime.int32Type.functionType([runtime.pointerType]);
     let known = runtime.existing("ens_create_directory", type);
@@ -100,14 +104,30 @@ public createDirectoryRuntime(Runtime runtime) -> RuntimeFunction {
     if (runtime.onWindows()) {
         return windowsCreateDirectory(runtime, type);
     }
+    return posixCreateDirectory(runtime, type);
+}
+
+posixCreateDirectory(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let makeDirectory = runtime.libc("mkdir",
         runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type]));
     let definition = runtime.beginDefinition("ens_create_directory", type);
     let builder = runtime.builder;
+    let madeBlock = runtime.block(definition, "create.made");
+    let refusedBlock = runtime.block(definition, "create.refused");
     let status = runtime.call(makeDirectory, [runtime.parameter(definition, 0),
         runtime.int32(0x1FF)], "status");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, status, runtime.int32(0), ""), madeBlock, refusedBlock);
+
+    builder.positionAtEnd(madeBlock);
+    instructions.buildRet(builder, runtime.int32(0));
+
+    // EEXIST.
+    builder.positionAtEnd(refusedBlock);
+    let why = memory.buildLoad(builder, runtime.int32Type,
+        runtime.call(errnoLocation(runtime), [], "errno.slot"), "why");
     instructions.buildRet(builder, instructions.buildSelect(builder,
-        instructions.buildICmpEQ(builder, status, runtime.int32(0), ""), runtime.int32(0),
+        instructions.buildICmpEQ(builder, why, runtime.int32(17), ""), runtime.int32(1),
         runtime.int32(-1), ""));
     return runtime.endDefinition(definition);
 }
@@ -115,24 +135,48 @@ public createDirectoryRuntime(Runtime runtime) -> RuntimeFunction {
 windowsCreateDirectory(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let createDirectory = runtime.libc("CreateDirectoryW",
         runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
+    let lastError = runtime.libc("GetLastError", runtime.int32Type.functionType([]));
     let widen = widetext.wideFromUtf8(runtime);
     let release = runtime.free();
     let definition = runtime.beginDefinition("ens_create_directory", type);
     let builder = runtime.builder;
     let createBlock = runtime.block(definition, "create.wide");
+    let madeBlock = runtime.block(definition, "create.made");
+    let refusedBlock = runtime.block(definition, "create.refused");
     let failedBlock = runtime.block(definition, "create.failed");
     let wide = runtime.call(widen, [runtime.parameter(definition, 0), runtime.int32(-1)],
         "path.wide");
     instructions.buildCondBr(builder, runtime.isNull(wide), failedBlock, createBlock);
 
+    // The reason is read before anything else runs, because the next call is free to leave a reason
+    // of its own behind.
     builder.positionAtEnd(createBlock);
     let created = runtime.call(createDirectory, [wide, runtime.nullPointer()], "created");
+    let why = runtime.call(lastError, [], "why");
     runtime.call(release, [wide], "");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, created, runtime.int32(0), ""), refusedBlock, madeBlock);
+
+    builder.positionAtEnd(madeBlock);
+    instructions.buildRet(builder, runtime.int32(0));
+
+    // ERROR_ALREADY_EXISTS.
+    builder.positionAtEnd(refusedBlock);
     instructions.buildRet(builder, instructions.buildSelect(builder,
-        instructions.buildICmpEQ(builder, created, runtime.int32(0), ""), runtime.int32(-1),
-        runtime.int32(0), ""));
+        instructions.buildICmpEQ(builder, why, runtime.int32(183), ""), runtime.int32(1),
+        runtime.int32(-1), ""));
 
     builder.positionAtEnd(failedBlock);
     instructions.buildRet(builder, runtime.int32(-1));
     return runtime.endDefinition(definition);
+}
+
+// The C library's own errno cell, which is reached through a function because a thread has one of its
+// own: glibc and musl name it __errno_location, and the BSDs and macOS name it __error.
+errnoLocation(Runtime runtime) -> RuntimeFunction {
+    string name = "__errno_location";
+    if (runtime.onDarwin()) {
+        name = "__error";
+    }
+    return runtime.libc(name, runtime.pointerType.functionType([]));
 }

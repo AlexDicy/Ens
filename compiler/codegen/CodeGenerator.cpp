@@ -2712,8 +2712,12 @@ struct CodeGenerator::Impl {
         return fn;
     }
 
-    // i32 ens_create_directory(ptr path): 0 when the one level the path names was
-    // created, -1 when it was not. Every parent is the caller's to create first.
+    // i32 ens_create_directory(ptr path): 0 when this call created the one level the
+    // path names, 1 when something was there already, -1 when it could not be
+    // created. Every parent is the caller's to create first. The three answers are
+    // what the operating system itself reports, so a caller can tell creating a
+    // directory from finding one, which is how a name is claimed by exactly one of
+    // two programs asking at the same instant.
     llvm::Function* defineCreateDirectoryRuntime() {
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         auto* i32Ty = llvm::Type::getInt32Ty(ctx);
@@ -2729,24 +2733,38 @@ struct CodeGenerator::Impl {
         auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
         builder->SetInsertPoint(entry);
         auto* created = llvm::ConstantInt::get(i32Ty, 0);
+        auto* existed = llvm::ConstantInt::get(i32Ty, 1);
         auto* refused = llvm::ConstantInt::getSigned(i32Ty, -1);
+        auto* madeBB = llvm::BasicBlock::Create(ctx, "create.made", fn);
+        auto* refusedBB = llvm::BasicBlock::Create(ctx, "create.refused", fn);
 
         if (module->getTargetTriple().isOSWindows()) {
             auto* create = llvm::BasicBlock::Create(ctx, "create.wide", fn);
             auto* failed = llvm::BasicBlock::Create(ctx, "create.failed", fn);
             llvm::FunctionCallee createDirectory = libcFn("CreateDirectoryW",
                 llvm::FunctionType::get(i32Ty, { ptrTy, ptrTy }, false));
+            llvm::FunctionCallee lastError = libcFn("GetLastError",
+                llvm::FunctionType::get(i32Ty, {}, false));
             llvm::Value* wide = builder->CreateCall(defineWideFromUtf8Runtime(),
                 { fn->getArg(0), llvm::ConstantInt::getSigned(i32Ty, -1) }, "path.wide");
             builder->CreateCondBr(builder->CreateICmpEQ(wide,
                 llvm::ConstantPointerNull::get(ptrTy)), failed, create);
 
+            // The reason is read before anything else runs, because the next call is
+            // free to leave a reason of its own behind.
             builder->SetInsertPoint(create);
             llvm::Value* ok = builder->CreateCall(createDirectory,
                 { wide, llvm::ConstantPointerNull::get(ptrTy) }, "created");
+            llvm::Value* why = builder->CreateCall(lastError, {}, "why");
             builder->CreateCall(getOrDeclareFree(), { wide });
+            builder->CreateCondBr(builder->CreateICmpEQ(ok, llvm::ConstantInt::get(i32Ty, 0)),
+                refusedBB, madeBB);
+
+            builder->SetInsertPoint(refusedBB);
+            // ERROR_ALREADY_EXISTS.
             builder->CreateRet(builder->CreateSelect(
-                builder->CreateICmpEQ(ok, llvm::ConstantInt::get(i32Ty, 0)), refused, created));
+                builder->CreateICmpEQ(why, llvm::ConstantInt::get(i32Ty, 183)),
+                existed, refused));
 
             builder->SetInsertPoint(failed);
             builder->CreateRet(refused);
@@ -2755,13 +2773,33 @@ struct CodeGenerator::Impl {
                 llvm::FunctionType::get(i32Ty, { ptrTy, i32Ty }, false));
             llvm::Value* status = builder->CreateCall(makeDirectory,
                 { fn->getArg(0), llvm::ConstantInt::get(i32Ty, 0777) }, "status");
+            builder->CreateCondBr(builder->CreateICmpEQ(status,
+                llvm::ConstantInt::get(i32Ty, 0)), madeBB, refusedBB);
+
+            builder->SetInsertPoint(refusedBB);
+            llvm::Value* why = builder->CreateLoad(i32Ty,
+                builder->CreateCall(errnoLocation(), {}, "errno.slot"), "why");
+            // EEXIST.
             builder->CreateRet(builder->CreateSelect(
-                builder->CreateICmpEQ(status, llvm::ConstantInt::get(i32Ty, 0)),
-                created, refused));
+                builder->CreateICmpEQ(why, llvm::ConstantInt::get(i32Ty, 17)),
+                existed, refused));
         }
+
+        builder->SetInsertPoint(madeBB);
+        builder->CreateRet(created);
 
         builder->restoreIP(savedIP);
         return fn;
+    }
+
+    // The C library's own errno cell, which is reached through a function because a
+    // thread has one of its own: glibc and musl name it __errno_location, and the BSDs
+    // and macOS name it __error.
+    llvm::FunctionCallee errnoLocation() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        const char* name = module->getTargetTriple().isOSDarwin() ? "__error"
+                                                                 : "__errno_location";
+        return libcFn(name, llvm::FunctionType::get(ptrTy, {}, false));
     }
 
     // i64 ens_executable_path(ptr buffer, i64 capacity): the number of bytes of the
