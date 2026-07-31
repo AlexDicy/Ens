@@ -60,6 +60,13 @@ void EscapeAnalyzer::analyzeFunction(Symbol* fnSym, const ast::FuncDecl& fn) {
         ei.paramMutated.assign(currentParams.size(), false);
     }
 
+    // A `this.field` shorthand parameter is stored into the field before the body runs, so it
+    // escapes whatever the body then does - including a constructor that has no body at all, whose
+    // parameters would otherwise be read as never leaving it.
+    for (size_t i = 0; i < params.size() && i < currentParams.size(); ++i) {
+        if (params[i].isThisField()) markSymbolEscape(currentParams[i]);
+    }
+
     if (auto body = fn.body()) {
         scanBlock(*body);
     }
