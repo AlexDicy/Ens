@@ -160,6 +160,16 @@ task("test")
             })
         end
 
+        -- the host library's tests: the environment snapshot a run reads once, the folders Ens keeps
+        -- for a user, and the scratch folder a run builds in and then removes.
+        if want("selfhost_host") then
+            table.insert(jobs, {
+                name = "selfhost_host",
+                source = path.join(os.projectdir(), "selfhost", "host"),
+                ens_test_args = {},
+            })
+        end
+
         -- the command-line library's tests: every rule of the grammar a command line is read
         -- with, every usage problem it reports, and the generated help pinned by goldens.
         if want("selfhost_cli") then
@@ -612,7 +622,7 @@ task("test")
                 end
             end
             for _, pkg in ipairs({"corpus", "frontend", "sema", "semacheck", "syntaxgen",
-                              "llvm", "codegen", "codegencheck", "cli", "link", "build",
+                              "llvm", "codegen", "codegencheck", "host", "cli", "link", "build",
                               "driver"}) do
                 local src = path.join(os.projectdir(), "selfhost", pkg, "src")
                 local seeds = {}
