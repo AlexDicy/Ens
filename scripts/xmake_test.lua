@@ -138,6 +138,16 @@ task("test")
             })
         end
 
+        -- the command-line library's tests: every rule of the grammar a command line is read
+        -- with, every usage problem it reports, and the generated help pinned by goldens.
+        if want("selfhost_cli") then
+            table.insert(jobs, {
+                name = "selfhost_cli",
+                source = path.join(os.projectdir(), "selfhost", "cli"),
+                ens_test_args = {},
+            })
+        end
+
         -- the corpus round-trip harness parses every .ens file in the real source trees and
         -- asserts the front end is lossless and clean over all of them.
         if want("corpus_roundtrip") then
@@ -415,7 +425,7 @@ task("test")
                 end
             end
             for _, pkg in ipairs({"corpus", "frontend", "sema", "semacheck", "syntaxgen",
-                              "llvm", "codegen", "codegencheck", "driver"}) do
+                              "llvm", "codegen", "codegencheck", "cli", "driver"}) do
                 local src = path.join(os.projectdir(), "selfhost", pkg, "src")
                 local seeds = {}
                 for _, f in ipairs(os.files(path.join(src, "**.ens"))) do

@@ -1,0 +1,346 @@
+// Reading a command line: a walk over the arguments a process was handed, answering with one
+// invocation value.
+//
+// The walk is a pure function of the declarations and the arguments. It reads nothing else, writes
+// nothing else, and keeps nothing between calls, so the same command line always reads the same way
+// and two readings never see each other.
+//
+// The grammar it accepts:
+//   --name value, --name=value        a long option and its value
+//   -x value, -xvalue, -x=value       the same option through its one-letter spelling
+//   -qv                               a run of short flags
+//   --                                ends the options; the rest belongs to the program that runs
+//   -                                 an ordinary argument, not an option
+// '--help', '-h' and '--version' are answered here rather than declared, and so is the 'help'
+// command, so a program never has to spell them out.
+import List from @std.collections.list;
+import Map from @std.collections.map;
+import Set from @std.collections.set;
+import Application from command;
+import Command from command;
+import CommandPath from commandpath;
+import Option from option;
+import Argument from argument;
+import Invocation from invocation;
+import problems;
+import suggest;
+
+// Reads `arguments`, the command line without the program's own name, against `application`.
+export commandLine(Application application, string[] arguments) -> Invocation {
+    let walk = new Walk(application);
+    walk.read(arguments);
+    return walk.result();
+}
+
+// Whether text written where a value belongs is an option rather than the value. A lone '-' is an
+// ordinary argument, so it is not one.
+looksLikeOption(string text) -> bool {
+    return text.length > 1 && text.startsWith("-");
+}
+
+// One reading in progress. It lives no longer than the call that made it.
+public class Walk {
+    Application application;
+    CommandPath path;
+    CommandPath? topic;
+
+    string? problem;
+    bool helpAsked;
+    CommandPath? helpTarget;
+    bool versionAsked;
+    bool restReached;
+
+    Map<string, List<string>> values;
+    Set<string> flags;
+    List<string> positionals;
+    List<string> rest;
+
+    public constructor(Application application) {
+        this.application = application;
+        this.path = new CommandPath(application);
+        this.topic = null;
+        this.problem = null;
+        this.helpAsked = false;
+        this.helpTarget = null;
+        this.versionAsked = false;
+        this.restReached = false;
+        this.values = new Map<string, List<string>>();
+        this.flags = new Set<string>();
+        this.positionals = new List<string>();
+        this.rest = new List<string>();
+    }
+
+    public read(string[] arguments) {
+        long at = 0;
+        while (at < arguments.length && this.stillReading()) {
+            at = this.step(arguments, at);
+        }
+        this.finish();
+    }
+
+    // A problem stops the walk, and so does a request for help or the version, which asks nothing
+    // of the arguments that follow it.
+    stillReading() -> bool {
+        return this.problem == null && !this.helpAsked && !this.versionAsked;
+    }
+
+    // Reads the argument at `at` and answers with the index of the next one.
+    step(string[] arguments, long at) -> long {
+        string token = arguments[at];
+        if (this.restReached) {
+            this.rest.push(token);
+            return at + 1;
+        }
+        if (token == "--") {
+            return this.startRest(at);
+        }
+        if (token.startsWith("--")) {
+            return this.readLongOption(arguments, at);
+        }
+        if (token.length > 1 && token.startsWith("-")) {
+            return this.readShortOptions(arguments, at);
+        }
+        return this.readArgument(token, at);
+    }
+
+    startRest(long at) -> long {
+        if (!this.path.deepest().passesThrough()) {
+            this.problem = problems.passthroughUnsupported(this.path);
+            return at + 1;
+        }
+        this.restReached = true;
+        return at + 1;
+    }
+
+    readLongOption(string[] arguments, long at) -> long {
+        string token = arguments[at];
+        string body = token.substring(2, token.length);
+        string name = body;
+        string? attached = null;
+        long equals = body.indexOf("=");
+        if (equals >= 0) {
+            name = body.substring(0, equals);
+            attached = body.substring(equals + 1, body.length);
+        }
+        if (name == "help") {
+            return this.askHelp(at);
+        }
+        if (name == "version") {
+            return this.askVersion(at);
+        }
+        let option = this.path.optionNamed(name);
+        if (option == null) {
+            this.problem = problems.unknownOption(this.path, "--" + name,
+                suggest.nearest(name, this.path.optionNames()));
+            return at + 1;
+        }
+        string written = "--" + name;
+        if (!option.takesValue()) {
+            if (attached != null) {
+                this.problem = problems.flagTakesNoValue(option, written);
+                return at + 1;
+            }
+            this.flags.add(option.name());
+            return at + 1;
+        }
+        if (attached != null) {
+            return this.keepAttached(option, written, attached, at + 1);
+        }
+        return this.keepFollowing(arguments, option, written, at);
+    }
+
+    readShortOptions(string[] arguments, long at) -> long {
+        string token = arguments[at];
+        string letters = token.substring(1, token.length);
+        // A whole long name behind one dash is answered before the letters are read one by one,
+        // so '-output app.exe' is told what to write instead of quietly reading as '-o utput'.
+        if (letters.length > 1 && this.path.optionNamed(letters) != null) {
+            this.problem = problems.oneDashLongOption(this.path, token, letters);
+            return at + 1;
+        }
+        long i = 0;
+        while (i < letters.length) {
+            if (letters.substring(i, i + 1) == "h") {
+                return this.askHelp(at);
+            }
+            let option = this.path.optionAtLetter(letters, i);
+            if (option == null) {
+                this.problem = this.shortOptionProblem(token, letters, i);
+                return at + 1;
+            }
+            i = i + option.letterSpelling().length;
+            if (!option.takesValue()) {
+                this.flags.add(option.name());
+                continue;
+            }
+            string attached = letters.substring(i, letters.length);
+            string written = option.shortSpelling();
+            if (attached.startsWith("=")) {
+                return this.keepAttached(option, written,
+                    attached.substring(1, attached.length), at + 1);
+            }
+            if (attached.length > 0) {
+                return this.keepValue(option, attached, at + 1);
+            }
+            return this.keepFollowing(arguments, option, written, at);
+        }
+        return at + 1;
+    }
+
+    // A run of short spellings that names nothing is often a misspelled long name behind one dash,
+    // which is named back before the letter that stopped the reading is.
+    shortOptionProblem(string token, string letters, long at) -> string {
+        if (letters.length > 1) {
+            string? nearest = suggest.nearest(letters, this.path.optionNames());
+            if (nearest != null) {
+                return problems.unknownOption(this.path, token, nearest);
+            }
+        }
+        string letter = "";
+        byte[] raw = letters.toBytes();
+        if (raw[at] < 128) {
+            letter = letters.substring(at, at + 1);
+        }
+        return problems.unknownShortOption(this.path, token, letter);
+    }
+
+    // The value written onto the option itself, as '--name=value' or '-xvalue'.
+    keepAttached(Option option, string written, string value, long next) -> long {
+        if (value.length == 0) {
+            this.problem = problems.emptyValue(option, written);
+            return next;
+        }
+        return this.keepValue(option, value, next);
+    }
+
+    // The value written as the argument after the option.
+    keepFollowing(string[] arguments, Option option, string written, long at) -> long {
+        if (at + 1 >= arguments.length) {
+            this.problem = problems.missingValue(option, written);
+            return at + 1;
+        }
+        string value = arguments[at + 1];
+        if (value.length == 0) {
+            this.problem = problems.emptyValue(option, written);
+            return at + 1;
+        }
+        if (looksLikeOption(value)) {
+            this.problem = problems.valueLooksLikeOption(option, written, value);
+            return at + 1;
+        }
+        return this.keepValue(option, value, at + 2);
+    }
+
+    keepValue(Option option, string value, long next) -> long {
+        let written = this.values.get(option.name());
+        if (written == null) {
+            let first = new List<string>();
+            first.push(value);
+            this.values.set(option.name(), first);
+            return next;
+        }
+        if (!option.repeatable()) {
+            this.problem = problems.repeatedOption(option);
+            return next;
+        }
+        written.push(value);
+        return next;
+    }
+
+    readArgument(string token, long at) -> long {
+        let asked = this.topic;
+        if (asked != null) {
+            return this.readTopic(asked, token, at);
+        }
+        let command = this.path.deepest();
+        if (command.commands().length > 0) {
+            return this.readCommand(command, token, at);
+        }
+        long limit = command.argumentLimit();
+        if (limit >= 0 && this.positionals.length() >= limit) {
+            this.problem = problems.unexpectedArgument(this.path, token);
+            return at + 1;
+        }
+        this.positionals.push(token);
+        return at + 1;
+    }
+
+    readCommand(Command command, string token, long at) -> long {
+        let child = command.commandNamed(token);
+        if (child == null) {
+            this.problem = problems.unknownCommand(this.path, token,
+                suggest.nearest(token, this.path.commandNames()));
+            return at + 1;
+        }
+        this.path = this.path.extended(child);
+        if (child == this.application.helpCommand()) {
+            this.topic = new CommandPath(this.application);
+        }
+        return at + 1;
+    }
+
+    // The arguments of the 'help' command name a command to explain rather than values.
+    readTopic(CommandPath asked, string token, long at) -> long {
+        let child = asked.deepest().commandNamed(token);
+        if (child == null) {
+            this.problem = problems.unknownCommand(asked, token,
+                suggest.nearest(token, asked.commandNames()));
+            return at + 1;
+        }
+        this.topic = asked.extended(child);
+        return at + 1;
+    }
+
+    askHelp(long at) -> long {
+        this.helpAsked = true;
+        if (!this.path.atRoot()) {
+            this.helpTarget = this.path;
+        }
+        return at + 1;
+    }
+
+    askVersion(long at) -> long {
+        this.versionAsked = true;
+        return at + 1;
+    }
+
+    // What the whole command line is missing, once every argument has been read.
+    finish() {
+        if (!this.stillReading()) {
+            return;
+        }
+        let asked = this.topic;
+        if (asked != null) {
+            this.helpAsked = true;
+            if (!asked.atRoot()) {
+                this.helpTarget = asked;
+            }
+            return;
+        }
+        let command = this.path.deepest();
+        if (command.commands().length > 0) {
+            if (this.path.atRoot()) {
+                this.problem = problems.noCommand(this.path);
+            } else {
+                this.problem = problems.commandNeeded(this.path);
+            }
+            return;
+        }
+        Argument[] declared = command.arguments();
+        for (long i = 0; i < declared.length; i++) {
+            if (declared[i].required() && this.positionals.length() <= i) {
+                this.problem = problems.missingArgument(this.path, declared[i]);
+                return;
+            }
+        }
+    }
+
+    public result() -> Invocation {
+        let stopped = this.problem;
+        if (stopped != null) {
+            return new Invocation(stopped);
+        }
+        return new Invocation(this.path.text(), this.helpAsked, this.helpTarget,
+            this.versionAsked, this.values, this.flags, this.positionals, this.rest);
+    }
+}

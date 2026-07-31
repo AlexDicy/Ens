@@ -1,0 +1,158 @@
+// The declaration model: what a declared option, argument and command answer about themselves, and
+// how a path through the command tree resolves what is written against it.
+import @std.testing;
+import sample;
+import Application from command;
+import Command from command;
+import CommandPath from commandpath;
+
+test "an option knows every way it can be written" {
+    let build = new Command("build", "Compile Ens sources");
+    build.option("output", 'o', "file", "Where to put the executable");
+    build.flag("locked", "Fail if ens.lock would change");
+
+    let output = build.optionNamed("output");
+    if (output == null) {
+        try testing.fail("--output was declared");
+    }
+    try testing.assertEqual(output.longSpelling(), "--output");
+    try testing.assertEqual(output.shortSpelling(), "-o");
+    try testing.assertEqual(output.letterSpelling(), "o");
+    try testing.assertEqual(output.valuePlaceholder(), "<file>");
+    try testing.assertTrue(output.takesValue(), "--output takes a value");
+    try testing.assertFalse(output.repeatable(), "--output takes one value");
+    try testing.assertFalse(output.hidden(), "--output is not hidden");
+
+    let locked = build.optionNamed("locked");
+    if (locked == null) {
+        try testing.fail("--locked was declared");
+    }
+    try testing.assertEqual(locked.shortSpelling(), "");
+    try testing.assertEqual(locked.letterSpelling(), "");
+    try testing.assertFalse(locked.takesValue(), "--locked takes no value");
+}
+
+test "an argument reads as required, optional, or variadic" {
+    let wrap = new Command("wrap", "Wrap text");
+    wrap.argument("file", "The file to wrap");
+    wrap.argument("width", "Where to wrap", required: false);
+    wrap.argument("extra", "More files", required: false, variadic: true);
+    let declared = wrap.arguments();
+    try testing.assertEqual(declared.length, 3L);
+    try testing.assertEqual(declared[0].placeholder(), "<file>");
+    try testing.assertEqual(declared[0].spelling(), "<file>");
+    try testing.assertEqual(declared[1].spelling(), "[<width>]");
+    try testing.assertEqual(declared[2].spelling(), "[<extra>...]");
+    try testing.assertEqual(wrap.argumentLimit(), -1L);
+}
+
+test "a command with no variadic argument accepts as many as it declares" {
+    let add = new Command("add", "Redirect a dependency");
+    try testing.assertEqual(add.argumentLimit(), 0L);
+    add.argument("package", "The dependency to redirect");
+    add.argument("folder", "The folder to redirect it to");
+    try testing.assertEqual(add.argumentLimit(), 2L);
+}
+
+test "a command keeps what it was declared with" {
+    let run = new Command("run", "Build an application and run it", details: "Two\nlines",
+        hidden: true);
+    try testing.assertEqual(run.name(), "run");
+    try testing.assertEqual(run.summary(), "Build an application and run it");
+    try testing.assertEqual(run.details(), "Two\nlines");
+    try testing.assertTrue(run.hidden(), "the command is hidden");
+    try testing.assertFalse(run.passesThrough(), "nothing is passed on yet");
+    run.passthrough();
+    try testing.assertTrue(run.passesThrough(), "the command passes arguments on");
+}
+
+test "the 'help' command is generated, and only where there is something to explain" {
+    let bare = new Application("bare", "A program with no commands");
+    try testing.assertEqual(bare.commands().length, 0L);
+
+    let ens = new Application("ens", "Ens compiler and build tool");
+    ens.command(new Command("build", "Compile Ens sources"));
+    Command[] commands = ens.commands();
+    try testing.assertEqual(commands.length, 2L);
+    try testing.assertEqual(commands[0].name(), "build");
+    try testing.assertEqual(commands[1].name(), "help");
+    try testing.assertTrue(commands[1] == ens.helpCommand(), "the last one is the generated help");
+    try testing.assertTrue(ens.commandNamed("help") != null, "the generated help is found");
+}
+
+test "a path names the commands it went through" {
+    let ens = sample.application();
+    let root = new CommandPath(ens);
+    try testing.assertTrue(root.atRoot(), "a fresh path names the application only");
+    try testing.assertEqual(root.label(), "ens");
+    try testing.assertEqual(root.text(), "");
+
+    let overrides = ens.commandNamed("override");
+    if (overrides == null) {
+        try testing.fail("'override' was declared");
+    }
+    let add = overrides.commandNamed("add");
+    if (add == null) {
+        try testing.fail("'override add' was declared");
+    }
+    let atOverride = root.extended(overrides);
+    let atAdd = atOverride.extended(add);
+    try testing.assertEqual(atAdd.label(), "ens override add");
+    try testing.assertEqual(atAdd.text(), "override add");
+    try testing.assertEqual(atAdd.deepest().name(), "add");
+    try testing.assertEqual(atAdd.root().name(), "ens");
+    try testing.assertFalse(atAdd.atRoot(), "the path went two commands deep");
+    try testing.assertEqual(atOverride.commands().length, 2L);
+    try testing.assertTrue(root.atRoot(), "extending a path leaves it as it was");
+}
+
+test "a path resolves an option a command above it declares" {
+    let ens = sample.application();
+    let atBuild = try pathTo(ens, "build");
+    try testing.assertTrue(atBuild.optionNamed("output") != null, "build declares --output");
+    try testing.assertTrue(atBuild.optionNamed("verbose") != null, "the application declares it");
+    try testing.assertTrue(atBuild.optionNamed("filter") == null, "'test' declares that one");
+    try testing.assertEqual(try letterName(atBuild, "qvO2", 1), "verbose");
+    try testing.assertEqual(try letterName(atBuild, "qvO2", 2), "optimization-level");
+    try testing.assertTrue(atBuild.optionAtLetter("qvO2", 3) == null, "'2' names no option");
+}
+
+test "a path names back only what the help shows" {
+    let ens = sample.application();
+    let atBuild = try pathTo(ens, "build");
+    string[] options = atBuild.optionNames();
+    try testing.assertFalse(names(options, "objects"), "a hidden option is not named back");
+    try testing.assertFalse(names(options, "disable-pass"), "a hidden option is not named back");
+    try testing.assertTrue(names(options, "output"), "a declared option is named back");
+    try testing.assertTrue(names(options, "verbose"), "an inherited option is named back");
+
+    string[] commands = new CommandPath(ens).commandNames();
+    try testing.assertFalse(names(commands, "cst-dump"), "a hidden command is not named back");
+    try testing.assertTrue(names(commands, "build"), "a declared command is named back");
+    try testing.assertTrue(names(commands, "help"), "the generated help is named back");
+}
+
+pathTo(Application application, string name) -> CommandPath throws {
+    let command = application.commandNamed(name);
+    if (command == null) {
+        try testing.fail("'{name}' was declared");
+    }
+    return new CommandPath(application).extended(command);
+}
+
+letterName(CommandPath path, string letters, long at) -> string throws {
+    let option = path.optionAtLetter(letters, at);
+    if (option == null) {
+        try testing.fail("'{letters}' names an option at {at}");
+    }
+    return option.name();
+}
+
+names(string[] all, string wanted) -> bool {
+    for (long i = 0; i < all.length; i++) {
+        if (all[i] == wanted) {
+            return true;
+        }
+    }
+    return false;
+}
