@@ -436,7 +436,7 @@ When several packages require the same package, every requirement must name the 
 Versions compare numerically, component by component.
 Fetched packages land in a content-addressed cache at `~/.ens/cache` (the `ENS_CACHE` environment variable overrides the location), shared by every build on the machine.
 
-The first build that resolves git-sourced packages writes `ens.lock` next to the root manifest.
+The first build that resolves git-sourced packages or binds a prebuilt artifact writes `ens.lock` next to the root manifest.
 The lock records each fetched package's exact version, source URL and commit, a hash of the fetched content, and its own requirements, so a later build reproduces the same result without touching the network, and a moved tag or altered content is detected and rejected.
 Commit `ens.lock` to version control; it is machine-owned and never edited by hand.
 Workspace members and overridden packages are never pinned in it: a member is used exactly as it is checked out and an override only says where a package comes from, so neither has a version, a source, or a commit to record.

@@ -2704,10 +2704,10 @@ task("test")
             io.writefile(path.join(using_retag, "src", "main.ens"),
                 'main() -> int {\n    return 0;\n}\n')
             run({"build", ".", "--locked"}, in_retag, 1,
-                "no longer depends on any git-sourced package",
+                "this build fetches nothing any more", "no prebuilt library",
                 "'--locked' does not allow it to change")
             run({"build", "."}, in_retag, 0,
-                "Removed ens.lock: this build no longer depends on any git-sourced package")
+                "Removed ens.lock: this build fetches nothing any more")
             if os.isfile(path.join(using_retag, "ens.lock")) then
                 table.insert(failures, "ens.lock survived losing its last git dependency")
             end
@@ -2818,6 +2818,27 @@ task("test")
                 table.insert(failures, "the downloaded library is not in the cache")
             end
 
+            -- a project that fetches only a prebuilt library gets a lock too: the binary behind the
+            -- URL is the one build input nobody can review by reading the repository
+            local only_lock = path.join(app, "ens.lock")
+            local locked_text = ((io.readfile(only_lock) or ""):gsub("\r\n", "\n"))
+            local expected_lock = "lock 1\n"
+                .. "root demo.prebuilt\n"
+                .. "artifact extras linux " .. url_lib .. " " .. good .. "\n"
+                .. "artifact extras macos " .. url_lib .. " " .. good .. "\n"
+                .. "artifact extras windows " .. url_lib .. " " .. good .. "\n"
+            if locked_text ~= expected_lock then
+                table.insert(failures, string.format("an artifact-only build wrote %q, expected %q",
+                    locked_text, expected_lock))
+            end
+
+            -- and it stays current: a second build changes nothing, and '--locked' is satisfied
+            run({"build", ".", "--locked"}, in_app, 0, "prebuilt: built",
+                "!ens.lock no longer matches")
+            if ((io.readfile(only_lock) or ""):gsub("\r\n", "\n")) ~= locked_text then
+                table.insert(failures, "a second artifact-only build rewrote ens.lock")
+            end
+
             -- a cached library needs no network, even with the file it came from gone
             os.mv(files, files .. ".away")
             run({"build", ".", "--offline"}, in_app, 0, "prebuilt: built")
@@ -2825,6 +2846,35 @@ task("test")
                 "'--offline' forbids downloading the prebuilt library for native 'extras'",
                 "without '--offline'")
             os.mv(files .. ".away", files)
+
+            -- rebinding and then unbinding a prebuilt library are both lock changes, so '--locked'
+            -- refuses each of them by name and a build without it keeps the lock current
+            local lifecycle = path.join(root, "lifecycle")
+            os.mkdir(path.join(lifecycle, "src"))
+            local function write_lifecycle(body)
+                io.writefile(path.join(lifecycle, "ens.package"),
+                    "package demo.lifecycle {\n" .. '    ens "0.1";\n\n' .. body .. "}\n")
+            end
+            io.writefile(path.join(lifecycle, "src", "main.ens"),
+                'main() -> int {\n    return 0;\n}\n')
+            local in_lifecycle = {curdir = lifecycle, envs = withCache(cache)}
+            write_lifecycle(binding("extras", good))
+            run({"build", "."}, in_lifecycle, 0,
+                "Updated ens.lock: updated the prebuilt libraries recorded for this build")
+            write_lifecycle(binding("renamed", good))
+            run({"build", ".", "--locked"}, in_lifecycle, 1,
+                "ens.lock no longer matches what this build requires",
+                "updated the prebuilt libraries recorded for this build",
+                "'--locked' does not allow it to change")
+            write_lifecycle("    native extras system;\n")
+            run({"build", ".", "--locked"}, in_lifecycle, 1,
+                "this build fetches nothing any more", "no prebuilt library",
+                "'--locked' does not allow it to change")
+            run({"build", "."}, in_lifecycle, 0,
+                "Removed ens.lock: this build fetches nothing any more")
+            if os.isfile(path.join(lifecycle, "ens.lock")) then
+                table.insert(failures, "ens.lock survived losing its last prebuilt library")
+            end
 
             -- a digest that does not match is refused, naming both digests, and nothing is cached
             local bad = path.join(root, "bad")
