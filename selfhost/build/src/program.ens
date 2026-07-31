@@ -6,11 +6,16 @@
 // graph was sound enough to reach it, and the problems as lines already formatted for a reader.
 // Nothing is written anywhere, so two units could be loaded at the same time without either seeing
 // the other.
+import @std.path;
 import List from @std.collections.list;
+import Source from @ens.frontend.support.source;
+import GreenNode from @ens.frontend.syntax.green;
+import @ens.frontend.parse.parser;
 import @ens.frontend.syntax.generated.factory;
 import SourceFileNode from @ens.frontend.syntax.generated.nodes;
 import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import FileDiagnostic from @ens.sema.support.diagnostics;
+import FileError from @ens.sema.support.loader;
 import FileLoader from @ens.sema.support.loader;
 import GraphResult from @ens.sema.program.graph;
 import NativeInfo from @ens.sema.program.workspace;
@@ -18,32 +23,44 @@ import @ens.sema.program.graph;
 import ProgramAnalysis from @ens.sema.pipeline;
 import @ens.sema.pipeline;
 import BuildOptions from options;
+import BuildTarget from target;
+import WorkspaceMember from target;
 import SourceCatalog from diagnostics;
 import diagnostics;
 import SourceScan from sources;
 import sources;
 
-// One thing to compile: where its modules are read from, which file is its main module, and how a
-// report names it.
+// One thing to compile: where its modules are read from, which files the graph starts from, and how
+// a report names it.
 export final class Unit {
     string unitSource;
+    string unitTests;
     string unitEntry;
+    string[] unitSeeds;
     string unitLabel;
 
-    export constructor(string sourceFolder, string entryFile, string label) {
-        this.unitSource = sourceFolder;
-        this.unitEntry = entryFile;
-        this.unitLabel = label;
-    }
+    protected constructor(this.unitSource, this.unitTests, this.unitEntry, this.unitSeeds,
+                this.unitLabel);
 
     export sourceFolder() -> string {
         return this.unitSource;
     }
 
-    // The one file that is the program's main module, or empty text when every source file in the
-    // folder is a seed.
+    // The folder the seeds are named relative to when it is not the source folder, which is how a
+    // test run reaches tests kept outside the sources; empty text otherwise.
+    export testsFolder() -> string {
+        return this.unitTests;
+    }
+
+    // The one file that is the program's main module, or empty text when the unit has no single
+    // main module.
     export entryFile() -> string {
         return this.unitEntry;
+    }
+
+    // The files the graph starts from, or empty when they are whatever the source folder holds.
+    export seeds() -> string[] {
+        return this.unitSeeds;
     }
 
     // How a report names this unit: a package name, or the file or folder that was named.
@@ -52,17 +69,49 @@ export final class Unit {
     }
 }
 
+// A folder of sources: every source file under it is a seed, so a module nothing imports is
+// compiled too.
+export folderUnit(string sourceFolder, string label) -> Unit {
+    string[] scanned = [];
+    return new Unit(sourceFolder, "", "", scanned, label);
+}
+
+// One file, which is the program's main module whatever it is called.
+export fileUnit(string sourceFolder, string entryFile, string label) -> Unit {
+    string[] scanned = [];
+    return new Unit(sourceFolder, "", entryFile, scanned, label);
+}
+
+// A unit whose seeds are named outright, relative to `testsFolder` when it names one and to
+// `sourceFolder` otherwise.
+export seededUnit(string sourceFolder, string testsFolder, string[] seeds, string label) -> Unit {
+    return new Unit(sourceFolder, testsFolder, "", seeds, label);
+}
+
+// What compiling the resolved target compiles: the one file it named, or the folder it named.
+export unitOf(BuildTarget resolved) -> Unit {
+    if (resolved.entryFile().length > 0) {
+        return fileUnit(resolved.sourceFolder(), resolved.entryFile(), resolved.artifactName());
+    }
+    return folderUnit(resolved.sourceFolder(), resolved.artifactName());
+}
+
+// What compiling one member of a workspace compiles.
+export memberUnit(WorkspaceMember member) -> Unit {
+    return folderUnit(path.join(member.folder(), "src"), member.packageName());
+}
+
 // One unit loaded and analyzed.
 export final class Loaded {
     ProgramAnalysis? programAnalysis;
     string[] problemLines;
     long modules;
-    bool entryPoint;
+    string[] entryPoints;
     NativeInfo[] declaredNatives;
     SourceCatalog sources;
 
     protected constructor(this.programAnalysis, this.problemLines, this.modules,
-                this.entryPoint, this.declaredNatives, this.sources);
+                this.entryPoints, this.declaredNatives, this.sources);
 
     // The analysis, or null when the program did not survive to it.
     export analysis() -> ProgramAnalysis? {
@@ -84,7 +133,18 @@ export final class Loaded {
     // Whether the program's main module defines main(), which is what makes it an application
     // rather than a library.
     export definesEntry() -> bool {
-        return this.entryPoint;
+        for (let modulePath in this.entryPoints) {
+            if (modulePath == "main") {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Every module of the program that defines main(), which a program that reaches an executable
+    // has exactly one of.
+    export entryModules() -> string[] {
+        return this.entryPoints;
     }
 
     // The native libraries the manifests governing these modules declare.
@@ -113,11 +173,11 @@ export load(FileLoader loader, BuildOptions options, Unit unit) -> Loaded {
 
     GraphResult graphResult;
     if (unit.entryFile().length > 0) {
-        graphResult = graph.buildFileProgram(loader, unit.sourceFolder(), "",
+        graphResult = graph.buildFileProgram(loader, unit.sourceFolder(), unit.testsFolder(),
             options.stdlibRoot(), unit.entryFile());
     } else {
-        graphResult = graph.buildGraph(loader, unit.sourceFolder(), "", options.stdlibRoot(),
-            seeds.files());
+        graphResult = graph.buildGraph(loader, unit.sourceFolder(), unit.testsFolder(),
+            options.stdlibRoot(), seeds.files());
     }
     catalog.addGraph(graphResult);
     long moduleCount = graphResult.modules().length;
@@ -132,22 +192,26 @@ export load(FileLoader loader, BuildOptions options, Unit unit) -> Loaded {
         return failed(diagnostics.formatAll(problems, catalog), moduleCount, catalog);
     }
     string[] clean = [];
-    return new Loaded(analysis, clean, moduleCount, definesEntry(graphResult),
+    return new Loaded(analysis, clean, moduleCount, entryModules(graphResult),
         graphResult.natives(), catalog);
 }
 
-// The files the graph starts from: the one named file, or every non-test source under the folder so
-// a module nothing imports is compiled too.
+// The files the graph starts from: the ones the unit named, the one file that is its main module, or
+// every non-test source under its folder so a module nothing imports is compiled too.
 seedsOf(Unit unit) -> SourceScan {
+    if (unit.seeds().length > 0) {
+        return sources.given(unit.seeds());
+    }
     if (unit.entryFile().length > 0) {
-        return sources.oneFile(unit.entryFile());
+        return sources.given([unit.entryFile()]);
     }
     return sources.scan(unit.sourceFolder());
 }
 
 failed(string[] problems, long moduleCount, SourceCatalog catalog) -> Loaded {
     NativeInfo[] none = [];
-    return new Loaded(null, problems, moduleCount, false, none, catalog);
+    string[] noEntry = [];
+    return new Loaded(null, problems, moduleCount, noEntry, none, catalog);
 }
 
 // Graph and parse diagnostics together, since both mean the program never reached analysis.
@@ -184,14 +248,22 @@ appendAll(List<FileDiagnostic> sink, FileDiagnostic[] diagnostics) {
     }
 }
 
-// Whether the program's main module declares a function named 'main'. Its shape is sema's business
-// by the time this is asked; all that matters here is whether an executable can come out.
-definesEntry(GraphResult graphResult) -> bool {
-    let entry = graphResult.moduleWithPath("main");
-    if (entry == null) {
-        return false;
+// Every module of the graph that declares a function named 'main'. Their shape is sema's business
+// by the time this is asked; all that matters here is where an executable's entry point could come
+// from, so a program with more than one can be told about it rather than left to the linker.
+entryModules(GraphResult graphResult) -> string[] {
+    let found = new List<string>();
+    for (let loaded in graphResult.modules()) {
+        if (declaresMain(loaded.parseResult().root())) {
+            found.push(loaded.canonicalPath());
+        }
     }
-    let root = factory.createRoot(entry.parseResult().root());
+    return found.toArray();
+}
+
+// Whether the parsed file declares a function named 'main'.
+declaresMain(GreenNode parsed) -> bool {
+    let root = factory.createRoot(parsed);
     if (!(root is SourceFileNode)) {
         return false;
     }
@@ -204,5 +276,14 @@ definesEntry(GraphResult graphResult) -> bool {
             }
         }
     }
+    return false;
+}
+
+// Whether the named file declares main(), which is what makes the program it is the main module of
+// an application rather than a library. Asked of a file before anything is compiled, so a command
+// that only runs applications can say so before it builds.
+export definesEntryFile(FileLoader loader, string file) -> bool {
+    return declaresMain(parser.parse(new Source(file, try loader.readText(file))).root());
+} catch (FileError error) {
     return false;
 }

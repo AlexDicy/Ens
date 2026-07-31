@@ -1,31 +1,23 @@
-// Verifies an '@ens-test' fixture: the harness plays the driver's test subcommand over the
-// self-hosted pipeline. It discovers the fixture's tests, synthesizes the runner module the
-// reference driver synthesizes - ordinary Ens that imports each test module, wraps every test in
-// a bool-returning function whose 'catch (Error)' prints the failure with its frames, and counts
-// passes in main() - injects it through a file-loader overlay the way the driver injects source
-// overrides, compiles and runs the result, and maps the run to the driver's observable contract:
-// the runner's stdout echoed verbatim, its stderr passed through, and an exit code outside
-// {0, 1} reported as an aborted run naming the test that was running.
+// Verifies an '@ens-test' fixture: the harness plays a test run over the self-hosted pipeline. It
+// discovers the fixture's tests and synthesizes its runner the way the command does - both come
+// from '@ens.build.testing', so there is one description of what a test run is - then compiles and
+// runs the result and maps the run to the driver's observable contract: the runner's stdout echoed
+// verbatim, its stderr passed through, and an exit code outside {0, 1} reported as an aborted run
+// naming the test that was running.
 import @std.system;
 import SystemError from @std.system;
 import List from @std.collections.list;
 import @std.text.strings;
-import Map from @std.collections.map;
-import @std.collections.sorting;
-import StringBuilder from @std.text.stringbuilder;
-import Source from @ens.frontend.support.source;
-import @ens.frontend.parse.parser;
-import @ens.frontend.syntax.generated.factory;
-import SourceFileNode from @ens.frontend.syntax.generated.nodes;
-import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
-import TestDeclarationNode from @ens.frontend.syntax.generated.nodes;
-import FileLoader from @ens.sema.support.loader;
-import FileError from @ens.sema.support.loader;
-import SystemFileLoader from @ens.sema.support.loader;
 import @std.path;
-import @ens.build.paths;
+import FileLoader from @ens.sema.support.loader;
+import SystemFileLoader from @ens.sema.support.loader;
 import @ens.sema.program.graph;
-import @ens.sema.model.literalvalues;
+import @ens.build.paths;
+import DiscoveredTest from @ens.build.testing.discovery;
+import TestPlan from @ens.build.testing.discovery;
+import @ens.build.testing.discovery;
+import RunnerOverlay from @ens.build.testing.runner;
+import @ens.build.testing.runner;
 import Manifest from manifest;
 import Fixture from manifest;
 import Directives from directives;
@@ -34,44 +26,6 @@ import CapturedRun from build;
 import Environment from build;
 import build;
 import text;
-
-// The synthesized runner enters the module graph as a virtual file over the real tree, the
-// self-hosted counterpart of the reference driver's source overrides.
-class OverlayFileLoader implements FileLoader {
-    FileLoader base;
-    string overlayPath;
-    string overlayText;
-
-    protected constructor(this.base, this.overlayPath, this.overlayText);
-
-    override exists(string path) -> bool {
-        if (path == this.overlayPath) {
-            return true;
-        }
-        return this.base.exists(path);
-    }
-
-    override readText(string path) -> string throws FileError {
-        if (path == this.overlayPath) {
-            return this.overlayText;
-        }
-        return try this.base.readText(path);
-    }
-}
-
-class DiscoveredTest {
-    protected string modulePath;
-    protected string file;
-    protected long index;
-    protected string rawLiteral;
-    protected string description;
-    protected bool selected;
-
-    protected constructor(this.modulePath, this.file, this.index, this.rawLiteral,
-                this.description) {
-        this.selected = true;
-    }
-}
 
 // What the driver's test subcommand would have shown: its exit code and its two streams.
 class DriverOutcome {
@@ -82,95 +36,40 @@ class DriverOutcome {
     protected constructor(this.exitCode, this.stdoutText, this.stderrText);
 }
 
-// Runs the fixture's test suite the way 'ens test <folder> <args>' runs it and compares the
-// outcome against the fixture's directives. Returns "" when the fixture verifies, or a
-// description of the first failing step.
+// Runs the fixture's test suite the way 'ens test <folder> <arguments>' runs it and compares the
+// outcome against the fixture's directives. Returns "" when the fixture verifies, or a description
+// of the first failing step.
 public verify(Manifest manifest, Environment environment, Fixture fixture,
               Directives parsed) -> string {
     string sourceRoot = path.parentFolder(paths.native(fixture.path()));
-    string filter = "";
-    string testsRoot = "";
-    string[] arguments = parsed.ensTestArguments;
-    long next = 0;
-    while (next < arguments.length) {
-        string argument = arguments[next];
-        if (argument == "--filter" && next + 1 < arguments.length) {
-            filter = expandDir(arguments[next + 1], sourceRoot);
-            next = next + 2;
-        } else if (argument == "--tests" && next + 1 < arguments.length) {
-            testsRoot = paths.native(expandDir(arguments[next + 1], sourceRoot));
-            next = next + 2;
-        } else {
-            return "unsupported @ens-test argument '{argument}'";
-        }
+    let asked = readArguments(parsed.ensTestArguments, sourceRoot);
+    if (asked.problem.length > 0) {
+        return asked.problem;
     }
     string discoveryRoot = sourceRoot;
-    if (testsRoot.length > 0) {
-        discoveryRoot = testsRoot;
+    if (asked.testsRoot.length > 0) {
+        discoveryRoot = asked.testsRoot;
     }
 
-    let testFiles = discoveryRelatives(manifest.testFilesFor(fixture.label()), sourceRoot,
-        discoveryRoot);
-    if (testFiles.length() == 0) {
-        return compare(parsed, new DriverOutcome(0, "no tests found under {discoveryRoot} "
-            + "(tests live in files ending '_test.ens')", ""));
+    FileLoader tree = new SystemFileLoader();
+    let plan = discovery.plan(tree, discoveryRoot, asked.filter);
+    if (plan.usageProblem().length > 0) {
+        return compare(parsed, new DriverOutcome(2, "", plan.usageProblem() + "\n"));
     }
-    string stemCollision = duplicateStemReport(testFiles);
-    if (stemCollision.length > 0) {
-        return compare(parsed, new DriverOutcome(2, "", stemCollision));
+    if (plan.nothingToRun().length > 0) {
+        return compare(parsed, new DriverOutcome(0, plan.nothingToRun(), ""));
     }
 
-    let tests = new List<DiscoveredTest>();
-    for (long i = 0; i < testFiles.length(); i++) {
-        string entryError = try discoverTests(discoveryRoot, testFiles.get(i), tests);
-        if (entryError.length > 0) {
-            return compare(parsed, new DriverOutcome(2, "", entryError));
-        }
-    }
-    if (tests.length() == 0) {
-        return compare(parsed, new DriverOutcome(0, "no tests found under {discoveryRoot}", ""));
-    }
-
-    long selectedCount = tests.length();
-    if (filter.length > 0) {
-        selectedCount = 0;
-        for (long i = 0; i < tests.length(); i++) {
-            let candidate = tests.get(i);
-            candidate.selected = candidate.description.indexOf(filter) >= 0;
-            if (candidate.selected) {
-                selectedCount++;
-            }
-        }
-        if (selectedCount == 0) {
-            return compare(parsed, new DriverOutcome(0, "no tests matched filter '{filter}'",
-                ""));
-        }
-    }
-
-    let overlay = new OverlayFileLoader(new SystemFileLoader(),
-        path.join(discoveryRoot, runnerFileName()), buildRunnerSource(tests));
-    let seeds = new List<string>();
-    for (long i = 0; i < testFiles.length(); i++) {
-        seeds.push(testFiles.get(i));
-    }
-    seeds.push(runnerFileName());
-    let graphResult = graph.buildGraph(overlay, sourceRoot, testsRoot, manifest.stdlibRoot,
-        seeds.toArray());
-    // The runner is harness-owned source, not part of the fixture's package; its libc external
-    // block is exempt from any manifest's native declarations, as it is under the driver.
-    for (let loaded in graphResult.modules()) {
-        if (loaded.canonicalPath() == runnerModulePath()) {
-            loaded.setNativePolicy(false, [], "");
-        }
-    }
-
+    let graphResult = graph.buildGraph(overlayOver(tree, discoveryRoot, plan), sourceRoot,
+        asked.testsRoot, manifest.stdlibRoot, seedsOf(plan));
     string prefix = text.sanitizedLabel(fixture.label());
     string buildProblem = build.compileAndLink(manifest, environment, graphResult, prefix);
     if (buildProblem.length > 0) {
         return "the test build failed: " + buildProblem;
     }
+
     let ran = try build.runCaptured(manifest, prefix);
-    return compare(parsed, driverOutcomeOf(ran, tests));
+    return compare(parsed, driverOutcomeOf(ran, plan.tests()));
 } catch (SystemError e) {
     return "could not run: {e.message}";
 }
@@ -180,11 +79,27 @@ compare(Directives parsed, DriverOutcome outcome) -> string {
         outcome.stderrText);
 }
 
+// The runner over the tree the tests were read from, exactly as the command injects it.
+overlayOver(FileLoader tree, string discoveryRoot, TestPlan plan) -> FileLoader {
+    return new RunnerOverlay(tree, path.join(discoveryRoot, runner.fileName()),
+        runner.source(plan.tests()));
+}
+
+// The files the graph starts from: every test file, then the runner that calls into them.
+seedsOf(TestPlan plan) -> string[] {
+    let seeds = new List<string>();
+    for (let file in plan.testFiles()) {
+        seeds.push(file);
+    }
+    seeds.push(runner.fileName());
+    return seeds.toArray();
+}
+
 // The driver echoes the runner's captured stdout verbatim and lets its stderr through; an exit
 // code other than 0 (all passed) and 1 (some failed) means the run aborted partway, so the
 // driver reports the test that was running on stderr and maps a negative code (a hard crash) to
 // 2 and any other abnormal code to 1.
-driverOutcomeOf(CapturedRun ran, List<DiscoveredTest> tests) -> DriverOutcome {
+driverOutcomeOf(CapturedRun ran, DiscoveredTest[] tests) -> DriverOutcome {
     if (ran.exitCode == 0 || ran.exitCode == 1) {
         return new DriverOutcome(ran.exitCode, ran.stdoutText, ran.stderrText);
     }
@@ -196,15 +111,9 @@ driverOutcomeOf(CapturedRun ran, List<DiscoveredTest> tests) -> DriverOutcome {
     return new DriverOutcome(mapped, ran.stdoutText, ran.stderrText + report);
 }
 
-// Names the test that was running when the runner died: each completed test flushed exactly one
-// line beginning "PASS " or "FAIL ", so the crasher is the next selected test after those.
-abortReport(List<DiscoveredTest> tests, string runnerStdout, long exitCode) -> string {
-    let selected = new List<DiscoveredTest>();
-    for (long i = 0; i < tests.length(); i++) {
-        if (tests.get(i).selected) {
-            selected.push(tests.get(i));
-        }
-    }
+// Names the test that was running when the runner died: each completed test printed exactly one
+// line beginning "PASS " or "FAIL ", so the crasher is the next test after those.
+abortReport(DiscoveredTest[] tests, string runnerStdout, long exitCode) -> string {
     long reported = 0;
     for (let line in strings.lines(runnerStdout)) {
         if (line.startsWith("PASS ") || line.startsWith("FAIL ")) {
@@ -212,197 +121,48 @@ abortReport(List<DiscoveredTest> tests, string runnerStdout, long exitCode) -> s
         }
     }
     string report = "The test run ended unexpectedly (exit code {exitCode})";
-    if (reported < selected.length()) {
-        let culprit = selected.get(reported);
-        report = report + " while running test '{culprit.description}' ({culprit.file})";
+    if (reported < tests.length) {
+        report = report + " while running test '{tests[reported].description()}' "
+            + "({tests[reported].file()})";
     }
-    return report + ". {reported} of {selected.length()} tests had reported a result.\n";
+    return report + ". {reported} of {tests.length} tests had reported a result.\n";
 }
 
-// Parses one test file and appends its tests in source order. Returns "" or the driver's usage
-// error when the file defines main(), which cannot be linked into a test binary.
-discoverTests(string discoveryRoot, string relativePath, List<DiscoveredTest> tests)
-        -> string throws {
-    string filePath = path.join(discoveryRoot, relativePath);
-    let parsed = parser.parse(new Source(filePath, try system.readAllText(filePath)));
-    let root = factory.createRoot(parsed.root());
-    if (!(root is SourceFileNode)) {
-        return "";
-    }
-    string modulePath = modulePathOfRelative(relativePath);
-    long index = 0;
-    for (long i = 0; i < root.itemsCount(); i++) {
-        switch (root.items(i)) {
-            is FunctionDeclarationNode declaration -> {
-                let name = declaration.name();
-                if (name != null && name.text() == "main") {
-                    return "ERROR: '{relativePath}' defines main(); a test file cannot define "
-                        + "the program entry point\n";
-                }
-            },
-            is TestDeclarationNode declaration -> {
-                string rawLiteral = "\"\"";
-                let token = declaration.descriptionToken();
-                if (token != null) {
-                    rawLiteral = token.text();
-                }
-                tests.push(new DiscoveredTest(modulePath, relativePath, index, rawLiteral,
-                    literalvalues.decodeString(rawLiteral)));
-                index++;
-            },
-            default -> { },
-        }
-    }
-    return "";
+// What the command line asked for: a filter, a tests folder, or a token neither of those.
+class Arguments {
+    protected string filter;
+    protected string testsRoot;
+    protected string problem;
+
+    protected constructor(this.filter, this.testsRoot, this.problem);
 }
 
-// The runner is ordinary Ens source. Descriptions are spliced as their original string literals,
-// so no re-escaping is needed. Each result line is flushed as it is printed - 'fflush(null)'
-// flushes every stream - so completed results survive a crash in a later test. Failure traces
-// print frame by frame and stop at the runner's own file, whose frames are internal.
-buildRunnerSource(List<DiscoveredTest> tests) -> string {
-    let out = new StringBuilder();
-    string lastImported = "";
-    for (long i = 0; i < tests.length(); i++) {
-        let entry = tests.get(i);
-        if (!entry.selected || entry.modulePath == lastImported) {
-            continue;
-        }
-        lastImported = entry.modulePath;
-        out.append("import {entry.modulePath};\n");
-    }
-    out.append("\nexternal type CStdioFile;\n\n"
-        + "external from libc \{\n"
-        + "    fflush(CStdioFile? stream) -> int;\n"
-        + "\}\n\n");
-
-    long runIndex = 0;
-    for (long i = 0; i < tests.length(); i++) {
-        let entry = tests.get(i);
-        if (!entry.selected) {
-            continue;
-        }
-        out.append("$run{runIndex}() -> bool \{\n    try ");
-        out.append(aliasOf(entry.modulePath));
-        out.append(".$test{entry.index}();\n    print(\"PASS \" + ");
-        out.append(entry.rawLiteral);
-        out.append(");\n    fflush(null);\n    return true;\n\} catch (Error e) \{\n"
-            + "    print(\"FAIL \" + ");
-        out.append(entry.rawLiteral);
-        out.append(" + \": \" + e.message);\n"
-            + "    for (let frame in e.stackFrames()) \{\n"
-            + "        if (frame.file == \"{runnerFileName()}\") \{ break; \}\n"
-            + "        print(\"  at \" + frame.function + \" (\" + frame.file + \":\" "
-            + "+ frame.line + \")\");\n"
-            + "    \}\n"
-            + "    fflush(null);\n    return false;\n\}\n\n");
-        runIndex++;
-    }
-
-    out.append("main() -> int \{\n    int passed = 0;\n");
-    for (long i = 0; i < runIndex; i++) {
-        out.append("    if ($run{i}()) \{ passed = passed + 1; \}\n");
-    }
-    out.append("    print(\"\{passed\}/{runIndex} tests passed\");\n"
-        + "    if (passed == {runIndex}) \{ return 0; \}\n    return 1;\n\}\n");
-    return out.toString();
-}
-
-runnerFileName() -> string {
-    return "$ens_test_runner.ens";
-}
-
-runnerModulePath() -> string {
-    return "$ens_test_runner";
-}
-
-aliasOf(string modulePath) -> string {
-    byte[] raw = modulePath.toBytes();
-    long start = 0;
-    for (long i = 0; i < raw.length; i++) {
-        if (raw[i] == '.') {
-            start = i + 1;
-        }
-    }
-    return modulePath.substring(start, modulePath.length);
-}
-
-// The manifest's test files, narrowed to the discovery root and re-relativized against it, in
-// the runner's deterministic path order.
-discoveryRelatives(List<string> fixtureRelatives, string sourceRoot, string discoveryRoot)
-        -> List<string> {
-    let kept = new List<string>();
-    string prefix = discoveryRoot + "/";
-    for (long i = 0; i < fixtureRelatives.length(); i++) {
-        string absolute = path.join(sourceRoot, paths.native(fixtureRelatives.get(i)));
-        if (discoveryRoot == sourceRoot) {
-            kept.push(paths.native(fixtureRelatives.get(i)));
-        } else if (absolute.startsWith(prefix)) {
-            kept.push(absolute.substring(prefix.length, absolute.length));
-        }
-    }
-    sorting.sort(kept);
-    return kept;
-}
-
-// Two test files with the same name would collide on the runner's imports; the driver rejects
-// them as a usage error. Returns "" or the driver's message.
-duplicateStemReport(List<string> testFiles) -> string {
-    let stems = new Map<string, string>();
-    for (long i = 0; i < testFiles.length(); i++) {
-        string relativePath = testFiles.get(i);
-        string stem = stemOf(relativePath);
-        let existing = stems.get(stem);
-        if (existing != null) {
-            return "ERROR: test files must have unique names: '{existing}' and "
-                + "'{relativePath}' would both be imported as '{stem}'\n";
-        }
-        stems.set(stem, relativePath);
-    }
-    return "";
-}
-
-stemOf(string relativePath) -> string {
-    string name = path.fileName(relativePath);
-    if (name.endsWith(".ens")) {
-        return name.substring(0, name.length - 4);
-    }
-    return name;
-}
-
-// "a/b/c.ens" -> "a.b.c"
-modulePathOfRelative(string relativePath) -> string {
-    string bare = relativePath;
-    if (bare.endsWith(".ens")) {
-        bare = bare.substring(0, bare.length - 4);
-    }
-    let builder = new StringBuilder();
-    byte[] raw = bare.toBytes();
-    for (long i = 0; i < raw.length; i++) {
-        if (raw[i] == '/') {
-            builder.append(".");
+readArguments(string[] arguments, string sourceRoot) -> Arguments {
+    string filter = "";
+    string testsRoot = "";
+    long next = 0;
+    while (next < arguments.length) {
+        string argument = arguments[next];
+        if (argument == "--filter" && next + 1 < arguments.length) {
+            filter = expandDir(arguments[next + 1], sourceRoot);
+            next = next + 2;
+        } else if (argument == "--tests" && next + 1 < arguments.length) {
+            testsRoot = paths.native(expandDir(arguments[next + 1], sourceRoot));
+            next = next + 2;
         } else {
-            builder.appendByte(raw[i]);
+            return new Arguments("", "", "unsupported @ens-test argument '{argument}'");
         }
     }
-    return builder.toString();
+    return new Arguments(filter, testsRoot, "");
 }
 
 // Every '\{dir\}' in an @ens-test argument expands to the fixture's source folder.
 expandDir(string token, string folder) -> string {
-    let out = new StringBuilder();
-    byte[] raw = token.toBytes();
     string marker = "\{dir\}";
-    long i = 0;
-    while (i < raw.length) {
-        if (i + marker.length <= raw.length
-                && token.substring(i, i + marker.length) == marker) {
-            out.append(folder);
-            i = i + marker.length;
-        } else {
-            out.appendByte(raw[i]);
-            i++;
-        }
+    long at = token.indexOf(marker);
+    if (at < 0) {
+        return token;
     }
-    return out.toString();
+    return token.substring(0, at) + folder
+        + expandDir(token.substring(at + marker.length, token.length), folder);
 }

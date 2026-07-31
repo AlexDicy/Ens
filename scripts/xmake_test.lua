@@ -698,17 +698,7 @@ task("test")
                     directive = src_main_ens
                 end
                 if directive then
-                    local label = "tests/" .. path.basename(sub)
-                    table.insert(lines, "fixture " .. label .. " " .. directive)
-                    local source_root = path.directory(directive)
-                    local test_files = {}
-                    for _, tf in ipairs(os.files(path.join(source_root, "**_test.ens"))) do
-                        table.insert(test_files, (path.relative(tf, source_root):gsub("\\", "/")))
-                    end
-                    table.sort(test_files)
-                    for _, tf in ipairs(test_files) do
-                        table.insert(lines, "testfile " .. label .. " " .. tf)
-                    end
+                    table.insert(lines, "fixture tests/" .. path.basename(sub) .. " " .. directive)
                 end
             end
             io.writefile(manifest, table.concat(lines, "\n") .. "\n")
