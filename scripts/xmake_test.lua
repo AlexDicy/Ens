@@ -2187,12 +2187,23 @@ task("test")
             expect_file("add", 'overrides {\n    override acme.json "../json";\n}\n')
             run({"override", "list"}, in_ws, 0, "acme.json -> ../json", "!not usable")
             -- the build says what it is taking from the override, because nothing in the program
-            -- does; a check says it too, and a run that reports nothing else keeps it to itself
-            run({"build"}, in_ws, 0, "demo.app: built",
-                "Using the override for package 'acme.json': "
-                    .. path.absolute(path.join(root, "json")):gsub("\\", "/"))
-            run({"check"}, in_ws, 0, "Using the override for package 'acme.json'")
-            run({"build", "--quiet"}, in_ws, 0, "!Using the override")
+            -- does, and a check says it too
+            local notice = "Using the override for package 'acme.json': "
+                .. path.absolute(path.join(root, "json")):gsub("\\", "/")
+            run({"build"}, in_ws, 0, "demo.app: built", notice)
+            run({"check"}, in_ws, 0, notice)
+
+            -- it survives '--quiet' and rides the error stream beside the problems: quiet hides an
+            -- account of the work, not a departure from what the manifests declare
+            local quiet_out = path.join(out_dir, name .. ".quiet.out")
+            local quiet_err = path.join(out_dir, name .. ".quiet.err")
+            local quiet_rc = execSplit(seed_exe, {"build", "--quiet"}, quiet_out, quiet_err, in_ws)
+            local quiet_stdout = captured(quiet_out)
+            local quiet_stderr = captured(quiet_err)
+            if quiet_rc ~= 0 or quiet_stdout ~= "" or not quiet_stderr:find(notice, 1, true) then
+                table.insert(failures, string.format("ens build --quiet: exit=%s stdout=%q "
+                    .. "stderr=%q", tostring(quiet_rc), quiet_stdout, quiet_stderr))
+            end
 
             -- both members take the package from the same override, and the build says so once
             local _, said = run({"build"}, in_ws, 0, "demo.app: built", "demo.tool: compiled")
