@@ -1,0 +1,253 @@
+// `ens.overrides`: where a build is told to take a package from a folder on this machine instead of
+// from wherever the dependency on it points. The file sits beside the workspace's manifest, is not
+// committed, and applies to every build rooted there.
+//
+// It is a person's file, not the build's. It is read by eye, it holds comments explaining why each
+// redirection is there, and it is edited by hand as often as by a command. So an edit made here
+// changes only the bytes of the one declaration it is about: every comment, blank line, order and
+// spelling choice in the rest of the file comes back exactly as it was found. That is what the
+// offsets in a survey are for, and it is why an edit is expressed as text in and text out rather
+// than as a file rewritten from a model.
+import @std.system;
+import SystemError from @std.system;
+import @std.path;
+import @std.text.strings;
+import List from @std.collections.list;
+import StringBuilder from @std.text.stringbuilder;
+import FileLoader from @ens.sema.support.loader;
+import OverrideEntry from @ens.sema.program.workspace;
+import OverridesSurvey from @ens.sema.program.workspace;
+import @ens.sema.program.workspace;
+
+export filePath(string folder) -> string {
+    return workspace.overridesFilePath(folder);
+}
+
+// One ens.overrides file as it stands: its text, and what a reading of that text found.
+export final class OverridesFile {
+    string filePathText;
+    bool wasThere;
+    string fileText;
+    OverridesSurvey reading;
+
+    protected constructor(this.filePathText, this.wasThere, this.fileText, this.reading);
+
+    export path() -> string {
+        return this.filePathText;
+    }
+
+    export found() -> bool {
+        return this.wasThere;
+    }
+
+    export text() -> string {
+        return this.fileText;
+    }
+
+    export survey() -> OverridesSurvey {
+        return this.reading;
+    }
+
+    // Whether the file says nothing at all: absent, or holding only whitespace. Either way there is
+    // no block to edit, so an override added to it starts the file afresh.
+    export saysNothing() -> bool {
+        if (!this.wasThere) {
+            return true;
+        }
+        for (let value in this.fileText.toBytes()) {
+            if (value != ' ' && value != '\t' && value != '\r' && value != '\n') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Why the file cannot be edited, or "" when it can: it has to parse, and it has to hold an
+    // overrides block for a declaration to go into.
+    export editingProblem() -> string {
+        if (this.saysNothing()) {
+            return "";
+        }
+        let diagnostics = this.reading.diagnostics();
+        if (diagnostics.length > 0) {
+            return "'{this.filePathText}' cannot be read: {diagnostics[0].message()} Fix the file "
+                + "by hand before editing it with 'ens override'";
+        }
+        if (!this.reading.isOverridesForm() || this.reading.closeBraceOffset() < 0) {
+            return "'{this.filePathText}' does not hold an overrides declaration; an ens.overrides "
+                + "file holds a single 'overrides \{ ... \}' block, and packages and workspaces are "
+                + "declared in ens.package instead";
+        }
+        return "";
+    }
+
+    // The text with the named package redirected at the folder: the declaration replaced where the
+    // file already has one, and added just inside the block's closing brace where it does not.
+    export withOverride(string name, string folder) -> string {
+        string declaration = "override " + name + " \"" + folder + "\";";
+        if (this.saysNothing()) {
+            return "overrides \{\n    " + declaration + "\n\}\n";
+        }
+        let existing = this.reading.find(name);
+        if (existing != null) {
+            return replaced(this.fileText, existing.start(), existing.end(), declaration);
+        }
+
+        // A brace that starts its own line keeps it, and the declaration goes on a line of its
+        // own in front of it; a brace sharing a line with something else has the line broken in
+        // front of it so the declaration still stands alone.
+        byte[] bytes = this.fileText.toBytes();
+        long close = this.reading.closeBraceOffset();
+        long lineStart = startOfLine(bytes, close);
+        if (blankBetween(bytes, lineStart, close)) {
+            return replaced(this.fileText, lineStart, lineStart, "    " + declaration + "\n");
+        }
+        return replaced(this.fileText, close, close, "\n    " + declaration + "\n");
+    }
+
+    // The text with the named package's override taken out, or the text unchanged when it
+    // declares none. A declaration standing alone on its lines takes those lines with it, so
+    // removing one does not leave a blank line where it was.
+    export withoutOverride(string name) -> string {
+        let existing = this.reading.find(name);
+        if (existing == null) {
+            return this.fileText;
+        }
+        byte[] bytes = this.fileText.toBytes();
+        long begin = existing.start();
+        long end = existing.end();
+        long lineStart = startOfLine(bytes, begin);
+        long lineEnd = endOfLine(bytes, end);
+        if (blankBetween(bytes, lineStart, begin) && blankBetween(bytes, end, lineEnd)) {
+            begin = lineStart;
+            end = lineEnd;
+            if (end < bytes.length) {
+                end++;
+            }
+        }
+        return replaced(this.fileText, begin, end, "");
+    }
+}
+
+// The file beside the given root manifest, as it stands.
+export read(string folder) -> OverridesFile throws {
+    return try readFile(filePath(folder));
+}
+
+readFile(string file) -> OverridesFile throws {
+    if (!system.isFile(file)) {
+        return new OverridesFile(file, false, "", workspace.surveyOverrides(file, ""));
+    }
+    string text = try system.readAllText(file);
+    return new OverridesFile(file, true, text, workspace.surveyOverrides(file, text));
+}
+
+// The same for text a caller already has, which is how the edits are tested.
+export of(string file, string text) -> OverridesFile {
+    return new OverridesFile(file, true, text, workspace.surveyOverrides(file, text));
+}
+
+export write(string file, string text) throws {
+    try system.writeAllText(file, text);
+}
+
+// Why the folder an override points at cannot be used, or "" when it can. It has to hold a manifest
+// declaring exactly the overridden package: an override says where a package comes from, never which
+// package it is. `root` is the folder the override's own text is read against.
+export targetProblem(FileLoader loader, string root, string name, string folder) -> string {
+    string target = resolved(root, folder);
+    if (!loader.exists(workspace.manifestFilePath(target))) {
+        return "there is no ens.package manifest at '{target}'";
+    }
+    let survey = workspace.surveyManifest(loader, target);
+    if (survey == null || !survey.isPackage()) {
+        return "'{target}' has an ens.package that declares no package";
+    }
+    if (survey.packageName() != name) {
+        return "'{target}' declares package '{survey.packageName()}' instead, and the names must "
+            + "match exactly";
+    }
+    return "";
+}
+
+// The folder an override's text names, read against the folder the file sits in.
+export resolved(string root, string folder) -> string {
+    return path.absolute(folder, root);
+}
+
+// `target` written as a path relative to `base`, both absolute and written with '/'. A target with
+// nothing in common with the base - another drive, say - is left as it is, since no relative path
+// leads there.
+export relativeTo(string target, string base) -> string {
+    string[] targetParts = strings.split(path.normalize(target), "/");
+    string[] baseParts = strings.split(path.normalize(base), "/");
+    long shared = 0;
+    while (shared < targetParts.length && shared < baseParts.length
+            && targetParts[shared] == baseParts[shared]) {
+        shared++;
+    }
+    if (shared == 0) {
+        return path.normalize(target);
+    }
+    let parts = new List<string>();
+    for (long i = shared; i < baseParts.length; i++) {
+        parts.push("..");
+    }
+    for (long i = shared; i < targetParts.length; i++) {
+        parts.push(targetParts[i]);
+    }
+    if (parts.length() == 0) {
+        return ".";
+    }
+    return strings.joined(parts.toArray(), "/");
+}
+
+// Whether the text spells a package name the way a manifest spells one. The manifest grammar decides
+// it, by being asked to read a declaration naming it, so this can never come to disagree with what a
+// manifest would accept.
+export isPackageName(string text) -> bool {
+    if (text.length == 0 || text.indexOf("\"") >= 0) {
+        return false;
+    }
+    let survey = workspace.surveyOverrides("<arguments>",
+        "overrides \{ override " + text + " \"x\"; \}\n");
+    if (survey.diagnostics().length > 0 || survey.overrides().length != 1) {
+        return false;
+    }
+    return survey.overrides()[0].packageName() == text;
+}
+
+startOfLine(byte[] bytes, long at) -> long {
+    long start = at;
+    while (start > 0 && bytes[start - 1] != '\n') {
+        start--;
+    }
+    return start;
+}
+
+endOfLine(byte[] bytes, long at) -> long {
+    long end = at;
+    while (end < bytes.length && bytes[end] != '\n') {
+        end++;
+    }
+    return end;
+}
+
+// Whether everything between the two offsets is blank, which decides whether a declaration stands
+// alone on its lines.
+blankBetween(byte[] bytes, long from, long to) -> bool {
+    for (long i = from; i < to; i++) {
+        if (bytes[i] != ' ' && bytes[i] != '\t' && bytes[i] != '\r') {
+            return false;
+        }
+    }
+    return true;
+}
+
+replaced(string text, long from, long to, string with) -> string {
+    let out = new StringBuilder();
+    out.append(text.substring(0, from));
+    out.append(with);
+    out.append(text.substring(to, text.length));
+    return out.toString();
+}
