@@ -830,9 +830,9 @@ const int max = 100;    // immutable, explicit type
 limit = 11;             // error: cannot assign to constant 'limit'
 ```
 
-A **compound assignment** folds an operator into the store: `a += b` means `a = a + b`, and the same holds for `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, and `>>=`.
+A **compound assignment** folds an operator into the store: `a += b` means `a = a + b`, and the same holds for `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`, and `>>>=`.
 The target is evaluated once, so in `xs[next()] += 1` the index `next()` runs a single time and serves both the read and the write.
-Each form applies wherever its operator does: the arithmetic ones (`+= -= *= /= %=`) to numeric targets, the bitwise and shift ones (`&= |= ^= <<= >>=`) to integer targets, and `+=` also to a string, where it appends the right side just as `+` concatenates.
+Each form applies wherever its operator does: the arithmetic ones (`+= -= *= /= %=`) to numeric targets, the bitwise and shift ones (`&= |= ^= <<= >>= >>>=`) to integer targets, and `+=` also to a string, where it appends the right side just as `+` concatenates.
 The two sides combine under the operator's own rules, and the operator's result must be assignable to the target, so a wider target takes a narrower value without a cast while a narrower target needs an explicit `as`.
 
 ```ens
@@ -890,6 +890,8 @@ for (let n in new Range(1, 10)) {
 The bitwise operators `&`, `|`, and `^` combine two integers of the same type and produce that type.
 An untyped integer literal adapts to the other side, the same way it does for `+`, `-`, and `*`, so a `uint` masked with `0xFF` needs no cast.
 The shift operators `<<` and `>>` move a value's bits by a distance, and `>>` keeps a signed value's sign while an unsigned one fills with zeros.
+A third shift, `>>>`, always fills with zeros, so it differs from `>>` only on a signed type: `>>` copies the sign bit into the vacated places and `>>>` discards it.
+On an unsigned type the two mean the same thing, because `>>` already fills with zeros there.
 A shift produces the type of the value it shifts, so the distance must be that same integer type, and an untyped literal distance adapts to it.
 The distance never decides the result, so an untyped literal on the left of a shift stays `int` and shifting by a `uint` distance is written `(1 as uint) << spread`.
 
@@ -900,6 +902,10 @@ uint flags = 0x12345678;
 uint low = flags & 0xFF;        // 0x78: the literal adapts to uint
 uint top = flags >> 24;         // 0x12: the distance adapts to uint
 uint flipped = ~flags;          // 0xEDCBA987
+
+int word = -8;
+int kept = word >> 1;           // -4: '>>' copies the sign bit
+int dropped = word >>> 1;       // 2147483644: '>>>' fills with zeros
 
 byte mask = 0x0F;
 byte bits = mask & 300;         // error: 300 does not fit in 'byte' (range 0..255)
