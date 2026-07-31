@@ -1,0 +1,173 @@
+// What a fetch asks git, pinned argument by argument, and what it makes of the answers. Everything
+// here is a value, so the whole shape of a fetch is verified on a machine with no network and no
+// repository on it - which is the only way the settings that keep a build from stopping to ask a
+// person something stay verified at all.
+import @std.testing;
+import @std.text.strings;
+import gitcommands;
+
+// The arguments as one line, so a command's whole shape reads as what would be typed.
+line(string[] arguments) -> string {
+    return strings.joined(arguments, " ");
+}
+
+test "every command carries the settings that stop a build waiting on a person" {
+    string carried = line(gitcommands.baseArguments());
+    try testing.assertEqual(carried, "-c credential.interactive=false -c core.askPass= "
+        + "-c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60");
+}
+
+test "a child git is told that nothing may ask a question" {
+    string[] variables = gitcommands.environmentOverrides();
+    try testing.assertEqual(line(variables), "GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= SSH_ASKPASS= "
+        + "GCM_INTERACTIVE=never");
+}
+
+test "an extraction works through an index of its own" {
+    string[] variables = gitcommands.environmentOverrides("/cache/staging/fetch-1/index");
+    try testing.assertEqual(variables[variables.length - 1],
+        "GIT_INDEX_FILE=/cache/staging/fetch-1/index");
+}
+
+test "listing tags is the one question a version asks the network" {
+    try testing.assertEqual(line(gitcommands.listTagsArguments("https://host/x.git")),
+        line(gitcommands.baseArguments()) + " ls-remote --tags https://host/x.git");
+}
+
+test "a fetch takes one tag, one commit deep, and follows no submodule" {
+    try testing.assertEqual(
+        line(gitcommands.fetchArguments("/cache/git/x-ab", "https://host/x.git", "v2.0")),
+        "--git-dir=/cache/git/x-ab " + line(gitcommands.baseArguments())
+        + " fetch --quiet --no-tags --no-recurse-submodules --depth 1 https://host/x.git "
+        + "+refs/tags/v2.0:refs/tags/v2.0");
+}
+
+test "the plumbing that turns a commit into files names the work tree outright" {
+    try testing.assertEqual(line(gitcommands.readTreeArguments("/cache/git/x-ab", "abc123")),
+        "--git-dir=/cache/git/x-ab " + line(gitcommands.baseArguments()) + " read-tree abc123");
+    try testing.assertEqual(
+        line(gitcommands.checkoutArguments("/cache/git/x-ab", "/cache/staging/fetch-1/tree")),
+        "--git-dir=/cache/git/x-ab --work-tree=/cache/staging/fetch-1/tree "
+        + line(gitcommands.baseArguments()) + " checkout-index -a -f");
+    try testing.assertEqual(line(gitcommands.listTreeArguments("/cache/git/x-ab", "abc123")),
+        "--git-dir=/cache/git/x-ab " + line(gitcommands.baseArguments()) + " ls-tree -r abc123");
+    try testing.assertEqual(line(gitcommands.hasCommitArguments("/cache/git/x-ab", "abc123")),
+        "--git-dir=/cache/git/x-ab " + line(gitcommands.baseArguments())
+        + " cat-file -e abc123^\{commit\}");
+    try testing.assertEqual(line(gitcommands.initArguments("/cache/git/x-ab")),
+        line(gitcommands.baseArguments()) + " init --bare --quiet /cache/git/x-ab");
+}
+
+test "a mirror's own attributes file is what keeps a machine's text rules off the bytes" {
+    try testing.assertEqual(gitcommands.attributesFileText(), "* -text -filter -ident\n");
+    try testing.assertEqual(gitcommands.attributesFilePath("/cache/git/x-ab"),
+        "/cache/git/x-ab/info/attributes");
+    try testing.assertEqual(gitcommands.mirrorMarkerPath("/cache/git/x-ab"),
+        "/cache/git/x-ab/HEAD");
+}
+
+test "a mirror is named so a person recognizes it and no two repositories share it" {
+    string first = gitcommands.mirrorFolder("/cache", "https://github.com/alex/json.git");
+    string second = gitcommands.mirrorFolder("/cache", "https://github.com/other/json.git");
+    try testing.assertTrue(first.startsWith("/cache/git/https---github.com-alex-json.git-"));
+    try testing.assertTrue(second != first);
+    try testing.assertEqual(first,
+        gitcommands.mirrorFolder("/cache", "https://github.com/alex/json.git"));
+}
+
+test "a long URL keeps its tail, which is where a repository's own name sits" {
+    string folder = gitcommands.mirrorFolder("/cache",
+        "https://very.long.host.example.com/a/deeply/nested/group/of/groups/project.git");
+    try testing.assertTrue(folder.indexOf("nested-group-of-groups-project.git-") > 0);
+    try testing.assertTrue(folder.indexOf("very.long.host") < 0);
+}
+
+test "a version takes the tag spelled exactly like it" {
+    let chosen = gitcommands.chooseTag("alex.json", "https://host/x.git", "1.0",
+        ["aaa1\trefs/tags/1.0", "bbb2\trefs/tags/0.9"]);
+    try testing.assertTrue(chosen.found());
+    try testing.assertEqual(chosen.tag(), "1.0");
+    try testing.assertEqual(chosen.commit(), "aaa1");
+}
+
+test "a version takes the same spelling behind a 'v'" {
+    let chosen = gitcommands.chooseTag("alex.json", "https://host/x.git", "1.1",
+        ["aaa1\trefs/tags/1.0", "bbb2\trefs/tags/v1.1"]);
+    try testing.assertTrue(chosen.found());
+    try testing.assertEqual(chosen.tag(), "v1.1");
+    try testing.assertEqual(chosen.commit(), "bbb2");
+}
+
+test "an annotated tag is taken at the commit it points at, not at the tag object" {
+    let chosen = gitcommands.chooseTag("alex.json", "https://host/x.git", "2.0",
+        ["tag00\trefs/tags/2.0", "commit0\trefs/tags/2.0^\{\}"]);
+    try testing.assertTrue(chosen.found());
+    try testing.assertEqual(chosen.commit(), "commit0");
+}
+
+test "both spellings existing is refused rather than guessed at" {
+    let chosen = gitcommands.chooseTag("alex.json", "https://host/x.git", "2.0",
+        ["aaa1\trefs/tags/2.0", "bbb2\trefs/tags/v2.0"]);
+    try testing.assertTrue(!chosen.found());
+    try testing.assertTrue(chosen.failure().indexOf("both the tags '2.0' and 'v2.0' exist") >= 0);
+    try testing.assertTrue(chosen.failure().indexOf("remove or rename one of the two tags") >= 0);
+}
+
+test "no such tag names the package, both spellings, and the way in for unreleased work" {
+    let chosen = gitcommands.chooseTag("alex.json", "https://host/x.git", "3.0",
+        ["aaa1\trefs/tags/1.0"]);
+    try testing.assertTrue(!chosen.found());
+    try testing.assertTrue(chosen.failure().indexOf(
+        "package 'alex.json' has no tag '3.0' or 'v3.0' at https://host/x.git") >= 0);
+    try testing.assertTrue(chosen.failure().indexOf(
+        "'ens override add alex.json <folder>'") >= 0);
+}
+
+test "a branch is never a version, however it is named" {
+    let chosen = gitcommands.chooseTag("alex.json", "https://host/x.git", "1.0",
+        ["aaa1\trefs/heads/1.0", "bbb2\tHEAD"]);
+    try testing.assertTrue(!chosen.found());
+}
+
+test "a tree entry reads as its mode, its kind and its whole path" {
+    let entry = gitcommands.parseTreeEntry("100644 blob c0d0fb45\tsrc/deep/thing.ens");
+    try testing.assertTrue(entry != null);
+    if (entry != null) {
+        try testing.assertEqual(entry.mode(), "100644");
+        try testing.assertEqual(entry.kind(), "blob");
+        try testing.assertEqual(entry.filePath(), "src/deep/thing.ens");
+    }
+    try testing.assertTrue(gitcommands.parseTreeEntry("") == null);
+    try testing.assertTrue(gitcommands.parseTreeEntry("no tab here") == null);
+}
+
+test "a path holding a space is kept whole" {
+    let entry = gitcommands.parseTreeEntry("100644 blob c0d0fb45\tdocs/read me.txt");
+    try testing.assertTrue(entry != null);
+    if (entry != null) {
+        try testing.assertEqual(entry.filePath(), "docs/read me.txt");
+    }
+}
+
+test "a package using submodules is refused, whichever way it shows" {
+    string byRecord = gitcommands.unusableTree("sub.pkg", "1.0", "https://host/s.git",
+        ["100644 blob aaa\tsrc/x.ens", "160000 commit bbb\tvendored"]);
+    try testing.assertTrue(byRecord.indexOf("uses git submodules") >= 0);
+    try testing.assertTrue(byRecord.indexOf("has to be self-contained") >= 0);
+    try testing.assertTrue(byRecord.indexOf("declare what the submodule holds as a dependency") >= 0);
+    string byFile = gitcommands.unusableTree("sub.pkg", "1.0", "https://host/s.git",
+        ["100644 blob aaa\t.gitmodules"]);
+    try testing.assertTrue(byFile.indexOf("uses git submodules") >= 0);
+}
+
+test "a symbolic link is refused and named" {
+    string problem = gitcommands.unusableTree("link.pkg", "2.1", "https://host/l.git",
+        ["100644 blob aaa\tsrc/x.ens", "120000 blob bbb\tsrc/shortcut"]);
+    try testing.assertTrue(problem.indexOf("holds the symbolic link 'src/shortcut'") >= 0);
+    try testing.assertTrue(problem.indexOf("commit a regular file instead") >= 0);
+}
+
+test "an ordinary tree of files is usable" {
+    try testing.assertEqual(gitcommands.unusableTree("ok.pkg", "1.0", "https://host/o.git",
+        ["100644 blob aaa\tens.package", "100755 blob bbb\tscripts/run.sh"]), "");
+}

@@ -1,0 +1,245 @@
+// Bringing one tagged version of one repository into the cache. Only tags are ever fetched: a tag
+// names a release, and unreleased work reaches a build through an override pointed at a checkout.
+//
+// A fetch is a function of the version it was asked for and answers with a value, so two of them are
+// independent and nothing one learns is visible to another. What they share is the cache, and they
+// share it the way everything else does: a mirror is named after the repository it holds, a tree is
+// named after what is inside it, and a tree is assembled somewhere else and moved into place in one
+// step.
+//
+// The mirror is the one thing here that is kept rather than thrown away. It holds a repository's
+// objects so a later fetch of another version of the same package asks the network only for what it
+// does not have, and it is never removed, so nothing ever has to unpick the read-only files git
+// leaves in it.
+import @std.system;
+import SystemError from @std.system;
+import @std.path;
+import ContentStore from store;
+import TagChoice from gitcommands;
+import ToolRun from tools;
+import Progress from progress;
+import gitcommands;
+import hashing;
+import @ens.host.scratch;
+import tools;
+
+// One fetched version: where its files are, which commit they came from, and what they hash to.
+export final class FetchedTree {
+    string treeFolder;
+    string tagName;
+    string commitId;
+    string contentDigest;
+    string problem;
+    string leftover;
+
+    protected constructor(this.treeFolder, this.tagName, this.commitId, this.contentDigest,
+                this.problem, this.leftover);
+
+    // The folder in the cache holding the repository's files at that tag.
+    export folder() -> string {
+        return this.treeFolder;
+    }
+
+    export tag() -> string {
+        return this.tagName;
+    }
+
+    export commit() -> string {
+        return this.commitId;
+    }
+
+    export digest() -> string {
+        return this.contentDigest;
+    }
+
+    export failure() -> string {
+        return this.problem;
+    }
+
+    // Anything the fetch could not tidy up, which is worth saying and is never allowed to decide
+    // whether the fetch worked: what was asked for is in the cache either way.
+    export leftBehind() -> string {
+        return this.leftover;
+    }
+
+    export succeeded() -> bool {
+        return this.problem.length == 0;
+    }
+}
+
+// Fetches the version of the package the URL names and answers where its files now are. `offline`
+// forbids every step that would touch the network, which is all of them: a version has to ask a
+// repository which tags it has before it can know which one it means.
+export fetch(ContentStore store, string packageName, string url, string version, bool offline,
+             Progress progress) -> FetchedTree {
+    if (offline) {
+        return refused(offlineMessage(packageName, version, url));
+    }
+    string mirror = gitcommands.mirrorFolder(store.root(), url);
+    string prepared = prepareMirror(mirror, packageName);
+    if (prepared.length > 0) {
+        return refused(prepared);
+    }
+
+    progress.step("asking {url} which tags it has");
+    let listed = tools.read("git", gitcommands.listTagsArguments(url),
+        gitcommands.environmentOverrides());
+    if (!listed.started()) {
+        return refused(missingGitMessage(packageName, listed.failure()));
+    }
+    if (!listed.succeeded()) {
+        return refused(withReport("could not list the tags of package '{packageName}' at {url}",
+            listed) + ". Check that the URL is right and that this machine can reach it");
+    }
+    let chosen = gitcommands.chooseTag(packageName, url, version, listed.lines());
+    if (!chosen.found()) {
+        return refused(chosen.failure());
+    }
+
+    string brought = bringCommit(mirror, packageName, url, chosen.tag(), chosen.commit(), progress);
+    if (brought.length > 0) {
+        return refused(brought);
+    }
+
+    let listing = tools.read("git", gitcommands.listTreeArguments(mirror, chosen.commit()),
+        gitcommands.environmentOverrides());
+    if (!listing.succeeded()) {
+        return refused(withReport("could not read what the tag '{chosen.tag()}' of package "
+            + "'{packageName}' holds", listing));
+    }
+    string unusable = gitcommands.unusableTree(packageName, version, url, listing.lines());
+    if (unusable.length > 0) {
+        return refused(unusable);
+    }
+    return extracted(store, mirror, packageName, version, chosen);
+}
+
+// Writes the commit's files out into the cache under the digest of what they are.
+extracted(ContentStore store, string mirror, string packageName, string version,
+          TagChoice chosen) -> FetchedTree {
+    let staging = store.stage("fetch");
+    if (staging.failure().length > 0) {
+        return refused("package '{packageName}' {version} could not be assembled: "
+            + staging.failure());
+    }
+    string tree = path.join(staging.folder(), "tree");
+    string index = path.join(staging.folder(), "index");
+    string problem = writeOut(mirror, tree, index, chosen.commit(), packageName, version);
+    if (problem.length > 0) {
+        return refused(problem + tidied(staging.folder(), ""));
+    }
+    string digest = try hashing.ofTree(tree);
+    let published = try store.publishTree(tree, digest);
+    return new FetchedTree(published.path(), chosen.tag(), chosen.commit(), digest, "",
+        tidied(staging.folder(), published.leftBehind()));
+} catch (SystemError error) {
+    return refused("package '{packageName}' {version} could not be put in the cache: "
+        + error.message);
+}
+
+// The two plumbing commands that turn a commit into files: one names what the commit holds, the
+// other writes it out. Both work through an index of this fetch's own, so two fetches never write
+// one another's.
+writeOut(string mirror, string tree, string index, string commit, string packageName,
+         string version) -> string {
+    try system.createDirectory(tree);
+    let variables = gitcommands.environmentOverrides(index);
+    let named = tools.read("git", gitcommands.readTreeArguments(mirror, commit), variables);
+    if (!named.succeeded()) {
+        return withReport("package '{packageName}' {version} could not be read out of the cached "
+            + "repository", named);
+    }
+    let written = tools.read("git", gitcommands.checkoutArguments(mirror, tree), variables);
+    if (!written.succeeded()) {
+        return withReport("the files of package '{packageName}' {version} could not be written "
+            + "into the cache", written);
+    }
+    return "";
+} catch (SystemError error) {
+    return "'{tree}' could not be created to hold package '{packageName}' {version}: "
+        + error.message;
+}
+
+// A mirror ready to fetch into: the folder, an empty repository in it, and the attributes file that
+// keeps this machine's own text rules off the bytes an extraction writes.
+prepareMirror(string mirror, string packageName) -> string {
+    if (!system.isFile(gitcommands.mirrorMarkerPath(mirror))) {
+        try system.createDirectory(mirror);
+        let started = tools.read("git", gitcommands.initArguments(mirror),
+            gitcommands.environmentOverrides());
+        if (!started.started()) {
+            return missingGitMessage(packageName, started.failure());
+        }
+        if (!started.succeeded()) {
+            return withReport("the cached copy of the repository at '{mirror}' could not be "
+                + "prepared", started);
+        }
+    }
+    try system.writeAllText(gitcommands.attributesFilePath(mirror),
+        gitcommands.attributesFileText());
+    return "";
+} catch (SystemError error) {
+    return "the cache folder '{mirror}' could not be prepared: " + error.message;
+}
+
+// Makes sure the mirror holds the commit, fetching the tag when it does not. A commit already there
+// was fetched by an earlier run and asks the network nothing.
+bringCommit(string mirror, string packageName, string url, string tag, string commit,
+            Progress progress) -> string {
+    if (hasCommit(mirror, commit)) {
+        return "";
+    }
+    progress.step("fetching the tag '{tag}' of {packageName} from {url}");
+    let fetched = tools.relay("git", gitcommands.fetchArguments(mirror, url, tag),
+        gitcommands.environmentOverrides(), progress);
+    if (!fetched.succeeded()) {
+        return withReport("could not fetch the tag '{tag}' of package '{packageName}' from {url}",
+            fetched);
+    }
+    if (!hasCommit(mirror, commit)) {
+        return "the tag '{tag}' at {url} moved while package '{packageName}' was being fetched; "
+            + "run the command again";
+    }
+    return "";
+}
+
+hasCommit(string mirror, string commit) -> bool {
+    return tools.read("git", gitcommands.hasCommitArguments(mirror, commit),
+        gitcommands.environmentOverrides()).succeeded();
+}
+
+// "<what failed>: <the last thing git said>", or just what failed when git said nothing.
+withReport(string what, ToolRun run) -> string {
+    string said = run.said();
+    if (said.length == 0) {
+        return what;
+    }
+    return what + ": " + said;
+}
+
+export offlineMessage(string packageName, string version, string url) -> string {
+    return "'--offline' forbids fetching package '{packageName}' {version} from {url}, and the "
+        + "cache does not hold it; run the command once without '--offline'";
+}
+
+missingGitMessage(string packageName, string reported) -> string {
+    return "fetching package '{packageName}' needs the 'git' command, which could not be started: "
+        + reported + ". Install git and make sure it is on PATH";
+}
+
+// Removes what a fetch left behind and answers with everything a caller should be told about, the
+// store's own leftover included.
+tidied(string staging, string alreadyLeft) -> string {
+    string mine = scratch.discard(staging);
+    if (alreadyLeft.length == 0) {
+        return mine;
+    }
+    if (mine.length == 0) {
+        return alreadyLeft;
+    }
+    return alreadyLeft + "; " + mine;
+}
+
+refused(string problem) -> FetchedTree {
+    return new FetchedTree("", "", "", "", problem, "");
+}

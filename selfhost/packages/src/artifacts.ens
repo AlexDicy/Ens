@@ -1,0 +1,148 @@
+// The prebuilt native libraries a package binds instead of naming a library for the linker to find.
+// One file per platform, downloaded once into the cache, and used only when its bytes are the bytes
+// the manifest said they would be.
+//
+// The hash is the whole point of the mechanism, so it is checked before the file is kept rather than
+// after: a download that does not match is refused and never reaches the cache, so a later build
+// cannot find it there and trust it. Nothing verifies a file already in the cache, because the digest
+// is what named the folder it sits in.
+import @std.system;
+import SystemError from @std.system;
+import @std.path;
+import @std.text.strings;
+import ContentStore from store;
+import Progress from progress;
+import hashing;
+import @ens.host.scratch;
+import tools;
+
+// One artifact the link needs: where its file is, or why there is none.
+export final class FetchedArtifact {
+    string libraryFile;
+    string problem;
+
+    protected constructor(this.libraryFile, this.problem);
+
+    export file() -> string {
+        return this.libraryFile;
+    }
+
+    export failure() -> string {
+        return this.problem;
+    }
+
+    export succeeded() -> bool {
+        return this.problem.length == 0;
+    }
+}
+
+// The file the binding names, downloading it when the cache does not hold it yet. `library` is the
+// native library the binding belongs to, which is what a reader of a problem recognizes.
+export fetch(ContentStore store, string library, string url, string checksum, bool offline,
+             Progress progress) -> FetchedArtifact {
+    string digest = hashing.canonical(checksum);
+    string name = fileNameOf(url);
+    string stored = store.artifactFile(digest, name);
+    if (system.isFile(stored)) {
+        return new FetchedArtifact(stored, "");
+    }
+    if (offline) {
+        return refused("'--offline' forbids downloading the prebuilt library for native "
+            + "'{library}' from {url}, and the cache does not hold it; run the command once "
+            + "without '--offline'");
+    }
+
+    let staging = store.stage("download");
+    if (staging.failure().length > 0) {
+        return refused("the prebuilt library for native '{library}' could not be downloaded: "
+            + staging.failure());
+    }
+    let outcome = downloaded(store, staging.folder(), library, url, digest, name, progress);
+    string leftBehind = scratch.discard(staging.folder());
+    if (outcome.succeeded() || leftBehind.length == 0) {
+        return outcome;
+    }
+    return refused(outcome.failure() + "; " + leftBehind);
+}
+
+downloaded(ContentStore store, string staging, string library, string url, string digest,
+           string name, Progress progress) -> FetchedArtifact {
+    string target = path.join(staging, name);
+    progress.step("downloading the prebuilt '{library}' library from {url}");
+    let download = tools.read("curl", curlArguments(url, target), noOverrides());
+    if (!download.started()) {
+        return refused("downloading the prebuilt library for native '{library}' needs the 'curl' "
+            + "command, which could not be started: " + download.failure() + ". Install curl and "
+            + "make sure it is on PATH");
+    }
+    if (!download.succeeded()) {
+        string said = download.said();
+        string report = "";
+        if (said.length > 0) {
+            report = ": " + said;
+        }
+        return refused("the prebuilt library for native '{library}' could not be downloaded from "
+            + "{url}" + report);
+    }
+
+    string found = try hashing.ofFile(target);
+    if (found != digest) {
+        return refused("the file downloaded from {url} for native '{library}' hashes to {found}, "
+            + "but the manifest declares {digest}, so it is not the library the manifest means and "
+            + "will not be used. If the library changed on purpose, put the new hash in the "
+            + "manifest");
+    }
+    let published = try store.publishArtifact(target, digest, name);
+    return new FetchedArtifact(published.path(), "");
+} catch (SystemError error) {
+    return refused("the prebuilt library for native '{library}' could not be kept: "
+        + error.message);
+}
+
+// How the download is asked for: fail on an error status rather than saving the error page, follow
+// where the server points, say nothing but what went wrong, and give up rather than wait forever.
+export curlArguments(string url, string target) -> string[] {
+    return ["--fail", "--location", "--silent", "--show-error", "--connect-timeout", "30",
+        "--max-time", "600", "--output", target, "--url", url];
+}
+
+// The name the artifact keeps in the cache: the last part of the URL's path, with anything a server
+// reads after it left off, so a link line names the library it is rather than a digest.
+export fileNameOf(string url) -> string {
+    string trimmed = url;
+    long marker = firstOf(trimmed, "?#");
+    if (marker >= 0) {
+        trimmed = trimmed.substring(0, marker);
+    }
+    while (trimmed.endsWith("/")) {
+        trimmed = trimmed.substring(0, trimmed.length - 1);
+    }
+    string[] parts = strings.split(trimmed, "/");
+    string name = parts[parts.length - 1];
+    if (name.length == 0) {
+        return "artifact";
+    }
+    return name;
+}
+
+// Where the first of the given characters sits, or -1 when the text holds none of them.
+firstOf(string text, string characters) -> long {
+    long found = -1;
+    for (let value in characters.toBytes()) {
+        byte[] one = [value];
+        long at = text.indexOf(string.fromBytes(one));
+        if (at >= 0 && (found < 0 || at < found)) {
+            found = at;
+        }
+    }
+    return found;
+}
+
+noOverrides() -> string[] {
+    string[] none = [];
+    return none;
+}
+
+refused(string problem) -> FetchedArtifact {
+    return new FetchedArtifact("", problem);
+}

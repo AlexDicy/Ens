@@ -1,0 +1,343 @@
+// Every git command a fetch runs, written as the arguments it runs with, and the reading of what git
+// answers back. Nothing here starts a program, so the whole shape of what a fetch asks git - and
+// what it makes of the answer - is a value a test can pin on a machine with no network and no
+// repository on it.
+//
+// Two settings are on every command for the same reason: a build must never stop to ask a person
+// something. Nothing may open a credential window and nothing may wait on a terminal, because a
+// build that is waiting for an answer nobody is there to give looks exactly like a build that has
+// hung. A transfer that has stalled is cut off for the same reason.
+//
+// The bytes a fetch extracts are the bytes the repository holds, whatever this machine's git is set
+// up to do to text on its way out of a repository. That is what the attributes file written into the
+// mirror is for: an end-of-line rule from the machine, or from the package's own '.gitattributes',
+// would make the same commit hash differently on two machines and every lock written on one of them
+// would be rejected on the other.
+import @std.path;
+import @std.text.strings;
+import List from @std.collections.list;
+import StringBuilder from @std.text.stringbuilder;
+import sha256;
+
+// What every invocation carries, whatever it is asking for.
+export baseArguments() -> string[] {
+    return ["-c", "credential.interactive=false", "-c", "core.askPass=",
+        "-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=60"];
+}
+
+// The variables a child git runs with. `indexFile` names the index the command works through, so
+// two fetches never write one another's; empty text leaves git to its own.
+export environmentOverrides(string indexFile = "") -> string[] {
+    let variables = new List<string>();
+    variables.push("GIT_TERMINAL_PROMPT=0");
+    variables.push("GIT_ASKPASS=");
+    variables.push("SSH_ASKPASS=");
+    variables.push("GCM_INTERACTIVE=never");
+    if (indexFile.length > 0) {
+        variables.push("GIT_INDEX_FILE=" + indexFile);
+    }
+    return variables.toArray();
+}
+
+// The tags a repository has, which is the one question a version has to ask the network.
+export listTagsArguments(string url) -> string[] {
+    return joinedWith(baseArguments(), ["ls-remote", "--tags", url]);
+}
+
+export initArguments(string mirror) -> string[] {
+    return joinedWith(baseArguments(), ["init", "--bare", "--quiet", mirror]);
+}
+
+// One tag, one commit deep, and no submodule followed however this machine's git is configured.
+export fetchArguments(string mirror, string url, string tag) -> string[] {
+    return joinedWith(atMirror(mirror), ["fetch", "--quiet", "--no-tags",
+        "--no-recurse-submodules", "--depth", "1", url,
+        "+refs/tags/" + tag + ":refs/tags/" + tag]);
+}
+
+// Whether the mirror already holds the commit, which is what decides that a fetch has nothing to
+// ask the network for.
+export hasCommitArguments(string mirror, string commit) -> string[] {
+    return joinedWith(atMirror(mirror), ["cat-file", "-e", commit + "^\{commit\}"]);
+}
+
+// Everything the commit holds, one path to a line, which is what a package is checked over before
+// any of it is written out.
+export listTreeArguments(string mirror, string commit) -> string[] {
+    return joinedWith(atMirror(mirror), ["ls-tree", "-r", commit]);
+}
+
+export readTreeArguments(string mirror, string commit) -> string[] {
+    return joinedWith(atMirror(mirror), ["read-tree", commit]);
+}
+
+export checkoutArguments(string mirror, string workTree) -> string[] {
+    return joinedWith(atWorkTree(mirror, workTree), ["checkout-index", "-a", "-f"]);
+}
+
+// The attributes an extraction is done under, and what a mirror's own attributes file has to say for
+// it: nothing about this machine or about the package's own attributes may touch a byte on its way
+// out, or the same commit would hash differently on two machines. A mirror's file outranks the one
+// committed in the tree, which is exactly why the rule is written here.
+export attributesFileText() -> string {
+    return "* -text -filter -ident\n";
+}
+
+export attributesFilePath(string mirror) -> string {
+    return path.join(path.join(mirror, "info"), "attributes");
+}
+
+// Whether the folder already holds a mirror, by the one file every git repository has.
+export mirrorMarkerPath(string mirror) -> string {
+    return path.join(mirror, "HEAD");
+}
+
+// Where one repository's mirror lives under the cache: a name a person can recognize, and a digest
+// of the whole URL after it so two repositories never share a folder however alike their names are.
+export mirrorFolder(string cacheRoot, string url) -> string {
+    return path.join(path.join(cacheRoot, "git"), slugOf(url) + "-" + shortDigest(url));
+}
+
+// The tag a version selects, or why it selects none.
+export final class TagChoice {
+    string tagName;
+    string tagCommit;
+    string problem;
+
+    protected constructor(this.tagName, this.tagCommit, this.problem);
+
+    export tag() -> string {
+        return this.tagName;
+    }
+
+    export commit() -> string {
+        return this.tagCommit;
+    }
+
+    export failure() -> string {
+        return this.problem;
+    }
+
+    export found() -> bool {
+        return this.problem.length == 0;
+    }
+}
+
+// The tag the version names in what 'ls-remote --tags' answered: the version spelled exactly, or the
+// same spelling behind a 'v'. Both spellings existing is an ambiguity nobody but the repository's
+// owner can settle, so it is refused rather than guessed at.
+export chooseTag(string packageName, string url, string version, string[] lines) -> TagChoice {
+    string plain = "";
+    string plainPeeled = "";
+    bool plainExists = false;
+    string prefixed = "";
+    string prefixedPeeled = "";
+    bool prefixedExists = false;
+    for (let line in lines) {
+        let reference = referenceOf(line);
+        if (reference == null) {
+            continue;
+        }
+        if (reference.name() == version) {
+            plainExists = true;
+            if (reference.isPeeled()) {
+                plainPeeled = reference.commit();
+            } else {
+                plain = reference.commit();
+            }
+        } else if (reference.name() == "v" + version) {
+            prefixedExists = true;
+            if (reference.isPeeled()) {
+                prefixedPeeled = reference.commit();
+            } else {
+                prefixed = reference.commit();
+            }
+        }
+    }
+    if (plainExists && prefixedExists) {
+        return refusedTag("both the tags '{version}' and 'v{version}' exist at {url}, so version "
+            + "\"{version}\" of package '{packageName}' could mean either of them; remove or rename "
+            + "one of the two tags");
+    }
+    if (!plainExists && !prefixedExists) {
+        return refusedTag("package '{packageName}' has no tag '{version}' or 'v{version}' at "
+            + "{url}, and a git dependency is fetched from a release tag. Tag the release, or take "
+            + "unreleased work from a checkout with 'ens override add {packageName} <folder>'");
+    }
+    string tag = version;
+    string peeled = plainPeeled;
+    string direct = plain;
+    if (prefixedExists) {
+        tag = "v" + version;
+        peeled = prefixedPeeled;
+        direct = prefixed;
+    }
+    // An annotated tag is listed twice: once as the tag object and once, peeled, as the commit it
+    // points at. The commit is the one to fetch.
+    string commit = peeled;
+    if (commit.length == 0) {
+        commit = direct;
+    }
+    if (commit.length == 0) {
+        return refusedTag("Internal: git listed the tag '{tag}' at {url} with no commit id");
+    }
+    return new TagChoice(tag, commit, "");
+}
+
+// One entry of a commit's tree, as 'ls-tree -r' writes it.
+export final class TreeEntry {
+    string entryMode;
+    string entryKind;
+    string entryPath;
+
+    protected constructor(this.entryMode, this.entryKind, this.entryPath);
+
+    export mode() -> string {
+        return this.entryMode;
+    }
+
+    // "blob" for a file, "commit" for the place a submodule would go.
+    export kind() -> string {
+        return this.entryKind;
+    }
+
+    export filePath() -> string {
+        return this.entryPath;
+    }
+}
+
+// "<mode> <kind> <object>\t<path>", or null for anything else.
+export parseTreeEntry(string line) -> TreeEntry? {
+    long tab = line.indexOf("\t");
+    if (tab < 0) {
+        return null;
+    }
+    string[] fields = words(line.substring(0, tab));
+    if (fields.length != 3) {
+        return null;
+    }
+    return new TreeEntry(fields[0], fields[1], line.substring(tab + 1, line.length));
+}
+
+// Why the package the commit holds cannot be used, or "" when it can. A package is fetched whole and
+// used as it was fetched, so anything the extraction could not reproduce exactly is refused here,
+// before a byte of it is written out.
+export unusableTree(string packageName, string version, string url, string[] lines) -> string {
+    for (let line in lines) {
+        let entry = parseTreeEntry(line);
+        if (entry == null) {
+            continue;
+        }
+        if (entry.kind() == "commit" || entry.filePath() == ".gitmodules") {
+            return "package '{packageName}' {version} at {url} uses git submodules, and a package "
+                + "has to be self-contained: either declare what the submodule holds as a "
+                + "dependency of '{packageName}' too, or commit those files into the repository";
+        }
+        if (entry.mode() == "120000") {
+            return "package '{packageName}' {version} at {url} holds the symbolic link "
+                + "'{entry.filePath()}', which a package cannot carry because not every system it "
+                + "is fetched onto has them; commit a regular file instead";
+        }
+    }
+    return "";
+}
+
+// One line of 'ls-remote': the commit, and the reference it belongs to.
+final class Reference {
+    string referenceCommit;
+    string referenceName;
+    bool peeled;
+
+    protected constructor(this.referenceCommit, this.referenceName, this.peeled);
+
+    protected commit() -> string {
+        return this.referenceCommit;
+    }
+
+    // The tag's own name, with the marker that says it was listed peeled taken off.
+    protected name() -> string {
+        return this.referenceName;
+    }
+
+    protected isPeeled() -> bool {
+        return this.peeled;
+    }
+}
+
+referenceOf(string line) -> Reference? {
+    long tab = line.indexOf("\t");
+    if (tab < 0) {
+        return null;
+    }
+    string commit = line.substring(0, tab).trim();
+    string reference = line.substring(tab + 1, line.length).trim();
+    string prefix = "refs/tags/";
+    if (commit.length == 0 || !reference.startsWith(prefix)) {
+        return null;
+    }
+    string name = reference.substring(prefix.length, reference.length);
+    string marker = "^\{\}";
+    if (name.endsWith(marker)) {
+        return new Reference(commit, name.substring(0, name.length - marker.length), true);
+    }
+    return new Reference(commit, name, false);
+}
+
+atMirror(string mirror) -> string[] {
+    return joinedWith(["--git-dir=" + mirror], baseArguments());
+}
+
+atWorkTree(string mirror, string workTree) -> string[] {
+    return joinedWith(["--git-dir=" + mirror, "--work-tree=" + workTree], baseArguments());
+}
+
+joinedWith(string[] first, string[] second) -> string[] {
+    let all = new List<string>();
+    for (let argument in first) {
+        all.push(argument);
+    }
+    for (let argument in second) {
+        all.push(argument);
+    }
+    return all.toArray();
+}
+
+words(string text) -> string[] {
+    let found = new List<string>();
+    for (let part in strings.split(text, " ")) {
+        if (part.length > 0) {
+            found.push(part);
+        }
+    }
+    return found.toArray();
+}
+
+// The part of a mirror's folder name a person reads: the URL with everything a folder name cannot
+// hold replaced, and only its tail kept, since that is where a repository's own name sits.
+slugOf(string url) -> string {
+    let kept = new StringBuilder();
+    byte[] bytes = url.toBytes();
+    long from = 0;
+    if (bytes.length > 48) {
+        from = bytes.length - 48;
+    }
+    for (long i = from; i < bytes.length; i++) {
+        byte value = bytes[i];
+        bool plain = (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z')
+            || (value >= '0' && value <= '9') || value == '.' || value == '-' || value == '_';
+        if (plain) {
+            kept.appendByte(value);
+        } else {
+            kept.appendByte('-');
+        }
+    }
+    return kept.toString();
+}
+
+shortDigest(string url) -> string {
+    return sha256.ofText(url).substring(0, 12);
+}
+
+refusedTag(string problem) -> TagChoice {
+    return new TagChoice("", "", problem);
+}
