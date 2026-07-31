@@ -2907,6 +2907,51 @@ task("test")
                     "ens.lock is missing the fetched package's prebuilt lines:\n%s", lock))
             end
 
+            -- a workspace declares no package, so its members' bindings are recorded under their own
+            -- names: the shape this repository itself uses has to be reviewable too
+            local ws = path.join(root, "ws")
+            os.mkdir(path.join(ws, "member", "src"))
+            io.writefile(path.join(ws, "ens.package"),
+                'workspace {\n    member "member";\n}\n')
+            io.writefile(path.join(ws, "member", "ens.package"),
+                "package demo.member {\n" .. '    ens "0.1";\n\n'
+                .. '    dependency art.dep "1.0" from "' .. url_dep .. '";\n\n'
+                .. binding("memberextras", good) .. "}\n")
+            io.writefile(path.join(ws, "member", "src", "main.ens"),
+                'import @art.dep.dep;\n\nmain() -> int {\n    print(dep.tag());\n'
+                .. '    return 0;\n}\n')
+            run({"build", "."}, {curdir = ws, envs = withCache(cache)}, 0, "demo.member: built")
+            run_program(path.join(ws, "member.exe"), 0, "dep with a prebuilt library")
+            local ws_lock = ((io.readfile(path.join(ws, "ens.lock")) or ""):gsub("\r\n", "\n"))
+            local recorded_member = "member demo.member\n"
+                .. "artifact memberextras linux " .. url_lib .. " " .. good .. "\n"
+                .. "artifact memberextras macos " .. url_lib .. " " .. good .. "\n"
+                .. "artifact memberextras windows " .. url_lib .. " " .. good .. "\n"
+            if not ws_lock:find(recorded_member, 1, true) then
+                table.insert(failures, string.format(
+                    "ens.lock is missing the member's prebuilt lines:\n%s", ws_lock))
+            end
+            -- a workspace has no root package to name, and the lock stays current across builds
+            if ws_lock:find("\nroot ", 1, true) then
+                table.insert(failures, string.format(
+                    "a workspace's lock named a root package:\n%s", ws_lock))
+            end
+            run({"build", ".", "--locked"}, {curdir = ws, envs = withCache(cache)}, 0,
+                "demo.member: built", "!ens.lock no longer matches")
+            if ((io.readfile(path.join(ws, "ens.lock")) or ""):gsub("\r\n", "\n")) ~= ws_lock then
+                table.insert(failures, "a second build rewrote the member's lock")
+            end
+
+            -- changing a member's binding is a lock change '--locked' has to refuse by name
+            io.writefile(path.join(ws, "member", "ens.package"),
+                "package demo.member {\n" .. '    ens "0.1";\n\n'
+                .. '    dependency art.dep "1.0" from "' .. url_dep .. '";\n\n'
+                .. binding("renamedextras", good) .. "}\n")
+            run({"build", ".", "--locked"}, {curdir = ws, envs = withCache(cache)}, 1,
+                "ens.lock no longer matches what this build requires",
+                "updated the prebuilt libraries demo.member binds",
+                "'--locked' does not allow it to change")
+
             if #failures == 0 then
                 return {name = name, ok = true}
             end

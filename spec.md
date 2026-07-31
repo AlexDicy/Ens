@@ -439,7 +439,8 @@ Fetched packages land in a content-addressed cache at `~/.ens/cache` (the `ENS_C
 The first build that resolves git-sourced packages writes `ens.lock` next to the root manifest.
 The lock records each fetched package's exact version, source URL and commit, a hash of the fetched content, and its own requirements, so a later build reproduces the same result without touching the network, and a moved tag or altered content is detected and rejected.
 Commit `ens.lock` to version control; it is machine-owned and never edited by hand.
-Workspace members and overridden packages never appear in it.
+Workspace members and overridden packages are never pinned in it: a member is used exactly as it is checked out and an override only says where a package comes from, so neither has a version, a source, or a commit to record.
+A workspace member that binds a prebuilt artifact is still listed under its own name, so that artifact and its hash are recorded alongside the fetched packages' rather than nowhere.
 Builds keep the lock current: when the manifests' requirements change, the build re-resolves what changed, rewrites the lock, and prints a summary of the difference.
 `--locked`, accepted by build, check, run, and test, turns any needed lock change into an error, which is what a CI build wants.
 `--offline` forbids all network use: anything not already in the local cache fails the build by name.

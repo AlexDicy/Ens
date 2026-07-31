@@ -105,12 +105,33 @@ export final class LockPackage {
     }
 }
 
+// A package of the build's own checkout that binds a prebuilt native library. It has no source to
+// pin down - a workspace member is used exactly as it is checked out - so the only thing worth
+// recording about it is the native code it brings into the link. That is what a workspace needs: its
+// root declares no package, so there is no root section for its members' bindings to sit in.
+export final class LockMember {
+    string memberName;
+    LockArtifact[] memberArtifacts;
+
+    export constructor(this.memberName, this.memberArtifacts);
+
+    export packageName() -> string {
+        return this.memberName;
+    }
+
+    export artifacts() -> LockArtifact[] {
+        return this.memberArtifacts;
+    }
+}
+
 export final class Lockfile {
     string rootPackage;
     LockArtifact[] rootArtifactList;
+    LockMember[] lockedMembers;
     LockPackage[] lockedPackages;
 
-    export constructor(this.rootPackage, this.rootArtifactList, this.lockedPackages);
+    export constructor(this.rootPackage, this.rootArtifactList, this.lockedMembers,
+                this.lockedPackages);
 
     // The package the build was rooted at, empty when the root declares none.
     export rootName() -> string {
@@ -120,6 +141,12 @@ export final class Lockfile {
     // The artifacts the root itself binds, which belong to no fetched package.
     export rootArtifacts() -> LockArtifact[] {
         return this.rootArtifactList;
+    }
+
+    // The build's own packages that bind a prebuilt library and are not the root, which is how a
+    // workspace's members are recorded.
+    export members() -> LockMember[] {
+        return this.lockedMembers;
     }
 
     export packages() -> LockPackage[] {
@@ -134,13 +161,23 @@ export final class Lockfile {
         }
         return null;
     }
+
+    export findMember(string name) -> LockMember? {
+        for (let member in this.lockedMembers) {
+            if (member.packageName() == name) {
+                return member;
+            }
+        }
+        return null;
+    }
 }
 
 // A lock that records nothing, which is what a tree with no lock file amounts to.
 export empty() -> Lockfile {
     LockArtifact[] noArtifacts = [];
+    LockMember[] noMembers = [];
     LockPackage[] noPackages = [];
-    return new Lockfile("", noArtifacts, noPackages);
+    return new Lockfile("", noArtifacts, noMembers, noPackages);
 }
 
 // What a lock file said, or the reason it says nothing a build can use.
@@ -224,6 +261,11 @@ export render(Lockfile lock) -> string {
         out.append("root " + lock.rootName() + "\n");
         appendSorted(out, artifactLines(lock.rootArtifacts()));
     }
+    let members = new List<string>();
+    for (let member in lock.members()) {
+        members.push(memberBlock(member));
+    }
+    appendSorted(out, members);
     let blocks = new List<string>();
     for (let locked in lock.packages()) {
         blocks.push(packageBlock(locked));
@@ -250,6 +292,15 @@ packageBlock(LockPackage locked) -> string {
     }
     appendSorted(out, requirements);
     appendSorted(out, artifactLines(locked.artifacts()));
+    return out.toString();
+}
+
+// One of the build's own packages as one block, sorted by the name it starts with the same way a
+// package's block is.
+memberBlock(LockMember member) -> string {
+    let out = new StringBuilder();
+    out.append("member " + member.packageName() + "\n");
+    appendSorted(out, artifactLines(member.artifacts()));
     return out.toString();
 }
 
@@ -298,14 +349,18 @@ class Draft {
     protected string rootName;
     protected bool inRoot;
     protected List<LockArtifact> rootArtifacts;
+    protected List<LockMember> members;
     protected List<LockPackage> packages;
+    protected MemberDraft? currentMember;
     protected PackageDraft? current;
 
     protected constructor() {
         this.rootName = "";
         this.inRoot = false;
         this.rootArtifacts = new List<LockArtifact>();
+        this.members = new List<LockMember>();
         this.packages = new List<LockPackage>();
+        this.currentMember = null;
         this.current = null;
     }
 
@@ -314,6 +369,9 @@ class Draft {
         switch (parts[0]) {
             "root" -> {
                 return this.takeRoot(parts);
+            },
+            "member" -> {
+                return this.takeMember(parts);
             },
             "package" -> {
                 return this.takePackage(parts);
@@ -338,7 +396,8 @@ class Draft {
 
     protected finished() -> Lockfile {
         this.close();
-        return new Lockfile(this.rootName, this.rootArtifacts.toArray(), this.packages.toArray());
+        return new Lockfile(this.rootName, this.rootArtifacts.toArray(), this.members.toArray(),
+            this.packages.toArray());
     }
 
     takeRoot(string[] parts) -> bool {
@@ -348,6 +407,16 @@ class Draft {
         this.close();
         this.rootName = parts[1];
         this.inRoot = true;
+        return true;
+    }
+
+    takeMember(string[] parts) -> bool {
+        if (parts.length != 2) {
+            return false;
+        }
+        this.close();
+        this.inRoot = false;
+        this.currentMember = new MemberDraft(parts[1]);
         return true;
     }
 
@@ -399,6 +468,11 @@ class Draft {
             locked.artifacts.push(artifact);
             return true;
         }
+        let member = this.currentMember;
+        if (member != null) {
+            member.artifacts.push(artifact);
+            return true;
+        }
         if (this.inRoot) {
             this.rootArtifacts.push(artifact);
             return true;
@@ -406,13 +480,32 @@ class Draft {
         return false;
     }
 
-    // Finishes the package being read, if there is one.
+    // Finishes whichever block is being read, if either is.
     close() {
         let locked = this.current;
         if (locked != null) {
             this.packages.push(locked.finished());
             this.current = null;
         }
+        let member = this.currentMember;
+        if (member != null) {
+            this.members.push(member.finished());
+            this.currentMember = null;
+        }
+    }
+}
+
+class MemberDraft {
+    protected string name;
+    protected List<LockArtifact> artifacts;
+
+    protected constructor(string name) {
+        this.name = name;
+        this.artifacts = new List<LockArtifact>();
+    }
+
+    protected finished() -> LockMember {
+        return new LockMember(this.name, this.artifacts.toArray());
     }
 }
 
