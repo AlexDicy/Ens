@@ -2860,11 +2860,11 @@ task("test")
             local in_lifecycle = {curdir = lifecycle, envs = withCache(cache)}
             write_lifecycle(binding("extras", good))
             run({"build", "."}, in_lifecycle, 0,
-                "Updated ens.lock: updated the prebuilt libraries recorded for this build")
+                "Updated ens.lock: recorded the prebuilt libraries this build itself binds")
             write_lifecycle(binding("renamed", good))
             run({"build", ".", "--locked"}, in_lifecycle, 1,
                 "ens.lock no longer matches what this build requires",
-                "updated the prebuilt libraries recorded for this build",
+                "updated the prebuilt libraries this build itself binds",
                 "'--locked' does not allow it to change")
             write_lifecycle("    native extras system;\n")
             run({"build", ".", "--locked"}, in_lifecycle, 1,
