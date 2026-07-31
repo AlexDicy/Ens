@@ -4959,13 +4959,13 @@ Type* Analyzer::analyzePrefix(const ast::PrefixExpression& expr) {
     switch (opTok->kind()) {
         case SyntaxKind::Minus:
             if (!t->isNumeric()) {
-                errorAtNode(expr.node, "Unary '-' requires numeric, got '" + t->toString() + "'");
+                errorAtNode(expr.node, "Unary '-' needs a number, got '" + t->toString() + "'.");
                 return typeCtx.getError();
             }
             return t;
         case SyntaxKind::Bang:
             if (!t->isBool()) {
-                errorAtNode(expr.node, "Unary '!' requires bool, got '" + t->toString() + "'");
+                errorAtNode(expr.node, "'!' negates a 'bool', got '" + t->toString() + "'.");
                 return typeCtx.getError();
             }
             return t;
