@@ -1251,6 +1251,10 @@ Any other system the compiler can target reports `"linux"`, whose behavior it sh
 
 `system.writeError(message)` writes `message` and a newline to standard error, the stream a program reports its problems on, the way `print` writes to standard output.
 
+What `print` writes is buffered, so a line it wrote may still be inside the program when the next statement runs, but the order a program can observe is guaranteed: everything printed before a `system.writeError`, before a child process starts, and before a panic is reported has left the program first, whichever stream those go to and whether the streams are a terminal or the same file.
+A panic therefore never loses what was printed before it.
+`system.flush()` hands over what is still buffered on demand, for an order only the program itself knows about.
+
 `system.run(command)` runs one command line through the operating system's command interpreter.
 `system.run(program, arguments)` starts `program` with `arguments` and waits for it, leaving both output streams with the running program, so what the child writes appears where it would have appeared as it is written.
 `system.runCaptured(program, arguments, stdoutPath, stderrPath)` writes what the child sent to its standard output and its standard error into the two files instead, and an empty path leaves that one stream alone, so one call can capture one stream and pass the other through.

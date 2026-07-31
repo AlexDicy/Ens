@@ -1475,6 +1475,7 @@ struct CodeGenerator::Impl {
         auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
         builder->SetInsertPoint(entry);
 
+        emitFlushBuffered();
         llvm::FunctionCallee systemFn = module->getOrInsertFunction("system", fnTy);
         llvm::Value* rawStatus = builder->CreateCall(systemFn, { fn->getArg(0) }, "raw.status");
         if (module->getTargetTriple().isOSWindows()) {
@@ -1536,7 +1537,12 @@ struct CodeGenerator::Impl {
                 llvm::ConstantInt::get(i8Ty, 0), "path.empty");
         };
 
+        // The child inherits this process's streams, and on a POSIX target it also
+        // inherits a copy of whatever is still buffered in them, which it would write
+        // out a second time. Handing the buffers over before the child starts is what
+        // keeps a printed line ahead of the child's output and unduplicated.
         builder->SetInsertPoint(entry);
+        emitFlushBuffered();
         llvm::Value* statusSlot = builder->CreateAlloca(i64Ty, nullptr, "status");
         llvm::Value* outSlot = builder->CreateAlloca(ptrTy, nullptr, "out.file");
         llvm::Value* errSlot = builder->CreateAlloca(ptrTy, nullptr, "err.file");
@@ -1931,6 +1937,7 @@ struct CodeGenerator::Impl {
         auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
         builder->SetInsertPoint(entry);
 
+        emitFlushBuffered();
         llvm::Value* stream = getStderr();
         auto fputs = getOrDeclareFputs();
         builder->CreateCall(fputs, { fn->getArg(0), stream });
@@ -4601,6 +4608,19 @@ struct CodeGenerator::Impl {
             llvm::Type::getInt32Ty(ctx), { ptrTy, ptrTy }, false));
     }
 
+    // Hands every buffered stream to the operating system. `print` writes to a
+    // buffered standard output, so this is what puts a printed line ahead of the
+    // things whose order against it a program can see: a diagnostic on standard
+    // error, the output of a child that inherits the same stream, and a panic
+    // message. A null stream means every stream that holds writes, which is exactly
+    // the set that could be seen out of order or lost.
+    void emitFlushBuffered() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        llvm::FunctionCallee flushFn = libcFn("fflush", llvm::FunctionType::get(
+            llvm::Type::getInt32Ty(ctx), { ptrTy }, false));
+        builder->CreateCall(flushFn, { llvm::ConstantPointerNull::get(ptrTy) });
+    }
+
     // The platform's stderr FILE*. glibc/ELF exposes `stderr`; macOS `__stderrp`;
     // Windows routes through __acrt_iob_func(2).
     llvm::Value* getStderr() {
@@ -6142,6 +6162,7 @@ struct CodeGenerator::Impl {
     // then exits. `messageData` is a NUL-terminated char pointer.
     void emitPanicMessagePtr(llvm::Value* messageData, int exitCode) {
         auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        emitFlushBuffered();
         llvm::Value* stderrF = getStderr();
         auto fputs = getOrDeclareFputs();
         builder->CreateCall(fputs, { builder->CreateGlobalString("panic: ", ".panic.pfx"), stderrF });
