@@ -17,8 +17,9 @@ export final class ToolRun {
     int code;
     string[] outputLines;
     string problem;
+    string stopping;
 
-    protected constructor(this.ran, this.code, this.outputLines, this.problem);
+    protected constructor(this.ran, this.code, this.outputLines, this.problem, this.stopping);
 
     // Whether the program ran at all. A program that could not be started said nothing, which is a
     // different thing from a program that ran and refused.
@@ -39,9 +40,14 @@ export final class ToolRun {
         return this.outputLines;
     }
 
-    // Why the program could not be run, or "" when it ran.
+    // Why the program could not be run at all, or "" when it ran.
     export failure() -> string {
         return this.problem;
+    }
+
+    // Why this build stopped the program short, or "" when it ended on its own.
+    export stoppedBecause() -> string {
+        return this.stopping;
     }
 
     // The last thing the program said, which is the part of its account worth repeating when a
@@ -55,6 +61,30 @@ export final class ToolRun {
         }
         return "";
     }
+
+    // What to say about a run that is no good: why it was stopped when this build stopped it, and
+    // otherwise the last thing it said. Empty when there is nothing to add.
+    export report() -> string {
+        if (this.stopping.length > 0) {
+            return this.stopping;
+        }
+        return this.said();
+    }
+}
+
+// How long a program may say nothing before a fetch gives up on it and stops it. The programs are
+// asked to give up on their own long before this - git cuts a transfer that has stalled after a
+// minute of it, and curl gives up on a whole download after ten - so this sits well above both: it is
+// what catches a program wedged for a reason neither of them can see, and a build waiting forever on
+// one of those looks exactly like a build that has stopped working.
+export silenceLimitMilliseconds() -> long {
+    return 900000;
+}
+
+// Why a program was stopped, named with the program and the bound it outstayed.
+export silenceProblem(string program, long milliseconds) -> string {
+    return "'{program}' said nothing for {milliseconds / 1000} seconds and was stopped; it was not "
+        + "getting on with anything this build could see";
 }
 
 // Runs the program and keeps everything it wrote, showing none of it: this is for a command whose
@@ -69,20 +99,32 @@ export relay(string program, string[] arguments, string[] environmentOverrides,
     return ranWith(program, arguments, environmentOverrides, progress);
 }
 
+// Every line the program writes, until it has nothing more to say or has said nothing for so long
+// that it is taken to be wedged. The wait is bounded because the programs' own limits cover a network
+// that has stalled and a prompt nobody can answer, and neither of them covers a program stuck for a
+// reason of its own: without a bound here, that is a build that never comes back.
 ranWith(string program, string[] arguments, string[] environmentOverrides,
         Progress? progress) -> ToolRun {
+    long bound = silenceLimitMilliseconds();
     let running = try system.start(program, arguments, environmentOverrides);
     let collected = new List<string>();
-    string? line = try running.readLine();
-    while (line != null) {
+    bool speaking = try running.waitForOutput(bound);
+    while (speaking) {
+        string? line = try running.readLine();
+        if (line == null) {
+            return new ToolRun(true, try running.wait(), collected.toArray(), "", "");
+        }
         collected.push(line);
         if (progress != null) {
             progress.relayed(line);
         }
-        line = try running.readLine();
+        speaking = try running.waitForOutput(bound);
     }
-    return new ToolRun(true, try running.wait(), collected.toArray(), "");
+    try running.kill();
+    int stopped = try running.wait();
+    return new ToolRun(true, stopped, collected.toArray(), "",
+        silenceProblem(program, bound));
 } catch (SystemError error) {
     string[] nothing = [];
-    return new ToolRun(false, 127, nothing, error.message);
+    return new ToolRun(false, 127, nothing, error.message, "");
 }
