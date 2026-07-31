@@ -33,6 +33,8 @@ external from libc {
                       string commandLine, byte[] environmentBlock, long environmentCount,
                       long environmentBytes) -> ChildHandle?;
     ens_read_child(ChildHandle child, byte[] buffer, long capacity) -> long;
+    ens_poll_child(ChildHandle child, long milliseconds) -> int;
+    ens_kill_child(ChildHandle child) -> int;
     ens_wait_child(ChildHandle child) -> long;
     ens_release_child(ChildHandle child);
     ens_path_kind(string path) -> int;
@@ -400,6 +402,7 @@ export final class ChildProcess {
     int code;
     bool ended;
     bool waited;
+    bool stopped;
 
     protected constructor(ChildHandle child, string program) {
         this.child = child;
@@ -409,6 +412,7 @@ export final class ChildProcess {
         this.code = 0;
         this.ended = false;
         this.waited = false;
+        this.stopped = false;
     }
 
     // The next line of the child's output, without its ending, or null once the output has ended.
@@ -426,15 +430,48 @@ export final class ChildProcess {
         return this.lines.rest();
     }
 
+    // Whether readLine() can go ahead without waiting for the child: true when a whole line is there
+    // to be had, and true once the output has ended, because reading then answers null at once. False
+    // means `milliseconds` went by with neither, and the child may still be about to write something.
+    // A bound of 0 asks about this moment alone. Reading itself is unchanged, so a reader that is
+    // content to wait for as long as the child takes never has to ask this.
+    export waitForOutput(long milliseconds) -> bool throws {
+        if (this.ended || this.lines.holdsLine()) {
+            return true;
+        }
+        int ready = ens_poll_child(this.child, milliseconds);
+        if (ready < 0) {
+            throw new SystemError("could not wait for the output of '{this.program}'");
+        }
+        return ready > 0;
+    }
+
+    // Stops the child. Its output ends where the child was stopped, and its exit code is then 137 -
+    // the code a system reports for a program that was ended rather than one that chose to stop -
+    // unless the child had already finished on its own, in which case the code stays the one it
+    // reported. A child that has already finished is left as it is, so stopping one twice, or
+    // stopping one that beat the call by a moment, is not a failure.
+    export kill() throws {
+        if (ens_kill_child(this.child) != 0) {
+            throw new SystemError("could not stop '{this.program}'");
+        }
+        this.stopped = true;
+    }
+
     // The child's exit code, waiting for it to finish first. Output that has not been read is read
     // and thrown away before the wait, because a child whose output nobody reads would be stopped by
     // a full pipe: asking for the code is asking for the child to be finished with. Read every line
     // with readLine() first where the output matters. Asking again answers the same code.
+    //
+    // A child that was stopped is not read out first: its output is no longer wanted, and something
+    // else it left behind holding the pipe would make asking for the code wait on that instead.
     export wait() -> int throws {
         if (this.waited) {
             return this.code;
         }
-        try this.discardRest();
+        if (!this.stopped) {
+            try this.discardRest();
+        }
         this.code = ens_wait_child(this.child) as int;
         this.waited = true;
         return this.code;

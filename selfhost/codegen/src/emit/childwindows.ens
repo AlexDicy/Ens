@@ -161,6 +161,117 @@ public windowsRead(Runtime runtime, TypeRef type) -> RuntimeFunction {
     return runtime.endDefinition(definition);
 }
 
+// A pipe cannot be waited on, so the pipe is asked what it holds and the wait is spent in short
+// sleeps: the bound is honored to within one turn of the loop, and a turn costs one question and one
+// sleep rather than a spin. The end of the output arrives here as a broken pipe, which is an answer of
+// its own - a read would return at once and say the output has ended - rather than a failure.
+public windowsPoll(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let peekPipe = runtime.libc("PeekNamedPipe", runtime.int32Type.functionType([
+        runtime.pointerType, runtime.pointerType, runtime.int32Type, runtime.pointerType,
+        runtime.pointerType, runtime.pointerType]));
+    let lastError = runtime.libc("GetLastError", runtime.int32Type.functionType([]));
+    let tickCount = runtime.libc("GetTickCount64", runtime.int64Type.functionType([]));
+    let sleepFor = runtime.libc("Sleep", runtime.voidType.functionType([runtime.int32Type]));
+    let definition = runtime.beginDefinition("ens_poll_child", type);
+    let builder = runtime.builder;
+    let askBlock = runtime.block(definition, "poll.ask");
+    let heldBlock = runtime.block(definition, "poll.held");
+    let waitBlock = runtime.block(definition, "poll.wait");
+    let sleepBlock = runtime.block(definition, "poll.sleep");
+    let readyBlock = runtime.block(definition, "poll.ready");
+    let endedBlock = runtime.block(definition, "poll.ended");
+    let spentBlock = runtime.block(definition, "poll.spent");
+
+    let handle = memory.buildLoad(builder, runtime.pointerType,
+        children.childField(runtime, runtime.parameter(definition, 0), 8), "read.end");
+    let availableSlot = memory.buildAlloca(builder, runtime.int32Type, "available");
+    // The first turn only gives up the rest of this thread's slice, so a child that is barely behind
+    // is heard almost at once; every turn after that sleeps, so waiting minutes costs nothing.
+    let turnSlot = memory.buildAlloca(builder, runtime.int64Type, "turn");
+    memory.buildStore(builder, runtime.int64(0), turnSlot);
+    let deadline = instructions.buildAdd(builder, runtime.call(tickCount, [], "started"),
+        runtime.parameter(definition, 1), "deadline");
+    instructions.buildBr(builder, askBlock);
+
+    builder.positionAtEnd(askBlock);
+    memory.buildStore(builder, runtime.int32(0), availableSlot);
+    let asked = runtime.call(peekPipe, [handle, runtime.nullPointer(), runtime.int32(0),
+        runtime.nullPointer(), availableSlot, runtime.nullPointer()], "asked");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, asked, runtime.int32(0), ""), endedBlock, heldBlock);
+
+    builder.positionAtEnd(heldBlock);
+    instructions.buildCondBr(builder, instructions.buildICmpSGT(builder,
+        memory.buildLoad(builder, runtime.int32Type, availableSlot, "held"), runtime.int32(0), ""),
+        readyBlock, waitBlock);
+
+    builder.positionAtEnd(waitBlock);
+    let now = runtime.call(tickCount, [], "now");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, now, deadline, ""), sleepBlock, spentBlock);
+
+    // The last turn sleeps only for what is left of the bound, so the wait never overruns it by more
+    // than the time one question takes.
+    builder.positionAtEnd(sleepBlock);
+    let left = instructions.buildSub(builder, deadline, now, "left");
+    let turnLength = memory.buildLoad(builder, runtime.int64Type, turnSlot, "turn.cur");
+    let turn = instructions.buildSelect(builder,
+        instructions.buildICmpSLT(builder, left, turnLength, ""), left, turnLength, "turn");
+    runtime.call(sleepFor, [instructions.buildTrunc(builder, turn, runtime.int32Type, "")], "");
+    memory.buildStore(builder, runtime.int64(sleepTurn()), turnSlot);
+    instructions.buildBr(builder, askBlock);
+
+    builder.positionAtEnd(readyBlock);
+    instructions.buildRet(builder, runtime.int32(1));
+
+    // ERROR_BROKEN_PIPE: nothing holds the writing end, so the output has ended.
+    builder.positionAtEnd(endedBlock);
+    instructions.buildRet(builder, instructions.buildSelect(builder,
+        instructions.buildICmpEQ(builder, runtime.call(lastError, [], "why"), runtime.int32(109),
+            ""), runtime.int32(1), runtime.int32(-1), ""));
+
+    builder.positionAtEnd(spentBlock);
+    instructions.buildRet(builder, runtime.int32(0));
+    return runtime.endDefinition(definition);
+}
+
+// How long every turn of the waiting loop after the first sleeps for. Short enough that a line
+// arriving is passed on without a reader noticing the wait, and long enough that waiting minutes for a
+// program to say something costs almost nothing.
+sleepTurn() -> long {
+    return 5;
+}
+
+// A child that has already finished is nothing to stop, and asking a system to end a program that
+// has ended is a failure on Windows, so it is asked first whether the child is still running. A child
+// this call does stop is told to report the code a stopped child reports everywhere.
+public windowsKill(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let waitForOne = runtime.libc("WaitForSingleObject",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type]));
+    let terminate = runtime.libc("TerminateProcess",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type]));
+    let definition = runtime.beginDefinition("ens_kill_child", type);
+    let builder = runtime.builder;
+    let stopBlock = runtime.block(definition, "kill.stop");
+    let goneBlock = runtime.block(definition, "kill.gone");
+    let child = memory.buildLoad(builder, runtime.pointerType,
+        children.childField(runtime, runtime.parameter(definition, 0), 0), "child");
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder,
+        runtime.call(waitForOne, [child, runtime.int32(0)], "finished"), runtime.int32(0), ""),
+        goneBlock, stopBlock);
+
+    builder.positionAtEnd(stopBlock);
+    let stopped = runtime.call(terminate, [child,
+        runtime.int32(children.stoppedCode())], "stopped");
+    instructions.buildRet(builder, instructions.buildSelect(builder,
+        instructions.buildICmpEQ(builder, stopped, runtime.int32(0), ""), runtime.int32(-1),
+        runtime.int32(0), ""));
+
+    builder.positionAtEnd(goneBlock);
+    instructions.buildRet(builder, runtime.int32(0));
+    return runtime.endDefinition(definition);
+}
+
 public windowsWait(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let waitForOne = runtime.libc("WaitForSingleObject",
         runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type]));

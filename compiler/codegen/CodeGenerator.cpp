@@ -2246,6 +2246,227 @@ struct CodeGenerator::Impl {
         return fn;
     }
 
+    // i32 ens_poll_child(child, milliseconds): 1 when a read of the child's output
+    // would go ahead now - bytes are there, or the output has ended and a read would
+    // say so - 0 when the milliseconds went by with neither, and -1 when the waiting
+    // itself failed. A bound of 0 asks about this moment alone. Nothing here spins: a
+    // POSIX target hands the bound to poll, and a Windows target, whose pipes cannot be
+    // waited on, asks the pipe and sleeps in short turns until the bound is spent.
+    llvm::Function* definePollChildRuntime() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i16Ty = llvm::Type::getInt16Ty(ctx);
+        auto* i8Ty  = llvm::Type::getInt8Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(i32Ty, { ptrTy, i64Ty }, false);
+        llvm::Function* fn = module->getFunction("ens_poll_child");
+        if (!fn) {
+            fn = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage,
+                "ens_poll_child", module.get());
+        }
+        if (!fn->empty()) return fn;
+
+        auto savedIP = builder->saveIP();
+        builder->SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", fn));
+        auto* askBB = llvm::BasicBlock::Create(ctx, "poll.ask", fn);
+        auto* readyBB = llvm::BasicBlock::Create(ctx, "poll.ready", fn);
+        auto* spentBB = llvm::BasicBlock::Create(ctx, "poll.spent", fn);
+        auto* failedBB = llvm::BasicBlock::Create(ctx, "poll.failed", fn);
+
+        if (module->getTargetTriple().isOSWindows()) {
+            // A pipe cannot be waited on, so the pipe is asked what it holds and the
+            // wait is spent in short sleeps: the bound is honored to within one turn of
+            // the loop, and a turn costs one question and one sleep rather than a spin.
+            // The end of the output arrives here as a broken pipe, which is an answer of
+            // its own rather than a failure.
+            auto* heldBB = llvm::BasicBlock::Create(ctx, "poll.held", fn);
+            auto* waitBB = llvm::BasicBlock::Create(ctx, "poll.wait", fn);
+            auto* sleepBB = llvm::BasicBlock::Create(ctx, "poll.sleep", fn);
+            auto* endedBB = llvm::BasicBlock::Create(ctx, "poll.ended", fn);
+            llvm::FunctionCallee peekPipe = libcFn("PeekNamedPipe",
+                llvm::FunctionType::get(i32Ty, { ptrTy, ptrTy, i32Ty, ptrTy, ptrTy, ptrTy },
+                    false));
+            llvm::FunctionCallee lastError = libcFn("GetLastError",
+                llvm::FunctionType::get(i32Ty, {}, false));
+            llvm::FunctionCallee tickCount = libcFn("GetTickCount64",
+                llvm::FunctionType::get(i64Ty, {}, false));
+            llvm::FunctionCallee sleepFor = libcFn("Sleep",
+                llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), { i32Ty }, false));
+
+            llvm::Value* handle = builder->CreateLoad(ptrTy, childField(fn->getArg(0), 8),
+                "read.end");
+            llvm::Value* availableSlot = builder->CreateAlloca(i32Ty, nullptr, "available");
+            // The first turn only gives up the rest of this thread's slice, so a child
+            // that is barely behind is heard almost at once; every turn after that
+            // sleeps, so waiting minutes costs nothing.
+            llvm::Value* turnSlot = builder->CreateAlloca(i64Ty, nullptr, "turn");
+            builder->CreateStore(llvm::ConstantInt::get(i64Ty, 0), turnSlot);
+            llvm::Value* deadline = builder->CreateAdd(
+                builder->CreateCall(tickCount, {}, "started"), fn->getArg(1), "deadline");
+            builder->CreateBr(askBB);
+
+            builder->SetInsertPoint(askBB);
+            builder->CreateStore(llvm::ConstantInt::get(i32Ty, 0), availableSlot);
+            llvm::Value* asked = builder->CreateCall(peekPipe,
+                { handle, llvm::ConstantPointerNull::get(ptrTy),
+                  llvm::ConstantInt::get(i32Ty, 0), llvm::ConstantPointerNull::get(ptrTy),
+                  availableSlot, llvm::ConstantPointerNull::get(ptrTy) }, "asked");
+            builder->CreateCondBr(builder->CreateICmpEQ(asked,
+                llvm::ConstantInt::get(i32Ty, 0)), endedBB, heldBB);
+
+            builder->SetInsertPoint(heldBB);
+            builder->CreateCondBr(builder->CreateICmpSGT(
+                builder->CreateLoad(i32Ty, availableSlot, "held"),
+                llvm::ConstantInt::get(i32Ty, 0)), readyBB, waitBB);
+
+            builder->SetInsertPoint(waitBB);
+            llvm::Value* now = builder->CreateCall(tickCount, {}, "now");
+            builder->CreateCondBr(builder->CreateICmpSLT(now, deadline), sleepBB, spentBB);
+
+            // The last turn sleeps only for what is left of the bound, so the wait never
+            // overruns it by more than the time one question takes.
+            builder->SetInsertPoint(sleepBB);
+            llvm::Value* left = builder->CreateSub(deadline, now, "left");
+            llvm::Value* turn = builder->CreateLoad(i64Ty, turnSlot, "turn.load");
+            builder->CreateCall(sleepFor, { builder->CreateTrunc(
+                builder->CreateSelect(builder->CreateICmpSLT(left, turn), left, turn),
+                i32Ty, "turn") });
+            builder->CreateStore(llvm::ConstantInt::get(i64Ty, pollSleepTurn()), turnSlot);
+            builder->CreateBr(askBB);
+
+            // ERROR_BROKEN_PIPE: nothing holds the writing end, so the output has ended.
+            builder->SetInsertPoint(endedBB);
+            builder->CreateRet(builder->CreateSelect(
+                builder->CreateICmpEQ(builder->CreateCall(lastError, {}, "why"),
+                    llvm::ConstantInt::get(i32Ty, 109)),
+                llvm::ConstantInt::get(i32Ty, 1),
+                llvm::ConstantInt::getSigned(i32Ty, -1)));
+        } else {
+            // poll takes the bound as it is given, so nothing here sleeps or spins. A
+            // child that has closed its end of the pipe wakes the wait too, which is the
+            // answer a reader wants: reading would return at once and say so.
+            auto* quietBB = llvm::BasicBlock::Create(ctx, "poll.quiet", fn);
+            auto* interruptedBB = llvm::BasicBlock::Create(ctx, "poll.interrupted", fn);
+            llvm::FunctionCallee pollDescriptors = libcFn("poll",
+                llvm::FunctionType::get(i32Ty, { ptrTy, i64Ty, i32Ty }, false));
+
+            // One 'struct pollfd': the descriptor, the events asked about, and the
+            // events that happened.
+            llvm::Value* watched = builder->CreateAlloca(llvm::ArrayType::get(i8Ty, 8), nullptr,
+                "watched");
+            llvm::Value* descriptor = childDescriptor(fn, 8);
+            llvm::Value* bound = builder->CreateTrunc(fn->getArg(1), i32Ty, "bound");
+            builder->CreateBr(askBB);
+
+            builder->SetInsertPoint(askBB);
+            builder->CreateStore(descriptor, childField(watched, 0));
+            // POLLIN, and no event reported yet.
+            builder->CreateStore(llvm::ConstantInt::get(i16Ty, 1), childField(watched, 4));
+            builder->CreateStore(llvm::ConstantInt::get(i16Ty, 0), childField(watched, 6));
+            llvm::Value* woken = builder->CreateCall(pollDescriptors,
+                { watched, llvm::ConstantInt::get(i64Ty, 1), bound }, "woken");
+            builder->CreateCondBr(builder->CreateICmpSGT(woken,
+                llvm::ConstantInt::get(i32Ty, 0)), readyBB, quietBB);
+
+            builder->SetInsertPoint(quietBB);
+            builder->CreateCondBr(builder->CreateICmpEQ(woken,
+                llvm::ConstantInt::get(i32Ty, 0)), spentBB, interruptedBB);
+
+            // EINTR: a signal arrived while waiting, which is no answer about the child,
+            // so the wait is asked again rather than reported as a failure.
+            builder->SetInsertPoint(interruptedBB);
+            llvm::Value* why = builder->CreateLoad(i32Ty,
+                builder->CreateCall(errnoLocation(), {}, "errno.slot"), "why");
+            builder->CreateCondBr(builder->CreateICmpEQ(why,
+                llvm::ConstantInt::get(i32Ty, 4)), askBB, failedBB);
+        }
+
+        builder->SetInsertPoint(readyBB);
+        builder->CreateRet(llvm::ConstantInt::get(i32Ty, 1));
+
+        builder->SetInsertPoint(spentBB);
+        builder->CreateRet(llvm::ConstantInt::get(i32Ty, 0));
+
+        builder->SetInsertPoint(failedBB);
+        builder->CreateRet(llvm::ConstantInt::getSigned(i32Ty, -1));
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    // i32 ens_kill_child(child): 0 when the child is no longer running - stopped by
+    // this call, or already finished before it - and -1 when it could not be stopped.
+    // The code a stopped child reports is 137 on every system, which is what a system
+    // reports for a program ended from outside: a POSIX target reaches it by being
+    // killed, 128 and the signal's own number, and a Windows target is told to report
+    // it. Ending a child that has already ended is nothing to do, which POSIX says with
+    // ESRCH and Windows refuses outright, so Windows is asked first whether the child is
+    // still running.
+    llvm::Function* defineKillChildRuntime() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(i32Ty, { ptrTy }, false);
+        llvm::Function* fn = module->getFunction("ens_kill_child");
+        if (!fn) {
+            fn = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage,
+                "ens_kill_child", module.get());
+        }
+        if (!fn->empty()) return fn;
+
+        auto savedIP = builder->saveIP();
+        builder->SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", fn));
+        auto* goneBB = llvm::BasicBlock::Create(ctx, "kill.gone", fn);
+
+        if (module->getTargetTriple().isOSWindows()) {
+            auto* stopBB = llvm::BasicBlock::Create(ctx, "kill.stop", fn);
+            llvm::FunctionCallee waitForOne = libcFn("WaitForSingleObject",
+                llvm::FunctionType::get(i32Ty, { ptrTy, i32Ty }, false));
+            llvm::FunctionCallee terminate = libcFn("TerminateProcess",
+                llvm::FunctionType::get(i32Ty, { ptrTy, i32Ty }, false));
+            llvm::Value* child = builder->CreateLoad(ptrTy, childField(fn->getArg(0), 0), "child");
+            builder->CreateCondBr(builder->CreateICmpEQ(
+                builder->CreateCall(waitForOne, { child, llvm::ConstantInt::get(i32Ty, 0) },
+                    "finished"), llvm::ConstantInt::get(i32Ty, 0)), goneBB, stopBB);
+
+            builder->SetInsertPoint(stopBB);
+            llvm::Value* stopped = builder->CreateCall(terminate,
+                { child, llvm::ConstantInt::get(i32Ty, stoppedChildCode()) }, "stopped");
+            builder->CreateRet(builder->CreateSelect(
+                builder->CreateICmpEQ(stopped, llvm::ConstantInt::get(i32Ty, 0)),
+                llvm::ConstantInt::getSigned(i32Ty, -1), llvm::ConstantInt::get(i32Ty, 0)));
+        } else {
+            auto* refusedBB = llvm::BasicBlock::Create(ctx, "kill.refused", fn);
+            llvm::FunctionCallee killProcess = libcFn("kill",
+                llvm::FunctionType::get(i32Ty, { i32Ty, i32Ty }, false));
+            llvm::Value* status = builder->CreateCall(killProcess,
+                { childDescriptor(fn, 0), llvm::ConstantInt::get(i32Ty, 9) }, "status");
+            builder->CreateCondBr(builder->CreateICmpEQ(status,
+                llvm::ConstantInt::get(i32Ty, 0)), goneBB, refusedBB);
+
+            builder->SetInsertPoint(refusedBB);
+            llvm::Value* why = builder->CreateLoad(i32Ty,
+                builder->CreateCall(errnoLocation(), {}, "errno.slot"), "why");
+            builder->CreateRet(builder->CreateSelect(
+                builder->CreateICmpEQ(why, llvm::ConstantInt::get(i32Ty, 3)),
+                llvm::ConstantInt::get(i32Ty, 0), llvm::ConstantInt::getSigned(i32Ty, -1)));
+        }
+
+        builder->SetInsertPoint(goneBB);
+        builder->CreateRet(llvm::ConstantInt::get(i32Ty, 0));
+
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    // How long every turn of the Windows waiting loop after the first sleeps for. Short
+    // enough that a line arriving is passed on without a reader noticing the wait, and
+    // long enough that waiting minutes for a program to say something costs almost
+    // nothing.
+    static long pollSleepTurn() { return 5; }
+
+    // The code a child stopped from outside reports.
+    static long stoppedChildCode() { return 137; }
+
     // i64 ens_wait_child(child): the code the child ended with, waiting for it to end
     // first.
     llvm::Function* defineWaitChildRuntime() {
@@ -9641,6 +9862,8 @@ struct CodeGenerator::Impl {
         if (sym && sym->name == u"ens_spawn_process") defineSpawnProcessRuntime();
         if (sym && sym->name == u"ens_start_process") defineStartProcessRuntime();
         if (sym && sym->name == u"ens_read_child") defineReadChildRuntime();
+        if (sym && sym->name == u"ens_poll_child") definePollChildRuntime();
+        if (sym && sym->name == u"ens_kill_child") defineKillChildRuntime();
         if (sym && sym->name == u"ens_wait_child") defineWaitChildRuntime();
         if (sym && sym->name == u"ens_release_child") defineReleaseChildRuntime();
         if (sym && sym->name == u"ens_path_kind") definePathKindRuntime();

@@ -122,6 +122,91 @@ public posixRead(Runtime runtime, TypeRef type) -> RuntimeFunction {
     return runtime.endDefinition(definition);
 }
 
+// poll takes the bound as it is given, so nothing here sleeps or spins. A child that has closed its
+// end of the pipe wakes the wait too, which is the answer a reader wants: reading would return at once
+// and say the output has ended.
+public posixPoll(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let pollDescriptors = runtime.libc("poll", runtime.int32Type.functionType([runtime.pointerType,
+        runtime.int64Type, runtime.int32Type]));
+    let definition = runtime.beginDefinition("ens_poll_child", type);
+    let builder = runtime.builder;
+    let askBlock = runtime.block(definition, "poll.ask");
+    let quietBlock = runtime.block(definition, "poll.quiet");
+    let interruptedBlock = runtime.block(definition, "poll.interrupted");
+    let readyBlock = runtime.block(definition, "poll.ready");
+    let spentBlock = runtime.block(definition, "poll.spent");
+    let failedBlock = runtime.block(definition, "poll.failed");
+
+    // One 'struct pollfd': the descriptor, the events asked about, and the events that happened.
+    let watched = memory.buildAlloca(builder, runtime.int8Type.arrayType(8 as ulong), "watched");
+    let descriptor = descriptorAt(runtime, definition, 8);
+    let bound = instructions.buildTrunc(builder, runtime.parameter(definition, 1),
+        runtime.int32Type, "bound");
+    instructions.buildBr(builder, askBlock);
+
+    builder.positionAtEnd(askBlock);
+    memory.buildStore(builder, descriptor, runtime.offsetPointer(watched, 0, ""));
+    // POLLIN, and no event reported yet.
+    memory.buildStore(builder, runtime.int16Type.constInt(1, false),
+        runtime.offsetPointer(watched, 4, ""));
+    memory.buildStore(builder, runtime.int16Type.constInt(0, false),
+        runtime.offsetPointer(watched, 6, ""));
+    let woken = runtime.call(pollDescriptors, [watched, runtime.int64(1), bound], "woken");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSGT(builder, woken, runtime.int32(0), ""), readyBlock, quietBlock);
+
+    builder.positionAtEnd(quietBlock);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, woken, runtime.int32(0), ""), spentBlock,
+        interruptedBlock);
+
+    // EINTR: a signal arrived while waiting, which is no answer about the child, so the wait is asked
+    // again rather than reported as a failure.
+    builder.positionAtEnd(interruptedBlock);
+    let why = memory.buildLoad(builder, runtime.int32Type,
+        runtime.call(system.errnoLocation(runtime), [], "errno.slot"), "why");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, why, runtime.int32(4), ""), askBlock, failedBlock);
+
+    builder.positionAtEnd(readyBlock);
+    instructions.buildRet(builder, runtime.int32(1));
+
+    builder.positionAtEnd(spentBlock);
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(failedBlock);
+    instructions.buildRet(builder, runtime.int32(-1));
+    return runtime.endDefinition(definition);
+}
+
+// Ending a child that has already ended is nothing to do, which the system says with ESRCH; every
+// other refusal is a failure. The signal is the one no program can decline, and a child ended by it
+// reports 128 and the signal's number, which is the code a stopped child reports everywhere.
+public posixKill(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let killProcess = runtime.libc("kill",
+        runtime.int32Type.functionType([runtime.int32Type, runtime.int32Type]));
+    let definition = runtime.beginDefinition("ens_kill_child", type);
+    let builder = runtime.builder;
+    let refusedBlock = runtime.block(definition, "kill.refused");
+    let stoppedBlock = runtime.block(definition, "kill.stopped");
+    let status = runtime.call(killProcess, [descriptorAt(runtime, definition, 0),
+        runtime.int32(9)], "status");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, status, runtime.int32(0), ""), stoppedBlock,
+        refusedBlock);
+
+    builder.positionAtEnd(refusedBlock);
+    let why = memory.buildLoad(builder, runtime.int32Type,
+        runtime.call(system.errnoLocation(runtime), [], "errno.slot"), "why");
+    instructions.buildRet(builder, instructions.buildSelect(builder,
+        instructions.buildICmpEQ(builder, why, runtime.int32(3), ""), runtime.int32(0),
+        runtime.int32(-1), ""));
+
+    builder.positionAtEnd(stoppedBlock);
+    instructions.buildRet(builder, runtime.int32(0));
+    return runtime.endDefinition(definition);
+}
+
 public posixWait(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let waitForChild = runtime.libc("waitpid", runtime.int32Type.functionType([runtime.int32Type,
         runtime.pointerType, runtime.int32Type]));

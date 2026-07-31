@@ -1301,8 +1301,14 @@ int built = try system.run("make", ["all"], ["CC=clang"]);
 It has the same further form taking a `string[]` of `NAME=VALUE` overrides after the arguments.
 `readLine()` returns the next line of the child's output without its ending, waiting as long as the child takes to write it, and `null` once the output has ended; output that does not end in a newline is a line of its own, handed over last, and a carriage return before a newline belongs to the ending.
 What the child sent to its standard output and what it sent to its standard error arrive together, in the order it wrote them, which is what a program relaying another program's output needs; use `runCaptured` when the two have to stay apart.
+`waitForOutput(milliseconds)` reports whether `readLine()` can go ahead without waiting for the child: `true` when a whole line is there to be had, and `true` once the output has ended, because reading then answers `null` at once.
+`false` means that many milliseconds went by with neither, and the child may still be about to write something; a bound of `0` asks about this moment alone.
+It is what a program that must not wait forever on another one asks before reading, since reading itself waits for as long as the child takes.
+`kill()` stops the child, whose output then ends where it was stopped and whose exit code is `137`, the code a system reports for a program ended from outside, unless the child had already finished on its own and reported a code of its own.
+Stopping a child that has already finished is not a failure, so a program that stops one it has given up on need not first find out whether it is still there.
 `wait()` returns the child's exit code, waiting for the child to finish first, and answers the same code however often it is asked.
 Output that has not been read is read and thrown away before that wait, because a child whose output nobody reads would be stopped by a full pipe: read every line first where the output matters.
+A child that was stopped is not read out first, so asking a stopped child for its code always comes back.
 Letting a `ChildProcess` go without waiting for it hands back the pipe its output was arriving on and this program's hold on the child, which keeps running with nothing left reading it.
 A program that could not be started at all raises a `SystemError` on the systems that report that while the child is being created, and elsewhere shows up as a child that ends with `127`.
 

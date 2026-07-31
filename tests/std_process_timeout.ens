@@ -1,0 +1,140 @@
+// @exit 0
+// @stdout silent: waits in range true, ended true, code 0
+// @stdout silent: stopping a finished child ok true, code still 0
+// @stdout stalled: spoke true, said 'one line, then nothing for a while', quiet true, code 137
+// @stdout buffered: ready with no bound true, second line 'second', nothing more with no bound true
+// The program starts itself as the child, so one fixture covers both sides. A child that is busy says
+// nothing, which is what a bounded wait is for: the waits are counted rather than timed, because how
+// many of them fit inside the time the child spends busy is what shows the bound is neither ignored
+// nor spun through.
+import @std.system;
+import SystemError from @std.system;
+import ChildProcess from @std.system;
+
+main() -> int {
+    string[] arguments = system.arguments();
+    if (arguments.length > 1) {
+        return child(arguments[1]);
+    }
+    return try parent();
+} catch (SystemError e) {
+    system.writeError("std_process_timeout: {e.message}");
+    return 1;
+}
+
+// The child: this same program, started again with the part it is to play.
+child(string mode) -> int {
+    return switch (mode) {
+        "silent" -> busyWithoutSpeaking(),
+        "stalled" -> oneLineThenBusy(),
+        "buffered" -> twoLinesThenBusy(),
+        default -> 0,
+    };
+}
+
+// Busy for a while and never a word, which is the child a bounded wait has to give up on.
+busyWithoutSpeaking() -> int {
+    let spent = busy();
+    return 0;
+}
+
+oneLineThenBusy() -> int {
+    print("one line, then nothing for a while");
+    system.flush();
+    let spent = busy();
+    return 7;
+}
+
+// Two lines in one breath, so both reach the reader in one go and the second waits in the reader's
+// own hands rather than in the pipe.
+twoLinesThenBusy() -> int {
+    print("first");
+    print("second");
+    system.flush();
+    let spent = busy();
+    return 0;
+}
+
+// Real work the compiler cannot fold away, which takes long enough for a good many bounded waits to
+// fit inside it.
+busy() -> long {
+    long asked = 0;
+    for (long i = 0; i < 150000; i++) {
+        if (system.isFile("no-such-file-{i}")) {
+            asked = asked + 100;
+        }
+        asked = asked + 1;
+    }
+    return asked;
+}
+
+parent() -> int throws {
+    string self = system.executablePath();
+
+    // A child that says nothing: every wait gives up, and the one that answers at last is the end of
+    // the output, because a child that has gone leaves nothing holding the pipe.
+    let silent = try system.start(self, ["silent"]);
+    long waits = 0;
+    bool spoke = try silent.waitForOutput(bound());
+    while (!spoke) {
+        waits = waits + 1;
+        spoke = try silent.waitForOutput(bound());
+    }
+    string? nothing = try silent.readLine();
+    int silentCode = try silent.wait();
+    print("silent: waits in range {inRange(waits)}, ended {nothing == null}, code {silentCode}");
+
+    // Stopping a child that has already finished is nothing to do, and the code it reported stands.
+    bool stoppedAgain = try stopping(silent);
+    int codeStill = try silent.wait();
+    print("silent: stopping a finished child ok {stoppedAgain}, code still {codeStill}");
+
+    // A child that says one thing and then goes quiet: the line arrives, and the wait after it gives
+    // up while the child is still running, which is what a fetch stops a wedged program on.
+    let stalled = try system.start(self, ["stalled"]);
+    bool said = try stalled.waitForOutput(patience());
+    string? line = try stalled.readLine();
+    bool quiet = !(try stalled.waitForOutput(bound()));
+    try stalled.kill();
+    int stalledCode = try stalled.wait();
+    print("stalled: spoke {said}, said '" + (line ?? "<nothing>")
+        + "', quiet {quiet}, code {stalledCode}");
+
+    // A line already in hand is an answer with no bound at all to spend: nothing is asked of the
+    // system, which is why the same question answers false once that line has been taken.
+    let buffered = try system.start(self, ["buffered"]);
+    string? firstLine = try buffered.readLine();
+    bool readyAtOnce = try buffered.waitForOutput(0);
+    string? secondLine = try buffered.readLine();
+    bool nothingMore = !(try buffered.waitForOutput(0));
+    try buffered.kill();
+    int bufferedCode = try buffered.wait();
+    print("buffered: ready with no bound {readyAtOnce}, second line '"
+        + (secondLine ?? "<nothing>") + "', nothing more with no bound {nothingMore}");
+    return 0;
+}
+
+// How long one bounded wait waits for. Short against the time the child spends busy, so several of
+// them fit inside it.
+bound() -> long {
+    return 100;
+}
+
+// Long enough that a line the child writes at once is never missed for want of waiting.
+patience() -> long {
+    return 30000;
+}
+
+// How many waits gave up while the child was busy. One or none would mean a wait outstaying its
+// bound; a great many would mean waits that answer without waiting at all.
+inRange(long waits) -> string {
+    if (waits >= 2 && waits <= 400) {
+        return "true";
+    }
+    return "false ({waits} waits)";
+}
+
+stopping(ChildProcess finished) -> bool throws {
+    try finished.kill();
+    return true;
+}
