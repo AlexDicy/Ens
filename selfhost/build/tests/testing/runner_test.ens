@@ -17,6 +17,7 @@ test "the runner imports each module once and calls every test in order" {
     let plan = discovery.plan(new SystemFileLoader(), root, "");
     string source = runner.source(plan.tests());
 
+    try assertOnce(source, "import @std.system;\n");
     try assertOnce(source, "import alpha_test;\n");
     try assertOnce(source, "import nested.beta_test;\n");
     try assertContains(source, "try alpha_test.$test0();");
@@ -27,6 +28,14 @@ test "the runner imports each module once and calls every test in order" {
     try assertContains(source, "print(\"\{passed\}/3 tests passed\");");
     try assertContains(source, "if (passed == 3) \{");
     try support.removeTree(root);
+}
+
+test "each result is handed over before the next test runs" {
+    let tests = try discovered("runner-flush", "test \"first\" \{ \}\n\ntest \"second\" \{ \}\n");
+    string source = runner.source(tests);
+    try assertContains(source, "    if ($run0()) \{\n        passed = passed + 1;\n    \}\n"
+        + "    system.flush();\n    if ($run1()) \{");
+    try assertContains(source, "    \}\n    system.flush();\n    print(");
 }
 
 test "the runner reaches for nothing outside the language" {
@@ -69,16 +78,42 @@ test "the overlay answers for the runner and passes everything else on" {
 }
 
 test "the code the runner ends with says what happened to the run" {
-    try testing.assertEqual(runner.outcomeOf(0).exitCode(), 0);
-    try testing.assertEqual(runner.outcomeOf(0).failure(), "");
-    try testing.assertEqual(runner.outcomeOf(1).exitCode(), 1);
-    try testing.assertEqual(runner.outcomeOf(1).failure(), "");
+    let tests = try discovered("outcome", "test \"first\" \{ \}\n\ntest \"second\" \{ \}\n");
+    try testing.assertEqual(runner.outcomeOf(0, tests, 2).exitCode(), 0);
+    try testing.assertEqual(runner.outcomeOf(0, tests, 2).failure(), "");
+    try testing.assertEqual(runner.outcomeOf(1, tests, 2).exitCode(), 1);
+    try testing.assertEqual(runner.outcomeOf(1, tests, 2).failure(), "");
 
-    let crashed = runner.outcomeOf(-1073741819);
+    let crashed = runner.outcomeOf(-1073741819, tests, 1);
     try testing.assertEqual(crashed.exitCode(), 2);
     try assertContains(crashed.failure(), "-1073741819");
+    try assertContains(crashed.failure(), "stopped while running 'second'");
+    try assertContains(crashed.failure(), "--filter 'second'");
+}
+
+test "a run that stopped with every result in says so rather than naming a test" {
+    let tests = try discovered("outcome-late", "test \"only\" \{ \}\n");
+    let crashed = runner.outcomeOf(3, tests, 1);
+    try testing.assertEqual(crashed.exitCode(), 2);
     try assertContains(crashed.failure(), "stopped before it had run every test");
-    try assertContains(crashed.failure(), "--filter");
+    try assertContains(crashed.failure(), "had already finished");
+    try testing.assertTrue(crashed.failure().indexOf("--filter") < 0,
+        "there is no test to point a filter at: {crashed.failure()}");
+}
+
+test "a result line is the one its own test prints, and nothing else is" {
+    let tests = try discovered("results", "test \"adds\" \{ \}\n\ntest \"subtracts\" \{ \}\n");
+    try testing.assertTrue(runner.reportsResult("PASS adds", tests[0]), "the pass of the test");
+    try testing.assertTrue(runner.reportsResult("FAIL adds: expected 2, got 3", tests[0]),
+        "the failure of the test, with what went wrong after it");
+    try testing.assertFalse(runner.reportsResult("PASS adds", tests[1]),
+        "another test's result is not this one's");
+    try testing.assertFalse(runner.reportsResult("PASS adds twice", tests[0]),
+        "a longer description that starts the same is not this test");
+    try testing.assertFalse(runner.reportsResult("  at assertEqual (testing.ens:7)", tests[0]),
+        "a frame under a failure is not a result");
+    try testing.assertFalse(runner.reportsResult("FAIL adds", tests[0]),
+        "a failure says what went wrong after the description");
 }
 
 test "the runner's file name is one no source file can have" {
@@ -100,6 +135,15 @@ class StubLoader implements FileLoader {
         }
         throw new FileError("Could not read '{path}'.");
     }
+}
+
+// The tests one written file declares, discovered the way a run discovers them.
+discovered(string label, string source) -> DiscoveredTest[] throws {
+    string root = try support.scratch(label);
+    try support.writeFile(root, "alpha_test.ens", source);
+    let plan = discovery.plan(new SystemFileLoader(), root, "");
+    try support.removeTree(root);
+    return plan.tests();
 }
 
 assertContains(string text, string fragment) throws {
