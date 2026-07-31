@@ -1,6 +1,10 @@
-// The compile-link-run machinery every verification shares: an analyzed module graph goes
-// through the self-hosted pipeline into object files, those are linked into an executable, and the
-// program runs with each stream captured into its own scratch file.
+// The compile-link-run machinery every verification shares: an analyzed module graph goes through
+// the self-hosted pipeline into object files, those are linked into an executable, and the program
+// runs with each stream captured into its own scratch file.
+//
+// The settings the fixtures compile with and the toolchain their links go through are settled once
+// per run and travel together as the environment. A thousand fixtures ask the machine the same
+// question about its C runtime, so it is asked once.
 import @std.system;
 import SystemError from @std.system;
 import List from @std.collections.list;
@@ -10,15 +14,59 @@ import ProgramAnalysis from @ens.sema.pipeline;
 import @ens.sema.pipeline;
 import CodegenSettings from @ens.codegen.settings;
 import OptimizationLevel from @ens.codegen.settings;
+import @ens.codegen.settings;
 import @ens.codegen.driver;
 import @ens.llvm.target;
 import LinkRequest from @ens.link.request;
+import Toolchain from @ens.link.toolchain;
+import @ens.link.discovery;
+import @ens.link.flavor;
 import @ens.link.linker;
+import @ens.build.natives;
+import @ens.build.platform;
 import Manifest from manifest;
+
+// Everything one harness run shares: the settings its fixtures are compiled with, the target they
+// are compiled for, and the toolchain their links go through.
+public class Environment {
+    CodegenSettings buildSettings;
+    Toolchain linkToolchain;
+    string targetPlatform;
+
+    protected constructor(this.buildSettings, this.linkToolchain, this.targetPlatform);
+
+    public settings() -> CodegenSettings {
+        return this.buildSettings;
+    }
+
+    public toolchain() -> Toolchain {
+        return this.linkToolchain;
+    }
+
+    // The platform name a manifest's native bindings use for the target.
+    public platform() -> string {
+        return this.targetPlatform;
+    }
+
+    public level() -> string {
+        return "{this.buildSettings.llvmOptimizationLevel()}";
+    }
+}
+
+// The environment the manifest asks for: this machine's target at the level the manifest names, and
+// the toolchain looked up once for every link that follows.
+public environmentFor(Manifest manifest) -> Environment {
+    string triple = target.hostTargetTriple();
+    let level = settings.levelFromText(manifest.optimization) ?? OptimizationLevel.Default;
+    return new Environment(new CodegenSettings(level, triple),
+        discovery.discover(flavor.flavorOf(triple), triple, manifest.scratch + "/link-probe"),
+        platform.platformName(triple));
+}
 
 // Compiles the graph through sema and the self-hosted code generator and links the result to
 // '<scratch>/<prefix>.exe'. Returns "" on success, or a description of the first failing step.
-public compileAndLink(Manifest manifest, GraphResult graphResult, string prefix) -> string {
+public compileAndLink(Manifest manifest, Environment environment, GraphResult graphResult,
+                      string prefix) -> string {
     string upstream = upstreamProblems(graphResult);
     if (upstream.length > 0) {
         return upstream;
@@ -30,7 +78,7 @@ public compileAndLink(Manifest manifest, GraphResult graphResult, string prefix)
     }
 
     let emitted = driver.emitProgram(analysis, manifest.scratch, prefix + ".",
-        new CodegenSettings(OptimizationLevel.Default, target.hostTargetTriple()));
+        environment.settings());
     if (!emitted.succeeded()) {
         return "codegen failed: " + firstDiagnostics(emitted.diagnostics());
     }
@@ -38,16 +86,20 @@ public compileAndLink(Manifest manifest, GraphResult graphResult, string prefix)
         return "codegen produced no object files";
     }
 
-    return linkObjects(emitted.objects(), executablePath(manifest, prefix));
+    let plan = natives.librariesFor(graphResult.natives(), environment.platform());
+    if (plan.failure().length > 0) {
+        return "the fixture's native libraries cannot be linked: " + plan.failure();
+    }
+    return linkObjects(environment, emitted.objects(), executablePath(manifest, prefix),
+        plan.libraries());
 }
 
-// Links emitted objects into a program. Returns "" on success, or the linker's own words. A fixture
-// links against nothing but the platform defaults, which is what the harness has always given it.
-public linkObjects(List<string> objects, string programPath) -> string {
-    string[] libraries = [];
+// Links emitted objects into a program. Returns "" on success, or the linker's own words.
+public linkObjects(Environment environment, List<string> objects, string programPath,
+                   string[] libraries) -> string {
     string[] libraryFiles = [];
     let linked = linker.link(new LinkRequest(objects.toArray(), libraries, libraryFiles,
-        programPath, target.hostTargetTriple()));
+        programPath, environment.settings().targetTriple()), environment.toolchain());
     if (linked.linked()) {
         return "";
     }

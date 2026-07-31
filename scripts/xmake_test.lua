@@ -242,10 +242,23 @@ task("test")
         -- the code-generation differential harness: build the spike (an Ens program that emits an
         -- object file through the ens.llvm binding) and the harness, then drive the spike from
         -- emission through linking and execution and enforce the skip-list anti-rot rule.
+        --
+        -- It runs once per shipped code-generation configuration. '-O0' is not a debug mode nobody
+        -- ships: it is what '-O0' compiles every program with, so it is gated exactly as hard as
+        -- the default is, with the same empty skip list.
         if want("codegencheck") then
             table.insert(jobs, {
                 name = "codegencheck",
                 codegencheck = true,
+                optimization = "2",
+            })
+        end
+
+        if want("codegencheck_unoptimized") then
+            table.insert(jobs, {
+                name = "codegencheck_unoptimized",
+                codegencheck = true,
+                optimization = "0",
             })
         end
 
@@ -608,7 +621,8 @@ task("test")
         -- the shared library loadable.
         local function run_codegencheck(job)
             local name = job.name
-            local check_dir = path.join(os.projectdir(), "build", "codegencheck")
+            local check_dir = path.join(os.projectdir(), "build",
+                "codegencheck-O" .. job.optimization)
             local harness_exe = path.join(check_dir, "codegencheck" .. exe_suffix)
             local spike_exe = path.join(check_dir, "spike" .. exe_suffix)
             local manifest = path.join(check_dir, "manifest.txt")
@@ -655,6 +669,7 @@ task("test")
                 "stdlib " .. (path.join(os.projectdir(), "libs"):gsub("\\", "/")),
                 "scratch " .. scratch,
                 "skiplist " .. skiplist,
+                "optimization " .. job.optimization,
             }
             local singles = os.files(path.join(tests_dir, "*.ens"))
             table.sort(singles)
@@ -694,10 +709,13 @@ task("test")
             -- fixture stays hermetic here too.
             env.ENS_TEST_FROMCSTRING_PRESENT = "hermetic"
             env.ENS_TEST_FROMCSTRING_ABSENT = nil
+            local started = os.mclock()
             local run_rc = execMerged(harness_exe, {manifest}, log, {envs = env})
-            local out = (io.readfile(log) or ""):gsub("[\r\n]+$", "")
+            local seconds = (os.mclock() - started) / 1000.0
+            local out = captured(log)
             if run_rc == 0 then
-                return {name = name, ok = true}
+                return {name = name, ok = true,
+                    note = string.format("-O%s, %.0fs", job.optimization, seconds)}
             end
             return {name = name, ok = false,
                 short = string.format("harness exit %s", tostring(run_rc)),
