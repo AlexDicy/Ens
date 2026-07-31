@@ -105,6 +105,7 @@ A field that is a class, an array, or an external handle has no JSON form and ma
 Overloading is allowed, best match arguments first, then visibility.
 Two declarations of the same name must differ in parameter count or parameter types.
 A call picks the overload whose parameter types match the arguments exactly; when there is no exact match, an overload reachable through implicit widening is chosen.
+An argument that names no type of its own, such as an empty array literal or a struct literal, takes no part in choosing the overload; once an overload is chosen the argument is typed from the parameter it maps to, and an argument that parameter cannot type is an error.
 When two overloads match equally well, the call is a compile error that lists the candidates.
 Overloads that are not visible from the call site lose to visible ones; visibility is only an error when no visible overload matches.
 Named arguments participate in selection: an overload is only considered when every named argument names one of its parameters.
