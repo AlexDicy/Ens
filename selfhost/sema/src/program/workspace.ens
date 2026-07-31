@@ -32,6 +32,7 @@ import @std.path;
 import List from @std.collections.list;
 import Map from @std.collections.map;
 import Set from @std.collections.set;
+import @std.collections.sorting;
 import StringBuilder from @std.text.stringbuilder;
 
 public class Workspace {
@@ -184,11 +185,13 @@ export class NativeBindingInfo {
         return this.artifactBinding;
     }
 
-    public url() -> string {
+    // Where a prebuilt library is downloaded from, empty for a binding that names libraries.
+    export url() -> string {
         return this.bindingUrl;
     }
 
-    public checksum() -> string {
+    // The digest the download is checked against, empty for a binding that names libraries.
+    export checksum() -> string {
         return this.bindingChecksum;
     }
 }
@@ -323,21 +326,58 @@ class ManifestData {
     }
 }
 
+// One dependency as a manifest declares it, for a resolution that has to act on the declaration
+// rather than just know the name: which version this package requires, and which repository it comes
+// from. A dependency on a workspace member declares neither.
+export final class DependencySurvey {
+    string declaredName;
+    bool versionDeclared;
+    string declaredVersion;
+    bool sourceDeclared;
+    string declaredUrl;
+
+    protected constructor(this.declaredName, this.versionDeclared, this.declaredVersion,
+                this.sourceDeclared, this.declaredUrl);
+
+    export packageName() -> string {
+        return this.declaredName;
+    }
+
+    export hasVersion() -> bool {
+        return this.versionDeclared;
+    }
+
+    export version() -> string {
+        return this.declaredVersion;
+    }
+
+    export hasSource() -> bool {
+        return this.sourceDeclared;
+    }
+
+    // The git URL the 'from' clause names, empty when the declaration has none.
+    export url() -> string {
+        return this.declaredUrl;
+    }
+}
+
 // What a manifest declares, as a build's target resolution needs to read it: which form it takes,
 // the package it declares and the Ens version that package is written for, the packages it depends
-// on, and the member folders a workspace lists. Nothing is validated here - a build loads the
-// manifest again through the module graph, which reports its problems with the compilation - so a
-// survey of a malformed manifest simply says less.
+// on, the native libraries it binds, and the member folders a workspace lists. Nothing is validated
+// here - a build loads the manifest again through the module graph, which reports its problems with
+// the compilation - so a survey of a malformed manifest simply says less.
 export final class ManifestSurvey {
     bool packageForm;
     bool workspaceForm;
     string declaredName;
     string declaredEnsVersion;
-    string[] declaredDependencies;
+    DependencySurvey[] declaredDependencies;
+    NativeInfo[] declaredNatives;
     string[] declaredMembers;
 
     protected constructor(this.packageForm, this.workspaceForm, this.declaredName,
-                this.declaredEnsVersion, this.declaredDependencies, this.declaredMembers);
+                this.declaredEnsVersion, this.declaredDependencies, this.declaredNatives,
+                this.declaredMembers);
 
     export isPackage() -> bool {
         return this.packageForm;
@@ -357,7 +397,21 @@ export final class ManifestSurvey {
     }
 
     export dependencies() -> string[] {
+        let names = new List<string>();
+        for (let dependency in this.declaredDependencies) {
+            names.push(dependency.packageName());
+        }
+        return names.toArray();
+    }
+
+    // Every dependency as it was written, which is what deciding where to fetch one from needs.
+    export requirements() -> DependencySurvey[] {
         return this.declaredDependencies;
+    }
+
+    // The native libraries the package binds, which is where a prebuilt artifact is declared.
+    export natives() -> NativeInfo[] {
+        return this.declaredNatives;
     }
 
     // The member folders a workspace lists, as written, relative to the manifest's own folder.
@@ -366,12 +420,38 @@ export final class ManifestSurvey {
     }
 }
 
+// Where the packages a build resolved from outside its own workspace ended up. A driver settles them
+// before anything is loaded - fetching what it has to - and hands the folders in here, so this layer
+// never reaches the network and a load given none of them says what it could not find instead of
+// looking for it.
+export final class PackageSources {
+    Map<string, string> foldersByName;
+
+    export constructor(this.foldersByName);
+
+    export folderOf(string packageName) -> string? {
+        return this.foldersByName.get(packageName);
+    }
+}
+
+export noPackageSources() -> PackageSources {
+    return new PackageSources(new Map<string, string>());
+}
+
 // The manifest of the given folder as a survey, or null when the folder holds no manifest.
 export surveyManifest(FileLoader loader, string folder) -> ManifestSurvey? {
     if (!loader.exists(manifestFilePath(folder))) {
         return null;
     }
     return new WorkspaceLoader(loader).surveyAt(folder);
+}
+
+// The packages the folder's own dependencies resolve against as workspace members: the members of
+// the nearest workspace-form manifest above it, and only when that workspace lists this folder as
+// one of them. A resolution asks this so it never goes looking for a package the checkout already
+// provides.
+export enclosingMemberNames(FileLoader loader, string packageFolder) -> string[] {
+    return new WorkspaceLoader(loader).memberNamesAround(packageFolder);
 }
 
 // One override as an ens.overrides file spells it: the package it redirects, the folder it points
@@ -522,6 +602,7 @@ export discoverRoot(FileLoader loader, string startFolder) -> string? {
 // caller drains them with diagnostics().
 public class WorkspaceLoader {
     FileLoader loader;
+    PackageSources fetched;
     Map<string, ManifestData> manifestCache;
     Map<string, MemberIndex> memberIndexCache;
     Map<string, string> overrideFolders;
@@ -529,6 +610,17 @@ public class WorkspaceLoader {
 
     public constructor(FileLoader loader) {
         this.loader = loader;
+        this.fetched = noPackageSources();
+        this.manifestCache = new Map<string, ManifestData>();
+        this.memberIndexCache = new Map<string, MemberIndex>();
+        this.overrideFolders = new Map<string, string>();
+        this.collected = new List<FileDiagnostic>();
+    }
+
+    // The same, over the packages a driver has already resolved from outside this workspace.
+    public constructor(FileLoader loader, PackageSources fetched) {
+        this.loader = loader;
+        this.fetched = fetched;
         this.manifestCache = new Map<string, ManifestData>();
         this.memberIndexCache = new Map<string, MemberIndex>();
         this.overrideFolders = new Map<string, string>();
@@ -539,13 +631,30 @@ public class WorkspaceLoader {
         return this.collected.toArray();
     }
 
+    // The packages the folder resolves as workspace members, in name order.
+    protected memberNamesAround(string packageFolder) -> string[] {
+        let index = this.enclosingMemberIndex(packageFolder);
+        if (index == null) {
+            string[] none = [];
+            return none;
+        }
+        let names = new List<string>();
+        for (let name in index.foldersByName.keys()) {
+            names.push(name);
+        }
+        sorting.sort(names);
+        return names.toArray();
+    }
+
     // The manifest in the folder as a survey. The folder must hold one; surveyManifest is the
     // way in that answers for a folder that does not.
     public surveyAt(string folder) -> ManifestSurvey {
         let data = this.manifestAt(folder);
-        let dependencies = new List<string>();
+        let dependencies = new List<DependencySurvey>();
         for (long i = 0; i < data.dependencies.length(); i++) {
-            dependencies.push(data.dependencies.get(i).name);
+            let declared = data.dependencies.get(i);
+            dependencies.push(new DependencySurvey(declared.name, declared.hasVersion,
+                declared.version, declared.hasSource, declared.sourceUrl));
         }
         let members = new List<string>();
         for (long i = 0; i < data.members.length(); i++) {
@@ -553,7 +662,7 @@ public class WorkspaceLoader {
         }
         return new ManifestSurvey(data.form == ManifestForm.PackageForm,
             data.form == ManifestForm.WorkspaceForm, data.packageName, data.ensVersion,
-            dependencies.toArray(), members.toArray());
+            dependencies.toArray(), data.natives.toArray(), members.toArray());
     }
 
     // The workspace the whole build runs in. Its root is discovered upward from the source
@@ -665,6 +774,11 @@ public class WorkspaceLoader {
                 workspace.dependencyFolders.set(dependency.name, memberFolder);
                 return;
             }
+        }
+        string? resolvedFolder = this.fetched.folderOf(dependency.name);
+        if (resolvedFolder != null) {
+            workspace.dependencyFolders.set(dependency.name, resolvedFolder);
+            return;
         }
         if (dependency.hasSource) {
             this.report(workspace.manifestFile, dependency.span,
