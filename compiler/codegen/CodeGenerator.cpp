@@ -1921,6 +1921,425 @@ struct CodeGenerator::Impl {
             builder->CreateSelect(signaled, signalCode, status), "normalized");
     }
 
+    // The bridges behind a child this process reads as it runs. The child's standard
+    // output and standard error are one pipe, so what it writes arrives merged in the
+    // order it wrote it and no read can be held up by the other stream filling first.
+    // The parent closes its own copy of the writing end as soon as the child holds
+    // one, which is what lets a read see the end of the output once the child is gone.
+    //
+    // A started child is a 16-byte block: the child itself at +0 and the reading end
+    // of its pipe at +8. That block is the handle Ens holds on to; nothing else about
+    // a child crosses the boundary.
+    llvm::Value* childField(llvm::Value* block, long offset) {
+        return builder->CreateGEP(llvm::Type::getInt8Ty(ctx), block,
+            llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), offset), "child.field");
+    }
+
+    // ptr ens_start_process(program, argumentBlock, argumentCount, commandLine,
+    // environmentBlock, environmentCount, environmentBytes): the started child, or
+    // null when it could not be started. An empty environment block hands this
+    // process's environment on unchanged. A POSIX target execs an argument vector
+    // built from the NUL separated block; Windows hands the joined command line to
+    // CreateProcessW, the only shape Win32 accepts.
+    llvm::Function* defineStartProcessRuntime() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(ptrTy,
+            { ptrTy, ptrTy, i64Ty, ptrTy, ptrTy, i64Ty, i64Ty }, false);
+        llvm::Function* fn = module->getFunction("ens_start_process");
+        if (!fn) {
+            fn = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage,
+                "ens_start_process", module.get());
+        }
+        if (!fn->empty()) return fn;
+
+        auto savedIP = builder->saveIP();
+        builder->SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", fn));
+        // The child inherits a copy of whatever is still buffered in this process's
+        // streams, which it would write out a second time; handing the buffers over
+        // first keeps a printed line ahead of the child's output and unduplicated.
+        emitFlushBuffered();
+        if (module->getTargetTriple().isOSWindows()) {
+            emitWindowsStart(fn);
+        } else {
+            emitPosixStart(fn);
+        }
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    // CreatePipe makes the pipe with a writing end the child may inherit and a reading
+    // end it may not; STARTUPINFOW aims both of the child's output handles at the
+    // writing end. The structures are raw byte blocks, so their fields are written at
+    // their documented x64 offsets.
+    void emitWindowsStart(llvm::Function* fn) {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8Ty  = llvm::Type::getInt8Ty(ctx);
+        auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy);
+        llvm::FunctionCallee createPipe = libcFn("CreatePipe",
+            llvm::FunctionType::get(i32Ty, { ptrTy, ptrTy, ptrTy, i32Ty }, false));
+        llvm::FunctionCallee handleInformation = libcFn("SetHandleInformation",
+            llvm::FunctionType::get(i32Ty, { ptrTy, i32Ty, i32Ty }, false));
+        llvm::FunctionCallee standardHandle = libcFn("GetStdHandle",
+            llvm::FunctionType::get(i64Ty, { i32Ty }, false));
+        llvm::FunctionCallee createProcess = libcFn("CreateProcessW",
+            llvm::FunctionType::get(i32Ty, { ptrTy, ptrTy, ptrTy, ptrTy, i32Ty, i32Ty, ptrTy,
+                ptrTy, ptrTy, ptrTy }, false));
+        llvm::FunctionCallee closeHandle = libcFn("CloseHandle",
+            llvm::FunctionType::get(i32Ty, { ptrTy }, false));
+
+        auto* pipeBB = llvm::BasicBlock::Create(ctx, "start.pipe", fn);
+        auto* startBB = llvm::BasicBlock::Create(ctx, "start.process", fn);
+        auto* runningBB = llvm::BasicBlock::Create(ctx, "start.running", fn);
+        auto* recordBB = llvm::BasicBlock::Create(ctx, "start.record", fn);
+        auto* closePipeBB = llvm::BasicBlock::Create(ctx, "start.close.pipe", fn);
+        auto* closeChildBB = llvm::BasicBlock::Create(ctx, "start.close.child", fn);
+        auto* failedBB = llvm::BasicBlock::Create(ctx, "start.failed", fn);
+
+        llvm::Value* wideCommand = builder->CreateCall(defineWideFromUtf8Runtime(),
+            { fn->getArg(3), llvm::ConstantInt::getSigned(i32Ty, -1) }, "command.wide");
+        builder->CreateCondBr(builder->CreateICmpEQ(wideCommand, nullPtr), failedBB, pipeBB);
+
+        builder->SetInsertPoint(pipeBB);
+        llvm::Value* security = builder->CreateAlloca(llvm::ArrayType::get(i8Ty, 24), nullptr,
+            "security");
+        for (long offset = 0; offset < 24; offset += 8) {
+            builder->CreateStore(llvm::ConstantInt::get(i64Ty, 0), childField(security, offset));
+        }
+        builder->CreateStore(llvm::ConstantInt::get(i32Ty, 24), childField(security, 0));
+        // bInheritHandle, which the writing end needs so the child can be given it.
+        builder->CreateStore(llvm::ConstantInt::get(i32Ty, 1), childField(security, 16));
+        llvm::Value* readSlot = builder->CreateAlloca(ptrTy, nullptr, "read.end");
+        llvm::Value* writeSlot = builder->CreateAlloca(ptrTy, nullptr, "write.end");
+        llvm::Value* piped = builder->CreateCall(createPipe,
+            { readSlot, writeSlot, security, llvm::ConstantInt::get(i32Ty, 0) }, "piped");
+        builder->CreateCondBr(builder->CreateICmpEQ(piped, llvm::ConstantInt::get(i32Ty, 0)),
+            failedBB, startBB);
+
+        builder->SetInsertPoint(startBB);
+        llvm::Value* readEnd = builder->CreateLoad(ptrTy, readSlot, "read.load");
+        llvm::Value* writeEnd = builder->CreateLoad(ptrTy, writeSlot, "write.load");
+        // HANDLE_FLAG_INHERIT off: only the writing end crosses into the child.
+        builder->CreateCall(handleInformation, { readEnd, llvm::ConstantInt::get(i32Ty, 1),
+            llvm::ConstantInt::get(i32Ty, 0) });
+        llvm::Value* wideEnvironment = builder->CreateCall(defineWideFromUtf8Runtime(),
+            { fn->getArg(4), builder->CreateTrunc(fn->getArg(6), i32Ty, "env.bytes") },
+            "environment.wide");
+        // CREATE_UNICODE_ENVIRONMENT, needed only when an environment block is given.
+        llvm::Value* flags = builder->CreateSelect(
+            builder->CreateICmpEQ(wideEnvironment, nullPtr),
+            llvm::ConstantInt::get(i32Ty, 0), llvm::ConstantInt::get(i32Ty, 0x400), "flags");
+        llvm::Value* startup = builder->CreateAlloca(llvm::ArrayType::get(i8Ty, 104), nullptr,
+            "startup");
+        llvm::Value* process = builder->CreateAlloca(llvm::ArrayType::get(i8Ty, 24), nullptr,
+            "process");
+        for (long offset = 0; offset < 104; offset += 8) {
+            builder->CreateStore(llvm::ConstantInt::get(i64Ty, 0), childField(startup, offset));
+        }
+        for (long offset = 0; offset < 24; offset += 8) {
+            builder->CreateStore(llvm::ConstantInt::get(i64Ty, 0), childField(process, offset));
+        }
+        builder->CreateStore(llvm::ConstantInt::get(i32Ty, 104), childField(startup, 0));
+        // dwFlags = STARTF_USESTDHANDLES.
+        builder->CreateStore(llvm::ConstantInt::get(i32Ty, 0x100), childField(startup, 60));
+        builder->CreateStore(builder->CreateCall(standardHandle,
+            { llvm::ConstantInt::getSigned(i32Ty, -10) }, "stdin.handle"), childField(startup, 80));
+        builder->CreateStore(writeEnd, childField(startup, 88));
+        builder->CreateStore(writeEnd, childField(startup, 96));
+        llvm::Value* started = builder->CreateCall(createProcess,
+            { nullPtr, wideCommand, nullPtr, nullPtr, llvm::ConstantInt::get(i32Ty, 1), flags,
+              wideEnvironment, nullPtr, startup, process }, "started");
+        builder->CreateCall(getOrDeclareFree(), { wideCommand });
+        builder->CreateCall(getOrDeclareFree(), { wideEnvironment });
+        builder->CreateCondBr(builder->CreateICmpEQ(started, llvm::ConstantInt::get(i32Ty, 0)),
+            closePipeBB, runningBB);
+
+        // The child holds the writing end now, so this process hands its own copy
+        // back; the end of the output is a read finding no writer left. The child's
+        // thread is of no use to anyone here.
+        builder->SetInsertPoint(runningBB);
+        llvm::Value* child = builder->CreateLoad(ptrTy, childField(process, 0), "child");
+        llvm::Value* thread = builder->CreateLoad(ptrTy, childField(process, 8), "child.thread");
+        builder->CreateCall(closeHandle, { writeEnd });
+        builder->CreateCall(closeHandle, { thread });
+        llvm::Value* block = builder->CreateCall(getOrDeclareMalloc(),
+            { llvm::ConstantInt::get(i64Ty, 16) }, "child.block");
+        builder->CreateCondBr(builder->CreateICmpEQ(block, nullPtr), closeChildBB, recordBB);
+
+        builder->SetInsertPoint(recordBB);
+        builder->CreateStore(child, childField(block, 0));
+        builder->CreateStore(readEnd, childField(block, 8));
+        builder->CreateRet(block);
+
+        builder->SetInsertPoint(closePipeBB);
+        builder->CreateCall(closeHandle, { readEnd });
+        builder->CreateCall(closeHandle, { writeEnd });
+        builder->CreateRet(nullPtr);
+
+        builder->SetInsertPoint(closeChildBB);
+        builder->CreateCall(closeHandle, { readEnd });
+        builder->CreateCall(closeHandle, { child });
+        builder->CreateRet(nullPtr);
+
+        // A command line that could not be widened frees nothing, and free ignores a
+        // null pointer.
+        builder->SetInsertPoint(failedBB);
+        builder->CreateCall(getOrDeclareFree(), { wideCommand });
+        builder->CreateRet(nullPtr);
+    }
+
+    // The pipe is made before the fork; the child aims both output descriptors at the
+    // writing end and lets go of the reading one, and the parent closes its own copy
+    // of the writing end straight after forking.
+    void emitPosixStart(llvm::Function* fn) {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy);
+        llvm::Value* one = llvm::ConstantInt::get(i64Ty, 1);
+        llvm::FunctionCallee makePipe = libcFn("pipe",
+            llvm::FunctionType::get(i32Ty, { ptrTy }, false));
+        llvm::FunctionCallee forkProcess = libcFn("fork",
+            llvm::FunctionType::get(i32Ty, {}, false));
+        llvm::FunctionCallee duplicate = libcFn("dup2",
+            llvm::FunctionType::get(i32Ty, { i32Ty, i32Ty }, false));
+        llvm::FunctionCallee closeDescriptor = libcFn("close",
+            llvm::FunctionType::get(i32Ty, { i32Ty }, false));
+        llvm::FunctionCallee execProgram = libcFn("execvp",
+            llvm::FunctionType::get(i32Ty, { ptrTy, ptrTy }, false));
+        llvm::FunctionCallee exitChild = libcFn("_exit",
+            llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), { i32Ty }, false));
+
+        auto* forkBB = llvm::BasicBlock::Create(ctx, "start.fork", fn);
+        auto* childBB = llvm::BasicBlock::Create(ctx, "start.child", fn);
+        auto* takeEnvBB = llvm::BasicBlock::Create(ctx, "start.child.environment", fn);
+        auto* execBB = llvm::BasicBlock::Create(ctx, "start.child.exec", fn);
+        auto* parentBB = llvm::BasicBlock::Create(ctx, "start.parent", fn);
+        auto* holdBB = llvm::BasicBlock::Create(ctx, "start.hold", fn);
+        auto* recordBB = llvm::BasicBlock::Create(ctx, "start.record", fn);
+        auto* closeReadBB = llvm::BasicBlock::Create(ctx, "start.close.read", fn);
+        auto* failedBB = llvm::BasicBlock::Create(ctx, "start.failed", fn);
+
+        llvm::Value* descriptors = builder->CreateAlloca(llvm::ArrayType::get(i32Ty, 2), nullptr,
+            "pipe");
+        llvm::Value* piped = builder->CreateCall(makePipe, { descriptors }, "piped");
+        builder->CreateCondBr(builder->CreateICmpEQ(piped, llvm::ConstantInt::get(i32Ty, 0)),
+            forkBB, failedBB);
+
+        builder->SetInsertPoint(forkBB);
+        llvm::Value* readEnd = builder->CreateLoad(i32Ty, childField(descriptors, 0), "read.end");
+        llvm::Value* writeEnd = builder->CreateLoad(i32Ty, childField(descriptors, 4), "write.end");
+        llvm::Value* argumentCount = fn->getArg(2);
+        llvm::Value* environmentCount = fn->getArg(5);
+        llvm::Value* argv = builder->CreateAlloca(ptrTy,
+            builder->CreateAdd(argumentCount, llvm::ConstantInt::get(i64Ty, 2)), "argv");
+        builder->CreateStore(fn->getArg(0), argv);
+        emitBlockVector(fn, argv, one, fn->getArg(1), argumentCount, "argv");
+        llvm::Value* envp = builder->CreateAlloca(ptrTy,
+            builder->CreateAdd(environmentCount, one), "envp");
+        emitBlockVector(fn, envp, llvm::ConstantInt::get(i64Ty, 0), fn->getArg(4),
+            environmentCount, "envp");
+        llvm::Value* child = builder->CreateCall(forkProcess, {}, "child");
+        builder->CreateCondBr(builder->CreateICmpEQ(child, llvm::ConstantInt::get(i32Ty, 0)),
+            childBB, parentBB);
+
+        builder->SetInsertPoint(childBB);
+        builder->CreateCall(duplicate, { writeEnd, llvm::ConstantInt::get(i32Ty, 1) });
+        builder->CreateCall(duplicate, { writeEnd, llvm::ConstantInt::get(i32Ty, 2) });
+        builder->CreateCall(closeDescriptor, { readEnd });
+        builder->CreateCall(closeDescriptor, { writeEnd });
+        builder->CreateCondBr(builder->CreateICmpSGT(environmentCount,
+            llvm::ConstantInt::get(i64Ty, 0)), takeEnvBB, execBB);
+
+        builder->SetInsertPoint(takeEnvBB);
+        builder->CreateStore(envp, environGlobal());
+        builder->CreateBr(execBB);
+
+        builder->SetInsertPoint(execBB);
+        builder->CreateCall(execProgram, { fn->getArg(0), argv });
+        builder->CreateCall(exitChild, { llvm::ConstantInt::get(i32Ty, 127) });
+        builder->CreateUnreachable();
+
+        builder->SetInsertPoint(parentBB);
+        builder->CreateCall(closeDescriptor, { writeEnd });
+        builder->CreateCondBr(builder->CreateICmpSLT(child, llvm::ConstantInt::get(i32Ty, 0)),
+            closeReadBB, holdBB);
+
+        builder->SetInsertPoint(holdBB);
+        llvm::Value* block = builder->CreateCall(getOrDeclareMalloc(),
+            { llvm::ConstantInt::get(i64Ty, 16) }, "child.block");
+        builder->CreateCondBr(builder->CreateICmpEQ(block, nullPtr), closeReadBB, recordBB);
+
+        builder->SetInsertPoint(recordBB);
+        builder->CreateStore(builder->CreateSExt(child, i64Ty, "child.wide"),
+            childField(block, 0));
+        builder->CreateStore(builder->CreateSExt(readEnd, i64Ty, "read.wide"),
+            childField(block, 8));
+        builder->CreateRet(block);
+
+        builder->SetInsertPoint(closeReadBB);
+        builder->CreateCall(closeDescriptor, { readEnd });
+        builder->CreateRet(nullPtr);
+
+        builder->SetInsertPoint(failedBB);
+        builder->CreateRet(nullPtr);
+    }
+
+    // i64 ens_read_child(child, buffer, capacity): how many bytes of the child's
+    // output were written into the buffer, 0 once the output has ended, or -1 when it
+    // could not be read.
+    llvm::Function* defineReadChildRuntime() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(i64Ty, { ptrTy, ptrTy, i64Ty }, false);
+        llvm::Function* fn = module->getFunction("ens_read_child");
+        if (!fn) {
+            fn = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage,
+                "ens_read_child", module.get());
+        }
+        if (!fn->empty()) return fn;
+
+        auto savedIP = builder->saveIP();
+        builder->SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", fn));
+        if (module->getTargetTriple().isOSWindows()) {
+            llvm::FunctionCallee readFile = libcFn("ReadFile",
+                llvm::FunctionType::get(i32Ty, { ptrTy, ptrTy, i32Ty, ptrTy, ptrTy }, false));
+            llvm::FunctionCallee lastError = libcFn("GetLastError",
+                llvm::FunctionType::get(i32Ty, {}, false));
+            auto* endedBB = llvm::BasicBlock::Create(ctx, "read.ended", fn);
+            auto* countBB = llvm::BasicBlock::Create(ctx, "read.count", fn);
+            llvm::Value* countSlot = builder->CreateAlloca(i32Ty, nullptr, "read.bytes");
+            builder->CreateStore(llvm::ConstantInt::get(i32Ty, 0), countSlot);
+            llvm::Value* handle = builder->CreateLoad(ptrTy, childField(fn->getArg(0), 8),
+                "read.end");
+            llvm::Value* ok = builder->CreateCall(readFile,
+                { handle, fn->getArg(1), builder->CreateTrunc(fn->getArg(2), i32Ty, "capacity"),
+                  countSlot, llvm::ConstantPointerNull::get(ptrTy) }, "read.ok");
+            builder->CreateCondBr(builder->CreateICmpEQ(ok, llvm::ConstantInt::get(i32Ty, 0)),
+                endedBB, countBB);
+
+            // ERROR_BROKEN_PIPE is the end of the output: the child is gone and
+            // nothing else holds the writing end. Every other failure is one to report.
+            builder->SetInsertPoint(endedBB);
+            llvm::Value* failure = builder->CreateCall(lastError, {}, "failure");
+            builder->CreateRet(builder->CreateSelect(
+                builder->CreateICmpEQ(failure, llvm::ConstantInt::get(i32Ty, 109)),
+                llvm::ConstantInt::get(i64Ty, 0),
+                llvm::ConstantInt::getSigned(i64Ty, -1)));
+
+            builder->SetInsertPoint(countBB);
+            builder->CreateRet(builder->CreateZExt(
+                builder->CreateLoad(i32Ty, countSlot, "count"), i64Ty, "count.wide"));
+        } else {
+            llvm::FunctionCallee readDescriptor = libcFn("read",
+                llvm::FunctionType::get(i64Ty, { i32Ty, ptrTy, i64Ty }, false));
+            llvm::Value* count = builder->CreateCall(readDescriptor,
+                { childDescriptor(fn, 8), fn->getArg(1), fn->getArg(2) }, "count");
+            builder->CreateRet(builder->CreateSelect(
+                builder->CreateICmpSLT(count, llvm::ConstantInt::get(i64Ty, 0)),
+                llvm::ConstantInt::getSigned(i64Ty, -1), count));
+        }
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    // i64 ens_wait_child(child): the code the child ended with, waiting for it to end
+    // first.
+    llvm::Function* defineWaitChildRuntime() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(i64Ty, { ptrTy }, false);
+        llvm::Function* fn = module->getFunction("ens_wait_child");
+        if (!fn) {
+            fn = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage,
+                "ens_wait_child", module.get());
+        }
+        if (!fn->empty()) return fn;
+
+        auto savedIP = builder->saveIP();
+        builder->SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", fn));
+        if (module->getTargetTriple().isOSWindows()) {
+            llvm::FunctionCallee waitForOne = libcFn("WaitForSingleObject",
+                llvm::FunctionType::get(i32Ty, { ptrTy, i32Ty }, false));
+            llvm::FunctionCallee exitCodeOf = libcFn("GetExitCodeProcess",
+                llvm::FunctionType::get(i32Ty, { ptrTy, ptrTy }, false));
+            llvm::Value* child = builder->CreateLoad(ptrTy, childField(fn->getArg(0), 0), "child");
+            builder->CreateCall(waitForOne, { child,
+                llvm::ConstantInt::get(i32Ty, 0xFFFFFFFF) });
+            llvm::Value* codeSlot = builder->CreateAlloca(i32Ty, nullptr, "exit.code");
+            builder->CreateStore(llvm::ConstantInt::get(i32Ty, 0), codeSlot);
+            builder->CreateCall(exitCodeOf, { child, codeSlot });
+            builder->CreateRet(builder->CreateZExt(
+                builder->CreateLoad(i32Ty, codeSlot, "code"), i64Ty, "code.wide"));
+        } else {
+            llvm::FunctionCallee waitForChild = libcFn("waitpid",
+                llvm::FunctionType::get(i32Ty, { i32Ty, ptrTy, i32Ty }, false));
+            llvm::Value* statusSlot = builder->CreateAlloca(i32Ty, nullptr, "wait.status");
+            builder->CreateStore(llvm::ConstantInt::get(i32Ty, 0), statusSlot);
+            builder->CreateCall(waitForChild, { childDescriptor(fn, 0), statusSlot,
+                llvm::ConstantInt::get(i32Ty, 0) });
+            llvm::Value* status = builder->CreateLoad(i32Ty, statusSlot, "wait.load");
+            builder->CreateRet(builder->CreateSExt(normalizedWaitStatus(status), i64Ty,
+                "status.wide"));
+        }
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    // void ens_release_child(child): the pipe and this process's hold on the child
+    // handed back, and the block freed. The child itself is left to run: nothing here
+    // waits for one.
+    llvm::Function* defineReleaseChildRuntime() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), { ptrTy }, false);
+        llvm::Function* fn = module->getFunction("ens_release_child");
+        if (!fn) {
+            fn = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage,
+                "ens_release_child", module.get());
+        }
+        if (!fn->empty()) return fn;
+
+        auto savedIP = builder->saveIP();
+        builder->SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", fn));
+        if (module->getTargetTriple().isOSWindows()) {
+            llvm::FunctionCallee closeHandle = libcFn("CloseHandle",
+                llvm::FunctionType::get(i32Ty, { ptrTy }, false));
+            builder->CreateCall(closeHandle, { builder->CreateLoad(ptrTy,
+                childField(fn->getArg(0), 8), "read.end") });
+            builder->CreateCall(closeHandle, { builder->CreateLoad(ptrTy,
+                childField(fn->getArg(0), 0), "child") });
+        } else {
+            llvm::FunctionCallee closeDescriptor = libcFn("close",
+                llvm::FunctionType::get(i32Ty, { i32Ty }, false));
+            llvm::FunctionCallee waitForChild = libcFn("waitpid",
+                llvm::FunctionType::get(i32Ty, { i32Ty, ptrTy, i32Ty }, false));
+            builder->CreateCall(closeDescriptor, { childDescriptor(fn, 8) });
+            // WNOHANG: a child that has already ended is collected here, and one still
+            // running is left to the system, because nothing in a release may wait for
+            // a program to finish.
+            builder->CreateCall(waitForChild, { childDescriptor(fn, 0),
+                llvm::ConstantPointerNull::get(ptrTy), llvm::ConstantInt::get(i32Ty, 1) });
+        }
+        builder->CreateCall(getOrDeclareFree(), { fn->getArg(0) });
+        builder->CreateRetVoid();
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
+    // A descriptor the child's block holds, narrowed to the width the system's calls
+    // take.
+    llvm::Value* childDescriptor(llvm::Function* fn, long offset) {
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        return builder->CreateTrunc(builder->CreateLoad(i64Ty,
+            childField(fn->getArg(0), offset), "held"), i32Ty, "descriptor");
+    }
+
     // void ens_write_error(char* text): the text and a newline on standard error,
     // the stream std.system.writeError() reports on.
     llvm::Function* defineWriteErrorRuntime() {
@@ -9179,6 +9598,10 @@ struct CodeGenerator::Impl {
             return builder->CreateCall(defineArgsRuntime(), {});
         if (sym && sym->name == u"ens_run_process") defineRunProcessRuntime();
         if (sym && sym->name == u"ens_spawn_process") defineSpawnProcessRuntime();
+        if (sym && sym->name == u"ens_start_process") defineStartProcessRuntime();
+        if (sym && sym->name == u"ens_read_child") defineReadChildRuntime();
+        if (sym && sym->name == u"ens_wait_child") defineWaitChildRuntime();
+        if (sym && sym->name == u"ens_release_child") defineReleaseChildRuntime();
         if (sym && sym->name == u"ens_path_kind") definePathKindRuntime();
         if (sym && sym->name == u"ens_list_directory") defineListDirectoryRuntime();
         if (sym && sym->name == u"ens_create_directory") defineCreateDirectoryRuntime();

@@ -2,13 +2,15 @@ import List from @std.collections.list;
 import @std.collections.sorting;
 import @std.path;
 import @std.process;
+import LineBuffer from @std.text.lines;
 
 external type CFile;
+external type ChildHandle;
 
-// The compiler defines the 'ens_' bridges wherever they are referenced. The spawn bridge takes the
-// arguments twice over: a POSIX target builds an argument vector out of the NUL separated block,
-// and a Windows target passes the joined command line on, because one string is the only shape
-// Win32 accepts. Building both here keeps the quoting rules in Ens instead of in two code
+// The compiler defines the 'ens_' bridges wherever they are referenced. The two bridges that start a
+// program take the arguments twice over: a POSIX target builds an argument vector out of the NUL
+// separated block, and a Windows target passes the joined command line on, because one string is the
+// only shape Win32 accepts. Building both here keeps the quoting rules in Ens instead of in two code
 // generators.
 external from libc {
     fopen(string path, string mode) -> CFile?;
@@ -26,6 +28,12 @@ external from libc {
     ens_spawn_process(string program, byte[] argumentBlock, long argumentCount,
                       string commandLine, byte[] environmentBlock, long environmentCount,
                       long environmentBytes, string stdoutPath, string stderrPath) -> long;
+    ens_start_process(string program, byte[] argumentBlock, long argumentCount,
+                      string commandLine, byte[] environmentBlock, long environmentCount,
+                      long environmentBytes) -> ChildHandle?;
+    ens_read_child(ChildHandle child, byte[] buffer, long capacity) -> long;
+    ens_wait_child(ChildHandle child) -> long;
+    ens_release_child(ChildHandle child);
     ens_path_kind(string path) -> int;
     ens_list_directory(string folder) -> string[]?;
     ens_create_directory(string path) -> int;
@@ -331,17 +339,137 @@ export runCaptured(string program, string[] arguments, string[] environmentOverr
     return try started(program, arguments, environmentOverrides, stdoutPath, stderrPath);
 }
 
+// A program this one started and is still running, whose output this one reads as it is written.
+// What the child sent to its standard output and what it sent to its standard error arrive together,
+// in the order it wrote them, which is the order a reader of both streams would have seen.
+export final class ChildProcess {
+    ChildHandle child;
+    string program;
+    byte[] chunk;
+    LineBuffer lines;
+
+    int code;
+    bool ended;
+    bool waited;
+
+    protected constructor(ChildHandle child, string program) {
+        this.child = child;
+        this.program = program;
+        this.chunk = new byte[4096];
+        this.lines = new LineBuffer();
+        this.code = 0;
+        this.ended = false;
+        this.waited = false;
+    }
+
+    // The next line of the child's output, without its ending, or null once the output has ended.
+    // The call waits for as long as the child takes to write that line. Output that does not end in
+    // a newline is a line of its own, handed over last, and every call after that answers null.
+    export readLine() -> string? throws {
+        string? line = this.lines.take();
+        while (line == null && !this.ended) {
+            try this.fill();
+            line = this.lines.take();
+        }
+        if (line != null) {
+            return line;
+        }
+        return this.lines.rest();
+    }
+
+    // The child's exit code, waiting for it to finish first. Output that has not been read is read
+    // and thrown away before the wait, because a child whose output nobody reads would be stopped by
+    // a full pipe: asking for the code is asking for the child to be finished with. Read every line
+    // with readLine() first where the output matters. Asking again answers the same code.
+    export wait() -> int throws {
+        if (this.waited) {
+            return this.code;
+        }
+        try this.discardRest();
+        this.code = ens_wait_child(this.child) as int;
+        this.waited = true;
+        return this.code;
+    }
+
+    // The next bytes of the output, kept for the lines they hold.
+    fill() throws {
+        long count = try this.received();
+        if (count > 0) {
+            this.lines.feed(this.chunk, count);
+        }
+    }
+
+    discardRest() throws {
+        while (!this.ended) {
+            let discarded = try this.received();
+        }
+    }
+
+    // How many bytes of output arrived, 0 once it has ended.
+    received() -> long throws {
+        long count = ens_read_child(this.child, this.chunk, this.chunk.length);
+        if (count < 0) {
+            throw new SystemError("could not read the output of '{this.program}'");
+        }
+        if (count == 0) {
+            this.ended = true;
+        }
+        return count;
+    }
+
+    // Letting a child go without waiting for it hands back the pipe its output was arriving on and
+    // this process's hold on the child itself. The child keeps running with nothing left reading it.
+    destructor() {
+        ens_release_child(this.child);
+    }
+}
+
+// Starts `program` with `arguments` and hands the child back while it runs, so this process can read
+// what it writes as it writes it. No shell takes part, so an argument reaches the program exactly as
+// written here, spaces, quotes and all; standard input stays this process's own. Raises a
+// 'SystemError' when the program could not be started at all.
+export start(string program, string[] arguments) -> ChildProcess throws {
+    return try startedChild(program, arguments, inherited());
+}
+
+// The same, with `environmentOverrides` - 'NAME=VALUE' entries - applied over the environment this
+// process inherited, so the child keeps every variable it is not given a new value for.
+export start(string program, string[] arguments,
+             string[] environmentOverrides) -> ChildProcess throws {
+    return try startedChild(program, arguments, environmentOverrides);
+}
+
 // No overrides, which hands the child the environment this process inherited.
 inherited() -> string[] {
     return [];
 }
 
+// The variables a child is started with: the inherited environment under the caller's overrides, or
+// none at all when there are none, which hands this process's own environment on unchanged.
+childVariables(string[] environmentOverrides) -> string[] {
+    if (environmentOverrides.length == 0) {
+        return inherited();
+    }
+    return process.mergedEnvironment(ens_environment(), environmentOverrides, platform());
+}
+
+startedChild(string program, string[] arguments,
+             string[] environmentOverrides) -> ChildProcess throws {
+    string[] variables = childVariables(environmentOverrides);
+    byte[] block = process.environmentBlock(variables);
+    ChildHandle? child = ens_start_process(program, process.argumentBlock(arguments),
+        arguments.length, process.commandLineOf(program, arguments), block, variables.length,
+        block.length);
+    if (child == null) {
+        throw new SystemError("could not start '{program}': check that the name is right and that "
+            + "the program is where this process can reach it");
+    }
+    return new ChildProcess(child, program);
+}
+
 started(string program, string[] arguments, string[] environmentOverrides, string stdoutPath,
         string stderrPath) -> int throws {
-    string[] variables = inherited();
-    if (environmentOverrides.length > 0) {
-        variables = process.mergedEnvironment(ens_environment(), environmentOverrides, platform());
-    }
+    string[] variables = childVariables(environmentOverrides);
     byte[] block = process.environmentBlock(variables);
     long status = ens_spawn_process(program, process.argumentBlock(arguments), arguments.length,
         process.commandLineOf(program, arguments), block, variables.length, block.length,

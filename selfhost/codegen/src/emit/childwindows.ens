@@ -1,0 +1,196 @@
+// The Windows half of the child bridges. CreatePipe makes the pipe its output arrives on with a
+// writing end the child may inherit and a reading end it may not, CreateProcessW aims both of the
+// child's output handles at that writing end, and the parent closes its own copy of it the moment the
+// child holds one: a reading end still open for writing anywhere would never report the end of the
+// output. STARTUPINFOW, PROCESS_INFORMATION and SECURITY_ATTRIBUTES are raw byte blocks here, so
+// their fields are written at their documented x64 offsets.
+import TypeRef from @ens.llvm.types;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import Runtime from emit.runtime;
+import RuntimeFunction from emit.runtime;
+import emit.children;
+import emit.widetext;
+
+public windowsStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let createPipe = runtime.libc("CreatePipe", runtime.int32Type.functionType([
+        runtime.pointerType, runtime.pointerType, runtime.pointerType, runtime.int32Type]));
+    let handleInformation = runtime.libc("SetHandleInformation", runtime.int32Type.functionType(
+        [runtime.pointerType, runtime.int32Type, runtime.int32Type]));
+    let standardHandle = runtime.libc("GetStdHandle",
+        runtime.int64Type.functionType([runtime.int32Type]));
+    let createProcess = runtime.libc("CreateProcessW", runtime.int32Type.functionType([
+        runtime.pointerType, runtime.pointerType, runtime.pointerType, runtime.pointerType,
+        runtime.int32Type, runtime.int32Type, runtime.pointerType, runtime.pointerType,
+        runtime.pointerType, runtime.pointerType]));
+    let closeHandle = runtime.libc("CloseHandle",
+        runtime.int32Type.functionType([runtime.pointerType]));
+    let widen = widetext.wideFromUtf8(runtime);
+    let allocate = runtime.malloc();
+    let release = runtime.free();
+    let definition = runtime.beginDefinition("ens_start_process", type);
+    let builder = runtime.builder;
+    let pipeBlock = runtime.block(definition, "start.pipe");
+    let startBlock = runtime.block(definition, "start.process");
+    let runningBlock = runtime.block(definition, "start.running");
+    let recordBlock = runtime.block(definition, "start.record");
+    let closePipeBlock = runtime.block(definition, "start.close.pipe");
+    let closeChildBlock = runtime.block(definition, "start.close.child");
+    let failedBlock = runtime.block(definition, "start.failed");
+
+    // The child inherits a copy of whatever is still buffered in this process's streams, which it
+    // would write out a second time; handing the buffers over first keeps a printed line ahead of the
+    // child's output and unduplicated.
+    runtime.flushBuffered();
+    let wideCommand = runtime.call(widen, [runtime.parameter(definition, 3), runtime.int32(-1)],
+        "command.wide");
+    instructions.buildCondBr(builder, runtime.isNull(wideCommand), failedBlock, pipeBlock);
+
+    builder.positionAtEnd(pipeBlock);
+    let security = memory.buildAlloca(builder, runtime.int8Type.arrayType(24 as ulong), "security");
+    for (long offset = 0; offset < 24; offset = offset + 8) {
+        memory.buildStore(builder, runtime.int64(0), runtime.offsetPointer(security, offset, ""));
+    }
+    memory.buildStore(builder, runtime.int32(24), runtime.offsetPointer(security, 0, ""));
+    // bInheritHandle, which the writing end needs so the child can be given it.
+    memory.buildStore(builder, runtime.int32(1), runtime.offsetPointer(security, 16, ""));
+    let readSlot = memory.buildAlloca(builder, runtime.pointerType, "read.end");
+    let writeSlot = memory.buildAlloca(builder, runtime.pointerType, "write.end");
+    let piped = runtime.call(createPipe, [readSlot, writeSlot, security, runtime.int32(0)], "piped");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, piped, runtime.int32(0), ""), failedBlock, startBlock);
+
+    builder.positionAtEnd(startBlock);
+    let readEnd = memory.buildLoad(builder, runtime.pointerType, readSlot, "read.cur");
+    let writeEnd = memory.buildLoad(builder, runtime.pointerType, writeSlot, "write.cur");
+    // HANDLE_FLAG_INHERIT off: only the writing end crosses into the child.
+    runtime.call(handleInformation, [readEnd, runtime.int32(1), runtime.int32(0)], "");
+    let wideEnvironment = runtime.call(widen, [runtime.parameter(definition, 4),
+        instructions.buildTrunc(builder, runtime.parameter(definition, 6), runtime.int32Type,
+            "environment.bytes")], "environment.wide");
+    // CREATE_UNICODE_ENVIRONMENT, which only an environment block of this process's own making needs.
+    let flags = instructions.buildSelect(builder, runtime.isNull(wideEnvironment),
+        runtime.int32(0), runtime.int32(0x400), "flags");
+    let startup = memory.buildAlloca(builder, runtime.int8Type.arrayType(104 as ulong), "startup");
+    let process = memory.buildAlloca(builder, runtime.int8Type.arrayType(24 as ulong), "process");
+    for (long offset = 0; offset < 104; offset = offset + 8) {
+        memory.buildStore(builder, runtime.int64(0), runtime.offsetPointer(startup, offset, ""));
+    }
+    for (long offset = 0; offset < 24; offset = offset + 8) {
+        memory.buildStore(builder, runtime.int64(0), runtime.offsetPointer(process, offset, ""));
+    }
+    memory.buildStore(builder, runtime.int32(104), runtime.offsetPointer(startup, 0, ""));
+    // dwFlags = STARTF_USESTDHANDLES.
+    memory.buildStore(builder, runtime.int32(0x100), runtime.offsetPointer(startup, 60, ""));
+    memory.buildStore(builder, runtime.call(standardHandle, [runtime.int32(-10)], "stdin.handle"),
+        runtime.offsetPointer(startup, 80, ""));
+    memory.buildStore(builder, writeEnd, runtime.offsetPointer(startup, 88, ""));
+    memory.buildStore(builder, writeEnd, runtime.offsetPointer(startup, 96, ""));
+    let started = runtime.call(createProcess, [runtime.nullPointer(), wideCommand,
+        runtime.nullPointer(), runtime.nullPointer(), runtime.int32(1), flags, wideEnvironment,
+        runtime.nullPointer(), startup, process], "started");
+    runtime.call(release, [wideCommand], "");
+    runtime.call(release, [wideEnvironment], "");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, started, runtime.int32(0), ""), closePipeBlock,
+        runningBlock);
+
+    // The child holds the writing end now, so this process hands its own copy back; the end of the
+    // output is a read finding no writer left. The child's thread is of no use to anyone here.
+    builder.positionAtEnd(runningBlock);
+    let child = memory.buildLoad(builder, runtime.pointerType,
+        runtime.offsetPointer(process, 0, ""), "child");
+    let thread = memory.buildLoad(builder, runtime.pointerType,
+        runtime.offsetPointer(process, 8, ""), "child.thread");
+    runtime.call(closeHandle, [writeEnd], "");
+    runtime.call(closeHandle, [thread], "");
+    let block = runtime.call(allocate, [runtime.int64(16)], "child.block");
+    instructions.buildCondBr(builder, runtime.isNull(block), closeChildBlock, recordBlock);
+
+    builder.positionAtEnd(recordBlock);
+    memory.buildStore(builder, child, children.childField(runtime, block, 0));
+    memory.buildStore(builder, readEnd, children.childField(runtime, block, 8));
+    instructions.buildRet(builder, block);
+
+    builder.positionAtEnd(closePipeBlock);
+    runtime.call(closeHandle, [readEnd], "");
+    runtime.call(closeHandle, [writeEnd], "");
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    builder.positionAtEnd(closeChildBlock);
+    runtime.call(closeHandle, [readEnd], "");
+    runtime.call(closeHandle, [child], "");
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    // A command line that could not be widened frees nothing, and free ignores a null pointer.
+    builder.positionAtEnd(failedBlock);
+    runtime.call(release, [wideCommand], "");
+    instructions.buildRet(builder, runtime.nullPointer());
+    return runtime.endDefinition(definition);
+}
+
+public windowsRead(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let readFile = runtime.libc("ReadFile", runtime.int32Type.functionType([runtime.pointerType,
+        runtime.pointerType, runtime.int32Type, runtime.pointerType, runtime.pointerType]));
+    let lastError = runtime.libc("GetLastError", runtime.int32Type.functionType([]));
+    let definition = runtime.beginDefinition("ens_read_child", type);
+    let builder = runtime.builder;
+    let endedBlock = runtime.block(definition, "read.ended");
+    let readBlock = runtime.block(definition, "read.count");
+    let countSlot = memory.buildAlloca(builder, runtime.int32Type, "read.bytes");
+    memory.buildStore(builder, runtime.int32(0), countSlot);
+    let handle = memory.buildLoad(builder, runtime.pointerType,
+        children.childField(runtime, runtime.parameter(definition, 0), 8), "read.end");
+    let ok = runtime.call(readFile, [handle, runtime.parameter(definition, 1),
+        instructions.buildTrunc(builder, runtime.parameter(definition, 2), runtime.int32Type,
+            "capacity"), countSlot, runtime.nullPointer()], "read.ok");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, ok, runtime.int32(0), ""), endedBlock, readBlock);
+
+    // ERROR_BROKEN_PIPE is the end of the output: the child is gone and nothing else holds the
+    // writing end. Every other failure is one to report.
+    builder.positionAtEnd(endedBlock);
+    let failure = runtime.call(lastError, [], "failure");
+    instructions.buildRet(builder, instructions.buildSelect(builder,
+        instructions.buildICmpEQ(builder, failure, runtime.int32(109), ""), runtime.int64(0),
+        runtime.int64(-1), ""));
+
+    builder.positionAtEnd(readBlock);
+    instructions.buildRet(builder, instructions.buildZExt(builder,
+        memory.buildLoad(builder, runtime.int32Type, countSlot, "count"), runtime.int64Type, ""));
+    return runtime.endDefinition(definition);
+}
+
+public windowsWait(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let waitForOne = runtime.libc("WaitForSingleObject",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type]));
+    let exitCodeOf = runtime.libc("GetExitCodeProcess",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
+    let definition = runtime.beginDefinition("ens_wait_child", type);
+    let builder = runtime.builder;
+    let child = memory.buildLoad(builder, runtime.pointerType,
+        children.childField(runtime, runtime.parameter(definition, 0), 0), "child");
+    runtime.call(waitForOne, [child, runtime.int32(0xFFFFFFFF)], "");
+    let codeSlot = memory.buildAlloca(builder, runtime.int32Type, "exit.code");
+    memory.buildStore(builder, runtime.int32(0), codeSlot);
+    runtime.call(exitCodeOf, [child, codeSlot], "");
+    instructions.buildRet(builder, instructions.buildZExt(builder,
+        memory.buildLoad(builder, runtime.int32Type, codeSlot, "code"), runtime.int64Type, ""));
+    return runtime.endDefinition(definition);
+}
+
+public windowsRelease(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let closeHandle = runtime.libc("CloseHandle",
+        runtime.int32Type.functionType([runtime.pointerType]));
+    let release = runtime.free();
+    let definition = runtime.beginDefinition("ens_release_child", type);
+    let builder = runtime.builder;
+    let block = runtime.parameter(definition, 0);
+    runtime.call(closeHandle, [memory.buildLoad(builder, runtime.pointerType,
+        children.childField(runtime, block, 8), "read.end")], "");
+    runtime.call(closeHandle, [memory.buildLoad(builder, runtime.pointerType,
+        children.childField(runtime, block, 0), "child")], "");
+    runtime.call(release, [block], "");
+    instructions.buildRetVoid(builder);
+    return runtime.endDefinition(definition);
+}

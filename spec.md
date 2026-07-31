@@ -1271,6 +1271,28 @@ int status = try system.runCaptured("git", ["commit", "-m", "a message with spac
 int built = try system.run("make", ["all"], ["CC=clang"]);
 ```
 
+`system.start(program, arguments)` starts `program` the same way but hands back a `ChildProcess` while it is still running, so this program reads what the child writes as it is written instead of after it has finished.
+It has the same further form taking a `string[]` of `NAME=VALUE` overrides after the arguments.
+`readLine()` returns the next line of the child's output without its ending, waiting as long as the child takes to write it, and `null` once the output has ended; output that does not end in a newline is a line of its own, handed over last, and a carriage return before a newline belongs to the ending.
+What the child sent to its standard output and what it sent to its standard error arrive together, in the order it wrote them, which is what a program relaying another program's output needs; use `runCaptured` when the two have to stay apart.
+`wait()` returns the child's exit code, waiting for the child to finish first, and answers the same code however often it is asked.
+Output that has not been read is read and thrown away before that wait, because a child whose output nobody reads would be stopped by a full pipe: read every line first where the output matters.
+Letting a `ChildProcess` go without waiting for it hands back the pipe its output was arriving on and this program's hold on the child, which keeps running with nothing left reading it.
+A program that could not be started at all raises a `SystemError` on the systems that report that while the child is being created, and elsewhere shows up as a child that ends with `127`.
+
+```ens
+import @std.system;
+import ChildProcess from @std.system;
+
+ChildProcess child = try system.start("git", ["clone", url]);
+string? line = try child.readLine();
+while (line != null) {
+    print(line);
+    line = try child.readLine();
+}
+int status = try child.wait();
+```
+
 The `@std.path` module works on paths as text, with `/` separating the parts on every platform, and never looks at the file system.
 `join(base, relative)` puts one separator between two parts, and gives back the relative part alone when the base is empty.
 `parentFolder(path)` returns the folder one level up: `""` when the path names no folder, and `/` at the root.

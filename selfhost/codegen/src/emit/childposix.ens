@@ -1,0 +1,164 @@
+// The POSIX half of the child bridges. The pipe the output arrives on is made before the fork, the
+// child aims both of its output descriptors at the writing end and lets go of the reading one, and the
+// parent closes its own copy of the writing end straight after forking: a reading end still open for
+// writing in this process would never report the end of the output.
+import TypeRef from @ens.llvm.types;
+import Value from @ens.llvm.values;
+import RuntimeDefinition from emit.runtime;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import Runtime from emit.runtime;
+import RuntimeFunction from emit.runtime;
+import emit.children;
+import emit.spawnposix;
+import emit.system;
+
+public posixStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let makePipe = runtime.libc("pipe", runtime.int32Type.functionType([runtime.pointerType]));
+    let forkProcess = runtime.libc("fork", runtime.int32Type.functionType([]));
+    let duplicate = runtime.libc("dup2",
+        runtime.int32Type.functionType([runtime.int32Type, runtime.int32Type]));
+    let closeDescriptor = runtime.libc("close",
+        runtime.int32Type.functionType([runtime.int32Type]));
+    let execProgram = runtime.libc("execvp",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
+    let exitChild = runtime.libc("_exit", runtime.voidType.functionType([runtime.int32Type]));
+    let allocate = runtime.malloc();
+    let definition = runtime.beginDefinition("ens_start_process", type);
+    let builder = runtime.builder;
+    let forkBlock = runtime.block(definition, "start.fork");
+    let childBlock = runtime.block(definition, "start.child");
+    let takeBlock = runtime.block(definition, "start.child.environment");
+    let execBlock = runtime.block(definition, "start.child.exec");
+    let parentBlock = runtime.block(definition, "start.parent");
+    let holdBlock = runtime.block(definition, "start.hold");
+    let recordBlock = runtime.block(definition, "start.record");
+    let closeReadBlock = runtime.block(definition, "start.close.read");
+    let failedBlock = runtime.block(definition, "start.failed");
+
+    // The child inherits a copy of whatever is still buffered in this process's streams, which it
+    // would write out a second time; handing the buffers over first keeps a printed line ahead of the
+    // child's output and unduplicated.
+    runtime.flushBuffered();
+    let descriptors = memory.buildAlloca(builder, runtime.int32Type.arrayType(2 as ulong), "pipe");
+    let piped = runtime.call(makePipe, [descriptors], "piped");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, piped, runtime.int32(0), ""), forkBlock, failedBlock);
+
+    builder.positionAtEnd(forkBlock);
+    let readEnd = memory.buildLoad(builder, runtime.int32Type,
+        runtime.offsetPointer(descriptors, 0, ""), "read.end");
+    let writeEnd = memory.buildLoad(builder, runtime.int32Type,
+        runtime.offsetPointer(descriptors, 4, ""), "write.end");
+    let program = runtime.parameter(definition, 0);
+    let argumentCount = runtime.parameter(definition, 2);
+    let environmentCount = runtime.parameter(definition, 5);
+    let argumentVector = memory.buildArrayAlloca(builder, runtime.pointerType,
+        instructions.buildAdd(builder, argumentCount, runtime.int64(2), ""), "argv");
+    memory.buildStore(builder, program, argumentVector);
+    spawnposix.blockVector(runtime, definition, argumentVector, runtime.int64(1),
+        runtime.parameter(definition, 1), argumentCount, "argv");
+    let environmentVector = memory.buildArrayAlloca(builder, runtime.pointerType,
+        instructions.buildAdd(builder, environmentCount, runtime.int64(1), ""), "envp");
+    spawnposix.blockVector(runtime, definition, environmentVector, runtime.int64(0),
+        runtime.parameter(definition, 4), environmentCount, "envp");
+    let child = runtime.call(forkProcess, [], "child");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, child, runtime.int32(0), ""), childBlock, parentBlock);
+
+    builder.positionAtEnd(childBlock);
+    runtime.call(duplicate, [writeEnd, runtime.int32(1)], "");
+    runtime.call(duplicate, [writeEnd, runtime.int32(2)], "");
+    runtime.call(closeDescriptor, [readEnd], "");
+    runtime.call(closeDescriptor, [writeEnd], "");
+    instructions.buildCondBr(builder, instructions.buildICmpSGT(builder, environmentCount,
+        runtime.int64(0), ""), takeBlock, execBlock);
+
+    builder.positionAtEnd(takeBlock);
+    memory.buildStore(builder, environmentVector, system.environGlobal(runtime));
+    instructions.buildBr(builder, execBlock);
+
+    builder.positionAtEnd(execBlock);
+    runtime.call(execProgram, [program, argumentVector], "");
+    runtime.call(exitChild, [runtime.int32(127)], "");
+    instructions.buildUnreachable(builder);
+
+    builder.positionAtEnd(parentBlock);
+    runtime.call(closeDescriptor, [writeEnd], "");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, child, runtime.int32(0), ""), closeReadBlock,
+        holdBlock);
+
+    builder.positionAtEnd(holdBlock);
+    let block = runtime.call(allocate, [runtime.int64(16)], "child.block");
+    instructions.buildCondBr(builder, runtime.isNull(block), closeReadBlock, recordBlock);
+
+    builder.positionAtEnd(recordBlock);
+    memory.buildStore(builder, instructions.buildSExt(builder, child, runtime.int64Type, ""),
+        children.childField(runtime, block, 0));
+    memory.buildStore(builder, instructions.buildSExt(builder, readEnd, runtime.int64Type, ""),
+        children.childField(runtime, block, 8));
+    instructions.buildRet(builder, block);
+
+    builder.positionAtEnd(closeReadBlock);
+    runtime.call(closeDescriptor, [readEnd], "");
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    builder.positionAtEnd(failedBlock);
+    instructions.buildRet(builder, runtime.nullPointer());
+    return runtime.endDefinition(definition);
+}
+
+public posixRead(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let readDescriptor = runtime.libc("read", runtime.int64Type.functionType([runtime.int32Type,
+        runtime.pointerType, runtime.int64Type]));
+    let definition = runtime.beginDefinition("ens_read_child", type);
+    let builder = runtime.builder;
+    let count = runtime.call(readDescriptor, [descriptorAt(runtime, definition, 8),
+        runtime.parameter(definition, 1), runtime.parameter(definition, 2)], "count");
+    instructions.buildRet(builder, instructions.buildSelect(builder,
+        instructions.buildICmpSLT(builder, count, runtime.int64(0), ""), runtime.int64(-1), count,
+        ""));
+    return runtime.endDefinition(definition);
+}
+
+public posixWait(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let waitForChild = runtime.libc("waitpid", runtime.int32Type.functionType([runtime.int32Type,
+        runtime.pointerType, runtime.int32Type]));
+    let definition = runtime.beginDefinition("ens_wait_child", type);
+    let builder = runtime.builder;
+    let statusSlot = memory.buildAlloca(builder, runtime.int32Type, "wait.status");
+    memory.buildStore(builder, runtime.int32(0), statusSlot);
+    runtime.call(waitForChild, [descriptorAt(runtime, definition, 0), statusSlot,
+        runtime.int32(0)], "");
+    let status = memory.buildLoad(builder, runtime.int32Type, statusSlot, "wait.cur");
+    instructions.buildRet(builder, instructions.buildSExt(builder,
+        spawnposix.normalizedStatus(runtime, status), runtime.int64Type, ""));
+    return runtime.endDefinition(definition);
+}
+
+public posixRelease(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let closeDescriptor = runtime.libc("close",
+        runtime.int32Type.functionType([runtime.int32Type]));
+    let waitForChild = runtime.libc("waitpid", runtime.int32Type.functionType([runtime.int32Type,
+        runtime.pointerType, runtime.int32Type]));
+    let release = runtime.free();
+    let definition = runtime.beginDefinition("ens_release_child", type);
+    let builder = runtime.builder;
+    runtime.call(closeDescriptor, [descriptorAt(runtime, definition, 8)], "");
+    // WNOHANG: a child that has already ended is collected here, and one still running is left to
+    // the system, because nothing in a release may wait for a program to finish.
+    runtime.call(waitForChild, [descriptorAt(runtime, definition, 0), runtime.nullPointer(),
+        runtime.int32(1)], "");
+    runtime.call(release, [runtime.parameter(definition, 0)], "");
+    instructions.buildRetVoid(builder);
+    return runtime.endDefinition(definition);
+}
+
+// A descriptor the child's block holds, narrowed to the width the system's calls take.
+descriptorAt(Runtime runtime, RuntimeDefinition definition, long offset) -> Value {
+    let builder = runtime.builder;
+    return instructions.buildTrunc(builder, memory.buildLoad(builder, runtime.int64Type,
+        children.childField(runtime, runtime.parameter(definition, 0), offset), "held"),
+        runtime.int32Type, "descriptor");
+}
