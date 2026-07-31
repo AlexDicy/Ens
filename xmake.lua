@@ -92,7 +92,9 @@ target("ens-codegen")
     add_ldflags("-lLLVMCGData", { public = true, force = true })
 
 
-target("ens")
+-- The reference compiler. It builds the seed the Ens-written compiler is bootstrapped from and
+-- gates the tests/ fixtures; the user-facing `ens` command is the Ens-written one.
+target("ens-ref")
     set_kind("binary")
     set_languages("cxx17")
     set_toolchains("@llvm")

@@ -37,13 +37,15 @@ task("test")
         local plat = config.get("plat") or os.host()
         local arch = config.get("arch") or os.arch()
         local build_dir = path.join(os.projectdir(), "build", plat, arch, mode)
-        local ens_exe = path.join(build_dir, "ens" .. (is_host("windows") and ".exe" or ""))
-        if not os.isfile(ens_exe) then
-            print("Building ens compiler...")
-            os.exec("xmake build ens")
+        local exe_suffix = is_host("windows") and ".exe" or ""
+        -- the reference compiler: it builds the seed and gates the tests/ fixtures.
+        local ref_exe = path.join(build_dir, "ens-ref" .. exe_suffix)
+        if not os.isfile(ref_exe) then
+            print("Building the ens-ref reference compiler...")
+            os.exec("xmake build ens-ref")
         end
-        if not os.isfile(ens_exe) then
-            os.raise("Could not locate ens.exe at " .. ens_exe)
+        if not os.isfile(ref_exe) then
+            os.raise("Could not locate the reference compiler at " .. ref_exe)
         end
 
         -- the linker bridge every Ens program links through. It is a separate target from the
@@ -357,7 +359,7 @@ task("test")
                 os.mkdir(corpus_dir)
             end
             os.tryrm(exe_file)
-            local compile_rc = execMerged(ens_exe, {"build", corpus_src, "--output", exe_file}, log)
+            local compile_rc = execMerged(ref_exe, {"build", corpus_src, "--output", exe_file}, log)
             if not os.isfile(exe_file) then
                 return {name = name, ok = false, short = "harness build failed",
                     full = string.format("%s: harness build failed (exit %s)\n%s",
@@ -412,7 +414,7 @@ task("test")
                 os.mkdir(check_dir)
             end
             os.tryrm(exe_file)
-            local compile_rc = execMerged(ens_exe, {"build", check_src, "--output", exe_file}, log)
+            local compile_rc = execMerged(ref_exe, {"build", check_src, "--output", exe_file}, log)
             if not os.isfile(exe_file) then
                 return {name = name, ok = false, short = "harness build failed",
                     full = string.format("%s: harness build failed (exit %s)\n%s",
@@ -549,8 +551,6 @@ task("test")
         -- the shared library loadable.
         local function run_codegencheck(job)
             local name = job.name
-            local on_windows = is_host("windows")
-            local exe_suffix = on_windows and ".exe" or ""
             local check_dir = path.join(os.projectdir(), "build", "codegencheck")
             local harness_exe = path.join(check_dir, "codegencheck" .. exe_suffix)
             local spike_exe = path.join(check_dir, "spike" .. exe_suffix)
@@ -573,14 +573,14 @@ task("test")
 
             -- the harness itself links the native LLVM binding through ens.codegen, so its
             -- build needs the same linker environment as the spike.
-            local harness_rc = execMerged(ens_exe,
+            local harness_rc = execMerged(ref_exe,
                 {"build", check_src, "--output", harness_exe}, log, {envs = env})
             if not os.isfile(harness_exe) then
                 return {name = name, ok = false, short = "harness build failed",
                     full = string.format("%s: harness build failed (exit %s)\n%s", name,
                         tostring(harness_rc), (io.readfile(log) or ""):gsub("[\r\n]+$", ""))}
             end
-            local spike_rc = execMerged(ens_exe, {"build", spike_src, "--output", spike_exe},
+            local spike_rc = execMerged(ref_exe, {"build", spike_src, "--output", spike_exe},
                 log, {envs = env})
             if not os.isfile(spike_exe) then
                 return {name = name, ok = false, short = "spike build failed",
@@ -658,7 +658,7 @@ task("test")
                 return {name = name, ok = false, short = "no LLVM library",
                     full = string.format("%s: %s", name, env_error)}
             end
-            local run_rc = execMerged(ens_exe, {"test", job.source}, log, {envs = env})
+            local run_rc = execMerged(ref_exe, {"test", job.source}, log, {envs = env})
             local out = (io.readfile(log) or ""):gsub("[\r\n]+$", "")
             if run_rc == 0 then
                 return {name = name, ok = true, note = out:match("(%d+/%d+ tests passed)")}
@@ -677,8 +677,6 @@ task("test")
         -- timestamps.
         local function run_bootstrap(job)
             local name = job.name
-            local on_windows = is_host("windows")
-            local exe_suffix = on_windows and ".exe" or ""
             local boot_dir = path.join(os.projectdir(), "build", "bootstrap")
             local stage2_dir = path.join(boot_dir, "stage2")
             local stage3_dir = path.join(boot_dir, "stage3")
@@ -715,7 +713,7 @@ task("test")
                 return nil
             end
 
-            local failed = staged("stage 1 (ens builds boot1)", ens_exe,
+            local failed = staged("stage 1 (ens builds boot1)", ref_exe,
                     {"build", driver_src, "--output", boot1}, boot1)
                 or staged("stage 2 (boot1 compiles the driver)", boot1,
                     {driver_src, "--output", boot2, "--stdlib", libs, "--objects", stage2_dir},
@@ -794,7 +792,7 @@ task("test")
             local failures = {}
 
             local function run(argv, opt, expected_rc, ...)
-                local rc = execMerged(ens_exe, argv, log, opt)
+                local rc = execMerged(ref_exe, argv, log, opt)
                 local out = io.readfile(log) or ""
                 local label = table.concat(argv, " ")
                 if expected_rc ~= nil and rc ~= expected_rc then
@@ -898,7 +896,7 @@ task("test")
             local failures = {}
 
             local function run(argv, opt, expected_rc, ...)
-                local rc = execMerged(ens_exe, argv, log, opt)
+                local rc = execMerged(ref_exe, argv, log, opt)
                 local out = io.readfile(log) or ""
                 local label = table.concat(argv, " ")
                 if expected_rc ~= nil and rc ~= expected_rc then
@@ -986,7 +984,7 @@ task("test")
             local failures = {}
 
             local function run(argv, opt, expected_rc, ...)
-                local rc = execMerged(ens_exe, argv, log, opt)
+                local rc = execMerged(ref_exe, argv, log, opt)
                 local out = io.readfile(log) or ""
                 local label = table.concat(argv, " ")
                 if expected_rc ~= nil and rc ~= expected_rc then
@@ -1085,7 +1083,7 @@ task("test")
             end
 
             local function run(argv, opt, expected_rc, ...)
-                local rc = execMerged(ens_exe, argv, log, opt)
+                local rc = execMerged(ref_exe, argv, log, opt)
                 local out = io.readfile(log) or ""
                 local label = table.concat(argv, " ")
                 if expected_rc ~= nil and rc ~= expected_rc then
@@ -1462,7 +1460,7 @@ task("test")
             end
 
             local function run(argv, opt, expected_rc, ...)
-                local rc = execMerged(ens_exe, argv, log, opt)
+                local rc = execMerged(ref_exe, argv, log, opt)
                 local out = io.readfile(log) or ""
                 local label = table.concat(argv, " ")
                 if expected_rc ~= nil and rc ~= expected_rc then
@@ -1705,7 +1703,7 @@ task("test")
                 for _, a in ipairs(ens_test_args) do
                     table.insert(argv, (a:gsub("{dir}", (job.source:gsub("\\", "/")))))
                 end
-                local run_rc = execSplit(ens_exe, argv, stdout_file, stderr_file)
+                local run_rc = execSplit(ref_exe, argv, stdout_file, stderr_file)
                 local actual_stdout = captured(stdout_file)
                 local actual_stderr = captured(stderr_file)
                 local why = compareRun(run_rc, actual_stdout, actual_stderr)
@@ -1722,7 +1720,7 @@ task("test")
             os.tryrm(stdout_file)
             os.tryrm(stderr_file)
 
-            local compile_rc = execMerged(ens_exe,
+            local compile_rc = execMerged(ref_exe,
                 {"build", job.source, "--output", exe_file}, compile_log)
             local compile_log_text = io.readfile(compile_log) or ""
 
