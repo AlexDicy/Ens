@@ -594,7 +594,6 @@ task("test")
             -- the standard library has no directory enumeration yet; the harness narrows them by
             -- the fixture's own @ens-test arguments.
             local lines = {
-                "ens " .. ens_exe,
                 "spike " .. spike_exe,
                 "stdlib " .. (path.join(os.projectdir(), "libs"):gsub("\\", "/")),
                 "scratch " .. scratch,
@@ -719,11 +718,11 @@ task("test")
             local failed = staged("stage 1 (ens builds boot1)", ens_exe,
                     {"build", driver_src, "--output", boot1}, boot1)
                 or staged("stage 2 (boot1 compiles the driver)", boot1,
-                    {driver_src, "--output", boot2, "--stdlib", libs, "--ens", ens_exe,
-                     "--objects", stage2_dir}, boot2)
+                    {driver_src, "--output", boot2, "--stdlib", libs, "--objects", stage2_dir},
+                    boot2)
                 or staged("stage 3 (boot2 compiles the driver)", boot2,
-                    {driver_src, "--output", boot3, "--stdlib", libs, "--ens", ens_exe,
-                     "--objects", stage3_dir}, boot3)
+                    {driver_src, "--output", boot3, "--stdlib", libs, "--objects", stage3_dir},
+                    boot3)
             if failed then
                 return {name = name, ok = false, short = failed:match("^[^\n]+"),
                     full = string.format("%s: %s", name, failed)}

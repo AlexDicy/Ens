@@ -1,9 +1,8 @@
 // One program in, one executable out: build the module graph, run the sema pipeline, emit one
-// object per module through the self-hosted code generator, and link through the reference
-// driver's hidden link-objects bridge. Any diagnostic stops the build before objects are
-// written; problems go to standard error, one per line, in (file, offset) order.
+// object per module through the self-hosted code generator, and link them into an executable. Any
+// diagnostic stops the build before objects are written; problems go to standard error, one per
+// line, in (file, offset) order.
 import @std.system;
-import SystemError from @std.system;
 import @std.path;
 import List from @std.collections.list;
 import @ens.frontend.syntax.generated.factory;
@@ -19,11 +18,12 @@ import ProgramAnalysis from @ens.sema.pipeline;
 import @ens.sema.pipeline;
 import @ens.codegen.driver;
 import @ens.llvm.target;
+import LinkRequest from @ens.link.request;
+import @ens.link.linker;
 import Options from arguments;
 import arguments;
 import SourceCatalog from reporting;
 import reporting;
-import LibraryPlan from natives;
 import natives;
 import stdlib;
 
@@ -122,61 +122,35 @@ public run(Options options) -> int {
         return 1;
     }
 
-    let plan = natives.librariesFor(graphResult.natives(),
-        natives.platformOfTriple(target.hostTargetTriple()));
+    string triple = target.hostTargetTriple();
+    let plan = natives.librariesFor(graphResult.natives(), natives.platformOfTriple(triple));
     if (plan.problem.length > 0) {
         system.writeError("ensc: error: " + plan.problem);
         return 1;
     }
 
-    string ensDriver = options.ensDriver;
-    if (ensDriver.length == 0) {
-        ensDriver = arguments.slashed(system.getEnvironmentVariable("ENS_DRIVER") ?? "");
-    }
-    if (ensDriver.length == 0) {
-        system.writeError("ensc: error: linking needs the reference 'ens' driver; pass --ens <file> or "
-            + "set ENS_DRIVER");
-        return 2;
-    }
-
-    return try link(emitted.objects(), plan, ensDriver, options.output, objectsFolder, prefix);
-} catch (SystemError error) {
-    system.writeError("ensc: error: {error.message}");
-    return 1;
-}
-
-// Links the objects through 'ens link-objects', with the linker's own words passed through on
-// failure.
-link(List<string> objects, LibraryPlan plan, string ensDriver, string output,
-     string objectsFolder, string prefix) -> int throws {
-    let linkArguments = new List<string>();
-    linkArguments.push("link-objects");
-    for (long i = 0; i < objects.length(); i++) {
-        linkArguments.push(objects.get(i));
-    }
-    for (let library in plan.libraries) {
-        linkArguments.push("--library");
-        linkArguments.push(library);
-    }
-    linkArguments.push("--output");
-    linkArguments.push(output);
-    string stdoutPath = objectsFolder + "/" + prefix + "link.stdout";
-    string stderrPath = objectsFolder + "/" + prefix + "link.stderr";
-    long linked = try system.runCaptured(ensDriver, linkArguments.toArray(), stdoutPath,
-        stderrPath);
-    if (linked != 0) {
-        system.writeError("ensc: error: linking failed ('{ensDriver} link-objects' exited {linked})");
-        string reported = readOrEmpty(stderrPath);
-        if (reported.length > 0) {
-            system.writeError(reported);
-        }
+    string[] libraryFiles = [];
+    let linked = linker.link(new LinkRequest(emitted.objects().toArray(), plan.libraries,
+        libraryFiles, options.output, triple));
+    if (!linked.linked()) {
+        reportLinkFailure(options.output, linked.output());
         return 1;
     }
-    if (!system.exists(output)) {
-        system.writeError("ensc: error: linking reported success but wrote no {output}");
-        return 1;
+    if (linked.output().length > 0) {
+        system.writeError(linked.output());
     }
     return 0;
+}
+
+// A failed link, in the linker's own words: they are the only description of what went wrong worth
+// printing, and swallowing them would leave nothing to act on.
+reportLinkFailure(string output, string reported) {
+    if (reported.length == 0) {
+        system.writeError("ensc: error: linking {output} failed and the linker reported no reason");
+        return;
+    }
+    system.writeError("ensc: error: linking {output} failed; the linker reported:");
+    system.writeError(reported);
 }
 
 reportAll(List<FileDiagnostic> diagnostics, SourceCatalog catalog) {
@@ -240,10 +214,4 @@ definesMain(GraphResult graphResult) -> bool {
         }
     }
     return false;
-}
-
-readOrEmpty(string path) -> string {
-    return try system.readAllText(path);
-} catch (SystemError error) {
-    return "";
 }

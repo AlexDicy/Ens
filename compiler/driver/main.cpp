@@ -1,13 +1,11 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <limits>
 #include <set>
 #include <string>
 #include <vector>
 
 #include "Compiler.h"
-#include "Linker.h"
 #include "Overrides.h"
 #include "PackageResolution.h"
 #include "Version.h"
@@ -649,44 +647,6 @@ int runCstTool(bool analyze, int argc, char* argv[]) {
     return ok ? 0 : 1;
 }
 
-// Hidden bridge for the codegen differential harness and the self-hosted driver: link
-// caller-supplied object files into an executable through the same lld path and default
-// libraries a normal build uses. Each --library adds one logical library name resolved by
-// platform convention, the way a manifest's native declaration reaches a normal build's link.
-int runLinkObjects(int argc, char* argv[]) {
-    ParsedCommand arguments;
-    int rc = parseCommand(argc, argv, 2, {"--output", "--target", "--library"}, {},
-                          std::numeric_limits<size_t>::max(), false, "link-objects", arguments);
-    if (rc != 0) return rc;
-
-    if (arguments.positionals.empty()) {
-        return usageError("'ens link-objects' needs at least one object file.");
-    }
-    std::string output = arguments.option("--output");
-    if (output.empty()) {
-        return usageError("'ens link-objects' needs an output path; pass --output <file>.");
-    }
-
-    std::vector<std::string> objectPaths;
-    for (const auto& positional : arguments.positionals) {
-        if (!fs::exists(positional)) {
-            return usageError("The object file '" + positional + "' does not exist.");
-        }
-        objectPaths.push_back(positional);
-    }
-
-    std::vector<std::string> libraries;
-    for (const auto& [key, value] : arguments.valued) {
-        if (key == "--library") libraries.push_back(value);
-    }
-
-    if (!Linker::link(objectPaths, libraries, {}, output, std::cerr,
-                      arguments.option("--target"))) {
-        return 1;
-    }
-    return 0;
-}
-
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -709,7 +669,6 @@ int main(int argc, char* argv[]) {
     if (command == "-h" || command == "--help") return printHelp("");
     if (command == "cst-dump") return runCstTool(/*analyze=*/false, argc, argv);
     if (command == "cst-analyze") return runCstTool(/*analyze=*/true, argc, argv);
-    if (command == "link-objects") return runLinkObjects(argc, argv);
 
     if (command == "--source") {
         return usageError("The --source option was retired; use 'ens build <path>' to "
