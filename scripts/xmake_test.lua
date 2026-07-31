@@ -2118,12 +2118,21 @@ task("test")
             env.ENS_STDLIB = path.join(os.projectdir(), "libs")
 
             io.writefile(path.join(ws_dir, "ens.package"),
-                'workspace {\n    member "app";\n}\n')
+                'workspace {\n    member "app";\n    member "tool";\n}\n')
             io.writefile(path.join(ws_dir, "app", "ens.package"),
                 'package demo.app {\n    ens "0.1";\n\n    dependency acme.json "1.0";\n}\n')
             io.writefile(path.join(ws_dir, "app", "src", "main.ens"),
                 'import @acme.json.parse;\n\nmain() -> int {\n    print(parse.tag());\n'
                 .. '    return 0;\n}\n')
+            -- a second member depending on the same package, so the notice a build prints about the
+            -- override is asserted to be one notice rather than one per member
+            os.mkdir(path.join(ws_dir, "tool", "src"))
+            io.writefile(path.join(ws_dir, "tool", "ens.package"),
+                'package demo.tool {\n    ens "0.1";\n\n'
+                .. '    dependency acme.json "1.0";\n}\n')
+            io.writefile(path.join(ws_dir, "tool", "src", "helper.ens"),
+                'import @acme.json.parse;\n\nexport describe() -> string {\n'
+                .. '    return parse.tag();\n}\n')
             io.writefile(path.join(root, "json", "ens.package"),
                 'package acme.json {\n    ens "0.1";\n}\n')
             io.writefile(path.join(root, "json", "src", "parse.ens"),
@@ -2177,7 +2186,24 @@ task("test")
                 "Added the override for package 'acme.json': ../json")
             expect_file("add", 'overrides {\n    override acme.json "../json";\n}\n')
             run({"override", "list"}, in_ws, 0, "acme.json -> ../json", "!not usable")
-            run({"build"}, in_ws, 0, "demo.app: built")
+            -- the build says what it is taking from the override, because nothing in the program
+            -- does; a check says it too, and a run that reports nothing else keeps it to itself
+            run({"build"}, in_ws, 0, "demo.app: built",
+                "Using the override for package 'acme.json': "
+                    .. path.absolute(path.join(root, "json")):gsub("\\", "/"))
+            run({"check"}, in_ws, 0, "Using the override for package 'acme.json'")
+            run({"build", "--quiet"}, in_ws, 0, "!Using the override")
+
+            -- both members take the package from the same override, and the build says so once
+            local _, said = run({"build"}, in_ws, 0, "demo.app: built", "demo.tool: compiled")
+            local times = 0
+            for _ in said:gmatch("Using the override for package 'acme%.json'") do
+                times = times + 1
+            end
+            if times ~= 1 then
+                table.insert(failures, string.format("the override notice appeared %d times, "
+                    .. "expected once:\n%s", times, said))
+            end
             local built = path.join(ws_dir, "app.exe")
             if os.isfile(built) then
                 local rc = execMerged(built, {}, log, {envs = env})
