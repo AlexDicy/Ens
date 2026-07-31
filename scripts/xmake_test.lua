@@ -2241,6 +2241,17 @@ task("test")
                     .. "hop is all there is:\n%s", hops, chained))
             end
 
+            -- the other two compiling commands reach the same hook. 'run' hops with its program's
+            -- arguments intact, and its program's exit code still comes back through the delegate.
+            run(seed_exe, {"run", pkg, "-v"}, chains, 0, hopped_to, "built by a delegate")
+            run(seed_exe, {"run", pkg, "-v", "--toolchain", "local"}, chains, 0,
+                "built by a delegate", not_hopped)
+            run(seed_exe, {"test", pkg, "-v"}, chains, 0, hopped_to, "there are no tests in")
+            run(seed_exe, {"run", hello, "--toolchain", "9.9"}, nothing_installed, 2,
+                "'--toolchain 9.9'", "holds no toolchain at all")
+            run(seed_exe, {"test", pkg, "--toolchain", "9.9"}, nothing_installed, 2,
+                "'--toolchain 9.9'", "holds no toolchain at all")
+
             -- the commands that never delegate, however the environment is set
             run(seed_exe, {"version"}, {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "9.9"}, 0,
                 "ens 0.1")
