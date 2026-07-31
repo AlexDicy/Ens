@@ -1,0 +1,135 @@
+// The take verifier, over hand-built EIR: the shape the move rewrite is allowed to produce passes,
+// and each way a take can move a reference out too early reports its own violation. Reading the
+// emptied slot and reading a reference borrowed out of it before the take are separate mistakes -
+// the first finds null, the second finds an object that may already be freed - so both get a test.
+//
+// Both bad functions count every reference exactly right, which is why each one also asserts that
+// the value and storage verifiers are silent on it: balance is not the property at stake here.
+import @std.testing;
+import PrimitiveKind from @ens.sema.model.types;
+import Type from @ens.sema.model.types;
+import TypeStore from @ens.sema.model.types;
+import EirFunction from eir.model;
+import EirFunctionBuilder from eir.model;
+import EirConstString from eir.model;
+import EirLoadSlot from eir.model;
+import EirRelease from eir.model;
+import EirReleasePtr from eir.model;
+import EirSlotAddress from eir.model;
+import EirStoreSlot from eir.model;
+import EirStringConcat from eir.model;
+import EirStringLength from eir.model;
+import EirTakeSlot from eir.model;
+import EirReturn from eir.model;
+import eir.ownership;
+import eir.storage;
+import eir.takes;
+import support;
+
+// A function whose one slot owns the only reference to a fresh string, ready for a take.
+final class Held {
+    protected EirFunctionBuilder builder;
+    protected TypeStore store;
+    protected long slot;
+
+    protected constructor(this.builder, this.store, this.slot);
+}
+
+holdingAString(string symbol, bool returnsLength) -> Held throws {
+    let store = try support.freshStore();
+    let stringType = store.stringType();
+    Type returnType = stringType;
+    if (returnsLength) {
+        returnType = store.primitive(PrimitiveKind.Long);
+    }
+    let builder = new EirFunctionBuilder(symbol, false, null, [], returnType);
+    long slot = builder.addSlot("text", stringType, true, false);
+    long left = builder.newTemp(stringType);
+    builder.append(new EirConstString(left, stringType, "hel".toBytes()));
+    long right = builder.newTemp(stringType);
+    builder.append(new EirConstString(right, stringType, "lo".toBytes()));
+    long joined = builder.newTemp(stringType);
+    builder.append(new EirStringConcat(joined, stringType, left, right));
+    builder.append(new EirStoreSlot(slot, joined));
+    return new Held(builder, store, slot);
+}
+
+// The length of a string, as the last thing the function does with it.
+measure(Held held, long text) -> long {
+    let longType = held.store.primitive(PrimitiveKind.Long);
+    long length = held.builder.newTemp(longType);
+    held.builder.append(new EirStringLength(length, longType, text));
+    return length;
+}
+
+test "a take whose slot nothing needs again is accepted" {
+    let held = try holdingAString("moved", false);
+    let builder = held.builder;
+    let stringType = held.store.stringType();
+    long taken = builder.newTemp(stringType);
+    builder.append(new EirTakeSlot(taken, stringType, held.slot));
+    long address = builder.newTemp(stringType);
+    builder.append(new EirSlotAddress(address, stringType, held.slot));
+    builder.append(new EirReleasePtr(address));
+    builder.terminate(new EirReturn(taken));
+    try assertNoViolations(takes.verifyTakes(builder.finish()));
+}
+
+test "reading the slot after the take is reported" {
+    let held = try holdingAString("readsAgain", true);
+    let builder = held.builder;
+    let stringType = held.store.stringType();
+    long taken = builder.newTemp(stringType);
+    builder.append(new EirTakeSlot(taken, stringType, held.slot));
+    builder.append(new EirRelease(taken));
+    long reread = builder.newTemp(stringType);
+    builder.append(new EirLoadSlot(reread, stringType, held.slot));
+    builder.terminate(new EirReturn(measure(held, reread)));
+    let function = builder.finish();
+    try assertBalanced(function);
+    try assertMentions(takes.verifyTakes(function),
+        "slot $0 'text' is read again after the take moved its reference out");
+}
+
+test "using a reference borrowed before the take is reported" {
+    let held = try holdingAString("borrowOutlives", true);
+    let builder = held.builder;
+    let stringType = held.store.stringType();
+    long borrowed = builder.newTemp(stringType);
+    builder.append(new EirLoadSlot(borrowed, stringType, held.slot));
+    long taken = builder.newTemp(stringType);
+    builder.append(new EirTakeSlot(taken, stringType, held.slot));
+    builder.append(new EirRelease(taken));
+    builder.terminate(new EirReturn(measure(held, borrowed)));
+    let function = builder.finish();
+    try assertBalanced(function);
+    try assertMentions(takes.verifyTakes(function),
+        "borrows what slot $0 'text' held and is still used after the take");
+}
+
+// Asserts the two ownership verifiers accept the function, so the violation the take verifier
+// reports is one neither of them can see.
+assertBalanced(EirFunction function) throws {
+    try assertNoViolations(ownership.verifyOwnership(function));
+    try assertNoViolations(storage.verifyStorage(function));
+}
+
+assertNoViolations(string[] violations) throws {
+    if (violations.length > 0) {
+        try testing.fail("expected no violations, got {violations.length}: {violations[0]}");
+    }
+}
+
+assertMentions(string[] violations, string fragment) throws {
+    for (let violation in violations) {
+        if (violation.indexOf(fragment) >= 0) {
+            return;
+        }
+    }
+    string seen = "none";
+    if (violations.length > 0) {
+        seen = violations[0];
+    }
+    try testing.fail("no violation mentions '{fragment}' ({violations.length} reported; "
+        + "first: {seen})");
+}
