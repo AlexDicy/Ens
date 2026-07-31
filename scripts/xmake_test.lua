@@ -151,15 +151,12 @@ task("test")
             })
         end
 
-        -- the self-hosted semantic layer's tests. This one suite is still compiled by ens-ref:
-        -- the seed miscompiles it at every optimization level above 0, in the EIR move rewrite of
-        -- the borrow-rewriting pass, and the run ends in an access violation partway through.
-        -- Moving this job onto the seed waits on that pass.
+        -- the self-hosted semantic layer's tests.
         if want("selfhost_sema") then
             table.insert(jobs, {
                 name = "selfhost_sema",
                 source = path.join(os.projectdir(), "selfhost", "sema"),
-                reference_tests = true,
+                ens_test_args = {},
             })
         end
 
@@ -732,25 +729,6 @@ task("test")
             end
             return {name = name, ok = false,
                 short = string.format("harness exit %s", tostring(run_rc)),
-                full = string.format("%s:\n%s", name, out)}
-        end
-
-        -- a `ens test` job the seed cannot compile yet, run by ens-ref instead.
-        local function run_reference_tests(job)
-            local name = job.name
-            local log = path.join(out_dir, name .. ".log")
-            local env, _, env_error = llvmEnvironment()
-            if not env then
-                return {name = name, ok = false, short = "no LLVM environment",
-                    full = string.format("%s: %s", name, env_error)}
-            end
-            local run_rc = execMerged(ref_exe, {"test", job.source}, log, {envs = env})
-            local out = captured(log)
-            if run_rc == 0 then
-                return {name = name, ok = true, note = out:match("(%d+/%d+ tests passed)")}
-            end
-            return {name = name, ok = false,
-                short = string.format("ens test exit %s", tostring(run_rc)),
                 full = string.format("%s:\n%s", name, out)}
         end
 
@@ -2280,7 +2258,6 @@ task("test")
             if job.cli_artifact then return run_cli_artifact(job) end
             if job.codegencheck then return run_codegencheck(job) end
             if job.bootstrap then return run_bootstrap(job) end
-            if job.reference_tests then return run_reference_tests(job) end
             local name = job.name
             local ens_file = job.ens_file
             local exe_file    = path.join(out_dir, name .. ".exe")
