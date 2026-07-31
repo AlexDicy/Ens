@@ -4890,15 +4890,47 @@ Type* Analyzer::analyzeBinaryOperands(const SyntaxNode& diagNode, SyntaxKind op,
 
         case SyntaxKind::Amp:
         case SyntaxKind::Pipe:
-        case SyntaxKind::Caret:
-        case SyntaxKind::LtLt:
-        case SyntaxKind::GtGt:
-        case SyntaxKind::GtGtGt:
-            if (!l->isInteger() || !r->isInteger() || !l->equals(r)) {
+        case SyntaxKind::Caret: {
+            if (!l->isInteger() || !r->isInteger()) {
+                errorAtNode(diagNode, "'" + opText + "' needs integers on both sides, got '" +
+                    l->toString() + "' and '" + r->toString() + "'.");
+                return typeCtx.getError();
+            }
+            if (!tryAdaptOperands()) return typeCtx.getError();
+            if (!l->equals(r)) {
                 errorAtNode(diagNode, "'" + opText + "' needs the same integer type on both "
-                    "sides, got '" + l->toString() + "' and '" + r->toString() + "'.");
+                    "sides, got '" + l->toString() + "' and '" + r->toString() +
+                    "'; convert one side with 'as'.");
+                return typeCtx.getError();
             }
             return l;
+        }
+
+        case SyntaxKind::LtLt:
+        case SyntaxKind::GtGt:
+        case SyntaxKind::GtGtGt: {
+            if (!l->isInteger()) {
+                errorAtNode(diagNode, "'" + opText + "' shifts an integer, got '" +
+                    l->toString() + "'.");
+                return typeCtx.getError();
+            }
+            if (!r->isInteger()) {
+                errorAtNode(diagNode, "'" + opText + "' needs an integer shift distance, got '" +
+                    r->toString() + "'.");
+                return typeCtx.getError();
+            }
+            // The shifted value alone decides the result type, so only the distance adapts.
+            tryAdaptIntegerLiteral(right, l);
+            if (Type* updated = analysis.typeOf(right.node.greenNode())) r = updated;
+            if (r->isError()) return typeCtx.getError();
+            if (!l->equals(r)) {
+                errorAtNode(diagNode, "'" + opText + "' shifts a value of type '" +
+                    l->toString() + "', so the shift distance must be '" + l->toString() +
+                    "' too, got '" + r->toString() + "'; convert the distance with 'as'.");
+                return typeCtx.getError();
+            }
+            return l;
+        }
 
         default:
             errorAtNode(diagNode, "Unsupported binary operator");

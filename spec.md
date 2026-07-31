@@ -886,6 +886,21 @@ for (let n in new Range(1, 10)) {
 
 `break` exits the nearest enclosing loop; `continue` skips to its next iteration. Using either outside a loop is a compile error.
 
+The bitwise operators `&`, `|`, and `^` combine two integers of the same type and produce that type.
+An untyped integer literal adapts to the other side, the same way it does for `+`, `-`, and `*`, so a `uint` masked with `0xFF` needs no cast.
+The shift operators `<<` and `>>` move a value's bits by a distance, and `>>` keeps a signed value's sign while an unsigned one fills with zeros.
+A shift produces the type of the value it shifts, so the distance must be that same integer type, and an untyped literal distance adapts to it.
+The distance never decides the result, so an untyped literal on the left of a shift stays `int` and shifting by a `uint` distance is written `(1 as uint) << spread`.
+
+```ens
+uint flags = 0x12345678;
+uint low = flags & 0xFF;        // 0x78: the literal adapts to uint
+uint top = flags >> 24;         // 0x12: the distance adapts to uint
+
+byte mask = 0x0F;
+byte bits = mask & 300;         // error: 300 does not fit in 'byte' (range 0..255)
+```
+
 The logical operators `&&` and `||` require `bool` operands and short-circuit: the right side is evaluated only when it can change the result, so `a != null && a.ready()` is safe.
 
 The null-coalescing operator `??` takes a nullable value on the left. It evaluates to that value when it is not `null`, and otherwise evaluates and returns the right side. The right side is skipped when the left is non-null.
