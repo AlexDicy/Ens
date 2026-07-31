@@ -1,0 +1,307 @@
+// `ens` is also a version multiplexer. When the build root is written for a version of Ens other
+// than this one, and that version is installed, the whole command is handed to it and its exit code
+// becomes this run's.
+//
+// Which toolchain does the work is one rule, `decide`, and nothing else decides it: a function of
+// what was asked for, what this toolchain is, and what is installed. Finding what is installed and
+// running it are the only parts that reach outside, so the rule itself is settled without touching a
+// file or starting a process.
+//
+// A version a manifest declares and a version a command line asks for are answered differently, on
+// purpose. A declaration says what a package is written for and does not ask for that version to be
+// present, so a declaration this machine cannot satisfy is built here and said out loud only to a
+// run that asked to be told. A command line asking for a toolchain that is not installed asked for
+// something that is not there, which is a mistake to report rather than to quietly ignore.
+import @std.system;
+import SystemError from @std.system;
+import @std.path;
+import List from @std.collections.list;
+import @ens.llvm.target;
+import Environment from environment;
+import home;
+import platform;
+import Reporter from report;
+import report;
+import version;
+
+// What the command line and the environment said about which toolchain does the work.
+export final class ToolchainRequest {
+    string optionText;
+    string environmentText;
+
+    export constructor(this.optionText, this.environmentText);
+
+    // The version '--toolchain' named, or empty text when the command line named none.
+    export option() -> string {
+        return this.optionText;
+    }
+
+    // The version ENS_TOOLCHAIN named, or empty text when the environment named none.
+    export environmentValue() -> string {
+        return this.environmentText;
+    }
+}
+
+// One installed toolchain: the version it is, and the program that is it.
+export final class InstalledToolchain {
+    string toolchainVersion;
+    string programFile;
+
+    export constructor(this.toolchainVersion, this.programFile);
+
+    export version() -> string {
+        return this.toolchainVersion;
+    }
+
+    export program() -> string {
+        return this.programFile;
+    }
+}
+
+// Every toolchain installed where toolchains live, with the folder they were looked for in and the
+// name one of their programs carries, so a run that wanted a missing one can say where it looked and
+// what it would have taken to be there.
+export final class InstalledToolchains {
+    string rootFolder;
+    string programFileName;
+    InstalledToolchain[] found;
+
+    export constructor(this.rootFolder, this.programFileName, this.found);
+
+    // The folder toolchains live in, or empty text when nothing says where that is.
+    export root() -> string {
+        return this.rootFolder;
+    }
+
+    // What the program of an installed toolchain is called on this machine.
+    export programName() -> string {
+        return this.programFileName;
+    }
+
+    export versions() -> string[] {
+        let named = new List<string>();
+        for (let one in this.found) {
+            named.push(one.version());
+        }
+        return named.toArray();
+    }
+
+    // The program that is the named version, or empty text when that version is not installed.
+    export programOf(string wanted) -> string {
+        for (let one in this.found) {
+            if (one.version() == wanted) {
+                return one.program();
+            }
+        }
+        return "";
+    }
+}
+
+// Which toolchain does the work, why, and what a command line that cannot be acted on got wrong.
+export final class ToolchainDecision {
+    string chosenVersion;
+    string chosenProgram;
+    string problem;
+    string reason;
+
+    protected constructor(this.chosenVersion, this.chosenProgram, this.problem, this.reason);
+
+    // Whether another toolchain does the work, which is exactly when there is a program to run.
+    export delegates() -> bool {
+        return this.chosenProgram.length > 0;
+    }
+
+    // The version doing the work when it is not this one, and empty text when this one is.
+    export version() -> string {
+        return this.chosenVersion;
+    }
+
+    // The program to run, when the work goes to another toolchain.
+    export program() -> string {
+        return this.chosenProgram;
+    }
+
+    // Why the command line cannot be acted on, or empty text when it can.
+    export failure() -> string {
+        return this.problem;
+    }
+
+    // What a run that asked to be told each step says about this choice, or empty text when the
+    // choice is the obvious one and there is nothing worth saying.
+    export explanation() -> string {
+        return this.reason;
+    }
+}
+
+// Whether another toolchain answered the command, and with what.
+export final class Handoff {
+    bool completed;
+    int code;
+
+    protected constructor(this.completed, this.code);
+
+    // Whether the command is answered: another toolchain ran it, or it asked for one that is not
+    // there. Either way there is nothing left for this toolchain to do.
+    export finished() -> bool {
+        return this.completed;
+    }
+
+    // The exit code the command ended with, which means something only once it is finished.
+    export exitCode() -> int {
+        return this.code;
+    }
+}
+
+// Decides which toolchain does the work and, when it is another one, runs it and answers with its
+// exit code. `argv` is what this process was given after its own name, forwarded exactly as it
+// arrived so the other toolchain reads the command line this one was given.
+export hand(Environment environment, ToolchainRequest request, string governingVersion,
+            string[] argv, Reporter reporter) -> Handoff {
+    let installed = discover(root(environment), target.hostTargetTriple());
+    let decision = decide(request, governingVersion, version.toolchainVersion(), installed);
+    if (decision.failure().length > 0) {
+        reporter.problem(decision.failure());
+        return new Handoff(true, 2);
+    }
+    if (decision.explanation().length > 0) {
+        reporter.step(decision.explanation());
+    }
+    if (!decision.delegates()) {
+        return new Handoff(false, 0);
+    }
+    return new Handoff(true, runToolchain(decision.program(), argv, reporter));
+}
+
+// Which toolchain does the work. `governing` is the version the build root is written for, `running`
+// is the version this toolchain is, and `installed` is what was found where toolchains live.
+//
+// The exact-text comparison of two versions is the whole of the rule for now: a build root written
+// for another version is built by that version when it is here, and by this one when it is not.
+export decide(ToolchainRequest request, string governing, string running,
+              InstalledToolchains installed) -> ToolchainDecision {
+    string asked = request.option();
+    if (asked.length == 0) {
+        asked = request.environmentValue();
+    }
+    if (asked == localToolchain() || asked == running) {
+        return buildHere("");
+    }
+    if (request.environmentValue() == localToolchain()) {
+        string named = askedBy(request, asked);
+        return buildHere("{named} asks for Ens {asked}, and ENS_TOOLCHAIN=local keeps the work "
+            + "here, so this toolchain is building it");
+    }
+    if (asked.length > 0) {
+        return honorRequest(request, asked, running, installed);
+    }
+    if (governing.length == 0 || governing == running) {
+        return buildHere("");
+    }
+    string program = installed.programOf(governing);
+    if (program.length == 0) {
+        string missing = missingFrom(installed, governing);
+        return buildHere("this build root is written for Ens {governing} and this toolchain is "
+            + "{running}; {missing}, so this toolchain is building it");
+    }
+    return new ToolchainDecision(governing, program, "",
+        "this build root is written for Ens {governing}, so '{program}' is building it");
+}
+
+// A version the command line or the environment asked for by name. Asking for one that is not here
+// is a usage problem: it names a toolchain, and there is no toolchain to name.
+honorRequest(ToolchainRequest request, string asked, string running,
+             InstalledToolchains installed) -> ToolchainDecision {
+    string named = askedBy(request, asked);
+    string program = installed.programOf(asked);
+    if (program.length > 0) {
+        return new ToolchainDecision(asked, program, "",
+            "{named} asks for Ens {asked}, so '{program}' is building it");
+    }
+    string missing = missingFrom(installed, asked);
+    string remedy = howToInstall(installed, asked);
+    return new ToolchainDecision("", "", "{named} asks for a toolchain that is not installed: "
+        + "{missing}. {remedy}, or ask for 'local' to build with this toolchain, which is Ens "
+        + "{running}", "");
+}
+
+// Where toolchains live: the folder ENS_TOOLCHAINS names, else '.ens/toolchains' under this user's
+// own folder, or empty text when neither says where.
+export root(Environment environment) -> string {
+    string named = environment.value("ENS_TOOLCHAINS");
+    if (named.length > 0) {
+        return path.normalize(path.fromNative(named, environment.platform()));
+    }
+    return home.ensFolder(environment, "toolchains");
+}
+
+// The toolchains installed under `root`: one folder per version, each holding the program that is
+// that version. A folder without that program is not a toolchain, so something else left in there
+// cannot make a version look installed. What the program is called follows `hostTriple`, because the
+// toolchain that runs has to run on this machine whatever the build is targeting.
+export discover(string root, string hostTriple) -> InstalledToolchains {
+    string program = platform.executableNamed("ens", hostTriple);
+    let found = new List<InstalledToolchain>();
+    if (root.length > 0 && system.isDirectory(root)) {
+        for (let entry in try system.listDirectory(root)) {
+            string candidate = path.join(path.join(root, entry), program);
+            if (system.isFile(candidate)) {
+                found.push(new InstalledToolchain(entry, candidate));
+            }
+        }
+    }
+    return new InstalledToolchains(root, program, found.toArray());
+} catch (SystemError error) {
+    InstalledToolchain[] none = [];
+    return new InstalledToolchains(root, platform.executableNamed("ens", hostTriple), none);
+}
+
+// Hands the whole command to another toolchain: the arguments exactly as they arrived, its streams
+// left with this process so its output appears as it is written, and ENS_TOOLCHAIN=local in its
+// environment, which is what stops it handing the work on again. One hop is all there ever is.
+runToolchain(string program, string[] argv, Reporter reporter) -> int {
+    string[] pinned = ["ENS_TOOLCHAIN=" + localToolchain()];
+    return try system.run(program, argv, pinned);
+} catch (SystemError error) {
+    reporter.problem("the toolchain at '{program}' could not be run: {error.message}");
+    return 1;
+}
+
+// The version that means "this one", whatever this one is.
+localToolchain() -> string {
+    return "local";
+}
+
+buildHere(string reason) -> ToolchainDecision {
+    return new ToolchainDecision("", "", "", reason);
+}
+
+// How the version being talked about was asked for, so a message names what the reader wrote.
+askedBy(ToolchainRequest request, string asked) -> string {
+    if (request.option().length > 0) {
+        return "'--toolchain {asked}'";
+    }
+    return "ENS_TOOLCHAIN={asked}";
+}
+
+// Why the wanted version is not here: what the folder holds instead, or that nothing says where to
+// look at all.
+missingFrom(InstalledToolchains installed, string wanted) -> string {
+    if (installed.root().length == 0) {
+        return "no toolchain for {wanted} is installed, and nothing says where toolchains live";
+    }
+    string[] versions = installed.versions();
+    if (versions.length == 0) {
+        return "'{installed.root()}' holds no toolchain at all";
+    }
+    return "'{installed.root()}' holds " + report.quotedNames(versions);
+}
+
+// What it would take for the wanted version to be found next time.
+howToInstall(InstalledToolchains installed, string wanted) -> string {
+    if (installed.root().length == 0) {
+        return "Set ENS_TOOLCHAINS to the folder your toolchains live in, or set HOME (USERPROFILE "
+            + "on Windows) so they are looked for under '.ens/toolchains' there";
+    }
+    return "Install Ens {wanted} as '"
+        + path.join(path.join(installed.root(), wanted), installed.programName()) + "'";
+}
