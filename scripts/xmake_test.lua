@@ -100,6 +100,17 @@ task("test")
             end
         end
 
+        -- the standard library's own unit tests: the rules its modules answer with rather than the
+        -- effects the tests/ fixtures drive against a real operating system. The environment merge
+        -- is checked for every platform here, since it is handed the platform's name.
+        if want("std_library") then
+            table.insert(jobs, {
+                name = "std_library",
+                source = path.join(os.projectdir(), "libs", "std"),
+                ens_test_args = {},
+            })
+        end
+
         -- the self-hosted front end's own tests run as one `ens test <package>` job.
         if want("selfhost_frontend") then
             table.insert(jobs, {

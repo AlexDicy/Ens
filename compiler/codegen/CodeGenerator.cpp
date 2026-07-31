@@ -1942,6 +1942,33 @@ struct CodeGenerator::Impl {
         return fn;
     }
 
+    // i32 ens_platform(): 0 for Windows, 2 for macOS, 1 for everything else, which
+    // behaves as Linux does. The code is decided while the module is compiled, so the
+    // Ens wrapper turns it into a name without asking the operating system anything.
+    llvm::Function* definePlatformRuntime() {
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* fnTy = llvm::FunctionType::get(i32Ty, {}, false);
+        llvm::Function* fn = module->getFunction("ens_platform");
+        if (!fn) {
+            fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "ens_platform", module.get());
+        }
+        if (!fn->empty()) return fn;
+
+        auto savedIP = builder->saveIP();
+        builder->SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", fn));
+        const llvm::Triple& triple = module->getTargetTriple();
+        int code = 1;
+        if (triple.isOSWindows()) {
+            code = 0;
+        } else if (triple.isOSDarwin()) {
+            code = 2;
+        }
+        builder->CreateRet(llvm::ConstantInt::get(i32Ty, code));
+        builder->restoreIP(savedIP);
+        return fn;
+    }
+
     // The bridge functions the module defines rather than links, one per referencing
     // module. The text crossing them is UTF-8, the encoding an Ens string holds, so
     // the Windows halves convert to and from UTF-16 and call the wide entry points.
@@ -9136,6 +9163,7 @@ struct CodeGenerator::Impl {
         if (sym && sym->name == u"ens_create_directory") defineCreateDirectoryRuntime();
         if (sym && sym->name == u"ens_executable_path") defineExecutablePathRuntime();
         if (sym && sym->name == u"ens_environment") defineEnvironmentRuntime();
+        if (sym && sym->name == u"ens_platform") definePlatformRuntime();
         if (sym && sym->name == u"ens_write_error") defineWriteErrorRuntime();
         llvm::Function* fn = getOrDeclareExternalFunction(sym, /*receiver*/ nullptr);
         if (!fn) {

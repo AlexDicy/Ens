@@ -1245,12 +1245,16 @@ Neither can be changed: a program builds the paths it works with rather than mov
 `system.environment()` returns the variables the program inherited as `NAME=VALUE` entries in ascending order by their bytes, and `system.getEnvironmentVariable(name)` returns one variable's value, or `null` when it is not set.
 The environment cannot be changed either; a program that wants a child to see something else passes it when it starts that child.
 
+`system.platform()` names the system the program was built for as `"windows"`, `"linux"` or `"macos"`, the same three names a package manifest uses for a native binding.
+Any other system the compiler can target reports `"linux"`, whose behavior it shares.
+
 `system.writeError(message)` writes `message` and a newline to standard error, the stream a program reports its problems on, the way `print` writes to standard output.
 
 `system.run(command)` runs one command line through the operating system's command interpreter.
 `system.run(program, arguments)` starts `program` with `arguments` and waits for it, leaving both output streams with the running program, so what the child writes appears where it would have appeared as it is written.
 `system.runCaptured(program, arguments, stdoutPath, stderrPath)` writes what the child sent to its standard output and its standard error into the two files instead, and an empty path leaves that one stream alone, so one call can capture one stream and pass the other through.
 Both have a further form taking a `string[]` of `NAME=VALUE` overrides after the arguments: those entries are laid over the environment the program inherited, replacing the entries naming the same variable and leaving every other variable in place, so a child never loses the search path it needs to find the programs it runs.
+Two names match without regard to case on Windows, the way that system matches them, and exactly everywhere else, where `PATH` and `path` name two different variables and both reach the child.
 No command interpreter takes part in these forms, so every argument reaches the program exactly as written, whatever spaces or quotes it holds, and nothing is expanded on the way.
 Each returns the child's exit code; a program that could not be started reports `127`, the code a shell reports for the same failure, and a capture file that could not be opened for writing raises a `SystemError`.
 
