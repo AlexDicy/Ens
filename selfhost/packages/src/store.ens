@@ -1,0 +1,151 @@
+// The cache every build on this machine shares. What a thing is decides where it lives: a folder in
+// the store is named after the digest of what is inside it, so two builds that fetched the same
+// package agree on where it is without either of them knowing about the other.
+//
+// Nothing already in the store is ever written to again. A fetch is assembled somewhere else under
+// the same root and moved into place in one step, so no build ever reads a half-written package, and
+// two builds racing to publish the same content settle it by both being right: the digest named the
+// folder, so whichever copy arrived first holds the same bytes as the one that lost.
+import @std.system;
+import SystemError from @std.system;
+import @std.path;
+import Environment from @ens.host.environment;
+import Scratch from @ens.host.scratch;
+import @ens.host.scratch;
+import @ens.host.home;
+import hashing;
+
+export final class ContentStore {
+    string rootFolder;
+
+    export constructor(this.rootFolder);
+
+    export root() -> string {
+        return this.rootFolder;
+    }
+
+    // Where a tree with this digest lives, whether or not it is there yet.
+    export treeFolder(string digest) -> string {
+        return path.join(path.join(this.rootFolder, "trees"), "sha256-" + hashing.digits(digest));
+    }
+
+    // Where an artifact with this digest lives. The file keeps its own name inside a folder named
+    // after the digest, so what a link line names still reads as the library it is.
+    export artifactFile(string digest, string fileName) -> string {
+        return path.join(path.join(path.join(this.rootFolder, "artifacts"),
+            hashing.digits(digest)), fileName);
+    }
+
+    export hasTree(string digest) -> bool {
+        return system.isDirectory(this.treeFolder(digest));
+    }
+
+    export hasArtifact(string digest, string fileName) -> bool {
+        return system.isFile(this.artifactFile(digest, fileName));
+    }
+
+    // Somewhere under the store to assemble a fetch. It sits under the store's own root so that
+    // publishing it is a move rather than a copy, which is what lets the store never hold a
+    // half-written tree.
+    export stage(string prefix) -> Scratch {
+        return scratch.createUnder(path.join(this.rootFolder, "staging"), prefix);
+    }
+
+    // Puts an assembled tree into the store under its digest. A tree another run published first is
+    // the one that stays, and the assembled copy is dropped.
+    export publishTree(string staged, string digest) -> Published throws {
+        string destination = this.treeFolder(digest);
+        string problem = claim(staged, destination);
+        if (problem.length > 0) {
+            let dropped = scratch.discard(staged);
+            throw new SystemError(problem);
+        }
+        return new Published(destination, scratch.discard(staged));
+    }
+
+    // The same for a single fetched file, which is what a native artifact is.
+    export publishArtifact(string stagedFile, string digest, string fileName) -> Published throws {
+        string destination = this.artifactFile(digest, fileName);
+        string problem = claim(stagedFile, destination);
+        if (problem.length > 0) {
+            throw new SystemError(problem);
+        }
+        return new Published(destination, discardFile(stagedFile));
+    }
+}
+
+// Where something now is in the store, and anything the publishing left behind on the way. A
+// leftover is reported without being allowed to decide the run's outcome: what was asked for is in
+// the store either way, and a staging folder nothing removed is stepped over rather than read.
+export final class Published {
+    string storedPath;
+    string leftover;
+
+    protected constructor(this.storedPath, this.leftover);
+
+    export path() -> string {
+        return this.storedPath;
+    }
+
+    export leftBehind() -> string {
+        return this.leftover;
+    }
+}
+
+// Where the store lives: what ENS_CACHE says, else the 'cache' folder Ens keeps for this user, and
+// empty text when nothing says where either of them is.
+export rootFor(Environment environment) -> string {
+    string named = environment.value("ENS_CACHE");
+    if (named.length > 0) {
+        return path.normalize(path.fromNative(named, environment.platform()));
+    }
+    return home.ensFolder(environment, "cache");
+}
+
+// The store for this run, or null when nothing says where it would live.
+export locate(Environment environment) -> ContentStore? {
+    string root = rootFor(environment);
+    if (root.length == 0) {
+        return null;
+    }
+    return new ContentStore(root);
+}
+
+// What to tell a user whose run found nowhere to cache what it fetched.
+export missingRootMessage(Environment environment) -> string {
+    string variable = "HOME";
+    if (environment.platform() == "windows") {
+        variable = "USERPROFILE";
+    }
+    return "there is nowhere to keep what a build fetches: nothing in the environment says where "
+        + "this user's own folder is. Set ENS_CACHE to a folder that can be written to, or set "
+        + variable;
+}
+
+// Moves what was assembled into its place in the store, when nothing is there yet. Something already
+// there was published by another run and stays as it is, since the digest named it and both hold the
+// same bytes. Answers with "" when the store now holds it, or with what stopped that.
+claim(string staged, string destination) -> string {
+    if (system.exists(destination)) {
+        return "";
+    }
+    string parent = path.parentFolder(destination);
+    if (parent.length > 0) {
+        try system.createDirectory(parent);
+    }
+    let mine = try system.move(staged, destination);
+    return "";
+} catch (SystemError error) {
+    return "'{destination}' could not be written: {error.message}";
+}
+
+// Removes a staged file the store did not take, doing nothing when the move already took it.
+discardFile(string file) -> string {
+    if (!system.isFile(file)) {
+        return "";
+    }
+    try system.removeFile(file);
+    return "";
+} catch (SystemError error) {
+    return "'{file}' could not be removed after it was cached: {error.message}";
+}

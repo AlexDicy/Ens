@@ -1,0 +1,136 @@
+// Where the store lives, where a digest puts a thing inside it, and what publishing does. Publishing
+// is driven against real folders, since what it promises is about a move the operating system makes
+// and not about text.
+import @std.testing;
+import @std.system;
+import @std.path;
+import Environment from @ens.host.environment;
+import ContentStore from store;
+import store;
+import hashing;
+import support;
+
+test "the environment names the store, and the user's own folder holds it when it does not" {
+    let named = new Environment(["ENS_CACHE=D:\\shared\\ens-cache",
+        "USERPROFILE=C:\\Users\\Ada"], "windows");
+    try testing.assertEqual(store.rootFor(named), "D:/shared/ens-cache");
+
+    let byUser = new Environment(["USERPROFILE=C:\\Users\\Ada"], "windows");
+    try testing.assertEqual(store.rootFor(byUser), "C:/Users/Ada/.ens/cache");
+
+    let posix = new Environment(["HOME=/home/ada"], "linux");
+    try testing.assertEqual(store.rootFor(posix), "/home/ada/.ens/cache");
+}
+
+test "a store nothing says the place of is no store, and says which variables would say it" {
+    let nothing = new Environment(["PATH=/usr/bin"], "linux");
+    try testing.assertEqual(store.rootFor(nothing), "");
+    try testing.assertTrue(store.locate(nothing) == null, "a store was located out of nothing");
+    string message = store.missingRootMessage(nothing);
+    try assertMentions(message, "ENS_CACHE");
+    try assertMentions(message, "HOME");
+    try assertMentions(store.missingRootMessage(new Environment(["PATH=x"], "windows")),
+        "USERPROFILE");
+}
+
+test "a digest decides where a thing lives, written either way round" {
+    let cache = new ContentStore("/cache");
+    string digest = "sha256:" + "ab" + zeros(62);
+    try testing.assertEqual(cache.treeFolder(digest), "/cache/trees/sha256-ab" + zeros(62));
+    try testing.assertEqual(cache.treeFolder(hashing.digits(digest)),
+        cache.treeFolder(digest));
+    try testing.assertEqual(cache.artifactFile(digest, "z.lib"),
+        "/cache/artifacts/ab" + zeros(62) + "/z.lib");
+    try testing.assertEqual(cache.root(), "/cache");
+}
+
+test "a fetch is assembled under the store, so publishing it never leaves the volume" {
+    string root = try support.scratch("store-stage");
+    let cache = new ContentStore(root);
+
+    let first = cache.stage("fetch");
+    try testing.assertEqual(first.failure(), "");
+    try testing.assertEqual(first.folder(), path.join(root, "staging/fetch-1"));
+    try testing.assertTrue(system.isDirectory(first.folder()), "the staging folder was created");
+
+    let second = cache.stage("fetch");
+    try testing.assertEqual(second.folder(), path.join(root, "staging/fetch-2"));
+    try support.removeTree(root);
+}
+
+test "publishing moves the assembled tree under its digest and leaves the staging folder empty" {
+    string root = try support.scratch("store-publish");
+    let cache = new ContentStore(root);
+    let staged = cache.stage("fetch");
+    try support.writeFile(staged.folder(), "src/main.ens", "the main module\n");
+    string digest = try hashing.ofTree(staged.folder());
+
+    try testing.assertFalse(cache.hasTree(digest), "the store already held the tree");
+    let published = try cache.publishTree(staged.folder(), digest);
+    try testing.assertEqual(published.path(), cache.treeFolder(digest));
+    try testing.assertEqual(published.leftBehind(), "");
+    try testing.assertTrue(cache.hasTree(digest), "the store does not hold the tree");
+    try testing.assertEqual(
+        try system.readAllText(path.join(published.path(), "src/main.ens")),
+        "the main module\n");
+    try testing.assertFalse(system.exists(staged.folder()), "the staging folder is still there");
+    try testing.assertEqual(try hashing.ofTree(published.path()), digest);
+    try support.removeTree(root);
+}
+
+// Two runs fetching the same package publish the same digest, and the copy that arrived first is the
+// one that stays: the digest named the folder, so both hold the same bytes and either will do.
+test "a tree another run published first stays, and the copy that lost is dropped" {
+    string root = try support.scratch("store-race");
+    let cache = new ContentStore(root);
+
+    let winner = cache.stage("fetch");
+    try support.writeFile(winner.folder(), "parse.ens", "the parse module\n");
+    string digest = try hashing.ofTree(winner.folder());
+    let first = try cache.publishTree(winner.folder(), digest);
+
+    let loser = cache.stage("fetch");
+    try support.writeFile(loser.folder(), "parse.ens", "the parse module\n");
+    let second = try cache.publishTree(loser.folder(), digest);
+
+    try testing.assertEqual(second.path(), first.path());
+    try testing.assertEqual(second.leftBehind(), "");
+    try testing.assertFalse(system.exists(loser.folder()), "the copy that lost was left behind");
+    try support.removeTree(root);
+}
+
+test "an artifact keeps its own name under a folder named after its digest" {
+    string root = try support.scratch("store-artifact");
+    let cache = new ContentStore(root);
+    let staged = cache.stage("download");
+    string downloaded = path.join(staged.folder(), "z.lib");
+    try system.writeAllText(downloaded, "not really a library\n");
+    string digest = try hashing.ofFile(downloaded);
+
+    try testing.assertFalse(cache.hasArtifact(digest, "z.lib"), "the store already held it");
+    let published = try cache.publishArtifact(downloaded, digest, "z.lib");
+    try testing.assertEqual(published.path(), cache.artifactFile(digest, "z.lib"));
+    try testing.assertEqual(published.leftBehind(), "");
+    try testing.assertTrue(cache.hasArtifact(digest, "z.lib"), "the store does not hold it");
+    try testing.assertEqual(try hashing.ofFile(published.path()), digest);
+
+    // A second download of the same bytes finds them already there and drops its own copy.
+    string again = path.join(staged.folder(), "z.lib");
+    try system.writeAllText(again, "not really a library\n");
+    let repeated = try cache.publishArtifact(again, digest, "z.lib");
+    try testing.assertEqual(repeated.path(), published.path());
+    try testing.assertFalse(system.isFile(again), "the second download was left behind");
+    try support.removeTree(root);
+}
+
+zeros(long count) -> string {
+    string text = "";
+    for (long i = 0; i < count; i++) {
+        text = text + "0";
+    }
+    return text;
+}
+
+assertMentions(string text, string fragment) throws {
+    try testing.assertTrue(text.indexOf(fragment) >= 0, "'{fragment}' is missing from: {text}");
+}
