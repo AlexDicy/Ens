@@ -4799,6 +4799,7 @@ Type* Analyzer::analyzeBinaryOperands(const SyntaxNode& diagNode, SyntaxKind op,
                                       const ast::Expression& right, Type* l, Type* r) {
     // Adapt polymorphic integer literals to the other operand's type when one
     // side is a non-literal concrete numeric type. Re-read after adaptation.
+    // False means a literal did not fit and said so, so the operator stays quiet.
     auto tryAdaptOperands = [&]() {
         tryAdaptIntegerLiteral(left, r);
         tryAdaptIntegerLiteral(right, l);
@@ -4806,6 +4807,7 @@ Type* Analyzer::analyzeBinaryOperands(const SyntaxNode& diagNode, SyntaxKind op,
         Type* ru = analysis.typeOf(right.node.greenNode());
         if (lu) l = lu;
         if (ru) r = ru;
+        return !l->isError() && !r->isError();
     };
 
     switch (op) {
@@ -4833,7 +4835,7 @@ Type* Analyzer::analyzeBinaryOperands(const SyntaxNode& diagNode, SyntaxKind op,
                     l->toString() + "' and '" + r->toString() + "'.");
                 return typeCtx.getError();
             }
-            tryAdaptOperands();
+            if (!tryAdaptOperands()) return typeCtx.getError();
             Type* common = numericCommonType(l, r);
             if (!common) {
                 errorAtNode(diagNode, "'" + opText + "' needs the same numeric type on both "
@@ -4877,7 +4879,7 @@ Type* Analyzer::analyzeBinaryOperands(const SyntaxNode& diagNode, SyntaxKind op,
                     l->toString() + "' and '" + r->toString() + "'.");
                 return typeCtx.getPrimitive(TypeKind::Bool);
             }
-            tryAdaptOperands();
+            if (!tryAdaptOperands()) return typeCtx.getPrimitive(TypeKind::Bool);
             if (!numericCommonType(l, r)) {
                 errorAtNode(diagNode, "'" + opText + "' needs the same numeric type on both "
                     "sides, got '" + l->toString() + "' and '" + r->toString() +
