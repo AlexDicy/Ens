@@ -1,0 +1,354 @@
+// What a path argument names, and what a build has to know about it: one '.ens' file, a plain
+// folder of sources, a package, or a workspace of member packages. With no path argument the
+// nearest manifest above the folder the command was run from is the target.
+//
+// A workspace keeps its members as the graph its manifests describe: each member carries the
+// packages it declares a dependency on, and the order a build runs them in is derived from that
+// graph rather than fixed here. A future scheduler can then run members that do not depend on each
+// other at the same time, which a flattened list would have thrown away.
+import @std.system;
+import @std.path;
+import @std.text.strings;
+import List from @std.collections.list;
+import Set from @std.collections.set;
+import FileLoader from @ens.sema.support.loader;
+import paths;
+import ManifestSurvey from @ens.sema.program.workspace;
+import @ens.sema.program.workspace;
+
+export enum TargetKind {
+    // One '.ens' file, compiled as a program whose main module is that file.
+    File,
+    // A folder of sources with no manifest above them inside the folder.
+    Folder,
+    // A folder whose manifest declares a package.
+    Package,
+    // A folder whose manifest lists member packages.
+    Workspace,
+}
+
+// One member of a workspace: the package it declares, the folder it lives in, the packages it
+// declares a dependency on, and the Ens version it says it is written for.
+export final class WorkspaceMember {
+    string memberName;
+    string memberFolder;
+    string[] memberDependencies;
+    string memberVersion;
+
+    export constructor(this.memberName, this.memberFolder, this.memberDependencies,
+                this.memberVersion);
+
+    export packageName() -> string {
+        return this.memberName;
+    }
+
+    export folder() -> string {
+        return this.memberFolder;
+    }
+
+    // The packages this member declares a dependency on, whether or not they are members too.
+    export dependencies() -> string[] {
+        return this.memberDependencies;
+    }
+
+    export ensVersion() -> string {
+        return this.memberVersion;
+    }
+}
+
+export final class BuildTarget {
+    TargetKind targetKind;
+    string targetRoot;
+    string targetSource;
+    string targetTests;
+    string targetEntry;
+    string targetName;
+    string targetPackage;
+    WorkspaceMember[] targetMembers;
+    string targetVersion;
+
+    protected constructor(this.targetKind, this.targetRoot, this.targetSource, this.targetTests,
+                this.targetEntry, this.targetName, this.targetPackage, this.targetMembers,
+                this.targetVersion);
+
+    export kind() -> TargetKind {
+        return this.targetKind;
+    }
+
+    // The folder or file the command line named, or the manifest folder discovery found.
+    export root() -> string {
+        return this.targetRoot;
+    }
+
+    // The folder the modules are read from.
+    export sourceFolder() -> string {
+        return this.targetSource;
+    }
+
+    // The folder holding the target's tests, or empty text when it has none.
+    export testsFolder() -> string {
+        return this.targetTests;
+    }
+
+    // The file that is the program's main module, for a single-file target; empty otherwise.
+    export entryFile() -> string {
+        return this.targetEntry;
+    }
+
+    // What an artifact of this target is named after.
+    export artifactName() -> string {
+        return this.targetName;
+    }
+
+    // The package the target's manifest declares, or empty text when it declares none.
+    export packageName() -> string {
+        return this.targetPackage;
+    }
+
+    export members() -> WorkspaceMember[] {
+        return this.targetMembers;
+    }
+
+    // The Ens version the build root declares it is written for: a package's own, a workspace's
+    // agreed member version, or empty text for a single file or a folder with no manifest.
+    export governingVersion() -> string {
+        return this.targetVersion;
+    }
+}
+
+// A resolved target, or the reason the path argument named none.
+export final class TargetResolution {
+    BuildTarget? found;
+    string problem;
+
+    protected constructor(this.found, this.problem);
+
+    export target() -> BuildTarget? {
+        return this.found;
+    }
+
+    export failure() -> string {
+        return this.problem;
+    }
+}
+
+// Resolves the optional path argument of a build. `given` is empty text when the command line named
+// no path, and the nearest manifest above the working folder is used instead.
+export resolve(FileLoader loader, string workingFolder, string given) -> TargetResolution {
+    if (given.length == 0) {
+        string? discovered = workspace.discoverRoot(loader, paths.slashed(workingFolder));
+        if (discovered == null) {
+            return failed("no path was given and no ens.package manifest was found in "
+                + "'{workingFolder}' or in any folder above it; name what to build, for example "
+                + "'src/main.ens' or the folder holding the package");
+        }
+        return resolveFolder(loader, discovered);
+    }
+    string named = paths.resolved(given, workingFolder);
+    if (system.isFile(named)) {
+        if (path.extension(named) != "ens") {
+            return failed("'{given}' is not an Ens source file; a file target is an '.ens' file, "
+                + "and a folder target is a package or a folder of sources");
+        }
+        return new TargetResolution(new BuildTarget(TargetKind.File, named,
+            path.parentFolder(named), "", path.fileName(named), path.stem(named), "", noMembers(),
+            ""), "");
+    }
+    if (!system.isDirectory(named)) {
+        return failed("'{given}' does not exist");
+    }
+    return resolveFolder(loader, named);
+}
+
+// The order a workspace's members build in, derived from the graph they declare.
+export final class MemberOrder {
+    WorkspaceMember[] ordered;
+    string[] entangled;
+
+    protected constructor(this.ordered, this.entangled);
+
+    // Every member, each one after the members it depends on.
+    export members() -> WorkspaceMember[] {
+        return this.ordered;
+    }
+
+    // The members whose dependencies form a cycle, so no order puts each of them after the ones it
+    // depends on; empty when the graph is acyclic.
+    export cycle() -> string[] {
+        return this.entangled;
+    }
+}
+
+// Orders members so each one follows every member it depends on. A dependency on a package that is
+// not a member imposes no order. Members caught in a cycle are named and kept in manifest order, so
+// a build can still report them all.
+export memberOrder(WorkspaceMember[] members) -> MemberOrder {
+    let placed = new Set<string>();
+    let ordered = new List<WorkspaceMember>();
+    let names = new Set<string>();
+    for (long i = 0; i < members.length; i++) {
+        names.add(members[i].packageName());
+    }
+    while (ordered.length() < members.length) {
+        bool progressed = false;
+        for (long i = 0; i < members.length; i++) {
+            if (placed.contains(members[i].packageName())) {
+                continue;
+            }
+            if (!dependenciesPlaced(members[i], names, placed)) {
+                continue;
+            }
+            placed.add(members[i].packageName());
+            ordered.push(members[i]);
+            progressed = true;
+        }
+        if (!progressed) {
+            let entangled = new List<string>();
+            for (long i = 0; i < members.length; i++) {
+                if (!placed.contains(members[i].packageName())) {
+                    entangled.push(members[i].packageName());
+                    ordered.push(members[i]);
+                }
+            }
+            return new MemberOrder(ordered.toArray(), entangled.toArray());
+        }
+    }
+    string[] acyclic = [];
+    return new MemberOrder(ordered.toArray(), acyclic);
+}
+
+// Whether every member the given member depends on has already been placed.
+dependenciesPlaced(WorkspaceMember member, Set<string> names, Set<string> placed) -> bool {
+    for (let dependency in member.dependencies()) {
+        if (names.contains(dependency) && !placed.contains(dependency)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The Ens version a workspace's members agree on, or the disagreement to report.
+export final class VersionAgreement {
+    string agreed;
+    string problem;
+
+    protected constructor(this.agreed, this.problem);
+
+    // The version every member declares, or empty text when none of them declares one.
+    export version() -> string {
+        return this.agreed;
+    }
+
+    export failure() -> string {
+        return this.problem;
+    }
+}
+
+// The version the members agree on. A workspace is built by one toolchain, so its members must
+// agree on the Ens version they are written for; a member that declares none is left out of the
+// comparison, because a missing declaration is already reported against that member's manifest.
+export versionAgreement(WorkspaceMember[] members) -> VersionAgreement {
+    string agreed = "";
+    string agreedBy = "";
+    for (long i = 0; i < members.length; i++) {
+        string declared = members[i].ensVersion();
+        if (declared.length == 0) {
+            continue;
+        }
+        if (agreed.length == 0) {
+            agreed = declared;
+            agreedBy = members[i].packageName();
+            continue;
+        }
+        if (declared != agreed) {
+            return new VersionAgreement("", "the members of this workspace disagree on the Ens "
+                + "version they are written for: '{agreedBy}' declares \"{agreed}\" and "
+                + "'{members[i].packageName()}' declares \"{declared}\". One workspace is built by "
+                + "one toolchain, so make every member declare the same 'ens' version");
+        }
+    }
+    return new VersionAgreement(agreed, "");
+}
+
+resolveFolder(FileLoader loader, string folder) -> TargetResolution {
+    let survey = workspace.surveyManifest(loader, folder);
+    if (survey == null) {
+        return new TargetResolution(new BuildTarget(TargetKind.Folder, folder, folder, "", "",
+            folderStem(folder), "", noMembers(), ""), "");
+    }
+    if (survey.isWorkspace()) {
+        return resolveWorkspace(loader, folder, survey);
+    }
+    string source = folder;
+    string tests = "";
+    if (system.isDirectory(path.join(folder, "src"))) {
+        source = path.join(folder, "src");
+        if (system.isDirectory(path.join(folder, "tests"))) {
+            tests = path.join(folder, "tests");
+        }
+    }
+    string declared = survey.packageName();
+    string name = folderStem(folder);
+    if (declared.length > 0) {
+        name = artifactStem(declared);
+    }
+    let kind = TargetKind.Folder;
+    if (survey.isPackage()) {
+        kind = TargetKind.Package;
+    }
+    return new TargetResolution(new BuildTarget(kind, folder, source, tests, "", name, declared,
+        noMembers(), survey.ensVersion()), "");
+}
+
+resolveWorkspace(FileLoader loader, string folder, ManifestSurvey survey) -> TargetResolution {
+    let members = new List<WorkspaceMember>();
+    for (let listed in survey.members()) {
+        string memberFolder = path.normalize(path.join(folder, listed));
+        let memberSurvey = workspace.surveyManifest(loader, memberFolder);
+        if (memberSurvey == null) {
+            return failed("the workspace at '{folder}' lists the member \"{listed}\", which has "
+                + "no ens.package manifest; every member folder declares a package");
+        }
+        if (!memberSurvey.isPackage()) {
+            return failed("the workspace at '{folder}' lists the member \"{listed}\", whose "
+                + "ens.package does not declare a package; a member folder declares one package");
+        }
+        members.push(new WorkspaceMember(memberSurvey.packageName(), memberFolder,
+            memberSurvey.dependencies(), memberSurvey.ensVersion()));
+    }
+    WorkspaceMember[] listed = members.toArray();
+    let agreement = versionAgreement(listed);
+    if (agreement.failure().length > 0) {
+        return failed(agreement.failure());
+    }
+    return new TargetResolution(new BuildTarget(TargetKind.Workspace, folder, folder, "", "",
+        folderStem(folder), "", listed, agreement.version()), "");
+}
+
+failed(string problem) -> TargetResolution {
+    return new TargetResolution(null, problem);
+}
+
+noMembers() -> WorkspaceMember[] {
+    WorkspaceMember[] none = [];
+    return none;
+}
+
+// The name of the folder itself, which is what a folder with no package name is called.
+folderStem(string folder) -> string {
+    string name = path.fileName(path.normalize(folder));
+    if (name.length == 0 || name == "." || name == "..") {
+        return "program";
+    }
+    return name;
+}
+
+// What an artifact of the named package is called: "acme.tools" builds "tools", the last segment
+// being the part a user recognizes.
+export artifactStem(string packageName) -> string {
+    string[] parts = strings.split(packageName, ".");
+    if (parts.length == 0) {
+        return packageName;
+    }
+    return parts[parts.length - 1];
+}

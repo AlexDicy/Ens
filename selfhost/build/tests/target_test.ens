@@ -1,0 +1,189 @@
+// What a path argument names, the order a workspace's members build in, and the version its members
+// must agree on. Resolution asks the operating system what a path is, so it runs against a scratch
+// tree; the ordering and the agreement are rules about values and are checked on their own.
+import @std.testing;
+import TestFailure from @std.testing;
+import @std.path;
+import BuildTarget from target;
+import TargetKind from target;
+import WorkspaceMember from target;
+import target;
+import MemoryFileLoader from support;
+import support;
+import SystemFileLoader from @ens.sema.support.loader;
+import FileLoader from @ens.sema.support.loader;
+
+test "a named .ens file is a single-file program" {
+    string root = try support.scratch("file-target");
+    try support.writeFile(root, "hello.ens", "main() -> int \{ return 0; \}\n");
+    let resolved = try resolveIn(root, path.join(root, "hello.ens"));
+    try testing.assertTrue(resolved.kind() == TargetKind.File, "a file target");
+    try testing.assertEqual(resolved.entryFile(), "hello.ens");
+    try testing.assertEqual(resolved.artifactName(), "hello");
+    try testing.assertEqual(resolved.sourceFolder(), path.normalize(root));
+    try testing.assertEqual(resolved.governingVersion(), "");
+    try support.removeTree(root);
+}
+
+test "a file that is not Ens source is refused, and so is one that is not there" {
+    string root = try support.scratch("file-refused");
+    try support.writeFile(root, "notes.txt", "hello\n");
+    string[] refused = [path.join(root, "notes.txt"), path.join(root, "missing.ens")];
+    for (let named in refused) {
+        let resolution = target.resolve(loader(), root, named);
+        try testing.assertTrue(resolution.target() == null, "'{named}' must be refused");
+        try testing.assertTrue(resolution.failure().length > 0, "with a reason");
+    }
+    try support.removeTree(root);
+}
+
+test "a folder with no manifest is a folder of sources named after itself" {
+    string root = try support.scratch("plain-folder");
+    try support.writeFile(root, "main.ens", "main() -> int \{ return 0; \}\n");
+    let resolved = try resolveIn(root, root);
+    try testing.assertTrue(resolved.kind() == TargetKind.Folder, "a folder target");
+    try testing.assertEqual(resolved.artifactName(), "plain-folder");
+    try testing.assertEqual(resolved.entryFile(), "");
+    try support.removeTree(root);
+}
+
+test "a package folder is named after its package and knows its src and tests" {
+    string root = try support.scratch("package-target");
+    try support.writeFile(root, "ens.package", "package acme.tools \{\n    ens \"0.1\";\n\}\n");
+    try support.writeFile(root, "src/main.ens", "main() -> int \{ return 0; \}\n");
+    try support.writeFile(root, "tests/main_test.ens", "test \"nothing\" \{ \}\n");
+    let resolved = try resolveIn(root, root);
+    try testing.assertTrue(resolved.kind() == TargetKind.Package, "a package target");
+    try testing.assertEqual(resolved.packageName(), "acme.tools");
+    try testing.assertEqual(resolved.artifactName(), "tools");
+    try testing.assertEqual(resolved.sourceFolder(), path.join(path.normalize(root), "src"));
+    try testing.assertEqual(resolved.testsFolder(), path.join(path.normalize(root), "tests"));
+    try testing.assertEqual(resolved.governingVersion(), "0.1");
+    try support.removeTree(root);
+}
+
+test "a workspace root carries its members with the packages they depend on" {
+    string root = try workspaceTree("workspace-target", "0.1", "0.1");
+    let resolved = try resolveIn(root, root);
+    try testing.assertTrue(resolved.kind() == TargetKind.Workspace, "a workspace target");
+    try testing.assertEqual(resolved.governingVersion(), "0.1");
+    WorkspaceMember[] members = resolved.members();
+    try testing.assertEqual(members.length, 2);
+    try testing.assertEqual(members[0].packageName(), "demo.app");
+    try testing.assertEqual(members[0].dependencies().length, 1);
+    try testing.assertEqual(members[0].dependencies()[0], "demo.lib");
+    try testing.assertEqual(members[1].packageName(), "demo.lib");
+    try testing.assertEqual(members[1].dependencies().length, 0);
+    try support.removeTree(root);
+}
+
+test "members that disagree on the Ens version stop the resolution, naming both" {
+    string root = try workspaceTree("workspace-disagree", "0.1", "0.2");
+    let resolution = target.resolve(loader(), root, root);
+    try testing.assertTrue(resolution.target() == null, "a disagreement must stop resolution");
+    string failure = resolution.failure();
+    try testing.assertTrue(failure.indexOf("demo.app") >= 0, "names the first member: {failure}");
+    try testing.assertTrue(failure.indexOf("demo.lib") >= 0, "names the other member: {failure}");
+    try testing.assertTrue(failure.indexOf("\"0.1\"") >= 0, "names the first version: {failure}");
+    try testing.assertTrue(failure.indexOf("\"0.2\"") >= 0, "names the other version: {failure}");
+    try support.removeTree(root);
+}
+
+test "no path discovers the nearest manifest above the folder the command ran in" {
+    string root = try support.scratch("discovered");
+    try support.writeFile(root, "ens.package", "package acme.deep \{\n    ens \"0.1\";\n\}\n");
+    try support.writeFile(root, "src/nested/main.ens", "main() -> int \{ return 0; \}\n");
+    let resolved = try resolveIn(path.join(root, "src/nested"), "");
+    try testing.assertEqual(resolved.packageName(), "acme.deep");
+    try support.removeTree(root);
+}
+
+test "no path and no manifest anywhere above says so" {
+    let resolution = target.resolve(new MemoryFileLoader(), "/nowhere/at/all", "");
+    try testing.assertTrue(resolution.target() == null, "nothing is resolved");
+    try testing.assertTrue(resolution.failure().indexOf("ens.package") >= 0,
+        "the reason names the manifest: {resolution.failure()}");
+}
+
+test "members build after the members they depend on" {
+    WorkspaceMember[] declared = [member("demo.app", ["demo.lib", "outside.pkg"]),
+        member("demo.lib", ["demo.core"]), member("demo.core", [])];
+    let order = target.memberOrder(declared);
+    try testing.assertEqual(order.cycle().length, 0);
+    WorkspaceMember[] ordered = order.members();
+    try testing.assertEqual(ordered.length, 3);
+    try testing.assertEqual(ordered[0].packageName(), "demo.core");
+    try testing.assertEqual(ordered[1].packageName(), "demo.lib");
+    try testing.assertEqual(ordered[2].packageName(), "demo.app");
+}
+
+test "members that depend on each other in a circle are named" {
+    WorkspaceMember[] declared = [member("demo.one", ["demo.two"]),
+        member("demo.two", ["demo.one"]), member("demo.free", [])];
+    let order = target.memberOrder(declared);
+    try testing.assertEqual(order.members().length, 3);
+    try testing.assertEqual(order.cycle().length, 2);
+    try testing.assertEqual(order.cycle()[0], "demo.one");
+    try testing.assertEqual(order.cycle()[1], "demo.two");
+    try testing.assertEqual(order.members()[0].packageName(), "demo.free");
+}
+
+test "a version every member declares is the one they agree on" {
+    WorkspaceMember[] agreeing = [versioned("demo.app", "0.1"), versioned("demo.lib", "0.1")];
+    let agreement = target.versionAgreement(agreeing);
+    try testing.assertEqual(agreement.failure(), "");
+    try testing.assertEqual(agreement.version(), "0.1");
+}
+
+test "a member that declares no version is left out of the comparison" {
+    WorkspaceMember[] partial = [versioned("demo.app", ""), versioned("demo.lib", "0.1")];
+    let agreement = target.versionAgreement(partial);
+    try testing.assertEqual(agreement.failure(), "");
+    try testing.assertEqual(agreement.version(), "0.1");
+    WorkspaceMember[] silent = [versioned("demo.app", ""), versioned("demo.lib", "")];
+    try testing.assertEqual(target.versionAgreement(silent).version(), "");
+}
+
+test "an artifact is named after the last segment of the package name" {
+    try testing.assertEqual(target.artifactStem("acme.tools"), "tools");
+    try testing.assertEqual(target.artifactStem("ens"), "ens");
+    try testing.assertEqual(target.artifactStem("a.b.c.d"), "d");
+}
+
+loader() -> FileLoader {
+    return new SystemFileLoader();
+}
+
+resolveIn(string workingFolder, string named) -> BuildTarget throws {
+    let resolution = target.resolve(loader(), workingFolder, named);
+    let resolved = resolution.target();
+    if (resolved == null) {
+        throw new TestFailure("'{named}' did not resolve: {resolution.failure()}");
+    }
+    return resolved;
+}
+
+// A workspace of two members, the application listed first and depending on the library, so the
+// order a build derives is not the order the manifest lists.
+workspaceTree(string name, string appVersion, string libVersion) -> string throws {
+    string root = try support.scratch(name);
+    try support.writeFile(root, "ens.package",
+        "workspace \{\n    member \"app\";\n    member \"lib\";\n\}\n");
+    try support.writeFile(root, "app/ens.package", "package demo.app \{\n"
+        + "    ens \"{appVersion}\";\n\n    dependency demo.lib;\n\}\n");
+    try support.writeFile(root, "app/src/main.ens", "main() -> int \{ return 0; \}\n");
+    try support.writeFile(root, "lib/ens.package",
+        "package demo.lib \{\n    ens \"{libVersion}\";\n\}\n");
+    try support.writeFile(root, "lib/src/greet.ens", "export greet() -> string \{\n"
+        + "    return \"hi\";\n\}\n");
+    return root;
+}
+
+member(string name, string[] dependencies) -> WorkspaceMember {
+    return new WorkspaceMember(name, "/work/" + name, dependencies, "0.1");
+}
+
+versioned(string name, string version) -> WorkspaceMember {
+    string[] none = [];
+    return new WorkspaceMember(name, "/work/" + name, none, version);
+}

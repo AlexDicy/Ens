@@ -1,16 +1,118 @@
-// The self-hosted driver's entry point: parse the command line, then run the one build it
-// names. The executable is called ensc to stand apart from the reference driver's ens.
+// The `ens` command: read the command line, settle the invocation, and run the one thing it names.
+//
+// The working folder is read once, here, into the invocation every part of a build then reads from;
+// nothing anywhere changes it. Exit codes are the same for every command: 0 it worked, 1 the work
+// failed, 2 the command line asked for something it cannot have.
 import @std.system;
-import arguments;
-import compile;
+import FileLoader from @ens.sema.support.loader;
+import SystemFileLoader from @ens.sema.support.loader;
+import Invocation from @ens.cli.invocation;
+import @ens.cli.help;
+import @ens.cli.parse;
+import @ens.build.build;
+import @ens.build.check;
+import @ens.build.stdlib;
+import @ens.build.version;
+import BuildTarget from @ens.build.target;
+import @ens.build.target;
+import Reporter from @ens.build.report;
+import @ens.build.paths;
+import commands;
+import cst;
+import options;
 
 main() -> int {
-    let parsed = arguments.parse(system.arguments());
-    let options = parsed.options;
-    if (options == null) {
-        system.writeError("ensc: error: " + parsed.problem);
-        system.writeError(arguments.usage());
+    let application = commands.application();
+    string[] argv = system.arguments();
+    let invocation = parse.commandLine(application, argv.slice(1, argv.length));
+
+    let problem = invocation.problem();
+    if (problem != null) {
+        system.writeError("ens: " + problem);
         return 2;
     }
-    return compile.run(options);
+    if (invocation.helpRequested()) {
+        print(help.text(application, invocation.helpTarget()));
+        return 0;
+    }
+    if (invocation.versionRequested()) {
+        print(versionLine());
+        return 0;
+    }
+    return dispatch(invocation);
+}
+
+dispatch(Invocation invocation) -> int {
+    switch (invocation.command()) {
+        "version" -> {
+            print(versionLine());
+            return 0;
+        },
+        "cst-dump" -> {
+            return cst.dumpFile(invocation.positionals()[0]);
+        },
+        "cst-analyze" -> {
+            return cst.analyzeFile(invocation.positionals()[0]);
+        },
+        "build" -> {
+            return compile(invocation, true);
+        },
+        "check" -> {
+            return compile(invocation, false);
+        },
+        default -> {
+            system.writeError("Internal: the command '{invocation.command()}' is declared but "
+                + "nothing runs it");
+            return 2;
+        },
+    }
+}
+
+// Runs a build or a check: resolve what was named, settle the options, then hand both to the build
+// package.
+compile(Invocation invocation, bool emit) -> int {
+    FileLoader loader = new SystemFileLoader();
+    string workingFolder = paths.slashed(system.currentDirectory());
+    string named = "";
+    string[] positionals = invocation.positionals();
+    if (positionals.length > 0) {
+        named = positionals[0];
+    }
+
+    // The options are settled before the target, so a command line nobody could act on is reported
+    // as the usage problem it is rather than as a missing package.
+    let settled = options.resolve(invocation, workingFolder);
+    let given = settled.options();
+    if (given == null) {
+        system.writeError("ens: " + settled.failure());
+        return 2;
+    }
+
+    let resolution = target.resolve(loader, workingFolder, named);
+    let resolved = resolution.target();
+    if (resolved == null) {
+        system.writeError("ens: " + resolution.failure());
+        return 2;
+    }
+
+    string stdlibRoot = given.stdlibRoot();
+    if (stdlibRoot.length == 0) {
+        stdlibRoot = stdlib.findRoot(loader, system.getEnvironmentVariable("ENS_STDLIB"),
+            resolved.root());
+    }
+    if (stdlibRoot.length == 0) {
+        system.writeError("ens: " + stdlib.missingMessage());
+        return 2;
+    }
+
+    let built = given.withStdlibRoot(stdlibRoot);
+    let reporter = new Reporter(built);
+    if (emit) {
+        return build.run(loader, built, resolved, reporter);
+    }
+    return check.run(loader, built, resolved, reporter);
+}
+
+versionLine() -> string {
+    return "ens " + version.toolchainVersion();
 }

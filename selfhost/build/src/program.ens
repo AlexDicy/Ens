@@ -1,0 +1,208 @@
+// Loading and analyzing one unit of work. A build and a check need exactly the same thing up to
+// this point - the module graph, then every sema stage over it - and differ only in what they do
+// afterwards, so both come through here.
+//
+// Loading is a function of its inputs and answers with a value: the graph, the analysis when the
+// graph was sound enough to reach it, and the problems as lines already formatted for a reader.
+// Nothing is written anywhere, so two units could be loaded at the same time without either seeing
+// the other.
+import List from @std.collections.list;
+import @ens.frontend.syntax.generated.factory;
+import SourceFileNode from @ens.frontend.syntax.generated.nodes;
+import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import FileDiagnostic from @ens.sema.support.diagnostics;
+import FileLoader from @ens.sema.support.loader;
+import GraphResult from @ens.sema.program.graph;
+import NativeInfo from @ens.sema.program.workspace;
+import @ens.sema.program.graph;
+import ProgramAnalysis from @ens.sema.pipeline;
+import @ens.sema.pipeline;
+import BuildOptions from options;
+import SourceCatalog from diagnostics;
+import diagnostics;
+import SourceScan from sources;
+import sources;
+
+// One thing to compile: where its modules are read from, which file is its main module, and how a
+// report names it.
+export final class Unit {
+    string unitSource;
+    string unitEntry;
+    string unitLabel;
+
+    export constructor(string sourceFolder, string entryFile, string label) {
+        this.unitSource = sourceFolder;
+        this.unitEntry = entryFile;
+        this.unitLabel = label;
+    }
+
+    export sourceFolder() -> string {
+        return this.unitSource;
+    }
+
+    // The one file that is the program's main module, or empty text when every source file in the
+    // folder is a seed.
+    export entryFile() -> string {
+        return this.unitEntry;
+    }
+
+    // How a report names this unit: a package name, or the file or folder that was named.
+    export label() -> string {
+        return this.unitLabel;
+    }
+}
+
+// One unit loaded and analyzed.
+export final class Loaded {
+    ProgramAnalysis? programAnalysis;
+    string[] problemLines;
+    long modules;
+    bool entryPoint;
+    NativeInfo[] declaredNatives;
+    SourceCatalog sources;
+
+    protected constructor(this.programAnalysis, this.problemLines, this.modules,
+                this.entryPoint, this.declaredNatives, this.sources);
+
+    // The analysis, or null when the program did not survive to it.
+    export analysis() -> ProgramAnalysis? {
+        return this.programAnalysis;
+    }
+
+    export problems() -> string[] {
+        return this.problemLines;
+    }
+
+    export succeeded() -> bool {
+        return this.programAnalysis != null;
+    }
+
+    export moduleCount() -> long {
+        return this.modules;
+    }
+
+    // Whether the program's main module defines main(), which is what makes it an application
+    // rather than a library.
+    export definesEntry() -> bool {
+        return this.entryPoint;
+    }
+
+    // The native libraries the manifests governing these modules declare.
+    export natives() -> NativeInfo[] {
+        return this.declaredNatives;
+    }
+
+    // The sources this load read, so a problem found after it - in code generation - is reported at
+    // its own line and column too.
+    export catalog() -> SourceCatalog {
+        return this.sources;
+    }
+}
+
+// Loads the unit's modules and runs every sema stage over them. A problem at any stage stops the
+// load there, so a program that never parsed is not reported as if it failed to type-check.
+export load(FileLoader loader, BuildOptions options, Unit unit) -> Loaded {
+    let catalog = new SourceCatalog(loader);
+    let seeds = seedsOf(unit);
+    if (seeds.failure().length > 0) {
+        return failed([seeds.failure()], 0, catalog);
+    }
+    if (seeds.files().length == 0) {
+        return failed(["no Ens source files were found in '{unit.sourceFolder()}'"], 0, catalog);
+    }
+
+    GraphResult graphResult;
+    if (unit.entryFile().length > 0) {
+        graphResult = graph.buildFileProgram(loader, unit.sourceFolder(), "",
+            options.stdlibRoot(), unit.entryFile());
+    } else {
+        graphResult = graph.buildGraph(loader, unit.sourceFolder(), "", options.stdlibRoot(),
+            seeds.files());
+    }
+    catalog.addGraph(graphResult);
+    long moduleCount = graphResult.modules().length;
+
+    let upstream = upstreamDiagnostics(graphResult);
+    if (upstream.length() > 0) {
+        return failed(diagnostics.formatAll(upstream, catalog), moduleCount, catalog);
+    }
+    let analysis = pipeline.analyzeProgram(graphResult);
+    let problems = analysisDiagnostics(analysis);
+    if (problems.length() > 0) {
+        return failed(diagnostics.formatAll(problems, catalog), moduleCount, catalog);
+    }
+    string[] clean = [];
+    return new Loaded(analysis, clean, moduleCount, definesEntry(graphResult),
+        graphResult.natives(), catalog);
+}
+
+// The files the graph starts from: the one named file, or every non-test source under the folder so
+// a module nothing imports is compiled too.
+seedsOf(Unit unit) -> SourceScan {
+    if (unit.entryFile().length > 0) {
+        return sources.oneFile(unit.entryFile());
+    }
+    return sources.scan(unit.sourceFolder());
+}
+
+failed(string[] problems, long moduleCount, SourceCatalog catalog) -> Loaded {
+    NativeInfo[] none = [];
+    return new Loaded(null, problems, moduleCount, false, none, catalog);
+}
+
+// Graph and parse diagnostics together, since both mean the program never reached analysis.
+upstreamDiagnostics(GraphResult graphResult) -> List<FileDiagnostic> {
+    let collected = new List<FileDiagnostic>();
+    for (let diagnostic in graphResult.diagnostics()) {
+        collected.push(diagnostic);
+    }
+    for (let loaded in graphResult.modules()) {
+        for (let diagnostic in loaded.parseResult().diagnostics()) {
+            collected.push(new FileDiagnostic(loaded.filePath(), diagnostic.message(),
+                diagnostic.span()));
+        }
+    }
+    return collected;
+}
+
+// Every stage's diagnostics in stage order; the formatting orders the merged list by position.
+analysisDiagnostics(ProgramAnalysis analysis) -> List<FileDiagnostic> {
+    let collected = new List<FileDiagnostic>();
+    appendAll(collected, analysis.declareDiagnostics());
+    appendAll(collected, analysis.linkDiagnostics());
+    appendAll(collected, analysis.signatureDiagnostics());
+    appendAll(collected, analysis.layoutDiagnostics());
+    appendAll(collected, analysis.checkDiagnostics());
+    appendAll(collected, analysis.bodyDiagnostics());
+    appendAll(collected, analysis.exceptionDiagnostics());
+    return collected;
+}
+
+appendAll(List<FileDiagnostic> sink, FileDiagnostic[] diagnostics) {
+    for (let diagnostic in diagnostics) {
+        sink.push(diagnostic);
+    }
+}
+
+// Whether the program's main module declares a function named 'main'. Its shape is sema's business
+// by the time this is asked; all that matters here is whether an executable can come out.
+definesEntry(GraphResult graphResult) -> bool {
+    let entry = graphResult.moduleWithPath("main");
+    if (entry == null) {
+        return false;
+    }
+    let root = factory.createRoot(entry.parseResult().root());
+    if (!(root is SourceFileNode)) {
+        return false;
+    }
+    for (long i = 0; i < root.itemsCount(); i++) {
+        let item = root.items(i);
+        if (item is FunctionDeclarationNode) {
+            let name = item.name();
+            if (name != null && name.text() == "main") {
+                return true;
+            }
+        }
+    }
+    return false;
+}

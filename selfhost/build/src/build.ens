@@ -1,0 +1,325 @@
+// Building a target: one unit at a time, each one loaded, analyzed, emitted into object files and
+// linked into an executable. A unit whose main module defines main() produces a program; one that
+// does not is a library and is compiled just as thoroughly with no artifact kept.
+//
+// Building one unit is a function of its inputs that answers with a value, so nothing a unit does is
+// visible to another and a future scheduler can build members that do not depend on each other at
+// the same time. The order they are built in, and everything shown about them, is decided in one
+// place: `run`.
+import @std.system;
+import SystemError from @std.system;
+import @std.path;
+import List from @std.collections.list;
+import FileDiagnostic from @ens.sema.support.diagnostics;
+import FileLoader from @ens.sema.support.loader;
+import ProgramAnalysis from @ens.sema.pipeline;
+import @ens.codegen.driver;
+import LinkRequest from @ens.link.request;
+import Toolchain from @ens.link.toolchain;
+import @ens.link.discovery;
+import @ens.link.flavor;
+import @ens.link.linker;
+import BuildOptions from options;
+import BuildTarget from target;
+import TargetKind from target;
+import WorkspaceMember from target;
+import target;
+import Reporter from report;
+import report;
+import diagnostics;
+import Loaded from program;
+import Unit from program;
+import program;
+import natives;
+import platform;
+
+export enum BuildOutcome {
+    BuiltExecutable,
+    ValidatedLibrary,
+    Failed,
+}
+
+// What building one unit came to.
+export final class UnitReport {
+    BuildOutcome result;
+    string producedArtifact;
+    string[] problemLines;
+    long modules;
+    long objects;
+    string[] account;
+
+    protected constructor(this.result, this.producedArtifact, this.problemLines, this.modules,
+                this.objects, this.account);
+
+    export outcome() -> BuildOutcome {
+        return this.result;
+    }
+
+    // The executable that was written, or empty text when the unit produced none.
+    export artifact() -> string {
+        return this.producedArtifact;
+    }
+
+    export problems() -> string[] {
+        return this.problemLines;
+    }
+
+    export moduleCount() -> long {
+        return this.modules;
+    }
+
+    export objectCount() -> long {
+        return this.objects;
+    }
+
+    // What the optimization pipeline elided, when the build asked to be told.
+    export explanation() -> string[] {
+        return this.account;
+    }
+}
+
+// Builds the target and answers with the exit code: 0 built, 1 the work failed, 2 the command line
+// asked for something it cannot have.
+export run(FileLoader loader, BuildOptions options, BuildTarget resolved,
+           Reporter reporter) -> int {
+    if (resolved.kind() == TargetKind.Workspace) {
+        return runWorkspace(loader, options, resolved, reporter);
+    }
+    reporter.step("building for {options.targetTriple()}");
+    let unit = new Unit(resolved.sourceFolder(), resolved.entryFile(), resolved.artifactName());
+    return runUnit(loader, options, unit, resolved.artifactName(), options.output(),
+        discoverToolchain(options), reporter, 1, 1);
+}
+
+// Builds every member of a workspace, each one after the members it depends on.
+runWorkspace(FileLoader loader, BuildOptions options, BuildTarget resolved,
+             Reporter reporter) -> int {
+    if (options.namesOutput()) {
+        reporter.problem("'--output' names one executable, and a workspace root builds every one "
+            + "of its members; name the member folder to build one, or drop '--output' and let "
+            + "each member be named after its own package");
+        return 2;
+    }
+    let order = target.memberOrder(resolved.members());
+    if (order.cycle().length > 0) {
+        reporter.problem("these workspace members depend on each other in a circle, so no order "
+            + "builds each one after what it needs: " + quotedNames(order.cycle())
+            + "; remove one of the dependencies");
+        return 1;
+    }
+    WorkspaceMember[] members = order.members();
+    if (members.length == 0) {
+        reporter.note("this workspace lists no members, so there is nothing to build");
+        return 0;
+    }
+    reporter.step("building {members.length} member(s) for {options.targetTriple()}");
+    let toolchain = discoverToolchain(options);
+    for (long i = 0; i < members.length; i++) {
+        let member = members[i];
+        let unit = new Unit(path.join(member.folder(), "src"), "", member.packageName());
+        int code = runUnit(loader, options, unit, target.artifactStem(member.packageName()), "",
+            toolchain, reporter, i + 1, members.length);
+        if (code != 0) {
+            return code;
+        }
+    }
+    return 0;
+}
+
+// Builds one unit and reports it, answering with the exit code its outcome deserves.
+runUnit(FileLoader loader, BuildOptions options, Unit unit, string artifactStem,
+        string namedOutput, Toolchain toolchain, Reporter reporter, long index,
+        long total) -> int {
+    string label = report.progress(index, total, unit.label());
+    reporter.step("{label}: reading {unit.sourceFolder()}");
+    let built = buildUnit(loader, options, unit, artifactStem, namedOutput, toolchain);
+    reporter.explanation(built.explanation());
+    return switch (built.outcome()) {
+        BuildOutcome.Failed -> reportFailure(reporter, label, built),
+        BuildOutcome.ValidatedLibrary -> reportLibrary(reporter, label, unit, namedOutput, built),
+        BuildOutcome.BuiltExecutable -> reportExecutable(reporter, label, built),
+    };
+}
+
+reportFailure(Reporter reporter, string label, UnitReport built) -> int {
+    reporter.problems(built.problems());
+    reporter.problem("{label}: build failed with "
+        + report.problemCount(built.problems().length));
+    return 1;
+}
+
+reportLibrary(Reporter reporter, string label, Unit unit, string namedOutput,
+              UnitReport built) -> int {
+    if (namedOutput.length > 0) {
+        reporter.problem("'{unit.label()}' does not define main() in its main module, so it builds "
+            + "as a library and there is no executable to write; drop '--output' to compile and "
+            + "check it");
+        return 2;
+    }
+    reporter.note("{label}: compiled {built.moduleCount()} module(s) as a library");
+    return 0;
+}
+
+reportExecutable(Reporter reporter, string label, UnitReport built) -> int {
+    reporter.problems(built.problems());
+    reporter.step("{label}: emitted {built.objectCount()} object file(s) from "
+        + "{built.moduleCount()} module(s)");
+    reporter.note("{label}: built {built.artifact()}");
+    return 0;
+}
+
+// Compiles one unit and links it when it is an application. Nothing here writes to a stream: the
+// report carries every line the caller may want to show.
+export buildUnit(FileLoader loader, BuildOptions options, Unit unit, string artifactStem,
+                 string namedOutput, Toolchain toolchain) -> UnitReport {
+    let loaded = program.load(loader, options, unit);
+    let analysis = loaded.analysis();
+    if (analysis == null) {
+        return failed(loaded.problems(), loaded.moduleCount());
+    }
+    if (!loaded.definesEntry()) {
+        return buildLibrary(options, analysis, loaded, artifactStem);
+    }
+
+    string output = namedOutput;
+    if (output.length == 0) {
+        output = path.join(options.workingFolder(),
+            platform.executableNamed(artifactStem, options.targetTriple()));
+    }
+    string objectsFolder = objectsFolderFor(options, output);
+    string prepared = prepareFolder(objectsFolder);
+    if (prepared.length > 0) {
+        return failed([prepared], loaded.moduleCount());
+    }
+
+    let emitted = driver.emitProgram(analysis, objectsFolder, path.stem(output) + ".",
+        options.codegen());
+    if (!emitted.succeeded()) {
+        return failed(diagnostics.formatAll(emitted.diagnostics(), loaded.catalog()),
+            loaded.moduleCount());
+    }
+    if (emitted.objects().length() == 0) {
+        return failed(["the program produced no object files, so there is nothing to link"],
+            loaded.moduleCount());
+    }
+
+    let plan = natives.librariesFor(loaded.natives(),
+        platform.platformName(options.targetTriple()));
+    if (plan.failure().length > 0) {
+        return failed([plan.failure()], loaded.moduleCount());
+    }
+
+    string[] libraryFiles = [];
+    let linked = linker.link(new LinkRequest(emitted.objects().toArray(), plan.libraries(),
+        libraryFiles, output, options.targetTriple()), toolchain);
+    if (!linked.linked()) {
+        return failed(linkFailureLines(output, linked.output()), loaded.moduleCount());
+    }
+    return new UnitReport(BuildOutcome.BuiltExecutable, output, linkerNoise(linked.output()),
+        loaded.moduleCount(), emitted.objects().length(), emitted.arcExplanation());
+}
+
+// A library is compiled the whole way, object files included, and then leaves nothing behind: the
+// point of building one is to know that it compiles. A build that named an objects folder keeps
+// them there, because that is what naming the folder asks for.
+buildLibrary(BuildOptions options, ProgramAnalysis analysis, Loaded loaded,
+             string artifactStem) -> UnitReport {
+    string objectsFolder = options.objects();
+    bool keep = objectsFolder.length > 0;
+    if (!keep) {
+        objectsFolder = path.join(options.workingFolder(), ".ens-library-" + artifactStem);
+    }
+    string prepared = prepareFolder(objectsFolder);
+    if (prepared.length > 0) {
+        return failed([prepared], loaded.moduleCount());
+    }
+    let emitted = driver.emitProgram(analysis, objectsFolder, artifactStem + ".",
+        options.codegen());
+    if (!keep) {
+        discardObjects(objectsFolder, emitted.objects());
+    }
+    if (!emitted.succeeded()) {
+        return failed(diagnostics.formatAll(emitted.diagnostics(), loaded.catalog()),
+            loaded.moduleCount());
+    }
+    string[] clean = [];
+    return new UnitReport(BuildOutcome.ValidatedLibrary, "", clean, loaded.moduleCount(),
+        emitted.objects().length(), emitted.arcExplanation());
+}
+
+// Everything this machine contributes to a link for the target, looked up once for the whole
+// invocation. A target that links COFF asks the machine nothing; one that links ELF runs the C
+// compiler a few times, which is exactly why a build with many members does it only once.
+export discoverToolchain(BuildOptions options) -> Toolchain {
+    string triple = options.targetTriple();
+    return discovery.discover(flavor.flavorOf(triple), triple,
+        path.join(options.workingFolder(), ".ens-link-probe"));
+}
+
+// Where the object files go: the folder the command line named, else the one the executable is
+// written to.
+objectsFolderFor(BuildOptions options, string output) -> string {
+    if (options.objects().length > 0) {
+        return options.objects();
+    }
+    string beside = path.parentFolder(output);
+    if (beside.length == 0) {
+        return options.workingFolder();
+    }
+    return beside;
+}
+
+// Anything the linker said on a link that still succeeded, which is worth passing on unchanged.
+linkerNoise(string reported) -> string[] {
+    if (reported.length == 0) {
+        string[] silent = [];
+        return silent;
+    }
+    return [reported];
+}
+
+// A failed link, in the linker's own words: they are the only description of what went wrong worth
+// showing, and swallowing them would leave nothing to act on.
+linkFailureLines(string output, string reported) -> string[] {
+    if (reported.length == 0) {
+        return ["linking '{output}' failed and the linker reported no reason"];
+    }
+    return ["linking '{output}' failed; the linker reported:", reported];
+}
+
+prepareFolder(string folder) -> string {
+    if (system.isDirectory(folder)) {
+        return "";
+    }
+    try system.createDirectory(folder);
+    return "";
+} catch (SystemError error) {
+    return "could not create '{folder}' to hold the object files: {error.message}";
+}
+
+discardObjects(string folder, List<string> objects) {
+    for (long i = 0; i < objects.length(); i++) {
+        discardFile(objects.get(i));
+    }
+    try system.removeDirectory(folder);
+} catch (SystemError error) { }
+
+discardFile(string file) {
+    try system.removeFile(file);
+} catch (SystemError error) { }
+
+failed(string[] problems, long moduleCount) -> UnitReport {
+    string[] nothing = [];
+    return new UnitReport(BuildOutcome.Failed, "", problems, moduleCount, 0, nothing);
+}
+
+quotedNames(string[] names) -> string {
+    string quoted = "";
+    for (long i = 0; i < names.length; i++) {
+        if (i > 0) {
+            quoted = quoted + ", ";
+        }
+        quoted = quoted + "'" + names[i] + "'";
+    }
+    return quoted;
+}

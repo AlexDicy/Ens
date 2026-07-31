@@ -60,6 +60,13 @@ task("test")
             os.raise("Could not locate the linker bridge at " .. lld_library)
         end
 
+        -- the seed: the Ens-written compiler, built once by ens-ref and shared by every job that
+        -- compiles Ens. Everything Ens-related is built by the Ens compiler, so a bug that lives
+        -- only in the reference compiler cannot shape the self-hosted tree. It is built below,
+        -- before the jobs start, because they run in parallel and every one of them needs it.
+        local seed_dir = path.join(os.projectdir(), "build", "seed")
+        local seed_exe = path.join(seed_dir, "ens" .. exe_suffix)
+
         local tests_dir = path.join(os.projectdir(), "tests")
         local out_dir   = path.join(os.projectdir(), "build", "tests")
         os.mkdir(out_dir)
@@ -285,14 +292,36 @@ task("test")
             })
         end
 
-        -- the self-hosted driver's unit tests: argument parsing, stdlib discovery, native
-        -- library mapping, and diagnostic formatting. The package pulls in ens.codegen and with
-        -- it the native ens.llvm binding, so the job carries the same LLVM plumbing.
+        -- the build library's unit tests: target resolution, the member order a workspace's graph
+        -- implies, the version its members must agree on, the source scan, native library mapping,
+        -- stdlib discovery, and the artifact naming of each target. It pulls in ens.codegen and
+        -- with it the native ens.llvm binding, so the job carries the same LLVM plumbing.
+        if want("selfhost_build") then
+            table.insert(jobs, {
+                name = "selfhost_build",
+                llvm_tests = true,
+                source = path.join(os.projectdir(), "selfhost", "build"),
+            })
+        end
+
+        -- the self-hosted driver's unit tests: the command surface it declares and the invocation
+        -- a command line settles into. The package pulls in ens.codegen and with it the native
+        -- ens.llvm binding, so the job carries the same LLVM plumbing.
         if want("selfhost_driver") then
             table.insert(jobs, {
                 name = "selfhost_driver",
                 llvm_tests = true,
                 source = path.join(os.projectdir(), "selfhost", "driver"),
+            })
+        end
+
+        -- the Ens-written command's own behavior: its help, the argv it refuses, each optimization
+        -- level, a library against an application, the order a workspace's members build in, and a
+        -- workspace whose members disagree on the Ens version.
+        if want("cli_build") then
+            table.insert(jobs, {
+                name = "cli_build",
+                cli_build = true,
             })
         end
 
@@ -341,135 +370,6 @@ task("test")
         -- a captured stream with its trailing newlines trimmed, the form the directives compare.
         local function captured(logpath)
             return ((io.readfile(logpath) or ""):gsub("[\r\n]+$", ""))
-        end
-
-        -- the corpus round-trip harness: build the driver exe fresh from its own workspace (it
-        -- imports the front end as the @ens.frontend package), enumerate every .ens file and
-        -- every ens.package/ens.overrides manifest in the real source trees, and run the
-        -- driver over the list.
-        local function run_corpus(job)
-            local name = job.name
-            local corpus_dir  = path.join(os.projectdir(), "build", "corpus")
-            local exe_file    = path.join(corpus_dir, "corpus.exe")
-            local manifest    = path.join(corpus_dir, "manifest.txt")
-            local log         = path.join(out_dir, name .. ".log")
-            local corpus_src   = path.join(os.projectdir(), "selfhost", "corpus")
-
-            if not os.isdir(corpus_dir) then
-                os.mkdir(corpus_dir)
-            end
-            os.tryrm(exe_file)
-            local compile_rc = execMerged(ref_exe, {"build", corpus_src, "--output", exe_file}, log)
-            if not os.isfile(exe_file) then
-                return {name = name, ok = false, short = "harness build failed",
-                    full = string.format("%s: harness build failed (exit %s)\n%s",
-                        name, tostring(compile_rc), (io.readfile(log) or ""):gsub("[\r\n]+$", ""))}
-            end
-
-            -- enumerate the corpus: every source file plus every manifest file.
-            local files = {}
-            local seen = {}
-            local function add(f)
-                local normalized = (f:gsub("\\", "/"))
-                if not seen[normalized] then
-                    seen[normalized] = true
-                    table.insert(files, normalized)
-                end
-            end
-            for _, root in ipairs({"selfhost", "libs", "tests"}) do
-                for _, pattern in ipairs({"**.ens", "ens.package", "**/ens.package",
-                                          "ens.overrides", "**/ens.overrides"}) do
-                    for _, f in ipairs(os.files(path.join(os.projectdir(), root, pattern))) do
-                        add(f)
-                    end
-                end
-            end
-            table.sort(files)
-            io.writefile(manifest, table.concat(files, "\n") .. "\n")
-
-            local run_rc = execMerged(exe_file, {manifest}, log)
-            local out = (io.readfile(log) or ""):gsub("[\r\n]+$", "")
-            if run_rc == 0 then
-                return {name = name, ok = true}
-            end
-            return {name = name, ok = false,
-                short = string.format("harness exit %s", tostring(run_rc)),
-                full = string.format("%s:\n%s", name, out)}
-        end
-
-        -- the semantic differential harness: build the driver exe fresh from its own workspace
-        -- (it imports the front end and the sema layer as packages), enumerate every program
-        -- unit into a manifest, and run the driver over it. Units are the single-file tests,
-        -- the folder tests, and the selfhost library packages; libs/std is covered transitively
-        -- by every unit that imports @std.
-        local function run_semacheck(job)
-            local name = job.name
-            local check_dir = path.join(os.projectdir(), "build", "semacheck")
-            local exe_file  = path.join(check_dir, "semacheck.exe")
-            local manifest  = path.join(check_dir, "manifest.txt")
-            local log       = path.join(out_dir, name .. ".log")
-            local check_src = path.join(os.projectdir(), "selfhost", "semacheck")
-
-            if not os.isdir(check_dir) then
-                os.mkdir(check_dir)
-            end
-            os.tryrm(exe_file)
-            local compile_rc = execMerged(ref_exe, {"build", check_src, "--output", exe_file}, log)
-            if not os.isfile(exe_file) then
-                return {name = name, ok = false, short = "harness build failed",
-                    full = string.format("%s: harness build failed (exit %s)\n%s",
-                        name, tostring(compile_rc), (io.readfile(log) or ""):gsub("[\r\n]+$", ""))}
-            end
-
-            -- enumerate the program units.
-            local function slashed(p) return (p:gsub("\\", "/")) end
-            local lines = {"stdlib " .. slashed(path.join(os.projectdir(), "libs"))}
-            local function add_unit(label, source, seeds, entry)
-                table.insert(lines, "unit " .. label)
-                table.insert(lines, "source " .. slashed(source))
-                if entry then
-                    table.insert(lines, "entry " .. entry)
-                end
-                for _, seed in ipairs(seeds) do
-                    table.insert(lines, "seed " .. seed)
-                end
-            end
-            -- a single .ens file is compiled as a single-file program: the file itself is the
-            -- program's main module regardless of its name, matching the driver.
-            local singles = os.files(path.join(tests_dir, "*.ens"))
-            table.sort(singles)
-            for _, f in ipairs(singles) do
-                add_unit("tests/" .. path.filename(f), tests_dir, {}, path.filename(f))
-            end
-            local folders = os.dirs(path.join(tests_dir, "*"))
-            table.sort(folders)
-            for _, sub in ipairs(folders) do
-                if os.isfile(path.join(sub, "main.ens")) then
-                    add_unit("tests/" .. path.basename(sub), sub, {"main.ens"})
-                elseif os.isfile(path.join(sub, "src", "main.ens")) then
-                    add_unit("tests/" .. path.basename(sub), path.join(sub, "src"), {"main.ens"})
-                end
-            end
-            for _, pkg in ipairs({"corpus", "frontend", "sema", "semacheck", "syntaxgen",
-                              "llvm", "codegen", "codegencheck", "cli", "link", "driver"}) do
-                local src = path.join(os.projectdir(), "selfhost", pkg, "src")
-                local seeds = {}
-                for _, f in ipairs(os.files(path.join(src, "**.ens"))) do
-                    table.insert(seeds, slashed(path.relative(f, src)))
-                end
-                table.sort(seeds)
-                add_unit("selfhost/" .. pkg, src, seeds)
-            end
-            io.writefile(manifest, table.concat(lines, "\n") .. "\n")
-
-            local run_rc = execMerged(exe_file, {manifest}, log)
-            local out = (io.readfile(log) or ""):gsub("[\r\n]+$", "")
-            if run_rc == 0 then
-                return {name = name, ok = true, note = out:match("expected%-reject caught [^\r\n]+")}
-            end
-            return {name = name, ok = false,
-                short = string.format("harness exit %s", tostring(run_rc)),
-                full = string.format("%s:\n%s", name, out)}
         end
 
         -- find the native libraries an Ens build links against - the local LLVM the compiler was
@@ -544,6 +444,163 @@ task("test")
             end
         end
 
+        -- build the seed once: the Ens-written compiler, compiled by ens-ref out of its own
+        -- workspace. Every job that compiles Ens then uses it, so nothing downstream depends on
+        -- the reference compiler's code generator.
+        local function buildSeed()
+            local log = path.join(out_dir, "seed.log")
+            local env, native_libraries, env_error = llvmEnvironment()
+            if not env then
+                os.raise("could not build the seed compiler: %s", env_error)
+            end
+            os.tryrm(seed_dir)
+            os.mkdir(seed_dir)
+            local rc = execMerged(ref_exe, {"build",
+                path.join(os.projectdir(), "selfhost", "driver"), "--output", seed_exe}, log,
+                {envs = env})
+            if rc ~= 0 or not os.isfile(seed_exe) then
+                os.raise("building the seed compiler failed (exit %s):\n%s", tostring(rc),
+                    captured(log))
+            end
+            -- the seed loads LLVM and the linker bridge at run time, and on Windows the loader
+            -- looks beside the executable first.
+            placeNativeLibraries(native_libraries, seed_dir)
+        end
+
+        -- the corpus round-trip harness: build the harness exe fresh from its own workspace with
+        -- the seed (it imports the front end as the @ens.frontend package), enumerate every .ens
+        -- file and every ens.package/ens.overrides manifest in the real source trees, and run the
+        -- harness over the list.
+        local function run_corpus(job)
+            local name = job.name
+            local corpus_dir  = path.join(os.projectdir(), "build", "corpus")
+            local exe_file    = path.join(corpus_dir, "corpus.exe")
+            local manifest    = path.join(corpus_dir, "manifest.txt")
+            local log         = path.join(out_dir, name .. ".log")
+            local corpus_src   = path.join(os.projectdir(), "selfhost", "corpus")
+
+            if not os.isdir(corpus_dir) then
+                os.mkdir(corpus_dir)
+            end
+            os.tryrm(exe_file)
+            local env = llvmEnvironment()
+            local compile_rc = execMerged(seed_exe, {"build", corpus_src, "--output", exe_file},
+                log, {envs = env})
+            if not os.isfile(exe_file) then
+                return {name = name, ok = false, short = "harness build failed",
+                    full = string.format("%s: harness build failed (exit %s)\n%s",
+                        name, tostring(compile_rc), (io.readfile(log) or ""):gsub("[\r\n]+$", ""))}
+            end
+
+            -- enumerate the corpus: every source file plus every manifest file.
+            local files = {}
+            local seen = {}
+            local function add(f)
+                local normalized = (f:gsub("\\", "/"))
+                if not seen[normalized] then
+                    seen[normalized] = true
+                    table.insert(files, normalized)
+                end
+            end
+            for _, root in ipairs({"selfhost", "libs", "tests"}) do
+                for _, pattern in ipairs({"**.ens", "ens.package", "**/ens.package",
+                                          "ens.overrides", "**/ens.overrides"}) do
+                    for _, f in ipairs(os.files(path.join(os.projectdir(), root, pattern))) do
+                        add(f)
+                    end
+                end
+            end
+            table.sort(files)
+            io.writefile(manifest, table.concat(files, "\n") .. "\n")
+
+            local run_rc = execMerged(exe_file, {manifest}, log)
+            local out = (io.readfile(log) or ""):gsub("[\r\n]+$", "")
+            if run_rc == 0 then
+                return {name = name, ok = true}
+            end
+            return {name = name, ok = false,
+                short = string.format("harness exit %s", tostring(run_rc)),
+                full = string.format("%s:\n%s", name, out)}
+        end
+
+        -- the semantic differential harness: build the harness exe fresh from its own workspace
+        -- with the seed (it imports the front end and the sema layer as packages), enumerate every
+        -- program unit into a manifest, and run the harness over it. Units are the single-file
+        -- tests, the folder tests, and the selfhost library packages; libs/std is covered
+        -- transitively by every unit that imports @std.
+        local function run_semacheck(job)
+            local name = job.name
+            local check_dir = path.join(os.projectdir(), "build", "semacheck")
+            local exe_file  = path.join(check_dir, "semacheck.exe")
+            local manifest  = path.join(check_dir, "manifest.txt")
+            local log       = path.join(out_dir, name .. ".log")
+            local check_src = path.join(os.projectdir(), "selfhost", "semacheck")
+
+            if not os.isdir(check_dir) then
+                os.mkdir(check_dir)
+            end
+            os.tryrm(exe_file)
+            local env = llvmEnvironment()
+            local compile_rc = execMerged(seed_exe, {"build", check_src, "--output", exe_file}, log,
+                {envs = env})
+            if not os.isfile(exe_file) then
+                return {name = name, ok = false, short = "harness build failed",
+                    full = string.format("%s: harness build failed (exit %s)\n%s",
+                        name, tostring(compile_rc), (io.readfile(log) or ""):gsub("[\r\n]+$", ""))}
+            end
+
+            -- enumerate the program units.
+            local function slashed(p) return (p:gsub("\\", "/")) end
+            local lines = {"stdlib " .. slashed(path.join(os.projectdir(), "libs"))}
+            local function add_unit(label, source, seeds, entry)
+                table.insert(lines, "unit " .. label)
+                table.insert(lines, "source " .. slashed(source))
+                if entry then
+                    table.insert(lines, "entry " .. entry)
+                end
+                for _, seed in ipairs(seeds) do
+                    table.insert(lines, "seed " .. seed)
+                end
+            end
+            -- a single .ens file is compiled as a single-file program: the file itself is the
+            -- program's main module regardless of its name, matching the driver.
+            local singles = os.files(path.join(tests_dir, "*.ens"))
+            table.sort(singles)
+            for _, f in ipairs(singles) do
+                add_unit("tests/" .. path.filename(f), tests_dir, {}, path.filename(f))
+            end
+            local folders = os.dirs(path.join(tests_dir, "*"))
+            table.sort(folders)
+            for _, sub in ipairs(folders) do
+                if os.isfile(path.join(sub, "main.ens")) then
+                    add_unit("tests/" .. path.basename(sub), sub, {"main.ens"})
+                elseif os.isfile(path.join(sub, "src", "main.ens")) then
+                    add_unit("tests/" .. path.basename(sub), path.join(sub, "src"), {"main.ens"})
+                end
+            end
+            for _, pkg in ipairs({"corpus", "frontend", "sema", "semacheck", "syntaxgen",
+                              "llvm", "codegen", "codegencheck", "cli", "link", "build",
+                              "driver"}) do
+                local src = path.join(os.projectdir(), "selfhost", pkg, "src")
+                local seeds = {}
+                for _, f in ipairs(os.files(path.join(src, "**.ens"))) do
+                    table.insert(seeds, slashed(path.relative(f, src)))
+                end
+                table.sort(seeds)
+                add_unit("selfhost/" .. pkg, src, seeds)
+            end
+            io.writefile(manifest, table.concat(lines, "\n") .. "\n")
+
+            local run_rc = execMerged(exe_file, {manifest}, log)
+            local out = (io.readfile(log) or ""):gsub("[\r\n]+$", "")
+            if run_rc == 0 then
+                return {name = name, ok = true, note = out:match("expected%-reject caught [^\r\n]+")}
+            end
+            return {name = name, ok = false,
+                short = string.format("harness exit %s", tostring(run_rc)),
+                full = string.format("%s:\n%s", name, out)}
+        end
+
         -- the code-generation differential harness: build the harness and the spike, drive the
         -- spike from object emission through linking and execution, and enforce the skip-list
         -- anti-rot rule over the runnable fixtures. The spike links the ens.llvm native binding,
@@ -573,14 +630,14 @@ task("test")
 
             -- the harness itself links the native LLVM binding through ens.codegen, so its
             -- build needs the same linker environment as the spike.
-            local harness_rc = execMerged(ref_exe,
+            local harness_rc = execMerged(seed_exe,
                 {"build", check_src, "--output", harness_exe}, log, {envs = env})
             if not os.isfile(harness_exe) then
                 return {name = name, ok = false, short = "harness build failed",
                     full = string.format("%s: harness build failed (exit %s)\n%s", name,
                         tostring(harness_rc), (io.readfile(log) or ""):gsub("[\r\n]+$", ""))}
             end
-            local spike_rc = execMerged(ref_exe, {"build", spike_src, "--output", spike_exe},
+            local spike_rc = execMerged(seed_exe, {"build", spike_src, "--output", spike_exe},
                 log, {envs = env})
             if not os.isfile(spike_exe) then
                 return {name = name, ok = false, short = "spike build failed",
@@ -668,21 +725,18 @@ task("test")
                 full = string.format("%s:\n%s", name, out)}
         end
 
-        -- the bootstrap fixpoint: the self-hosted driver compiles itself, twice, with identical
-        -- output. Stage 1 builds the driver package with the reference compiler (boot1), stage 2
-        -- has boot1 compile the same package through the self-hosted pipeline (stage2/ensc plus
-        -- one object per module), stage 3 has stage2's ensc compile the same sources again. The
-        -- gate holds when the two stages' objects hold the same modules with identical bytes;
-        -- the executables are compared as a note only, because linker output may carry
-        -- timestamps.
+        -- the bootstrap fixpoint: the Ens-written compiler compiles itself, twice, with identical
+        -- output. Stage 2 has the seed compile its own sources (stage2/ens plus one object per
+        -- module), stage 3 has stage2's ens compile the same sources again. The gate holds when the
+        -- two stages' objects hold the same modules with identical bytes; the executables are
+        -- compared as a note only, because linker output may carry timestamps.
         local function run_bootstrap(job)
             local name = job.name
             local boot_dir = path.join(os.projectdir(), "build", "bootstrap")
             local stage2_dir = path.join(boot_dir, "stage2")
             local stage3_dir = path.join(boot_dir, "stage3")
-            local boot1 = path.join(boot_dir, "boot1" .. exe_suffix)
-            local boot2 = path.join(stage2_dir, "ensc" .. exe_suffix)
-            local boot3 = path.join(stage3_dir, "ensc" .. exe_suffix)
+            local boot2 = path.join(stage2_dir, "ens" .. exe_suffix)
+            local boot3 = path.join(stage3_dir, "ens" .. exe_suffix)
             local log = path.join(out_dir, name .. ".log")
             local driver_src = path.join(os.projectdir(), "selfhost", "driver")
             local libs = path.join(os.projectdir(), "libs")
@@ -697,8 +751,7 @@ task("test")
                 return {name = name, ok = false, short = "no LLVM library",
                     full = string.format("%s: %s", name, env_error)}
             end
-            -- boot1 and stage2's ensc load LLVM and the linker bridge at run time.
-            placeNativeLibraries(native_libraries, boot_dir)
+            -- stage2's ens loads LLVM and the linker bridge at run time.
             placeNativeLibraries(native_libraries, stage2_dir)
 
             local seconds = {}
@@ -713,14 +766,12 @@ task("test")
                 return nil
             end
 
-            local failed = staged("stage 1 (ens builds boot1)", ref_exe,
-                    {"build", driver_src, "--output", boot1}, boot1)
-                or staged("stage 2 (boot1 compiles the driver)", boot1,
-                    {driver_src, "--output", boot2, "--stdlib", libs, "--objects", stage2_dir},
-                    boot2)
-                or staged("stage 3 (boot2 compiles the driver)", boot2,
-                    {driver_src, "--output", boot3, "--stdlib", libs, "--objects", stage3_dir},
-                    boot3)
+            local failed = staged("stage 2 (the seed compiles itself)", seed_exe,
+                    {"build", driver_src, "--output", boot2, "--stdlib", libs,
+                     "--objects", stage2_dir}, boot2)
+                or staged("stage 3 (stage 2 compiles the same sources)", boot2,
+                    {"build", driver_src, "--output", boot3, "--stdlib", libs,
+                     "--objects", stage3_dir}, boot3)
             if failed then
                 return {name = name, ok = false, short = failed:match("^[^\n]+"),
                     full = string.format("%s: %s", name, failed)}
@@ -776,9 +827,9 @@ task("test")
             end
             local executables = readBytes(boot2) == readBytes(boot3) and "identical"
                 or "differ (not gating: linker output)"
-            local note = string.format("stages %.0fs/%.0fs/%.0fs; fixpoint over %d modules, "
+            local note = string.format("stages %.0fs/%.0fs; fixpoint over %d modules, "
                 .. "%.1f MB; executables %s", seconds[1] or 0, seconds[2] or 0,
-                seconds[3] or 0, #names2, total_bytes / (1024 * 1024), executables)
+                #names2, total_bytes / (1024 * 1024), executables)
             return {name = name, ok = true, note = note}
         end
 
@@ -1606,11 +1657,176 @@ task("test")
                 full = string.format("%s:\n%s", name, table.concat(failures, "\n"))}
         end
 
+        -- the Ens-written command's own behavior, driven end to end against scratch fixtures. It is
+        -- deliberately not a comparison against the reference CLI: the two commands are meant to
+        -- differ, so every assertion here is written to this command's own contract.
+        local function run_cli_build(job)
+            local name = job.name
+            local root = path.join(os.projectdir(), "build", "cli", "ensbuild")
+            os.tryrm(root)
+            os.mkdir(root)
+            local work = path.join(root, "work")
+            os.mkdir(work)
+            local log = path.join(out_dir, name .. ".log")
+            local failures = {}
+
+            local env = llvmEnvironment()
+
+            -- run the command and assert its exit code and the fragments its output must carry; a
+            -- fragment prefixed '!' must not appear.
+            local function run(argv, opt, expected_rc, ...)
+                local options = {envs = env}
+                for key, value in pairs(opt or {}) do options[key] = value end
+                local rc = execMerged(seed_exe, argv, log, options)
+                local out = io.readfile(log) or ""
+                local label = table.concat(argv, " ")
+                if expected_rc ~= nil and rc ~= expected_rc then
+                    table.insert(failures, string.format("ens %s: exit=%s expected=%s\n%s",
+                        label, tostring(rc), tostring(expected_rc), out))
+                end
+                for _, fragment in ipairs({...}) do
+                    if fragment:sub(1, 1) == "!" then
+                        if out:find(fragment:sub(2), 1, true) then
+                            table.insert(failures, string.format("ens %s: output must not carry "
+                                .. "%q\n%s", label, fragment:sub(2), out))
+                        end
+                    elseif not out:find(fragment, 1, true) then
+                        table.insert(failures, string.format("ens %s: output missing %q\n%s",
+                            label, fragment, out))
+                    end
+                end
+                return rc, out
+            end
+
+            local function run_program(exe, expected_rc, expected_stdout)
+                if not os.isfile(exe) then
+                    table.insert(failures, string.format("expected executable %s", exe))
+                    return
+                end
+                local rc = execMerged(exe, {}, log)
+                local out = captured(log)
+                if rc ~= expected_rc or out ~= expected_stdout then
+                    table.insert(failures, string.format("%s: exit=%s stdout=%q",
+                        path.filename(exe), tostring(rc), out))
+                end
+            end
+
+            local hello = path.join(tests_dir, "hello.ens")
+            local in_work = {curdir = work}
+            io.writefile(path.join(root, "notes.txt"), "not Ens source\n")
+            io.writefile(path.join(root, "broken.ens"), "main() -> int {\n    return 0;\n")
+
+            -- help and version
+            run({"--help"}, nil, 0, "Usage: ens <command>", "build", "check", "version",
+                "!cst-dump")
+            run({"-h"}, nil, 0, "Usage: ens <command>")
+            run({"help", "build"}, nil, 0, "Usage: ens build", "-o, --output <file>",
+                "-O, --optimization-level <level>", "!--objects")
+            run({"version"}, nil, 0, "ens 0.1")
+            run({"--version"}, nil, 0, "ens 0.1")
+            run({}, nil, 2, "no command given")
+
+            -- argv the command refuses, each one naming what to write instead
+            run({"frobnicate"}, nil, 2, "unknown command 'frobnicate'")
+            run({"biuld", hello}, nil, 2, "did you mean 'build'?")
+            run({"build", "--outpu", hello}, nil, 2, "did you mean '--output'?")
+            run({"build", "--output"}, nil, 2, "needs a value", "-o<file>")
+            run({"build", "-O"}, nil, 2, "-O<level>", "--optimization-level <level>")
+            run({"build", "--optimization-level=9"}, nil, 2, "takes a level from 0 to 3")
+            run({"build", "-q", "-v"}, nil, 2, "opposite things")
+            run({"build", "--target", "pdp11-dec-unix"}, nil, 2, "pdp11-dec-unix")
+            run({"build", hello, "extra"}, nil, 2, "unexpected argument 'extra'")
+            run({"build", path.join(tests_dir, "no_such_place")}, nil, 2, "does not exist")
+            run({"build", path.join(root, "notes.txt")}, nil, 2, "not an Ens source file")
+            run({"build"}, in_work, 2, "no ens.package manifest was found")
+
+            -- a single file: named output, then the default name in the folder the command ran in
+            local hello_exe = path.join(root, "hello_out.exe")
+            run({"build", hello, "--output", hello_exe}, nil, 0, "built")
+            run_program(hello_exe, 0, "Hello, world!")
+            run({"build", hello}, in_work, 0, "built")
+            run_program(path.join(work, "hello.exe"), 0, "Hello, world!")
+
+            -- every optimization level is a shipped configuration, so every one is run
+            for _, level in ipairs({"-O0", "-O1", "-O2", "-O3"}) do
+                local leveled = path.join(root, "hello" .. level .. ".exe")
+                run({"build", hello, level, "--output", leveled}, nil, 0, "built")
+                run_program(leveled, 0, "Hello, world!")
+            end
+
+            -- quiet says nothing on success, verbose says what it did, and --explain-arc accounts
+            local _, quiet_out = run({"build", hello, "--output",
+                path.join(root, "quiet.exe"), "-q"}, nil, 0)
+            if quiet_out:gsub("%s+", "") ~= "" then
+                table.insert(failures, string.format("ens build -q said %q", quiet_out))
+            end
+            run({"build", hello, "--output", path.join(root, "loud.exe"), "-v"}, nil, 0,
+                "emitted", "object file(s)")
+            run({"build", hello, "--output", path.join(root, "arc.exe"), "--explain-arc"}, nil, 0,
+                "elided across the program")
+
+            -- an application package is named after its package; a library keeps no artifact and
+            -- refuses an output
+            run({"build", path.join(tests_dir, "pkg_import_main")}, in_work, 0, "built")
+            run_program(path.join(work, "main.exe"), 0, "Hello, Ada! [acme.tools]")
+            run({"build", path.join(tests_dir, "pkg_import_dep")}, in_work, 0, "as a library")
+            if os.isfile(path.join(work, "tools.exe")) then
+                table.insert(failures, "building a library left an executable behind")
+            end
+            run({"build", path.join(tests_dir, "pkg_import_dep"), "--output",
+                path.join(root, "tools.exe")}, nil, 2, "builds as a library")
+
+            -- check writes nothing and reports what it found
+            run({"check", hello}, nil, 0, "nothing to report")
+            run({"check", path.join(tests_dir, "pkg_import_dep")}, nil, 0, "nothing to report")
+            run({"check", path.join(tests_dir, "undefined_function.ens")}, nil, 1,
+                "Undefined function")
+
+            -- a workspace root builds every member, the library before the application that
+            -- depends on it even though the manifest lists the application first
+            local workspace = path.join(tests_dir, "cli_workspace")
+            run({"build", workspace}, in_work, 0, "[1/2] demo.lib: compiled",
+                "[2/2] demo.app: built")
+            run({"build", workspace, "--output", path.join(root, "x.exe")}, nil, 2, "--output")
+            run({"check", workspace}, nil, 0, "[1/2] demo.lib", "[2/2] demo.app")
+
+            -- a workspace whose members disagree on the Ens version is refused, naming both
+            local split = path.join(root, "split")
+            os.mkdir(path.join(split, "app", "src"))
+            os.mkdir(path.join(split, "lib", "src"))
+            io.writefile(path.join(split, "ens.package"),
+                'workspace {\n    member "app";\n    member "lib";\n}\n')
+            io.writefile(path.join(split, "app", "ens.package"),
+                'package split.app {\n    ens "0.1";\n}\n')
+            io.writefile(path.join(split, "app", "src", "main.ens"),
+                'main() -> int {\n    return 0;\n}\n')
+            io.writefile(path.join(split, "lib", "ens.package"),
+                'package split.lib {\n    ens "0.2";\n}\n')
+            io.writefile(path.join(split, "lib", "src", "greet.ens"),
+                'export greet() -> string {\n    return "hi";\n}\n')
+            run({"build", split}, nil, 2, "disagree on the Ens version", "split.app", "split.lib",
+                '"0.1"', '"0.2"')
+
+            -- the hidden syntax tools
+            run({"cst-dump", hello}, nil, 0, "SourceFile")
+            run({"cst-analyze", hello}, nil, 0)
+            run({"cst-analyze", path.join(root, "broken.ens")}, nil, 1, "broken.ens:")
+            run({"cst-dump", path.join(root, "gone.ens")}, nil, 2, "could not read")
+
+            if #failures == 0 then
+                return {name = name, ok = true}
+            end
+            return {name = name, ok = false,
+                short = string.format("%d CLI assertion(s) failed", #failures),
+                full = string.format("%s:\n%s", name, table.concat(failures, "\n"))}
+        end
+
         -- run a single test: compile, optionally run, and compare against the header.
         -- returns { name = ..., ok = bool, short = <fail reason>, full = <detailed report> }.
         local function run_one(job)
             if job.corpus then return run_corpus(job) end
             if job.semacheck then return run_semacheck(job) end
+            if job.cli_build then return run_cli_build(job) end
             if job.cli_core then return run_cli_core(job) end
             if job.cli_workspace then return run_cli_workspace(job) end
             if job.cli_override then return run_cli_override(job) end
@@ -1764,6 +1980,13 @@ task("test")
             return {name = name, ok = false, short = short,
                 full = string.format("%s: %s", name, short)}
         end
+
+        -- the seed has to exist before any job that compiles Ens starts, and the jobs run in
+        -- parallel, so it is built here rather than on demand inside one of them.
+        print("Building the seed compiler with ens-ref...")
+        local seed_started = os.mclock()
+        buildSeed()
+        print(string.format("Seed compiler built in %.0fs", (os.mclock() - seed_started) / 1000.0))
 
         -- worker count: ENS_TEST_JOBS override, else one per cpu, capped at the test count.
         local njob = tonumber(os.getenv("ENS_TEST_JOBS"))

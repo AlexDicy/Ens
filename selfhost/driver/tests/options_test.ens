@@ -1,0 +1,153 @@
+// Turning a read command line into the invocation a build runs on: the level it optimizes at, the
+// target it builds for, the passes it leaves out, how loud it is, and the paths it resolves.
+import @std.testing;
+import TestFailure from @std.testing;
+import @std.path;
+import BuildOptions from @ens.build.options;
+import Verbosity from @ens.build.options;
+import OptimizationLevel from @ens.codegen.settings;
+import @ens.llvm.target;
+import @ens.cli.parse;
+import commands;
+import options;
+
+test "a build with no options optimizes at level 2 for this machine" {
+    let settled = try settle(["build", "hello.ens"]);
+    try testing.assertTrue(settled.codegen().optimizationLevel() == OptimizationLevel.Default,
+        "the default level is 2");
+    try testing.assertTrue(settled.codegen().optimizesEir(), "the pipeline runs");
+    try testing.assertEqual(settled.targetTriple(), target.hostTargetTriple());
+    try testing.assertTrue(settled.verbosity() == Verbosity.Normal, "an ordinary run");
+    try testing.assertFalse(settled.namesOutput(), "no output was named");
+    try testing.assertEqual(settled.objects(), "");
+    try testing.assertFalse(settled.codegen().explainsArc(), "nothing is explained");
+}
+
+test "every spelling of a level reaches the level it names" {
+    try testing.assertTrue(try levelOf(["build", "-O0"]) == OptimizationLevel.None, "-O0");
+    try testing.assertTrue(try levelOf(["build", "-O1"]) == OptimizationLevel.Less, "-O1");
+    try testing.assertTrue(try levelOf(["build", "-O", "2"]) == OptimizationLevel.Default, "-O 2");
+    try testing.assertTrue(
+        try levelOf(["build", "--optimization-level", "3"]) == OptimizationLevel.Aggressive,
+        "--optimization-level 3");
+    try testing.assertTrue(
+        try levelOf(["build", "--optimization-level=0"]) == OptimizationLevel.None,
+        "--optimization-level=0");
+}
+
+test "level 0 turns the pipeline off and every other level leaves it on" {
+    let none = try settle(["build", "-O0"]);
+    try testing.assertFalse(none.codegen().optimizesEir(), "level 0 optimizes nothing");
+    try testing.assertEqual(none.codegen().llvmOptimizationLevel(), 0);
+    let hardest = try settle(["build", "-O3"]);
+    try testing.assertTrue(hardest.codegen().optimizesEir(), "level 3 optimizes");
+    try testing.assertEqual(hardest.codegen().llvmOptimizationLevel(), 3);
+}
+
+test "a level outside 0 to 3 is refused, naming both spellings" {
+    for (let written in ["4", "-1", "two", "10"]) {
+        string problem = try problemOf(["build", "--optimization-level=" + written]);
+        try testing.assertTrue(problem.contains("-O2"), "the short form: {problem}");
+        try testing.assertTrue(problem.contains("--optimization-level 2"),
+            "the long form: {problem}");
+    }
+}
+
+test "a pass nobody knows is refused, with the passes there are" {
+    string problem = try problemOf(["build", "--disable-pass", "nonsense"]);
+    try testing.assertTrue(problem.contains("nonsense"), "names what was written: {problem}");
+    try testing.assertTrue(problem.contains("'stack-promotion'"), "names a real pass: {problem}");
+}
+
+test "the passes a build leaves out are kept in the order they were written" {
+    let settled = try settle(["build", "--disable-pass", "cleanup-pruning", "--disable-pass",
+        "borrow-rewriting"]);
+    string[] disabled = settled.codegen().disabledPasses();
+    try testing.assertEqual(disabled.length, 2);
+    try testing.assertEqual(disabled[0], "cleanup-pruning");
+    try testing.assertEqual(disabled[1], "borrow-rewriting");
+    try testing.assertFalse(settled.codegen().runsPass("cleanup-pruning"), "left out");
+    try testing.assertTrue(settled.codegen().runsPass("devirtualization"), "still runs");
+}
+
+test "quiet and verbose are each honored, and asking for both is refused" {
+    let quiet = try settle(["build", "-q"]);
+    try testing.assertTrue(quiet.verbosity() == Verbosity.Quiet, "quiet");
+    let verbose = try settle(["build", "-v"]);
+    try testing.assertTrue(verbose.verbosity() == Verbosity.Verbose, "verbose");
+    string problem = try problemOf(["build", "-q", "-v"]);
+    try testing.assertTrue(problem.contains("--quiet"), "names quiet: {problem}");
+    try testing.assertTrue(problem.contains("--verbose"), "names verbose: {problem}");
+}
+
+test "a target triple this toolchain builds for is taken, and one it does not is refused" {
+    for (let triple in ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu",
+            "arm64-apple-macosx14.0"]) {
+        let settled = try settle(["build", "--target", triple]);
+        try testing.assertEqual(settled.targetTriple(), triple);
+    }
+    string problem = try problemOf(["build", "--target", "pdp11-dec-unix"]);
+    try testing.assertTrue(problem.contains("pdp11-dec-unix"), "names the triple: {problem}");
+    try testing.assertTrue(problem.contains("aarch64"), "names what it does build: {problem}");
+}
+
+test "the paths a build was given read from the folder the command ran in" {
+    let settled = try settle(["build", "hello.ens", "--output", "out/hello.exe", "--objects",
+        "out/objects", "--stdlib", "vendor/libs"]);
+    try testing.assertEqual(settled.output(), "/work/out/hello.exe");
+    try testing.assertEqual(settled.objects(), "/work/out/objects");
+    try testing.assertEqual(settled.stdlibRoot(), "/work/vendor/libs");
+    try testing.assertEqual(settled.workingFolder(), "/work");
+}
+
+test "an absolute path a build was given is left where it points" {
+    let settled = try settle(["build", "--output", "/elsewhere/hello.exe"]);
+    try testing.assertEqual(settled.output(), "/elsewhere/hello.exe");
+}
+
+test "discovery supplies the standard library when the command line does not" {
+    let settled = try settle(["build", "hello.ens"]);
+    try testing.assertEqual(settled.stdlibRoot(), "/discovered/libs");
+}
+
+// The options a command line settles into, failing the test when it was refused.
+settle(string[] argv) -> BuildOptions throws {
+    let read = parse.commandLine(commands.application(), argv);
+    let problem = read.problem();
+    if (problem != null) {
+        throw new TestFailure("the command line was refused before the options: {problem}");
+    }
+    let resolution = options.resolve(read, "/work");
+    let settled = resolution.options();
+    if (settled == null) {
+        throw new TestFailure("the options were refused: {resolution.failure()}");
+    }
+    return settled.withStdlibRoot(discoveredStdlib(settled));
+}
+
+// Why a command line was refused, failing the test when it was accepted.
+problemOf(string[] argv) -> string throws {
+    let read = parse.commandLine(commands.application(), argv);
+    let readingProblem = read.problem();
+    if (readingProblem != null) {
+        return readingProblem;
+    }
+    let resolution = options.resolve(read, "/work");
+    if (resolution.options() != null) {
+        throw new TestFailure("the command line was accepted but should have been refused");
+    }
+    return resolution.failure();
+}
+
+// What discovery would have found, standing in for the walk a real build makes.
+discoveredStdlib(BuildOptions given) -> string {
+    if (given.stdlibRoot().length > 0) {
+        return given.stdlibRoot();
+    }
+    return "/discovered/libs";
+}
+
+levelOf(string[] argv) -> OptimizationLevel throws {
+    let settled = try settle(argv);
+    return settled.codegen().optimizationLevel();
+}
