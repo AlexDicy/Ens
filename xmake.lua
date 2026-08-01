@@ -68,14 +68,15 @@ rule("link-llvm-libs")
     end)
 
 
-target("ens-frontend")
+-- The language server's own front end: lexer, parser, CST and semantic analysis, in C++. It is
+-- not the language's front end, which is written in Ens under selfhost/frontend.
+target("lsp-frontend")
     set_kind("static")
     set_languages("cxx17")
     set_toolchains("@llvm")
-    add_rules("link-llvm-libs")
-    add_files("compiler/frontend/**.cpp")
-    add_headerfiles("compiler/frontend/**.h")
-    add_includedirs("compiler/frontend", { public = true })
+    add_files("lsp/frontend/**.cpp")
+    add_headerfiles("lsp/frontend/**.h")
+    add_includedirs("lsp/frontend", { public = true })
 
 
 target("ens-codegen")
@@ -86,7 +87,7 @@ target("ens-codegen")
     add_files("compiler/codegen/**.cpp")
     add_headerfiles("compiler/codegen/**.h")
     add_includedirs("compiler/codegen", { public = true })
-    add_deps("ens-frontend")
+    add_deps("lsp-frontend")
     add_packages("libllvm", "libxml2", { public = true })
     -- fix to have the flag appear later comapred to add_links(...) for GNU ld
     add_ldflags("-lLLVMCGData", { public = true, force = true })
@@ -101,7 +102,7 @@ target("ens-ref")
     add_rules("link-llvm-libs")
     add_files("compiler/driver/**.cpp")
     add_headerfiles("compiler/driver/**.h")
-    add_deps("ens-frontend", "ens-codegen")
+    add_deps("lsp-frontend", "ens-codegen")
 
 
 -- The linker bridge the Ens-written compiler links through: one C entry point over lld's C++
@@ -134,7 +135,7 @@ target("ens-lsp")
     set_languages("cxx20")
     set_toolchains("@llvm")
     add_rules("link-llvm-libs")
-    add_files("lsp/**.cpp")
-    add_headerfiles("lsp/**.h")
-    add_deps("ens-frontend")
+    add_files("lsp/server/**.cpp")
+    add_headerfiles("lsp/server/**.h")
+    add_deps("lsp-frontend")
     add_packages("lsp-framework")
