@@ -5,6 +5,8 @@
 
 #include "lld/Common/CommonLinkerContext.h"
 #include "lld/Common/Driver.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/Support/CrashRecoveryContext.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <cstdlib>
@@ -63,15 +65,32 @@ bool callDriver(int flavor, llvm::ArrayRef<const char*> arguments, llvm::raw_ost
     }
 }
 
+// Runs one step of a link where lld giving up is a return rather than the end of the process. lld
+// reports a corrupted input, or an output it cannot open, through fatal(), and fatal() leaves
+// through llvm::sys::Process::Exit however exitEarly was answered: the caller never hears back, and
+// what the linker printed on its way out is discarded along with the process. Process::Exit gives
+// control back to the calling thread's crash-recovery context rather than ending the process
+// whenever there is one, and nothing puts one in place by default, so the bridge puts one around
+// every step it runs lld under.
+void runWithoutExiting(llvm::function_ref<void()> step) {
+    llvm::CrashRecoveryContext::Enable();
+    llvm::CrashRecoveryContext recovery;
+    recovery.RunSafely(step);
+}
+
 // One link, leaving nothing of itself behind. lld keeps what a run builds up, the files it read and
 // the symbols it resolved, in one heap-allocated context, and a driver called directly never takes
 // it down: a second link then reads a first link's spent state and resolves nothing out of the
 // libraries it thinks it already has. Discarding the context is what lld's own library entry point
-// does, and it is what makes the next call a fresh linker.
+// does, and it is what makes the next call a fresh linker. The discarding runs under recovery as
+// well, since a link that stopped partway is the state its teardown is likeliest to fault on.
 bool runDriver(int flavor, llvm::ArrayRef<const char*> arguments, llvm::raw_ostream& outStream,
                llvm::raw_ostream& errStream) {
-    const bool linked = callDriver(flavor, arguments, outStream, errStream);
-    if (lld::hasContext()) lld::CommonLinkerContext::destroy();
+    bool linked = false;
+    runWithoutExiting([&] { linked = callDriver(flavor, arguments, outStream, errStream); });
+    runWithoutExiting([] {
+        if (lld::hasContext()) lld::CommonLinkerContext::destroy();
+    });
     return linked;
 }
 
@@ -82,8 +101,8 @@ extern "C" {
 // Runs one link. `argumentBlock` holds `argumentCount` NUL-terminated arguments back to back,
 // starting with the linker name the flavor answers to. `output` receives everything the linker
 // printed, or stays null when it printed nothing; a null `output` is accepted and drops the text.
-// Returns 0 when the executable was written, 1 when the linker refused the link, and 2 when the
-// request itself was unusable.
+// Returns 0 when the executable was written, 1 when the linker refused or gave up on the link, and
+// 2 when the request itself was unusable.
 ENS_LLD_EXPORT int ens_lld_link(int flavor, const char* argumentBlock, long long argumentCount,
                                 char** output) {
     if (output != nullptr) *output = nullptr;
