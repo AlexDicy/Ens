@@ -3,6 +3,7 @@
 // vector and the flavor to run it under, and everything the linker printed comes back as one
 // allocated text the caller releases through ens_lld_free.
 
+#include "lld/Common/CommonLinkerContext.h"
 #include "lld/Common/Driver.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -49,8 +50,8 @@ char* copied(const std::string& text) {
     return buffer;
 }
 
-bool runDriver(int flavor, llvm::ArrayRef<const char*> arguments, llvm::raw_ostream& outStream,
-               llvm::raw_ostream& errStream) {
+bool callDriver(int flavor, llvm::ArrayRef<const char*> arguments, llvm::raw_ostream& outStream,
+                llvm::raw_ostream& errStream) {
     switch (flavor) {
         case kFlavorElf:
             return lld::elf::link(arguments, outStream, errStream, /*exitEarly=*/false,
@@ -60,6 +61,18 @@ bool runDriver(int flavor, llvm::ArrayRef<const char*> arguments, llvm::raw_ostr
         default:
             return lld::coff::link(arguments, outStream, errStream, false, false);
     }
+}
+
+// One link, leaving nothing of itself behind. lld keeps what a run builds up, the files it read and
+// the symbols it resolved, in one heap-allocated context, and a driver called directly never takes
+// it down: a second link then reads a first link's spent state and resolves nothing out of the
+// libraries it thinks it already has. Discarding the context is what lld's own library entry point
+// does, and it is what makes the next call a fresh linker.
+bool runDriver(int flavor, llvm::ArrayRef<const char*> arguments, llvm::raw_ostream& outStream,
+               llvm::raw_ostream& errStream) {
+    const bool linked = callDriver(flavor, arguments, outStream, errStream);
+    if (lld::hasContext()) lld::CommonLinkerContext::destroy();
+    return linked;
 }
 
 }  // namespace
