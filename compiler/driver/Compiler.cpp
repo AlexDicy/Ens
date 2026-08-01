@@ -673,6 +673,14 @@ Compiler::BuildResult Compiler::build(const fs::path& source,
                   << "extension or '.exe', not '" << ext << "'\n";
         return result;
     }
+    // Asked to write a program over a folder, the linker stops the whole process on the spot and
+    // takes its own account of why with it, so the one thing said about it has to be said here.
+    if (fs::is_directory(exePath)) {
+        std::cerr << "ERROR: '" << exePath.string() << "' is a folder, so the program cannot be "
+                  << "written there; name the program with '--output' or build from a folder that "
+                  << "holds no '" << exePath.filename().string() << "'\n";
+        return result;
+    }
 
     std::vector<std::string> libraries;
     std::vector<std::string> libraryFiles;
