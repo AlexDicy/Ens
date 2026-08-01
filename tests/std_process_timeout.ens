@@ -1,20 +1,20 @@
 // @exit 0
-// @stdout silent: waits in range true, ended true, code 0
+// @stdout silent: every bounded wait gave up true, ended true, code 0
 // @stdout silent: stopping a finished child ok true, code still 0
 // @stdout stalled: spoke true, said 'one line, then nothing for a while', quiet true, code 137
 // @stdout buffered: ready with no bound true, second line 'second', nothing more with no bound true
 // The program starts itself as the child, so one fixture covers both sides. A child that is busy says
-// nothing, which is what a bounded wait is for: the waits are counted rather than timed, because how
-// many of them fit inside the time the child spends busy is what shows the bound is neither ignored
-// nor spun through.
+// nothing, which is what a bounded wait is for. Nothing here is measured against the clock: a child
+// stays busy until the parent leaves the file it watches for, so how fast this machine runs never
+// decides whether a bounded wait still had a running child to give up on.
 import @std.system;
 import SystemError from @std.system;
 import ChildProcess from @std.system;
 
 main() -> int {
     string[] arguments = system.arguments();
-    if (arguments.length > 1) {
-        return child(arguments[1]);
+    if (arguments.length > 2) {
+        return child(arguments[1], arguments[2]);
     }
     return try parent();
 } catch (SystemError e) {
@@ -22,45 +22,59 @@ main() -> int {
     return 1;
 }
 
-// The child: this same program, started again with the part it is to play.
-child(string mode) -> int {
+// The child: this same program, started again with the part it is to play and the file that ends it.
+child(string mode, string ending) -> int {
     return switch (mode) {
-        "silent" -> busyWithoutSpeaking(),
-        "stalled" -> oneLineThenBusy(),
-        "buffered" -> twoLinesThenBusy(),
+        "silent" -> busyWithoutSpeaking(ending),
+        "stalled" -> oneLineThenBusy(ending),
+        "buffered" -> twoLinesThenBusy(ending),
         default -> 0,
     };
 }
 
-// Busy for a while and never a word, which is the child a bounded wait has to give up on.
-busyWithoutSpeaking() -> int {
-    let spent = busy();
-    return 0;
+// Busy and never a word, which is the child a bounded wait has to give up on.
+busyWithoutSpeaking(string ending) -> int {
+    return busyUntilReleased(ending, 0);
 }
 
-oneLineThenBusy() -> int {
+oneLineThenBusy(string ending) -> int {
+    let spent = work(ending);
     print("one line, then nothing for a while");
     system.flush();
-    let spent = busy();
-    return 7;
+    return busyUntilReleased(ending, 7);
 }
 
 // Two lines in one breath, so both reach the reader in one go and the second waits in the reader's
 // own hands rather than in the pipe.
-twoLinesThenBusy() -> int {
+twoLinesThenBusy(string ending) -> int {
     print("first");
     print("second");
     system.flush();
-    let spent = busy();
-    return 0;
+    return busyUntilReleased(ending, 0);
 }
 
-// Real work the compiler cannot fold away, which takes long enough for a good many bounded waits to
-// fit inside it.
-busy() -> long {
+// Busy until the parent leaves the file that ends this child, which is what makes the parent rather
+// than the clock decide how long the child stays busy. Answers `released` once the file is there, and
+// 99 when it gave up asking: a correct run never reaches that, and it is there so a wait that never
+// answers or a kill that did nothing ends in a code the parent reports rather than in a child nobody
+// ever hears from again.
+busyUntilReleased(string ending, int released) -> int {
+    for (long i = 0; i < probes(); i++) {
+        if (system.isFile(ending)) {
+            return released;
+        }
+    }
+    return 99;
+}
+
+// Work before the first word, so the line the parent waits for is one it has to wait for rather than
+// one already written by the time it first asks. The names are built from the file this child was
+// given, which is a full path, so what the work costs does not depend on the folder the child was
+// started in or on what that folder holds.
+work(string ending) -> long {
     long asked = 0;
-    for (long i = 0; i < 150000; i++) {
-        if (system.isFile("no-such-file-{i}")) {
+    for (long i = 0; i < 20000; i++) {
+        if (system.isFile("{ending}-{i}")) {
             asked = asked + 100;
         }
         asked = asked + 1;
@@ -70,28 +84,35 @@ busy() -> long {
 
 parent() -> int throws {
     string self = system.executablePath();
+    string ending = self + ".release";
+    try take(ending);
 
-    // A child that says nothing: every wait gives up, and the one that answers at last is the end of
-    // the output, because a child that has gone leaves nothing holding the pipe.
-    let silent = try system.start(self, ["silent"]);
-    long waits = 0;
-    bool spoke = try silent.waitForOutput(bound());
-    while (!spoke) {
-        waits = waits + 1;
-        spoke = try silent.waitForOutput(bound());
+    // A child that says nothing: every bounded wait gives up, because the child is still running and
+    // has written nothing. It is let go only once those waits are done, and the read after that ends,
+    // because a child that has gone leaves nothing holding the pipe.
+    let silent = try system.start(self, ["silent", ending]);
+    bool gaveUpEveryTime = true;
+    for (long i = 0; i < waits(); i++) {
+        if (try silent.waitForOutput(bound())) {
+            gaveUpEveryTime = false;
+        }
     }
+    try leave(ending);
     string? nothing = try silent.readLine();
     int silentCode = try silent.wait();
-    print("silent: waits in range {inRange(waits)}, ended {nothing == null}, code {silentCode}");
+    print("silent: every bounded wait gave up {gaveUpEveryTime}, ended {nothing == null}, "
+        + "code {silentCode}");
 
     // Stopping a child that has already finished is nothing to do, and the code it reported stands.
     bool stoppedAgain = try stopping(silent);
     int codeStill = try silent.wait();
     print("silent: stopping a finished child ok {stoppedAgain}, code still {codeStill}");
+    try take(ending);
 
-    // A child that says one thing and then goes quiet: the line arrives, and the wait after it gives
-    // up while the child is still running, which is what a fetch stops a wedged program on.
-    let stalled = try system.start(self, ["stalled"]);
+    // A child that says one thing and then goes quiet: the line arrives after work the parent has to
+    // wait through, and the wait after it gives up while the child is still running, which is what a
+    // fetch stops a wedged program on.
+    let stalled = try system.start(self, ["stalled", ending]);
     bool said = try stalled.waitForOutput(patience());
     string? line = try stalled.readLine();
     bool quiet = !(try stalled.waitForOutput(bound()));
@@ -102,7 +123,7 @@ parent() -> int throws {
 
     // A line already in hand is an answer with no bound at all to spend: nothing is asked of the
     // system, which is why the same question answers false once that line has been taken.
-    let buffered = try system.start(self, ["buffered"]);
+    let buffered = try system.start(self, ["buffered", ending]);
     string? firstLine = try buffered.readLine();
     bool readyAtOnce = try buffered.waitForOutput(0);
     string? secondLine = try buffered.readLine();
@@ -114,24 +135,40 @@ parent() -> int throws {
     return 0;
 }
 
-// How long one bounded wait waits for. Short against the time the child spends busy, so several of
-// them fit inside it.
+// How long one bounded wait waits for. Short, because every one of them is spent on a child that is
+// certainly running and certainly silent.
 bound() -> long {
     return 100;
 }
 
-// Long enough that a line the child writes at once is never missed for want of waiting.
+// How many bounded waits the silent child has to outlast. One would show the wait gives up; several
+// show that a wait which gave up leaves the next one just as much to give up on.
+waits() -> long {
+    return 3;
+}
+
+// Long enough that a line the child writes after its work is never missed for want of waiting.
 patience() -> long {
     return 30000;
 }
 
-// How many waits gave up while the child was busy. One or none would mean a wait outstaying its
-// bound; a great many would mean waits that answer without waiting at all.
-inRange(long waits) -> string {
-    if (waits >= 2 && waits <= 400) {
-        return "true";
+// How many times a child asks for the file before it gives up on ever being let go. Asking the file
+// system is a system call, so no machine gets through this many in the fraction of a second a correct
+// run leaves a child waiting.
+probes() -> long {
+    return 20000000;
+}
+
+// Leaves the file a child is watching for, which is how the parent says that child may end.
+leave(string path) throws {
+    try system.writeAllText(path, "go");
+}
+
+// Takes that file away again, so the next child starts with nothing telling it to end.
+take(string path) throws {
+    if (system.isFile(path)) {
+        try system.removeFile(path);
     }
-    return "false ({waits} waits)";
 }
 
 stopping(ChildProcess finished) -> bool throws {
