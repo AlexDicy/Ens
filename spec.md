@@ -806,6 +806,9 @@ int n = arr.length;      // error: long -> int, can be forced with `arr.length a
 
 Integer literals without a type suffix adapt to the surrounding type when it's an integer that fits the value. With no context they default to `int`. Values out of range produce a specific error.
 
+That default is held to the same rule as any other type, so a literal nothing gives a type to must fit the type it falls back to, and a value past it is an error naming the type that would hold it rather than a silent truncation.
+A cast counts as naming a type: a literal whose value the target holds adapts to it, while one the target cannot hold keeps its default and is truncated by the cast, which is what a narrowing cast is for.
+
 ```ens
 byte b = 5;              // OK - 5 fits in byte
 long n = 5;              // OK - 5 fits in long

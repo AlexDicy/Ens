@@ -175,6 +175,27 @@ private:
 
     StructInfo* errorClassInfo_ = nullptr;
 
+    // A numeric literal whose value its own default type cannot hold. The report waits
+    // until bodies are analyzed, because a literal in a target-typed position is retyped
+    // first and diagnosed against that target instead; what is left over here is a
+    // literal that kept its default and would otherwise be truncated in silence.
+    struct PendingLiteralRange {
+        const GreenElement* green;
+        uint32_t offset;
+        uint32_t length;
+        Type* defaultType;
+        std::u16string text;
+        bool negative;
+        bool parsed;          // an integer magnitude that fits 64 bits
+        uint64_t magnitude;
+    };
+    std::vector<PendingLiteralRange> pendingLiteralRanges;
+
+    void adaptLiteralToCastTarget(const ast::Expression& src, Type* target);
+    void recordLiteralRange(const ast::LiteralExpression& lit, Type* defaultType);
+    void retargetLiteralRange(const SyntaxNode& outer, const SyntaxNode& operand, bool negative);
+    void reportPendingLiteralRanges();
+
     Symbol* makeSymbol(SymbolKind k, std::u16string n, Type* t, uint32_t offset);
     Scope* pushScope();
     void popScope();

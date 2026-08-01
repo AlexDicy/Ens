@@ -199,6 +199,29 @@ class AssignmentFlow {
     protected constructor(this.assigned, this.assignedFields, this.terminated);
 }
 
+// A numeric literal whose value its own default type cannot hold. The report waits until the
+// module's bodies are checked, because a literal in a target-typed position is retyped first
+// and diagnosed against that target instead; what is left over is a literal that kept its
+// default and would otherwise be truncated in silence.
+class PendingLiteralRange {
+    protected GreenNode green;
+    protected Span span;
+    protected PrimitiveType defaultType;
+    protected string text;
+    protected bool negative;
+    protected bool parsed;
+    protected ulong magnitude;
+
+    protected constructor(this.green, this.span, this.defaultType, this.text, this.negative,
+                this.parsed, this.magnitude);
+
+    protected moveTo(GreenNode green, Span span, bool negative) {
+        this.green = green;
+        this.span = span;
+        this.negative = negative;
+    }
+}
+
 // What a member name means on a receiver type.
 sealed abstract class MemberLookup {
 }
@@ -263,6 +286,8 @@ class BodyChecker implements NoreturnCalls {
     GreenNode? obligationOwner;
     string obligationOwnerName;
 
+    List<PendingLiteralRange> pendingLiteralRanges;
+
     protected constructor(ModuleContext context, Map<string, ModuleContext> contextsByPath,
                 List<FileDiagnostic> collected, ObligationRegistry deferred) {
         this.context = context;
@@ -294,6 +319,7 @@ class BodyChecker implements NoreturnCalls {
         this.deferredObligations = deferred;
         this.obligationOwner = null;
         this.obligationOwnerName = "";
+        this.pendingLiteralRanges = new List<PendingLiteralRange>();
     }
 
     protected run() {
@@ -318,6 +344,7 @@ class BodyChecker implements NoreturnCalls {
                 default -> { },
             }
         }
+        this.reportPendingLiteralRanges();
     }
 
     // ---- Declaration walking ----
@@ -2372,16 +2399,143 @@ class BodyChecker implements NoreturnCalls {
 
     analyzeLiteral(LiteralExpressionNode node) -> Type {
         return switch (node.value().kind()) {
-            IntLiteral -> this.store.primitive(PrimitiveKind.Int),
-            LongLiteral -> this.store.primitive(PrimitiveKind.Long),
-            FloatLiteral -> this.store.primitive(PrimitiveKind.Float),
-            DoubleLiteral -> this.store.primitive(PrimitiveKind.Double),
+            IntLiteral -> this.numericLiteral(node, PrimitiveKind.Int),
+            LongLiteral -> this.numericLiteral(node, PrimitiveKind.Long),
+            FloatLiteral -> this.numericLiteral(node, PrimitiveKind.Float),
+            DoubleLiteral -> this.numericLiteral(node, PrimitiveKind.Double),
             StringLiteral -> this.store.stringType(),
             CharLiteral -> this.store.primitive(PrimitiveKind.Char),
             TrueKeyword, FalseKeyword -> this.store.primitive(PrimitiveKind.Bool),
             NullKeyword -> this.store.nullType(),
             default -> this.store.errorType(),
         };
+    }
+
+    // A numeric literal starts at its own default type. Where nothing adapts it, that default
+    // has to hold the value, so the ones that do not are recorded and reported at the end.
+    numericLiteral(LiteralExpressionNode node, PrimitiveKind kind) -> Type {
+        let defaultType = this.store.primitive(kind);
+        this.recordLiteralRange(node, defaultType);
+        return defaultType;
+    }
+
+    // A cast names the width the value should take, so a literal whose value the target holds
+    // adapts to it and stays exact. One the target cannot hold keeps its default type, because
+    // a narrowing cast is how the language spells a deliberate truncation.
+    adaptLiteralToCastTarget(Expression node, Type target) {
+        if (!(target is PrimitiveType)) {
+            return;
+        }
+        if (convert.isIntegerType(target)) {
+            let literal = intLiteralOf(node);
+            if (literal == null) {
+                return;
+            }
+            let magnitude = literalvalues.integerMagnitude(literal.value().text());
+            if (magnitude == null || !literalvalues.magnitudeFits(isNegativeLiteral(node),
+                    magnitude, target.kind())) {
+                return;
+            }
+            this.result.setType(node.green(), target);
+            this.result.setType(literal.green(), target);
+            return;
+        }
+        if (target.kind() != PrimitiveKind.Float && target.kind() != PrimitiveKind.Double) {
+            return;
+        }
+        let literal = floatLiteralOf(node);
+        if (literal == null) {
+            return;
+        }
+        if (!literalvalues.floatMagnitudeFits(
+                literalvalues.floatMagnitude(literal.value().text()), target.kind())) {
+            return;
+        }
+        this.result.setType(node.green(), target);
+        this.result.setType(literal.green(), target);
+    }
+
+    recordLiteralRange(LiteralExpressionNode node, PrimitiveType defaultType) {
+        string text = node.value().text();
+        if (convert.isIntegerType(defaultType)) {
+            let magnitude = literalvalues.integerMagnitude(text);
+            if (magnitude != null
+                    && literalvalues.magnitudeFits(false, magnitude, defaultType.kind())) {
+                return;
+            }
+            ulong value = 0;
+            bool parsed = magnitude != null;
+            if (magnitude != null) {
+                value = magnitude;
+            }
+            this.pendingLiteralRanges.push(new PendingLiteralRange(node.green(), node.span(),
+                defaultType, text, false, parsed, value));
+            return;
+        }
+        if (literalvalues.floatMagnitudeFits(literalvalues.floatMagnitude(text),
+                defaultType.kind())) {
+            return;
+        }
+        this.pendingLiteralRanges.push(new PendingLiteralRange(node.green(), node.span(),
+            defaultType, text, false, false, 0));
+    }
+
+    // A sign sits outside the literal as a prefix, and it moves the integer boundary: the
+    // magnitude 2147483648 is not an 'int' on its own but -2147483648 is. The pending entry
+    // moves up to the prefix so adaptation and the diagnostic both see the whole value.
+    retargetLiteralRange(PrefixExpressionNode outer, Expression operand, bool negative) {
+        if (this.pendingLiteralRanges.length() == 0) {
+            return;
+        }
+        let pending = this.pendingLiteralRanges.get(this.pendingLiteralRanges.length() - 1);
+        if (pending.green != operand.green()) {
+            return;
+        }
+        if (negative && pending.parsed && literalvalues.magnitudeFits(true, pending.magnitude,
+                pending.defaultType.kind())) {
+            this.pendingLiteralRanges.pop();
+            return;
+        }
+        pending.moveTo(outer.green(), outer.span(), negative);
+    }
+
+    reportPendingLiteralRanges() {
+        for (let pending in this.pendingLiteralRanges) {
+            // Retyped by a target-typed position, which already judged the value there.
+            let finalType = this.result.typeOf(pending.green);
+            if (finalType != null && finalType != pending.defaultType) {
+                continue;
+            }
+            string sign = "";
+            if (pending.negative) {
+                sign = "-";
+            }
+            string typeName = types.display(pending.defaultType);
+            if (convert.isIntegerType(pending.defaultType)) {
+                string wider = widerIntegerHolding(pending.negative, pending.magnitude,
+                    pending.defaultType.kind());
+                if (!pending.parsed || wider.length == 0) {
+                    this.reporter.report("Literal {sign}{pending.text} does not fit in any "
+                        + "integer type; the widest, 'ulong', holds up to "
+                        + "18446744073709551615.", pending.span);
+                } else {
+                    this.reporter.report("Literal {sign}{pending.text} does not fit in "
+                        + "'{typeName}' (range "
+                        + "{literalvalues.integerRange(pending.defaultType.kind())}); declare "
+                        + "'{wider}' to hold it.", pending.span);
+                }
+            } else {
+                string hint = ".";
+                if (pending.defaultType.kind() == PrimitiveKind.Float) {
+                    hint = "; 'double' reaches further.";
+                }
+                this.reporter.report("Literal {sign}{pending.text} is too large for "
+                    + "'{typeName}', which holds "
+                    + "{literalvalues.floatLimit(pending.defaultType.kind())} at most{hint}",
+                    pending.span);
+            }
+        }
+        this.pendingLiteralRanges = new List<PendingLiteralRange>();
     }
 
     analyzeIdentifier(IdentifierExpressionNode node) -> Type {
@@ -2677,6 +2831,11 @@ class BodyChecker implements NoreturnCalls {
 
     analyzePrefix(PrefixExpressionNode node) -> Type {
         Type operand = this.analyzeExpression(node.operand());
+        SyntaxKind prefixOperator = node.operator().kind();
+        if (prefixOperator == SyntaxKind.Minus || prefixOperator == SyntaxKind.Plus) {
+            this.retargetLiteralRange(node, node.operand(),
+                prefixOperator == SyntaxKind.Minus);
+        }
         if (operand is ErrorType) {
             return this.store.errorType();
         }
@@ -2985,6 +3144,11 @@ class BodyChecker implements NoreturnCalls {
         Type target = this.resolver.resolveType(node.target());
         if (source is ErrorType || target is ErrorType) {
             return this.store.errorType();
+        }
+        this.adaptLiteralToCastTarget(node.value(), target);
+        let retyped = this.result.typeOf(node.value().green());
+        if (retyped != null) {
+            source = retyped;
         }
         if (source is EnumType) {
             if (!source.isNumeric()) {
@@ -5782,6 +5946,22 @@ isNegativeLiteral(Expression node) -> bool {
         return node.operator().kind() == SyntaxKind.Minus;
     }
     return false;
+}
+
+// The narrowest integer kind past `from` that holds the value, for a suggestion. Empty when no
+// integer kind does, which is the only case with nothing to reach for.
+widerIntegerHolding(bool negative, ulong magnitude, PrimitiveKind from) -> string {
+    bool fromIsLong = from == PrimitiveKind.Long;
+    if (negative) {
+        if (!fromIsLong && magnitude <= 9223372036854775808) {
+            return "long";
+        }
+        return "";
+    }
+    if (!fromIsLong && magnitude <= 9223372036854775807) {
+        return "long";
+    }
+    return "ulong";
 }
 
 // The unsuffixed floating-point literal a value is written as, behind an optional sign. A

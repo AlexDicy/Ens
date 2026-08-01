@@ -340,6 +340,18 @@ const ast::LiteralExpression* asFloatLiteralChild(const ast::Expression& e) {
     return nullptr;
 }
 
+// The narrowest integer type past `from` that holds the value, for a suggestion. Null when
+// no integer type does, which is the only case with nothing to reach for.
+const char* widerIntegerHolding(bool negative, uint64_t magnitude, Type* from) {
+    bool fromIsLong = from->kind == TypeKind::Long;
+    if (negative) {
+        if (!fromIsLong && magnitude <= 9223372036854775808ull) return "long";
+        return nullptr;
+    }
+    if (!fromIsLong && magnitude <= 9223372036854775807ull) return "long";
+    return "ulong";
+}
+
 std::string floatLimitString(Type* target) {
     if (!target) return "";
     switch (target->kind) {
@@ -443,6 +455,109 @@ void Analyzer::tryAdaptCharLiteral(const ast::Expression& src, Type* target) {
     }
     analysis.setType(src.node.greenNode(), target);
     analysis.setType(lit->node.greenNode(), target);
+}
+
+// A cast names the width the value should take, so a literal whose value the target holds
+// adapts to it and stays exact. One the target cannot hold keeps its default type, because a
+// narrowing cast is how the language spells a deliberate truncation.
+void Analyzer::adaptLiteralToCastTarget(const ast::Expression& src, Type* target) {
+    if (!target || target->isError()) return;
+    auto retype = [&](const ast::LiteralExpression& lit) {
+        analysis.setType(src.node.greenNode(), target);
+        analysis.setType(lit.node.greenNode(), target);
+    };
+    if (target->isInteger()) {
+        const ast::LiteralExpression* lit = asIntLiteralChild(src);
+        if (!lit || !lit->token()) return;
+        uint64_t magnitude = 0;
+        if (!parseIntegerLiteralMagnitude(lit->token()->tokenText(), magnitude)) return;
+        if (!literalFitsTarget(literalIsNegative(src), magnitude, target)) return;
+        retype(*lit);
+        return;
+    }
+    if (target->isFloat() && target->kind != TypeKind::Decimal) {
+        const ast::LiteralExpression* lit = asFloatLiteralChild(src);
+        if (!lit || !lit->token()) return;
+        if (!floatMagnitudeFits(parseFloatLiteralMagnitude(lit->token()->tokenText()),
+                                target->kind == TypeKind::Float)) {
+            return;
+        }
+        retype(*lit);
+    }
+}
+
+// A literal whose value its own default type cannot hold. Nothing is reported yet: a
+// target-typed position retypes the literal and diagnoses it against that target, so only a
+// literal that keeps its default reaches reportPendingLiteralRanges.
+void Analyzer::recordLiteralRange(const ast::LiteralExpression& lit, Type* defaultType) {
+    auto tok = lit.token();
+    if (!tok) return;
+    std::u16string text(tok->tokenText());
+    auto [offset, length] = lit.node.contentRange();
+    PendingLiteralRange pending{lit.node.greenNode(), offset, length, defaultType, text,
+                                /*negative=*/false, /*parsed=*/false, /*magnitude=*/0};
+    if (defaultType->isInteger()) {
+        pending.parsed = parseIntegerLiteralMagnitude(text, pending.magnitude);
+        if (pending.parsed && literalFitsTarget(false, pending.magnitude, defaultType)) return;
+    } else {
+        if (floatMagnitudeFits(parseFloatLiteralMagnitude(text),
+                               defaultType->kind == TypeKind::Float)) {
+            return;
+        }
+    }
+    pendingLiteralRanges.push_back(std::move(pending));
+}
+
+// A sign sits outside the literal as a prefix, and it moves the integer boundary: the
+// magnitude 2147483648 is not an `int` on its own but -2147483648 is. The pending entry moves
+// up to the prefix so adaptation and the diagnostic both see the whole value.
+void Analyzer::retargetLiteralRange(const SyntaxNode& outer, const SyntaxNode& operand,
+                                    bool negative) {
+    if (pendingLiteralRanges.empty()) return;
+    auto& pending = pendingLiteralRanges.back();
+    if (pending.green != operand.greenNode()) return;
+    if (negative && pending.parsed &&
+        literalFitsTarget(true, pending.magnitude, pending.defaultType)) {
+        pendingLiteralRanges.pop_back();
+        return;
+    }
+    auto [offset, length] = outer.contentRange();
+    pending.green = outer.greenNode();
+    pending.offset = offset;
+    pending.length = length;
+    pending.negative = negative;
+}
+
+void Analyzer::reportPendingLiteralRanges() {
+    for (const auto& pending : pendingLiteralRanges) {
+        // Retyped by a target-typed position, which already judged the value there.
+        Type* finalType = analysis.typeOf(pending.green);
+        if (finalType && !finalType->equals(pending.defaultType)) continue;
+        std::string num = (pending.negative ? std::string("-") : std::string("")) +
+            asciiOf(pending.text);
+        std::string typeName = pending.defaultType->toString();
+        std::string message;
+        if (pending.defaultType->isInteger()) {
+            const char* wider = pending.parsed
+                ? widerIntegerHolding(pending.negative, pending.magnitude, pending.defaultType)
+                : nullptr;
+            if (wider) {
+                message = "Literal " + num + " does not fit in '" + typeName + "' (range " +
+                    integerRangeString(pending.defaultType) + "); declare '" + wider +
+                    "' to hold it.";
+            } else {
+                message = "Literal " + num + " does not fit in any integer type; the widest, "
+                    "'ulong', holds up to 18446744073709551615.";
+            }
+        } else {
+            std::string hint = pending.defaultType->kind == TypeKind::Float
+                ? "; 'double' reaches further." : ".";
+            message = "Literal " + num + " is too large for '" + typeName + "', which holds " +
+                floatLimitString(pending.defaultType) + " at most" + hint;
+        }
+        error(pending.offset, static_cast<int>(pending.length), std::move(message));
+    }
+    pendingLiteralRanges.clear();
 }
 
 // An unsuffixed floating-point literal takes the surrounding floating-point type when the
@@ -1045,6 +1160,8 @@ void Analyzer::analyzeBodies() {
     for (auto& sd : sf.structs())   for (auto& m : sd.methods()) analyzeFunctionBody(m);
     for (auto& cd : sf.classes())   for (auto& m : cd.methods()) analyzeFunctionBody(m);
     for (auto& td : sf.tests())     analyzeTestBody(td);
+
+    reportPendingLiteralRanges();
 }
 
 void Analyzer::resolveDeclaredThrows(const ast::FuncDecl& fn, Symbol* sym) {
@@ -4489,11 +4606,18 @@ Type* Analyzer::analyzeInterpString(const ast::InterpStringExpression& expr) {
 }
 
 Type* Analyzer::analyzeLiteral(const ast::LiteralExpression& expr) {
+    // A numeric literal starts at its own default type. Where nothing adapts it, that default
+    // has to hold the value, so the ones that do not are recorded and reported at the end.
+    auto atDefault = [&](TypeKind kind) {
+        Type* defaultType = typeCtx.getPrimitive(kind);
+        recordLiteralRange(expr, defaultType);
+        return defaultType;
+    };
     switch (expr.literalKind()) {
-        case SyntaxKind::IntLiteral:    return typeCtx.getPrimitive(TypeKind::Int);
-        case SyntaxKind::LongLiteral:   return typeCtx.getPrimitive(TypeKind::Long);
-        case SyntaxKind::FloatLiteral:  return typeCtx.getPrimitive(TypeKind::Float);
-        case SyntaxKind::DoubleLiteral: return typeCtx.getPrimitive(TypeKind::Double);
+        case SyntaxKind::IntLiteral:    return atDefault(TypeKind::Int);
+        case SyntaxKind::LongLiteral:   return atDefault(TypeKind::Long);
+        case SyntaxKind::FloatLiteral:  return atDefault(TypeKind::Float);
+        case SyntaxKind::DoubleLiteral: return atDefault(TypeKind::Double);
         case SyntaxKind::StringLiteral: return typeCtx.getPrimitive(TypeKind::String);
         case SyntaxKind::CharLiteral:   return typeCtx.getPrimitive(TypeKind::Char);
         case SyntaxKind::KwTrue:
@@ -5037,6 +5161,9 @@ Type* Analyzer::analyzePrefix(const ast::PrefixExpression& expr) {
     if (t->isError()) return typeCtx.getError();
     auto opTok = expr.operatorToken();
     if (!opTok) return typeCtx.getError();
+    if (opTok->kind() == SyntaxKind::Minus || opTok->kind() == SyntaxKind::Plus) {
+        retargetLiteralRange(expr.node, operand->node, opTok->kind() == SyntaxKind::Minus);
+    }
     switch (opTok->kind()) {
         case SyntaxKind::Minus:
             if (!t->isNumeric()) {
@@ -6480,6 +6607,8 @@ Type* Analyzer::analyzeCast(const ast::CastExpression& expr) {
     Type* srcT = analyzeExpr(*src);
     Type* dstT = resolveTypeReference(*tr);
     if (srcT->isError() || dstT->isError()) return typeCtx.getError();
+    adaptLiteralToCastTarget(*src, dstT);
+    if (Type* adapted = analysis.typeOf(src->node.greenNode())) srcT = adapted;
 
     // A numeric enum yields its member's assigned value; the target must be an
     // integer type (widening to 'long' or narrowing per the usual 'as' rules).
