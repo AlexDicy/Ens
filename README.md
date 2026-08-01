@@ -5,7 +5,6 @@ Ens is a compiled programming language with automatic reference counting, checke
 ## Building and testing
 
 ```pwsh
-xmake build ens-ref
 xmake build ens-lld
 xmake test
 ```

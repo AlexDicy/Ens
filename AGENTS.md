@@ -21,12 +21,12 @@ Two compilers live in this repository, and knowing which is which matters before
   It compiles itself to a byte-identical fixpoint, which the `bootstrap` job gates on every test run.
   This is the `ens` command a user runs, and new language and tool work belongs here.
 - **`ens-ref`** is the older compiler, written in C++, under `compiler/`.
-  It is no longer the product.
-  It stays for one reason: it compiles the `tests/` fixtures as a second opinion.
-  Nothing blocks its removal any more; the seed a fresh clone bootstraps from is committed, not built (see [The bootstrap seed](#the-bootstrap-seed)).
+  It is no longer the product, and nothing drives it any more: the `tests/` fixtures it used to compile are compiled by `ens`, the seed a fresh clone bootstraps from is committed rather than built, and the CLI jobs that drove its command line are gone.
+  `xmake test` neither builds nor runs it.
+  It is kept only until it is deleted, so do not teach it anything new; a language change lands in `ens` alone.
 
 `spec.md` is the single source of truth for user-facing language and tool behavior.
-If the spec, `ens`, and `ens-ref` disagree, that is a bug worth surfacing, not a detail to paper over.
+If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surfacing, not a detail to paper over.
 
 ## Repository map
 
@@ -46,7 +46,7 @@ If the spec, `ens`, and `ens-ref` disagree, that is a bug worth surfacing, not a
   - `build/` - target resolution, the toolchain decision, build and check orchestration, test discovery and runner synthesis, reporting.
   - `driver/` - the `ens` executable itself: command declarations, dispatch, exit codes.
   - `corpus/` - a harness asserting the front end parses every `.ens` file in the repo losslessly.
-  - `semacheck/` - the differential harness gating sema behavior against `ens-ref` (see Test conventions).
+  - `semacheck/` - the harness gating sema behavior against every fixture and package in the tree (see Test conventions).
   - `codegencheck/` - the differential harness gating code generation, with `codegencheck/spike` as its own member: a small program that emits an object file through the LLVM binding.
 - `tests/` - the compiler test suite; every fixture is executable specification.
 - `lsp/`, `tools/` - editor integrations; `tools/grammar/` is canonical for the shared grammar/config files.
@@ -54,22 +54,20 @@ If the spec, `ens`, and `ens-ref` disagree, that is a bug worth surfacing, not a
 
 ## Building and testing
 
-- Two native targets carry the compiler and its tests: `xmake build ens-ref` and `xmake build ens-lld`.
-  `ens-lld` is the linker bridge every Ens program links through, so a fresh clone cannot reach an executable without it.
+- One native target carries what the tests need: `xmake build ens-lld`, the linker bridge every Ens program links through, without which a fresh clone cannot reach an executable.
   `ens-lsp` is for editor work only and is built on its own (see `tools/vscode/README.md`).
   Do not build all targets routinely; `ens-lsp.exe` may be running and will fail to relink.
 - Run everything: `xmake test` (subset: `xmake test <name>...`).
   The full suite must be green before every commit, with no exceptions.
-  `xmake test` builds either of those targets itself when it is missing, so it is the one command that always works from a clean checkout.
+  `xmake test` builds that target itself when it is missing, so it is the one command that always works from a clean checkout.
 - `xmake test` starts by building the compiler it then tests: the committed **seed** for this host compiles `selfhost/driver` into `build/host/ens`, and every job that compiles Ens drives that.
-  Everything Ens-related is therefore built by the Ens compiler as this tree defines it, so neither a bug that lives only in `ens-ref` nor one frozen into the seed can shape what the suite measures.
+  Everything Ens-related is therefore built by the Ens compiler as this tree defines it, so nothing frozen into the seed can shape what the suite measures.
   It is built before the jobs start, because they run in parallel and all of them need it.
-- `ens-ref`'s remaining role is exactly one: it compiles the `tests/` fixtures for the reference gate.
 - The packaging tests (`cli_dependencies`, `cli_prebuilt`) shell out to the system `git` and `curl`; both must be on PATH.
   They drive scratch repositories over `file://` URLs and a scratch cache, so no test ever reaches the network or this machine's own cache.
 - `xmake test` uses the binary of the currently configured mode.
   Never run `xmake f -m release` to "fix" staleness; rebuild instead.
-  If linking fails with unresolved LLVM symbols, put the LLVM package's `bin` folder (containing `clang++.exe`) on PATH, run `xmake f -c -m <current mode> -p windows -a x64`, then `xmake build ens-ref`.
+  If linking fails with unresolved LLVM symbols, put the LLVM package's `bin` folder (containing `clang++.exe`) on PATH, run `xmake f -c -m <current mode> -p windows -a x64`, then `xmake build ens-lld`.
   Pass the platform and architecture explicitly: with `clang++` on PATH and no `-p`/`-a`, xmake detects `mingw/x86_64` and then refuses the packages.
   Building without that `bin` folder on PATH re-resolves the linker to MSVC `link.exe`, which silently ignores `-lLLVMCGData` and leaves unresolved LLVM CGData symbols.
   That choice is written into the config, so later builds keep failing even once PATH is fixed until the reconfigure above is rerun.
@@ -79,14 +77,15 @@ If the spec, `ens`, and `ens-ref` disagree, that is a bug worth surfacing, not a
 
 - A fixture is a `tests/*.ens` file, a `tests/<dir>/main.ens` folder program, or a `tests/<dir>/src/main.ens` package.
   Header directives drive assertions: `// @exit N`, `// @stdout ...`, `// @expect-error <substring>`, `// @ens-test <args>`.
-  A fixture carrying `@ens-test` runs through `ens test`; every other fixture is compiled by `ens-ref`, and `codegencheck` compiles all of them through the self-hosted pipeline as well.
+  A fixture carrying `@ens-test` runs through `ens test`; every other fixture is compiled by `ens build`, and `codegencheck` compiles all of them through the self-hosted pipeline as well.
+  An `@expect-error` substring is the diagnostic's wording, so it is what holds the message to its bar: never shorten one to make a run pass, and never point one at a weaker message than the compiler can give.
 - Group related scenarios into one or two files (happy paths vs errors), not one file per scenario.
 - Unit test coverage matters: new code ships with tests for its own logic (the self-hosted packages keep unit tests in their `tests/` folders), not just end-to-end fixtures.
 - A package's `tests/` folder mirrors the grouping of its `src/` folder; put new tests in the subfolder matching the code under test.
 - `corpus_roundtrip` asserts the self-hosted front end parses the whole repo byte-exact with no unexpected diagnostics.
 - `semacheck` is a bidirectional gate: every accepted program must produce zero self-hosted sema diagnostics, and every `@expect-error` fixture must be rejected by sema.
   A fixture whose diagnostic belongs to a later phase carries `// @expect-error-at <phase>`; a tag sema outgrows fails the run as stale.
-  Consequence: new language behavior must land in `ens-ref` and in the self-hosted sema in lockstep (atomic commits are acceptable when needed to keep every commit green).
+  A fixture the front end rejects never reaches sema at all, so a parse-level error and the semantic errors of the same feature cannot share a file: the parse error is reported alone.
 - `codegencheck` runs twice, once per shipped code-generation configuration: `codegencheck` at `-O2` and `codegencheck_unoptimized` at `-O0`.
   `-O0` is what every program built with `-O0` gets, so it is gated exactly as hard as the default is.
 - Both arms must keep `selfhost/codegencheck/skiplist.txt` **empty**.
@@ -122,8 +121,8 @@ The cost this model accepts is a multi-megabyte binary per platform in git histo
 ## The self-hosted compiler
 
 - It is a clean redesign, not a port.
-  `ens-ref` is authoritative for observable language behavior only (what is accepted, rejected, and diagnosed); never mirror its structure, naming, or style, and nothing about its command line is authoritative at all.
-- Parity is the floor, not the ceiling: when work reveals a hole in `ens-ref` (a crash, unsound accept, weak diagnostic), surface it for triage instead of replicating it.
+  `spec.md` and the `tests/` fixtures are what observable behavior answers to; `ens-ref` answers for nothing any more, so never mirror its structure, naming, or style and never reach for it to settle a question.
+- Parity with it was the floor and never the ceiling: a crash, an unsound accept or a weak diagnostic found in it is a hole to report, not a shape to copy.
   Genuine bugs that block a design choice stop the work; report a minimal repro rather than adopting a workaround design.
 - Generated files (`selfhost/frontend/src/syntax/generated/kind.ens`, `nodes.ens`, `factory.ens`, `dump.ens`) say "Generated by syntaxgen - Do not edit".
   Change `selfhost/syntax.grammar` or the emitter in `selfhost/syntaxgen/src/` and regenerate.
@@ -137,7 +136,7 @@ The cost this model accepts is a multi-megabyte binary per platform in git histo
 Diagnostics are the user experience of the language and are held to a high bar.
 
 - User-facing messages use the real type/symbol names from the user's program, plain language a beginner can follow, a suggested fix, and where natural a concrete example of the correct form.
-- Never copy a weak message from `ens-ref` into new code for parity; write the good version and flag the C++ side for triage.
+- Never copy a weak message for parity with anything; write the good version.
 - Messages prefixed `Internal:` are bug-catchers for states no valid program can reach; they may cite implementation details and are exempt from the wording bar.
   Use the prefix only when the error genuinely cannot reach a user.
 

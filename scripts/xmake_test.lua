@@ -1,5 +1,5 @@
--- compile each tests/*.ens with the ens-ref reference compiler and verify the exit code, the
--- standard output and the standard error against the directives in the test source header:
+-- compile each tests/*.ens with `ens` and verify the exit code, the standard output and the
+-- standard error against the directives in the test source header:
 --     // @exit 12
 --     // @stdout Hello!
 --     // @stdout-contains Hello
@@ -49,16 +49,6 @@ task("test")
                 stem .. exe_suffix))
             return found[1] or path.join(workspace, ".ens", "<target>", "O2", stem .. exe_suffix)
         end
-        -- the reference compiler: it gates the tests/ fixtures.
-        local ref_exe = path.join(build_dir, "ens-ref" .. exe_suffix)
-        if not os.isfile(ref_exe) then
-            print("Building the ens-ref reference compiler...")
-            os.exec("xmake build ens-ref")
-        end
-        if not os.isfile(ref_exe) then
-            os.raise("Could not locate the reference compiler at " .. ref_exe)
-        end
-
         -- the linker bridge every Ens program links through. It is a separate target from the
         -- compiler, so a fresh clone needs it built before anything can reach an executable.
         local lld_library = path.join(build_dir, is_host("windows") and "ens-lld.dll"
@@ -2691,8 +2681,17 @@ task("test")
             os.tryrm(stdout_file)
             os.tryrm(stderr_file)
 
-            local compile_rc = execMerged(ref_exe,
-                {"build", job.source, "--output", exe_file}, compile_log)
+            -- the objects go beside the executable rather than under a build root of their own:
+            -- every fixture is built for the same target and level, and one object name per
+            -- fixture keeps the jobs that share this folder out of each other's way.
+            local env, _, env_error = llvmEnvironment()
+            if not env then
+                return {name = name, ok = false, short = "no LLVM environment",
+                    full = string.format("%s: %s", name, env_error)}
+            end
+            local compile_rc = execMerged(host_exe,
+                {"build", job.source, "--output", exe_file, "--objects", out_dir}, compile_log,
+                {envs = env})
             local compile_log_text = io.readfile(compile_log) or ""
 
             if expected_error ~= nil then
