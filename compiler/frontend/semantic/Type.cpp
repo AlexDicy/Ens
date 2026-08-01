@@ -237,8 +237,11 @@ bool Type::widensTo(const Type* target) const {
         return false;
     }
 
-    // Integer -> float.
+    // Integer -> float. A `char` is a code point rather than a quantity: arithmetic on it in
+    // integers is meaningful, but as a floating-point number it has no use, so it converts
+    // only where the program asks for it with `as`.
     if (isInteger() && target->isFloat()) {
+        if (kind == TypeKind::Char) return false;
         int srcW = integerBitWidth();
         int mantissa = target->floatBitWidth() == 32 ? 24 : 53;
         return srcW <= mantissa;

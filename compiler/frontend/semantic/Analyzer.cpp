@@ -685,6 +685,16 @@ Type* Analyzer::analyzeExprAdapt(const ast::Expression& expr, Type* target) {
     }
     Type* t = analyzeExpr(expr);
     if (!target || target->isError() || t->isError()) return t;
+    // A 'char' is a code point rather than a quantity. Arithmetic on it in integers is
+    // meaningful, but as a floating-point number it has no use, so the refusal says why
+    // instead of leaving the reader to wonder which conversion was missing.
+    if (t->kind == TypeKind::Char && isTextualFloat(target)) {
+        errorAtNode(expr.node, "A 'char' is a code point rather than a quantity, so it has no "
+            "'" + target->toString() + "' form of its own. Write 'as " + target->toString() +
+            "' where the code point's number is what you mean.");
+        analysis.setType(expr.node.greenNode(), typeCtx.getError());
+        return typeCtx.getError();
+    }
     tryAdaptIntegerLiteral(expr, target);
     tryAdaptCharLiteral(expr, target);
     tryAdaptFloatLiteral(expr, target);
