@@ -12,7 +12,7 @@
 -- asserted with the @stderr directives and never appears in stdout.
 -- use @expect-error instead to assert the compiler reports a specific diagnostic.
 --     // @expect-error Undefined function 'testFunction'
--- a folder test's main.ens may use @ens-test (optionally with extra arguments) to run the seed
+-- a folder test's main.ens may use @ens-test (optionally with extra arguments) to run
 -- `ens test <folder> ...` instead of compile+run, asserting on its two streams the same way.
 -- the token {dir} in the extra arguments expands to the folder's absolute path.
 --     // @ens-test --filter needle
@@ -71,14 +71,21 @@ task("test")
             os.raise("Could not locate the linker bridge at " .. lld_library)
         end
 
-        -- the seed: the committed `ens` for this host, shared by every job that compiles Ens.
-        -- Everything Ens-related is therefore built by the Ens compiler itself. It is placed below,
-        -- before the jobs start, because they run in parallel and every one of them needs it.
+        -- the seed: the committed `ens` for this host. Its one job is to build the compiler out of
+        -- this tree, and nothing else in the suite runs it. Nothing it produces is ever compared
+        -- against anything either, so a seed left behind by the tree shows up as a failure to build
+        -- rather than as drift in what the tests measure.
         local seed_platforms = {windows = "windows", linux = "linux", macosx = "macos"}
         local seed_architectures = {x64 = "x64", x86_64 = "x64", arm64 = "arm64"}
         local seed_host = (seed_platforms[plat] or plat) .. "-" .. (seed_architectures[arch] or arch)
         local seed_dir = path.join(os.projectdir(), "build", "seed")
         local seed_exe = path.join(seed_dir, "ens" .. exe_suffix)
+
+        -- the compiler under test: `ens` as this tree defines it, and what every job that compiles
+        -- Ens drives. It is built below, before the jobs start, because they run in parallel and
+        -- every one of them needs it.
+        local host_dir = path.join(os.projectdir(), "build", "host")
+        local host_exe = path.join(host_dir, "ens" .. exe_suffix)
 
         local tests_dir = path.join(os.projectdir(), "tests")
         local out_dir   = path.join(os.projectdir(), "build", "tests")
@@ -501,9 +508,9 @@ task("test")
             end
         end
 
-        -- place the seed: the `ens` committed for this host, put where every job that compiles Ens
-        -- looks for it. A host with no committed seed cannot run the suite, and saying so is the
-        -- right outcome: falling back to another compiler would leave the seed untested.
+        -- place the seed: the `ens` committed for this host, put where the build below looks for it.
+        -- A host with no committed seed cannot run the suite, and saying so is the right outcome:
+        -- falling back to another compiler would leave the seed untested.
         local function locateSeed()
             local committed = path.join(os.projectdir(), "seed", seed_host, "ens" .. exe_suffix)
             if not os.isfile(committed) then
@@ -527,10 +534,34 @@ task("test")
             placeNativeLibraries(native_libraries, seed_dir)
         end
 
-        -- the corpus round-trip harness: build the harness exe fresh from its own workspace with
-        -- the seed (it imports the front end as the @ens.frontend package), enumerate every .ens
-        -- file and every ens.package/ens.overrides manifest in the real source trees, and run the
-        -- harness over the list.
+        -- build the compiler every job then drives: the seed compiles `selfhost/driver` out of this
+        -- tree, so what the suite measures is the sources rather than a binary in the repository.
+        -- This is also the whole of what the committed seed has to do, and it is checked here by
+        -- construction: a seed that cannot build the tree stops the run before any job starts.
+        local function buildHostCompiler()
+            local log = path.join(out_dir, "host.log")
+            local env, native_libraries, env_error = llvmEnvironment()
+            if not env then
+                os.raise("could not build the compiler: %s", env_error)
+            end
+            os.tryrm(host_dir)
+            os.mkdir(host_dir)
+            local rc = execMerged(seed_exe, {"build",
+                path.join(os.projectdir(), "selfhost", "driver"), "--output", host_exe,
+                "--stdlib", path.join(os.projectdir(), "libs"), "--objects", host_dir}, log,
+                {envs = env})
+            if rc ~= 0 or not os.isfile(host_exe) then
+                os.raise("the %s seed could not build the compiler from this tree (exit %s). A seed "
+                    .. "older than the sources has to be replaced:\n%s", seed_host, tostring(rc),
+                    captured(log))
+            end
+            placeNativeLibraries(native_libraries, host_dir)
+        end
+
+        -- the corpus round-trip harness: build the harness exe fresh from its own workspace (it
+        -- imports the front end as the @ens.frontend package), enumerate every .ens file and every
+        -- ens.package/ens.overrides manifest in the real source trees, and run the harness over
+        -- the list.
         local function run_corpus(job)
             local name = job.name
             local corpus_dir  = path.join(os.projectdir(), "build", "corpus")
@@ -544,7 +575,7 @@ task("test")
             end
             os.tryrm(exe_file)
             local env = llvmEnvironment()
-            local compile_rc = execMerged(seed_exe, {"build", corpus_src, "--output", exe_file},
+            local compile_rc = execMerged(host_exe, {"build", corpus_src, "--output", exe_file},
                 log, {envs = env})
             if not os.isfile(exe_file) then
                 return {name = name, ok = false, short = "harness build failed",
@@ -583,11 +614,11 @@ task("test")
                 full = string.format("%s:\n%s", name, out)}
         end
 
-        -- the semantic differential harness: build the harness exe fresh from its own workspace
-        -- with the seed (it imports the front end and the sema layer as packages), enumerate every
-        -- program unit into a manifest, and run the harness over it. Units are the single-file
-        -- tests, the folder tests, and the selfhost library packages; libs/std is covered
-        -- transitively by every unit that imports @std.
+        -- the semantic differential harness: build the harness exe fresh from its own workspace (it
+        -- imports the front end and the sema layer as packages), enumerate every program unit into
+        -- a manifest, and run the harness over it. Units are the single-file tests, the folder
+        -- tests, and the selfhost library packages; libs/std is covered transitively by every unit
+        -- that imports @std.
         local function run_semacheck(job)
             local name = job.name
             local check_dir = path.join(os.projectdir(), "build", "semacheck")
@@ -601,7 +632,7 @@ task("test")
             end
             os.tryrm(exe_file)
             local env = llvmEnvironment()
-            local compile_rc = execMerged(seed_exe, {"build", check_src, "--output", exe_file}, log,
+            local compile_rc = execMerged(host_exe, {"build", check_src, "--output", exe_file}, log,
                 {envs = env})
             if not os.isfile(exe_file) then
                 return {name = name, ok = false, short = "harness build failed",
@@ -699,7 +730,7 @@ task("test")
             -- '--objects' is what says otherwise.
             local harness_objects = path.join(check_dir, "objects-harness")
             local spike_objects = path.join(check_dir, "objects-spike")
-            local harness_rc = execMerged(seed_exe,
+            local harness_rc = execMerged(host_exe,
                 {"build", check_src, "--output", harness_exe, "--objects", harness_objects},
                 log, {envs = env})
             if not os.isfile(harness_exe) then
@@ -707,7 +738,7 @@ task("test")
                     full = string.format("%s: harness build failed (exit %s)\n%s", name,
                         tostring(harness_rc), (io.readfile(log) or ""):gsub("[\r\n]+$", ""))}
             end
-            local spike_rc = execMerged(seed_exe, {"build", spike_src, "--output", spike_exe,
+            local spike_rc = execMerged(host_exe, {"build", spike_src, "--output", spike_exe,
                 "--objects", spike_objects}, log, {envs = env})
             if not os.isfile(spike_exe) then
                 return {name = name, ok = false, short = "spike build failed",
@@ -767,10 +798,13 @@ task("test")
         end
 
         -- the bootstrap fixpoint: the Ens-written compiler compiles itself, twice, with identical
-        -- output. Stage 2 has the seed compile its own sources (stage2/ens plus one object per
-        -- module), stage 3 has stage2's ens compile the same sources again. The gate holds when the
-        -- two stages' objects hold the same modules with identical bytes; the executables are
-        -- compared as a note only, because linker output may carry timestamps.
+        -- output. Stage 2 has the compiler under test compile its own sources (stage2/ens plus one
+        -- object per module), stage 3 has stage2's ens compile the same sources again. The gate
+        -- holds when the two stages' objects hold the same modules with identical bytes; the
+        -- executables are compared as a note only, because linker output may carry timestamps.
+        --
+        -- Neither side of that comparison was produced by the seed, so what the seed generates
+        -- cannot decide it: the gate answers for this tree's code generation and nothing else.
         local function run_bootstrap(job)
             local name = job.name
             local boot_dir = path.join(os.projectdir(), "build", "bootstrap")
@@ -807,7 +841,7 @@ task("test")
                 return nil
             end
 
-            local failed = staged("stage 2 (the seed compiles itself)", seed_exe,
+            local failed = staged("stage 2 (the compiler compiles itself)", host_exe,
                     {"build", driver_src, "--output", boot2, "--stdlib", libs,
                      "--objects", stage2_dir}, boot2)
                 or staged("stage 3 (stage 2 compiles the same sources)", boot2,
@@ -893,7 +927,7 @@ task("test")
             local function run(argv, opt, expected_rc, ...)
                 local options = {envs = env}
                 for key, value in pairs(opt or {}) do options[key] = value end
-                local rc = execMerged(seed_exe, argv, log, options)
+                local rc = execMerged(host_exe, argv, log, options)
                 local out = io.readfile(log) or ""
                 local label = table.concat(argv, " ")
                 if expected_rc ~= nil and rc ~= expected_rc then
@@ -1165,7 +1199,7 @@ task("test")
             local function run(argv, opt, expected_rc, ...)
                 local options = {envs = base}
                 for key, value in pairs(opt or {}) do options[key] = value end
-                local rc = execMerged(seed_exe, argv, log, options)
+                local rc = execMerged(host_exe, argv, log, options)
                 local out = io.readfile(log) or ""
                 local label = table.concat(argv, " ")
                 if expected_rc ~= nil and rc ~= expected_rc then
@@ -1466,7 +1500,7 @@ task("test")
             -- run the command and assert its exit code and the fragments its output must carry; a
             -- fragment prefixed '!' must not appear.
             local function run(argv, opt, expected_rc, ...)
-                local rc = execMerged(seed_exe, argv, log, opt)
+                local rc = execMerged(host_exe, argv, log, opt)
                 local out = io.readfile(log) or ""
                 local label = table.concat(argv, " ")
                 if expected_rc ~= nil and rc ~= expected_rc then
@@ -1517,7 +1551,7 @@ task("test")
             -- account of the work, not a departure from what the manifests declare
             local quiet_out = path.join(out_dir, name .. ".quiet.out")
             local quiet_err = path.join(out_dir, name .. ".quiet.err")
-            local quiet_rc = execSplit(seed_exe, {"build", "--quiet"}, quiet_out, quiet_err, in_ws)
+            local quiet_rc = execSplit(host_exe, {"build", "--quiet"}, quiet_out, quiet_err, in_ws)
             local quiet_stdout = captured(quiet_out)
             local quiet_stderr = captured(quiet_err)
             if quiet_rc ~= 0 or quiet_stdout ~= "" or not quiet_stderr:find(notice, 1, true) then
@@ -1650,7 +1684,7 @@ task("test")
             -- run the command and assert its exit code and the fragments its output must carry; a
             -- fragment prefixed '!' must not appear.
             local function run(argv, opt, expected_rc, ...)
-                local rc = execMerged(seed_exe, argv, log, opt)
+                local rc = execMerged(host_exe, argv, log, opt)
                 local out = io.readfile(log) or ""
                 local label = table.concat(argv, " ")
                 if expected_rc ~= nil and rc ~= expected_rc then
@@ -2075,7 +2109,7 @@ task("test")
             end
 
             local function run(argv, opt, expected_rc, ...)
-                local rc = execMerged(seed_exe, argv, log, opt)
+                local rc = execMerged(host_exe, argv, log, opt)
                 local out = io.readfile(log) or ""
                 local label = table.concat(argv, " ")
                 if expected_rc ~= nil and rc ~= expected_rc then
@@ -2355,7 +2389,7 @@ task("test")
             local installed_dir = path.join(toolchains, "9.9")
             local installed_exe = path.join(installed_dir, "ens" .. exe_suffix)
             os.mkdir(installed_dir)
-            os.cp(seed_exe, installed_exe)
+            os.cp(host_exe, installed_exe)
             -- the copy loads LLVM and the linker bridge at run time, and on Windows the loader
             -- looks beside the executable first.
             placeNativeLibraries(native_libraries, installed_dir)
@@ -2441,48 +2475,48 @@ task("test")
             -- the hop: the package is built by the toolchain installed as the version it is written
             -- for, and the command line reaches it exactly as it was written here, spaces and all
             local spaced_out = path.join(root, "spaced out.exe")
-            run(seed_exe, {"build", pkg, "--output", spaced_out, "-v"}, chains, 0,
+            run(host_exe, {"build", pkg, "--output", spaced_out, "-v"}, chains, 0,
                 "written for Ens 9.9", hopped_to, "built")
             run_program(spaced_out, 0, "built by a delegate")
 
             -- the exit code of the toolchain that did the work is this command's own
-            run(seed_exe, {"check", broken, "-v"}, chains, 1, hopped_to,
+            run(host_exe, {"check", broken, "-v"}, chains, 1, hopped_to,
                 "Undefined function 'missing'")
-            run(seed_exe, {"build", library, "--output", path.join(root, "library.exe"), "-v"},
+            run(host_exe, {"build", library, "--output", path.join(root, "library.exe"), "-v"},
                 chains, 2, hopped_to, "builds as a library")
 
             -- '--toolchain' asks for one by name, whatever the build root says, and answers for a
             -- name that is not installed instead of ignoring it
             local by_option = path.join(root, "by option.exe")
-            run(seed_exe, {"build", hello, "--output", by_option, "--toolchain", "9.9", "-v"},
+            run(host_exe, {"build", hello, "--output", by_option, "--toolchain", "9.9", "-v"},
                 chains, 0, "'--toolchain 9.9'", hopped_to, "built")
             run_program(by_option, 0, "Hello, world!")
-            run(seed_exe, {"build", hello, "--toolchain", "9.9"}, nothing_installed, 2,
+            run(host_exe, {"build", hello, "--toolchain", "9.9"}, nothing_installed, 2,
                 "'--toolchain 9.9'", "holds no toolchain at all", "ask for 'local'",
                 slashed(path.join(empty, "9.9", "ens" .. exe_suffix)))
 
             -- both ways of keeping the work here
-            run(seed_exe, {"build", pkg, "--output", path.join(root, "kept.exe"), "-v",
+            run(host_exe, {"build", pkg, "--output", path.join(root, "kept.exe"), "-v",
                 "--toolchain", "local"}, chains, 0, "built", not_hopped)
-            run(seed_exe, {"build", pkg, "--output", path.join(root, "pinned.exe"), "-v"},
+            run(host_exe, {"build", pkg, "--output", path.join(root, "pinned.exe"), "-v"},
                 {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "local"}, 0, "built", not_hopped)
 
             -- ENS_TOOLCHAIN is the option's environment spelling, and the option wins over it
-            run(seed_exe, {"build", hello, "--output", path.join(root, "by variable.exe"), "-v"},
+            run(host_exe, {"build", hello, "--output", path.join(root, "by variable.exe"), "-v"},
                 {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "9.9"}, 0, "ENS_TOOLCHAIN=9.9",
                 hopped_to, "built")
-            run(seed_exe, {"build", hello, "--output", path.join(root, "overridden.exe"), "-v",
+            run(host_exe, {"build", hello, "--output", path.join(root, "overridden.exe"), "-v",
                 "--toolchain", "local"}, {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "9.9"}, 0,
                 "built", not_hopped)
 
             -- a version declared but not installed is what a manifest's declaration has always
             -- been: a statement, not a requirement. It builds here, and says so only when asked.
             local anyway = path.join(root, "anyway.exe")
-            run(seed_exe, {"build", pkg, "--output", anyway, "-v"}, nothing_installed, 0,
+            run(host_exe, {"build", pkg, "--output", anyway, "-v"}, nothing_installed, 0,
                 "written for Ens 9.9", "holds no toolchain at all", "this toolchain is building it",
                 "built")
             run_program(anyway, 0, "built by a delegate")
-            run(seed_exe, {"build", pkg, "--output", path.join(root, "quiet.exe")},
+            run(host_exe, {"build", pkg, "--output", path.join(root, "quiet.exe")},
                 nothing_installed, 0, "built", "!9.9")
 
             -- the loop guard, from the delegate's side: the copy sees the very declaration that
@@ -2511,19 +2545,19 @@ task("test")
 
             -- the other two compiling commands reach the same hook. 'run' hops with its program's
             -- arguments intact, and its program's exit code still comes back through the delegate.
-            run(seed_exe, {"run", pkg, "-v"}, chains, 0, hopped_to, "built by a delegate")
-            run(seed_exe, {"run", pkg, "-v", "--toolchain", "local"}, chains, 0,
+            run(host_exe, {"run", pkg, "-v"}, chains, 0, hopped_to, "built by a delegate")
+            run(host_exe, {"run", pkg, "-v", "--toolchain", "local"}, chains, 0,
                 "built by a delegate", not_hopped)
-            run(seed_exe, {"test", pkg, "-v"}, chains, 0, hopped_to, "there are no tests in")
-            run(seed_exe, {"run", hello, "--toolchain", "9.9"}, nothing_installed, 2,
+            run(host_exe, {"test", pkg, "-v"}, chains, 0, hopped_to, "there are no tests in")
+            run(host_exe, {"run", hello, "--toolchain", "9.9"}, nothing_installed, 2,
                 "'--toolchain 9.9'", "holds no toolchain at all")
-            run(seed_exe, {"test", pkg, "--toolchain", "9.9"}, nothing_installed, 2,
+            run(host_exe, {"test", pkg, "--toolchain", "9.9"}, nothing_installed, 2,
                 "'--toolchain 9.9'", "holds no toolchain at all")
 
             -- the commands that never delegate, however the environment is set
-            run(seed_exe, {"version"}, {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "9.9"}, 0,
+            run(host_exe, {"version"}, {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "9.9"}, 0,
                 "ens 0.1")
-            run(seed_exe, {"help", "build"}, chains, 0, "--toolchain <version>")
+            run(host_exe, {"help", "build"}, chains, 0, "--toolchain <version>")
 
             if #failures == 0 then
                 return {name = name, ok = true}
@@ -2623,8 +2657,8 @@ task("test")
             end
 
             -- `ens test` on a folder, asserting its two streams: the unit tests of every selfhost
-            -- package and of the standard library, and the @ens-test fixtures. The seed command runs
-            -- them, so the self-hosted sema and code generator see every one of those tests. Its
+            -- package and of the standard library, and the @ens-test fixtures. The command under
+            -- test runs them, so its sema and code generator see every one of those tests. Its
             -- builds link through ens-lld and some of the suites bind native libraries, so the job
             -- carries the same linker and loader environment the codegen harness does.
             if ens_test_args ~= nil then
@@ -2639,7 +2673,7 @@ task("test")
                     return {name = name, ok = false, short = "no LLVM environment",
                         full = string.format("%s: %s", name, env_error)}
                 end
-                local run_rc = execSplit(seed_exe, argv, stdout_file, stderr_file, {envs = env})
+                local run_rc = execSplit(host_exe, argv, stdout_file, stderr_file, {envs = env})
                 local actual_stdout = captured(stdout_file)
                 local actual_stderr = captured(stderr_file)
                 local why = compareRun(run_rc, actual_stdout, actual_stderr)
@@ -2702,10 +2736,14 @@ task("test")
                 full = string.format("%s: %s", name, short)}
         end
 
-        -- the seed has to be in place before any job that compiles Ens starts, and the jobs run in
-        -- parallel, so it is placed here rather than on demand inside one of them.
+        -- the compiler has to exist before any job that compiles Ens starts, and the jobs run in
+        -- parallel, so the seed is placed and the compiler built here rather than on demand inside
+        -- one of them.
         locateSeed()
-        print(string.format("Using the committed %s seed compiler", seed_host))
+        print(string.format("Building the compiler with the committed %s seed...", seed_host))
+        local host_started = os.mclock()
+        buildHostCompiler()
+        print(string.format("Compiler built in %.0fs", (os.mclock() - host_started) / 1000.0))
 
         -- worker count: ENS_TEST_JOBS override, else one per cpu, capped at the test count.
         local njob = tonumber(os.getenv("ENS_TEST_JOBS"))

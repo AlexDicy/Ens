@@ -61,9 +61,9 @@ If the spec, `ens`, and `ens-ref` disagree, that is a bug worth surfacing, not a
 - Run everything: `xmake test` (subset: `xmake test <name>...`).
   The full suite must be green before every commit, with no exceptions.
   `xmake test` builds either of those targets itself when it is missing, so it is the one command that always works from a clean checkout.
-- `xmake test` starts by placing the **seed** and then shares it: the committed `ens` for this host is copied into `build/seed/ens`, and every job that compiles Ens uses that seed.
-  Everything Ens-related is therefore built by the Ens compiler, so a bug that lives only in `ens-ref` cannot shape the self-hosted tree.
-  The seed is placed before the jobs start, because they run in parallel and all of them need it.
+- `xmake test` starts by building the compiler it then tests: the committed **seed** for this host compiles `selfhost/driver` into `build/host/ens`, and every job that compiles Ens drives that.
+  Everything Ens-related is therefore built by the Ens compiler as this tree defines it, so neither a bug that lives only in `ens-ref` nor one frozen into the seed can shape what the suite measures.
+  It is built before the jobs start, because they run in parallel and all of them need it.
 - `ens-ref`'s remaining role is exactly one: it compiles the `tests/` fixtures for the reference gate.
 - The packaging tests (`cli_dependencies`, `cli_prebuilt`) shell out to the system `git` and `curl`; both must be on PATH.
   They drive scratch repositories over `file://` URLs and a scratch cache, so no test ever reaches the network or this machine's own cache.
@@ -79,7 +79,7 @@ If the spec, `ens`, and `ens-ref` disagree, that is a bug worth surfacing, not a
 
 - A fixture is a `tests/*.ens` file, a `tests/<dir>/main.ens` folder program, or a `tests/<dir>/src/main.ens` package.
   Header directives drive assertions: `// @exit N`, `// @stdout ...`, `// @expect-error <substring>`, `// @ens-test <args>`.
-  A fixture carrying `@ens-test` runs through the seed `ens`; every other fixture is compiled by `ens-ref`, and `codegencheck` compiles all of them through the self-hosted pipeline as well.
+  A fixture carrying `@ens-test` runs through `ens test`; every other fixture is compiled by `ens-ref`, and `codegencheck` compiles all of them through the self-hosted pipeline as well.
 - Group related scenarios into one or two files (happy paths vs errors), not one file per scenario.
 - Unit test coverage matters: new code ships with tests for its own logic (the self-hosted packages keep unit tests in their `tests/` folders), not just end-to-end fixtures.
 - A package's `tests/` folder mirrors the grouping of its `src/` folder; put new tests in the subfolder matching the code under test.
@@ -91,15 +91,16 @@ If the spec, `ens`, and `ens-ref` disagree, that is a bug worth surfacing, not a
   `-O0` is what every program built with `-O0` gets, so it is gated exactly as hard as the default is.
 - Both arms must keep `selfhost/codegencheck/skiplist.txt` **empty**.
   The list may only shrink: the harness fails if a runnable fixture is neither verified nor listed, and equally if a listed name is no longer a runnable fixture, so the exemption list cannot rot.
-- `bootstrap` is the strongest end-to-end gate: the seed compiles `selfhost/driver`, the `ens` that came out of that compiles the same sources again, and the two stages' object files must hold the same modules with identical bytes.
+- `bootstrap` is the strongest end-to-end gate: `build/host/ens` compiles `selfhost/driver` into stage 2, stage 2's `ens` compiles the same sources into stage 3, and the two stages' object files must hold the same modules with identical bytes.
   Executables are compared as a note only, because linker output carries timestamps.
+  The seed built the host compiler but neither stage, so what the seed generates cannot decide this gate: it answers for this tree's code generation alone.
 - The `cli_*` jobs (`cli_build`, `cli_runtest`, `cli_overriding`, `cli_dependencies`, `cli_prebuilt`, `cli_toolchain`) all drive `ens`, and each asserts the command's own contract.
   Nothing about another command line is authoritative for them.
 
 ## The bootstrap seed
 
 `ens` is written in Ens, so building it needs an `ens` that already runs.
-That first one is committed to the repository, one binary per host, and `xmake test` copies the one matching the host into `build/seed/` before any job starts:
+That first one is committed to the repository, one binary per host, and `xmake test` copies the one matching the host into `build/seed/` before anything else:
 
 - `seed/windows-x64/ens.exe`
 - `seed/linux-x64/ens`
@@ -107,6 +108,11 @@ That first one is committed to the repository, one binary per host, and `xmake t
 
 A host with no committed seed fails the run by name instead of falling back to another compiler, because a fallback would leave the seed itself untested.
 So a fresh clone needs no compiler built from C++ to compile Ens, only the `ens-lld` linker bridge and the LLVM package every build links against.
+
+**What the seed is for, and what it is not.**
+Its one job is to build `build/host/ens` out of the tree, and no test drives the seed itself.
+Nothing it produces is compared against anything either, so it cannot pull a gate towards its own behavior: a diagnostic or a code-generation change is measured the run it lands in, not the run after some binary is refreshed.
+A seed the sources have outgrown therefore shows up as a failure to build the compiler, before any job starts, and never as drift in what the tests assert.
 
 Refreshing a seed is a deliberate act rather than a build artifact.
 When a language or library change makes the tree uncompilable by the committed seed, the new binary lands in the same commit as the source change, because every commit has to be buildable from its own checkout.
