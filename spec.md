@@ -816,7 +816,8 @@ byte big = 300;          // error: 300 does not fit in 'byte' (range -128..127)
 ```
 
 Floating-point literals follow the same rule in their own family: one written without a type suffix adapts to the surrounding type when that type is `float` or `double`, and with no context it defaults to `double`.
-Rounding to the nearest value the type has is part of the conversion, so `float ratio = 0.1;` is accepted even though no binary floating-point type holds a tenth exactly.
+An unsuffixed integer literal adapts to a floating-point type too, since it names such a value just as well: `float half = 5;` holds `5.0`.
+Rounding to the nearest value the type has is part of the conversion, so `float ratio = 0.1;` is accepted even though no binary floating-point type holds a tenth exactly, and `float count = 16777217;` stores `16777216`, the nearest value a `float` has.
 Only a magnitude the type cannot hold at all, one that would become infinity, produces an error; a magnitude too small to tell apart from zero rounds to zero.
 A suffix names the type and leaves nothing to adapt, so `1.0f` is a `float` and `1.0d` a `double`, just as `5L` is a `long`.
 

@@ -4143,6 +4143,13 @@ struct CodeGenerator::Impl {
             case SyntaxKind::IntLiteral:
             case SyntaxKind::LongLiteral: {
                 llvm::Type* lt = mapType(t);
+                // An integer literal that took a floating-point type from its surroundings is
+                // that value; the sign, when there is one, is a prefix over this node.
+                if (t && t->isFloat()) {
+                    uint64_t magnitude = 0;
+                    parseIntegerLiteralMagnitude(text, magnitude);
+                    return llvm::ConstantFP::get(lt, static_cast<double>(magnitude));
+                }
                 long long v = parseIntText(text);
                 return llvm::ConstantInt::get(lt, static_cast<uint64_t>(v), t && t->isSignedInteger());
             }

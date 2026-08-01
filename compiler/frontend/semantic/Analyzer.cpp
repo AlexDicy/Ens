@@ -568,7 +568,18 @@ void Analyzer::tryAdaptFloatLiteral(const ast::Expression& src, Type* target) {
     if (!target || target->isError()) return;
     if (!target->isFloat() || target->kind == TypeKind::Decimal) return;
     const ast::LiteralExpression* lit = asFloatLiteralChild(src);
-    if (!lit) return;
+    if (!lit) {
+        // An untyped integer literal names a floating-point value just as well, so it takes a
+        // floating-point target under the same rule. No 64-bit magnitude reaches either type's
+        // limit, so these always fit and only the precision rounds.
+        const ast::LiteralExpression* intLit = asIntLiteralChild(src);
+        if (!intLit || !intLit->token()) return;
+        uint64_t magnitude = 0;
+        if (!parseIntegerLiteralMagnitude(intLit->token()->tokenText(), magnitude)) return;
+        analysis.setType(src.node.greenNode(), target);
+        analysis.setType(intLit->node.greenNode(), target);
+        return;
+    }
 
     auto tok = lit->token();
     if (!tok) return;
