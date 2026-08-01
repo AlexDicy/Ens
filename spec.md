@@ -1165,7 +1165,8 @@ The accepted escapes are `\n`, `\r`, `\t`, `\b`, `\f`, `\0`, `\\`, `\"`, `\'`, `
   Only the sign of the result is meaningful.
   Strings have no `<`, `<=`, `>` or `>=` operators; write the comparison against `compareTo` instead.
 
-A `float` or `double` renders as the shortest decimal text that reads back as exactly the same value, so no program has to know which digits a compiler chose to keep.
+A `float` or `double` renders as decimal text that reads back as exactly the same value, so nothing is lost between printing a number and reading it again.
+The text is kept short where that costs nothing, but it is the reading back, not the shortness, that is promised.
 Concretely the text carries the fewest of 15, 16, and 17 significant digits that still reads back exactly, with trailing zeros left off: `2.5` is `"2.5"` and `0.1` is `"0.1"`, while `0.1 + 0.2` is `"0.30000000000000004"` because that sum genuinely is not three tenths.
 A `float` renders through the same rule after widening to `double`, which is lossless, so both types print the same text for the same value.
 A value with nothing after its decimal point loses the point too, so `3.0` is `"3"` and `0.0` is `"0"`; negative zero keeps its sign as `"-0"`.

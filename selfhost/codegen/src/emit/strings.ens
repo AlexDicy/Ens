@@ -451,8 +451,8 @@ public integerText(Runtime runtime) -> RuntimeFunction {
 }
 
 // ptr ens_double_to_string(double value): the fewest of 15, 16, and 17 significant digits that
-// reads back as the same value. Fifteen covers the ordinary cases and keeps their text short,
-// seventeen always round-trips, so every value prints text that reads back exactly.
+// reads back as the same value, stopping at the first that does. Fifteen settles the ordinary
+// cases and keeps their text short; seventeen always round-trips, so it needs no check of its own.
 public doubleText(Runtime runtime) -> RuntimeFunction {
     let type = runtime.pointerType.functionType([runtime.doubleType]);
     let known = runtime.existing("ens_double_to_string", type);
@@ -462,54 +462,75 @@ public doubleText(Runtime runtime) -> RuntimeFunction {
     let allocator = allocateString(runtime);
     let definition = runtime.beginDefinition("ens_double_to_string", type);
     let value = runtime.parameter(definition, 0);
+    let builder = runtime.builder;
 
-    let attempt15 = formatAtPrecision(runtime, "%.15g", ".format.g15", value);
-    let attempt16 = formatAtPrecision(runtime, "%.16g", ".format.g16", value);
-    let attempt17 = formatAtPrecision(runtime, "%.17g", ".format.g17", value);
-    let exact15 = readsBackAs(runtime, attempt15.text(), value);
-    let exact16 = readsBackAs(runtime, attempt16.text(), value);
+    let at15 = runtime.block(definition, "d2s.at15");
+    let at16 = runtime.block(definition, "d2s.at16");
+    let at17 = runtime.block(definition, "d2s.at17");
+    let done = runtime.block(definition, "d2s.done");
 
-    let shorterText = instructions.buildSelect(runtime.builder, exact16, attempt16.text(),
-        attempt17.text(), "");
-    let shorterLength = instructions.buildSelect(runtime.builder, exact16, attempt16.length(),
-        attempt17.length(), "");
-    Value text = instructions.buildSelect(runtime.builder, exact15, attempt15.text(),
-        shorterText, "");
-    Value length = instructions.buildSelect(runtime.builder, exact15, attempt15.length(),
-        shorterLength, "");
+    let buffer = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType(formatBufferCapacity() as ulong), "d2s.buffer");
+    let textSlot = memory.buildAlloca(builder, runtime.pointerType, "d2s.text");
+    let lengthSlot = memory.buildAlloca(builder, runtime.int64Type, "d2s.length");
 
-    // The special values get one spelling of their own. A C library is free to write them
-    // differently, and a program should not have to know which one it linked against.
-    let sameAsItself = instructions.buildFCmpOEQ(runtime.builder, value, value, "");
-    let chosen = new FormattedNumber(text, length);
-    let positiveInfinity = runtime.doubleType.constReal(infinity());
-    let negativeInfinity = runtime.doubleType.constReal(0.0 - infinity());
-    let atPositive = spellAs(runtime, chosen,
-        instructions.buildFCmpOEQ(runtime.builder, value, positiveInfinity, ""), "inf");
-    let atNegative = spellAs(runtime, atPositive,
-        instructions.buildFCmpOEQ(runtime.builder, value, negativeInfinity, ""), "-inf");
-    let spelled = spellAs(runtime, atNegative,
-        instructions.buildNot(runtime.builder, sameAsItself, ""), "nan");
+    // The special values get one spelling of their own, decided before the ladder runs. A C
+    // library is free to write them differently, a program should not have to know which one it
+    // linked against, and no number of digits ever reads a NaN back as itself.
+    let isNotANumber = instructions.buildNot(builder,
+        instructions.buildFCmpOEQ(builder, value, value, ""), "d2s.nan");
+    let isPositiveInfinity = instructions.buildFCmpOEQ(builder, value,
+        runtime.doubleType.constReal(infinity()), "d2s.pinf");
+    let isNegativeInfinity = instructions.buildFCmpOEQ(builder, value,
+        runtime.doubleType.constReal(0.0 - infinity()), "d2s.ninf");
+    let notANumberText = globals.buildGlobalString(builder, "nan", ".text.nan");
+    let positiveText = globals.buildGlobalString(builder, "inf", ".text.inf");
+    let negativeText = globals.buildGlobalString(builder, "-inf", ".text.negative.inf");
+    memory.buildStore(builder, instructions.buildSelect(builder, isNotANumber, notANumberText,
+        instructions.buildSelect(builder, isPositiveInfinity, positiveText, negativeText, ""),
+        ""), textSlot);
+    memory.buildStore(builder, instructions.buildSelect(builder, isNotANumber, runtime.int64(3),
+        instructions.buildSelect(builder, isPositiveInfinity, runtime.int64(3),
+            runtime.int64(4), ""), ""), lengthSlot);
+    let isSpecial = instructions.buildOr(builder, isNotANumber,
+        instructions.buildOr(builder, isPositiveInfinity, isNegativeInfinity, ""), "d2s.special");
 
-    instructions.buildRet(runtime.builder,
-        copyOfBytes(runtime, allocator, spelled.text(), spelled.length()));
+    // Each attempt sits on the path that needs it, so an ordinary value pays one format and one
+    // read-back, and a special value pays neither.
+    instructions.buildCondBr(builder, isSpecial, done, at15);
+    builder.positionAtEnd(at15);
+    formatInto(runtime, buffer, textSlot, lengthSlot, "%.15g", ".format.g15", value, at16, done);
+    builder.positionAtEnd(at16);
+    formatInto(runtime, buffer, textSlot, lengthSlot, "%.16g", ".format.g16", value, at17, done);
+    builder.positionAtEnd(at17);
+    formatInto(runtime, buffer, textSlot, lengthSlot, "%.17g", ".format.g17", value, null, done);
+
+    builder.positionAtEnd(done);
+    let text = memory.buildLoad(builder, runtime.pointerType, textSlot, "d2s.text.value");
+    let length = memory.buildLoad(builder, runtime.int64Type, lengthSlot, "d2s.length.value");
+    instructions.buildRet(builder, copyOfBytes(runtime, allocator, text, length));
     return runtime.endDefinition(definition);
 }
 
-// A rendering of a number: where its bytes are and how many there are.
-class FormattedNumber {
-    Value textPointer;
-    Value byteLength;
-
-    protected constructor(this.textPointer, this.byteLength);
-
-    protected text() -> Value {
-        return this.textPointer;
+// Renders the value at one precision into the shared buffer and records it. When there is a
+// next attempt, control passes to it unless the text already reads back as the same value.
+formatInto(Runtime runtime, Value buffer, Value textSlot, Value lengthSlot, string specifier,
+           string specifierName, Value value, BasicBlock? next, BasicBlock done) {
+    let builder = runtime.builder;
+    let written = runtime.call(runtime.snprintf(), [buffer,
+        runtime.int64(formatBufferCapacity()),
+        globals.buildGlobalString(builder, specifier, specifierName), value], "written");
+    memory.buildStore(builder, buffer, textSlot);
+    memory.buildStore(builder,
+        instructions.buildSExt(builder, written, runtime.int64Type, ""), lengthSlot);
+    if (next == null) {
+        instructions.buildBr(builder, done);
+        return;
     }
-
-    protected length() -> Value {
-        return this.byteLength;
-    }
+    let parsed = runtime.call(runtime.strtod(), [buffer, runtime.pointerType.constNull()],
+        "parsed");
+    instructions.buildCondBr(builder,
+        instructions.buildFCmpOEQ(builder, parsed, value, "d2s.exact"), done, next);
 }
 
 // '-1.2345678901234567e-308' is the longest a double reaches, so this holds every rendering
@@ -521,31 +542,6 @@ formatBufferCapacity() -> long {
 // There is no infinity literal to write, so the value comes of overflowing a finite one.
 infinity() -> double {
     return 1e308 * 10.0;
-}
-
-formatAtPrecision(Runtime runtime, string specifier, string specifierName,
-                  Value value) -> FormattedNumber {
-    long capacity = formatBufferCapacity();
-    let buffer = memory.buildAlloca(runtime.builder,
-        runtime.int8Type.arrayType(capacity as ulong), "buffer");
-    let written = runtime.call(runtime.snprintf(), [buffer, runtime.int64(capacity),
-        globals.buildGlobalString(runtime.builder, specifier, specifierName), value], "written");
-    return new FormattedNumber(buffer,
-        instructions.buildSExt(runtime.builder, written, runtime.int64Type, ""));
-}
-
-readsBackAs(Runtime runtime, Value text, Value value) -> Value {
-    let parsed = runtime.call(runtime.strtod(),
-        [text, runtime.pointerType.constNull()], "parsed");
-    return instructions.buildFCmpOEQ(runtime.builder, parsed, value, "");
-}
-
-spellAs(Runtime runtime, FormattedNumber chosen, Value when, string spelling) -> FormattedNumber {
-    let literal = globals.buildGlobalString(runtime.builder, spelling, ".text.number");
-    let text = instructions.buildSelect(runtime.builder, when, literal, chosen.text(), "");
-    let length = instructions.buildSelect(runtime.builder, when,
-        runtime.int64(spelling.length), chosen.length(), "");
-    return new FormattedNumber(text, length);
 }
 
 // ptr ens_char_to_string(i32 scalar): the UTF-8 encoding of one Unicode scalar, one to four bytes.

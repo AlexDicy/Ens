@@ -7470,50 +7470,71 @@ struct CodeGenerator::Impl {
             "ens_double_to_string", module.get());
         fn->addFnAttr(llvm::Attribute::NoUnwind);
         auto savedIP = builder->saveIP();
-        builder->SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", fn));
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* at15 = llvm::BasicBlock::Create(ctx, "d2s.at15", fn);
+        auto* at16 = llvm::BasicBlock::Create(ctx, "d2s.at16", fn);
+        auto* at17 = llvm::BasicBlock::Create(ctx, "d2s.at17", fn);
+        auto* done = llvm::BasicBlock::Create(ctx, "d2s.done", fn);
+        builder->SetInsertPoint(entry);
         llvm::Value* v = fn->getArg(0);
         auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy);
         const uint64_t kCapacity = 40;  // '-1.2345678901234567e-308' and a terminator over
 
-        // The fewest of 15, 16, and 17 significant digits that reads back as the same value.
-        // Fifteen covers the ordinary cases and keeps their text short, seventeen always
-        // round-trips, so every value prints text that reads back exactly.
-        auto formatAt = [&](const char* spec, const char* name, llvm::Value** exact) {
-            llvm::Value* buf = builder->CreateAlloca(llvm::ArrayType::get(i8Ty, kCapacity),
-                nullptr, name);
+        llvm::Value* buf = builder->CreateAlloca(llvm::ArrayType::get(i8Ty, kCapacity),
+            nullptr, "d2s.buf");
+        llvm::Value* textSlot = builder->CreateAlloca(ptrTy, nullptr, "d2s.text");
+        llvm::Value* lenSlot = builder->CreateAlloca(i64Ty, nullptr, "d2s.len");
+
+        // The special values get one spelling of their own, decided before the ladder runs. A C
+        // library is free to write them differently, a program should not have to know which one
+        // it linked against, and no number of digits ever reads a NaN back as itself.
+        llvm::Value* isNan = builder->CreateFCmpUNO(v, v, "d2s.nan");
+        llvm::Value* isPosInf = builder->CreateFCmpOEQ(
+            v, llvm::ConstantFP::getInfinity(dblTy, false), "d2s.pinf");
+        llvm::Value* isNegInf = builder->CreateFCmpOEQ(
+            v, llvm::ConstantFP::getInfinity(dblTy, true), "d2s.ninf");
+        auto text = [&](const char* s) { return builder->CreateGlobalString(s, ".txt.d2s"); };
+        auto length = [&](const char* s) {
+            return llvm::ConstantInt::get(i64Ty, std::strlen(s));
+        };
+        builder->CreateStore(builder->CreateSelect(isNan, text("nan"),
+            builder->CreateSelect(isPosInf, text("inf"), text("-inf"))), textSlot);
+        builder->CreateStore(builder->CreateSelect(isNan, length("nan"),
+            builder->CreateSelect(isPosInf, length("inf"), length("-inf"))), lenSlot);
+        llvm::Value* isSpecial = builder->CreateOr(isNan,
+            builder->CreateOr(isPosInf, isNegInf), "d2s.special");
+
+        // The fewest of 15, 16, and 17 significant digits that reads back as the same value,
+        // stopping at the first that does. Fifteen settles the ordinary cases and keeps their
+        // text short; seventeen always round-trips, so it needs no check of its own.
+        auto formatAt = [&](const char* spec, llvm::BasicBlock* next) {
             llvm::Value* written = builder->CreateCall(getOrDeclareSnprintf(),
-                { buf, llvm::ConstantInt::get(i64Ty, kCapacity),
-                  builder->CreateGlobalString(spec, ".fmt.d2s"), v });
-            if (exact) {
-                llvm::Value* back = builder->CreateCall(getOrDeclareStrtod(), { buf, nullPtr });
-                *exact = builder->CreateFCmpOEQ(back, v, "d2s.exact");
+                { buf, llvm::ConstantInt::get(i64Ty, kCapacity), text(spec), v });
+            builder->CreateStore(buf, textSlot);
+            builder->CreateStore(builder->CreateSExt(written, i64Ty), lenSlot);
+            if (!next) {
+                builder->CreateBr(done);
+                return;
             }
-            return std::pair<llvm::Value*, llvm::Value*>{
-                buf, builder->CreateSExt(written, i64Ty) };
+            llvm::Value* back = builder->CreateCall(getOrDeclareStrtod(), { buf, nullPtr });
+            builder->CreateCondBr(builder->CreateFCmpOEQ(back, v, "d2s.exact"), done, next);
         };
-        llvm::Value* exact15 = nullptr;
-        llvm::Value* exact16 = nullptr;
-        auto [buf15, len15] = formatAt("%.15g", "d2s.b15", &exact15);
-        auto [buf16, len16] = formatAt("%.16g", "d2s.b16", &exact16);
-        auto [buf17, len17] = formatAt("%.17g", "d2s.b17", nullptr);
-        llvm::Value* buf = builder->CreateSelect(exact15, buf15,
-            builder->CreateSelect(exact16, buf16, buf17));
-        llvm::Value* len = builder->CreateSelect(exact15, len15,
-            builder->CreateSelect(exact16, len16, len17));
+        // Each attempt sits on the path that needs it, so an ordinary value pays one format and
+        // one read-back, and a special value pays neither.
+        builder->CreateCondBr(isSpecial, done, at15);
+        builder->SetInsertPoint(at15);
+        formatAt("%.15g", at16);
+        builder->SetInsertPoint(at16);
+        formatAt("%.16g", at17);
+        builder->SetInsertPoint(at17);
+        formatAt("%.17g", nullptr);
 
-        // The special values get one spelling of their own. A C library is free to write them
-        // differently, and a program should not have to know which one it linked against.
-        auto override = [&](llvm::Value* when, const char* text) {
-            buf = builder->CreateSelect(when, builder->CreateGlobalString(text, ".txt.d2s"), buf);
-            len = builder->CreateSelect(when,
-                llvm::ConstantInt::get(i64Ty, std::strlen(text)), len);
-        };
-        override(builder->CreateFCmpOEQ(v, llvm::ConstantFP::getInfinity(dblTy, false)), "inf");
-        override(builder->CreateFCmpOEQ(v, llvm::ConstantFP::getInfinity(dblTy, true)), "-inf");
-        override(builder->CreateFCmpUNO(v, v, "d2s.nan"), "nan");
-
+        builder->SetInsertPoint(done);
+        llvm::Value* len = builder->CreateLoad(i64Ty, lenSlot, "d2s.len.v");
+        llvm::Value* chosen = builder->CreateLoad(ptrTy, textSlot, "d2s.text.v");
         llvm::Value* obj = emitStringAlloc(len);
-        builder->CreateMemCpy(emitStringDataPtr(obj), llvm::MaybeAlign(1), buf, llvm::MaybeAlign(1), len);
+        builder->CreateMemCpy(emitStringDataPtr(obj), llvm::MaybeAlign(1), chosen,
+            llvm::MaybeAlign(1), len);
         builder->CreateRet(obj);
         builder->restoreIP(savedIP);
         return fn;
