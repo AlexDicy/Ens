@@ -14,25 +14,22 @@ Read this before touching code; it encodes conventions that are enforced by revi
 
 Ens is a compiled programming language with automatic reference counting, checked exceptions, flow-sensitive nullability, and per-instantiation generics.
 
-Two compilers live in this repository, and knowing which is which matters before you change anything:
+`ens` is the compiler and build tool, written in Ens, under `selfhost/`.
+It is the whole toolchain: front end, semantic analyzer, LLVM code generator, linker, package resolution, and command-line interface.
+It compiles itself to a byte-identical fixpoint, which the `bootstrap` job gates on every test run.
+It is the `ens` command a user runs, and it is the only compiler this repository has.
 
-- **`ens`** is the compiler and build tool, written in Ens, under `selfhost/`.
-  It is the whole toolchain: front end, semantic analyzer, LLVM code generator, linker, package resolution, and command-line interface.
-  It compiles itself to a byte-identical fixpoint, which the `bootstrap` job gates on every test run.
-  This is the `ens` command a user runs, and new language and tool work belongs here.
-- **`ens-ref`** is the older compiler, written in C++, under `compiler/`.
-  It is no longer the product, and nothing drives it any more: the `tests/` fixtures it used to compile are compiled by `ens`, the seed a fresh clone bootstraps from is committed rather than built, and the CLI jobs that drove its command line are gone.
-  `xmake test` neither builds nor runs it.
-  It is kept only until it is deleted, so do not teach it anything new; a language change lands in `ens` alone.
+The C++ compiler Ens was first written in has been deleted.
+Nothing in the tree answers for its behavior any more, and building, testing and bootstrapping Ens go through no C++ but the `ens-lld` linker bridge.
+The language server is C++ as well, but it is a separate tool with a front end of its own; see the repository map.
 
 `spec.md` is the single source of truth for user-facing language and tool behavior.
 If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surfacing, not a detail to paper over.
 
 ## Repository map
 
-- `compiler/` - the C++ reference compiler behind `ens-ref`: front end (lexer/parser/CST), semantic analyzer, LLVM codegen, module/workspace resolution, and its own driver.
 - `libs/std/` - the standard library, written in Ens, imported as the built-in `@std` package.
-- `runtime/lld/` - `ens_lld.cpp`, one C entry point over lld's C++ link drivers, built as the `ens-lld` shared library. It carries no link policy and is meant to outlive `compiler/`.
+- `runtime/lld/` - `ens_lld.cpp`, one C entry point over lld's C++ link drivers, built as the `ens-lld` shared library. It carries no link policy; that all lives in `selfhost/link/`.
 - `selfhost/` - the `ens` compiler and build tool, written in Ens, as one workspace of packages:
   - `syntax.grammar` + `syntaxgen/` - the declarative grammar and the generator that emits the syntax-tree sources.
   - `frontend/` - lexer, event parser, red-green syntax tree.
@@ -47,19 +44,24 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
   - `driver/` - the `ens` executable itself: command declarations, dispatch, exit codes.
   - `corpus/` - a harness asserting the front end parses every `.ens` file in the repo losslessly.
   - `semacheck/` - the harness gating sema behavior against every fixture and package in the tree (see Test conventions).
-  - `codegencheck/` - the differential harness gating code generation, with `codegencheck/spike` as its own member: a small program that emits an object file through the LLVM binding.
+  - `codegencheck/` - the harness gating code generation against every runnable fixture, with `codegencheck/spike` as its own member: a small program that emits an object file through the LLVM binding.
 - `tests/` - the compiler test suite; every fixture is executable specification.
-- `lsp/`, `tools/` - editor integrations; `tools/grammar/` is canonical for the shared grammar/config files.
+- `lsp/` - the language server, in C++, and the only C++ here besides `runtime/lld/`:
+  - `server/` - the server itself, built as `ens-lsp`: the document store, the diagnostic bridge, and the requests it answers.
+  - `frontend/` - the C++ lexer, parser, CST and semantic analyzer it reads a document with, built as `lsp-frontend`. It belongs to the language server and to nothing else; the language's own front end is `selfhost/frontend/`, and a question about the language is answered there or in `spec.md`, never here.
+- `tools/` - editor integrations; `tools/grammar/` is canonical for the shared grammar/config files.
 - `scripts/xmake_test.lua` - the test runner; read its header comment for the fixture directives.
 
 ## Building and testing
 
 - One native target carries what the tests need: `xmake build ens-lld`, the linker bridge every Ens program links through, without which a fresh clone cannot reach an executable.
-  `ens-lsp` is for editor work only and is built on its own (see `tools/vscode/README.md`).
-  Do not build all targets routinely; `ens-lsp.exe` may be running and will fail to relink.
+- The language server is built on its own: `xmake build ens-lsp` (see `tools/vscode/README.md`).
+  Nothing in `xmake test` builds it, so the whole suite can stay green while the language server no longer compiles.
+  Any change that touches `lsp/`, and any repository-wide rename or move that its sources could be reading, is gated by running `xmake build ens-lsp` by hand.
+  Close a running `ens-lsp.exe` first, or the link fails on the file being in use.
 - Run everything: `xmake test` (subset: `xmake test <name>...`).
   The full suite must be green before every commit, with no exceptions.
-  `xmake test` builds that target itself when it is missing, so it is the one command that always works from a clean checkout.
+  `xmake test` builds `ens-lld` itself when it is missing, so it is the one command that always works from a clean checkout.
 - `xmake test` starts by building the compiler it then tests: the committed **seed** for this host compiles `selfhost/driver` into `build/host/ens`, and every job that compiles Ens drives that.
   Everything Ens-related is therefore built by the Ens compiler as this tree defines it, so nothing frozen into the seed can shape what the suite measures.
   It is built before the jobs start, because they run in parallel and all of them need it.
@@ -106,28 +108,38 @@ That first one is committed to the repository, one binary per host, and `xmake t
 - `seed/macos-arm64/ens`
 
 A host with no committed seed fails the run by name instead of falling back to another compiler, because a fallback would leave the seed itself untested.
-So a fresh clone needs no compiler built from C++ to compile Ens, only the `ens-lld` linker bridge and the LLVM package every build links against.
+Nothing has to be compiled from C++ before Ens can be, beyond the `ens-lld` linker bridge and the LLVM package every build links against.
 
 **What the seed is for, and what it is not.**
 Its one job is to build `build/host/ens` out of the tree, and no test drives the seed itself.
 Nothing it produces is compared against anything either, so it cannot pull a gate towards its own behavior: a diagnostic or a code-generation change is measured the run it lands in, not the run after some binary is refreshed.
 A seed the sources have outgrown therefore shows up as a failure to build the compiler, before any job starts, and never as drift in what the tests assert.
 
-Refreshing a seed is a deliberate act rather than a build artifact.
-When a language or library change makes the tree uncompilable by the committed seed, the new binary lands in the same commit as the source change, because every commit has to be buildable from its own checkout.
-Build the replacement with an `ens` that already runs on that platform and commit it in place; a platform nobody can produce a seed for cannot bootstrap at all until somebody does.
-The cost this model accepts is a multi-megabyte binary per platform in git history, growing every time it is refreshed, and a supply-chain question no reviewer can answer by reading a diff.
+### Refreshing a seed
+
+A seed goes stale when the sources start using something it cannot compile: a new keyword, a library call it does not have, a rule it does not enforce yet.
+The symptom is always the same, and it is loud: `xmake test` stops before any job runs, naming the platform and quoting the build it could not finish.
+It never shows up as a test that starts passing or failing differently.
+
+To produce a replacement, run an `ens` that already works on that platform against this tree, and write the result over the committed binary: `ens build selfhost/driver --output seed/windows-x64/ens.exe --stdlib libs`, with the platform folder and file name of the host you are on.
+`--stdlib libs` is what makes it this tree's standard library rather than the one belonging to whatever `ens` is doing the building.
+That `ens` may be the seed being replaced, a `build/host/ens` from an earlier commit, or an installed toolchain; all that matters is that it compiles these sources.
+
+The new binary lands in the same commit as the change that needed it, because every commit has to be buildable from its own checkout.
+A change no seed can compile therefore needs all three refreshed, and each one has to be built on its own platform: seeds are not cross-compiled, and there is no C++ compiler to fall back on any more.
+A platform whose seed is too old cannot bootstrap at all until somebody on that platform builds one, so a change that outruns the seeds should not land until every platform has its replacement.
+
+The cost this model accepts is a multi-megabyte binary per platform in git history, growing every time it is refreshed.
 
 ## The self-hosted compiler
 
-- It is a clean redesign, not a port.
-  `spec.md` and the `tests/` fixtures are what observable behavior answers to; `ens-ref` answers for nothing any more, so never mirror its structure, naming, or style and never reach for it to settle a question.
-- Parity with it was the floor and never the ceiling: a crash, an unsound accept or a weak diagnostic found in it is a hole to report, not a shape to copy.
+- `spec.md` and the `tests/` fixtures are what observable behavior answers to, and nothing else is.
+  There is no second implementation to compare against and no parity to keep: a weak diagnostic, an unsound accept or a crash is a hole to fix or report, never a shape to copy from anywhere.
   Genuine bugs that block a design choice stop the work; report a minimal repro rather than adopting a workaround design.
 - Generated files (`selfhost/frontend/src/syntax/generated/kind.ens`, `nodes.ens`, `factory.ens`, `dump.ens`) say "Generated by syntaxgen - Do not edit".
   Change `selfhost/syntax.grammar` or the emitter in `selfhost/syntaxgen/src/` and regenerate.
 - Ens packages use a workspace model: an `ens.package` manifest declares either one package or a workspace of member packages, a package's `dependency` declarations resolve by name against the enclosing workspace's members, and a package is consumed through its `src/` folder.
-  Keep knowledge of the manifest format isolated where it already lives (`compiler/frontend/module/` and `selfhost/sema/src/program/workspace.ens`).
+  Keep knowledge of the manifest format isolated where it already lives, `selfhost/sema/src/program/workspace.ens`; the language server reads manifests through its own copy under `lsp/frontend/module/`.
 - Per-file work (parsing, declaration scanning) must stay a pure function with no shared mutable state; cross-file phases are staged and return their results and diagnostics as values.
   Threads are coming to Ens eventually; do not add designs that would need refactoring then.
 
@@ -158,7 +170,7 @@ C++ code: match the surrounding style of the file you are in.
 
 Comments (both languages): minimal.
 Prefer clean, understandable code over explaining unclear code with a comment.
-A comment only states what the code cannot; never phase tags, decision rationale, or references to "the other compiler" - that context belongs in commits and reviews, not source.
+A comment only states what the code cannot; never phase tags, decision rationale, or references to another implementation. That context belongs in commits and reviews, not source.
 
 ## Process
 

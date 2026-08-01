@@ -9,7 +9,7 @@ xmake build ens-lld
 xmake test
 ```
 
-`ens-lld` is the linker bridge every Ens program links through.
+`ens-lld` is the linker bridge every Ens program links through, and the only C++ a build of Ens needs.
 `xmake test` builds `ens` from source with the seed committed for this platform under `seed/`, then runs the whole suite through it.
 
 ## Editor support

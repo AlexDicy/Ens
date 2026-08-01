@@ -79,34 +79,8 @@ target("lsp-frontend")
     add_includedirs("lsp/frontend", { public = true })
 
 
-target("ens-codegen")
-    set_kind("static")
-    set_languages("cxx17")
-    set_toolchains("@llvm")
-    add_rules("link-llvm-libs", "gen-macos-sdk-stubs")
-    add_files("compiler/codegen/**.cpp")
-    add_headerfiles("compiler/codegen/**.h")
-    add_includedirs("compiler/codegen", { public = true })
-    add_deps("lsp-frontend")
-    add_packages("libllvm", "libxml2", { public = true })
-    -- fix to have the flag appear later comapred to add_links(...) for GNU ld
-    add_ldflags("-lLLVMCGData", { public = true, force = true })
-
-
--- The reference compiler. It builds the seed the Ens-written compiler is bootstrapped from and
--- gates the tests/ fixtures; the user-facing `ens` command is the Ens-written one.
-target("ens-ref")
-    set_kind("binary")
-    set_languages("cxx17")
-    set_toolchains("@llvm")
-    add_rules("link-llvm-libs")
-    add_files("compiler/driver/**.cpp")
-    add_headerfiles("compiler/driver/**.h")
-    add_deps("lsp-frontend", "ens-codegen")
-
-
--- The linker bridge the Ens-written compiler links through: one C entry point over lld's C++
--- drivers, shipped as a shared library beside LLVM-C so it outlives the C++ compiler.
+-- The linker bridge `ens` links every Ens program through: one C entry point over lld's C++
+-- drivers, shipped as a shared library beside LLVM-C. All link policy lives in selfhost/link.
 target("ens-lld")
     set_kind("shared")
     set_languages("cxx17")
@@ -130,6 +104,8 @@ target("ens-lld")
     end
 
 
+-- The language server. `xmake test` never builds it, so a change anywhere under lsp/ is gated by
+-- building this target by hand.
 target("ens-lsp")
     set_kind("binary")
     set_languages("cxx20")

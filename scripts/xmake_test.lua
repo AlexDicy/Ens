@@ -38,8 +38,8 @@ task("test")
         local arch = config.get("arch") or os.arch()
         local build_dir = path.join(os.projectdir(), "build", plat, arch, mode)
         local exe_suffix = is_host("windows") and ".exe" or ""
-        -- what a compiler names the artifacts it is not told the name of: both compilers follow the
-        -- target's object format, and every assertion about a default-named file has to as well.
+        -- what `ens` names the artifacts it is not told the name of: it follows the target's object
+        -- format, and every assertion about a default-named file has to as well.
         local obj_suffix = is_host("windows") and ".obj" or ".o"
         -- where `ens` puts a workspace member's program: with its objects under the build root,
         -- where it cannot land on the member folder it was built from. The triple in that path is
