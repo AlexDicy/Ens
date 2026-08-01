@@ -1861,6 +1861,29 @@ task("test")
             if #os.files(path.join(objects, ".ens", "*", "O2", "*.obj")) == 0 then
                 table.insert(failures, "a build left no object files under the build root")
             end
+
+            -- each object is assembled in a folder of the build's own and moved into place once it
+            -- is whole, so nothing can read one half-written. That the move is indivisible cannot be
+            -- asserted without racing two builds; what is asserted is that the staging folder is
+            -- always taken away, and that a build whose objects are already there replaces them.
+            local function expectNoStaging(base, after)
+                local left = os.dirs(path.join(base, "staging-*"))
+                if #left > 0 then
+                    table.insert(failures, string.format("%s left %s behind", after,
+                        path.filename(left[1])))
+                end
+            end
+            expectNoStaging(path.join(objects, ".ens", triple, "O2"), "a build")
+            run({"build", objects, "--output", path.join(root, "objects.exe")}, nil, 0, "built")
+            expectNoStaging(path.join(objects, ".ens", triple, "O2"), "a build over its own objects")
+            run_program(path.join(root, "objects.exe"), 0, "objects")
+
+            -- an edited source reaches the object at its path rather than the previous one staying
+            io.writefile(path.join(objects, "src", "main.ens"),
+                'main() -> int {\n    print("objects again");\n    return 0;\n}\n')
+            run({"build", objects, "--output", path.join(root, "objects.exe")}, nil, 0, "built")
+            run_program(path.join(root, "objects.exe"), 0, "objects again")
+
             -- and nowhere else: not beside the executable, and not in the folder it was run from
             for _, elsewhere in ipairs({root, work}) do
                 if #os.files(path.join(elsewhere, "*.obj")) > 0 then
@@ -1889,6 +1912,7 @@ task("test")
             if #os.files(path.join(named_objects, "*.obj")) == 0 then
                 table.insert(failures, "'--objects' did not decide where the objects went")
             end
+            expectNoStaging(named_objects, "a build into a named objects folder")
 
             -- quiet says nothing on success, verbose says what it did, and --explain-arc accounts
             local _, quiet_out = run({"build", hello, "--output",

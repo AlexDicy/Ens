@@ -9,9 +9,11 @@
 import @std.system;
 import SystemError from @std.system;
 import @std.path;
+import List from @std.collections.list;
 import FileDiagnostic from @ens.sema.support.diagnostics;
 import FileLoader from @ens.sema.support.loader;
 import ProgramAnalysis from @ens.sema.pipeline;
+import @ens.host.scratch;
 import @ens.codegen.driver;
 import @ens.codegen.settings;
 import LinkRequest from @ens.link.request;
@@ -208,13 +210,15 @@ export finishUnit(BuildOptions options, Packaging packaging, Loaded loaded, stri
         return failed([prepared], loaded.moduleCount(), loaded.notices());
     }
 
-    let emitted = driver.emitProgram(analysis, objectsFolder, path.stem(output) + ".",
-        options.codegen());
-    if (!emitted.succeeded()) {
-        return failed(diagnostics.formatAll(emitted.diagnostics(), loaded.catalog()),
+    let emitted = emitObjects(options, analysis, objectsFolder, path.stem(output) + ".");
+    if (emitted.failure.length > 0) {
+        return failed([emitted.failure], loaded.moduleCount(), loaded.notices());
+    }
+    if (emitted.diagnostics.length > 0) {
+        return failed(diagnostics.formatAll(emitted.diagnostics, loaded.catalog()),
             loaded.moduleCount(), loaded.notices());
     }
-    if (emitted.objects().length() == 0) {
+    if (emitted.objects.length == 0) {
         return failed(["the program produced no object files, so there is nothing to link"],
             loaded.moduleCount(), loaded.notices());
     }
@@ -229,15 +233,14 @@ export finishUnit(BuildOptions options, Packaging packaging, Loaded loaded, stri
         return failed([prebuiltFiles.failure()], loaded.moduleCount(), loaded.notices());
     }
 
-    let linked = linker.link(new LinkRequest(emitted.objects().toArray(), plan.libraries(),
+    let linked = linker.link(new LinkRequest(emitted.objects, plan.libraries(),
         prebuiltFiles.files(), output, options.targetTriple()), toolchain);
     if (!linked.linked()) {
         return failed(linkFailureLines(output, linked.output()), loaded.moduleCount(),
             loaded.notices());
     }
     return new UnitReport(BuildOutcome.BuiltExecutable, output, linkerNoise(linked.output()),
-        loaded.moduleCount(), emitted.objects().length(), emitted.arcExplanation(),
-        loaded.notices());
+        loaded.moduleCount(), emitted.objects.length, emitted.account, loaded.notices());
 }
 
 // A library is compiled the whole way, object files included, and produces no executable: the point
@@ -250,15 +253,17 @@ buildLibrary(BuildOptions options, ProgramAnalysis analysis, Loaded loaded,
     if (prepared.length > 0) {
         return failed([prepared], loaded.moduleCount(), loaded.notices());
     }
-    let emitted = driver.emitProgram(analysis, objectsFolder, artifactStem + ".",
-        options.codegen());
-    if (!emitted.succeeded()) {
-        return failed(diagnostics.formatAll(emitted.diagnostics(), loaded.catalog()),
+    let emitted = emitObjects(options, analysis, objectsFolder, artifactStem + ".");
+    if (emitted.failure.length > 0) {
+        return failed([emitted.failure], loaded.moduleCount(), loaded.notices());
+    }
+    if (emitted.diagnostics.length > 0) {
+        return failed(diagnostics.formatAll(emitted.diagnostics, loaded.catalog()),
             loaded.moduleCount(), loaded.notices());
     }
     string[] clean = [];
     return new UnitReport(BuildOutcome.ValidatedLibrary, "", clean, loaded.moduleCount(),
-        emitted.objects().length(), emitted.arcExplanation(), loaded.notices());
+        emitted.objects.length, emitted.account, loaded.notices());
 }
 
 // Everything this machine contributes to a link for the target, looked up once for the whole
@@ -268,6 +273,98 @@ export discoverToolchain(BuildOptions options) -> Toolchain {
     string triple = options.targetTriple();
     return discovery.discover(flavor.flavorOf(triple), triple,
         path.join(options.workingFolder(), ".ens-link-probe"));
+}
+
+// What code generation left behind: the object files where they belong, whatever it diagnosed about
+// the program, and the account it was asked for. A failure is the one thing here that is not the
+// program's fault - a folder that could not be made, or an object that could not be put in place.
+final class Emitted {
+    protected string[] objects;
+    protected FileDiagnostic[] diagnostics;
+    protected string[] account;
+    protected string failure;
+
+    protected constructor(this.objects, this.diagnostics, this.account, this.failure);
+}
+
+// Generates the program's object files. Every one of them is written into a folder of this build's
+// own and moved to where it belongs once it is whole, so what sits at an object's path is always a
+// complete object rather than one half-written. The staging folder is inside the folder the objects go
+// to, so the move is a rename within one volume, and it is taken away once they are out of it.
+//
+// Whole is all this decides: which build's object is at the path is a different question, and one
+// that belongs to whatever reuses objects rather than to emitting them.
+emitObjects(BuildOptions options, ProgramAnalysis analysis, string objectsFolder,
+            string filePrefix) -> Emitted {
+    let staging = scratch.createUnder(objectsFolder, stagingPrefix());
+    if (staging.failure().length > 0) {
+        return failedEmission("the object files could not be assembled: " + staging.failure());
+    }
+    let emitted = driver.emitProgram(analysis, staging.folder(), filePrefix, options.codegen());
+    string[] nothing = [];
+    if (!emitted.succeeded()) {
+        scratch.discard(staging.folder());
+        return new Emitted(nothing, emitted.diagnostics(), emitted.arcExplanation(), "");
+    }
+    let placed = placeObjects(objectsFolder, emitted.objects());
+    // A staging folder that could not be taken away is stepped over by the next build rather than
+    // reused, and the run that finally has nowhere left to stage says so and names what to remove.
+    scratch.discard(staging.folder());
+    if (placed.failure.length > 0) {
+        return failedEmission(placed.failure);
+    }
+    FileDiagnostic[] clean = [];
+    return new Emitted(placed.files, clean, emitted.arcExplanation(), "");
+}
+
+// The object files of one emission, once each is where it belongs.
+final class PlacedObjects {
+    protected string[] files;
+    protected string failure;
+
+    protected constructor(this.files, this.failure);
+}
+
+placeObjects(string objectsFolder, List<string> staged) -> PlacedObjects {
+    let placed = new List<string>();
+    for (long i = 0; i < staged.length(); i++) {
+        string from = staged.get(i);
+        string to = path.join(objectsFolder, path.fileName(from));
+        string problem = placeObject(from, to);
+        if (problem.length > 0) {
+            string[] nothing = [];
+            return new PlacedObjects(nothing, problem);
+        }
+        placed.push(to);
+    }
+    return new PlacedObjects(placed.toArray(), "");
+}
+
+// Puts one finished object at its own path. What an earlier build left there goes first, because a
+// move answers rather than replaces when a name is taken; across the two steps the path holds either
+// that whole earlier object or this whole new one, and never a part of either.
+placeObject(string from, string to) -> string {
+    if (system.exists(to)) {
+        try system.removeFile(to);
+    }
+    if (try system.move(from, to)) {
+        return "";
+    }
+    return "the object file '{to}' was written by something else while this build was building it; "
+        + "run one build of these sources at a time";
+} catch (SystemError error) {
+    return "the object file could not be put at '{to}': {error.message}";
+}
+
+failedEmission(string problem) -> Emitted {
+    string[] nothing = [];
+    FileDiagnostic[] clean = [];
+    return new Emitted(nothing, clean, nothing, problem);
+}
+
+// What a folder holding one build's objects on their way into place is called.
+stagingPrefix() -> string {
+    return "staging";
 }
 
 // The folder Ens keeps what a build root produces under. The name is dotted and tool-owned, so it
