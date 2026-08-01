@@ -469,8 +469,9 @@ task("test")
         -- process linking or loading them needs: on Windows lld-link reads LIB (and finds nothing
         -- else once LIB is set, so the MSVC and SDK folders must be added too) and the loader
         -- searches PATH; on Linux/macOS the ens linker turns LIBRARY_PATH into -L and -rpath, and
-        -- the loader honors LD_LIBRARY_PATH / DYLD_LIBRARY_PATH. A machine without the LLVM library
-        -- cannot build the compiler either, so a clear hard failure is the right outcome.
+        -- the loader honors LD_LIBRARY_PATH / DYLD_FALLBACK_LIBRARY_PATH. A machine without the
+        -- LLVM library cannot build the compiler either, so a clear hard failure is the right
+        -- outcome.
         -- Returns env, the shared libraries to place beside an executable, nil, or nil, nil, message.
         local function llvmEnvironment()
             local on_windows = is_host("windows")
@@ -519,7 +520,12 @@ task("test")
             end
             env.LIBRARY_PATH = prepend(prepend(env.LIBRARY_PATH, llvm_lib), build_dir)
             if is_host("macosx") then
-                env.DYLD_LIBRARY_PATH = prepend(prepend(env.DYLD_LIBRARY_PATH, llvm_lib),
+                -- the fallback list rather than DYLD_LIBRARY_PATH, which is consulted first and
+                -- by file name alone: the LLVM package ships its own libc++, and shadowing the
+                -- system one leaves every process started here without the C++ runtime this
+                -- macOS builds against.
+                env.DYLD_FALLBACK_LIBRARY_PATH = prepend(prepend(
+                    env.DYLD_FALLBACK_LIBRARY_PATH or "/usr/local/lib:/usr/lib", llvm_lib),
                     build_dir)
             else
                 env.LD_LIBRARY_PATH = prepend(prepend(env.LD_LIBRARY_PATH, llvm_lib), build_dir)
