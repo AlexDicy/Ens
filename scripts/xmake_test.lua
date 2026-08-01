@@ -1,5 +1,5 @@
--- compile each tests/*.ens with the ens compiler and verify the exit code, the standard output
--- and the standard error against the directives in the test source header:
+-- compile each tests/*.ens with the ens-ref reference compiler and verify the exit code, the
+-- standard output and the standard error against the directives in the test source header:
 --     // @exit 12
 --     // @stdout Hello!
 --     // @stdout-contains Hello
@@ -12,7 +12,7 @@
 -- asserted with the @stderr directives and never appears in stdout.
 -- use @expect-error instead to assert the compiler reports a specific diagnostic.
 --     // @expect-error Undefined function 'testFunction'
--- a folder test's main.ens may use @ens-test (optionally with extra arguments) to run
+-- a folder test's main.ens may use @ens-test (optionally with extra arguments) to run the seed
 -- `ens test <folder> ...` instead of compile+run, asserting on its two streams the same way.
 -- the token {dir} in the extra arguments expands to the folder's absolute path.
 --     // @ens-test --filter needle
@@ -212,8 +212,13 @@ task("test")
             })
         end
 
-        -- the driver's command-line surface: command spellings, retired flags, artifact
-        -- naming, libraries, and the hidden cst tools.
+        -- The next five jobs drive ens-ref's own command line, and they are deleted along with it.
+        -- The Ens-written command's equivalents are the cli_build, cli_runtest, cli_overriding,
+        -- cli_dependencies and cli_prebuilt jobs further down; the two command lines are meant to
+        -- differ, so each side is asserted against its own behavior rather than against the other.
+        --
+        -- the reference command's surface: command spellings, retired flags, artifact naming,
+        -- libraries, and the hidden cst tools.
         if want("cli_core") then
             table.insert(jobs, {
                 name = "cli_core",
@@ -221,8 +226,8 @@ task("test")
             })
         end
 
-        -- the workspace-root and run behaviors: member builds in dependency order, test-all,
-        -- application selection, argument passthrough, and exit-code forwarding.
+        -- the reference command's workspace-root and run behaviors: member builds in dependency
+        -- order, test-all, application selection, argument passthrough, and exit-code forwarding.
         if want("cli_workspace") then
             table.insert(jobs, {
                 name = "cli_workspace",
@@ -230,8 +235,8 @@ task("test")
             })
         end
 
-        -- the override subcommands: an add/remove/list roundtrip against a scratch workspace,
-        -- name-mismatch validation, and byte-exact edits of ens.overrides.
+        -- the reference command's override subcommands: an add/remove/list roundtrip against a
+        -- scratch workspace, name-mismatch validation, and byte-exact edits of ens.overrides.
         if want("cli_override") then
             table.insert(jobs, {
                 name = "cli_override",
@@ -239,11 +244,11 @@ task("test")
             })
         end
 
-        -- git-sourced dependencies end to end: tag resolution (verbatim, v-prefix, ambiguity),
-        -- fetching into the content store, ens.lock creation, no-network reuse, minimal
-        -- updates, --offline and --locked, MVS across transitive requirements, and the
-        -- conflict and rejection errors. Everything runs against scratch git repos and a
-        -- scratch ENS_CACHE, so no network or real cache is ever touched.
+        -- git-sourced dependencies end to end through the reference command: tag resolution
+        -- (verbatim, v-prefix, ambiguity), fetching into the content store, ens.lock creation,
+        -- no-network reuse, minimal updates, --offline and --locked, MVS across transitive
+        -- requirements, and the conflict and rejection errors. Everything runs against scratch git
+        -- repos and a scratch ENS_CACHE, so no network or real cache is ever touched.
         if want("cli_git") then
             table.insert(jobs, {
                 name = "cli_git",
@@ -251,8 +256,9 @@ task("test")
             })
         end
 
-        -- native artifact fetching over file:// URLs: the happy path into the link, cache
-        -- reuse under --offline, hash-mismatch rejection, and the artifact lines in ens.lock.
+        -- native artifact fetching over file:// URLs through the reference command: the happy path
+        -- into the link, cache reuse under --offline, hash-mismatch rejection, and the artifact
+        -- lines in ens.lock.
         if want("cli_artifact") then
             table.insert(jobs, {
                 name = "cli_artifact",
@@ -733,10 +739,8 @@ task("test")
             end
             placeNativeLibraries(native_libraries, check_dir)
 
-            -- list every candidate fixture; the harness reads each for its directives. A folder
-            -- fixture also lists its '*_test.ens' files relative to its source folder, because
-            -- the standard library has no directory enumeration yet; the harness narrows them by
-            -- the fixture's own @ens-test arguments.
+            -- list every candidate fixture, naming the file whose header carries the directives;
+            -- the harness reads each one and works out for itself what the fixture asks for.
             local lines = {
                 "spike " .. spike_exe,
                 "stdlib " .. (path.join(os.projectdir(), "libs"):gsub("\\", "/")),
