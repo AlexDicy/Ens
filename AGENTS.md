@@ -103,7 +103,7 @@ That first one is committed to the repository, one binary per host, and `xmake t
 
 - `seed/windows-x64/ens.exe`
 - `seed/linux-x64/ens`
-- `seed/macos-arm64/ens` is where a macOS seed goes; there is none yet.
+- `seed/macos-arm64/ens`
 
 A host with no committed seed fails the run by name instead of falling back to another compiler, because a fallback would leave the seed itself untested.
 So a fresh clone needs no compiler built from C++ to compile Ens, only the `ens-lld` linker bridge and the LLVM package every build links against.
