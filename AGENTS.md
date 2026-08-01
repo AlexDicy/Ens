@@ -22,7 +22,7 @@ Two compilers live in this repository, and knowing which is which matters before
   This is the `ens` command a user runs, and new language and tool work belongs here.
 - **`ens-ref`** is the older compiler, written in C++, under `compiler/`.
   It is no longer the product.
-  It stays for two reasons: it compiles the `tests/` fixtures as a second opinion, and it drives five CLI jobs that will be deleted along with it.
+  It stays for one reason: it compiles the `tests/` fixtures as a second opinion.
   Nothing blocks its removal any more; the seed a fresh clone bootstraps from is committed, not built (see [The bootstrap seed](#the-bootstrap-seed)).
 
 `spec.md` is the single source of truth for user-facing language and tool behavior.
@@ -64,9 +64,8 @@ If the spec, `ens`, and `ens-ref` disagree, that is a bug worth surfacing, not a
 - `xmake test` starts by placing the **seed** and then shares it: the committed `ens` for this host is copied into `build/seed/ens`, and every job that compiles Ens uses that seed.
   Everything Ens-related is therefore built by the Ens compiler, so a bug that lives only in `ens-ref` cannot shape the self-hosted tree.
   The seed is placed before the jobs start, because they run in parallel and all of them need it.
-- `ens-ref`'s remaining roles are exactly two: it compiles the `tests/` fixtures for the reference gate, and it drives `cli_core`, `cli_workspace`, `cli_override`, `cli_git` and `cli_artifact`.
-  Those five jobs have `ens`-side counterparts already, so they are deleted with the C++ driver rather than ported.
-- The packaging tests (`cli_git`, `cli_artifact`, `cli_dependencies`, `cli_prebuilt`) shell out to the system `git` and `curl`; both must be on PATH.
+- `ens-ref`'s remaining role is exactly one: it compiles the `tests/` fixtures for the reference gate.
+- The packaging tests (`cli_dependencies`, `cli_prebuilt`) shell out to the system `git` and `curl`; both must be on PATH.
   They drive scratch repositories over `file://` URLs and a scratch cache, so no test ever reaches the network or this machine's own cache.
 - `xmake test` uses the binary of the currently configured mode.
   Never run `xmake f -m release` to "fix" staleness; rebuild instead.
@@ -94,9 +93,8 @@ If the spec, `ens`, and `ens-ref` disagree, that is a bug worth surfacing, not a
   The list may only shrink: the harness fails if a runnable fixture is neither verified nor listed, and equally if a listed name is no longer a runnable fixture, so the exemption list cannot rot.
 - `bootstrap` is the strongest end-to-end gate: the seed compiles `selfhost/driver`, the `ens` that came out of that compiles the same sources again, and the two stages' object files must hold the same modules with identical bytes.
   Executables are compared as a note only, because linker output carries timestamps.
-- The `cli_*` jobs split by which binary they drive.
-  `cli_core`, `cli_workspace`, `cli_override`, `cli_git` and `cli_artifact` drive `ens-ref`; `cli_build`, `cli_runtest`, `cli_overriding`, `cli_dependencies`, `cli_prebuilt` and `cli_toolchain` drive `ens`.
-  The two command lines are deliberately different, so there is no scenario-for-scenario differential gate between them: each job asserts its own binary's behavior.
+- The `cli_*` jobs (`cli_build`, `cli_runtest`, `cli_overriding`, `cli_dependencies`, `cli_prebuilt`, `cli_toolchain`) all drive `ens`, and each asserts the command's own contract.
+  Nothing about another command line is authoritative for them.
 
 ## The bootstrap seed
 
