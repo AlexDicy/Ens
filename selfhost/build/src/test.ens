@@ -32,6 +32,19 @@ import testing.discovery;
 import RunnerOverlay from testing.runner;
 import testing.runner;
 
+// What running one suite came to: the code it deserves, how many of its tests passed, how many were
+// going to run, and whether it ran them all. A suite that stopped partway or never compiled reports
+// the results it did produce out of the ones it had, so a total over several of them is short by
+// exactly what did not happen rather than by nothing.
+final class SuiteResult {
+    protected int code;
+    protected long passedTests;
+    protected long plannedTests;
+    protected bool ranThrough;
+
+    protected constructor(this.code, this.passedTests, this.plannedTests, this.ranThrough);
+}
+
 // Runs the target's tests and answers with the exit code: 0 every test passed, 1 some of them
 // failed, 2 the command line asked for something it cannot have or a run did not finish.
 export run(FileLoader loader, BuildOptions options, Packaging packaging, Environment environment,
@@ -51,7 +64,8 @@ export run(FileLoader loader, BuildOptions options, Packaging packaging, Environ
             reporter);
     }
     return runSuite(loader, options, packaging, environment, resolved.sourceFolder(),
-        discoveryRootOf(resolved, namedTests), "", resolved.artifactName(), filter, reporter, 1, 1);
+        discoveryRootOf(resolved, namedTests), "", resolved.artifactName(), filter, reporter, 1,
+        1).code;
 }
 
 // Where a target's tests are read from: the folder '--tests' named, else the target's own tests
@@ -68,6 +82,10 @@ discoveryRootOf(BuildTarget resolved, string namedTests) -> string {
 
 // Tests every member of a workspace, each one against its own tests. Every member is tested even
 // after one of them has failures, because a test run is asked in order to see them all.
+//
+// Each member's results are announced under its own name and then counted, so a run over several of
+// them ends by saying what the whole workspace came to rather than leaving a reader to add up the
+// members themselves.
 runWorkspace(FileLoader loader, BuildOptions options, Packaging packaging, Environment environment,
              BuildTarget resolved, string namedTests, string filter, Reporter reporter) -> int {
     if (namedTests.length > 0) {
@@ -82,16 +100,42 @@ runWorkspace(FileLoader loader, BuildOptions options, Packaging packaging, Envir
         return 0;
     }
     int worst = 0;
+    long passed = 0;
+    long planned = 0;
+    long withTests = 0;
+    let unfinished = new List<string>();
     for (long i = 0; i < members.length; i++) {
         string source = path.join(members[i].folder(), "src");
-        int code = runSuite(loader, options, packaging, environment, source,
+        let result = runSuite(loader, options, packaging, environment, source,
             memberTestsFolder(members[i], source), resolved.root(), members[i].packageName(),
             filter, reporter, i + 1, members.length);
-        if (code > worst) {
-            worst = code;
+        if (result.code > worst) {
+            worst = result.code;
+        }
+        passed = passed + result.passedTests;
+        planned = planned + result.plannedTests;
+        if (result.plannedTests > 0) {
+            withTests = withTests + 1;
+        }
+        if (!result.ranThrough) {
+            unfinished.push(members[i].packageName());
         }
     }
+    reportTotal(passed, planned, withTests, unfinished.toArray(), reporter);
     return worst;
+}
+
+// What the whole workspace came to, once every member has had its turn. Nothing is said when no
+// member had a test to run, because each of them has already said so on its own account.
+reportTotal(long passed, long planned, long withTests, string[] unfinished, Reporter reporter) {
+    if (withTests == 0) {
+        return;
+    }
+    string total = "{passed}/{planned} tests passed across " + report.memberCount(withTests);
+    if (unfinished.length > 0) {
+        total = total + "; " + report.quotedNames(unfinished) + " did not finish";
+    }
+    reporter.note(total);
 }
 
 // Where a member keeps its tests: its own 'tests' folder, or its sources when it has none.
@@ -103,47 +147,54 @@ memberTestsFolder(WorkspaceMember member, string source) -> string {
     return source;
 }
 
-// Runs one suite: everything from what is under the discovery root to what the run came to.
+// Runs one suite: everything from what is under the discovery root to what the run came to. A run
+// over several suites announces each one under its own name, so whose results are being read is never
+// left to be worked out; a run over one has nothing to distinguish and says nothing.
 runSuite(FileLoader loader, BuildOptions options, Packaging packaging, Environment environment,
          string sourceFolder, string discoveryRoot, string overridesFolder, string label,
-         string filter, Reporter reporter, long index, long total) -> int {
+         string filter, Reporter reporter, long index, long total) -> SuiteResult {
     string announced = report.progress(index, total, label);
     if (!system.isDirectory(discoveryRoot)) {
         reporter.problem("{announced}: '{discoveryRoot}' is not a folder, so there are no tests to "
             + "read from it");
-        return 2;
+        return refusedSuite();
     }
     reporter.step("{announced}: reading the tests in {discoveryRoot}");
 
     let plan = discovery.plan(loader, discoveryRoot, filter);
     if (plan.usageProblem().length > 0) {
         reporter.problem("{announced}: " + plan.usageProblem());
-        return 2;
+        return refusedSuite();
     }
     if (plan.nothingToRun().length > 0) {
         reporter.note("{announced}: " + plan.nothingToRun());
-        return 0;
+        return new SuiteResult(0, 0, 0, true);
     }
     reporter.step("{announced}: running {plan.tests().length} of {plan.discoveredCount()} test(s)");
 
     let folder = scratch.create(environment, "ens-test");
     if (folder.failure().length > 0) {
         reporter.problem("{announced}: " + folder.failure());
-        return 2;
+        return new SuiteResult(2, 0, plan.tests().length, false);
     }
-    int code = runIn(loader, options, packaging, folder.folder(), sourceFolder, discoveryRoot,
-        overridesFolder, plan, announced, reporter);
+    let result = runIn(loader, options, packaging, folder.folder(), sourceFolder, discoveryRoot,
+        overridesFolder, plan, announced, total > 1, reporter);
     string leftBehind = scratch.discard(folder.folder());
     if (leftBehind.length > 0) {
         reporter.problem("{announced}: " + leftBehind);
     }
-    return code;
+    return result;
+}
+
+// A suite the command line ruled out before there was a plan to count against.
+refusedSuite() -> SuiteResult {
+    return new SuiteResult(2, 0, 0, false);
 }
 
 // Builds the suite into the folder and runs it there.
 runIn(FileLoader loader, BuildOptions options, Packaging packaging, string folder,
       string sourceFolder, string discoveryRoot, string overridesFolder, TestPlan plan,
-      string announced, Reporter reporter) -> int {
+      string announced, bool announceSuite, Reporter reporter) -> SuiteResult {
     string suite = path.join(folder, platform.executableNamed("tests", options.targetTriple()));
     let built = compile(loader, options, packaging, sourceFolder, discoveryRoot, overridesFolder,
         plan, suite);
@@ -152,9 +203,14 @@ runIn(FileLoader loader, BuildOptions options, Packaging packaging, string folde
     if (built.outcome() != BuildOutcome.BuiltExecutable) {
         reporter.problems(built.problems());
         reporter.problem("{announced}: the tests did not compile, so none of them ran");
-        return 2;
+        return new SuiteResult(2, 0, plan.tests().length, false);
     }
     reporter.step("{announced}: running {suite}");
+    // Said before the suite starts, so the results stream in under the name they belong to rather
+    // than being held back to be labeled afterwards.
+    if (announceSuite) {
+        reporter.note("{announced}:");
+    }
     return started(suite, plan, announced, reporter);
 }
 
@@ -162,14 +218,18 @@ runIn(FileLoader loader, BuildOptions options, Packaging packaging, string folde
 // test that produced it finishes. The results are counted on the way past, which is what lets a run
 // that stopped partway name the test it stopped in. What a test wrote to the error stream arrives
 // among the results in the order it was written rather than apart from them.
-started(string suite, TestPlan plan, string announced, Reporter reporter) -> int {
+started(string suite, TestPlan plan, string announced, Reporter reporter) -> SuiteResult {
     DiscoveredTest[] tests = plan.tests();
     let suiteRun = try system.start(suite, noArguments());
     long finished = 0;
+    long passed = 0;
     string? line = try suiteRun.readLine();
     while (line != null) {
         reporter.relayed(line);
         if (finished < tests.length && runner.reportsResult(line, tests[finished])) {
+            if (runner.reportsPass(line, tests[finished])) {
+                passed = passed + 1;
+            }
             finished = finished + 1;
         }
         line = try suiteRun.readLine();
@@ -179,10 +239,10 @@ started(string suite, TestPlan plan, string announced, Reporter reporter) -> int
     if (outcome.failure().length > 0) {
         reporter.problem("{announced}: " + outcome.failure());
     }
-    return outcome.exitCode();
+    return new SuiteResult(outcome.exitCode(), passed, tests.length, outcome.exitCode() != 2);
 } catch (SystemError error) {
     reporter.problem("{announced}: the tests were built but could not be run: {error.message}");
-    return 2;
+    return new SuiteResult(2, 0, plan.tests().length, false);
 }
 
 // Compiles the tests and the runner around them into one program. Only the runner may be the

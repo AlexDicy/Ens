@@ -2037,8 +2037,9 @@ task("test")
                     .. 'test "twice zero" {\n'
                     .. '    try testing.assertEqual(math.twice(0), 0L);\n}\n',
             })
+            -- one target has nothing to tell apart, so it is neither announced nor added up
             run({"test", suite}, nil, 0, "PASS twice a small number", "PASS twice zero",
-                "2/2 tests passed")
+                "2/2 tests passed", "!demo.suite:", "!tests passed across")
             assertTempEmpty("ens test")
             run({"test", suite, "--filter", "zero"}, nil, 0, "PASS twice zero",
                 "1/1 tests passed", "!twice a small")
@@ -2091,6 +2092,50 @@ task("test")
             run({"test", one, "--tests", path.join(suite, "tests")}, nil, 2,
                 "'--tests' names one folder of tests")
             run({"test", one}, nil, 0, "there are no tests in")
+
+            -- a workspace root tests every member: each member's results arrive under its own name,
+            -- and the run ends by saying what the whole workspace came to
+            local suites = path.join(root, "suites")
+            os.mkdir(suites)
+            io.writefile(path.join(suites, "ens.package"),
+                'workspace {\n    member "alpha";\n    member "beta";\n}\n')
+            writePackage(path.join(suites, "alpha"), 'package suite.alpha {\n    ens "0.1";\n}\n', {
+                ["src/thing.ens"] = 'export tag() -> string {\n    return "alpha";\n}\n',
+                ["tests/thing_test.ens"] = 'import @std.testing;\nimport thing;\n\n'
+                    .. 'test "alpha holds" {\n'
+                    .. '    try testing.assertEqual(thing.tag(), "alpha");\n}\n',
+            })
+            local beta_tests = path.join(suites, "beta", "tests", "thing_test.ens")
+            writePackage(path.join(suites, "beta"), 'package suite.beta {\n    ens "0.1";\n}\n', {
+                ["src/thing.ens"] = 'export tag() -> string {\n    return "beta";\n}\n',
+                ["tests/thing_test.ens"] = 'import @std.testing;\nimport thing;\n\n'
+                    .. 'test "beta holds" {\n'
+                    .. '    try testing.assertEqual(thing.tag(), "beta");\n}\n\n'
+                    .. 'test "beta counts" {\n    try testing.assertEqual(1, 1);\n}\n',
+            })
+            run({"test", suites}, nil, 0, "[1/2] suite.alpha:", "PASS alpha holds",
+                "[2/2] suite.beta:", "PASS beta counts", "3/3 tests passed across 2 members")
+            assertTempEmpty("ens test over a workspace")
+
+            -- one member's failures neither stop the other members nor go missing from the total
+            io.writefile(beta_tests, 'import @std.testing;\nimport thing;\n\n'
+                .. 'test "beta holds" {\n'
+                .. '    try testing.assertEqual(thing.tag(), "wrong");\n}\n')
+            run({"test", suites}, nil, 1, "PASS alpha holds", "FAIL beta holds",
+                "1/2 tests passed across 2 members", "!did not finish")
+
+            -- a member whose tests never ran is named, and the total is short by exactly what that
+            -- member had rather than pretending those tests were never there
+            io.writefile(beta_tests, 'import @std.testing;\n\n'
+                .. 'test "beta broken" {\n    try testing.assertEqual(nope(), 1);\n}\n')
+            run({"test", suites}, nil, 2, "the tests did not compile",
+                "1/2 tests passed across 2 members; 'suite.beta' did not finish")
+            assertTempEmpty("a workspace member whose tests did not compile")
+
+            -- a member with no tests of its own is not one of the members the total counts
+            os.rm(beta_tests)
+            run({"test", suites}, nil, 0, "there are no tests in",
+                "1/1 tests passed across 1 member")
 
             if #failures == 0 then
                 return {name = name, ok = true}

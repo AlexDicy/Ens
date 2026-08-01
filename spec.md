@@ -627,8 +627,25 @@ FAIL subtraction fails on purpose: expected 1, got -1
 ```
 
 `--filter` runs only the tests whose description contains the substring.
-The exit code is `0` when every test passes, `1` when any test fails, and `2` when the tests do not compile.
+The exit code is `0` when every test passes, `1` when any test fails, and `2` when the tests do not compile or a test run stops before it has run them all.
 Test files must have unique file names, and neither a test file nor anything it imports may define `main()`.
+
+At a workspace root every member is tested against its own tests.
+Each member's results are announced under its package name, the way a build announces its members, and the run ends with one total across every member that had a test to run:
+
+```
+[1/2] demo.lib:
+PASS greeting composes
+1/1 tests passed
+[2/2] demo.app:
+FAIL rendering fails on purpose: expected 1, got -1
+  at assertEqual (testing.ens:7)
+  at "rendering fails on purpose" (render_test.ens:5)
+0/1 tests passed
+1/2 tests passed across 2 members
+```
+
+A member whose tests could not run at all is named in that line, and the tests it had still count towards the total as tests that did not pass, so a total is never quietly short.
 
 ---
 
