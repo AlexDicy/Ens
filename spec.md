@@ -1148,8 +1148,8 @@ The accepted escapes are `\n`, `\r`, `\t`, `\b`, `\f`, `\0`, `\\`, `\"`, `\'`, `
 
 - `==` and `!=` compare **contents**, not identity, so `"ab" == "a" + "b"` is true.
 - `s.length` returns the number of UTF-8 **bytes** as a `long`.
-- `+` concatenates strings. When one side is a string, an integer, `char`, or `bool` on the other side is converted to text implicitly (the same way `.toString()` would). Types without a string conversion yet are still rejected.
-- `.toString()` produces a string from a value explicitly: integer types format as decimal, a `char` as the one character it denotes (its Unicode scalar encoded as UTF-8 bytes, so `'A'` is `"A"` and `'7'` is `"7"`, not their code points; write `c as int` first for the number), `bool` as `true` or `false`, a string returns itself, and a struct produces its JSON form.
+- `+` concatenates strings. When one side is a string, a number (integer, `char`, or floating-point) or a `bool` on the other side is converted to text implicitly (the same way `.toString()` would). Types without a string conversion yet are still rejected.
+- `.toString()` produces a string from a value explicitly: integer types format as decimal, floating-point types by the rule below, a `char` as the one character it denotes (its Unicode scalar encoded as UTF-8 bytes, so `'A'` is `"A"` and `'7'` is `"7"`, not their code points; write `c as int` first for the number), `bool` as `true` or `false`, a string returns itself, and a struct produces its JSON form.
   It can be written directly on a literal, as in `42.toString()`.
 - `s.toBytes()` returns the UTF-8 bytes as a `byte[]`, and `string.fromBytes(bytes)` builds a string from a `byte[]` by interpreting it as UTF-8.
 - `s.contains(needle)` reports whether `needle` occurs in `s`.
@@ -1164,6 +1164,13 @@ The accepted escapes are `\n`, `\r`, `\t`, `\b`, `\f`, `\0`, `\\`, `\"`, `\'`, `
   The order is the order of the UTF-8 bytes, and a string that is a prefix of another sorts before it.
   Only the sign of the result is meaningful.
   Strings have no `<`, `<=`, `>` or `>=` operators; write the comparison against `compareTo` instead.
+
+A `float` or `double` renders as the shortest decimal text that reads back as exactly the same value, so no program has to know which digits a compiler chose to keep.
+Concretely the text carries the fewest of 15, 16, and 17 significant digits that still reads back exactly, with trailing zeros left off: `2.5` is `"2.5"` and `0.1` is `"0.1"`, while `0.1 + 0.2` is `"0.30000000000000004"` because that sum genuinely is not three tenths.
+A `float` renders through the same rule after widening to `double`, which is lossless, so both types print the same text for the same value.
+A value with nothing after its decimal point loses the point too, so `3.0` is `"3"` and `0.0` is `"0"`; negative zero keeps its sign as `"-0"`.
+Exponent form is used when the value's decimal exponent is below -4 or reaches the number of significant digits shown, and is written as `e`, a sign, and at least two digits: `1e-5` is `"1e-05"` and `1e21` is `"1e+21"`, while `0.0001` and `1234567` are written out in full.
+The three values that are not numbers render as `"inf"`, `"-inf"` and `"nan"`, whatever the C library underneath would have called them.
 
 ```ens
 let greeting = "Hello, " + name + "!";
@@ -1188,7 +1195,7 @@ let status = "done={finished}, items={count}";                // bool and intege
 let braces = "use \{these\} verbatim";                        // "use {these} verbatim"
 ```
 
-Holes accept string, integer (including `char`), `bool`, and enum values, and structs whose fields are all serializable (rendered as JSON); convert other types explicitly with `.toString()` first.
+Holes accept string, integer (including `char`), floating-point, `bool`, and enum values, and structs whose fields are all serializable (rendered as JSON); convert other types explicitly with `.toString()` first.
 A `char` hole renders as its character rather than its numeric code point, so `"{'A'}"` is `"A"`; interpolate `c as int` when the number is wanted.
 Inside a generic body a hole may hold a value of a type-parameter type; the requirement is then checked against the concrete type of each instantiation.
 

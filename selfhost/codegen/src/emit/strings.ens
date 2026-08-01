@@ -450,7 +450,9 @@ public integerText(Runtime runtime) -> RuntimeFunction {
     return runtime.endDefinition(definition);
 }
 
-// ptr ens_double_to_string(double value): the shortest of decimal and exponent form, as "%g".
+// ptr ens_double_to_string(double value): the fewest of 15, 16, and 17 significant digits that
+// reads back as the same value. Fifteen covers the ordinary cases and keeps their text short,
+// seventeen always round-trips, so every value prints text that reads back exactly.
 public doubleText(Runtime runtime) -> RuntimeFunction {
     let type = runtime.pointerType.functionType([runtime.doubleType]);
     let known = runtime.existing("ens_double_to_string", type);
@@ -458,16 +460,92 @@ public doubleText(Runtime runtime) -> RuntimeFunction {
         return known;
     }
     let allocator = allocateString(runtime);
-    let format = runtime.snprintf();
     let definition = runtime.beginDefinition("ens_double_to_string", type);
-    long capacity = 32;
-    let buffer = memory.buildAlloca(runtime.builder, runtime.int8Type.arrayType(capacity as ulong),
-        "buffer");
-    let written = runtime.call(format, [buffer, runtime.int64(capacity),
-        globals.buildGlobalString(runtime.builder, "%g", ".format.general"),
-        runtime.parameter(definition, 0)], "written");
-    instructions.buildRet(runtime.builder, copyOfBuffer(runtime, allocator, buffer, written));
+    let value = runtime.parameter(definition, 0);
+
+    let attempt15 = formatAtPrecision(runtime, "%.15g", ".format.g15", value);
+    let attempt16 = formatAtPrecision(runtime, "%.16g", ".format.g16", value);
+    let attempt17 = formatAtPrecision(runtime, "%.17g", ".format.g17", value);
+    let exact15 = readsBackAs(runtime, attempt15.text(), value);
+    let exact16 = readsBackAs(runtime, attempt16.text(), value);
+
+    let shorterText = instructions.buildSelect(runtime.builder, exact16, attempt16.text(),
+        attempt17.text(), "");
+    let shorterLength = instructions.buildSelect(runtime.builder, exact16, attempt16.length(),
+        attempt17.length(), "");
+    Value text = instructions.buildSelect(runtime.builder, exact15, attempt15.text(),
+        shorterText, "");
+    Value length = instructions.buildSelect(runtime.builder, exact15, attempt15.length(),
+        shorterLength, "");
+
+    // The special values get one spelling of their own. A C library is free to write them
+    // differently, and a program should not have to know which one it linked against.
+    let sameAsItself = instructions.buildFCmpOEQ(runtime.builder, value, value, "");
+    let chosen = new FormattedNumber(text, length);
+    let positiveInfinity = runtime.doubleType.constReal(infinity());
+    let negativeInfinity = runtime.doubleType.constReal(0.0 - infinity());
+    let atPositive = spellAs(runtime, chosen,
+        instructions.buildFCmpOEQ(runtime.builder, value, positiveInfinity, ""), "inf");
+    let atNegative = spellAs(runtime, atPositive,
+        instructions.buildFCmpOEQ(runtime.builder, value, negativeInfinity, ""), "-inf");
+    let spelled = spellAs(runtime, atNegative,
+        instructions.buildNot(runtime.builder, sameAsItself, ""), "nan");
+
+    instructions.buildRet(runtime.builder,
+        copyOfBytes(runtime, allocator, spelled.text(), spelled.length()));
     return runtime.endDefinition(definition);
+}
+
+// A rendering of a number: where its bytes are and how many there are.
+class FormattedNumber {
+    Value textPointer;
+    Value byteLength;
+
+    protected constructor(this.textPointer, this.byteLength);
+
+    protected text() -> Value {
+        return this.textPointer;
+    }
+
+    protected length() -> Value {
+        return this.byteLength;
+    }
+}
+
+// '-1.2345678901234567e-308' is the longest a double reaches, so this holds every rendering
+// with room for the terminator snprintf writes.
+formatBufferCapacity() -> long {
+    return 40;
+}
+
+// There is no infinity literal to write, so the value comes of overflowing a finite one.
+infinity() -> double {
+    return 1e308 * 10.0;
+}
+
+formatAtPrecision(Runtime runtime, string specifier, string specifierName,
+                  Value value) -> FormattedNumber {
+    long capacity = formatBufferCapacity();
+    let buffer = memory.buildAlloca(runtime.builder,
+        runtime.int8Type.arrayType(capacity as ulong), "buffer");
+    let written = runtime.call(runtime.snprintf(), [buffer, runtime.int64(capacity),
+        globals.buildGlobalString(runtime.builder, specifier, specifierName), value], "written");
+    return new FormattedNumber(buffer,
+        instructions.buildSExt(runtime.builder, written, runtime.int64Type, ""));
+}
+
+readsBackAs(Runtime runtime, Value text, Value value) -> Value {
+    let parsed = runtime.call(runtime.strtod(),
+        [text, runtime.pointerType.constNull()], "parsed");
+    return instructions.buildFCmpOEQ(runtime.builder, parsed, value, "");
+}
+
+spellAs(Runtime runtime, FormattedNumber chosen, Value when, string spelling) -> FormattedNumber {
+    let literal = globals.buildGlobalString(runtime.builder, spelling, ".text.number");
+    let text = instructions.buildSelect(runtime.builder, when, literal, chosen.text(), "");
+    let length = instructions.buildSelect(runtime.builder, when,
+        runtime.int64(spelling.length), chosen.length(), "");
+    return new FormattedNumber(text, length);
 }
 
 // ptr ens_char_to_string(i32 scalar): the UTF-8 encoding of one Unicode scalar, one to four bytes.

@@ -340,6 +340,12 @@ const ast::LiteralExpression* asFloatLiteralChild(const ast::Expression& e) {
     return nullptr;
 }
 
+// A floating-point type that converts to text. `decimal` is reserved rather than implemented,
+// so it has no textual form even though it counts as floating-point elsewhere.
+bool isTextualFloat(Type* type) {
+    return type && type->isFloat() && type->kind != TypeKind::Decimal;
+}
+
 // The narrowest integer type past `from` that holds the value, for a suggestion. Null when
 // no integer type does, which is the only case with nothing to reach for.
 const char* widerIntegerHolding(bool negative, uint64_t magnitude, Type* from) {
@@ -4601,6 +4607,7 @@ Type* Analyzer::analyzeInterpString(const ast::InterpStringExpression& expr) {
         // generation, the same way its equality and JSON emission are.
         if (ht->isTypeParam() || (ht->isStruct() && TypeContext::containsTypeParam(ht))) continue;
         if (ht->isInteger() || ht->isBool() || ht->isString() || ht->isEnum()) continue;
+        if (isTextualFloat(ht)) continue;
         if (ht->isStruct()) {
             // A struct that declares its own toString interpolates through that method and is
             // never serialized; without one it interpolates as its JSON form, which is valid
@@ -5036,14 +5043,15 @@ Type* Analyzer::analyzeBinaryOperands(const SyntaxNode& diagNode, SyntaxKind op,
                 // String concatenation. The non-string operand is converted to
                 // text implicitly, the same way '.toString()' would.
                 auto stringable = [](Type* t) {
-                    return t->isString() || t->isInteger() || t->isBool();
+                    return t->isString() || t->isInteger() || t->isBool() ||
+                           isTextualFloat(t);
                 };
                 if (stringable(l) && stringable(r)) {
                     return typeCtx.getPrimitive(TypeKind::String);
                 }
                 Type* other = l->isString() ? r : l;
                 errorAtNode(diagNode, "Cannot concatenate a value of type '" + other->toString() +
-                    "' onto a string; only string, integer, and bool values are supported.");
+                    "' onto a string; only string, number, and bool values are supported.");
                 return typeCtx.getError();
             }
             if (!l->isNumeric() || !r->isNumeric()) {
@@ -5723,14 +5731,15 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
             if (memberName && *memberName == u"toString") {
                 Type* recvT = analyzeExpr(*objExpr);
                 if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }
-                if (recvT->isInteger() || recvT->isBool() || recvT->isString() || recvT->isEnum()) {
+                if (recvT->isInteger() || recvT->isBool() || recvT->isString() ||
+                    recvT->isEnum() || isTextualFloat(recvT)) {
                     if (!args.empty()) {
                         errorAtNode(expr.node, "'toString' takes no arguments.");
                         for (auto& a : args) analyzeExpr(a);
                     }
                     return typeCtx.getPrimitive(TypeKind::String);
                 }
-                if (recvT->isFloat() || recvT->kind == TypeKind::Decimal) {
+                if (recvT->kind == TypeKind::Decimal) {
                     errorAtNode(expr.node, "'.toString()' is not yet available for type '" +
                         recvT->toString() + "'.");
                     for (auto& a : args) analyzeExpr(a);

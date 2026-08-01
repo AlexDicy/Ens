@@ -31,6 +31,7 @@
 #include "llvm/Target/TargetOptions.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <optional>
 #include <unordered_map>
@@ -5449,6 +5450,11 @@ struct CodeGenerator::Impl {
         return libcFn("snprintf",
             llvm::FunctionType::get(i32, { ptrTy, i64, ptrTy }, /*isVarArg=*/true));
     }
+    llvm::FunctionCallee getOrDeclareStrtod() {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* dblTy = llvm::Type::getDoubleTy(ctx);
+        return libcFn("strtod", llvm::FunctionType::get(dblTy, { ptrTy, ptrTy }, false));
+    }
     llvm::Function* getOrDeclareUnwindBacktrace() {
         if (auto* f = module->getFunction("_Unwind_Backtrace")) return f;
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
@@ -6099,7 +6105,7 @@ struct CodeGenerator::Impl {
             n.starts_with("_typedesc") || n.starts_with("_Unwind") || n.starts_with("llvm."))
             return true;
         static const char* kLibc[] = { "malloc", "calloc", "free", "memcpy", "memset",
-            "snprintf", "puts", "fputs", "exit", "strlen", "__acrt_iob_func" };
+            "snprintf", "strtod", "puts", "fputs", "exit", "strlen", "__acrt_iob_func" };
         for (const char* c : kLibc) if (n == c) return true;
         return false;
     }
@@ -7465,11 +7471,47 @@ struct CodeGenerator::Impl {
         fn->addFnAttr(llvm::Attribute::NoUnwind);
         auto savedIP = builder->saveIP();
         builder->SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", fn));
-        llvm::Value* buf = builder->CreateAlloca(llvm::ArrayType::get(i8Ty, 32), nullptr, "d2s.buf");
-        llvm::Value* w = builder->CreateCall(getOrDeclareSnprintf(),
-            { buf, llvm::ConstantInt::get(i64Ty, 32),
-              builder->CreateGlobalString("%g", ".fmt.g"), fn->getArg(0) }, "d2s.w");
-        llvm::Value* len = builder->CreateSExt(w, i64Ty);
+        llvm::Value* v = fn->getArg(0);
+        auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy);
+        const uint64_t kCapacity = 40;  // '-1.2345678901234567e-308' and a terminator over
+
+        // The fewest of 15, 16, and 17 significant digits that reads back as the same value.
+        // Fifteen covers the ordinary cases and keeps their text short, seventeen always
+        // round-trips, so every value prints text that reads back exactly.
+        auto formatAt = [&](const char* spec, const char* name, llvm::Value** exact) {
+            llvm::Value* buf = builder->CreateAlloca(llvm::ArrayType::get(i8Ty, kCapacity),
+                nullptr, name);
+            llvm::Value* written = builder->CreateCall(getOrDeclareSnprintf(),
+                { buf, llvm::ConstantInt::get(i64Ty, kCapacity),
+                  builder->CreateGlobalString(spec, ".fmt.d2s"), v });
+            if (exact) {
+                llvm::Value* back = builder->CreateCall(getOrDeclareStrtod(), { buf, nullPtr });
+                *exact = builder->CreateFCmpOEQ(back, v, "d2s.exact");
+            }
+            return std::pair<llvm::Value*, llvm::Value*>{
+                buf, builder->CreateSExt(written, i64Ty) };
+        };
+        llvm::Value* exact15 = nullptr;
+        llvm::Value* exact16 = nullptr;
+        auto [buf15, len15] = formatAt("%.15g", "d2s.b15", &exact15);
+        auto [buf16, len16] = formatAt("%.16g", "d2s.b16", &exact16);
+        auto [buf17, len17] = formatAt("%.17g", "d2s.b17", nullptr);
+        llvm::Value* buf = builder->CreateSelect(exact15, buf15,
+            builder->CreateSelect(exact16, buf16, buf17));
+        llvm::Value* len = builder->CreateSelect(exact15, len15,
+            builder->CreateSelect(exact16, len16, len17));
+
+        // The special values get one spelling of their own. A C library is free to write them
+        // differently, and a program should not have to know which one it linked against.
+        auto override = [&](llvm::Value* when, const char* text) {
+            buf = builder->CreateSelect(when, builder->CreateGlobalString(text, ".txt.d2s"), buf);
+            len = builder->CreateSelect(when,
+                llvm::ConstantInt::get(i64Ty, std::strlen(text)), len);
+        };
+        override(builder->CreateFCmpOEQ(v, llvm::ConstantFP::getInfinity(dblTy, false)), "inf");
+        override(builder->CreateFCmpOEQ(v, llvm::ConstantFP::getInfinity(dblTy, true)), "-inf");
+        override(builder->CreateFCmpUNO(v, v, "d2s.nan"), "nan");
+
         llvm::Value* obj = emitStringAlloc(len);
         builder->CreateMemCpy(emitStringDataPtr(obj), llvm::MaybeAlign(1), buf, llvm::MaybeAlign(1), len);
         builder->CreateRet(obj);
@@ -7717,6 +7759,13 @@ struct CodeGenerator::Impl {
         }
         if (t->kind == TypeKind::Char) {
             return builder->CreateCall(getOrDefineEnsCharToString(), { v }, "char.str");
+        }
+        if (t->isFloat()) {
+            // One formatter for both widths, as the JSON emitter already does: a float
+            // widens to double losslessly and prints the same text either way.
+            llvm::Value* d = t->kind == TypeKind::Float
+                ? builder->CreateFPExt(v, llvm::Type::getDoubleTy(ctx), "f2d") : v;
+            return builder->CreateCall(getOrDefineEnsDoubleToString(), { d }, "dbl.str");
         }
         llvm::Value* asI64 = builder->CreateIntCast(
             v, llvm::Type::getInt64Ty(ctx), t->isSignedInteger(), "i2s.ext");
@@ -8343,9 +8392,11 @@ struct CodeGenerator::Impl {
         llvm::Value* acc = decodePart(parts[0]);
         for (size_t i = 0; i < holes.size(); ++i) {
             ::Type* holeType = typeOf(holes[i].node);
+            bool textualFloat = holeType && holeType->isFloat() &&
+                holeType->kind != TypeKind::Decimal;
             if (holeType && !holeType->isError() && !holeType->isInteger() &&
                 !holeType->isBool() && !holeType->isString() && !holeType->isEnum() &&
-                !subst(holeType)->isStruct()) {
+                !textualFloat && !subst(holeType)->isStruct()) {
                 error(holes[i].node.startOffset(),
                     "Cannot interpolate a value of type '" + holeType->toString() +
                     "'; only string, integer, bool, enum, and JSON-serializable struct values are supported here. "
@@ -9548,9 +9599,11 @@ struct CodeGenerator::Impl {
             if (auto obj = member.object()) {
                 auto memberName = member.memberText();
                 ::Type* recvT = typeOf(obj->node);
+                bool textualFloat = recvT && recvT->isFloat() &&
+                    recvT->kind != TypeKind::Decimal;
                 if (memberName && *memberName == u"toString" && !methodSymbolOf(member.node) &&
                     recvT && (recvT->isInteger() || recvT->isBool() || recvT->isString() ||
-                              recvT->isEnum() || subst(recvT)->isStruct())) {
+                              recvT->isEnum() || textualFloat || subst(recvT)->isStruct())) {
                     return emitToString(*obj, recvT);
                 }
                 if (memberName && *memberName == u"toBytes" && !methodSymbolOf(member.node) &&
