@@ -1406,6 +1406,7 @@ Both have a further form taking a `string[]` of `NAME=VALUE` overrides after the
 Two names match without regard to case on Windows, the way that system matches them, and exactly everywhere else, where `PATH` and `path` name two different variables and both reach the child.
 No command interpreter takes part in these forms, so every argument reaches the program exactly as written, whatever spaces or quotes it holds, and nothing is expanded on the way.
 Each returns the child's exit code; a program that could not be started reports `127`, the code a shell reports for the same failure, and a capture file that could not be opened for writing raises a `SystemError`.
+A wait the system could not answer raises a `SystemError` as well, because the child's exit code is then unknown and no code stands for unknown.
 
 ```ens
 import @std.system;
@@ -1427,6 +1428,7 @@ Stopping a child that has already finished is not a failure, so a program that s
 `wait()` returns the child's exit code, waiting for the child to finish first, and answers the same code however often it is asked.
 Output that has not been read is read and thrown away before that wait, because a child whose output nobody reads would be stopped by a full pipe: read every line first where the output matters.
 A child that was stopped is not read out first, so asking a stopped child for its code always comes back.
+A wait the system could not answer raises a `SystemError`, since the child's code is then unknown and unknown is not a code.
 Letting a `ChildProcess` go without waiting for it hands back the pipe its output was arriving on and this program's hold on the child, which keeps running with nothing left reading it.
 A program that could not be started at all raises a `SystemError` on the systems that report that while the child is being created, and elsewhere shows up as a child that ends with `127`.
 

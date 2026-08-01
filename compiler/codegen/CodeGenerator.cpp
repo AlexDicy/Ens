@@ -1501,8 +1501,9 @@ struct CodeGenerator::Impl {
     // process's environment on unchanged. A POSIX target execs an argument vector
     // built from the NUL separated block; Windows hands the joined command line to
     // CreateProcessW, the only shape Win32 accepts. Returns the child's exit code,
-    // 127 when the program could not be started at all, or -1 when a capture file
-    // could not be opened for writing.
+    // 127 when the program could not be started at all, -1 when a capture file
+    // could not be opened for writing, or -2 when the wait for the child could not be
+    // answered and its exit code is therefore unknown.
     llvm::Function* defineSpawnProcessRuntime() {
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         auto* i32Ty = llvm::Type::getInt32Ty(ctx);
@@ -1747,8 +1748,6 @@ struct CodeGenerator::Impl {
             llvm::FunctionType::get(i32Ty, { ptrTy, ptrTy }, false));
         llvm::FunctionCallee exitChild = libcFn("_exit",
             llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), { i32Ty }, false));
-        llvm::FunctionCallee waitForChild = libcFn("waitpid",
-            llvm::FunctionType::get(i32Ty, { i32Ty, ptrTy, i32Ty }, false));
 
         auto* childBB  = llvm::BasicBlock::Create(ctx, "spawn.child", fn);
         auto* parentBB = llvm::BasicBlock::Create(ctx, "spawn.parent", fn);
@@ -1800,13 +1799,50 @@ struct CodeGenerator::Impl {
 
         builder->SetInsertPoint(waitBB);
         llvm::Value* waitedSlot = builder->CreateAlloca(i32Ty, nullptr, "wait.status");
-        builder->CreateStore(llvm::ConstantInt::get(i32Ty, 0), waitedSlot);
-        builder->CreateCall(waitForChild, { child, waitedSlot,
-            llvm::ConstantInt::get(i32Ty, 0) });
+        auto* lostBB = llvm::BasicBlock::Create(ctx, "spawn.lost", fn);
+        emitAwaitChild(fn, child, waitedSlot, lostBB, "wait");
         llvm::Value* waited = builder->CreateLoad(i32Ty, waitedSlot, "wait.load");
         builder->CreateStore(builder->CreateSExt(normalizedWaitStatus(waited), i64Ty,
             "status.wide"), statusSlot);
         builder->CreateBr(closeBB);
+
+        builder->SetInsertPoint(lostBB);
+        builder->CreateStore(llvm::ConstantInt::get(i64Ty, -2), statusSlot);
+        builder->CreateBr(closeBB);
+    }
+
+    // Waits for the child and leaves its raw wait status in the slot, going on to lostBB
+    // when no status could be read at all and leaving the builder where the status is
+    // known. A signal arriving mid-wait says nothing about the child, so the wait is
+    // asked again; any other refusal is a failure, because a status nobody read stands
+    // for no exit code at all.
+    void emitAwaitChild(llvm::Function* fn, llvm::Value* child, llvm::Value* statusSlot,
+                        llvm::BasicBlock* lostBB, const char* label) {
+        auto* ptrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        llvm::FunctionCallee waitForChild = libcFn("waitpid",
+            llvm::FunctionType::get(i32Ty, { i32Ty, ptrTy, i32Ty }, false));
+        auto* askBB = llvm::BasicBlock::Create(ctx, std::string(label) + ".ask", fn);
+        auto* refusedBB = llvm::BasicBlock::Create(ctx, std::string(label) + ".refused", fn);
+        auto* knownBB = llvm::BasicBlock::Create(ctx, std::string(label) + ".known", fn);
+        builder->CreateBr(askBB);
+
+        builder->SetInsertPoint(askBB);
+        builder->CreateStore(llvm::ConstantInt::get(i32Ty, 0), statusSlot);
+        llvm::Value* answer = builder->CreateCall(waitForChild, { child, statusSlot,
+            llvm::ConstantInt::get(i32Ty, 0) }, label);
+        builder->CreateCondBr(
+            builder->CreateICmpSLT(answer, llvm::ConstantInt::get(i32Ty, 0)), refusedBB, knownBB);
+
+        // EINTR: a signal arrived while waiting, which is no answer about the child, so
+        // the wait is asked again rather than reported as a failure.
+        builder->SetInsertPoint(refusedBB);
+        llvm::Value* why = builder->CreateLoad(i32Ty,
+            builder->CreateCall(errnoLocation(), {}, "errno.slot"), "why");
+        builder->CreateCondBr(
+            builder->CreateICmpEQ(why, llvm::ConstantInt::get(i32Ty, 4)), askBB, lostBB);
+
+        builder->SetInsertPoint(knownBB);
     }
 
     // Fills a pointer vector from a NUL separated block: the block holds the values
@@ -2470,7 +2506,7 @@ struct CodeGenerator::Impl {
     static long stoppedChildCode() { return 137; }
 
     // i64 ens_wait_child(child): the code the child ended with, waiting for it to end
-    // first.
+    // first, or -1 when the wait could not be answered and there is no code to report.
     llvm::Function* defineWaitChildRuntime() {
         auto* ptrTy = llvm::PointerType::get(ctx, 0);
         auto* i32Ty = llvm::Type::getInt32Ty(ctx);
@@ -2499,15 +2535,15 @@ struct CodeGenerator::Impl {
             builder->CreateRet(builder->CreateZExt(
                 builder->CreateLoad(i32Ty, codeSlot, "code"), i64Ty, "code.wide"));
         } else {
-            llvm::FunctionCallee waitForChild = libcFn("waitpid",
-                llvm::FunctionType::get(i32Ty, { i32Ty, ptrTy, i32Ty }, false));
             llvm::Value* statusSlot = builder->CreateAlloca(i32Ty, nullptr, "wait.status");
-            builder->CreateStore(llvm::ConstantInt::get(i32Ty, 0), statusSlot);
-            builder->CreateCall(waitForChild, { childDescriptor(fn, 0), statusSlot,
-                llvm::ConstantInt::get(i32Ty, 0) });
+            auto* lostBB = llvm::BasicBlock::Create(ctx, "wait.lost", fn);
+            emitAwaitChild(fn, childDescriptor(fn, 0), statusSlot, lostBB, "wait");
             llvm::Value* status = builder->CreateLoad(i32Ty, statusSlot, "wait.load");
             builder->CreateRet(builder->CreateSExt(normalizedWaitStatus(status), i64Ty,
                 "status.wide"));
+
+            builder->SetInsertPoint(lostBB);
+            builder->CreateRet(llvm::ConstantInt::get(i64Ty, -1));
         }
         builder->restoreIP(savedIP);
         return fn;

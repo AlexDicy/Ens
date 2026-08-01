@@ -20,12 +20,11 @@ public posixSpawn(Runtime runtime, RuntimeDefinition definition, Value outSlot, 
     let execProgram = runtime.libc("execvp",
         runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
     let exitChild = runtime.libc("_exit", runtime.voidType.functionType([runtime.int32Type]));
-    let waitForChild = runtime.libc("waitpid", runtime.int32Type.functionType([runtime.int32Type,
-        runtime.pointerType, runtime.int32Type]));
     let childBlock = runtime.block(definition, "spawn.child");
     let parentBlock = runtime.block(definition, "spawn.parent");
     let failedBlock = runtime.block(definition, "spawn.failed");
     let waitBlock = runtime.block(definition, "spawn.wait");
+    let lostBlock = runtime.block(definition, "spawn.lost");
 
     let program = runtime.parameter(definition, 0);
     let argumentCount = runtime.parameter(definition, 2);
@@ -73,13 +72,47 @@ public posixSpawn(Runtime runtime, RuntimeDefinition definition, Value outSlot, 
 
     builder.positionAtEnd(waitBlock);
     let waitedSlot = memory.buildAlloca(builder, runtime.int32Type, "wait.status");
-    memory.buildStore(builder, runtime.int32(0), waitedSlot);
-    runtime.call(waitForChild, [child, waitedSlot, runtime.int32(0)], "");
+    awaitChild(runtime, definition, child, waitedSlot, lostBlock, "wait");
     let waited = memory.buildLoad(builder, runtime.int32Type, waitedSlot, "wait.cur");
     memory.buildStore(builder,
         instructions.buildSExt(builder, normalizedStatus(runtime, waited), runtime.int64Type, ""),
         statusSlot);
     instructions.buildBr(builder, closeBlock);
+
+    builder.positionAtEnd(lostBlock);
+    memory.buildStore(builder, runtime.int64(-2), statusSlot);
+    instructions.buildBr(builder, closeBlock);
+}
+
+// Waits for the child and leaves its raw wait status in the slot, going on to `lostBlock` when no
+// status could be read at all and leaving the builder where the status is known. A signal arriving
+// mid-wait says nothing about the child, so the wait is asked again; any other refusal is a failure,
+// because a status nobody read stands for no exit code at all.
+public awaitChild(Runtime runtime, RuntimeDefinition definition, Value child, Value statusSlot,
+                  BasicBlock lostBlock, string label) {
+    let builder = runtime.builder;
+    let waitForChild = runtime.libc("waitpid", runtime.int32Type.functionType([runtime.int32Type,
+        runtime.pointerType, runtime.int32Type]));
+    let askBlock = runtime.block(definition, label + ".ask");
+    let refusedBlock = runtime.block(definition, label + ".refused");
+    let knownBlock = runtime.block(definition, label + ".known");
+    instructions.buildBr(builder, askBlock);
+
+    builder.positionAtEnd(askBlock);
+    memory.buildStore(builder, runtime.int32(0), statusSlot);
+    let answer = runtime.call(waitForChild, [child, statusSlot, runtime.int32(0)], label);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, answer, runtime.int32(0), ""), refusedBlock, knownBlock);
+
+    // EINTR: a signal arrived while waiting, which is no answer about the child, so the wait is asked
+    // again rather than reported as a failure.
+    builder.positionAtEnd(refusedBlock);
+    let why = memory.buildLoad(builder, runtime.int32Type,
+        runtime.call(system.errnoLocation(runtime), [], "errno.slot"), "why");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, why, runtime.int32(4), ""), askBlock, lostBlock);
+
+    builder.positionAtEnd(knownBlock);
 }
 
 // The exit code a POSIX wait status stands for: the low seven bits name the signal that ended the
