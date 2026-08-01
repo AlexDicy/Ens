@@ -22,8 +22,8 @@ Two compilers live in this repository, and knowing which is which matters before
   This is the `ens` command a user runs, and new language and tool work belongs here.
 - **`ens-ref`** is the older compiler, written in C++, under `compiler/`.
   It is no longer the product.
-  It stays for three reasons: it builds the seed `ens` that a fresh clone bootstraps from, it compiles the `tests/` fixtures as a second opinion, and it drives five CLI jobs that will be deleted along with it.
-  The seed is the only one of those that blocks its removal; see [The bootstrap seed](#the-bootstrap-seed).
+  It stays for two reasons: it compiles the `tests/` fixtures as a second opinion, and it drives five CLI jobs that will be deleted along with it.
+  Nothing blocks its removal any more; the seed a fresh clone bootstraps from is committed, not built (see [The bootstrap seed](#the-bootstrap-seed)).
 
 `spec.md` is the single source of truth for user-facing language and tool behavior.
 If the spec, `ens`, and `ens-ref` disagree, that is a bug worth surfacing, not a detail to paper over.
@@ -61,10 +61,10 @@ If the spec, `ens`, and `ens-ref` disagree, that is a bug worth surfacing, not a
 - Run everything: `xmake test` (subset: `xmake test <name>...`).
   The full suite must be green before every commit, with no exceptions.
   `xmake test` builds either of those targets itself when it is missing, so it is the one command that always works from a clean checkout.
-- `xmake test` starts by building the **seed** and then shares it: `ens-ref` compiles `selfhost/driver` once into `build/seed/ens`, and every job that compiles Ens uses that seed.
+- `xmake test` starts by placing the **seed** and then shares it: the committed `ens` for this host is copied into `build/seed/ens`, and every job that compiles Ens uses that seed.
   Everything Ens-related is therefore built by the Ens compiler, so a bug that lives only in `ens-ref` cannot shape the self-hosted tree.
-  The seed is built before the jobs start, because they run in parallel and all of them need it.
-- `ens-ref`'s remaining roles are exactly three: it builds the seed, it compiles the `tests/` fixtures for the reference gate, and it drives `cli_core`, `cli_workspace`, `cli_override`, `cli_git` and `cli_artifact`.
+  The seed is placed before the jobs start, because they run in parallel and all of them need it.
+- `ens-ref`'s remaining roles are exactly two: it compiles the `tests/` fixtures for the reference gate, and it drives `cli_core`, `cli_workspace`, `cli_override`, `cli_git` and `cli_artifact`.
   Those five jobs have `ens`-side counterparts already, so they are deleted with the C++ driver rather than ported.
 - The packaging tests (`cli_git`, `cli_artifact`, `cli_dependencies`, `cli_prebuilt`) shell out to the system `git` and `curl`; both must be on PATH.
   They drive scratch repositories over `file://` URLs and a scratch cache, so no test ever reaches the network or this machine's own cache.
@@ -101,27 +101,19 @@ If the spec, `ens`, and `ens-ref` disagree, that is a bug worth surfacing, not a
 ## The bootstrap seed
 
 `ens` is written in Ens, so building it needs an `ens` that already runs.
-`ens-ref` is where that first one comes from today, and it is the only remaining reason `compiler/` cannot be deleted: everything else Ens-related already goes through the seed, and the five C++ CLI jobs have `ens`-side counterparts, so they are deleted with the driver rather than ported.
+That first one is committed to the repository, one binary per host, and `xmake test` copies the one matching the host into `build/seed/` before any job starts:
 
-How a fresh clone should get its first `ens` is an open decision for the project owner.
-Three options, each with its real cost:
+- `seed/windows-x64/ens.exe`
+- `seed/linux-x64/ens`
+- `seed/macos-arm64/ens` is where a macOS seed goes; there is none yet.
 
-**Publish a prebuilt `ens` per platform.**
-A fresh clone downloads one binary and builds everything else from source, so `compiler/` can go as soon as the download exists.
-The cost is release infrastructure that has to exist before the deletion rather than after it: a build per supported platform and architecture, somewhere to host them, a published checksum, and an answer for a machine that cannot reach the host.
-A brand-new platform cannot bootstrap at all until somebody produces a seed for it, and producing one needs a working `ens` on that platform, which is the problem the seed was there to solve.
-When a language change makes the tree uncompilable by the previous seed, a new seed has to be published before that commit can land, so the seed becomes part of the release process rather than a build artifact.
+A host with no committed seed fails the run by name instead of falling back to another compiler, because a fallback would leave the seed itself untested.
+So a fresh clone needs no compiler built from C++ to compile Ens, only the `ens-lld` linker bridge and the LLVM package every build links against.
 
-**Commit a seed binary to the repository.**
-A fresh clone needs nothing but a checkout, and there is no infrastructure to run at all.
-The cost is a multi-megabyte binary per platform inside git history, growing every time it is refreshed, and a supply-chain question every reviewer has to take on trust because nobody diffs a binary.
-A new platform has exactly the same chicken-and-egg problem as above, and a language change that outruns the committed seed forces a binary refresh in the same commit as the source change, which is a diff no human can review.
-
-**Keep `ens-ref` as a build-only target.**
-A fresh clone builds C++ once, exactly as it does today; nothing new has to be trusted, every platform bootstraps from source, and a language change is absorbed by teaching `ens-ref` the least it needs to compile the tree.
-The cost is that the C++ compiler never dies.
-It has to keep accepting and generating code for whatever `selfhost/` and `libs/std/` use, so any feature or native bridge the self-hosted tree adopts still has to land in C++ too, which is the lockstep tax this whole effort set out to retire.
-It also keeps LLVM's C++ API, the macOS SDK stub generator, and a second full code generator alive in the tree, and every one of those is maintenance nobody is paid back for.
+Refreshing a seed is a deliberate act rather than a build artifact.
+When a language or library change makes the tree uncompilable by the committed seed, the new binary lands in the same commit as the source change, because every commit has to be buildable from its own checkout.
+Build the replacement with an `ens` that already runs on that platform and commit it in place; a platform nobody can produce a seed for cannot bootstrap at all until somebody does.
+The cost this model accepts is a multi-megabyte binary per platform in git history, growing every time it is refreshed, and a supply-chain question no reviewer can answer by reading a diff.
 
 ## The self-hosted compiler
 

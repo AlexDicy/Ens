@@ -11,7 +11,7 @@ xmake test
 ```
 
 `ens-lld` is the linker bridge every Ens program links through.
-`xmake test` builds the seed `ens` with `ens-ref` and then runs the whole suite through it.
+`xmake test` runs the whole suite through the seed `ens` committed for this platform under `seed/`.
 
 ## Editor support
 

@@ -71,10 +71,12 @@ task("test")
             os.raise("Could not locate the linker bridge at " .. lld_library)
         end
 
-        -- the seed: the Ens-written compiler, built once by ens-ref and shared by every job that
-        -- compiles Ens. Everything Ens-related is built by the Ens compiler, so a bug that lives
-        -- only in the reference compiler cannot shape the self-hosted tree. It is built below,
+        -- the seed: the committed `ens` for this host, shared by every job that compiles Ens.
+        -- Everything Ens-related is therefore built by the Ens compiler itself. It is placed below,
         -- before the jobs start, because they run in parallel and every one of them needs it.
+        local seed_platforms = {windows = "windows", linux = "linux", macosx = "macos"}
+        local seed_architectures = {x64 = "x64", x86_64 = "x64", arm64 = "arm64"}
+        local seed_host = (seed_platforms[plat] or plat) .. "-" .. (seed_architectures[arch] or arch)
         local seed_dir = path.join(os.projectdir(), "build", "seed")
         local seed_exe = path.join(seed_dir, "ens" .. exe_suffix)
 
@@ -553,23 +555,26 @@ task("test")
             end
         end
 
-        -- build the seed once: the Ens-written compiler, compiled by ens-ref out of its own
-        -- workspace. Every job that compiles Ens then uses it, so nothing downstream depends on
-        -- the reference compiler's code generator.
-        local function buildSeed()
-            local log = path.join(out_dir, "seed.log")
+        -- place the seed: the `ens` committed for this host, put where every job that compiles Ens
+        -- looks for it. A host with no committed seed cannot run the suite, and saying so is the
+        -- right outcome: falling back to another compiler would leave the seed untested.
+        local function locateSeed()
+            local committed = path.join(os.projectdir(), "seed", seed_host, "ens" .. exe_suffix)
+            if not os.isfile(committed) then
+                os.raise("no bootstrap seed for %s: %s does not exist. Build one on that platform "
+                    .. "with an `ens` that already runs there (`ens build selfhost/driver "
+                    .. "--output <path>`) and commit it there.", seed_host, committed)
+            end
             local env, native_libraries, env_error = llvmEnvironment()
             if not env then
-                os.raise("could not build the seed compiler: %s", env_error)
+                os.raise("could not place the seed compiler: %s", env_error)
             end
             os.tryrm(seed_dir)
             os.mkdir(seed_dir)
-            local rc = execMerged(ref_exe, {"build",
-                path.join(os.projectdir(), "selfhost", "driver"), "--output", seed_exe}, log,
-                {envs = env})
-            if rc ~= 0 or not os.isfile(seed_exe) then
-                os.raise("building the seed compiler failed (exit %s):\n%s", tostring(rc),
-                    captured(log))
+            os.cp(committed, seed_exe)
+            if not is_host("windows") then
+                -- a copy is not guaranteed to keep the executable bit the checkout recorded.
+                os.runv("chmod", {"+x", seed_exe})
             end
             -- the seed loads LLVM and the linker bridge at run time, and on Windows the loader
             -- looks beside the executable first.
@@ -3566,12 +3571,10 @@ task("test")
                 full = string.format("%s: %s", name, short)}
         end
 
-        -- the seed has to exist before any job that compiles Ens starts, and the jobs run in
-        -- parallel, so it is built here rather than on demand inside one of them.
-        print("Building the seed compiler with ens-ref...")
-        local seed_started = os.mclock()
-        buildSeed()
-        print(string.format("Seed compiler built in %.0fs", (os.mclock() - seed_started) / 1000.0))
+        -- the seed has to be in place before any job that compiles Ens starts, and the jobs run in
+        -- parallel, so it is placed here rather than on demand inside one of them.
+        locateSeed()
+        print(string.format("Using the committed %s seed compiler", seed_host))
 
         -- worker count: ENS_TEST_JOBS override, else one per cpu, capped at the test count.
         local njob = tonumber(os.getenv("ENS_TEST_JOBS"))
