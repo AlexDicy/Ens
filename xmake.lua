@@ -115,6 +115,18 @@ target("ens-lld")
     add_packages("libllvm", "libxml2")
     -- fix to have the flag appear later compared to add_links(...) for GNU ld
     add_shflags("-lLLVMCGData", { force = true })
+    -- Only the two entry points leave this library. It statically links lld and the parts of LLVM
+    -- lld needs, and a program that binds it also binds LLVM itself: any LLVM symbol exported here
+    -- would resolve to this copy's own registries instead of that LLVM's. Windows exports only what
+    -- the source marks, so this says the same thing for the platforms that would otherwise export
+    -- everything.
+    if is_plat("macosx") then
+        add_shflags("-Wl,-exported_symbol,_ens_lld_link", "-Wl,-exported_symbol,_ens_lld_free",
+            { force = true })
+    elseif not is_plat("windows") then
+        add_shflags("-Wl,--exclude-libs,ALL", { force = true })
+        add_cxxflags("-fvisibility=hidden")
+    end
 
 
 target("ens-lsp")
