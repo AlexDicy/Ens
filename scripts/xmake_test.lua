@@ -38,6 +38,17 @@ task("test")
         local arch = config.get("arch") or os.arch()
         local build_dir = path.join(os.projectdir(), "build", plat, arch, mode)
         local exe_suffix = is_host("windows") and ".exe" or ""
+        -- what a compiler names the artifacts it is not told the name of: both compilers follow the
+        -- target's object format, and every assertion about a default-named file has to as well.
+        local obj_suffix = is_host("windows") and ".obj" or ".o"
+        -- where `ens` puts a workspace member's program: with its objects under the build root,
+        -- where it cannot land on the member folder it was built from. The triple in that path is
+        -- this machine's own, so it is read back rather than named here.
+        local function member_artifact(workspace, stem)
+            local found = os.files(path.join(workspace, ".ens", "*", "O*",
+                stem .. exe_suffix))
+            return found[1] or path.join(workspace, ".ens", "<target>", "O2", stem .. exe_suffix)
+        end
         -- the reference compiler: it builds the seed and gates the tests/ fixtures.
         local ref_exe = path.join(build_dir, "ens-ref" .. exe_suffix)
         if not os.isfile(ref_exe) then
@@ -859,7 +870,7 @@ task("test")
             -- the fixpoint: the two stages' objects, module by module in name order.
             local function objectNames(folder)
                 local names = {}
-                for _, f in ipairs(os.files(path.join(folder, "*.obj"))) do
+                for _, f in ipairs(os.files(path.join(folder, "*" .. obj_suffix))) do
                     table.insert(names, path.filename(f))
                 end
                 table.sort(names)
@@ -979,22 +990,22 @@ task("test")
             run({"build", hello, "--output", hello_exe}, nil, 0, "Compiled successfully")
             run_program(hello_exe, 0, "Hello, world!")
             run({"build", hello}, {curdir = cli_dir}, 0, "Compiled successfully")
-            run_program(path.join(cli_dir, "hello.exe"), 0, "Hello, world!")
+            run_program(path.join(cli_dir, "hello" .. exe_suffix), 0, "Hello, world!")
 
             -- build a package folder: the executable is named after the package
             run({"build", path.join(tests_dir, "pkg_import_main")}, {curdir = cli_dir},
                 0, "Compiled successfully")
-            run_program(path.join(cli_dir, "main.exe"), 0, "Hello, Ada! [acme.tools]")
+            run_program(path.join(cli_dir, "main" .. exe_suffix), 0, "Hello, Ada! [acme.tools]")
 
             -- a package without main() is a library: it validates fully, keeps no artifact,
             -- and refuses an explicit output
             run({"build", path.join(tests_dir, "pkg_import_dep")}, {curdir = cli_dir},
                 0, "library")
-            if os.isfile(path.join(cli_dir, "tools.exe")) then
+            if os.isfile(path.join(cli_dir, "tools" .. exe_suffix)) then
                 table.insert(failures, "building a library left an executable behind")
             end
             run({"build", path.join(tests_dir, "pkg_import_dep"), "--output",
-                path.join(cli_dir, "tools.exe")}, nil, 1, "does not define main()")
+                path.join(cli_dir, "tools" .. exe_suffix)}, nil, 1, "does not define main()")
 
             -- check: no artifacts, plain success and failure
             run({"check", hello}, nil, 0, "No problems found")
@@ -1048,9 +1059,9 @@ task("test")
             -- build every member in dependency order: the library goes first even though the
             -- manifest lists the application first, and only the application leaves an artifact
             local _, build_out = run({"build", workspace}, {curdir = cli_dir}, 0,
-                "[1/2] demo.lib: library ok", "[2/2] demo.app: built app.exe")
-            if not os.isfile(path.join(cli_dir, "app.exe")) then
-                table.insert(failures, "the workspace build did not produce app.exe")
+                "[1/2] demo.lib: library ok", "[2/2] demo.app: built app" .. exe_suffix)
+            if not os.isfile(path.join(cli_dir, "app" .. exe_suffix)) then
+                table.insert(failures, "the workspace build did not produce app" .. exe_suffix)
             end
             run({"build", workspace, "--output", path.join(cli_dir, "x.exe")}, nil, 2,
                 "--output")
@@ -1092,14 +1103,18 @@ task("test")
             local scratch = path.join(os.projectdir(), "build", "cli", "override")
             os.tryrm(scratch)
             local ws_dir = path.join(scratch, "ws")
-            os.mkdir(path.join(ws_dir, "app", "src"))
+            -- the member folder is deliberately not named after the program it holds: ens-ref
+            -- writes a member's program into the folder the command ran in, which on a system that
+            -- gives executables no suffix is the member folder itself. `ens` keeps a member's
+            -- program under the build root instead, which cli_overriding covers.
+            os.mkdir(path.join(ws_dir, "application", "src"))
             os.mkdir(path.join(scratch, "json", "src"))
             os.mkdir(path.join(scratch, "wrong"))
             io.writefile(path.join(ws_dir, "ens.package"),
-                'workspace {\n    member "app";\n}\n')
-            io.writefile(path.join(ws_dir, "app", "ens.package"),
+                'workspace {\n    member "application";\n}\n')
+            io.writefile(path.join(ws_dir, "application", "ens.package"),
                 'package demo.app {\n    ens "0.1";\n\n    dependency acme.json "1.0";\n}\n')
-            io.writefile(path.join(ws_dir, "app", "src", "main.ens"),
+            io.writefile(path.join(ws_dir, "application", "src", "main.ens"),
                 'import @acme.json.parse;\n\nmain() -> int {\n    print(parse.tag());\n'
                 .. '    return 0;\n}\n')
             io.writefile(path.join(scratch, "json", "ens.package"),
@@ -1154,7 +1169,7 @@ task("test")
             expect_file("add", 'overrides {\n    override acme.json "../json";\n}\n')
             run({"override", "list"}, in_ws, 0, 'acme.json -> ../json (ok)')
             run({"build"}, in_ws, 0, "Using the override for package 'acme.json'",
-                "[1/1] demo.app: built app.exe")
+                "[1/1] demo.app: built app" .. exe_suffix)
             run({"run", "--"}, in_ws, 0, "json override")
 
             -- a target that declares a different package is rejected and nothing changes
@@ -1397,7 +1412,7 @@ task("test")
                 "Fetched beta.utils 1.1",
                 "Updated ens.lock: locked acme.tools 1.0, locked alex.json 1.0, "
                     .. "locked beta.utils 1.1")
-            run_program(path.join(app1, "gitapp.exe"), 0, "json 1.0 | tools(utils 1.1)")
+            run_program(path.join(app1, "gitapp" .. exe_suffix), 0, "json 1.0 | tools(utils 1.1)")
 
             -- the lock is deterministic, sorted, and complete
             local lock1 = lock_text()
@@ -1458,7 +1473,7 @@ task("test")
             run({"build", "."}, in_app1, 0,
                 "Fetched alex.json 1.1 from " .. url_json .. " (tag v1.1).",
                 "Updated ens.lock: updated alex.json 1.0 -> 1.1")
-            run_program(path.join(app1, "gitapp.exe"), 0, "json 1.1 | tools(utils 1.1)")
+            run_program(path.join(app1, "gitapp" .. exe_suffix), 0, "json 1.1 | tools(utils 1.1)")
             if not lock_text():find("package alex.json 1.1", 1, true) then
                 table.insert(failures, "ens.lock does not record the updated version")
             end
@@ -1513,7 +1528,7 @@ task("test")
                 .. '    return 0;\n}\n')
             run({"build", "."}, {curdir = app_ws, envs = envs_with_cache(cache)}, 0,
                 "Fetched ws.core 1.0")
-            run_program(path.join(app_ws, "wsapp.exe"), 0, "core(extra)")
+            run_program(path.join(app_ws, "wsapp" .. exe_suffix), 0, "core(extra)")
             local ws_lock = (io.readfile(path.join(app_ws, "ens.lock")) or "")
             if not ws_lock:find("package ws.core 1.0", 1, true) then
                 table.insert(failures, "the workspace-form package was not locked")
@@ -1543,7 +1558,7 @@ task("test")
                 .. '    return 0;\n}\n')
             local in_retag = {curdir = app_retag, envs = envs_with_cache(cache)}
             run({"build", "."}, in_retag, 0, "Fetched rt.pkg 1.0")
-            run_program(path.join(app_retag, "retag.exe"), 0, "retag 1")
+            run_program(path.join(app_retag, "retag" .. exe_suffix), 0, "retag 1")
             io.writefile(path.join(retag_dir, "src", "thing.ens"),
                 'export tag() -> string {\n    return "retag 2";\n}\n')
             commit_all(retag_dir, "moved")
@@ -1648,7 +1663,7 @@ task("test")
                 'main() -> int {\n    print("artifact linked");\n    return 0;\n}\n')
             local in_app1 = {curdir = app1, envs = envs_with_cache(cache)}
             run({"build", "."}, in_app1, 0, "Compiled successfully")
-            run_program(path.join(app1, "artifactapp.exe"), 0, "artifact linked")
+            run_program(path.join(app1, "artifactapp" .. exe_suffix), 0, "artifact linked")
             local stored = path.join(cache, "artifacts", good_hash:gsub("^sha256:", ""),
                 "extras.lib")
             if not os.isfile(stored) then
@@ -1709,7 +1724,7 @@ task("test")
                 .. '    return 0;\n}\n')
             run({"build", "."}, {curdir = app3, envs = envs_with_cache(cache)}, 0,
                 "Fetched art.dep 1.0", "Updated ens.lock: locked art.dep 1.0")
-            run_program(path.join(app3, "lockapp.exe"), 0, "dep with artifact")
+            run_program(path.join(app3, "lockapp" .. exe_suffix), 0, "dep with artifact")
             local lock = ((io.readfile(path.join(app3, "ens.lock")) or ""):gsub("\r\n", "\n"))
             local root_lines = "root demo.lockapp\n"
                 .. "artifact extras linux " .. url_lib .. " " .. good_hash .. "\n"
@@ -1824,7 +1839,7 @@ task("test")
             run({"build", hello, "--output", hello_exe}, nil, 0, "built")
             run_program(hello_exe, 0, "Hello, world!")
             run({"build", hello}, in_work, 0, "built")
-            run_program(path.join(work, "hello.exe"), 0, "Hello, world!")
+            run_program(path.join(work, "hello" .. exe_suffix), 0, "Hello, world!")
 
             -- every optimization level is a shipped configuration, so every one is run
             for _, level in ipairs({"-O0", "-O1", "-O2", "-O3"}) do
@@ -1864,7 +1879,7 @@ task("test")
             run({"build", objects, "--output", path.join(root, "objects.exe")}, nil, 0, "built")
             local triple = path.filename(os.dirs(path.join(objects, ".ens", "*"))[1] or "none")
             expectFolders(objects, triple .. "/O2", "a default build")
-            if #os.files(path.join(objects, ".ens", "*", "O2", "*.obj")) == 0 then
+            if #os.files(path.join(objects, ".ens", "*", "O2", "*" .. obj_suffix)) == 0 then
                 table.insert(failures, "a build left no object files under the build root")
             end
 
@@ -1892,7 +1907,7 @@ task("test")
 
             -- and nowhere else: not beside the executable, and not in the folder it was run from
             for _, elsewhere in ipairs({root, work}) do
-                if #os.files(path.join(elsewhere, "*.obj")) > 0 then
+                if #os.files(path.join(elsewhere, "*" .. obj_suffix)) > 0 then
                     table.insert(failures, string.format("object files were left in %s", elsewhere))
                 end
             end
@@ -1915,14 +1930,20 @@ task("test")
             os.mkdir(named_objects)
             run({"build", objects, "--objects", named_objects, "--output",
                 path.join(root, "objects2.exe")}, nil, 0, "built")
-            if #os.files(path.join(named_objects, "*.obj")) == 0 then
+            if #os.files(path.join(named_objects, "*" .. obj_suffix)) == 0 then
                 table.insert(failures, "'--objects' did not decide where the objects went")
             end
             expectNoStaging(named_objects, "a build into a named objects folder")
 
-            -- quiet says nothing on success, verbose says what it did, and --explain-arc accounts
+            -- quiet says nothing on success, verbose says what it did, and --explain-arc accounts.
+            -- The quiet run links with only this build's own folder on the library path: the LLVM
+            -- package's folder holds a libunwind newer than the deployment target, which the linker
+            -- rightly remarks on and which is not what is being asserted here.
+            local quiet_env = {}
+            for key, value in pairs(env) do quiet_env[key] = value end
+            quiet_env.LIBRARY_PATH = build_dir
             local _, quiet_out = run({"build", hello, "--output",
-                path.join(root, "quiet.exe"), "-q"}, nil, 0)
+                path.join(root, "quiet.exe"), "-q"}, {envs = quiet_env}, 0)
             if quiet_out:gsub("%s+", "") ~= "" then
                 table.insert(failures, string.format("ens build -q said %q", quiet_out))
             end
@@ -1936,14 +1957,14 @@ task("test")
             -- The library's build root is in the fixture tree, so what an earlier run left there
             -- goes first and the assertion is about this run.
             run({"build", path.join(tests_dir, "pkg_import_main")}, in_work, 0, "built")
-            run_program(path.join(work, "main.exe"), 0, "Hello, Ada! [acme.tools]")
+            run_program(path.join(work, "main" .. exe_suffix), 0, "Hello, Ada! [acme.tools]")
             local library_root = path.join(tests_dir, "pkg_import_dep")
             os.tryrm(path.join(library_root, ".ens"))
             run({"build", library_root}, in_work, 0, "as a library")
-            if os.isfile(path.join(work, "tools.exe")) then
+            if os.isfile(path.join(work, "tools" .. exe_suffix)) then
                 table.insert(failures, "building a library left an executable behind")
             end
-            if #os.files(path.join(library_root, ".ens", "*", "O2", "*.obj")) == 0 then
+            if #os.files(path.join(library_root, ".ens", "*", "O2", "*" .. obj_suffix)) == 0 then
                 table.insert(failures, "a library build left no object files under the build root")
             end
             if #os.dirs(path.join(work, ".ens-library-*")) > 0 then
@@ -2376,12 +2397,12 @@ task("test")
                 table.insert(failures, string.format("the override notice appeared %d times, "
                     .. "expected once:\n%s", times, said))
             end
-            local built = path.join(ws_dir, "app.exe")
+            local built = member_artifact(ws_dir, "app")
             if os.isfile(built) then
                 local rc = execMerged(built, {}, log, {envs = env})
                 local out = captured(log)
                 if rc ~= 0 or out ~= "json override" then
-                    table.insert(failures, string.format("app.exe: exit=%s stdout=%q",
+                    table.insert(failures, string.format("the built app: exit=%s stdout=%q",
                         tostring(rc), out))
                 end
             else
@@ -2680,7 +2701,7 @@ task("test")
                 "Updated ens.lock: locked acme.tools 1.0, locked alex.json 1.0, "
                     .. "locked beta.utils 1.1",
                 "!refs/tags/")
-            run_program(path.join(app, "gitapp.exe"), 0, "json 1.0 | tools(utils 1.1)")
+            run_program(path.join(app, "gitapp" .. exe_suffix), 0, "json 1.0 | tools(utils 1.1)")
 
             -- the lock is complete, sorted, and records what each package requires
             local locked = lock_text()
@@ -2743,7 +2764,7 @@ task("test")
             run({"build", "."}, in_app, 0,
                 "Fetched alex.json 1.1 from " .. url_json .. " (tag v1.1)",
                 "Updated ens.lock: updated alex.json 1.0 -> 1.1", "!locked beta.utils")
-            run_program(path.join(app, "gitapp.exe"), 0, "json 1.1 | tools(utils 1.1)")
+            run_program(path.join(app, "gitapp" .. exe_suffix), 0, "json 1.1 | tools(utils 1.1)")
             if not lock_text():find("package alex.json 1.1", 1, true) then
                 table.insert(failures, "ens.lock does not record the raised version")
             end
@@ -2810,7 +2831,7 @@ task("test")
                 .. '    return 0;\n}\n')
             run({"build", "."}, {curdir = using_ws, envs = withCache(cache)}, 0,
                 "Fetched ws.core 1.0")
-            run_program(path.join(using_ws, "wsapp.exe"), 0, "core(extra)")
+            run_program(path.join(using_ws, "wsapp" .. exe_suffix), 0, "core(extra)")
             local ws_lock = (io.readfile(path.join(using_ws, "ens.lock")) or "")
             if not ws_lock:find("package ws.core 1.0", 1, true) then
                 table.insert(failures, "the workspace-form package was not locked")
@@ -2850,7 +2871,7 @@ task("test")
                 .. '    return 0;\n}\n')
             local in_retag = {curdir = using_retag, envs = withCache(cache)}
             run({"build", "."}, in_retag, 0, "Fetched rt.pkg 1.0")
-            run_program(path.join(using_retag, "retag.exe"), 0, "retag 1")
+            run_program(path.join(using_retag, "retag" .. exe_suffix), 0, "retag 1")
             io.writefile(path.join(retag_dir, "src", "thing.ens"),
                 'export tag() -> string {\n    return "retag 2";\n}\n')
             commit_all(retag_dir, "moved")
@@ -2973,7 +2994,7 @@ task("test")
                 'main() -> int {\n    print("prebuilt linked");\n    return 0;\n}\n')
             local in_app = {curdir = app, envs = withCache(cache)}
             run({"build", "."}, in_app, 0, "prebuilt: built")
-            run_program(path.join(app, "prebuilt.exe"), 0, "prebuilt linked")
+            run_program(path.join(app, "prebuilt" .. exe_suffix), 0, "prebuilt linked")
             local stored = path.join(cache, "artifacts", good:gsub("^sha256:", ""), "extras.lib")
             if not os.isfile(stored) then
                 table.insert(failures, "the downloaded library is not in the cache")
@@ -3062,7 +3083,7 @@ task("test")
                 'main() -> int {\n    print("capitals linked");\n    return 0;\n}\n')
             run({"build", "."}, {curdir = capitals, envs = withCache(cache)}, 0,
                 "capitals: built")
-            run_program(path.join(capitals, "capitals.exe"), 0, "capitals linked")
+            run_program(path.join(capitals, "capitals" .. exe_suffix), 0, "capitals linked")
 
             -- the lock records the bindings of the build's own package and of every fetched one,
             -- flattened per platform, so the exact native code a build links reads in one place
@@ -3099,7 +3120,7 @@ task("test")
                 .. '    return 0;\n}\n')
             run({"build", "."}, {curdir = recorded, envs = withCache(cache)}, 0,
                 "Fetched art.dep 1.0", "Updated ens.lock: locked art.dep 1.0")
-            run_program(path.join(recorded, "lockapp.exe"), 0, "dep with a prebuilt library")
+            run_program(path.join(recorded, "lockapp" .. exe_suffix), 0, "dep with a prebuilt library")
             local lock = ((io.readfile(path.join(recorded, "ens.lock")) or ""):gsub("\r\n", "\n"))
             local own = "root demo.lockapp\n"
                 .. "artifact extras linux " .. url_lib .. " " .. good .. "\n"
@@ -3132,7 +3153,7 @@ task("test")
                 'import @art.dep.dep;\n\nmain() -> int {\n    print(dep.tag());\n'
                 .. '    return 0;\n}\n')
             run({"build", "."}, {curdir = ws, envs = withCache(cache)}, 0, "demo.member: built")
-            run_program(path.join(ws, "member.exe"), 0, "dep with a prebuilt library")
+            run_program(member_artifact(ws, "member"), 0, "dep with a prebuilt library")
             local ws_lock = ((io.readfile(path.join(ws, "ens.lock")) or ""):gsub("\r\n", "\n"))
             local recorded_member = "member demo.member\n"
                 .. "artifact memberextras linux " .. url_lib .. " " .. good .. "\n"
