@@ -723,15 +723,24 @@ task("test")
 
             -- the harness itself links the native LLVM binding through ens.codegen, so its
             -- build needs the same linker environment as the spike.
+            --
+            -- Both arms build these same two packages, at the same time and in the same
+            -- configuration, so both are told where to put their object files: left to itself a
+            -- build keeps them under the build root, which the two arms would then share and write
+            -- over each other in. Only a harness runs the same build twice at once like this, and
+            -- '--objects' is what says otherwise.
+            local harness_objects = path.join(check_dir, "objects-harness")
+            local spike_objects = path.join(check_dir, "objects-spike")
             local harness_rc = execMerged(seed_exe,
-                {"build", check_src, "--output", harness_exe}, log, {envs = env})
+                {"build", check_src, "--output", harness_exe, "--objects", harness_objects},
+                log, {envs = env})
             if not os.isfile(harness_exe) then
                 return {name = name, ok = false, short = "harness build failed",
                     full = string.format("%s: harness build failed (exit %s)\n%s", name,
                         tostring(harness_rc), (io.readfile(log) or ""):gsub("[\r\n]+$", ""))}
             end
-            local spike_rc = execMerged(seed_exe, {"build", spike_src, "--output", spike_exe},
-                log, {envs = env})
+            local spike_rc = execMerged(seed_exe, {"build", spike_src, "--output", spike_exe,
+                "--objects", spike_objects}, log, {envs = env})
             if not os.isfile(spike_exe) then
                 return {name = name, ok = false, short = "spike build failed",
                     full = string.format("%s: spike build failed (exit %s)\n%s", name,
@@ -1818,6 +1827,69 @@ task("test")
                 run_program(leveled, 0, "Hello, world!")
             end
 
+            -- the object files a build emits are kept under the build root, in a folder of their
+            -- own per target and per optimization level. The triple is this machine's own, so the
+            -- folders are read back rather than named here.
+            local function objectFolders(base)
+                local found = {}
+                for _, triple in ipairs(os.dirs(path.join(base, ".ens", "*"))) do
+                    for _, level in ipairs(os.dirs(path.join(triple, "*"))) do
+                        table.insert(found, path.filename(triple) .. "/" .. path.filename(level))
+                    end
+                end
+                table.sort(found)
+                return found
+            end
+            local function expectFolders(base, expected, after)
+                local found = table.concat(objectFolders(base), " ")
+                if found ~= expected then
+                    table.insert(failures, string.format("%s: objects are under %q, expected %q",
+                        after, found, expected))
+                end
+            end
+
+            local objects = path.join(root, "objects")
+            os.mkdir(path.join(objects, "src"))
+            io.writefile(path.join(objects, "ens.package"),
+                'package demo.objects {\n    ens "0.1";\n}\n')
+            io.writefile(path.join(objects, "src", "main.ens"),
+                'main() -> int {\n    print("objects");\n    return 0;\n}\n')
+
+            run({"build", objects, "--output", path.join(root, "objects.exe")}, nil, 0, "built")
+            local triple = path.filename(os.dirs(path.join(objects, ".ens", "*"))[1] or "none")
+            expectFolders(objects, triple .. "/O2", "a default build")
+            if #os.files(path.join(objects, ".ens", "*", "O2", "*.obj")) == 0 then
+                table.insert(failures, "a build left no object files under the build root")
+            end
+            -- and nowhere else: not beside the executable, and not in the folder it was run from
+            for _, elsewhere in ipairs({root, work}) do
+                if #os.files(path.join(elsewhere, "*.obj")) > 0 then
+                    table.insert(failures, string.format("object files were left in %s", elsewhere))
+                end
+            end
+
+            -- a second level does not share the first one's folder, so an object built at one level
+            -- can never be picked up by a build at another
+            run({"build", objects, "-O0", "--output", path.join(root, "objects0.exe")}, nil, 0,
+                "built")
+            expectFolders(objects, triple .. "/O0 " .. triple .. "/O2", "a build at another level")
+
+            -- the folder says to ignore everything under it, so nothing has to be added to a
+            -- .gitignore anywhere and nobody has to remember it
+            local ignored = io.readfile(path.join(objects, ".ens", ".gitignore")) or ""
+            if ignored:gsub("%s+", "") ~= "*" then
+                table.insert(failures, string.format("the artifacts folder ignores %q", ignored))
+            end
+
+            -- '--objects' still decides where they go, which is what the bootstrap gate relies on
+            local named_objects = path.join(root, "named-objects")
+            os.mkdir(named_objects)
+            run({"build", objects, "--objects", named_objects, "--output",
+                path.join(root, "objects2.exe")}, nil, 0, "built")
+            if #os.files(path.join(named_objects, "*.obj")) == 0 then
+                table.insert(failures, "'--objects' did not decide where the objects went")
+            end
+
             -- quiet says nothing on success, verbose says what it did, and --explain-arc accounts
             local _, quiet_out = run({"build", hello, "--output",
                 path.join(root, "quiet.exe"), "-q"}, nil, 0)
@@ -1830,12 +1902,22 @@ task("test")
                 "elided across the program")
 
             -- an application package is named after its package; a library keeps no artifact and
-            -- refuses an output
+            -- refuses an output, while keeping its object files the way a program keeps its own.
+            -- The library's build root is in the fixture tree, so what an earlier run left there
+            -- goes first and the assertion is about this run.
             run({"build", path.join(tests_dir, "pkg_import_main")}, in_work, 0, "built")
             run_program(path.join(work, "main.exe"), 0, "Hello, Ada! [acme.tools]")
-            run({"build", path.join(tests_dir, "pkg_import_dep")}, in_work, 0, "as a library")
+            local library_root = path.join(tests_dir, "pkg_import_dep")
+            os.tryrm(path.join(library_root, ".ens"))
+            run({"build", library_root}, in_work, 0, "as a library")
             if os.isfile(path.join(work, "tools.exe")) then
                 table.insert(failures, "building a library left an executable behind")
+            end
+            if #os.files(path.join(library_root, ".ens", "*", "O2", "*.obj")) == 0 then
+                table.insert(failures, "a library build left no object files under the build root")
+            end
+            if #os.dirs(path.join(work, ".ens-library-*")) > 0 then
+                table.insert(failures, "a library build left a folder of its own beside the command")
             end
             run({"build", path.join(tests_dir, "pkg_import_dep"), "--output",
                 path.join(root, "tools.exe")}, nil, 2, "builds as a library")

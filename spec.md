@@ -478,8 +478,14 @@ At a workspace root every member is built, checked, or tested, each one after th
 
 An executable is named after what was built: a single file's own name, the last segment of a package's name (`acme.tools` builds `tools`), or the folder's name when a folder declares no package.
 It is written to the folder the command was run in unless `--output` names a file.
-A package whose main module defines no `main()` is a library: it is compiled and checked just as thoroughly, nothing is kept, and `--output` is refused because there is no executable to write.
+A package whose main module defines no `main()` is a library: it is compiled and checked just as thoroughly, no executable is written, and `--output` is refused because there is none to write.
 A workspace root refuses `--output` for the same reason: it builds more than one artifact.
+
+A build keeps the object files it produced under the build root, in `.ens/<target triple>/O<level>/`.
+The build root is the folder holding the manifest that governs the sources, so where the objects go does not move when `--output` names an executable somewhere else; sources that no manifest governs keep theirs beside themselves.
+Every target triple and every optimization level has a folder of its own, so an object built for one configuration is never read by a build of another.
+The `.ens` folder carries a `.gitignore` that ignores everything under it, and a build leaves what it put there in place.
+`ens run` and `ens test` are the exception: each builds in a folder of its own under the system's temporary directory and removes that folder afterwards, object files included, so neither leaves anything anywhere.
 
 Commands use the same three exit codes: `0` when the command did what was asked, `1` when the program or the project had problems, and `2` when the command line itself could not be acted on.
 `ens run` adds one case to that: once the program has run, its own exit code is what comes back.

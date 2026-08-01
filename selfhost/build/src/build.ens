@@ -9,11 +9,11 @@
 import @std.system;
 import SystemError from @std.system;
 import @std.path;
-import List from @std.collections.list;
 import FileDiagnostic from @ens.sema.support.diagnostics;
 import FileLoader from @ens.sema.support.loader;
 import ProgramAnalysis from @ens.sema.pipeline;
 import @ens.codegen.driver;
+import @ens.codegen.settings;
 import LinkRequest from @ens.link.request;
 import Toolchain from @ens.link.toolchain;
 import @ens.link.discovery;
@@ -202,8 +202,8 @@ export finishUnit(BuildOptions options, Packaging packaging, Loaded loaded, stri
         output = path.join(options.workingFolder(),
             platform.executableNamed(artifactStem, options.targetTriple()));
     }
-    string objectsFolder = objectsFolderFor(options, output);
-    string prepared = prepareFolder(objectsFolder);
+    string objectsFolder = objectsFolderFor(options);
+    string prepared = prepareObjectsFolder(options, objectsFolder);
     if (prepared.length > 0) {
         return failed([prepared], loaded.moduleCount(), loaded.notices());
     }
@@ -240,25 +240,18 @@ export finishUnit(BuildOptions options, Packaging packaging, Loaded loaded, stri
         loaded.notices());
 }
 
-// A library is compiled the whole way, object files included, and then leaves nothing behind: the
-// point of building one is to know that it compiles. A build that named an objects folder keeps
-// them there, because that is what naming the folder asks for.
+// A library is compiled the whole way, object files included, and produces no executable: the point
+// of building one is to know that it compiles. Its objects are kept exactly where a program's are,
+// because a library's objects are the ones most worth having again.
 buildLibrary(BuildOptions options, ProgramAnalysis analysis, Loaded loaded,
              string artifactStem) -> UnitReport {
-    string objectsFolder = options.objects();
-    bool keep = objectsFolder.length > 0;
-    if (!keep) {
-        objectsFolder = path.join(options.workingFolder(), ".ens-library-" + artifactStem);
-    }
-    string prepared = prepareFolder(objectsFolder);
+    string objectsFolder = objectsFolderFor(options);
+    string prepared = prepareObjectsFolder(options, objectsFolder);
     if (prepared.length > 0) {
         return failed([prepared], loaded.moduleCount(), loaded.notices());
     }
     let emitted = driver.emitProgram(analysis, objectsFolder, artifactStem + ".",
         options.codegen());
-    if (!keep) {
-        discardObjects(objectsFolder, emitted.objects());
-    }
     if (!emitted.succeeded()) {
         return failed(diagnostics.formatAll(emitted.diagnostics(), loaded.catalog()),
             loaded.moduleCount(), loaded.notices());
@@ -277,17 +270,27 @@ export discoverToolchain(BuildOptions options) -> Toolchain {
         path.join(options.workingFolder(), ".ens-link-probe"));
 }
 
-// Where the object files go: the folder the command line named, else the one the executable is
-// written to.
-objectsFolderFor(BuildOptions options, string output) -> string {
+// The folder Ens keeps what a build root produces under. The name is dotted and tool-owned, so it
+// cannot be read as a folder of sources and cannot be confused with a package of a workspace, and it
+// leaves room beside the objects for whatever else a build root comes to keep.
+export artifactsFolderIn(string artifactRoot) -> string {
+    return path.join(artifactRoot, ".ens");
+}
+
+// Where the object files go: the folder the command line named, else a folder under the build root
+// named after the target and the optimization level they were built for. Nothing built for one
+// configuration ever shares a folder with another, so an object emitted for a different target or a
+// different level can never be picked up by mistake.
+export objectsFolderFor(BuildOptions options) -> string {
     if (options.objects().length > 0) {
         return options.objects();
     }
-    string beside = path.parentFolder(output);
-    if (beside.length == 0) {
-        return options.workingFolder();
+    string root = options.artifactRoot();
+    if (root.length == 0) {
+        root = options.workingFolder();
     }
-    return beside;
+    string configured = path.join(artifactsFolderIn(root), options.targetTriple());
+    return path.join(configured, "O" + settings.levelText(options.codegen().optimizationLevel()));
 }
 
 // Anything the linker said on a link that still succeeded, which is worth passing on unchanged.
@@ -308,6 +311,28 @@ linkFailureLines(string output, string reported) -> string[] {
     return ["linking '{output}' failed; the linker reported:", reported];
 }
 
+// Makes the folder the objects go into, and, when that folder is one this build root owns, leaves a
+// .gitignore beside it saying to ignore everything under it. What a build produces is not something
+// anyone commits, and a file that says so where the files are needs nothing of whoever cloned the
+// repository and nothing of anybody's memory.
+prepareObjectsFolder(BuildOptions options, string objectsFolder) -> string {
+    string problem = prepareFolder(objectsFolder);
+    if (problem.length > 0) {
+        return problem;
+    }
+    if (options.objects().length == 0) {
+        ignoreEverythingIn(artifactsFolderIn(ownedRoot(options)));
+    }
+    return "";
+}
+
+ownedRoot(BuildOptions options) -> string {
+    if (options.artifactRoot().length > 0) {
+        return options.artifactRoot();
+    }
+    return options.workingFolder();
+}
+
 prepareFolder(string folder) -> string {
     if (system.isDirectory(folder)) {
         return "";
@@ -318,15 +343,14 @@ prepareFolder(string folder) -> string {
     return "could not create '{folder}' to hold the object files: {error.message}";
 }
 
-discardObjects(string folder, List<string> objects) {
-    for (long i = 0; i < objects.length(); i++) {
-        discardFile(objects.get(i));
+// A build that could not write the file goes on regardless: an ignore file is a courtesy to whoever
+// reads the tree, and no build should fail over one.
+ignoreEverythingIn(string folder) {
+    string file = path.join(folder, ".gitignore");
+    if (system.isFile(file)) {
+        return;
     }
-    try system.removeDirectory(folder);
-} catch (SystemError error) { }
-
-discardFile(string file) {
-    try system.removeFile(file);
+    try system.writeAllText(file, "*\n");
 } catch (SystemError error) { }
 
 // A unit that never reached an artifact, for the problems a caller found in it before a build did.
