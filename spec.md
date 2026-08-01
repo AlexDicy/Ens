@@ -388,7 +388,8 @@ package alex.jsonkit {
 A package's sources live in its `src/` folder, with its tests in a sibling `tests/` folder.
 A package whose `src/main.ens` defines `main()` is an application and builds to an executable; a package without one is a library.
 Every package declares `ens`, the language version it is written for as major.minor; `version`, the package's own version in dotted numerals, is optional.
-Both are informational today: nothing gates on their values yet.
+The shape of both is checked, but neither value gates a package's own build: a package declaring a version other than the running toolchain's still builds.
+What does read a declared `ens` version is described with the `ens` command below.
 Each `dependency` declares a package this one may import with `@`: the leading segments of an `@` import select the dependency with the longest matching name, and the remaining segments name the module inside it.
 
 A workspace groups packages that are developed together.
@@ -403,6 +404,7 @@ workspace {
 ```
 
 Every member folder must itself contain a package manifest.
+Every member must declare the same `ens` version, because one workspace is built by one toolchain; a disagreement is an error naming the members and the versions they declare.
 Dependencies resolve by name against the workspace: `dependency ens.frontend;` in one member finds the member whose manifest declares `package ens.frontend`, wherever that folder sits, so package names must be unique within a workspace.
 A dependency that resolves to a workspace member never carries a version (and never a `from` clause); members are used exactly as checked out.
 Every other dependency declares the version this package requires, and a dependency that is neither a member nor overridden names its git source with `from`:
@@ -456,7 +458,58 @@ An artifact is a single library file for its platform.
 Artifact bindings and their hashes are recorded in `ens.lock`, so the exact native code a build links is reviewable in one place.
 When two packages in one build declare the same native library, the declarations must be identical; identical declarations are linked once.
 
-Methods that can throw exceptions are marked with `throws`; any other method can be considered safe. Every thrown value must be an instance of `Error` or a subclass of it. For most methods the set of throwable types is computed by the compiler and shown by IDEs on hover. A method may also declare its thrown types explicitly — `read() -> bytes throws IOError` or `read() -> bytes throws IOError, ParseError`, which is required for abstract methods and forms a contract: an override may throw those types or their subclasses, never others.
+---
+
+The toolchain is one command, `ens`, with a subcommand for each thing it does.
+`ens help` and `ens --help` list the commands, and `ens help <command>` describes one of them along with every option it takes.
+`ens --version` prints the toolchain version, the same as `ens version`.
+
+- `ens build [path]` compiles a program and writes an executable.
+- `ens check [path]` does everything a build does up to code generation and nothing after it: the same problems are reported, and no artifact is produced.
+- `ens run [path] [-- arguments]` builds a program in a folder of its own, runs it, and removes the folder, so the tree it was pointed at is left as it was found.
+  Everything written after `--` reaches the program exactly as it was written, and the code the program ends with becomes this command's own.
+- `ens test [path]` builds a target's tests together with its sources and runs them, as described in the section on tests.
+- `ens override add <package> <folder>`, `ens override remove <package>` and `ens override list` maintain the `ens.overrides` file beside the build root's manifest.
+- `ens version` prints the toolchain version.
+
+The path is an `.ens` file, a folder of sources, a package folder, or a workspace root.
+With no path, the command works on the nearest package above the folder it was run in, found the way `git` finds a repository from a subfolder.
+At a workspace root every member is built, checked, or tested, each one after the members it depends on; `ens run` needs the workspace to hold exactly one application and says which members it found when there is more than one.
+
+An executable is named after what was built: a single file's own name, the last segment of a package's name (`acme.tools` builds `tools`), or the folder's name when a folder declares no package.
+It is written to the folder the command was run in unless `--output` names a file.
+A package whose main module defines no `main()` is a library: it is compiled and checked just as thoroughly, nothing is kept, and `--output` is refused because there is no executable to write.
+A workspace root refuses `--output` for the same reason: it builds more than one artifact.
+
+Commands use the same three exit codes: `0` when the command did what was asked, `1` when the program or the project had problems, and `2` when the command line itself could not be acted on.
+`ens run` adds one case to that: once the program has run, its own exit code is what comes back.
+
+`build`, `check`, `run` and `test` all accept these options:
+
+- `-O0`, `-O1`, `-O2` and `-O3`, written `--optimization-level <level>` in full, choose how hard to optimize.
+  The level may be attached to the short form (`-O2`) or written beside it (`-O 2`).
+  The default is `-O2`, and `-O0` turns the optimizer off.
+- `--target <triple>` builds for a target other than this machine's own, such as `x86_64-unknown-linux-gnu` or `arm64-apple-macosx14.0`.
+- `--stdlib <folder>` names the folder holding `std/` instead of letting the build look for one by walking up from the sources; `ENS_STDLIB` does the same thing.
+- `--explain-arc` reports what the reference-counting optimizer elided, as described in the section on memory management.
+- `--offline` and `--locked` govern package fetching and `ens.lock`, as described above.
+- `--quiet` reports problems and nothing else, and `--verbose` reports each step as it runs; asking for both is an error.
+- `--toolchain <version>` chooses which installed version of Ens does the work.
+
+`ens build` also takes `--output <file>`, naming the executable to write.
+`ens test` also takes `--filter` and `--tests`, described in the section on tests.
+
+`ens` is also a version multiplexer: a build root's declared `ens` version can send the whole invocation to the toolchain that is that version, and that toolchain's exit code becomes this command's own.
+Which declared versions send the work elsewhere is not settled yet; what is settled is where toolchains are found and how one is asked for by name.
+Toolchains live one folder per version under `~/.ens/toolchains`, each folder holding the `ens` program that is that version, and `ENS_TOOLCHAINS` names a different root to look in.
+`--toolchain <version>` asks for a version by name whatever the build root declares, and `--toolchain local` keeps the work with the running toolchain; `ENS_TOOLCHAIN` is the environment spelling of the same choice, and the option wins when both are given.
+Asking by name for a version that is not installed is an error saying where it was looked for and what would have to be there.
+Only `build`, `check`, `run` and `test` can hand work over; `version`, `help` and `override` are always answered by the running toolchain.
+The command line reaches the other toolchain exactly as it was written, and a toolchain that was handed the work never hands it on again, so there is at most one hop.
+
+---
+
+Methods that can throw exceptions are marked with `throws`; any other method can be considered safe. Every thrown value must be an instance of `Error` or a subclass of it. For most methods the set of throwable types is computed by the compiler and shown by IDEs on hover. A method may also declare its thrown types explicitly - `read() -> bytes throws IOError` or `read() -> bytes throws IOError, ParseError`, which is required for abstract methods and forms a contract: an override may throw those types or their subclasses, never others.
 
 If any exception is not handled and the method is not marked as `throws`, this should result in a compilation error explaining which exceptions were not handled and how to handle them (either with a `catch` block or via the `throws` keyword).
 
@@ -1266,7 +1319,12 @@ class Child {
 
 `weak` fields must be nullable class types. They don't contribute to the strong refcount, so they don't keep objects alive. When the referenced object dies, every weak reference to it reads as `null`.
 
-The compiler performs **escape analysis** to elide retain/release pairs and large-struct copies when it can prove a value does not escape its scope. The `--explain-arc` flag surfaces what was elided for diagnostics.
+The compiler performs **escape analysis** to elide retain/release pairs and large-struct copies when it can prove a value does not escape its scope.
+
+`--explain-arc` reports that work.
+A function appears in the account when there is something to say about it: which of its incoming references may outlive the call or have their storage written, and one line for each optimization pass that removed reference-counting operations from it, saying how many.
+A last line gives the total for the whole program.
+The account describes an optimization that ran, so `-O0` prints nothing, the optimizer being off there, and `ens check` prints nothing, since it stops before code generation.
 
 ---
 
