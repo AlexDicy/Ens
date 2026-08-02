@@ -571,22 +571,23 @@ task("test")
             return path.join(path.join(path.normalize(user), ".ens"), "seeds")
         end
 
-        -- download this host's seed for `tag` and install it at `installed`. It lands in a scratch
-        -- folder and is moved into place only once it hashes to what the tree pins, so an
+        -- download this host's seed for `tag` and install it at `installed`. It lands beside where
+        -- it is going and is renamed into place only once it hashes to what the tree pins, so an
         -- interrupted or tampered download cannot leave behind something a later run mistakes for a
-        -- verified seed.
+        -- verified seed. Beside rather than in a temporary folder because the rename has to stay on
+        -- one filesystem: a system temporary folder is frequently a different one, and renaming
+        -- across two fails.
         local function fetchSeed(tag, url, sha256, installed)
             local asset = string.format("%s/%s/ens-%s%s", url, tag, seed_host, exe_suffix)
-            local scratch = path.join(os.tmpdir(), "ens-seed-" .. tag .. "-" .. seed_host)
-            os.tryrm(scratch)
-            os.mkdir(scratch)
-            local downloaded = path.join(scratch, "ens" .. exe_suffix)
+            local partial = installed .. ".partial"
+            os.mkdir(path.directory(installed))
+            os.tryrm(partial)
             print(string.format("Downloading the %s bootstrap seed %s...", seed_host, tag))
             try {
-                function() http.download(asset, downloaded) end,
+                function() http.download(asset, partial) end,
                 catch {
                     function(errors)
-                        os.tryrm(scratch)
+                        os.tryrm(partial)
                         os.raise("could not download the %s bootstrap seed from '%s': %s. The "
                             .. "suite needs it to build the compiler; with no network, point "
                             .. "ENS_SEEDS at a folder holding '%s/ens%s'.", seed_host, asset,
@@ -594,17 +595,15 @@ task("test")
                     end
                 }
             }
-            local found = hash.sha256(downloaded)
+            local found = hash.sha256(partial)
             if found ~= sha256 then
-                os.tryrm(scratch)
+                os.tryrm(partial)
                 os.raise("the %s bootstrap seed downloaded from '%s' is not what this tree pins.\n"
                     .. "  pinned sha256 %s\n  downloaded    %s\nThe release asset was replaced or "
                     .. "the download is corrupt; nothing is run until the two agree.", seed_host,
                     asset, sha256, found)
             end
-            os.mkdir(path.directory(installed))
-            os.mv(downloaded, installed)
-            os.tryrm(scratch)
+            os.mv(partial, installed)
         end
 
         -- place the seed: the `ens` this tree pins for this host, put where the build below looks
