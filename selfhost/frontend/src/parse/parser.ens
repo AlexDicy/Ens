@@ -20,16 +20,21 @@ import GreenNode from syntax.green;
 import EventKind from parse.events;
 import ParseEvent from parse.events;
 import EventList from parse.events;
+import Recovery from parse.recovery;
+import RecoveryScope from parse.recovery;
+import parse.recovery;
 import parse.treebuilder;
 import List from @std.collections.list;
 
 export class ParseResult {
     GreenNode greenRoot;
     Diagnostic[] allDiagnostics;
+    Recovery[] allRecoveries;
 
-    protected constructor(GreenNode root, Diagnostic[] diagnostics) {
+    protected constructor(GreenNode root, Diagnostic[] diagnostics, Recovery[] recoveries) {
         this.greenRoot = root;
         this.allDiagnostics = diagnostics;
+        this.allRecoveries = recoveries;
     }
 
     // The green root; factory.createRoot builds the typed red tree over it. For parse() this is
@@ -42,6 +47,13 @@ export class ParseResult {
     // Lex and parse diagnostics merged, ordered by span start.
     export diagnostics() -> Diagnostic[] {
         return this.allDiagnostics;
+    }
+
+    // The tokens the parser had to invent, in the order it invented them: which parts of the tree
+    // are its guess rather than the author's text. Error nodes are the other half of the picture and
+    // the tree carries those itself.
+    export recoveries() -> Recovery[] {
+        return this.allRecoveries;
     }
 }
 
@@ -104,7 +116,23 @@ public parseStatementOnly(Source input) -> ParseResult {
 finishParse(Source input, LexResult lexed, Parser parser) -> ParseResult {
     let root = treebuilder.buildTree(input, lexed.tokens(), parser.finishedEvents());
     let diagnostics = mergeDiagnostics(lexed.diagnostics(), parser.collectedDiagnostics());
-    return new ParseResult(root, diagnostics);
+    return new ParseResult(root, diagnostics, allRecoveries(lexed, parser));
+}
+
+// The parser's own guesses, and one for the whole file when the text did not even tokenize: a run of
+// bytes that is not a token leaves the parser reading a stream the author did not write, so no
+// construct after it keeps a shape worth trusting.
+allRecoveries(LexResult lexed, Parser parser) -> Recovery[] {
+    let parsed = parser.collectedRecoveries();
+    if (lexed.diagnostics().length == 0) {
+        return parsed;
+    }
+    let all = new List<Recovery>();
+    all.push(new Recovery(lexed.diagnostics()[0].span(), RecoveryScope.File));
+    for (let recovery in parsed) {
+        all.push(recovery);
+    }
+    return all.toArray();
 }
 
 // Two-pointer merge of the position-ordered lex and parse diagnostic lists; lex wins ties.
@@ -162,14 +190,52 @@ class DiagnosticList {
     }
 }
 
+// A rewindable recovery list, alongside the diagnostics for the same reason: a failed speculation
+// invented tokens that are not in the tree it kept.
+class RecoveryList {
+    List<Recovery> backing;
+    long recoveryCount;
+
+    protected constructor() {
+        this.backing = new List<Recovery>();
+        this.recoveryCount = 0;
+    }
+
+    protected count() -> long {
+        return this.recoveryCount;
+    }
+
+    protected push(Recovery recovery) {
+        if (this.recoveryCount == this.backing.length()) {
+            this.backing.push(recovery);
+        } else {
+            this.backing.set(this.recoveryCount, recovery);
+        }
+        this.recoveryCount++;
+    }
+
+    protected truncate(long newCount) {
+        this.recoveryCount = newCount;
+    }
+
+    protected toArray() -> Recovery[] {
+        Recovery[] result = new Recovery[this.recoveryCount];
+        for (long i = 0; i < result.length; i = i + 1) {
+            result[i] = this.backing.get(i);
+        }
+        return result;
+    }
+}
+
 // A snapshot of everything speculation can change: the token cursor (including split state), the
-// event list, and the diagnostics.
+// event list, the diagnostics, and the recoveries.
 struct ParserMark {
     long position;
     long splitOffset;
     long lastContentEnd;
     long eventCount;
     long diagnosticCount;
+    long recoveryCount;
 }
 
 // Expressions nest through recursion; beyond this depth the parser stops recursing and emits an
@@ -193,6 +259,7 @@ class Parser {
 
     EventList events;
     DiagnosticList diagnostics;
+    RecoveryList recoveries;
     long expressionDepth;
 
     protected constructor(Source input, LexedToken[] tokens) {
@@ -204,6 +271,7 @@ class Parser {
         this.lastContentEnd = 0;
         this.events = new EventList();
         this.diagnostics = new DiagnosticList();
+        this.recoveries = new RecoveryList();
         this.expressionDepth = 0;
     }
 
@@ -213,6 +281,10 @@ class Parser {
 
     protected collectedDiagnostics() -> Diagnostic[] {
         return this.diagnostics.toArray();
+    }
+
+    protected collectedRecoveries() -> Recovery[] {
+        return this.recoveries.toArray();
     }
 
     // ============================================================ entries
@@ -412,21 +484,36 @@ class Parser {
     }
 
     // A zero-length Missing token at the end of the previous token's content, with a diagnostic
-    // anchored there.
-    missing(string message) {
+    // anchored there, recorded as a guess unless the token was a separator carrying no meaning.
+    missing(SyntaxKind expected, string message) {
         this.pushMissingToken();
+        if (!recovery.missingCostsNothing(expected)) {
+            this.recovered(recovery.scopeForMissing(expected));
+        }
         this.report(message, source.makeSpan(this.lastContentEnd, 0));
+    }
+
+    // A Missing token the parser puts in a slot the source was never going to fill, with the
+    // diagnostic reported by the caller: nothing is consumed, so the guess reaches no further than
+    // the construct being built.
+    missingInPlace() {
+        this.pushMissingToken();
+        this.recovered(RecoveryScope.Construct);
     }
 
     pushMissingToken() {
         this.pushTokenEvent(SyntaxKind.Missing, -1, 0, 0, false, false);
     }
 
+    recovered(RecoveryScope scope) {
+        this.recoveries.push(new Recovery(source.makeSpan(this.lastContentEnd, 0), scope));
+    }
+
     expect(SyntaxKind kind, string message) {
         if (this.at(kind)) {
             this.bump();
         } else {
-            this.missing(message);
+            this.missing(kind, message);
         }
     }
 
@@ -439,6 +526,7 @@ class Parser {
             lastContentEnd: this.lastContentEnd,
             eventCount: this.events.count(),
             diagnosticCount: this.diagnostics.count(),
+            recoveryCount: this.recoveries.count(),
         };
     }
 
@@ -448,6 +536,7 @@ class Parser {
         this.lastContentEnd = restore.lastContentEnd;
         this.events.truncate(restore.eventCount);
         this.diagnostics.truncate(restore.diagnosticCount);
+        this.recoveries.truncate(restore.recoveryCount);
     }
 
     // A speculative parse succeeded when it reported nothing since the mark.
@@ -470,7 +559,7 @@ class Parser {
             Greater -> this.bump(),
             GreaterGreater, GreaterGreaterGreater, GreaterEquals, GreaterGreaterEquals,
             GreaterGreaterGreaterEquals -> this.bumpSplit(SyntaxKind.Greater),
-            default -> this.missing(message),
+            default -> this.missing(SyntaxKind.Greater, message),
         }
     }
 
@@ -478,7 +567,7 @@ class Parser {
         switch (this.currentKind()) {
             Less -> this.bump(),
             LessLess, LessLessEquals -> this.bumpSplit(SyntaxKind.Less),
-            default -> this.missing(message),
+            default -> this.missing(SyntaxKind.Less, message),
         }
     }
 
@@ -730,7 +819,8 @@ class Parser {
             if (this.atContextual("hash")) {
                 this.bumpAs(SyntaxKind.HashKeyword);
             } else {
-                this.missing("Expected 'hash' and the artifact's checksum after the URL");
+                this.missing(SyntaxKind.HashKeyword,
+                "Expected 'hash' and the artifact's checksum after the URL");
             }
             this.expect(SyntaxKind.StringLiteral, "Expected the artifact's checksum as a "
                 + "string, for example 'hash \"sha256:...\"'");
@@ -889,7 +979,7 @@ class Parser {
         if (this.atContextual("from")) {
             this.bumpAs(SyntaxKind.FromKeyword);
         } else {
-            this.missing("Expected 'from' after 'external', for example "
+            this.missing(SyntaxKind.FromKeyword, "Expected 'from' after 'external', for example "
                 + "'external from libc \{ ... \}'");
         }
         this.expect(SyntaxKind.Identifier, "Expected the native library's name after 'from', "
@@ -933,7 +1023,7 @@ class Parser {
         } else if (this.at(SyntaxKind.InterpolatedStringStart)) {
             this.parseInterpolatedString();
         } else {
-            this.missing("Expected the test description string, for example "
+            this.missing(SyntaxKind.StringLiteral, "Expected the test description string, for example "
                 + "'test \"adds numbers\" \{ ... \}'");
         }
         this.parseBlockOrMissing("Expected '\{' for the test body");
@@ -987,7 +1077,7 @@ class Parser {
             this.bump();
         } else {
             this.nullSlot();
-            this.missing("Expected '\{' to begin the {what} body, or ';' for a bodiless "
+            this.missing(SyntaxKind.OpenBrace, "Expected '\{' to begin the {what} body, or ';' for a bodiless "
                 + "declaration");
         }
         let catches = this.start();
@@ -1022,7 +1112,7 @@ class Parser {
                         break;
                     }
                 } else {
-                    this.missing("Expected ',' between parameters");
+                    this.missing(SyntaxKind.Comma, "Expected ',' between parameters");
                 }
             }
             if (this.atParameterStart()) {
@@ -1191,7 +1281,7 @@ class Parser {
     parseMemberList(bool withLeadingJunk) {
         let marker = this.start();
         if (withLeadingJunk) {
-            this.pushMissingToken();
+            this.missingInPlace();
         } else {
             this.expect(SyntaxKind.OpenBrace, "Expected '\{' to begin the body");
         }
@@ -1290,7 +1380,7 @@ class Parser {
                 if (this.at(SyntaxKind.Comma)) {
                     this.bump();
                 } else {
-                    this.missing("Expected ',' after the enum member");
+                    this.missing(SyntaxKind.Comma, "Expected ',' after the enum member");
                 }
                 if (this.at(SyntaxKind.CloseBrace)) {
                     break;
@@ -1529,7 +1619,9 @@ class Parser {
     }
 
     // For a required Block slot when no '{' is present: an empty Block with missing braces keeps
-    // the typed accessors total, and the single diagnostic explains what was expected.
+    // the typed accessors total, and the single diagnostic explains what was expected. The block is
+    // zero-width and nothing is consumed, so the pair of braces is one guess reaching no further
+    // than the statement being built.
     parseBlockOrMissing(string message) {
         if (this.at(SyntaxKind.OpenBrace)) {
             this.parseBlock();
@@ -1537,7 +1629,7 @@ class Parser {
         }
         this.report(message, source.makeSpan(this.lastContentEnd, 0));
         let marker = this.start();
-        this.pushMissingToken();
+        this.missingInPlace();
         let statements = this.start();
         this.complete(statements, SyntaxKind.List);
         this.pushMissingToken();
@@ -1634,7 +1726,8 @@ class Parser {
                 "Expected the variable's name after its type, for example 'int count = 0;'");
         } else {
             this.nullSlot();
-            this.missing("Expected the variable's name, for example 'let count = 0;'");
+            this.missing(SyntaxKind.Identifier,
+                "Expected the variable's name, for example 'let count = 0;'");
         }
         if (this.at(SyntaxKind.Equals)) {
             this.parseInitializer();
@@ -1708,7 +1801,7 @@ class Parser {
             if (this.atContextual("in")) {
                 this.bumpAs(SyntaxKind.InKeyword);
             } else {
-                this.missing("Expected 'in' between the loop variable and the values, for "
+                this.missing(SyntaxKind.InKeyword, "Expected 'in' between the loop variable and the values, for "
                     + "example 'for (let item in items)'");
             }
             this.parseExpression();
@@ -1979,7 +2072,7 @@ class Parser {
         if (isTypeStart(this.currentKind())) {
             this.bump();
         } else {
-            this.missing(missingMessage);
+            this.missing(SyntaxKind.Identifier, missingMessage);
         }
         if (!this.at(SyntaxKind.Less) || !this.tryParseTypeArgumentList()) {
             this.nullSlot();

@@ -487,6 +487,10 @@ Every target triple and every optimization level has a folder of its own, so an 
 The `.ens` folder carries a `.gitignore` that ignores everything under it, and a build leaves what it put there in place.
 `ens run` and `ens test` are the exception: each builds in a folder of its own under the system's temporary directory and removes that folder afterwards, object files included, so neither leaves anything anywhere.
 
+A command reports every problem it found rather than stopping at the first.
+A syntax error does not hide the semantic problems around it: the compiler reads on past it and still reports what it can be sure of, so fixing one problem does not uncover a fresh crop of them.
+Where a syntax error leaves what a file declares in doubt, though, it is reported on its own, because anything said about the meaning of that file would be a consequence of the syntax error rather than a problem in its own right.
+
 Commands use the same three exit codes: `0` when the command did what was asked, `1` when the program or the project had problems, and `2` when the command line itself could not be acted on.
 `ens run` adds one case to that: once the program has run, its own exit code is what comes back.
 

@@ -88,7 +88,8 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
 - `corpus_roundtrip` asserts the self-hosted front end parses the whole repo byte-exact with no unexpected diagnostics.
 - `semacheck` is a bidirectional gate: every accepted program must produce zero self-hosted sema diagnostics, and every `@expect-error` fixture must be rejected by sema.
   A fixture whose diagnostic belongs to a later phase carries `// @expect-error-at <phase>`; a tag sema outgrows fails the run as stale.
-  A fixture the front end rejects never reaches sema at all, so a parse-level error and the semantic errors of the same feature cannot share a file: the parse error is reported alone.
+  A fixture with a syntax error still reaches sema, over the declarations the parser did not have to guess at: a syntax error inside one function body is reported alongside the semantic errors of every other declaration, so both can share a file.
+  A syntax error in what the file declares is still reported alone, because every reference to a declaration the parser guessed at would report a consequence rather than a problem (see `selfhost/sema/src/program/trust.ens`).
 - `codegencheck` runs twice, once per shipped code-generation configuration: `codegencheck` at `-O2` and `codegencheck_unoptimized` at `-O0`.
   `-O0` is what every program built with `-O0` gets, so it is gated exactly as hard as the default is.
 - Both arms must keep `selfhost/codegencheck/skiplist.txt` **empty**.
