@@ -32,7 +32,9 @@ task("test")
         import("core.project.config")
         import("core.base.option")
         import("core.base.global")
+        import("core.base.json")
         import("core.tool.toolchain")
+        import("net.http")
         import("async.runjobs")
         config.load()
         local mode = config.get("mode") or "release"
@@ -63,10 +65,10 @@ task("test")
             os.raise("Could not locate the linker bridge at " .. lld_library)
         end
 
-        -- the seed: the committed `ens` for this host. Its one job is to build the compiler out of
-        -- this tree, and nothing else in the suite runs it. Nothing it produces is ever compared
-        -- against anything either, so a seed left behind by the tree shows up as a failure to build
-        -- rather than as drift in what the tests measure.
+        -- the seed: the published `ens` this tree pins for this host. Its one job is to build the
+        -- compiler out of this tree, and nothing else in the suite runs it. Nothing it produces is
+        -- ever compared against anything either, so a seed left behind by the tree shows up as a
+        -- failure to build rather than as drift in what the tests measure.
         local seed_platforms = {windows = "windows", linux = "linux", macosx = "macos"}
         local seed_architectures = {x64 = "x64", x86_64 = "x64", arm64 = "arm64"}
         local seed_host = (seed_platforms[plat] or plat) .. "-" .. (seed_architectures[arch] or arch)
@@ -509,15 +511,118 @@ task("test")
             end
         end
 
-        -- place the seed: the `ens` committed for this host, put where the build below looks for it.
-        -- A host with no committed seed cannot run the suite, and saying so is the right outcome:
+        -- what the tree pins the seed to: the release tag it was published under and the sha256 of
+        -- each host's binary. One file covers all three hosts, because a refresh replaces every one
+        -- of them together and a per-host pin would let one host bootstrap from a seed the others
+        -- have already moved past.
+        local function seedPin()
+            local pin_file = path.join(os.projectdir(), "seed", "seed.json")
+            local text = io.readfile(pin_file)
+            if not text then
+                os.raise("the bootstrap seed pin is missing: '%s' does not exist. It names the "
+                    .. "release every host's seed is downloaded from, and nothing can be built "
+                    .. "without it.", pin_file)
+            end
+            local pin = try {
+                function() return json.decode(text) end,
+                catch {
+                    function(errors)
+                        os.raise("the bootstrap seed pin at '%s' is not valid JSON: %s", pin_file,
+                            ((tostring(errors):gsub("%s+$", ""))))
+                    end
+                }
+            }
+            if type(pin) ~= "table" or type(pin.tag) ~= "string" or type(pin.url) ~= "string"
+                    or type(pin.hosts) ~= "table" then
+                os.raise("the bootstrap seed pin at '%s' is missing what it has to say: a 'tag' "
+                    .. "string, a 'url' string, and a 'hosts' object mapping each host to the "
+                    .. "sha256 of its seed.", pin_file)
+            end
+            local sha256 = pin.hosts[seed_host]
+            if type(sha256) ~= "string" then
+                local named = {}
+                for host in pairs(pin.hosts) do
+                    table.insert(named, "'" .. host .. "'")
+                end
+                table.sort(named)
+                os.raise("no bootstrap seed for %s: '%s' pins %s. Seeds are not cross-compiled, so "
+                    .. "one has to be built on this host and published before it can bootstrap; "
+                    .. "until then, point ENS_SEEDS at a folder holding '%s/ens%s'.", seed_host,
+                    pin_file, table.concat(named, ", "), pin.tag, exe_suffix)
+            end
+            return pin.tag, pin.url, sha256
+        end
+
+        -- where downloaded seeds are kept: the folder ENS_SEEDS names, else '.ens/seeds' under this
+        -- user's own folder, one folder per release tag. They sit beside the toolchains a version
+        -- hop reaches for rather than among them: a toolchain there is a language version, a seed is
+        -- one particular build, and several seeds are the same language version.
+        local function seedRoot()
+            local named = os.getenv("ENS_SEEDS")
+            if named and #named > 0 then
+                return path.normalize(named)
+            end
+            local variable = is_host("windows") and "USERPROFILE" or "HOME"
+            local user = os.getenv(variable)
+            if not user or #user == 0 then
+                os.raise("nowhere to keep the bootstrap seed: set ENS_SEEDS to the folder seeds "
+                    .. "live in, or set %s so they are kept under '.ens/seeds' there.", variable)
+            end
+            return path.join(path.join(path.normalize(user), ".ens"), "seeds")
+        end
+
+        -- download this host's seed for `tag` and install it at `installed`. It lands in a scratch
+        -- folder and is moved into place only once it hashes to what the tree pins, so an
+        -- interrupted or tampered download cannot leave behind something a later run mistakes for a
+        -- verified seed.
+        local function fetchSeed(tag, url, sha256, installed)
+            local asset = string.format("%s/%s/ens-%s%s", url, tag, seed_host, exe_suffix)
+            local scratch = path.join(os.tmpdir(), "ens-seed-" .. tag .. "-" .. seed_host)
+            os.tryrm(scratch)
+            os.mkdir(scratch)
+            local downloaded = path.join(scratch, "ens" .. exe_suffix)
+            print(string.format("Downloading the %s bootstrap seed %s...", seed_host, tag))
+            try {
+                function() http.download(asset, downloaded) end,
+                catch {
+                    function(errors)
+                        os.tryrm(scratch)
+                        os.raise("could not download the %s bootstrap seed from '%s': %s. The "
+                            .. "suite needs it to build the compiler; with no network, point "
+                            .. "ENS_SEEDS at a folder holding '%s/ens%s'.", seed_host, asset,
+                            ((tostring(errors):gsub("%s+$", ""))), tag, exe_suffix)
+                    end
+                }
+            }
+            local found = hash.sha256(downloaded)
+            if found ~= sha256 then
+                os.tryrm(scratch)
+                os.raise("the %s bootstrap seed downloaded from '%s' is not what this tree pins.\n"
+                    .. "  pinned sha256 %s\n  downloaded    %s\nThe release asset was replaced or "
+                    .. "the download is corrupt; nothing is run until the two agree.", seed_host,
+                    asset, sha256, found)
+            end
+            os.mkdir(path.directory(installed))
+            os.mv(downloaded, installed)
+            os.tryrm(scratch)
+        end
+
+        -- place the seed: the `ens` this tree pins for this host, put where the build below looks
+        -- for it. A host with no seed cannot run the suite, and saying so is the right outcome:
         -- falling back to another compiler would leave the seed untested.
         local function locateSeed()
-            local committed = path.join(os.projectdir(), "seed", seed_host, "ens" .. exe_suffix)
-            if not os.isfile(committed) then
-                os.raise("no bootstrap seed for %s: %s does not exist. Build one on that platform "
-                    .. "with an `ens` that already runs there (`ens build selfhost/driver "
-                    .. "--output <path>`) and commit it there.", seed_host, committed)
+            local tag, url, sha256 = seedPin()
+            local installed = path.join(path.join(seedRoot(), tag), "ens" .. exe_suffix)
+            if not os.isfile(installed) then
+                fetchSeed(tag, url, sha256, installed)
+            end
+            -- checked on every run and not only when downloaded: this is the one binary the suite
+            -- runs that the tree did not build, so what it is stays verified rather than assumed.
+            local found = hash.sha256(installed)
+            if found ~= sha256 then
+                os.raise("the %s bootstrap seed at '%s' is not what this tree pins.\n  pinned "
+                    .. "sha256 %s\n  found         %s\nDelete it to have the pinned one downloaded "
+                    .. "again.", seed_host, installed, sha256, found)
             end
             local env, native_libraries, env_error = llvmEnvironment()
             if not env then
@@ -525,9 +630,9 @@ task("test")
             end
             os.tryrm(seed_dir)
             os.mkdir(seed_dir)
-            os.cp(committed, seed_exe)
+            os.cp(installed, seed_exe)
             if not is_host("windows") then
-                -- a copy is not guaranteed to keep the executable bit the checkout recorded.
+                -- a release asset carries no permissions, so the executable bit is set here.
                 os.runv("chmod", {"+x", seed_exe})
             end
             -- the seed loads LLVM and the linker bridge at run time, and on Windows the loader
@@ -537,7 +642,7 @@ task("test")
 
         -- build the compiler every job then drives: the seed compiles `selfhost/driver` out of this
         -- tree, so what the suite measures is the sources rather than a binary in the repository.
-        -- This is also the whole of what the committed seed has to do, and it is checked here by
+        -- This is also the whole of what the pinned seed has to do, and it is checked here by
         -- construction: a seed that cannot build the tree stops the run before any job starts.
         local function buildHostCompiler()
             local log = path.join(out_dir, "host.log")
@@ -2775,7 +2880,7 @@ task("test")
         -- parallel, so the seed is placed and the compiler built here rather than on demand inside
         -- one of them.
         locateSeed()
-        print(string.format("Building the compiler with the committed %s seed...", seed_host))
+        print(string.format("Building the compiler with the pinned %s seed...", seed_host))
         local host_started = os.mclock()
         buildHostCompiler()
         print(string.format("Compiler built in %.0fs", (os.mclock() - host_started) / 1000.0))
