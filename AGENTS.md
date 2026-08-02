@@ -50,7 +50,10 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
   - `server/` - the server itself, built as `ens-lsp`: the document store, the diagnostic bridge, and the requests it answers.
   - `frontend/` - the C++ lexer, parser, CST and semantic analyzer it reads a document with, built as `lsp-frontend`. It belongs to the language server and to nothing else; the language's own front end is `selfhost/frontend/`, and a question about the language is answered there or in `spec.md`, never here.
 - `tools/` - editor integrations; `tools/grammar/` is canonical for the shared grammar/config files.
+- `seed/seed.json` - which published release every host's bootstrap seed is downloaded from, and the sha256 of each; see The bootstrap seed.
 - `scripts/xmake_test.lua` - the test runner; read its header comment for the fixture directives.
+- `scripts/xmake_packages.lua` - local overrides of xmake-repo package definitions, each one a workaround for an upstream bug and each carrying the condition for deleting it.
+- `.github/workflows/` - `test.yml` runs the suite on all three hosts; `release.yml` is dispatch-only and publishes a release plus the pull request that repins the seed.
 
 ## Building and testing
 
@@ -62,11 +65,13 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
 - Run everything: `xmake test` (subset: `xmake test <name>...`).
   The full suite must be green before every commit, with no exceptions.
   `xmake test` builds `ens-lld` itself when it is missing, so it is the one command that always works from a clean checkout.
-- `xmake test` starts by building the compiler it then tests: the committed **seed** for this host compiles `selfhost/driver` into `build/host/ens`, and every job that compiles Ens drives that.
+- `xmake test` starts by building the compiler it then tests: the **seed** for this host compiles `selfhost/driver` into `build/host/ens`, and every job that compiles Ens drives that.
   Everything Ens-related is therefore built by the Ens compiler as this tree defines it, so nothing frozen into the seed can shape what the suite measures.
   It is built before the jobs start, because they run in parallel and all of them need it.
+  The seed is downloaded once per pin, so the first run on a machine needs the network; see The bootstrap seed.
 - The packaging tests (`cli_dependencies`, `cli_prebuilt`) shell out to the system `git` and `curl`; both must be on PATH.
-  They drive scratch repositories over `file://` URLs and a scratch cache, so no test ever reaches the network or this machine's own cache.
+  They drive scratch repositories over `file://` URLs and a scratch cache, so no test reaches the network or this machine's own cache.
+  Placing the seed is the one thing in a run that does, and it happens before any job starts.
 - `xmake test` uses the binary of the currently configured mode.
   Never run `xmake f -m release` to "fix" staleness; rebuild instead.
   If linking fails with unresolved LLVM symbols, put the LLVM package's `bin` folder (containing `clang++.exe`) on PATH, run `xmake f -c -m <current mode> -p windows -a x64`, then `xmake build ens-lld`.
@@ -103,13 +108,14 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
 ## The bootstrap seed
 
 `ens` is written in Ens, so building it needs an `ens` that already runs.
-That first one is committed to the repository, one binary per host, and `xmake test` copies the one matching the host into `build/seed/` before anything else:
+That first one is published as a GitHub release, one binary per host, and the tree pins which release in `seed/seed.json`.
 
-- `seed/windows-x64/ens.exe`
-- `seed/linux-x64/ens`
-- `seed/macos-arm64/ens`
+Before anything else, `xmake test` downloads the asset for this host to `~/.ens/seeds/<tag>/`, checks it against the pinned sha256, and copies it into `build/seed/`.
+The download happens once per pin; later runs use the cached copy, and the hash is re-checked every run, because this is the one binary the suite runs that the tree did not build.
+`ENS_SEEDS` overrides where seeds are kept, which is also how to work offline or from a seed built by hand.
 
-A host with no committed seed fails the run by name instead of falling back to another compiler, because a fallback would leave the seed itself untested.
+A host the pin does not name fails the run by name instead of falling back to another compiler, because a fallback would leave the seed itself untested.
+A pin whose asset is gone, or whose bytes no longer hash to what is pinned, is equally a hard failure: nothing runs until the two agree.
 Nothing has to be compiled from C++ before Ens can be, beyond the `ens-lld` linker bridge and the LLVM package every build links against.
 
 **What the seed is for, and what it is not.**
@@ -123,15 +129,23 @@ A seed goes stale when the sources start using something it cannot compile: a ne
 The symptom is always the same, and it is loud: `xmake test` stops before any job runs, naming the platform and quoting the build it could not finish.
 It never shows up as a test that starts passing or failing differently.
 
-To produce a replacement, run an `ens` that already works on that platform against this tree, and write the result over the committed binary: `ens build selfhost/driver --output seed/windows-x64/ens.exe --stdlib libs`, with the platform folder and file name of the host you are on.
+A refresh is one dispatch of the `release` workflow: it builds `ens` on all three hosts, publishes them as a release, and opens a pull request moving `seed/seed.json` to that tag.
+Merging that pull request is what makes the new seed the one every run bootstraps from, so the suite has to be green on all three hosts against it first.
+Each binary is built on its own platform because seeds are not cross-compiled, and there is no C++ compiler to fall back on any more.
+
+By hand, the same thing is `ens build selfhost/driver --output ens --stdlib libs`, run on the platform being refreshed.
 `--stdlib libs` is what makes it this tree's standard library rather than the one belonging to whatever `ens` is doing the building.
 That `ens` may be the seed being replaced, a `build/host/ens` from an earlier commit, or an installed toolchain; all that matters is that it compiles these sources.
 
-The new binary lands in the same commit as the change that needed it, because every commit has to be buildable from its own checkout.
-A change no seed can compile therefore needs all three refreshed, and each one has to be built on its own platform: seeds are not cross-compiled, and there is no C++ compiler to fall back on any more.
-A platform whose seed is too old cannot bootstrap at all until somebody on that platform builds one, so a change that outruns the seeds should not land until every platform has its replacement.
+A release is never rewritten: a pin names a release, so replacing an asset breaks every commit that pinned it, and the sha256 turns that into a loud failure rather than a silent swap.
+A newer seed supersedes an older one under a new tag instead.
 
-The cost this model accepts is a multi-megabyte binary per platform in git history, growing every time it is refreshed.
+Two rules follow from the pin naming a release that already exists.
+A feature has to be implemented by the compiler in one commit before the sources are allowed to use it in a later one, because the seed for a commit is built from an earlier commit and cannot know anything newer.
+And a change that outruns the seeds should not land until every platform has its replacement, since a platform whose seed is too old cannot bootstrap at all.
+
+The cost this model accepts is that a checkout is only buildable while its pinned release still exists, so the tag behind a pin is never deleted.
+Recovery from a lost asset means rebuilding it from that tag, which needs the seed the tag itself pinned, so the chain has to stay walkable.
 
 ## The self-hosted compiler
 
