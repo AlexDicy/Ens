@@ -1,0 +1,199 @@
+# Publishes an `ens` release and the seed the tree bootstraps from: the same binary, one per host.
+# Dispatch only. A seed is refreshed when the sources outgrow it, which is an occasional deliberate
+# act and not something a push should trigger.
+#
+# The tag is the version with a leading v. Seeds are cached by tag.
+#
+# The release is created as a draft first and each host uploads straight into it, instead of passing
+# through the artifact store.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to publish, without the leading "v"
+        required: true
+      dry_run:
+        description: Build, test and hash on every host without publishing anything
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-v${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Open a draft release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ inputs.version }}" \
+            --draft \
+            --target "$GITHUB_SHA" \
+            --title "Ens ${{ inputs.version }}" \
+            --generate-notes
+
+  build:
+    needs: draft
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-2022, host: windows-x64,  plat: windows, arch: x64,   suffix: .exe }
+          - { os: ubuntu-22.04, host: linux-x64,    plat: linux,   arch: x64,   suffix: '' }
+          - { os: macos-14,     host: macos-arm64,  plat: macosx,  arch: arm64, suffix: '' }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: xmake-io/github-action-setup-xmake@v1
+
+      # The key covers the add_requires lines only to prevent rebuilding LLVM from source for unrelated changes.
+      - name: Resolve the cache key and the package folder
+        id: packages
+        shell: bash
+        run: |
+          folder="$(xmake l -c 'import("core.base.global"); print(global.directory())' | tr -d '\r')"
+          echo "folder=${folder}/packages" >> "$GITHUB_OUTPUT"
+          grep -E '^\s*add_requires' xmake.lua > requires.txt
+          key="$(xmake l -c "print(hash.sha256('requires.txt'))" | tr -d '\r\n' | cut -c1-16)"
+          test -n "$key" || { echo "could not hash the add_requires lines"; exit 1; }
+          echo "key=packages-${{ matrix.host }}-${key}" >> "$GITHUB_OUTPUT"
+          rm requires.txt
+
+      - name: Cache the LLVM packages
+        if: runner.os != 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.packages.outputs.folder }}
+          key: ${{ steps.packages.outputs.key }}
+
+      - name: Cache the bootstrap seed
+        uses: actions/cache@v4
+        with:
+          path: ~/.ens/seeds
+          key: seeds-${{ matrix.host }}-${{ hashFiles('seed/seed.json') }}
+
+      - name: Resolve packages
+        run: xmake f -y -m release -p ${{ matrix.plat }} -a ${{ matrix.arch }}
+
+      - name: Put the LLVM package on PATH
+        shell: bash
+        run: |
+          clang="$(find "${{ steps.packages.outputs.folder }}/l/llvm" -type f \
+            \( -name 'clang++' -o -name 'clang++.exe' \) -print -quit)"
+          test -n "$clang" || { echo "no clang++ in the llvm package"; exit 1; }
+          dirname "$clang" >> "$GITHUB_PATH"
+
+      - name: Configure
+        run: xmake f -c -y -m release -p ${{ matrix.plat }} -a ${{ matrix.arch }}
+
+      - name: Build the linker bridge
+        run: xmake build ens-lld
+
+      # a release is only ever cut from a tree that is green on the host it is cut for. This also
+      # produces build/host/ens: the compiler this tree defines, built by the pinned seed.
+      - name: Test
+        run: xmake test
+
+      # built by build/host/ens rather than by the seed, so nothing the seed decided reaches the
+      # published binary. The bootstrap gate already proved the two (host and final) agree byte for byte.
+      - name: Build the release compiler
+        shell: bash
+        run: |
+          mkdir -p dist
+          ./build/host/ens build selfhost/driver --stdlib libs \
+            --output "dist/ens-${{ matrix.host }}${{ matrix.suffix }}"
+
+      - name: Hash
+        id: digest
+        shell: bash
+        run: |
+          cd dist
+          name="ens-${{ matrix.host }}${{ matrix.suffix }}"
+          digest="$(xmake l -c "print(hash.sha256('${name}'))" | tr -d '\r\n')"
+          test -n "$digest" || { echo "could not hash ${name}"; exit 1; }
+          printf '%s' "$digest" > "${name}.sha256"
+          echo "${name} ${digest}"
+
+      - name: Upload to the release
+        if: ${{ !inputs.dry_run }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "v${{ inputs.version }}" \
+            "dist/ens-${{ matrix.host }}${{ matrix.suffix }}" --clobber
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.host }}
+          path: dist/*.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: digests
+          merge-multiple: true
+
+      - name: Rewrite the seed pin
+        shell: bash
+        run: |
+          shopt -s nullglob
+          hosts='{}'
+          for file in digests/*.sha256; do
+            host="$(basename "$file" .sha256)"
+            host="${host#ens-}"
+            host="${host%.exe}"
+            hosts="$(jq --arg h "$host" --arg s "$(cat "$file")" '.[$h] = $s' <<<"$hosts")"
+          done
+          # every host is refreshed together.
+          expected='["linux-x64","macos-arm64","windows-x64"]'
+          found="$(jq -c 'keys' <<<"$hosts")"
+          test "$found" = "$expected" || {
+            echo "the digests name $found, expected $expected"; exit 1; }
+          jq -n --sort-keys \
+            --arg tag "v${{ inputs.version }}" \
+            --arg url "https://github.com/${GITHUB_REPOSITORY}/releases/download" \
+            --argjson hosts "$hosts" \
+            '{tag: $tag, url: $url, hosts: $hosts}' > seed/seed.json
+          cat seed/seed.json
+
+      - name: Publish the release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "v${{ inputs.version }}" --draft=false
+
+      # the pin lands as a pull request, not a push: the suite has to run against the new seed on
+      # every host before it becomes what the tree bootstraps from. Building the seed proved it can
+      # rebuild the commit it came from, which is necessary but not enough.
+      #
+      # A pull request opened with GITHUB_TOKEN does not trigger another workflow,
+      # use a custom SEED_PR_TOKEN instead.
+      - uses: peter-evans/create-pull-request@v6
+        if: ${{ !inputs.dry_run }}
+        with:
+          token: ${{ secrets.SEED_PR_TOKEN || github.token }}
+          branch: seed/v${{ inputs.version }}
+          title: Bootstrap from the v${{ inputs.version }} seed
+          commit-message: Bootstrap from the v${{ inputs.version }} seed
+          body: |
+            Points `seed/seed.json` at the `v${{ inputs.version }}` release, built from
+            ${{ github.sha }} on every supported host.
+
+            Merging this makes it the seed every run bootstraps from, so the suite has to be
+            green on all three hosts here.

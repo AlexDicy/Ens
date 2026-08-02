@@ -1,0 +1,83 @@
+# Runs the suite on every host, on every push and pull request.
+#
+# The nightly schedule prevents cache eviction after 7 days without a read, a cold cache
+# on Linux or macOS means building LLVM from source.
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-2022, host: windows-x64,  plat: windows, arch: x64 }
+          - { os: ubuntu-22.04, host: linux-x64,    plat: linux,   arch: x64 }
+          - { os: macos-14,     host: macos-arm64,  plat: macosx,  arch: arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: xmake-io/github-action-setup-xmake@v1
+
+      # The key covers the add_requires lines only to prevent rebuilding LLVM from source for unrelated changes.
+      - name: Resolve the cache key and the package folder
+        id: packages
+        shell: bash
+        run: |
+          folder="$(xmake l -c 'import("core.base.global"); print(global.directory())' | tr -d '\r')"
+          echo "folder=${folder}/packages" >> "$GITHUB_OUTPUT"
+          grep -E '^\s*add_requires' xmake.lua > requires.txt
+          key="$(xmake l -c "print(hash.sha256('requires.txt'))" | tr -d '\r\n' | cut -c1-16)"
+          test -n "$key" || { echo "could not hash the add_requires lines"; exit 1; }
+          echo "key=packages-${{ matrix.host }}-${key}" >> "$GITHUB_OUTPUT"
+          rm requires.txt
+
+      # Linux and macOS build LLVM from source, Windows downloads prebuilt binaries.
+      - name: Cache the LLVM packages
+        if: runner.os != 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.packages.outputs.folder }}
+          key: ${{ steps.packages.outputs.key }}
+
+      - name: Cache the bootstrap seed
+        uses: actions/cache@v4
+        with:
+          path: ~/.ens/seeds
+          key: seeds-${{ matrix.host }}-${{ hashFiles('seed/seed.json') }}
+
+      - name: Resolve packages
+        run: xmake f -y -m release -p ${{ matrix.plat }} -a ${{ matrix.arch }}
+
+      # the LLVM package's bin folder has to be on PATH before the configure that sticks, or the
+      # linker resolves to MSVC link.exe, -lLLVMCGData is ignored and CGData symbols go unresolved.
+      # That choice is written into the config, so a later fix to PATH alone does not undo it.
+      - name: Put the LLVM package on PATH
+        shell: bash
+        run: |
+          clang="$(find "${{ steps.packages.outputs.folder }}/l/llvm" -type f \
+            \( -name 'clang++' -o -name 'clang++.exe' \) -print -quit)"
+          test -n "$clang" || { echo "no clang++ in the llvm package"; exit 1; }
+          dirname "$clang" >> "$GITHUB_PATH"
+
+      - name: Configure
+        run: xmake f -c -y -m release -p ${{ matrix.plat }} -a ${{ matrix.arch }}
+
+      # xmake test builds this itself when it is missing, but doing it here keeps a failure to build
+      # the bridge separate from a failure in the suite.
+      - name: Build the linker bridge
+        run: xmake build ens-lld
+
+      - name: Test
+        run: xmake test
