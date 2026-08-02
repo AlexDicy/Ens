@@ -143,6 +143,15 @@ task("test")
             })
         end
 
+        -- the language server is the one target nothing else here compiles, so it can stop building
+        -- without a single check noticing.
+        if want("ens_lsp") then
+            table.insert(jobs, {
+                name = "ens_lsp",
+                lsp_build = true,
+            })
+        end
+
         -- the self-hosted front end's own tests run as one `ens test <package>` job.
         if want("selfhost_frontend") then
             table.insert(jobs, {
@@ -2557,9 +2566,32 @@ task("test")
                 full = string.format("%s:\n%s", name, table.concat(failures, "\n"))}
         end
 
+        -- builds the language server, which nothing else compiles. An editor holding the binary open
+        -- makes the link fail for a reason that has nothing to do with the change, so that case is
+        -- reported as a skip: a run that cannot check says so instead of going red.
+        local function run_lsp_build(job)
+            local log = path.join(out_dir, job.name .. ".log")
+            local rc = execMerged("xmake", {"build", "ens-lsp"}, log)
+            if rc == 0 then
+                return {name = job.name, ok = true}
+            end
+            local out = io.readfile(log) or ""
+            for _, locked in ipairs({"LNK1104", "Permission denied", "Access is denied",
+                                     "being used by another process"}) do
+                if out:find(locked, 1, true) then
+                    return {name = job.name, ok = true,
+                        note = "skipped: the language server binary is in use"}
+                end
+            end
+            return {name = job.name, ok = false,
+                short = string.format("build exit %s", tostring(rc)),
+                full = string.format("%s: %s", job.name, (out:gsub("[\r\n]+$", "")))}
+        end
+
         -- run a single test: compile, optionally run, and compare against the header.
         -- returns { name = ..., ok = bool, short = <fail reason>, full = <detailed report> }.
         local function run_one(job)
+            if job.lsp_build then return run_lsp_build(job) end
             if job.corpus then return run_corpus(job) end
             if job.semacheck then return run_semacheck(job) end
             if job.cli_build then return run_cli_build(job) end
