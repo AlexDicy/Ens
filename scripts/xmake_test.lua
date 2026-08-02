@@ -210,7 +210,7 @@ task("test")
             })
         end
 
-        -- the semantic differential harness runs the self-hosted sema pipeline over every
+        -- the semantic gate runs the self-hosted sema pipeline over every
         -- program unit and gates the build in both directions: accepted units must be clean,
         -- and every @expect-error unit must be rejected unless a seed file tags the diagnostic
         -- as belonging to a later phase with '// @expect-error-at <phase>' (a tag that sema
@@ -222,7 +222,7 @@ task("test")
             })
         end
 
-        -- the code-generation differential harness: build the spike (an Ens program that emits an
+        -- the code-generation gate: build the spike (an Ens program that emits an
         -- object file through the ens.llvm binding) and the harness, then drive the spike from
         -- emission through linking and execution and enforce the skip-list anti-rot rule.
         --
@@ -604,7 +604,7 @@ task("test")
                 full = string.format("%s:\n%s", name, out)}
         end
 
-        -- the semantic differential harness: build the harness exe fresh from its own workspace (it
+        -- the semantic gate: build the harness exe fresh from its own workspace (it
         -- imports the front end and the sema layer as packages), enumerate every program unit into
         -- a manifest, and run the harness over it. Units are the single-file tests, the folder
         -- tests, and the selfhost library packages; libs/std is covered transitively by every unit
@@ -682,7 +682,7 @@ task("test")
                 full = string.format("%s:\n%s", name, out)}
         end
 
-        -- the code-generation differential harness: build the harness and the spike, drive the
+        -- the code-generation gate: build the harness and the spike, drive the
         -- spike from object emission through linking and execution, and enforce the skip-list
         -- anti-rot rule over the runnable fixtures. The spike links the ens.llvm native binding,
         -- so the build has to point the linker at the local LLVM library and the run has to make
