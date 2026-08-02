@@ -10,7 +10,9 @@
 -- and @stderr-contains each name a substring the stream must contain. Both streams are captured
 -- separately, so what the runtime reports on stderr - a panic, an unhandled exception - is
 -- asserted with the @stderr directives and never appears in stdout.
--- use @expect-error instead to assert the compiler reports a specific diagnostic.
+-- use @expect-error instead to assert the compiler reports a specific diagnostic. These accumulate:
+-- every one of them names a substring the compiler's output must contain, so a file whose problems
+-- are reported together says so by listing them all.
 --     // @expect-error Undefined function 'testFunction'
 -- a folder test's main.ens may use @ens-test (optionally with extra arguments) to run
 -- `ens test <folder> ...` instead of compile+run, asserting on its two streams the same way.
@@ -2614,7 +2616,7 @@ task("test")
             local expected_contains = {}    -- substrings that must each appear in stdout
             local expected_stderr   = nil   -- the same, for the standard error stream
             local expected_stderr_contains = {}
-            local expected_error    = nil
+            local expected_errors   = {}
             local ens_test_args     = job.ens_test_args   -- @ens-test: run `ens test` on the folder instead
             local content = (ens_file and io.readfile(ens_file)) or ""
             for line in content:gmatch("[^\r\n]+") do
@@ -2637,7 +2639,7 @@ task("test")
                     table.insert(expected_stderr, stderr_str)
                 end
                 local error_str = line:match("^%s*//%s*@expect%-error%s+(.*)$")
-                if error_str then expected_error = error_str end
+                if error_str then table.insert(expected_errors, error_str) end
                 local enstest_str = line:match("^%s*//%s*@ens%-test%s*(.*)$")
                 if enstest_str then
                     ens_test_args = {}
@@ -2726,13 +2728,15 @@ task("test")
                 {envs = env})
             local compile_log_text = io.readfile(compile_log) or ""
 
-            if expected_error ~= nil then
+            if #expected_errors > 0 then
                 local why = {}
                 if os.isfile(exe_file) then
                     table.insert(why, "compile succeeded but @expect-error was set")
                 end
-                if not compile_log_text:find(expected_error, 1, true) then
-                    table.insert(why, string.format("error %q not found in stderr", expected_error))
+                for _, expected in ipairs(expected_errors) do
+                    if not compile_log_text:find(expected, 1, true) then
+                        table.insert(why, string.format("error %q not found in stderr", expected))
+                    end
                 end
                 if #why == 0 then
                     return {name = name, ok = true}

@@ -81,6 +81,7 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
   Header directives drive assertions: `// @exit N`, `// @stdout ...`, `// @expect-error <substring>`, `// @ens-test <args>`.
   A fixture carrying `@ens-test` runs through `ens test`; every other fixture is compiled by `ens build`, and `codegencheck` compiles all of them through the self-hosted pipeline as well.
   An `@expect-error` substring is the diagnostic's wording, so it is what holds the message to its bar: never shorten one to make a run pass, and never point one at a weaker message than the compiler can give.
+  The directive accumulates: a fixture whose problems are reported together lists all of them, and `@expect-error build failed with N problems` pins the count, which is how a fixture holds the compiler to reporting nothing extra.
 - Group related scenarios into one or two files (happy paths vs errors), not one file per scenario.
 - Unit test coverage matters: new code ships with tests for its own logic (the self-hosted packages keep unit tests in their `tests/` folders), not just end-to-end fixtures.
 - A package's `tests/` folder mirrors the grouping of its `src/` folder; put new tests in the subfolder matching the code under test.
