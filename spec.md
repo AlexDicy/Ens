@@ -188,6 +188,9 @@ A field whose type has no default value, such as a class, a string, an array, or
 A `this.field` parameter, a declared field default, and a `this.field = ...` assignment in the body all count, and assigning the field in every branch of an `if` or `switch` satisfies the rule exactly as a single unconditional assignment does.
 A constructor that leaves such a field unassigned on some path, for example by returning early before it is set, is a compile error, and a class that has such a field but declares no constructor at all is rejected the same way.
 
+A field carries visibility modifiers, and in a class also `weak`; no other modifier applies to one.
+`abstract`, `override`, `final`, `sealed`, `noreturn`, and `const` each govern a method, a type, or a local declaration, so writing one on a field is an error that names where the modifier does belong.
+
 A class may declare a `destructor`, introduced by the `destructor` keyword, to run cleanup when an instance is destroyed.
 A destructor takes no parameters, has no return type, and cannot be `throws`; a class declares at most one, and it cannot be called explicitly.
 When the last reference to an object is released its destructor runs, followed by each inherited destructor from the most derived class up to the base, and then the object's fields are released.
