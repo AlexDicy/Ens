@@ -5,6 +5,7 @@ import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import FieldDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import NamedTypeNode from @ens.frontend.syntax.generated.nodes;
 import SyntaxKind from @ens.frontend.syntax.generated.kind;
+import SyntaxToken from @ens.frontend.syntax.node;
 import Span from @ens.frontend.support.source;
 import Reporter from support.diagnostics;
 import TypeResolver from phases.resolve;
@@ -110,50 +111,128 @@ public fieldModifiers(FieldDeclarationNode declaration) -> MemberModifiers {
     return modifiers;
 }
 
-// A field carries visibility and 'weak'. Every other modifier governs a method, a type, or a
-// local declaration, so on a field it promises something the language never honors; the answer
-// names where the modifier does belong. A modifier the grammar gains later lands in the last arm
-// and is refused on fields until someone decides it means something there.
-fieldModifierProblem(SyntaxKind kind) -> string? {
+// What a declaration is, for the modifiers that suit one kind and not another. A member is a
+// method, constructor, or destructor of a class, struct, or interface; a function is declared at
+// the top level, where nothing inherits it.
+enum DeclarationShape {
+    Field,
+    Member,
+    Function,
+}
+
+// Why a declaration cannot carry a modifier, or null when it may. One table for every shape, so a
+// modifier's rule and the phrase naming where it does belong are each written once: a field carries
+// visibility and 'weak', a member adds the markers that govern dispatch, a function adds only
+// 'noreturn', and what is left over governs a type or a local declaration. Each shape narrows this
+// further where it is read - an interface method takes no visibility, a constructor no 'override',
+// an abstract method needs an abstract class - and a modifier the grammar gains later reaches the
+// last arm and is refused everywhere until someone places it.
+modifierProblem(SyntaxKind kind, DeclarationShape shape) -> string? {
     switch (kind) {
-        PublicKeyword, PrivateKeyword, ProtectedKeyword, ExportKeyword, WeakKeyword -> {
+        PublicKeyword, PrivateKeyword, ProtectedKeyword, ExportKeyword -> {
             return null;
         },
-        AbstractKeyword -> {
-            return "'abstract' leaves a method for a subclass to implement, and nothing can "
-                + "implement a field";
-        },
-        OverrideKeyword -> {
-            return "'override' marks a method that replaces one it inherits or a behavior the "
-                + "language provides, and a field replaces neither";
-        },
-        FinalKeyword -> {
-            return "'final' forbids overriding a method or extending a class";
-        },
-        SealedKeyword -> {
-            return "'sealed' closes a class hierarchy, so it belongs on a class";
-        },
-        ConstKeyword -> {
-            return "only a local declaration can be ('const limit = 10')";
+        WeakKeyword -> {
+            if (shape == DeclarationShape.Field) {
+                return null;
+            }
+            return "'weak' goes on a class field that refers to an object without keeping it "
+                + "alive, as in 'weak Parent? parent'";
         },
         NoreturnKeyword -> {
-            return "'noreturn' states that a function never returns to its caller";
+            if (shape != DeclarationShape.Field) {
+                return null;
+            }
+            return "'noreturn' goes on a function or method that never finishes normally, because "
+                + "it always throws or calls 'panic'";
+        },
+        AbstractKeyword -> {
+            if (shape == DeclarationShape.Member) {
+                return null;
+            }
+            return "'abstract' is for a method with no body, which each subclass then writes for "
+                + "itself";
+        },
+        OverrideKeyword -> {
+            if (shape == DeclarationShape.Member) {
+                return null;
+            }
+            return "'override' is for a method that replaces one the type inherits";
+        },
+        FinalKeyword -> {
+            if (shape == DeclarationShape.Member) {
+                return null;
+            }
+            return "'final' stops a method from being overridden or a class from being extended";
+        },
+        SealedKeyword -> {
+            return "'sealed' goes on a class, where it means only the same module can extend it";
+        },
+        ConstKeyword -> {
+            return "'const' goes on a variable inside a function, as in 'const limit = 10'";
         },
         default -> {
-            return "a field carries only visibility and 'weak'";
+            return "no field, method, or function takes it";
         },
     }
 }
 
+reportModifierProblem(Reporter reporter, SyntaxToken modifier, string subject, string problem) {
+    string word = modifier.text();
+    reporter.report("{subject} cannot be '{word}'; {problem}. Remove '{word}'.", modifier.span());
+}
+
 checkFieldModifiers(Reporter reporter, FieldDeclarationNode declaration) {
+    string subject = "Field '{declaration.name().text()}'";
     for (long i = 0; i < declaration.modifiersCount(); i++) {
         let modifier = declaration.modifiers(i);
-        let problem = fieldModifierProblem(modifier.kind());
+        let problem = modifierProblem(modifier.kind(), DeclarationShape.Field);
         if (problem != null) {
-            reporter.report("A field cannot be '{modifier.text()}'; {problem}. Drop the "
-                + "modifier.", modifier.span());
+            reportModifierProblem(reporter, modifier, subject, problem);
         }
     }
+}
+
+checkCallableModifiers(Reporter reporter, FunctionDeclarationNode declaration, string subject,
+                       DeclarationShape shape) {
+    for (long i = 0; i < declaration.modifiersCount(); i++) {
+        let modifier = declaration.modifiers(i);
+        let problem = modifierProblem(modifier.kind(), shape);
+        if (problem != null) {
+            reportModifierProblem(reporter, modifier, subject, problem);
+        }
+    }
+}
+
+// How a declaration is named in a diagnostic about one of its modifiers: by its own name, or by
+// what introduces it when it has none of its own.
+declarationSubject(string kind, SyntaxToken? name) -> string {
+    if (name == null || name.text().length == 0) {
+        return "This {kind}";
+    }
+    return "{kind} '{name.text()}'";
+}
+
+public checkMemberModifiers(Reporter reporter, FunctionDeclarationNode declaration) {
+    let introducer = declaration.introducer();
+    string subject = declarationSubject("Method", declaration.name());
+    if (introducer != null) {
+        switch (introducer.kind()) {
+            ConstructorKeyword -> {
+                subject = "A constructor";
+            },
+            DestructorKeyword -> {
+                subject = "A destructor";
+            },
+            default -> { },
+        }
+    }
+    checkCallableModifiers(reporter, declaration, subject, DeclarationShape.Member);
+}
+
+public checkFunctionModifiers(Reporter reporter, FunctionDeclarationNode declaration) {
+    checkCallableModifiers(reporter, declaration,
+        declarationSubject("Function", declaration.name()), DeclarationShape.Function);
 }
 
 // A member's visibility: the given default when unmarked, 'protected' as written, and an

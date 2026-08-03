@@ -189,7 +189,9 @@ A `this.field` parameter, a declared field default, and a `this.field = ...` ass
 A constructor that leaves such a field unassigned on some path, for example by returning early before it is set, is a compile error, and a class that has such a field but declares no constructor at all is rejected the same way.
 
 A field carries visibility modifiers, and in a class also `weak`; no other modifier applies to one.
-`abstract`, `override`, `final`, `sealed`, `noreturn`, and `const` each govern a method, a type, or a local declaration, so writing one on a field is an error that names where the modifier does belong.
+A method, a constructor, and a destructor carry visibility and the markers that govern overriding - `abstract`, `override`, `final` - along with `noreturn`, while a function declared at the top level carries visibility and `noreturn` alone, because nothing inherits it.
+`sealed` belongs to a class and `const` to a variable inside a function, so neither applies to a field or a callable at all.
+Writing a modifier where it does not belong is an error that names where it does.
 
 A class may declare a `destructor`, introduced by the `destructor` keyword, to run cleanup when an instance is destroyed.
 A destructor takes no parameters, has no return type, and cannot be `throws`; a class declares at most one, and it cannot be called explicitly.
