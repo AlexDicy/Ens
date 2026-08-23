@@ -42,3 +42,8 @@ Copy-on-write value-semantics collections.
 Unicode case conversion, locale collation, normalization.
 Conditional conformances (as opposed to conditional members).
 A `where` clause relating two type parameters.
+
+## Reminders
+
+When `@std.time` is designed, replace `Metadata.modifiedMillis: long` with a proper instant type; the field name carries the unit until then.
+Constructors cannot be `throws` (selfhost/sema/src/phases/members.ens:501, deliberate), which is why anything whose creation does I/O uses a static factory: `TemporaryDirectory.create()`, `TemporaryFile.create()`, `Path.open()`.
