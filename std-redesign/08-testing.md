@@ -1,9 +1,37 @@
 # @std.testing
 
-`test "..." { }` is a language declaration, so the module holds assertions only.
+`test "..." { }` is a language declaration, so the module holds the failure type and assertions only.
 
-`assertThrows` takes a closure and the expected kind: `assertThrows(fs.ErrorKind.NotFound, () { try fs.open(missing); })`, spelling pending the closure decision.
-Assertion failures print structured diffs: element by element for collections, line by line for multi-line text, pointing at the first difference.
-`assertEqual` on floats needs a tolerance form or a ban; undecided.
-Each std module keeps the happy-path file and errors file split.
+```ens
+// @std.testing
+// What a test throws to fail, and the assertions that throw it.
+
+export class TestFailure extends Error {
+    export constructor(this.message, Error? cause = null);
+}
+
+// Equality by ==. A failure prints both values, and for collections and multi-line text it points
+// at the first difference rather than printing two long lines.
+export assertEqual<T>(T actual, T expected) throws TestFailure;
+export assertNotEqual<T>(T actual, T expected) throws TestFailure;
+
+export assertTrue(bool condition, string message = "expected condition to be true") throws TestFailure;
+export assertFalse(bool condition, string message = "expected condition to be false") throws TestFailure;
+
+export noreturn fail(string message) throws TestFailure;
+
+// Runs `body` and answers the E it threw; a body that throws nothing, or something that is not an
+// E, fails the test. The answer is the error itself, so the test goes on to check its kind or its
+// message.
+export assertThrows<E: Error>(() -> void body) -> E throws TestFailure;
+```
+
+## Decisions
+
+`assertThrows` is generic over the error type and returns the caught error, because the expected condition cannot be a parameter: every module's `ErrorKind` is a different enum type.
+The caller checks `kind` or `message` with the assertions that already exist.
+This requires class-typed bounds (`E: Error`), which today name interfaces only; on the language list.
+Structured diffs live in `assertEqual`'s implementation, not its signature.
+`assertEqual` on floats needs a tolerance form or a ban; still undecided.
 No test may depend on any unspecified order: map iteration, set iteration, or sort tie order.
+Each std module keeps the happy-path file and errors file split.
