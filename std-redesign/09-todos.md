@@ -1,17 +1,13 @@
 # Open questions and deferred items
 
-## Blocking decisions, needed before or during implementation
+## Blocking decisions
 
-The closure spelling: type position and value position; not `function`.
-The primitive binding declaration form: `primitive string implements ... { }` is a placeholder.
-Class-typed generic bounds (`E: Error` on `assertThrows`); bounds today name interfaces only.
-The error type `string.fromBytes` throws: `IoError` is written as a placeholder since `ParseError` was cut.
-`assertEqual` on floats: tolerance form or ban.
+All five were decided on 2026-08-05 and folded into the other documents; nothing blocks implementation.
 
 ## Still to write
 
 The prelude mechanism for `print`/`eprint`.
-The migration order from today's `libs/std` to this design, and which language milestones land first.
+The migration order is written: see 10-migration-plan.md.
 
 ## Implementation work items surfaced by the design
 

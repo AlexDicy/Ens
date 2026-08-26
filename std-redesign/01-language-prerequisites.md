@@ -1,7 +1,7 @@
 # Language prerequisites
 
 Every feature here was decided during the redesign and must exist before the library is implemented.
-Each was signed off on the concrete shape described, except where a spelling is marked open.
+Each was signed off on the concrete shape described.
 
 ## Function values (closures)
 
@@ -10,8 +10,9 @@ A lambda copies what it captures and cannot mutate an enclosing local.
 This avoids boxed upvalues, aliasing surprises, and mutable-capture escape analysis.
 A cycle is possible only by storing a closure inside an object it captured, which `weak` already covers and std never does.
 
-The spelling is open.
-It will not be `function`; do not reserve that word.
+The spelling: type position is `(T, T) -> int`; value position is an arrow lambda with parameter types inferred from the target type, `(a, b) -> a.age - b.age`, with a block body written `(a, b) -> { ... }`.
+Explicit parameter types stay legal, and one lambda is all typed or all untyped, never mixed.
+The keyword `function` is not used and not reserved.
 
 ## Interfaces extending interfaces
 
@@ -80,7 +81,7 @@ Nothing in std needs that, and a `where` clause can be added later without confl
 
 A std module written in Ens declares a primitive's members; the compiler links the module to the primitive.
 `"text".split(",")` then works like a builtin, and go-to-definition lands in readable Ens source.
-Placeholder spelling `primitive string { ... }`; the declaration form needs a decision.
+The declaration is `primitive string implements ... { }`, with `primitive` a contextual keyword legal only in std; `this` inside is the primitive value, statics are allowed, and the intrinsic core is not declared in the binding because the compiler owns it.
 
 A binding can declare interface conformances, which is how primitives participate in generics: `primitive string implements Comparable<string>`.
 Numeric primitives get `Comparable` the same way, which is what makes `SortedMap<long, V>` work with no special case.
@@ -120,3 +121,9 @@ A `protected constructor` on an exported class is reachable from cross-package s
 Verified empirically and in the sema; `spec.md:366` states it as a guarantee.
 Caveat: an open exported class holds protected member signatures to an export-grade floor, so parameters added to `Error`'s constructor must be exported types.
 The protected-constructor case had no test fixture before this investigation; one should be added.
+
+## Class-typed generic bounds
+
+A bound may name a class: `<E: Error>` accepts `Error` or any subclass.
+At most one class per bound list, mirroring single inheritance, combinable with interfaces via `+`.
+Naming a `final` class is an error, since only the class itself could satisfy it.

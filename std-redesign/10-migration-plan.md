@@ -31,7 +31,7 @@ The order puts independent small features first and the two big ones last, so a 
 - A7: nested optionals: remove the collapse, audit the six places that assume one level, rewrite the two tests that assert collapsing, add the spec section for the level rules.
   This is the one Phase A feature that can change the meaning of existing code, so the audit includes every generic instantiation in the tree whose argument is already nullable.
 - A8: closures: the type form, the value form, by-value capture, throws inference, EIR lowering, ARC for captured references.
-  The spelling needs its own sign-off before this milestone starts.
+  The spelling is signed off: inferred-parameter arrow lambdas, explicit types legal, all-or-nothing per lambda.
 - A9: primitive binding declarations: the declaration form, member lookup routing, go-to-definition; the intrinsic core stays in the compiler.
 - A10: the prelude mechanism for `print` and `eprint`, alongside the implicit `@std.core` import.
 
@@ -73,4 +73,4 @@ Consumer migration inside C means the selfhost compiler, build, cli, and lsp sou
 
 Any agent brief for a milestone states the quality bar explicitly: HIGH, parallel-ready, clean code, and the milestone's gate.
 A compiler bug found mid-milestone is surfaced and fixed, never designed around.
-Grammar spellings still open (the closure form, the primitive binding form) get sign-off before their milestone starts, not during.
+Every grammar spelling the plan needs is signed off; a new one arising mid-milestone stops for sign-off first.

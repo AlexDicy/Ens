@@ -68,7 +68,7 @@ primitive string implements Comparable<string> {
 
     // Text from UTF-8 bytes. `fromBytes` refuses bytes that are not valid UTF-8; `fromBytesLossy`
     // replaces each invalid sequence with U+FFFD and never fails.
-    export static fromBytes(byte[] bytes) -> string throws IoError;
+    export static fromBytes(byte[] bytes) -> string throws EncodingError;
     export static fromBytesLossy(byte[] bytes) -> string;
 
     // `parts` with `separator` between neighbors, nothing before the first or after the last.
@@ -76,7 +76,7 @@ primitive string implements Comparable<string> {
 }
 ```
 
-Open point: `fromBytes` needs an error type; `IoError` is written above as a placeholder, since `ParseError` was cut, and this wants a decision.
+`EncodingError` lives in this module: one failure condition, so a `const long offset` field and no kind enum.
 
 ## StringBuilder
 
@@ -134,3 +134,14 @@ Parsers return `T?` and there is no `ParseError` class: nothing in the module th
 `string` implements `Comparable<string>` but not `Iterable<char>`; `for (let c in text)` does not compile.
 `StringBuilder.append(double)` creates a work item: shortest round-trip float formatting exists nowhere yet.
 Case conversion beyond ASCII, locale collation, and Unicode normalization are all out of scope for v1.
+
+## EncodingError
+
+```ens
+// @std.text
+export class EncodingError extends Error {
+    // The byte offset of the first invalid sequence.
+    export const long offset;
+    export constructor(this.message, this.offset, Error? cause = null);
+}
+```
