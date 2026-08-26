@@ -333,6 +333,8 @@ Allows `new Renderer();`
 
 In both cases, the path is `/src/engine/renderer.ens` and the file contains a public `Renderer` class.
 
+A file and a folder with the same name may sit side by side: `io.ens` next to an `io/` folder makes `import io;` resolve to the file, while `import io.streams;` resolves to `streams.ens` inside the folder.
+
 Source files are UTF-8 text.
 A byte order mark at the very start of a file is accepted and skipped; the same bytes anywhere else in the file are an error.
 
