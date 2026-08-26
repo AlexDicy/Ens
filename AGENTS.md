@@ -59,9 +59,8 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
 
 - One native target carries what the tests need: `xmake build ens-lld`, the linker bridge every Ens program links through, without which a fresh clone cannot reach an executable.
 - The language server is built on its own: `xmake build ens-lsp` (see `tools/vscode/README.md`).
-  Nothing in `xmake test` builds it, so the whole suite can stay green while the language server no longer compiles.
-  Any change that touches `lsp/`, and any repository-wide rename or move that its sources could be reading, is gated by running `xmake build ens-lsp` by hand.
-  Close a running `ens-lsp.exe` first, or the link fails on the file being in use.
+  `xmake test` includes an `ens_lsp` job that builds it; when the binary is held open by a running editor the job reports a skip instead of failing, so a green suite has not necessarily checked it.
+  Any change that touches `lsp/`, and any repository-wide rename or move that its sources could be reading, is gated by closing a running `ens-lsp.exe` and running `xmake build ens-lsp` by hand.
 - Run everything: `xmake test` (subset: `xmake test <name>...`).
   The full suite must be green before every commit, with no exceptions.
   `xmake test` builds `ens-lld` itself when it is missing, so it is the one command that always works from a clean checkout.
