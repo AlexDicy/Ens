@@ -766,7 +766,7 @@ bool Parser::looksLikeKeywordNamedMethod() const {
 void Parser::parseFieldDecl() {
     builder.startNode(SyntaxKind::FieldDecl);
     parseVisibilityModifier();
-    if (at(SyntaxKind::KwWeak)) bump();
+    while (at(SyntaxKind::KwWeak) || at(SyntaxKind::KwConst)) bump();
     if (isTypeStart(kindAt())) parseType();
     else emitMissing(SyntaxKind::Identifier, "field type");
     expect(SyntaxKind::Identifier, "field name");

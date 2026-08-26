@@ -188,9 +188,17 @@ A field whose type has no default value, such as a class, a string, an array, or
 A `this.field` parameter, a declared field default, and a `this.field = ...` assignment in the body all count, and assigning the field in every branch of an `if` or `switch` satisfies the rule exactly as a single unconditional assignment does.
 A constructor that leaves such a field unassigned on some path, for example by returning early before it is set, is a compile error, and a class that has such a field but declares no constructor at all is rejected the same way.
 
-A field carries visibility modifiers, and in a class also `weak`; no other modifier applies to one.
+A field may also be `const`, in a struct as in a class: a const field is given its value when the object is constructed and never changes afterwards.
+It is assigned by a constructor of the type that declares it, through a `this.field = ...` statement or a `this.field` shorthand parameter, and a struct's const field is equally set by an aggregate literal naming it.
+Construction assigns it at most once: a second assignment on any path through a constructor is an error, and so is an assignment inside a loop, which could run more than once.
+A const field without a default value must be assigned on every path through every constructor, whatever its type, a class that declares one but no constructor is rejected, and every aggregate literal must name it.
+A const field with a default value keeps the default when construction does not assign it, so a constructor path may assign it once or not at all, and an aggregate literal may leave it out.
+Everything else is an error: assigning from a method, a destructor, or a free function, assigning through any reference other than `this`, assigning an inherited const field from a subclass constructor, and `++`, `--`, or a compound assignment anywhere.
+A const field may be nullable, and it cannot also be `weak`, because a weak field resets to null when its target is destroyed while a const field never changes.
+
+A field carries visibility modifiers and `const`, and in a class also `weak`; no other modifier applies to one.
 A method, a constructor, and a destructor carry visibility and the markers that govern overriding - `abstract`, `override`, `final` - along with `noreturn`, while a function declared at the top level carries visibility and `noreturn` alone, because nothing inherits it.
-`sealed` belongs to a class and `const` to a variable inside a function, so neither applies to a field or a callable at all.
+`sealed` belongs to a class, so it does not apply to a field or a callable; `const` belongs to a field or a variable inside a function, so it does not apply to a callable.
 Writing a modifier where it does not belong is an error that names where it does.
 
 A class may declare a `destructor`, introduced by the `destructor` keyword, to run cleanup when an instance is destroyed.
@@ -835,7 +843,7 @@ The `++` and `--` operators add or subtract one from a numeric value in place.
 Each works in prefix position (`++x`) and in postfix position (`x++`), and both forms change the operand the same way.
 The difference is the value the expression produces: a prefix form evaluates to the new value, and a postfix form evaluates to the value from before the change.
 The operand must be an assignable numeric location, such as a variable, a parameter, a field, or an array element, of an integer or floating-point type.
-Applying either operator to a literal, a computed expression, a `const` binding, or a non-numeric value is a compile error.
+Applying either operator to a literal, a computed expression, a `const` binding, a `const` field, or a non-numeric value is a compile error.
 
 ```ens
 int i = 0;

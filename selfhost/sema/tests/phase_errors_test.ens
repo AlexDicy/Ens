@@ -669,18 +669,17 @@ test "a method replacing a built-in behavior follows its type's visibility" {
             + "as visible as 'Key' itself; mark it 'public'.");
 }
 
-test "a field refuses every modifier but visibility and 'weak'" {
+test "a field refuses every modifier but visibility, 'weak', and 'const'" {
     let loader = new FakeFileLoader();
     loader.add("/proj/src/app.ens",
         "class Box \{\n"
         + "    abstract int first = 0;\n"
         + "    override int second = 0;\n"
         + "    final int third = 0;\n"
-        + "    sealed int fourth = 0;\n"
         + "    noreturn int fifth = 0;\n"
         + "\}\n"
         + "struct Point \{\n"
-        + "    const int x = 0;\n"
+        + "    sealed int fourth = 0;\n"
         + "\}\n");
     let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
     try sema_support.assertMentions(analysis.layoutDiagnostics(),
@@ -690,13 +689,10 @@ test "a field refuses every modifier but visibility and 'weak'" {
         "Field 'second' cannot be 'override'");
     try sema_support.assertMentions(analysis.layoutDiagnostics(),
         "Field 'third' cannot be 'final'");
-    try sema_support.assertMentions(analysis.layoutDiagnostics(),
+    try sema_support.assertMentions(analysis.signatureDiagnostics(),
         "Field 'fourth' cannot be 'sealed'");
     try sema_support.assertMentions(analysis.layoutDiagnostics(),
         "Field 'fifth' cannot be 'noreturn'");
-    try sema_support.assertMentions(analysis.signatureDiagnostics(),
-        "Field 'x' cannot be 'const'; 'const' goes on a variable inside a function, as in "
-            + "'const limit = 10'. Remove 'const'.");
 }
 
 test "no callable carries 'weak', 'sealed', or 'const', wherever it is declared" {
@@ -724,8 +720,8 @@ test "no callable carries 'weak', 'sealed', or 'const', wherever it is declared"
     try sema_support.assertMentions(analysis.signatureDiagnostics(),
         "Function 'helper' cannot be 'const'");
     try sema_support.assertMentions(analysis.layoutDiagnostics(),
-        "A constructor cannot be 'const'; 'const' goes on a variable inside a function, as in "
-            + "'const limit = 10'. Remove 'const'.");
+        "A constructor cannot be 'const'; 'const' goes on a field or a variable inside a "
+            + "function, as in 'const string name;' or 'const limit = 10'. Remove 'const'.");
     try sema_support.assertMentions(analysis.layoutDiagnostics(),
         "A destructor cannot be 'weak'");
     try sema_support.assertMentions(analysis.layoutDiagnostics(),
@@ -777,6 +773,65 @@ test "a field keeps its visibility modifiers and 'weak'" {
         + "\}\n");
     let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
     try sema_support.assertProgramClean(analysis);
+}
+
+test "a 'const' field is legal on a class and a struct, with or without a default" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/app.ens",
+        "public class Message \{\n"
+        + "    public const string text;\n"
+        + "    public const Message? cause;\n"
+        + "    const int code = 3;\n"
+        + "    public constructor(this.text, this.cause = null);\n"
+        + "\}\n"
+        + "public struct Frame \{\n"
+        + "    public const string name;\n"
+        + "    public const bool inlined = false;\n"
+        + "\}\n"
+        + "read(Message message) -> string \{\n"
+        + "    Frame frame = \{name: message.text\};\n"
+        + "    return frame.name;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
+    try sema_support.assertProgramClean(analysis);
+}
+
+test "a field cannot be both 'weak' and 'const'" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/app.ens",
+        "class Tangle \{\n"
+        + "    weak const Tangle? neighbor;\n"
+        + "    constructor(this.neighbor);\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
+    try sema_support.assertMentions(analysis.layoutDiagnostics(),
+        "Field 'neighbor' cannot be both 'weak' and 'const': a 'const' field keeps one value "
+            + "for the object's whole life, while a 'weak' field becomes null when the object "
+            + "it refers to is destroyed. Remove one of the two.");
+}
+
+test "a class with a non-defaulted 'const' field needs a constructor to assign it" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/app.ens",
+        "class Silent \{\n"
+        + "    const int value;\n"
+        + "\}\n"
+        + "class Covered \{\n"
+        + "    const int value = 1;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
+    let found = analysis.checkDiagnostics();
+    try sema_support.assertMentions(found,
+        "Field 'value' of class 'Silent' is 'const' but 'Silent' has no constructor to assign "
+            + "it. A 'const' field without a default value is assigned exactly once, in a "
+            + "constructor; add one (e.g. 'constructor(this.value);'), or give the field a "
+            + "default value.");
+    for (let diagnostic in found) {
+        if (diagnostic.message().indexOf("'Covered'") >= 0) {
+            try testing.fail("a defaulted const field needs no constructor: "
+                + diagnostic.message());
+        }
+    }
 }
 
 test "weak fields must be nullable classes and never sit on structs" {
@@ -859,6 +914,177 @@ test "class fields must be initialized while struct fields may be non-defaultabl
     for (let diagnostic in analysis.bodyDiagnostics()) {
         if (diagnostic.message().indexOf("'first'") >= 0) {
             try testing.fail("initialized fields should not be reported: "
+                + diagnostic.message());
+        }
+    }
+}
+
+test "a 'const' field takes exactly one write on every constructor path" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/app.ens",
+        "class Twice \{\n"
+        + "    const int value;\n"
+        + "    constructor() \{\n"
+        + "        this.value = 1;\n"
+        + "        this.value = 2;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class MaybeTwice \{\n"
+        + "    const int maybe;\n"
+        + "    constructor(bool flag) \{\n"
+        + "        if (flag) \{\n"
+        + "            this.maybe = 1;\n"
+        + "        \}\n"
+        + "        this.maybe = 2;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Looped \{\n"
+        + "    const int looped;\n"
+        + "    constructor() \{\n"
+        + "        for (int i = 0; i < 3; i++) \{\n"
+        + "            this.looped = i;\n"
+        + "        \}\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Sometimes \{\n"
+        + "    const int sometimes;\n"
+        + "    constructor(bool flag) \{\n"
+        + "        if (flag) \{\n"
+        + "            this.sometimes = 1;\n"
+        + "        \}\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Balanced \{\n"
+        + "    const int chosen;\n"
+        + "    constructor(bool flag) \{\n"
+        + "        if (flag) \{\n"
+        + "            this.chosen = 1;\n"
+        + "        \} else \{\n"
+        + "            this.chosen = 2;\n"
+        + "        \}\n"
+        + "    \}\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
+    let found = analysis.bodyDiagnostics();
+    try sema_support.assertMentions(found,
+        "Field 'value' is 'const' and may already be assigned when this line runs; a 'const' "
+            + "field is assigned exactly once. Remove one of the assignments.");
+    try sema_support.assertMentions(found,
+        "Field 'maybe' is 'const' and may already be assigned when this line runs");
+    try sema_support.assertMentions(found,
+        "Field 'looped' is 'const', so it cannot be assigned inside a loop: the loop can "
+            + "run more than once, but a 'const' field is assigned exactly once. Assign it "
+            + "once, outside the loop.");
+    try sema_support.assertMentions(found,
+        "Field 'sometimes' of class 'Sometimes' is not assigned on every path through this "
+            + "constructor. A 'const' field without a default value must be assigned exactly "
+            + "once before the constructor returns; assign it on every path, for example "
+            + "'this.sometimes = ...;'.");
+    for (let diagnostic in found) {
+        if (diagnostic.message().indexOf("'chosen'") >= 0) {
+            try testing.fail("assigning a const field once per branch is legal: "
+                + diagnostic.message());
+        }
+    }
+}
+
+test "a 'const' field is writable only by its own type's constructors, through 'this'" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/app.ens",
+        "class Box \{\n"
+        + "    const int value;\n"
+        + "    const int counter = 0;\n"
+        + "    constructor(this.value);\n"
+        + "    constructor(Box other) \{\n"
+        + "        this.value = 1;\n"
+        + "        other.value = 2;\n"
+        + "    \}\n"
+        + "    poke() \{\n"
+        + "        this.value = 9;\n"
+        + "        this.counter++;\n"
+        + "        this.counter += 4;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Root \{\n"
+        + "    const int seed;\n"
+        + "    constructor(this.seed);\n"
+        + "\}\n"
+        + "class Stem extends Root \{\n"
+        + "    constructor() \{\n"
+        + "        super(1);\n"
+        + "        this.seed = 2;\n"
+        + "    \}\n"
+        + "    constructor(this.seed, bool ignored) \{\n"
+        + "        super(3);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "struct Pair \{\n"
+        + "    const int first;\n"
+        + "\}\n"
+        + "rewrite(Pair pair) \{\n"
+        + "    pair.first = 5;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
+    let found = analysis.bodyDiagnostics();
+    try sema_support.assertMentions(found,
+        "Cannot assign a new value to field 'value' because it is declared 'const'; a 'const' "
+            + "field is assigned exactly once, inside a constructor of 'Box' as "
+            + "'this.value = ...', and never changes afterwards. Remove 'const' from the field "
+            + "if it needs to change.");
+    try sema_support.assertMentions(found,
+        "The '++' operator cannot change field 'counter' because it is declared 'const'");
+    try sema_support.assertMentions(found,
+        "Cannot use '+=' on field 'counter' because 'counter' is declared 'const'");
+    try sema_support.assertMentions(found,
+        "Field 'seed' is 'const' and declared in base class 'Root', so only a constructor of "
+            + "'Root' can assign it; a subclass constructor cannot. Pass the value along in the "
+            + "'super(...)' call instead.");
+    try sema_support.assertMentions(found,
+        "Parameter 'this.seed' assigns field 'seed', but 'seed' is 'const' and declared in "
+            + "base class 'Root', so only a constructor of 'Root' can assign it. Take an "
+            + "ordinary parameter and pass it along in the 'super(...)' call instead.");
+    try sema_support.assertMentions(found,
+        "Cannot assign a new value to field 'first' because it is declared 'const'; a 'const' "
+            + "field is assigned exactly once, inside a constructor of 'Pair' as "
+            + "'this.first = ...' or by a struct literal like '\{first: ...\}', and never "
+            + "changes afterwards. Remove 'const' from the field if it needs to change.");
+}
+
+test "a catch clause assigns a 'const' field only when the body could not have" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/app.ens",
+        "shaky() -> int throws \{\n"
+        + "    throw new Error(\"boom\");\n"
+        + "\}\n"
+        + "boom() throws \{\n"
+        + "    throw new Error(\"boom\");\n"
+        + "\}\n"
+        + "class Fallback \{\n"
+        + "    const int parsed;\n"
+        + "    constructor() \{\n"
+        + "        this.parsed = try shaky();\n"
+        + "    \}\n"
+        + "    catch (Error e) \{\n"
+        + "        this.parsed = -1;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class TooLate \{\n"
+        + "    const int early;\n"
+        + "    constructor() \{\n"
+        + "        this.early = 1;\n"
+        + "        try boom();\n"
+        + "    \}\n"
+        + "    catch (Error e) \{\n"
+        + "        this.early = -1;\n"
+        + "    \}\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
+    let found = analysis.bodyDiagnostics();
+    try sema_support.assertMentions(found,
+        "Field 'early' is 'const' and may already be assigned when this line runs");
+    for (let diagnostic in found) {
+        if (diagnostic.message().indexOf("'parsed'") >= 0) {
+            try testing.fail("the body could not have assigned 'parsed' before throwing: "
                 + diagnostic.message());
         }
     }

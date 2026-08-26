@@ -189,14 +189,16 @@ class NarrowingFact {
 }
 
 // A snapshot of definite-assignment state at one program point: the locals and this-fields
-// assigned so far and whether the path has already left through a return, throw, break,
-// continue, or panic.
+// assigned so far, the this-fields that may have been assigned on some path reaching it, and
+// whether the path has already left through a return, throw, break, continue, or panic.
 class AssignmentFlow {
     protected List<LocalBinding> assigned;
     protected List<Field> assignedFields;
+    protected List<Field> maybeAssignedFields;
     protected bool terminated;
 
-    protected constructor(this.assigned, this.assignedFields, this.terminated);
+    protected constructor(this.assigned, this.assignedFields, this.maybeAssignedFields,
+                this.terminated);
 }
 
 // A numeric literal whose value its own default type cannot hold. The report waits until the
@@ -274,10 +276,15 @@ class BodyChecker implements NoreturnCalls {
     // The class whose constructor body is being analyzed, or null outside a constructor.
     // assignedThisFields is the current flow's set of own fields definitely assigned;
     // ctorSeededThisFields is the entry state (this-field parameters), which each catch
-    // clause resets to on the exception path.
+    // clause resets to on the exception path. maybeAssignedThisFields is the fields assigned
+    // on at least one path reaching this point, which is what holds a 'const' field to one
+    // write; ctorEscapedMaybeFields accumulates that set at every point an exception can
+    // leave the body, so a catch clause knows what may already be written when it runs.
     Type? ctorFieldOwner;
     List<Field> assignedThisFields;
     List<Field> ctorSeededThisFields;
+    List<Field> maybeAssignedThisFields;
+    List<Field> ctorEscapedMaybeFields;
 
     Set<GreenNode> fillProvenNews;
     Map<GreenNode, string> arrayNewNames;
@@ -314,6 +321,8 @@ class BodyChecker implements NoreturnCalls {
         this.ctorFieldOwner = null;
         this.assignedThisFields = new List<Field>();
         this.ctorSeededThisFields = new List<Field>();
+        this.maybeAssignedThisFields = new List<Field>();
+        this.ctorEscapedMaybeFields = new List<Field>();
         this.fillProvenNews = new Set<GreenNode>();
         this.arrayNewNames = new Map<GreenNode, string>();
         this.deferredObligations = deferred;
@@ -714,9 +723,18 @@ class BodyChecker implements NoreturnCalls {
         this.inCatchClause = true;
         // The catch body runs on the exception path, where the try body may have thrown before
         // assigning any local or field, so only the caught variable and the fields assigned
-        // before the body (the this-field parameters) carry in.
+        // before the body (the this-field parameters) carry in as definitely assigned. What may
+        // be assigned is the opposite union: everything written before any point the body could
+        // have thrown from.
         this.assignedLocals = new List<LocalBinding>();
         this.assignedThisFields = this.copyFields(this.ctorSeededThisFields);
+        this.maybeAssignedThisFields = this.copyFields(this.ctorSeededThisFields);
+        for (long i = 0; i < this.ctorEscapedMaybeFields.length(); i++) {
+            let escaped = this.ctorEscapedMaybeFields.get(i);
+            if (!this.fieldsContain(this.maybeAssignedThisFields, escaped)) {
+                this.maybeAssignedThisFields.push(escaped);
+            }
+        }
         this.breakFlows = new List<List<AssignmentFlow>>();
         this.flowTerminated = false;
         this.trackLocal(binding, true);
@@ -1184,6 +1202,8 @@ class BodyChecker implements NoreturnCalls {
         this.ctorFieldOwner = null;
         this.assignedThisFields = new List<Field>();
         this.ctorSeededThisFields = new List<Field>();
+        this.maybeAssignedThisFields = new List<Field>();
+        this.ctorEscapedMaybeFields = new List<Field>();
     }
 
     bindingsContain(List<LocalBinding> set, LocalBinding binding) -> bool {
@@ -1232,7 +1252,9 @@ class BodyChecker implements NoreturnCalls {
     }
 
     // Records the this-field shorthand parameters as assigned before the body runs, so a
-    // constructor whose only initialization is 'constructor(this.field)' starts complete.
+    // constructor whose only initialization is 'constructor(this.field)' starts complete. A
+    // shorthand parameter is a write, so it also counts against a 'const' field's one
+    // assignment, and it may not reach into a base class's const field at all.
     seedConstructorFields(Signature signature, Type receiver) {
         this.ctorFieldOwner = receiver;
         let fields = types.fieldsOf(receiver);
@@ -1246,11 +1268,23 @@ class BodyChecker implements NoreturnCalls {
                 continue;
             }
             let field = members.findField(fields, parameter.name());
-            if (field != null && !this.fieldsContain(this.assignedThisFields, field)) {
+            if (field == null) {
+                continue;
+            }
+            if (field.isConst() && field.definingType() != receiver) {
+                this.reporter.report("Parameter 'this.{field.name()}' assigns field "
+                    + "'{field.name()}', but '{field.name()}' is 'const' and declared in base "
+                    + "class '{this.constFieldOwnerName(field)}', so only a constructor of "
+                    + "'{this.constFieldOwnerName(field)}' can assign it. Take an ordinary "
+                    + "parameter and pass it along in the 'super(...)' call instead.",
+                    parameter.span());
+            }
+            if (!this.fieldsContain(this.assignedThisFields, field)) {
                 this.assignedThisFields.push(field);
             }
         }
         this.ctorSeededThisFields = this.copyFields(this.assignedThisFields);
+        this.maybeAssignedThisFields = this.copyFields(this.assignedThisFields);
     }
 
     markThisFieldAssigned(Field field) {
@@ -1262,8 +1296,42 @@ class BodyChecker implements NoreturnCalls {
         }
     }
 
-    // Reports every own non-defaultable field left unassigned on the path reaching span, and
-    // credits them so the same field is not reported twice.
+    markThisFieldMaybeAssigned(Field field) {
+        if (this.flowTerminated || this.ctorFieldOwner == null) {
+            return;
+        }
+        if (!this.fieldsContain(this.maybeAssignedThisFields, field)) {
+            this.maybeAssignedThisFields.push(field);
+        }
+    }
+
+    // Called where an exception can leave the constructor body: whatever may be assigned here
+    // may be assigned when a catch clause starts. A throw inside a catch clause leaves the
+    // constructor altogether, so it feeds no other clause's entry state.
+    noteThrowEscapePoint() {
+        if (this.flowTerminated || this.ctorFieldOwner == null || this.inCatchClause) {
+            return;
+        }
+        for (long i = 0; i < this.maybeAssignedThisFields.length(); i++) {
+            let field = this.maybeAssignedThisFields.get(i);
+            if (!this.fieldsContain(this.ctorEscapedMaybeFields, field)) {
+                this.ctorEscapedMaybeFields.push(field);
+            }
+        }
+    }
+
+    // The name a diagnostic about a field's declaring type should use.
+    constFieldOwnerName(Field field) -> string {
+        let authority = types.authorityOf(field.definingType());
+        if (authority != null) {
+            return authority.name();
+        }
+        return types.display(field.definingType());
+    }
+
+    // Reports every own field left unassigned on the path reaching span when the field needed
+    // an assignment - a non-defaultable one, or a 'const' one without a default - and credits
+    // them so the same field is not reported twice.
     checkConstructorFieldsAssigned(Span span) {
         let owner = this.ctorFieldOwner;
         if (owner == null || this.flowTerminated) {
@@ -1274,51 +1342,50 @@ class BodyChecker implements NoreturnCalls {
             return;
         }
         let missing = new List<Field>();
+        let missingConst = new List<Field>();
         for (long i = types.baseFieldCount(owner); i < fields.length(); i++) {
             let field = fields.get(i);
             if (field.type() is ErrorType) {
                 continue;
             }
-            if (field.hasDefault() || convert.isDefaultable(field.type())) {
+            if (field.hasDefault()) {
                 continue;
             }
             if (this.fieldsContain(this.assignedThisFields, field)) {
                 continue;
             }
-            missing.push(field);
-        }
-        if (missing.length() == 0) {
-            return;
-        }
-        string names = "";
-        for (long i = 0; i < missing.length(); i++) {
-            if (i > 0) {
-                if (i + 1 == missing.length()) {
-                    names = names + " and ";
-                } else {
-                    names = names + ", ";
-                }
+            if (field.isConst()) {
+                missingConst.push(field);
+            } else if (!convert.isDefaultable(field.type())) {
+                missing.push(field);
             }
-            names = names + "'{missing.get(i).name()}'";
-        }
-        string subject = "Fields ";
-        string verb = "are";
-        if (missing.length() == 1) {
-            subject = "Field ";
-            verb = "is";
         }
         string owningName = types.display(owner);
+        string kindWord = "class";
         let authority = types.authorityOf(owner);
         if (authority != null) {
             owningName = authority.name();
+            kindWord = types.kindWordOf(authority);
         }
-        string example = "'this.{missing.get(0).name()} = ...;'";
-        this.reporter.report(subject + names + " of class '{owningName}' " + verb + " not "
-            + "assigned on every path through this constructor. A non-nullable field must be "
-            + "assigned before the constructor returns; assign it on every path, for example "
-            + example + ".", span);
+        if (missing.length() > 0) {
+            this.reporter.report(fieldListSubject(missing) + " of class '{owningName}' "
+                + fieldListVerb(missing) + " not assigned on every path through this "
+                + "constructor. A non-nullable field must be assigned before the constructor "
+                + "returns; assign it on every path, for example "
+                + "'this.{missing.get(0).name()} = ...;'.", span);
+        }
+        if (missingConst.length() > 0) {
+            this.reporter.report(fieldListSubject(missingConst) + " of {kindWord} "
+                + "'{owningName}' " + fieldListVerb(missingConst) + " not assigned on every "
+                + "path through this constructor. A 'const' field without a default value must "
+                + "be assigned exactly once before the constructor returns; assign it on every "
+                + "path, for example 'this.{missingConst.get(0).name()} = ...;'.", span);
+        }
         for (long i = 0; i < missing.length(); i++) {
             this.assignedThisFields.push(missing.get(i));
+        }
+        for (long i = 0; i < missingConst.length(); i++) {
+            this.assignedThisFields.push(missingConst.get(i));
         }
     }
 
@@ -1350,28 +1417,41 @@ class BodyChecker implements NoreturnCalls {
 
     snapshotAssignment() -> AssignmentFlow {
         return new AssignmentFlow(this.copyBindings(this.assignedLocals),
-            this.copyFields(this.assignedThisFields), this.flowTerminated);
+            this.copyFields(this.assignedThisFields),
+            this.copyFields(this.maybeAssignedThisFields), this.flowTerminated);
     }
 
     restoreAssignment(AssignmentFlow flow) {
         this.assignedLocals = this.copyBindings(flow.assigned);
         this.assignedThisFields = this.copyFields(flow.assignedFields);
+        this.maybeAssignedThisFields = this.copyFields(flow.maybeAssignedFields);
         this.flowTerminated = flow.terminated;
     }
 
-    // The join of several branch out-states: a local is assigned after the join only when it is
-    // assigned on every branch that can fall through. A terminated branch cannot reach the join,
-    // so it drops out. When every branch terminates the join is unreachable, so it stays
+    unionFieldsInto(List<Field> target, List<Field> source) {
+        for (long i = 0; i < source.length(); i++) {
+            if (!this.fieldsContain(target, source.get(i))) {
+                target.push(source.get(i));
+            }
+        }
+    }
+
+    // The join of several branch out-states: a local or field is definitely assigned after the
+    // join only when it is assigned on every branch that can fall through, and may be assigned
+    // when any falling-through branch may have assigned it. A terminated branch cannot reach the
+    // join, so it drops out. When every branch terminates the join is unreachable, so it stays
     // terminated and credits every branch's writes to avoid reports in the dead code that follows.
     joinAssignment(List<AssignmentFlow> flows) -> AssignmentFlow {
         let result = new List<LocalBinding>();
         let resultFields = new List<Field>();
+        let resultMaybeFields = new List<Field>();
         bool anySurvivor = false;
         for (long i = 0; i < flows.length(); i++) {
             let flow = flows.get(i);
             if (flow.terminated) {
                 continue;
             }
+            this.unionFieldsInto(resultMaybeFields, flow.maybeAssignedFields);
             if (!anySurvivor) {
                 result = this.copyBindings(flow.assigned);
                 resultFields = this.copyFields(flow.assignedFields);
@@ -1406,9 +1486,10 @@ class BodyChecker implements NoreturnCalls {
                         resultFields.push(flow.assignedFields.get(j));
                     }
                 }
+                this.unionFieldsInto(resultMaybeFields, flow.maybeAssignedFields);
             }
         }
-        return new AssignmentFlow(result, resultFields, !anySurvivor);
+        return new AssignmentFlow(result, resultFields, resultMaybeFields, !anySurvivor);
     }
 
     conditionIsAlwaysTrue(Expression condition) -> bool {
@@ -1758,6 +1839,7 @@ class BodyChecker implements NoreturnCalls {
             },
             is ThrowStatementNode thrown -> {
                 this.checkThrowStatement(thrown);
+                this.noteThrowEscapePoint();
                 this.flowTerminated = true;
             },
             is RethrowStatementNode rethrown -> {
@@ -1936,7 +2018,10 @@ class BodyChecker implements NoreturnCalls {
     // point, so condition narrowing is safe in the body.
     checkWhileStatement(WhileStatementNode node) {
         this.preClearLoopBodyWrites(node.body());
+        // The condition re-evaluates every iteration, so writes in it count as loop writes.
+        this.loopDepth++;
         Type condition = this.analyzeExpression(node.condition());
+        this.loopDepth--;
         this.checkConditionIsBool(condition, "While condition", node.condition().span());
         let facts = new List<NarrowingFact>();
         this.collectNarrowings(node.condition(), true, facts);
@@ -1976,7 +2061,10 @@ class BodyChecker implements NoreturnCalls {
         let condition = node.condition();
         bool alwaysTrue = false;
         if (condition != null) {
+            // The condition re-evaluates every iteration, so writes in it count as loop writes.
+            this.loopDepth++;
             Type conditionType = this.analyzeExpression(condition);
+            this.loopDepth--;
             this.checkConditionIsBool(conditionType, "For condition", condition.span());
             this.collectNarrowings(condition, true, facts);
             alwaysTrue = this.conditionIsAlwaysTrue(condition);
@@ -2950,6 +3038,20 @@ class BodyChecker implements NoreturnCalls {
                 return operandType;
             }
         }
+        if (operand is MemberExpressionNode) {
+            let objectType = this.result.typeOf(operand.object().green());
+            if (objectType != null) {
+                let field = members.findField(types.fieldsOf(objectType),
+                    operand.member().text());
+                if (field != null && field.isConst()) {
+                    this.reporter.report("The '{operator}' operator cannot change field "
+                        + "'{field.name()}' because it is declared 'const'; a 'const' field is "
+                        + "assigned exactly once when the object is constructed. Remove 'const' "
+                        + "from the field if it needs to change.", span);
+                    return operandType;
+                }
+            }
+        }
         this.invalidateForWrite(operand);
         return operandType;
     }
@@ -3029,19 +3131,73 @@ class BodyChecker implements NoreturnCalls {
                 }
             }
         } else if (assignTargetNode is MemberExpressionNode) {
-            if (simpleAssign && this.unconditionalPosition
-                    && assignTargetNode.object() is ThisExpressionNode) {
-                let objectType = this.result.typeOf(assignTargetNode.object().green());
-                if (objectType != null) {
-                    let field = members.findField(types.fieldsOf(objectType),
-                        assignTargetNode.member().text());
-                    if (field != null) {
-                        this.markThisFieldAssigned(field);
+            let objectType = this.result.typeOf(assignTargetNode.object().green());
+            if (objectType != null) {
+                let field = members.findField(types.fieldsOf(objectType),
+                    assignTargetNode.member().text());
+                if (field != null) {
+                    bool throughThis = assignTargetNode.object() is ThisExpressionNode;
+                    if (field.isConst()) {
+                        this.checkConstFieldWrite(node, field, throughThis, simpleAssign);
+                    }
+                    if (simpleAssign && throughThis) {
+                        this.markThisFieldMaybeAssigned(field);
+                        if (this.unconditionalPosition) {
+                            this.markThisFieldAssigned(field);
+                        }
                     }
                 }
             }
         }
         return assignTarget;
+    }
+
+    // Enforces the write-once contract of a 'const' field at an assignment naming it. The one
+    // legal write is a plain '=' through 'this' inside a constructor of the field's own type,
+    // outside any loop, on a path that cannot have assigned the field already; everything else
+    // is rejected here.
+    checkConstFieldWrite(AssignmentExpressionNode node, Field field, bool throughThis,
+                                 bool simpleAssign) {
+        string name = field.name();
+        string ownerName = this.constFieldOwnerName(field);
+        if (!simpleAssign) {
+            string operatorText = node.operator().text();
+            this.reporter.report("Cannot use '{operatorText}' on field '{name}' because "
+                + "'{name}' is declared 'const': '{operatorText}' stores a new value into the "
+                + "field, and a 'const' field is assigned exactly once when the object is "
+                + "constructed. Remove 'const' from the field if it needs to change.",
+                node.span());
+            return;
+        }
+        if (!this.inConstructor || !throughThis) {
+            string sites = "inside a constructor of '{ownerName}' as 'this.{name} = ...'";
+            if (types.authorityOf(field.definingType()) is StructType) {
+                sites = sites + " or by a struct literal like '\{{name}: ...\}'";
+            }
+            this.reporter.report("Cannot assign a new value to field '{name}' because it is "
+                + "declared 'const'; a 'const' field is assigned exactly once, " + sites
+                + ", and never changes afterwards. Remove 'const' from the field if it needs "
+                + "to change.", node.span());
+            return;
+        }
+        if (field.definingType() != this.ctorFieldOwner) {
+            this.reporter.report("Field '{name}' is 'const' and declared in base class "
+                + "'{ownerName}', so only a constructor of '{ownerName}' can assign it; a "
+                + "subclass constructor cannot. Pass the value along in the 'super(...)' call "
+                + "instead.", node.span());
+            return;
+        }
+        if (this.loopDepth > 0) {
+            this.reporter.report("Field '{name}' is 'const', so it cannot be assigned inside "
+                + "a loop: the loop can run more than once, but a 'const' field is "
+                + "assigned exactly once. Assign it once, outside the loop.", node.span());
+            return;
+        }
+        if (this.fieldsContain(this.maybeAssignedThisFields, field)) {
+            this.reporter.report("Field '{name}' is 'const' and may already be assigned when "
+                + "this line runs; a 'const' field is assigned exactly once. Remove one of the "
+                + "assignments.", node.span());
+        }
     }
 
     // 'a OP= b' means 'a = a OP b', so the right side is the operator's operand and it is the
@@ -3402,7 +3558,9 @@ class BodyChecker implements NoreturnCalls {
             this.reporter.report("'try' must directly prefix a single call, e.g. 'try f(x)' "
                 + "or 'try obj.m()'.", node.span());
         }
-        return this.analyzeExpression(node.operand());
+        Type analyzed = this.analyzeExpression(node.operand());
+        this.noteThrowEscapePoint();
+        return analyzed;
     }
 
     // Array literal with no target type: the first element's type drives the rest.
@@ -5700,6 +5858,32 @@ fieldIndexNamed(List<Field> fields, string name) -> long {
         }
     }
     return -1;
+}
+
+// "Field 'a'" or "Fields 'a', 'b' and 'c'", for a diagnostic naming several fields at once.
+fieldListSubject(List<Field> fields) -> string {
+    string subject = "Fields ";
+    if (fields.length() == 1) {
+        subject = "Field ";
+    }
+    for (long i = 0; i < fields.length(); i++) {
+        if (i > 0) {
+            if (i + 1 == fields.length()) {
+                subject = subject + " and ";
+            } else {
+                subject = subject + ", ";
+            }
+        }
+        subject = subject + "'{fields.get(i).name()}'";
+    }
+    return subject;
+}
+
+fieldListVerb(List<Field> fields) -> string {
+    if (fields.length() == 1) {
+        return "is";
+    }
+    return "are";
 }
 
 structDisplayName(Type structType) -> string {
