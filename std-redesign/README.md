@@ -17,3 +17,4 @@ The language prerequisites in `01-language-prerequisites.md` must land before th
 | `07-fs-process-environment.md` | `@std.fs`, `@std.process`, `@std.environment`: rulings so far, signatures pending |
 | `08-testing.md` | `@std.testing` rulings |
 | `09-todos.md` | Open questions and deferred items |
+| `10-migration-plan.md` | Phase 0/A/B/C/D migration order from today's tree to this design |
