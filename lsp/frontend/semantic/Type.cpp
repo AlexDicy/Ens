@@ -55,10 +55,12 @@ StructInfo* StructInfo::classDeclaringZeroArgMethod(const std::u16string& method
 }
 
 bool StructInfo::conformsToInterface(const StructInfo* iface) const {
-    if (this == iface) return true;
     for (const StructInfo* s = this; s; s = s->baseInfo) {
+        if (s == iface) return true;
         for (const Type* t : s->implementedInterfaces) {
-            if (t && t->structInfo == iface) return true;
+            for (const StructInfo* i = t ? t->structInfo : nullptr; i; i = i->baseInfo) {
+                if (i == iface) return true;
+            }
         }
     }
     return false;

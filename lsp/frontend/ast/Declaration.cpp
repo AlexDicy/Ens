@@ -468,6 +468,26 @@ std::vector<TypeParam> InterfaceDecl::typeParams() const {
     if (auto l = typeParamList()) return l->params();
     return {};
 }
+std::optional<SyntaxNode> InterfaceDecl::baseInterfaceToken() const {
+    return firstIdentAfterKeyword(node, SyntaxKind::KwExtends);
+}
+std::optional<std::u16string> InterfaceDecl::baseInterfaceName() const {
+    if (auto t = baseInterfaceToken()) return std::u16string(t->tokenText());
+    return std::nullopt;
+}
+std::vector<TypeReference> InterfaceDecl::baseTypeArguments() const {
+    std::vector<TypeReference> out;
+    bool afterExtends = false;
+    for (auto& c : node.children()) {
+        if (c.kind() == SyntaxKind::KwExtends) { afterExtends = true; continue; }
+        if (!afterExtends || c.kind() != SyntaxKind::TypeArgList) continue;
+        for (auto& a : c.children()) {
+            if (auto tr = TypeReference::cast(a)) out.push_back(*tr);
+        }
+        break;
+    }
+    return out;
+}
 std::optional<MemberList> InterfaceDecl::memberList() const {
     if (auto m = firstChildNode(node, SyntaxKind::MemberList)) return MemberList::cast(*m);
     return std::nullopt;

@@ -220,7 +220,7 @@ Because the compiler sees the whole hierarchy, a `switch` over a sealed class ca
 An `interface` declares a named contract: a set of method signatures with no bodies.
 Interfaces are declared at the top level and follow the same visibility tiers as classes; they may be generic, specialized per type-argument set like generic classes.
 An interface body contains only method signatures, each ended with `;`.
-An interface cannot declare fields, constructors, or method bodies, and it cannot extend or implement anything.
+An interface cannot declare fields, constructors, or method bodies, and it cannot use `implements`.
 A throwing interface method must list its thrown types explicitly (`load(string path) -> string throws IOError;`), the same rule as abstract methods.
 
 ```ens
@@ -233,15 +233,22 @@ interface Source<T> {
 }
 ```
 
+An interface may extend one other interface with an `extends` clause: `interface Collection<T> extends Iterable<T> { ... }`.
+The extending interface inherits every requirement of the interface it extends, and chains may be any depth.
+Redeclaring an inherited requirement (the same name and parameter types) is an error naming the interface that already declares it; an overload with different parameters is a new requirement like any other.
+The `extends` target must be an interface: naming a class, struct, enum, primitive, or type parameter is an error, and so is an interface extending itself, directly or through a chain.
+An interface cannot extend a less-visible interface, under the same rule that stops a class from extending a less-visible base class.
+
 A class names the interfaces it implements in an `implements` clause after the optional `extends`, separated by commas: `class Dog extends Animal implements Speaker, Source<string> { ... }`.
-The class must provide every method of every listed interface with the exact signature, either declared in the class or inherited from a base class; a missing or mismatched method is a compile error naming the interface and the signature.
+The class must provide every method of every listed interface with the exact signature, including the methods of every interface those extend, either declared in the class or inherited from a base class; a missing or mismatched method is a compile error naming the interface that declares it and the signature.
 A method declared in the implementing class that provides an interface method must be marked `override`, exactly like the override of an abstract base method; a satisfying method inherited from a base class needs no marker.
 An abstract class may declare an interface method `abstract override` and leave the body to its concrete subclasses.
 A method satisfying a throwing interface method may throw the declared types or their subclasses, never others; satisfying a non-throwing interface method means not throwing at all.
 Structs cannot implement interfaces.
 
 An interface name is a reference type usable wherever a class type is: variables, parameters, returns, fields, generic type arguments, `I?`, and arrays under the same element rules as classes.
-A value of an implementing class converts implicitly to each interface it implements (and to `I?`); there are no implicit conversions between unrelated interfaces.
+A value of an implementing class converts implicitly to each interface it implements and to every interface those extend (and to `I?`); there are no implicit conversions between unrelated interfaces.
+A value of an extending interface's type converts implicitly to any interface it extends, directly or through the chain, and `is` and `as?` between interface types follow the same relation, decided by the value's runtime type.
 A call through an interface-typed value dispatches on the value's runtime type, so a subclass override runs even when the call happens through the interface.
 `==` and `!=` on interface-typed values compare identity, exactly like class references.
 An interface cannot be instantiated with `new`, and a `weak` field cannot have an interface type; weak references stay class-only.
@@ -290,6 +297,7 @@ swap(1, 2);        // T inferred as int
 
 A type parameter may declare bounds with `T: Base + Comparable`, joined by `+`: at most one bound may be a class (conventionally written first) and every other bound must be an interface, and listing the same bound twice is an error.
 Every type argument must satisfy all bounds, being the class or a subclass of it and implementing each interface; a violation is a compile error naming the failing bound.
+An interface bound is also satisfied through interface extension: a class implementing an interface that extends the bound satisfies it, and so does the extending interface itself as a type argument.
 The body may use the members of every bound on a value of that parameter.
 The `Animation<S: Shape + Comparable>` example above uses exactly this form.
 
@@ -984,9 +992,9 @@ for (int x in xs) {     // x takes each element in turn
 }
 ```
 
-A class is iterable when it implements the `Iterable<T>` interface from `@std.collections.iterator`, whose single method `makeIterator() -> Iterator<T>` returns an `Iterator<T>` (an interface with `hasNext() -> bool` and `next() -> T`).
+A class is iterable when it implements the `Iterable<T>` interface from `@std.collections.iterator`, directly or through an interface that extends it; its single method `makeIterator() -> Iterator<T>` returns an `Iterator<T>` (an interface with `hasNext() -> bool` and `next() -> T`).
 The loop calls `makeIterator()` once, then draws values with `next()` while `hasNext()` is true.
-A value whose static type is `Iterable<T>` itself can also be iterated.
+A value whose static type is `Iterable<T>` itself, or an interface extending it, can also be iterated.
 
 ```ens
 import Iterable from @std.collections.iterator;

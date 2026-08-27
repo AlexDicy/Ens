@@ -1392,6 +1392,7 @@ void Analyzer::collectInterfaces(const ast::SourceFile& file) {
         if (!t || !t->structInfo) continue;
         StructInfo* si = t->structInfo;
         size_t tpCount = enterTemplateScope(si, id.typeParams());
+        resolveInterfaceBase(id, si);
 
         for (auto& f : id.fields()) {
             errorAtNode(f.node, "An interface cannot declare fields; its body lists only "
@@ -1469,6 +1470,51 @@ void Analyzer::collectInterfaces(const ast::SourceFile& file) {
         markOverloadedMethods(si);
         si->membersCollected = true;
         popTypeParams(tpCount);
+    }
+
+    // An extension cycle would make the ladder walks endless; the compiler reports it, the
+    // editor front end just breaks the link.
+    for (auto& id : file.interfaces()) {
+        Type* t = analysis.typeOf(id.node.greenNode());
+        if (!t || !t->structInfo) continue;
+        StructInfo* si = t->structInfo;
+        std::unordered_set<StructInfo*> seen;
+        for (StructInfo* s = si; s; s = s->baseInfo) {
+            if (!seen.insert(s).second) {
+                si->baseInfo = nullptr;
+                break;
+            }
+        }
+    }
+}
+
+// The interface's 'extends' target, resolved into the base link so member lookup and
+// conformance walk the ladder; the compiler enforces the extension rules, so anything but a
+// well-formed interface target is silently left unlinked.
+void Analyzer::resolveInterfaceBase(const ast::InterfaceDecl& id, StructInfo* si) {
+    auto baseName = id.baseInterfaceName();
+    if (!baseName) return;
+    Type* baseT = typeCtx.lookupNamedType(modulePath_, *baseName);
+    if (!baseT || !baseT->isInterface() || !baseT->structInfo) return;
+    auto baseArgs = id.baseTypeArguments();
+    if (baseT->structInfo->isTemplate) {
+        std::vector<Type*> argTypes;
+        for (auto& a : baseArgs) {
+            Type* at = resolveTypeReference(a);
+            if (!at || at->isError()) return;
+            argTypes.push_back(at);
+        }
+        if (argTypes.size() != baseT->structInfo->typeParamNames.size()) return;
+        Type* baseInst = typeCtx.instantiate(baseT, argTypes);
+        if (!baseInst || baseInst->isError() || !baseInst->structInfo) return;
+        baseT = baseInst;
+    } else if (!baseArgs.empty()) {
+        return;
+    }
+    if (baseT->structInfo == si || baseT->structInfo->templateOf == si) return;
+    si->baseInfo = baseT->structInfo;
+    if (auto baseTok = id.baseInterfaceToken()) {
+        analysis.setType(baseTok->greenNode(), baseT);
     }
 }
 
@@ -1762,17 +1808,21 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
         si->fields.push_back(std::move(fi));
     }
 
-    // Interface methods a locally-declared method may implement; used to
-    // validate 'override' markers the same way base-class methods are.
+    // Interface methods a locally-declared method may implement, the interfaces the
+    // implemented ones extend included; used to validate 'override' markers the same way
+    // base-class methods are. Returns the type of the interface declaring the method.
     auto interfaceDeclaring = [&](const std::u16string& name, Symbol* sym,
                                   bool bySignature) -> Type* {
         for (Type* ifaceT : si->implementedInterfaces) {
             if (!ifaceT || !ifaceT->structInfo) continue;
-            StructInfo* iface = ifaceT->structInfo;
-            if (iface->templateOf) typeCtx.ensureFilled(iface);
-            int idx = bySignature ? iface->findMethodIndexBySignature(name, sym)
-                                  : iface->findMethodIndex(name);
-            if (idx >= 0) return ifaceT;
+            for (StructInfo* iface = ifaceT->structInfo; iface; iface = iface->baseInfo) {
+                if (iface->templateOf) typeCtx.ensureFilled(iface);
+                int idx = bySignature ? iface->findMethodIndexBySignature(name, sym)
+                                      : iface->findMethodIndex(name);
+                if (idx < 0) continue;
+                if (iface == ifaceT->structInfo) return ifaceT;
+                if (Type* level = typeCtx.classTypeFor(iface)) return level;
+            }
         }
         return nullptr;
     };
@@ -4429,16 +4479,19 @@ static bool isIterableInterface(const StructInfo* si) {
 Type* Analyzer::resolveIterableElement(Type* iterT, const SyntaxNode& diag) {
     StructInfo* si = iterT->structInfo;
     StructInfo* iterableInst = nullptr;
-    if (isIterableInterface(si)) {
-        iterableInst = si;
-    } else {
-        for (StructInfo* s = si; s && !iterableInst; s = s->baseInfo) {
-            for (Type* it : s->implementedInterfaces) {
-                if (it && isIterableInterface(it->structInfo)) {
-                    iterableInst = it->structInfo;
+    for (StructInfo* s = si; s && !iterableInst; s = s->baseInfo) {
+        if (isIterableInterface(s)) {
+            iterableInst = s;
+            break;
+        }
+        for (Type* it : s->implementedInterfaces) {
+            for (StructInfo* i = it ? it->structInfo : nullptr; i; i = i->baseInfo) {
+                if (isIterableInterface(i)) {
+                    iterableInst = i;
                     break;
                 }
             }
+            if (iterableInst) break;
         }
     }
     if (!iterableInst) {

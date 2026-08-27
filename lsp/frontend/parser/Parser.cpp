@@ -702,9 +702,14 @@ void Parser::parseInterfaceDecl() {
     expect(SyntaxKind::KwInterface, "'interface'");
     expect(SyntaxKind::Identifier, "interface name");
     if (at(SyntaxKind::Lt)) parseTypeParamList();
-    if (at(SyntaxKind::KwExtends) || at(SyntaxKind::KwImplements)) {
-        reportAtCurrent("An interface cannot extend or implement anything; its body lists "
-                        "only method signatures");
+    if (at(SyntaxKind::KwExtends)) {
+        bump();  // 'extends'
+        expect(SyntaxKind::Identifier, "interface name after 'extends'");
+        if (at(SyntaxKind::Lt)) parseTypeArgList();
+    }
+    if (at(SyntaxKind::KwImplements)) {
+        reportAtCurrent("An interface cannot use 'implements'; an interface builds on another "
+                        "one with 'extends', and classes implement interfaces");
         builder.startNode(SyntaxKind::Error);
         while (!at(SyntaxKind::LBrace) && !atEnd()) bump();
         builder.finishNode();

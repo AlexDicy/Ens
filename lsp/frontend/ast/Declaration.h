@@ -265,6 +265,9 @@ public:
     std::optional<std::u16string> nameText() const;
     std::optional<TypeParamList> typeParamList() const;
     std::vector<TypeParam> typeParams() const;
+    std::optional<SyntaxNode> baseInterfaceToken() const;
+    std::optional<std::u16string> baseInterfaceName() const;
+    std::vector<TypeReference> baseTypeArguments() const;
     std::optional<MemberList> memberList() const;
     std::vector<FieldDecl> fields() const;
     std::vector<FuncDecl> methods() const;

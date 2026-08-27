@@ -213,6 +213,7 @@ private:
     void rejectTopLevelVariables(const ast::SourceFile& file);
     void collectStructs(const ast::SourceFile& file);
     void collectInterfaces(const ast::SourceFile& file);
+    void resolveInterfaceBase(const ast::InterfaceDecl& id, StructInfo* si);
     void collectEnums(const ast::SourceFile& file);
     void resolveClassBases(const ast::SourceFile& file);
     void layoutDeclaredClasses(const ast::SourceFile& file);

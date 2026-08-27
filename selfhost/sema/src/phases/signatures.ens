@@ -41,6 +41,8 @@ import StructType from model.types;
 import InterfaceType from model.types;
 import EnumType from model.types;
 import TypeParamType from model.types;
+import DeclaredType from model.types;
+import InstantiationType from model.types;
 import model.literalvalues;
 import Field from model.types;
 import Method from model.types;
@@ -48,6 +50,7 @@ import Parameter from model.types;
 import Signature from model.types;
 import Visibility from model.types;
 import List from @std.collections.list;
+import Set from @std.collections.set;
 
 // Resolves every type declaration's type parameter list, bounds included. Runs for every module
 // before any module resolves signatures, so bound checks see the bounds at every reference site
@@ -389,6 +392,12 @@ class SignatureCollector {
             }
             let parameters = interfaceType.typeParameterTypes();
             this.resolver.pushTypeParameters(parameters);
+            let extendsClause = node.extendsClause();
+            if (extendsClause != null) {
+                let reference = extendsClause.base();
+                Type base = this.resolver.resolveType(reference);
+                this.checkAndSetInterfaceBase(interfaceType, base, reference.span());
+            }
             let body = node.body();
             for (long i = 0; i < body.membersCount(); i++) {
                 switch (body.members(i)) {
@@ -466,6 +475,33 @@ class SignatureCollector {
         interfaceType.methods().push(new Method(signature,
             types.followedMemberVisibility(interfaceType.visibility()), false, false,
             false, false, true, member.body() != null, interfaceType));
+    }
+
+    checkAndSetInterfaceBase(InterfaceType interfaceType, Type base, Span span) {
+        if (base is ErrorType) {
+            return;
+        }
+        string shown = types.display(base);
+        if (!types.isInterfaceLike(base)) {
+            if (types.isClassLike(base)) {
+                this.reporter.report("Interface '{interfaceType.name()}' cannot extend class "
+                    + "'{shown}': interfaces extend interfaces, and classes implement them. "
+                    + "Write 'class {shown} implements {interfaceType.name()}' to have "
+                    + "'{shown}' implement it.", span);
+            } else {
+                this.reporter.report("Interface '{interfaceType.name()}' cannot extend "
+                    + "{extendTargetKind(base)} '{shown}': interfaces extend interfaces, and "
+                    + "classes implement them.", span);
+            }
+            return;
+        }
+        let authority = types.authorityOf(base);
+        if (base == interfaceType || authority == interfaceType) {
+            this.reporter.report("Interface '{interfaceType.name()}' cannot extend itself.",
+                span);
+            return;
+        }
+        interfaceType.setBase(base);
     }
 
     collectEnums() {
@@ -924,6 +960,83 @@ class SignatureCollector {
             true, false, contract, contractSpans, [], node.green(), at);
         this.context.functions().add(new FunctionEntry(signature, Visibility.Public, false,
             false, ""));
+    }
+}
+
+// A cycle of interface 'extends' links has no flattened requirement set; the first interface
+// found on a cycle is diagnosed and its extends link cleared, which dissolves the cycle for the
+// rest. Runs once, after every module's signatures resolved the links.
+public breakInterfaceExtensionCycles(List<ModuleContext> contexts) -> FileDiagnostic[] {
+    let collected = new List<FileDiagnostic>();
+    for (long i = 0; i < contexts.length(); i++) {
+        let context = contexts.get(i);
+        let root = context.root();
+        if (root == null) {
+            continue;
+        }
+        let store = context.resolver().typeStore();
+        string modulePath = context.module().canonicalPath();
+        for (long n = 0; n < root.itemsCount(); n++) {
+            switch (root.items(n)) {
+                is InterfaceDeclarationNode node -> {
+                    let found = store.findDeclared(modulePath, node.name().text());
+                    if (found is InterfaceType && found.declaration() == node.green()) {
+                        breakCycleThrough(found, context.module().filePath(), node.name().span(),
+                            collected);
+                    }
+                },
+                default -> { },
+            }
+        }
+    }
+    return diagnostics.sorted(collected);
+}
+
+breakCycleThrough(InterfaceType interfaceType, string filePath, Span nameSpan,
+                  List<FileDiagnostic> collected) {
+    let seen = new Set<InterfaceType>();
+    InterfaceType? current = interfaceType;
+    while (current != null) {
+        if (!seen.add(current)) {
+            collected.push(new FileDiagnostic(filePath,
+                "Interface '{interfaceType.name()}' eventually extends itself through the "
+                + "interfaces it extends. An interface cannot extend itself, directly or "
+                + "indirectly.", nameSpan));
+            interfaceType.clearBase();
+            return;
+        }
+        current = extendedAuthority(current);
+    }
+}
+
+// The interface the extends link continues through: a generic target defers to its template.
+extendedAuthority(InterfaceType interfaceType) -> InterfaceType? {
+    let base = interfaceType.base();
+    if (base == null) {
+        return null;
+    }
+    let authority = types.authorityOf(base);
+    if (authority is InterfaceType) {
+        return authority;
+    }
+    return null;
+}
+
+// The kind of a rejected interface 'extends' target, as the diagnostic reads it.
+extendTargetKind(Type base) -> string {
+    switch (base) {
+        is TypeParamType ignored -> {
+            return "type parameter";
+        },
+        is DeclaredType declared -> {
+            return types.kindWordOf(declared);
+        },
+        is InstantiationType instantiation -> {
+            return types.kindWordOf(instantiation.template());
+        },
+        default -> {
+            return "primitive type";
+        },
     }
 }
 

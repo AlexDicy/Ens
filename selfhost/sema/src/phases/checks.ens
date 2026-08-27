@@ -18,6 +18,7 @@ import FileDiagnostic from support.diagnostics;
 import Reporter from support.diagnostics;
 import support.diagnostics;
 import ModuleContext from context;
+import phases.layout;
 import phases.members;
 import model.convert;
 import model.types;
@@ -102,6 +103,7 @@ class ModuleChecks {
         this.checkStructCycles();
         this.checkFieldDefaultOrder();
         this.checkFieldInitialization();
+        this.checkInterfaceRedeclarations();
         this.checkDeclaredThrows();
         this.checkVisibilityLeaks();
     }
@@ -319,6 +321,57 @@ class ModuleChecks {
         }
     }
 
+    // ---- Interface requirement redeclarations ----
+
+    // A sub-interface inherits every requirement of the interface it extends, so redeclaring
+    // one (same name and parameter types) is an error naming the ancestor that declares it.
+    // Genuine overloads with different parameters stay legal, like overloads within one
+    // interface.
+    checkInterfaceRedeclarations() {
+        for (long i = 0; i < this.interfaceNodes.length(); i++) {
+            let node = this.interfaceNodes.get(i);
+            let interfaceType = this.interfaceFor(node);
+            if (interfaceType == null) {
+                continue;
+            }
+            let methods = interfaceType.methods();
+            for (long m = 0; m < methods.length(); m++) {
+                let method = methods.get(m);
+                let inherited = this.inheritedRequirement(interfaceType, method);
+                if (inherited == null) {
+                    continue;
+                }
+                this.reporter.report("Interface '{interfaceType.name()}' already requires "
+                    + "'{layout.methodDisplay(inherited)}' through "
+                    + "'{types.display(inherited.definingType())}', which it extends; an "
+                    + "extending interface inherits every requirement. Remove the "
+                    + "redeclaration.", method.signature().nameSpan());
+            }
+        }
+    }
+
+    // The nearest requirement up the extends chain that the method redeclares: the same name
+    // and parameter types on an interface the declaring one extends.
+    inheritedRequirement(InterfaceType interfaceType, Method method) -> Method? {
+        let seen = new Set<Type>();
+        Type? current = types.baseOf(interfaceType);
+        while (current != null && seen.add(current)) {
+            let candidates = types.methodsOf(current);
+            if (candidates != null) {
+                for (long i = 0; i < candidates.length(); i++) {
+                    let candidate = candidates.get(i);
+                    if (candidate.name() == method.name()
+                            && types.sameParameterTypes(candidate.signature(),
+                                method.signature())) {
+                        return candidate;
+                    }
+                }
+            }
+            current = types.baseOf(current);
+        }
+        return null;
+    }
+
     // ---- Declared throws ----
 
     checkDeclaredThrows() {
@@ -442,6 +495,7 @@ class ModuleChecks {
                 continue;
             }
             string declPhrase = "Interface '{interfaceType.name()}'";
+            this.checkInterfaceBaseLeaks(interfaceType, node, declPhrase);
             this.checkBoundLeaks(interfaceType.typeParameterTypes(),
                 interfaceType.visibility(), declPhrase, node.name().span());
             let methods = interfaceType.methods();
@@ -481,6 +535,39 @@ class ModuleChecks {
             for (let argument in base.arguments()) {
                 this.checkMentionedType(argument, classType.visibility(), declPhrase,
                     "base class type argument", at);
+            }
+        }
+    }
+
+    checkInterfaceBaseLeaks(InterfaceType interfaceType, InterfaceDeclarationNode node,
+                            string declPhrase) {
+        if (types.visibilityTier(interfaceType.visibility()) == 0) {
+            return;
+        }
+        let base = interfaceType.base();
+        if (base == null) {
+            return;
+        }
+        Span at = node.name().span();
+        let extendsClause = node.extendsClause();
+        if (extendsClause != null) {
+            at = extendsClause.base().span();
+        }
+        let baseAuthority = types.authorityOf(base);
+        if (baseAuthority != null
+                && types.visibilityTier(baseAuthority.visibility())
+                    < types.visibilityTier(interfaceType.visibility())) {
+            this.reporter.report("{declPhrase} is visible as "
+                + "'{types.visibilityWord(interfaceType.visibility())}' but the interface it "
+                + "extends, '{baseAuthority.name()}', is {notNameablePhrase(baseAuthority)}. "
+                + "Mark '{baseAuthority.name()}' as "
+                + "'{types.visibilityWord(interfaceType.visibility())}', or lower the "
+                + "declaration.", at);
+        }
+        if (base is InstantiationType) {
+            for (let argument in base.arguments()) {
+                this.checkMentionedType(argument, interfaceType.visibility(), declPhrase,
+                    "extended interface type argument", at);
             }
         }
     }
