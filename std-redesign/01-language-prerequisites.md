@@ -24,6 +24,10 @@ Required for the collections protocol ladder.
 Implemented, reachable only through the type name: `List.withCapacity(8)` is legal and `myList.withCapacity(8)` is an error.
 This is the C# rule; Java allowing instance access is the known mistake.
 
+Ratified 2026-08-27: static methods, plus `static const` fields with mandatory initializers as type-level constants; no mutable static fields.
+On a generic type, a static's type arguments are supplied three ways: written on the type name (`List<int>.withCapacity(8)`), inferred from the call's own arguments (`List.of(items)`, the generic-function rule), or target-typed from the surrounding context (`List<int> xs = List.withCapacity(8);`), using the same context set as aggregate literals.
+Type arguments are never written on the method name; method-position brackets stay reserved for the member's own type-parameter list (conditional members).
+
 ## Nested optionals
 
 The silent collapse of `T??` to `T?` is removed.
