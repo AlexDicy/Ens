@@ -6543,6 +6543,25 @@ Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
         }
     }
 
+    // Static member access ('Path.separator', 'List.withCapacity(8)', 'List<int>.of(...)'):
+    // this temporary front end parses the shape and leaves the checking to the compiler, so a
+    // type-name head produces no diagnostic here.
+    if (auto idObj = obj->asIdent()) {
+        if (auto idName = idObj->nameText()) {
+            Symbol* typeSym = currentScope ? currentScope->lookup(*idName) : nullptr;
+            if (typeSym && typeSym->isTypeName) {
+                analysis.setSymbol(idObj->node.greenNode(), typeSym);
+                return typeCtx.getError();
+            }
+            if (!typeSym && typeCtx.lookupNamedType(modulePath_, *idName)) {
+                return typeCtx.getError();
+            }
+        }
+    }
+    if (obj->node.kind() == SyntaxKind::GenericNameExpr) {
+        return typeCtx.getError();
+    }
+
     Type* objT = analyzeExpr(*obj);
     if (objT->isError()) return typeCtx.getError();
     // A bounded type parameter exposes the members of every one of its bounds;

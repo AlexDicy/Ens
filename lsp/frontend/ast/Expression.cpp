@@ -6,6 +6,7 @@ bool Expression::isExpressionKind(SyntaxKind k) {
     switch (k) {
         case SyntaxKind::LiteralExpr:
         case SyntaxKind::IdentExpr:
+        case SyntaxKind::GenericNameExpr:
         case SyntaxKind::ThisExpr:
         case SyntaxKind::SuperExpr:
         case SyntaxKind::BinaryExpr:

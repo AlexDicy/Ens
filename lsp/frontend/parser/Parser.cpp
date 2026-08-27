@@ -439,11 +439,12 @@ bool Parser::looksLikeFuncDecl(bool allowShorthand) const {
         idx++;
         while (idx < tokens.size() && isTrivia(tokens[idx].kind)) idx++;
     }
-    // Skip optional method modifiers (override / final / abstract / noreturn).
+    // Skip optional method modifiers (override / final / abstract / noreturn / static).
     while (idx < tokens.size() && (tokens[idx].kind == SyntaxKind::KwOverride ||
                                    tokens[idx].kind == SyntaxKind::KwFinal ||
                                    tokens[idx].kind == SyntaxKind::KwAbstract ||
-                                   tokens[idx].kind == SyntaxKind::KwNoreturn)) {
+                                   tokens[idx].kind == SyntaxKind::KwNoreturn ||
+                                   tokens[idx].kind == SyntaxKind::KwStatic)) {
         idx++;
         while (idx < tokens.size() && isTrivia(tokens[idx].kind)) idx++;
     }
@@ -477,7 +478,7 @@ void Parser::parseFuncDecl() {
     builder.startNode(SyntaxKind::FuncDecl);
     parseVisibilityModifier();
     while (at(SyntaxKind::KwOverride) || at(SyntaxKind::KwFinal) || at(SyntaxKind::KwAbstract) ||
-           at(SyntaxKind::KwNoreturn)) {
+           at(SyntaxKind::KwNoreturn) || at(SyntaxKind::KwStatic)) {
         bump();  // method modifier; analyzer validates context
     }
     if (at(SyntaxKind::KwConstructor) || at(SyntaxKind::KwDestructor)) {
@@ -758,7 +759,8 @@ bool Parser::looksLikeKeywordNamedMethod() const {
     while (idx < tokens.size() && (tokens[idx].kind == SyntaxKind::KwOverride ||
                                    tokens[idx].kind == SyntaxKind::KwFinal ||
                                    tokens[idx].kind == SyntaxKind::KwAbstract ||
-                                   tokens[idx].kind == SyntaxKind::KwNoreturn)) {
+                                   tokens[idx].kind == SyntaxKind::KwNoreturn ||
+                                   tokens[idx].kind == SyntaxKind::KwStatic)) {
         idx++;
         skipTrivia();
     }
@@ -771,7 +773,7 @@ bool Parser::looksLikeKeywordNamedMethod() const {
 void Parser::parseFieldDecl() {
     builder.startNode(SyntaxKind::FieldDecl);
     parseVisibilityModifier();
-    while (at(SyntaxKind::KwWeak) || at(SyntaxKind::KwConst)) bump();
+    while (at(SyntaxKind::KwWeak) || at(SyntaxKind::KwConst) || at(SyntaxKind::KwStatic)) bump();
     if (isTypeStart(kindAt())) parseType();
     else emitMissing(SyntaxKind::Identifier, "field type");
     expect(SyntaxKind::Identifier, "field name");
@@ -1411,13 +1413,20 @@ void Parser::parsePrecedence(int minPrec) {
     while (true) {
         SyntaxKind op = kindAt();
         // Generic call `callee<TypeArgs>(args)`: a balanced type-ish `<...>`
-        // immediately followed by `(`. Otherwise `<` is a comparison operator.
+        // immediately followed by `(`. A `.` after the `>` instead is a static member
+        // access head, `TypeName<TypeArgs>.member`. Otherwise `<` is a comparison operator.
         if (op == SyntaxKind::Lt) {
             size_t after = scanTypeArgs(0);
             if (after != 0 && peekKind(after) == SyntaxKind::LParen) {
                 builder.startNodeAt(cp, SyntaxKind::CallExpr);
                 parseTypeArgList();
                 parseArgList();
+                builder.finishNode();
+                continue;
+            }
+            if (after != 0 && peekKind(after) == SyntaxKind::Dot) {
+                builder.startNodeAt(cp, SyntaxKind::GenericNameExpr);
+                parseTypeArgList();
                 builder.finishNode();
                 continue;
             }

@@ -1,0 +1,702 @@
+// Evaluation of static const initializers, program-wide. A static const holds a compile-time
+// constant: a literal, unary '+'/'-', arithmetic ('+', '-', '*', '/', '%') and string
+// concatenation over other constants, and reads of other static consts through their type name,
+// behind any depth of parentheses. Evaluation is demand-driven with an in-progress mark, so a
+// chain of references evaluates in dependency order whatever the module order, and a cycle is
+// reported at the reference that closes it. The evaluated values land on the Field objects,
+// where the body phase reads them to fold every use site.
+import StructDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import ClassDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import FieldDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import MemberListNode from @ens.frontend.syntax.generated.nodes;
+import Expression from @ens.frontend.syntax.generated.nodes;
+import LiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import PrefixExpressionNode from @ens.frontend.syntax.generated.nodes;
+import BinaryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ParenthesizedExpressionNode from @ens.frontend.syntax.generated.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import GenericNameExpressionNode from @ens.frontend.syntax.generated.nodes;
+import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import NewExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ArrayLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import StructLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import InterpolatedStringExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxKind from @ens.frontend.syntax.generated.kind;
+import Span from @ens.frontend.support.source;
+import FileDiagnostic from support.diagnostics;
+import support.diagnostics;
+import ModuleContext from context;
+import ImportedType from phases.link;
+import ImportedNamespace from phases.link;
+import phases.members;
+import model.literalvalues;
+import ConstantValue from model.literalvalues;
+import ConstantKind from model.literalvalues;
+import model.types;
+import Type from model.types;
+import ErrorType from model.types;
+import StringType from model.types;
+import PrimitiveType from model.types;
+import PrimitiveKind from model.types;
+import DeclaredType from model.types;
+import Field from model.types;
+import Visibility from model.types;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+
+public evaluateProgram(List<ModuleContext> contexts) -> FileDiagnostic[] {
+    let collected = new List<FileDiagnostic>();
+    let evaluator = new ConstantEvaluator(collected);
+    for (long i = 0; i < contexts.length(); i++) {
+        evaluator.gather(contexts.get(i));
+    }
+    evaluator.evaluateAll();
+    return diagnostics.sorted(collected);
+}
+
+// One static const with an initializer to evaluate, in the module that declares it.
+class ConstantItem {
+    protected Field field;
+    protected Expression initializer;
+    protected ModuleContext context;
+    protected DeclaredType owner;
+    protected long state;
+
+    protected constructor(this.field, this.initializer, this.context, this.owner) {
+        this.state = statePending();
+    }
+}
+
+statePending() -> long {
+    return 0;
+}
+
+stateEvaluating() -> long {
+    return 1;
+}
+
+stateFinished() -> long {
+    return 2;
+}
+
+class ConstantEvaluator {
+    List<FileDiagnostic> collected;
+    List<ConstantItem> items;
+    Map<Field, ConstantItem> itemsByField;
+
+    protected constructor(List<FileDiagnostic> collected) {
+        this.collected = collected;
+        this.items = new List<ConstantItem>();
+        this.itemsByField = new Map<Field, ConstantItem>();
+    }
+
+    protected gather(ModuleContext context) {
+        let root = context.root();
+        if (root == null) {
+            return;
+        }
+        let store = context.resolver().typeStore();
+        string modulePath = context.module().canonicalPath();
+        for (long i = 0; i < root.itemsCount(); i++) {
+            switch (root.items(i)) {
+                is StructDeclarationNode declaration -> {
+                    let found = store.findDeclared(modulePath, declaration.name().text());
+                    if (found != null && found.declaration() == declaration.green()) {
+                        this.gatherMembers(context, found, declaration.body());
+                    }
+                },
+                is ClassDeclarationNode declaration -> {
+                    let found = store.findDeclared(modulePath, declaration.name().text());
+                    if (found != null && found.declaration() == declaration.green()) {
+                        this.gatherMembers(context, found, declaration.body());
+                    }
+                },
+                default -> { },
+            }
+        }
+    }
+
+    gatherMembers(ModuleContext context, DeclaredType owner, MemberListNode body) {
+        for (long i = 0; i < body.membersCount(); i++) {
+            let member = body.members(i);
+            if (!(member is FieldDeclarationNode)) {
+                continue;
+            }
+            if (!members.fieldModifiers(member).declaresStatic) {
+                continue;
+            }
+            let field = members.findField(types.staticFieldsOf(owner), member.name().text());
+            if (field == null || field.nameSpan() != member.name().span()) {
+                continue;
+            }
+            let initializer = member.defaultValue();
+            if (initializer == null) {
+                continue;
+            }
+            let item = new ConstantItem(field, initializer.value(), context, owner);
+            this.items.push(item);
+            this.itemsByField.set(field, item);
+        }
+    }
+
+    protected evaluateAll() {
+        for (long i = 0; i < this.items.length(); i++) {
+            this.evaluateItem(this.items.get(i));
+        }
+    }
+
+    evaluateItem(ConstantItem item) {
+        if (item.state != statePending()) {
+            return;
+        }
+        item.state = stateEvaluating();
+        let value = this.evaluate(item, item.initializer);
+        if (value != null) {
+            let fitted = this.fitDeclaredType(item, value);
+            if (fitted != null) {
+                item.field.setConstantValue(fitted);
+            }
+        }
+        item.state = stateFinished();
+    }
+
+    report(ConstantItem item, string message, Span span) {
+        this.collected.push(new FileDiagnostic(item.context.module().filePath(), message, span));
+    }
+
+    // The standard refusal: what the initializer did, then what a constant may be built from.
+    reportNotConstant(ConstantItem item, Span span, string what) {
+        this.report(item, "The initializer of static const "
+            + "'{item.owner.name()}.{item.field.name()}' must be a compile-time constant, but "
+            + "{what}. A constant is built from literals, '+', '-', '*', '/', '%', string "
+            + "concatenation, and other static consts read through their type name.", span);
+    }
+
+    evaluate(ConstantItem item, Expression node) -> ConstantValue? {
+        switch (node) {
+            is LiteralExpressionNode literal -> {
+                return this.evaluateLiteral(item, literal);
+            },
+            is ParenthesizedExpressionNode parenthesized -> {
+                return this.evaluate(item, parenthesized.inner());
+            },
+            is PrefixExpressionNode prefix -> {
+                return this.evaluatePrefix(item, prefix);
+            },
+            is BinaryExpressionNode binary -> {
+                return this.evaluateBinary(item, binary);
+            },
+            is MemberExpressionNode member -> {
+                return this.evaluateReference(item, member);
+            },
+            is IdentifierExpressionNode identifier -> {
+                this.evaluateIdentifier(item, identifier);
+                return null;
+            },
+            is CallExpressionNode ignored -> {
+                this.reportNotConstant(item, node.span(), "it calls a function, which only "
+                    + "runs at run time");
+                return null;
+            },
+            is NewExpressionNode ignored -> {
+                this.reportNotConstant(item, node.span(), "it creates an object with 'new', "
+                    + "which only happens at run time");
+                return null;
+            },
+            is ArrayLiteralExpressionNode ignored -> {
+                this.reportNotConstant(item, node.span(), "it builds an array, and a static "
+                    + "const holds a primitive, 'char', 'bool', or 'string'");
+                return null;
+            },
+            is StructLiteralExpressionNode ignored -> {
+                this.reportNotConstant(item, node.span(), "it builds a struct, and a static "
+                    + "const holds a primitive, 'char', 'bool', or 'string'");
+                return null;
+            },
+            is InterpolatedStringExpressionNode ignored -> {
+                this.reportNotConstant(item, node.span(), "string interpolation builds its "
+                    + "text at run time; join the pieces with '+' instead");
+                return null;
+            },
+            default -> {
+                this.reportNotConstant(item, node.span(),
+                    "this expression is only computed at run time");
+                return null;
+            },
+        }
+    }
+
+    evaluateLiteral(ConstantItem item, LiteralExpressionNode literal) -> ConstantValue? {
+        let token = literal.value();
+        switch (token.kind()) {
+            IntLiteral, LongLiteral -> {
+                let magnitude = literalvalues.integerMagnitude(token.text());
+                if (magnitude == null) {
+                    this.report(item, "Integer literal '{token.text()}' is too large for any "
+                        + "integer type.", literal.span());
+                    return null;
+                }
+                return literalvalues.integerConstant(false, magnitude);
+            },
+            FloatLiteral, DoubleLiteral -> {
+                return literalvalues.floatConstant(false,
+                    literalvalues.floatMagnitude(token.text()));
+            },
+            StringLiteral -> {
+                return literalvalues.stringConstant(literalvalues.decodeString(token.text()));
+            },
+            CharLiteral -> {
+                return literalvalues.charConstant(literalvalues.charCodepoint(token.text()));
+            },
+            TrueKeyword -> {
+                return literalvalues.boolConstant(true);
+            },
+            FalseKeyword -> {
+                return literalvalues.boolConstant(false);
+            },
+            NullKeyword -> {
+                this.reportNotConstant(item, literal.span(), "a static const holds a "
+                    + "primitive, 'char', 'bool', or 'string' value, none of which is null");
+                return null;
+            },
+            default -> {
+                this.reportNotConstant(item, literal.span(),
+                    "this expression is only computed at run time");
+                return null;
+            },
+        }
+    }
+
+    evaluatePrefix(ConstantItem item, PrefixExpressionNode prefix) -> ConstantValue? {
+        SyntaxKind operator = prefix.operator().kind();
+        if (operator != SyntaxKind.Plus && operator != SyntaxKind.Minus) {
+            this.reportNotConstant(item, prefix.span(), "'{prefix.operator().text()}' is not "
+                + "part of a constant expression");
+            return null;
+        }
+        let operand = this.evaluate(item, prefix.operand());
+        if (operand == null) {
+            return null;
+        }
+        if (operand.kind() == ConstantKind.Integer) {
+            if (operator == SyntaxKind.Minus) {
+                return literalvalues.integerConstant(!operand.isNegative(),
+                    operand.magnitude());
+            }
+            return operand;
+        }
+        if (operand.kind() == ConstantKind.Float) {
+            if (operator == SyntaxKind.Minus) {
+                return literalvalues.floatConstant(true, operand.floatValue());
+            }
+            return operand;
+        }
+        this.report(item, "'{prefix.operator().text()}' in a constant expression applies to a "
+            + "number, not to {constantKindText(operand)}.", prefix.span());
+        return null;
+    }
+
+    evaluateBinary(ConstantItem item, BinaryExpressionNode binary) -> ConstantValue? {
+        SyntaxKind operator = binary.operator().kind();
+        if (!isConstantOperator(operator)) {
+            this.reportNotConstant(item, binary.span(), "'{binary.operator().text()}' is not "
+                + "part of a constant expression");
+            return null;
+        }
+        let left = this.evaluate(item, binary.left());
+        let right = this.evaluate(item, binary.right());
+        if (left == null || right == null) {
+            return null;
+        }
+        if (left.kind() == ConstantKind.String || right.kind() == ConstantKind.String) {
+            if (operator != SyntaxKind.Plus || left.kind() != right.kind()) {
+                this.report(item, "'{binary.operator().text()}' in a constant expression "
+                    + "combines two numbers, or '+' joins two strings; here it gets "
+                    + "{constantKindText(left)} and {constantKindText(right)}.", binary.span());
+                return null;
+            }
+            return literalvalues.stringConstant(left.text() + right.text());
+        }
+        if (left.kind() == ConstantKind.Bool || right.kind() == ConstantKind.Bool) {
+            this.report(item, "'{binary.operator().text()}' in a constant expression combines "
+                + "numbers or strings, and a 'bool' is neither.", binary.span());
+            return null;
+        }
+        if (left.kind() == ConstantKind.Float || right.kind() == ConstantKind.Float) {
+            return this.combineFloats(item, binary, operator, asFloat(left), asFloat(right));
+        }
+        return this.combineIntegers(item, binary, operator, left, right);
+    }
+
+    combineFloats(ConstantItem item, BinaryExpressionNode binary, SyntaxKind operator,
+                  double left, double right) -> ConstantValue? {
+        switch (operator) {
+            Plus -> {
+                return literalvalues.floatConstant(false, left + right);
+            },
+            Minus -> {
+                return literalvalues.floatConstant(false, left - right);
+            },
+            Star -> {
+                return literalvalues.floatConstant(false, left * right);
+            },
+            Slash -> {
+                if (right == 0.0) {
+                    this.report(item, "The initializer of static const "
+                        + "'{item.owner.name()}.{item.field.name()}' divides by zero.",
+                        binary.span());
+                    return null;
+                }
+                return literalvalues.floatConstant(false, left / right);
+            },
+            default -> {
+                this.report(item, "'%' in a constant expression works on integers.",
+                    binary.span());
+                return null;
+            },
+        }
+    }
+
+    combineIntegers(ConstantItem item, BinaryExpressionNode binary, SyntaxKind operator,
+                    ConstantValue left, ConstantValue right) -> ConstantValue? {
+        bool leftNegative = left.isNegative();
+        ulong leftMagnitude = left.magnitude();
+        bool rightNegative = right.isNegative();
+        ulong rightMagnitude = right.magnitude();
+        switch (operator) {
+            Plus -> {
+                return this.addSigned(item, binary, leftNegative, leftMagnitude, rightNegative,
+                    rightMagnitude);
+            },
+            Minus -> {
+                return this.addSigned(item, binary, leftNegative, leftMagnitude,
+                    !rightNegative && rightMagnitude != 0, rightMagnitude);
+            },
+            Star -> {
+                if (leftMagnitude != 0 && rightMagnitude > integerCeiling() / leftMagnitude) {
+                    this.reportOverflow(item, binary);
+                    return null;
+                }
+                return literalvalues.integerConstant(leftNegative != rightNegative,
+                    leftMagnitude * rightMagnitude);
+            },
+            Slash -> {
+                if (rightMagnitude == 0) {
+                    this.report(item, "The initializer of static const "
+                        + "'{item.owner.name()}.{item.field.name()}' divides by zero.",
+                        binary.span());
+                    return null;
+                }
+                return literalvalues.integerConstant(leftNegative != rightNegative,
+                    leftMagnitude / rightMagnitude);
+            },
+            default -> {
+                if (rightMagnitude == 0) {
+                    this.report(item, "The initializer of static const "
+                        + "'{item.owner.name()}.{item.field.name()}' divides by zero.",
+                        binary.span());
+                    return null;
+                }
+                return literalvalues.integerConstant(leftNegative,
+                    leftMagnitude % rightMagnitude);
+            },
+        }
+    }
+
+    // Signed addition in sign-and-magnitude form: equal signs add the magnitudes, opposite
+    // signs subtract the smaller from the larger and keep the larger's sign. The subtraction
+    // above passes the right operand's sign flipped ('a - b' is 'a + (-b)'), normalizing a
+    // zero so it stays positive.
+    addSigned(ConstantItem item, BinaryExpressionNode binary, bool leftNegative,
+              ulong leftMagnitude, bool rightNegative, ulong rightMagnitude) -> ConstantValue? {
+        if (leftNegative == rightNegative || rightMagnitude == 0) {
+            if (leftMagnitude > integerCeiling() - rightMagnitude) {
+                this.reportOverflow(item, binary);
+                return null;
+            }
+            return literalvalues.integerConstant(leftNegative,
+                leftMagnitude + rightMagnitude);
+        }
+        if (leftMagnitude >= rightMagnitude) {
+            return literalvalues.integerConstant(leftNegative,
+                leftMagnitude - rightMagnitude);
+        }
+        return literalvalues.integerConstant(rightNegative, rightMagnitude - leftMagnitude);
+    }
+
+    reportOverflow(ConstantItem item, BinaryExpressionNode binary) {
+        this.report(item, "The initializer of static const "
+            + "'{item.owner.name()}.{item.field.name()}' overflows: the result does not fit "
+            + "any integer type.", binary.span());
+    }
+
+    // A read of another static const, written through its type name: 'Path.separator'.
+    evaluateReference(ConstantItem item, MemberExpressionNode member) -> ConstantValue? {
+        string memberName = member.member().text();
+        let object = member.object();
+        DeclaredType? named = null;
+        switch (object) {
+            is IdentifierExpressionNode identifier -> {
+                named = this.resolveTypeName(item, identifier.name().text());
+                if (named == null) {
+                    this.reportUnknownHead(item, identifier.name().text(), member.span());
+                    return null;
+                }
+            },
+            is GenericNameExpressionNode generic -> {
+                let head = generic.head();
+                string headName = "";
+                if (head is IdentifierExpressionNode) {
+                    headName = head.name().text();
+                    named = this.resolveTypeName(item, headName);
+                }
+                if (named == null) {
+                    this.reportUnknownHead(item, headName, member.span());
+                    return null;
+                }
+                this.report(item, "A static const never depends on type arguments, so a "
+                    + "constant initializer reads it through the bare type name: write "
+                    + "'{named.name()}.{memberName}'.", generic.typeArguments().span());
+                return null;
+            },
+            default -> {
+                this.reportQualifiedHead(item, member, memberName);
+                return null;
+            },
+        }
+        let field = members.findField(types.staticFieldsOf(named), memberName);
+        if (field == null) {
+            this.reportNotConstant(item, member.span(), "'{named.name()}.{memberName}' is "
+                + "not a static const");
+            return null;
+        }
+        if (!this.referenceVisible(item, field, member.member().span())) {
+            return null;
+        }
+        let target = this.itemsByField.get(field);
+        if (target == null) {
+            return null;
+        }
+        if (target.state == stateEvaluating()) {
+            this.report(item, "'{item.owner.name()}.{item.field.name()}' cannot take its "
+                + "value from '{named.name()}.{memberName}' here: the chain of static consts "
+                + "between them closes a cycle. Break the cycle by giving one of them a "
+                + "literal value.", member.span());
+            return null;
+        }
+        this.evaluateItem(target);
+        return field.constantValue();
+    }
+
+    // The class or struct an initializer's type-name head resolves to: the file's imported
+    // names, then the module's own declarations, matching how a body resolves the same head.
+    resolveTypeName(ConstantItem item, string name) -> DeclaredType? {
+        if (name.length == 0) {
+            return null;
+        }
+        let imported = item.context.linkTable().binding(name);
+        if (imported is ImportedType) {
+            return this.asStaticOwner(imported.target());
+        }
+        if (imported is ImportedNamespace) {
+            return null;
+        }
+        let store = item.context.resolver().typeStore();
+        let declared = store.findDeclared(item.context.module().canonicalPath(), name);
+        if (declared != null) {
+            return this.asStaticOwner(declared);
+        }
+        return null;
+    }
+
+    asStaticOwner(DeclaredType declared) -> DeclaredType? {
+        if (types.staticFieldsOf(declared) == null) {
+            return null;
+        }
+        return declared;
+    }
+
+    reportUnknownHead(ConstantItem item, string headName, Span span) {
+        this.reportNotConstant(item, span, "'{headName}' is not a class or struct this file "
+            + "can name");
+    }
+
+    reportQualifiedHead(ConstantItem item, MemberExpressionNode member, string memberName) {
+        let object = member.object();
+        if (object is MemberExpressionNode) {
+            let inner = object.object();
+            if (inner is IdentifierExpressionNode
+                    && item.context.linkTable().binding(inner.name().text())
+                        is ImportedNamespace) {
+                this.reportNotConstant(item, member.span(), "it reads "
+                    + "'{object.member().text()}.{memberName}' through the module namespace "
+                    + "'{inner.name().text()}'; import '{object.member().text()}' by name and "
+                    + "write '{object.member().text()}.{memberName}'");
+                return;
+            }
+        }
+        this.reportNotConstant(item, member.span(),
+            "it reads a member of a value, which only exists at run time");
+    }
+
+    evaluateIdentifier(ConstantItem item, IdentifierExpressionNode identifier) {
+        string name = identifier.name().text();
+        let sibling = members.findField(types.staticFieldsOf(item.owner), name);
+        if (sibling != null) {
+            this.report(item, "Statics are read through the type name even inside "
+                + "'{item.owner.name()}'; write '{item.owner.name()}.{name}'.",
+                identifier.span());
+            return;
+        }
+        this.reportNotConstant(item, identifier.span(), "'{name}' is not a constant; only "
+            + "another static const can be named, through its type name");
+    }
+
+    // Whether the referring initializer may read the target field, under the ordinary member
+    // access rules with the referring type standing for the access site.
+    referenceVisible(ConstantItem item, Field field, Span at) -> bool {
+        let defining = types.authorityOf(field.definingType());
+        if (defining == null) {
+            return true;
+        }
+        bool allowed = types.memberAccessAllowed(field.visibility(), defining, item.owner,
+            item.context.module().canonicalPath(), item.context.module().packagePrefix());
+        if (!allowed) {
+            this.report(item, "'{field.name()}' is "
+                + "{types.visibilityWord(field.visibility())} to "
+                + "{types.kindWordOf(defining)} '{defining.name()}', so the initializer of "
+                + "'{item.owner.name()}.{item.field.name()}' cannot read it.", at);
+        }
+        return allowed;
+    }
+
+    // The evaluated value adapted to the field's declared type, or null after a diagnostic. The
+    // adaptation follows the untyped-literal rules: an integer fits any integer type that holds
+    // its value and converts to a floating-point type, a char's codepoint fits the integer types
+    // the same way a char literal does, and everything else must match its own family. A type
+    // outside the constant family was already rejected when the field was collected.
+    fitDeclaredType(ConstantItem item, ConstantValue value) -> ConstantValue? {
+        Type declared = item.field.type();
+        string name = "{item.owner.name()}.{item.field.name()}";
+        Span at = item.initializer.span();
+        if (declared is ErrorType) {
+            return null;
+        }
+        if (declared is StringType) {
+            if (value.kind() == ConstantKind.String) {
+                return value;
+            }
+            this.report(item, "Static const '{name}' has type 'string' but its initializer "
+                + "is {constantKindText(value)}.", at);
+            return null;
+        }
+        if (!(declared is PrimitiveType)) {
+            return null;
+        }
+        PrimitiveKind kind = declared.kind();
+        if (kind == PrimitiveKind.Bool) {
+            if (value.kind() == ConstantKind.Bool) {
+                return value;
+            }
+            this.report(item, "Static const '{name}' has type 'bool' but its initializer is "
+                + "{constantKindText(value)}.", at);
+            return null;
+        }
+        if (kind == PrimitiveKind.Char) {
+            if (value.kind() == ConstantKind.Char) {
+                return value;
+            }
+            this.report(item, "Static const '{name}' has type 'char' but its initializer is "
+                + "{constantKindText(value)}; write a char literal such as '/'.", at);
+            return null;
+        }
+        if (kind == PrimitiveKind.Float || kind == PrimitiveKind.Double) {
+            double magnitude = 0.0;
+            bool negative = false;
+            switch (value.kind()) {
+                Float -> {
+                    magnitude = value.floatValue();
+                    if (magnitude < 0.0) {
+                        negative = true;
+                        magnitude = 0.0 - magnitude;
+                    }
+                },
+                Integer -> {
+                    magnitude = value.magnitude() as double;
+                    negative = value.isNegative();
+                },
+                default -> {
+                    this.report(item, "Static const '{name}' has type "
+                        + "'{types.display(declared)}' but its initializer is "
+                        + "{constantKindText(value)}.", at);
+                    return null;
+                },
+            }
+            if (!literalvalues.floatMagnitudeFits(magnitude, kind)) {
+                this.report(item, "Static const '{name}' has type "
+                    + "'{types.display(declared)}', which holds at most "
+                    + "{literalvalues.floatLimit(kind)}; this value is larger.", at);
+                return null;
+            }
+            return literalvalues.floatConstant(negative, magnitude);
+        }
+        bool negativeValue = false;
+        ulong magnitudeValue = 0;
+        switch (value.kind()) {
+            Integer -> {
+                negativeValue = value.isNegative();
+                magnitudeValue = value.magnitude();
+            },
+            Char -> {
+                magnitudeValue = value.magnitude();
+            },
+            default -> {
+                this.report(item, "Static const '{name}' has type "
+                    + "'{types.display(declared)}' but its initializer is "
+                    + "{constantKindText(value)}.", at);
+                return null;
+            },
+        }
+        if (!literalvalues.magnitudeFits(negativeValue, magnitudeValue, kind)) {
+            this.report(item, "Static const '{name}' has type '{types.display(declared)}', "
+                + "which holds {literalvalues.integerRange(kind)}; "
+                + "{literalvalues.constantText(value)} is outside that range.", at);
+            return null;
+        }
+        return literalvalues.integerConstant(negativeValue, magnitudeValue);
+    }
+}
+
+isConstantOperator(SyntaxKind operator) -> bool {
+    return switch (operator) {
+        Plus, Minus, Star, Slash, Percent -> true,
+        default -> false,
+    };
+}
+
+asFloat(ConstantValue value) -> double {
+    if (value.kind() == ConstantKind.Float) {
+        return value.floatValue();
+    }
+    double magnitude = value.magnitude() as double;
+    if (value.isNegative()) {
+        return 0.0 - magnitude;
+    }
+    return magnitude;
+}
+
+// How a constant value's kind reads in a diagnostic.
+constantKindText(ConstantValue value) -> string {
+    return switch (value.kind()) {
+        Integer -> "the number {literalvalues.constantText(value)}",
+        Float -> "the fractional number {literalvalues.constantText(value)}",
+        Bool -> "the bool '{literalvalues.constantText(value)}'",
+        Char -> "a char",
+        String -> "the string {literalvalues.constantText(value)}",
+    };
+}
+
+integerCeiling() -> ulong {
+    return 18446744073709551615;
+}

@@ -274,10 +274,16 @@ class SignatureCollector {
                 if (member is FieldDeclarationNode) {
                     let field = members.readField(this.resolver, this.reporter, member, found,
                         types.followedMemberVisibility(found.visibility()));
+                    if (field.isStatic()) {
+                        this.collectStaticField(found, member, field);
+                        continue;
+                    }
                     if (field.isWeak()) {
                         this.reporter.report("'weak' fields are not allowed on structs.",
                             field.nameSpan());
                     }
+                    members.checkStaticInstanceCollision(this.reporter, found, field.name(),
+                        false, field.nameSpan());
                     found.fields().push(field);
                 }
             }
@@ -305,6 +311,22 @@ class SignatureCollector {
             structType.setMembersComplete();
             members.checkHashEqualsPairing(this.reporter, structType, node.name().span());
         }
+    }
+
+    // One static const field of a struct; the class twin lives in the layout phase. The shape
+    // checks and the shared-namespace collision rules are one home in phases.members.
+    collectStaticField(StructType structType, FieldDeclarationNode declaration, Field field) {
+        members.checkStaticFieldShape(this.reporter, declaration, field);
+        if (field.name().length > 0) {
+            if (members.findField(structType.staticFields(), field.name()) != null) {
+                this.reporter.report("Static const '{field.name()}' is already declared in "
+                    + "'{structType.name()}'.", field.nameSpan());
+                return;
+            }
+            members.checkStaticInstanceCollision(this.reporter, structType, field.name(), true,
+                field.nameSpan());
+        }
+        structType.staticFields().push(field);
     }
 
     collectStructMethod(StructType structType, FunctionDeclarationNode member) {
@@ -343,6 +365,13 @@ class SignatureCollector {
         }
         let modifiers = members.functionModifiers(member);
         members.checkMemberModifiers(this.reporter, member);
+        if (modifiers.declaresStatic && !isConstructor) {
+            members.collectStaticMethod(this.resolver, this.reporter, structType,
+                structType.staticMethods(), member, methodName, nameSpan, modifiers);
+            return;
+        }
+        members.checkStaticMethodMarkers(this.reporter, modifiers, methodName, isConstructor,
+            false, nameSpan);
         string memberKindWord = "Method";
         if (isConstructor) {
             memberKindWord = "Constructor";
@@ -361,6 +390,10 @@ class SignatureCollector {
         }
         members.checkFieldMethodCollision(this.reporter, structType.fields(), methodName,
             isConstructor, nameSpan);
+        if (!isConstructor) {
+            members.checkStaticInstanceCollision(this.reporter, structType, methodName, false,
+                nameSpan);
+        }
         members.checkThrowsPlacement(this.reporter, member, false, isConstructor,
             modifiers.declaresAbstract);
         members.checkNoreturnPlacement(this.reporter, member, isConstructor, false,
@@ -380,7 +413,7 @@ class SignatureCollector {
         }
         structType.methods().push(new Method(signature, visibility, isConstructor,
             false, modifiers.declaresOverride, modifiers.declaresFinal,
-            modifiers.declaresAbstract, member.body() != null, structType));
+            modifiers.declaresAbstract, false, member.body() != null, structType));
     }
 
     collectInterfaces() {
@@ -452,6 +485,11 @@ class SignatureCollector {
             this.reporter.report("Interface methods are plain signatures; 'abstract', "
                 + "'override', and 'final' are not allowed on '{name}'.", nameSpan);
         }
+        if (modifiers.declaresStatic) {
+            this.reporter.report("An interface cannot declare a static member; a static "
+                + "belongs on the class or struct itself, so declare '{name}' there. Remove "
+                + "'static', or move the member.", modifiers.staticModifierSpan(nameSpan));
+        }
         if (member.body() != null) {
             this.reporter.report("Interface method '{name}' cannot have a body; end the "
                 + "signature with ';'. Implementing classes provide the body.", nameSpan);
@@ -474,7 +512,7 @@ class SignatureCollector {
         }
         interfaceType.methods().push(new Method(signature,
             types.followedMemberVisibility(interfaceType.visibility()), false, false,
-            false, false, true, member.body() != null, interfaceType));
+            false, false, true, false, member.body() != null, interfaceType));
     }
 
     checkAndSetInterfaceBase(InterfaceType interfaceType, Type base, Span span) {

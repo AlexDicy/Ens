@@ -4,6 +4,7 @@
 import GreenNode from @ens.frontend.syntax.green;
 import Span from @ens.frontend.support.source;
 import @ens.frontend.support.source;
+import ConstantValue from model.literalvalues;
 import FileDiagnostic from support.diagnostics;
 import List from @std.collections.list;
 import Map from @std.collections.map;
@@ -77,6 +78,30 @@ public isVisibleFrom(Visibility visibility, string declModulePath, string declPa
         return declPackagePrefix == usePackagePrefix;
     }
     return false;
+}
+
+// Whether a member with the given visibility, declared by 'defining', is accessible from a
+// site enclosed by 'siteOwner' (null outside any type) in the module at 'modulePath' within
+// 'packagePrefix'. The one home for the member-access decision; reporting stays with callers.
+public memberAccessAllowed(Visibility visibility, DeclaredType defining, DeclaredType? siteOwner,
+                           string modulePath, string packagePrefix) -> bool {
+    switch (visibility) {
+        Export -> {
+            return true;
+        },
+        Public -> {
+            return defining.packagePrefix() == packagePrefix;
+        },
+        Private -> {
+            return siteOwner != null && siteOwner == defining;
+        },
+        Protected -> {
+            if (siteOwner != null && isSubclassOf(siteOwner, defining)) {
+                return true;
+            }
+            return defining.modulePath() == modulePath;
+        },
+    }
 }
 
 // "<kindWord> '<name>' is private to module 'M'; ..." with the modifier that fixes it.
@@ -312,23 +337,30 @@ public sameParameterTypes(Signature first, Signature second) -> bool {
 
 // One field of a struct or class. Flattened class layouts share the base class's Field objects,
 // so definingType still names the class - or generic instantiation - that declared the field.
+// A static const field lives outside every instance: it takes no layout slot, its value is the
+// evaluated constant the constants phase fills in, and instantiations of a generic type share
+// the template's Field object because neither its type nor its initializer may mention a type
+// parameter.
 export class Field {
     string fieldName;
     Type fieldType;
     Visibility fieldVisibility;
     bool weakField;
     bool constField;
+    bool staticMarked;
     bool defaulted;
     Span fieldNameSpan;
     Type definingDeclaration;
+    ConstantValue? evaluatedConstant;
 
     public constructor(string name, Type type, Visibility visibility, bool isWeak, bool isConst,
-                bool hasDefault, Span nameSpan, Type definingType) {
+                bool isStatic, bool hasDefault, Span nameSpan, Type definingType) {
         this.fieldName = name;
         this.fieldType = type;
         this.fieldVisibility = visibility;
         this.weakField = isWeak;
         this.constField = isConst;
+        this.staticMarked = isStatic;
         this.defaulted = hasDefault;
         this.fieldNameSpan = nameSpan;
         this.definingDeclaration = definingType;
@@ -354,6 +386,10 @@ export class Field {
         return this.constField;
     }
 
+    export isStatic() -> bool {
+        return this.staticMarked;
+    }
+
     export hasDefault() -> bool {
         return this.defaulted;
     }
@@ -365,10 +401,22 @@ export class Field {
     export definingType() -> Type {
         return this.definingDeclaration;
     }
+
+    // The evaluated value of a static const field, or null until the constants phase fills it
+    // (or when the initializer failed to evaluate).
+    export constantValue() -> ConstantValue? {
+        return this.evaluatedConstant;
+    }
+
+    public setConstantValue(ConstantValue value) {
+        this.evaluatedConstant = value;
+    }
 }
 
 // One method of a struct, class, or interface. Constructors are stored under the name
 // 'constructor' and destructors under 'destructor', so overload checks treat them uniformly.
+// A static method belongs to the type itself: it takes no receiver, never dispatches, and is
+// stored in the owner's staticMethods list rather than among the instance methods.
 export class Method {
     Signature methodSignature;
     Visibility methodVisibility;
@@ -377,11 +425,12 @@ export class Method {
     bool overrideMarked;
     bool finalMarked;
     bool abstractMarked;
+    bool staticMarked;
     bool bodied;
     Type definingDeclaration;
 
     public constructor(Signature signature, Visibility visibility, bool isConstructor, bool isDestructor,
-                bool isOverride, bool isFinal, bool isAbstract, bool hasBody,
+                bool isOverride, bool isFinal, bool isAbstract, bool isStatic, bool hasBody,
                 Type definingType) {
         this.methodSignature = signature;
         this.methodVisibility = visibility;
@@ -390,6 +439,7 @@ export class Method {
         this.overrideMarked = isOverride;
         this.finalMarked = isFinal;
         this.abstractMarked = isAbstract;
+        this.staticMarked = isStatic;
         this.bodied = hasBody;
         this.definingDeclaration = definingType;
     }
@@ -424,6 +474,10 @@ export class Method {
 
     export isAbstract() -> bool {
         return this.abstractMarked;
+    }
+
+    export isStatic() -> bool {
+        return this.staticMarked;
     }
 
     export isNoreturn() -> bool {
@@ -535,6 +589,8 @@ export class ClassType extends DeclaredType {
     List<Field> classFields;
     long inheritedFieldCount;
     List<Method> classMethods;
+    List<Field> classStaticFields;
+    List<Method> classStaticMethods;
     List<ClassType> classDirectSubclasses;
 
     protected constructor(string name, string modulePath, string packagePrefix, string filePath,
@@ -548,6 +604,8 @@ export class ClassType extends DeclaredType {
         this.classFields = new List<Field>();
         this.inheritedFieldCount = 0;
         this.classMethods = new List<Method>();
+        this.classStaticFields = new List<Field>();
+        this.classStaticMethods = new List<Method>();
         this.classDirectSubclasses = new List<ClassType>();
     }
 
@@ -601,6 +659,16 @@ export class ClassType extends DeclaredType {
     // Own methods only; inherited methods are reached through base().
     export methods() -> List<Method> {
         return this.classMethods;
+    }
+
+    // Static const fields, outside every instance layout.
+    export staticFields() -> List<Field> {
+        return this.classStaticFields;
+    }
+
+    // Static methods, reachable only through this class's name.
+    export staticMethods() -> List<Method> {
+        return this.classStaticMethods;
     }
 
     export directSubclasses() -> List<ClassType> {
@@ -659,12 +727,16 @@ export class InterfaceType extends DeclaredType {
 export class StructType extends DeclaredType {
     List<Field> structFields;
     List<Method> structMethods;
+    List<Field> structStaticFields;
+    List<Method> structStaticMethods;
 
     protected constructor(string name, string modulePath, string packagePrefix, string filePath,
                 GreenNode declaration, Visibility visibility, string[] typeParameters) {
         super(name, modulePath, packagePrefix, filePath, declaration, visibility, typeParameters);
         this.structFields = new List<Field>();
         this.structMethods = new List<Method>();
+        this.structStaticFields = new List<Field>();
+        this.structStaticMethods = new List<Method>();
     }
 
     export fields() -> List<Field> {
@@ -673,6 +745,16 @@ export class StructType extends DeclaredType {
 
     export methods() -> List<Method> {
         return this.structMethods;
+    }
+
+    // Static const fields, outside every instance layout.
+    export staticFields() -> List<Field> {
+        return this.structStaticFields;
+    }
+
+    // Static methods, reachable only through this struct's name.
+    export staticMethods() -> List<Method> {
+        return this.structStaticMethods;
     }
 
     override kindWord() -> string {
@@ -787,6 +869,7 @@ export class InstantiationType extends Type {
     List<Field> instantiationFields;
     long inheritedFieldCount;
     List<Method> instantiationMethods;
+    List<Method> instantiationStaticMethods;
 
     protected constructor(DeclaredType template, Type[] arguments) {
         this.instantiationTemplate = template;
@@ -796,6 +879,7 @@ export class InstantiationType extends Type {
         this.instantiationFields = new List<Field>();
         this.inheritedFieldCount = 0;
         this.instantiationMethods = new List<Method>();
+        this.instantiationStaticMethods = new List<Method>();
     }
 
     export template() -> DeclaredType {
@@ -851,6 +935,13 @@ export class InstantiationType extends Type {
 
     export methods() -> List<Method> {
         return this.instantiationMethods;
+    }
+
+    // The template's static methods with this instantiation's arguments applied, parallel to the
+    // template's list. Static const fields are not copied: their types and initializers never
+    // mention a type parameter, so the template's Field objects stand for every instantiation.
+    export staticMethods() -> List<Method> {
+        return this.instantiationStaticMethods;
     }
 }
 
@@ -1149,18 +1240,25 @@ export class TypeStore {
                 this.fillFields(instantiation, classTemplate.fields(), owner, arguments,
                     classTemplate.baseFieldCount());
                 instantiation.setBaseFieldCount(classTemplate.baseFieldCount());
-                this.fillMethods(instantiation, classTemplate.methods(), owner, arguments);
+                this.fillMethods(instantiation, classTemplate.methods(), owner, arguments,
+                    instantiation.methods());
+                this.fillMethods(instantiation, classTemplate.staticMethods(), owner, arguments,
+                    instantiation.staticMethods());
             },
             is StructType structTemplate -> {
                 this.fillFields(instantiation, structTemplate.fields(), owner, arguments, 0);
-                this.fillMethods(instantiation, structTemplate.methods(), owner, arguments);
+                this.fillMethods(instantiation, structTemplate.methods(), owner, arguments,
+                    instantiation.methods());
+                this.fillMethods(instantiation, structTemplate.staticMethods(), owner, arguments,
+                    instantiation.staticMethods());
             },
             is InterfaceType interfaceTemplate -> {
                 let base = interfaceTemplate.base();
                 if (base != null) {
                     instantiation.setBase(this.substitute(base, owner, arguments));
                 }
-                this.fillMethods(instantiation, interfaceTemplate.methods(), owner, arguments);
+                this.fillMethods(instantiation, interfaceTemplate.methods(), owner, arguments,
+                    instantiation.methods());
             },
             default -> { },
         }
@@ -1181,19 +1279,20 @@ export class TypeStore {
             }
             instantiation.fields().push(new Field(field.name(),
                 this.substitute(field.type(), owner, arguments), field.visibility(),
-                field.isWeak(), field.isConst(), field.hasDefault(), field.nameSpan(),
-                definingType));
+                field.isWeak(), field.isConst(), field.isStatic(), field.hasDefault(),
+                field.nameSpan(), definingType));
         }
     }
 
     fillMethods(InstantiationType instantiation, List<Method> templateMethods,
-                        GreenNode owner, Type[] arguments) {
+                        GreenNode owner, Type[] arguments, List<Method> filled) {
         for (long i = 0; i < templateMethods.length(); i++) {
             let method = templateMethods.get(i);
             let signature = this.substituteSignature(method.signature(), owner, arguments);
-            instantiation.methods().push(new Method(signature, method.visibility(),
+            filled.push(new Method(signature, method.visibility(),
                 method.isConstructor(), method.isDestructor(), method.isOverride(),
-                method.isFinal(), method.isAbstract(), method.hasBody(), instantiation));
+                method.isFinal(), method.isAbstract(), method.isStatic(), method.hasBody(),
+                instantiation));
         }
     }
 
@@ -1476,6 +1575,47 @@ export baseFieldCount(Type type) -> long {
         },
         default -> {
             return 0;
+        },
+    }
+}
+
+// The static methods a type declares itself, or null for types that cannot carry statics. A
+// filled instantiation exposes its substituted statics; an unfilled one has none to expose yet.
+export staticMethodsOf(Type type) -> List<Method>? {
+    switch (type) {
+        is ClassType classType -> {
+            return classType.staticMethods();
+        },
+        is StructType structType -> {
+            return structType.staticMethods();
+        },
+        is InstantiationType instantiation -> {
+            if (instantiation.isFilled()) {
+                return instantiation.staticMethods();
+            }
+            return null;
+        },
+        default -> {
+            return null;
+        },
+    }
+}
+
+// The static const fields a type declares, or null for types that cannot carry statics. An
+// instantiation shares its template's fields: a static const never mentions a type parameter.
+export staticFieldsOf(Type type) -> List<Field>? {
+    switch (type) {
+        is ClassType classType -> {
+            return classType.staticFields();
+        },
+        is StructType structType -> {
+            return structType.staticFields();
+        },
+        is InstantiationType instantiation -> {
+            return staticFieldsOf(instantiation.template());
+        },
+        default -> {
+            return null;
         },
     }
 }

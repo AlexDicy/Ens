@@ -114,6 +114,7 @@ enum class SyntaxKind : uint16_t {
     // === Expressions ===
     LiteralExpr,         // wraps any literal token
     IdentExpr,
+    GenericNameExpr,     // TypeName<Args> as the head of a static member access
     ThisExpr,
     SuperExpr,
     BinaryExpr,

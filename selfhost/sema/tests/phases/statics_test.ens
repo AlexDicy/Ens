@@ -1,0 +1,193 @@
+// Static members through the sema phases: the model lists they land in, the evaluated constants
+// on static const fields, the three ways a generic type's arguments reach a static call, the
+// type-name-only access rule, the constant initializer's visibility rules, and the checked
+// exceptions a throwing static factory carries.
+import @std.testing;
+import ProgramAnalysis from pipeline;
+import ConstantKind from model.literalvalues;
+import model.literalvalues;
+import sema_support;
+import FakeFileLoader from sema_support;
+
+analyzeOne(string text) -> ProgramAnalysis throws {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", text);
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertNoDiagnostics(analysis.declareDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.linkDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.signatureDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.layoutDiagnostics());
+    return analysis;
+}
+
+test "statics land beside the instance members, outside layout and dispatch" {
+    let analysis = try analyzeOne(
+        "public class Path \{\n"
+        + "    public static const string separator = \"/\";\n"
+        + "    public static const int limit = 10;\n"
+        + "    public static const int doubled = Path.limit * 2 + 1;\n"
+        + "\n"
+        + "    public static join(string left, string right) -> string \{\n"
+        + "        return left + Path.separator + right;\n"
+        + "    \}\n"
+        + "\n"
+        + "    public describe() -> string \{\n"
+        + "        return Path.separator;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    print(Path.join(\"a\", \"b\"));\n"
+        + "    return Path.limit - 10;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.checkDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+    let path = try sema_support.classNamed(analysis, "main", "Path");
+    try testing.assertEqual(path.fields().length(), 0L);
+    try testing.assertEqual(path.methods().length(), 1L);
+    try testing.assertEqual(path.staticFields().length(), 3L);
+    try testing.assertEqual(path.staticMethods().length(), 1L);
+    try testing.assertTrue(path.staticMethods().get(0).isStatic(),
+        "the static list must carry the marker");
+    try testing.assertTrue(!path.methods().get(0).isStatic(),
+        "an instance method must not carry the marker");
+    let separator = path.staticFields().get(0).constantValue();
+    try testing.assertTrue(separator != null, "'separator' should have evaluated");
+    if (separator != null) {
+        try testing.assertTrue(separator.kind() == ConstantKind.String, "a string constant");
+        try testing.assertEqual(separator.text(), "/");
+    }
+    let doubled = path.staticFields().get(2).constantValue();
+    try testing.assertTrue(doubled != null, "'doubled' should have evaluated");
+    if (doubled != null) {
+        try testing.assertEqual(doubled.integerBits(), 21L);
+    }
+}
+
+test "the three type-argument forms resolve a generic type's static" {
+    let analysis = try analyzeOne(
+        "public class Registry<T> \{\n"
+        + "    T[] slots;\n"
+        + "\n"
+        + "    public constructor(T[] slots) \{\n"
+        + "        this.slots = slots;\n"
+        + "    \}\n"
+        + "\n"
+        + "    public static withCapacity(long capacity) -> Registry<T> \{\n"
+        + "        return new Registry<T>(new T[capacity]);\n"
+        + "    \}\n"
+        + "\n"
+        + "    public static of(T[] values) -> Registry<T> \{\n"
+        + "        return new Registry<T>(values);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "build() -> Registry<bool> \{\n"
+        + "    return Registry.withCapacity(2);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let explicit = Registry<int>.withCapacity(8);\n"
+        + "    let inferred = Registry.of([\"a\", \"b\"]);\n"
+        + "    Registry<char> targeted = Registry.withCapacity(4);\n"
+        + "    let built = build();\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.checkDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.exceptionDiagnostics());
+}
+
+test "statics are reached only through the declaring type's name" {
+    let analysis = try analyzeOne(
+        "public class Widget \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public static make() -> Widget \{\n"
+        + "        return new Widget();\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public struct Pair<A, B> \{\n"
+        + "    public A first;\n"
+        + "    public B second;\n"
+        + "\n"
+        + "    public static describe() -> string \{\n"
+        + "        return \"pair\";\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let widget = Widget.make();\n"
+        + "    let bad = widget.make();\n"
+        + "    let bare = Pair.describe();\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "Use 'Widget.make(...)'; a static belongs to the type, not to an instance.");
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "Cannot tell the type arguments for 'Pair.describe': neither the call's arguments nor "
+        + "the surrounding context supplies them. Write them on the type name, as in "
+        + "'Pair<A, B>.describe(...)'.");
+}
+
+test "a static const initializer follows the member visibility rules" {
+    let analysis = try analyzeOne(
+        "public class Secret \{\n"
+        + "    static const int hidden = 5;\n"
+        + "\}\n"
+        + "public class Reader \{\n"
+        + "    public static const int copy = Secret.hidden + 1;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertMentions(analysis.checkDiagnostics(),
+        "'hidden' is private to class 'Secret', so the initializer of 'Reader.copy' cannot "
+        + "read it.");
+}
+
+test "a static const evaluates across modules in dependency order" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/lib.ens",
+        "public class Config \{\n"
+        + "    public static const int width = 6;\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens",
+        "import Config from lib;\n"
+        + "public class Screen \{\n"
+        + "    public static const int total = Config.width * 7;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return Screen.total - 42;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramClean(analysis);
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+    let screen = try sema_support.classNamed(analysis, "main", "Screen");
+    let total = screen.staticFields().get(0).constantValue();
+    try testing.assertTrue(total != null, "'total' should have evaluated");
+    if (total != null) {
+        try testing.assertEqual(total.integerBits(), 42L);
+    }
+}
+
+test "a throwing static factory demands 'try' at its call sites" {
+    let analysis = try analyzeOne(
+        "class Failure extends Error \{\n"
+        + "    protected constructor(string message) \{\n"
+        + "        super(message);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class Parsed \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public static parse(string text) -> Parsed throws \{\n"
+        + "        if (text.length == 0) \{\n"
+        + "            throw new Failure(\"empty\");\n"
+        + "        \}\n"
+        + "        return new Parsed();\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let parsed = Parsed.parse(\"x\");\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertMentions(analysis.exceptionDiagnostics(),
+        "Call to 'parse' can throw 'Failure'; prefix it with 'try'");
+}

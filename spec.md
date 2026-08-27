@@ -197,10 +197,34 @@ A const field with a default value keeps the default when construction does not 
 Everything else is an error: assigning from a method, a destructor, or a free function, assigning through any reference other than `this`, assigning an inherited const field from a subclass constructor, and `++`, `--`, or a compound assignment anywhere.
 A const field may be nullable, and it cannot also be `weak`, because a weak field resets to null when its target is destroyed while a const field never changes.
 
-A field carries visibility modifiers and `const`, and in a class also `weak`; no other modifier applies to one.
-A method, a constructor, and a destructor carry visibility and the markers that govern overriding - `abstract`, `override`, `final` - along with `noreturn`, while a function declared at the top level carries visibility and `noreturn` alone, because nothing inherits it.
+A field carries visibility modifiers, `const`, and `static` (which requires `const`), and in a class also `weak`; no other modifier applies to one.
+A method carries visibility, the markers that govern overriding (`abstract`, `override`, `final`), `noreturn`, and `static`, while a constructor and a destructor carry visibility alone, and a function declared at the top level carries visibility and `noreturn` alone, because nothing inherits it.
 `sealed` belongs to a class, so it does not apply to a field or a callable; `const` belongs to a field or a variable inside a function, so it does not apply to a callable.
 Writing a modifier where it does not belong is an error that names where it does.
+
+A class or a struct may declare `static` members: methods and `const` fields that belong to the type itself rather than to any instance.
+A static member is reached only through the declaring type's name, never through an instance: `List.withCapacity(8)` is legal, and `myList.withCapacity(8)` is an error naming the spelling to use.
+Statics are not inherited: a static declared by a base class is reached through the base class's own name, and naming it through a subclass is an error that names the declaring class.
+The rule is uniform, so even inside the declaring type a static is called through the type name, and `this` cannot appear inside a static method, because a static has no instance.
+A static method may be `throws`, which is what makes static factories useful where a constructor cannot throw, and it may be `noreturn`.
+A static and an instance member cannot share a name, and `abstract`, `override`, and `final` do not apply to a static, which never takes part in dispatch.
+Static methods may overload each other under the ordinary overload rules.
+Interfaces, enums, and external types cannot declare statics; the error names where statics belong.
+A static cannot be reached through a type parameter: `T.create()` is an error, because `T` stands for a different type in every instantiation.
+
+A `static const` field is a type-level constant with a mandatory initializer: `static const string separator = "/";`.
+There are no mutable static fields, so `static` on a field requires `const`.
+The initializer is a compile-time constant: literals, unary `+` and `-`, arithmetic with `+`, `-`, `*`, `/`, and `%`, string concatenation with `+`, and reads of other static consts through their type name.
+A cycle between static const initializers is an error, and so are function calls, `new`, aggregate literals, and array literals inside one.
+A static const's type is therefore a primitive, `char`, `bool`, or `string`, and on a generic type it cannot mention the type's parameters, so every instantiation shares one value.
+Reads go through the type name, as in `Path.separator`, and each read compiles to the constant's value; assigning to a static const, or applying `++` or `--` to one, is an error.
+
+A static of a generic type takes the type's arguments in one of three ways.
+They may be written on the type name: `List<int>.withCapacity(8)`.
+They may be inferred from the call's own arguments, the way a generic function call infers them: `List.of(items)` takes `T` from the element type of `items`.
+They may be target-typed from the surrounding context, using the same context set as aggregate literals (the declared type of a variable, a parameter, a return type, an assignment target, or an array element): `List<int> xs = List.withCapacity(8);`.
+Explicit arguments on the type name always win, and a bare call that none of the three sources completes is an error telling you to write the arguments on the type name.
+Type arguments are never written on the method name: `List.withCapacity<int>(8)` is rejected.
 
 A class may declare a `destructor`, introduced by the `destructor` keyword, to run cleanup when an instance is destroyed.
 A destructor takes no parameters, has no return type, and cannot be `throws`; a class declares at most one, and it cannot be called explicitly.

@@ -37,6 +37,7 @@ import DefaultArmNode from @ens.frontend.syntax.generated.nodes;
 import ArmBody from @ens.frontend.syntax.generated.nodes;
 import LiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
 import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import GenericNameExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ThisExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SuperExpressionNode from @ens.frontend.syntax.generated.nodes;
 import BinaryExpressionNode from @ens.frontend.syntax.generated.nodes;
@@ -259,6 +260,10 @@ class BodyChecker implements NoreturnCalls {
     NarrowingState narrowing;
     LocalBinding? thisBinding;
     Type? thisType;
+    // The class or struct whose member body is being checked, statics included; the access
+    // rules judge private and protected members from here. Null outside member bodies.
+    Type? enclosingOwner;
+    bool inStaticMethod;
     Type? currentReturnType;
     bool currentNoreturn;
     bool inConstructor;
@@ -307,6 +312,8 @@ class BodyChecker implements NoreturnCalls {
         this.packagePrefix = context.module().packagePrefix();
         this.narrowing = new NarrowingState();
         this.thisBinding = null;
+        this.enclosingOwner = null;
+        this.inStaticMethod = false;
         this.currentNoreturn = false;
         this.inConstructor = false;
         this.sawSuperCall = false;
@@ -366,8 +373,9 @@ class BodyChecker implements NoreturnCalls {
                 continue;
             }
             if (entry.signature().declaration() == node.green()) {
+                this.enclosingOwner = null;
                 this.checkParameterDefaults(entry.signature(), node);
-                this.checkCallableBody(entry.signature(), null, null, node);
+                this.checkCallableBody(entry.signature(), null, null, null, node);
                 return;
             }
         }
@@ -378,7 +386,7 @@ class BodyChecker implements NoreturnCalls {
         if (found is StructType && found.declaration() == node.green()) {
             this.enterObligationOwner(found);
             this.checkFieldDefaults(found, node.body());
-            this.checkMemberBodies(found, found.methods(), node.body());
+            this.checkMemberBodies(found, found.methods(), found.staticMethods(), node.body());
             this.leaveObligationOwner();
         }
     }
@@ -388,7 +396,7 @@ class BodyChecker implements NoreturnCalls {
         if (found is ClassType && found.declaration() == node.green()) {
             this.enterObligationOwner(found);
             this.checkFieldDefaults(found, node.body());
-            this.checkMemberBodies(found, found.methods(), node.body());
+            this.checkMemberBodies(found, found.methods(), found.staticMethods(), node.body());
             this.leaveObligationOwner();
         }
     }
@@ -433,14 +441,24 @@ class BodyChecker implements NoreturnCalls {
         }
     }
 
-    checkMemberBodies(DeclaredType owner, List<Method> methods, MemberListNode body) {
+    checkMemberBodies(DeclaredType owner, List<Method> methods, List<Method> staticMethods,
+                      MemberListNode body) {
         for (long i = 0; i < body.membersCount(); i++) {
             let member = body.members(i);
             if (member is FunctionDeclarationNode) {
                 let method = methodDeclaredBy(methods, member.green());
                 if (method != null) {
+                    this.enclosingOwner = owner;
                     this.checkParameterDefaults(method.signature(), member);
-                    this.checkCallableBody(method.signature(), owner, method, member);
+                    this.checkCallableBody(method.signature(), owner, owner, method, member);
+                    continue;
+                }
+                let staticMethod = methodDeclaredBy(staticMethods, member.green());
+                if (staticMethod != null) {
+                    this.enclosingOwner = owner;
+                    this.checkParameterDefaults(staticMethod.signature(), member);
+                    this.checkCallableBody(staticMethod.signature(), null, owner, staticMethod,
+                        member);
                 }
             }
         }
@@ -452,6 +470,8 @@ class BodyChecker implements NoreturnCalls {
         this.narrowing = new NarrowingState();
         this.thisBinding = null;
         this.thisType = null;
+        this.enclosingOwner = null;
+        this.inStaticMethod = false;
         this.currentReturnType = this.store.primitive(PrimitiveKind.Void);
         this.currentNoreturn = false;
         this.inConstructor = false;
@@ -466,18 +486,22 @@ class BodyChecker implements NoreturnCalls {
         this.currentReturnType = null;
     }
 
-    // Checks one callable's body: the parameter scope (with 'this' for methods), a child scope
-    // for the body's locals, and the catch clauses as siblings that cannot see those locals.
-    checkCallableBody(Signature signature, Type? receiver, Method? method,
+    // Checks one callable's body: the parameter scope (with 'this' for instance methods), a
+    // child scope for the body's locals, and the catch clauses as siblings that cannot see those
+    // locals. A static method takes its owner but no receiver: the owner's type parameters are
+    // in scope and its members are reachable, while 'this' does not exist.
+    checkCallableBody(Signature signature, Type? receiver, Type? owner, Method? method,
                               FunctionDeclarationNode node) {
-        if (receiver == null && signature.isGeneric()) {
+        bool ownsObligations = false;
+        if (owner == null && signature.isGeneric()) {
             let declaration = signature.declaration();
             if (declaration != null) {
+                ownsObligations = true;
                 this.obligationOwner = declaration;
                 this.obligationOwnerName = signature.name();
             }
         }
-        long pushed = this.pushCallableTypeParameters(signature, receiver);
+        long pushed = this.pushCallableTypeParameters(signature, owner);
         this.parameterScope = new Scope(null);
         this.scope = this.parameterScope;
         this.narrowing = new NarrowingState();
@@ -487,6 +511,8 @@ class BodyChecker implements NoreturnCalls {
                 signature.nameSpan());
         }
         this.thisType = receiver;
+        this.enclosingOwner = owner;
+        this.inStaticMethod = method != null && method.isStatic();
         this.currentReturnType = signature.returnType();
         this.currentNoreturn = signature.isNoreturn();
         this.inConstructor = method != null && method.isConstructor();
@@ -541,24 +567,26 @@ class BodyChecker implements NoreturnCalls {
         this.parameterScope = null;
         this.thisBinding = null;
         this.thisType = null;
+        this.enclosingOwner = null;
+        this.inStaticMethod = false;
         this.currentReturnType = null;
         this.currentNoreturn = false;
         this.inConstructor = false;
         this.resolver.popTypeParameters(pushed);
-        if (receiver == null) {
+        if (ownsObligations) {
             this.leaveObligationOwner();
         }
     }
 
-    pushCallableTypeParameters(Signature signature, Type? receiver) -> long {
+    pushCallableTypeParameters(Signature signature, Type? owner) -> long {
         long pushed = 0;
         if (signature.isGeneric()) {
             this.resolver.pushTypeParameters(signature.typeParameters());
             pushed = pushed + signature.typeParameters().length;
         }
-        if (receiver is DeclaredType && receiver.isGeneric()) {
-            this.resolver.pushTypeParameters(receiver.typeParameterTypes());
-            pushed = pushed + receiver.typeParameterTypes().length;
+        if (owner is DeclaredType && owner.isGeneric()) {
+            this.resolver.pushTypeParameters(owner.typeParameterTypes());
+            pushed = pushed + owner.typeParameterTypes().length;
         }
         return pushed;
     }
@@ -761,10 +789,15 @@ class BodyChecker implements NoreturnCalls {
         this.narrowing = new NarrowingState();
         this.thisBinding = null;
         this.thisType = null;
+        this.enclosingOwner = owner;
+        this.inStaticMethod = false;
         this.currentReturnType = null;
+        // Static const fields stay out on both sides: their initializers are compile-time
+        // constants the constants phase evaluates, never expressions over sibling fields.
         for (long i = 0; i < body.membersCount(); i++) {
             let member = body.members(i);
-            if (member is FieldDeclarationNode) {
+            if (member is FieldDeclarationNode
+                    && !members.fieldModifiers(member).declaresStatic) {
                 let sink = this.scope;
                 if (sink != null) {
                     sink.define(new LocalBinding(member.name().text(),
@@ -775,7 +808,8 @@ class BodyChecker implements NoreturnCalls {
         }
         for (long i = 0; i < body.membersCount(); i++) {
             let member = body.members(i);
-            if (member is FieldDeclarationNode) {
+            if (member is FieldDeclarationNode
+                    && !members.fieldModifiers(member).declaresStatic) {
                 let defaultValue = member.defaultValue();
                 if (defaultValue != null) {
                     Type expected = this.fieldTypeOrError(fields, member.name().text());
@@ -2277,7 +2311,10 @@ class BodyChecker implements NoreturnCalls {
                 return this.analyzePostfix(postfix);
             },
             is CallExpressionNode call -> {
-                return this.analyzeCall(call);
+                return this.analyzeCall(call, null);
+            },
+            is GenericNameExpressionNode generic -> {
+                return this.analyzeGenericNameValue(generic);
             },
             is MemberExpressionNode member -> {
                 return this.analyzeMemberValue(member);
@@ -2338,7 +2375,9 @@ class BodyChecker implements NoreturnCalls {
     }
 
     // Analyzes toward a target type, adapting untyped integer and char literals to it and, for
-    // array literals, typing the elements against the target's element type.
+    // array literals, typing the elements against the target's element type. A call sees the
+    // target as its expected type, which is what lets a static call on a generic type take its
+    // type arguments from the surrounding context.
     analyzeExpressionAdapt(Expression node, Type target) -> Type {
         if (node is ArrayLiteralExpressionNode) {
             Type adapted = this.analyzeArrayLiteralAdapt(node, target);
@@ -2350,7 +2389,13 @@ class BodyChecker implements NoreturnCalls {
             this.result.setType(node.green(), adapted);
             return adapted;
         }
-        Type analyzed = this.analyzeExpression(node);
+        Type analyzed = this.store.errorType();
+        if (node is CallExpressionNode) {
+            analyzed = this.analyzeCall(node, target);
+            this.result.setType(node.green(), analyzed);
+        } else {
+            analyzed = this.analyzeExpression(node);
+        }
         if (target is ErrorType || analyzed is ErrorType) {
             return analyzed;
         }
@@ -2668,6 +2713,12 @@ class BodyChecker implements NoreturnCalls {
         }
         let resolution = this.resolveName(name);
         if (resolution == null) {
+            let ownerName = this.staticSuggestionOwner(name);
+            if (ownerName != null) {
+                this.reporter.report("Statics are reached through the type name, even inside "
+                    + "'{ownerName}'; write '{ownerName}.{name}'.", node.name().span());
+                return this.store.errorType();
+            }
             this.reporter.report("Undefined name '{name}'. Check the spelling, or declare it "
                 + "before it is used.", node.name().span());
             return this.store.errorType();
@@ -2686,7 +2737,10 @@ class BodyChecker implements NoreturnCalls {
                 return this.store.errorType();
             },
             is TypeName named -> {
-                return named.target;
+                this.reporter.report("'{name}' is a type, not a value. A type name starts a "
+                    + "static member access such as '{name}.member(...)'; to work with an "
+                    + "instance, construct or reference one.", node.name().span());
+                return this.store.errorType();
             },
             is NamespaceName ignored -> {
                 return this.store.errorType();
@@ -2694,11 +2748,35 @@ class BodyChecker implements NoreturnCalls {
         }
     }
 
+    // The enclosing type's name when it declares a static under the given name, for the
+    // uniform-access suggestion; null otherwise.
+    staticSuggestionOwner(string name) -> string? {
+        let owner = this.enclosingOwner;
+        if (owner == null) {
+            return null;
+        }
+        if (members.findField(types.staticFieldsOf(owner), name) == null
+                && members.findMethodNamed(types.staticMethodsOf(owner), name) == null) {
+            return null;
+        }
+        let authority = types.authorityOf(owner);
+        if (authority == null) {
+            return null;
+        }
+        return authority.name();
+    }
+
     analyzeThis(ThisExpressionNode node) -> Type {
         let receiver = this.thisType;
         if (receiver == null) {
-            this.reporter.report("'this' is only valid inside a method",
-                node.thisKeyword().span());
+            if (this.inStaticMethod) {
+                this.reporter.report("'this' cannot be used in a static method; a static "
+                    + "belongs to the type itself and has no instance. Take the instance as a "
+                    + "parameter, or drop 'static'.", node.thisKeyword().span());
+            } else {
+                this.reporter.report("'this' is only valid inside a method",
+                    node.thisKeyword().span());
+            }
             return this.store.errorType();
         }
         return receiver;
@@ -2707,8 +2785,14 @@ class BodyChecker implements NoreturnCalls {
     analyzeSuper(SuperExpressionNode node) -> Type {
         let receiver = this.thisType;
         if (receiver == null) {
-            this.reporter.report("'super' is only valid inside a method",
-                node.superKeyword().span());
+            if (this.inStaticMethod) {
+                this.reporter.report("'super' cannot be used in a static method; a static "
+                    + "belongs to the type itself and has no instance.",
+                    node.superKeyword().span());
+            } else {
+                this.reporter.report("'super' is only valid inside a method",
+                    node.superKeyword().span());
+            }
             return this.store.errorType();
         }
         let base = types.baseOf(receiver);
@@ -3042,6 +3126,13 @@ class BodyChecker implements NoreturnCalls {
             }
         }
         if (operand is MemberExpressionNode) {
+            let staticField = this.result.staticConstFieldOf(operand.green());
+            if (staticField != null) {
+                this.reporter.report("The '{operator}' operator cannot change "
+                    + "'{staticConstDisplay(staticField)}': a static const takes its one "
+                    + "value from its initializer and never changes.", span);
+                return operandType;
+            }
             let objectType = this.result.typeOf(operand.object().green());
             if (objectType != null) {
                 let field = members.findField(types.fieldsOf(objectType),
@@ -3103,6 +3194,15 @@ class BodyChecker implements NoreturnCalls {
         if (!this.isLValue(node.target())) {
             this.reporter.report("The left side of '=' must be a variable, field, or array "
                 + "element.", node.span());
+        }
+        if (target is MemberExpressionNode) {
+            let staticTarget = this.result.staticConstFieldOf(target.green());
+            if (staticTarget != null) {
+                this.reporter.report("Cannot assign to "
+                    + "'{staticConstDisplay(staticTarget)}': a static const takes its one "
+                    + "value from its initializer and never changes. Change the initializer, "
+                    + "or use an instance field.", node.span());
+            }
         }
         Type assignTarget = this.declaredTargetType(node.target(), targetType);
         Type valueType = this.analyzeExpressionAdapt(node.value(), assignTarget);
@@ -3817,28 +3917,17 @@ class BodyChecker implements NoreturnCalls {
     // visible inside the declaring type, and protected ones in a subclass method or anywhere
     // in the module that declares the type.
     isAccessAllowed(Visibility visibility, Type definingType) -> bool {
-        if (visibility == Visibility.Export) {
-            return true;
-        }
         let defining = types.authorityOf(definingType);
         if (defining == null) {
             return true;
         }
-        if (visibility == Visibility.Public) {
-            return defining.packagePrefix() == this.packagePrefix;
-        }
         DeclaredType? current = null;
-        let receiver = this.thisType;
-        if (receiver != null) {
-            current = types.authorityOf(receiver);
+        let site = this.enclosingOwner;
+        if (site != null) {
+            current = types.authorityOf(site);
         }
-        if (visibility == Visibility.Private) {
-            return current != null && current == defining;
-        }
-        if (current != null && types.isSubclassOf(current, defining)) {
-            return true;
-        }
-        return defining.modulePath() == this.modulePath;
+        return types.memberAccessAllowed(visibility, defining, current, this.modulePath,
+            this.packagePrefix);
     }
 
     checkMemberAccess(string memberName, Visibility visibility, Type definingType,
@@ -3928,6 +4017,10 @@ class BodyChecker implements NoreturnCalls {
                 return this.store.errorType();
             }
         }
+        let staticHead = this.resolveStaticHead(object);
+        if (staticHead != null) {
+            return this.analyzeStaticMemberValue(node, object, staticHead);
+        }
         Type objectType = this.analyzeExpression(object);
         if (objectType is ErrorType) {
             return this.store.errorType();
@@ -3987,11 +4080,40 @@ class BodyChecker implements NoreturnCalls {
                 return this.store.errorType();
             },
             is MissingMember ignored -> {
+                if (this.reportStaticThroughInstance(core, name, node.member().span())) {
+                    return this.store.errorType();
+                }
                 this.reporter.report("No field or method '{name}' on type "
                     + "'{types.display(core)}'", node.member().span());
                 return this.store.errorType();
             },
         }
+    }
+
+    // The C# rule: a static is reachable only through the declaring type's name, so reaching it
+    // through an instance is an error that names the spelling to use, wherever in the chain the
+    // static lives. True when it reported.
+    reportStaticThroughInstance(Type receiver, string name, Span at) -> bool {
+        Type? current = receiver;
+        while (current != null) {
+            bool isMethod = staticsNamed(current, name).length() > 0;
+            if (isMethod || members.findField(types.staticFieldsOf(current), name) != null) {
+                let authority = types.authorityOf(current);
+                string ownerName = types.display(current);
+                if (authority != null) {
+                    ownerName = authority.name();
+                }
+                string spelled = "'{ownerName}.{name}'";
+                if (isMethod) {
+                    spelled = "'{ownerName}.{name}(...)'";
+                }
+                this.reporter.report("Use {spelled}; a static belongs to the type, not to an "
+                    + "instance.", at);
+                return true;
+            }
+            current = types.baseOf(current);
+        }
+        return false;
     }
 
     analyzeSafeMemberValue(SafeMemberExpressionNode node) -> Type {
@@ -4032,6 +4154,9 @@ class BodyChecker implements NoreturnCalls {
                 return this.store.errorType();
             },
             is MissingMember ignored -> {
+                if (this.reportStaticThroughInstance(inner, name, node.member().span())) {
+                    return this.store.errorType();
+                }
                 this.reporter.report("No field or method named '{name}' on "
                     + "'{types.display(inner)}'.", node.member().span());
                 return this.store.errorType();
@@ -4069,6 +4194,585 @@ class BodyChecker implements NoreturnCalls {
             }
         }
         return null;
+    }
+
+    // ---- Static members ----
+
+    // What a member access's written head names when it is a type rather than a value: the
+    // declared type of a bare name, the instantiation of a 'Name<Args>' head, or a type
+    // parameter, which the static paths then reject by name. Null when the head is a value (or
+    // a namespace or enum, which the callers handled first); the error type when the head named
+    // a type but its arguments did not resolve, after a diagnostic.
+    resolveStaticHead(Expression object) -> Type? {
+        switch (object) {
+            is IdentifierExpressionNode identifier -> {
+                return this.staticHeadNamed(identifier.name().text());
+            },
+            is GenericNameExpressionNode generic -> {
+                return this.resolveGenericHead(generic);
+            },
+            default -> {
+                return null;
+            },
+        }
+    }
+
+    // The type a bare head name stands for: locals shadow types, a type parameter wins over an
+    // imported name exactly as it does in a type position, and the module's own declarations
+    // answer last. Enums stay with the enum-member path.
+    staticHeadNamed(string name) -> Type? {
+        if (name.length == 0) {
+            return null;
+        }
+        let resolution = this.resolveName(name);
+        if (resolution == null) {
+            let parameter = this.resolver.typeParameterNamed(name);
+            if (parameter != null) {
+                return parameter;
+            }
+            let declared = this.store.findDeclared(this.modulePath, name);
+            if (declared != null && !(declared is EnumType)) {
+                return declared;
+            }
+            return null;
+        }
+        if (resolution is TypeName && !(resolution.target is EnumType)) {
+            return resolution.target;
+        }
+        return null;
+    }
+
+    // A 'Name<Args>' head: the name must be a generic type this file can see, and the written
+    // arguments instantiate it, bounds checked by the resolver.
+    resolveGenericHead(GenericNameExpressionNode generic) -> Type? {
+        let head = generic.head();
+        if (!(head is IdentifierExpressionNode)) {
+            this.reporter.report("Type arguments follow a plain type name here, as in "
+                + "'List<int>.withCapacity(8)'; this expression cannot take them.",
+                generic.typeArguments().span());
+            return this.store.errorType();
+        }
+        string name = head.name().text();
+        let named = this.staticHeadNamed(name);
+        if (named == null) {
+            this.reporter.report("'{name}' is not a type, so it cannot take type arguments "
+                + "here; only a generic type's name does, as in 'List<int>.withCapacity(8)'.",
+                head.span());
+            return this.store.errorType();
+        }
+        if (named is TypeParamType) {
+            this.reportTypeParameterHead(named, generic.span());
+            return this.store.errorType();
+        }
+        if (named is DeclaredType) {
+            if (!named.isGeneric()) {
+                this.reporter.report("Type '{name}' is not generic and takes no type "
+                    + "arguments.", generic.typeArguments().span());
+                return this.store.errorType();
+            }
+            Type instantiated = this.resolver.instantiateGeneric(named, name,
+                generic.typeArguments(), generic.span());
+            if (!(instantiated is ErrorType)) {
+                this.result.setType(generic.green(), instantiated);
+            }
+            return instantiated;
+        }
+        return this.store.errorType();
+    }
+
+    reportTypeParameterHead(TypeParamType parameter, Span at) {
+        this.reporter.report("Statics cannot be reached through a type parameter: "
+            + "'{parameter.name()}' stands for a different type in every instantiation, so "
+            + "'{parameter.name()}.member' names nothing the compiler can resolve. Name the "
+            + "type itself.", at);
+    }
+
+    // A member read whose head is a type name: a static const resolves to its constant value, a
+    // static method must be called, and everything else explains where the member actually
+    // lives.
+    analyzeStaticMemberValue(MemberExpressionNode node, Expression object, Type head) -> Type {
+        if (head is ErrorType) {
+            return this.store.errorType();
+        }
+        if (head is TypeParamType) {
+            this.reportTypeParameterHead(head, node.span());
+            return this.store.errorType();
+        }
+        this.result.setType(object.green(), head);
+        string name = node.member().text();
+        let owner = types.authorityOf(head);
+        if (owner == null || types.staticFieldsOf(head) == null) {
+            this.reportStaticsUnsupported(head, node.span());
+            return this.store.errorType();
+        }
+        let field = members.findField(types.staticFieldsOf(head), name);
+        if (field != null) {
+            this.checkMemberAccess(name, field.visibility(), field.definingType(),
+                node.member().span());
+            this.result.setStaticConstField(node.green(), field);
+            return field.type();
+        }
+        if (staticsNamed(head, name).length() > 0) {
+            this.reporter.report("Static method '{name}' of '{owner.name()}' must be called; "
+                + "write '{owner.name()}.{name}(...)'.", node.member().span());
+            return this.store.errorType();
+        }
+        this.reportMissingStatic(head, owner, name, node.member().span());
+        return this.store.errorType();
+    }
+
+    // Interfaces, enums, and external types carry no statics; the error names where they live.
+    reportStaticsUnsupported(Type head, Span at) {
+        string kind = "type";
+        string shown = types.display(head);
+        let authority = types.authorityOf(head);
+        if (authority != null) {
+            kind = types.kindWordOf(authority);
+            shown = authority.name();
+        }
+        this.reporter.report("The {kind} '{shown}' has no static members; statics belong on "
+            + "classes and structs.", at);
+    }
+
+    // The member is not a static of the named type: an instance member is reached through a
+    // value, a base class's static through the base's own name, and anything else is unknown.
+    reportMissingStatic(Type head, DeclaredType owner, string name, Span at) {
+        if (!(this.lookupMember(head, name) is MissingMember)) {
+            this.reporter.report("'{name}' is an instance member of '{owner.name()}', so it "
+                + "is reached through an instance, not the type name; a static belongs to the "
+                + "type itself. Call '{name}' on a value of type '{owner.name()}'.", at);
+            return;
+        }
+        Type? current = types.baseOf(head);
+        while (current != null) {
+            if (members.findField(types.staticFieldsOf(current), name) != null
+                    || staticsNamed(current, name).length() > 0) {
+                let declaring = types.authorityOf(current);
+                string declaringName = types.display(current);
+                if (declaring != null) {
+                    declaringName = declaring.name();
+                }
+                this.reporter.report("Statics are not inherited: '{name}' is declared by "
+                    + "'{declaringName}', so it is reached only through that name. Write "
+                    + "'{declaringName}.{name}'.", at);
+                return;
+            }
+            current = types.baseOf(current);
+        }
+        this.reporter.report("Type '{owner.name()}' has no static member '{name}'.", at);
+    }
+
+    // A call whose head is a type name: 'List<int>.withCapacity(8)', 'List.of(items)', or
+    // 'Path.parse(text)'. A concrete head resolves like any single-receiver call; a bare
+    // generic head first determines the type arguments from the call's own arguments and the
+    // expected type, the same two sources a generic function call and an aggregate literal use.
+    analyzeStaticCall(CallExpressionNode node, MemberExpressionNode member, Type head,
+                      Type? expected) -> Type {
+        let arguments = node.arguments();
+        if (head is ErrorType) {
+            this.analyzeArgumentsOnly(arguments);
+            return this.store.errorType();
+        }
+        if (head is TypeParamType) {
+            this.reportTypeParameterHead(head, node.span());
+            this.analyzeArgumentsOnly(arguments);
+            return this.store.errorType();
+        }
+        this.result.setType(member.object().green(), head);
+        string name = member.member().text();
+        let owner = types.authorityOf(head);
+        if (owner == null || types.staticFieldsOf(head) == null) {
+            this.reportStaticsUnsupported(head, node.span());
+            this.analyzeArgumentsOnly(arguments);
+            return this.store.errorType();
+        }
+        let writtenOnMethod = node.typeArguments();
+        if (writtenOnMethod != null) {
+            if (owner.isGeneric()) {
+                this.reporter.report("Type arguments are never written on the method name; "
+                    + "write them on the type name instead: "
+                    + "'{owner.name()}<{typeParameterExample(owner)}>.{name}(...)'.",
+                    writtenOnMethod.span());
+            } else {
+                this.reporter.report("Type arguments are never written on the method name, "
+                    + "and '{owner.name()}' is not generic; remove them.",
+                    writtenOnMethod.span());
+            }
+            this.analyzeArgumentsOnly(arguments);
+            return this.store.errorType();
+        }
+        let constField = members.findField(types.staticFieldsOf(head), name);
+        if (constField != null) {
+            this.reporter.report("'{owner.name()}.{name}' is a static const, not a method, so "
+                + "it cannot be called. Remove the parentheses.", node.span());
+            this.analyzeArgumentsOnly(arguments);
+            return this.store.errorType();
+        }
+        if (head is DeclaredType && head.isGeneric()) {
+            return this.analyzeInferredStaticCall(node, member, head, name, expected);
+        }
+        let candidates = staticsNamed(head, name);
+        if (candidates.length() == 0) {
+            this.reportMissingStatic(head, owner, name, member.member().span());
+            this.analyzeArgumentsOnly(arguments);
+            return this.store.errorType();
+        }
+        return this.finishStaticCall(node, member, name, candidates);
+    }
+
+    // Resolves a static call against a concrete owner, mirroring finishMethodCall: overloads
+    // and named arguments through full resolution, the single candidate checked directly.
+    finishStaticCall(CallExpressionNode node, MemberExpressionNode member, string name,
+                     List<Method> candidates) -> Type {
+        let arguments = node.arguments();
+        if (candidates.length() > 1 || usesNamedArguments(arguments)) {
+            let built = this.buildCallShape(arguments);
+            let callCandidates = new List<CallCandidate>();
+            for (long i = 0; i < candidates.length(); i++) {
+                let candidate = candidates.get(i);
+                callCandidates.push(new CallCandidate(candidate.signature(), candidate,
+                    this.isAccessAllowed(candidate.visibility(), candidate.definingType())));
+            }
+            let resolved = calls.resolveCall(callCandidates, built.shape, this.reporter,
+                node.span(), name, "Method");
+            if (resolved.failed()) {
+                return this.store.errorType();
+            }
+            let chosen = resolved.chosen();
+            if (chosen == null) {
+                return this.store.errorType();
+            }
+            let chosenMethod = chosen.method();
+            if (chosenMethod != null) {
+                if (!chosen.isAccessible()) {
+                    this.checkMemberAccess(name, chosenMethod.visibility(),
+                        chosenMethod.definingType(), member.member().span());
+                }
+                this.result.setMethod(member.green(), chosenMethod);
+            }
+            return this.checkResolvedArguments(built, resolved, node.green());
+        }
+        let single = candidates.get(0);
+        this.checkMemberAccess(name, single.visibility(), single.definingType(),
+            member.member().span());
+        this.result.setMethod(member.green(), single);
+        return this.checkDirectArguments("Method", name, single.signature(), arguments,
+            node.span());
+    }
+
+    // A static call on a generic type written without its type arguments. Each candidate infers
+    // them independently: from the arguments whose parameter is exactly one of the type's own
+    // parameters (the generic-function rule), then from the expected type when it is an
+    // instantiation of the same template. Explicit arguments never reach here; they resolve on
+    // the type name.
+    analyzeInferredStaticCall(CallExpressionNode node, MemberExpressionNode member,
+                              DeclaredType template, string name, Type? expected) -> Type {
+        let arguments = node.arguments();
+        let templateStatics = types.staticMethodsOf(template);
+        if (templateStatics == null) {
+            this.analyzeArgumentsOnly(arguments);
+            return this.store.errorType();
+        }
+        let indexes = new List<long>();
+        for (long i = 0; i < templateStatics.length(); i++) {
+            if (templateStatics.get(i).name() == name) {
+                indexes.push(i);
+            }
+        }
+        if (indexes.length() == 0) {
+            this.reportMissingStatic(template, template, name, member.member().span());
+            this.analyzeArgumentsOnly(arguments);
+            return this.store.errorType();
+        }
+        if (usesNamedArguments(arguments)) {
+            this.reporter.report("A call that infers the type arguments of "
+                + "'{template.name()}' does not support named arguments; pass the arguments "
+                + "in order, or write the type arguments on the type name, as in "
+                + "'{template.name()}<{typeParameterExample(template)}>.{name}(...)'.",
+                node.span());
+            this.analyzeArgumentsOnly(arguments);
+            return this.store.errorType();
+        }
+        let argumentTypes = new List<Type>();
+        for (long i = 0; i < arguments.argumentsCount(); i++) {
+            let argument = arguments.arguments(i);
+            if (argument is Expression) {
+                argumentTypes.push(this.analyzeExpression(argument));
+            } else {
+                argumentTypes.push(this.store.errorType());
+            }
+        }
+        let owner = template.declaration();
+        TypeParamType[] typeParameters = template.typeParameterTypes();
+        long arity = typeParameters.length;
+        Type[] contextArguments = [];
+        if (expected != null) {
+            Type bare = convert.bareOf(expected);
+            if (bare is InstantiationType && bare.template() == template) {
+                contextArguments = bare.arguments();
+            }
+        }
+        let completedIndexes = new List<long>();
+        let completedArguments = new List<Type[]>();
+        for (long c = 0; c < indexes.length(); c++) {
+            let candidate = templateStatics.get(indexes.get(c));
+            let inferred = this.inferTypeArgumentVector(candidate, owner, arity, argumentTypes,
+                contextArguments);
+            if (inferred != null) {
+                completedIndexes.push(indexes.get(c));
+                completedArguments.push(inferred);
+            }
+        }
+        if (completedIndexes.length() == 0) {
+            this.reporter.report("Cannot tell the type arguments for "
+                + "'{template.name()}.{name}': neither the call's arguments nor the "
+                + "surrounding context supplies them. Write them on the type name, as in "
+                + "'{template.name()}<{typeParameterExample(template)}>.{name}(...)'.",
+                node.span());
+            return this.store.errorType();
+        }
+        let boundedIndexes = new List<long>();
+        let boundedArguments = new List<Type[]>();
+        for (long c = 0; c < completedIndexes.length(); c++) {
+            Type[] vector = completedArguments.get(c);
+            bool satisfied = true;
+            for (long k = 0; k < arity; k++) {
+                if (!this.resolver.boundsSatisfied(vector[k], typeParameters[k])) {
+                    satisfied = false;
+                }
+            }
+            if (satisfied) {
+                boundedIndexes.push(completedIndexes.get(c));
+                boundedArguments.push(vector);
+            }
+        }
+        if (boundedIndexes.length() == 0) {
+            Type[] vector = completedArguments.get(0);
+            for (long k = 0; k < arity; k++) {
+                this.resolver.checkArgumentBounds(vector[k], typeParameters[k], node.span());
+            }
+            return this.store.errorType();
+        }
+        if (boundedIndexes.length() == 1) {
+            return this.checkInferredStaticCall(node, member, template,
+                boundedIndexes.get(0), boundedArguments.get(0), argumentTypes);
+        }
+        return this.selectInferredStaticCall(node, member, template, name, boundedIndexes,
+            boundedArguments, argumentTypes);
+    }
+
+    // Per-candidate type-argument determination: the arguments fill what they can, the expected
+    // type fills what is left, and a slot no source fills fails the candidate. An argument
+    // matches its parameter structurally, through arrays, optionals, and instantiations of the
+    // same template, so 'of(T[] values)' infers T from an 'int[]' argument.
+    inferTypeArgumentVector(Method candidate, GreenNode owner, long arity,
+                            List<Type> argumentTypes, Type[] contextArguments) -> Type[]? {
+        let slots = new List<Type?>();
+        for (long i = 0; i < arity; i++) {
+            slots.push(null);
+        }
+        Parameter[] parameters = candidate.signature().parameters();
+        for (long i = 0; i < argumentTypes.length() && i < parameters.length; i++) {
+            if (!(argumentTypes.get(i) is ErrorType)) {
+                this.unifyTypeArgument(parameters[i].type(), argumentTypes.get(i), owner,
+                    arity, slots);
+            }
+        }
+        for (long i = 0; i < arity && i < contextArguments.length; i++) {
+            if (slots.get(i) == null) {
+                slots.set(i, contextArguments[i]);
+            }
+        }
+        let resolved = new List<Type>();
+        for (long i = 0; i < arity; i++) {
+            let slot = slots.get(i);
+            if (slot == null) {
+                return null;
+            }
+            resolved.push(slot);
+        }
+        return resolved.toArray();
+    }
+
+    // One-way structural matching of a parameter type against an argument type, binding each of
+    // the owner's still-open type parameters at the position it first appears. A mismatch binds
+    // nothing and stays quiet: the ordinary argument checking reports it against whatever the
+    // other sources determined.
+    unifyTypeArgument(Type parameterType, Type argumentType, GreenNode owner, long arity,
+                      List<Type?> slots) {
+        switch (parameterType) {
+            is TypeParamType parameter -> {
+                if (parameter.owner() == owner && parameter.index() < arity
+                        && slots.get(parameter.index()) == null
+                        && !(argumentType is NullType)) {
+                    slots.set(parameter.index(), argumentType);
+                }
+            },
+            is ArrayType array -> {
+                if (argumentType is ArrayType) {
+                    this.unifyTypeArgument(array.element(), argumentType.element(), owner,
+                        arity, slots);
+                }
+            },
+            is OptionalType optional -> {
+                Type inner = argumentType;
+                if (inner is OptionalType) {
+                    inner = inner.inner();
+                }
+                this.unifyTypeArgument(optional.inner(), inner, owner, arity, slots);
+            },
+            is InstantiationType parameterInstantiation -> {
+                if (argumentType is InstantiationType
+                        && argumentType.template() == parameterInstantiation.template()) {
+                    Type[] parameterArguments = parameterInstantiation.arguments();
+                    Type[] argumentArguments = argumentType.arguments();
+                    for (long i = 0; i < parameterArguments.length
+                            && i < argumentArguments.length; i++) {
+                        this.unifyTypeArgument(parameterArguments[i], argumentArguments[i],
+                            owner, arity, slots);
+                    }
+                }
+            },
+            default -> { },
+        }
+    }
+
+    // The single inferred candidate: instantiate, then check the arguments against the
+    // substituted signature the way a generic function call does, without re-analyzing them.
+    checkInferredStaticCall(CallExpressionNode node, MemberExpressionNode member,
+                            DeclaredType template, long staticIndex, Type[] typeArguments,
+                            List<Type> argumentTypes) -> Type {
+        let instantiation = this.store.instantiationOf(template, typeArguments);
+        let resolved = this.staticAtIndex(instantiation, staticIndex);
+        if (resolved == null) {
+            return this.store.errorType();
+        }
+        this.result.setType(member.object().green(), instantiation);
+        this.checkMemberAccess(resolved.name(), resolved.visibility(),
+            resolved.definingType(), member.member().span());
+        this.result.setMethod(member.green(), resolved);
+        let signature = resolved.signature();
+        Parameter[] parameters = signature.parameters();
+        let arguments = node.arguments();
+        long count = arguments.argumentsCount();
+        long required = calls.requiredArgumentCount(signature);
+        if (count < required || count > parameters.length) {
+            this.reporter.report("Method '{resolved.name()}' expects "
+                + "{calls.expectedCountText(signature)} argument(s), got {count}",
+                node.span());
+        }
+        for (long i = 0; i < count && i < parameters.length; i++) {
+            let argument = arguments.arguments(i);
+            if (argument is Expression) {
+                Type parameterType = parameters[i].type();
+                this.adaptIntegerLiteral(argument, parameterType);
+                this.adaptCharLiteral(argument, parameterType);
+                this.adaptFloatLiteral(argument, parameterType);
+                Type actual = argumentTypes.get(i);
+                let updated = this.result.typeOf(argument.green());
+                if (updated != null) {
+                    actual = updated;
+                }
+                if (!(parameterType is ErrorType) && !(actual is ErrorType)
+                        && !convert.isAssignableStrict(parameterType, actual)) {
+                    this.reporter.report("Argument {i + 1}: expected "
+                        + "'{types.display(parameterType)}', got '{types.display(actual)}'"
+                        + "{nullabilityHint(parameterType, actual)}", argument.span());
+                }
+            }
+        }
+        return signature.returnType();
+    }
+
+    // Several candidates inferred complete vectors: rank their substituted signatures over the
+    // already-analyzed arguments and let overload resolution pick.
+    selectInferredStaticCall(CallExpressionNode node, MemberExpressionNode member,
+                             DeclaredType template, string name, List<long> staticIndexes,
+                             List<Type[]> vectors, List<Type> argumentTypes) -> Type {
+        let arguments = node.arguments();
+        let shape = new CallShape();
+        let values = new List<Expression?>();
+        for (long i = 0; i < arguments.argumentsCount(); i++) {
+            switch (arguments.arguments(i)) {
+                is Expression value -> {
+                    Type analyzed = argumentTypes.get(i);
+                    let updated = this.result.typeOf(value.green());
+                    if (updated != null) {
+                        analyzed = updated;
+                    }
+                    shape.positional().push(this.argumentValueOf("", value, analyzed));
+                    values.push(value);
+                },
+                default -> {
+                    shape.markErrorArgument();
+                    shape.positional().push(new ArgumentValue("", this.store.errorType(),
+                        false, false, 0, false, node.span()));
+                    values.push(null);
+                },
+            }
+        }
+        let built = new BuiltShape(shape, values);
+        let callCandidates = new List<CallCandidate>();
+        let resolvedMethods = new List<Method>();
+        let resolvedOwners = new List<Type>();
+        for (long c = 0; c < staticIndexes.length(); c++) {
+            let instantiation = this.store.instantiationOf(template, vectors.get(c));
+            let resolved = this.staticAtIndex(instantiation, staticIndexes.get(c));
+            if (resolved == null) {
+                continue;
+            }
+            resolvedMethods.push(resolved);
+            resolvedOwners.push(instantiation);
+            callCandidates.push(new CallCandidate(resolved.signature(), resolved,
+                this.isAccessAllowed(resolved.visibility(), resolved.definingType())));
+        }
+        if (callCandidates.length() == 0) {
+            return this.store.errorType();
+        }
+        let resolution = calls.resolveCall(callCandidates, built.shape, this.reporter,
+            node.span(), name, "Method");
+        if (resolution.failed()) {
+            return this.store.errorType();
+        }
+        let chosen = resolution.chosen();
+        if (chosen == null) {
+            return this.store.errorType();
+        }
+        let chosenMethod = chosen.method();
+        if (chosenMethod != null) {
+            for (long c = 0; c < resolvedMethods.length(); c++) {
+                if (resolvedMethods.get(c) == chosenMethod) {
+                    this.result.setType(member.object().green(), resolvedOwners.get(c));
+                }
+            }
+            if (!chosen.isAccessible()) {
+                this.checkMemberAccess(name, chosenMethod.visibility(),
+                    chosenMethod.definingType(), member.member().span());
+            }
+            this.result.setMethod(member.green(), chosenMethod);
+        }
+        return this.checkResolvedArguments(built, resolution, node.green());
+    }
+
+    // The instantiation's static at a template list position; the lists fill in parallel, so
+    // a miss is a compiler bug rather than a user error.
+    staticAtIndex(InstantiationType instantiation, long index) -> Method? {
+        this.store.ensureFilled(instantiation);
+        let statics = types.staticMethodsOf(instantiation);
+        if (statics == null || index >= statics.length()) {
+            panic("Internal: instantiation '{types.display(instantiation)}' has no static at "
+                + "position {index}");
+        }
+        return statics.get(index);
+    }
+
+    // A 'Name<Args>' head reached as a value: the parser only builds it before a '.', so this
+    // is a recovery path, but it still explains itself.
+    analyzeGenericNameValue(GenericNameExpressionNode generic) -> Type {
+        this.reporter.report("A type name with type arguments is not a value; it can only "
+            + "start a static member access, as in 'List<int>.withCapacity(8)'.",
+            generic.span());
+        return this.store.errorType();
     }
 
     // ---- Call shapes and argument checking ----
@@ -4268,16 +4972,16 @@ class BodyChecker implements NoreturnCalls {
 
     // ---- Calls ----
 
-    analyzeCall(CallExpressionNode node) -> Type {
-        Type analyzed = this.analyzeCallInner(node);
+    analyzeCall(CallExpressionNode node, Type? expected) -> Type {
+        Type analyzed = this.analyzeCallInner(node, expected);
         this.clearNarrowingsForCall(node);
         return analyzed;
     }
 
-    analyzeCallInner(CallExpressionNode node) -> Type {
+    analyzeCallInner(CallExpressionNode node, Type? expected) -> Type {
         switch (node.callee()) {
             is MemberExpressionNode member -> {
-                return this.analyzeMemberCall(node, member);
+                return this.analyzeMemberCall(node, member, expected);
             },
             is SafeMemberExpressionNode member -> {
                 return this.analyzeSafeMemberCall(node, member);
@@ -4305,6 +5009,13 @@ class BodyChecker implements NoreturnCalls {
             let declared = this.store.findDeclared(this.modulePath, name);
             if (declared != null && isStructValue(declared)) {
                 return this.analyzeStructConstructorCall(node, declared, name);
+            }
+            let ownerName = this.staticSuggestionOwner(name);
+            if (ownerName != null) {
+                this.reporter.report("Statics are called through the type name, even inside "
+                    + "'{ownerName}'; write '{ownerName}.{name}(...)'.", identifier.span());
+                this.analyzeArgumentsOnly(node.arguments());
+                return this.store.errorType();
             }
             this.reporter.report("Undefined function '{name}'. Check the spelling, or import "
                 + "the module that declares it.", identifier.span());
@@ -4356,7 +5067,8 @@ class BodyChecker implements NoreturnCalls {
             node.arguments(), node.span());
     }
 
-    analyzeMemberCall(CallExpressionNode node, MemberExpressionNode member) -> Type {
+    analyzeMemberCall(CallExpressionNode node, MemberExpressionNode member, Type? expected)
+            -> Type {
         let object = member.object();
         string memberName = member.member().text();
         if (object is IdentifierExpressionNode) {
@@ -4371,6 +5083,10 @@ class BodyChecker implements NoreturnCalls {
                     return handled;
                 }
             }
+        }
+        let staticHead = this.resolveStaticHead(object);
+        if (staticHead != null) {
+            return this.analyzeStaticCall(node, member, staticHead, expected);
         }
         let intercepted = this.interceptBuiltinCall(node, object, memberName);
         if (intercepted != null) {
@@ -5859,6 +6575,44 @@ methodCandidates(Type record, string name) -> List<Method> {
             }
         }
         current = types.baseOf(current);
+    }
+    return found;
+}
+
+// The type-argument list an example spelling shows: the declaration's own parameter names, so
+// 'Pair<A, B>.of(...)' reads against 'Pair<A, B>'.
+typeParameterExample(DeclaredType owner) -> string {
+    string[] names = owner.typeParameters();
+    string example = "";
+    for (long i = 0; i < names.length; i++) {
+        if (i > 0) {
+            example = example + ", ";
+        }
+        example = example + names[i];
+    }
+    return example;
+}
+
+// "Path.separator", the way a static const reads in a diagnostic.
+staticConstDisplay(Field field) -> string {
+    let owner = types.authorityOf(field.definingType());
+    if (owner == null) {
+        return field.name();
+    }
+    return "{owner.name()}.{field.name()}";
+}
+
+// The statics a type declares under the name. No chain walk: statics are not inherited, so only
+// the named type's own list answers.
+staticsNamed(Type owner, string name) -> List<Method> {
+    let found = new List<Method>();
+    let statics = types.staticMethodsOf(owner);
+    if (statics != null) {
+        for (long i = 0; i < statics.length(); i++) {
+            if (statics.get(i).name() == name) {
+                found.push(statics.get(i));
+            }
+        }
     }
     return found;
 }

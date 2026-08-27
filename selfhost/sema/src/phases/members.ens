@@ -9,8 +9,10 @@ import SyntaxToken from @ens.frontend.syntax.node;
 import Span from @ens.frontend.support.source;
 import Reporter from support.diagnostics;
 import TypeResolver from phases.resolve;
+import model.convert;
 import model.types;
 import Type from model.types;
+import ErrorType from model.types;
 import Field from model.types;
 import Parameter from model.types;
 import Signature from model.types;
@@ -41,6 +43,8 @@ public final class MemberModifiers {
     protected bool declaresWeak;
     protected bool declaresConst;
     public bool declaresNoreturn;
+    public bool declaresStatic;
+    protected Span? staticMark;
 
     protected constructor() {
         this.visibilityMarks = new List<MemberVisibilityMark>();
@@ -81,6 +85,10 @@ public final class MemberModifiers {
             NoreturnKeyword -> {
                 this.declaresNoreturn = true;
             },
+            StaticKeyword -> {
+                this.declaresStatic = true;
+                this.staticMark = span;
+            },
             default -> { },
         }
     }
@@ -96,6 +104,15 @@ public final class MemberModifiers {
             return fallback;
         }
         return this.visibilityMarks.get(0).markSpan;
+    }
+
+    // Where a diagnostic about the 'static' modifier points.
+    public staticModifierSpan(Span fallback) -> Span {
+        let mark = this.staticMark;
+        if (mark == null) {
+            return fallback;
+        }
+        return mark;
     }
 }
 
@@ -126,11 +143,12 @@ enum DeclarationShape {
 
 // Why a declaration cannot carry a modifier, or null when it may. One table for every shape, so a
 // modifier's rule and the phrase naming where it does belong are each written once: a field carries
-// visibility, 'weak', and 'const', a member adds the markers that govern dispatch, a function adds
-// only 'noreturn', and what is left over governs a type or a local declaration. Each shape narrows
-// this further where it is read - an interface method takes no visibility, a constructor no
-// 'override', an abstract method needs an abstract class - and a modifier the grammar gains later
-// reaches the last arm and is refused everywhere until someone places it.
+// visibility, 'weak', 'const', and 'static', a member adds the markers that govern dispatch, a
+// function adds only 'noreturn', and what is left over governs a type or a local declaration. Each
+// shape narrows this further where it is read - an interface method takes no visibility, a
+// constructor no 'override', an abstract method needs an abstract class, a 'static' field needs
+// 'const' - and a modifier the grammar gains later reaches the last arm and is refused everywhere
+// until someone places it.
 modifierProblem(SyntaxKind kind, DeclarationShape shape) -> string? {
     switch (kind) {
         PublicKeyword, PrivateKeyword, ProtectedKeyword, ExportKeyword -> {
@@ -178,6 +196,14 @@ modifierProblem(SyntaxKind kind, DeclarationShape shape) -> string? {
             }
             return "'const' goes on a field or a variable inside a function, as in "
                 + "'const string name;' or 'const limit = 10'";
+        },
+        StaticKeyword -> {
+            if (shape != DeclarationShape.Function) {
+                return null;
+            }
+            return "'static' goes on a method or a 'const' field of a class or a struct, "
+                + "where it makes the member belong to the type itself; a top-level function "
+                + "already belongs to no instance";
         },
         default -> {
             return "no field, method, or function takes it";
@@ -353,8 +379,182 @@ public readField(TypeResolver resolver, Reporter reporter, FieldDeclarationNode 
     Visibility visibility = memberVisibility(modifiers, defaultVisibility, owner, "Field",
         declaration.name().text(), reporter);
     return new Field(declaration.name().text(), fieldType, visibility,
-        modifiers.declaresWeak, modifiers.declaresConst, declaration.defaultValue() != null,
-        declaration.name().span(), owner);
+        modifiers.declaresWeak, modifiers.declaresConst, modifiers.declaresStatic,
+        declaration.defaultValue() != null, declaration.name().span(), owner);
+}
+
+// The shape of a static const field: 'const' and an initializer are mandatory because nothing
+// else ever assigns it, its value is a compile-time constant so its type comes from the constant
+// family, and it belongs to the type itself so it can mention no type parameter and hold no weak
+// reference. The initializer's own rules live with the constants phase.
+public checkStaticFieldShape(Reporter reporter, FieldDeclarationNode declaration, Field field) {
+    let modifiers = fieldModifiers(declaration);
+    string name = field.name();
+    Span at = field.nameSpan();
+    string shownType = types.display(field.type());
+    if (!field.isConst()) {
+        reporter.report("A 'static' field must also be 'const'; there is no mutable type-level "
+            + "state. Write 'static const {shownType} {name} = ...', or make '{name}' an "
+            + "instance field.", modifiers.staticModifierSpan(at));
+    }
+    if (field.isWeak()) {
+        reporter.report("A static const field cannot be 'weak': it holds a compile-time "
+            + "constant, not a reference to an object. Remove 'weak'.", at);
+    }
+    if (declaration.defaultValue() == null) {
+        reporter.report("Static const '{name}' needs its value on the declaration, because "
+            + "nothing else ever assigns it: write 'static const {shownType} {name} = ...'.",
+            at);
+    }
+    if (!isConstantFamily(field.type())) {
+        reporter.report("Static const '{name}' has type '{shownType}', but a static const "
+            + "holds a compile-time constant, so its type must be a primitive, 'char', 'bool', "
+            + "or 'string'.", at);
+    } else if (convert.containsTypeParam(field.type())) {
+        reporter.report("Static const '{name}' cannot have type '{shownType}': a static "
+            + "belongs to the type itself, which every instantiation shares, so its type "
+            + "cannot use a type parameter.", at);
+    }
+}
+
+// The types a compile-time constant can have. 'void' is excluded because it names no value, and
+// error types pass so one failed resolution does not cascade.
+isConstantFamily(Type type) -> bool {
+    if (type is StringType || type is ErrorType || type is TypeParamType) {
+        return true;
+    }
+    if (type is PrimitiveType) {
+        return type.kind() != PrimitiveKind.Void;
+    }
+    return false;
+}
+
+// A static member never takes part in dispatch: it is not inherited, so nothing overrides it and
+// nothing marks it 'final' or 'abstract'. Constructors and destructors describe instances, so
+// they cannot be static either.
+public checkStaticMethodMarkers(Reporter reporter, MemberModifiers modifiers, string methodName,
+                                bool isConstructor, bool isDestructor, Span nameSpan) {
+    if (!modifiers.declaresStatic) {
+        return;
+    }
+    Span at = modifiers.staticModifierSpan(nameSpan);
+    if (isConstructor) {
+        reporter.report("A constructor cannot be 'static'; a constructor always builds an "
+            + "instance. Remove 'static', or make it a static factory method that returns the "
+            + "new instance.", at);
+        return;
+    }
+    if (isDestructor) {
+        reporter.report("A destructor cannot be 'static'; it runs when an instance is "
+            + "destroyed. Remove 'static'.", at);
+        return;
+    }
+    if (modifiers.declaresAbstract) {
+        reporter.report("Static method '{methodName}' cannot be 'abstract': a static is "
+            + "called through the type name and never dispatches, so no subclass could supply "
+            + "its body. Remove one of the two.", at);
+    }
+    if (modifiers.declaresOverride) {
+        reporter.report("Static method '{methodName}' cannot be 'override': statics are not "
+            + "inherited, so there is nothing to override. Remove one of the two.", at);
+    }
+    if (modifiers.declaresFinal) {
+        reporter.report("Static method '{methodName}' cannot be 'final': statics are not "
+            + "inherited, so there is no override to forbid. Remove one of the two.", at);
+    }
+}
+
+// Statics share one namespace with instance members: the same name on both sides would read
+// ambiguously, so it is rejected like any other duplicate. Checked from the side being declared,
+// against whatever the other side has collected so far.
+public checkStaticInstanceCollision(Reporter reporter, DeclaredType owner, string memberName,
+                                    bool memberIsStatic, Span span) {
+    if (memberName.length == 0) {
+        return;
+    }
+    if (memberIsStatic) {
+        let field = findField(types.fieldsOf(owner), memberName);
+        if (field != null) {
+            reporter.report("Static member '{memberName}' has the same name as a field of "
+                + "'{types.display(field.definingType())}'; a static and an instance member "
+                + "cannot share a name. Rename one of the two.", span);
+            return;
+        }
+        let method = findMethodNamed(types.methodsOf(owner), memberName);
+        if (method != null) {
+            reporter.report("Static member '{memberName}' has the same name as a method of "
+                + "'{owner.name()}'; a static and an instance member cannot share a name. "
+                + "Rename one of the two.", span);
+        }
+        return;
+    }
+    let staticField = findField(types.staticFieldsOf(owner), memberName);
+    if (staticField != null) {
+        reporter.report("'{memberName}' is already declared as a static const of "
+            + "'{owner.name()}'; a static and an instance member cannot share a name. Rename "
+            + "one of the two.", span);
+        return;
+    }
+    let staticMethod = findMethodNamed(types.staticMethodsOf(owner), memberName);
+    if (staticMethod != null) {
+        reporter.report("'{memberName}' is already declared as a static method of "
+            + "'{owner.name()}'; a static and an instance member cannot share a name. Rename "
+            + "one of the two.", span);
+    }
+}
+
+// Reads one static method into its owner's static list: the signature, the marker, throws, and
+// collision rules, and the duplicate-overload check. Shared by the struct signature phase and
+// the class layout phase, which differ only in when they run. Statics may overload each other
+// under the ordinary overload rules; explicit throws types stay reserved for overridable
+// methods, and a static is never overridable.
+public collectStaticMethod(TypeResolver resolver, Reporter reporter, DeclaredType owner,
+                           List<Method> staticMethods, FunctionDeclarationNode member,
+                           string methodName, Span nameSpan, MemberModifiers modifiers) {
+    let signature = buildSignature(resolver, reporter, member, methodName, nameSpan, false,
+        false, false, modifiers.declaresNoreturn, null, owner.name(), []);
+    Visibility visibility = memberVisibility(modifiers, Visibility.Private, owner, "Method",
+        methodName, reporter);
+    checkStaticMethodMarkers(reporter, modifiers, methodName, false, false, nameSpan);
+    checkThrowsPlacement(reporter, member, false, false, modifiers.declaresAbstract);
+    checkNoreturnPlacement(reporter, member, false, false, modifiers.declaresNoreturn);
+    checkStaticInstanceCollision(reporter, owner, methodName, true, nameSpan);
+    checkStaticFieldMethodCollision(reporter, owner, methodName, nameSpan);
+    if (findSameSignature(staticMethods, methodName, signature) != null) {
+        reporter.report("Static method '{methodName}' of '{owner.name()}' is already declared "
+            + "with the same parameter types; overloads must differ in parameter count or "
+            + "types.", nameSpan);
+        return;
+    }
+    staticMethods.push(new Method(signature, visibility, false, false, false, false, false,
+        true, member.body() != null, owner));
+}
+
+// A static method may not share its name with a static const of the same type; the two sides of
+// the static namespace collide exactly as a field and a method do.
+public checkStaticFieldMethodCollision(Reporter reporter, DeclaredType owner, string methodName,
+                                       Span span) {
+    let collided = findField(types.staticFieldsOf(owner), methodName);
+    if (collided != null) {
+        reporter.report("'{methodName}' is already declared as a static const of "
+            + "'{owner.name()}'; a field and a method cannot share a name.", span);
+    }
+}
+
+public findMethodNamed(List<Method>? methods, string name) -> Method? {
+    if (methods == null) {
+        return null;
+    }
+    for (long i = 0; i < methods.length(); i++) {
+        let method = methods.get(i);
+        if (method.isConstructor() || method.isDestructor()) {
+            continue;
+        }
+        if (method.name() == name) {
+            return method;
+        }
+    }
+    return null;
 }
 
 // Resolves one callable's signature: parameters (with the 'this.field' shorthand against the
