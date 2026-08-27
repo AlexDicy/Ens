@@ -24,6 +24,8 @@ OS-level redirection for `run(captureOutput: true)`, wait-with-timeout, and kill
 A ruling on `new T[n]` in generic bodies: it bypasses element-defaultability checking and is never re-checked at monomorphization, so `List<Pair>` today materializes struct values whose non-defaulted `const` fields hold zeros nobody assigned (verified 2026-08-27, pre-existing).
 The naive fix, re-checking at monomorphization, would reject the collections' own backing arrays (`new T[4]` in `List`), so the containers need a sanctioned raw-storage story first.
 
+A dedicated review pass over the diagnostic messages introduced across the whole migration, once the plan completes (requested 2026-08-27).
+
 ## Reminders
 
 When `@std.time` is designed, replace `Metadata.modifiedMillis` and `wait(long timeoutMillis)` with a proper duration/instant type; the names carry the unit until then.
