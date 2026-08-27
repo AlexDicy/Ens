@@ -21,6 +21,8 @@ A pinning fixture for file-next-to-folder module resolution, plus a spec line.
 A fixture for a cross-package subclass calling a protected constructor.
 The 23 `new Error(...)` sites that break when `Error` goes abstract, most of which should throw `TestFailure`.
 OS-level redirection for `run(captureOutput: true)`, wait-with-timeout, and kill in the native bridges.
+A ruling on `new T[n]` in generic bodies: it bypasses element-defaultability checking and is never re-checked at monomorphization, so `List<Pair>` today materializes struct values whose non-defaulted `const` fields hold zeros nobody assigned (verified 2026-08-27, pre-existing).
+The naive fix, re-checking at monomorphization, would reject the collections' own backing arrays (`new T[4]` in `List`), so the containers need a sanctioned raw-storage story first.
 
 ## Reminders
 

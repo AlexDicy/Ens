@@ -89,6 +89,7 @@ A struct local must be built as a whole, with a literal or a constructor, before
 
 A struct field may have any type, including a non-nullable one such as a class, a string, an array, or another struct that has no default.
 A struct with such a field has no default value of its own, so it cannot be an array element or a field left without a default, though it can still be built with a literal or a constructor wherever a value is needed.
+A `const` field without a default value removes the struct's default the same way, whatever the field's type: a default-built value would hold a zero that no constructor or aggregate literal ever assigned.
 
 Two values of the same struct type compare with `==` and `!=` field by field, in declaration order, stopping at the first field that differs.
 Each field compares by its own `==`: primitives and enums by value (so IEEE rules hold, and a `float` or `double` field that is `NaN` never equals itself), strings by content, class and array fields by reference identity unless the two objects' run-time class opted into content equality, a nested struct memberwise unless it declared its own equality, and a nullable field null-aware (both `null` are equal, one `null` is unequal, otherwise the inner values compare).
