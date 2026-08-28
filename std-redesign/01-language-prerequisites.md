@@ -62,6 +62,11 @@ Classes may override `toString` the way structs already do.
 `toString()` is total: it never throws and never returns null.
 Any conversion that can fail or lose information gets its own name and signature.
 
+Ratified 2026-08-28: `toString` is universal for class values, like `hash`: a class with no override in its chain answers with its runtime type's name, so a subclass prints its own name through a base reference.
+Interpolation holes and explicit `.toString()` accept every class value through the same dispatch; `+` concatenation keeps rejecting classes, matching structs.
+A class replacement is written `override toString() -> string` with a body, under the struct shape rules.
+Until the Phase B seed release, a class method named `toString` without `override` stays what it is today, an ordinary method outside the dispatch; requiring the marker everywhere is deferred to Phase D, because the pinned seed still compiles today's std sources.
+
 ## Conditional members
 
 A member may constrain the enclosing type's parameters by restating them with a bound in its own type-parameter list: `export sort<T: Comparable<T>>();`.
