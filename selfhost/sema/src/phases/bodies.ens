@@ -4521,13 +4521,16 @@ class BodyChecker implements NoreturnCalls {
         }
         let completedIndexes = new List<long>();
         let completedArguments = new List<Type[]>();
+        let completedSources = new List<long[]>();
         for (long c = 0; c < indexes.length(); c++) {
             let candidate = templateStatics.get(indexes.get(c));
+            let sources = new List<long>();
             let inferred = this.inferTypeArgumentVector(candidate, owner, arity, argumentTypes,
-                contextArguments);
+                contextArguments, sources);
             if (inferred != null) {
                 completedIndexes.push(indexes.get(c));
                 completedArguments.push(inferred);
+                completedSources.push(sources.toArray());
             }
         }
         if (completedIndexes.length() == 0) {
@@ -4540,6 +4543,7 @@ class BodyChecker implements NoreturnCalls {
         }
         let boundedIndexes = new List<long>();
         let boundedArguments = new List<Type[]>();
+        let boundedSources = new List<long[]>();
         for (long c = 0; c < completedIndexes.length(); c++) {
             Type[] vector = completedArguments.get(c);
             bool satisfied = true;
@@ -4551,6 +4555,7 @@ class BodyChecker implements NoreturnCalls {
             if (satisfied) {
                 boundedIndexes.push(completedIndexes.get(c));
                 boundedArguments.push(vector);
+                boundedSources.push(completedSources.get(c));
             }
         }
         if (boundedIndexes.length() == 0) {
@@ -4562,7 +4567,8 @@ class BodyChecker implements NoreturnCalls {
         }
         if (boundedIndexes.length() == 1) {
             return this.checkInferredStaticCall(node, member, template,
-                boundedIndexes.get(0), boundedArguments.get(0), argumentTypes);
+                boundedIndexes.get(0), boundedArguments.get(0), argumentTypes,
+                templateStatics.get(boundedIndexes.get(0)), owner, boundedSources.get(0));
         }
         return this.selectInferredStaticCall(node, member, template, name, boundedIndexes,
             boundedArguments, argumentTypes);
@@ -4573,21 +4579,26 @@ class BodyChecker implements NoreturnCalls {
     // matches its parameter structurally, through arrays, optionals, and instantiations of the
     // same template, so 'of(T[] values)' infers T from an 'int[]' argument.
     inferTypeArgumentVector(Method candidate, GreenNode owner, long arity,
-                            List<Type> argumentTypes, Type[] contextArguments) -> Type[]? {
+                            List<Type> argumentTypes, Type[] contextArguments,
+                            List<long> sources) -> Type[]? {
+        // sources holds, per slot, the argument index that bound it, -1 for a fill from the
+        // surrounding context, and -2 while unbound.
         let slots = new List<Type?>();
         for (long i = 0; i < arity; i++) {
             slots.push(null);
+            sources.push(-2);
         }
         Parameter[] parameters = candidate.signature().parameters();
         for (long i = 0; i < argumentTypes.length() && i < parameters.length; i++) {
             if (!(argumentTypes.get(i) is ErrorType)) {
                 this.unifyTypeArgument(parameters[i].type(), argumentTypes.get(i), owner,
-                    arity, slots);
+                    arity, slots, sources, i);
             }
         }
         for (long i = 0; i < arity && i < contextArguments.length; i++) {
             if (slots.get(i) == null) {
                 slots.set(i, contextArguments[i]);
+                sources.set(i, -1);
             }
         }
         let resolved = new List<Type>();
@@ -4606,19 +4617,20 @@ class BodyChecker implements NoreturnCalls {
     // nothing and stays quiet: the ordinary argument checking reports it against whatever the
     // other sources determined.
     unifyTypeArgument(Type parameterType, Type argumentType, GreenNode owner, long arity,
-                      List<Type?> slots) {
+                      List<Type?> slots, List<long> sources, long argumentIndex) {
         switch (parameterType) {
             is TypeParamType parameter -> {
                 if (parameter.owner() == owner && parameter.index() < arity
                         && slots.get(parameter.index()) == null
                         && !(argumentType is NullType)) {
                     slots.set(parameter.index(), argumentType);
+                    sources.set(parameter.index(), argumentIndex);
                 }
             },
             is ArrayType array -> {
                 if (argumentType is ArrayType) {
                     this.unifyTypeArgument(array.element(), argumentType.element(), owner,
-                        arity, slots);
+                        arity, slots, sources, argumentIndex);
                 }
             },
             is OptionalType optional -> {
@@ -4626,7 +4638,8 @@ class BodyChecker implements NoreturnCalls {
                 if (inner is OptionalType) {
                     inner = inner.inner();
                 }
-                this.unifyTypeArgument(optional.inner(), inner, owner, arity, slots);
+                this.unifyTypeArgument(optional.inner(), inner, owner, arity, slots, sources,
+                    argumentIndex);
             },
             is InstantiationType parameterInstantiation -> {
                 if (argumentType is InstantiationType
@@ -4636,7 +4649,7 @@ class BodyChecker implements NoreturnCalls {
                     for (long i = 0; i < parameterArguments.length
                             && i < argumentArguments.length; i++) {
                         this.unifyTypeArgument(parameterArguments[i], argumentArguments[i],
-                            owner, arity, slots);
+                            owner, arity, slots, sources, argumentIndex);
                     }
                 }
             },
@@ -4648,7 +4661,8 @@ class BodyChecker implements NoreturnCalls {
     // substituted signature the way a generic function call does, without re-analyzing them.
     checkInferredStaticCall(CallExpressionNode node, MemberExpressionNode member,
                             DeclaredType template, long staticIndex, Type[] typeArguments,
-                            List<Type> argumentTypes) -> Type {
+                            List<Type> argumentTypes, Method templateCandidate,
+                            GreenNode owner, long[] inferenceSources) -> Type {
         let instantiation = this.store.instantiationOf(template, typeArguments);
         let resolved = this.staticAtIndex(instantiation, staticIndex);
         if (resolved == null) {
@@ -4682,9 +4696,20 @@ class BodyChecker implements NoreturnCalls {
                 }
                 if (!(parameterType is ErrorType) && !(actual is ErrorType)
                         && !convert.isAssignableStrict(parameterType, actual)) {
+                    Parameter[] templateParameters =
+                        templateCandidate.signature().parameters();
+                    string provenance = "";
+                    if (i < templateParameters.length) {
+                        provenance = inferenceProvenance(templateParameters[i].type(), owner,
+                            typeArguments, inferenceSources, "write the type arguments on "
+                            + "the type name, as in '{template.name()}"
+                            + "<{typeParameterExample(template)}>.{resolved.name()}(...)'");
+                    }
+                    string hint = nullabilityHint(parameterType, actual);
                     this.reporter.report("Argument {i + 1}: expected "
                         + "'{types.display(parameterType)}', got '{types.display(actual)}'"
-                        + "{nullabilityHint(parameterType, actual)}", argument.span());
+                        + "{hint}{sentenceSeparator(hint, provenance)}{provenance}",
+                        argument.span());
                 }
             }
         }
@@ -5657,14 +5682,22 @@ class BodyChecker implements NoreturnCalls {
         }
 
         Parameter[] parameters = signature.parameters();
+        // Per slot: the argument index that bound it, or -2 while unbound (functions have no
+        // context fills).
+        let inferenceSources = new List<long>();
+        for (long i = 0; i < arity; i++) {
+            inferenceSources.push(-2);
+        }
         if (explicitList == null) {
             for (long i = 0; i < argumentTypes.length() && i < parameters.length; i++) {
                 let parameterType = parameters[i].type();
                 if (parameterType is TypeParamType && parameterType.owner() == owner
                         && parameterType.index() < arity
                         && typeArguments.get(parameterType.index()) == null
-                        && !(argumentTypes.get(i) is ErrorType)) {
+                        && !(argumentTypes.get(i) is ErrorType)
+                        && !(argumentTypes.get(i) is NullType)) {
                     typeArguments.set(parameterType.index(), argumentTypes.get(i));
+                    inferenceSources.set(parameterType.index(), i);
                 }
             }
         }
@@ -5716,9 +5749,18 @@ class BodyChecker implements NoreturnCalls {
                 }
                 if (!(parameterType is ErrorType) && !(actual is ErrorType)
                         && !convert.isAssignableStrict(parameterType, actual)) {
+                    string provenance = "";
+                    if (explicitList == null) {
+                        provenance = inferenceProvenance(parameters[i].type(), owner,
+                            resolvedArguments, inferenceSources.toArray(), "pass the type "
+                            + "arguments explicitly, as in "
+                            + "'{name}<{typeParameterNamesText(signature)}>(...)'");
+                    }
+                    string hint = nullabilityHint(parameterType, actual);
                     this.reporter.report("Argument {i + 1}: expected "
                         + "'{types.display(parameterType)}', got '{types.display(actual)}'"
-                        + "{nullabilityHint(parameterType, actual)}", argument.span());
+                        + "{hint}{sentenceSeparator(hint, provenance)}{provenance}",
+                        argument.span());
                 }
             }
         }
@@ -6798,6 +6840,84 @@ nullabilityHint(Type target, Type source) -> string {
             + "'{types.display(target)}?' if it should allow null.";
     }
     return "";
+}
+
+// The provenance sentence for an argument mismatch whose expected type contains an inferred
+// type argument: which parameter, what it was bound to, where the binding came from, and the
+// explicit form that overrides inference. Empty when the expected type mentions no inferred
+// parameter; the caller joins it with sentenceSeparator.
+inferenceProvenance(Type templateParameterType, GreenNode owner, Type[] bindings,
+                    long[] sources, string explicitForm) -> string {
+    let parameter = firstBoundParameter(templateParameterType, owner, sources);
+    if (parameter == null) {
+        return "";
+    }
+    long slot = parameter.index();
+    if (slot >= bindings.length) {
+        return "";
+    }
+    string origin = "from the surrounding context";
+    if (sources[slot] >= 0) {
+        origin = "from argument {sources[slot] + 1}";
+    }
+    return "'{parameter.name()}' was inferred as '{types.display(bindings[slot])}' "
+        + "{origin}; {explicitForm}.";
+}
+
+// Joins a follow-on sentence to a diagnostic whose optional preceding hint already ends with
+// a period, so the two never produce a doubled one.
+sentenceSeparator(string before, string sentence) -> string {
+    if (sentence.length == 0) {
+        return "";
+    }
+    if (before.length > 0) {
+        return " ";
+    }
+    return ". ";
+}
+
+// The first type parameter of 'owner' inside the type that inference actually bound, walking
+// the same shapes unification walks.
+firstBoundParameter(Type templateType, GreenNode owner, long[] sources) -> TypeParamType? {
+    switch (templateType) {
+        is TypeParamType parameter -> {
+            if (parameter.owner() == owner && parameter.index() < sources.length
+                    && sources[parameter.index()] != -2) {
+                return parameter;
+            }
+            return null;
+        },
+        is ArrayType array -> {
+            return firstBoundParameter(array.element(), owner, sources);
+        },
+        is OptionalType optional -> {
+            return firstBoundParameter(optional.inner(), owner, sources);
+        },
+        is InstantiationType instantiation -> {
+            for (let argument in instantiation.arguments()) {
+                let found = firstBoundParameter(argument, owner, sources);
+                if (found != null) {
+                    return found;
+                }
+            }
+            return null;
+        },
+        default -> {
+            return null;
+        },
+    }
+}
+
+typeParameterNamesText(Signature signature) -> string {
+    string text = "";
+    let parameters = signature.typeParameters();
+    for (long i = 0; i < parameters.length; i++) {
+        if (i > 0) {
+            text = text + ", ";
+        }
+        text = text + parameters[i].name();
+    }
+    return text;
 }
 
 // Guidance for a comparison against 'null' over a value that can never be null.
