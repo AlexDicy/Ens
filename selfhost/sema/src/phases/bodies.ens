@@ -3930,10 +3930,12 @@ class BodyChecker implements NoreturnCalls {
             this.packagePrefix);
     }
 
+    // Reports a denied access and answers whether it was allowed, so a caller layering its own
+    // diagnostic on the same node can stay quiet after a denial.
     checkMemberAccess(string memberName, Visibility visibility, Type definingType,
-                              Span span) {
+                              Span span) -> bool {
         if (this.isAccessAllowed(visibility, definingType)) {
-            return;
+            return true;
         }
         string owner = types.display(definingType);
         string kind = "type";
@@ -3957,6 +3959,7 @@ class BodyChecker implements NoreturnCalls {
                 + "be accessed from inside '{owner}', a subclass of it, or the file where "
                 + "'{owner}' is declared", span);
         }
+        return false;
     }
 
     // Constructor calls run through the same accessibility rules as any other member; only the
@@ -4056,8 +4059,10 @@ class BodyChecker implements NoreturnCalls {
         }
         switch (this.lookupMember(core, name)) {
             is FieldMember found -> {
-                this.checkMemberAccess(name, found.field.visibility(),
-                    found.field.definingType(), node.member().span());
+                if (!this.checkMemberAccess(name, found.field.visibility(),
+                        found.field.definingType(), node.member().span())) {
+                    this.result.markMemberAccessDenied(node.green());
+                }
                 Type fieldType = found.field.type();
                 if (fieldType is OptionalType || types.isClassLike(fieldType)) {
                     let path = this.buildNarrowingPath(node, false);
@@ -4140,8 +4145,10 @@ class BodyChecker implements NoreturnCalls {
         }
         switch (this.lookupMember(inner, name)) {
             is FieldMember found -> {
-                this.checkMemberAccess(name, found.field.visibility(),
-                    found.field.definingType(), node.member().span());
+                if (!this.checkMemberAccess(name, found.field.visibility(),
+                        found.field.definingType(), node.member().span())) {
+                    this.result.markMemberAccessDenied(node.green());
+                }
                 return this.store.optionalOf(found.field.type());
             },
             is MethodMember found -> {
@@ -5096,11 +5103,31 @@ class BodyChecker implements NoreturnCalls {
         this.result.setType(member.green(), memberType);
         let method = this.result.methodOf(member.green());
         if (method == null) {
+            this.reportUncallableMember(member.green(), member.member().span(), memberName,
+                memberType);
             this.analyzeArgumentsOnly(node.arguments());
             return this.store.errorType();
         }
         return this.finishMethodCall(node, member.green(), member.member().span(), memberName,
             object, method, false);
+    }
+
+    // The member resolved to a value rather than a method: an enum member or a field. The value
+    // path reported nothing, because reading the member is fine; only calling it is not.
+    reportUncallableMember(GreenNode member, Span span, string name, Type memberType) {
+        if (memberType is ErrorType) {
+            return;
+        }
+        if (this.result.memberAccessDeniedAt(member)) {
+            return;
+        }
+        if (memberType is EnumType && this.result.enumConstantOf(member) != null) {
+            this.reporter.report("'{name}' is a member of enum '{memberType.name()}', not a "
+                + "method; write '{memberType.name()}.{name}' without parentheses.", span);
+            return;
+        }
+        this.reporter.report("'{name}' is a field of type '{types.display(memberType)}', not "
+            + "a method, so it cannot be called. Read it without parentheses.", span);
     }
 
     analyzeSafeMemberCall(CallExpressionNode node, SafeMemberExpressionNode member)
@@ -5119,6 +5146,8 @@ class BodyChecker implements NoreturnCalls {
         this.result.setType(member.green(), memberType);
         let method = this.result.methodOf(member.green());
         if (method == null) {
+            this.reportUncallableMember(member.green(), member.member().span(),
+                member.member().text(), memberType);
             this.analyzeArgumentsOnly(node.arguments());
             return this.store.errorType();
         }
