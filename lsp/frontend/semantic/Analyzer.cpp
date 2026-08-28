@@ -1353,7 +1353,7 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             checkHashMethodSignature(m, sym, isCtor);
             checkEqualsMethodSignature(m, sym, isCtor);
             checkToStringMethodSignature(m, sym, isCtor);
-            const char* behavior = builtinBehaviorReplaced(t, mname, sym);
+            const char* behavior = builtinBehaviorReplaced(t, mname, sym, m.isOverride());
             checkStructOverrideMarker(m, t, mname, sym, isCtor, behavior);
             checkStructAbstractMarker(m, t, mname, isCtor);
             analysis.setSymbol(m.node.greenNode(), sym);
@@ -1868,7 +1868,8 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
             continue;
         }
 
-        const char* behavior = isDtor ? nullptr : builtinBehaviorReplaced(t, mname, sym);
+        const char* behavior = isDtor ? nullptr
+                                      : builtinBehaviorReplaced(t, mname, sym, m.isOverride());
         MethodInfo mi;
         mi.name = mname;
         mi.symbol = sym;
@@ -1925,10 +1926,11 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
         }
         // A conforming `hash` or `equals` overrides the compiler's built-in
         // identity hash/equality, so it is written with 'override' like any
-        // other override. `reservedIntent` also covers the near-miss shapes,
+        // other override, and a marked `toString` replaces the type-name text
+        // form the same way. `reservedIntent` also covers the near-miss shapes,
         // which get their own signature diagnostics rather than a spurious
         // "nothing to override".
-        bool reservedIntent = mname == u"hash" ||
+        bool reservedIntent = mname == u"hash" || mname == u"toString" ||
             (mname == u"equals" && equalsSignatureIntent(sym));
         bool reservedConforming = (mname == u"hash" && hashSignatureConforms(sym)) ||
                                   (mname == u"equals" && equalsSignatureConforms(sym));
@@ -2386,12 +2388,14 @@ void Analyzer::checkToStringMethodSignature(const ast::FuncDecl& fn, Symbol* sym
 }
 
 // The behavior a member takes over from the language, or null for an ordinary
-// member: a struct's text form, and the hash and equality a value is keyed by. A
-// class has no text form of its own to replace, and what an `equals` replaces
-// differs by kind: a struct's memberwise comparison, a class's identity.
+// member: a type's text form, and the hash and equality a value is keyed by. What
+// an `equals` replaces differs by kind: a struct's memberwise comparison, a
+// class's identity. A class's text form (its type name) is replaced only by a
+// declaration that writes the `override` marker; a class `toString` without it is
+// an ordinary method the language never calls.
 const char* Analyzer::builtinBehaviorReplaced(const Type* owner,
                                               const std::u16string& memberName,
-                                              const Symbol* sym) const {
+                                              const Symbol* sym, bool declaresOverride) const {
     if (!owner || !owner->structInfo || !sym) return nullptr;
     if (owner->isStruct()) {
         if (memberName == u"toString") return "text form";
@@ -2400,6 +2404,7 @@ const char* Analyzer::builtinBehaviorReplaced(const Type* owner,
         return nullptr;
     }
     if (owner->isClass() && !owner->isInterface()) {
+        if (memberName == u"toString" && declaresOverride) return "text form";
         if (memberName == u"hash") return "identity hash";
         if (memberName == u"equals" && equalsSignatureIntent(sym)) return "identity equality";
     }
@@ -4679,9 +4684,12 @@ Type* Analyzer::analyzeInterpString(const ast::InterpStringExpression& expr) {
             checkStructJsonable(ht, hole.node);
             continue;
         }
+        // A class or interface value renders through its runtime type: the `toString` override
+        // that type declared, or its type name when no class in the chain declares one.
+        if (ht->isClass()) continue;
         errorAtNode(hole.node, "Cannot interpolate a value of type '" + ht->toString() +
-            "'; only string, integer, bool, enum, and JSON-serializable struct values are supported here. "
-            "Convert it with '.toString()' first.");
+            "'; only string, integer, bool, enum, class, and JSON-serializable struct values are "
+            "supported here. Convert it with '.toString()' first.");
     }
     return stringTy;
 }
@@ -5819,6 +5827,40 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                     // A generic struct is judged per instantiation during code generation.
                     if (!TypeContext::containsTypeParam(recvT)) checkStructJsonable(recvT, expr.node);
                     return typeCtx.getPrimitive(TypeKind::String);
+                }
+                // A class or interface value whose chain declares no toString answers with
+                // its runtime type's text form; a chain that declares one falls through to
+                // normal method resolution.
+                if (recvT->isClass() && recvT->structInfo) {
+                    bool chainDeclares = false;
+                    for (StructInfo* s = recvT->structInfo; s; s = s->baseInfo) {
+                        if (declaredToString(s)) { chainDeclares = true; break; }
+                    }
+                    if (!chainDeclares) {
+                        if (!args.empty()) {
+                            errorAtNode(expr.node, "'toString' takes no arguments.");
+                            for (auto& a : args) analyzeExpr(a);
+                        }
+                        return typeCtx.getPrimitive(TypeKind::String);
+                    }
+                }
+                // A bare type parameter is judged per instantiation, exactly like a hole; a
+                // bound that declares toString resolves against the contract.
+                if (recvT->isTypeParam()) {
+                    bool declaresToString = false;
+                    for (StructInfo* b : boundsOfTypeParam(recvT)) {
+                        if (b && b->classDeclaringMethod(u"toString")) {
+                            declaresToString = true;
+                            break;
+                        }
+                    }
+                    if (!declaresToString) {
+                        if (!args.empty()) {
+                            errorAtNode(expr.node, "'toString' takes no arguments.");
+                            for (auto& a : args) analyzeExpr(a);
+                        }
+                        return typeCtx.getPrimitive(TypeKind::String);
+                    }
                 }
                 // Records may declare their own toString: fall through to resolution.
             }

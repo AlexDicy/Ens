@@ -6,12 +6,14 @@ import LiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
 import InterpolatedStringExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SyntaxToken from @ens.frontend.syntax.node;
 import Span from @ens.frontend.support.source;
+import Method from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
 import EnumType from @ens.sema.model.types;
 import StructType from @ens.sema.model.types;
 import PrimitiveKind from @ens.sema.model.types;
 import @ens.sema.model.types;
 import EirConstString from eir.model;
+import EirDynamicToString from eir.model;
 import EirStringConcat from eir.model;
 import EirStringEqual from eir.model;
 import EirIntToString from eir.model;
@@ -22,6 +24,8 @@ import EirDoubleToString from eir.model;
 import EirUnary from eir.model;
 import EirUnaryOp from eir.model;
 import LoweringContext from lower.context;
+import layout.behaviors;
+import lower.calls;
 import lower.conversions;
 import lower.expressions;
 import lower.json;
@@ -144,11 +148,69 @@ public lowerToString(LoweringContext lowering, Expression node) -> long {
         }
         return json.lowerStruct(lowering, node, structType);
     }
+    if (!primitives.isOptionalType(type) && primitives.isClassLike(type)) {
+        return lowerClassToString(lowering, node, type);
+    }
     long value = expressions.lowerConverted(lowering, node, type);
     if (value < 0) {
         return -1;
     }
     return convertToString(lowering, value, type, node.span());
+}
+
+// A class or interface value's text form: the 'toString' its runtime type declared, or that
+// type's name. An interpolation hole and an explicit '.toString()' reach the same dispatch. A
+// receiver sema narrowed out of its optional storage arrives as the whole pair, so the read
+// projects the referent before it is asked.
+lowerClassToString(LoweringContext lowering, Expression node, Type type) -> long {
+    long value = expressions.lower(lowering, node);
+    if (value < 0) {
+        return -1;
+    }
+    long adapted = conversions.convert(lowering, value, type, node.span());
+    if (adapted < 0) {
+        return -1;
+    }
+    long text = classTextOfValue(lowering, adapted, type, node.span());
+    expressions.releaseTemporary(lowering, node, value);
+    return text;
+}
+
+// The text of one loaded reference. When every value of the static type carries one descriptor
+// the answer is known here: the declared 'toString' is called directly, or the name folds to a
+// constant; otherwise the runtime type decides through its descriptor slot.
+classTextOfValue(LoweringContext lowering, long value, Type type, Span span) -> long {
+    let stringType = lowering.store().stringType();
+    if (!behaviors.isOnlyRuntimeType(type)) {
+        let builder = lowering.builder();
+        long text = builder.newTemp(stringType);
+        builder.append(new EirDynamicToString(text, stringType, value));
+        return text;
+    }
+    let classType = primitives.classOf(type);
+    if (classType == null) {
+        lowering.internalError("a value with one runtime type names no class", span);
+        return -1;
+    }
+    let declared = behaviors.declaredBehavior(classType, "toString");
+    if (declared == null) {
+        long name = constantFrom(lowering, types.display(classType).toBytes(), stringType);
+        ownership.retainValue(lowering, name);
+        return name;
+    }
+    return callDeclaredToString(lowering, classType, declared, value, span);
+}
+
+// The 'toString' a class declared for itself, dispatched like any other method call.
+callDeclaredToString(LoweringContext lowering, Type classType, Method declared, long value,
+                     Span span) -> long {
+    let info = lowering.index().infoFor(declared.signature());
+    if (info == null
+            || !calls.supportedDispatchTarget(lowering, info, "method 'toString'", span)) {
+        return -1;
+    }
+    return calls.emitCall(lowering, info, classType, value, [],
+        lowering.tables().vtableSlotOf(declared.signature()), null, span);
 }
 
 // The text form of an already lowered value.

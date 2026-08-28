@@ -15,7 +15,7 @@ An unmarked top-level declaration is visible only within its file, and an unmark
 Top-level `protected` is not allowed.
 Struct fields follow their struct's visibility; a field that writes its own modifier, such as `private`, opts out.
 Class members never follow their class: they stay private unless marked.
-The one exception is a method that replaces a behavior the language already provides for its type: a struct's `toString`, `hash`, and `equals`, and a class's `hash` and `equals`.
+The one exception is a method that replaces a behavior the language already provides for its type: a struct's or a class's `toString`, `hash`, and `equals`.
 The language calls such a method wherever the type is used, so it follows its type's visibility when unmarked and may not be marked less visible than its type.
 Interface members carry no visibility of their own: they always follow the interface, and writing a visibility modifier on an interface member is an error.
 Enum cases follow their enum.
@@ -178,8 +178,17 @@ class Square extends Shape {
 ```
 
 Methods are overridable by default. An override must be marked `override` and must match a method declared in a base class; this catches typos and accidental shadowing. Mark a method or a class `final` to forbid overriding or extending it.
-`override` on a method that overrides nothing is an error, so the marker always names something real: a base or interface method, or a behavior the language provides for the type, which for a struct means only `toString`, `hash`, and `equals`.
-The marker is required for all three, so a struct that declares a `toString`, a `hash`, or an `equals` always writes it as an `override`.
+`override` on a method that overrides nothing is an error, so the marker always names something real: a base or interface method, or a behavior the language provides for the type, which means `toString`, `hash`, and `equals` for a struct and for a class alike.
+The marker is required for all three on a struct, so a struct that declares a `toString`, a `hash`, or an `equals` always writes it as an `override`.
+
+Every class value has a text form, rendered from the value's runtime type wherever `.toString()` is called or an interpolation hole holds the value.
+A class with no `toString` override anywhere in its chain answers with its runtime type's name, so a subclass prints its own name even through a base-class-typed or interface-typed reference.
+A generic class renders with its arguments the way diagnostics spell them, such as `Box<int>`.
+A class replaces that default by declaring `override toString() -> string` with a body, under the same shape rules as a struct's `toString`: no parameters, a `string` result, and never `throws`.
+The replacement dispatches from the runtime type, so a subclass's `toString` wins through a base-class-typed or interface-typed reference, and a subclass may override an ancestor's `toString` like any other method.
+A `toString` override cannot be `abstract`: every class already answers with its type name, so there is no text form left unwritten.
+A class method named `toString` that does not write `override` is an ordinary method; calls reach it by name, but interpolation holes and the built-in text form do not use it.
+Like a `toString` on a struct, one written `override` follows its class's visibility when unmarked and may not be marked less visible than the class itself.
 
 `super.method(...)` calls the base class's implementation, bypassing any override. A constructor may call `super(...)` as its first statement to run the base constructor; if it does not, the base class must be constructible with no arguments. `protected` members (see above) are reachable from subclasses.
 
@@ -1278,8 +1287,8 @@ The accepted escapes are `\n`, `\r`, `\t`, `\b`, `\f`, `\0`, `\\`, `\"`, `\'`, `
 
 - `==` and `!=` compare **contents**, not identity, so `"ab" == "a" + "b"` is true.
 - `s.length` returns the number of UTF-8 **bytes** as a `long`.
-- `+` concatenates strings. When one side is a string, a number (integer, `char`, or floating-point) or a `bool` on the other side is converted to text implicitly (the same way `.toString()` would). Types without a string conversion yet are still rejected.
-- `.toString()` produces a string from a value explicitly: integer types format as decimal, floating-point types by the rule below, a `char` as the one character it denotes (its Unicode scalar encoded as UTF-8 bytes, so `'A'` is `"A"` and `'7'` is `"7"`, not their code points; write `c as int` first for the number), `bool` as `true` or `false`, a string returns itself, and a struct produces its JSON form.
+- `+` concatenates strings. When one side is a string, a number (integer, `char`, or floating-point) or a `bool` on the other side is converted to text implicitly (the same way `.toString()` would). Every other type is rejected here, structs and classes included even though they have a text form; interpolate those or call `.toString()` instead.
+- `.toString()` produces a string from a value explicitly: integer types format as decimal, floating-point types by the rule below, a `char` as the one character it denotes (its Unicode scalar encoded as UTF-8 bytes, so `'A'` is `"A"` and `'7'` is `"7"`, not their code points; write `c as int` first for the number), `bool` as `true` or `false`, a string returns itself, a struct produces its JSON form or what its own `toString` returns, and a class or interface value produces what its runtime type's `toString` override returns, or that type's name when no class in its chain declares one.
   It can be written directly on a literal, as in `42.toString()`.
 - `s.toBytes()` returns the UTF-8 bytes as a `byte[]`, and `string.fromBytes(bytes)` builds a string from a `byte[]` by interpreting it as UTF-8.
 - `s.contains(needle)` reports whether `needle` occurs in `s`.
@@ -1326,9 +1335,10 @@ let status = "done={finished}, items={count}";                // bool and intege
 let braces = "use \{these\} verbatim";                        // "use {these} verbatim"
 ```
 
-Holes accept string, integer (including `char`), floating-point, `bool`, and enum values, and structs whose fields are all serializable (rendered as JSON); convert other types explicitly with `.toString()` first.
+Holes accept string, integer (including `char`), floating-point, `bool`, and enum values, structs whose fields are all serializable (rendered as JSON) or that declare their own `toString`, and class and interface values, rendered from the runtime type: its `toString` override, or its type name when no class in the chain declares one; convert other types explicitly with `.toString()` first.
 A `char` hole renders as its character rather than its numeric code point, so `"{'A'}"` is `"A"`; interpolate `c as int` when the number is wanted.
 Inside a generic body a hole may hold a value of a type-parameter type; the requirement is then checked against the concrete type of each instantiation.
+An explicit `.toString()` on a type-parameter value is checked the same way, against the concrete type of each instantiation.
 
 ---
 

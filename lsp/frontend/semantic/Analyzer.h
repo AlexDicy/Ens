@@ -539,7 +539,7 @@ private:
     // The behavior a member replaces for its type, or null when it is an ordinary
     // member; the phrase names the behavior in a diagnostic.
     const char* builtinBehaviorReplaced(const Type* owner, const std::u16string& memberName,
-                                        const Symbol* sym) const;
+                                        const Symbol* sym, bool declaresOverride) const;
     // The effective visibility of a member that replaces a built-in behavior: it
     // follows its type, and a marker narrower than the type is rejected.
     Visibility builtinReplacementVisibility(
