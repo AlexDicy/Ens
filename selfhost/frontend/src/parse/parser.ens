@@ -502,6 +502,24 @@ class Parser {
         }
     }
 
+    // ============================================================ adjacent questions
+
+    // True at the first '?' of a '??' written with nothing between the two. There is no '??'
+    // token: the lexer emits two Question tokens so a type can stack its suffixes ('string??'),
+    // and the operator is the adjacent pair, which is the mirror of the '>>' the parser splits
+    // for nested generics. A separated pair is a ternary whose then-branch starts with '?', and
+    // fails where an expression was expected.
+    atNullCoalesce() -> bool {
+        if (this.currentKind() != SyntaxKind.Question) {
+            return false;
+        }
+        let next = this.position + 1;
+        if (next >= this.tokens.length || this.tokens[next].kind != SyntaxKind.Question) {
+            return false;
+        }
+        return this.tokens[this.position].end() == this.tokens[next].offset;
+    }
+
     // ============================================================ top level
 
     parseTopLevelItem() {
@@ -1982,9 +2000,26 @@ class Parser {
 
     // Type = NamedType with any chain of '?' and '[]' suffixes; returns the completed marker.
     parseType(string missingMessage) -> long {
-        long completed = this.parseNamedType(missingMessage);
+        return this.parseTypeSuffixes(this.parseNamedType(missingMessage), false);
+    }
+
+    // The target of 'as' or 'as?'. This is the one type position an expression continues from, so
+    // it is the one where a '?' can belong to the expression instead: in 'x as? Foo ?? fallback'
+    // the pair is the coalescing operator, not two suffixes on the target. Everywhere else a type
+    // is followed by a name, a comma, a bracket or '>', so an adjacent '??' cannot follow one and
+    // the suffixes stay greedy. Giving the pair up here loses no valid reading, because 'as' and
+    // 'as?' reject a nullable target outright.
+    parseCastTargetType(string missingMessage) -> long {
+        return this.parseTypeSuffixes(this.parseNamedType(missingMessage), true);
+    }
+
+    parseTypeSuffixes(long named, bool leaveCoalesceToExpression) -> long {
+        long completed = named;
         while (true) {
             if (this.at(SyntaxKind.Question)) {
+                if (leaveCoalesceToExpression && this.atNullCoalesce()) {
+                    break;
+                }
                 let marker = this.precede(completed);
                 this.bump();
                 completed = this.complete(marker, SyntaxKind.OptionalType);
@@ -2087,9 +2122,12 @@ class Parser {
             }
             bool safeSubscript = operator == SyntaxKind.Question
                 && this.peekKind(1) == SyntaxKind.OpenBracket;
+            bool coalesce = this.atNullCoalesce();
             long precedence = infixPrecedence(operator);
             if (safeSubscript) {
                 precedence = 14;
+            } else if (coalesce) {
+                precedence = nullCoalescePrecedence();
             }
             if (precedence < minPrecedence || precedence == 0) {
                 break;
@@ -2103,13 +2141,15 @@ class Parser {
                 completed = this.complete(marker, SyntaxKind.SafeSubscriptExpression);
                 continue;
             }
+            if (coalesce) {
+                let marker = this.precede(completed);
+                this.bump();
+                this.bump();
+                this.parsePrecedence(precedence);
+                completed = this.complete(marker, SyntaxKind.NullCoalesceExpression);
+                continue;
+            }
             switch (operator) {
-                QuestionQuestion -> {
-                    let marker = this.precede(completed);
-                    this.bump();
-                    this.parsePrecedence(precedence);
-                    completed = this.complete(marker, SyntaxKind.NullCoalesceExpression);
-                },
                 Question -> {
                     let marker = this.precede(completed);
                     this.bump();
@@ -2155,10 +2195,12 @@ class Parser {
                     this.bump();
                     if (checked) {
                         this.bump();
-                        this.parseType("Expected a type after 'as?', for example 'x as? Circle'");
+                        this.parseCastTargetType(
+                            "Expected a type after 'as?', for example 'x as? Circle'");
                         completed = this.complete(marker, SyntaxKind.CheckedCastExpression);
                     } else {
-                        this.parseType("Expected a type after 'as', for example 'x as long'");
+                        this.parseCastTargetType(
+                            "Expected a type after 'as', for example 'x as long'");
                         completed = this.complete(marker, SyntaxKind.CastExpression);
                     }
                 },
@@ -2510,16 +2552,22 @@ isAssignmentOperator(SyntaxKind kind) -> bool {
     };
 }
 
+// '??' binds like '||' and is right-associative. The operator is a pair of Question tokens rather
+// than a kind of its own, so its strength cannot come out of infixPrecedence.
+nullCoalescePrecedence() -> long {
+    return 3;
+}
+
 // The binding strength of an infix or postfix operator, or 0 when the kind ends an expression.
-// Assignment and '??' are right-associative; the caller passes the same precedence back down for
-// those and precedence + 1 for the left-associative rest.
+// Assignment is right-associative, and so is '??' through nullCoalescePrecedence; the caller
+// passes the same precedence back down for those and precedence + 1 for the rest.
 infixPrecedence(SyntaxKind kind) -> long {
     if (isAssignmentOperator(kind)) {
         return 1;
     }
     return switch (kind) {
         Question -> 2,
-        PipePipe, QuestionQuestion -> 3,
+        PipePipe -> 3,
         AmpersandAmpersand -> 4,
         Pipe -> 5,
         Caret -> 6,

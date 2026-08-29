@@ -34,6 +34,9 @@ private:
     // Peek the n-th non-trivia token ahead (n=0 == current).
     SyntaxKind peekKind(size_t n) const;
 
+    // At the first `?` of a `??` written with the two adjacent.
+    bool atNullCoalesce() const;
+
     // Emit current token (and any preceding trivia) into the builder, advance.
     void bump();
     // Like bump(), but record the current token under an overridden kind (for
@@ -88,7 +91,10 @@ private:
     void parseExternalFuncDecl();
 
     // === Type ===
-    void parseType();
+    // `leaveCoalesceToExpression` stops the suffix chain at a `?` that opens an adjacent `??`
+    // pair, which only the target of `as`/`as?` wants: it is the one type position an
+    // expression continues from.
+    void parseType(bool leaveCoalesceToExpression = false);
     void parseTypeHead();  // base + namespace only, no [] or ? (used in `new`)
     bool isTypeStart(SyntaxKind k) const;
     bool isPrimitiveTypeKw(SyntaxKind k) const;

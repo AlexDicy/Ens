@@ -48,6 +48,10 @@ Assigning a `T?` to a `T??` wraps once; assigning a `T` wraps twice.
 Rationale: substitution producing `T?` where `T` is already nullable currently truncates silently, so an `Iterator<string?>` stops at the first null element.
 Nesting turns that into a compile error at the use site.
 
+Ratified 2026-08-29, both arising during implementation.
+The `??` token is split in the lexer so `T??` lexes as two `?` suffixes, and the parser joins two adjacent `?` tokens into the null-coalescing operator only when no trivia separates them, which matches the `>>` splitting the parser already does for nested generics and the C++ front end's existing treatment of `??`.
+`?.` and `?[` flatten the one level they add, so a chain through a nullable member keeps working; the rule that `?.` on a doubly-nullable value is an error still applies to a value that arrived doubly nullable through substitution.
+
 ## `const` on fields
 
 `export const string message;` becomes legal: write-once, assigned by the constructor or a struct literal, readable everywhere, assignable nowhere else.

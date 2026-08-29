@@ -156,10 +156,10 @@ bool Type::assignableFrom(const Type* source) const {
         return true;
     }
     if (isOptional()) {
+        // 'null' fills the outermost level. Anything else has to reach the payload, wrapping one
+        // level per step: a 'T?' fills the payload of a 'T??' and a bare 'T' fills the payload of
+        // that 'T?' in turn. Nothing lets a deeper value reach a shallower type.
         if (source->isNull()) return true;
-        if (inner && inner->equals(source)) return true;
-        if (inner && source->widensTo(inner)) return true;
-        if (source->isOptional() && inner && source->inner && inner->equals(source->inner)) return true;
         // A nullable class accepts a derived or conforming class (nullable or not).
         if (inner && inner->isClass() && inner->structInfo) {
             const Type* src = source->isOptional() ? source->inner : source;
@@ -168,6 +168,10 @@ bool Type::assignableFrom(const Type* source) const {
                 return true;
             }
         }
+        if (source->isOptional()) {
+            return inner && inner->isOptional() && inner->assignableFrom(source);
+        }
+        return inner && inner->assignableFrom(source);
     }
     return false;
 }

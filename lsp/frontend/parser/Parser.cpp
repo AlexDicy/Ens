@@ -51,6 +51,18 @@ SyntaxKind Parser::peekKind(size_t n) const {
     }
 }
 
+// `??` is two adjacent `?` tokens; nothing may separate them, because a lone `?` is also the
+// ternary's operator and the nullable type suffix. Offsets settle which was written: a gap means
+// trivia sat between the two.
+bool Parser::atNullCoalesce() const {
+    if (kindAt() != SyntaxKind::Question) return false;
+    if (peekKind(1) != SyntaxKind::Question) return false;
+    size_t next = current + 1;
+    while (next < tokens.size() && isTrivia(tokens[next].kind)) next++;
+    return next < tokens.size() &&
+        tokens[next].offset == tokens[current].offset + tokens[current].text.size();
+}
+
 void Parser::bumpAs(SyntaxKind kind) {
     while (nextToEmit < tokens.size() && nextToEmit < current) {
         const auto& t = tokens[nextToEmit];
@@ -841,7 +853,7 @@ bool Parser::isTypeStart(SyntaxKind k) const {
     return k == SyntaxKind::Identifier || isPrimitiveTypeKw(k);
 }
 
-void Parser::parseType() {
+void Parser::parseType(bool leaveCoalesceToExpression) {
     builder.startNode(SyntaxKind::TypeRef);
     bool wasIdentifier = at(SyntaxKind::Identifier);
     if (isTypeStart(kindAt())) bump();
@@ -856,7 +868,13 @@ void Parser::parseType() {
     // Each '[' must be followed immediately by ']' to be a type-position
     // array suffix; otherwise it's left for the caller (e.g. `new T[n]`).
     while (true) {
-        if (at(SyntaxKind::Question)) { bump(); continue; }
+        if (at(SyntaxKind::Question)) {
+            // In `x as? Foo ?? fallback` the pair is the coalescing operator, not two
+            // suffixes on the target; `as`/`as?` reject a nullable target anyway.
+            if (leaveCoalesceToExpression && atNullCoalesce()) break;
+            bump();
+            continue;
+        }
         if (at(SyntaxKind::LBracket) && peekKind(1) == SyntaxKind::RBracket) {
             bump();  // '['
             bump();  // ']'
@@ -1443,8 +1461,7 @@ void Parser::parsePrecedence(int minPrec) {
                                 peekKind(1) == SyntaxKind::LBracket);
         // `??` is two adjacent `?` tokens; like `?[` it is disambiguated here rather
         // than merged in the lexer, so type syntax such as `T??` keeps working.
-        bool isNullCoalesce = (op == SyntaxKind::Question &&
-                               peekKind(1) == SyntaxKind::Question);
+        bool isNullCoalesce = atNullCoalesce();
         int prec = isSafeSubscript ? 14 : (isNullCoalesce ? 3 : infixPrecedence(op));
         if (prec < minPrec) break;
 
@@ -1509,7 +1526,7 @@ void Parser::parsePrecedence(int minPrec) {
             builder.startNodeAt(cp, checked ? SyntaxKind::CheckedCastExpr : SyntaxKind::CastExpr);
             bump();  // 'as'
             if (checked) bump();  // '?'
-            if (isTypeStart(kindAt())) parseType();
+            if (isTypeStart(kindAt())) parseType(/*leaveCoalesceToExpression=*/true);
             else emitMissing(SyntaxKind::Identifier, checked ? "type after 'as?'" : "type after 'as'");
             builder.finishNode();
             continue;

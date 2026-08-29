@@ -20,9 +20,10 @@ Type* TypeContext::getPrimitive(TypeKind k) {
     return t;
 }
 
+// Optionals nest: an optional over 'T?' is the distinct type 'T??', whose outer level says
+// whether there is a 'T?' at all. The cache keys on the inner type, so each level interns once.
 Type* TypeContext::getOptional(Type* inner) {
     if (!inner || inner->isError()) return errorType;
-    if (inner->isOptional()) return inner;  // T?? collapses to T?
     auto it = optionalCache.find(inner);
     if (it != optionalCache.end()) return it->second;
     Type* t = allocate(TypeKind::Optional, inner);

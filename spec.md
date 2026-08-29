@@ -770,7 +770,7 @@ findIndex(int[] xs, int wanted) -> long? {
 long position = findIndex(numbers, 7) ?? -1;
 ```
 
-To read through a nullable value, use the safe member operator `?.`. If the value on the left is `null`, the whole expression evaluates to `null` and the right-hand side is not evaluated; otherwise it behaves like `.`.
+To read through a nullable value, use the safe member operator `?.`. If the value on the left is `null`, the whole expression evaluates to `null` and the right-hand side is not evaluated; otherwise it behaves like `.`. The result is nullable, and a member that is already nullable keeps its own single level rather than gaining a second, so chains such as `a?.b?.c` read through every nullable link.
 
 ```ens
 Outer? outer = new Outer();
@@ -899,6 +899,41 @@ if (room.door != null) {
 ```
 
 The `is` type test (described with `as?` further below) narrows by exactly the same rules, including these invalidation points.
+
+A `?` suffix always adds a nullable level rather than folding into one that is already there, so `string??` is a type of its own: the outer level says whether there is a `string?` at all, and the inner one is that `string?`.
+That is what keeps "there is no value here" apart from "there is a value here and it is null".
+The everyday way to arrive at one is a generic member declared `T?` used at a nullable `T`: `Map<string, int?>` answers `int??` from `get`, so a key that was never stored and a key stored with a null value are different answers rather than the same `null`.
+
+```ens
+string?? text = "written";        // a plain string fills both levels
+string?? held = maybe();          // a 'string?' fills the outer level only
+string?? nothing = null;          // the outer level is absent
+```
+
+`null` always means the outermost level.
+An assignment fills the levels it needs in one step: a `string?` written where a `string??` is expected wraps once, and a plain `string` wraps twice.
+A value nullable at more levels than the type it flows into never fits, so it has to be unwrapped first.
+
+`x == null` tests the outermost level only, and one null check strips exactly one level; reaching the value under a `string??` therefore takes two checks.
+`??` unwraps exactly one level: its result is whatever that level held, and its fallback is typed at the level below, so `x ?? fallback` on a `string??` produces a `string?` and uses the fallback only when the outer level is absent.
+Chaining is how a value reaches its core, as in `(x ?? null) ?? value`.
+
+```ens
+describe(string?? value) -> string {
+    if (value == null) {
+        return "nothing at all";      // the outer level is absent
+    }
+    string? inner = value;            // one check took the outer level off
+    if (inner == null) {
+        return "a null value";        // the inner level holds null
+    }
+    return inner;                     // the second check reached the string
+}
+```
+
+Every operator that looks through one nullable level rejects a value that has two, and says which level to unwrap first: `?.`, `?[`, `.`, `[`, `for (... in ...)`, `switch`, `is`, `as?`, and interpolation.
+`?.` and `?[` are not an exception to that rule and not a way to make one: they flatten the level they would add, so reading a member that is already nullable answers at that member's own level and a chain keeps working, while a receiver that is already doubly nullable is still rejected.
+A `weak` field stays single-level by rule, `weak T?` over a class and nothing deeper.
 
 ---
 
@@ -1120,7 +1155,7 @@ bool ready = ~true;             // error: '~' flips the bits of an integer, got 
 
 The logical operators `&&` and `||` require `bool` operands and short-circuit: the right side is evaluated only when it can change the result, so `a != null && a.ready()` is safe.
 
-The null-coalescing operator `??` takes a nullable value on the left. It evaluates to that value when it is not `null`, and otherwise evaluates and returns the right side. The right side is skipped when the left is non-null.
+The null-coalescing operator `??` takes a nullable value on the left. It evaluates to that value when it is not `null`, and otherwise evaluates and returns the right side. The right side is skipped when the left is non-null. Its two `?` characters must be adjacent, because a `?` is also the nullable type suffix; `a ? ? b`, with anything at all between them, is a malformed conditional rather than this operator.
 
 ```ens
 Inner? maybe = outer?.inner;

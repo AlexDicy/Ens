@@ -346,6 +346,15 @@ bool isTextualFloat(Type* type) {
     return type && type->isFloat() && type->kind != TypeKind::Decimal;
 }
 
+// The type `?.` and `?[` answer with. Both say `null` when the receiver is absent, and a value
+// that is already nullable carries that answer in the level it has, so the operator adds no
+// second level and a chain through a nullable member keeps working. A value that arrived doubly
+// nullable is still rejected by the operators themselves; this is only the level they add.
+Type* safeResultOf(TypeContext& typeCtx, Type* value) {
+    if (value && value->isOptional()) return value;
+    return typeCtx.getOptional(value);
+}
+
 // The narrowest integer type past `from` that holds the value, for a suggestion. Null when
 // no integer type does, which is the only case with nothing to reach for.
 const char* widerIntegerHolding(bool negative, uint64_t magnitude, Type* from) {
@@ -2561,7 +2570,7 @@ bool Analyzer::findNonComparableField(Type* structT, std::vector<StructInfo*>& v
         Type* ft = f.type;
         if (!ft || TypeContext::containsTypeParam(ft)) continue;
         Type* core = ft;
-        if (core->isOptional() && core->inner) core = core->inner;
+        while (core->isOptional() && core->inner) core = core->inner;
         if (core->isExternal()) {
             fieldPath = asciiOf(f.name);
             leaf = core;
@@ -2611,7 +2620,7 @@ bool Analyzer::findNonJsonableField(Type* structT, std::vector<StructInfo*>& vis
         Type* ft = f.type;
         if (!ft || TypeContext::containsTypeParam(ft)) continue;
         Type* core = ft;
-        if (core->isOptional() && core->inner) core = core->inner;
+        while (core->isOptional() && core->inner) core = core->inner;
         bool jsonableLeaf = core->isInteger() || core->kind == TypeKind::Float ||
             core->kind == TypeKind::Double || core->isBool() || core->isString() || core->isEnum();
         if (jsonableLeaf) continue;
@@ -3780,9 +3789,9 @@ void Analyzer::clearNarrowingsForArguments(const std::vector<ast::Expression>& a
         }
         Type* t = analysis.typeOf(target.node.greenNode());
         if (!t) continue;
-        Type* base = t->isOptional() ? t->inner : t;
-        if (!base) continue;
-        if (!base->isClass() && !base->isArray()) continue;
+        Type* core = t;
+        while (core->isOptional() && core->inner) core = core->inner;
+        if (!core->isClass() && !core->isArray()) continue;
         clearNarrowingsTouchedBy(target);
     }
 }
@@ -6148,7 +6157,7 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                 Type* ret = checkResolvedCallArguments(shape, choice, expr.node.greenNode());
                 if (!ret || ret->isError()) return typeCtx.getError();
                 if (ret->isVoid()) return ret;
-                return typeCtx.getOptional(ret);
+                return safeResultOf(typeCtx, ret);
             }
             size_t req = requiredArgCount(methodSym);
             if (args.size() < req || args.size() > methodSym->paramTypes.size()) {
@@ -6172,7 +6181,7 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
             // A void safe call is a statement: it runs only when the receiver
             // is non-null and produces no value.
             if (ret->isVoid()) return ret;
-            return typeCtx.getOptional(ret);
+            return safeResultOf(typeCtx, ret);
         }
         for (auto& a : args) analyzeExpr(a);
         return typeCtx.getError();
@@ -6701,6 +6710,13 @@ Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
                     "' is a 'weak' field, so it can become null whenever the object it "
                     "refers to loses its last strong reference; a null check does not carry "
                     "past it. Copy it into a local first and check the local.");
+            } else if (objT->inner && objT->inner->isOptional()) {
+                const Type* core = objT;
+                while (core->isOptional() && core->inner) core = core->inner;
+                errorAtNode(expr.node, "Cannot read a member of '" + objT->toString() +
+                    "' because it may be null at more than one level. Unwrap one level at a "
+                    "time, with a null check ('if (value != null)') or a fallback "
+                    "('value ?? null'), until what remains is '" + core->toString() + "'.");
             } else {
                 errorAtNode(expr.node, "Cannot read a member of '" + objT->toString() +
                     "' because it may be null. Use '?.' or check for null first.");
@@ -6758,15 +6774,22 @@ Type* Analyzer::analyzeSafeMember(const ast::SafeMemberExpression& expr) {
         return typeCtx.getError();
     }
     Type* inner = objT->inner;
+    if (inner && inner->isOptional()) {
+        errorAtNode(expr.node, "The value on the left of '?.' has type '" + objT->toString() +
+            "', which is nullable at more than one level, and '?.' looks through only one. "
+            "Unwrap one level first: check the value for null ('if (value != null)') or supply "
+            "a fallback ('value ?? null'), then use '?.' on the '" + inner->toString() +
+            "' that remains.");
+        return typeCtx.getError();
+    }
     auto memberName = expr.memberText();
     if (!memberName) return typeCtx.getError();
     if (inner && (inner->isString() || inner->isArray()) && *memberName == u"length") {
-        return typeCtx.getOptional(typeCtx.getPrimitive(TypeKind::Long));
+        return safeResultOf(typeCtx, typeCtx.getPrimitive(TypeKind::Long));
     }
     if (!inner || !inner->hasRecordLayout() || !inner->structInfo) {
-        std::string innerName = inner ? inner->toString() : std::string("?");
-        errorAtNode(expr.node, "The value on the left of '?.' has type '" + innerName +
-            "?', which has no members to access.");
+        errorAtNode(expr.node, "The value on the left of '?.' has type '" + objT->toString() +
+            "', which has no members to access.");
         return typeCtx.getError();
     }
 
@@ -6774,7 +6797,7 @@ Type* Analyzer::analyzeSafeMember(const ast::SafeMemberExpression& expr) {
     if (idx >= 0) {
         const FieldInfo& fld = inner->structInfo->fields[idx];
         checkMemberAccess(expr.node, *memberName, fld.visibility, fld.definingClass);
-        return typeCtx.getOptional(fld.type);
+        return safeResultOf(typeCtx, fld.type);
     }
     if (StructInfo* decl = inner->structInfo->classDeclaringMethod(*memberName)) {
         const MethodInfo& mi = decl->methods[decl->findMethodIndex(*memberName)];
@@ -6852,14 +6875,25 @@ bool Analyzer::checkClassTypeTest(Type* srcT, Type* dstT, bool isCast,
                                   const SyntaxNode& diagNode) {
     std::string op = isCast ? "as?" : "is";
     if (dstT->isOptional()) {
-        std::string inner = dstT->inner ? dstT->inner->toString() : std::string("?");
+        const Type* target = dstT;
+        while (target->isOptional() && target->inner) target = target->inner;
+        std::string core = target->toString();
         if (isCast) {
-            errorAtNode(diagNode, "The target of 'as?' cannot be nullable; 'as? " + inner +
-                "' already produces '" + inner + "?'. Drop the '?' on the target.");
+            errorAtNode(diagNode, "The target of 'as?' cannot be nullable; 'as? " + core +
+                "' already produces '" + core + "?'. Write the target without its '?', as "
+                "'as? " + core + "'.");
         } else {
             errorAtNode(diagNode, "The target of 'is' cannot be nullable; 'is' is never true "
-                "for null. Test against '" + inner + "' instead.");
+                "for null. Test against '" + core + "' instead.");
         }
+        return false;
+    }
+    if (srcT->isOptional() && srcT->inner && srcT->inner->isOptional()) {
+        errorAtNode(diagNode, "Cannot use '" + op + "' on a value of type '" + srcT->toString() +
+            "', which is nullable at more than one level, and '" + op + "' looks through only "
+            "one. Unwrap one level first: check the value for null ('if (value != null)') or "
+            "supply a fallback ('value ?? null'), then test the '" + srcT->inner->toString() +
+            "' that remains.");
         return false;
     }
     if (dstT->isTypeParam()) {
@@ -6927,9 +6961,11 @@ bool Analyzer::checkClassTypeTest(Type* srcT, Type* dstT, bool isCast,
 StructInfo* Analyzer::checkTypeArmTarget(Type* scrutType, Type* inner, Type* armT,
                                          const SyntaxNode& diagNode) {
     if (armT->isOptional()) {
-        std::string name = armT->inner ? armT->inner->toString() : std::string("?");
+        const Type* core = armT;
+        while (core->isOptional() && core->inner) core = core->inner;
         errorAtNode(diagNode, "The type of an 'is' arm cannot be nullable; 'is' never matches "
-            "null. Test against '" + name + "' and handle null with a 'null ->' arm.");
+            "null. Test against '" + core->toString() + "' and handle null with a 'null ->' "
+            "arm.");
         return nullptr;
     }
     if (armT->isTypeParam()) {
@@ -7024,6 +7060,13 @@ Type* Analyzer::analyzeSubscript(const ast::SubscriptExpression& expr) {
     Type* objT = analyzeExpr(*obj);
     Type* idxT = analyzeExpr(*idx);
     if (objT->isError()) return typeCtx.getError();
+    if (objT->isOptional() && objT->inner && objT->inner->isOptional()) {
+        errorAtNode(expr.node, "Cannot index '" + objT->toString() +
+            "' because it may be null at more than one level. Unwrap one level first: check it "
+            "for null ('if (value != null)') or supply a fallback ('value ?? null'), then index "
+            "the '" + objT->inner->toString() + "' that remains.");
+        return typeCtx.getError();
+    }
     if (objT->isOptional() && objT->inner && objT->inner->isArray()) {
         errorAtNode(expr.node, "Cannot index '" + objT->toString() +
             "' because it may be null. Check for null first.");
@@ -7064,8 +7107,15 @@ Type* Analyzer::analyzeSafeSubscript(const ast::SafeSubscriptExpression& expr) {
         return typeCtx.getError();
     }
     Type* inner = objT->inner;
+    if (inner && inner->isOptional()) {
+        errorAtNode(expr.node, "The value on the left of '?[' has type '" + objT->toString() +
+            "', which is nullable at more than one level, and '?[' looks through only one. "
+            "Unwrap one level first: check the value for null ('if (value != null)') or supply "
+            "a fallback ('value ?? null'), then index the '" + inner->toString() +
+            "' that remains.");
+        return typeCtx.getError();
+    }
     if (!inner || !inner->isArray()) {
-        std::string innerName = inner ? inner->toString() : std::string("?");
         errorAtNode(expr.node, "The value on the left of '?[' has type '" + objT->toString() +
             "', which is not a nullable array.");
         return typeCtx.getError();
@@ -7075,7 +7125,7 @@ Type* Analyzer::analyzeSafeSubscript(const ast::SafeSubscriptExpression& expr) {
     if (!idxT->isError() && !idxT->isInteger()) {
         errorAtNode(idx->node, "Array index must be an integer, got '" + idxT->toString() + "'");
     }
-    return typeCtx.getOptional(elem);
+    return safeResultOf(typeCtx, elem);
 }
 
 void Analyzer::invalidateNarrowingsForWrite(const ast::Expression& target) {
@@ -7120,7 +7170,11 @@ Type* Analyzer::declaredBindingType(const ast::Expression& operand) const {
     return nullptr;
 }
 
+// A value still nullable after narrowing needs nothing restored: the operator asks about the
+// level it has now, which for a doubly-nullable path already proven present at its outer level
+// is the inner one.
 Type* Analyzer::presenceOperandType(const ast::Expression& operand, Type* analyzed) {
+    if (analyzed && analyzed->isOptional()) return analyzed;
     Type* declared = declaredBindingType(operand);
     if (!declared || !declared->isOptional() || declared->equals(analyzed)) return analyzed;
     analysis.setType(operand.node.greenNode(), declared);
@@ -7134,9 +7188,15 @@ void Analyzer::establishAssignmentNarrowing(Symbol* sym, Type* valueT) {
     if (sym->kind != SymbolKind::Variable && sym->kind != SymbolKind::Parameter) return;
     Type* declared = sym->type;
     if (!declared || !declared->isOptional() || !declared->inner) return;
-    if (valueT->isError() || valueT->isNull() || valueT->isOptional()) return;
-    if (!declared->inner->assignableFrom(valueT)) return;
-    currentScope->narrowedTypes[NarrowingPath{sym, {}}] = declared->inner;
+    if (valueT->isError() || valueT->isNull()) return;
+    // The value's own type proves every level it wraps into: a bare value proves both levels of
+    // a 'T??', a 'T?' assigned to one proves the outer level.
+    Type* proven = declared;
+    while (proven->isOptional() && proven->inner && proven->inner->assignableFrom(valueT)) {
+        proven = proven->inner;
+    }
+    if (proven == declared) return;
+    currentScope->narrowedTypes[NarrowingPath{sym, {}}] = proven;
 }
 
 Type* Analyzer::analyzeAssign(const ast::AssignExpression& expr) {
@@ -7587,11 +7647,22 @@ Type* Analyzer::analyzeSwitchArms(const std::optional<ast::Expression>& scrutine
         if (arm.isTypeArm()) { hasTypeArm = true; break; }
     }
 
-    bool classScrut = inner && !inner->isError() && inner->isClass() && inner->structInfo;
-    bool scrutOk = inner && !inner->isError() &&
+    // A 'null ->' arm covers the outer level only, so a doubly-nullable scrutinee has no
+    // meaningful set of arms; it is rejected the way '?.' and '?[' are.
+    bool doublyNullable = nullable && inner && inner->isOptional();
+    if (scrutinee && !scrutType->isError() && doublyNullable) {
+        errorAtNode(scrutinee->node, "Cannot switch on a value of type '" +
+            scrutType->toString() + "' because it may be null at more than one level, and a "
+            "'null ->' arm covers only the outer one. Unwrap one level first: check the value "
+            "for null ('if (value != null)') or supply a fallback ('value ?? null'), then "
+            "switch on the '" + inner->toString() + "' that remains.");
+    }
+    bool classScrut = !doublyNullable && inner && !inner->isError() && inner->isClass() &&
+                      inner->structInfo;
+    bool scrutOk = !doublyNullable && inner && !inner->isError() &&
                    (inner->isEnum() || inner->isInteger() || inner->isString());
     bool typeSwitch = hasTypeArm && classScrut;
-    if (scrutinee && !scrutType->isError()) {
+    if (scrutinee && !scrutType->isError() && !doublyNullable) {
         if (classScrut && !hasTypeArm) {
             errorAtNode(scrutinee->node, "A switch over a class value needs at least one "
                 "'is Type ->' arm.");
@@ -7926,14 +7997,15 @@ Type* Analyzer::analyzeArrayLiteral(const ast::ArrayLiteralExpression& expr) {
 }
 
 // Array literal with a target type: each element is adapted to the target's
-// element type. The target may be `T[]` or `T[]?` (nullable holder).
+// element type. The target may be an array or an array under any number of
+// optional levels; the wrapping applies at the use site.
 Type* Analyzer::analyzeArrayLiteralAdapt(const ast::ArrayLiteralExpression& expr,
                                          Type* target) {
     if (!target || target->isError()) {
         return analyzeArrayLiteral(expr);
     }
     Type* arrayT = target;
-    if (arrayT->isOptional() && arrayT->inner) arrayT = arrayT->inner;
+    while (arrayT->isOptional() && arrayT->inner) arrayT = arrayT->inner;
     if (!arrayT->isArray() || !arrayT->inner) {
         errorAtNode(expr.node,
             "Cannot assign array literal to non-array type '" +
@@ -7977,7 +8049,7 @@ Type* Analyzer::analyzeStructLiteralAdapt(const ast::StructLiteralExpression& ex
         return analyzeStructLiteral(expr);
     }
     Type* structT = target;
-    if (structT->isOptional() && structT->inner) structT = structT->inner;
+    while (structT->isOptional() && structT->inner) structT = structT->inner;
     if (!structT->isStruct() || !structT->structInfo) {
         errorAtNode(expr.node, "Cannot build '" + target->toString() +
             "' from a '{...}' literal; that type is not a struct.");
@@ -8153,7 +8225,7 @@ namespace {
 // A field stores a struct inline when its type is that struct or an optional of it.
 // Classes, arrays, and strings are references and never nest a struct's storage.
 StructInfo* byValueFieldStruct(Type* t) {
-    if (t && t->isOptional()) t = t->inner;
+    while (t && t->isOptional()) t = t->inner;
     return t && t->isStruct() ? t->structInfo : nullptr;
 }
 

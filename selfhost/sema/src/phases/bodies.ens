@@ -1166,8 +1166,8 @@ class BodyChecker implements NoreturnCalls {
     }
 
     // Recognizes 'x == null' and 'x != null' over a narrowable path whose analyzed type is
-    // still optional; the equality analysis has already reset a checked operand back to its
-    // declared storage type, so a redundant re-check re-proves the same fact.
+    // still optional. The equality analysis resets a fully-proven operand back to its declared
+    // storage type, so a redundant re-check re-proves the same fact rather than widening it.
     detectNullCheck(Expression condition) -> NarrowingFact? {
         if (!(condition is BinaryExpressionNode)) {
             return null;
@@ -1195,8 +1195,13 @@ class BodyChecker implements NoreturnCalls {
         if (path == null) {
             return null;
         }
-        return new NarrowingFact(path, checkedType.inner(),
-            operator == SyntaxKind.NotEquals);
+        // One check strips one level, off the sharpest type proven for the path so far: a
+        // re-check of a value already proven present at every level proves nothing new.
+        Type presence = this.narrowing.provenType(path) ?? checkedType;
+        if (!(presence is OptionalType)) {
+            return null;
+        }
+        return new NarrowingFact(path, presence.inner(), operator == SyntaxKind.NotEquals);
     }
 
     // A type test proves its operand is the target exactly when the test succeeds, so the
@@ -1756,7 +1761,14 @@ class BodyChecker implements NoreturnCalls {
     // storage type, so a re-check of a proven-non-null declared-optional stays legal; the
     // operand is retyped back to the declared type, and a declared non-optional keeps its
     // analyzed type and is rejected by the operator's own rule.
+    //
+    // A value still nullable after narrowing needs nothing restored: the operator asks about
+    // the level it has now, which for a doubly-nullable path already proven present at its
+    // outer level is the inner one.
     presenceOperandType(Expression operand, Type analyzed) -> Type {
+        if (analyzed is OptionalType) {
+            return analyzed;
+        }
         let declared = this.declaredSlotType(operand);
         if (declared == null || !(declared is OptionalType) || declared == analyzed) {
             return analyzed;
@@ -1770,20 +1782,26 @@ class BodyChecker implements NoreturnCalls {
         return declared;
     }
 
-    // Assigning a statically non-null value to a plain binding of optional declared type
-    // narrows the binding from that point on; declaration initializers come through here too.
+    // Assigning a value to a binding of optional declared type narrows the binding to the
+    // deepest level the value's own static type proves present: a bare value proves every
+    // wrapped level, a 'T?' assigned to a 'T??' proves the outer one. Declaration initializers
+    // come through here too.
     establishAssignmentNarrowing(LocalBinding binding, Type value) {
         let declared = binding.type();
         if (!(declared is OptionalType)) {
             return;
         }
-        if (value is ErrorType || value is NullType || value is OptionalType) {
+        if (value is ErrorType || value is NullType) {
             return;
         }
-        if (!convert.isAssignableStrict(declared.inner(), value)) {
+        Type proven = declared;
+        while (proven is OptionalType && convert.isAssignableStrict(proven.inner(), value)) {
+            proven = proven.inner();
+        }
+        if (proven == declared) {
             return;
         }
-        this.narrowing.narrow(narrow.bindingPath(binding), declared.inner());
+        this.narrowing.narrow(narrow.bindingPath(binding), proven);
     }
 
     // A write into the storage an expression names drops every narrowing the write could
@@ -1849,8 +1867,8 @@ class BodyChecker implements NoreturnCalls {
             if (argumentType == null) {
                 continue;
             }
-            Type bare = convert.bareOf(argumentType);
-            if (types.isClassLike(bare) || bare is ArrayType) {
+            Type core = convert.coreOf(argumentType);
+            if (types.isClassLike(core) || core is ArrayType) {
                 this.dropTouchedByCall(value);
             }
         }
@@ -2285,7 +2303,14 @@ class BodyChecker implements NoreturnCalls {
         Type iterable = this.analyzeExpression(node.iterable());
         Type element = this.store.errorType();
         if (!(iterable is ErrorType)) {
-            if (iterable is OptionalType) {
+            if (iterable is OptionalType && iterable.inner() is OptionalType) {
+                this.reporter.report("'for (... in ...)' cannot iterate "
+                    + "'{types.display(iterable)}' because it may be null at more than one "
+                    + "level. Unwrap one level at a time, with a null check "
+                    + "('if (value != null)') or a fallback ('value ?? null'), until what "
+                    + "remains is '{types.display(convert.coreOf(iterable))}'.",
+                    node.iterable().span());
+            } else if (iterable is OptionalType) {
                 this.reporter.report("'for (... in ...)' cannot iterate "
                     + "'{types.display(iterable)}' because it may be null. Check it for null "
                     + "first ('if (value != null)'), or supply a fallback with '??'.",
@@ -3693,13 +3718,14 @@ class BodyChecker implements NoreturnCalls {
             operator = "as?";
         }
         if (target is OptionalType) {
-            string inner = types.display(target.inner());
+            string core = types.display(convert.coreOf(target));
             if (isCast) {
-                this.reporter.report("The target of 'as?' cannot be nullable; 'as? {inner}' "
-                    + "already produces '{inner}?'. Drop the '?' on the target.", span);
+                this.reporter.report("The target of 'as?' cannot be nullable; 'as? {core}' "
+                    + "already produces '{core}?'. Write the target without its '?', as "
+                    + "'as? {core}'.", span);
             } else {
                 this.reporter.report("The target of 'is' cannot be nullable; 'is' is never "
-                    + "true for null. Test against '{inner}' instead.", span);
+                    + "true for null. Test against '{core}' instead.", span);
             }
             return false;
         }
@@ -3731,10 +3757,18 @@ class BodyChecker implements NoreturnCalls {
         if (objectType is ErrorType) {
             return this.store.errorType();
         }
-        if (objectType is OptionalType && objectType.inner() is ArrayType) {
-            this.reporter.report("Cannot index '{types.display(objectType)}' because it may "
-                + "be null. Check it for null first ('if (value != null)'), or use '?[' to "
-                + "index it only when it is present.", node.span());
+        if (objectType is OptionalType && convert.coreOf(objectType) is ArrayType) {
+            if (objectType.inner() is OptionalType) {
+                this.reporter.report("Cannot index '{types.display(objectType)}' because it "
+                    + "may be null at more than one level. Unwrap one level first: check it for "
+                    + "null ('if (value != null)') or supply a fallback ('value ?? null'), then "
+                    + "index the '{types.display(objectType.inner())}' that remains.",
+                    node.span());
+            } else {
+                this.reporter.report("Cannot index '{types.display(objectType)}' because it may "
+                    + "be null. Check it for null first ('if (value != null)'), or use '?[' to "
+                    + "index it only when it is present.", node.span());
+            }
             return this.store.errorType();
         }
         if (objectType is ArrayType) {
@@ -3770,9 +3804,17 @@ class BodyChecker implements NoreturnCalls {
             return this.store.errorType();
         }
         Type inner = objectType.inner();
+        if (inner is OptionalType) {
+            this.reporter.report("The value on the left of '?[' has type "
+                + "'{types.display(objectType)}', which is nullable at more than one level, "
+                + "and '?[' looks through only one. Unwrap one level first: check the value "
+                + "for null ('if (value != null)') or supply a fallback ('value ?? null'), "
+                + "then index the '{types.display(inner)}' that remains.", node.span());
+            return this.store.errorType();
+        }
         if (inner is ArrayType) {
             this.checkIndexIsInteger(indexType, node.index().span());
-            return this.store.optionalOf(inner.element());
+            return this.safeResultOf(inner.element());
         }
         this.reporter.report("The value on the left of '?[' has type "
             + "'{types.display(objectType)}', which is not a nullable array.", node.span());
@@ -3869,12 +3911,13 @@ class BodyChecker implements NoreturnCalls {
     }
 
     // Array literal with a target type: each element adapts to the target's element type. The
-    // target may be 'T[]' or 'T[]?'; the optional wrap applies at the use site.
+    // target may be an array or an array under any number of optional levels; the wrapping
+    // applies at the use site.
     analyzeArrayLiteralAdapt(ArrayLiteralExpressionNode node, Type target) -> Type {
         if (target is ErrorType) {
             return this.analyzeArrayLiteral(node);
         }
-        Type arrayType = convert.bareOf(target);
+        Type arrayType = convert.coreOf(target);
         if (arrayType is ArrayType) {
             Type elementType = arrayType.element();
             for (long i = 0; i < node.elementsCount(); i++) {
@@ -3917,7 +3960,7 @@ class BodyChecker implements NoreturnCalls {
         if (target is ErrorType) {
             return this.analyzeStructLiteral(node);
         }
-        Type structType = convert.bareOf(target);
+        Type structType = convert.coreOf(target);
         if (!isStructValue(structType)) {
             this.reporter.report("Cannot build '{types.display(target)}' from a '\{...\}' "
                 + "literal; that type is not a struct.", node.span());
@@ -4356,6 +4399,12 @@ class BodyChecker implements NoreturnCalls {
             if (guidance != null) {
                 this.reporter.report("Cannot read a member of '{types.display(objectType)}' "
                     + "because it may be null here. {guidance}", node.span());
+            } else if (objectType.inner() is OptionalType) {
+                this.reporter.report("Cannot read a member of '{types.display(objectType)}' "
+                    + "because it may be null at more than one level. Unwrap one level at a "
+                    + "time, with a null check ('if (value != null)') or a fallback "
+                    + "('value ?? null'), until what remains is "
+                    + "'{types.display(convert.coreOf(objectType))}'.", node.span());
             } else {
                 this.reporter.report("Cannot read a member of '{types.display(objectType)}' "
                     + "because it may be null here. Check it for null first "
@@ -4466,13 +4515,21 @@ class BodyChecker implements NoreturnCalls {
             return this.store.errorType();
         }
         Type inner = objectType.inner();
+        if (inner is OptionalType) {
+            this.reporter.report("The value on the left of '?.' has type "
+                + "'{types.display(objectType)}', which is nullable at more than one level, "
+                + "and '?.' looks through only one. Unwrap one level first: check the value "
+                + "for null ('if (value != null)') or supply a fallback ('value ?? null'), "
+                + "then use '?.' on the '{types.display(inner)}' that remains.", node.span());
+            return this.store.errorType();
+        }
         string name = node.member().text();
         if ((inner is StringType || inner is ArrayType) && name == "length") {
-            return this.store.optionalOf(this.store.primitive(PrimitiveKind.Long));
+            return this.safeResultOf(this.store.primitive(PrimitiveKind.Long));
         }
         if (!isRecordLike(inner)) {
             this.reporter.report("The value on the left of '?.' has type "
-                + "'{types.display(inner)}?', which has no members to access.", node.span());
+                + "'{types.display(objectType)}', which has no members to access.", node.span());
             return this.store.errorType();
         }
         switch (this.lookupMember(inner, name)) {
@@ -4481,7 +4538,7 @@ class BodyChecker implements NoreturnCalls {
                         found.field.definingType(), node.member().span())) {
                     this.result.markMemberAccessDenied(node.green());
                 }
-                return this.store.optionalOf(found.field.type());
+                return this.safeResultOf(found.field.type());
             },
             is MethodMember found -> {
                 if (found.candidates.length() <= 1) {
@@ -4859,9 +4916,9 @@ class BodyChecker implements NoreturnCalls {
         long arity = typeParameters.length;
         Type[] contextArguments = [];
         if (expected != null) {
-            Type bare = convert.bareOf(expected);
-            if (bare is InstantiationType && bare.template() == template) {
-                contextArguments = bare.arguments();
+            Type core = convert.coreOf(expected);
+            if (core is InstantiationType && core.template() == template) {
+                contextArguments = core.arguments();
             }
         }
         let completedIndexes = new List<long>();
@@ -5629,7 +5686,19 @@ class BodyChecker implements NoreturnCalls {
         if (returned is ErrorType || types.isVoidType(returned)) {
             return returned;
         }
-        return this.store.optionalOf(returned);
+        return this.safeResultOf(returned);
+    }
+
+    // The type '?.' and '?[' answer with. Both say 'null' when the receiver is absent, and a
+    // value that is already nullable carries that answer in the level it has: its own null says
+    // "nothing here" just as well, so the operator adds no second level and a chain through a
+    // nullable member keeps working. This is only about the level these operators add; a value
+    // that arrived doubly nullable is still rejected by the operators themselves.
+    safeResultOf(Type value) -> Type {
+        if (value is OptionalType) {
+            return value;
+        }
+        return this.store.optionalOf(value);
     }
 
     // A namespace-qualified free-function call, or null when the member is not a function of
@@ -6576,7 +6645,16 @@ class BodyChecker implements NoreturnCalls {
                             bool requireValue) -> Type {
         Type scrutineeType = this.analyzeExpression(scrutinee);
         Type inner = convert.bareOf(scrutineeType);
-        bool known = !(scrutineeType is ErrorType);
+        bool doublyNullable = !(scrutineeType is ErrorType) && inner is OptionalType;
+        if (doublyNullable) {
+            this.reporter.report("Cannot switch on a value of type "
+                + "'{types.display(scrutineeType)}' because it may be null at more than one "
+                + "level, and a 'null ->' arm covers only the outer one. Unwrap one level "
+                + "first: check the value for null ('if (value != null)') or supply a fallback "
+                + "('value ?? null'), then switch on the '{types.display(inner)}' that "
+                + "remains.", scrutinee.span());
+        }
+        bool known = !(scrutineeType is ErrorType) && !doublyNullable;
         bool classScrutinee = known && types.isClassLike(inner);
         bool valueScrutinee = known && (inner is EnumType || convert.isIntegerType(inner)
             || inner is StringType);
@@ -6867,8 +6945,8 @@ class BodyChecker implements NoreturnCalls {
             -> Type? {
         if (armType is OptionalType) {
             this.reporter.report("The type of an 'is' arm cannot be nullable; 'is' never "
-                + "matches null. Test against '{types.display(armType.inner())}' and handle "
-                + "null with a 'null ->' arm.", span);
+                + "matches null. Test against '{types.display(convert.coreOf(armType))}' and "
+                + "handle null with a 'null ->' arm.", span);
             return null;
         }
         if (armType is TypeParamType) {
@@ -7321,17 +7399,32 @@ simpleSpelling(Expression expression) -> string? {
     }
 }
 
-// Guidance appended to an assignability failure when the mismatch is exactly nullability:
-// a possibly-null source flowing into a never-null slot.
+// Guidance appended to an assignability failure when the mismatch is exactly nullability: a
+// source nullable at more levels than the slot it flows into, each of which has to be unwrapped.
 nullabilityHint(Type target, Type source) -> string {
-    if (target is ErrorType || target is OptionalType) {
+    if (target is ErrorType) {
         return "";
     }
-    if (source is OptionalType && convert.isAssignableStrict(target, source.inner())) {
-        return ". The value may be null here; check it first ('if (value != null)'), or "
-            + "supply a fallback with '??'.";
+    if (source is OptionalType) {
+        long levels = 0;
+        Type remaining = source;
+        while (remaining is OptionalType) {
+            remaining = remaining.inner();
+            levels++;
+            if (!convert.isAssignableStrict(target, remaining)) {
+                continue;
+            }
+            if (levels == 1) {
+                return ". The value may be null here; check it first "
+                    + "('if (value != null)'), or supply a fallback with '??'.";
+            }
+            return ". The value may be null at {levels} separate levels, and each one has to "
+                + "be unwrapped: check it for null ('if (value != null)') or supply a fallback "
+                + "('value ?? null'), once per level.";
+        }
+        return "";
     }
-    if (source is NullType) {
+    if (source is NullType && !(target is OptionalType)) {
         return ". '{types.display(target)}' can never be null; write the type as "
             + "'{types.display(target)}?' if it should allow null.";
     }
