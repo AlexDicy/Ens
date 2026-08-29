@@ -329,6 +329,7 @@ swap(1, 2);        // T inferred as int
 ```
 
 A type parameter may declare bounds with `T: Base + Comparable`, joined by `+`: at most one bound may be a class (conventionally written first) and every other bound must be an interface, and listing the same bound twice is an error.
+A bound may not name a `final` class: no type except that class itself could satisfy it, so write the class type directly instead.
 Every type argument must satisfy all bounds, being the class or a subclass of it and implementing each interface; a violation is a compile error naming the failing bound.
 An interface bound is also satisfied through interface extension: a class implementing an interface that extends the bound satisfies it, and so does the extending interface itself as a type argument.
 The body may use the members of every bound on a value of that parameter.
