@@ -827,6 +827,21 @@ if (ys[i] != null) {
 }
 ```
 
+A `weak` field never narrows, and no narrowing is established through a path that passes through one: the field can become null whenever the object it refers to loses its last strong reference, so a null check proves nothing about a later read.
+Comparing a weak field against null stays legal as an ordinary boolean expression; it simply narrows nothing.
+The idiom is the strong-local copy: reading a weak field yields a strong reference, so a local holding it keeps the object alive for the local's scope and narrows by the ordinary rules.
+
+```ens
+if (h.target != null) {
+    h.target.use();      // error - 'target' is weak, the check does not carry
+}
+
+let target = h.target;   // the local holds a strong reference
+if (target != null) {
+    target.use();        // ok - the local keeps the object alive
+}
+```
+
 Narrowing is dropped when the analyzer can't prove the narrowed value is still non-null. Specifically:
 - Writing to the narrowed path or any deeper part of it (`r.door = null`, `xs[0] = null`).
   Writing through a subscript also drops the narrowing of any element it could alias: `xs[j] = null` drops `xs[0]` because `j` could be `0`, and `xs[0] = null` drops `xs[i]`.
@@ -1403,6 +1418,9 @@ class Child {
 ```
 
 `weak` fields must be nullable class types. They don't contribute to the strong refcount, so they don't keep objects alive. When the referenced object dies, every weak reference to it reads as `null`.
+
+A null check on a weak field does not narrow it, because the field can go null the moment the referenced object loses its last strong reference.
+Read the field into a local and check the local instead: the read produces a strong reference, and the local keeps the object alive while it is in scope.
 
 The compiler performs **escape analysis** to elide retain/release pairs and large-struct copies when it can prove a value does not escape its scope.
 

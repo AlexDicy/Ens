@@ -3615,6 +3615,7 @@ std::optional<NarrowingPath> Analyzer::buildNarrowingPath(
         if (!obj || !name) return std::nullopt;
         auto base = buildNarrowingPath(*obj, indexSymbols, allowAnyIndex, byName);
         if (!base) return std::nullopt;
+        if (weakFieldRead(core)) return std::nullopt;
         PathSegment seg;
         seg.kind = PathSegment::Kind::Field;
         seg.field = *name;
@@ -3692,6 +3693,23 @@ std::optional<NarrowingPath> Analyzer::buildNarrowingPath(
         return unrecognizedIndex();
     }
     return std::nullopt;
+}
+
+const FieldInfo* Analyzer::weakFieldRead(const ast::Expression& expr) const {
+    ast::Expression core = unwrapParens(expr);
+    auto m = core.asMember();
+    if (!m) return nullptr;
+    auto obj = m->object();
+    auto name = m->memberText();
+    if (!obj || !name) return nullptr;
+    Type* objT = analysis.typeOf(obj->node.greenNode());
+    if (!objT) return nullptr;
+    if (objT->isOptional() && objT->inner) objT = objT->inner;
+    if (!objT->structInfo) return nullptr;
+    int idx = objT->structInfo->findFieldIndex(*name);
+    if (idx < 0) return nullptr;
+    const FieldInfo& fld = objT->structInfo->fields[idx];
+    return fld.isWeak ? &fld : nullptr;
 }
 
 // A value a call can reach - the receiver, or a class / array argument - loses
@@ -6647,8 +6665,16 @@ Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
     }
     if (!objT->hasRecordLayout() || !objT->structInfo) {
         if (objT->isOptional()) {
-            errorAtNode(expr.node, "Cannot read a member of '" + objT->toString() +
-                "' because it may be null. Use '?.' or check for null first.");
+            if (const FieldInfo* weak = weakFieldRead(*obj)) {
+                errorAtNode(expr.node, "Cannot read a member of '" + objT->toString() +
+                    "' because it may be null. '" + asciiOf(weak->name) +
+                    "' is a 'weak' field, so it can become null whenever the object it "
+                    "refers to loses its last strong reference; a null check does not carry "
+                    "past it. Copy it into a local first and check the local.");
+            } else {
+                errorAtNode(expr.node, "Cannot read a member of '" + objT->toString() +
+                    "' because it may be null. Use '?.' or check for null first.");
+            }
         } else {
             errorAtNode(expr.node, "Cannot read a member of '" + objT->toString() +
                 "' because it has no members.");

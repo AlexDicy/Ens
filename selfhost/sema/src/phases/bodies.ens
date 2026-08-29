@@ -819,7 +819,8 @@ class BodyChecker implements NoreturnCalls {
                             && !convert.isAssignableStrict(expected, actual)) {
                         this.reporter.report("Default value for field '{member.name().text()}': "
                             + "expected '{types.display(expected)}', got "
-                            + "'{types.display(actual)}'{nullabilityHint(expected, actual)}",
+                            + "'{types.display(actual)}'"
+                            + "{this.valueNullabilityHint(expected, actual, value)}",
                             value.span());
                     }
                 }
@@ -863,8 +864,8 @@ class BodyChecker implements NoreturnCalls {
                     && !convert.isAssignableStrict(expected, actual)) {
                 this.reporter.report("Default value for parameter "
                     + "'{parameterNode.name().text()}': expected '{types.display(expected)}', "
-                    + "got '{types.display(actual)}'{nullabilityHint(expected, actual)}",
-                    value.span());
+                    + "got '{types.display(actual)}'"
+                    + "{this.valueNullabilityHint(expected, actual, value)}", value.span());
             }
         }
         this.scope = null;
@@ -926,6 +927,9 @@ class BodyChecker implements NoreturnCalls {
     // location: a local or parameter, 'this', or such a root followed by field hops and
     // subscript hops with literal or plain-identifier indices. 'allowAnyIndex' admits every
     // other index form as an AnyIndex hop, for write-invalidation queries only.
+    // A 'weak' field never joins a path: its value can become null whenever the referent
+    // loses its last strong reference, so refusing it here keeps fact collection, proven-type
+    // lookup, and invalidation agreeing that nothing is ever proven through one.
     buildNarrowingPath(Expression expression, bool allowAnyIndex,
                                bool byName = false) -> NarrowingPath? {
         let segments = new List<PathSegment>();
@@ -956,6 +960,9 @@ class BodyChecker implements NoreturnCalls {
                 let root = this.collectPathSegments(member.object(), allowAnyIndex, byName,
                     segments);
                 if (root == null) {
+                    return null;
+                }
+                if (this.readsWeakField(member)) {
                     return null;
                 }
                 segments.push(narrow.fieldSegment(member.member().text()));
@@ -1010,6 +1017,54 @@ class BodyChecker implements NoreturnCalls {
             return true;
         }
         return false;
+    }
+
+    // Whether the member access reads a 'weak' field. In by-name mode the object carries no
+    // analyzed type yet, so this reads false there; that is harmless, because a weak path is
+    // never stored and a pre-clear query over one has nothing to erase.
+    readsWeakField(MemberExpressionNode member) -> bool {
+        let objectType = this.result.typeOf(member.object().green());
+        if (objectType == null) {
+            return false;
+        }
+        let field = members.findField(types.fieldsOf(objectType), member.member().text());
+        return field != null && field.isWeak();
+    }
+
+    // The weak-field explanation for a value that may be null, or null when the value does
+    // not read a 'weak' field: why a null check on it cannot carry to the use, and the
+    // strong-local copy that does.
+    weakFieldGuidance(Expression value) -> string? {
+        Expression core = unwrapParentheses(value);
+        if (!(core is MemberExpressionNode)) {
+            return null;
+        }
+        if (!this.readsWeakField(core)) {
+            return null;
+        }
+        string name = core.member().text();
+        string example = "let {name} = ...;";
+        let receiver = simpleSpelling(core.object());
+        if (receiver != null) {
+            example = "let {name} = {receiver}.{name};";
+        }
+        return "'{name}' is a 'weak' field, so it can become null whenever the object it "
+            + "refers to loses its last strong reference; a null check does not carry past "
+            + "it. Copy it into a local first ('{example}') and check the local.";
+    }
+
+    // nullabilityHint with the mismatched value in hand: a possibly-null value read from a
+    // 'weak' field gets the weak explanation instead of the plain check suggestion.
+    valueNullabilityHint(Type target, Type source, Expression? value) -> string {
+        if (value != null && !(target is ErrorType) && !(target is OptionalType)
+                && source is OptionalType
+                && convert.isAssignableStrict(target, source.inner())) {
+            let guidance = this.weakFieldGuidance(value);
+            if (guidance != null) {
+                return ". The value may be null here. {guidance}";
+            }
+        }
+        return nullabilityHint(target, source);
     }
 
     // Recognizes 'x == null' and 'x != null' over a narrowable path whose analyzed type is
@@ -1951,7 +2006,8 @@ class BodyChecker implements NoreturnCalls {
                     && !convert.isAssignableStrict(declared, initType)) {
                 this.reporter.report("Cannot assign value of type '{types.display(initType)}' "
                     + "to variable of type '{types.display(declared)}'"
-                    + "{nullabilityHint(declared, initType)}", initializer.value().span());
+                    + "{this.valueNullabilityHint(declared, initType, initializer.value())}",
+                    initializer.value().span());
             }
             return declared;
         }
@@ -2253,7 +2309,7 @@ class BodyChecker implements NoreturnCalls {
         if (!convert.isAssignableStrict(expected, actual)) {
             this.reporter.report("Cannot return value of type '{types.display(actual)}' from "
                 + "function returning '{types.display(expected)}'"
-                + "{nullabilityHint(expected, actual)}", value.span());
+                + "{this.valueNullabilityHint(expected, actual, value)}", value.span());
         }
     }
 
@@ -3213,7 +3269,8 @@ class BodyChecker implements NoreturnCalls {
                 if (!convert.isAssignableStrict(assignTarget, valueType)) {
                     this.reporter.report("Cannot assign '{types.display(valueType)}' to "
                         + "'{types.display(assignTarget)}'"
-                        + "{nullabilityHint(assignTarget, valueType)}", node.span());
+                        + "{this.valueNullabilityHint(assignTarget, valueType, node.value())}",
+                        node.span());
                 }
             } else if (!(targetType is ErrorType)) {
                 storedType = this.checkCompoundAssignment(node, assignTarget, targetType,
@@ -3646,6 +3703,15 @@ class BodyChecker implements NoreturnCalls {
         if (analyzed is ErrorType) {
             return;
         }
+        if (analyzed is OptionalType) {
+            let guidance = this.weakFieldGuidance(hole);
+            if (guidance != null) {
+                this.reporter.report("Cannot interpolate a value of type "
+                    + "'{types.display(analyzed)}' because it may be null. {guidance}",
+                    hole.span());
+                return;
+            }
+        }
         if (convert.containsTypeParam(analyzed)) {
             this.recordObligation(new InterpolationObligation(analyzed, hole.span()));
             return;
@@ -3697,7 +3763,8 @@ class BodyChecker implements NoreturnCalls {
             if (!convert.isAssignableStrict(elementType, actual)) {
                 this.reporter.report("Element {i + 1}: expected "
                     + "'{types.display(elementType)}', got '{types.display(actual)}'"
-                    + "{nullabilityHint(elementType, actual)}", node.elements(i).span());
+                    + "{this.valueNullabilityHint(elementType, actual, node.elements(i))}",
+                    node.elements(i).span());
             }
         }
         return this.store.arrayOf(elementType);
@@ -3720,7 +3787,8 @@ class BodyChecker implements NoreturnCalls {
                 if (!convert.isAssignableStrict(elementType, actual)) {
                     this.reporter.report("Element {i + 1}: expected "
                         + "'{types.display(elementType)}', got '{types.display(actual)}'"
-                        + "{nullabilityHint(elementType, actual)}", node.elements(i).span());
+                        + "{this.valueNullabilityHint(elementType, actual, node.elements(i))}",
+                        node.elements(i).span());
                 }
             }
             return arrayType;
@@ -3796,7 +3864,8 @@ class BodyChecker implements NoreturnCalls {
                     && !convert.isAssignableStrict(fieldType, valueType)) {
                 this.reporter.report("Field '{fieldName}': expected "
                     + "'{types.display(fieldType)}', got '{types.display(valueType)}'"
-                    + "{nullabilityHint(fieldType, valueType)}", entry.value().span());
+                    + "{this.valueNullabilityHint(fieldType, valueType, entry.value())}",
+                    entry.value().span());
             }
         }
         for (long i = 0; i < fields.length(); i++) {
@@ -4029,10 +4098,16 @@ class BodyChecker implements NoreturnCalls {
             return this.store.errorType();
         }
         if (objectType is OptionalType) {
-            this.reporter.report("Cannot read a member of '{types.display(objectType)}' "
-                + "because it may be null here. Check it for null first "
-                + "('if (value != null)'), read it with '?.' to get a nullable result, or "
-                + "supply a fallback with '??'.", node.span());
+            let guidance = this.weakFieldGuidance(object);
+            if (guidance != null) {
+                this.reporter.report("Cannot read a member of '{types.display(objectType)}' "
+                    + "because it may be null here. {guidance}", node.span());
+            } else {
+                this.reporter.report("Cannot read a member of '{types.display(objectType)}' "
+                    + "because it may be null here. Check it for null first "
+                    + "('if (value != null)'), read it with '?.' to get a nullable result, or "
+                    + "supply a fallback with '??'.", node.span());
+            }
             return this.store.errorType();
         }
         Type core = this.memberReceiverCore(objectType, name);
@@ -4705,7 +4780,7 @@ class BodyChecker implements NoreturnCalls {
                             + "the type name, as in '{template.name()}"
                             + "<{typeParameterExample(template)}>.{resolved.name()}(...)'");
                     }
-                    string hint = nullabilityHint(parameterType, actual);
+                    string hint = this.valueNullabilityHint(parameterType, actual, argument);
                     this.reporter.report("Argument {i + 1}: expected "
                         + "'{types.display(parameterType)}', got '{types.display(actual)}'"
                         + "{hint}{sentenceSeparator(hint, provenance)}{provenance}",
@@ -4942,7 +5017,8 @@ class BodyChecker implements NoreturnCalls {
                 }
                 this.reporter.report("Argument {label}: expected "
                     + "'{types.display(parameterType)}', got '{types.display(finalType)}'"
-                    + "{nullabilityHint(parameterType, finalType)}", argument.span());
+                    + "{this.valueNullabilityHint(parameterType, finalType, value)}",
+                    argument.span());
             }
         }
         if (shape.named().length() > 0) {
@@ -4976,7 +5052,8 @@ class BodyChecker implements NoreturnCalls {
                             this.reporter.report("Argument {i + 1}: expected "
                                 + "'{types.display(parameterType)}', got "
                                 + "'{types.display(actual)}'"
-                                + "{nullabilityHint(parameterType, actual)}", value.span());
+                                + "{this.valueNullabilityHint(parameterType, actual, value)}",
+                                value.span());
                         }
                     } else {
                         this.analyzeExpression(value);
@@ -5779,7 +5856,7 @@ class BodyChecker implements NoreturnCalls {
                             + "arguments explicitly, as in "
                             + "'{name}<{typeParameterNamesText(signature)}>(...)'");
                     }
-                    string hint = nullabilityHint(parameterType, actual);
+                    string hint = this.valueNullabilityHint(parameterType, actual, argument);
                     this.reporter.report("Argument {i + 1}: expected "
                         + "'{types.display(parameterType)}', got '{types.display(actual)}'"
                         + "{hint}{sentenceSeparator(hint, provenance)}{provenance}",
@@ -5843,7 +5920,8 @@ class BodyChecker implements NoreturnCalls {
                     this.reporter.report("Argument {i + 1}: expected "
                         + "'{types.display(parameter.type())}', got "
                         + "'{types.display(actual)}'"
-                        + "{nullabilityHint(parameter.type(), actual)}", argument.span());
+                        + "{this.valueNullabilityHint(parameter.type(), actual, argument)}",
+                        argument.span());
                 }
             }
         }
@@ -6846,6 +6924,41 @@ hasTypeArm(List<SwitchArm> arms) -> bool {
 
 isNullLabel(Expression label) -> bool {
     return label is LiteralExpressionNode && label.value().kind() == SyntaxKind.NullKeyword;
+}
+
+// The source spelling of an expression simple enough to quote in an example: a name, 'this',
+// a literal, or field and subscript hops over those. Null for anything longer.
+simpleSpelling(Expression expression) -> string? {
+    Expression core = unwrapParentheses(expression);
+    switch (core) {
+        is IdentifierExpressionNode identifier -> {
+            return identifier.name().text();
+        },
+        is ThisExpressionNode ignored -> {
+            return "this";
+        },
+        is LiteralExpressionNode literal -> {
+            return literal.value().text();
+        },
+        is MemberExpressionNode member -> {
+            let object = simpleSpelling(member.object());
+            if (object == null) {
+                return null;
+            }
+            return "{object}.{member.member().text()}";
+        },
+        is SubscriptExpressionNode subscript -> {
+            let object = simpleSpelling(subscript.object());
+            let index = simpleSpelling(subscript.index());
+            if (object == null || index == null) {
+                return null;
+            }
+            return "{object}[{index}]";
+        },
+        default -> {
+            return null;
+        },
+    }
 }
 
 // Guidance appended to an assignability failure when the mismatch is exactly nullability:

@@ -438,6 +438,12 @@ private:
         bool allowAnyIndex = false,
         bool byName = false) const;
 
+    // The weak field a member access reads, or null. A weak field never joins a
+    // narrowing path: its value can become null whenever the referent loses its
+    // last strong reference, so no fact is ever established or looked up through
+    // one, and a rejected use names the field to explain why a check did not carry.
+    const FieldInfo* weakFieldRead(const ast::Expression& expr) const;
+
     void clearNarrowingsForCall(const ast::CallExpression& expr);
     void clearNarrowingsForArguments(const std::vector<ast::Expression>& args);
     void clearNarrowingsTouchedBy(const ast::Expression& e);

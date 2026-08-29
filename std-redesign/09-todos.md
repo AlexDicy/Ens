@@ -22,8 +22,6 @@ A fixture for a cross-package subclass calling a protected constructor.
 The 23 `new Error(...)` sites that break when `Error` goes abstract, most of which should throw `TestFailure`.
 OS-level redirection for `run(captureOutput: true)`, wait-with-timeout, and kill in the native bridges.
 The toString marker flip: after the Phase B seed and the C6 text rewrite give `StringBuilder` its `export override toString()`, Phase D makes an unmarked class method named `toString` an error, closing the A4 transition rule (ratified 2026-08-28).
-A soundness fix for weak-field narrowing (found 2026-08-28, pre-existing): narrowing `h.target != null` on a `weak` field survives the death of the target's last strong owner, so a later read through the narrowed path dereferences a dead object and crashes; even a plain field read reproduces it.
-The fix needs a ruling first: invalidate weak-field narrowing at every statement that could release a strong reference, or forbid narrowing weak fields outright so the idiom is copying to a strong local, which the ARC read already keeps alive.
 A ruling on `new T[n]` in generic bodies: it bypasses element-defaultability checking and is never re-checked at monomorphization, so `List<Pair>` today materializes struct values whose non-defaulted `const` fields hold zeros nobody assigned (verified 2026-08-27, pre-existing).
 The naive fix, re-checking at monomorphization, would reject the collections' own backing arrays (`new T[4]` in `List`), so the containers need a sanctioned raw-storage story first.
 
