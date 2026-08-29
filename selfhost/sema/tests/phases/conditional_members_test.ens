@@ -1,0 +1,209 @@
+// Conditional members through the sema phases: the constraints a member's type-parameter list
+// records on the model, the per-instantiation existence answer, the constraint's extra bound
+// inside the member's own body and nowhere else, the unmet-constraint diagnostics for calls,
+// constructions, and inferred statics, and the guard that keeps a conditional member's deferred
+// obligations away from instantiations the member does not exist on.
+import @std.testing;
+import TestFailure from @std.testing;
+import ProgramAnalysis from pipeline;
+import Method from model.types;
+import ClassType from model.types;
+import InstantiationType from model.types;
+import model.types;
+import sema_support;
+import FakeFileLoader from sema_support;
+
+analyzeAll(string text) -> ProgramAnalysis {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", text);
+    return sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+}
+
+analyzeClean(string text) -> ProgramAnalysis throws {
+    let analysis = analyzeAll(text);
+    try sema_support.assertNoDiagnostics(analysis.declareDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.linkDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.signatureDiagnostics());
+    return analysis;
+}
+
+// A shared program: 'Item' satisfies 'Comparable<Item>', 'Plain' satisfies nothing, and 'Duo'
+// carries a conditional method and a conditional static beside unconditional members. Extra
+// members join 'Duo'; extra declarations follow it.
+duoProgram(string extraMembers, string extraDeclarations, string mainBody) -> string {
+    return "public interface Comparable<T> \{\n"
+        + "    compareTo(T other) -> int;\n"
+        + "\}\n"
+        + "public class Item implements Comparable<Item> \{\n"
+        + "    int value;\n"
+        + "\n"
+        + "    public constructor(this.value);\n"
+        + "\n"
+        + "    public override compareTo(Item other) -> int \{\n"
+        + "        return this.value - other.value;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class Plain \{\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "public class Duo<T> \{\n"
+        + "    T first;\n"
+        + "    T second;\n"
+        + "\n"
+        + "    public constructor(this.first, this.second);\n"
+        + "\n"
+        + "    public pair() -> T \{\n"
+        + "        return this.first;\n"
+        + "    \}\n"
+        + "\n"
+        + "    public lower<T: Comparable<T>>() -> T \{\n"
+        + "        if (this.second.compareTo(this.first) < 0) \{\n"
+        + "            return this.second;\n"
+        + "        \}\n"
+        + "        return this.first;\n"
+        + "    \}\n"
+        + "\n"
+        + "    public static pickLower<T: Comparable<T>>(T left, T right) -> T \{\n"
+        + "        if (right.compareTo(left) < 0) \{\n"
+        + "            return right;\n"
+        + "        \}\n"
+        + "        return left;\n"
+        + "    \}\n"
+        + extraMembers
+        + "\}\n"
+        + extraDeclarations
+        + "main() -> int \{\n"
+        + mainBody
+        + "    return 0;\n"
+        + "\}\n";
+}
+
+methodNamed(ClassType owner, string name, bool statics) -> Method throws {
+    let list = owner.methods();
+    if (statics) {
+        list = owner.staticMethods();
+    }
+    for (long i = 0; i < list.length(); i++) {
+        if (list.get(i).name() == name) {
+            return list.get(i);
+        }
+    }
+    throw new TestFailure("no method '{name}' on '{owner.name()}'");
+}
+
+instanceMethodNamed(InstantiationType owner, string name) -> Method throws {
+    let list = owner.methods();
+    for (long i = 0; i < list.length(); i++) {
+        if (list.get(i).name() == name) {
+            return list.get(i);
+        }
+    }
+    throw new TestFailure("no method '{name}' on '{types.display(owner)}'");
+}
+
+instantiationDisplayed(ProgramAnalysis analysis, string displayed) -> InstantiationType throws {
+    for (let instantiation in analysis.store().allInstantiations()) {
+        if (types.display(instantiation) == displayed) {
+            return instantiation;
+        }
+    }
+    throw new TestFailure("no instantiation '{displayed}' was interned");
+}
+
+test "a member's constraints land on the model and decide existence per instantiation" {
+    let analysis = try analyzeClean(duoProgram("", "",
+        "    let items = new Duo<Item>(new Item(2), new Item(1));\n"
+        + "    let winner = items.lower();\n"
+        + "    let lowest = Duo.pickLower(new Item(3), new Item(4));\n"
+        + "    let plains = new Duo<Plain>(new Plain(), new Plain());\n"
+        + "    let still = plains.pair();\n"));
+    try sema_support.assertNoDiagnostics(analysis.layoutDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.checkDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.exceptionDiagnostics());
+    let duo = try sema_support.classNamed(analysis, "main", "Duo");
+    let lower = try methodNamed(duo, "lower", false);
+    try testing.assertTrue(lower.isConditional(), "'lower' must carry its constraint");
+    try testing.assertEqual(lower.constraints().length, 1L);
+    try testing.assertEqual(lower.constraints()[0].parameterIndex(), 0L);
+    try testing.assertEqual(lower.constraints()[0].bounds().length, 1L);
+    let pickLower = try methodNamed(duo, "pickLower", true);
+    try testing.assertTrue(pickLower.isConditional(), "'pickLower' must carry its constraint");
+    let pair = try methodNamed(duo, "pair", false);
+    try testing.assertTrue(!pair.isConditional(), "'pair' must stay unconditional");
+
+    let satisfied = try instantiationDisplayed(analysis, "Duo<Item>");
+    let excluded = try instantiationDisplayed(analysis, "Duo<Plain>");
+    try testing.assertEqual(satisfied.methods().length(), duo.methods().length());
+    try testing.assertEqual(excluded.methods().length(), duo.methods().length());
+    let store = analysis.store();
+    let satisfiedLower = try instanceMethodNamed(satisfied, "lower");
+    let excludedLower = try instanceMethodNamed(excluded, "lower");
+    let excludedPair = try instanceMethodNamed(excluded, "pair");
+    try testing.assertTrue(types.memberExistsOn(store, satisfiedLower),
+        "'lower' must exist on 'Duo<Item>'");
+    try testing.assertTrue(!types.memberExistsOn(store, excludedLower),
+        "'lower' must not exist on 'Duo<Plain>'");
+    try testing.assertTrue(types.memberExistsOn(store, excludedPair),
+        "'pair' must exist on 'Duo<Plain>'");
+}
+
+test "the constraint's extra bound serves the member's own body and nowhere else" {
+    let analysis = analyzeAll(duoProgram(
+        "\n"
+        + "    public peek() -> T \{\n"
+        + "        return this.lower();\n"
+        + "    \}\n", "", ""));
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "'lower' exists on 'Duo<T>' only when 'T' satisfies 'Comparable<T>'; here nothing "
+        + "constrains 'T' to satisfy it. Constrain the enclosing member the same way, as in "
+        + "'<T: Comparable<T>>', or add the bound where 'T' is declared.");
+}
+
+test "calls, constructions, and inferred statics on excluded instantiations name the unmet bound" {
+    let analysis = analyzeAll(duoProgram("",
+        "public class Sorted<T> \{\n"
+        + "    long size;\n"
+        + "\n"
+        + "    public constructor<T: Comparable<T>>() \{\n"
+        + "        this.size = 0;\n"
+        + "    \}\n"
+        + "\n"
+        + "    public constructor(long capacity) \{\n"
+        + "        this.size = capacity;\n"
+        + "    \}\n"
+        + "\}\n",
+        "    let plains = new Duo<Plain>(new Plain(), new Plain());\n"
+        + "    let missing = plains.lower();\n"
+        + "    let inferred = Duo.pickLower(new Plain(), new Plain());\n"
+        + "    let bag = new Sorted<Plain>();\n"));
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "'lower' exists on 'Duo<T>' only when 'T' satisfies 'Comparable<T>'; in 'Duo<Plain>', "
+        + "'T' is 'Plain', which does not implement 'Comparable<Plain>'.");
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "'pickLower' exists on 'Duo<T>' only when 'T' satisfies 'Comparable<T>'; in "
+        + "'Duo<Plain>', 'T' is 'Plain', which does not implement 'Comparable<Plain>'.");
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "This constructor of 'Sorted<T>' exists only when 'T' satisfies 'Comparable<T>'; in "
+        + "'Sorted<Plain>', 'T' is 'Plain', which does not implement 'Comparable<Plain>'.");
+}
+
+test "an obligation inside a conditional member is judged only where the member exists" {
+    let analysis = try analyzeClean(duoProgram(
+        "\n"
+        + "    public tell<T: Comparable<T>>() -> string \{\n"
+        + "        return \"\{this.first\}\";\n"
+        + "    \}\n",
+        "public struct Carrier \{\n"
+        + "    public Item held;\n"
+        + "\}\n",
+        "    Carrier one = \{held: new Item(1)\};\n"
+        + "    Carrier two = \{held: new Item(2)\};\n"
+        + "    let mixed = new Duo<Carrier>(one, two);\n"
+        + "    let still = mixed.pair();\n"
+        + "    let items = new Duo<Item>(new Item(1), new Item(2));\n"
+        + "    let told = items.tell();\n"));
+    try sema_support.assertNoDiagnostics(analysis.layoutDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.checkDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+}

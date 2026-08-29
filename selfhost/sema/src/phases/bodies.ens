@@ -119,6 +119,8 @@ import TypeParamType from model.types;
 import TypeStore from model.types;
 import Field from model.types;
 import Method from model.types;
+import MemberConstraint from model.types;
+import FailedConstraint from model.types;
 import Parameter from model.types;
 import Signature from model.types;
 import Visibility from model.types;
@@ -418,6 +420,7 @@ class BodyChecker implements NoreturnCalls {
     recordObligation(Obligation obligation) {
         let owner = this.obligationOwner;
         if (owner != null) {
+            obligation.setGuards(this.activeGuardsFor(owner));
             this.deferredObligations.recordObligation(owner, this.obligationOwnerName,
                 this.context.module().filePath(), obligation);
         }
@@ -437,8 +440,18 @@ class BodyChecker implements NoreturnCalls {
         let owner = this.obligationOwner;
         if (owner != null) {
             this.deferredObligations.recordOpenCall(owner, this.obligationOwnerName,
-                this.context.module().filePath(), signature, arguments);
+                this.context.module().filePath(), signature, arguments,
+                this.activeGuardsFor(owner));
         }
+    }
+
+    // The active conditional member's constraints, as guards for a deferred judgment, when the
+    // constrained declaration is the obligation's owner itself.
+    activeGuardsFor(GreenNode owner) -> MemberConstraint[] {
+        if (this.resolver.activeConstraintOwner() == owner) {
+            return this.resolver.activeConstraints();
+        }
+        return [];
     }
 
     checkMemberBodies(DeclaredType owner, List<Method> methods, List<Method> staticMethods,
@@ -502,6 +515,13 @@ class BodyChecker implements NoreturnCalls {
             }
         }
         long pushed = this.pushCallableTypeParameters(signature, owner);
+        // Inside a conditional member, the constrained parameters carry the member's extra
+        // bounds: lookups, bound checks, and existence checks all read the scope.
+        bool pushedConstraints = false;
+        if (method != null && method.isConditional() && owner is DeclaredType) {
+            this.resolver.pushMemberConstraints(owner.declaration(), method.constraints());
+            pushedConstraints = true;
+        }
         this.parameterScope = new Scope(null);
         this.scope = this.parameterScope;
         this.narrowing = new NarrowingState();
@@ -572,6 +592,9 @@ class BodyChecker implements NoreturnCalls {
         this.currentReturnType = null;
         this.currentNoreturn = false;
         this.inConstructor = false;
+        if (pushedConstraints) {
+            this.resolver.popMemberConstraints();
+        }
         this.resolver.popTypeParameters(pushed);
         if (ownsObligations) {
             this.leaveObligationOwner();
@@ -623,18 +646,93 @@ class BodyChecker implements NoreturnCalls {
                     continue;
                 }
                 anyConstructor = true;
+                if (!this.resolver.memberExists(candidate)) {
+                    continue;
+                }
                 if (calls.requiredArgumentCount(candidate.signature()) == 0
                         && this.isAccessAllowed(candidate.visibility(),
                             candidate.definingType())) {
                     anyZeroArgument = true;
                 }
             }
-            if (anyConstructor && !anyZeroArgument) {
+            if (!anyConstructor) {
+                return;
+            }
+            // The implicit chain runs one specific constructor, chosen over the declared list
+            // in declaration order; when this receiver's arguments exclude that winner, no
+            // implicit chain can run, whatever else the base declares.
+            let winner = types.implicitConstructorChoice(base);
+            if (winner != null && !this.resolver.memberExists(winner)) {
+                string clause = this.excludedConstructorClause(winner,
+                    "Constrain this constructor the same way");
+                if (clause.length > 0) {
+                    this.reporter.report("Constructor of '{current.name()}' cannot initialize "
+                        + "base class '{types.display(base)}': " + clause,
+                        signature.nameSpan());
+                    return;
+                }
+            }
+            if (!anyZeroArgument) {
                 this.reporter.report("Constructor of '{current.name()}' must call 'super(...)' "
                     + "because base class '{baseAuthority.name()}' has no zero-argument "
                     + "constructor callable from here.", signature.nameSpan());
             }
         }
+    }
+
+    // How an excluded conditional base constructor explains itself: the constraint, then either
+    // the concrete failing argument or the unconstrained parameter with the fix that would
+    // constrain the enclosing declaration the same way.
+    excludedConstructorClause(Method excluded, string constrainAdvice) -> string {
+        let template = types.authorityOf(excluded.definingType());
+        let failed = this.resolver.firstUnmetConstraint(excluded);
+        if (template == null || failed == null) {
+            return "";
+        }
+        string templateShown = "{template.name()}<{typeParameterExample(template)}>";
+        string parameterName = template.typeParameters()[failed.parameterIndex()];
+        string declaredBound = types.display(failed.bound());
+        Type argument = types.typeArgumentsOf(excluded.definingType())[failed.parameterIndex()];
+        string shownArgument = types.display(argument);
+        if (argument is TypeParamType) {
+            return "the constructor of '{templateShown}' exists only when '{parameterName}' "
+                + "satisfies '{declaredBound}', and here nothing constrains '{shownArgument}' "
+                + "to satisfy it. {constrainAdvice}, as in '<{shownArgument}: "
+                + "{types.display(failed.boundHere())}>', or add the bound where "
+                + "'{shownArgument}' is declared.";
+        }
+        string failurePhrase = "which does not implement "
+            + "'{types.display(failed.boundHere())}'";
+        if (!types.isInterfaceLike(failed.bound())) {
+            failurePhrase = "which is not '{types.display(failed.boundHere())}' or a subclass "
+                + "of it";
+        }
+        return "the constructor of '{templateShown}' exists only when '{parameterName}' "
+            + "satisfies '{declaredBound}', and in "
+            + "'{types.display(excluded.definingType())}', '{parameterName}' is "
+            + "'{shownArgument}', {failurePhrase}. Give '{template.name()}' a constructor that "
+            + "exists for every instantiation, or use a type argument that satisfies the "
+            + "bound.";
+    }
+
+    // The implicit chain a class with no constructor of its own runs at construction: the
+    // nearest base with an implicit-constructor choice, exactly as code generation walks it.
+    // When this instantiation excludes that winner, construction cannot run it, whatever else
+    // the base declares, because the choice never consults existence.
+    excludedImplicitBaseConstructor(Type classType) -> Method? {
+        let seen = new Set<Type>();
+        Type? current = types.baseOf(classType);
+        while (current != null && seen.add(current)) {
+            let winner = types.implicitConstructorChoice(current);
+            if (winner != null) {
+                if (this.resolver.memberExists(winner)) {
+                    return null;
+                }
+                return winner;
+            }
+            current = types.baseOf(current);
+        }
+        return null;
     }
 
     // A non-void callable must exit on every path: through its body and through each catch
@@ -3905,7 +4003,15 @@ class BodyChecker implements NoreturnCalls {
             }
         }
         this.result.setType(node.green(), target);
-        let constructors = constructorsOf(target);
+        let allConstructors = constructorsOf(target);
+        let constructors = this.existingOnly(allConstructors);
+        if (constructors.length() < allConstructors.length()
+                && this.reportUnmetConstraintCall(allConstructors, constructors, arguments,
+                    node.span())) {
+            this.analyzeArgumentsOnly(arguments);
+            this.clearNarrowingsForArguments(arguments);
+            return target;
+        }
         if (constructors.length() == 0) {
             this.reporter.report("Struct '{name}' has no constructor to call; build it with an "
                 + "aggregate literal, e.g. '{name} value = \{...\};', or add a "
@@ -3952,12 +4058,12 @@ class BodyChecker implements NoreturnCalls {
     // ---- Member access ----
 
     // The type whose members a receiver exposes: a bounded type parameter exposes the members
-    // of its bounds, the first bound declaring the member winning. Optional receivers are
-    // rejected before this point.
+    // of its bounds, the first bound declaring the member winning; inside a conditional member
+    // the constraint's extra bounds count. Optional receivers are rejected before this point.
     memberReceiverCore(Type analyzed, string memberName) -> Type {
         Type core = analyzed;
         if (core is TypeParamType) {
-            Type[] bounds = core.bounds();
+            Type[] bounds = this.effectiveBoundsOf(core);
             for (let bound in bounds) {
                 if (!(this.lookupMember(bound, memberName) is MissingMember)) {
                     return bound;
@@ -3970,16 +4076,164 @@ class BodyChecker implements NoreturnCalls {
         return core;
     }
 
+    // The parameter's declared bounds plus whatever the active conditional member's constraint
+    // adds to it.
+    effectiveBoundsOf(TypeParamType parameter) -> Type[] {
+        Type[] extra = types.extraBoundsFor(parameter, this.resolver.activeConstraintOwner(),
+            this.resolver.activeConstraints());
+        if (extra.length == 0) {
+            return parameter.bounds();
+        }
+        let combined = new List<Type>();
+        for (let bound in parameter.bounds()) {
+            combined.push(bound);
+        }
+        for (let bound in extra) {
+            combined.push(bound);
+        }
+        return combined.toArray();
+    }
+
     lookupMember(Type record, string name) -> MemberLookup {
         let field = members.findField(types.fieldsOf(record), name);
         if (field != null) {
             return new FieldMember(field);
         }
-        let candidates = methodCandidates(record, name);
+        let candidates = this.availableMethods(record, name);
         if (candidates.length() > 0) {
             return new MethodMember(candidates);
         }
         return new MissingMember();
+    }
+
+    // ---- Conditional members ----
+
+    // The name's method candidates that exist on their defining types, judged under the active
+    // constraint scope; a conditional member excluded here surfaces through the
+    // unmet-constraint reporting instead.
+    availableMethods(Type record, string name) -> List<Method> {
+        return this.existingOnly(methodCandidates(record, name));
+    }
+
+    availableStatics(Type owner, string name) -> List<Method> {
+        return this.existingOnly(staticsNamed(owner, name));
+    }
+
+    existingOnly(List<Method> candidates) -> List<Method> {
+        bool anyConditional = false;
+        for (long i = 0; i < candidates.length(); i++) {
+            if (candidates.get(i).isConditional()) {
+                anyConditional = true;
+            }
+        }
+        if (!anyConditional) {
+            return candidates;
+        }
+        let kept = new List<Method>();
+        for (long i = 0; i < candidates.length(); i++) {
+            if (this.resolver.memberExists(candidates.get(i))) {
+                kept.push(candidates.get(i));
+            }
+        }
+        return kept;
+    }
+
+    // The conditional candidates the receiver's type arguments exclude.
+    missingConditional(List<Method> candidates) -> List<Method> {
+        let missing = new List<Method>();
+        for (long i = 0; i < candidates.length(); i++) {
+            let candidate = candidates.get(i);
+            if (candidate.isConditional() && !this.resolver.memberExists(candidate)) {
+                missing.push(candidate);
+            }
+        }
+        return missing;
+    }
+
+    // Reports why a member access missed when the receiver's type arguments exclude a
+    // conditional member with the name. True when it reported.
+    reportUnmetConstraintMember(Type receiver, string name, Span span) -> bool {
+        return this.reportFirstUnmet(this.missingConditional(methodCandidates(receiver, name)),
+            span);
+    }
+
+    reportFirstUnmet(List<Method> missing, Span span) -> bool {
+        for (long i = 0; i < missing.length(); i++) {
+            let member = missing.get(i);
+            let failed = this.resolver.firstUnmetConstraint(member);
+            if (failed != null) {
+                let template = types.authorityOf(member.definingType());
+                if (template != null) {
+                    this.reporter.report(this.unmetConstraintMessage(member, template,
+                        types.typeArgumentsOf(member.definingType()), failed), span);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // A call that reaches no available overload but fits an excluded conditional one reports
+    // the unmet constraint instead of a mismatched-overload error. True when it reported.
+    reportUnmetConstraintCall(List<Method> allCandidates, List<Method> available,
+                              ArgumentListNode? arguments, Span span) -> bool {
+        long count = 0;
+        if (arguments != null) {
+            if (usesNamedArguments(arguments)) {
+                return false;
+            }
+            count = arguments.argumentsCount();
+        }
+        let missing = this.missingConditional(allCandidates);
+        if (missing.length() == 0) {
+            return false;
+        }
+        if (available.length() == 0) {
+            return this.reportFirstUnmet(missing, span);
+        }
+        for (long i = 0; i < available.length(); i++) {
+            if (fitsArgumentCount(available.get(i).signature(), count)) {
+                return false;
+            }
+        }
+        let fitting = new List<Method>();
+        for (long i = 0; i < missing.length(); i++) {
+            if (fitsArgumentCount(missing.get(i).signature(), count)) {
+                fitting.push(missing.get(i));
+            }
+        }
+        return this.reportFirstUnmet(fitting, span);
+    }
+
+    // "'sort' exists on 'List<T>' only when 'T' satisfies 'Comparable<T>'; in 'List<Widget>',
+    // 'T' is 'Widget', which does not implement 'Comparable<Widget>'."
+    unmetConstraintMessage(Method member, DeclaredType template, Type[] arguments,
+                           FailedConstraint failed) -> string {
+        string templateShown = "{template.name()}<{typeParameterExample(template)}>";
+        string what = "'{member.name()}' exists on '{templateShown}'";
+        if (member.isConstructor()) {
+            what = "This constructor of '{templateShown}' exists";
+        }
+        string parameterName = template.typeParameters()[failed.parameterIndex()];
+        string declaredBound = types.display(failed.bound());
+        Type argument = arguments[failed.parameterIndex()];
+        string shownArgument = types.display(argument);
+        if (argument is TypeParamType) {
+            return "{what} only when '{parameterName}' satisfies '{declaredBound}'; here "
+                + "nothing constrains '{shownArgument}' to satisfy it. Constrain the enclosing "
+                + "member the same way, as in '<{shownArgument}: "
+                + "{types.display(failed.boundHere())}>', or add the bound where "
+                + "'{shownArgument}' is declared.";
+        }
+        string ownerShown = "{template.name()}<{typeArgumentsText(arguments)}>";
+        string failurePhrase = "which does not implement "
+            + "'{types.display(failed.boundHere())}'";
+        if (!types.isInterfaceLike(failed.bound())) {
+            failurePhrase = "which is not '{types.display(failed.boundHere())}' or a subclass "
+                + "of it";
+        }
+        return "{what} only when '{parameterName}' satisfies '{declaredBound}'; in "
+            + "'{ownerShown}', '{parameterName}' is '{shownArgument}', {failurePhrase}.";
     }
 
     // Export members are visible everywhere and public ones package-wide; private members are
@@ -4163,6 +4417,9 @@ class BodyChecker implements NoreturnCalls {
                 if (this.reportStaticThroughInstance(core, name, node.member().span())) {
                     return this.store.errorType();
                 }
+                if (this.reportUnmetConstraintMember(core, name, node.member().span())) {
+                    return this.store.errorType();
+                }
                 this.reporter.report("No field or method '{name}' on type "
                     + "'{types.display(core)}'", node.member().span());
                 return this.store.errorType();
@@ -4237,6 +4494,9 @@ class BodyChecker implements NoreturnCalls {
             },
             is MissingMember ignored -> {
                 if (this.reportStaticThroughInstance(inner, name, node.member().span())) {
+                    return this.store.errorType();
+                }
+                if (this.reportUnmetConstraintMember(inner, name, node.member().span())) {
                     return this.store.errorType();
                 }
                 this.reporter.report("No field or method named '{name}' on "
@@ -4394,7 +4654,7 @@ class BodyChecker implements NoreturnCalls {
             this.result.setStaticConstField(node.green(), field);
             return field.type();
         }
-        if (staticsNamed(head, name).length() > 0) {
+        if (this.availableStatics(head, name).length() > 0) {
             this.reporter.report("Static method '{name}' of '{owner.name()}' must be called; "
                 + "write '{owner.name()}.{name}(...)'.", node.member().span());
             return this.store.errorType();
@@ -4440,6 +4700,9 @@ class BodyChecker implements NoreturnCalls {
                 return;
             }
             current = types.baseOf(current);
+        }
+        if (this.reportFirstUnmet(this.missingConditional(staticsNamed(head, name)), at)) {
+            return;
         }
         this.reporter.report("Type '{owner.name()}' has no static member '{name}'.", at);
     }
@@ -4493,7 +4756,14 @@ class BodyChecker implements NoreturnCalls {
         if (head is DeclaredType && head.isGeneric()) {
             return this.analyzeInferredStaticCall(node, member, head, name, expected);
         }
-        let candidates = staticsNamed(head, name);
+        let allCandidates = staticsNamed(head, name);
+        let candidates = this.existingOnly(allCandidates);
+        if (candidates.length() < allCandidates.length()
+                && this.reportUnmetConstraintCall(allCandidates, candidates, arguments,
+                    node.span())) {
+            this.analyzeArgumentsOnly(arguments);
+            return this.store.errorType();
+        }
         if (candidates.length() == 0) {
             this.reportMissingStatic(head, owner, name, member.member().span());
             this.analyzeArgumentsOnly(arguments);
@@ -4627,6 +4897,10 @@ class BodyChecker implements NoreturnCalls {
                     satisfied = false;
                 }
             }
+            if (satisfied && this.unmetStaticConstraint(
+                    templateStatics.get(completedIndexes.get(c)), template, vector) != null) {
+                satisfied = false;
+            }
             if (satisfied) {
                 boundedIndexes.push(completedIndexes.get(c));
                 boundedArguments.push(vector);
@@ -4635,8 +4909,20 @@ class BodyChecker implements NoreturnCalls {
         }
         if (boundedIndexes.length() == 0) {
             Type[] vector = completedArguments.get(0);
+            bool declaredHold = true;
             for (long k = 0; k < arity; k++) {
-                this.resolver.checkArgumentBounds(vector[k], typeParameters[k], node.span());
+                if (!this.resolver.checkArgumentBounds(vector[k], typeParameters[k],
+                        node.span())) {
+                    declaredHold = false;
+                }
+            }
+            if (declaredHold) {
+                let candidate = templateStatics.get(completedIndexes.get(0));
+                let failed = this.unmetStaticConstraint(candidate, template, vector);
+                if (failed != null) {
+                    this.reporter.report(this.unmetConstraintMessage(candidate, template,
+                        vector, failed), node.span());
+                }
             }
             return this.store.errorType();
         }
@@ -4647,6 +4933,18 @@ class BodyChecker implements NoreturnCalls {
         }
         return this.selectInferredStaticCall(node, member, template, name, boundedIndexes,
             boundedArguments, argumentTypes);
+    }
+
+    // The first constraint a conditional static fails at this inferred type-argument vector, or
+    // null for an unconditional or satisfied candidate; the candidate is only a candidate where
+    // it exists.
+    unmetStaticConstraint(Method candidate, DeclaredType template, Type[] vector)
+            -> FailedConstraint? {
+        if (!candidate.isConditional()) {
+            return null;
+        }
+        return types.firstFailedConstraint(this.store, candidate, template, vector,
+            this.resolver.activeConstraintOwner(), this.resolver.activeConstraints());
     }
 
     // Per-candidate type-argument determination: the arguments fill what they can, the expected
@@ -4739,6 +5037,7 @@ class BodyChecker implements NoreturnCalls {
                             List<Type> argumentTypes, Method templateCandidate,
                             GreenNode owner, long[] inferenceSources) -> Type {
         let instantiation = this.store.instantiationOf(template, typeArguments);
+        this.resolver.recordInstantiationMention(instantiation);
         let resolved = this.staticAtIndex(instantiation, staticIndex);
         if (resolved == null) {
             return this.store.errorType();
@@ -4824,6 +5123,7 @@ class BodyChecker implements NoreturnCalls {
         let resolvedOwners = new List<Type>();
         for (long c = 0; c < staticIndexes.length(); c++) {
             let instantiation = this.store.instantiationOf(template, vectors.get(c));
+            this.resolver.recordInstantiationMention(instantiation);
             let resolved = this.staticAtIndex(instantiation, staticIndexes.get(c));
             if (resolved == null) {
                 continue;
@@ -5272,8 +5572,15 @@ class BodyChecker implements NoreturnCalls {
             }
             receiverCore = this.memberReceiverCore(receiverType, name);
         }
-        let candidates = methodCandidates(receiverCore, name);
+        let allCandidates = methodCandidates(receiverCore, name);
+        let candidates = this.existingOnly(allCandidates);
         let arguments = node.arguments();
+        if (candidates.length() < allCandidates.length()
+                && this.reportUnmetConstraintCall(allCandidates, candidates, arguments,
+                    node.span())) {
+            this.analyzeArgumentsOnly(arguments);
+            return this.store.errorType();
+        }
         if (candidates.length() > 1 || usesNamedArguments(arguments)) {
             let built = this.buildCallShape(arguments);
             let callCandidates = new List<CallCandidate>();
@@ -5451,8 +5758,15 @@ class BodyChecker implements NoreturnCalls {
         if (baseAuthority != null) {
             baseName = baseAuthority.name();
         }
-        let constructors = constructorsOf(base);
+        let allConstructors = constructorsOf(base);
+        let constructors = this.existingOnly(allConstructors);
         let arguments = node.arguments();
+        if (constructors.length() < allConstructors.length()
+                && this.reportUnmetConstraintCall(allConstructors, constructors, arguments,
+                    node.span())) {
+            this.analyzeArgumentsOnly(arguments);
+            return voidType;
+        }
         if (constructors.length() == 0) {
             if (arguments.argumentsCount() > 0) {
                 this.reporter.report("Base class '{baseName}' has no constructor, so "
@@ -5583,7 +5897,7 @@ class BodyChecker implements NoreturnCalls {
             // A class or interface value whose chain declares no toString answers with its
             // runtime type's text form; a chain that declares one falls through to normal
             // resolution.
-            if (types.isClassLike(core) && methodCandidates(core, "toString").length() == 0) {
+            if (types.isClassLike(core) && this.availableMethods(core, "toString").length() == 0) {
                 this.checkNoArguments(node, "toString");
                 return this.store.stringType();
             }
@@ -5591,7 +5905,7 @@ class BodyChecker implements NoreturnCalls {
             // hole; a bound that declares toString resolves the call against the contract.
             if (core is TypeParamType) {
                 bool declaresToString = false;
-                for (let bound in core.bounds()) {
+                for (let bound in this.effectiveBoundsOf(core)) {
                     if (methodCandidates(bound, "toString").length() > 0) {
                         declaresToString = true;
                     }
@@ -5665,13 +5979,13 @@ class BodyChecker implements NoreturnCalls {
         }
         bool declaresHash = false;
         if (core is TypeParamType) {
-            for (let bound in core.bounds()) {
+            for (let bound in this.effectiveBoundsOf(core)) {
                 if (methodCandidates(bound, "hash").length() > 0) {
                     declaresHash = true;
                 }
             }
         } else if (isRecordLike(core)) {
-            declaresHash = methodCandidates(core, "hash").length() > 0;
+            declaresHash = this.availableMethods(core, "hash").length() > 0;
         }
         if (declaresHash) {
             return null;
@@ -6011,7 +6325,35 @@ class BodyChecker implements NoreturnCalls {
             this.reporter.report("Cannot create an instance of abstract class '{shownName}'; "
                 + "instantiate a concrete subclass instead", node.span());
         }
-        let constructors = constructorsOf(t);
+        let allConstructors = constructorsOf(t);
+        let constructors = this.existingOnly(allConstructors);
+        if (constructors.length() < allConstructors.length()
+                && this.reportUnmetConstraintCall(allConstructors, constructors, arguments,
+                    node.span())) {
+            if (arguments != null) {
+                this.analyzeArgumentsOnly(arguments);
+            }
+            this.clearNarrowingsForArguments(arguments);
+            return t;
+        }
+        if (allConstructors.length() == 0) {
+            let blocked = this.excludedImplicitBaseConstructor(t);
+            if (blocked != null) {
+                string clause = this.excludedConstructorClause(blocked,
+                    "Constrain the enclosing member the same way");
+                if (clause.length > 0) {
+                    this.reporter.report("Cannot construct '{shownName}': it declares no "
+                        + "constructor of its own, so it needs the zero-argument constructor "
+                        + "of its base class '{types.display(blocked.definingType())}', but "
+                        + clause, node.span());
+                    if (arguments != null) {
+                        this.analyzeArgumentsOnly(arguments);
+                    }
+                    this.clearNarrowingsForArguments(arguments);
+                    return t;
+                }
+            }
+        }
         long argumentCount = 0;
         if (arguments != null) {
             argumentCount = arguments.argumentsCount();
@@ -6749,6 +7091,24 @@ methodCandidates(Type record, string name) -> List<Method> {
         current = types.baseOf(current);
     }
     return found;
+}
+
+// True when a call with this many positional arguments could reach the signature.
+fitsArgumentCount(Signature signature, long count) -> bool {
+    return count >= calls.requiredArgumentCount(signature)
+        && count <= signature.parameters().length;
+}
+
+// "int, string", the way a type-argument vector reads inside angle brackets.
+typeArgumentsText(Type[] arguments) -> string {
+    string text = "";
+    for (long i = 0; i < arguments.length; i++) {
+        if (i > 0) {
+            text = text + ", ";
+        }
+        text = text + types.display(arguments[i]);
+    }
+    return text;
 }
 
 // The type-argument list an example spelling shows: the declaration's own parameter names, so

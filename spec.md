@@ -294,7 +294,8 @@ Speaker? quiet = null;     // nullable interface reference
 
 ---
 
-Classes, structs, functions, and methods may be generic: they declare type parameters in angle brackets and work uniformly over any type argument. A type parameter can be used as a field type, a parameter or return type, a local type, and as the element type of an array.
+Classes, structs, and functions may be generic: they declare type parameters in angle brackets and work uniformly over any type argument. A type parameter can be used as a field type, a parameter or return type, a local type, and as the element type of an array.
+A method does not declare type parameters of its own; a type-parameter list on a member constrains the enclosing type's parameters instead, as described under conditional members below.
 
 ```ens
 class List<T> {
@@ -363,6 +364,35 @@ class Constant<T> extends Source<T> {
 Source<int> source = new Constant<int>(5);
 source.read();
 ```
+
+A member of a generic class or struct, whether a method, a static, or a constructor, may constrain the enclosing type's parameters by restating them in its own type-parameter list with a bound.
+Such a member is conditional: it exists only on the instantiations whose type arguments satisfy the constraint, and it costs nothing anywhere else.
+A name in the list must match one of the enclosing type's parameters and must carry a bound.
+Restating a parameter without a bound is an error, which is what makes a rename of the type's parameter detectable, and a name that matches no parameter is an error too, because a member cannot introduce type parameters of its own.
+The constraint's bounds follow the same rules as declared bounds, and a bound may name the constrained parameter itself, as `Comparable<T>` does below.
+
+```ens
+interface Comparable<T> {
+    compareTo(T other) -> int;
+}
+
+class List<T> {
+    push(T value) { /* exists on every List<T> */ }
+
+    // exists only on instantiations whose T implements Comparable<T>
+    sort<T: Comparable<T>>() {
+        // inside the body, T carries the extra bound, so T values have compareTo
+    }
+}
+```
+
+Calling a conditional member, or constructing through a conditional constructor, on an instantiation that does not satisfy the constraint is an error naming the member, the parameter, the unmet bound, and the failing type argument.
+Overload resolution never sees a conditional member where its constraint fails; where it holds, the member participates like any other, so a conditional constructor can sit beside an unconditional overload and each instantiation gets the constructors that exist for it.
+Inside the member's body the constrained parameter carries the extra bound, which also lets the body reach other members conditional on the same bound.
+
+A conditional member may not be `override` or `abstract`, may not be overridden or hidden by a subclass, and cannot satisfy an interface requirement, because all of those promise a member that exists on every instantiation.
+An interface method cannot have a type-parameter list for the same reason, and a destructor cannot have one because it takes no parameters of any kind.
+A constraint cannot relate two different parameters, so a bound like `K: Comparable<V>` is not expressible.
 
 ---
 

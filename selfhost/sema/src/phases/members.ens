@@ -17,6 +17,7 @@ import Field from model.types;
 import Parameter from model.types;
 import Signature from model.types;
 import Method from model.types;
+import MemberConstraint from model.types;
 import DeclaredType from model.types;
 import StructType from model.types;
 import ClassType from model.types;
@@ -515,8 +516,16 @@ public checkStaticInstanceCollision(Reporter reporter, DeclaredType owner, strin
 public collectStaticMethod(TypeResolver resolver, Reporter reporter, DeclaredType owner,
                            List<Method> staticMethods, FunctionDeclarationNode member,
                            string methodName, Span nameSpan, MemberModifiers modifiers) {
+    MemberConstraint[] constraints = readMemberConstraints(resolver, reporter, owner, member,
+        "Static method '{methodName}' of '{owner.name()}'");
+    if (constraints.length > 0) {
+        resolver.pushMemberConstraints(owner.declaration(), constraints);
+    }
     let signature = buildSignature(resolver, reporter, member, methodName, nameSpan, false,
         false, false, modifiers.declaresNoreturn, null, owner.name(), []);
+    if (constraints.length > 0) {
+        resolver.popMemberConstraints();
+    }
     Visibility visibility = memberVisibility(modifiers, Visibility.Private, owner, "Method",
         methodName, reporter);
     checkStaticMethodMarkers(reporter, modifiers, methodName, false, false, nameSpan);
@@ -531,7 +540,7 @@ public collectStaticMethod(TypeResolver resolver, Reporter reporter, DeclaredTyp
         return;
     }
     staticMethods.push(new Method(signature, visibility, false, false, false, false, false,
-        true, member.body() != null, owner));
+        true, member.body() != null, constraints, owner));
 }
 
 // A static method may not share its name with a static const of the same type; the two sides of
@@ -542,6 +551,117 @@ public checkStaticFieldMethodCollision(Reporter reporter, DeclaredType owner, st
     if (collided != null) {
         reporter.report("'{methodName}' is already declared as a static const of "
             + "'{owner.name()}'; a field and a method cannot share a name.", span);
+    }
+}
+
+// Reads a member's type-parameter list as constraints on the enclosing type's parameters: a name
+// matching an enclosing parameter must carry a bound and constrains it, a name matching none is
+// rejected because a member cannot introduce type parameters of its own, and a list on a
+// non-generic type is rejected whole. The bounds resolve under the shared bound rules.
+public readMemberConstraints(TypeResolver resolver, Reporter reporter, DeclaredType owner,
+                             FunctionDeclarationNode member, string memberSubject)
+        -> MemberConstraint[] {
+    let list = member.typeParameters();
+    if (list == null) {
+        return [];
+    }
+    string[] parameterNames = owner.typeParameters();
+    if (parameterNames.length == 0) {
+        reporter.report("{memberSubject} cannot have a type-parameter list: a member's "
+            + "type-parameter list restates the enclosing type's parameters to constrain them, "
+            + "and '{owner.name()}' has none. Remove the '<...>' list.", list.span());
+        return [];
+    }
+    let constraints = new List<MemberConstraint>();
+    for (long i = 0; i < list.parametersCount(); i++) {
+        let declaration = list.parameters(i);
+        string name = declaration.name().text();
+        if (name.length == 0) {
+            continue;
+        }
+        long index = parameterIndexNamed(parameterNames, name);
+        if (index < 0) {
+            reporter.report("'{name}' does not name a type parameter of '{owner.name()}'; a "
+                + "member's type-parameter list restates the enclosing type's parameters "
+                + "({quotedNameList(parameterNames)}) to constrain them, and a member cannot "
+                + "introduce type parameters of its own.", declaration.name().span());
+            continue;
+        }
+        bool repeated = false;
+        for (long c = 0; c < constraints.length(); c++) {
+            if (constraints.get(c).parameterIndex() == index) {
+                repeated = true;
+                break;
+            }
+        }
+        if (repeated) {
+            reporter.report("Type parameter '{name}' is already constrained in this list; "
+                + "write one entry per parameter and join its bounds with '+'.",
+                declaration.name().span());
+            continue;
+        }
+        let boundsClause = declaration.bounds();
+        if (boundsClause == null) {
+            reporter.report("'{name}' restates type parameter '{name}' of '{owner.name()}' but "
+                + "adds no bound. A member's type-parameter list exists to constrain the "
+                + "enclosing type's parameters, so write the bound this member needs, as in "
+                + "'<{name}: Comparable<{name}>>'.", declaration.name().span());
+            continue;
+        }
+        Type[] bounds = resolver.resolveBoundList(name, boundsClause);
+        if (bounds.length > 0) {
+            constraints.push(new MemberConstraint(index, bounds));
+        }
+    }
+    return constraints.toArray();
+}
+
+parameterIndexNamed(string[] names, string name) -> long {
+    for (long i = 0; i < names.length; i++) {
+        if (names[i] == name) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// "'T'" or "'K' and 'V'", the way a list of parameter names reads in a diagnostic.
+quotedNameList(string[] names) -> string {
+    string text = "";
+    for (long i = 0; i < names.length; i++) {
+        if (i > 0) {
+            if (i + 1 == names.length) {
+                text = text + " and ";
+            } else {
+                text = text + ", ";
+            }
+        }
+        text = text + "'{names[i]}'";
+    }
+    return text;
+}
+
+// A conditional member exists only where its constraints hold, so it can neither replace a
+// member that exists everywhere nor leave a hole for a subclass to fill: 'override' and
+// 'abstract' are both rejected. Constructors and statics reject those markers on their own, so
+// this covers instance methods.
+public checkConditionalMarkers(Reporter reporter, MemberConstraint[] constraints,
+                               MemberModifiers modifiers, string memberName, DeclaredType owner,
+                               Span nameSpan) {
+    if (constraints.length == 0) {
+        return;
+    }
+    if (modifiers.declaresOverride) {
+        reporter.report("Method '{memberName}' of '{owner.name()}' cannot be both conditional "
+            + "and 'override': a member that exists only for some instantiations cannot "
+            + "replace one that exists for all of them. Remove 'override', or remove the "
+            + "'<...>' constraint list.", nameSpan);
+    }
+    if (modifiers.declaresAbstract) {
+        reporter.report("Method '{memberName}' of '{owner.name()}' cannot be both conditional "
+            + "and 'abstract': a conditional member cannot be overridden, so no subclass could "
+            + "supply its body. Remove 'abstract', or remove the '<...>' constraint list.",
+            nameSpan);
     }
 }
 

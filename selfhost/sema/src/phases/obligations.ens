@@ -25,22 +25,34 @@ import StringType from model.types;
 import PrimitiveType from model.types;
 import PrimitiveKind from model.types;
 import Field from model.types;
+import MemberConstraint from model.types;
 import List from @std.collections.list;
 import Map from @std.collections.map;
 import Set from @std.collections.set;
 import StringBuilder from @std.text.stringbuilder;
 
 // One deferred judgment: where it sits in its template's file, and the open types to re-judge
-// once concrete type arguments arrive.
+// once concrete type arguments arrive. One recorded inside a conditional member carries that
+// member's constraints as guards, so it is only judged for instantiations the member exists on.
 public sealed abstract class Obligation {
     Span obligationSpan;
+    MemberConstraint[] obligationGuards;
 
     protected constructor(Span span) {
         this.obligationSpan = span;
+        this.obligationGuards = [];
     }
 
     protected span() -> Span {
         return this.obligationSpan;
+    }
+
+    public setGuards(MemberConstraint[] guards) {
+        this.obligationGuards = guards;
+    }
+
+    protected guards() -> MemberConstraint[] {
+        return this.obligationGuards;
     }
 }
 
@@ -95,13 +107,42 @@ public class EqualityObligation extends Obligation {
     }
 }
 
+// One generic instantiation a declaration mentions, as written or inferred, plus the constraint
+// scope active when it was resolved. A concrete mention seeds its template's obligations
+// directly; an open one, its arguments still naming the enclosing owner's parameters, replays
+// per owner assignment, and one recorded inside a conditional member replays only for
+// assignments that satisfy the member's constraints. The resolvers record these; the pass reads
+// them, and nothing else decides which instantiations are judged, so an instantiation whose only
+// provenance is an excluded member's substituted signature is never judged at all.
+public final class InstantiationMention {
+    InstantiationType mentionedInstantiation;
+    GreenNode? mentionGuardOwner;
+    MemberConstraint[] mentionGuards;
+
+    public constructor(this.mentionedInstantiation, this.mentionGuardOwner, this.mentionGuards);
+
+    public instantiation() -> InstantiationType {
+        return this.mentionedInstantiation;
+    }
+
+    public guardOwner() -> GreenNode? {
+        return this.mentionGuardOwner;
+    }
+
+    public guards() -> MemberConstraint[] {
+        return this.mentionGuards;
+    }
+}
+
 // A generic call whose type arguments still mention a type parameter of the enclosing owner;
-// it names a concrete callee instantiation only once the owner's own arguments arrive.
+// it names a concrete callee instantiation only once the owner's own arguments arrive. A call
+// written inside a conditional member carries the member's constraints as guards.
 class OpenCall {
     protected Signature callee;
     protected Type[] arguments;
+    protected MemberConstraint[] guards;
 
-    protected constructor(this.callee, this.arguments);
+    protected constructor(this.callee, this.arguments, this.guards);
 }
 
 class ConcreteCall {
@@ -158,9 +199,9 @@ public final class ObligationRegistry {
     }
 
     public recordOpenCall(GreenNode owner, string name, string filePath, Signature callee,
-                   Type[] arguments) {
+                   Type[] arguments, MemberConstraint[] guards) {
         this.entryFor(owner, name, filePath).openCalls().push(
-            new OpenCall(callee, arguments));
+            new OpenCall(callee, arguments, guards));
     }
 
     public recordConcreteCall(Signature callee, Type[] arguments) {
@@ -192,9 +233,11 @@ public final class ObligationRegistry {
 
 // Runs every recorded obligation against every concrete type-argument assignment its owner
 // receives, and returns the diagnostics, each anchored in the owner's file and naming the
-// instantiation it was judged for.
-public check(TypeStore store, ObligationRegistry registry) -> FileDiagnostic[] {
-    let pass = new ObligationPass(store, registry);
+// instantiation it was judged for. The mentions carry every instantiation the program's
+// declarations reference, with the constraint scope each was resolved under.
+public check(TypeStore store, ObligationRegistry registry, List<InstantiationMention> mentions)
+        -> FileDiagnostic[] {
+    let pass = new ObligationPass(store, registry, mentions);
     return pass.run();
 }
 
@@ -245,35 +288,43 @@ class AssignmentKey {
 class ObligationPass {
     TypeStore store;
     ObligationRegistry registry;
+    List<InstantiationMention> mentions;
     List<FileDiagnostic> collected;
     Set<AssignmentKey> seen;
     List<Assignment> worklist;
-    Map<GreenNode, List<InstantiationType>> openInstantiationsByOwner;
+    Map<GreenNode, List<InstantiationMention>> openMentionsByOwner;
     Set<GreenNode> productive;
 
-    protected constructor(TypeStore store, ObligationRegistry registry) {
+    protected constructor(TypeStore store, ObligationRegistry registry,
+                List<InstantiationMention> mentions) {
         this.store = store;
         this.registry = registry;
+        this.mentions = mentions;
         this.collected = new List<FileDiagnostic>();
         this.seen = new Set<AssignmentKey>();
         this.worklist = new List<Assignment>();
-        this.openInstantiationsByOwner = new Map<GreenNode, List<InstantiationType>>();
+        this.openMentionsByOwner = new Map<GreenNode, List<InstantiationMention>>();
         this.productive = new Set<GreenNode>();
     }
 
+    // A concrete mention seeds its template's assignment directly; an open one becomes an edge
+    // per owner its arguments name, replayed under its guards. Fill-derived instantiations are
+    // reached transitively - the mention of the owner that fills them plus the filled template's
+    // own mentions - so the store's instantiation list is never consulted: it also holds the
+    // substituted signatures of excluded conditional members, which must not be judged.
     protected run() -> FileDiagnostic[] {
         let concreteInstantiations = new List<InstantiationType>();
-        for (let instantiation in this.store.allInstantiations()) {
+        for (long i = 0; i < this.mentions.length(); i++) {
+            let mention = this.mentions.get(i);
             let owners = new Set<GreenNode>();
-            for (let argument in instantiation.arguments()) {
+            for (let argument in mention.instantiation().arguments()) {
                 collectOwners(argument, owners);
             }
             if (owners.length() == 0) {
-                concreteInstantiations.push(instantiation);
-            } else {
-                for (let owner in owners.items()) {
-                    this.openInstantiationsFor(owner).push(instantiation);
-                }
+                concreteInstantiations.push(mention.instantiation());
+            }
+            for (let owner in owners.items()) {
+                this.openMentionsFor(owner).push(mention);
             }
         }
         this.computeProductive();
@@ -294,13 +345,13 @@ class ObligationPass {
         return diagnostics.sorted(this.collected);
     }
 
-    openInstantiationsFor(GreenNode owner) -> List<InstantiationType> {
-        let existing = this.openInstantiationsByOwner.get(owner);
+    openMentionsFor(GreenNode owner) -> List<InstantiationMention> {
+        let existing = this.openMentionsByOwner.get(owner);
         if (existing != null) {
             return existing;
         }
-        let created = new List<InstantiationType>();
-        this.openInstantiationsByOwner.set(owner, created);
+        let created = new List<InstantiationMention>();
+        this.openMentionsByOwner.set(owner, created);
         return created;
     }
 
@@ -323,7 +374,7 @@ class ObligationPass {
                     progress = true;
                 }
             }
-            for (let owner in this.openInstantiationsByOwner.keys()) {
+            for (let owner in this.openMentionsByOwner.keys()) {
                 if (!this.productive.contains(owner) && this.reachesProductive(owner)) {
                     this.productive.add(owner);
                     progress = true;
@@ -342,10 +393,10 @@ class ObligationPass {
                 }
             }
         }
-        let openInstantiations = this.openInstantiationsByOwner.get(owner);
-        if (openInstantiations != null) {
-            for (long i = 0; i < openInstantiations.length(); i++) {
-                let declaration = openInstantiations.get(i).template().declaration();
+        let openMentions = this.openMentionsByOwner.get(owner);
+        if (openMentions != null) {
+            for (long i = 0; i < openMentions.length(); i++) {
+                let declaration = openMentions.get(i).instantiation().template().declaration();
                 if (this.productive.contains(declaration)) {
                     return true;
                 }
@@ -383,6 +434,9 @@ class ObligationPass {
                 if (declaration == null || !this.productive.contains(declaration)) {
                     continue;
                 }
+                if (!this.guardsHold(call.guards, assignment)) {
+                    continue;
+                }
                 let substituted = this.substituteAll(call.arguments, assignment);
                 if (substituted != null) {
                     this.push(declaration, call.callee.name(), substituted,
@@ -390,12 +444,16 @@ class ObligationPass {
                 }
             }
         }
-        let openInstantiations = this.openInstantiationsByOwner.get(assignment.owner);
-        if (openInstantiations != null) {
-            for (long i = 0; i < openInstantiations.length(); i++) {
-                let instantiation = openInstantiations.get(i);
+        let openMentions = this.openMentionsByOwner.get(assignment.owner);
+        if (openMentions != null) {
+            for (long i = 0; i < openMentions.length(); i++) {
+                let mention = openMentions.get(i);
+                let instantiation = mention.instantiation();
                 let declaration = instantiation.template().declaration();
                 if (!this.productive.contains(declaration)) {
+                    continue;
+                }
+                if (!this.mentionGuardsHold(mention, assignment)) {
                     continue;
                 }
                 let substituted = this.substituteAll(instantiation.arguments(), assignment);
@@ -405,6 +463,17 @@ class ObligationPass {
                 }
             }
         }
+    }
+
+    // A guarded mention replays only where the conditional member that wrote it exists; the
+    // guards speak about the guard owner's parameters, so they only apply to that owner's own
+    // assignments.
+    mentionGuardsHold(InstantiationMention mention, Assignment assignment) -> bool {
+        let owner = mention.guardOwner();
+        if (owner == null || owner != assignment.owner) {
+            return true;
+        }
+        return this.guardsHold(mention.guards(), assignment);
     }
 
     // The arguments with the assignment's substitution applied, or null when one still
@@ -422,7 +491,30 @@ class ObligationPass {
         return substituted.toArray();
     }
 
+    // True when the assignment satisfies every guard, meaning the conditional member the
+    // obligation was recorded in exists for it; an unguarded obligation always holds.
+    guardsHold(MemberConstraint[] guards, Assignment assignment) -> bool {
+        for (let guard in guards) {
+            long index = guard.parameterIndex();
+            if (index >= assignment.arguments.length) {
+                continue;
+            }
+            Type argument = assignment.arguments[index];
+            for (let bound in guard.bounds()) {
+                Type here = this.store.substitute(bound, assignment.owner,
+                    assignment.arguments);
+                if (!types.satisfiesBound(argument, here, [])) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
     judge(OwnerEntry entry, Assignment assignment, Obligation obligation) {
+        if (!this.guardsHold(obligation.guards(), assignment)) {
+            return;
+        }
         switch (obligation) {
             is InterpolationObligation hole -> {
                 let concrete = this.substituteOne(hole.hole(), assignment);

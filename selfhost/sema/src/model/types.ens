@@ -413,10 +413,31 @@ export class Field {
     }
 }
 
+// One constraint a conditional member places on an enclosing type parameter: which parameter it
+// restates, by index, and the extra bounds the member requires of it. The bounds stay written in
+// the template's own terms; judging them for an instantiation substitutes its arguments in.
+export class MemberConstraint {
+    long constrainedIndex;
+    Type[] requiredBounds;
+
+    public constructor(this.constrainedIndex, this.requiredBounds);
+
+    export parameterIndex() -> long {
+        return this.constrainedIndex;
+    }
+
+    export bounds() -> Type[] {
+        return this.requiredBounds;
+    }
+}
+
 // One method of a struct, class, or interface. Constructors are stored under the name
 // 'constructor' and destructors under 'destructor', so overload checks treat them uniformly.
 // A static method belongs to the type itself: it takes no receiver, never dispatches, and is
 // stored in the owner's staticMethods list rather than among the instance methods.
+// A conditional member carries constraints on the enclosing type's parameters and exists only
+// on instantiations that satisfy them; every list keeps such members in place, parallel to the
+// template's, and consumers ask memberExistsOn before treating one as present.
 export class Method {
     Signature methodSignature;
     Visibility methodVisibility;
@@ -427,11 +448,12 @@ export class Method {
     bool abstractMarked;
     bool staticMarked;
     bool bodied;
+    MemberConstraint[] methodConstraints;
     Type definingDeclaration;
 
     public constructor(Signature signature, Visibility visibility, bool isConstructor, bool isDestructor,
                 bool isOverride, bool isFinal, bool isAbstract, bool isStatic, bool hasBody,
-                Type definingType) {
+                MemberConstraint[] constraints, Type definingType) {
         this.methodSignature = signature;
         this.methodVisibility = visibility;
         this.constructorMethod = isConstructor;
@@ -441,6 +463,7 @@ export class Method {
         this.abstractMarked = isAbstract;
         this.staticMarked = isStatic;
         this.bodied = hasBody;
+        this.methodConstraints = constraints;
         this.definingDeclaration = definingType;
     }
 
@@ -486,6 +509,14 @@ export class Method {
 
     protected hasBody() -> bool {
         return this.bodied;
+    }
+
+    export constraints() -> MemberConstraint[] {
+        return this.methodConstraints;
+    }
+
+    export isConditional() -> bool {
+        return this.methodConstraints.length > 0;
     }
 
     export definingType() -> Type {
@@ -1292,7 +1323,7 @@ export class TypeStore {
             filled.push(new Method(signature, method.visibility(),
                 method.isConstructor(), method.isDestructor(), method.isOverride(),
                 method.isFinal(), method.isAbstract(), method.isStatic(), method.hasBody(),
-                instantiation));
+                method.constraints(), instantiation));
         }
     }
 
@@ -1644,6 +1675,45 @@ export methodsOf(Type type) -> List<Method>? {
     }
 }
 
+// The number of leading parameters without defaults: the least a call must supply.
+export requiredParameterCount(Signature signature) -> long {
+    Parameter[] parameters = signature.parameters();
+    long required = 0;
+    for (long i = 0; i < parameters.length; i++) {
+        if (parameters[i].hasDefault()) {
+            break;
+        }
+        required++;
+    }
+    return required;
+}
+
+// The constructor an implicit zero-argument construction binds on one type, or null when it
+// declares none that takes no arguments: the first zero-parameter constructor in declaration
+// order, else the first whose parameters all take defaults. The one home for the choice: code
+// generation runs the winner, and sema asks whether that same winner exists on the
+// instantiation, so the two can never latch onto different constructors.
+export implicitConstructorChoice(Type classType) -> Method? {
+    Method? fallback = null;
+    let methods = methodsOf(classType);
+    if (methods == null) {
+        return null;
+    }
+    for (long i = 0; i < methods.length(); i++) {
+        let method = methods.get(i);
+        if (!method.isConstructor()) {
+            continue;
+        }
+        if (method.signature().parameters().length == 0) {
+            return method;
+        }
+        if (fallback == null && requiredParameterCount(method.signature()) == 0) {
+            fallback = method;
+        }
+    }
+    return fallback;
+}
+
 // A struct's own 'toString', or null when it declares none. Both an explicit '.toString()' and an
 // interpolation hole ask this one question to decide whether a struct has a text form of its own
 // instead of its JSON form. Its declaration is held to 'toString() -> string' without 'throws', so
@@ -1782,6 +1852,166 @@ export isSubclassOrConforms(Type source, Type target) -> bool {
         return conformsTo(source, target);
     }
     return isSubclassOf(source, target);
+}
+
+// The 'std.hash.Hashable' interface is the compiler-known hashing contract: every type hashes,
+// so every type argument satisfies it.
+export isUniversalHashable(Type bound) -> bool {
+    if (bound is InterfaceType) {
+        return bound.name() == "Hashable" && bound.modulePath() == "std.hash";
+    }
+    return false;
+}
+
+// Whether one type argument satisfies one bound: a class or interface value through the subclass
+// chain or conformance, and a type-parameter argument through its own declared bounds plus the
+// extra bounds the enclosing conditional member's constraints put in scope. The one home for the
+// judgment; the resolver's bound checks and the conditional-member existence checks both ask here.
+export satisfiesBound(Type argument, Type bound, Type[] extraArgumentBounds) -> bool {
+    if (isUniversalHashable(bound)) {
+        return true;
+    }
+    if (isClassLike(argument)) {
+        return isSubclassOrConforms(argument, bound);
+    }
+    if (argument is TypeParamType) {
+        for (let own in argument.bounds()) {
+            if (own == bound || isSubclassOrConforms(own, bound)) {
+                return true;
+            }
+        }
+        for (let own in extraArgumentBounds) {
+            if (own == bound || isSubclassOrConforms(own, bound)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// The extra bounds the active conditional member's constraints add to this type when it is one
+// of the constrained parameters, or none. scopeOwner is the declaration whose parameters the
+// active constraints restate; null outside any conditional member's scope.
+export extraBoundsFor(Type argument, GreenNode? scopeOwner, MemberConstraint[] scopeConstraints)
+        -> Type[] {
+    if (argument is TypeParamType && scopeOwner != null && argument.owner() == scopeOwner) {
+        for (let constraint in scopeConstraints) {
+            if (constraint.parameterIndex() == argument.index()) {
+                return constraint.bounds();
+            }
+        }
+    }
+    return [];
+}
+
+// One constraint an owner's type arguments fail: the constrained parameter, the bound as the
+// member declares it, and the bound with the owner's arguments substituted in, for diagnostics.
+export class FailedConstraint {
+    long failedIndex;
+    Type declaredBound;
+    Type substitutedBound;
+
+    public constructor(this.failedIndex, this.declaredBound, this.substitutedBound);
+
+    export parameterIndex() -> long {
+        return this.failedIndex;
+    }
+
+    export bound() -> Type {
+        return this.declaredBound;
+    }
+
+    export boundHere() -> Type {
+        return this.substitutedBound;
+    }
+}
+
+// The first constraint of a conditional member that these type arguments fail, or null when
+// every one holds (an unconditional member always holds). The arguments are the template's own
+// parameters when judging the template itself, and an instantiation's arguments otherwise.
+export firstFailedConstraint(TypeStore store, Method method, DeclaredType template,
+                             Type[] arguments, GreenNode? scopeOwner,
+                             MemberConstraint[] scopeConstraints) -> FailedConstraint? {
+    for (let constraint in method.constraints()) {
+        long index = constraint.parameterIndex();
+        if (index >= arguments.length) {
+            continue;
+        }
+        Type argument = arguments[index];
+        if (argument is ErrorType) {
+            continue;
+        }
+        for (let bound in constraint.bounds()) {
+            Type here = store.substitute(bound, template.declaration(), arguments);
+            if (!satisfiesBound(argument, here,
+                    extraBoundsFor(argument, scopeOwner, scopeConstraints))) {
+                return new FailedConstraint(index, bound, here);
+            }
+        }
+    }
+    return null;
+}
+
+// The type arguments a type stands at: an instantiation's own, and the template's parameters
+// standing for themselves on the template or on any other declared type.
+export typeArgumentsOf(Type owner) -> Type[] {
+    if (owner is InstantiationType) {
+        return owner.arguments();
+    }
+    let template = authorityOf(owner);
+    if (template == null) {
+        return [];
+    }
+    TypeParamType[] parameters = template.typeParameterTypes();
+    let arguments = new List<Type>();
+    for (let parameter in parameters) {
+        arguments.push(parameter);
+    }
+    return arguments.toArray();
+}
+
+// Whether a member exists on the type that defines it: an unconditional member always does; a
+// conditional one only where the defining type's arguments satisfy every constraint. The scope
+// carries the enclosing conditional member's constraints, so a body may use members its own
+// constraint unlocks; pass none outside a body.
+export memberExistsOn(TypeStore store, Method method, GreenNode? scopeOwner,
+                      MemberConstraint[] scopeConstraints) -> bool {
+    if (!method.isConditional()) {
+        return true;
+    }
+    let owner = method.definingType();
+    let template = authorityOf(owner);
+    if (template == null) {
+        return true;
+    }
+    return firstFailedConstraint(store, method, template, typeArgumentsOf(owner), scopeOwner,
+        scopeConstraints) == null;
+}
+
+export memberExistsOn(TypeStore store, Method method) -> bool {
+    return memberExistsOn(store, method, null, []);
+}
+
+// True when the template declares any conditional member, instance or static; the plan and the
+// harvest only pay the per-member filter for templates that need it.
+export hasConditionalMembers(DeclaredType template) -> bool {
+    let methods = methodsOf(template);
+    if (methods != null) {
+        for (long i = 0; i < methods.length(); i++) {
+            if (methods.get(i).isConditional()) {
+                return true;
+            }
+        }
+    }
+    let statics = staticMethodsOf(template);
+    if (statics != null) {
+        for (long i = 0; i < statics.length(); i++) {
+            if (statics.get(i).isConditional()) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 // Lossless primitive widening, the implicit numeric conversion the language allows.

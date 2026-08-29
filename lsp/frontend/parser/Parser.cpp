@@ -767,6 +767,10 @@ bool Parser::looksLikeKeywordNamedMethod() const {
     if (idx >= tokens.size() || !isKeyword(tokens[idx].kind)) return false;
     idx++;
     skipTrivia();
+    // A type-parameter list may sit between the name and '(', which is how
+    // `constructor<T: Comparable<T>>()` is recognized as a member.
+    idx = skipAnglesRaw(idx);
+    skipTrivia();
     return idx < tokens.size() && tokens[idx].kind == SyntaxKind::LParen;
 }
 

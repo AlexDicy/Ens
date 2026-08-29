@@ -3111,6 +3111,33 @@ void Analyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
         tpCount += pushTypeParams(owner, owner->typeParamNames, owner->typeParamBounds);
     }
 
+    // A conditional member restates enclosing type parameters with extra bounds; inside its
+    // body the restated placeholders carry them, so member access through the bound resolves.
+    // The placeholders are shared per (owner, index), so the extra bounds are appended for the
+    // body and trimmed back afterwards.
+    std::vector<std::pair<Type*, size_t>> augmentedPlaceholders;
+    if (receiverType && receiverType->structInfo && receiverType->structInfo->isTemplate) {
+        StructInfo* owner = receiverType->structInfo;
+        auto constraintParams = fn.typeParams();
+        if (!constraintParams.empty()) {
+            auto extraBounds = resolveTypeParamBounds(owner, constraintParams);
+            for (size_t c = 0; c < constraintParams.size(); ++c) {
+                auto cname = constraintParams[c].nameText().value_or(std::u16string{});
+                for (size_t p = 0; p < owner->typeParamNames.size(); ++p) {
+                    if (owner->typeParamNames[p] != cname) continue;
+                    Type* placeholder = typeCtx.getTypeParam(owner, static_cast<int>(p),
+                                                             cname, {});
+                    augmentedPlaceholders.push_back({placeholder,
+                                                     placeholder->paramBounds.size()});
+                    for (StructInfo* bound : extraBounds[c]) {
+                        if (bound) placeholder->paramBounds.push_back(bound);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
     if (receiverType) {
         Symbol* thisSym = makeSymbol(SymbolKind::Parameter, std::u16string(u"this"),
                                      receiverType, fn.node.startOffset());
@@ -3199,6 +3226,9 @@ void Analyzer::analyzeFunctionBody(const ast::FuncDecl& fn) {
     checkFunctionReturnPaths(fn);
 
     popScope();
+    for (auto& entry : augmentedPlaceholders) {
+        entry.first->paramBounds.resize(entry.second);
+    }
     popTypeParams(tpCount);
     currentFunction = prevFunction;
     currentThis = prevThis;

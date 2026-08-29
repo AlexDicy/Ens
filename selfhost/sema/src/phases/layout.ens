@@ -22,6 +22,7 @@ import InstantiationType from model.types;
 import OptionalType from model.types;
 import Field from model.types;
 import Method from model.types;
+import MemberConstraint from model.types;
 import Signature from model.types;
 import Visibility from model.types;
 import List from @std.collections.list;
@@ -301,10 +302,32 @@ class ClassLayout {
         }
         members.checkStaticMethodMarkers(this.reporter, modifiers, methodName, isConstructor,
             isDestructor, nameSpan);
+        MemberConstraint[] constraints = [];
+        if (isDestructor) {
+            let constraintList = member.typeParameters();
+            if (constraintList != null) {
+                this.reporter.report("A destructor cannot have a type-parameter list; it takes "
+                    + "no parameters of any kind. Remove the '<...>' list.",
+                    constraintList.span());
+            }
+        } else {
+            string constraintSubject = "Method '{methodName}' of '{this.classType.name()}'";
+            if (isConstructor) {
+                constraintSubject = "A constructor of '{this.classType.name()}'";
+            }
+            constraints = members.readMemberConstraints(this.resolver, this.reporter,
+                this.classType, member, constraintSubject);
+        }
+        if (constraints.length > 0) {
+            this.resolver.pushMemberConstraints(this.classType.declaration(), constraints);
+        }
         let signature = members.buildSignature(this.resolver, this.reporter, member,
             methodName, nameSpan, isConstructor, false,
             isConstructor || modifiers.declaresAbstract, modifiers.declaresNoreturn,
             this.classType.fields(), this.classType.name(), []);
+        if (constraints.length > 0) {
+            this.resolver.popMemberConstraints();
+        }
         Visibility visibility = Visibility.Private;
         if (!isDestructor) {
             string memberKindWord = "Method";
@@ -330,7 +353,8 @@ class ClassLayout {
         }
         let method = new Method(signature, visibility, isConstructor,
             isDestructor, modifiers.declaresOverride, modifiers.declaresFinal,
-            modifiers.declaresAbstract, false, member.body() != null, this.classType);
+            modifiers.declaresAbstract, false, member.body() != null, constraints,
+            this.classType);
         this.classType.methods().push(method);
 
         members.checkNoreturnPlacement(this.reporter, member, isConstructor, isDestructor,
@@ -396,6 +420,11 @@ class ClassLayout {
                     + "body, or remove the method.", nameSpan);
             }
         }
+        members.checkConditionalMarkers(this.reporter, constraints, modifiers, methodName,
+            this.classType, nameSpan);
+        if (constraints.length > 0 && modifiers.declaresOverride) {
+            return;
+        }
         this.checkOverrideRules(member, method, methodName, nameSpan, modifiers);
     }
 
@@ -424,6 +453,13 @@ class ClassLayout {
             || (methodName == "equals"
                 && members.equalsSignatureConforms(signature, this.classType));
         if (modifiers.declaresOverride) {
+            if (baseBySignature != null && baseBySignature.isConditional()) {
+                this.reporter.report("Cannot override '{methodName}': "
+                    + "'{types.display(baseBySignature.definingType())}' declares it "
+                    + "conditionally, so it does not exist on every instantiation and cannot "
+                    + "be replaced. Rename the method.", nameSpan);
+                return;
+            }
             if (baseBySignature != null) {
                 string ownerName = types.display(baseBySignature.definingType());
                 if (baseBySignature.isFinal()) {
@@ -477,13 +513,26 @@ class ClassLayout {
             return;
         }
         if (baseBySignature != null) {
+            string ownerName = types.display(baseBySignature.definingType());
+            if (baseBySignature.isConditional()) {
+                this.reporter.report("Method '{methodName}' has the same signature as a "
+                    + "conditional method of '{ownerName}', which exists only for "
+                    + "instantiations satisfying its constraints; a conditional member cannot "
+                    + "be overridden or hidden. Rename one of the two.", nameSpan);
+                return;
+            }
+            if (method.isConditional()) {
+                this.reporter.report("Method '{methodName}' is conditional but has the same "
+                    + "signature as a method inherited from '{ownerName}'; a conditional "
+                    + "member cannot replace an inherited one. Rename it.", nameSpan);
+                return;
+            }
             this.reporter.report("Method '{methodName}' hides a method inherited from "
-                + "'{types.display(baseBySignature.definingType())}'; mark it 'override' to "
-                + "replace it, or rename it.", nameSpan);
+                + "'{ownerName}'; mark it 'override' to replace it, or rename it.", nameSpan);
             return;
         }
         let interfaceBySignature = this.findInInterfaces(methodName, signature, true);
-        if (interfaceBySignature != null) {
+        if (interfaceBySignature != null && !method.isConditional()) {
             string interfaceName = types.display(interfaceBySignature.definingType());
             this.reporter.report("Method '{methodName}' of '{this.classType.name()}' "
                 + "implements a method declared in interface '{interfaceName}'; mark it "
@@ -589,6 +638,19 @@ class ClassLayout {
                         + "'{interfaceName}' extends. Declare the method, or inherit it from "
                         + "a base class.", at);
                 }
+                continue;
+            }
+            if (provided.isConditional()) {
+                string requiredBy = "'{interfaceName}'";
+                if (level != implemented) {
+                    requiredBy = "'{levelName}', which '{interfaceName}' extends";
+                }
+                this.reporter.report("Class '{this.classType.name()}' implements "
+                    + "'{interfaceName}' but provides '{methodDisplay(required)}', required by "
+                    + "{requiredBy}, only conditionally; an interface requirement must exist "
+                    + "on every instantiation, so a conditional member cannot satisfy it. "
+                    + "Remove the '<...>' constraint list from '{required.name()}', or stop "
+                    + "implementing '{interfaceName}'.", at);
                 continue;
             }
             if (!overrideCompatible(required.signature(), provided.signature())) {

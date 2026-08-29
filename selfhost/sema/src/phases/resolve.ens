@@ -10,14 +10,17 @@ import OptionalTypeNode from @ens.frontend.syntax.generated.nodes;
 import ErrorTypeNode from @ens.frontend.syntax.generated.nodes;
 import TypeQualifierNode from @ens.frontend.syntax.generated.nodes;
 import TypeParameterListNode from @ens.frontend.syntax.generated.nodes;
+import BoundsClauseNode from @ens.frontend.syntax.generated.nodes;
 import GreenNode from @ens.frontend.syntax.green;
 import Span from @ens.frontend.support.source;
 import FileDiagnostic from support.diagnostics;
 import ModuleLinkTable from phases.link;
 import ImportedType from phases.link;
 import ImportedNamespace from phases.link;
+import InstantiationMention from phases.obligations;
 import program.implicit;
 import SemaResult from result;
+import model.convert;
 import model.types;
 import Type from model.types;
 import ErrorType from model.types;
@@ -25,10 +28,13 @@ import TypeStore from model.types;
 import DeclaredType from model.types;
 import ClassType from model.types;
 import InstantiationType from model.types;
-import InterfaceType from model.types;
 import TypeParamType from model.types;
+import Method from model.types;
+import MemberConstraint from model.types;
+import FailedConstraint from model.types;
 import PrimitiveKind from model.types;
 import List from @std.collections.list;
+import Map from @std.collections.map;
 
 public class TypeResolver {
     TypeStore store;
@@ -39,8 +45,13 @@ public class TypeResolver {
     ClassType? implicitErrorClass;
     SemaResult semaResult;
     List<TypeParamType> parameterScope;
+    GreenNode? constraintScopeOwner;
+    MemberConstraint[] constraintScope;
+    MemberConstraint[] noConstraints;
     List<FileDiagnostic> collected;
     List<DeferredBoundCheck> deferredBoundChecks;
+    List<InstantiationMention> instantiationMentions;
+    Map<InstantiationType, List<MemberConstraint[]>> mentionScopes;
     bool checkBoundsImmediately;
 
     public constructor(TypeStore store, string modulePath, string packagePrefix, string filePath,
@@ -53,8 +64,13 @@ public class TypeResolver {
         this.implicitErrorClass = errorClass;
         this.semaResult = result;
         this.parameterScope = new List<TypeParamType>();
+        this.constraintScopeOwner = null;
+        this.noConstraints = [];
+        this.constraintScope = this.noConstraints;
         this.collected = new List<FileDiagnostic>();
         this.deferredBoundChecks = new List<DeferredBoundCheck>();
+        this.instantiationMentions = new List<InstantiationMention>();
+        this.mentionScopes = new Map<InstantiationType, List<MemberConstraint[]>>();
         this.checkBoundsImmediately = false;
     }
 
@@ -99,6 +115,45 @@ public class TypeResolver {
         for (long i = 0; i < count; i++) {
             this.parameterScope.pop();
         }
+    }
+
+    // The constraint scope of the conditional member being resolved or checked: inside it, the
+    // constrained parameters carry the member's extra bounds. At most one member is in scope at
+    // a time, so the scope is a single slot rather than a stack.
+    public pushMemberConstraints(GreenNode owner, MemberConstraint[] constraints) {
+        this.constraintScopeOwner = owner;
+        this.constraintScope = constraints;
+    }
+
+    public popMemberConstraints() {
+        this.constraintScopeOwner = null;
+        this.constraintScope = this.noConstraints;
+    }
+
+    public activeConstraintOwner() -> GreenNode? {
+        return this.constraintScopeOwner;
+    }
+
+    public activeConstraints() -> MemberConstraint[] {
+        return this.constraintScope;
+    }
+
+    // Whether this member exists on the type that defines it, judged under the active
+    // constraint scope; see types.memberExistsOn.
+    public memberExists(Method method) -> bool {
+        return !method.isConditional() || this.firstUnmetConstraint(method) == null;
+    }
+
+    // The first constraint the member's defining type fails under the active scope, or null
+    // when the member exists there.
+    public firstUnmetConstraint(Method method) -> FailedConstraint? {
+        let template = types.authorityOf(method.definingType());
+        if (template == null) {
+            return null;
+        }
+        return types.firstFailedConstraint(this.store, method, template,
+            types.typeArgumentsOf(method.definingType()), this.constraintScopeOwner,
+            this.constraintScope);
     }
 
     // The type parameter in scope under this name, innermost first, or null when none is.
@@ -238,9 +293,57 @@ public class TypeResolver {
                 spans.push(argumentList.arguments(i).span());
             }
             this.deferredBoundChecks.push(new DeferredBoundCheck(base, argumentTypes,
-                spans.toArray()));
+                spans.toArray(), this.constraintScopeOwner, this.constraintScope));
         }
-        return this.store.instantiationOf(base, argumentTypes);
+        let instantiation = this.store.instantiationOf(base, argumentTypes);
+        this.recordInstantiationMention(instantiation);
+        return instantiation;
+    }
+
+    // Logs one instantiation mention, once per (instantiation, scope) pair, for the obligation
+    // pass: a concrete mention seeds its template's judgments, and an open one replays per
+    // owner assignment under the constraint scope active here. A concrete mention seeds
+    // unconditionally, so it records no scope.
+    public recordInstantiationMention(InstantiationType instantiation) {
+        bool open = false;
+        for (let argument in instantiation.arguments()) {
+            if (convert.containsTypeParam(argument)) {
+                open = true;
+            }
+        }
+        GreenNode? guardOwner = this.constraintScopeOwner;
+        MemberConstraint[] guards = this.constraintScope;
+        if (!open) {
+            guardOwner = null;
+            guards = this.noConstraints;
+        }
+        let scopes = this.mentionScopesFor(instantiation);
+        for (long i = 0; i < scopes.length(); i++) {
+            if (scopes.get(i) == guards) {
+                return;
+            }
+        }
+        scopes.push(guards);
+        this.instantiationMentions.push(new InstantiationMention(instantiation, guardOwner,
+            guards));
+    }
+
+    mentionScopesFor(InstantiationType instantiation) -> List<MemberConstraint[]> {
+        let existing = this.mentionScopes.get(instantiation);
+        if (existing != null) {
+            return existing;
+        }
+        let created = new List<MemberConstraint[]>();
+        this.mentionScopes.set(instantiation, created);
+        return created;
+    }
+
+    // Drains the instantiation mentions recorded so far.
+    public takeInstantiationMentions() -> InstantiationMention[] {
+        InstantiationMention[] taken = this.instantiationMentions.toArray();
+        this.instantiationMentions = new List<InstantiationMention>();
+        this.mentionScopes = new Map<InstantiationType, List<MemberConstraint[]>>();
+        return taken;
     }
 
     // Unqualified lookup order: primitives, type parameters in scope (innermost first), the
@@ -286,12 +389,13 @@ public class TypeResolver {
 
     // Every type argument must satisfy every bound of its parameter: a class bound through the
     // subclass chain, an interface bound through conformance, and a type-parameter argument
-    // through its own declared bounds. The standard hashing contract is compiler-known and
-    // satisfied by every type. Generic calls check inferred arguments through here too.
+    // through its own declared bounds plus whatever the active constraint scope adds. The
+    // standard hashing contract is compiler-known and satisfied by every type. Generic calls
+    // check inferred arguments through here too.
     public checkArgumentBounds(Type argument, TypeParamType parameter, Span span) -> bool {
         bool satisfied = true;
         for (let bound in parameter.bounds()) {
-            if (isUniversalHashable(bound) || argumentSatisfiesBound(argument, bound)) {
+            if (types.satisfiesBound(argument, bound, this.extraBoundsOf(argument))) {
                 continue;
             }
             string shownArgument = types.display(argument);
@@ -312,11 +416,15 @@ public class TypeResolver {
     // which failure to report.
     public boundsSatisfied(Type argument, TypeParamType parameter) -> bool {
         for (let bound in parameter.bounds()) {
-            if (!isUniversalHashable(bound) && !argumentSatisfiesBound(argument, bound)) {
+            if (!types.satisfiesBound(argument, bound, this.extraBoundsOf(argument))) {
                 return false;
             }
         }
         return true;
+    }
+
+    extraBoundsOf(Type argument) -> Type[] {
+        return types.extraBoundsFor(argument, this.constraintScopeOwner, this.constraintScope);
     }
 
     // Checks the type arguments of every instantiation resolved so far. Bound checks wait until
@@ -324,18 +432,26 @@ public class TypeResolver {
     // can name a declaration that resolves later, and a conformance walk reads an
     // instantiation's substituted base and interfaces, which an unfilled instantiation does not
     // have yet. The pipeline runs this once after class layout, and every later reference
-    // checks immediately.
+    // checks immediately. Each check replays under the constraint scope it was recorded in, so
+    // a conditional member's signature keeps the extra bounds its constraints grant.
     public checkDeferredBounds() {
         this.checkBoundsImmediately = true;
         let deferred = this.deferredBoundChecks;
         this.deferredBoundChecks = new List<DeferredBoundCheck>();
         for (long i = 0; i < deferred.length(); i++) {
             let check = deferred.get(i);
+            let recordedOwner = check.scopeOwner();
+            if (recordedOwner != null) {
+                this.pushMemberConstraints(recordedOwner, check.scopeConstraints());
+            }
             TypeParamType[] parameters = check.template().typeParameterTypes();
             Type[] arguments = check.arguments();
             Span[] spans = check.spans();
             for (long a = 0; a < parameters.length && a < arguments.length; a++) {
                 this.checkArgumentBounds(arguments[a], parameters[a], spans[a]);
+            }
+            if (recordedOwner != null) {
+                this.popMemberConstraints();
             }
         }
     }
@@ -402,74 +518,88 @@ public class TypeResolver {
             if (boundsClause == null) {
                 continue;
             }
-            let accepted = new List<Type>();
-            Type? classBound = null;
-            for (long b = 0; b < boundsClause.boundsCount(); b++) {
-                let reference = boundsClause.bounds(b);
-                Type bound = this.resolveType(reference);
-                if (bound is ErrorType) {
-                    continue;
-                }
-                bool isInterface = types.isInterfaceLike(bound);
-                if (!isInterface && !types.isClassLike(bound)) {
-                    this.report("A type-parameter bound must be a non-generic class or an "
-                        + "interface; '{types.display(bound)}' is not.", reference.span());
-                    continue;
-                }
-                if (!isInterface && bound is InstantiationType) {
-                    this.report("A type-parameter bound must be a non-generic class or an "
-                        + "interface; '{types.display(bound)}' instantiates a generic class. "
-                        + "Bound the parameter by an interface the class implements, or use "
-                        + "'{types.display(bound)}' itself as the type.", reference.span());
-                    continue;
-                }
-                bool duplicate = false;
-                for (long a = 0; a < accepted.length(); a++) {
-                    if (accepted.get(a) == bound) {
-                        duplicate = true;
-                        break;
-                    }
-                }
-                if (duplicate) {
-                    this.report("Duplicate bound '{types.display(bound)}' on type parameter "
-                        + "'{name}'; list each bound once.", reference.span());
-                    continue;
-                }
-                if (!isInterface) {
-                    if (bound is ClassType && bound.isFinal()) {
-                        this.report("Bound '{types.display(bound)}' is a 'final' class: no "
-                            + "type except '{types.display(bound)}' itself could satisfy it, "
-                            + "so the type parameter adds nothing. Use '{types.display(bound)}' "
-                            + "directly, or remove 'final' from the class.", reference.span());
-                        continue;
-                    }
-                    if (classBound != null) {
-                        this.report("Type parameter '{name}' already has the class bound "
-                            + "'{types.display(classBound)}'; at most one bound can be a class, "
-                            + "every other bound must be an interface.", reference.span());
-                        continue;
-                    }
-                    classBound = bound;
-                }
-                accepted.push(bound);
-            }
-            parameter.setBounds(accepted.toArray());
+            parameter.setBounds(this.resolveBoundList(name, boundsClause));
         }
         return parameters.toArray();
+    }
+
+    // Resolves and validates one bound list under the shared bound rules: interfaces
+    // (instantiated forms included), at most one class, no generic-class instantiations, no
+    // 'final' classes, each bound listed once. Type-parameter declarations and conditional-member
+    // constraints both read their bounds through here.
+    public resolveBoundList(string parameterName, BoundsClauseNode boundsClause) -> Type[] {
+        let accepted = new List<Type>();
+        Type? classBound = null;
+        for (long b = 0; b < boundsClause.boundsCount(); b++) {
+            let reference = boundsClause.bounds(b);
+            Type bound = this.resolveType(reference);
+            if (bound is ErrorType) {
+                continue;
+            }
+            bool isInterface = types.isInterfaceLike(bound);
+            if (!isInterface && !types.isClassLike(bound)) {
+                this.report("A type-parameter bound must be a non-generic class or an "
+                    + "interface; '{types.display(bound)}' is not.", reference.span());
+                continue;
+            }
+            if (!isInterface && bound is InstantiationType) {
+                this.report("A type-parameter bound must be a non-generic class or an "
+                    + "interface; '{types.display(bound)}' instantiates a generic class. "
+                    + "Bound the parameter by an interface the class implements, or use "
+                    + "'{types.display(bound)}' itself as the type.", reference.span());
+                continue;
+            }
+            bool duplicate = false;
+            for (long a = 0; a < accepted.length(); a++) {
+                if (accepted.get(a) == bound) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                this.report("Duplicate bound '{types.display(bound)}' on type parameter "
+                    + "'{parameterName}'; list each bound once.", reference.span());
+                continue;
+            }
+            if (!isInterface) {
+                if (bound is ClassType && bound.isFinal()) {
+                    this.report("Bound '{types.display(bound)}' is a 'final' class: no "
+                        + "type except '{types.display(bound)}' itself could satisfy it, "
+                        + "so the type parameter adds nothing. Use '{types.display(bound)}' "
+                        + "directly, or remove 'final' from the class.", reference.span());
+                    continue;
+                }
+                if (classBound != null) {
+                    this.report("Type parameter '{parameterName}' already has the class bound "
+                        + "'{types.display(classBound)}'; at most one bound can be a class, "
+                        + "every other bound must be an interface.", reference.span());
+                    continue;
+                }
+                classBound = bound;
+            }
+            accepted.push(bound);
+        }
+        return accepted.toArray();
     }
 }
 
 // One instantiation whose type arguments still await their bound checks: the template, the
-// resolved arguments, and each argument's source span for diagnostics.
+// resolved arguments, each argument's source span for diagnostics, and the constraint scope the
+// reference was resolved in, so the deferred check judges it as its enclosing member would.
 class DeferredBoundCheck {
     DeclaredType checkTemplate;
     Type[] checkArguments;
     Span[] checkSpans;
+    GreenNode? checkScopeOwner;
+    MemberConstraint[] checkScopeConstraints;
 
-    protected constructor(DeclaredType template, Type[] arguments, Span[] spans) {
+    protected constructor(DeclaredType template, Type[] arguments, Span[] spans,
+                GreenNode? scopeOwner, MemberConstraint[] scopeConstraints) {
         this.checkTemplate = template;
         this.checkArguments = arguments;
         this.checkSpans = spans;
+        this.checkScopeOwner = scopeOwner;
+        this.checkScopeConstraints = scopeConstraints;
     }
 
     protected template() -> DeclaredType {
@@ -483,29 +613,14 @@ class DeferredBoundCheck {
     protected spans() -> Span[] {
         return this.checkSpans;
     }
-}
 
-argumentSatisfiesBound(Type argument, Type bound) -> bool {
-    if (types.isClassLike(argument)) {
-        return types.isSubclassOrConforms(argument, bound);
+    protected scopeOwner() -> GreenNode? {
+        return this.checkScopeOwner;
     }
-    if (argument is TypeParamType) {
-        for (let own in argument.bounds()) {
-            if (own == bound || types.isSubclassOrConforms(own, bound)) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
 
-// The 'std.hash.Hashable' interface is the compiler-known hashing contract: every type hashes,
-// so every type argument satisfies it.
-isUniversalHashable(Type bound) -> bool {
-    if (bound is InterfaceType) {
-        return bound.name() == "Hashable" && bound.modulePath() == "std.hash";
+    protected scopeConstraints() -> MemberConstraint[] {
+        return this.checkScopeConstraints;
     }
-    return false;
 }
 
 countOf(long count, string noun) -> string {
