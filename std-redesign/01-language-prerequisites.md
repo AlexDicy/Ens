@@ -14,6 +14,11 @@ The spelling: type position is `(T, T) -> int`; value position is an arrow lambd
 Explicit parameter types stay legal, and one lambda is all typed or all untyped, never mixed.
 The keyword `function` is not used and not reserved.
 
+Ratified 2026-08-29.
+A function type never throws, so a lambda whose body can throw is rejected against such a target and told to handle the failure inside itself; the throwing form can be added later without invalidating any code that compiles today.
+A lambda may capture `this`, by value like any other reference, so field writes and method calls through the captured reference are legal while the rule against mutating an enclosing local stands.
+The three shapes the library needs are `(T, T) -> int`, `(T) -> bool`, and `() -> V`.
+
 ## Interfaces extending interfaces
 
 `interface Collection<T> extends Iterable<T>` becomes legal, reusing `ExtendsClause` on `InterfaceDeclaration`.
