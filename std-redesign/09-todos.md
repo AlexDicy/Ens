@@ -38,9 +38,6 @@ The language server reports a spurious entry-point placement error on a single-f
 Opening `tests/inheritance.ens` says `main` may only be defined in the main module, because the server names a lone file's module after the file rather than treating the file as the program's main module, which is what `ens build <file>` does.
 Folder programs and packages are both clean; only a single file is affected, so this is worth carrying to the language server's replacement rather than fixing in the one being retired.
 
-A switch arm's value-label list does not stop at `default` or `is` after a comma, so it reads the keyword as another label (found 2026-08-30, reproducing on the pinned seed).
-`switch (v) { 1, default -> 0, }` reports three problems for one mistake: a missing expression, a missing `->`, and a missing expression again.
-
 A long chain of type suffixes still exhausts the stack: `int?[]?[]...` past about 1500 suffixes exits with no diagnostic at all (measured 2026-08-30, the same on the pinned seed).
 Ratified 2026-08-30 to bound all four deep shapes in the parser; infix chains, postfix call chains and nested blocks now are, and this one is not.
 A type's slots hold one head that its suffixes wrap, so there is no shape a half-abandoned chain could take, and giving the whole type up reports a diagnostic that makes the statement classifier's speculative type parse unclean, which drops the declaration to the expression path and floods it with one problem per suffix.
