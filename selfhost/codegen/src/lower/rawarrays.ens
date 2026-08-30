@@ -1,0 +1,258 @@
+// The '@std.collections.rawarray.RawArray<T>' intercept. The type is an ordinary generic struct
+// holding one 'T[]', so its machine shape is already a bare array pointer and nothing here changes
+// how it is laid out or stored. What is intercepted is its four methods, which lower to the array
+// operations they stand for rather than to calls, so a container reaching a slot pays exactly what
+// indexing an array pays. Nothing runs an inliner, so a call left here would be a real one.
+//
+// 'clear' has no Ens body that could do the job: returning a slot to the state it had before
+// anything wrote to it means storing a value of T that does not exist. It is the one method whose
+// written body is weaker than this one, and the difference is a delayed destructor.
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import Expression from @ens.frontend.syntax.generated.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import NamedArgumentNode from @ens.frontend.syntax.generated.nodes;
+import Span from @ens.frontend.support.source;
+import ArrayType from @ens.sema.model.types;
+import DeclaredType from @ens.sema.model.types;
+import InstantiationType from @ens.sema.model.types;
+import Method from @ens.sema.model.types;
+import PrimitiveKind from @ens.sema.model.types;
+import Type from @ens.sema.model.types;
+import @ens.sema.model.types;
+import EirArrayLength from eir.model;
+import EirConstNull from eir.model;
+import EirFieldAddress from eir.model;
+import EirSlotAddress from eir.model;
+import EirLoadPtr from eir.model;
+import LoweringContext from lower.context;
+import lower.arrays;
+import lower.expressions;
+import lower.ownership;
+import lower.places;
+import lower.stores;
+import lower.structs;
+import support.primitives;
+import List from @std.collections.list;
+
+modulePath() -> string {
+    return "std.collections.rawarray";
+}
+
+// The store's element type when the receiver is a RawArray, or null for anything else. The type is
+// read off the single field rather than off the type argument, so a rename of the parameter cannot
+// silently change which type is meant.
+public elementOf(Type receiverType) -> Type? {
+    let structType = primitives.structOf(receiverType);
+    if (structType == null) {
+        return null;
+    }
+    let declared = structType;
+    if (declared is InstantiationType) {
+        declared = declared.template();
+    }
+    if (!(declared is DeclaredType)) {
+        return null;
+    }
+    if (declared.name() != "RawArray" || declared.modulePath() != modulePath()) {
+        return null;
+    }
+    let fields = types.fieldsOf(structType);
+    if (fields == null || fields.length() != 1) {
+        return null;
+    }
+    let cells = fields.get(0).type();
+    if (!(cells is ArrayType)) {
+        return null;
+    }
+    return cells.element();
+}
+
+// True for a call this module lowers: one of RawArray's own methods on a RawArray receiver.
+public isIntercepted(Type receiverType, Method method) -> bool {
+    if (elementOf(receiverType) == null) {
+        return false;
+    }
+    return switch (method.name()) {
+        "read", "write", "clear", "length" -> true,
+        default -> false,
+    };
+}
+
+public lowerCall(LoweringContext lowering, CallExpressionNode call, MemberExpressionNode member,
+                 Method method) -> long {
+    let receiverType = lowering.typeOf(member.object());
+    if (receiverType == null) {
+        return -1;
+    }
+    let elementType = elementOf(receiverType);
+    if (elementType == null) {
+        return -1;
+    }
+    long cells = cellsOf(lowering, member, receiverType, elementType);
+    if (cells < 0) {
+        return -1;
+    }
+    let arguments = argumentsOf(lowering, call);
+    if (arguments == null) {
+        return -1;
+    }
+    switch (method.name()) {
+        "length" -> {
+            return lowerLength(lowering, cells, arguments, call.span());
+        },
+        "read" -> {
+            return lowerRead(lowering, cells, elementType, arguments, call.span());
+        },
+        "write" -> {
+            return lowerWrite(lowering, cells, elementType, arguments, call.span());
+        },
+        default -> {
+            return lowerClear(lowering, cells, elementType, arguments, call.span());
+        },
+    }
+}
+
+// The array the receiver's single field holds, borrowed for the length of the operation.
+cellsOf(LoweringContext lowering, MemberExpressionNode member, Type receiverType,
+        Type elementType) -> long {
+    long receiver = structs.addressOf(lowering, member.object(), receiverType);
+    if (receiver < 0) {
+        if (!lowering.failed()) {
+            lowering.unsupported("reaching a raw store through this expression", member.span());
+        }
+        return -1;
+    }
+    let builder = lowering.builder();
+    let arrayType = lowering.store().arrayOf(elementType);
+    long field = builder.newTemp(arrayType);
+    builder.append(new EirFieldAddress(field, arrayType, receiver, 0));
+    long cells = builder.newTemp(arrayType);
+    builder.append(new EirLoadPtr(cells, arrayType, field));
+    return cells;
+}
+
+// The written arguments in order, or null once lowering has failed. A raw store's methods take no
+// default and no 'out', so an argument list is a plain list of expressions.
+argumentsOf(LoweringContext lowering, CallExpressionNode call) -> List<Expression>? {
+    let collected = new List<Expression>();
+    let arguments = call.arguments();
+    for (long i = 0; i < arguments.argumentsCount(); i++) {
+        switch (arguments.arguments(i)) {
+            is NamedArgumentNode named -> {
+                collected.push(named.value());
+            },
+            is Expression plain -> {
+                collected.push(plain);
+            },
+            default -> {
+                lowering.internalError("a raw store's method takes no 'out' argument",
+                    call.span());
+                return null;
+            },
+        }
+    }
+    return collected;
+}
+
+lowerLength(LoweringContext lowering, long cells, List<Expression> arguments, Span span) -> long {
+    if (arguments.length() != 0) {
+        lowering.internalError("'length' reached lowering with {arguments.length()} argument(s)",
+            span);
+        return -1;
+    }
+    let builder = lowering.builder();
+    let longType = lowering.store().primitive(PrimitiveKind.Long);
+    long result = builder.newTemp(longType);
+    builder.append(new EirArrayLength(result, longType, cells));
+    return result;
+}
+
+// A call hands its result back owning a reference, so the slot's contents are copied at +1 the way
+// the method this stands in for would have returned them.
+lowerRead(LoweringContext lowering, long cells, Type elementType, List<Expression> arguments,
+          Span span) -> long {
+    long address = slotAddress(lowering, cells, elementType, arguments, 1, span);
+    if (address < 0) {
+        return -1;
+    }
+    long value = places.readFrom(lowering, address, elementType, span);
+    if (value < 0) {
+        return -1;
+    }
+    if (primitives.isReferenceType(elementType)) {
+        ownership.retainValue(lowering, value);
+    } else if (primitives.hasArcContent(elementType)) {
+        ownership.retainAt(lowering, address, elementType);
+    }
+    return value;
+}
+
+lowerWrite(LoweringContext lowering, long cells, Type elementType, List<Expression> arguments,
+           Span span) -> long {
+    long address = slotAddress(lowering, cells, elementType, arguments, 2, span);
+    if (address < 0) {
+        return -1;
+    }
+    let operand = stores.lowerOperand(lowering, arguments.get(1), elementType);
+    if (operand == null) {
+        return -1;
+    }
+    if (!stores.assignThroughAddress(lowering, address, elementType, operand)) {
+        lowering.internalError("the value written into a raw store borrows a value with no "
+            + "storage to retain", span);
+        return -1;
+    }
+    return -1;
+}
+
+// Writing a zero through the ordinary barrier is what returns the slot to its unwritten state: the
+// barrier gives up whatever was there, and a zero owns nothing to take.
+lowerClear(LoweringContext lowering, long cells, Type elementType, List<Expression> arguments,
+           Span span) -> long {
+    long address = slotAddress(lowering, cells, elementType, arguments, 1, span);
+    if (address < 0) {
+        return -1;
+    }
+    if (!primitives.hasArcContent(elementType)) {
+        return -1;
+    }
+    long zero = zeroOf(lowering, elementType);
+    if (!stores.assignThroughAddress(lowering, address, elementType,
+            stores.operandFor(lowering, zero, false, elementType))) {
+        lowering.internalError("a raw store's slot has no storage to clear through", span);
+        return -1;
+    }
+    return -1;
+}
+
+// A value of the element type holding nothing: the null pointer for a reference, and the contents
+// of storage that starts zeroed for everything else.
+zeroOf(LoweringContext lowering, Type elementType) -> long {
+    let builder = lowering.builder();
+    if (primitives.isReferenceType(elementType)) {
+        long absent = builder.newTemp(elementType);
+        builder.append(new EirConstNull(absent, elementType));
+        return absent;
+    }
+    long slot = builder.addSlot("cleared", elementType, true, true);
+    long address = builder.newTemp(elementType);
+    builder.append(new EirSlotAddress(address, elementType, slot));
+    long value = builder.newTemp(elementType);
+    builder.append(new EirLoadPtr(value, elementType, address));
+    return value;
+}
+
+slotAddress(LoweringContext lowering, long cells, Type elementType, List<Expression> arguments,
+            long expected, Span span) -> long {
+    if (arguments.length() != expected) {
+        lowering.internalError("a raw store's method reached lowering with "
+            + "{arguments.length()} argument(s), expected {expected}", span);
+        return -1;
+    }
+    let longType = lowering.store().primitive(PrimitiveKind.Long);
+    long index = expressions.lowerConverted(lowering, arguments.get(0), longType);
+    if (index < 0) {
+        return -1;
+    }
+    return arrays.elementAddress(lowering, cells, index, elementType, lowering.lineAt(span));
+}

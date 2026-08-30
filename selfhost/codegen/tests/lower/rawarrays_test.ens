@@ -1,0 +1,113 @@
+// The raw store's methods are lowered to the array operations they stand for, so reaching a slot
+// costs what indexing an array costs and no call is left behind. `clear` has no Ens body that
+// could do its job, so this is the only place its meaning exists.
+import @std.testing;
+import support;
+
+// A standard library holding just the raw store, plus an exported probe inside the package: the
+// type is package-wide, so a program cannot name it from outside.
+rawStoreProgram(string body) -> support.MemoryFileLoader {
+    let loader = new support.MemoryFileLoader();
+    loader.add("/stdlib/std/src/collections/rawarray.ens",
+        "public struct RawArray<T> \{\n"
+        + "    T[] cells;\n"
+        + "    public read(long index) -> T \{\n"
+        + "        return this.cells[index];\n"
+        + "    \}\n"
+        + "    public write(long index, T value) \{\n"
+        + "        this.cells[index] = value;\n"
+        + "    \}\n"
+        + "    public clear(long index) \{\n"
+        + "    \}\n"
+        + "    public length() -> long \{\n"
+        + "        return this.cells.length;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public allocate<T>(long size) -> RawArray<T> \{\n"
+        + "    return \{cells: new T[size]\};\n"
+        + "\}\n"
+        + "export class Cell \{\n"
+        + "\}\n"
+        + body);
+    loader.add("/src/main.ens",
+        "import @std.collections.rawarray;\n"
+        + "main() -> int \{\n"
+        + "    rawarray.probe();\n"
+        + "    return 0;\n"
+        + "\}\n");
+    return loader;
+}
+
+probeDump(string body) -> string throws {
+    let analysis = try support.analyzeLoaded(rawStoreProgram(body));
+    return try support.loweredLoadedDump(analysis, "probe");
+}
+
+test "reaching a raw store's slot lowers to the array operations, leaving no call" {
+    let dumped = try probeDump(
+        "export probe() -> Cell \{\n"
+        + "    let store = allocate<Cell>(4);\n"
+        + "    store.write(0, new Cell());\n"
+        + "    let back = store.read(0);\n"
+        + "    store.clear(0);\n"
+        + "    return back;\n"
+        + "\}\n");
+    // Allocating is an ordinary call, which happens once per store rather than once per slot.
+    try testing.assertEqual(occurrences(dumped, "call @"), 1L);
+    try testing.assertTrue(dumped.indexOf("call @std.collections.rawarray$allocate") >= 0,
+        "allocating should still be the call it is written as: {dumped}");
+    // One bounds check and one element address for each of write, read and clear.
+    try testing.assertEqual(occurrences(dumped, "bounds_check"), 3L);
+    try testing.assertEqual(occurrences(dumped, "element_addr"), 3L);
+}
+
+test "a raw store's read hands its value back owning a reference" {
+    let dumped = try probeDump(
+        "export probe() -> Cell \{\n"
+        + "    let store = allocate<Cell>(4);\n"
+        + "    return store.read(0);\n"
+        + "\}\n");
+    try testing.assertEqual(occurrences(dumped, "bounds_check"), 1L);
+    try testing.assertTrue(dumped.indexOf("retain %") >= 0,
+        "a call's result owns a reference, so the slot's contents are copied at +1: {dumped}");
+}
+
+test "a raw store's clear gives the slot up and leaves it as it was unwritten" {
+    let dumped = try probeDump(
+        "export probe() -> Cell \{\n"
+        + "    let store = allocate<Cell>(4);\n"
+        + "    store.clear(0);\n"
+        + "    return new Cell();\n"
+        + "\}\n");
+    try testing.assertTrue(dumped.indexOf("const null: Cell") >= 0,
+        "the slot should be left holding nothing: {dumped}");
+    try testing.assertTrue(dumped.indexOf("release_ptr") >= 0,
+        "whatever the slot held should be given up: {dumped}");
+}
+
+test "a raw store's length reads the store's own length" {
+    let dumped = try probeDump(
+        "export probe() -> Cell \{\n"
+        + "    let store = allocate<Cell>(4);\n"
+        + "    if (store.length() == 4) \{\n"
+        + "        return new Cell();\n"
+        + "    \}\n"
+        + "    return new Cell();\n"
+        + "\}\n");
+    try testing.assertEqual(occurrences(dumped, "call @"), 1L);
+    try testing.assertTrue(dumped.indexOf("array.len") >= 0,
+        "the length should be read off the store rather than called for: {dumped}");
+}
+
+occurrences(string text, string needle) -> long {
+    long found = 0;
+    string rest = text;
+    while (true) {
+        long next = rest.indexOf(needle);
+        if (next < 0) {
+            return found;
+        }
+        found = found + 1;
+        rest = rest.substring(next + needle.length, rest.length);
+    }
+}
