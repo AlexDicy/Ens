@@ -39,7 +39,9 @@ The temporary C++ LSP front end gets parse-level support per feature so the edit
 
 ## Phase B: seed release
 
-- B1: cut and publish the seed that supports A1 through A10, and pin it in `seed.json`.
+- B0: a declaration whose name and parameter types match a function the language provides replaces it in the declaring module instead of colliding with it, so the library can take over what the compiler provided.
+  The seed has to carry this rule before C5 and C6 can land as ordinary commits: each of them adds a declaration in a commit the preceding seed has to compile.
+- B1: cut and publish the seed that supports A1 through A10 and B0, and pin it in `seed.json`.
 From here on, std and selfhost sources may use every new feature.
 
 ## Phase C: the new std, module by module, old kept alive

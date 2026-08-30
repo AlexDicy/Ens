@@ -506,6 +506,11 @@ A declaration of your own with one of those names takes precedence inside the mo
 That precedence goes by name and not by signature: a `describe(int)` of your own hides every implicitly imported `describe`, so a call that does not fit yours is an error rather than a call to theirs, and the hidden one is reached by importing its module and qualifying the call.
 Every other module of the standard library has to be imported.
 
+A module may also declare a function with the same name and parameter types as one the language itself provides, such as `print`.
+The declaration answers every call to that name in the module that writes it, and every other module keeps the function the language provides.
+Such a declaration is an ordinary function and takes nothing from the one it stands in for: a `panic` of your own never returns only if you write `noreturn` on it.
+A declaration whose parameter types differ is an ordinary overload alongside the provided function, exactly as two declarations of your own overload each other.
+
 A program's entry point is the top-level function `main` in its **main module**: `src/main.ens` for a package or a folder of sources, or the compiled file itself for a single-file program.
 No other module may define a top-level `main`; the compiler rejects one wherever it is loaded from, including through an import of another package's main module.
 

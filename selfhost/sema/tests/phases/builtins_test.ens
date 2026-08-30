@@ -1,0 +1,226 @@
+// A declaration replacing a function the language provides: what the declaring module's function
+// table holds afterwards, what every other module still holds, and what the ordinary overload and
+// duplicate rules do around it.
+import @std.testing;
+import TestFailure from @std.testing;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+import BuiltinFunction from context;
+import FunctionEntry from context;
+import ModuleContext from context;
+import Visibility from model.types;
+import ProgramAnalysis from pipeline;
+import phases.prelude;
+import FakeFileLoader from sema_support;
+import sema_support;
+
+// The entries one module's function table holds under a name, failing when it holds none.
+entriesOf(ProgramAnalysis analysis, string modulePath, string name)
+        -> List<FunctionEntry> throws {
+    let context = try sema_support.contextFor(analysis, modulePath);
+    let found = context.functions().entriesNamed(name);
+    if (found == null || found.length() == 0) {
+        throw new TestFailure("module '{modulePath}' has no function named '{name}'");
+    }
+    return found;
+}
+
+// The single entry one module's function table holds under a name.
+onlyEntryOf(ProgramAnalysis analysis, string modulePath, string name) -> FunctionEntry throws {
+    let found = try entriesOf(analysis, modulePath, name);
+    try testing.assertEqual(found.length(), 1L);
+    return found.get(0);
+}
+
+// A two-module program: 'main' plus 'other', both over the stand-in standard library.
+analyzeTwo(string mainText, string otherText) -> ProgramAnalysis {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", mainText);
+    loader.add("/proj/src/other.ens", otherText);
+    return sema_support.analyzeAll(loader, "/proj/src", ["main.ens", "other.ens"]);
+}
+
+test "a declaration with the same parameter types replaces the provided function" {
+    let analysis = analyzeTwo(
+        "print(string message) \{\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    print(\"hello\");\n"
+        + "    return 0;\n"
+        + "\}\n",
+        "public write(string text) \{\n"
+        + "    print(text);\n"
+        + "\}\n");
+    try sema_support.assertProgramClean(analysis);
+
+    let declared = try onlyEntryOf(analysis, "main", "print");
+    try testing.assertFalse(declared.isBuiltin(),
+        "the declaration answers 'print' in the module that writes it");
+    try testing.assertTrue(declared.builtin() == null, "it is nothing the language provides");
+    try testing.assertTrue(declared.signature().declaration() != null,
+        "the entry carries the declaration it came from");
+
+    let provided = try onlyEntryOf(analysis, "other", "print");
+    try testing.assertTrue(provided.builtin() == BuiltinFunction.Print,
+        "every other module keeps the provided 'print'");
+}
+
+test "a replacing declaration keeps the visibility it is marked with" {
+    let analysis = analyzeTwo(
+        "print(string message) \{\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n",
+        "export panic(string message) \{\n"
+        + "\}\n");
+    try sema_support.assertProgramClean(analysis);
+
+    let unmarked = try onlyEntryOf(analysis, "main", "print");
+    try testing.assertTrue(unmarked.visibility() == Visibility.Private,
+        "an unmarked declaration is private to its file, like any other function");
+
+    let marked = try onlyEntryOf(analysis, "other", "panic");
+    try testing.assertTrue(marked.visibility() == Visibility.Export,
+        "a marked declaration keeps the visibility it wrote");
+}
+
+test "a replacing declaration is noreturn only when it says so" {
+    let analysis = analyzeTwo(
+        "panic(string message) \{\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    panic(\"ordinary\");\n"
+        + "    return 0;\n"
+        + "\}\n",
+        "public guarded(bool flag) -> long \{\n"
+        + "    long value;\n"
+        + "    if (flag) \{\n"
+        + "        value = 1;\n"
+        + "    \} else \{\n"
+        + "        panic(\"no value\");\n"
+        + "    \}\n"
+        + "    return value;\n"
+        + "\}\n");
+    try sema_support.assertProgramClean(analysis);
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+
+    let declared = try onlyEntryOf(analysis, "main", "panic");
+    try testing.assertFalse(declared.signature().isNoreturn(),
+        "the declaration wrote no 'noreturn', so it returns like any other function");
+
+    let provided = try onlyEntryOf(analysis, "other", "panic");
+    try testing.assertTrue(provided.signature().isNoreturn(),
+        "the provided 'panic' still ends every path it sits on");
+}
+
+test "a declaration with the same parameter types and a different return type replaces it too" {
+    let analysis = analyzeTwo(
+        "print(string message) -> long \{\n"
+        + "    return message.length;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return print(\"hello\") as int;\n"
+        + "\}\n",
+        "public write(string text) \{\n"
+        + "    print(text);\n"
+        + "\}\n");
+    try sema_support.assertProgramClean(analysis);
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+
+    let declared = try onlyEntryOf(analysis, "main", "print");
+    try testing.assertFalse(declared.isBuiltin(), "the declaration answers 'print' here");
+}
+
+test "a different parameter list overloads the provided function instead of replacing it" {
+    let analysis = analyzeTwo(
+        "print(long count) \{\n"
+        + "    print(\"count \{count\}\");\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    print(7L);\n"
+        + "    return 0;\n"
+        + "\}\n",
+        "public write(string text) \{\n"
+        + "    print(text);\n"
+        + "\}\n");
+    try sema_support.assertProgramClean(analysis);
+
+    let entries = try entriesOf(analysis, "main", "print");
+    try testing.assertEqual(entries.length(), 2L);
+    long provided = 0;
+    for (long i = 0; i < entries.length(); i++) {
+        if (entries.get(i).isBuiltin()) {
+            provided++;
+        }
+    }
+    try testing.assertEqual(provided, 1L);
+}
+
+test "a second declaration with the same parameter types is an ordinary duplicate" {
+    let analysis = analyzeTwo(
+        "print(string message) \{\n"
+        + "\}\n"
+        + "print(string other) \{\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n",
+        "public write(string text) \{\n"
+        + "    print(text);\n"
+        + "\}\n");
+    try sema_support.assertDiagnostic(analysis.signatureDiagnostics(), 0, "/proj/src/main.ens",
+        "Function 'print' is already declared with the same parameter types; overloads must "
+        + "differ in parameter count or types.");
+    try testing.assertEqual(analysis.signatureDiagnostics().length, 1L);
+}
+
+test "an external declaration cannot share its name with a provided function" {
+    let analysis = analyzeTwo(
+        "external from libc \{\n"
+        + "    print(int code);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n",
+        "public write(string text) \{\n"
+        + "    print(text);\n"
+        + "\}\n");
+    try sema_support.assertDiagnostic(analysis.signatureDiagnostics(), 0, "/proj/src/main.ens",
+        "External function 'print' cannot share its name with another function; C symbols "
+        + "cannot be overloaded.");
+    try testing.assertEqual(analysis.signatureDiagnostics().length, 1L);
+}
+
+test "the prelude carries a declaration that replaced a provided function" {
+    let loader = new FakeFileLoader();
+    loader.addToCore("export print(string message) \{\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens",
+        "main() -> int \{\n"
+        + "    print(\"hello\");\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramClean(analysis);
+
+    let contexts = new Map<string, ModuleContext>();
+    let analyzed = analysis.contexts();
+    for (long i = 0; i < analyzed.length(); i++) {
+        contexts.set(analyzed.get(i).module().canonicalPath(), analyzed.get(i));
+    }
+    let scope = prelude.scopeOver(["std.core"], contexts);
+    let offered = scope.match("print", "main", "");
+    if (offered == null) {
+        throw new TestFailure("the prelude should offer the declaration '@std.core' exported");
+    }
+    try testing.assertEqual(offered.entries().length(), 1L);
+    try testing.assertFalse(offered.entries().get(0).isBuiltin(),
+        "what the prelude hands on is the declaration, never a provided function");
+
+    // The calling module still holds its own provided 'print', which answers before the prelude
+    // is ever consulted.
+    let provided = try onlyEntryOf(analysis, "main", "print");
+    try testing.assertTrue(provided.builtin() == BuiltinFunction.Print,
+        "'main' declares nothing, so its 'print' is the provided one");
+}

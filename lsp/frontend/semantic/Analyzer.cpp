@@ -2320,12 +2320,21 @@ void Analyzer::collectFunctions(const ast::SourceFile& file) {
                     "generic functions do not support overloading.");
             } else {
                 Symbol* last = existing;
-                bool duplicate = false;
+                Symbol* before = nullptr;
+                Symbol* clashing = nullptr;
                 for (Symbol* o = existing; o; o = o->nextOverload) {
                     last = o;
-                    if (sameParameterTypes(o, sym)) { duplicate = true; break; }
+                    if (sameParameterTypes(o, sym)) { clashing = o; break; }
+                    before = o;
                 }
-                if (duplicate) {
+                if (clashing && clashing->isBuiltin) {
+                    // A declaration with the same name and parameter types as a function the
+                    // language provides takes it over and answers every call in this module.
+                    sym->nextOverload = clashing->nextOverload;
+                    sym->isOverloaded = clashing->isOverloaded;
+                    if (before) before->nextOverload = sym;
+                    else globalScope->symbols[fname] = sym;
+                } else if (clashing) {
                     errorAtNode(fn.node, "Function '" + asciiOf(fname) +
                         "' is already declared with the same parameter types; "
                         "overloads must differ in parameter count or types.");
