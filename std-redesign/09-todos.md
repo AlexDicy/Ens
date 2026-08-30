@@ -32,9 +32,6 @@ The naive fix, re-checking at monomorphization, would reject the collections' ow
 
 A dedicated review pass over the diagnostic messages introduced across the whole migration, once the plan completes (requested 2026-08-27).
 
-A clearer message when a declaration collides with a function the language provides but cannot replace it (found 2026-08-30).
-Declaring `print<T>(T value)` reports that the name cannot be overloaded because one of its declarations is generic, which reads as nonsense to an author who wrote exactly one declaration, since the other one is the invisible provided function.
-
 Two external handles compared with each other are accepted by sema and refused by code generation (found 2026-08-30, pre-existing).
 `h1 == h2` over two handles reports `The self-hosted code generator does not support comparing 'Handle?' with 'Handle' yet`, while the spec says a handle is passed around and compared with `null`, which is the only comparison it names.
 So either sema should refuse the handle-to-handle comparison and say why, or code generation should answer it by identity the way a presence check already does.

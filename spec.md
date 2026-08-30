@@ -513,6 +513,7 @@ A module may also declare a function with the same name and parameter types as o
 The declaration answers every call to that name in the module that writes it, and every other module keeps the function the language provides.
 Such a declaration is an ordinary function and takes nothing from the one it stands in for: a `panic` of your own never returns only if you write `noreturn` on it.
 A declaration whose parameter types differ is an ordinary overload alongside the provided function, exactly as two declarations of your own overload each other.
+A generic declaration of that name is rejected either way, because a generic function cannot be overloaded and replacing the provided function needs its parameter list.
 
 A program's entry point is the top-level function `main` in its **main module**: `src/main.ens` for a package or a folder of sources, or the compiled file itself for a single-file program.
 No other module may define a top-level `main`; the compiler rejects one wherever it is loaded from, including through an import of another package's main module.
