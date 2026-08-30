@@ -37,9 +37,10 @@ Declaring `print<T>(T value)` reports that the name cannot be overloaded because
 A switch arm's value-label list does not stop at `default` or `is` after a comma, so it reads the keyword as another label (found 2026-08-30, reproducing on the pinned seed).
 `switch (v) { 1, default -> 0, }` reports three problems for one mistake: a missing expression, a missing `->`, and a missing expression again.
 
-A ruling on bounding tree depth for chains and statement nesting (found 2026-08-30).
-The A8 work bounded nesting for parenthesized expressions and types, but four shapes still exhaust the stack in the phases that walk the tree: long infix chains, postfix call chains, deeply nested blocks, and long type-suffix chains.
-The first three do the same on the pinned seed, so only the suffix chain is new, and bounding them changes the diagnostics any long chain produces, which is why it needs a decision rather than a quiet limit.
+A long chain of type suffixes still exhausts the stack: `int?[]?[]...` past about 1500 suffixes exits with no diagnostic at all (measured 2026-08-30, the same on the pinned seed).
+Ratified 2026-08-30 to bound all four deep shapes in the parser; infix chains, postfix call chains and nested blocks now are, and this one is not.
+A type's slots hold one head that its suffixes wrap, so there is no shape a half-abandoned chain could take, and giving the whole type up reports a diagnostic that makes the statement classifier's speculative type parse unclean, which drops the declaration to the expression path and floods it with one problem per suffix.
+Bounding it needs a decision on one of those two: a flat form for a suffix chain in the grammar, or a speculation rule saying a construct given up for depth still counts as that construct.
 
 ## Reminders
 

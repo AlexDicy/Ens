@@ -165,9 +165,11 @@ struct ParserMark {
     long recoveryCount;
 }
 
-// Expressions and types nest through recursion; beyond this depth the parser stops recursing and
-// abandons the construct, so neither its own stack nor the walk any later phase makes over the
-// tree it produces can be driven past its limit by a pathological input.
+// How deep a tree one declaration may be written as. Expressions, types and blocks all count
+// against it, because each can contain the others and every later phase walks the result by
+// recursing once per level, so no pathological input can drive either the parser's own stack or
+// theirs past its limit. A long chain counts too: each operator that extends what came before
+// wraps it, which is one more level whether or not the parser recursed to build it.
 maximumNestingDepth() -> long {
     return 500;
 }
@@ -578,6 +580,12 @@ class Parser {
 
     leaveNesting() {
         this.nestingDepth--;
+    }
+
+    // Gives back the levels one construct took together: a chain of operators is one expression,
+    // so its links are entered one at a time and left in a single step when it finishes.
+    leaveNestingTimes(long count) {
+        this.nestingDepth = this.nestingDepth - count;
     }
 
     // A node standing in for a construct the parser gave up on, holding the tokens it abandoned.
@@ -1747,16 +1755,47 @@ class Parser {
         }
     }
 
+    // A block holds statements that hold blocks, so its nesting counts towards the same limit an
+    // expression's and a type's do: all three deepen the tree the later phases walk. Past the limit
+    // the body becomes one error statement holding the tokens, so the braces around it still match.
     parseBlock() {
         let marker = this.start();
         this.expect(SyntaxKind.OpenBrace, "Expected '\{' to begin the block");
         let statements = this.start();
-        while (!this.at(SyntaxKind.CloseBrace) && !this.atEnd()) {
-            this.parseStatement();
+        if (this.enterNesting("These blocks nest too deeply to be parsed; move the inner ones "
+                + "into functions of their own")) {
+            while (!this.at(SyntaxKind.CloseBrace) && !this.atEnd()) {
+                this.parseStatement();
+            }
+            this.leaveNesting();
+        } else {
+            this.skipDeepBlockBody();
         }
         this.complete(statements, SyntaxKind.List);
         this.expect(SyntaxKind.CloseBrace, "Expected '\}' to close the block");
         this.complete(marker, SyntaxKind.Block);
+    }
+
+    // The statements of a block too deep to parse, taken as tokens up to the brace that closes it,
+    // so the enclosing blocks still find their own closers.
+    skipDeepBlockBody() {
+        let marker = this.start();
+        let skipped = this.start();
+        long depth = 0;
+        while (!this.atEnd()) {
+            let kind = this.currentKind();
+            if (kind == SyntaxKind.CloseBrace) {
+                if (depth == 0) {
+                    break;
+                }
+                depth--;
+            } else if (kind == SyntaxKind.OpenBrace) {
+                depth++;
+            }
+            this.bump();
+        }
+        this.complete(skipped, SyntaxKind.List);
+        this.complete(marker, SyntaxKind.ErrorStatement);
     }
 
     // For a required Block slot when no '{' is present: an empty Block with missing braces keeps
@@ -2353,15 +2392,24 @@ class Parser {
         return this.parsePrecedence(1);
     }
 
+    // Every operator that extends what came before wraps it, so a chain's length is the depth of
+    // the expression tree, and it is bounded by the same count parentheses are: the phases that
+    // walk the tree recurse once per level either way. The levels a chain took are given back
+    // together, because they are one expression rather than one per link.
     parsePrecedence(long minPrecedence) -> long {
-        if (!this.enterNesting("This expression nests too deeply to be parsed; split it into "
-                + "smaller expressions")) {
+        if (!this.enterNesting(deeplyNestedExpression())) {
             return this.abandoned(SyntaxKind.ErrorExpression);
         }
+        long taken = 1;
         long completed = this.parsePrefix();
         while (true) {
             let operator = this.currentKind();
             if (operator == SyntaxKind.Less && this.tryParseGenericSuffix()) {
+                if (!this.enterNesting(deeplyNestedExpression())) {
+                    this.leaveNestingTimes(taken);
+                    return this.abandoned(SyntaxKind.ErrorExpression);
+                }
+                taken++;
                 if (this.at(SyntaxKind.OpenParenthesis)) {
                     let call = this.precede(completed);
                     this.parseArgumentList();
@@ -2384,6 +2432,11 @@ class Parser {
             if (precedence < minPrecedence || precedence == 0) {
                 break;
             }
+            if (!this.enterNesting(deeplyNestedExpression())) {
+                this.leaveNestingTimes(taken);
+                return this.abandoned(SyntaxKind.ErrorExpression);
+            }
+            taken++;
             if (safeSubscript) {
                 let marker = this.precede(completed);
                 this.bump();
@@ -2478,7 +2531,7 @@ class Parser {
                 },
             }
         }
-        this.leaveNesting();
+        this.leaveNestingTimes(taken);
         return completed;
     }
 
@@ -2926,6 +2979,12 @@ isAssignmentOperator(SyntaxKind kind) -> bool {
         GreaterGreaterGreaterEquals -> true,
         default -> false,
     };
+}
+
+// What an expression too deep to parse reports, whether it got there by nesting or by chaining:
+// both are the same count and the same fix, so both say it the same way.
+deeplyNestedExpression() -> string {
+    return "This expression nests too deeply to be parsed; split it into smaller expressions";
 }
 
 // '??' binds like '||' and is right-associative. The operator is a pair of Question tokens rather
