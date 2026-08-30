@@ -14,7 +14,9 @@ The migration order is written: see 10-migration-plan.md.
 Shortest round-trip float formatting, for `StringBuilder.append(double)` and interpolation; exists nowhere today.
 Number formatting beyond decimal (radix, width, padding) and parsing/formatting for `decimal`.
 A modification counter in `Map`, `Set`, `SortedMap`, and their views, aborting on mutation during a walk.
-The compiler's rejected-key-type list for map and set keys: arrays, external handles, mutable collections.
+The compiler's rejected-key-type list for map and set keys: arrays, external handles, mutable collections, and function types.
+Function types are the verified case (2026-08-30): `Set<(int) -> char>` compiles, because the `Hashable` bound is treated as universally satisfied, and the elements then hash by object identity, so two identical lambdas written at two sites are two keys while a capturing lambda evaluated twice is also two keys.
+Writing `hash()` on a function value directly is already refused, so the generic path is the inconsistency, and the real work is making `Hashable` a bound with an exclusion list rather than special-casing one type.
 A test that ARC releases live locals on the throw path.
 A pinning fixture for file-next-to-folder module resolution, plus a spec line.
 A fixture for a cross-package subclass calling a protected constructor.
