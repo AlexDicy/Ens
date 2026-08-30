@@ -31,6 +31,13 @@ public:
     // class namespace so name lookups treat the two uniformly.
     Type* registerInterface(const std::u16string& modulePath, std::u16string name);
 
+    // Attaches a member table to a primitive, which is how the standard library's `primitive`
+    // declaration puts members on `string` and the numeric types. Returns null when the
+    // primitive already carries one, so a second declaration changes nothing here and the
+    // compiler is left to report it.
+    StructInfo* bindPrimitive(Type* primitive, const std::u16string& modulePath,
+                              std::u16string name);
+
     Type* registerExternalType(const std::u16string& modulePath, std::u16string name);
     Type* lookupExternalType(const std::u16string& modulePath, const std::u16string& name) const;
 

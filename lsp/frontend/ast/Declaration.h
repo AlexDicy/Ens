@@ -25,6 +25,7 @@ class FieldDecl;
 class StructDecl;
 class ClassDecl;
 class InterfaceDecl;
+class PrimitiveDecl;
 class ImplementsClause;
 class MemberList;
 class ImportDecl;
@@ -273,6 +274,23 @@ public:
     std::vector<FuncDecl> methods() const;
 };
 
+// `primitive string implements Comparable<string> { ... }`: what the standard library declares a
+// primitive's members to be. The name position holds the primitive's own keyword.
+class PrimitiveDecl {
+public:
+    SyntaxNode node;
+    static std::optional<PrimitiveDecl> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::PrimitiveDecl) return std::nullopt;
+        return PrimitiveDecl{n};
+    }
+    std::optional<SyntaxNode> nameToken() const;
+    std::optional<std::u16string> nameText() const;
+    std::vector<TypeReference> implementedInterfaces() const;
+    std::optional<MemberList> memberList() const;
+    std::vector<FieldDecl> fields() const;
+    std::vector<FuncDecl> methods() const;
+};
+
 class ImportPath {
 public:
     SyntaxNode node;
@@ -394,6 +412,7 @@ public:
     std::vector<StructDecl> structs() const;
     std::vector<ClassDecl> classes() const;
     std::vector<InterfaceDecl> interfaces() const;
+    std::vector<PrimitiveDecl> primitiveBindings() const;
     std::vector<EnumDecl> enums() const;
     std::vector<TestDecl> tests() const;
     std::vector<TypedVarDeclStatement> topLevelVarDecls() const;

@@ -49,7 +49,7 @@ enum class SyntaxKind : uint16_t {
     KwAbstract, KwAs, KwAssert, KwBreak, KwCase, KwCatch, KwClass, KwComputed, KwConst, KwConstructor, KwContinue,
     KwDefault, KwDestructor, KwDo, KwElse, KwEnum, KwExport, KwExtends, KwExternal, KwFalse, KwFinal, KwFinally,
     KwFor, KwFrom, KwGoto, KwIf, KwImplements, KwImport, KwIn, KwInterface, KwIs, KwLet, KwNew, KwNoreturn, KwNull, KwOut, KwOverride, KwPackage,
-    KwPrivate, KwProtected, KwPublic, KwRethrow, KwReturn, KwSealed, KwStatic, KwStruct,
+    KwPrimitive, KwPrivate, KwProtected, KwPublic, KwRethrow, KwReturn, KwSealed, KwStatic, KwStruct,
     KwSuper, KwSwitch, KwTest, KwThis, KwThrow, KwThrows, KwTrue, KwTry, KwType, KwWeak, KwWhile,
 
     // ============================================================
@@ -71,6 +71,7 @@ enum class SyntaxKind : uint16_t {
     StructDecl,
     ClassDecl,
     InterfaceDecl,
+    PrimitiveDecl,       // primitive string implements Comparable<string> { ... }, in std only
     ImplementsClause,    // implements I, J<int> on a class
     FieldDecl,
     MemberList,

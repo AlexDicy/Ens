@@ -189,6 +189,38 @@ bool Parser::peekIsContextualType(size_t n) const {
     }
 }
 
+// `primitive` is a contextual keyword: an ordinary identifier everywhere except at the top level,
+// where `primitive string { ... }` declares what a primitive's members are.
+bool Parser::atContextualPrimitive() const {
+    return kindAt() == SyntaxKind::Identifier && tokenAt().text == u"primitive";
+}
+
+bool Parser::peekIsContextualPrimitive(size_t n) const {
+    size_t idx = current;
+    while (true) {
+        if (idx >= tokens.size()) return false;
+        if (!isTrivia(tokens[idx].kind)) {
+            if (n == 0) {
+                return tokens[idx].kind == SyntaxKind::Identifier &&
+                       tokens[idx].text == u"primitive";
+            }
+            n--;
+        }
+        idx++;
+    }
+}
+
+// The word, the primitive it names, and the clause or brace that follows. The last check is what
+// keeps `primitive` an ordinary identifier: a declaration written with it as a type name reads as
+// one instead of as a binding.
+bool Parser::atPrimitiveBinding(size_t ahead) const {
+    if (!peekIsContextualPrimitive(ahead)) return false;
+    SyntaxKind named = peekKind(ahead + 1);
+    if (named != SyntaxKind::Identifier && !isPrimitiveTypeKw(named)) return false;
+    SyntaxKind following = peekKind(ahead + 2);
+    return following == SyntaxKind::LBrace || following == SyntaxKind::KwImplements;
+}
+
 bool Parser::eat(SyntaxKind k) {
     if (!at(k)) return false;
     bump();
@@ -330,6 +362,21 @@ void Parser::parseTopLevel() {
     if (atContextualTest() &&
         (peekKind(1) == SyntaxKind::StringLiteral || peekKind(1) == SyntaxKind::InterpStringStart)) {
         parseTestDecl();
+        return;
+    }
+
+    if (atPrimitiveBinding(0)) {
+        parsePrimitiveDecl();
+        return;
+    }
+
+    // A primitive binding is introduced by 'primitive' alone; how far a member reaches is its own
+    // modifier's business.
+    if (declMods > 0 && atPrimitiveBinding(static_cast<size_t>(declMods))) {
+        reportAtCurrent("A primitive binding takes no modifiers; write 'primitive string "
+                        "{ ... }' and let each member's own modifier decide how far it reaches");
+        for (int i = 0; i < declMods; i++) bump();
+        parsePrimitiveDecl();
         return;
     }
 
@@ -709,6 +756,30 @@ void Parser::parseStructOrClassDecl(SyntaxKind nodeKind, SyntaxKind keywordKind)
         parseStructOrClassMember();
         if (current == before) {
             reportAtCurrent("Unexpected token in member list");
+            recoverTo({SyntaxKind::RBrace, SyntaxKind::Semi, SyntaxKind::EndOfFile});
+            eat(SyntaxKind::Semi);
+            if (current == before && !atEnd()) bump();
+        }
+    }
+    builder.finishNode();
+    expect(SyntaxKind::RBrace, "'}'");
+    builder.finishNode();
+}
+
+// `primitive string implements Comparable<string> { ... }`: what a primitive's members are. The
+// word is re-tagged here and nowhere else, so it stays a valid identifier in every other position.
+void Parser::parsePrimitiveDecl() {
+    builder.startNode(SyntaxKind::PrimitiveDecl);
+    bumpAs(SyntaxKind::KwPrimitive);
+    bump();  // the primitive being bound: its own keyword, or an identifier the compiler refuses
+    if (at(SyntaxKind::KwImplements)) parseImplementsClause();
+    expect(SyntaxKind::LBrace, "'{'");
+    builder.startNode(SyntaxKind::MemberList);
+    while (!at(SyntaxKind::RBrace) && !atEnd()) {
+        size_t before = current;
+        parseStructOrClassMember();
+        if (current == before) {
+            reportAtCurrent("Unexpected token in the primitive binding's body");
             recoverTo({SyntaxKind::RBrace, SyntaxKind::Semi, SyntaxKind::EndOfFile});
             eat(SyntaxKind::Semi);
             if (current == before && !atEnd()) bump();
@@ -1702,13 +1773,30 @@ void Parser::parsePrefix() {
             return;
         }
         case SyntaxKind::Identifier:
-        case SyntaxKind::KwString:
-            // `KwString` is the `string` type name as an expression receiver, for static
-            // builtins like `string.fromBytes(bytes)`.
             if (lambdaHere && peekKind(1) == SyntaxKind::Arrow) {
                 parseBareParameterLambda();
                 return;
             }
+            builder.startNode(SyntaxKind::IdentExpr);
+            bump();
+            builder.finishNode();
+            return;
+        // A primitive's keyword names the type itself, which is how a static of that type is
+        // reached: `string.fromBytes(bytes)`, `string.joined(parts, ", ")`.
+        case SyntaxKind::KwBool:
+        case SyntaxKind::KwByte:
+        case SyntaxKind::KwShort:
+        case SyntaxKind::KwUShort:
+        case SyntaxKind::KwInt:
+        case SyntaxKind::KwUInt:
+        case SyntaxKind::KwLong:
+        case SyntaxKind::KwULong:
+        case SyntaxKind::KwFloat:
+        case SyntaxKind::KwDouble:
+        case SyntaxKind::KwDecimal:
+        case SyntaxKind::KwChar:
+        case SyntaxKind::KwString:
+        case SyntaxKind::KwVoid:
             builder.startNode(SyntaxKind::IdentExpr);
             bump();
             builder.finishNode();

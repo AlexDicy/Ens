@@ -58,6 +58,11 @@ private:
     // True when positioned on the contextual `type` keyword (a `type` identifier).
     bool atContextualType() const;
     bool peekIsContextualType(size_t n) const;
+    // True when positioned on the contextual `primitive` keyword (a `primitive` identifier).
+    bool atContextualPrimitive() const;
+    bool peekIsContextualPrimitive(size_t n) const;
+    // True when a primitive binding starts `ahead` significant tokens from the cursor.
+    bool atPrimitiveBinding(size_t ahead) const;
 
     void expect(SyntaxKind k, const char* what);
     void emitMissing(SyntaxKind expectedKind, const char* what);
@@ -82,6 +87,7 @@ private:
     void parseCatchClause();
     void parseStructOrClassDecl(SyntaxKind nodeKind, SyntaxKind keywordKind);
     void parseInterfaceDecl();
+    void parsePrimitiveDecl();
     void parseImplementsClause();
     void parseStructOrClassMember();
     bool looksLikeKeywordNamedMethod() const;

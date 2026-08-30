@@ -208,6 +208,8 @@ private:
     void registerStructNames(const ast::SourceFile& file);
     void registerClassNames(const ast::SourceFile& file);
     void registerInterfaceNames(const ast::SourceFile& file);
+    void registerPrimitiveBindingNames(const ast::SourceFile& file);
+    void collectPrimitiveBindings(const ast::SourceFile& file);
     void registerEnumNames(const ast::SourceFile& file);
     void registerExternalTypeNames(const ast::SourceFile& file);
     void rejectTopLevelVariables(const ast::SourceFile& file);

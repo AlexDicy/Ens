@@ -18,6 +18,11 @@
 -- `ens test <folder> ...` instead of compile+run, asserting on its two streams the same way.
 -- the token {dir} in the extra arguments expands to the folder's absolute path.
 --     // @ens-test --filter needle
+-- @stdlib names a folder holding a std/ package the fixture is compiled against instead of libs/,
+-- which is how a fixture exercises a standard library the tree's own cannot yet contain. The path
+-- is relative to the folder of the file the directive is written in, and semacheck and
+-- codegencheck honor it too.
+--     // @stdlib ../stdlib
 -- tests run in parallel; set ENS_TEST_JOBS to override the worker count (default: cpu count).
 -- pass test names to run a subset, e.g. `xmake test arc_basic class_constructor`; runs all if omitted.
 task("test")
@@ -2675,9 +2680,12 @@ task("test")
         -- builds the language server, which nothing else compiles. An editor holding the binary open
         -- makes the link fail for a reason that has nothing to do with the change, so that case is
         -- reported as a skip: a run that cannot check says so instead of going red.
+        -- '-y' is what keeps the nested build from asking: a toolchain re-check offers to fetch the
+        -- packages the language server's own toolchain names, and this process has no standard
+        -- input to answer with, so a prompt would hang the whole run.
         local function run_lsp_build(job)
             local log = path.join(out_dir, job.name .. ".log")
-            local rc = execMerged("xmake", {"build", "ens-lsp"}, log)
+            local rc = execMerged("xmake", {"build", "-y", "ens-lsp"}, log)
             if rc == 0 then
                 return {name = job.name, ok = true}
             end
@@ -2722,8 +2730,13 @@ task("test")
             local expected_stderr_contains = {}
             local expected_errors   = {}
             local ens_test_args     = job.ens_test_args   -- @ens-test: run `ens test` on the folder instead
+            local stdlib_root       = nil   -- @stdlib: a std/ package to compile against instead of libs/
             local content = (ens_file and io.readfile(ens_file)) or ""
             for line in content:gmatch("[^\r\n]+") do
+                local stdlib_str = line:match("^%s*//%s*@stdlib%s+(%S+)")
+                if stdlib_str then
+                    stdlib_root = path.absolute(stdlib_str, path.directory(ens_file))
+                end
                 local exit_str = line:match("^%s*//%s*@exit%s+(%-?%d+)")
                 if exit_str then expected_exit = tonumber(exit_str) end
                 local contains_str = line:match("^%s*//%s*@stdout%-contains%s+(.*)$")
@@ -2793,6 +2806,10 @@ task("test")
                 os.tryrm(stdout_file)
                 os.tryrm(stderr_file)
                 local argv = {"test", job.source}
+                if stdlib_root then
+                    table.insert(argv, "--stdlib")
+                    table.insert(argv, stdlib_root)
+                end
                 for _, a in ipairs(ens_test_args) do
                     table.insert(argv, (a:gsub("{dir}", (job.source:gsub("\\", "/")))))
                 end
@@ -2827,9 +2844,12 @@ task("test")
                 return {name = name, ok = false, short = "no LLVM environment",
                     full = string.format("%s: %s", name, env_error)}
             end
-            local compile_rc = execMerged(host_exe,
-                {"build", job.source, "--output", exe_file, "--objects", out_dir}, compile_log,
-                {envs = env})
+            local build_argv = {"build", job.source, "--output", exe_file, "--objects", out_dir}
+            if stdlib_root then
+                table.insert(build_argv, "--stdlib")
+                table.insert(build_argv, stdlib_root)
+            end
+            local compile_rc = execMerged(host_exe, build_argv, compile_log, {envs = env})
             local compile_log_text = io.readfile(compile_log) or ""
 
             if #expected_errors > 0 then

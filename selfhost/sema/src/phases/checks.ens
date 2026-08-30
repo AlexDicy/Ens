@@ -5,6 +5,7 @@ import SourceFileNode from @ens.frontend.syntax.generated.nodes;
 import StructDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import ClassDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import InterfaceDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import PrimitiveDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import FieldDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import MemberListNode from @ens.frontend.syntax.generated.nodes;
@@ -32,6 +33,7 @@ import DeclaredType from model.types;
 import ClassType from model.types;
 import StructType from model.types;
 import InterfaceType from model.types;
+import PrimitiveBinding from model.types;
 import TypeParamType from model.types;
 import Field from model.types;
 import Method from model.types;
@@ -72,6 +74,7 @@ class ModuleChecks {
     List<StructDeclarationNode> structNodes;
     List<ClassDeclarationNode> classNodes;
     List<InterfaceDeclarationNode> interfaceNodes;
+    List<PrimitiveDeclarationNode> primitiveNodes;
 
     protected constructor(ModuleContext context, List<FileDiagnostic> collected) {
         this.context = context;
@@ -80,6 +83,7 @@ class ModuleChecks {
         this.structNodes = new List<StructDeclarationNode>();
         this.classNodes = new List<ClassDeclarationNode>();
         this.interfaceNodes = new List<InterfaceDeclarationNode>();
+        this.primitiveNodes = new List<PrimitiveDeclarationNode>();
     }
 
     protected run() {
@@ -98,6 +102,9 @@ class ModuleChecks {
                 is InterfaceDeclarationNode declaration -> {
                     this.interfaceNodes.push(declaration);
                 },
+                is PrimitiveDeclarationNode declaration -> {
+                    this.primitiveNodes.push(declaration);
+                },
                 default -> { },
             }
         }
@@ -105,8 +112,143 @@ class ModuleChecks {
         this.checkFieldDefaultOrder();
         this.checkFieldInitialization();
         this.checkInterfaceRedeclarations();
+        this.checkPrimitiveConformances();
         this.checkDeclaredThrows();
         this.checkVisibilityLeaks();
+    }
+
+    bindingFor(PrimitiveDeclarationNode node) -> PrimitiveBinding? {
+        let store = this.context.resolver().typeStore();
+        let primitive = types.primitiveNamed(store, node.name().text());
+        if (primitive == null) {
+            return null;
+        }
+        let binding = types.bindingOf(primitive);
+        if (binding != null && binding.declaration() == node.green()) {
+            return binding;
+        }
+        return null;
+    }
+
+    // A conformance a binding declares has to hold: every method the interface and the
+    // interfaces it extends require must be a member of the binding, with a matching signature
+    // and the 'override' marker, exactly as a class implementing the same interface would.
+    // Whole-program, because the interface may be declared in another module.
+    checkPrimitiveConformances() {
+        for (long n = 0; n < this.primitiveNodes.length(); n++) {
+            let node = this.primitiveNodes.get(n);
+            let binding = this.bindingFor(node);
+            if (binding == null) {
+                continue;
+            }
+            Span at = node.name().span();
+            let checked = new Set<Type>();
+            for (let implemented in binding.interfaces()) {
+                for (let level in types.interfaceLadderOf(implemented)) {
+                    if (!checked.add(level)) {
+                        continue;
+                    }
+                    this.checkBindingLevelSatisfied(binding, implemented, level, at);
+                }
+            }
+            this.checkBindingOverrideMarkers(binding, node);
+        }
+    }
+
+    checkBindingLevelSatisfied(PrimitiveBinding binding, Type implemented, Type level, Span at) {
+        let required = types.methodsOf(level);
+        if (required == null) {
+            return;
+        }
+        string interfaceName = types.display(implemented);
+        string levelName = types.display(level);
+        for (long i = 0; i < required.length(); i++) {
+            let wanted = required.get(i);
+            let provided = members.findSameSignature(binding.methods(), wanted.name(),
+                wanted.signature());
+            if (provided == null) {
+                string requiredBy = "";
+                if (level != implemented) {
+                    requiredBy = ", required by '{levelName}', which '{interfaceName}' extends";
+                }
+                if (members.compilerOwnedMember(binding.primitive(), wanted.name())) {
+                    this.reporter.report("The binding for '{binding.name()}' implements "
+                        + "'{interfaceName}' but cannot provide "
+                        + "'{layout.methodDisplay(wanted)}'{requiredBy}, because the compiler "
+                        + "answers for '{wanted.name()}' on '{binding.name()}' itself. Stop "
+                        + "implementing '{interfaceName}' here.", at);
+                    continue;
+                }
+                this.reporter.report("The binding for '{binding.name()}' implements "
+                    + "'{interfaceName}' but does not provide "
+                    + "'{layout.methodDisplay(wanted)}'{requiredBy}. Declare the method here, "
+                    + "or stop implementing '{interfaceName}'.", at);
+                continue;
+            }
+            if (!convert.isAssignableStrict(wanted.signature().returnType(),
+                    provided.signature().returnType())) {
+                this.reporter.report("Method '{wanted.name()}' of the '{binding.name()}' "
+                    + "binding does not match '{layout.methodDisplay(wanted)}' declared in "
+                    + "interface '{levelName}'.", at);
+            }
+            if (wanted.isNoreturn() && !provided.isNoreturn()) {
+                this.reporter.report("Method '{wanted.name()}' of the '{binding.name()}' "
+                    + "binding must be marked 'noreturn' because interface '{levelName}' "
+                    + "declares it 'noreturn'; callers rely on it never returning.", at);
+            }
+        }
+    }
+
+    // The marker rules, with no base chain to consult: a member marked 'override' has to answer
+    // a declared conformance, and one that answers a conformance has to carry the marker.
+    checkBindingOverrideMarkers(PrimitiveBinding binding, PrimitiveDeclarationNode node) {
+        let body = node.body();
+        for (long i = 0; i < body.membersCount(); i++) {
+            let member = body.members(i);
+            if (!(member is FunctionDeclarationNode)) {
+                continue;
+            }
+            let declared = members.methodDeclaredBy(binding.methods(), member.green());
+            if (declared == null) {
+                continue;
+            }
+            let nameToken = member.name();
+            if (nameToken == null) {
+                continue;
+            }
+            let answered = this.requirementAnswered(binding, declared);
+            if (declared.isOverride()) {
+                if (answered == null) {
+                    this.reporter.report("Method '{declared.name()}' of the '{binding.name()}' "
+                        + "binding is marked 'override' but no implemented interface declares "
+                        + "it. A primitive has no base to override, so 'override' here only "
+                        + "means the member answers a conformance.", nameToken.span());
+                }
+                continue;
+            }
+            if (answered != null) {
+                this.reporter.report("Method '{declared.name()}' of the '{binding.name()}' "
+                    + "binding implements a method declared in interface '{answered}'; mark it "
+                    + "'override'.", nameToken.span());
+            }
+        }
+    }
+
+    // The interface whose requirement this member answers, as it reads in a diagnostic, or null.
+    requirementAnswered(PrimitiveBinding binding, Method declared) -> string? {
+        for (let implemented in binding.interfaces()) {
+            for (let level in types.interfaceLadderOf(implemented)) {
+                let methods = types.methodsOf(level);
+                if (methods == null) {
+                    continue;
+                }
+                if (members.findSameSignature(methods, declared.name(),
+                        declared.signature()) != null) {
+                    return types.display(level);
+                }
+            }
+        }
+        return null;
     }
 
     structFor(StructDeclarationNode node) -> StructType? {
@@ -498,6 +640,18 @@ class ModuleChecks {
                 protectedMemberReach(classType));
             this.checkMemberLeaks("class", classType, classType.staticFields(), 0,
                 classType.staticMethods(), protectedMemberReach(classType));
+        }
+        for (long i = 0; i < this.primitiveNodes.length(); i++) {
+            let binding = this.bindingFor(this.primitiveNodes.get(i));
+            if (binding == null) {
+                continue;
+            }
+            // A binding is nameable everywhere the primitive is, so an exported member of one
+            // answers for the types it mentions exactly as an exported class member does.
+            this.checkMemberLeaks("primitive", binding, binding.staticFields(), 0,
+                binding.methods(), Visibility.Protected);
+            this.checkMemberLeaks("primitive", binding, binding.staticFields(), 0,
+                binding.staticMethods(), Visibility.Protected);
         }
         for (long i = 0; i < this.interfaceNodes.length(); i++) {
             let node = this.interfaceNodes.get(i);

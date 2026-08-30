@@ -7,6 +7,7 @@ import @ens.frontend.syntax.generated.nodes;
 import SourceFileNode from @ens.frontend.syntax.generated.nodes;
 import StructDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import ClassDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import PrimitiveDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import TestDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import FieldDeclarationNode from @ens.frontend.syntax.generated.nodes;
@@ -427,6 +428,9 @@ class BodyChecker implements NoreturnCalls {
                 is ClassDeclarationNode declaration -> {
                     this.checkClassBodies(declaration);
                 },
+                is PrimitiveDeclarationNode declaration -> {
+                    this.checkPrimitiveBindingBodies(declaration);
+                },
                 is TestDeclarationNode declaration -> {
                     this.checkTestBody(declaration);
                 },
@@ -472,6 +476,21 @@ class BodyChecker implements NoreturnCalls {
             this.checkMemberBodies(found, found.methods(), found.staticMethods(), node.body());
             this.leaveObligationOwner();
         }
+    }
+
+    // A binding's members belong to the primitive, so 'this' inside one is the primitive value
+    // and the members reachable without a receiver are the binding's own.
+    checkPrimitiveBindingBodies(PrimitiveDeclarationNode node) {
+        let primitive = types.primitiveNamed(this.store, node.name().text());
+        if (primitive == null) {
+            return;
+        }
+        let binding = types.bindingOf(primitive);
+        if (binding == null || binding.declaration() != node.green()) {
+            return;
+        }
+        this.checkMemberBodies(primitive, binding.methods(), binding.staticMethods(),
+            node.body());
     }
 
     // Deferred judgments and open generic calls found while checking a generic template's or
@@ -525,19 +544,19 @@ class BodyChecker implements NoreturnCalls {
         return [];
     }
 
-    checkMemberBodies(DeclaredType owner, List<Method> methods, List<Method> staticMethods,
+    checkMemberBodies(Type owner, List<Method> methods, List<Method> staticMethods,
                       MemberListNode body) {
         for (long i = 0; i < body.membersCount(); i++) {
             let member = body.members(i);
             if (member is FunctionDeclarationNode) {
-                let method = methodDeclaredBy(methods, member.green());
+                let method = members.methodDeclaredBy(methods, member.green());
                 if (method != null) {
                     this.enclosingOwner = owner;
                     this.checkParameterDefaults(method.signature(), member);
                     this.checkCallableBody(method.signature(), owner, owner, method, member);
                     continue;
                 }
-                let staticMethod = methodDeclaredBy(staticMethods, member.green());
+                let staticMethod = members.methodDeclaredBy(staticMethods, member.green());
                 if (staticMethod != null) {
                     this.enclosingOwner = owner;
                     this.checkParameterDefaults(staticMethod.signature(), member);
@@ -989,7 +1008,7 @@ class BodyChecker implements NoreturnCalls {
                         this.reporter.report("Default value for field '{member.name().text()}': "
                             + "expected '{types.display(expected)}', got "
                             + "'{types.display(actual)}'"
-                            + "{this.valueNullabilityHint(expected, actual, value)}",
+                            + "{this.valueAssignabilityHint(expected, actual, value)}",
                             value.span());
                     }
                 }
@@ -1034,7 +1053,7 @@ class BodyChecker implements NoreturnCalls {
                 this.reporter.report("Default value for parameter "
                     + "'{parameterNode.name().text()}': expected '{types.display(expected)}', "
                     + "got '{types.display(actual)}'"
-                    + "{this.valueNullabilityHint(expected, actual, value)}", value.span());
+                    + "{this.valueAssignabilityHint(expected, actual, value)}", value.span());
             }
         }
         this.scope = null;
@@ -1226,9 +1245,9 @@ class BodyChecker implements NoreturnCalls {
             + "it. Copy it into a local first ('{example}') and check the local.";
     }
 
-    // nullabilityHint with the mismatched value in hand: a possibly-null value read from a
+    // assignabilityHint with the mismatched value in hand: a possibly-null value read from a
     // 'weak' field gets the weak explanation instead of the plain check suggestion.
-    valueNullabilityHint(Type target, Type source, Expression? value) -> string {
+    valueAssignabilityHint(Type target, Type source, Expression? value) -> string {
         if (value != null && !(target is ErrorType) && !(target is OptionalType)
                 && source is OptionalType
                 && convert.isAssignableStrict(target, source.inner())) {
@@ -1237,7 +1256,7 @@ class BodyChecker implements NoreturnCalls {
                 return ". The value may be null here. {guidance}";
             }
         }
-        return nullabilityHint(target, source);
+        return assignabilityHint(target, source);
     }
 
     // Recognizes 'x == null' and 'x != null' over a narrowable path whose analyzed type is
@@ -2203,7 +2222,7 @@ class BodyChecker implements NoreturnCalls {
                     && !convert.isAssignableStrict(declared, initType)) {
                 this.reporter.report("Cannot assign value of type '{types.display(initType)}' "
                     + "to variable of type '{types.display(declared)}'"
-                    + "{this.valueNullabilityHint(declared, initType, initializer.value())}",
+                    + "{this.valueAssignabilityHint(declared, initType, initializer.value())}",
                     initializer.value().span());
             }
             return declared;
@@ -2400,6 +2419,10 @@ class BodyChecker implements NoreturnCalls {
                 element = iterable.element();
             } else if (types.isClassLike(iterable)) {
                 element = this.iterableElementType(iterable, node.iterable().span());
+            } else if (iterable is StringType) {
+                this.reporter.report("'for (... in ...)' cannot iterate a 'string': text is not "
+                    + "a sequence of its own, so a walk over it says which view it reads. "
+                    + "Iterate 'text.toBytes()' to visit the bytes.", node.iterable().span());
             } else {
                 this.reporter.report("'for (... in ...)' requires an array or an iterable "
                     + "object, got '{types.display(iterable)}'. A class is iterable when it "
@@ -2513,7 +2536,7 @@ class BodyChecker implements NoreturnCalls {
         if (!convert.isAssignableStrict(expected, actual)) {
             this.reporter.report("Cannot return value of type '{types.display(actual)}' from "
                 + "function returning '{types.display(expected)}'"
-                + "{this.valueNullabilityHint(expected, actual, value)}", value.span());
+                + "{this.valueAssignabilityHint(expected, actual, value)}", value.span());
         }
     }
 
@@ -2883,7 +2906,7 @@ class BodyChecker implements NoreturnCalls {
                 this.reporter.report("This lambda's body produces "
                     + "'{types.display(actual)}', but its type returns "
                     + "'{types.display(returned)}'"
-                    + "{this.valueNullabilityHint(returned, actual, body)}", body.span());
+                    + "{this.valueAssignabilityHint(returned, actual, body)}", body.span());
             }
         }
     }
@@ -2908,13 +2931,14 @@ class BodyChecker implements NoreturnCalls {
     // Records that every lambda being checked copies the enclosing receiver, which is what makes
     // 'this' readable, its fields writable, and its methods callable inside a lambda. A struct
     // receiver is refused: copying it would give the lambda its own struct, so a write through
-    // the copy would not be a write to the one the method runs over.
+    // the copy would not be a write to the one the method runs over. A primitive receiver is a
+    // value nothing can write through, so copying it changes nothing and it is allowed.
     captureReceiver(Type receiver, Span at) {
         long depth = this.lambdaFrames.length();
         if (depth == 0) {
             return;
         }
-        if (!types.isClassLike(receiver)) {
+        if (!types.isClassLike(receiver) && types.bindingOf(receiver) == null) {
             if (this.lambdaFrames.get(depth - 1).captureReceiver(receiver)) {
                 this.reporter.report("A lambda cannot capture 'this' here: "
                     + "'{types.display(receiver)}' is a struct, so the lambda would copy it and "
@@ -3243,6 +3267,10 @@ class BodyChecker implements NoreturnCalls {
         if (name.length == 0) {
             return this.store.errorType();
         }
+        if (types.primitiveNamed(this.store, name) != null) {
+            this.reportTypeAsValue(name, node.name().span());
+            return this.store.errorType();
+        }
         let resolution = this.resolveName(name);
         if (resolution == null) {
             let ownerName = this.staticSuggestionOwner(name);
@@ -3269,15 +3297,19 @@ class BodyChecker implements NoreturnCalls {
                 return this.store.errorType();
             },
             is TypeName named -> {
-                this.reporter.report("'{name}' is a type, not a value. A type name starts a "
-                    + "static member access such as '{name}.member(...)'; to work with an "
-                    + "instance, construct or reference one.", node.name().span());
+                this.reportTypeAsValue(name, node.name().span());
                 return this.store.errorType();
             },
             is NamespaceName ignored -> {
                 return this.store.errorType();
             },
         }
+    }
+
+    reportTypeAsValue(string name, Span at) {
+        this.reporter.report("'{name}' is a type, not a value. A type name starts a static "
+            + "member access such as '{name}.member(...)'; to work with an instance, construct "
+            + "or reference one.", at);
     }
 
     // The enclosing type's name when it declares a static under the given name, for the
@@ -3779,7 +3811,7 @@ class BodyChecker implements NoreturnCalls {
                 if (!convert.isAssignableStrict(assignTarget, valueType)) {
                     this.reporter.report("Cannot assign '{types.display(valueType)}' to "
                         + "'{types.display(assignTarget)}'"
-                        + "{this.valueNullabilityHint(assignTarget, valueType, node.value())}",
+                        + "{this.valueAssignabilityHint(assignTarget, valueType, node.value())}",
                         node.span());
                 }
             } else if (!(targetType is ErrorType)) {
@@ -4296,7 +4328,7 @@ class BodyChecker implements NoreturnCalls {
             if (!convert.isAssignableStrict(elementType, actual)) {
                 this.reporter.report("Element {i + 1}: expected "
                     + "'{types.display(elementType)}', got '{types.display(actual)}'"
-                    + "{this.valueNullabilityHint(elementType, actual, node.elements(i))}",
+                    + "{this.valueAssignabilityHint(elementType, actual, node.elements(i))}",
                     node.elements(i).span());
             }
         }
@@ -4321,7 +4353,7 @@ class BodyChecker implements NoreturnCalls {
                 if (!convert.isAssignableStrict(elementType, actual)) {
                     this.reporter.report("Element {i + 1}: expected "
                         + "'{types.display(elementType)}', got '{types.display(actual)}'"
-                        + "{this.valueNullabilityHint(elementType, actual, node.elements(i))}",
+                        + "{this.valueAssignabilityHint(elementType, actual, node.elements(i))}",
                         node.elements(i).span());
                 }
             }
@@ -4398,7 +4430,7 @@ class BodyChecker implements NoreturnCalls {
                     && !convert.isAssignableStrict(fieldType, valueType)) {
                 this.reporter.report("Field '{fieldName}': expected "
                     + "'{types.display(fieldType)}', got '{types.display(valueType)}'"
-                    + "{this.valueNullabilityHint(fieldType, valueType, entry.value())}",
+                    + "{this.valueAssignabilityHint(fieldType, valueType, entry.value())}",
                     entry.value().span());
             }
         }
@@ -4819,9 +4851,11 @@ class BodyChecker implements NoreturnCalls {
             if (name == "length") {
                 return this.store.primitive(PrimitiveKind.Long);
             }
-            this.reporter.report("Type 'string' has no member '{name}'.",
-                node.member().span());
-            return this.store.errorType();
+            if (types.bindingOf(core) == null) {
+                this.reporter.report("Type 'string' has no member '{name}'.",
+                    node.member().span());
+                return this.store.errorType();
+            }
         }
         if (core is FunctionType) {
             return this.reportFunctionMember(name, core, node.member().span());
@@ -5012,12 +5046,17 @@ class BodyChecker implements NoreturnCalls {
         }
     }
 
-    // The type a bare head name stands for: locals shadow types, a type parameter wins over an
-    // imported name exactly as it does in a type position, and the module's own declarations
-    // answer last. Enums stay with the enum-member path.
+    // The type a bare head name stands for: a primitive's own keyword names the primitive, then
+    // locals shadow types, a type parameter wins over an imported name exactly as it does in a
+    // type position, and the module's own declarations answer last. Enums stay with the
+    // enum-member path.
     staticHeadNamed(string name) -> Type? {
         if (name.length == 0) {
             return null;
+        }
+        let primitive = types.primitiveNamed(this.store, name);
+        if (primitive != null) {
+            return primitive;
         }
         let resolution = this.resolveName(name);
         if (resolution == null) {
@@ -5116,10 +5155,16 @@ class BodyChecker implements NoreturnCalls {
         return this.store.errorType();
     }
 
-    // Interfaces, enums, and external types carry no statics; the error names where they live.
+    // Interfaces, enums, and external types carry no statics, and neither does a primitive the
+    // standard library declares no members for; the error names where they live.
     reportStaticsUnsupported(Type head, Span at) {
-        string kind = "type";
         string shown = types.display(head);
+        if (head is StringType || head is PrimitiveType) {
+            this.reporter.report("'{shown}' has no static members; what the members of a "
+                + "primitive are is declared by the standard library.", at);
+            return;
+        }
+        string kind = "type";
         let authority = types.authorityOf(head);
         if (authority != null) {
             kind = types.kindWordOf(authority);
@@ -5532,7 +5577,7 @@ class BodyChecker implements NoreturnCalls {
                             + "the type name, as in '{template.name()}"
                             + "<{typeParameterExample(template)}>.{resolved.name()}(...)'");
                     }
-                    string hint = this.valueNullabilityHint(parameterType, actual, argument);
+                    string hint = this.valueAssignabilityHint(parameterType, actual, argument);
                     this.reporter.report("Argument {i + 1}: expected "
                         + "'{types.display(parameterType)}', got '{types.display(actual)}'"
                         + "{hint}{sentenceSeparator(hint, provenance)}{provenance}",
@@ -5770,7 +5815,7 @@ class BodyChecker implements NoreturnCalls {
                 }
                 this.reporter.report("Argument {label}: expected "
                     + "'{types.display(parameterType)}', got '{types.display(finalType)}'"
-                    + "{this.valueNullabilityHint(parameterType, finalType, value)}",
+                    + "{this.valueAssignabilityHint(parameterType, finalType, value)}",
                     argument.span());
             }
         }
@@ -5805,7 +5850,7 @@ class BodyChecker implements NoreturnCalls {
                             this.reporter.report("Argument {i + 1}: expected "
                                 + "'{types.display(parameterType)}', got "
                                 + "'{types.display(actual)}'"
-                                + "{this.valueNullabilityHint(parameterType, actual, value)}",
+                                + "{this.valueAssignabilityHint(parameterType, actual, value)}",
                                 value.span());
                         }
                     } else {
@@ -5928,7 +5973,7 @@ class BodyChecker implements NoreturnCalls {
                             this.reporter.report("Argument {i + 1}: expected "
                                 + "'{types.display(parameterType)}', got "
                                 + "'{types.display(actual)}'"
-                                + "{this.valueNullabilityHint(parameterType, actual, value)}",
+                                + "{this.valueAssignabilityHint(parameterType, actual, value)}",
                                 value.span());
                         }
                     } else {
@@ -6025,7 +6070,10 @@ class BodyChecker implements NoreturnCalls {
         string memberName = member.member().text();
         if (object is IdentifierExpressionNode) {
             if (object.name().kind() == SyntaxKind.StringKeyword) {
-                return this.analyzeStringStatic(node, memberName);
+                let owned = this.analyzeStringStatic(node, memberName);
+                if (owned != null) {
+                    return owned;
+                }
             }
             let resolution = this.resolveName(object.name().text());
             if (resolution is NamespaceName) {
@@ -6370,7 +6418,10 @@ class BodyChecker implements NoreturnCalls {
     }
 
     // Static builtins on the 'string' type keyword: string.fromBytes(byte[]).
-    analyzeStringStatic(CallExpressionNode node, string memberName) -> Type {
+    // 'string.fromBytes(bytes)', the one static the compiler answers for on a primitive. Null
+    // for every other name, so the general static path answers it, whether through the standard
+    // library's binding or with the diagnostic for a name nothing declares.
+    analyzeStringStatic(CallExpressionNode node, string memberName) -> Type? {
         let arguments = node.arguments();
         if (memberName == "fromBytes") {
             Type byteArray = this.store.arrayOf(this.store.primitive(PrimitiveKind.Byte));
@@ -6390,14 +6441,13 @@ class BodyChecker implements NoreturnCalls {
             }
             return this.store.stringType();
         }
-        this.reporter.report("'string' has no static member '{memberName}'.", node.span());
-        this.analyzeArgumentsOnly(arguments);
-        return this.store.errorType();
+        return null;
     }
 
     // The built-in members of strings, arrays, and primitives, intercepted before general
     // member resolution; a record declaring its own member of the same name falls through
-    // (null result) to normal resolution.
+    // (null result) to normal resolution. What this owns on a primitive is also what a primitive
+    // binding may not declare, so the two lists move together: see members.compilerOwnedMember.
     interceptBuiltinCall(CallExpressionNode node, Expression object, string name)
             -> Type? {
         if (name != "toString" && name != "toBytes" && name != "indexOf" && name != "contains"
@@ -6740,7 +6790,7 @@ class BodyChecker implements NoreturnCalls {
                             + "arguments explicitly, as in "
                             + "'{name}<{typeParameterNamesText(signature)}>(...)'");
                     }
-                    string hint = this.valueNullabilityHint(parameterType, actual, argument);
+                    string hint = this.valueAssignabilityHint(parameterType, actual, argument);
                     this.reporter.report("Argument {i + 1}: expected "
                         + "'{types.display(parameterType)}', got '{types.display(actual)}'"
                         + "{hint}{sentenceSeparator(hint, provenance)}{provenance}",
@@ -6804,7 +6854,7 @@ class BodyChecker implements NoreturnCalls {
                     this.reporter.report("Argument {i + 1}: expected "
                         + "'{types.display(parameter.type())}', got "
                         + "'{types.display(actual)}'"
-                        + "{this.valueNullabilityHint(parameter.type(), actual, argument)}",
+                        + "{this.valueAssignabilityHint(parameter.type(), actual, argument)}",
                         argument.span());
                 }
             }
@@ -7795,9 +7845,11 @@ constructorsOf(Type record) -> List<Method> {
     return found;
 }
 
+// The receivers member lookup walks: a declaration's own members, or the members the standard
+// library declares for a primitive.
 isRecordLike(Type type) -> bool {
     return type is ClassType || type is InterfaceType || type is StructType
-        || type is InstantiationType;
+        || type is InstantiationType || types.bindingOf(type) != null;
 }
 
 isStructValue(Type type) -> bool {
@@ -7951,11 +8003,38 @@ simpleSpelling(Expression expression) -> string? {
     }
 }
 
-// Guidance appended to an assignability failure when the mismatch is exactly nullability: a
-// source nullable at more levels than the slot it flows into, each of which has to be unwrapped.
-nullabilityHint(Type target, Type source) -> string {
+// A primitive flowing into an interface-typed slot it conforms to. The conformance its binding
+// declares is a compile-time judgment: it lets a generic bound take the primitive, and nothing
+// more, because a primitive is never wrapped in an object and so has no interface value.
+primitiveConformanceHint(Type target, Type source) -> string {
+    if (types.bindingOf(source) == null) {
+        return "";
+    }
+    Type slot = target;
+    while (slot is OptionalType) {
+        slot = slot.inner();
+    }
+    if (!types.isInterfaceLike(slot) || !types.conformsTo(source, slot)) {
+        return "";
+    }
+    string shown = types.display(source);
+    string named = types.display(slot);
+    return ". '{shown}' does implement '{named}', but only as a generic bound: a "
+        + "'<T: {named}>' parameter accepts '{shown}', while an interface-typed slot needs a "
+        + "value that carries the interface, and a primitive is never wrapped in one. Write the "
+        + "slot as '{shown}', or make it a type parameter bounded by '{named}'.";
+}
+
+// Guidance appended to an assignability failure: a primitive flowing into an interface it
+// conforms to, or a source nullable at more levels than the slot it flows into, each of which has
+// to be unwrapped.
+assignabilityHint(Type target, Type source) -> string {
     if (target is ErrorType) {
         return "";
+    }
+    string conformance = primitiveConformanceHint(target, source);
+    if (conformance.length > 0) {
+        return conformance;
     }
     if (source is OptionalType) {
         long levels = 0;
@@ -8439,16 +8518,6 @@ fillLoopBodyMatches(BlockNode body, string arrayName, string indexName) -> bool 
         }
     }
     return false;
-}
-
-// The first method whose signature was read from the given declaration node.
-methodDeclaredBy(List<Method> methods, GreenNode declaration) -> Method? {
-    for (long i = 0; i < methods.length(); i++) {
-        if (methods.get(i).signature().declaration() == declaration) {
-            return methods.get(i);
-        }
-    }
-    return null;
 }
 
 // The element type argument when the type is an 'Iterable<T>' instantiation from

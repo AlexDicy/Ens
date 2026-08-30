@@ -43,7 +43,7 @@ inline int visibilityTier(Visibility v) {
 
 // What a StructInfo was declared as. Classes, interfaces, structs, enums and
 // external types all carry a StructInfo, so diagnostics need the real keyword.
-enum class DeclKind { Class, Struct, Interface, Enum, External };
+enum class DeclKind { Class, Struct, Interface, Enum, External, Primitive };
 
 inline const char* declKindWord(DeclKind k) {
     switch (k) {
@@ -51,6 +51,7 @@ inline const char* declKindWord(DeclKind k) {
         case DeclKind::Interface: return "interface";
         case DeclKind::Enum:      return "enum";
         case DeclKind::External:  return "external type";
+        case DeclKind::Primitive: return "primitive";
         case DeclKind::Class:     return "class";
     }
     return "class";

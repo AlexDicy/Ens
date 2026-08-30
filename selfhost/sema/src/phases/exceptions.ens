@@ -9,6 +9,7 @@ import SourceFileNode from @ens.frontend.syntax.generated.nodes;
 import StructDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import ClassDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import TestDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import PrimitiveDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import FieldDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import MemberListNode from @ens.frontend.syntax.generated.nodes;
@@ -38,12 +39,14 @@ import Reporter from support.diagnostics;
 import support.diagnostics;
 import ModuleContext from context;
 import SemaResult from result;
+import phases.members;
 import model.types;
 import Type from model.types;
 import ErrorType from model.types;
 import DeclaredType from model.types;
 import ClassType from model.types;
 import StructType from model.types;
+import PrimitiveBinding from model.types;
 import TypeStore from model.types;
 import Method from model.types;
 import Signature from model.types;
@@ -338,6 +341,14 @@ class ModuleExceptions {
                             declaration.body(), declaration.name().span());
                     }
                 },
+                is PrimitiveDeclarationNode declaration -> {
+                    let binding = this.bindingFor(declaration);
+                    if (binding != null) {
+                        this.collectMembers(binding, binding.methods(),
+                            binding.staticMethods(), declaration.body(),
+                            declaration.name().span());
+                    }
+                },
                 is TestDeclarationNode declaration -> {
                     this.testItems.push(declaration);
                 },
@@ -345,6 +356,18 @@ class ModuleExceptions {
             }
         }
         this.collectLambdas(root);
+    }
+
+    bindingFor(PrimitiveDeclarationNode node) -> PrimitiveBinding? {
+        let primitive = types.primitiveNamed(this.store, node.name().text());
+        if (primitive == null) {
+            return null;
+        }
+        let binding = types.bindingOf(primitive);
+        if (binding != null && binding.declaration() == node.green()) {
+            return binding;
+        }
+        return null;
     }
 
     collectLambdas(SyntaxNode node) {
@@ -388,9 +411,9 @@ class ModuleExceptions {
         for (long i = 0; i < body.membersCount(); i++) {
             let member = body.members(i);
             if (member is FunctionDeclarationNode) {
-                let method = methodDeclaredBy(methods, member.green());
+                let method = members.methodDeclaredBy(methods, member.green());
                 if (method == null) {
-                    method = methodDeclaredBy(staticMethods, member.green());
+                    method = members.methodDeclaredBy(staticMethods, member.green());
                 }
                 if (method != null) {
                     this.functionItems.push(new FunctionItem(member, method.signature(),
@@ -843,30 +866,35 @@ class ModuleExceptions {
             is ClassType classType -> {
                 this.validateInterfaceThrows(classType, item);
             },
+            is PrimitiveBinding binding -> {
+                this.validateInterfaceThrows(binding, item);
+            },
             default -> { },
         }
     }
 
-    validateInterfaceThrows(ClassType classType, TypeItem item) {
+    // Every conformance an owner declares holds its implementations to the interface's throws
+    // contract: a class's through its chain, a primitive binding's through its own members.
+    validateInterfaceThrows(DeclaredType owner, TypeItem item) {
         let checked = new Set<Type>();
-        for (let implemented in classType.interfaces()) {
+        for (let implemented in types.interfacesOf(owner)) {
             for (let level in types.interfaceLadderOf(implemented)) {
                 if (!checked.add(level)) {
                     continue;
                 }
-                this.validateLevelThrows(classType, item, level);
+                this.validateLevelThrows(owner, item, level);
             }
         }
     }
 
-    validateLevelThrows(ClassType classType, TypeItem item, Type level) {
+    validateLevelThrows(DeclaredType owner, TypeItem item, Type level) {
         let methods = types.methodsOf(level);
         if (methods == null) {
             return;
         }
         for (long i = 0; i < methods.length(); i++) {
             let required = methods.get(i);
-            let provided = findDeclaring(classType, required);
+            let provided = findDeclaring(owner, required);
             // A conditional member never satisfies an interface requirement; the layout phase
             // already rejected the conformance, so there is no implementation to hold to the
             // interface's contract here.
@@ -880,10 +908,10 @@ class ModuleExceptions {
                 continue;
             }
             Span at = item.nameSpan;
-            if (provided.definingType() == classType) {
+            if (types.authorityOf(provided.definingType()) == owner) {
                 at = provided.signature().nameSpan();
             }
-            this.reporter.report("Method '{required.name()}' of '{classType.name()}' can "
+            this.reporter.report("Method '{required.name()}' of '{owner.name()}' can "
                 + "throw {nameList(strays)}, which interface "
                 + "'{types.display(level)}' does not allow. An implementing method "
                 + "may only throw types the interface method declares.", at);
@@ -922,15 +950,6 @@ rootDeclarationOf(DeclaredType owner, Method method) -> Method {
         current = types.baseOf(current);
     }
     return root;
-}
-
-methodDeclaredBy(List<Method> methods, GreenNode green) -> Method? {
-    for (long i = 0; i < methods.length(); i++) {
-        if (methods.get(i).signature().declaration() == green) {
-            return methods.get(i);
-        }
-    }
-    return null;
 }
 
 caughtBefore(Type thrown, List<Type?> clauseTypes, long limit) -> bool {
@@ -1055,14 +1074,14 @@ findBaseMethod(DeclaredType owner, Method method) -> Method? {
     return null;
 }
 
-// The most derived declaration with the name and parameter types: the class's own methods
-// first, then its base chain.
-findDeclaring(ClassType classType, Method required) -> Method? {
-    let own = findOwnMethod(classType, required.name(), required.signature());
+// The most derived declaration with the name and parameter types: the owner's own methods
+// first, then its base chain, which a primitive binding does not have.
+findDeclaring(DeclaredType owner, Method required) -> Method? {
+    let own = findOwnMethod(owner, required.name(), required.signature());
     if (own != null) {
         return own;
     }
-    return findBaseMethod(classType, required);
+    return findBaseMethod(owner, required);
 }
 
 findOwnMethod(Type owner, string methodName, Signature signature) -> Method? {

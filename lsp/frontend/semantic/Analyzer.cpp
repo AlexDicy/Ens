@@ -735,6 +735,7 @@ void Analyzer::registerNames(const SyntaxNode& root) {
     registerStructNames(*sf);
     registerClassNames(*sf);
     registerInterfaceNames(*sf);
+    registerPrimitiveBindingNames(*sf);
     registerEnumNames(*sf);
     registerExternalTypeNames(*sf);
     rejectTopLevelVariables(*sf);
@@ -771,6 +772,7 @@ void Analyzer::resolveSignatures() {
 
     collectStructs(sf);
     collectInterfaces(sf);
+    collectPrimitiveBindings(sf);
     collectEnums(sf);
     resolveClassBases(sf);
     collectFunctions(sf);
@@ -1295,6 +1297,84 @@ static std::string interfaceMethodSignature(const MethodInfo& mi) {
         sig += " -> " + mi.symbol->returnType->toString();
     }
     return sig;
+}
+
+// The member table a `primitive` declaration puts on the primitive itself, attached in the first
+// pass so a module analyzed before the declaring one still finds the members. Only the standard
+// library may declare them, and the compiler answers for everything else about the declaration;
+// this front end goes just far enough that member lookup and go-to-definition work.
+void Analyzer::registerPrimitiveBindingNames(const ast::SourceFile& file) {
+    for (auto& pd : file.primitiveBindings()) {
+        auto name = pd.nameText();
+        if (packagePrefix_ != u"std") {
+            errorAtNode(pd.node, "'primitive' declares what the members of a built-in type are, "
+                "which only the standard library may do. Elsewhere 'primitive' is an ordinary "
+                "identifier. To add operations to '" +
+                asciiOf(name.value_or(std::u16string{})) + "', write functions that take it, or "
+                "a class or struct of your own.");
+            continue;
+        }
+        if (!name) continue;
+        Type* primitive = typeCtx.primitiveFromName(*name);
+        if (!primitive) continue;
+        StructInfo* si = typeCtx.bindPrimitive(primitive, modulePath_, *name);
+        if (!si) continue;
+        auto [line, col] = source.offsetToPosition(
+            pd.nameToken() ? pd.nameToken()->startOffset() : pd.node.startOffset());
+        si->line = line;
+        si->column = col;
+        si->visibility = Visibility::Export;
+        si->packagePrefix = packagePrefix_;
+        analysis.setType(pd.node.greenNode(), primitive);
+    }
+}
+
+// The binding's members, resolved in the signature pass the way an interface's are. Statics land
+// beside the instance members: this front end does not model statics, and a static access on a
+// type name produces no diagnostic here either way.
+void Analyzer::collectPrimitiveBindings(const ast::SourceFile& file) {
+    for (auto& pd : file.primitiveBindings()) {
+        Type* t = analysis.typeOf(pd.node.greenNode());
+        if (!t || !t->structInfo) continue;
+        StructInfo* si = t->structInfo;
+        if (si->modulePath != modulePath_) continue;
+        for (auto& ir : pd.implementedInterfaces()) {
+            Type* interfaceT = resolveTypeReference(ir);
+            if (interfaceT && interfaceT->structInfo && interfaceT->isInterface()) {
+                si->implementedInterfaces.push_back(interfaceT);
+            }
+        }
+        for (auto& m : pd.methods()) {
+            auto mname = m.nameText().value_or(std::u16string{});
+            if (mname.empty()) continue;
+            Type* retType = m.returnType() && m.returnType()->typeReference()
+                ? resolveTypeReference(*m.returnType()->typeReference())
+                : typeCtx.getPrimitive(TypeKind::Void);
+            uint32_t mPos = m.nameToken() ? m.nameToken()->startOffset() : m.node.startOffset();
+            Symbol* sym = makeSymbol(SymbolKind::Function, mname, nullptr, mPos);
+            sym->returnType = retType;
+            sym->funcDeclCst = m.node.greenNode();
+            sym->declaredThrows = m.isThrows();
+            sym->abiThrows = m.isThrows();
+            sym->methodOwner = si;
+            sym->isNoreturn = m.isNoreturn();
+            resolveMethodParams(m, t, sym);
+            analysis.setSymbol(m.node.greenNode(), sym);
+            analysis.setReceiver(m.node.greenNode(), t);
+
+            MethodInfo mi;
+            mi.name = mname;
+            mi.symbol = sym;
+            mi.declaration = const_cast<GreenElement*>(m.node.greenNode());
+            mi.visibility = memberVisibility(m.visibilityModifier(), Visibility::Private, si,
+                                             "Method", mname);
+            mi.isNoreturn = m.isNoreturn();
+            mi.definingClass = si;
+            si->methods.push_back(std::move(mi));
+        }
+        markOverloadedMethods(si);
+        si->membersCollected = true;
+    }
 }
 
 void Analyzer::collectStructs(const ast::SourceFile& file) {
@@ -2940,7 +3020,10 @@ bool Analyzer::checkTypeArgBound(Type* arg, const std::vector<StructInfo*>& boun
         // Every type satisfies the compiler-known hashing contract.
         if (isHashableClass(bound)) continue;
         bool satisfied = false;
-        if (arg && arg->isClass() && arg->structInfo) {
+        if (arg && arg->structInfo && (arg->isClass() ||
+                arg->structInfo->declKind == DeclKind::Primitive)) {
+            // A primitive satisfies a bound through the conformances its binding declares. It
+            // still has no interface value, and the compiler is what enforces that.
             satisfied = arg->structInfo->isSubclassOrConforms(bound);
         } else if (arg && arg->isTypeParam()) {
             // A type-parameter argument satisfies a bound its own bounds imply.
@@ -5884,10 +5967,9 @@ StructInfo* Analyzer::receiverStructInfo(const std::optional<ast::Expression>& o
         if (!t->isOptional() || !t->inner) return nullptr;
         t = t->inner;
     }
-    if (t->isTypeParam()) {
-        return t->structInfo;  // primary bound (or null when unbounded)
-    }
-    return (t->hasRecordLayout() && t->structInfo) ? t->structInfo : nullptr;
+    // A primitive carries a member table only when the standard library declares one for it, so
+    // the field alone answers for every receiver shape.
+    return t->structInfo;
 }
 
 Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
@@ -5919,9 +6001,15 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                         }
                         return typeCtx.getPrimitive(TypeKind::String);
                     }
+                    // Every other name is a static the standard library's binding may declare;
+                    // this front end does not model statics, so it leaves the checking to the
+                    // compiler exactly as it does for a static on a type name.
+                    for (auto& a : args) analyzeExpr(a);
+                    if (typeCtx.getPrimitive(TypeKind::String)->structInfo) {
+                        return typeCtx.getError();
+                    }
                     errorAtNode(expr.node, "'string' has no static member '" +
                         asciiOf(member.memberText().value_or(std::u16string{})) + "'.");
-                    for (auto& a : args) analyzeExpr(a);
                     return typeCtx.getError();
                 }
             }
@@ -6867,11 +6955,15 @@ Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
         if (*memberName == u"length") {
             return typeCtx.getPrimitive(TypeKind::Long);
         }
-        errorAtNode(expr.node, "Type 'string' has no member '" +
-            asciiOf(*memberName) + "'.");
-        return typeCtx.getError();
+        // Anything else is a member the standard library's binding declares, so it resolves
+        // through the table below; without a binding, text has no other member.
+        if (!objT->structInfo) {
+            errorAtNode(expr.node, "Type 'string' has no member '" +
+                asciiOf(*memberName) + "'.");
+            return typeCtx.getError();
+        }
     }
-    if (!objT->hasRecordLayout() || !objT->structInfo) {
+    if (!objT->structInfo) {
         if (objT->isOptional()) {
             if (const FieldInfo* weak = weakFieldRead(*obj)) {
                 errorAtNode(expr.node, "Cannot read a member of '" + objT->toString() +
@@ -6956,7 +7048,7 @@ Type* Analyzer::analyzeSafeMember(const ast::SafeMemberExpression& expr) {
     if (inner && (inner->isString() || inner->isArray()) && *memberName == u"length") {
         return safeResultOf(typeCtx, typeCtx.getPrimitive(TypeKind::Long));
     }
-    if (!inner || !inner->hasRecordLayout() || !inner->structInfo) {
+    if (!inner || !inner->structInfo) {
         errorAtNode(expr.node, "The value on the left of '?.' has type '" + objT->toString() +
             "', which has no members to access.");
         return typeCtx.getError();

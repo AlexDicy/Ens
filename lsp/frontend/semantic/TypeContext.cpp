@@ -121,6 +121,19 @@ Type* TypeContext::registerInterface(const std::u16string& modulePath, std::u16s
     return t;
 }
 
+StructInfo* TypeContext::bindPrimitive(Type* primitive, const std::u16string& modulePath,
+                                       std::u16string name) {
+    if (!primitive || primitive->structInfo) return nullptr;
+    auto info = std::make_unique<StructInfo>();
+    info->name = std::move(name);
+    info->modulePath = modulePath;
+    info->declKind = DeclKind::Primitive;
+    StructInfo* infoPtr = info.get();
+    ownedStructs.push_back(std::move(info));
+    primitive->structInfo = infoPtr;
+    return infoPtr;
+}
+
 Type* TypeContext::registerExternalType(const std::u16string& modulePath, std::u16string name) {
     auto info = std::make_unique<StructInfo>();
     info->name = name;

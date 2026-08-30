@@ -501,6 +501,40 @@ std::vector<FuncDecl> InterfaceDecl::methods() const {
     if (auto ml = memberList()) return ml->methods();
     return {};
 }
+// === PrimitiveDecl ===
+
+std::optional<SyntaxNode> PrimitiveDecl::nameToken() const {
+    bool seenKeyword = false;
+    for (auto& c : node.children()) {
+        if (isTrivia(c.kind())) continue;
+        if (c.kind() == SyntaxKind::KwPrimitive) { seenKeyword = true; continue; }
+        if (seenKeyword && c.isToken()) return c;
+    }
+    return std::nullopt;
+}
+std::optional<std::u16string> PrimitiveDecl::nameText() const {
+    if (auto t = nameToken()) return std::u16string(t->tokenText());
+    return std::nullopt;
+}
+std::vector<TypeReference> PrimitiveDecl::implementedInterfaces() const {
+    for (auto& c : node.children()) {
+        if (auto ic = ImplementsClause::cast(c)) return ic->types();
+    }
+    return {};
+}
+std::optional<MemberList> PrimitiveDecl::memberList() const {
+    if (auto m = firstChildNode(node, SyntaxKind::MemberList)) return MemberList::cast(*m);
+    return std::nullopt;
+}
+std::vector<FieldDecl> PrimitiveDecl::fields() const {
+    if (auto ml = memberList()) return ml->fields();
+    return {};
+}
+std::vector<FuncDecl> PrimitiveDecl::methods() const {
+    if (auto ml = memberList()) return ml->methods();
+    return {};
+}
+
 std::optional<MemberList> ClassDecl::memberList() const {
     if (auto m = firstChildNode(node, SyntaxKind::MemberList)) return MemberList::cast(*m);
     return std::nullopt;
@@ -714,6 +748,14 @@ std::vector<InterfaceDecl> SourceFile::interfaces() const {
     std::vector<InterfaceDecl> out;
     for (auto& c : node.children()) {
         if (auto i = InterfaceDecl::cast(c)) out.push_back(*i);
+    }
+    return out;
+}
+
+std::vector<PrimitiveDecl> SourceFile::primitiveBindings() const {
+    std::vector<PrimitiveDecl> out;
+    for (auto& c : node.children()) {
+        if (auto p = PrimitiveDecl::cast(c)) out.push_back(*p);
     }
     return out;
 }

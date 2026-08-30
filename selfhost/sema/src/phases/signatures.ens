@@ -6,6 +6,7 @@ import SourceFileNode from @ens.frontend.syntax.generated.nodes;
 import StructDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import ClassDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import InterfaceDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import PrimitiveDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import EnumDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import Expression from @ens.frontend.syntax.generated.nodes;
 import LiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
@@ -40,6 +41,7 @@ import ClassType from model.types;
 import StructType from model.types;
 import InterfaceType from model.types;
 import EnumType from model.types;
+import PrimitiveBinding from model.types;
 import TypeParamType from model.types;
 import DeclaredType from model.types;
 import InstantiationType from model.types;
@@ -138,6 +140,7 @@ class SignatureCollector {
     List<FunctionDeclarationNode> functionNodes;
     List<TestDeclarationNode> testNodes;
     List<ExternalBlockNode> externalBlockNodes;
+    List<PrimitiveDeclarationNode> primitiveNodes;
 
     protected constructor(ModuleContext context, List<FileDiagnostic> collected) {
         this.context = context;
@@ -152,6 +155,7 @@ class SignatureCollector {
         this.functionNodes = new List<FunctionDeclarationNode>();
         this.testNodes = new List<TestDeclarationNode>();
         this.externalBlockNodes = new List<ExternalBlockNode>();
+        this.primitiveNodes = new List<PrimitiveDeclarationNode>();
     }
 
     protected run() {
@@ -166,6 +170,7 @@ class SignatureCollector {
         this.collectInterfaces();
         this.collectEnums();
         this.resolveClassBases();
+        this.collectPrimitiveBindings();
         this.collectFunctions();
         this.collectExternalFunctions();
         this.checkTests();
@@ -194,6 +199,9 @@ class SignatureCollector {
                 },
                 is ExternalBlockNode declaration -> {
                     this.externalBlockNodes.push(declaration);
+                },
+                is PrimitiveDeclarationNode declaration -> {
+                    this.primitiveNodes.push(declaration);
                 },
                 default -> { },
             }
@@ -438,6 +446,179 @@ class SignatureCollector {
         structType.methods().push(new Method(signature, visibility, isConstructor,
             false, modifiers.declaresOverride, modifiers.declaresFinal,
             modifiers.declaresAbstract, false, member.body() != null, constraints, structType));
+    }
+
+    // The binding whose members this declaration writes, or null when the link phase refused it.
+    bindingFor(PrimitiveDeclarationNode node) -> PrimitiveBinding? {
+        let primitive = types.primitiveNamed(this.resolver.typeStore(), node.name().text());
+        if (primitive == null) {
+            return null;
+        }
+        let binding = types.bindingOf(primitive);
+        if (binding != null && binding.declaration() == node.green()) {
+            return binding;
+        }
+        return null;
+    }
+
+    // A primitive binding's declared conformances and members. The binding owns the member rules,
+    // and the primitive is what each member is declared on, so a diagnostic and a stack trace
+    // both read 'string'. Whether the conformances are actually satisfied is a whole-program
+    // question and waits for the declaration checks.
+    collectPrimitiveBindings() {
+        for (long n = 0; n < this.primitiveNodes.length(); n++) {
+            let node = this.primitiveNodes.get(n);
+            let binding = this.bindingFor(node);
+            if (binding == null) {
+                continue;
+            }
+            let implementsClause = node.implementsClause();
+            if (implementsClause != null) {
+                let resolved = new List<Type>();
+                for (long i = 0; i < implementsClause.interfacesCount(); i++) {
+                    let reference = implementsClause.interfaces(i);
+                    Type declared = this.resolver.resolveType(reference);
+                    if (this.acceptBindingInterface(binding, declared, reference.span())) {
+                        resolved.push(declared);
+                    }
+                }
+                binding.setInterfaces(resolved.toArray());
+            }
+            let body = node.body();
+            for (long i = 0; i < body.membersCount(); i++) {
+                switch (body.members(i)) {
+                    is FieldDeclarationNode field -> {
+                        this.reportBindingField(binding, field);
+                    },
+                    is FunctionDeclarationNode method -> {
+                        this.collectPrimitiveMember(binding, method);
+                    },
+                    default -> { },
+                }
+            }
+            binding.setMembersComplete();
+        }
+    }
+
+    acceptBindingInterface(PrimitiveBinding binding, Type declared, Span span) -> bool {
+        if (declared is ErrorType) {
+            return false;
+        }
+        if (!types.isInterfaceLike(declared)) {
+            this.reporter.report("'{binding.name()}' can only implement an interface, and "
+                + "'{types.display(declared)}' is not one. A primitive has no object to inherit "
+                + "into, so a binding never extends a class.", span);
+            return false;
+        }
+        return true;
+    }
+
+    // A primitive stores nothing of its own, so no member of a binding is a field. A 'static
+    // const' would put a constant under a name the language owns, which is a different thing
+    // from declaring what a value can do.
+    reportBindingField(PrimitiveBinding binding, FieldDeclarationNode declaration) {
+        let modifiers = members.fieldModifiers(declaration);
+        string name = declaration.name().text();
+        if (modifiers.declaresStatic) {
+            this.reporter.report("A binding for '{binding.name()}' cannot declare a static "
+                + "const: it declares what a '{binding.name()}' value can do, not constants "
+                + "under the primitive's name. Declare '{name}' on a class or struct of this "
+                + "module instead.", declaration.name().span());
+            return;
+        }
+        this.reporter.report("A binding for '{binding.name()}' cannot declare a field: "
+            + "'{name}' would need storage in every '{binding.name()}' value, and a primitive "
+            + "carries none. Declare methods here, and put the state in a class or struct that "
+            + "holds a '{binding.name()}'.", declaration.name().span());
+    }
+
+    collectPrimitiveMember(PrimitiveBinding binding, FunctionDeclarationNode member) {
+        let introducer = member.introducer();
+        if (introducer != null) {
+            if (introducer.kind() == SyntaxKind.DestructorKeyword) {
+                this.reporter.report("A binding for '{binding.name()}' cannot declare a "
+                    + "destructor: a primitive owns nothing to release, and its values are "
+                    + "copied rather than destroyed.", introducer.span());
+            } else {
+                this.reporter.report("A binding for '{binding.name()}' cannot declare a "
+                    + "constructor: a '{binding.name()}' is written as a literal or produced by "
+                    + "an expression, never built with 'new'. Declare a static that returns a "
+                    + "'{binding.name()}' instead.", introducer.span());
+            }
+            return;
+        }
+        let nameToken = member.name();
+        if (nameToken == null || nameToken.text().length == 0) {
+            return;
+        }
+        string name = nameToken.text();
+        Span nameSpan = nameToken.span();
+        let modifiers = members.functionModifiers(member);
+        members.checkMemberModifiers(this.reporter, member);
+        if (modifiers.declaresStatic) {
+            if (this.reportOwnedMember(binding, name, nameSpan, true)) {
+                return;
+            }
+            members.collectStaticMethod(this.resolver, this.reporter, binding,
+                binding.staticMethods(), member, name, nameSpan, modifiers);
+            return;
+        }
+        if (this.reportOwnedMember(binding, name, nameSpan, false)) {
+            return;
+        }
+        if (modifiers.declaresAbstract) {
+            this.reporter.report("Method '{name}' of the '{binding.name()}' binding cannot be "
+                + "'abstract': a primitive has no subclass to supply a body, so every member "
+                + "here is written out.", modifiers.abstractModifierSpan(nameSpan));
+        } else if (member.body() == null) {
+            this.reporter.report("Method '{name}' of the '{binding.name()}' binding needs a "
+                + "body: a primitive's members are ordinary Ens code, and nothing else supplies "
+                + "one.", nameSpan);
+        }
+        if (modifiers.declaresFinal) {
+            this.reporter.report("Method '{name}' of the '{binding.name()}' binding cannot be "
+                + "'final': 'final' forbids an override, and a primitive has nothing that could "
+                + "override it.", modifiers.finalModifierSpan(nameSpan));
+        }
+        let constraints = members.readMemberConstraints(this.resolver, this.reporter, binding,
+            member, "Method '{name}' of '{binding.name()}'");
+        let signature = members.buildSignature(this.resolver, this.reporter, member, name,
+            nameSpan, false, false, true, modifiers.declaresNoreturn, null, binding.name(), []);
+        Visibility visibility = members.memberVisibility(modifiers, Visibility.Private, binding,
+            "Method", name, this.reporter);
+        members.checkThrowsPlacement(this.reporter, member, false, false, false);
+        members.checkNoreturnPlacement(this.reporter, member, false, false,
+            modifiers.declaresNoreturn);
+        members.checkStaticInstanceCollision(this.reporter, binding, name, false, nameSpan);
+        if (members.findSameSignature(binding.methods(), name, signature) != null) {
+            this.reporter.report("Method '{name}' of the '{binding.name()}' binding is already "
+                + "declared with the same parameter types; overloads must differ in parameter "
+                + "count or types.", nameSpan);
+            return;
+        }
+        binding.methods().push(new Method(signature, visibility, false, false,
+            modifiers.declaresOverride, false, false, false, member.body() != null, constraints,
+            binding.primitive()));
+    }
+
+    // A member the compiler answers for on this primitive already. Declaring it in a binding
+    // would leave the declaration unreachable, since the compiler's own answer comes first, so
+    // it is refused by name until the library takes the member over.
+    reportOwnedMember(PrimitiveBinding binding, string name, Span at, bool isStatic) -> bool {
+        if (isStatic) {
+            if (!members.compilerOwnedStatic(binding.primitive(), name)) {
+                return false;
+            }
+            this.reporter.report("'{binding.name()}.{name}' is provided by the compiler, so a "
+                + "binding cannot declare it. Choose another name.", at);
+            return true;
+        }
+        if (!members.compilerOwnedMember(binding.primitive(), name)) {
+            return false;
+        }
+        this.reporter.report("'{name}' is provided by the compiler on every "
+            + "'{binding.name()}', so a binding cannot declare it. Choose another name.", at);
+        return true;
     }
 
     collectInterfaces() {

@@ -1,0 +1,269 @@
+// Primitive bindings, the accepted side: the standard library declares a primitive's members, the
+// compiler links them onto the primitive itself, and a conformance the binding declares satisfies
+// a generic bound without giving the primitive an interface value.
+import @std.testing;
+import TestFailure from @std.testing;
+import sema_support;
+import FakeFileLoader from sema_support;
+import ProgramAnalysis from pipeline;
+import model.types;
+import PrimitiveBinding from model.types;
+import PrimitiveKind from model.types;
+import Visibility from model.types;
+
+// A program whose standard library carries one extra module: the binding under test.
+analyzeWithBinding(string bindingSource, string mainSource) -> ProgramAnalysis throws {
+    let loader = new FakeFileLoader();
+    loader.add("/stdlib/std/src/text.ens", bindingSource);
+    loader.add("/proj/src/main.ens", mainSource);
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramClean(analysis);
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.exceptionDiagnostics());
+    return analysis;
+}
+
+bindingOfString(ProgramAnalysis analysis) -> PrimitiveBinding throws {
+    let bound = types.bindingOf(analysis.store().stringType());
+    if (bound == null) {
+        throw new TestFailure("'string' carries no binding");
+    }
+    return bound;
+}
+
+test "a binding links its members onto the primitive itself" {
+    let analysis = try analyzeWithBinding(
+        "primitive string \{\n"
+        + "    export isEmpty() -> bool \{\n"
+        + "        return this.length == 0;\n"
+        + "    \}\n"
+        + "\n"
+        + "    export static joined(string left, string right) -> string \{\n"
+        + "        return left + right;\n"
+        + "    \}\n"
+        + "\}\n",
+        "import @std.text;\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let store = analysis.store();
+    let binding = try bindingOfString(analysis);
+    try testing.assertEqual(binding.name(), "string");
+    try testing.assertEqual(binding.modulePath(), "std.text");
+    try testing.assertTrue(binding.primitive() == store.stringType(),
+        "the binding names the interned string type");
+    try testing.assertTrue(binding.visibility() == Visibility.Export,
+        "a binding is nameable wherever its primitive is");
+
+    let methods = types.methodsOf(store.stringType());
+    if (methods == null) {
+        try testing.fail("'string' should expose the binding's methods");
+        return;
+    }
+    try testing.assertEqual(methods.length(), 1L);
+    try testing.assertEqual(methods.get(0).name(), "isEmpty");
+    try testing.assertTrue(methods.get(0).definingType() == store.stringType(),
+        "a member is declared on the primitive, not on the binding");
+    try testing.assertTrue(types.authorityOf(store.stringType()) == binding,
+        "the binding speaks for the primitive in the access rules");
+
+    let statics = types.staticMethodsOf(store.stringType());
+    if (statics == null) {
+        try testing.fail("'string' should expose the binding's statics");
+        return;
+    }
+    try testing.assertEqual(statics.length(), 1L);
+    try testing.assertEqual(statics.get(0).name(), "joined");
+    try testing.assertTrue(statics.get(0).isStatic(), "the static list carries the marker");
+
+    let fields = types.fieldsOf(store.stringType());
+    try testing.assertTrue(fields == null, "a primitive stores nothing of its own");
+    try testing.assertTrue(types.bindingOf(store.primitive(PrimitiveKind.Long)) == null,
+        "a primitive nothing declares members for carries no binding");
+}
+
+test "a binding's members resolve on a literal, on a variable, and through 'this'" {
+    let analysis = try analyzeWithBinding(
+        "primitive string \{\n"
+        + "    export isEmpty() -> bool \{\n"
+        + "        return this.length == 0;\n"
+        + "    \}\n"
+        + "\n"
+        + "    export doubledLength() -> long \{\n"
+        + "        return this.length + this.length;\n"
+        + "    \}\n"
+        + "\n"
+        + "    export static joined(string left, string right) -> string \{\n"
+        + "        return left + right;\n"
+        + "    \}\n"
+        + "\}\n",
+        "import @std.text;\n"
+        + "main() -> int \{\n"
+        + "    let empty = \"\".isEmpty();\n"
+        + "    let text = \"hello\";\n"
+        + "    let size = text.doubledLength();\n"
+        + "    let joined = string.joined(\"a\", \"b\");\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let binding = try bindingOfString(analysis);
+    try testing.assertEqual(binding.methods().length(), 2L);
+    try testing.assertEqual(binding.staticMethods().length(), 1L);
+}
+
+test "overloads inside a binding differ by parameter types" {
+    let analysis = try analyzeWithBinding(
+        "primitive string \{\n"
+        + "    export repeated(long times) -> long \{\n"
+        + "        return this.length * times;\n"
+        + "    \}\n"
+        + "\n"
+        + "    export repeated() -> long \{\n"
+        + "        return this.repeated(2L);\n"
+        + "    \}\n"
+        + "\}\n",
+        "import @std.text;\n"
+        + "main() -> int \{\n"
+        + "    let once = \"ab\".repeated();\n"
+        + "    let twice = \"ab\".repeated(3L);\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let binding = try bindingOfString(analysis);
+    try testing.assertEqual(binding.methods().length(), 2L);
+}
+
+test "a declared conformance satisfies a generic bound at two different primitives" {
+    let analysis = try analyzeWithBinding(
+        "export interface Measured \{\n"
+        + "    size() -> long;\n"
+        + "\}\n"
+        + "\n"
+        + "primitive string implements Measured \{\n"
+        + "    export override size() -> long \{\n"
+        + "        return this.length;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "\n"
+        + "primitive long implements Measured \{\n"
+        + "    export override size() -> long \{\n"
+        + "        return this;\n"
+        + "    \}\n"
+        + "\}\n",
+        "import Measured from @std.text;\n"
+        + "biggest<T: Measured>(T[] values) -> long \{\n"
+        + "    long best = 0;\n"
+        + "    for (let value in values) \{\n"
+        + "        if (value.size() > best) \{\n"
+        + "            best = value.size();\n"
+        + "        \}\n"
+        + "    \}\n"
+        + "    return best;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    string[] words = [\"a\", \"abc\"];\n"
+        + "    long[] numbers = [1L, 4L];\n"
+        + "    return (biggest<string>(words) - biggest<long>(numbers)) as int;\n"
+        + "\}\n");
+    let store = analysis.store();
+    let measured = try sema_support.interfaceNamed(analysis, "std.text", "Measured");
+    try testing.assertTrue(types.satisfiesBound(store.stringType(), measured, []),
+        "'string' satisfies the bound its binding declares");
+    try testing.assertTrue(
+        types.satisfiesBound(store.primitive(PrimitiveKind.Long), measured, []),
+        "'long' satisfies the same bound through its own binding");
+    try testing.assertTrue(
+        !types.satisfiesBound(store.primitive(PrimitiveKind.Int), measured, []),
+        "a primitive with no conformance does not satisfy it");
+    try testing.assertTrue(types.conformsTo(store.stringType(), measured),
+        "conformance reads through the binding's interfaces");
+}
+
+test "a conformance reaches the interfaces the declared one extends" {
+    let analysis = try analyzeWithBinding(
+        "export interface Measured \{\n"
+        + "    size() -> long;\n"
+        + "\}\n"
+        + "\n"
+        + "export interface Scaled extends Measured \{\n"
+        + "    scaled(long factor) -> long;\n"
+        + "\}\n"
+        + "\n"
+        + "primitive string implements Scaled \{\n"
+        + "    export override size() -> long \{\n"
+        + "        return this.length;\n"
+        + "    \}\n"
+        + "\n"
+        + "    export override scaled(long factor) -> long \{\n"
+        + "        return this.size() * factor;\n"
+        + "    \}\n"
+        + "\}\n",
+        "import @std.text;\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let store = analysis.store();
+    let measured = try sema_support.interfaceNamed(analysis, "std.text", "Measured");
+    let scaled = try sema_support.interfaceNamed(analysis, "std.text", "Scaled");
+    try testing.assertTrue(types.satisfiesBound(store.stringType(), scaled, []),
+        "'string' satisfies the interface it names");
+    try testing.assertTrue(types.satisfiesBound(store.stringType(), measured, []),
+        "and the one that interface extends");
+}
+
+test "a public binding member reaches the standard library's own package and no further" {
+    let loader = new FakeFileLoader();
+    loader.add("/stdlib/std/src/text.ens",
+        "primitive string \{\n"
+        + "    public inPackageOnly() -> long \{\n"
+        + "        return this.length;\n"
+        + "    \}\n"
+        + "\n"
+        + "    export exported() -> long \{\n"
+        + "        return this.inPackageOnly();\n"
+        + "    \}\n"
+        + "\}\n");
+    loader.add("/stdlib/std/src/reader.ens",
+        "import @std.text;\n"
+        + "export sizeOf(string value) -> long \{\n"
+        + "    return value.inPackageOnly();\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens",
+        "import @std.text;\n"
+        + "import @std.reader;\n"
+        + "main() -> int \{\n"
+        + "    let allowed = \"ab\".exported();\n"
+        + "    let alsoAllowed = reader.sizeOf(\"ab\");\n"
+        + "    let refused = \"ab\".inPackageOnly();\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramClean(analysis);
+    try sema_support.assertDiagnostic(analysis.bodyDiagnostics(), 0, "/proj/src/main.ens",
+        "'inPackageOnly' of 'string' is public inside package 'std' but not exported. Mark it "
+        + "'export' to use it from another package.");
+    try testing.assertEqual(analysis.bodyDiagnostics().length, 1L);
+}
+
+test "a throwing binding member takes part in checked exceptions" {
+    let loader = new FakeFileLoader();
+    loader.add("/stdlib/std/src/text.ens",
+        "export class Failure extends Error \{\n"
+        + "    export constructor(string message) \{\n"
+        + "        super(message);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "\n"
+        + "primitive string \{\n"
+        + "    export risky() -> long \{\n"
+        + "        throw new Failure(\"boom\");\n"
+        + "    \}\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens",
+        "import @std.text;\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramClean(analysis);
+    try sema_support.assertMentions(analysis.exceptionDiagnostics(),
+        "'risky' can throw 'Failure' but is not marked 'throws'");
+}

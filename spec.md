@@ -1183,6 +1183,7 @@ for (int x in xs) {     // x takes each element in turn
 A class is iterable when it implements the `Iterable<T>` interface from `@std.collections.iterator`, directly or through an interface that extends it; its single method `makeIterator() -> Iterator<T>` returns an `Iterator<T>` (an interface with `hasNext() -> bool` and `next() -> T`).
 The loop calls `makeIterator()` once, then draws values with `next()` while `hasNext()` is true.
 A value whose static type is `Iterable<T>` itself, or an interface extending it, can also be iterated.
+Text is not a sequence of its own, so a `string` cannot be iterated directly: a walk over text says which view it reads, and the loop takes the array that view produces.
 
 ```ens
 import Iterable from @std.collections.iterator;
@@ -1571,7 +1572,18 @@ The account describes an optimization that ran, so `-O0` prints nothing, the opt
 
 ---
 
-The standard library is an external package, imported with `@`, and is opt-in apart from the implicitly imported `std.core`: its other exported declarations are visible only after they are imported. The `std.system` module wraps common operating system facilities and reports failures as exceptions. Import the module to call its functions through the `system` namespace, and import any types you use by name:
+The standard library is an external package, imported with `@`, and is opt-in apart from the implicitly imported `std.core`: its other exported declarations are visible only after they are imported.
+
+The standard library also declares members of the primitive types, so what a `string`, a `bool`, a `char`, or a numeric type can do is written there in ordinary Ens source rather than built into the compiler.
+Such a member is called like any other, on a literal as readily as on a variable, and a static of a primitive is reached through the type name, as in `string.fromBytes(bytes)`.
+Reaching one from another package follows the ordinary visibility rules, so a program sees the members the library exported and nothing else.
+The library may also declare that a primitive implements an interface, which is how a primitive satisfies a generic bound: a `<T: Comparable<T>>` parameter accepts `string` once `string` is declared to implement `Comparable<string>`.
+That conformance is a compile-time judgment and nothing more, because a primitive value is never wrapped in an object.
+Storing a primitive in an interface-typed variable, field, array element, or parameter is an error, and so is `is` or `as?` against an interface; each message names the bound the conformance does serve.
+Only the standard library declares a primitive's members, and a program that writes `primitive` is told so.
+The word stays an ordinary identifier everywhere else, so a variable, field, parameter, method, or function may be named `primitive`.
+
+The `std.system` module wraps common operating system facilities and reports failures as exceptions. Import the module to call its functions through the `system` namespace, and import any types you use by name:
 
 ```ens
 import @std.system;
