@@ -34,6 +34,10 @@ A dedicated review pass over the diagnostic messages introduced across the whole
 A clearer message when a declaration collides with a function the language provides but cannot replace it (found 2026-08-30).
 Declaring `print<T>(T value)` reports that the name cannot be overloaded because one of its declarations is generic, which reads as nonsense to an author who wrote exactly one declaration, since the other one is the invisible provided function.
 
+A nullable external handle fails to lower (found 2026-08-30, pre-existing, the same on the pinned seed).
+Returning a `Handle?` from a function and comparing it to null reports `Internal: lowering produced malformed EIR: release of %0, which holds Handle? and owns no reference`, with no override or generic involved.
+A handle is a raw pointer that reference counting never touches, so the release the optional's cleanup emits has nothing to release; found while trying to pin that an override may narrow a `Handle?` to a `Handle`, which sema accepts and which therefore has no runtime fixture.
+
 The language server reports a spurious entry-point placement error on a single-file program (found 2026-08-30, pre-existing).
 Opening `tests/inheritance.ens` says `main` may only be defined in the main module, because the server names a lone file's module after the file rather than treating the file as the program's main module, which is what `ens build <file>` does.
 Folder programs and packages are both clean; only a single file is affected, so this is worth carrying to the language server's replacement rather than fixing in the one being retired.
