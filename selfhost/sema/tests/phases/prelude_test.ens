@@ -1,0 +1,449 @@
+// The prelude: the exported functions of the implicitly imported modules, callable unqualified in
+// every module. What a module's own declarations take back, what visibility keeps out, and what
+// two prelude modules exporting one name do to every call that names it.
+import @std.testing;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxNode from @ens.frontend.syntax.node;
+import ModuleContext from context;
+import ProgramAnalysis from pipeline;
+import Signature from model.types;
+import Type from model.types;
+import phases.prelude;
+import SemaResult from result;
+import FakeFileLoader from sema_support;
+import sema_support;
+
+// One program over a stand-in standard library whose '@std.core' also declares 'preludeText'.
+analyzeWith(string preludeText, string mainText) -> ProgramAnalysis throws {
+    let loader = new FakeFileLoader();
+    loader.addToCore(preludeText);
+    loader.add("/proj/src/main.ens", mainText);
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertNoDiagnostics(analysis.declareDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.linkDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.signatureDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.layoutDiagnostics());
+    return analysis;
+}
+
+// The signature the nth call written to 'name' in the module at 'modulePath' resolved to.
+calleeOf(ProgramAnalysis analysis, string modulePath, string name, long index)
+        -> Signature throws {
+    let context = try sema_support.contextFor(analysis, modulePath);
+    let root = context.root();
+    if (root == null) {
+        try testing.fail("module '{modulePath}' did not parse");
+    }
+    let callees = new List<Signature>();
+    collectCallees(root, context.result(), name, callees);
+    if (callees.length() <= index) {
+        try testing.fail("module '{modulePath}' has {callees.length()} resolved call(s) to "
+            + "'{name}', not {index + 1}");
+    }
+    return callees.get(index);
+}
+
+collectCallees(SyntaxNode node, SemaResult result, string name, List<Signature> found) {
+    if (node is IdentifierExpressionNode && node.name().text() == name) {
+        let callee = result.callableOf(node.green());
+        if (callee != null) {
+            found.push(callee);
+        }
+    }
+    let children = node.childNodes();
+    for (long i = 0; i < children.length(); i++) {
+        collectCallees(children.get(i), result, name, found);
+    }
+}
+
+// The type recorded for the first call written to 'name' in the module at 'modulePath', which is
+// the built type when the call constructs a struct.
+callTypeOf(ProgramAnalysis analysis, string modulePath, string name) -> Type throws {
+    let context = try sema_support.contextFor(analysis, modulePath);
+    let root = context.root();
+    if (root == null) {
+        try testing.fail("module '{modulePath}' did not parse");
+    }
+    let call = firstCallTo(root, name);
+    if (call == null) {
+        try testing.fail("module '{modulePath}' writes no call to '{name}'");
+    }
+    let recorded = context.result().typeOf(call.green());
+    if (recorded == null) {
+        try testing.fail("nothing was recorded for the call to '{name}'");
+    }
+    return recorded;
+}
+
+firstCallTo(SyntaxNode node, string name) -> CallExpressionNode? {
+    if (node is CallExpressionNode) {
+        let callee = node.callee();
+        if (callee is IdentifierExpressionNode && callee.name().text() == name) {
+            return node;
+        }
+    }
+    let children = node.childNodes();
+    for (long i = 0; i < children.length(); i++) {
+        let found = firstCallTo(children.get(i), name);
+        if (found != null) {
+            return found;
+        }
+    }
+    return null;
+}
+
+// The first member access written in the module at 'modulePath' that names 'memberName'.
+memberAccessOf(ProgramAnalysis analysis, string modulePath, string memberName)
+        -> MemberExpressionNode throws {
+    let context = try sema_support.contextFor(analysis, modulePath);
+    let root = context.root();
+    if (root == null) {
+        try testing.fail("module '{modulePath}' did not parse");
+    }
+    let found = firstMemberAccess(root, memberName);
+    if (found == null) {
+        try testing.fail("module '{modulePath}' writes no access to '{memberName}'");
+    }
+    return found;
+}
+
+firstMemberAccess(SyntaxNode node, string memberName) -> MemberExpressionNode? {
+    if (node is MemberExpressionNode && node.member().text() == memberName) {
+        return node;
+    }
+    let children = node.childNodes();
+    for (long i = 0; i < children.length(); i++) {
+        let found = firstMemberAccess(children.get(i), memberName);
+        if (found != null) {
+            return found;
+        }
+    }
+    return null;
+}
+
+// The entry the prelude module declares under this name, at the given overload position.
+preludeSignature(ProgramAnalysis analysis, string name, long index) -> Signature throws {
+    let context = try sema_support.contextFor(analysis, "std.core");
+    let declared = context.functions().entriesNamed(name);
+    if (declared == null) {
+        try testing.fail("the prelude module declares no '{name}'");
+    }
+    return declared.get(index).signature();
+}
+
+test "an exported prelude function is callable unqualified" {
+    let analysis = try analyzeWith(
+        "export greet(string name) -> string \{\n"
+        + "    return \"hello, \" + name;\n"
+        + "\}\n"
+        + "export shout(string name) -> string \{\n"
+        + "    return greet(name) + \"!\";\n"
+        + "\}\n",
+        "main() -> int \{\n"
+        + "    print(shout(\"world\"));\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.checkDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+    let callee = try calleeOf(analysis, "main", "shout", 0);
+    try testing.assertTrue(callee == try preludeSignature(analysis, "shout", 0),
+        "the call must resolve to the prelude module's own signature");
+    let inner = try calleeOf(analysis, "std.core", "greet", 0);
+    try testing.assertTrue(inner == try preludeSignature(analysis, "greet", 0),
+        "a prelude module reaches its own functions as any module does");
+}
+
+test "prelude overloads resolve by the ordinary overload rules" {
+    let analysis = try analyzeWith(
+        "export describe(string text) -> string \{\n"
+        + "    return \"text \" + text;\n"
+        + "\}\n"
+        + "export describe(int value) -> string \{\n"
+        + "    return \"number \" + value.toString();\n"
+        + "\}\n",
+        "main() -> int \{\n"
+        + "    print(describe(\"abc\"));\n"
+        + "    print(describe(7));\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+    try testing.assertTrue(try calleeOf(analysis, "main", "describe", 0)
+        == try preludeSignature(analysis, "describe", 0),
+        "the string argument must pick the string overload");
+    try testing.assertTrue(try calleeOf(analysis, "main", "describe", 1)
+        == try preludeSignature(analysis, "describe", 1),
+        "the int argument must pick the int overload");
+}
+
+test "a module's own declaration takes the name back from the prelude" {
+    let analysis = try analyzeWith(
+        "export describe(string text) -> string \{\n"
+        + "    return \"text \" + text;\n"
+        + "\}\n",
+        "describe(bool flag) -> string \{\n"
+        + "    return \"flag \" + flag.toString();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    print(describe(true));\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+    let callee = try calleeOf(analysis, "main", "describe", 0);
+    try testing.assertEqual(callee.parameters().length, 1L);
+    try testing.assertTrue(callee != try preludeSignature(analysis, "describe", 0),
+        "the module's own declaration must win over the prelude's");
+}
+
+test "a bad call to a shadowed name reports against the module's own declaration" {
+    let analysis = try analyzeWith(
+        "export describe(string text) -> string \{\n"
+        + "    return \"text \" + text;\n"
+        + "\}\n",
+        "describe(bool flag) -> string \{\n"
+        + "    return \"flag \" + flag.toString();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    print(describe(\"abc\"));\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertDiagnostic(analysis.bodyDiagnostics(), 0, "/proj/src/main.ens",
+        "Argument 1: expected 'bool', got 'string'");
+    try testing.assertEqual(analysis.bodyDiagnostics().length, 1L);
+}
+
+test "a struct this module declares keeps its name from the prelude" {
+    let analysis = try analyzeWith(
+        "export greet(string name) -> string \{\n"
+        + "    return name;\n"
+        + "\}\n",
+        "public struct greet \{\n"
+        + "    public long value;\n"
+        + "\n"
+        + "    public constructor(this.value);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let made = greet(5L);\n"
+        + "    return made.value as int - 5;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+    try testing.assertTrue(try callTypeOf(analysis, "main", "greet")
+        == try sema_support.structNamed(analysis, "main", "greet"),
+        "the bare call must build the struct this module declares");
+}
+
+test "a class this module declares keeps its statics from the prelude" {
+    let analysis = try analyzeWith(
+        "export describe(string text) -> string \{\n"
+        + "    return text;\n"
+        + "\}\n",
+        "public class describe \{\n"
+        + "    public static tag() -> string \{\n"
+        + "        return \"tag\";\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    print(describe.tag());\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+    let access = try memberAccessOf(analysis, "main", "tag");
+    let context = try sema_support.contextFor(analysis, "main");
+    let method = context.result().methodOf(access.green());
+    if (method == null) {
+        try testing.fail("'describe.tag()' resolved to no method");
+    }
+    try testing.assertTrue(method.definingType()
+        == try sema_support.classNamed(analysis, "main", "describe"),
+        "the static must be the one the class declares");
+}
+
+test "an enum this module declares keeps its members from the prelude" {
+    let analysis = try analyzeWith(
+        "export describe(string text) -> string \{\n"
+        + "    return text;\n"
+        + "\}\n",
+        "enum describe \{\n"
+        + "    Alpha,\n"
+        + "    Beta,\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let chosen = describe.Alpha;\n"
+        + "    if (chosen == describe.Beta) \{\n"
+        + "        return 1;\n"
+        + "    \}\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+    let access = try memberAccessOf(analysis, "main", "Alpha");
+    let context = try sema_support.contextFor(analysis, "main");
+    let recorded = context.result().typeOf(access.green());
+    try testing.assertTrue(recorded != null
+        && recorded == try sema_support.enumNamed(analysis, "main", "describe"),
+        "'describe.Alpha' must read the enum this module declares");
+}
+
+test "a static of the enclosing type does not claim a bare name" {
+    let analysis = try analyzeWith(
+        "export greet(string name) -> string \{\n"
+        + "    return name;\n"
+        + "\}\n",
+        "public class Holder \{\n"
+        + "    static greet() -> string \{\n"
+        + "        return \"static\";\n"
+        + "    \}\n"
+        + "\n"
+        + "    public static use() -> string \{\n"
+        + "        return greet(\"owner\");\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    print(Holder.use());\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+    try testing.assertTrue(try calleeOf(analysis, "main", "greet", 0)
+        == try preludeSignature(analysis, "greet", 0),
+        "a static is reached through its type name, so the bare call is the prelude's");
+}
+
+test "a module of the standard library's own package sees its public functions" {
+    let loader = new FakeFileLoader();
+    loader.addToCore("public inPackageOnly() -> string \{\n    return \"package\";\n\}\n");
+    loader.add("/stdlib/std/src/text/helper.ens",
+        "export nearby() -> string \{\n"
+        + "    return inPackageOnly();\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens",
+        "import @std.text.helper;\n"
+        + "main() -> int \{\n"
+        + "    print(helper.nearby());\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramClean(analysis);
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+    try testing.assertTrue(try calleeOf(analysis, "std.text.helper", "inPackageOnly", 0)
+        == try preludeSignature(analysis, "inPackageOnly", 0),
+        "a module inside package 'std' reaches the prelude module's public functions");
+    let contexts = new Map<string, ModuleContext>();
+    let analyzed = analysis.contexts();
+    for (long i = 0; i < analyzed.length(); i++) {
+        contexts.set(analyzed.get(i).module().canonicalPath(), analyzed.get(i));
+    }
+    let scope = prelude.scopeOver(["std.core"], contexts);
+    try testing.assertTrue(scope.match("inPackageOnly", "main", "") == null,
+        "the same function stays out of scope in a module of another package");
+}
+
+test "a prelude module's unexported function is not in scope unqualified" {
+    let analysis = try analyzeWith(
+        "public helper() -> string \{\n"
+        + "    return \"hidden\";\n"
+        + "\}\n",
+        "main() -> int \{\n"
+        + "    print(helper());\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertDiagnostic(analysis.bodyDiagnostics(), 0, "/proj/src/main.ens",
+        "Function 'helper' is public inside package 'std' but not exported. Mark it 'export' in "
+        + "module 'std.core' to use it from another package.");
+    try testing.assertEqual(analysis.bodyDiagnostics().length, 1L);
+}
+
+test "an unknown name still reports as an undefined function" {
+    let analysis = try analyzeWith(
+        "export greet(string name) -> string \{\n"
+        + "    return name;\n"
+        + "\}\n",
+        "main() -> int \{\n"
+        + "    print(greetings(\"world\"));\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertDiagnostic(analysis.bodyDiagnostics(), 0, "/proj/src/main.ens",
+        "Undefined function 'greetings'. Check the spelling, or import the module that "
+        + "declares it.");
+}
+
+test "a written import still reaches a prelude module's function qualified" {
+    let analysis = try analyzeWith(
+        "export greet(string name) -> string \{\n"
+        + "    return \"hello, \" + name;\n"
+        + "\}\n",
+        "import @std.core;\n"
+        + "main() -> int \{\n"
+        + "    print(core.greet(\"world\"));\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+}
+
+test "two prelude modules exporting one name make every call to it ambiguous" {
+    let loader = new FakeFileLoader();
+    loader.addToCore("export greet(string name) -> string \{\n    return name;\n\}\n");
+    loader.add("/stdlib/std/src/extra.ens",
+        "export greet(string name) -> string \{\n    return name;\n\}\n");
+    loader.add("/proj/src/main.ens",
+        "import @std.extra;\n"
+        + "main() -> int \{\n"
+        + "    print(extra.greet(\"world\"));\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+
+    let contexts = new Map<string, ModuleContext>();
+    let analyzed = analysis.contexts();
+    for (long i = 0; i < analyzed.length(); i++) {
+        contexts.set(analyzed.get(i).module().canonicalPath(), analyzed.get(i));
+    }
+    let scope = prelude.scopeOver(["std.core", "std.extra"], contexts);
+    let match = scope.match("greet", "main", "");
+    if (match == null) {
+        try testing.fail("both prelude modules export 'greet'");
+    } else {
+        try testing.assertTrue(match.isAmbiguous(), "two owning modules is an ambiguity");
+        try testing.assertEqual(match.entries().length(), 2L);
+        try testing.assertEqual(prelude.ambiguousMessage("greet", match.modulePaths()),
+            "Call to 'greet' is ambiguous: 'greet' is exported by modules 'std.core' and "
+            + "'std.extra', which are in scope everywhere without an import. That is a problem "
+            + "in the standard library, not in this program; until it is fixed, write "
+            + "'import @std.core;' and call 'core.greet(...)'.");
+    }
+}
+
+test "a prelude path the program never loaded is left out of the scope" {
+    let analysis = try analyzeWith("",
+        "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let contexts = new Map<string, ModuleContext>();
+    let analyzed = analysis.contexts();
+    for (long i = 0; i < analyzed.length(); i++) {
+        contexts.set(analyzed.get(i).module().canonicalPath(), analyzed.get(i));
+    }
+    let scope = prelude.scopeOver(["std.core", "std.nowhere"], contexts);
+    string[] paths = scope.modulePaths();
+    try testing.assertEqual(paths.length, 1L);
+    try testing.assertEqual(paths[0], "std.core");
+}
+
+test "the built-ins seeded into every module are not what the prelude carries" {
+    let analysis = try analyzeWith("",
+        "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let contexts = new Map<string, ModuleContext>();
+    let analyzed = analysis.contexts();
+    for (long i = 0; i < analyzed.length(); i++) {
+        contexts.set(analyzed.get(i).module().canonicalPath(), analyzed.get(i));
+    }
+    let scope = prelude.scopeOver(["std.core"], contexts);
+    try testing.assertTrue(scope.match("print", "main", "") == null,
+        "'print' is a built-in of every module, not a prelude function");
+    try testing.assertTrue(scope.hidden("print", "main", "") == null,
+        "a built-in is never reported as hidden");
+}

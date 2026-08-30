@@ -129,6 +129,47 @@ void Analyzer::bindImplicitImports(const ModuleResolver& resolver) {
     if (err && err->structInfo) errorClassInfo_ = err->structInfo;
 }
 
+std::vector<Symbol*> Analyzer::topLevelFunctions() const {
+    std::vector<Symbol*> out;
+    if (!astRoot) return out;
+    std::unordered_set<std::u16string> seen;
+    for (auto& fn : astRoot->functions()) {
+        auto name = fn.nameText();
+        if (!name || !seen.insert(*name).second) continue;
+        Symbol* sym = globalSymbol(*name);
+        if (sym && sym->kind == SymbolKind::Function) out.push_back(sym);
+    }
+    return out;
+}
+
+void Analyzer::bindPreludeFunctions(const ModuleResolver& resolver) {
+    // A prelude name is in scope wherever any declaration under it is visible from here: the
+    // overload chain belongs to the declaring module, so it is bound whole or not at all.
+    auto anyOverloadVisible = [&](const Symbol* sym, const std::u16string& declModulePath,
+                                  const std::u16string& declPackagePrefix) {
+        for (const Symbol* s = sym; s; s = s->nextOverload) {
+            if (isTopLevelVisibleFrom(s->visibility, declModulePath, declPackagePrefix)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (std::u16string_view implicitPath : kImplicitImportPaths) {
+        std::u16string path(implicitPath);
+        if (path == modulePath_) continue;
+        const Analyzer* target = resolver(path);
+        if (!target) continue;
+        for (Symbol* sym : target->topLevelFunctions()) {
+            if (!anyOverloadVisible(sym, target->modulePath(), target->packagePrefix())) continue;
+            // A name this file declares keeps it, whatever it declares it as: a function or a
+            // test in the scope, or a type of its own, which lives in the type registry.
+            if (globalScope->lookupLocal(sym->name)) continue;
+            if (typeCtx.lookupNamedType(modulePath_, sym->name)) continue;
+            globalScope->define(sym);
+        }
+    }
+}
+
 void Analyzer::registerBuiltins() {
     Type* voidTy   = typeCtx.getPrimitive(TypeKind::Void);
     Type* stringTy = typeCtx.getPrimitive(TypeKind::String);

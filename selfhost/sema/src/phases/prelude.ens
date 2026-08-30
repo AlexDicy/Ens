@@ -1,0 +1,200 @@
+// The prelude: the exported functions of the implicitly imported modules, callable unqualified in
+// every module. A module's own declarations and its written imports answer a name first, so a name
+// only reaches the prelude when nothing nearer claims it. The implicit import list is the
+// compiler's own, so two prelude modules exporting one name is a standard-library problem, and
+// every unqualified call to that name says so instead of picking one.
+import ModuleContext from context;
+import FunctionEntry from context;
+import model.types;
+import Visibility from model.types;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+import @std.text.strings;
+import StringBuilder from @std.text.stringbuilder;
+
+// What the prelude offers under one name: every entry the prelude modules export under it, and
+// the modules that export it. More than one module means the name cannot be used unqualified.
+public final class PreludeMatch {
+    List<FunctionEntry> matchEntries;
+    string[] matchModulePaths;
+
+    protected constructor(this.matchEntries, this.matchModulePaths);
+
+    public entries() -> List<FunctionEntry> {
+        return this.matchEntries;
+    }
+
+    public modulePaths() -> string[] {
+        return this.matchModulePaths;
+    }
+
+    public isAmbiguous() -> bool {
+        return this.matchModulePaths.length > 1;
+    }
+}
+
+// A prelude module's declaration the calling module cannot see: what an unqualified call to a
+// function that exists but is not exported reports against.
+public final class PreludeHidden {
+    Visibility hiddenVisibility;
+    string hiddenModulePath;
+    string hiddenPackagePrefix;
+
+    protected constructor(this.hiddenVisibility, this.hiddenModulePath, this.hiddenPackagePrefix);
+
+    public visibility() -> Visibility {
+        return this.hiddenVisibility;
+    }
+
+    public modulePath() -> string {
+        return this.hiddenModulePath;
+    }
+
+    public packagePrefix() -> string {
+        return this.hiddenPackagePrefix;
+    }
+}
+
+// The prelude modules of one analyzed program, in the order the implicit import list names them.
+// Read-only once built: the signature phase has filled every function table it looks in.
+public final class PreludeScope {
+    List<ModuleContext> preludeContexts;
+
+    protected constructor(this.preludeContexts);
+
+    public modulePaths() -> string[] {
+        let paths = new List<string>();
+        for (long i = 0; i < this.preludeContexts.length(); i++) {
+            paths.push(this.preludeContexts.get(i).module().canonicalPath());
+        }
+        return paths.toArray();
+    }
+
+    // What the prelude answers this name with for a call in the module at 'useModulePath', or
+    // null when no prelude module offers it there.
+    public match(string name, string useModulePath, string usePackagePrefix) -> PreludeMatch? {
+        if (!this.declaredAnywhere(name)) {
+            return null;
+        }
+        let entries = new List<FunctionEntry>();
+        let modulePaths = new List<string>();
+        for (long i = 0; i < this.preludeContexts.length(); i++) {
+            let context = this.preludeContexts.get(i);
+            long before = entries.length();
+            this.collectVisible(context, name, useModulePath, usePackagePrefix, entries);
+            if (entries.length() > before) {
+                modulePaths.push(context.module().canonicalPath());
+            }
+        }
+        if (modulePaths.length() == 0) {
+            return null;
+        }
+        return new PreludeMatch(entries, modulePaths.toArray());
+    }
+
+    // The first declaration under this name a prelude module keeps to itself, for the diagnostic
+    // an unqualified call to it deserves. Null when no prelude module declares the name or every
+    // declaration of it is visible.
+    public hidden(string name, string useModulePath, string usePackagePrefix) -> PreludeHidden? {
+        for (long i = 0; i < this.preludeContexts.length(); i++) {
+            let context = this.preludeContexts.get(i);
+            let declared = context.functions().entriesNamed(name);
+            if (declared == null) {
+                continue;
+            }
+            string modulePath = context.module().canonicalPath();
+            string packagePrefix = context.module().packagePrefix();
+            for (long e = 0; e < declared.length(); e++) {
+                let entry = declared.get(e);
+                if (entry.isBuiltin() || types.isVisibleFrom(entry.visibility(), modulePath,
+                        packagePrefix, useModulePath, usePackagePrefix)) {
+                    continue;
+                }
+                return new PreludeHidden(entry.visibility(), modulePath, packagePrefix);
+            }
+        }
+        return null;
+    }
+
+    // Whether any prelude module names this at all, which is the cheap answer for the many
+    // unqualified names that reach the prelude and find nothing.
+    declaredAnywhere(string name) -> bool {
+        for (long i = 0; i < this.preludeContexts.length(); i++) {
+            let declared = this.preludeContexts.get(i).functions().entriesNamed(name);
+            if (declared != null && declared.length() > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    collectVisible(ModuleContext context, string name, string useModulePath,
+                   string usePackagePrefix, List<FunctionEntry> into) {
+        let declared = context.functions().entriesNamed(name);
+        if (declared == null) {
+            return;
+        }
+        string modulePath = context.module().canonicalPath();
+        string packagePrefix = context.module().packagePrefix();
+        for (long i = 0; i < declared.length(); i++) {
+            let entry = declared.get(i);
+            // A built-in entry is seeded into every module alike, so it is nothing the prelude
+            // module declares and nothing the prelude hands on.
+            if (entry.isBuiltin()) {
+                continue;
+            }
+            if (types.isVisibleFrom(entry.visibility(), modulePath, packagePrefix, useModulePath,
+                    usePackagePrefix)) {
+                into.push(entry);
+            }
+        }
+    }
+}
+
+// The prelude scope of one program: the modules at 'modulePaths' the program loaded, in the order
+// the paths list them. A path the graph could not load is left out; it already reported that.
+public scopeOver(string[] modulePaths, Map<string, ModuleContext> contextsByPath) -> PreludeScope {
+    let contexts = new List<ModuleContext>();
+    for (let modulePath in modulePaths) {
+        let found = contextsByPath.get(modulePath);
+        if (found != null) {
+            contexts.push(found);
+        }
+    }
+    return new PreludeScope(contexts);
+}
+
+// The call site's diagnostic when several prelude modules export the same name. The program cannot
+// fix which names the prelude carries, so the message says where the problem is and how to get
+// past it in the meantime.
+public ambiguousMessage(string name, string[] modulePaths) -> string {
+    string first = modulePaths[0];
+    return "Call to '{name}' is ambiguous: '{name}' is exported by "
+        + "{modulesText(modulePaths)}, which are in scope everywhere without an import. That is "
+        + "a problem in the standard library, not in this program; until it is fixed, write "
+        + "'import @{first};' and call '{aliasOf(first)}.{name}(...)'.";
+}
+
+modulesText(string[] modulePaths) -> string {
+    let builder = new StringBuilder();
+    builder.append("modules ");
+    for (long i = 0; i < modulePaths.length; i++) {
+        if (i > 0) {
+            if (i == modulePaths.length - 1) {
+                builder.append(" and ");
+            } else {
+                builder.append(", ");
+            }
+        }
+        builder.append("'");
+        builder.append(modulePaths[i]);
+        builder.append("'");
+    }
+    return builder.toString();
+}
+
+// The namespace name an 'import' of this module binds: its last path segment.
+aliasOf(string modulePath) -> string {
+    string[] segments = strings.split(modulePath, ".");
+    return segments[segments.length - 1];
+}

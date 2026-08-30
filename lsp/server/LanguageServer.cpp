@@ -193,9 +193,15 @@ struct DefinitionTarget {
     size_t nameLength = 0;      // UTF-16 length of the declared name at (line, column)
 };
 
+// A symbol declared in another module - a prelude function, a method reached through its owner -
+// carries where it came from, and its definition is in that module's file.
 DefinitionTarget targetForSymbol(const Symbol& s) {
     DefinitionTarget t;
-    if (s.methodOwner) t.modulePath = s.methodOwner->modulePath;
+    if (s.methodOwner) {
+        t.modulePath = s.methodOwner->modulePath;
+    } else {
+        t.modulePath = s.modulePath;
+    }
     t.line = s.line;
     t.column = s.column;
     t.nameLength = s.name.size();

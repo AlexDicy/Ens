@@ -61,6 +61,15 @@ public:
     // implicit import can bind the ones visible to it.
     std::vector<std::pair<std::u16string, Type*>> topLevelTypes() const;
 
+    // Brings the exported functions of the implicitly imported modules into this module's
+    // scope, so a call to one needs no import. Runs after every module resolved its
+    // signatures, and binds nothing under a name this module already claims.
+    void bindPreludeFunctions(const ModuleResolver& resolver);
+
+    // Every top-level function this module declares, one entry per name and each the head of
+    // its overload chain, so another module's prelude can bind the exported ones.
+    std::vector<Symbol*> topLevelFunctions() const;
+
     void layoutOneClass(const ast::ClassDecl& classDecl);
     static void finalizeClassHierarchy(const std::vector<StructInfo*>& classes);
 

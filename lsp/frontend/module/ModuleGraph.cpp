@@ -497,6 +497,10 @@ bool analyzeModuleGraph(std::vector<std::unique_ptr<Module>>& modules,
 
     for (auto& m : modules) m->analyzer->bindValueImports(resolver);
 
+    // The prelude binds after the written imports are judged, so a name only the prelude
+    // provides never makes a named import of another module look like a function import.
+    for (auto& m : modules) m->analyzer->bindPreludeFunctions(resolver);
+
     // Lay out classes whole-program, bases before derived, so a class can extend a class
     // in another module (inherited fields + virtual slots resolve across module
     // boundaries). The implicit imports load first, so they sort first among roots.

@@ -93,6 +93,10 @@ import ArgumentValue from phases.calls;
 import CallShape from phases.calls;
 import CallCandidate from phases.calls;
 import CallResolution from phases.calls;
+import phases.prelude;
+import PreludeMatch from phases.prelude;
+import PreludeScope from phases.prelude;
+import program.implicit;
 import model.convert;
 import model.flow;
 import ExitScope from model.flow;
@@ -141,7 +145,8 @@ import Set from @std.collections.set;
 import StringBuilder from @std.text.stringbuilder;
 
 // Checks every body of every module. Modules see each other only through the type store, the
-// link tables, and the other modules' function tables (for namespace-qualified calls).
+// link tables, and the other modules' function tables (for namespace-qualified calls and for the
+// prelude).
 public checkBodies(List<ModuleContext> contexts, ObligationRegistry deferred)
         -> FileDiagnostic[] {
     let collected = new List<FileDiagnostic>();
@@ -149,8 +154,10 @@ public checkBodies(List<ModuleContext> contexts, ObligationRegistry deferred)
     for (long i = 0; i < contexts.length(); i++) {
         contextsByPath.set(contexts.get(i).module().canonicalPath(), contexts.get(i));
     }
+    let preludeScope = prelude.scopeOver(implicit.implicitImportPaths(), contextsByPath);
     for (long i = 0; i < contexts.length(); i++) {
-        let checker = new BodyChecker(contexts.get(i), contextsByPath, collected, deferred);
+        let checker = new BodyChecker(contexts.get(i), contextsByPath, preludeScope, collected,
+            deferred);
         checker.run();
         for (let diagnostic in contexts.get(i).resolver().takeDiagnostics()) {
             collected.push(diagnostic);
@@ -169,10 +176,13 @@ class LocalName extends NameResolution {
     protected constructor(this.binding);
 }
 
+// The entries a call to this name could reach, and the prelude match they came from when they
+// came from there rather than from the module's own function table.
 class FunctionName extends NameResolution {
     protected List<FunctionEntry> entries;
+    protected PreludeMatch? fromPrelude;
 
-    protected constructor(this.entries);
+    protected constructor(this.entries, this.fromPrelude);
 }
 
 class TypeName extends NameResolution {
@@ -318,6 +328,7 @@ class MissingMember extends MemberLookup {
 class BodyChecker implements NoreturnCalls {
     ModuleContext context;
     Map<string, ModuleContext> contextsByPath;
+    PreludeScope preludeScope;
     TypeResolver resolver;
     TypeStore store;
     SemaResult result;
@@ -374,9 +385,11 @@ class BodyChecker implements NoreturnCalls {
     List<PendingLiteralRange> pendingLiteralRanges;
 
     protected constructor(ModuleContext context, Map<string, ModuleContext> contextsByPath,
-                List<FileDiagnostic> collected, ObligationRegistry deferred) {
+                PreludeScope preludeScope, List<FileDiagnostic> collected,
+                ObligationRegistry deferred) {
         this.context = context;
         this.contextsByPath = contextsByPath;
+        this.preludeScope = preludeScope;
         this.resolver = context.resolver();
         this.store = context.resolver().typeStore();
         this.result = context.result();
@@ -1087,7 +1100,8 @@ class BodyChecker implements NoreturnCalls {
     }
 
     // Unqualified name resolution: local scopes innermost-first, then the module's functions,
-    // then the file's imports, then the implicit exception base class.
+    // then the file's imports, then the prelude's functions unless this file's own declarations
+    // claim the name, then the implicit exception base class.
     resolveName(string name) -> NameResolution? {
         let binding = this.lookupBinding(name);
         if (binding != null) {
@@ -1095,7 +1109,7 @@ class BodyChecker implements NoreturnCalls {
         }
         let entries = this.context.functions().entriesNamed(name);
         if (entries != null && entries.length() > 0) {
-            return new FunctionName(entries);
+            return new FunctionName(entries, null);
         }
         let imported = this.context.linkTable().binding(name);
         if (imported is ImportedType) {
@@ -1104,6 +1118,10 @@ class BodyChecker implements NoreturnCalls {
         if (imported is ImportedNamespace) {
             return new NamespaceName(imported.modulePath());
         }
+        let offered = this.preludeScope.match(name, this.modulePath, this.packagePrefix);
+        if (offered != null && !this.declaredHere(name)) {
+            return new FunctionName(offered.entries(), offered);
+        }
         if (name == "Error") {
             let errorClass = this.resolver.errorClass();
             if (errorClass != null) {
@@ -1111,6 +1129,18 @@ class BodyChecker implements NoreturnCalls {
             }
         }
         return null;
+    }
+
+    // Whether this file's own declarations claim the name for something the expression namespace
+    // does not carry: a type it declares, or a type parameter in scope. The callers that read a
+    // name as a type head resolve both for themselves, so the prelude leaves those names to them.
+    // A member is not one of them: a static or a method is reached through its type name or
+    // 'this', never as a bare name.
+    declaredHere(string name) -> bool {
+        if (this.store.findDeclared(this.modulePath, name) != null) {
+            return true;
+        }
+        return this.resolver.typeParameterNamed(name) != null;
     }
 
     // ---- Narrowing ----
@@ -6002,12 +6032,27 @@ class BodyChecker implements NoreturnCalls {
                 this.analyzeArgumentsOnly(node.arguments());
                 return this.store.errorType();
             }
+            let kept = this.preludeScope.hidden(name, this.modulePath, this.packagePrefix);
+            if (kept != null) {
+                this.reporter.report(types.notVisibleMessage("Function", name, kept.visibility(),
+                    kept.modulePath(), kept.packagePrefix(), this.packagePrefix),
+                    identifier.span());
+                this.analyzeArgumentsOnly(node.arguments());
+                return this.store.errorType();
+            }
             this.reporter.report("Undefined function '{name}'. Check the spelling, or import "
                 + "the module that declares it.", identifier.span());
             this.analyzeArgumentsOnly(node.arguments());
             return this.store.errorType();
         }
         if (resolution is FunctionName) {
+            let offered = resolution.fromPrelude;
+            if (offered != null && offered.isAmbiguous()) {
+                this.reporter.report(prelude.ambiguousMessage(name, offered.modulePaths()),
+                    identifier.span());
+                this.analyzeArgumentsOnly(node.arguments());
+                return this.store.errorType();
+            }
             return this.dispatchFunctionCall(node, identifier, name, resolution.entries);
         }
         if (resolution is TypeName && isStructValue(resolution.target)) {

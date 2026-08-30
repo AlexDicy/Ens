@@ -496,11 +496,14 @@ A byte order mark at the very start of a file is accepted and skipped; the same 
 A module's private declarations never leave its file; `public` declarations are visible to every module in the same package, and `export` declarations also to the packages that consume it.
 Types (classes and structs) may be brought into scope by name as above, but free functions are always called through their module namespace, never imported by name: write `import engine.renderer;` then call `renderer.configure()`.
 Importing a function by name (`import configure from engine.renderer;`) is an error.
+The implicitly imported modules described below are the one exception: no import is written for them at all, so their exported functions are called unqualified.
 
 Two modules may import each other: circular imports are allowed, and declarations resolve across the cycle like any other import.
 
-A short list of standard-library modules is imported implicitly, today just `@std.core`: its exported names `Error` and `StackFrame` are in scope in every module with no import written.
+A short list of standard-library modules is imported implicitly, today just `@std.core`.
+Every exported name of such a module is in scope in every module with no import written: its types `Error` and `StackFrame` are used by name, and its exported functions are called unqualified.
 A declaration of your own with one of those names takes precedence inside the module that declares it.
+That precedence goes by name and not by signature: a `describe(int)` of your own hides every implicitly imported `describe`, so a call that does not fit yours is an error rather than a call to theirs, and the hidden one is reached by importing its module and qualifying the call.
 Every other module of the standard library has to be imported.
 
 A program's entry point is the top-level function `main` in its **main module**: `src/main.ens` for a package or a folder of sources, or the compiled file itself for a single-file program.

@@ -3,8 +3,9 @@
 #include <string_view>
 
 // The implicitly imported modules: ordinary standard-library modules, loaded into every
-// module graph, whose exported names are in scope in every module with no import written.
-// Every compilation therefore has to be able to resolve the standard library.
+// module graph, whose exported names are in scope in every module with no import written,
+// types and functions alike. Every compilation therefore has to be able to resolve the
+// standard library.
 
 // The module holding the exception base class `Error` and `StackFrame`. Code generation keys
 // its interception of the two trace methods on this path.
