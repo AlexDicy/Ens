@@ -155,13 +155,15 @@ mergeDiagnostics(Diagnostic[] first, Diagnostic[] second) -> Diagnostic[] {
 }
 
 // A snapshot of everything speculation can change: the token cursor (including split state), the
-// event list, the diagnostics, and the recoveries.
+// event list, the diagnostics, and the recoveries. The depth-limit count rides along because
+// clean reads it apart from the diagnostic count.
 struct ParserMark {
     long position;
     long splitOffset;
     long lastContentEnd;
     long eventCount;
     long diagnosticCount;
+    long depthLimitCount;
     long recoveryCount;
 }
 
@@ -194,6 +196,9 @@ class Parser {
     // How deeply expressions and types are nested at this point; see maximumNestingDepth.
     long nestingDepth;
 
+    // How many of the diagnostics reported so far are depth limits; see clean.
+    long depthLimits;
+
     // True while a switch arm's labels are being parsed. There a '->' ends the labels, so
     // 'Circle -> ...' and '(1) -> ...' are the arm rather than a lambda; a label is a constant,
     // so no lambda can appear inside one anyway.
@@ -210,6 +215,7 @@ class Parser {
         this.diagnostics = new RewindableList<Diagnostic>();
         this.recoveries = new RewindableList<Recovery>();
         this.nestingDepth = 0;
+        this.depthLimits = 0;
         this.inArmLabels = false;
     }
 
@@ -464,6 +470,7 @@ class Parser {
             lastContentEnd: this.lastContentEnd,
             eventCount: this.events.count(),
             diagnosticCount: this.diagnostics.count(),
+            depthLimitCount: this.depthLimits,
             recoveryCount: this.recoveries.count(),
         };
     }
@@ -474,6 +481,7 @@ class Parser {
         this.lastContentEnd = restore.lastContentEnd;
         this.events.truncate(restore.eventCount);
         this.diagnostics.truncate(restore.diagnosticCount);
+        this.depthLimits = restore.depthLimitCount;
         this.recoveries.truncate(restore.recoveryCount);
     }
 
@@ -481,8 +489,12 @@ class Parser {
     // Every guess is reported today, so the second test is redundant and kept anyway: a guess that
     // stopped reporting would otherwise let a speculation look clean while leaving an invented
     // token in the tree it kept.
+    //
+    // A depth limit is not counted: it says how big the construct is and not which construct it
+    // is, so a reading given up for depth is still that reading.
     clean(ParserMark restore) -> bool {
-        return this.diagnostics.count() == restore.diagnosticCount
+        return this.diagnostics.count() - this.depthLimits
+                == restore.diagnosticCount - restore.depthLimitCount
             && this.recoveries.count() == restore.recoveryCount;
     }
 
@@ -572,6 +584,7 @@ class Parser {
     enterNesting(string message) -> bool {
         if (this.nestingDepth >= maximumNestingDepth()) {
             this.report(message, source.makeSpan(this.lastContentEnd, 0));
+            this.depthLimits++;
             return false;
         }
         this.nestingDepth++;
@@ -2243,16 +2256,38 @@ class Parser {
         return this.parseTypeAndSuffixes(missingMessage, false);
     }
 
-    // Every written type is parsed here, which is where its nesting is bounded.
+    // Every written type is parsed here, which is where its nesting is bounded. A type's slots
+    // hold one head that its suffixes wrap, so half a chain has no shape a type position could
+    // hold: an over-long chain is read to its end and then given up whole.
     parseTypeAndSuffixes(string missingMessage, bool leaveCoalesceToExpression) -> long {
-        if (!this.enterNesting("This type nests too deeply to be parsed; reduce how deeply its "
-                + "parentheses and type arguments nest")) {
+        if (!this.enterNesting(deeplyNestedType())) {
             return this.abandoned(SyntaxKind.ErrorType);
         }
+        let restore = this.mark();
         long completed = this.parseTypeSuffixes(this.parseTypeHead(missingMessage),
             leaveCoalesceToExpression);
         this.leaveNesting();
-        return completed;
+        if (completed >= 0) {
+            return completed;
+        }
+        long end = this.position;
+        this.rewind(restore);
+        return this.abandonedDeepType(end);
+    }
+
+    // A type given up for depth, as one error type holding the tokens it was written with. The
+    // parse ends where the type ended, so the declaration around it keeps its shape.
+    abandonedDeepType(long end) -> long {
+        let marker = this.start();
+        long start = this.tokens[this.position].offset;
+        let skipped = this.start();
+        while (this.position < end && !this.atEnd()) {
+            this.bump();
+        }
+        this.complete(skipped, SyntaxKind.List);
+        this.report(deeplyNestedType(), source.makeSpan(start, 0));
+        this.depthLimits++;
+        return this.complete(marker, SyntaxKind.ErrorType);
     }
 
     // The head a type starts with: a function type or a type in parentheses when it opens with
@@ -2326,19 +2361,37 @@ class Parser {
         return this.atSafeSubscript() && this.peekKind(2) != SyntaxKind.CloseBracket;
     }
 
+    // Every suffix wraps what came before, so a chain's length is the depth of the type tree and
+    // it counts against the same limit the type's parentheses and type arguments do. The levels a
+    // chain took are given back together, because they are one type rather than one per suffix.
+    // Reaching the limit reads the rest of the chain, which only '?' and '[]' can extend, and
+    // answers -1 for the caller to give the type up.
     parseTypeSuffixes(long named, bool leaveCoalesceToExpression) -> long {
         long completed = named;
+        long taken = 0;
         while (true) {
             if (this.at(SyntaxKind.Question)) {
                 if (leaveCoalesceToExpression && this.leavesQuestionToExpression()) {
                     break;
                 }
+                if (!this.enterNesting(deeplyNestedType())) {
+                    this.leaveNestingTimes(taken);
+                    this.skipTypeSuffixes(leaveCoalesceToExpression);
+                    return -1;
+                }
+                taken++;
                 let marker = this.precede(completed);
                 this.bump();
                 completed = this.complete(marker, SyntaxKind.OptionalType);
                 continue;
             }
             if (this.at(SyntaxKind.OpenBracket) && this.peekKind(1) == SyntaxKind.CloseBracket) {
+                if (!this.enterNesting(deeplyNestedType())) {
+                    this.leaveNestingTimes(taken);
+                    this.skipTypeSuffixes(leaveCoalesceToExpression);
+                    return -1;
+                }
+                taken++;
                 let marker = this.precede(completed);
                 this.bump();
                 this.bump();
@@ -2347,7 +2400,24 @@ class Parser {
             }
             break;
         }
+        this.leaveNestingTimes(taken);
         return completed;
+    }
+
+    skipTypeSuffixes(bool leaveCoalesceToExpression) {
+        while (true) {
+            if (this.at(SyntaxKind.Question)
+                    && !(leaveCoalesceToExpression && this.leavesQuestionToExpression())) {
+                this.bump();
+                continue;
+            }
+            if (this.at(SyntaxKind.OpenBracket) && this.peekKind(1) == SyntaxKind.CloseBracket) {
+                this.bump();
+                this.bump();
+                continue;
+            }
+            break;
+        }
     }
 
     // NamedType = qualifier? name typeArguments?. A '<' after the name is taken as type arguments
@@ -3005,6 +3075,13 @@ isAssignmentOperator(SyntaxKind kind) -> bool {
 // both are the same count and the same fix, so both say it the same way.
 deeplyNestedExpression() -> string {
     return "This expression nests too deeply to be parsed; split it into smaller expressions";
+}
+
+// What a type too deep to parse reports. Its three sources share one count, so all three are
+// named rather than guessing which one filled it.
+deeplyNestedType() -> string {
+    return "This type nests too deeply to be parsed; reduce how deeply its type arguments, "
+        + "parentheses and '?' or '[]' suffixes nest";
 }
 
 // '??' binds like '||' and is right-associative. The operator is a pair of Question tokens rather

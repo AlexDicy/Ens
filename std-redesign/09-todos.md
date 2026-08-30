@@ -39,14 +39,15 @@ Two external handles compared with each other are accepted by sema and refused b
 `h1 == h2` over two handles reports `The self-hosted code generator does not support comparing 'Handle?' with 'Handle' yet`, while the spec says a handle is passed around and compared with `null`, which is the only comparison it names.
 So either sema should refuse the handle-to-handle comparison and say why, or code generation should answer it by identity the way a presence check already does.
 
+A type the statement classifier cannot read floods the statement with one problem per suffix (found 2026-08-30, pre-existing, unchanged by the suffix bound).
+`atTypedVariableDeclaration` parses the type speculatively and requires `clean`, so any diagnostic other than a depth limit makes the statement not-a-declaration and drops it to the expression path, where each `?[]` reads as an empty safe subscript and reports.
+Three measured shapes: a parenthesized head missing its `)` followed by 600 suffixes gives 499 problems instead of 2; a chain truncated at end of file gives 5 problems at 6 suffixes and 302 at 600; and an over-deep type-parameter bound reports only `Expected a top-level declaration` because `looksLikeFunctionDeclaration` discards the depth diagnostic on rewind and the real parse never runs.
+Every message is individually true, so this is noise rather than a wrong answer, and the fix is a classifier that keeps its reading when the type is unreadable for any reason rather than only for depth.
+
 The language server reports a spurious entry-point placement error on a single-file program (found 2026-08-30, pre-existing).
 Opening `tests/inheritance.ens` says `main` may only be defined in the main module, because the server names a lone file's module after the file rather than treating the file as the program's main module, which is what `ens build <file>` does.
 Folder programs and packages are both clean; only a single file is affected, so this is worth carrying to the language server's replacement rather than fixing in the one being retired.
-
-A long chain of type suffixes still exhausts the stack: `int?[]?[]...` past about 1500 suffixes exits with no diagnostic at all (measured 2026-08-30, the same on the pinned seed).
-Ratified 2026-08-30 to bound all four deep shapes in the parser; infix chains, postfix call chains and nested blocks now are, and this one is not.
-A type's slots hold one head that its suffixes wrap, so there is no shape a half-abandoned chain could take, and giving the whole type up reports a diagnostic that makes the statement classifier's speculative type parse unclean, which drops the declaration to the expression path and floods it with one problem per suffix.
-Bounding it needs a decision on one of those two: a flat form for a suffix chain in the grammar, or a speculation rule saying a construct given up for depth still counts as that construct.
+Its parser also bounds no nesting at all, so all four deep shapes reach its stack the way they used to reach the compiler's (found 2026-08-30); the replacement needs the bound the compiler's parser now has.
 
 ## Reminders
 
