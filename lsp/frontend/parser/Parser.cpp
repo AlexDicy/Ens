@@ -57,6 +57,35 @@ SyntaxKind Parser::peekKind(size_t n) const {
 bool Parser::atNullCoalesce() const {
     if (kindAt() != SyntaxKind::Question) return false;
     if (peekKind(1) != SyntaxKind::Question) return false;
+    return nextIsAdjacent();
+}
+
+// A `?` with something between it and the second one. No expression begins with `?`, so the pair
+// can only be a mistyped `??`, which is what the caller reports and then reads it as.
+bool Parser::atSeparatedNullCoalesce() const {
+    if (kindAt() != SyntaxKind::Question) return false;
+    if (peekKind(1) != SyntaxKind::Question) return false;
+    return !nextIsAdjacent();
+}
+
+// `?[` is the postfix safe subscript only when written adjacent, for the reason `??` is: a `?` with
+// a space after it begins a conditional, whose first branch may well be an array literal.
+bool Parser::atSafeSubscript() const {
+    if (kindAt() != SyntaxKind::Question) return false;
+    if (peekKind(1) != SyntaxKind::LBracket) return false;
+    return nextIsAdjacent();
+}
+
+// Where the `?` the type suffixes are looking at opens an operator instead: the two of a `??`, or
+// the one of a `?[` that indexes rather than the `?[]` that spells an array of a nullable element.
+bool Parser::leavesQuestionToExpression() const {
+    if (atNullCoalesce()) return true;
+    return atSafeSubscript() && peekKind(2) != SyntaxKind::RBracket;
+}
+
+// True when the token after the current one starts exactly where the current one ends, so nothing,
+// trivia included, was written between them.
+bool Parser::nextIsAdjacent() const {
     size_t next = current + 1;
     while (next < tokens.size() && isTrivia(tokens[next].kind)) next++;
     return next < tokens.size() &&
@@ -265,6 +294,22 @@ void Parser::reportAtCurrent(std::string message) {
         length = 1;
     }
     sink.error({line, column, length}, std::move(message));
+}
+
+// Reports over the current token and the next significant one together, which is how a complaint
+// about what was written between two tokens gets a span covering the gap.
+void Parser::reportOverQuestionPair(std::string message) {
+    size_t next = current + 1;
+    while (next < tokens.size() && isTrivia(tokens[next].kind)) next++;
+    if (current >= tokens.size() || next >= tokens.size() ||
+        tokens[next].line != tokens[current].line) {
+        reportAtCurrent(std::move(message));
+        return;
+    }
+    int length = tokens[next].column + static_cast<int>(tokens[next].text.size()) -
+        tokens[current].column;
+    sink.error({tokens[current].line, tokens[current].column, std::max(1, length)},
+        std::move(message));
 }
 
 void Parser::recoverTo(std::initializer_list<SyntaxKind> syncSet) {
@@ -1015,9 +1060,10 @@ void Parser::parseParenthesizedType(bool leaveCoalesceToExpression) {
 void Parser::parseTypeSuffixes(bool leaveCoalesceToExpression) {
     while (true) {
         if (at(SyntaxKind::Question)) {
-            // In `x as? Foo ?? fallback` the pair is the coalescing operator, not two
-            // suffixes on the target; `as`/`as?` reject a nullable target anyway.
-            if (leaveCoalesceToExpression && atNullCoalesce()) break;
+            // In `x as? Foo ?? fallback` the pair is the coalescing operator, and in
+            // `x as? Foo?[0]` the `?[` is the safe subscript, neither one a suffix on the
+            // target; `as`/`as?` reject a nullable target anyway.
+            if (leaveCoalesceToExpression && leavesQuestionToExpression()) break;
             bump();
             continue;
         }
@@ -1617,15 +1663,17 @@ void Parser::parsePrecedence(int minPrec) {
             }
         }
         // `?[` is a postfix safe-subscript when written adjacent; otherwise `?`
-        // is the loose-binding ternary operator. We disambiguate by lookahead
-        // so the lexer doesn't have to merge `?[`, which would otherwise break
-        // type syntax like `Box?[]?[]`.
-        bool isSafeSubscript = (op == SyntaxKind::Question &&
-                                peekKind(1) == SyntaxKind::LBracket);
+        // is the loose-binding ternary operator, whose first branch may be an
+        // array literal. We disambiguate by lookahead so the lexer doesn't have
+        // to merge `?[`, which would otherwise break type syntax like `Box?[]?[]`.
+        bool isSafeSubscript = atSafeSubscript();
         // `??` is two adjacent `?` tokens; like `?[` it is disambiguated here rather
         // than merged in the lexer, so type syntax such as `T??` keeps working.
         bool isNullCoalesce = atNullCoalesce();
-        int prec = isSafeSubscript ? 14 : (isNullCoalesce ? 3 : infixPrecedence(op));
+        bool isSeparatedNullCoalesce = !isNullCoalesce && atSeparatedNullCoalesce();
+        int prec = isSafeSubscript
+            ? 14
+            : ((isNullCoalesce || isSeparatedNullCoalesce) ? 3 : infixPrecedence(op));
         if (prec < minPrec) break;
 
         if (isSafeSubscript) {
@@ -1638,7 +1686,14 @@ void Parser::parsePrecedence(int minPrec) {
             continue;
         }
 
-        if (isNullCoalesce) {
+        if (isNullCoalesce || isSeparatedNullCoalesce) {
+            if (isSeparatedNullCoalesce) {
+                // Reported over both question marks, so the editor underlines the gap rather
+                // than the first '?' alone. The second '?' in the text is escaped so "??'" is
+                // not read as a trigraph.
+                reportOverQuestionPair("The two question marks of '?\?' must be written "
+                    "together, with nothing between them");
+            }
             builder.startNodeAt(cp, SyntaxKind::NullCoalesceExpr);
             bump();  // '?'
             bump();  // '?'
@@ -1705,8 +1760,15 @@ void Parser::parsePrecedence(int minPrec) {
         if (op == SyntaxKind::Question) {
             builder.startNodeAt(cp, SyntaxKind::TernaryExpr);
             bump();
+            // A first branch opening with '[' is most likely a safe subscript written with a
+            // space, so a missing ':' says how to spell that too.
+            bool branchOpensBracket = at(SyntaxKind::LBracket);
             parseExpression();
-            expect(SyntaxKind::Colon, "':' in ternary expression");
+            expect(SyntaxKind::Colon, branchOpensBracket
+                ? "':' between the two results of the conditional; for a safe subscript write "
+                  "'?[' with no space before the bracket, as in 'rows?[0]'"
+                : "':' between the two results of the conditional, as in "
+                  "'condition ? whenTrue : whenFalse'");
             parsePrecedence(1);
             builder.finishNode();
             continue;

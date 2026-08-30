@@ -519,11 +519,44 @@ class Parser {
     // for nested generics. A separated pair is a ternary whose then-branch starts with '?', and
     // fails where an expression was expected.
     atNullCoalesce() -> bool {
+        return this.atQuestionPair() && this.questionsAreAdjacent();
+    }
+
+    // A '?' with something between it and the second one. No valid expression begins with '?', so
+    // the pair can only be a mistyped '??', which is what the caller reports and reads it as.
+    atSeparatedNullCoalesce() -> bool {
+        return this.atQuestionPair() && !this.questionsAreAdjacent();
+    }
+
+    atQuestionPair() -> bool {
         if (this.currentKind() != SyntaxKind.Question) {
             return false;
         }
         let next = this.position + 1;
-        if (next >= this.tokens.length || this.tokens[next].kind != SyntaxKind.Question) {
+        return next < this.tokens.length && this.tokens[next].kind == SyntaxKind.Question;
+    }
+
+    questionsAreAdjacent() -> bool {
+        return this.tokens[this.position].end() == this.tokens[this.position + 1].offset;
+    }
+
+    // Reported over both question marks, so the fix is spelled where the gap is.
+    reportSeparatedQuestions() {
+        let first = this.tokens[this.position];
+        let second = this.tokens[this.position + 1];
+        this.report("The two question marks of '??' must be written together, with nothing "
+            + "between them. Write 'value ?? fallback', which uses 'fallback' when 'value' is "
+            + "null.", source.makeSpan(first.offset, second.end() - first.offset));
+    }
+
+    // The safe subscript '?[', which is adjacent for the reason '??' is: a '?' with a space after
+    // it begins a conditional expression, whose first branch may well be an array literal.
+    atSafeSubscript() -> bool {
+        if (this.currentKind() != SyntaxKind.Question) {
+            return false;
+        }
+        let next = this.position + 1;
+        if (next >= this.tokens.length || this.tokens[next].kind != SyntaxKind.OpenBracket) {
             return false;
         }
         return this.tokens[this.position].end() == this.tokens[next].offset;
@@ -2214,19 +2247,29 @@ class Parser {
 
     // The target of 'as' or 'as?'. This is the one type position an expression continues from, so
     // it is the one where a '?' can belong to the expression instead: in 'x as? Foo ?? fallback'
-    // the pair is the coalescing operator, not two suffixes on the target. Everywhere else a type
-    // is followed by a name, a comma, a bracket or '>', so an adjacent '??' cannot follow one and
-    // the suffixes stay greedy. Giving the pair up here loses no valid reading, because 'as' and
-    // 'as?' reject a nullable target outright.
+    // the pair is the coalescing operator, and in 'x as? Foo?[0]' the '?[' is the safe subscript.
+    // Everywhere else a type is followed by a name, a comma, a bracket or '>', so neither can
+    // follow one and the suffixes stay greedy. Giving them up here loses no valid reading, because
+    // 'as' and 'as?' reject a nullable target outright.
     parseCastTargetType(string missingMessage) -> long {
         return this.parseTypeAndSuffixes(missingMessage, true);
+    }
+
+    // True where the '?' the type suffixes are looking at opens an operator instead: the two of a
+    // '??', or the one of a '?[' that indexes rather than the '?[]' that spells an array of a
+    // nullable element.
+    leavesQuestionToExpression() -> bool {
+        if (this.atNullCoalesce()) {
+            return true;
+        }
+        return this.atSafeSubscript() && this.peekKind(2) != SyntaxKind.CloseBracket;
     }
 
     parseTypeSuffixes(long named, bool leaveCoalesceToExpression) -> long {
         long completed = named;
         while (true) {
             if (this.at(SyntaxKind.Question)) {
-                if (leaveCoalesceToExpression && this.atNullCoalesce()) {
+                if (leaveCoalesceToExpression && this.leavesQuestionToExpression()) {
                     break;
                 }
                 let marker = this.precede(completed);
@@ -2327,13 +2370,13 @@ class Parser {
                 }
                 continue;
             }
-            bool safeSubscript = operator == SyntaxKind.Question
-                && this.peekKind(1) == SyntaxKind.OpenBracket;
+            bool safeSubscript = this.atSafeSubscript();
             bool coalesce = this.atNullCoalesce();
+            bool separatedCoalesce = !coalesce && this.atSeparatedNullCoalesce();
             long precedence = infixPrecedence(operator);
             if (safeSubscript) {
                 precedence = 14;
-            } else if (coalesce) {
+            } else if (coalesce || separatedCoalesce) {
                 precedence = nullCoalescePrecedence();
             }
             if (precedence < minPrecedence || precedence == 0) {
@@ -2348,7 +2391,10 @@ class Parser {
                 completed = this.complete(marker, SyntaxKind.SafeSubscriptExpression);
                 continue;
             }
-            if (coalesce) {
+            if (coalesce || separatedCoalesce) {
+                if (separatedCoalesce) {
+                    this.reportSeparatedQuestions();
+                }
                 let marker = this.precede(completed);
                 this.bump();
                 this.bump();
@@ -2360,9 +2406,9 @@ class Parser {
                 Question -> {
                     let marker = this.precede(completed);
                     this.bump();
+                    bool branchOpensBracket = this.at(SyntaxKind.OpenBracket);
                     this.parseExpression();
-                    this.expect(SyntaxKind.Colon,
-                        "Expected ':' between the two branches of the '?:' expression");
+                    this.expect(SyntaxKind.Colon, missingTernaryColon(branchOpensBracket));
                     this.parsePrecedence(1);
                     completed = this.complete(marker, SyntaxKind.TernaryExpression);
                 },
@@ -2884,6 +2930,18 @@ isAssignmentOperator(SyntaxKind kind) -> bool {
 // than a kind of its own, so its strength cannot come out of infixPrecedence.
 nullCoalescePrecedence() -> long {
     return 3;
+}
+
+// What a conditional expression missing its ':' reports. A first branch that opened with '[' is
+// most likely a safe subscript written with a space, so the message says how to spell that too.
+missingTernaryColon(bool branchOpensBracket) -> string {
+    string wanted = "This conditional expression is missing its ':'. Write "
+        + "'condition ? valueWhenTrue : valueWhenFalse', with ':' between the two results.";
+    if (!branchOpensBracket) {
+        return wanted;
+    }
+    return wanted + " If you meant to index a value that may be null, write '?[' with no space "
+        + "before the bracket, for example 'rows?[0]'.";
 }
 
 // The binding strength of an infix or postfix operator, or 0 when the kind ends an expression.

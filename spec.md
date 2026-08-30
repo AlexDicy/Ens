@@ -1384,6 +1384,8 @@ let n = xs.length;            // long
   An invalid range aborts the program.
   Elements are copied the way ordinary assignment copies them, so class elements are shared by reference.
 - `T?[]` is an array of nullable `T`, each **element** can be `null`. `T[]?` is a nullable array variable. The variable itself may be `null`. The two compose: `T?[]?` is both. To safely index a nullable array, use `?[i]`: it short-circuits to `null` when the receiver is `null`, otherwise it indexes normally.
+  The `?` and `[` must be adjacent, with nothing at all between them, because a `?` also begins a conditional expression whose first result may be an array literal.
+  So `rows?[0]` indexes, while `cond ? [1, 2] : [3, 4]` is a conditional choosing between two array literals.
 
 ```ens
 int[]? cache = null;

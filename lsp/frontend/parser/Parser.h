@@ -40,6 +40,14 @@ private:
 
     // At the first `?` of a `??` written with the two adjacent.
     bool atNullCoalesce() const;
+    // At the first `?` of a `??` written with something between the two.
+    bool atSeparatedNullCoalesce() const;
+    // At the `?` of a `?[` safe subscript, written with the two adjacent.
+    bool atSafeSubscript() const;
+    // Where the `?` the type suffixes are looking at opens an operator instead.
+    bool leavesQuestionToExpression() const;
+    // Whether nothing at all was written between the current token and the next.
+    bool nextIsAdjacent() const;
 
     // Emit current token (and any preceding trivia) into the builder, advance.
     void bump();
@@ -70,6 +78,8 @@ private:
     // The current token's text for a diagnostic; non-ASCII code units become '?'.
     std::string asciiTokenText() const;
     void reportAtCurrent(std::string message);
+    // Reports over the current token and the next together, so the span covers the gap between.
+    void reportOverQuestionPair(std::string message);
     void recoverTo(std::initializer_list<SyntaxKind> syncSet);
 
     // === Decl-level ===
@@ -104,8 +114,8 @@ private:
 
     // === Type ===
     // `leaveCoalesceToExpression` stops the suffix chain at a `?` that opens an adjacent `??`
-    // pair, which only the target of `as`/`as?` wants: it is the one type position an
-    // expression continues from.
+    // pair or an adjacent `?[` safe subscript, which only the target of `as`/`as?` wants: it is
+    // the one type position an expression continues from.
     void parseType(bool leaveCoalesceToExpression = false);
     void parseNamedType(bool leaveCoalesceToExpression);
     void parseFunctionType();

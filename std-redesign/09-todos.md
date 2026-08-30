@@ -36,9 +36,8 @@ Declaring `print<T>(T value)` reports that the name cannot be overloaded because
 
 Pre-existing compiler bugs found during the A7 review (2026-08-29), reproducing on the pinned seed as well, none caused by the migration.
 A `switch` arm testing a nullable type (`is Node?`) panics with an internal message about an unexpected node slot.
-The `?[` safe-subscript is recognized from a question mark followed by an open bracket with no adjacency requirement, which costs two spellings: `x as? Foo?[0]` reads the cast target as `Foo?`, and a ternary whose then-branch is an array literal (`cond ? [1, 2] : [3, 4]`) cannot be written at all.
-One fix covers both, the adjacency test the `??` operator already uses since A7.
-`??` over a checked cast on its right operand (`fallback ?? (x as? Foo)`) fails lowering with an unbalanced-ownership message, parenthesized or not.
+`??` whose right operand produces an owned value fails lowering with an unbalanced-ownership message when the result type stays nullable.
+A checked cast (`fallback ?? (x as? Foo)`) and a call returning a nullable (`fallback ?? value.maybe()`) both hit it; a borrowed right operand and a non-nullable result both compile (measured 2026-08-30).
 
 A ruling on bounding tree depth for chains and statement nesting (found 2026-08-30).
 The A8 work bounded nesting for parenthesized expressions and types, but four shapes still exhaust the stack in the phases that walk the tree: long infix chains, postfix call chains, deeply nested blocks, and long type-suffix chains.
