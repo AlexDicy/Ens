@@ -17,6 +17,7 @@ A modification counter in `Map`, `Set`, `SortedMap`, and their views, aborting o
 The compiler's rejected-key-type list for map and set keys: arrays, external handles, mutable collections, and function types.
 Function types are the verified case (2026-08-30): `Set<(int) -> char>` compiles, because the `Hashable` bound is treated as universally satisfied, and the elements then hash by object identity, so two identical lambdas written at two sites are two keys while a capturing lambda evaluated twice is also two keys.
 Writing `hash()` on a function value directly is already refused, so the generic path is the inconsistency, and the real work is making `Hashable` a bound with an exclusion list rather than special-casing one type.
+External handles are refused by code generation as of 2026-08-30, in both the `Handle` and the `Handle?` spelling, with a message naming the type; sema still accepts the call, so making the bound honest is what moves the refusal to where it belongs.
 Ratified 2026-08-30: keep the direct rejection and make the bound honest, so the generic path refuses too, rather than granting every value an identity.
 A function value's identity is not stable under the compiler's freedom to share one closure object per capture-free lambda site or to allocate a fresh one per evaluation, so equality on it would answer questions about code generation rather than about the function; a class holding the function is how a program that needs identity gets it.
 The work belongs to C4, which designs the containers and their key rules.
@@ -34,9 +35,9 @@ A dedicated review pass over the diagnostic messages introduced across the whole
 A clearer message when a declaration collides with a function the language provides but cannot replace it (found 2026-08-30).
 Declaring `print<T>(T value)` reports that the name cannot be overloaded because one of its declarations is generic, which reads as nonsense to an author who wrote exactly one declaration, since the other one is the invisible provided function.
 
-A nullable external handle fails to lower (found 2026-08-30, pre-existing, the same on the pinned seed).
-Returning a `Handle?` from a function and comparing it to null reports `Internal: lowering produced malformed EIR: release of %0, which holds Handle? and owns no reference`, with no override or generic involved.
-A handle is a raw pointer that reference counting never touches, so the release the optional's cleanup emits has nothing to release; found while trying to pin that an override may narrow a `Handle?` to a `Handle`, which sema accepts and which therefore has no runtime fixture.
+Two external handles compared with each other are accepted by sema and refused by code generation (found 2026-08-30, pre-existing).
+`h1 == h2` over two handles reports `The self-hosted code generator does not support comparing 'Handle?' with 'Handle' yet`, while the spec says a handle is passed around and compared with `null`, which is the only comparison it names.
+So either sema should refuse the handle-to-handle comparison and say why, or code generation should answer it by identity the way a presence check already does.
 
 The language server reports a spurious entry-point placement error on a single-file program (found 2026-08-30, pre-existing).
 Opening `tests/inheritance.ens` says `main` may only be defined in the main module, because the server names a lone file's module after the file rather than treating the file as the program's main module, which is what `ens build <file>` does.
