@@ -34,8 +34,10 @@ A dedicated review pass over the diagnostic messages introduced across the whole
 A clearer message when a declaration collides with a function the language provides but cannot replace it (found 2026-08-30).
 Declaring `print<T>(T value)` reports that the name cannot be overloaded because one of its declarations is generic, which reads as nonsense to an author who wrote exactly one declaration, since the other one is the invisible provided function.
 
+A switch arm's value-label list does not stop at `default` or `is` after a comma, so it reads the keyword as another label (found 2026-08-30, reproducing on the pinned seed).
+`switch (v) { 1, default -> 0, }` reports three problems for one mistake: a missing expression, a missing `->`, and a missing expression again.
+
 Pre-existing compiler bugs found during the A7 review (2026-08-29), reproducing on the pinned seed as well, none caused by the migration.
-A `switch` arm testing a nullable type (`is Node?`) panics with an internal message about an unexpected node slot.
 `??` whose right operand produces an owned value fails lowering with an unbalanced-ownership message when the result type stays nullable.
 A checked cast (`fallback ?? (x as? Foo)`) and a call returning a nullable (`fallback ?? value.maybe()`) both hit it; a borrowed right operand and a non-nullable result both compile (measured 2026-08-30).
 
