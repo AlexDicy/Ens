@@ -34,6 +34,10 @@ A dedicated review pass over the diagnostic messages introduced across the whole
 A clearer message when a declaration collides with a function the language provides but cannot replace it (found 2026-08-30).
 Declaring `print<T>(T value)` reports that the name cannot be overloaded because one of its declarations is generic, which reads as nonsense to an author who wrote exactly one declaration, since the other one is the invisible provided function.
 
+The language server reports a spurious entry-point placement error on a single-file program (found 2026-08-30, pre-existing).
+Opening `tests/inheritance.ens` says `main` may only be defined in the main module, because the server names a lone file's module after the file rather than treating the file as the program's main module, which is what `ens build <file>` does.
+Folder programs and packages are both clean; only a single file is affected, so this is worth carrying to the language server's replacement rather than fixing in the one being retired.
+
 A switch arm's value-label list does not stop at `default` or `is` after a comma, so it reads the keyword as another label (found 2026-08-30, reproducing on the pinned seed).
 `switch (v) { 1, default -> 0, }` reports three problems for one mistake: a missing expression, a missing `->`, and a missing expression again.
 

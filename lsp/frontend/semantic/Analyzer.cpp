@@ -6959,8 +6959,14 @@ Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
                 analysis.setSymbol(idObj->node.greenNode(), typeSym);
                 return typeCtx.getError();
             }
-            if (!typeSym && typeCtx.lookupNamedType(modulePath_, *idName)) {
-                return typeCtx.getError();
+            // A type this module declares is not in the value scope, so the head carries no
+            // symbol. Recording the type it denotes is what lets go-to-definition and hover
+            // reach the declaration, and the member beside it resolve against that type.
+            if (!typeSym) {
+                if (Type* named = typeCtx.lookupNamedType(modulePath_, *idName)) {
+                    analysis.setType(idObj->node.greenNode(), named);
+                    return typeCtx.getError();
+                }
             }
         }
     }

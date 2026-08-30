@@ -105,11 +105,24 @@ const Document* DocumentStore::find(const std::string& uri) const {
     return it == docs.end() ? nullptr : it->second.get();
 }
 
+// Where a file no manifest governs has its modules rooted. A folder program is rooted where its
+// entry lives, which is the folder `ens build` would be pointed at and the folder its imports
+// resolve against, so the nearest ancestor holding a main.ens wins. The walk stops at the folder
+// that encloses the file's world: a workspace root the file is not a member of, or the opened
+// folder. A file belonging to no folder program is rooted there, which is where it was before.
 fs::path DocumentStore::sourceRootFor(const fs::path& fileAbs) const {
-    if (workspaceRoot_) {
+    fs::path stop = ens::modules::discoverWorkspaceRoot(fileAbs.parent_path());
+    if (stop.empty() && workspaceRoot_) {
         fs::path rel = fileAbs.lexically_relative(*workspaceRoot_);
-        if (!rel.empty() && rel.string().compare(0, 2, "..") != 0) return *workspaceRoot_;
+        if (!rel.empty() && rel.string().compare(0, 2, "..") != 0) stop = *workspaceRoot_;
     }
+    std::error_code ec;
+    for (fs::path dir = fileAbs.parent_path(); !dir.empty(); dir = dir.parent_path()) {
+        if (fs::exists(dir / "main.ens", ec)) return dir;
+        if (!stop.empty() && dir == stop) break;
+        if (dir == dir.parent_path()) break;
+    }
+    if (!stop.empty()) return stop;
     return fileAbs.parent_path();
 }
 
@@ -120,7 +133,7 @@ static bool isUnder(const fs::path& p, const fs::path& base) {
 
 ResolvedWorkspace DocumentStore::resolveWorkspaceFor(const fs::path& fileAbs) const {
     ResolvedWorkspace r;
-    fs::path wsRoot = ens::modules::discoverWorkspaceRoot(fileAbs.parent_path());
+    fs::path wsRoot = ens::modules::discoverGoverningRoot(fileAbs.parent_path());
     if (wsRoot.empty()) {
         r.srcRoot = sourceRootFor(fileAbs);
         r.depsFolder = r.srcRoot;
@@ -165,23 +178,22 @@ void DocumentStore::setTransientOverride(const fs::path& absolute, std::u16strin
 WorkspaceModules DocumentStore::buildWorkspaceModules(const fs::path& forFile) const {
     WorkspaceModules workspace;
 
-    // Scope the graph to the file's own workspace so nested workspaces stay isolated. A file
-    // with no ens.package manifest falls back to the single workspace-root hint (flat project).
+    // Scope the graph to the file's own workspace so nested workspaces stay isolated. A file no
+    // manifest governs is a folder program, rooted where sourceRootFor puts it.
     fs::path depsFolder, srcRoot, testsRoot;
     bool withDependencies;
-    fs::path wsRoot = ens::modules::discoverWorkspaceRoot(forFile.parent_path());
+    fs::path wsRoot = ens::modules::discoverGoverningRoot(forFile.parent_path());
     std::error_code ec;
     if (!wsRoot.empty()) {
         depsFolder = wsRoot;
         srcRoot = fs::is_directory(wsRoot / "src", ec) ? wsRoot / "src" : wsRoot;
         testsRoot = fs::is_directory(wsRoot / "tests", ec) ? wsRoot / "tests" : fs::path();
         withDependencies = true;
-    } else if (workspaceRoot_) {
-        depsFolder = *workspaceRoot_;
-        srcRoot = *workspaceRoot_;
-        withDependencies = false;
     } else {
-        return workspace;
+        srcRoot = sourceRootFor(forFile);
+        if (srcRoot.empty()) return workspace;
+        depsFolder = srcRoot;
+        withDependencies = false;
     }
 
     // Seed every .ens file under the source root (and tests root) so files that import a

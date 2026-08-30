@@ -51,6 +51,10 @@ std::optional<PackageMatch> matchPackage(
 // when none is found. Mirrors how `git` finds a repository from a subfolder.
 fs::path discoverWorkspaceRoot(const fs::path& startDir);
 
+// The same walk, stepping over a workspace-form manifest, which claims only the folders its
+// members declare and every one of those declares a package of its own.
+fs::path discoverGoverningRoot(const fs::path& startDir);
+
 // One member of a workspace-form manifest: the package it declares, its folder, and the names
 // of the packages it depends on.
 struct WorkspaceMember {

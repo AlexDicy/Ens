@@ -58,6 +58,29 @@ fs::path discoverWorkspaceRoot(const fs::path& startDir) {
     return {};
 }
 
+// The nearest ancestor of `startDir` (inclusive) whose manifest governs it. A workspace-form
+// manifest is stepped over: every member of a workspace declares its own package, so a member is
+// always found by its own manifest first, and a folder that reaches the workspace root without one
+// is a standalone program the workspace does not claim. Rooting such a folder at the workspace
+// would give its modules the wrong paths and send its imports looking beside the wrong folder.
+fs::path discoverGoverningRoot(const fs::path& startDir) {
+    std::error_code ec;
+    fs::path dir = fs::absolute(startDir, ec);
+    if (ec) dir = startDir;
+    dir = dir.lexically_normal();
+
+    for (fs::path d = dir;; d = d.parent_path()) {
+        fs::path manifestFile = d / "ens.package";
+        if (fs::exists(manifestFile, ec)) {
+            std::vector<std::string> ignored;
+            Manifest manifest = loadManifestFile(manifestFile, ignored);
+            if (manifest.form != ManifestForm::Workspace) return d;
+        }
+        if (d == d.parent_path()) break;
+    }
+    return {};
+}
+
 std::vector<WorkspaceMember> listWorkspaceMembers(const fs::path& workspaceRoot,
                                                   std::vector<std::string>& errors) {
     std::vector<WorkspaceMember> members;
