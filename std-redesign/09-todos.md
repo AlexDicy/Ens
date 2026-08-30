@@ -29,8 +29,13 @@ A dedicated review pass over the diagnostic messages introduced across the whole
 Two severe pre-existing compiler bugs found during the A7 review (2026-08-29), both reproducing on the pinned seed as well, neither caused by the migration.
 An override that narrows a base's `T?` return to a bare `T` is accepted by the type checker, but a call through a base-typed reference reads the wrong shape: garbage at -O0 and a segmentation fault at -O2, because the override returns a bare value where the base's ABI declares the optional pair.
 A `switch` arm testing a nullable type (`is Node?`) panics with an internal message about an unexpected node slot.
-A cast target followed by `?[` swallows the question mark, so `x as? Foo?[0]` reads the target as `Foo?` and reports the nullable-target error; the A7 fix covers the `??` form of the same ambiguity, and `?[` needs the same treatment.
+The `?[` safe-subscript is recognized from a question mark followed by an open bracket with no adjacency requirement, which costs two spellings: `x as? Foo?[0]` reads the cast target as `Foo?`, and a ternary whose then-branch is an array literal (`cond ? [1, 2] : [3, 4]`) cannot be written at all.
+One fix covers both, the adjacency test the `??` operator already uses since A7.
 `??` over a checked cast on its right operand (`fallback ?? (x as? Foo)`) fails lowering with an unbalanced-ownership message, parenthesized or not.
+
+A ruling on bounding tree depth for chains and statement nesting (found 2026-08-30).
+The A8 work bounded nesting for parenthesized expressions and types, but four shapes still exhaust the stack in the phases that walk the tree: long infix chains, postfix call chains, deeply nested blocks, and long type-suffix chains.
+The first three do the same on the pinned seed, so only the suffix chain is new, and bounding them changes the diagnostics any long chain produces, which is why it needs a decision rather than a quiet limit.
 
 ## Reminders
 

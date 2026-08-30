@@ -396,6 +396,80 @@ A constraint cannot relate two different parameters, so a bound like `K: Compara
 
 ---
 
+A function value is a value that can be called.
+Its type is written as a parameter list, an arrow, and a return type: `(int, int) -> int` takes two integers and answers with one, and `() -> string` takes nothing.
+The return type may be `void`, which means the call produces no value; a parameter type may not be, because there is no value to pass.
+
+A `?` or `[]` suffix written after a function type belongs to the return type, so `(int) -> bool?` is a function returning `bool?`.
+A nullable or arrayed function type is therefore written in parentheses: `((int) -> bool)?` and `((int) -> bool)[]`.
+A function type is the only type parentheses are allowed around, and nothing else needs them: a function type returning a function type reads right to left, so `(int) -> (int) -> int` returns `(int) -> int`, and a function type is written directly as another's parameter type, as in `((int) -> bool, int) -> int`.
+Parentheses around any other type, as in `(int) x = 1;`, are an error naming the plain spelling, so every type keeps one written form.
+
+Everywhere else a function type is an ordinary type.
+It can be a field's type, a parameter's type, a local's type, a return type, a generic type argument such as `List<(int) -> bool>`, and an array's element type.
+
+A function value is written as a lambda: the parameters in parentheses, an arrow, and the body.
+The parentheses are always required, even around a single parameter, so `(a) -> a * 2` is the form and `a -> a * 2` is an error.
+The body is either one expression, whose value the call answers with, or a block written `(a, b) -> { ... }`, which returns the way any function body does.
+
+A lambda takes its shape from the type it is written against, so it always needs one: a local or field with a declared function type, a parameter, a return type, an assignment target, an array element, or an aggregate literal's field.
+A lambda with nothing to take its shape from, such as `let f = (a) -> a;`, is an error, exactly as an aggregate literal with no context is.
+The parameter types come from that type, and the number of parameters must match it.
+A parameter's type may also be written, as in `(int a, int b) -> a - b`, and then it must be exactly the type the target passes there; one lambda writes every parameter's type or none of them.
+
+A lambda copies the values it reads from around it, and only those.
+Reading a local, a parameter, or `this` inside the body captures it: the closure keeps its own copy from the moment it is created, and a class reference it captured stays alive for as long as the closure does.
+A local a lambda captures must already be assigned where the lambda is created.
+A capture takes the local's declared type, not what the surrounding code narrowed it to, so a local proved non-null outside the lambda is nullable again inside its body and is checked there on its own.
+Assigning to a captured local inside the lambda is an error, because the write would land on the copy and leave the local outside it unchanged; return the value the lambda computes instead, or keep the value in an object the lambda can reach.
+The lambda's own parameters and locals are ordinary storage and may be written freely.
+
+`this` is captured like any other reference, so a lambda inside a class's method may read the object's fields, write them, and call its methods.
+A struct's method cannot hand its `this` to a lambda, because a struct is a value: the lambda would capture a copy, and a write through that copy would not reach the struct the method runs over.
+
+A function type never throws.
+A lambda whose body can raise is refused against one, and the fix is to handle the failure inside the lambda: move the throwing work into a named function whose own `catch` clause turns the failure into a value, and call that function from the lambda.
+
+Assignability between function types is exact.
+A `(long, long) -> long` is not accepted where a `(int, int) -> int` is expected, and neither is the reverse, whatever the parameter and return types would allow on their own.
+
+A function value is called with ordinary call syntax on the value itself, wherever that value comes from: a local, a field, an array element, or the result of another call.
+A function type has no parameter names, so the arguments are positional and named arguments are an error, and the call passes exactly as many arguments as the type declares.
+A nullable function value is checked for null before it is called, exactly like any other nullable reference.
+
+A function value has no identity and no text form.
+Comparing two function values with `==` or `!=` is an error, as are `hash()`, `toString()`, and putting one in an interpolation hole.
+Testing a nullable function value against `null` is a presence check rather than a comparison, and stays allowed.
+
+```ens
+sortWith(long[] values, (long, long) -> int order) { /* ... */ }
+
+orElse(string? text, () -> string make) -> string {
+    return text != null ? text : make();
+}
+
+class Counter {
+    private long total;
+
+    constructor() { this.total = 0; }
+
+    public adder() -> (long) -> void {
+        return (by) -> this.total = this.total + by;   // captures 'this'
+    }
+}
+
+report(long[] values, long threshold) {
+    sortWith(values, (a, b) -> (a - b) as int);        // parameter types from the target
+    let label = orElse(null, () -> "none");
+    ((long) -> bool)? accept = (v) -> v > threshold;   // captures 'threshold' by value
+    if (accept != null) {
+        accept(values[0]);
+    }
+}
+```
+
+---
+
 Imports are based on paths and qualified by default. Imports are file-local.
 
 ```ens

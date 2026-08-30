@@ -36,6 +36,8 @@ class InterpStringExpression;
 class TryExpression;
 class SwitchArm;
 class SwitchExpression;
+class LambdaParameter;
+class LambdaExpression;
 class ArgumentList;
 
 class Expression {
@@ -74,6 +76,7 @@ public:
     std::optional<InterpStringExpression> asInterpString() const;
     std::optional<TryExpression>       asTry() const;
     std::optional<SwitchExpression>    asSwitch() const;
+    std::optional<LambdaExpression>    asLambda() const;
 };
 
 class LiteralExpression {
@@ -432,6 +435,34 @@ public:
     }
     std::optional<Expression> scrutinee() const;
     std::vector<SwitchArm> arms() const;
+};
+
+// One parameter of a lambda: `a`, or `int a` when its type is written. An untyped
+// parameter takes its type from the lambda's target type.
+class LambdaParameter {
+public:
+    SyntaxNode node;
+    static std::optional<LambdaParameter> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::LambdaParam) return std::nullopt;
+        return LambdaParameter{n};
+    }
+    std::optional<TypeReference> typeReference() const;
+    std::optional<SyntaxNode> nameToken() const;
+    std::optional<std::u16string> nameText() const;
+};
+
+// A function value: `(a, b) -> a - b`, `(a) -> { ... }`, `() -> make()`. The body is
+// either a block (statement form) or a single expression.
+class LambdaExpression {
+public:
+    SyntaxNode node;
+    static std::optional<LambdaExpression> cast(const SyntaxNode& n) {
+        if (n.kind() != SyntaxKind::LambdaExpr) return std::nullopt;
+        return LambdaExpression{n};
+    }
+    std::vector<LambdaParameter> parameters() const;
+    std::optional<Expression> bodyExpr() const;
+    std::optional<SyntaxNode> bodyBlockNode() const;
 };
 
 }  // namespace ast

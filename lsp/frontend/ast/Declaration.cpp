@@ -75,7 +75,7 @@ std::optional<std::u16string> TypeParam::nameText() const {
 }
 
 std::optional<TypeReference> TypeParam::bound() const {
-    if (auto tr = firstChildNode(node, SyntaxKind::TypeRef)) return TypeReference::cast(*tr);
+    if (auto tr = firstTypeChild(node)) return TypeReference::cast(*tr);
     return std::nullopt;
 }
 
@@ -98,7 +98,7 @@ std::vector<TypeParam> TypeParamList::params() const {
 // === ReturnType ===
 
 std::optional<TypeReference> ReturnType::typeReference() const {
-    if (auto tr = firstChildNode(node, SyntaxKind::TypeRef)) return TypeReference::cast(*tr);
+    if (auto tr = firstTypeChild(node)) return TypeReference::cast(*tr);
     return std::nullopt;
 }
 
@@ -145,7 +145,7 @@ std::optional<SyntaxNode> Parameter::nameToken() const {
     for (auto& c : node.children()) {
         if (isTrivia(c.kind())) continue;
         if (c.kind() == SyntaxKind::KwOut) continue;
-        if (c.kind() == SyntaxKind::TypeRef) { seenType = true; continue; }
+        if (isTypeNode(c.kind())) { seenType = true; continue; }
         if (seenType && c.kind() == SyntaxKind::Identifier) return c;
     }
     return std::nullopt;
@@ -157,7 +157,7 @@ std::optional<std::u16string> Parameter::nameText() const {
 }
 
 std::optional<TypeReference> Parameter::typeReference() const {
-    if (auto tr = firstChildNode(node, SyntaxKind::TypeRef)) return TypeReference::cast(*tr);
+    if (auto tr = firstTypeChild(node)) return TypeReference::cast(*tr);
     return std::nullopt;
 }
 
@@ -287,7 +287,7 @@ std::vector<TypeReference> ThrowsClause::types() const {
 // === CatchClause ===
 
 std::optional<TypeReference> CatchClause::typeReference() const {
-    if (auto tr = firstChildNode(node, SyntaxKind::TypeRef)) return TypeReference::cast(*tr);
+    if (auto tr = firstTypeChild(node)) return TypeReference::cast(*tr);
     return std::nullopt;
 }
 
@@ -295,7 +295,7 @@ std::optional<SyntaxNode> CatchClause::nameToken() const {
     bool seenType = false;
     for (auto& c : node.children()) {
         if (isTrivia(c.kind())) continue;
-        if (c.kind() == SyntaxKind::TypeRef) { seenType = true; continue; }
+        if (isTypeNode(c.kind())) { seenType = true; continue; }
         if (seenType && c.kind() == SyntaxKind::Identifier) return c;
     }
     return std::nullopt;
@@ -324,13 +324,13 @@ Visibility FieldDecl::visibility() const {
 bool FieldDecl::isWeak() const {
     for (auto& c : node.children()) {
         if (c.kind() == SyntaxKind::KwWeak) return true;
-        if (c.kind() == SyntaxKind::TypeRef) break;
+        if (isTypeNode(c.kind())) break;
     }
     return false;
 }
 
 std::optional<TypeReference> FieldDecl::typeReference() const {
-    if (auto tr = firstChildNode(node, SyntaxKind::TypeRef)) return TypeReference::cast(*tr);
+    if (auto tr = firstTypeChild(node)) return TypeReference::cast(*tr);
     return std::nullopt;
 }
 
@@ -338,7 +338,7 @@ std::optional<SyntaxNode> FieldDecl::nameToken() const {
     bool seenType = false;
     for (auto& c : node.children()) {
         if (isTrivia(c.kind())) continue;
-        if (c.kind() == SyntaxKind::TypeRef) { seenType = true; continue; }
+        if (isTypeNode(c.kind())) { seenType = true; continue; }
         if (seenType && c.kind() == SyntaxKind::Identifier) return c;
     }
     return std::nullopt;

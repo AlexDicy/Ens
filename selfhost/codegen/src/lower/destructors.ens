@@ -12,6 +12,7 @@
 //
 // It is built straight from the class rather than from a declaration, so nothing here walks a
 // syntax tree and no expression lowering is involved.
+import LambdaCapture from @ens.sema.model.lambdas;
 import ClassType from @ens.sema.model.types;
 import PrimitiveKind from @ens.sema.model.types;
 import StructType from @ens.sema.model.types;
@@ -21,6 +22,7 @@ import @ens.sema.model.types;
 import EirBranch from eir.model;
 import EirCall from eir.model;
 import EirCallee from eir.model;
+import EirClosureCapture from eir.model;
 import EirFieldAddress from eir.model;
 import EirFunction from eir.model;
 import EirFunctionBuilder from eir.model;
@@ -34,9 +36,13 @@ import EirReleasePtr from eir.model;
 import EirReturn from eir.model;
 import EirWeakRelease from eir.model;
 import layout.vtables;
+import mono.substitution;
+import FunctionInfo from lower.index;
 import ProgramIndex from lower.index;
 import lower.classes;
+import lower.closures;
 import support.primitives;
+import List from @std.collections.list;
 
 // Builds the destructor of one class, declared or instantiated. Returns null when the class is
 // one code generation cannot lay out, in which case nothing that touches it will lower either.
@@ -69,6 +75,52 @@ public synthesize(Type classType, ProgramIndex index, TypeStore store) -> EirFun
         } else {
             releaseStorage(builder, store, address, field.type());
         }
+    }
+    builder.terminate(new EirReturn(-1));
+    return builder.finish();
+}
+
+// Builds the destructor of one closure object: it gives up every captured value that holds a
+// reference, in capture order. A capture-free lambda needs none, because its one object is
+// immortal and is never freed. Returns null when the lambda's shape is one code generation cannot
+// lay out, in which case nothing that creates it will lower either.
+public synthesizeClosure(FunctionInfo info, TypeStore store) -> EirFunction? {
+    let lambda = info.lambdaDeclaration();
+    if (lambda == null) {
+        return null;
+    }
+    let recorded = info.context().result().lambdaOf(lambda.green());
+    let closureType = info.receiverType();
+    if (recorded == null || closureType == null) {
+        return null;
+    }
+    LambdaCapture[] captures = recorded.captures();
+    let captureTypes = new List<Type>();
+    for (let capture in captures) {
+        Type captureType = substitution.apply(store, info.substitution(), capture.type());
+        if (!primitives.isRepresentable(captureType)) {
+            return null;
+        }
+        captureTypes.push(captureType);
+    }
+    Type[] layout = captureTypes.toArray();
+    string symbol = closures.destructorSymbolOf(info.symbol(), layout);
+    if (symbol.length == 0) {
+        return null;
+    }
+    let voidType = store.primitive(PrimitiveKind.Void);
+    // External, like the lambda's body and like a class's destructor: the module that writes the
+    // lambda defines it, and any module that builds a closure over it names it.
+    let builder = new EirFunctionBuilder(symbol, false, null,
+        [new EirParameter("closure", closureType)], voidType);
+    long closure = 0;
+    for (long i = 0; i < captures.length; i++) {
+        if (!primitives.hasArcContent(layout[i])) {
+            continue;
+        }
+        long address = builder.newTemp(layout[i]);
+        builder.append(new EirClosureCapture(address, layout[i], closure, i, layout));
+        releaseStorage(builder, store, address, layout[i]);
     }
     builder.terminate(new EirReturn(-1));
     return builder.finish();

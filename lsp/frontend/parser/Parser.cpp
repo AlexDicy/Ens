@@ -63,6 +63,29 @@ bool Parser::atNullCoalesce() const {
         tokens[next].offset == tokens[current].offset + tokens[current].text.size();
 }
 
+bool Parser::atArrowAfterParentheses() const {
+    if (!at(SyntaxKind::LParen)) return false;
+    int depth = 0;
+    for (size_t idx = current; idx < tokens.size(); ++idx) {
+        SyntaxKind k = tokens[idx].kind;
+        if (isTrivia(k)) continue;
+        if (k == SyntaxKind::EndOfFile) break;
+        if (k == SyntaxKind::LParen) {
+            depth++;
+            continue;
+        }
+        if (k != SyntaxKind::RParen) continue;
+        depth--;
+        if (depth > 0) continue;
+        for (size_t after = idx + 1; after < tokens.size(); ++after) {
+            if (isTrivia(tokens[after].kind)) continue;
+            return tokens[after].kind == SyntaxKind::Arrow;
+        }
+        break;
+    }
+    return false;
+}
+
 void Parser::bumpAs(SyntaxKind kind) {
     while (nextToEmit < tokens.size() && nextToEmit < current) {
         const auto& t = tokens[nextToEmit];
@@ -190,6 +213,12 @@ void Parser::emitMissing(SyntaxKind /*expectedKind*/, const char* what) {
     }
     builder.token(SyntaxKind::Missing, std::u16string{});
     reportAtCurrent(std::string("Expected ") + what);
+}
+
+std::string Parser::asciiTokenText() const {
+    std::string out;
+    for (char16_t c : tokenAt().text) out.push_back(c < 128 ? static_cast<char>(c) : '?');
+    return out;
 }
 
 void Parser::reportAtCurrent(std::string message) {
@@ -496,9 +525,8 @@ void Parser::parseFuncDecl() {
     if (at(SyntaxKind::KwConstructor) || at(SyntaxKind::KwDestructor)) {
         bump();  // constructor/destructor introducer; no name follows
     } else if (isKeyword(kindAt())) {
-        std::string word;
-        for (char16_t c : tokenAt().text) word.push_back(c < 128 ? static_cast<char>(c) : '?');
-        reportAtCurrent("'" + word + "' is a keyword and cannot be used as a method name");
+        reportAtCurrent("'" + asciiTokenText() +
+            "' is a keyword and cannot be used as a method name");
         bumpAs(SyntaxKind::Identifier);
     } else {
         expect(SyntaxKind::Identifier, "function name");
@@ -580,7 +608,7 @@ void Parser::parseParameter() {
     } else {
         // optional 'out' modifier (followed by the parameter type); analyzer enforces context
         if (atContextualOut() && isTypeStart(peekKind(1))) bumpAs(SyntaxKind::KwOut);
-        if (isTypeStart(kindAt())) {
+        if (isTypeOrGroupStart(kindAt())) {
             parseType();
         } else {
             emitMissing(SyntaxKind::Identifier, "parameter type");
@@ -589,10 +617,8 @@ void Parser::parseParameter() {
         // into a stream of unrelated errors; report it once and recover by taking
         // the keyword as the name, mirroring keyword-named method recovery.
         if (isKeyword(kindAt())) {
-            std::string word;
-            for (char16_t c : tokenAt().text) word.push_back(c < 128 ? static_cast<char>(c) : '?');
-            reportAtCurrent("'" + word + "' is a keyword and cannot be used as a parameter name; "
-                "choose a different name such as 'source'");
+            reportAtCurrent("'" + asciiTokenText() + "' is a keyword and cannot be used as a "
+                "parameter name; choose a different name such as 'source'");
             bumpAs(SyntaxKind::Identifier);
         } else {
             expect(SyntaxKind::Identifier, "parameter name");
@@ -612,7 +638,7 @@ void Parser::parseDefaultValue() {
 void Parser::parseReturnType() {
     builder.startNode(SyntaxKind::ReturnType);
     expect(SyntaxKind::Arrow, "'->'");
-    if (isTypeStart(kindAt())) parseType();
+    if (isTypeOrGroupStart(kindAt())) parseType();
     else emitMissing(SyntaxKind::Identifier, "return type");
     builder.finishNode();
 }
@@ -790,7 +816,7 @@ void Parser::parseFieldDecl() {
     builder.startNode(SyntaxKind::FieldDecl);
     parseVisibilityModifier();
     while (at(SyntaxKind::KwWeak) || at(SyntaxKind::KwConst) || at(SyntaxKind::KwStatic)) bump();
-    if (isTypeStart(kindAt())) parseType();
+    if (isTypeOrGroupStart(kindAt())) parseType();
     else emitMissing(SyntaxKind::Identifier, "field type");
     expect(SyntaxKind::Identifier, "field name");
     if (at(SyntaxKind::Eq)) parseDefaultValue();
@@ -853,7 +879,20 @@ bool Parser::isTypeStart(SyntaxKind k) const {
     return k == SyntaxKind::Identifier || isPrimitiveTypeKw(k);
 }
 
+bool Parser::isTypeOrGroupStart(SyntaxKind k) const {
+    return isTypeStart(k) || k == SyntaxKind::LParen;
+}
+
 void Parser::parseType(bool leaveCoalesceToExpression) {
+    if (at(SyntaxKind::LParen)) {
+        if (atArrowAfterParentheses()) parseFunctionType();
+        else parseParenthesizedType(leaveCoalesceToExpression);
+        return;
+    }
+    parseNamedType(leaveCoalesceToExpression);
+}
+
+void Parser::parseNamedType(bool leaveCoalesceToExpression) {
     builder.startNode(SyntaxKind::TypeRef);
     bool wasIdentifier = at(SyntaxKind::Identifier);
     if (isTypeStart(kindAt())) bump();
@@ -864,9 +903,45 @@ void Parser::parseType(bool leaveCoalesceToExpression) {
         bump();  // identifier
     }
     if (at(SyntaxKind::Lt) && scanTypeArgs(0) != 0) parseTypeArgList();
-    // Interleaved suffix chain: any sequence of `?` and `[]` pairs.
-    // Each '[' must be followed immediately by ']' to be a type-position
-    // array suffix; otherwise it's left for the caller (e.g. `new T[n]`).
+    parseTypeSuffixes(leaveCoalesceToExpression);
+    builder.finishNode();
+}
+
+// `(int, int) -> int`. The caller has established that the token after the matching ')'
+// is '->'. A `?` or `[]` written after the return type belongs to that return type, which
+// is why the return type is parsed as a whole type and this node takes no suffixes.
+void Parser::parseFunctionType() {
+    builder.startNode(SyntaxKind::FuncType);
+    expect(SyntaxKind::LParen, "'('");
+    if (!at(SyntaxKind::RParen) && !atEnd()) {
+        parseType();
+        while (eat(SyntaxKind::Comma)) {
+            if (at(SyntaxKind::RParen)) break;
+            parseType();
+        }
+    }
+    expect(SyntaxKind::RParen, "')' to close the function type's parameter types");
+    expect(SyntaxKind::Arrow, "'->' after the parameter types, e.g. '(int, int) -> int'");
+    parseType();
+    builder.finishNode();
+}
+
+// `(T)`, which is what lets a `?` or `[]` suffix apply to a function type: the only type
+// parentheses are allowed around. Every form parses here and the restriction is a semantic one,
+// reported once the inner type is known.
+void Parser::parseParenthesizedType(bool leaveCoalesceToExpression) {
+    builder.startNode(SyntaxKind::ParenType);
+    expect(SyntaxKind::LParen, "'('");
+    parseType();
+    expect(SyntaxKind::RParen, "')' after the type in parentheses");
+    parseTypeSuffixes(leaveCoalesceToExpression);
+    builder.finishNode();
+}
+
+// Interleaved suffix chain: any sequence of `?` and `[]` pairs. Each '[' must be followed
+// immediately by ']' to be a type-position array suffix; otherwise it's left for the caller
+// (e.g. `new T[n]`).
+void Parser::parseTypeSuffixes(bool leaveCoalesceToExpression) {
     while (true) {
         if (at(SyntaxKind::Question)) {
             // In `x as? Foo ?? fallback` the pair is the coalescing operator, not two
@@ -882,7 +957,6 @@ void Parser::parseType(bool leaveCoalesceToExpression) {
         }
         break;
     }
-    builder.finishNode();
 }
 
 void Parser::parseTypeHead() {
@@ -1005,6 +1079,10 @@ size_t Parser::scanTypeArgs(size_t cursor) const {
             case SyntaxKind::Question:
             case SyntaxKind::LBracket:
             case SyntaxKind::RBracket:
+            // A function type may be written as a type argument: `List<(int) -> bool>`.
+            case SyntaxKind::LParen:
+            case SyntaxKind::RParen:
+            case SyntaxKind::Arrow:
                 break;
             default:
                 if (!isPrimitiveTypeKw(k)) return 0;
@@ -1013,6 +1091,50 @@ size_t Parser::scanTypeArgs(size_t cursor) const {
         if (depth <= 0) return c;
     }
     return 0;
+}
+
+size_t Parser::scanType(size_t cursor, int depth) const {
+    if (depth > kMaxTypeScanDepth) return 0;
+    auto scanSuffixes = [&](size_t c) {
+        while (true) {
+            if (peekKind(c) == SyntaxKind::Question) { c += 1; continue; }
+            if (peekKind(c) == SyntaxKind::LBracket &&
+                peekKind(c + 1) == SyntaxKind::RBracket) {
+                c += 2;
+                continue;
+            }
+            return c;
+        }
+    };
+    SyntaxKind k0 = peekKind(cursor);
+    if (k0 == SyntaxKind::LParen) {
+        // The two readings of a leading '(' share their opening: a comma-separated list of
+        // types closed by ')'. A following '->' makes it a function type, whose return type
+        // owns any suffix; without one it is a single type in parentheses, which takes them.
+        size_t c = cursor + 1;
+        if (peekKind(c) != SyntaxKind::RParen) {
+            c = scanType(c, depth + 1);
+            if (c == 0) return 0;
+            while (peekKind(c) == SyntaxKind::Comma) {
+                c = scanType(c + 1, depth + 1);
+                if (c == 0) return 0;
+            }
+        }
+        if (peekKind(c) != SyntaxKind::RParen) return 0;
+        c++;
+        if (peekKind(c) == SyntaxKind::Arrow) return scanType(c + 1, depth + 1);
+        return scanSuffixes(c);
+    }
+    if (!isTypeStart(k0)) return 0;
+    // A single optional namespace qualifier: `ns.Name`. Primitives can't be qualified.
+    size_t c = cursor + 1;
+    if (k0 == SyntaxKind::Identifier &&
+        peekKind(cursor + 1) == SyntaxKind::Dot &&
+        peekKind(cursor + 2) == SyntaxKind::Identifier) {
+        c = cursor + 3;
+    }
+    if (size_t a = scanTypeArgs(c)) c = a;
+    return scanSuffixes(c);
 }
 
 size_t Parser::skipAnglesRaw(size_t idx) const {
@@ -1041,27 +1163,8 @@ bool Parser::looksLikeTypedVarDecl() const {
 }
 
 bool Parser::looksLikeTypedVarDeclFrom(size_t start) const {
-    SyntaxKind k0 = peekKind(start);
-    if (!isTypeStart(k0)) return false;
-    // Skip a single optional namespace qualifier: `ns.Name ...`. Primitives can't
-    // be qualified, so this only fires when the leading token is an Identifier.
-    size_t cursor = start + 1;
-    if (k0 == SyntaxKind::Identifier &&
-        peekKind(start + 1) == SyntaxKind::Dot &&
-        peekKind(start + 2) == SyntaxKind::Identifier) {
-        cursor = start + 3;
-    }
-    if (size_t a = scanTypeArgs(cursor)) cursor = a;
-    // Skip any interleaved sequence of `?` and `[]` type suffixes.
-    while (true) {
-        if (peekKind(cursor) == SyntaxKind::Question) { cursor += 1; continue; }
-        if (peekKind(cursor) == SyntaxKind::LBracket &&
-            peekKind(cursor + 1) == SyntaxKind::RBracket) {
-            cursor += 2;
-            continue;
-        }
-        break;
-    }
+    size_t cursor = scanType(start);
+    if (cursor == 0) return false;
     SyntaxKind name = peekKind(cursor);
     SyntaxKind afterName = peekKind(cursor + 1);
     if (name != SyntaxKind::Identifier) return false;
@@ -1194,22 +1297,8 @@ bool Parser::looksLikeForeachHeader() const {
     if (k0 == SyntaxKind::KwLet || k0 == SyntaxKind::KwConst) {
         return peekKind(1) == SyntaxKind::Identifier && peekIsContextualIn(2);
     }
-    if (!isTypeStart(k0)) return false;
-    size_t cursor = 1;
-    if (k0 == SyntaxKind::Identifier &&
-        peekKind(1) == SyntaxKind::Dot &&
-        peekKind(2) == SyntaxKind::Identifier) {
-        cursor = 3;
-    }
-    while (true) {
-        if (peekKind(cursor) == SyntaxKind::Question) { cursor += 1; continue; }
-        if (peekKind(cursor) == SyntaxKind::LBracket &&
-            peekKind(cursor + 1) == SyntaxKind::RBracket) {
-            cursor += 2;
-            continue;
-        }
-        break;
-    }
+    size_t cursor = scanType(0);
+    if (cursor == 0) return false;
     if (peekKind(cursor) != SyntaxKind::Identifier) return false;
     return peekIsContextualIn(cursor + 1);
 }
@@ -1352,11 +1441,14 @@ void Parser::parseSwitchArm() {
         eat(SyntaxKind::Identifier);  // optional binding name
     } else {
         // One or more comma-separated labels, ending at the `->`.
+        bool outerLabels = inArmLabels;
+        inArmLabels = true;
         parseExpression();
         while (eat(SyntaxKind::Comma)) {
             if (at(SyntaxKind::Arrow) || at(SyntaxKind::RBrace) || atEnd()) break;
             parseExpression();
         }
+        inArmLabels = outerLabels;
     }
     expect(SyntaxKind::Arrow, "'->' after the switch label");
     if (at(SyntaxKind::LBrace) && !atStructLiteralStart()) parseBlock();
@@ -1526,7 +1618,7 @@ void Parser::parsePrecedence(int minPrec) {
             builder.startNodeAt(cp, checked ? SyntaxKind::CheckedCastExpr : SyntaxKind::CastExpr);
             bump();  // 'as'
             if (checked) bump();  // '?'
-            if (isTypeStart(kindAt())) parseType(/*leaveCoalesceToExpression=*/true);
+            if (isTypeOrGroupStart(kindAt())) parseType(/*leaveCoalesceToExpression=*/true);
             else emitMissing(SyntaxKind::Identifier, checked ? "type after 'as?'" : "type after 'as'");
             builder.finishNode();
             continue;
@@ -1563,6 +1655,9 @@ void Parser::parsePrecedence(int minPrec) {
 }
 
 void Parser::parsePrefix() {
+    // Inside a switch arm's label list a '(' never opens a lambda and an identifier before
+    // '->' is the label, not a bare parameter.
+    bool lambdaHere = !inArmLabels;
     SyntaxKind k = kindAt();
     switch (k) {
         case SyntaxKind::KwTry: {
@@ -1607,13 +1702,13 @@ void Parser::parsePrefix() {
             return;
         }
         case SyntaxKind::Identifier:
-            builder.startNode(SyntaxKind::IdentExpr);
-            bump();
-            builder.finishNode();
-            return;
         case SyntaxKind::KwString:
-            // The `string` type name as an expression receiver, for static
+            // `KwString` is the `string` type name as an expression receiver, for static
             // builtins like `string.fromBytes(bytes)`.
+            if (lambdaHere && peekKind(1) == SyntaxKind::Arrow) {
+                parseBareParameterLambda();
+                return;
+            }
             builder.startNode(SyntaxKind::IdentExpr);
             bump();
             builder.finishNode();
@@ -1663,6 +1758,10 @@ void Parser::parsePrefix() {
             return;
         }
         case SyntaxKind::LParen: {
+            if (lambdaHere && atArrowAfterParentheses()) {
+                parseLambda();
+                return;
+            }
             builder.startNode(SyntaxKind::ParenExpr);
             bump();
             parseExpression();
@@ -1772,4 +1871,77 @@ void Parser::parseStructLiteralField() {
     expect(SyntaxKind::Colon, "':' after the field name, e.g. '{x: 1}'");
     parseExpression();
     builder.finishNode();
+}
+
+// =================================================================
+// Lambdas
+// =================================================================
+
+// `(a, b) -> a - b`. The caller has established that the token after the matching ')' is
+// '->'. The body extends as far right as it can, so `(a) -> a + 1 == 2` has the whole
+// comparison as its body.
+void Parser::parseLambda() {
+    builder.startNode(SyntaxKind::LambdaExpr);
+    expect(SyntaxKind::LParen, "'('");
+    parseLambdaParameters();
+    expect(SyntaxKind::RParen, "')' to close the lambda's parameters");
+    expect(SyntaxKind::Arrow, "'->' after the lambda's parameters, e.g. '(a, b) -> a - b'");
+    parseLambdaBody();
+    builder.finishNode();
+}
+
+// `a -> a * 2`, which the language does not accept: the parentheses around a lambda's
+// parameters are always required. The name becomes the sole parameter of the recovered
+// lambda, so the body is still checked.
+void Parser::parseBareParameterLambda() {
+    std::string name = asciiTokenText();
+    reportAtCurrent("A lambda's parameters are always written in parentheses: use '(" + name +
+        ") -> ...' rather than '" + name + " -> ...'");
+    builder.startNode(SyntaxKind::LambdaExpr);
+    builder.startNode(SyntaxKind::LambdaParam);
+    bumpAs(SyntaxKind::Identifier);
+    builder.finishNode();
+    bump();  // '->'
+    parseLambdaBody();
+    builder.finishNode();
+}
+
+void Parser::parseLambdaParameters() {
+    if (at(SyntaxKind::RParen) || atEnd()) return;
+    parseLambdaParameter();
+    while (eat(SyntaxKind::Comma)) {
+        if (at(SyntaxKind::RParen)) break;  // trailing comma reported by the RParen expect
+        parseLambdaParameter();
+    }
+}
+
+// `declaredType? name`. A bare name takes its type from the target type; a written type
+// comes first, exactly as in a parameter list. One lambda writes every parameter's type or
+// none of them, which the analyzer decides.
+void Parser::parseLambdaParameter() {
+    builder.startNode(SyntaxKind::LambdaParam);
+    bool bareName = at(SyntaxKind::Identifier) &&
+        (peekKind(1) == SyntaxKind::Comma || peekKind(1) == SyntaxKind::RParen);
+    if (!bareName && isTypeOrGroupStart(kindAt())) parseType();
+    if (at(SyntaxKind::Identifier)) {
+        bump();
+    } else if (at(SyntaxKind::Comma) || at(SyntaxKind::RParen)) {
+        emitMissing(SyntaxKind::Identifier,
+                    "the parameter's name after its type, e.g. '(int a, int b) -> a - b'");
+    } else if (isKeyword(kindAt())) {
+        reportAtCurrent("'" + asciiTokenText() + "' is a keyword and cannot be used as a "
+            "parameter name; choose a different name such as 'value'");
+        bumpAs(SyntaxKind::Identifier);
+    } else {
+        reportAtCurrent("Expected the lambda parameter's name, e.g. '(a, b) -> a - b'");
+        bumpAs(SyntaxKind::Identifier);
+    }
+    builder.finishNode();
+}
+
+// The body after '->': a block when a '{' follows that is not a struct literal, and a
+// single expression otherwise, exactly as a switch arm's body decides.
+void Parser::parseLambdaBody() {
+    if (at(SyntaxKind::LBrace) && !atStructLiteralStart()) parseBlock();
+    else parseExpression();
 }

@@ -91,6 +91,8 @@ enum class SyntaxKind : uint16_t {
     TypeRef,             // identifier (or primitive keyword) optionally followed by ?
     OptionalType,        // wraps TypeRef with trailing ?
     TypeArgList,         // <int, string> applied to a type or call
+    FuncType,            // (int, int) -> int: the type of a function value
+    ParenType,           // (T), with any ? / [] suffixes that apply to it
 
     // === Statements ===
     Block,
@@ -143,6 +145,8 @@ enum class SyntaxKind : uint16_t {
     InterpStringExpr,    // "text {expr} text": alternating literal parts and holes
     TryExpr,             // try <call>: prefixes a single throwing call
     SwitchExpr,          // switch (scrutinee) { arm, arm, ... } used as a value
+    LambdaExpr,          // (a, b) -> a - b: a function value
+    LambdaParam,         // one lambda parameter, its type written or left to the target
 
     // === Recovery ===
     Error,               // wraps unexpected/skipped tokens during recovery
@@ -155,6 +159,8 @@ bool isTrivia(SyntaxKind k);
 bool isNode(SyntaxKind k);
 bool isKeyword(SyntaxKind k);
 bool isLiteral(SyntaxKind k);
+// A node kind a whole type is written as, i.e. what ast::TypeReference wraps.
+bool isTypeNode(SyntaxKind k);
 
 std::string_view kindName(SyntaxKind k);
 

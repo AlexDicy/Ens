@@ -1,0 +1,401 @@
+// Function values: how a function type interns and displays, what a lambda takes from its target,
+// what its body may read from the enclosing scope, and every rule the checker holds one to.
+import @std.testing;
+import ProgramAnalysis from pipeline;
+import model.types;
+import Type from model.types;
+import TypeStore from model.types;
+import FunctionType from model.types;
+import PrimitiveKind from model.types;
+import LambdaInfo from model.lambdas;
+import FileDiagnostic from support.diagnostics;
+import sema_support;
+import FakeFileLoader from sema_support;
+
+analyzeOne(string text) -> ProgramAnalysis throws {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", text);
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertNoDiagnostics(analysis.declareDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.linkDiagnostics());
+    return analysis;
+}
+
+// Every diagnostic the body and exception stages produced, in order.
+problemsIn(string text) -> FileDiagnostic[] {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", text);
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    let body = analysis.bodyDiagnostics();
+    if (body.length > 0) {
+        return body;
+    }
+    let signatures = analysis.signatureDiagnostics();
+    if (signatures.length > 0) {
+        return signatures;
+    }
+    return analysis.exceptionDiagnostics();
+}
+
+assertOnlyProblem(string text, string message) throws {
+    let problems = problemsIn(text);
+    if (problems.length != 1) {
+        string first = "";
+        if (problems.length > 0) {
+            first = problems[0].message();
+        }
+        try testing.fail("expected 1 problem but found {problems.length}; first: {first}");
+    }
+    try testing.assertEqual(problems[0].message(), message);
+}
+
+test "a function type interns by its parameter types and its return type" {
+    let store = new TypeStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let longType = store.primitive(PrimitiveKind.Long);
+    let first = store.functionOf([intType, intType], intType);
+    let again = store.functionOf([intType, intType], intType);
+    try testing.assertTrue(first == again, "the same shape is the same type object");
+    try testing.assertTrue(first != store.functionOf([intType], intType),
+        "a different arity is a different type");
+    try testing.assertTrue(first != store.functionOf([intType, longType], intType),
+        "a different parameter type is a different type");
+    try testing.assertTrue(first != store.functionOf([intType, intType], longType),
+        "a different return type is a different type");
+    try testing.assertTrue(first is FunctionType, "the store answers with a function type");
+}
+
+test "an error anywhere in the shape keeps the whole type an error" {
+    let store = new TypeStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    try testing.assertTrue(store.functionOf([store.errorType()], intType) == store.errorType(),
+        "an error parameter type");
+    try testing.assertTrue(store.functionOf([intType], store.errorType()) == store.errorType(),
+        "an error return type");
+}
+
+test "a function type displays the way the language writes it" {
+    let store = new TypeStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let boolType = store.primitive(PrimitiveKind.Bool);
+    let voidType = store.primitive(PrimitiveKind.Void);
+    let compare = store.functionOf([intType, intType], intType);
+    try testing.assertEqual(types.display(compare), "(int, int) -> int");
+    try testing.assertEqual(types.display(store.functionOf([], store.stringType())),
+        "() -> string");
+    let test = store.functionOf([intType], boolType);
+    try testing.assertEqual(types.display(store.optionalOf(test)), "((int) -> bool)?");
+    try testing.assertEqual(types.display(store.arrayOf(test)), "((int) -> bool)[]");
+    try testing.assertEqual(types.display(store.functionOf([intType], test)),
+        "(int) -> (int) -> bool");
+    try testing.assertEqual(types.display(store.functionOf([test, intType], voidType)),
+        "((int) -> bool, int) -> void");
+}
+
+test "a lambda takes its parameter and return types from its target" {
+    let analysis = try analyzeOne("apply((int) -> int f, int x) -> int \{ return f(x); \}\n"
+        + "main() -> int \{\n"
+        + "    (int, int) -> int order = (a, b) -> a - b;\n"
+        + "    return apply((v) -> v + 1, order(3, 1));\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.exceptionDiagnostics());
+}
+
+test "a function type is an ordinary type wherever a type may be written" {
+    let analysis = try analyzeOne("public class Holder \{\n"
+        + "    (int, int) -> int order;\n"
+        + "    ((int) -> bool)? filter;\n"
+        + "    public constructor((int, int) -> int order) \{\n"
+        + "        this.order = order;\n"
+        + "        this.filter = null;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "pick() -> (int) -> int \{ return (v) -> v; \}\n"
+        + "hold(((int) -> int)[] steps) -> long \{ return steps.length; \}\n"
+        + "main() -> int \{\n"
+        + "    let holder = new Holder((a, b) -> a - b);\n"
+        + "    return hold([(v) -> v, pick()]) as int;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.exceptionDiagnostics());
+}
+
+test "a lambda records the values its body reads from the enclosing scope" {
+    let analysis = try analyzeOne("class Counter \{\n"
+        + "    long total;\n"
+        + "    constructor() \{ this.total = 0; \}\n"
+        + "    adder(long step) -> (long) -> void \{\n"
+        + "        long extra = step + 1;\n"
+        + "        return (by) -> this.bump(by + step + extra);\n"
+        + "    \}\n"
+        + "    bump(long by) \{ this.total = this.total + by; \}\n"
+        + "\}\n"
+        + "main() -> int \{ return 0; \}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+    let info = try onlyLambdaOf(analysis);
+    let captures = info.captures();
+    try testing.assertEqual(captures.length, 3L);
+    try testing.assertTrue(captures[0].isReceiver(), "'this' is captured first, as it is read");
+    let step = captures[1].binding();
+    try testing.assertTrue(step != null && step.name() == "step", "then the parameter");
+    let extra = captures[2].binding();
+    try testing.assertTrue(extra != null && extra.name() == "extra", "then the local");
+}
+
+test "a lambda captures only what its body reads" {
+    let analysis = try analyzeOne("main() -> int \{\n"
+        + "    long used = 1;\n"
+        + "    long unused = 2;\n"
+        + "    (long) -> long add = (v) -> v + used;\n"
+        + "    return (add(unused)) as int;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+    let info = try onlyLambdaOf(analysis);
+    try testing.assertEqual(info.captures().length, 1L);
+    let captured = info.captures()[0].binding();
+    try testing.assertTrue(captured != null && captured.name() == "used",
+        "only the local the body reads");
+}
+
+test "a nested lambda makes the lambda around it capture what it reads" {
+    let analysis = try analyzeOne("main() -> int \{\n"
+        + "    long base = 1;\n"
+        + "    () -> (long) -> long outer = () -> (v) -> v + base;\n"
+        + "    return (outer()(2L)) as int;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+    let lambdas = sema_support.lambdasOf(analysis, "main");
+    try testing.assertEqual(lambdas.length(), 2L);
+    for (long i = 0; i < lambdas.length(); i++) {
+        try testing.assertEqual(lambdas.get(i).captures().length, 1L);
+    }
+}
+
+test "a lambda has no shape without a target type" {
+    try assertOnlyProblem("main() -> int \{\n"
+        + "    let f = (a) -> a;\n"
+        + "    return 0;\n"
+        + "\}\n",
+        "This lambda has nothing to take its parameter and return types from. Declare what "
+        + "holds it with a function type, for example '(int, int) -> int compare = (a, b) -> a "
+        + "- b;', or pass it to a parameter declared with one.");
+}
+
+test "a lambda's parameter list must match its target's exactly" {
+    try assertOnlyProblem("main() -> int \{\n"
+        + "    (int, int) -> int order = (a) -> a;\n"
+        + "    return 0;\n"
+        + "\}\n",
+        "This lambda takes 1 parameter, but '(int, int) -> int' takes 2 parameters. Write it as "
+        + "'(a, b) -> ...'.");
+    try assertOnlyProblem("main() -> int \{\n"
+        + "    (int, int) -> int order = (int a, b) -> a - b;\n"
+        + "    return 0;\n"
+        + "\}\n",
+        "This lambda writes the type of some parameters and not others. Write every parameter's "
+        + "type or none of them, for example '(int a, int b) -> a - b' or '(a, b) -> a - b'.");
+    try assertOnlyProblem("main() -> int \{\n"
+        + "    (int, int) -> int order = (long a, int b) -> b;\n"
+        + "    return 0;\n"
+        + "\}\n",
+        "Parameter 'a' is declared 'long', but '(int, int) -> int' passes 'int' there. Write "
+        + "'int a', or leave the type out and let the target supply it.");
+}
+
+test "assignability between function types is invariant" {
+    try assertOnlyProblem("take((long, long) -> long order) \{ \}\n"
+        + "main() -> int \{\n"
+        + "    (int, int) -> int order = (a, b) -> a - b;\n"
+        + "    take(order);\n"
+        + "    return 0;\n"
+        + "\}\n",
+        "Argument 1: expected '(long, long) -> long', got '(int, int) -> int'");
+}
+
+test "a captured local cannot be written inside the lambda" {
+    try assertOnlyProblem("main() -> int \{\n"
+        + "    long total = 0;\n"
+        + "    (long) -> void add = (v) -> total = total + v;\n"
+        + "    return 0;\n"
+        + "\}\n",
+        "Cannot assign a new value to 'total' inside a lambda: a lambda copies the values it "
+        + "captures, so the write would change that copy and leave the 'total' outside it "
+        + "unchanged. Return the value the lambda computes and store it at the call site, or "
+        + "keep the value in an object the lambda can reach.");
+}
+
+test "a lambda's own local may be written" {
+    let analysis = try analyzeOne("main() -> int \{\n"
+        + "    (long) -> long twice = (v) -> \{\n"
+        + "        long total = v;\n"
+        + "        total = total + v;\n"
+        + "        return total;\n"
+        + "    \};\n"
+        + "    return (twice(2L)) as int;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+}
+
+test "a captured local must be assigned where the lambda is created" {
+    try assertOnlyProblem("main() -> int \{\n"
+        + "    long total;\n"
+        + "    (long) -> long add = (v) -> v + total;\n"
+        + "    total = 1;\n"
+        + "    return 0;\n"
+        + "\}\n",
+        "Variable 'total' is used before it is assigned a value. Assign it on every path that "
+        + "reaches this point first, for example 'total = ...;'.");
+}
+
+test "a lambda body that can throw is refused against a function type" {
+    try assertOnlyProblem("public class Failure extends Error \{\n"
+        + "    public constructor(string message) \{ super(message); \}\n"
+        + "\}\n"
+        + "mayFail(int value) -> int throws \{\n"
+        + "    if (value < 0) \{ throw new Failure(\"negative\"); \}\n"
+        + "    return value;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    (int) -> int f = (a) -> try mayFail(a);\n"
+        + "    return 0;\n"
+        + "\}\n",
+        "This lambda's body can throw 'Failure', and a function type never throws, so nothing "
+        + "can report it to the caller. Handle the failure inside the lambda: move the throwing "
+        + "work into a named function whose own 'catch' clause turns the failure into a value, "
+        + "and call that function here.");
+}
+
+test "a function value has no identity, no members and no text form" {
+    try assertOnlyProblem("main() -> int \{\n"
+        + "    (int) -> int f = (a) -> a;\n"
+        + "    (int) -> int g = (a) -> a;\n"
+        + "    if (f == g) \{ return 1; \}\n"
+        + "    return 0;\n"
+        + "\}\n",
+        "A function value has no identity, so '(int) -> int' and '(int) -> int' cannot be "
+        + "compared. Compare what the functions produce, or keep a name or tag beside each one "
+        + "and compare that.");
+    try assertOnlyProblem("main() -> int \{\n"
+        + "    (int) -> int f = (a) -> a;\n"
+        + "    return (f.hash()) as int;\n"
+        + "\}\n",
+        "A function value has no members, so 'hash' cannot be used on '(int) -> int': it has no "
+        + "identity and no text form. Call the value with '(...)', or keep the data you need "
+        + "beside it.");
+    try assertOnlyProblem("main() -> int \{\n"
+        + "    (int) -> int f = (a) -> a;\n"
+        + "    print(\"\{f\}\");\n"
+        + "    return 0;\n"
+        + "\}\n",
+        "Cannot interpolate a value of type '(int) -> int': a function value has no text form. "
+        + "Interpolate what the function returns, or a name you keep beside it.");
+}
+
+test "a function value is called by position, with the arity its type declares" {
+    try assertOnlyProblem("main() -> int \{\n"
+        + "    (int, int) -> int order = (a, b) -> a - b;\n"
+        + "    return order(1);\n"
+        + "\}\n",
+        "'order' has type '(int, int) -> int', so the call takes 2 arguments, got 1.");
+    try assertOnlyProblem("main() -> int \{\n"
+        + "    (int) -> int step = (a) -> a;\n"
+        + "    return step(a: 1);\n"
+        + "\}\n",
+        "A function type has no parameter names, so a function value's arguments are given by "
+        + "position; write the values in order without 'a:'.");
+}
+
+test "a nullable function value is called only after it narrows" {
+    try assertOnlyProblem("main() -> int \{\n"
+        + "    ((int) -> int)? maybe = null;\n"
+        + "    return maybe(1);\n"
+        + "\}\n",
+        "'maybe' has type '((int) -> int)?', which may be null here, so it cannot be called. "
+        + "Check it for null first ('if (maybe != null)'), or supply a fallback with '??'.");
+    let analysis = try analyzeOne("main() -> int \{\n"
+        + "    ((int) -> int)? maybe = null;\n"
+        + "    if (maybe != null) \{ return maybe(1); \}\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+}
+
+test "a struct's method cannot hand its own 'this' to a lambda" {
+    try assertOnlyProblem("struct Point \{\n"
+        + "    int x;\n"
+        + "    reader() -> (int) -> int \{ return (v) -> v + this.x; \}\n"
+        + "\}\n"
+        + "main() -> int \{ return 0; \}\n",
+        "A lambda cannot capture 'this' here: 'Point' is a struct, so the lambda would copy it "
+        + "and a write through the copy would leave the struct this method runs over unchanged. "
+        + "Capture the fields the lambda needs as locals, or make 'Point' a class.");
+}
+
+test "a function type takes no 'void' parameter" {
+    try assertOnlyProblem("take((void) -> int f) \{ \}\n"
+        + "main() -> int \{ return 0; \}\n",
+        "'void' means no value, so it cannot be a parameter type. Write '() -> ...' for a "
+        + "function value that takes nothing.");
+}
+
+test "parentheses in a type are allowed only around a function type" {
+    try assertOnlyProblem("main() -> int \{\n"
+        + "    (int) count = 1;\n"
+        + "    return count;\n"
+        + "\}\n",
+        "Remove the parentheses around 'int': in a type, parentheses are only allowed around a "
+        + "function type, for example '((int) -> bool)?'.");
+    try assertOnlyProblem("main() -> int \{\n"
+        + "    (((int) -> int)) step = (a) -> a;\n"
+        + "    return step(1);\n"
+        + "\}\n",
+        "Remove the parentheses around '(int) -> int': in a type, parentheses are only allowed "
+        + "around a function type, for example '((int) -> bool)?'.");
+    let analysis = try analyzeOne("take(((int) -> bool) -> int pick) \{ \}\n"
+        + "main() -> int \{\n"
+        + "    ((int) -> bool)? maybe = null;\n"
+        + "    ((int) -> bool)[] many = [(v) -> v > 0];\n"
+        + "    return many.length as int;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+}
+
+// A '?' after a function type binds to its return type, so the type that allows null is the
+// parenthesized one and the hint has to say so.
+test "the hint for a function type that should allow null names the parenthesized form" {
+    try assertOnlyProblem("main() -> int \{\n"
+        + "    (int) -> bool? notNullable = null;\n"
+        + "    return 0;\n"
+        + "\}\n",
+        "Cannot assign value of type 'null' to variable of type '(int) -> bool?'. "
+        + "'(int) -> bool?' can never be null; write the type as '((int) -> bool?)?' if it "
+        + "should allow null.");
+}
+
+test "a lambda takes its shape from the target through a '?:' and through switch arms" {
+    let ternary = try analyzeOne("main() -> int \{\n"
+        + "    bool ascending = true;\n"
+        + "    (int, int) -> int order = ascending ? (a, b) -> a - b : (a, b) -> b - a;\n"
+        + "    return order(1, 2);\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(ternary.bodyDiagnostics());
+    let switched = try analyzeOne("main() -> int \{\n"
+        + "    int mode = 1;\n"
+        + "    (int) -> int step = switch (mode) \{\n"
+        + "        1 -> (v) -> v + 1,\n"
+        + "        default -> (v) -> v - 1,\n"
+        + "    \};\n"
+        + "    return step(10);\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(switched.bodyDiagnostics());
+}
+
+// The single lambda a one-lambda program holds.
+onlyLambdaOf(ProgramAnalysis analysis) -> LambdaInfo throws {
+    let lambdas = sema_support.lambdasOf(analysis, "main");
+    if (lambdas.length() == 1) {
+        return lambdas.get(0);
+    }
+    try testing.fail("expected exactly one lambda but found {lambdas.length()}");
+}

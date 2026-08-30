@@ -426,6 +426,18 @@ private:
     Type* analyzeStructConstructorCall(const ast::CallExpression& expr, Type* structType,
                                        const std::u16string& typeName);
     Type* analyzeInterpString(const ast::InterpStringExpression& expr);
+    // A lambda checked against the function type its position gives it. An untyped
+    // parameter takes its type from that target, and the body is checked in a scope of its
+    // own, below the enclosing one, so the locals, parameters and `this` it captures stay
+    // visible. `target` is null where the position offers no type.
+    Type* analyzeLambda(const ast::LambdaExpression& expr, Type* target);
+    // The function type a value of type `t` can be called through, looking past
+    // nullability, or null when `t` is not one.
+    static Type* callableFunctionType(Type* t);
+    // A call through a function value: the arguments are checked against the function
+    // type's parameter types, and the call yields what it returns.
+    Type* checkFunctionValueCall(Type* fnType, const std::vector<ast::Expression>& args,
+                                 const SyntaxNode& diagNode);
 
     // Build a NarrowingPath from a member / subscript chain. Returns nullopt when
     // any segment is something we can't reliably re-recognize on later reads
@@ -503,6 +515,8 @@ private:
     bool pathRootInScope(const NarrowingPath& path) const;
 
     Type* resolveTypeReference(const ast::TypeReference& tr);
+    // The `?` / `[]` chain written on `tr`, applied to the type it wraps.
+    Type* applyTypeSuffixes(Type* base, const ast::TypeReference& tr);
     Type* lookupTypeByName(const std::u16string& qualifier, const std::u16string& name,
                            const SyntaxNode& diagNode);
 

@@ -14,6 +14,14 @@ inline std::optional<SyntaxNode> firstChildNode(const SyntaxNode& parent, Syntax
     return std::nullopt;
 }
 
+// The first child that is a whole type, whichever node kind it is written as.
+inline std::optional<SyntaxNode> firstTypeChild(const SyntaxNode& parent) {
+    for (auto& c : parent.children()) {
+        if (isTypeNode(c.kind())) return c;
+    }
+    return std::nullopt;
+}
+
 inline std::optional<SyntaxNode> firstNonTriviaToken(const SyntaxNode& parent) {
     for (auto& c : parent.children()) {
         if (!isTrivia(c.kind()) && c.isToken()) return c;

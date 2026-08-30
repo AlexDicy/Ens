@@ -19,6 +19,9 @@ A function type never throws, so a lambda whose body can throw is rejected again
 A lambda may capture `this`, by value like any other reference, so field writes and method calls through the captured reference are legal while the rule against mutating an enclosing local stands.
 The three shapes the library needs are `(T, T) -> int`, `(T) -> bool`, and `() -> V`.
 
+Parentheses in a type are legal only around a function type, since that is the only form whose trailing part `?` and `[]` could attach to and the only one a comma could split ambiguously inside another parameter list.
+`((int) -> bool)?` and `((int) -> bool)[]` are the reason the form exists; parentheses around anything else, as in `(int) x`, are an error naming the plain spelling, so every type keeps one written form.
+
 ## Interfaces extending interfaces
 
 `interface Collection<T> extends Iterable<T>` becomes legal, reusing `ExtendsClause` on `InterfaceDeclaration`.

@@ -198,6 +198,27 @@ export class ArrayType extends Type {
     }
 }
 
+// The type of a function value: '(int, int) -> int', '() -> string'. Interned by its parameter
+// types and its return type, so two spellings of the same shape are the same object and
+// assignability between function types is identity. A function type never throws.
+export class FunctionType extends Type {
+    Type[] functionParameterTypes;
+    Type functionReturnType;
+
+    protected constructor(Type[] parameterTypes, Type returnType) {
+        this.functionParameterTypes = parameterTypes;
+        this.functionReturnType = returnType;
+    }
+
+    export parameterTypes() -> Type[] {
+        return this.functionParameterTypes;
+    }
+
+    export returnType() -> Type {
+        return this.functionReturnType;
+    }
+}
+
 // One resolved parameter of a function, method, or constructor.
 export class Parameter {
     string parameterName;
@@ -1012,6 +1033,39 @@ class TypeParamKey {
     }
 }
 
+class FunctionTypeKey {
+    Type[] keyParameterTypes;
+    Type keyReturnType;
+
+    protected constructor(Type[] parameterTypes, Type returnType) {
+        this.keyParameterTypes = parameterTypes;
+        this.keyReturnType = returnType;
+    }
+
+    override hash() -> long {
+        long combined = this.keyReturnType.hash();
+        for (let parameter in this.keyParameterTypes) {
+            combined = combined * 31 + parameter.hash();
+        }
+        return combined;
+    }
+
+    override equals(FunctionTypeKey other) -> bool {
+        if (this.keyReturnType != other.keyReturnType) {
+            return false;
+        }
+        if (this.keyParameterTypes.length != other.keyParameterTypes.length) {
+            return false;
+        }
+        for (long i = 0; i < this.keyParameterTypes.length; i++) {
+            if (this.keyParameterTypes[i] != other.keyParameterTypes[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
 class InstantiationKey {
     DeclaredType keyTemplate;
     Type[] keyArguments;
@@ -1055,6 +1109,7 @@ export class TypeStore {
     ErrorType internedError;
     Map<Type, OptionalType> optionals;
     Map<Type, ArrayType> arrays;
+    Map<FunctionTypeKey, FunctionType> functions;
     Map<DeclaredTypeKey, DeclaredType> declaredTypes;
     Map<TypeParamKey, TypeParamType> typeParameters;
     Map<InstantiationKey, InstantiationType> instantiations;
@@ -1069,6 +1124,7 @@ export class TypeStore {
         this.internedError = new ErrorType();
         this.optionals = new Map<Type, OptionalType>();
         this.arrays = new Map<Type, ArrayType>();
+        this.functions = new Map<FunctionTypeKey, FunctionType>();
         this.declaredTypes = new Map<DeclaredTypeKey, DeclaredType>();
         this.typeParameters = new Map<TypeParamKey, TypeParamType>();
         this.instantiations = new Map<InstantiationKey, InstantiationType>();
@@ -1124,6 +1180,27 @@ export class TypeStore {
         }
         let created = new ArrayType(element);
         this.arrays.set(element, created);
+        return created;
+    }
+
+    // The function type over these parameter types and this return type. An error anywhere in
+    // the shape stays an error, so one diagnosis does not cascade.
+    export functionOf(Type[] parameterTypes, Type returnType) -> Type {
+        if (returnType is ErrorType) {
+            return returnType;
+        }
+        for (let parameter in parameterTypes) {
+            if (parameter is ErrorType) {
+                return parameter;
+            }
+        }
+        let key = new FunctionTypeKey(parameterTypes, returnType);
+        let existing = this.functions.get(key);
+        if (existing != null) {
+            return existing;
+        }
+        let created = new FunctionType(parameterTypes, returnType);
+        this.functions.set(key, created);
         return created;
     }
 
@@ -1234,6 +1311,11 @@ export class TypeStore {
             },
             is ArrayType array -> {
                 return this.arrayOf(this.substitute(array.element(), owner, arguments));
+            },
+            is FunctionType functionType -> {
+                return this.functionOf(
+                    this.substituteAll(functionType.parameterTypes(), owner, arguments),
+                    this.substitute(functionType.returnType(), owner, arguments));
             },
             is InstantiationType nested -> {
                 return this.instantiationOf(nested.template(),
@@ -1431,6 +1513,14 @@ referencesTemplate(Type type, DeclaredType template) -> bool {
         is ArrayType array -> {
             return referencesTemplate(array.element(), template);
         },
+        is FunctionType functionType -> {
+            for (let parameter in functionType.parameterTypes()) {
+                if (referencesTemplate(parameter, template)) {
+                    return true;
+                }
+            }
+            return referencesTemplate(functionType.returnType(), template);
+        },
         is InstantiationType instantiation -> {
             if (instantiation.template() == template) {
                 return true;
@@ -1448,7 +1538,8 @@ referencesTemplate(Type type, DeclaredType template) -> bool {
     }
 }
 
-// The type as it reads in a diagnostic: 'int', 'Box<string>?', 'T[]'.
+// The type as it reads in a diagnostic, spelled the way the language writes it: 'int',
+// 'Box<string>?', 'T[]', '(int, int) -> int', '((int) -> bool)?'.
 export display(Type type) -> string {
     switch (type) {
         is PrimitiveType primitive -> {
@@ -1464,10 +1555,24 @@ export display(Type type) -> string {
             return "<error>";
         },
         is OptionalType optional -> {
-            return display(optional.inner()) + "?";
+            return displaySuffixed(optional.inner()) + "?";
         },
         is ArrayType array -> {
-            return display(array.element()) + "[]";
+            return displaySuffixed(array.element()) + "[]";
+        },
+        is FunctionType functionType -> {
+            let builder = new StringBuilder();
+            builder.append("(");
+            Type[] parameters = functionType.parameterTypes();
+            for (long i = 0; i < parameters.length; i++) {
+                if (i > 0) {
+                    builder.append(", ");
+                }
+                builder.append(display(parameters[i]));
+            }
+            builder.append(") -> ");
+            builder.append(display(functionType.returnType()));
+            return builder.toString();
         },
         is DeclaredType declared -> {
             return declared.name();
@@ -1490,6 +1595,23 @@ export display(Type type) -> string {
             return builder.toString();
         },
     }
+}
+
+// A type under a '?' or '[]' suffix. A function type takes parentheses there, because the
+// suffixes of the written form bind to the return type instead.
+displaySuffixed(Type type) -> string {
+    if (type is FunctionType) {
+        return "(" + display(type) + ")";
+    }
+    return display(type);
+}
+
+// The nullable spelling of a type, for a diagnostic suggesting a type that allows null. It is not
+// always the type's own spelling with a '?' added, because a function type needs parentheses
+// first: '((int) -> bool)?' is a function reference that may be null, while '(int) -> bool?' is a
+// function whose return may be.
+export displayNullable(Type type) -> string {
+    return displaySuffixed(type) + "?";
 }
 
 public primitiveName(PrimitiveKind kind) -> string {

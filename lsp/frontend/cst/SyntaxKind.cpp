@@ -44,6 +44,17 @@ bool isLiteral(SyntaxKind k) {
     }
 }
 
+bool isTypeNode(SyntaxKind k) {
+    switch (k) {
+        case SyntaxKind::TypeRef:
+        case SyntaxKind::FuncType:
+        case SyntaxKind::ParenType:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static constexpr std::pair<SyntaxKind, std::string_view> KIND_NAMES[] = {
     {SyntaxKind::Whitespace,        "Whitespace"},
     {SyntaxKind::Newline,           "Newline"},
@@ -212,6 +223,8 @@ static constexpr std::pair<SyntaxKind, std::string_view> KIND_NAMES[] = {
     {SyntaxKind::TypeRef,           "TypeRef"},
     {SyntaxKind::OptionalType,      "OptionalType"},
     {SyntaxKind::TypeArgList,       "TypeArgList"},
+    {SyntaxKind::FuncType,          "FuncType"},
+    {SyntaxKind::ParenType,         "ParenType"},
     {SyntaxKind::Block,             "Block"},
     {SyntaxKind::LetStmt,           "LetStmt"},
     {SyntaxKind::TypedVarDecl,      "TypedVarDecl"},
@@ -260,6 +273,8 @@ static constexpr std::pair<SyntaxKind, std::string_view> KIND_NAMES[] = {
     {SyntaxKind::InterpStringExpr,  "InterpStringExpr"},
     {SyntaxKind::TryExpr,           "TryExpr"},
     {SyntaxKind::SwitchExpr,        "SwitchExpr"},
+    {SyntaxKind::LambdaExpr,        "LambdaExpr"},
+    {SyntaxKind::LambdaParam,       "LambdaParam"},
     {SyntaxKind::Error,             "Error"},
 };
 

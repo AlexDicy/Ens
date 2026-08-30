@@ -30,6 +30,7 @@ import SuperExpressionNode from @ens.frontend.syntax.generated.nodes;
 import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SafeMemberExpressionNode from @ens.frontend.syntax.generated.nodes;
 import TryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import LambdaExpressionNode from @ens.frontend.syntax.generated.nodes;
 import GreenNode from @ens.frontend.syntax.green;
 import Span from @ens.frontend.support.source;
 import FileDiagnostic from support.diagnostics;
@@ -292,6 +293,9 @@ class ModuleExceptions {
     List<FunctionItem> functionItems;
     List<TestDeclarationNode> testItems;
     List<TypeItem> typeItems;
+    // Every lambda the module writes, wherever it appears. A lambda's body is a callable of its
+    // own, so it converges under its own key instead of feeding the function around it.
+    List<LambdaExpressionNode> lambdaItems;
 
     protected constructor(ModuleContext context, ThrowsRegistry registry,
                 List<FileDiagnostic> collected) {
@@ -305,6 +309,7 @@ class ModuleExceptions {
         this.functionItems = new List<FunctionItem>();
         this.testItems = new List<TestDeclarationNode>();
         this.typeItems = new List<TypeItem>();
+        this.lambdaItems = new List<LambdaExpressionNode>();
     }
 
     protected collect() {
@@ -338,6 +343,17 @@ class ModuleExceptions {
                 },
                 default -> { },
             }
+        }
+        this.collectLambdas(root);
+    }
+
+    collectLambdas(SyntaxNode node) {
+        if (node is LambdaExpressionNode) {
+            this.lambdaItems.push(node);
+        }
+        let children = node.childNodes();
+        for (long i = 0; i < children.length(); i++) {
+            this.collectLambdas(children.get(i));
         }
     }
 
@@ -403,7 +419,25 @@ class ModuleExceptions {
                 changed = true;
             }
         }
+        for (long i = 0; i < this.lambdaItems.length(); i++) {
+            let lambda = this.lambdaItems.get(i);
+            let outward = new ThrowSet();
+            this.collectLambdaThrows(lambda, outward);
+            if (this.registry.outwardFor(lambda.green()).addAll(outward)) {
+                changed = true;
+            }
+        }
         return changed;
+    }
+
+    // A lambda has no catch clauses, so what its body raises is its whole outward set. Walking
+    // the lambda's own children rather than its body slot keeps one code path for the two shapes
+    // a body can take.
+    collectLambdaThrows(LambdaExpressionNode lambda, ThrowSet into) {
+        let children = lambda.childNodes();
+        for (long i = 0; i < children.length(); i++) {
+            this.collectThrows(children.get(i), into);
+        }
     }
 
     computeOutward(FunctionDeclarationNode declaration) -> ThrowSet {
@@ -496,6 +530,11 @@ class ModuleExceptions {
                     into.addAll(contractOf(target, this.registry));
                 }
             },
+            // A lambda is a callable of its own: what its body raises belongs to the lambda's
+            // set, never to the function the lambda is written inside.
+            is LambdaExpressionNode ignored -> {
+                return;
+            },
             default -> { },
         }
         let children = node.childNodes();
@@ -546,6 +585,23 @@ class ModuleExceptions {
         for (long i = 0; i < this.typeItems.length(); i++) {
             this.validateTypeItem(this.typeItems.get(i));
         }
+        for (long i = 0; i < this.lambdaItems.length(); i++) {
+            this.validateLambda(this.lambdaItems.get(i));
+        }
+    }
+
+    // A function type never throws, so neither may the body of a lambda written against one. A
+    // lambda carries no catch clauses of its own, so the fix lives in a named function.
+    validateLambda(LambdaExpressionNode lambda) {
+        let outward = this.registry.outwardFor(lambda.green());
+        if (outward.isEmpty()) {
+            return;
+        }
+        this.reporter.report("This lambda's body can throw {nameList(outward)}, and a function "
+            + "type never throws, so nothing can report it to the caller. Handle the failure "
+            + "inside the lambda: move the throwing work into a named function whose own "
+            + "'catch' clause turns the failure into a value, and call that function here.",
+            lambda.arrow().span());
     }
 
     validateFunction(FunctionItem item) {

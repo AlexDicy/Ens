@@ -1,0 +1,187 @@
+// Golden lowering tests for function values: the closure object a lambda becomes, the stores that
+// fill its captures, the body that reads them back, the destructor that gives them up, and the
+// call through the code pointer the object leads with. The goldens pin exactly where each
+// reference changes hands, so a leak or an extra release shows up as a diff.
+import @std.testing;
+import support;
+
+test "a capture-free lambda becomes a closure with no captures" {
+    let dumped = try support.loweredDump(
+        "main() -> int \{\n"
+        + "    (int) -> int step = (a) -> a + 1;\n"
+        + "    return step(41);\n"
+        + "\}\n", "main");
+    try testing.assertEqual(dumped,
+        "func internal @ens.main() -> int \{\n"
+        + "  $0 step: (int) -> int zeroed\n"
+        + "b0.entry:\n"
+        + "  %0 = closure.new @main$lambda0, 0 capture(s): (int) -> int\n"
+        + "  store $0, %0\n"
+        + "  %1 = load $0: (int) -> int\n"
+        + "  %2 = const 41: int\n"
+        + "  %3 = closure_call %1(%2): int\n"
+        + "  %4 = slot_addr $0: &(int) -> int  ; step\n"
+        + "  release_ptr %4\n"
+        + "  ret %3\n"
+        + "\}\n");
+}
+
+test "a captured reference is copied into the closure through the same barrier a field uses" {
+    let dumped = try support.loweredDump(
+        "class Box \{\n"
+        + "    protected int value;\n"
+        + "    protected constructor(this.value);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let box = new Box(7);\n"
+        + "    (int) -> int add = (a) -> a + box.value;\n"
+        + "    return add(1);\n"
+        + "\}\n", "main");
+    try testing.assertEqual(dumped,
+        "func internal @ens.main() -> int \{\n"
+        + "  $0 box: Box zeroed\n"
+        + "  $1 add: (int) -> int zeroed\n"
+        + "b0.entry:\n"
+        + "  %0 = class.new @_dtor$main$Box: Box\n"
+        + "  %1 = const 7: int\n"
+        + "  call @main$Box$constructor(this %0, %1)\n"
+        + "  store $0, %0\n"
+        + "  %2 = closure.new @main$lambda0, 1 capture(s): (int) -> int\n"
+        + "  %3 = load $0: Box\n"
+        + "  %4 = closure_capture %2, 0: &Box\n"
+        + "  retain %3\n"
+        + "  store_ptr %4, %3\n"
+        + "  store $1, %2\n"
+        + "  %5 = load $1: (int) -> int\n"
+        + "  %6 = const 1: int\n"
+        + "  %7 = closure_call %5(%6): int\n"
+        + "  %8 = slot_addr $1: &(int) -> int  ; add\n"
+        + "  release_ptr %8\n"
+        + "  %9 = slot_addr $0: &Box  ; box\n"
+        + "  release_ptr %9\n"
+        + "  ret %7\n"
+        + "\}\n");
+}
+
+test "a lambda's body reads each capture out of a slot filled from the closure object" {
+    let dumped = try support.loweredSymbolDump(
+        "class Box \{\n"
+        + "    protected int value;\n"
+        + "    protected constructor(this.value);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let box = new Box(7);\n"
+        + "    (int) -> int add = (a) -> a + box.value;\n"
+        + "    return add(1);\n"
+        + "\}\n", "main$lambda0");
+    try testing.assertEqual(dumped,
+        "func @main$lambda0(%0: (int) -> int, %1: int) -> int \{\n"
+        + "  $0 box: Box borrowed\n"
+        + "  $1 a: int\n"
+        + "b0.entry:\n"
+        + "  %2 = closure_capture %0, 0: &Box\n"
+        + "  %3 = load_ptr %2: Box\n"
+        + "  store $0, %3\n"
+        + "  store $1, %1\n"
+        + "  %4 = load $1: int\n"
+        + "  %5 = load $0: Box\n"
+        + "  %6 = object_field_addr %5, 0: &int  ; %5.value\n"
+        + "  %7 = load_ptr %6: int\n"
+        + "  %8 = add %4, %7: int\n"
+        + "  ret %8\n"
+        + "\}\n");
+}
+
+test "a closure's destructor gives up every captured reference" {
+    let dumped = try support.closureDestructorDump(
+        "class Box \{\n"
+        + "    protected int value;\n"
+        + "    protected constructor(this.value);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let box = new Box(7);\n"
+        + "    (int) -> int add = (a) -> a + box.value;\n"
+        + "    return add(1);\n"
+        + "\}\n", "main$lambda0");
+    try testing.assertEqual(dumped,
+        "func @main$lambda0$dtor(%0: (int) -> int) -> void \{\n"
+        + "b0.entry:\n"
+        + "  %1 = closure_capture %0, 0: &Box\n"
+        + "  release_ptr %1\n"
+        + "  ret\n"
+        + "\}\n");
+}
+
+test "a captured value type needs no destructor at all" {
+    let analysis = try support.analyzeMain(
+        "main() -> int \{\n"
+        + "    int base = 1;\n"
+        + "    (int) -> int add = (a) -> a + base;\n"
+        + "    return add(1);\n"
+        + "\}\n");
+    bool released = try support.hasClosureDestructor(analysis, "main$lambda0");
+    try testing.assertTrue(!released,
+        "a capture that holds no reference leaves nothing to release");
+}
+
+test "a lambda capturing 'this' reads the receiver out of its own slot" {
+    let dumped = try support.loweredSymbolDump(
+        "class Counter \{\n"
+        + "    protected long total;\n"
+        + "    protected constructor() \{ this.total = 0; \}\n"
+        + "    protected adder() -> (long) -> void \{\n"
+        + "        return (by) -> this.total = this.total + by;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{ return 0; \}\n", "main$lambda0");
+    try testing.assertEqual(dumped,
+        "func @main$lambda0(%0: (long) -> void, %1: long) -> void \{\n"
+        + "  $0 this: Counter borrowed\n"
+        + "  $1 by: long\n"
+        + "b0.entry:\n"
+        + "  %2 = closure_capture %0, 0: &Counter\n"
+        + "  %3 = load_ptr %2: Counter\n"
+        + "  store $0, %3\n"
+        + "  store $1, %1\n"
+        + "  %4 = load $0: Counter\n"
+        + "  %5 = object_field_addr %4, 0: &long  ; %4.total\n"
+        + "  %6 = load $0: Counter\n"
+        + "  %7 = object_field_addr %6, 0: &long  ; %6.total\n"
+        + "  %8 = load_ptr %7: long\n"
+        + "  %9 = load $1: long\n"
+        + "  %10 = add %8, %9: long\n"
+        + "  store_ptr %5, %10\n"
+        + "  ret\n"
+        + "\}\n");
+}
+
+test "a lambda inside a generic body lowers once per instance" {
+    let analysis = try support.analyzeMain(
+        "twice<T>((T) -> T step, T start) -> T \{\n"
+        + "    return step(step(start));\n"
+        + "\}\n"
+        + "picker<T>() -> (T) -> T \{\n"
+        + "    return (value) -> value;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let ints = picker<int>();\n"
+        + "    let longs = picker<long>();\n"
+        + "    return twice<int>(ints, 1) + (twice<long>(longs, 1L)) as int;\n"
+        + "\}\n");
+    try testing.assertEqual(try support.loweredLoadedSymbolDump(analysis, "main$lambda0__int__"),
+        "func @main$lambda0__int__(%0: (int) -> int, %1: int) -> int \{\n"
+        + "  $0 value: int\n"
+        + "b0.entry:\n"
+        + "  store $0, %1\n"
+        + "  %2 = load $0: int\n"
+        + "  ret %2\n"
+        + "\}\n");
+    try testing.assertEqual(try support.loweredLoadedSymbolDump(analysis, "main$lambda0__long__"),
+        "func @main$lambda0__long__(%0: (long) -> long, %1: long) -> long \{\n"
+        + "  $0 value: long\n"
+        + "b0.entry:\n"
+        + "  store $0, %1\n"
+        + "  %2 = load $0: long\n"
+        + "  ret %2\n"
+        + "\}\n");
+}

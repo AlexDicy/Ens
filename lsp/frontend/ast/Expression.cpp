@@ -33,6 +33,7 @@ bool Expression::isExpressionKind(SyntaxKind k) {
         case SyntaxKind::InterpStringExpr:
         case SyntaxKind::TryExpr:
         case SyntaxKind::SwitchExpr:
+        case SyntaxKind::LambdaExpr:
             return true;
         default:
             return false;
@@ -86,6 +87,7 @@ std::optional<StructLiteralExpression> Expression::asStructLiteral() const { ret
 std::optional<InterpStringExpression> Expression::asInterpString() const { return InterpStringExpression::cast(node); }
 std::optional<TryExpression>       Expression::asTry()       const { return TryExpression::cast(node); }
 std::optional<SwitchExpression>    Expression::asSwitch()    const { return SwitchExpression::cast(node); }
+std::optional<LambdaExpression>    Expression::asLambda()    const { return LambdaExpression::cast(node); }
 
 // === LiteralExpression ===
 
@@ -363,7 +365,7 @@ std::optional<Expression> TernaryExpression::elseBranch() const {
 // === NewExpression ===
 
 std::optional<TypeReference> NewExpression::typeReference() const {
-    if (auto tr = firstChildNode(node, SyntaxKind::TypeRef)) return TypeReference::cast(*tr);
+    if (auto tr = firstTypeChild(node)) return TypeReference::cast(*tr);
     return std::nullopt;
 }
 
@@ -614,6 +616,47 @@ std::vector<SwitchArm> SwitchExpression::arms() const {
         if (auto a = SwitchArm::cast(c)) out.push_back(*a);
     }
     return out;
+}
+
+// === LambdaParameter ===
+
+std::optional<TypeReference> LambdaParameter::typeReference() const {
+    if (auto tr = firstTypeChild(node)) return TypeReference::cast(*tr);
+    return std::nullopt;
+}
+
+std::optional<SyntaxNode> LambdaParameter::nameToken() const {
+    // A written type keeps its own name segments inside the type node, so the only
+    // identifier among the direct children is the parameter's name.
+    for (auto& c : node.children()) {
+        if (c.kind() == SyntaxKind::Identifier) return c;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::u16string> LambdaParameter::nameText() const {
+    if (auto t = nameToken()) return std::u16string(t->tokenText());
+    return std::nullopt;
+}
+
+// === LambdaExpression ===
+
+std::vector<LambdaParameter> LambdaExpression::parameters() const {
+    std::vector<LambdaParameter> out;
+    for (auto& c : node.children()) {
+        if (auto p = LambdaParameter::cast(c)) out.push_back(*p);
+    }
+    return out;
+}
+
+std::optional<Expression> LambdaExpression::bodyExpr() const {
+    // The parameters are LambdaParam nodes and their types are type nodes, so the only
+    // direct expression child is the body.
+    return firstExpressionChild(node);
+}
+
+std::optional<SyntaxNode> LambdaExpression::bodyBlockNode() const {
+    return firstChildNode(node, SyntaxKind::Block);
 }
 
 }  // namespace ast

@@ -1215,6 +1215,17 @@ void collectFromExpression(const SyntaxNode& node, const SourceFile& source,
     } else if (auto ca = e->asCast()) {
         if (auto src = ca->source()) collectFromExpression(src->node, source, analysis, out);
         if (auto tr = ca->targetType()) collectFromTypeReference(*tr, source, analysis, out);
+    } else if (auto lm = e->asLambda()) {
+        for (auto& p : lm->parameters()) {
+            if (auto tr = p.typeReference()) collectFromTypeReference(*tr, source, analysis, out);
+            if (auto nameTok = p.nameToken()) {
+                emitTokenAt(out, source, *nameTok, StParameter, StModifierDeclaration);
+            }
+        }
+        if (auto body = lm->bodyExpr()) collectFromExpression(body->node, source, analysis, out);
+        else if (auto block = lm->bodyBlockNode()) {
+            collectFromStatement(*block, source, analysis, out);
+        }
     } else {
         for (auto& child : node.children()) {
             collectFromExpression(child, source, analysis, out);
@@ -1225,6 +1236,19 @@ void collectFromExpression(const SyntaxNode& node, const SourceFile& source,
 void collectFromTypeReference(const ast::TypeReference& tr, const SourceFile& source,
                               const AnalysisResult& analysis,
                               std::vector<SemanticTokenEntry>& out) {
+    // A function type and a type in parentheses name nothing themselves; the types they
+    // are written over do.
+    if (tr.isFunctionType()) {
+        for (auto& p : tr.parameterTypes()) collectFromTypeReference(p, source, analysis, out);
+        if (auto returned = tr.returnedType()) {
+            collectFromTypeReference(*returned, source, analysis, out);
+        }
+        return;
+    }
+    if (tr.isParenthesized()) {
+        if (auto inner = tr.innerType()) collectFromTypeReference(*inner, source, analysis, out);
+        return;
+    }
     auto nameTok = tr.nameToken();
     if (!nameTok) return;
     if (nameTok->kind() != SyntaxKind::Identifier) return;  // primitive keywords handled by TextMate

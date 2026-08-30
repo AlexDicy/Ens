@@ -117,6 +117,7 @@ bool Type::isPrimitive() const {
         case TypeKind::Null:
         case TypeKind::Optional:
         case TypeKind::Array:
+        case TypeKind::Function:
         case TypeKind::Struct:
         case TypeKind::Class:
         case TypeKind::Enum:
@@ -141,6 +142,16 @@ bool Type::equals(const Type* other) const {
     }
     if (kind == TypeKind::TypeParam) {
         return paramOwner == other->paramOwner && paramIndex == other->paramIndex;
+    }
+    if (kind == TypeKind::Function) {
+        if (functionParams.size() != other->functionParams.size()) return false;
+        for (size_t i = 0; i < functionParams.size(); ++i) {
+            Type* a = functionParams[i];
+            Type* b = other->functionParams[i];
+            if (!a || !b || !a->equals(b)) return false;
+        }
+        return functionReturn && other->functionReturn &&
+               functionReturn->equals(other->functionReturn);
     }
     return true;
 }
@@ -261,6 +272,13 @@ bool Type::widensTo(const Type* target) const {
     return false;
 }
 
+// A type under a '?' or '[]' suffix. A function type takes parentheses there, because the
+// suffixes of the written form bind to its return type instead.
+static std::string suffixedForm(const Type* t) {
+    if (!t) return "?";
+    return t->isFunction() ? "(" + t->toString() + ")" : t->toString();
+}
+
 std::string Type::toString() const {
     switch (kind) {
         case TypeKind::Bool:     return "bool";
@@ -278,8 +296,18 @@ std::string Type::toString() const {
         case TypeKind::String:   return "string";
         case TypeKind::Void:     return "void";
         case TypeKind::Null:     return "null";
-        case TypeKind::Optional: return (inner ? inner->toString() : std::string("?")) + "?";
-        case TypeKind::Array:    return (inner ? inner->toString() : std::string("?")) + "[]";
+        case TypeKind::Optional: return suffixedForm(inner) + "?";
+        case TypeKind::Array:    return suffixedForm(inner) + "[]";
+        case TypeKind::Function: {
+            std::string r = "(";
+            for (size_t i = 0; i < functionParams.size(); ++i) {
+                if (i) r += ", ";
+                r += functionParams[i] ? functionParams[i]->toString() : "?";
+            }
+            r += ") -> ";
+            r += functionReturn ? functionReturn->toString() : "?";
+            return r;
+        }
         case TypeKind::Struct:
         case TypeKind::Class:    {
             std::string r;

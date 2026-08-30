@@ -1,0 +1,263 @@
+// The two shapes '(' opens: a lambda or a parenthesized expression in expression position, and a
+// function type or a type in parentheses in type position. Every parse asserts the byte-for-byte
+// round trip.
+import @std.testing;
+import parse.parser_support;
+import ParseResult from parse.parser;
+import SyntaxKind from syntax.generated.kind;
+import syntax.generated.factory;
+import SourceFileNode from syntax.generated.nodes;
+import SyntaxNode from syntax.node;
+import Expression from syntax.generated.nodes;
+import LambdaExpressionNode from syntax.generated.nodes;
+import BinaryExpressionNode from syntax.generated.nodes;
+import CallExpressionNode from syntax.generated.nodes;
+import StructLiteralExpressionNode from syntax.generated.nodes;
+import BlockNode from syntax.generated.nodes;
+import ParenthesizedExpressionNode from syntax.generated.nodes;
+import FunctionTypeNode from syntax.generated.nodes;
+import ParenthesizedTypeNode from syntax.generated.nodes;
+import OptionalTypeNode from syntax.generated.nodes;
+import NamedTypeNode from syntax.generated.nodes;
+import VariableDeclarationNode from syntax.generated.nodes;
+import FunctionDeclarationNode from syntax.generated.nodes;
+import SwitchStatementNode from syntax.generated.nodes;
+import ValueArmNode from syntax.generated.nodes;
+import Type from syntax.generated.nodes;
+
+test "an untyped lambda takes its parameters and an expression body" {
+    let node = try lambdaOf("(a, b) -> a - b");
+    try testing.assertEqual(node.parametersCount(), 2L);
+    try testing.assertEqual(node.parameters(0).name().text(), "a");
+    try testing.assertTrue(node.parameters(0).declaredType() == null,
+        "an untyped parameter declares no type");
+    try testing.assertEqual(node.parameters(1).name().text(), "b");
+    try testing.assertTrue(node.body() is BinaryExpressionNode, "the body is a subtraction");
+}
+
+test "a lambda takes zero and one parameters" {
+    let none = try lambdaOf("() -> make()");
+    try testing.assertEqual(none.parametersCount(), 0L);
+    try testing.assertTrue(none.body() is CallExpressionNode, "the body is a call");
+    let one = try lambdaOf("(value) -> value * 2");
+    try testing.assertEqual(one.parametersCount(), 1L);
+    try testing.assertEqual(one.parameters(0).name().text(), "value");
+}
+
+test "a lambda's parameter types may be written" {
+    let node = try lambdaOf("(int a, string b) -> a");
+    try testing.assertEqual(node.parametersCount(), 2L);
+    let first = node.parameters(0).declaredType();
+    if (first is NamedTypeNode) {
+        try testing.assertEqual(first.name().text(), "int");
+    } else {
+        try testing.fail("the first parameter should declare 'int'");
+    }
+    try testing.assertEqual(node.parameters(1).name().text(), "b");
+}
+
+test "a parameter of a lambda may itself be function typed" {
+    let node = try lambdaOf("((int) -> bool test) -> test");
+    try testing.assertEqual(node.parametersCount(), 1L);
+    try testing.assertEqual(node.parameters(0).name().text(), "test");
+    let declared = node.parameters(0).declaredType();
+    try testing.assertTrue(declared is FunctionTypeNode,
+        "the parameter's type should be a function type");
+}
+
+test "a lambda body may be a block" {
+    let node = try lambdaOf("(a) -> \{ return a; \}");
+    try testing.assertTrue(node.body() is BlockNode, "the body is a block");
+}
+
+test "a braced lambda body reads as a struct literal when it names fields" {
+    let node = try lambdaOf("(a) -> \{x: a, y: a\}");
+    try testing.assertTrue(node.body() is StructLiteralExpressionNode,
+        "the body is a struct literal");
+}
+
+test "a lambda body extends as far right as it can" {
+    let node = try lambdaOf("(a) -> a + 1 == 2");
+    let body = node.body();
+    if (body is BinaryExpressionNode) {
+        try testing.assertEqual(body.operator().text(), "==");
+    } else {
+        try testing.fail("the body should be the whole comparison");
+    }
+}
+
+test "a lambda in an argument list stops at the comma" {
+    let node = try parser_support.expressionNode("sort(items, (a, b) -> a - b, 3)");
+    if (node is CallExpressionNode) {
+        try testing.assertEqual(node.arguments().argumentsCount(), 3L);
+        try testing.assertTrue(node.arguments().arguments(1) is LambdaExpressionNode,
+            "the second argument is a lambda");
+    } else {
+        try testing.fail("a lambda argument should parse");
+    }
+}
+
+test "a lambda may return a lambda" {
+    let node = try lambdaOf("(a) -> (b) -> a + b");
+    try testing.assertTrue(node.body() is LambdaExpressionNode, "the body is another lambda");
+}
+
+test "parentheses with no arrow stay a parenthesized expression" {
+    let node = try parser_support.expressionNode("(a - b) * 2");
+    if (node is BinaryExpressionNode) {
+        try testing.assertEqual(node.left().kind(), SyntaxKind.ParenthesizedExpression);
+    } else {
+        try testing.fail("'(a - b) * 2' should stay a multiplication");
+    }
+    let grouped = try parser_support.expressionNode("(a)");
+    try testing.assertEqual(grouped.kind(), SyntaxKind.ParenthesizedExpression);
+}
+
+test "a parenthesized switch label is the arm, not a lambda" {
+    let text = "run() \{ switch (n) \{ (one) -> handle(), -1 -> other(), default -> stop() \} \}";
+    let result = parser_support.parseText(text);
+    try parser_support.assertRoundTrip(text, result);
+    try parser_support.assertNoDiagnostics(result);
+    let statement = try onlyStatementOf(result);
+    if (statement is SwitchStatementNode) {
+        try testing.assertEqual(statement.armsCount(), 3L);
+        let first = statement.arms(0);
+        if (first is ValueArmNode) {
+            try testing.assertEqual(first.labels(0).kind(),
+                SyntaxKind.ParenthesizedExpression);
+        } else {
+            try testing.fail("the first arm should be a value arm");
+        }
+    } else {
+        try testing.fail("the body should hold a switch statement");
+    }
+}
+
+test "an unparenthesized lambda parameter reports the parenthesized form" {
+    let result = parser_support.parseExpressionText("a -> a * 2");
+    try parser_support.assertRoundTrip("a -> a * 2", result);
+    try parser_support.assertDiagnosticCount(result, 1);
+    try testing.assertEqual(result.diagnostics()[0].message(),
+        "A lambda's parameters are always written in parentheses: use '(a) -> ...' rather "
+        + "than 'a -> ...'");
+}
+
+test "a function type reads its parameter types and its return type" {
+    let node = try typeOfLocal("(int, int) -> int order");
+    if (node is FunctionTypeNode) {
+        try testing.assertEqual(node.parameterTypesCount(), 2L);
+        try testing.assertEqual(node.returnedType().kind(), SyntaxKind.NamedType);
+    } else {
+        try testing.fail("'(int, int) -> int' should be a function type");
+    }
+}
+
+test "a function type takes no parameters" {
+    let node = try typeOfLocal("() -> string make");
+    if (node is FunctionTypeNode) {
+        try testing.assertEqual(node.parameterTypesCount(), 0L);
+    } else {
+        try testing.fail("'() -> string' should be a function type");
+    }
+}
+
+test "a suffix after the return type belongs to that return type" {
+    let node = try typeOfLocal("(int) -> bool? test");
+    if (node is FunctionTypeNode) {
+        try testing.assertEqual(node.returnedType().kind(), SyntaxKind.OptionalType);
+    } else {
+        try testing.fail("'(int) -> bool?' should be a function type");
+    }
+}
+
+test "a parenthesized function type takes the suffixes itself" {
+    let optional = try typeOfLocal("((int) -> bool)? test");
+    if (optional is OptionalTypeNode) {
+        let inner = optional.inner();
+        if (inner is ParenthesizedTypeNode) {
+            try testing.assertEqual(inner.inner().kind(), SyntaxKind.FunctionType);
+        } else {
+            try testing.fail("the optional should wrap a parenthesized type");
+        }
+    } else {
+        try testing.fail("'((int) -> bool)?' should be an optional type");
+    }
+    let array = try typeOfLocal("((int) -> bool)[] tests");
+    try testing.assertEqual(array.kind(), SyntaxKind.ArrayType);
+}
+
+test "a function type nests in both positions" {
+    let returning = try typeOfLocal("(int) -> (int) -> int curried");
+    if (returning is FunctionTypeNode) {
+        try testing.assertEqual(returning.returnedType().kind(), SyntaxKind.FunctionType);
+    } else {
+        try testing.fail("a function type returning a function type should parse");
+    }
+    let taking = try typeOfLocal("((int) -> bool, int) -> int folded");
+    if (taking is FunctionTypeNode) {
+        try testing.assertEqual(taking.parameterTypesCount(), 2L);
+        try testing.assertEqual(taking.parameterTypes(0).kind(), SyntaxKind.FunctionType);
+    } else {
+        try testing.fail("a function type taking a function type should parse");
+    }
+}
+
+test "a function type is an ordinary type elsewhere" {
+    let sources = ["class Sorter \{ (int, int) -> int order; \}",
+        "pick() -> (int) -> int \{ return null; \}",
+        "hold() \{ let box = new List<(int) -> bool>(); \}",
+        "apply((int) -> int f, int x) -> int \{ return f(x); \}",
+        "keep(((int) -> bool)[] tests) \{ \}"];
+    for (let text in sources) {
+        let result = parser_support.parseText(text);
+        try parser_support.assertRoundTrip(text, result);
+        try parser_support.assertNoDiagnostics(result);
+    }
+}
+
+test "a type in parentheses with no arrow needs its closing bracket" {
+    let result = parser_support.parseStatementText("(int, int) x = 1;");
+    try parser_support.assertRoundTrip("(int, int) x = 1;", result);
+    try testing.assertTrue(result.diagnostics().length > 0,
+        "'(int, int)' with no '->' should report");
+}
+
+// The lambda a standalone expression parse produced.
+lambdaOf(string text) -> LambdaExpressionNode throws {
+    let node = try parser_support.expressionNode(text);
+    if (node is LambdaExpressionNode) {
+        return node;
+    }
+    try testing.fail("'{text}' should be a lambda expression");
+}
+
+// The one statement of a single-function file's body.
+onlyStatementOf(ParseResult result) -> SyntaxNode throws {
+    let root = factory.createRoot(result.root());
+    if (root is SourceFileNode) {
+        let item = root.items(0);
+        if (item is FunctionDeclarationNode) {
+            let body = item.body();
+            if (body != null) {
+                return body.statements(0);
+            }
+        }
+    }
+    try testing.fail("the file should hold one function with one statement");
+}
+
+// The declared type of the only local in a single-function file's body.
+typeOfLocal(string declaration) -> Type throws {
+    string text = "run() \{ " + declaration + " = null; \}";
+    let result = parser_support.parseText(text);
+    try parser_support.assertRoundTrip(text, result);
+    try parser_support.assertNoDiagnostics(result);
+    let statement = try onlyStatementOf(result);
+    if (statement is VariableDeclarationNode) {
+        let declared = statement.declaredType();
+        if (declared != null) {
+            return declared;
+        }
+    }
+    try testing.fail("'{declaration}' should declare a typed local");
+}

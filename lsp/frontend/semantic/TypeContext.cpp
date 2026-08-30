@@ -41,6 +41,23 @@ Type* TypeContext::getArray(Type* element) {
     return t;
 }
 
+// Interned by its parameter types and its return type, so two spellings of the same shape
+// are the same object and assignability between function types is identity.
+Type* TypeContext::getFunction(std::vector<Type*> params, Type* returnType) {
+    if (!returnType || returnType->isError()) return errorType;
+    for (Type* p : params) {
+        if (!p || p->isError()) return errorType;
+    }
+    FunctionKey key{std::move(params), returnType};
+    auto it = functionCache.find(key);
+    if (it != functionCache.end()) return it->second;
+    Type* t = allocate(TypeKind::Function);
+    t->functionParams = key.params;
+    t->functionReturn = returnType;
+    functionCache[std::move(key)] = t;
+    return t;
+}
+
 Type* TypeContext::primitiveFromName(const std::u16string& name) {
     if (name == u"bool")    return getPrimitive(TypeKind::Bool);
     if (name == u"byte")    return getPrimitive(TypeKind::Byte);
@@ -198,6 +215,12 @@ Type* TypeContext::substitute(Type* t, const void* owner, const std::vector<Type
             return getArray(substitute(t->inner, owner, args));
         case TypeKind::Optional:
             return getOptional(substitute(t->inner, owner, args));
+        case TypeKind::Function: {
+            std::vector<Type*> params;
+            params.reserve(t->functionParams.size());
+            for (Type* p : t->functionParams) params.push_back(substitute(p, owner, args));
+            return getFunction(std::move(params), substitute(t->functionReturn, owner, args));
+        }
         case TypeKind::Struct:
         case TypeKind::Class:
             if (t->structInfo && t->structInfo->templateOf) {
@@ -423,6 +446,11 @@ bool TypeContext::containsTypeParam(const Type* t) {
         case TypeKind::Array:
         case TypeKind::Optional:
             return containsTypeParam(t->inner);
+        case TypeKind::Function:
+            for (const Type* p : t->functionParams) {
+                if (containsTypeParam(p)) return true;
+            }
+            return containsTypeParam(t->functionReturn);
         case TypeKind::Struct:
         case TypeKind::Class:
             if (t->structInfo && t->structInfo->templateOf) {

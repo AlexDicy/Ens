@@ -165,9 +165,10 @@ struct ParserMark {
     long recoveryCount;
 }
 
-// Expressions nest through recursion; beyond this depth the parser stops recursing and emits an
-// error expression so pathological inputs cannot exhaust the stack.
-maximumExpressionDepth() -> long {
+// Expressions and types nest through recursion; beyond this depth the parser stops recursing and
+// abandons the construct, so neither its own stack nor the walk any later phase makes over the
+// tree it produces can be driven past its limit by a pathological input.
+maximumNestingDepth() -> long {
     return 500;
 }
 
@@ -187,7 +188,14 @@ class Parser {
     RewindableList<ParseEvent> events;
     RewindableList<Diagnostic> diagnostics;
     RewindableList<Recovery> recoveries;
-    long expressionDepth;
+
+    // How deeply expressions and types are nested at this point; see maximumNestingDepth.
+    long nestingDepth;
+
+    // True while a switch arm's labels are being parsed. There a '->' ends the labels, so
+    // 'Circle -> ...' and '(1) -> ...' are the arm rather than a lambda; a label is a constant,
+    // so no lambda can appear inside one anyway.
+    bool inArmLabels;
 
     protected constructor(Source input, LexedToken[] tokens) {
         this.input = input;
@@ -199,7 +207,8 @@ class Parser {
         this.events = new RewindableList<ParseEvent>();
         this.diagnostics = new RewindableList<Diagnostic>();
         this.recoveries = new RewindableList<Recovery>();
-        this.expressionDepth = 0;
+        this.nestingDepth = 0;
+        this.inArmLabels = false;
     }
 
     protected finishedEvents() -> ParseEvent[] {
@@ -518,6 +527,89 @@ class Parser {
             return false;
         }
         return this.tokens[this.position].end() == this.tokens[next].offset;
+    }
+
+    // ============================================================ nesting depth
+
+    // Enters one level of nesting, or reports that the limit is reached and leaves it to the caller
+    // to abandon what it was parsing. Expressions and types share the count because each can
+    // contain the other, so neither can carry the pair past the limit on its own.
+    enterNesting(string message) -> bool {
+        if (this.nestingDepth >= maximumNestingDepth()) {
+            this.report(message, source.makeSpan(this.lastContentEnd, 0));
+            return false;
+        }
+        this.nestingDepth++;
+        return true;
+    }
+
+    leaveNesting() {
+        this.nestingDepth--;
+    }
+
+    // A node standing in for a construct the parser gave up on, holding the tokens it abandoned.
+    abandoned(SyntaxKind nodeKind) -> long {
+        let marker = this.start();
+        let skipped = this.start();
+        this.skipAbandonedTokens();
+        this.complete(skipped, SyntaxKind.List);
+        return this.complete(marker, nodeKind);
+    }
+
+    // The tokens of an abandoned construct: nesting inside it is consumed whole, so the constructs
+    // around it still find the closing tokens they are waiting for and the parse resumes at the
+    // right place instead of reporting one problem per enclosing level. A closer or ',' at the
+    // outer level ends the skip, as does a ';' or '\}' anywhere, since neither can belong to what
+    // was abandoned.
+    skipAbandonedTokens() {
+        long depth = 0;
+        while (!this.atEnd()) {
+            let kind = this.currentKind();
+            if (kind == SyntaxKind.Semicolon || kind == SyntaxKind.CloseBrace) {
+                return;
+            }
+            if (kind == SyntaxKind.OpenParenthesis || kind == SyntaxKind.OpenBracket) {
+                depth++;
+            } else if (kind == SyntaxKind.CloseParenthesis
+                    || kind == SyntaxKind.CloseBracket) {
+                if (depth == 0) {
+                    return;
+                }
+                depth--;
+            } else if (depth == 0 && kind == SyntaxKind.Comma) {
+                return;
+            }
+            this.bump();
+        }
+    }
+
+    // ============================================================ arrow after parentheses
+
+    // At '(': true when the token after the matching ')' is '->'. Both readings of a leading '('
+    // ask this one question. In type position it tells a function type from a type in
+    // parentheses, and in expression position a lambda from a parenthesized expression. Reads the
+    // token kinds directly, so the answer costs no events, no diagnostics and no stack beyond this
+    // frame however deeply the question is asked.
+    atArrowAfterParentheses() -> bool {
+        long depth = 0;
+        long index = this.position;
+        while (index < this.tokens.length) {
+            let kind = this.tokens[index].kind;
+            if (kind == SyntaxKind.EndOfFile) {
+                return false;
+            }
+            if (kind == SyntaxKind.OpenParenthesis) {
+                depth++;
+            } else if (kind == SyntaxKind.CloseParenthesis) {
+                depth--;
+            }
+            index++;
+            if (depth == 0) {
+                return index < this.tokens.length
+                    && this.tokens[index].kind == SyntaxKind.Arrow;
+            }
+        }
+        return false;
     }
 
     // ============================================================ top level
@@ -1078,7 +1170,7 @@ class Parser {
     }
 
     atParameterStart() -> bool {
-        return this.at(SyntaxKind.ThisKeyword) || isTypeStart(this.currentKind());
+        return this.at(SyntaxKind.ThisKeyword) || isTypeOrGroupStart(this.currentKind());
     }
 
     parseParameter() {
@@ -1279,7 +1371,7 @@ class Parser {
         while (isModifier(this.peekKind(modifierCount))) {
             modifierCount++;
         }
-        if (isTypeStart(this.peekKind(modifierCount))) {
+        if (isTypeOrGroupStart(this.peekKind(modifierCount))) {
             this.parseFieldDeclaration();
             return;
         }
@@ -1625,7 +1717,7 @@ class Parser {
     // True at `Type name = ...` or `Type name;`, the typed variable-declaration shape. The type
     // is parsed speculatively and always rewound; the caller re-parses it for real.
     atTypedVariableDeclaration() -> bool {
-        if (!isTypeStart(this.currentKind())) {
+        if (!isTypeOrGroupStart(this.currentKind())) {
             return false;
         }
         let restore = this.mark();
@@ -1660,7 +1752,7 @@ class Parser {
         }
         bool bareName = this.at(SyntaxKind.Identifier)
             && (this.peekKind(1) == SyntaxKind.Equals || this.peekKind(1) == SyntaxKind.Semicolon);
-        if (!bareName && isTypeStart(this.currentKind())) {
+        if (!bareName && isTypeOrGroupStart(this.currentKind())) {
             this.parseType("");
         }
         string name = "";
@@ -1685,7 +1777,7 @@ class Parser {
         if (bareName) {
             this.nullSlot();
             this.bump();
-        } else if (isTypeStart(this.currentKind())) {
+        } else if (isTypeOrGroupStart(this.currentKind())) {
             this.parseType("Expected the variable's type");
             this.expect(SyntaxKind.Identifier,
                 "Expected the variable's name after its type, for example 'int count = 0;'");
@@ -1814,7 +1906,7 @@ class Parser {
         bool result;
         if (this.at(SyntaxKind.Identifier) && this.peekIsContextual(1, "in")) {
             result = true;
-        } else if (isTypeStart(this.currentKind())) {
+        } else if (isTypeOrGroupStart(this.currentKind())) {
             this.parseType("");
             result = this.clean(restore) && this.at(SyntaxKind.Identifier)
                 && this.peekIsContextual(1, "in");
@@ -1947,6 +2039,8 @@ class Parser {
             default -> {
                 let marker = this.start();
                 let labels = this.start();
+                bool outerLabels = this.inArmLabels;
+                this.inArmLabels = true;
                 this.parseExpression();
                 while (this.at(SyntaxKind.Comma)) {
                     this.bump();
@@ -1956,6 +2050,7 @@ class Parser {
                     }
                     this.parseExpression();
                 }
+                this.inArmLabels = outerLabels;
                 this.complete(labels, SyntaxKind.List);
                 this.expect(SyntaxKind.Arrow, "Expected '->' after the switch labels, for "
                     + "example '1 -> handleOne()'");
@@ -1998,9 +2093,72 @@ class Parser {
 
     // ============================================================ types
 
-    // Type = NamedType with any chain of '?' and '[]' suffixes; returns the completed marker.
+    // Type = a type head with any chain of '?' and '[]' suffixes; returns the completed marker.
     parseType(string missingMessage) -> long {
-        return this.parseTypeSuffixes(this.parseNamedType(missingMessage), false);
+        return this.parseTypeAndSuffixes(missingMessage, false);
+    }
+
+    // Every written type is parsed here, which is where its nesting is bounded.
+    parseTypeAndSuffixes(string missingMessage, bool leaveCoalesceToExpression) -> long {
+        if (!this.enterNesting("This type nests too deeply to be parsed; reduce how deeply its "
+                + "parentheses and type arguments nest")) {
+            return this.abandoned(SyntaxKind.ErrorType);
+        }
+        long completed = this.parseTypeSuffixes(this.parseTypeHead(missingMessage),
+            leaveCoalesceToExpression);
+        this.leaveNesting();
+        return completed;
+    }
+
+    // The head a type starts with: a function type or a type in parentheses when it opens with
+    // '(', and a named type otherwise.
+    parseTypeHead(string missingMessage) -> long {
+        if (this.at(SyntaxKind.OpenParenthesis)) {
+            if (this.atArrowAfterParentheses()) {
+                return this.parseFunctionType();
+            }
+            return this.parseParenthesizedType();
+        }
+        return this.parseNamedType(missingMessage);
+    }
+
+    // FunctionType = '(' parameterTypes ')' '->' returnedType. The caller has established that
+    // the token after the matching ')' is '->'.
+    parseFunctionType() -> long {
+        let marker = this.start();
+        this.bump();
+        let list = this.start();
+        if (!this.at(SyntaxKind.CloseParenthesis) && !this.atEnd()) {
+            this.parseType("Expected a parameter type, for example '(int, int) -> int'");
+            while (this.at(SyntaxKind.Comma)) {
+                this.bump();
+                if (this.at(SyntaxKind.CloseParenthesis)) {
+                    break;
+                }
+                this.parseType("Expected a parameter type after ','");
+            }
+        }
+        this.complete(list, SyntaxKind.List);
+        this.expect(SyntaxKind.CloseParenthesis,
+            "Expected ')' to close the function type's parameter types");
+        this.expect(SyntaxKind.Arrow,
+            "Expected '->' after the parameter types, for example '(int, int) -> int'");
+        this.parseType("Expected the return type after '->', for example '(int, int) -> int'");
+        return this.complete(marker, SyntaxKind.FunctionType);
+    }
+
+    // ParenthesizedType = '(' inner: Type ')'. The parentheses exist so a '?' or '[]' suffix can
+    // apply to a function type, which is the only type they are allowed around. Every form is
+    // parsed here and the restriction is a semantic one, because a type in parentheses is parsed
+    // speculatively wherever a statement could begin with one, and a rejection reported here
+    // would make that reading look like a failure and cost the declaration its shape.
+    parseParenthesizedType() -> long {
+        let marker = this.start();
+        this.bump();
+        this.parseType("Expected a type inside the parentheses, for example '((int) -> bool)?'");
+        this.expect(SyntaxKind.CloseParenthesis, "Expected ')' after the type in parentheses; a "
+            + "function type needs '->' and its return type too, for example '(int, int) -> int'");
+        return this.complete(marker, SyntaxKind.ParenthesizedType);
     }
 
     // The target of 'as' or 'as?'. This is the one type position an expression continues from, so
@@ -2010,7 +2168,7 @@ class Parser {
     // the suffixes stay greedy. Giving the pair up here loses no valid reading, because 'as' and
     // 'as?' reject a nullable target outright.
     parseCastTargetType(string missingMessage) -> long {
-        return this.parseTypeSuffixes(this.parseNamedType(missingMessage), true);
+        return this.parseTypeAndSuffixes(missingMessage, true);
     }
 
     parseTypeSuffixes(long named, bool leaveCoalesceToExpression) -> long {
@@ -2100,12 +2258,10 @@ class Parser {
     }
 
     parsePrecedence(long minPrecedence) -> long {
-        if (this.expressionDepth >= maximumExpressionDepth()) {
-            this.report("This expression nests too deeply to be parsed; split it into smaller "
-                + "expressions", source.makeSpan(this.lastContentEnd, 0));
-            return this.emptyErrorExpression();
+        if (!this.enterNesting("This expression nests too deeply to be parsed; split it into "
+                + "smaller expressions")) {
+            return this.abandoned(SyntaxKind.ErrorExpression);
         }
-        this.expressionDepth++;
         long completed = this.parsePrefix();
         while (true) {
             let operator = this.currentKind();
@@ -2223,7 +2379,7 @@ class Parser {
                 },
             }
         }
-        this.expressionDepth--;
+        this.leaveNesting();
         return completed;
     }
 
@@ -2242,12 +2398,16 @@ class Parser {
     }
 
     parsePrefix() -> long {
+        bool lambdaHere = !this.inArmLabels;
         switch (this.currentKind()) {
             IntLiteral, LongLiteral, FloatLiteral, DoubleLiteral, StringLiteral, CharLiteral,
             TrueKeyword, FalseKeyword, NullKeyword -> {
                 return this.parseSingleTokenExpression(SyntaxKind.LiteralExpression);
             },
             Identifier, StringKeyword -> {
+                if (lambdaHere && this.peekKind(1) == SyntaxKind.Arrow) {
+                    return this.parseBareParameterLambda();
+                }
                 return this.parseSingleTokenExpression(SyntaxKind.IdentifierExpression);
             },
             ThisKeyword -> {
@@ -2257,6 +2417,9 @@ class Parser {
                 return this.parseSingleTokenExpression(SyntaxKind.SuperExpression);
             },
             OpenParenthesis -> {
+                if (lambdaHere && this.atArrowAfterParentheses()) {
+                    return this.parseLambda();
+                }
                 let marker = this.start();
                 this.bump();
                 this.parseExpression();
@@ -2302,6 +2465,105 @@ class Parser {
         let marker = this.start();
         this.bump();
         return this.complete(marker, nodeKind);
+    }
+
+    // ============================================================ lambdas
+
+    // LambdaExpression = '(' parameters ')' '->' body. The caller has established that the token
+    // after the matching ')' is '->'.
+    parseLambda() -> long {
+        let marker = this.start();
+        this.bump();
+        this.parseLambdaParameters();
+        this.expect(SyntaxKind.CloseParenthesis,
+            "Expected ')' to close the lambda's parameters");
+        this.expect(SyntaxKind.Arrow,
+            "Expected '->' after the lambda's parameters, for example '(a, b) -> a - b'");
+        this.parseLambdaBody();
+        return this.complete(marker, SyntaxKind.LambdaExpression);
+    }
+
+    // 'a -> a * 2', which the language does not accept: the parentheses around a lambda's
+    // parameters are always required. The name becomes the sole parameter of a lambda whose
+    // parentheses the parser supplies, so the body is still checked.
+    parseBareParameterLambda() -> long {
+        this.reportAtCurrent("A lambda's parameters are always written in parentheses: use "
+            + "'({this.currentText()}) -> ...' rather than "
+            + "'{this.currentText()} -> ...'");
+        let marker = this.start();
+        this.missingInPlace();
+        let list = this.start();
+        let parameter = this.start();
+        this.nullSlot();
+        this.bumpAs(SyntaxKind.Identifier);
+        this.complete(parameter, SyntaxKind.LambdaParameter);
+        this.complete(list, SyntaxKind.List);
+        this.missingInPlace();
+        this.bump();
+        this.parseLambdaBody();
+        return this.complete(marker, SyntaxKind.LambdaExpression);
+    }
+
+    parseLambdaParameters() {
+        let list = this.start();
+        bool needSeparator = false;
+        while (!this.at(SyntaxKind.CloseParenthesis) && !this.atEnd()) {
+            if (needSeparator) {
+                if (this.at(SyntaxKind.Comma)) {
+                    this.bump();
+                    if (this.at(SyntaxKind.CloseParenthesis)) {
+                        this.report("Expected a parameter after ','",
+                            source.makeSpan(this.lastContentEnd, 0));
+                        break;
+                    }
+                } else {
+                    this.missing(SyntaxKind.Comma,
+                        "Expected ',' between the lambda's parameters");
+                }
+            }
+            this.parseLambdaParameter();
+            needSeparator = true;
+        }
+        this.complete(list, SyntaxKind.List);
+    }
+
+    // LambdaParameter = declaredType? name. A bare name takes its type from the target type; a
+    // written type comes first, exactly as in a parameter list.
+    parseLambdaParameter() {
+        let marker = this.start();
+        bool bareName = this.at(SyntaxKind.Identifier)
+            && (this.peekKind(1) == SyntaxKind.Comma
+                || this.peekKind(1) == SyntaxKind.CloseParenthesis);
+        if (!bareName && isTypeOrGroupStart(this.currentKind())) {
+            this.parseType("Expected the parameter's type, for example '(int a, int b) -> a - b'");
+        } else {
+            this.nullSlot();
+        }
+        if (this.at(SyntaxKind.Identifier)) {
+            this.bump();
+        } else if (this.at(SyntaxKind.Comma) || this.at(SyntaxKind.CloseParenthesis)) {
+            this.missing(SyntaxKind.Identifier, "Expected the parameter's name after its type, "
+                + "for example '(int a, int b) -> a - b'");
+        } else if (kind.isKeyword(this.currentKind())) {
+            this.reportAtCurrent("'{this.currentText()}' is a keyword and cannot be used as a "
+                + "parameter name; choose a different name such as 'value'");
+            this.bumpAs(SyntaxKind.Identifier);
+        } else {
+            this.reportAtCurrent("Expected the lambda parameter's name, for example "
+                + "'(a, b) -> a - b'");
+            this.bumpAs(SyntaxKind.Identifier);
+        }
+        this.complete(marker, SyntaxKind.LambdaParameter);
+    }
+
+    // The body after '->': a block when a '{' follows that is not a struct literal, and a single
+    // expression otherwise.
+    parseLambdaBody() {
+        if (this.at(SyntaxKind.OpenBrace) && !this.atStructLiteralStart()) {
+            this.parseBlock();
+            return;
+        }
+        this.parseExpression();
     }
 
     // InterpolatedStringExpression = start firstHole (middle hole)* end; the lexer guarantees
@@ -2414,7 +2676,7 @@ class Parser {
 
     parseNewCreatedType() {
         long completed =
-            this.parseNamedType("Expected a type after 'new', for example 'new Point(0, 0)'");
+            this.parseTypeHead("Expected a type after 'new', for example 'new Point(0, 0)'");
         while (true) {
             if (this.at(SyntaxKind.Question)) {
                 let marker = this.precede(completed);
@@ -2503,6 +2765,12 @@ class Parser {
 
 isTypeStart(SyntaxKind kind) -> bool {
     return kind == SyntaxKind.Identifier || isPrimitiveTypeKeyword(kind);
+}
+
+// Where a whole Type is expected rather than a NamedType: a '(' opens a function type or a type
+// in parentheses.
+isTypeOrGroupStart(SyntaxKind kind) -> bool {
+    return isTypeStart(kind) || kind == SyntaxKind.OpenParenthesis;
 }
 
 isPrimitiveTypeKeyword(SyntaxKind kind) -> bool {

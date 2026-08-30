@@ -1,0 +1,145 @@
+// Function values as heap objects: the object a lambda's evaluation hands back, the address of a
+// capture inside one, and the call through the code pointer the object leads with.
+//
+// A closure object is one pointer wide from the outside, exactly like a class reference, and its
+// payload is the code pointer followed by one word per capture. The 32-byte header sits below the
+// payload as it does for every other object, so retain, release and the destructor call all reach
+// a function value with no special case. The type descriptor slot stays null: a function value has
+// no identity, no text form and no runtime type test, so nothing ever reads it.
+//
+// A lambda with nothing to capture allocates nothing: its object is a read-only global carrying
+// the immortal strong count, so every evaluation hands back the same pointer and reference
+// counting on it is a runtime no-op.
+import EirCallee from eir.model;
+import EirClosureCall from eir.model;
+import EirClosureCapture from eir.model;
+import EirClosureNew from eir.model;
+import Type from @ens.sema.model.types;
+import FunctionType from @ens.sema.model.types;
+import @ens.sema.model.types;
+import TypeRef from @ens.llvm.types;
+import Value from @ens.llvm.values;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import @ens.llvm.globals;
+import ModuleEmitter from emit.context;
+import EmissionFrame from emit.context;
+import emit.exceptions;
+import emit.signatures;
+import support.primitives;
+import List from @std.collections.list;
+
+public emitClosureNew(ModuleEmitter emitter, EmissionFrame frame,
+                      EirClosureNew closure) -> string {
+    let functionType = primitives.functionOf(closure.type);
+    if (functionType == null) {
+        return "Internal: closure.new produces a non-function type in {frame.symbol()}";
+    }
+    let target = bodyValue(emitter, closure.targetSymbol, functionType);
+    if (closure.captureTypes.length == 0) {
+        frame.define(closure.result, immortalObject(emitter, closure.targetSymbol, target));
+        return "";
+    }
+    let layout = closureLayout(emitter, closure.captureTypes);
+    let payloadBytes = emitter.context.int64Type().constInt(
+        emitter.dataLayout().abiSizeOfType(layout), false);
+    // No destructor is named when the captures hold no reference, so the object header carries
+    // no finalizer and releasing it only gives the allocation back.
+    let finalizer = emitter.runtime.nullPointer();
+    if (closure.destructorSymbol.length > 0) {
+        finalizer = emitter.objectDestructor(closure.destructorSymbol);
+    }
+    let object = emitter.runtime.call(emitter.runtime.alloc(),
+        [payloadBytes, finalizer, emitter.runtime.nullPointer()], "closure");
+    memory.buildStore(emitter.builder, target, object);
+    frame.define(closure.result, object);
+    return "";
+}
+
+public emitClosureCapture(ModuleEmitter emitter, EmissionFrame frame,
+                          EirClosureCapture capture) {
+    frame.define(capture.result, memory.buildStructGEP(emitter.builder,
+        closureLayout(emitter, capture.captureTypes), frame.value(capture.closure),
+        (capture.captureIndex + 1) as uint, ""));
+}
+
+public emitClosureCall(ModuleEmitter emitter, EmissionFrame frame,
+                       EirClosureCall call) -> string {
+    let functionType = primitives.functionOf(frame.tempType(call.closure));
+    if (functionType == null) {
+        return "Internal: closure_call calls a value that is not a function value in "
+            + "{frame.symbol()}";
+    }
+    exceptions.markSite(emitter, frame, call.line);
+    let closure = frame.value(call.closure);
+    let target = memory.buildLoad(emitter.builder, emitter.context.pointerType(), closure,
+        "closure.code");
+    let arguments = new List<Value>();
+    arguments.push(closure);
+    for (let argument in call.arguments) {
+        arguments.push(frame.value(argument));
+    }
+    let produced = instructions.buildCall(emitter.builder,
+        signatures.calleeType(emitter, calleeFor("", functionType)), target,
+        arguments.toArray(), "");
+    if (call.result >= 0) {
+        frame.define(call.result, produced);
+    }
+    return "";
+}
+
+// The body's value, declared here when this module only creates the closure. A lambda written in
+// a parameter default is lowered wherever that default is filled in, so the module holding a
+// creation is not always the one defining the body.
+bodyValue(ModuleEmitter emitter, string symbol, FunctionType functionType) -> Value {
+    return signatures.calleeValue(emitter, calleeFor(symbol, functionType));
+}
+
+// The shape a lambda's body is declared at: the closure object ahead of the declared parameters.
+calleeFor(string symbol, FunctionType functionType) -> EirCallee {
+    return new EirCallee(symbol, functionType, functionType.parameterTypes(),
+        functionType.returnType());
+}
+
+// The payload layout of a closure object: the code pointer, then one field per capture. The type
+// is a literal struct, which LLVM uniques by structure, so the same capture list always maps to
+// the same type without a cache.
+closureLayout(ModuleEmitter emitter, Type[] captureTypes) -> TypeRef {
+    let fields = new List<TypeRef>();
+    fields.push(emitter.context.pointerType());
+    for (let captureType in captureTypes) {
+        fields.push(emitter.mapType(captureType));
+    }
+    return emitter.context.structType(fields.toArray(), false);
+}
+
+// The read-only object a capture-free lambda hands out: a null type descriptor, the immortal
+// strong count, no finalizer, no side table, and the code pointer as its whole payload. One global
+// per lambda, so evaluating it never allocates.
+immortalObject(ModuleEmitter emitter, string symbol, Value target) -> Value {
+    let pointerType = emitter.context.pointerType();
+    let objectType = emitter.context.structType([pointerType, emitter.context.int64Type(),
+        pointerType, pointerType, pointerType], false);
+    string name = ".closure." + symbol;
+    let existing = globals.getNamedGlobal(emitter.module, name);
+    if (existing != null) {
+        return payloadOf(emitter, objectType, existing);
+    }
+    let global = globals.addGlobal(emitter.module, objectType, name);
+    globals.setInitializer(global, objectType.constNamedStruct([
+        emitter.runtime.nullPointer(),
+        emitter.runtime.immortalCountValue(),
+        emitter.runtime.nullPointer(),
+        emitter.runtime.nullPointer(),
+        target,
+    ]));
+    globals.setGlobalConstant(global, true);
+    globals.setLinkage(global, globals.linkagePrivate());
+    globals.setAlignment(global, 8);
+    return payloadOf(emitter, objectType, global);
+}
+
+payloadOf(ModuleEmitter emitter, TypeRef objectType, Value global) -> Value {
+    return objectType.constInBoundsGEP(global,
+        [emitter.runtime.int32(0), emitter.runtime.int32(4)]);
+}

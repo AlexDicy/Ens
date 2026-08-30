@@ -108,6 +108,10 @@ const ThrowsAnalyzer::TypeSet& ThrowsAnalyzer::contractOf(const Symbol* sym) con
 
 void ThrowsAnalyzer::collectBlockThrows(const SyntaxNode& node, TypeSet& out) const {
     SyntaxKind k = node.kind();
+    // A lambda's body is not part of the function that writes it: a function type never
+    // throws, so what its body can raise answers to the lambda, not to the enclosing
+    // contract. This front end draws no conclusion from it either way.
+    if (k == SyntaxKind::LambdaExpr) return;
     if (k == SyntaxKind::ThrowStmt) {
         if (auto th = ast::ThrowStatement::cast(node)) {
             if (auto v = th->value()) addType(out, structOfType(analysis.typeOf(v->node.greenNode())));
@@ -276,6 +280,29 @@ void ThrowsAnalyzer::validateNoThrowingCalls(const SyntaxNode& node, const char*
         }
     }
     for (auto& c : node.children()) validateNoThrowingCalls(c, contextDescription);
+}
+
+// A function type never throws, so neither may the body of a lambda written against one. A
+// lambda carries no catch clauses of its own, so what its body raises is its whole outward set
+// and the fix lives in a named function. Every lambda in the file is reached from here, wherever
+// it is written, which is what covers the ones in field and parameter defaults.
+void ThrowsAnalyzer::validateLambdas(const SyntaxNode& node) {
+    if (node.kind() == SyntaxKind::LambdaExpr) {
+        // Walking the lambda's own children rather than its body keeps one code path for the two
+        // shapes a body can take, and steps past the guard collectBlockThrows puts on a lambda so
+        // that what the body raises is counted here instead of nowhere.
+        TypeSet outward;
+        for (auto& c : node.children()) collectBlockThrows(c, outward);
+        if (!outward.empty()) {
+            auto arrow = ast::firstChildNode(node, SyntaxKind::Arrow);
+            errorAt(arrow.value_or(node), "This lambda's body can throw " + nameList(outward) +
+                ", and a function type never throws, so nothing can report it to the caller. "
+                "Handle the failure inside the lambda: move the throwing work into a named "
+                "function whose own 'catch' clause turns the failure into a value, and call that "
+                "function here.");
+        }
+    }
+    for (auto& c : node.children()) validateLambdas(c);
 }
 
 void ThrowsAnalyzer::validateFunction(Symbol* sym, const ast::FuncDecl& fn, bool isConstructor,
@@ -458,6 +485,8 @@ void ThrowsAnalyzer::validate(DiagnosticSink& sink, const SourceFile& source) {
     };
     for (auto& sd : sf.structs()) checkFieldDefaults(sd.fields());
     for (auto& cd : sf.classes()) checkFieldDefaults(cd.fields());
+
+    validateLambdas(sf.node);
 
     sink_ = nullptr;
     source_ = nullptr;

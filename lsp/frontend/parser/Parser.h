@@ -23,6 +23,10 @@ private:
     size_t nextToEmit = 0;
     size_t current = 0;
     SyntaxBuilder builder;
+    // True for the duration of a switch arm's label list, where a '(' never opens a lambda
+    // and an identifier before '->' is the label rather than a bare parameter: `(one) -> body`
+    // and `Circle -> body` are the arm.
+    bool inArmLabels = false;
 
     // === Cursor / token API ===
     SyntaxKind kindAt() const;
@@ -58,6 +62,8 @@ private:
     void expect(SyntaxKind k, const char* what);
     void emitMissing(SyntaxKind expectedKind, const char* what);
 
+    // The current token's text for a diagnostic; non-ASCII code units become '?'.
+    std::string asciiTokenText() const;
     void reportAtCurrent(std::string message);
     void recoverTo(std::initializer_list<SyntaxKind> syncSet);
 
@@ -95,14 +101,30 @@ private:
     // pair, which only the target of `as`/`as?` wants: it is the one type position an
     // expression continues from.
     void parseType(bool leaveCoalesceToExpression = false);
+    void parseNamedType(bool leaveCoalesceToExpression);
+    void parseFunctionType();
+    void parseParenthesizedType(bool leaveCoalesceToExpression);
+    // The `?` / `[]` chain, emitted into the type node the caller has open.
+    void parseTypeSuffixes(bool leaveCoalesceToExpression);
     void parseTypeHead();  // base + namespace only, no [] or ? (used in `new`)
     bool isTypeStart(SyntaxKind k) const;
+    // Where a whole type is expected rather than a named one: a '(' opens a function type
+    // or a type in parentheses.
+    bool isTypeOrGroupStart(SyntaxKind k) const;
     bool isPrimitiveTypeKw(SyntaxKind k) const;
     void parseTypeArgList();
     void expectClosingGt(const char* what);
     bool atClosingGt() const;
     size_t scanTypeArgs(size_t cursor) const;  // peek-index past a type-ish <...>, else 0
+    // The peek-index just past a whole type written at `cursor`, or 0 when none is. The
+    // token-level counterpart of parseType, for the lookaheads that classify a statement.
+    size_t scanType(size_t cursor, int depth = 0) const;
+    static constexpr int kMaxTypeScanDepth = 32;
     size_t skipAnglesRaw(size_t idx) const;    // raw-index past <...>, else idx
+    // At '(': true when the token after the matching ')' is '->'. Both readings of a leading
+    // '(' ask this one question: in type position it tells a function type from a type in
+    // parentheses, and in expression position a lambda from a parenthesized expression.
+    bool atArrowAfterParentheses() const;
 
     // === Statements ===
     void parseStatement();
@@ -137,6 +159,11 @@ private:
     void parseCallArgument();
     void parseStructLiteral();
     void parseStructLiteralField();
+    void parseLambda();
+    void parseBareParameterLambda();
+    void parseLambdaParameters();
+    void parseLambdaParameter();
+    void parseLambdaBody();
 
     int infixPrecedence(SyntaxKind k) const;
     bool isAssignmentOp(SyntaxKind k) const;

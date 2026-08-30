@@ -4,6 +4,7 @@ namespace ast {
 
 std::vector<SyntaxNode> TypeReference::segmentTokens() const {
     std::vector<SyntaxNode> out;
+    if (node.kind() != SyntaxKind::TypeRef) return out;  // only a named type has segments
     for (auto& c : node.children()) {
         if (isTrivia(c.kind()) || !c.isToken()) continue;
         if (c.kind() == SyntaxKind::Identifier || isKeyword(c.kind())) out.push_back(c);
@@ -49,6 +50,38 @@ std::vector<TypeReference> TypeReference::typeArguments() const {
         break;
     }
     return out;
+}
+
+std::vector<TypeReference> TypeReference::parameterTypes() const {
+    std::vector<TypeReference> out;
+    if (!isFunctionType()) return out;
+    for (auto& c : node.children()) {
+        if (c.kind() == SyntaxKind::Arrow) break;
+        if (auto t = TypeReference::cast(c)) out.push_back(*t);
+    }
+    return out;
+}
+
+std::optional<TypeReference> TypeReference::returnedType() const {
+    if (!isFunctionType()) return std::nullopt;
+    bool afterArrow = false;
+    for (auto& c : node.children()) {
+        if (c.kind() == SyntaxKind::Arrow) {
+            afterArrow = true;
+            continue;
+        }
+        if (!afterArrow) continue;
+        if (auto t = TypeReference::cast(c)) return t;
+    }
+    return std::nullopt;
+}
+
+std::optional<TypeReference> TypeReference::innerType() const {
+    if (!isParenthesized()) return std::nullopt;
+    for (auto& c : node.children()) {
+        if (auto t = TypeReference::cast(c)) return t;
+    }
+    return std::nullopt;
 }
 
 bool TypeReference::isOptional() const {

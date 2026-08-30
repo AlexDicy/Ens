@@ -11,6 +11,7 @@ enum class TypeKind {
     Null,        // type of the `null` literal - assignable to any Optional
     Optional,    // wraps another type
     Array,       // T[]
+    Function,    // (int, int) -> int: the type of a function value
     Struct,      // user-defined struct (value semantics)
     Class,       // user-defined class (reference semantics, heap-allocated)
     Enum,        // user-defined enum (integer-backed value type)
@@ -208,6 +209,12 @@ public:
     std::u16string paramName;
     std::vector<StructInfo*> paramBounds;
 
+    // Function type (kind == Function): its parameter types in order and the type it
+    // returns. A function type never throws, and two of them are the same type only when
+    // every part matches, so assignability between them is identity.
+    std::vector<Type*> functionParams;
+    Type* functionReturn = nullptr;
+
     explicit Type(TypeKind k) : kind(k) {}
     Type(TypeKind k, Type* i) : kind(k), inner(i) {}
 
@@ -221,6 +228,7 @@ public:
     bool isBool() const { return kind == TypeKind::Bool; }
     bool isNull() const { return kind == TypeKind::Null; }
     bool isArray() const { return kind == TypeKind::Array; }
+    bool isFunction() const { return kind == TypeKind::Function; }
     bool isStruct() const { return kind == TypeKind::Struct; }
     bool isClass() const  { return kind == TypeKind::Class; }
     // Interfaces share the class type kind; this narrows to them.

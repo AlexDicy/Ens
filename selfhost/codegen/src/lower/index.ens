@@ -12,6 +12,7 @@ import ProgramAnalysis from @ens.sema.pipeline;
 import ModuleContext from @ens.sema.context;
 import ClassType from @ens.sema.model.types;
 import InterfaceType from @ens.sema.model.types;
+import InstantiationType from @ens.sema.model.types;
 import Method from @ens.sema.model.types;
 import Signature from @ens.sema.model.types;
 import StructType from @ens.sema.model.types;
@@ -21,16 +22,22 @@ import @ens.sema.model.types;
 import ClassDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import InterfaceDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import LambdaExpressionNode from @ens.frontend.syntax.generated.nodes;
 import MemberListNode from @ens.frontend.syntax.generated.nodes;
 import StructDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import TestDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import GreenNode from @ens.frontend.syntax.green;
+import SyntaxNode from @ens.frontend.syntax.node;
+import TypeStore from @ens.sema.model.types;
 import Substitution from mono.substitution;
+import mono.substitution;
+import lower.closures;
 import lower.symbols;
 import lower.throwing;
 import support.primitives;
 import List from @std.collections.list;
 import Map from @std.collections.map;
+import Set from @std.collections.set;
 
 // One function of the program: entry metadata plus the red declaration node lowering walks. The
 // declaration is null for built-in and body-less entries. A method carries the type it runs
@@ -45,13 +52,15 @@ public final class FunctionInfo {
     Method? declaringMethod;
     FunctionDeclarationNode? redDeclaration;
     TestDeclarationNode? testRedDeclaration;
+    LambdaExpressionNode? lambdaRedDeclaration;
     string linkSymbol;
     Substitution? instanceSubstitution;
 
     public constructor(ModuleContext context, Signature signature, Visibility visibility,
                 bool isExternal, bool isBuiltin, Type? receiverType, Method? method,
                 FunctionDeclarationNode? declaration, string symbol,
-                Substitution? substitution = null, TestDeclarationNode? test = null) {
+                Substitution? substitution = null, TestDeclarationNode? test = null,
+                LambdaExpressionNode? lambda = null) {
         this.owningContext = context;
         this.functionSignature = signature;
         this.functionVisibility = visibility;
@@ -61,6 +70,7 @@ public final class FunctionInfo {
         this.declaringMethod = method;
         this.redDeclaration = declaration;
         this.testRedDeclaration = test;
+        this.lambdaRedDeclaration = lambda;
         this.linkSymbol = symbol;
         this.instanceSubstitution = substitution;
     }
@@ -110,6 +120,12 @@ public final class FunctionInfo {
         return this.testRedDeclaration;
     }
 
+    // The lambda whose body this entry lowers, or null for everything else. Its receiver is the
+    // closure object the captures live in.
+    public lambdaDeclaration() -> LambdaExpressionNode? {
+        return this.lambdaRedDeclaration;
+    }
+
     public symbol() -> string {
         return this.linkSymbol;
     }
@@ -123,7 +139,9 @@ public final class FunctionInfo {
     // Internal linkage keeps a private function's bare name from colliding across modules. A
     // method is always external: its symbol already carries its module and record, and its
     // address travels in the dispatch tables other modules' descriptors reference. A generic
-    // instance is always external: its home module defines it once for the whole program.
+    // instance is always external: its home module defines it once for the whole program. So is
+    // a lambda's body, for the same reason: it is defined in the module that writes the lambda
+    // while a closure over it may be built in any module, as a field default is.
     public internalLinkage() -> bool {
         return this.functionVisibility == Visibility.Private && !this.externalFunction
             && !this.builtinFunction && this.methodReceiverType == null
@@ -189,6 +207,23 @@ public final class ModuleFunctions {
     }
 }
 
+// Where one lambda sits: the module that writes it and its position among that module's lambdas.
+// Together with the substitution it is lowered under, that is its symbol.
+public final class LambdaSite {
+    string owningModulePath;
+    long lambdaIndex;
+
+    public constructor(this.owningModulePath, this.lambdaIndex);
+
+    public modulePath() -> string {
+        return this.owningModulePath;
+    }
+
+    public index() -> long {
+        return this.lambdaIndex;
+    }
+}
+
 // One generic function instance, identified by its template's signature and its concrete type
 // arguments; signatures and types are interned, so identity comparison is enough.
 class FunctionInstanceKey {
@@ -229,6 +264,7 @@ public final class ProgramIndex {
     Map<FunctionInstanceKey, FunctionInfo> instanceByKey;
     Map<Type, RecordInfo> recordByType;
     List<ModuleFunctions> moduleList;
+    Map<GreenNode, LambdaSite> lambdaSites;
     FunctionInfo? mainInfo;
 
     public constructor() {
@@ -236,7 +272,31 @@ public final class ProgramIndex {
         this.instanceByKey = new Map<FunctionInstanceKey, FunctionInfo>();
         this.recordByType = new Map<Type, RecordInfo>();
         this.moduleList = new List<ModuleFunctions>();
+        this.lambdaSites = new Map<GreenNode, LambdaSite>();
         this.mainInfo = null;
+    }
+
+    public registerLambdaSite(GreenNode node, LambdaSite site) {
+        this.lambdaSites.set(node, site);
+    }
+
+    public lambdaSiteOf(GreenNode node) -> LambdaSite? {
+        return this.lambdaSites.get(node);
+    }
+
+    // The linker symbol of one lambda's body under the substitution it is lowered beneath: the
+    // module's numbering alone for ordinary code, and the instance's type arguments appended
+    // inside a template body. Null when the lambda is not one this program lowers.
+    public lambdaSymbolOf(GreenNode node, Substitution? active) -> string? {
+        let site = this.lambdaSites.get(node);
+        if (site == null) {
+            return null;
+        }
+        Type[] arguments = [];
+        if (active != null) {
+            arguments = active.arguments();
+        }
+        return symbols.lambdaLinkName(site.modulePath(), site.index(), arguments);
     }
 
     public infoFor(Signature signature) -> FunctionInfo? {
@@ -283,11 +343,138 @@ public final class ProgramIndex {
     }
 }
 
+// Adds one entry per lambda body the program lowers, once per enclosing instance. Called after
+// monomorphization has filled the function lists, so an instance discovered there brings its
+// lambdas with it; a lambda inside a template that nothing instantiates gets no entry, because
+// nothing lowers it.
+//
+// The module that WRITES a lambda defines its body, whichever module builds a closure over it.
+// That matters for the lambdas nothing in this module's function bodies reaches: a field default
+// is lowered wherever the record is built, so its lambda is indexed from the record instead.
+//
+// A lambda's symbol names its module and its position among that module's lambdas rather than the
+// function around it, because a lambda in a default has no one enclosing function to be named
+// after and the position is the only thing every site that lowers it agrees on.
+public indexLambdas(ProgramIndex index, TypeStore store) {
+    let modules = index.modules();
+    for (long m = 0; m < modules.length(); m++) {
+        let moduleFunctions = modules.get(m);
+        let taken = new Set<string>();
+        let entries = new List<FunctionInfo>();
+        indexBodyLambdas(index, store, moduleFunctions, taken, entries);
+        indexFieldDefaultLambdas(index, store, moduleFunctions, taken, entries);
+        for (long i = 0; i < entries.length(); i++) {
+            moduleFunctions.functions().push(entries.get(i));
+        }
+    }
+}
+
+// The lambdas one module's own callables hold, each under that callable's substitution: a
+// declaration covers its parameter defaults, its body and its catch clauses, and a test its body.
+indexBodyLambdas(ProgramIndex index, TypeStore store, ModuleFunctions moduleFunctions,
+                 Set<string> taken, List<FunctionInfo> entries) {
+    let functions = moduleFunctions.functions();
+    for (long f = 0; f < functions.length(); f++) {
+        let owner = functions.get(f);
+        SyntaxNode? node = owner.declaration();
+        if (node == null) {
+            node = owner.testDeclaration();
+        }
+        if (node == null) {
+            continue;
+        }
+        addLambdaEntries(index, store, owner.context(), owner.substitution(),
+            closures.lambdasIn(node), taken, entries);
+    }
+}
+
+// The lambdas one module's records hold in their field defaults. A default is lowered wherever the
+// record is built, which is why the declaring module indexes it here rather than waiting for a
+// construction it may never see: once for the declared record, and once for every instantiation of
+// it this module homes, because that is the set of substitutions a default is ever lowered under.
+indexFieldDefaultLambdas(ProgramIndex index, TypeStore store, ModuleFunctions moduleFunctions,
+                         Set<string> taken, List<FunctionInfo> entries) {
+    let context = moduleFunctions.context();
+    let root = context.root();
+    if (root == null) {
+        return;
+    }
+    for (long i = 0; i < root.itemsCount(); i++) {
+        let item = root.items(i);
+        MemberListNode? members = null;
+        string name = "";
+        if (item is StructDeclarationNode) {
+            members = item.body();
+            name = item.name().text();
+        } else if (item is ClassDeclarationNode) {
+            members = item.body();
+            name = item.name().text();
+        }
+        if (members == null) {
+            continue;
+        }
+        let lambdas = closures.lambdasInFieldDefaults(members);
+        if (lambdas.length() == 0) {
+            continue;
+        }
+        let declared = store.findDeclared(context.module().canonicalPath(), name);
+        if (declared == null) {
+            continue;
+        }
+        if (!declared.isGeneric()) {
+            addLambdaEntries(index, store, context, null, lambdas, taken, entries);
+        }
+        for (long n = 0; n < moduleFunctions.instantiations().length(); n++) {
+            let instantiation = moduleFunctions.instantiations().get(n);
+            if (!(instantiation is InstantiationType)
+                    || instantiation.template() != declared) {
+                continue;
+            }
+            addLambdaEntries(index, store, context,
+                substitution.forInstantiation(instantiation), lambdas, taken, entries);
+        }
+    }
+}
+
+addLambdaEntries(ProgramIndex index, TypeStore store, ModuleContext context,
+                 Substitution? active, List<LambdaExpressionNode> lambdas, Set<string> taken,
+                 List<FunctionInfo> entries) {
+    for (long i = 0; i < lambdas.length(); i++) {
+        let lambda = lambdas.get(i);
+        let info = context.result().lambdaOf(lambda.green());
+        if (info == null) {
+            continue;
+        }
+        let symbol = index.lambdaSymbolOf(lambda.green(), active);
+        if (symbol == null || !taken.add(symbol)) {
+            continue;
+        }
+        Type closureType = substitution.apply(store, active, info.type());
+        entries.push(new FunctionInfo(context, info.signature(), Visibility.Private, false,
+            false, closureType, null, null, symbol, active, null, lambda));
+    }
+}
+
+// Numbers every lambda a module writes, in source order over the whole file, so the position a
+// symbol carries is the same whichever body the walk reached the lambda from.
+numberLambdas(ProgramIndex index, ModuleContext context) {
+    let root = context.root();
+    if (root == null) {
+        return;
+    }
+    string modulePath = context.module().canonicalPath();
+    let lambdas = closures.lambdasIn(root);
+    for (long i = 0; i < lambdas.length(); i++) {
+        index.registerLambdaSite(lambdas.get(i).green(), new LambdaSite(modulePath, i));
+    }
+}
+
 public buildIndex(ProgramAnalysis analysis) -> ProgramIndex {
     let index = new ProgramIndex();
     let contexts = analysis.contexts();
     for (long c = 0; c < contexts.length(); c++) {
         let context = contexts.get(c);
+        numberLambdas(index, context);
         let declarations = redFunctionDeclarations(context);
         let testDeclarations = redTestDeclarations(context);
         let moduleFunctions = new ModuleFunctions(context);

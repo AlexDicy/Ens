@@ -692,6 +692,11 @@ Type* Analyzer::analyzeExprAdapt(const ast::Expression& expr, Type* target) {
         analysis.setType(expr.node.greenNode(), t);
         return t;
     }
+    if (auto lm = expr.asLambda()) {
+        Type* t = analyzeLambda(*lm, target);
+        analysis.setType(expr.node.greenNode(), t);
+        return t;
+    }
     Type* t = analyzeExpr(expr);
     if (!target || target->isError() || t->isError()) return t;
     // A 'char' is a code point rather than a quantity. Arithmetic on it in integers is
@@ -2548,17 +2553,19 @@ void Analyzer::checkStructEquatable(Type* structT, const SyntaxNode& node) {
     std::string fieldPath;
     Type* leaf = nullptr;
     if (findNonComparableField(structT, visiting, fieldPath, leaf) && leaf) {
+        std::string reason = leaf->isFunction() ? "a function value has no identity"
+                                               : "external types have no value equality";
         errorAtNode(node, "Struct '" + asciiOf(structT->structInfo->name) +
             "' cannot be compared with '=='. Field '" + fieldPath + "' has type '" +
-            leaf->toString() + "', which has no '=='; external types have no value equality. "
-            "Compare the fields you need directly instead.");
+            leaf->toString() + "', which has no '=='; " + reason +
+            ". Compare the fields you need directly instead.");
     }
 }
 
 // Walks a struct's fields for one whose type has no '=='. Descends through
 // nullable wrappers and nested structs, recording the dotted path to the leaf.
-// External-typed fields are the only concrete leaf without '=='; arrays and
-// classes compare by identity, so they are fine.
+// External and function-typed fields are the concrete leaves without '=='; arrays
+// and classes compare by identity, so they are fine.
 bool Analyzer::findNonComparableField(Type* structT, std::vector<StructInfo*>& visiting,
                                       std::string& fieldPath, Type*& leaf) {
     if (!structT || !structT->structInfo) return false;
@@ -2571,7 +2578,7 @@ bool Analyzer::findNonComparableField(Type* structT, std::vector<StructInfo*>& v
         if (!ft || TypeContext::containsTypeParam(ft)) continue;
         Type* core = ft;
         while (core->isOptional() && core->inner) core = core->inner;
-        if (core->isExternal()) {
+        if (core->isExternal() || core->isFunction()) {
             fieldPath = asciiOf(f.name);
             leaf = core;
             return true;
@@ -3027,7 +3034,61 @@ Type* Analyzer::lookupTypeByName(const std::u16string& qualifier,
     return t;
 }
 
+Type* Analyzer::applyTypeSuffixes(Type* base, const ast::TypeReference& tr) {
+    Type* result = base;
+    for (auto s : tr.suffixChain()) {
+        if (result->isError()) break;
+        if (s == ast::TypeReference::Suffix::Array) {
+            if (result->isVoid()) {
+                errorAtNode(tr.node, "void cannot be an array element type");
+                return typeCtx.getError();
+            }
+            // Don't reject types like `int[][]` at name-resolution: multi-dim
+            // `new T[a][b]` fully populates inner slots, so the type is fine
+            // as long as every value of this type is constructed. The
+            // element-nullability rule is enforced where slots actually get
+            // zero-initialised (single-dim `new T[size]` and variable/field
+            // declarations without an initializer).
+            result = typeCtx.getArray(result);
+        } else {
+            if (result->isVoid()) {
+                errorAtNode(tr.node, "void cannot be optional");
+                return typeCtx.getError();
+            }
+            result = typeCtx.getOptional(result);
+        }
+    }
+    return result;
+}
+
 Type* Analyzer::resolveTypeReference(const ast::TypeReference& tr) {
+    // A function type carries no suffix of its own: a `?` or `[]` written after the return
+    // type belongs to that return type, and a suffix on the whole thing needs parentheses.
+    if (tr.isFunctionType()) {
+        std::vector<Type*> params;
+        for (auto& p : tr.parameterTypes()) params.push_back(resolveTypeReference(p));
+        auto returned = tr.returnedType();
+        Type* returnType = returned ? resolveTypeReference(*returned) : typeCtx.getError();
+        Type* result = typeCtx.getFunction(std::move(params), returnType);
+        analysis.setType(tr.node.greenNode(), result);
+        return result;
+    }
+    if (tr.isParenthesized()) {
+        auto inner = tr.innerType();
+        Type* result = inner ? resolveTypeReference(*inner) : typeCtx.getError();
+        // Parentheses exist in a type so a `?` or `[]` suffix can apply to a function type,
+        // which is why they are allowed around nothing else: every other type already has
+        // exactly one written form. The inner type still resolves, so one rejected pair of
+        // parentheses does not cost the declaration its meaning.
+        if (inner && !inner->isFunctionType() && !result->isError()) {
+            errorAtNode(tr.node, "Remove the parentheses around '" + result->toString() +
+                "': in a type, parentheses are only allowed around a function type, for "
+                "example '((int) -> bool)?'.");
+        }
+        result = applyTypeSuffixes(result, tr);
+        analysis.setType(tr.node.greenNode(), result);
+        return result;
+    }
     auto name = tr.nameText();
     if (!name) return typeCtx.getError();
     auto qualifier = tr.qualifierText().value_or(std::u16string{});
@@ -3058,32 +3119,7 @@ Type* Analyzer::resolveTypeReference(const ast::TypeReference& tr) {
         analysis.setType(tr.node.greenNode(), typeCtx.getError());
         return typeCtx.getError();
     }
-    Type* result = base;
-    auto suffixes = tr.suffixChain();
-    for (auto s : suffixes) {
-        if (result->isError()) break;
-        if (s == ast::TypeReference::Suffix::Array) {
-            if (result->isVoid()) {
-                errorAtNode(tr.node, "void cannot be an array element type");
-                result = typeCtx.getError();
-                break;
-            }
-            // Don't reject types like `int[][]` at name-resolution: multi-dim
-            // `new T[a][b]` fully populates inner slots, so the type is fine
-            // as long as every value of this type is constructed. The
-            // element-nullability rule is enforced where slots actually get
-            // zero-initialised (single-dim `new T[size]` and variable/field
-            // declarations without an initializer).
-            result = typeCtx.getArray(result);
-        } else {
-            if (result->isVoid()) {
-                errorAtNode(tr.node, "void cannot be optional");
-                result = typeCtx.getError();
-                break;
-            }
-            result = typeCtx.getOptional(result);
-        }
-    }
+    Type* result = applyTypeSuffixes(base, tr);
     analysis.setType(tr.node.greenNode(), result);
     return result;
 }
@@ -4718,9 +4754,109 @@ Type* Analyzer::analyzeExpr(const ast::Expression& expr) {
     else if (auto sl = expr.asStructLiteral()) t = analyzeStructLiteral(*sl);
     else if (auto is = expr.asInterpString()) t = analyzeInterpString(*is);
     else if (auto sw = expr.asSwitch()) t = analyzeSwitchExpr(*sw);
+    else if (auto lm = expr.asLambda()) t = analyzeLambda(*lm, nullptr);
     else                                t = typeCtx.getError();
     analysis.setType(expr.node.greenNode(), t);
     return t;
+}
+
+Type* Analyzer::callableFunctionType(Type* t) {
+    while (t && t->isOptional()) t = t->inner;
+    return (t && t->isFunction()) ? t : nullptr;
+}
+
+Type* Analyzer::checkFunctionValueCall(Type* fnType, const std::vector<ast::Expression>& args,
+                                       const SyntaxNode& diagNode) {
+    const std::vector<Type*>& params = fnType->functionParams;
+    if (args.size() != params.size()) {
+        errorAtNode(diagNode, "A value of type '" + fnType->toString() + "' takes " +
+            std::to_string(params.size()) + " argument(s), got " +
+            std::to_string(args.size()) + ".");
+    }
+    size_t n = std::min(args.size(), params.size());
+    for (size_t i = 0; i < n; ++i) {
+        Type* paramT = params[i];
+        Type* argT = analyzeExprAdapt(args[i], paramT);
+        if (!paramT->assignableFrom(argT)) {
+            errorAtNode(args[i].node, "Argument " + std::to_string(i + 1) +
+                ": expected '" + paramT->toString() + "', got '" + argT->toString() + "'");
+        }
+    }
+    for (size_t i = n; i < args.size(); ++i) analyzeExpr(args[i]);
+    return fnType->functionReturn ? fnType->functionReturn : typeCtx.getError();
+}
+
+Type* Analyzer::analyzeLambda(const ast::LambdaExpression& expr, Type* target) {
+    Type* targetFn = callableFunctionType(target);
+    auto params = expr.parameters();
+
+    // A parameter's written type wins; an untyped one takes the target's, and stays
+    // unknown where the position offers none, which keeps the body checkable in silence.
+    std::vector<Type*> paramTypes;
+    paramTypes.reserve(params.size());
+    for (size_t i = 0; i < params.size(); ++i) {
+        Type* pt = nullptr;
+        if (auto tr = params[i].typeReference()) {
+            pt = resolveTypeReference(*tr);
+        } else if (targetFn && i < targetFn->functionParams.size()) {
+            pt = targetFn->functionParams[i];
+        }
+        paramTypes.push_back(pt ? pt : typeCtx.getError());
+    }
+    Type* returnType = targetFn ? targetFn->functionReturn : nullptr;
+
+    // A lambda body runs at a time of its own, so neither the assignments it makes nor a
+    // `return` that leaves it belong to the enclosing function's straight line.
+    AssignmentFlow outerFlow = snapshotAssignment();
+    Symbol* prevFunction = currentFunction;
+    Scope* prevParamScope = currentFunctionParamScope;
+    StructInfo* prevCtorFields = ctorFieldClass_;
+    int prevLoopDepth = loopDepth;
+    bool prevUnconditional = unconditionalPosition_;
+
+    Symbol* lambdaSym = makeSymbol(SymbolKind::Function, std::u16string{}, nullptr,
+                                   expr.node.startOffset());
+    lambdaSym->paramTypes = paramTypes;
+    lambdaSym->returnType = returnType ? returnType : typeCtx.getError();
+    currentFunction = lambdaSym;
+    ctorFieldClass_ = nullptr;
+    loopDepth = 0;
+    unconditionalPosition_ = true;
+
+    Scope* lambdaScope = pushScope();
+    currentFunctionParamScope = lambdaScope;
+    for (size_t i = 0; i < params.size(); ++i) {
+        auto name = params[i].nameText();
+        if (!name) continue;
+        auto nameToken = params[i].nameToken();
+        uint32_t namePos = nameToken ? nameToken->startOffset() : params[i].node.startOffset();
+        Symbol* psym = makeSymbol(SymbolKind::Parameter, *name, paramTypes[i], namePos);
+        if (!lambdaScope->define(psym)) {
+            errorAtNode(params[i].node, "Duplicate parameter name '" + asciiOf(*name) + "'");
+        }
+        analysis.setSymbol(params[i].node.greenNode(), psym);
+    }
+
+    Type* bodyT = nullptr;
+    if (auto body = expr.bodyExpr()) {
+        bodyT = returnType ? analyzeExprAdapt(*body, returnType) : analyzeExpr(*body);
+    } else if (auto blockNode = expr.bodyBlockNode()) {
+        if (auto block = ast::Block::cast(*blockNode)) analyzeBlock(*block);
+    }
+
+    popScope();
+    currentFunctionParamScope = prevParamScope;
+    currentFunction = prevFunction;
+    ctorFieldClass_ = prevCtorFields;
+    loopDepth = prevLoopDepth;
+    unconditionalPosition_ = prevUnconditional;
+    restoreAssignment(outerFlow);
+
+    // Without a target the shape still follows from what was written: the parameter types
+    // the source spelled out and, for an expression body, the type that body has.
+    if (!returnType) returnType = bodyT;
+    if (!returnType) return typeCtx.getError();
+    return typeCtx.getFunction(std::move(paramTypes), returnType);
 }
 
 Type* Analyzer::analyzeInterpString(const ast::InterpStringExpression& expr) {
@@ -5468,11 +5604,14 @@ void parameterInfoOf(Symbol* sym, std::vector<std::u16string>& names, std::vecto
 }  // namespace
 
 // True for a written argument that names no type of its own: an empty array
-// literal, whose element type has to come from somewhere, and a `{...}` literal,
-// which never names its struct. An overloaded call learns nothing from such an
-// argument and types it once it has chosen the parameter it reaches.
+// literal, whose element type has to come from somewhere, a `{...}` literal,
+// which never names its struct, and a lambda, which takes both its untyped
+// parameters and its return type from the target. An overloaded call learns
+// nothing from such an argument and types it once it has chosen the parameter it
+// reaches.
 static bool argumentNeedsTargetType(const ast::Expression& arg) {
     if (auto al = arg.asArrayLiteral()) return al->elements().empty();
+    if (arg.asLambda()) return true;
     return arg.asStructLiteral().has_value();
 }
 
@@ -6062,7 +6201,7 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
             }
         }
 
-        analyzeExpr(*callee);  // resolves field-or-method on member
+        Type* calleeT = analyzeExpr(*callee);  // resolves field-or-method on member
         auto* memberInfo = analysis.find(member.node.greenNode());
         Symbol* methodSym = memberInfo ? memberInfo->resolvedMethodSymbol : nullptr;
         if (methodSym) {
@@ -6107,6 +6246,10 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
             for (size_t i = n; i < args.size(); ++i) analyzeExpr(args[i]);
             return methodSym->returnType ? methodSym->returnType : typeCtx.getError();
         }
+        // A field holding a function value is called through that value.
+        if (Type* fnType = callableFunctionType(calleeT)) {
+            return checkFunctionValueCall(fnType, args, expr.node);
+        }
         for (auto& a : args) analyzeExpr(a);
         return typeCtx.getError();
     }
@@ -6130,7 +6273,7 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
             }
         }
 
-        analyzeExpr(*callee);  // resolves field-or-method on safe-member
+        Type* calleeT = analyzeExpr(*callee);  // resolves field-or-method on safe-member
         auto* memberInfo = analysis.find(member.node.greenNode());
         Symbol* methodSym = memberInfo ? memberInfo->resolvedMethodSymbol : nullptr;
         if (methodSym) {
@@ -6180,6 +6323,13 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
             if (!ret || ret->isError()) return typeCtx.getError();
             // A void safe call is a statement: it runs only when the receiver
             // is non-null and produces no value.
+            if (ret->isVoid()) return ret;
+            return safeResultOf(typeCtx, ret);
+        }
+        // A field holding a function value is called through that value.
+        if (Type* fnType = callableFunctionType(calleeT)) {
+            Type* ret = checkFunctionValueCall(fnType, args, expr.node);
+            if (!ret || ret->isError()) return typeCtx.getError();
             if (ret->isVoid()) return ret;
             return safeResultOf(typeCtx, ret);
         }
@@ -6256,7 +6406,15 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
     // Function call: name(args)
     auto idCallee = callee ? callee->asIdent() : std::nullopt;
     if (!idCallee) {
-        errorAtNode(expr.node, "Only direct function calls are supported");
+        // Any other expression is callable when it holds a function value: `(f)(1)`,
+        // `handlers[0](event)`, `makeAdder(1)(2)`.
+        Type* calleeT = callee ? analyzeExpr(*callee) : typeCtx.getError();
+        if (Type* fnType = callableFunctionType(calleeT)) {
+            return checkFunctionValueCall(fnType, args, expr.node);
+        }
+        if (!calleeT->isError()) {
+            errorAtNode(expr.node, "Only direct function calls are supported");
+        }
         for (auto& a : args) analyzeExpr(a);
         return typeCtx.getError();
     }
@@ -6300,7 +6458,18 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
         return typeCtx.getError();
     }
     if (sym->kind != SymbolKind::Function) {
-        errorAtNode(idCallee->node, "'" + asciiOf(*name) + "' is not a function");
+        // A binding of function type is called through the value it holds.
+        Type* calleeT = analyzeExpr(*callee);
+        if (Type* fnType = callableFunctionType(calleeT)) {
+            return checkFunctionValueCall(fnType, args, expr.node);
+        }
+        if (calleeT && !calleeT->isError()) {
+            errorAtNode(idCallee->node, "'" + asciiOf(*name) + "' has type '" +
+                calleeT->toString() + "', which is not a function type, so it cannot be called.");
+        } else {
+            errorAtNode(idCallee->node, "'" + asciiOf(*name) +
+                "' is not a function and cannot be called.");
+        }
         for (auto& a : args) analyzeExpr(a);
         return typeCtx.getError();
     }

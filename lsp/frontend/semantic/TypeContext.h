@@ -15,6 +15,7 @@ public:
     Type* getPrimitive(TypeKind k);
     Type* getOptional(Type* inner);
     Type* getArray(Type* element);
+    Type* getFunction(std::vector<Type*> params, Type* returnType);
     Type* getError() { return errorType; }
     Type* getNull() { return nullType; }
 
@@ -138,6 +139,20 @@ private:
             return h;
         }
     };
+    struct FunctionKey {
+        std::vector<Type*> params;
+        Type* returnType;
+        bool operator==(const FunctionKey& o) const {
+            return returnType == o.returnType && params == o.params;
+        }
+    };
+    struct FunctionKeyHash {
+        size_t operator()(const FunctionKey& k) const noexcept {
+            size_t h = std::hash<const void*>{}(k.returnType);
+            for (Type* p : k.params) h = h * 1315423911u ^ std::hash<const void*>{}(p);
+            return h;
+        }
+    };
     struct Key {
         std::u16string modulePath;
         std::u16string name;
@@ -155,6 +170,7 @@ private:
     std::unordered_map<int, Type*> primitiveCache;
     std::unordered_map<Type*, Type*> optionalCache;
     std::unordered_map<Type*, Type*> arrayCache;
+    std::unordered_map<FunctionKey, Type*, FunctionKeyHash> functionCache;
     std::unordered_map<Key, Type*, KeyHash> structCache;
     std::unordered_map<Key, Type*, KeyHash> classCache;
     std::unordered_map<Key, Type*, KeyHash> externalCache;

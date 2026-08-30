@@ -30,6 +30,7 @@ import ThrowStatementNode from @ens.frontend.syntax.generated.nodes;
 import RethrowStatementNode from @ens.frontend.syntax.generated.nodes;
 import SwitchStatementNode from @ens.frontend.syntax.generated.nodes;
 import SwitchExpressionNode from @ens.frontend.syntax.generated.nodes;
+import LambdaExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SwitchArm from @ens.frontend.syntax.generated.nodes;
 import ValueArmNode from @ens.frontend.syntax.generated.nodes;
 import TypeArmNode from @ens.frontend.syntax.generated.nodes;
@@ -84,6 +85,8 @@ import SemaResult from result;
 import Scope from model.scopes;
 import LocalBinding from model.scopes;
 import BindingKind from model.scopes;
+import LambdaCapture from model.lambdas;
+import LambdaInfo from model.lambdas;
 import phases.calls;
 import ArgumentValue from phases.calls;
 import CallShape from phases.calls;
@@ -106,6 +109,7 @@ import NullType from model.types;
 import StringType from model.types;
 import OptionalType from model.types;
 import ArrayType from model.types;
+import FunctionType from model.types;
 import PrimitiveType from model.types;
 import PrimitiveKind from model.types;
 import DeclaredType from model.types;
@@ -133,6 +137,7 @@ import phases.obligations;
 import List from @std.collections.list;
 import Map from @std.collections.map;
 import Set from @std.collections.set;
+import StringBuilder from @std.text.stringbuilder;
 
 // Checks every body of every module. Modules see each other only through the type store, the
 // link tables, and the other modules' function tables (for namespace-qualified calls).
@@ -227,6 +232,68 @@ class PendingLiteralRange {
     }
 }
 
+// One lambda whose body is being checked: the scope outside it, the receiver outside it, and
+// what its body has read from either so far. The captures accumulate in first-read order, which
+// is the order the closure copies them in.
+class LambdaFrame {
+    protected Scope? enclosingScope;
+    protected Type? enclosingReceiver;
+    protected List<LambdaCapture> captures;
+    protected List<LocalBinding> capturedBindings;
+    protected bool readsReceiver;
+
+    protected constructor(Scope? enclosingScope, Type? enclosingReceiver) {
+        this.enclosingScope = enclosingScope;
+        this.enclosingReceiver = enclosingReceiver;
+        this.captures = new List<LambdaCapture>();
+        this.capturedBindings = new List<LocalBinding>();
+        this.readsReceiver = false;
+    }
+
+    // The binding this name has outside the lambda, or null when the enclosing scope has none.
+    protected lookupOuter(string name) -> LocalBinding? {
+        let outer = this.enclosingScope;
+        if (outer == null) {
+            return null;
+        }
+        return outer.lookup(name);
+    }
+
+    protected captureBinding(LocalBinding binding) {
+        for (long i = 0; i < this.capturedBindings.length(); i++) {
+            if (this.capturedBindings.get(i) == binding) {
+                return;
+            }
+        }
+        this.capturedBindings.push(binding);
+        this.captures.push(new LambdaCapture(binding, binding.type()));
+    }
+
+    // Records that the lambda copies the enclosing receiver; true the first time, so a rejection
+    // reports once however many times the body reads 'this'.
+    protected captureReceiver(Type receiver) -> bool {
+        if (this.readsReceiver) {
+            return false;
+        }
+        this.readsReceiver = true;
+        this.captures.push(new LambdaCapture(null, receiver));
+        return true;
+    }
+
+    protected holds(LocalBinding binding) -> bool {
+        for (long i = 0; i < this.capturedBindings.length(); i++) {
+            if (this.capturedBindings.get(i) == binding) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    protected result() -> LambdaCapture[] {
+        return this.captures.toArray();
+    }
+}
+
 // What a member name means on a receiver type.
 sealed abstract class MemberLookup {
 }
@@ -259,6 +326,9 @@ class BodyChecker implements NoreturnCalls {
 
     Scope? scope;
     Scope? parameterScope;
+    // The lambdas whose bodies are being checked, outermost first. Empty in ordinary code; a
+    // name the innermost one does not declare itself is a capture.
+    List<LambdaFrame> lambdaFrames;
     NarrowingState narrowing;
     LocalBinding? thisBinding;
     Type? thisType;
@@ -312,6 +382,7 @@ class BodyChecker implements NoreturnCalls {
         this.reporter = new Reporter(context.module().filePath(), collected);
         this.modulePath = context.module().canonicalPath();
         this.packagePrefix = context.module().packagePrefix();
+        this.lambdaFrames = new List<LambdaFrame>();
         this.narrowing = new NarrowingState();
         this.thisBinding = null;
         this.enclosingOwner = null;
@@ -989,7 +1060,11 @@ class BodyChecker implements NoreturnCalls {
         if (current == null) {
             return null;
         }
-        return current.lookup(name);
+        let own = current.lookup(name);
+        if (own != null) {
+            return own;
+        }
+        return this.lookupCapture(name);
     }
 
     // Unqualified name resolution: local scopes innermost-first, then the module's functions,
@@ -1702,16 +1777,22 @@ class BodyChecker implements NoreturnCalls {
     }
 
     // Analyzes a branch expression under the facts the condition proves on its side: a
-    // ternary branch, or the right operand of a short-circuit operator.
-    analyzeGuardedBranch(Expression condition, Expression branch, bool conditionHolds)
-            -> Type {
+    // ternary branch, or the right operand of a short-circuit operator. A target is the type the
+    // branch's value has to answer to, and is null where the branch answers to nothing.
+    analyzeGuardedBranch(Expression condition, Expression branch, bool conditionHolds,
+                                 Type? target) -> Type {
         let facts = new List<NarrowingFact>();
         this.collectNarrowings(condition, conditionHolds, facts);
         this.narrowing.push();
         this.applyFacts(facts);
         bool previous = this.unconditionalPosition;
         this.unconditionalPosition = false;
-        Type analyzed = this.analyzeExpression(branch);
+        Type analyzed = this.store.errorType();
+        if (target != null) {
+            analyzed = this.analyzeExpressionAdapt(branch, target);
+        } else {
+            analyzed = this.analyzeExpression(branch);
+        }
         this.unconditionalPosition = previous;
         this.narrowing.pop();
         return analyzed;
@@ -2056,7 +2137,7 @@ class BodyChecker implements NoreturnCalls {
             },
             is SwitchStatementNode switched -> {
                 this.checkSwitchArms(switched.scrutinee(), armsOfStatement(switched),
-                    switched.switchKeyword().span(), false);
+                    switched.switchKeyword().span(), false, null);
             },
             default -> { },
         }
@@ -2520,7 +2601,7 @@ class BodyChecker implements NoreturnCalls {
                 return this.analyzeAssignment(assignment);
             },
             is TernaryExpressionNode ternary -> {
-                return this.analyzeTernary(ternary);
+                return this.analyzeTernary(ternary, null);
             },
             is NullCoalesceExpressionNode coalesce -> {
                 return this.analyzeNullCoalesce(coalesce);
@@ -2544,8 +2625,14 @@ class BodyChecker implements NoreturnCalls {
                 return this.analyzeTry(tried);
             },
             is SwitchExpressionNode switched -> {
-                return this.checkSwitchArms(switched.scrutinee(), armsOfExpression(switched),
-                    switched.switchKeyword().span(), true);
+                return this.analyzeSwitchExpression(switched, null);
+            },
+            is LambdaExpressionNode lambda -> {
+                this.reporter.report("This lambda has nothing to take its parameter and return "
+                    + "types from. Declare what holds it with a function type, for example "
+                    + "'(int, int) -> int compare = (a, b) -> a - b;', or pass it to a "
+                    + "parameter declared with one.", lambda.span());
+                return this.store.errorType();
             },
             is ErrorExpressionNode ignored -> {
                 return this.store.errorType();
@@ -2553,11 +2640,25 @@ class BodyChecker implements NoreturnCalls {
         }
     }
 
-    // Analyzes toward a target type, adapting untyped integer and char literals to it and, for
-    // array literals, typing the elements against the target's element type. A call sees the
-    // target as its expected type, which is what lets a static call on a generic type take its
-    // type arguments from the surrounding context.
+    // Analyzes toward a target type. The forms with no type of their own take theirs from it: a
+    // lambda its parameter and return types, an array literal its element type, an aggregate
+    // literal its struct. An untyped integer or char literal adapts to it. A call sees it as the
+    // expected type, which is what lets a static call on a generic type take its type arguments
+    // from the surrounding context. A '?:' and a switch expression produce one value out of
+    // several branches, so the target reaches each branch: whichever of these forms a branch is,
+    // it is written against the same type the whole expression answers to. Parentheses group an
+    // expression without changing what it is written against, so the target passes through them.
     analyzeExpressionAdapt(Expression node, Type target) -> Type {
+        if (node is ParenthesizedExpressionNode) {
+            Type adapted = this.analyzeExpressionAdapt(node.inner(), target);
+            this.result.setType(node.green(), adapted);
+            return adapted;
+        }
+        if (node is LambdaExpressionNode) {
+            Type adapted = this.analyzeLambda(node, target);
+            this.result.setType(node.green(), adapted);
+            return adapted;
+        }
         if (node is ArrayLiteralExpressionNode) {
             Type adapted = this.analyzeArrayLiteralAdapt(node, target);
             this.result.setType(node.green(), adapted);
@@ -2571,6 +2672,12 @@ class BodyChecker implements NoreturnCalls {
         Type analyzed = this.store.errorType();
         if (node is CallExpressionNode) {
             analyzed = this.analyzeCall(node, target);
+            this.result.setType(node.green(), analyzed);
+        } else if (node is TernaryExpressionNode) {
+            analyzed = this.analyzeTernary(node, target);
+            this.result.setType(node.green(), analyzed);
+        } else if (node is SwitchExpressionNode) {
+            analyzed = this.analyzeSwitchExpression(node, target);
             this.result.setType(node.green(), analyzed);
         } else {
             analyzed = this.analyzeExpression(node);
@@ -2597,6 +2704,252 @@ class BodyChecker implements NoreturnCalls {
             return updated;
         }
         return analyzed;
+    }
+
+    // ---- Lambdas ----
+
+    // Checks a lambda against the function type its surroundings expect. The target supplies the
+    // parameter types the lambda leaves out and the return type its body answers to. The body is
+    // checked as a callable of its own: its own scope, its own narrowing, its own loops, and a
+    // return type of its own, so nothing about the enclosing control flow reaches into it. What
+    // it reads from outside is a capture, recorded for the phases that lower it.
+    analyzeLambda(LambdaExpressionNode node, Type target) -> Type {
+        Type core = convert.coreOf(target);
+        if (core is ErrorType) {
+            return this.store.errorType();
+        }
+        if (!(core is FunctionType)) {
+            this.reporter.report("A lambda is a function value, and '{types.display(target)}' "
+                + "is not a function type, so it cannot hold one. Declare the target as a "
+                + "function type such as '(int, int) -> int'.", node.span());
+            return this.store.errorType();
+        }
+        Type[] expected = core.parameterTypes();
+        if (!this.checkLambdaShape(node, core, expected)) {
+            return this.store.errorType();
+        }
+        let parameters = new List<Parameter>();
+        for (long i = 0; i < node.parametersCount(); i++) {
+            let declared = node.parameters(i);
+            parameters.push(new Parameter(declared.name().text(), expected[i], false, false,
+                false, declared.name().span()));
+        }
+        let signature = new Signature("lambda", parameters.toArray(),
+            core.returnType(), false, false, [], [], [], node.green(), node.span());
+        let captures = this.checkLambdaBody(node, signature);
+        this.result.setLambda(node.green(),
+            new LambdaInfo(signature, core, captures));
+        return core;
+    }
+
+    // The lambda's parameter list against the target's: the same count, all types written or
+    // none, and every written type exactly the one the target passes. Invariant, so a written
+    // type that merely accepts the target's is still a mismatch.
+    checkLambdaShape(LambdaExpressionNode node, FunctionType target, Type[] expected) -> bool {
+        long given = node.parametersCount();
+        if (given != expected.length) {
+            string mine = parameterCountText(given);
+            string theirs = parameterCountText(expected.length);
+            this.reporter.report("This lambda takes {mine}, but '{types.display(target)}' "
+                + "takes {theirs}. Write it as '{lambdaShapeExample(expected.length)}'.",
+                node.span());
+            return false;
+        }
+        long typed = 0;
+        for (long i = 0; i < given; i++) {
+            if (node.parameters(i).declaredType() != null) {
+                typed++;
+            }
+        }
+        if (typed > 0 && typed < given) {
+            this.reporter.report("This lambda writes the type of some parameters and not "
+                + "others. Write every parameter's type or none of them, for example "
+                + "'(int a, int b) -> a - b' or '(a, b) -> a - b'.", node.span());
+            return false;
+        }
+        bool matched = true;
+        for (long i = 0; i < given; i++) {
+            let reference = node.parameters(i).declaredType();
+            if (reference == null) {
+                continue;
+            }
+            Type written = this.resolver.resolveType(reference);
+            if (written is ErrorType) {
+                matched = false;
+                continue;
+            }
+            if (written != expected[i]) {
+                this.reporter.report("Parameter '{node.parameters(i).name().text()}' is "
+                    + "declared '{types.display(written)}', but '{types.display(target)}' "
+                    + "passes '{types.display(expected[i])}' there. Write "
+                    + "'{types.display(expected[i])} {node.parameters(i).name().text()}', or "
+                    + "leave the type out and let the target supply it.", reference.span());
+                matched = false;
+            }
+        }
+        return matched;
+    }
+
+    // Walks the lambda's body under its own checker state and answers with what it captured.
+    checkLambdaBody(LambdaExpressionNode node, Signature signature) -> LambdaCapture[] {
+        let frame = new LambdaFrame(this.scope, this.thisType);
+        let outerScope = this.scope;
+        let outerNarrowing = this.narrowing;
+        let outerReturnType = this.currentReturnType;
+        bool outerNoreturn = this.currentNoreturn;
+        bool outerConstructor = this.inConstructor;
+        bool outerInCatch = this.inCatchClause;
+        long outerLoopDepth = this.loopDepth;
+        let outerBreakFlows = this.breakFlows;
+        let outerCtorFieldOwner = this.ctorFieldOwner;
+        let outerAssigned = this.copyBindings(this.assignedLocals);
+        let outerTracked = this.copyBindings(this.trackedLocals);
+        bool outerTerminated = this.flowTerminated;
+        bool outerUnconditional = this.unconditionalPosition;
+        let outerAssignmentTarget = this.assignmentTarget;
+
+        this.lambdaFrames.push(frame);
+        this.scope = new Scope(null);
+        this.narrowing = new NarrowingState();
+        this.currentReturnType = signature.returnType();
+        this.currentNoreturn = false;
+        this.inConstructor = false;
+        this.inCatchClause = false;
+        this.loopDepth = 0;
+        this.breakFlows = new List<List<AssignmentFlow>>();
+        this.ctorFieldOwner = null;
+        this.flowTerminated = false;
+        this.unconditionalPosition = true;
+        this.assignmentTarget = null;
+
+        Parameter[] parameters = signature.parameters();
+        let lambdaScope = this.scope;
+        for (long i = 0; i < parameters.length; i++) {
+            let parameter = parameters[i];
+            let binding = new LocalBinding(parameter.name(), parameter.type(),
+                BindingKind.Parameter, false, parameter.span());
+            if (lambdaScope != null && !lambdaScope.define(binding)) {
+                this.reporter.report("Duplicate parameter name '{parameter.name()}' in this "
+                    + "lambda; rename one of the parameters.", parameter.span());
+            }
+            this.result.setBinding(node.parameters(i).green(), binding);
+        }
+
+        this.enterScope();
+        this.walkLambdaBody(node, signature.returnType());
+        this.leaveScope();
+
+        this.lambdaFrames.pop();
+        this.scope = outerScope;
+        this.narrowing = outerNarrowing;
+        this.currentReturnType = outerReturnType;
+        this.currentNoreturn = outerNoreturn;
+        this.inConstructor = outerConstructor;
+        this.inCatchClause = outerInCatch;
+        this.loopDepth = outerLoopDepth;
+        this.breakFlows = outerBreakFlows;
+        this.ctorFieldOwner = outerCtorFieldOwner;
+        this.assignedLocals = outerAssigned;
+        this.trackedLocals = outerTracked;
+        this.flowTerminated = outerTerminated;
+        this.unconditionalPosition = outerUnconditional;
+        this.assignmentTarget = outerAssignmentTarget;
+        return frame.result();
+    }
+
+    // A block body is a function body: every path must return a value when the target returns
+    // one. An expression body is the value itself, unless the target returns nothing, in which
+    // case it is evaluated and discarded like an expression statement.
+    walkLambdaBody(LambdaExpressionNode node, Type returned) {
+        let body = node.body();
+        if (body is BlockNode) {
+            this.walkBlock(body);
+            if (!types.isVoidType(returned) && !(returned is ErrorType)
+                    && !flow.blockTerminates(body, ExitScope.Function, this)) {
+                this.reporter.report("This lambda returns "
+                    + "'{types.display(returned)}', so every path through its body needs a "
+                    + "'return'; this one can reach the end without one.", node.arrow().span());
+            }
+            return;
+        }
+        if (body is Expression) {
+            if (types.isVoidType(returned)) {
+                this.analyzeExpression(body);
+                return;
+            }
+            Type actual = this.analyzeExpressionAdapt(body, returned);
+            if (!(returned is ErrorType) && !(actual is ErrorType)
+                    && !convert.isAssignableStrict(returned, actual)) {
+                this.reporter.report("This lambda's body produces "
+                    + "'{types.display(actual)}', but its type returns "
+                    + "'{types.display(returned)}'"
+                    + "{this.valueNullabilityHint(returned, actual, body)}", body.span());
+            }
+        }
+    }
+
+    // A name the lambda being checked does not declare itself: the enclosing lambdas' scopes,
+    // outermost last, then the enclosing callable's. Finding one there is a capture, and every
+    // lambda between the declaration and the use copies it.
+    lookupCapture(string name) -> LocalBinding? {
+        for (long i = this.lambdaFrames.length() - 1; i >= 0; i--) {
+            let found = this.lambdaFrames.get(i).lookupOuter(name);
+            if (found == null) {
+                continue;
+            }
+            for (long j = i; j < this.lambdaFrames.length(); j++) {
+                this.lambdaFrames.get(j).captureBinding(found);
+            }
+            return found;
+        }
+        return null;
+    }
+
+    // Records that every lambda being checked copies the enclosing receiver, which is what makes
+    // 'this' readable, its fields writable, and its methods callable inside a lambda. A struct
+    // receiver is refused: copying it would give the lambda its own struct, so a write through
+    // the copy would not be a write to the one the method runs over.
+    captureReceiver(Type receiver, Span at) {
+        long depth = this.lambdaFrames.length();
+        if (depth == 0) {
+            return;
+        }
+        if (!types.isClassLike(receiver)) {
+            if (this.lambdaFrames.get(depth - 1).captureReceiver(receiver)) {
+                this.reporter.report("A lambda cannot capture 'this' here: "
+                    + "'{types.display(receiver)}' is a struct, so the lambda would copy it and "
+                    + "a write through the copy would leave the struct this method runs over "
+                    + "unchanged. Capture the fields the lambda needs as locals, or make "
+                    + "'{types.display(receiver)}' a class.", at);
+            }
+            return;
+        }
+        for (long i = 0; i < depth; i++) {
+            let ignored = this.lambdaFrames.get(i).captureReceiver(receiver);
+        }
+    }
+
+    // Whether the binding lives outside the lambda being checked, so a write to it would land on
+    // the lambda's own copy.
+    isCapturedBinding(LocalBinding binding) -> bool {
+        if (this.lambdaFrames.length() == 0) {
+            return false;
+        }
+        return this.lambdaFrames.get(this.lambdaFrames.length() - 1).holds(binding);
+    }
+
+    // Reports a write to a captured local; true when it reported. 'action' names what the write
+    // would do, so '=' and '++' read naturally.
+    reportCapturedWrite(LocalBinding binding, string action, Span at) -> bool {
+        if (!this.isCapturedBinding(binding)) {
+            return false;
+        }
+        this.reporter.report("Cannot {action} '{binding.name()}' inside a lambda: a lambda "
+            + "copies the values it captures, so the write would change that copy and leave the "
+            + "'{binding.name()}' outside it unchanged. Return the value the lambda computes and "
+            + "store it at the call site, or keep the value in an object the lambda can reach.",
+            at);
+        return true;
     }
 
     // Retypes an untyped integer literal to the integer target its value fits, and rejects the
@@ -2958,6 +3311,7 @@ class BodyChecker implements NoreturnCalls {
             }
             return this.store.errorType();
         }
+        this.captureReceiver(receiver, node.thisKeyword().span());
         return receiver;
     }
 
@@ -2985,6 +3339,7 @@ class BodyChecker implements NoreturnCalls {
                 + "class", node.superKeyword().span());
             return this.store.errorType();
         }
+        this.captureReceiver(receiver, node.superKeyword().span());
         return base;
     }
 
@@ -2995,7 +3350,7 @@ class BodyChecker implements NoreturnCalls {
         if (operator == SyntaxKind.AmpersandAmpersand || operator == SyntaxKind.PipePipe) {
             Type shortLeft = this.analyzeExpression(node.left());
             Type shortRight = this.analyzeGuardedBranch(node.left(), node.right(),
-                operator == SyntaxKind.AmpersandAmpersand);
+                operator == SyntaxKind.AmpersandAmpersand, null);
             if (shortLeft is ErrorType || shortRight is ErrorType) {
                 return this.store.errorType();
             }
@@ -3112,6 +3467,9 @@ class BodyChecker implements NoreturnCalls {
         } else if (leftSide is NullType) {
             rightSide = this.presenceOperandType(rightNode, rightSide);
         }
+        if (this.reportFunctionComparison(span, leftSide, rightSide)) {
+            return this.store.primitive(PrimitiveKind.Bool);
+        }
         if (!convert.isAssignableStrict(leftSide, rightSide)
                 && !convert.isAssignableStrict(rightSide, leftSide)) {
             this.reporter.report("Cannot compare '{types.display(leftSide)}' and "
@@ -3120,6 +3478,32 @@ class BodyChecker implements NoreturnCalls {
             this.checkStructEquatable(leftSide, rightSide, span);
         }
         return this.store.primitive(PrimitiveKind.Bool);
+    }
+
+    // A function value has nothing to reach into: no fields, no methods, no identity and no text
+    // form. The one home for saying so, whether the name was read or called.
+    reportFunctionMember(string name, Type functionType, Span at) -> Type {
+        this.reporter.report("A function value has no members, so '{name}' cannot be used on "
+            + "'{types.display(functionType)}': it has no identity and no text form. Call the "
+            + "value with '(...)', or keep the data you need beside it.", at);
+        return this.store.errorType();
+    }
+
+    // A function value has no identity: two lambdas with the same body are different values, and
+    // the same lambda written once may answer with a different value every time it is evaluated.
+    // Testing a nullable one against 'null' asks about presence instead and stays allowed. True
+    // when it reported.
+    reportFunctionComparison(Span span, Type left, Type right) -> bool {
+        if (left is NullType || right is NullType) {
+            return false;
+        }
+        if (!(convert.coreOf(left) is FunctionType) && !(convert.coreOf(right) is FunctionType)) {
+            return false;
+        }
+        this.reporter.report("A function value has no identity, so '{types.display(left)}' and "
+            + "'{types.display(right)}' cannot be compared. Compare what the functions produce, "
+            + "or keep a name or tag beside each one and compare that.", span);
+        return true;
     }
 
     // Same-type struct '==' lowers to a memberwise compare, so every field's type must have its
@@ -3297,6 +3681,9 @@ class BodyChecker implements NoreturnCalls {
         }
         if (operand is IdentifierExpressionNode) {
             let binding = this.result.bindingOf(operand.green());
+            if (binding != null && this.reportCapturedWrite(binding, "change", span)) {
+                return operandType;
+            }
             if (binding != null && binding.isConst()) {
                 this.reporter.report("The '{operator}' operator cannot change "
                     + "'{binding.name()}' because it is declared as constant; use 'let' "
@@ -3518,6 +3905,10 @@ class BodyChecker implements NoreturnCalls {
                 if (binding == null) {
                     return analyzed;
                 }
+                if (this.reportCapturedWrite(binding, "assign a new value to",
+                        identifier.span())) {
+                    return binding.type();
+                }
                 if (binding.isConst()) {
                     this.reporter.report("Cannot assign a new value to '{binding.name()}' "
                         + "because it is declared as constant; use 'let' instead of 'const' "
@@ -3549,10 +3940,12 @@ class BodyChecker implements NoreturnCalls {
         }
     }
 
-    analyzeTernary(TernaryExpressionNode node) -> Type {
+    analyzeTernary(TernaryExpressionNode node, Type? target) -> Type {
         Type condition = this.analyzeExpression(node.condition());
-        Type thenType = this.analyzeGuardedBranch(node.condition(), node.thenValue(), true);
-        Type elseType = this.analyzeGuardedBranch(node.condition(), node.elseValue(), false);
+        Type thenType = this.analyzeGuardedBranch(node.condition(), node.thenValue(), true,
+            target);
+        Type elseType = this.analyzeGuardedBranch(node.condition(), node.elseValue(), false,
+            target);
         this.checkConditionIsBool(condition, "Ternary condition", node.condition().span());
         if (thenType is ErrorType || elseType is ErrorType) {
             return this.store.errorType();
@@ -4429,6 +4822,9 @@ class BodyChecker implements NoreturnCalls {
             this.reporter.report("Type 'string' has no member '{name}'.",
                 node.member().span());
             return this.store.errorType();
+        }
+        if (core is FunctionType) {
+            return this.reportFunctionMember(name, core, node.member().span());
         }
         if (!isRecordLike(core)) {
             this.reporter.report("Cannot read a member of '{types.display(core)}' because it "
@@ -5459,12 +5855,90 @@ class BodyChecker implements NoreturnCalls {
                 return this.analyzeFunctionCall(node, identifier);
             },
             default -> {
-                this.reporter.report("This expression cannot be called; call a function or "
-                    + "method by name, e.g. 'f(x)' or 'value.method(x)'.", node.span());
+                Type calleeType = this.analyzeExpression(node.callee());
+                if (convert.coreOf(calleeType) is FunctionType) {
+                    return this.analyzeFunctionValueCall(node, calleeType, "",
+                        node.callee().span());
+                }
+                if (!(calleeType is ErrorType)) {
+                    this.reporter.report("This expression cannot be called; call a function or "
+                        + "method by name, e.g. 'f(x)' or 'value.method(x)'.", node.span());
+                }
                 this.analyzeArgumentsOnly(node.arguments());
                 return this.store.errorType();
             },
         }
+    }
+
+    // A call on a function value: ordinary call syntax on the value itself. A function type has
+    // no parameter names, so the arguments are positional and the call takes exactly as many as
+    // the type declares.
+    analyzeFunctionValueCall(CallExpressionNode node, Type calleeType, string calleeName,
+                                     Span calleeSpan) -> Type {
+        string subject = "This function value";
+        if (calleeName.length > 0) {
+            subject = "'{calleeName}'";
+        }
+        let typeArguments = node.typeArguments();
+        if (typeArguments != null) {
+            this.reporter.report("A function value takes no type arguments: its type "
+                + "'{types.display(calleeType)}' is already fixed.", typeArguments.span());
+        }
+        if (calleeType is OptionalType) {
+            string check = "if (value != null)";
+            if (calleeName.length > 0) {
+                check = "if ({calleeName} != null)";
+            }
+            this.reporter.report("{subject} has type '{types.display(calleeType)}', which may be "
+                + "null here, so it cannot be called. Check it for null first ('{check}'), or "
+                + "supply a fallback with '??'.", calleeSpan);
+            this.analyzeArgumentsOnly(node.arguments());
+            return this.store.errorType();
+        }
+        if (!(calleeType is FunctionType)) {
+            this.analyzeArgumentsOnly(node.arguments());
+            return this.store.errorType();
+        }
+        Type[] parameters = calleeType.parameterTypes();
+        let arguments = node.arguments();
+        long count = arguments.argumentsCount();
+        if (count != parameters.length) {
+            string wanted = argumentCountText(parameters.length);
+            this.reporter.report("{subject} has type '{types.display(calleeType)}', so the call "
+                + "takes {wanted}, got {count}.", node.span());
+        }
+        for (long i = 0; i < count; i++) {
+            switch (arguments.arguments(i)) {
+                is NamedArgumentNode named -> {
+                    this.reporter.report("A function type has no parameter names, so a function "
+                        + "value's arguments are given by position; write the values in order "
+                        + "without '{named.name().text()}:'.", named.span());
+                    this.analyzeExpression(named.value());
+                },
+                is OutArgumentNode outArgument -> {
+                    this.reporter.report("'out' can only be used when calling an external "
+                        + "function.", outArgument.span());
+                },
+                is Expression value -> {
+                    if (i < parameters.length) {
+                        Type parameterType = parameters[i];
+                        Type actual = this.analyzeExpressionAdapt(value, parameterType);
+                        if (!(parameterType is ErrorType) && !(actual is ErrorType)
+                                && !convert.isAssignableStrict(parameterType, actual)) {
+                            this.reporter.report("Argument {i + 1}: expected "
+                                + "'{types.display(parameterType)}', got "
+                                + "'{types.display(actual)}'"
+                                + "{this.valueNullabilityHint(parameterType, actual, value)}",
+                                value.span());
+                        }
+                    } else {
+                        this.analyzeExpression(value);
+                    }
+                },
+                default -> { },
+            }
+        }
+        return calleeType.returnType();
     }
 
     analyzeFunctionCall(CallExpressionNode node, IdentifierExpressionNode identifier)
@@ -5493,6 +5967,18 @@ class BodyChecker implements NoreturnCalls {
         }
         if (resolution is TypeName && isStructValue(resolution.target)) {
             return this.analyzeStructConstructorCall(node, resolution.target, name);
+        }
+        if (resolution is LocalName) {
+            Type calleeType = this.analyzeExpression(identifier);
+            if (convert.coreOf(calleeType) is FunctionType) {
+                return this.analyzeFunctionValueCall(node, calleeType, name, identifier.span());
+            }
+            if (!(calleeType is ErrorType)) {
+                this.reporter.report("'{name}' has type '{types.display(calleeType)}', which is "
+                    + "not a function type, so it cannot be called.", identifier.span());
+            }
+            this.analyzeArgumentsOnly(node.arguments());
+            return this.store.errorType();
         }
         this.reporter.report("'{name}' is not a function and cannot be called.",
             identifier.span());
@@ -5562,6 +6048,10 @@ class BodyChecker implements NoreturnCalls {
         this.result.setType(member.green(), memberType);
         let method = this.result.methodOf(member.green());
         if (method == null) {
+            if (convert.coreOf(memberType) is FunctionType) {
+                return this.analyzeFunctionValueCall(node, memberType, memberName,
+                    member.member().span());
+            }
             this.reportUncallableMember(member.green(), member.member().span(), memberName,
                 memberType);
             this.analyzeArgumentsOnly(node.arguments());
@@ -5923,6 +6413,10 @@ class BodyChecker implements NoreturnCalls {
         }
         Type core = objectType;
         let arguments = node.arguments();
+        if (convert.coreOf(core) is FunctionType) {
+            this.analyzeArgumentsOnly(arguments);
+            return this.reportFunctionMember(name, core, node.span());
+        }
         if (core is OptionalType) {
             if (name == "slice" && core.inner() is ArrayType) {
                 this.reporter.report("Cannot call 'slice' on '{types.display(core)}' because "
@@ -6154,10 +6648,13 @@ class BodyChecker implements NoreturnCalls {
             }
         }
 
+        // A value with no type of its own - a lambda, an aggregate literal - waits for the
+        // parameter it fills, which is known once the type arguments are resolved; it offers
+        // nothing to infer them from either.
         let argumentTypes = new List<Type>();
         for (long i = 0; i < arguments.argumentsCount(); i++) {
             let argument = arguments.arguments(i);
-            if (argument is Expression) {
+            if (argument is Expression && !needsTargetType(argument)) {
                 argumentTypes.push(this.analyzeExpression(argument));
             } else {
                 argumentTypes.push(this.store.errorType());
@@ -6223,12 +6720,16 @@ class BodyChecker implements NoreturnCalls {
             if (argument is Expression) {
                 Type parameterType = this.store.substitute(parameters[i].type(), owner,
                     resolvedArguments);
-                this.adaptIntegerLiteral(argument, parameterType);
-                this.adaptFloatLiteral(argument, parameterType);
                 Type actual = argumentTypes.get(i);
-                let updated = this.result.typeOf(argument.green());
-                if (updated != null) {
-                    actual = updated;
+                if (needsTargetType(argument)) {
+                    actual = this.analyzeExpressionAdapt(argument, parameterType);
+                } else {
+                    this.adaptIntegerLiteral(argument, parameterType);
+                    this.adaptFloatLiteral(argument, parameterType);
+                    let updated = this.result.typeOf(argument.green());
+                    if (updated != null) {
+                        actual = updated;
+                    }
                 }
                 if (!(parameterType is ErrorType) && !(actual is ErrorType)
                         && !convert.isAssignableStrict(parameterType, actual)) {
@@ -6637,12 +7138,19 @@ class BodyChecker implements NoreturnCalls {
 
     // ---- Switch arms ----
 
+    // A switch used as a value. The target is the type its arms answer to, and is null where the
+    // surroundings offer none.
+    analyzeSwitchExpression(SwitchExpressionNode node, Type? target) -> Type {
+        return this.checkSwitchArms(node.scrutinee(), armsOfExpression(node),
+            node.switchKeyword().span(), true, target);
+    }
+
     // Checks a switch in either form: the scrutinee kind, the labels or 'is' arm targets, arm
     // reachability, exhaustiveness, and the unified value type of the expression form.
     // Exhaustiveness reasons over the unwrapped scrutinee type; a scrutinee whose
     // narrowing-aware type is still nullable additionally needs a 'null' arm or a default.
     checkSwitchArms(Expression scrutinee, List<SwitchArm> arms, Span span,
-                            bool requireValue) -> Type {
+                            bool requireValue, Type? armTargetType) -> Type {
         Type scrutineeType = this.analyzeExpression(scrutinee);
         Type inner = convert.bareOf(scrutineeType);
         bool doublyNullable = !(scrutineeType is ErrorType) && inner is OptionalType;
@@ -6694,8 +7202,8 @@ class BodyChecker implements NoreturnCalls {
                             arm.span());
                     }
                     hasDefault = true;
-                    if (this.walkArmBodyFlow(arm.body(), requireValue, valueExpressions,
-                            armFlows, armNarrowings)) {
+                    if (this.walkArmBodyFlow(arm.body(), requireValue, armTargetType,
+                            valueExpressions, armFlows, armNarrowings)) {
                         sawValueBlock = true;
                     }
                 },
@@ -6732,8 +7240,8 @@ class BodyChecker implements NoreturnCalls {
                         }
                         this.result.setBinding(arm.green(), binding);
                     }
-                    if (this.walkArmBodyFlow(arm.body(), requireValue, valueExpressions,
-                            armFlows, armNarrowings)) {
+                    if (this.walkArmBodyFlow(arm.body(), requireValue, armTargetType,
+                            valueExpressions, armFlows, armNarrowings)) {
                         sawValueBlock = true;
                     }
                     this.leaveScope();
@@ -6773,8 +7281,8 @@ class BodyChecker implements NoreturnCalls {
                             this.checkStringLabel(label, seenStringLabels);
                         }
                     }
-                    if (this.walkArmBodyFlow(arm.body(), requireValue, valueExpressions,
-                            armFlows, armNarrowings)) {
+                    if (this.walkArmBodyFlow(arm.body(), requireValue, armTargetType,
+                            valueExpressions, armFlows, armNarrowings)) {
                         sawValueBlock = true;
                     }
                 },
@@ -7086,15 +7594,15 @@ class BodyChecker implements NoreturnCalls {
     // out-state and the narrowings holding at its end, so the arms can be joined: a local
     // assigned in every arm of an exhaustive switch is assigned after, and a path narrowed by
     // every arm stays narrowed after.
-    walkArmBodyFlow(ArmBody body, bool requireValue, List<Expression> sink,
+    walkArmBodyFlow(ArmBody body, bool requireValue, Type? target, List<Expression> sink,
                             List<AssignmentFlow> armFlows,
                             List<Map<NarrowingPath, Type>> armNarrowings) -> bool {
-        let sawBlock = this.walkArmBody(body, requireValue, sink, armNarrowings);
+        let sawBlock = this.walkArmBody(body, requireValue, target, sink, armNarrowings);
         armFlows.push(this.snapshotAssignment());
         return sawBlock;
     }
 
-    walkArmBody(ArmBody body, bool requireValue, List<Expression> sink,
+    walkArmBody(ArmBody body, bool requireValue, Type? target, List<Expression> sink,
                         List<Map<NarrowingPath, Type>> armNarrowings) -> bool {
         switch (body) {
             is BlockNode block -> {
@@ -7111,7 +7619,11 @@ class BodyChecker implements NoreturnCalls {
                 return sawBlock;
             },
             is Expression expression -> {
-                this.analyzeExpression(expression);
+                if (target != null) {
+                    this.analyzeExpressionAdapt(expression, target);
+                } else {
+                    this.analyzeExpression(expression);
+                }
                 armNarrowings.push(this.narrowing.flatten());
                 if (requireValue) {
                     sink.push(expression);
@@ -7322,6 +7834,43 @@ isStringable(Type core) -> bool {
         || isTextualFloat(core);
 }
 
+parameterCountText(long count) -> string {
+    if (count == 1) {
+        return "1 parameter";
+    }
+    return "{count} parameters";
+}
+
+argumentCountText(long count) -> string {
+    if (count == 1) {
+        return "1 argument";
+    }
+    return "{count} arguments";
+}
+
+// A lambda of the right arity, as a diagnostic shows the shape to write: '(a, b) -> ...'.
+lambdaShapeExample(long count) -> string {
+    let builder = new StringBuilder();
+    builder.append("(");
+    for (long i = 0; i < count; i++) {
+        if (i > 0) {
+            builder.append(", ");
+        }
+        builder.append(parameterExampleName(i));
+    }
+    builder.append(") -> ...");
+    return builder.toString();
+}
+
+parameterExampleName(long index) -> string {
+    return switch (index) {
+        0 -> "a",
+        1 -> "b",
+        2 -> "c",
+        default -> "p{index + 1}",
+    };
+}
+
 usesNamedArguments(ArgumentListNode arguments) -> bool {
     for (long i = 0; i < arguments.argumentsCount(); i++) {
         if (arguments.arguments(i) is NamedArgumentNode) {
@@ -7334,11 +7883,14 @@ usesNamedArguments(ArgumentListNode arguments) -> bool {
 // True for a written argument that names no type of its own: an empty array literal, whose element
 // type has to come from somewhere, and a '\{...\}' literal, which never names its struct. An
 // overloaded call analyzes such an argument only once it has chosen the parameter it reaches.
+// True for the values that have no type of their own to offer overload resolution, and are
+// checked once the parameter they fill is known: an empty array literal, an aggregate literal,
+// and a lambda, whose parameter and return types come from the function type it fills.
 needsTargetType(Expression value) -> bool {
     if (value is ArrayLiteralExpressionNode) {
         return value.elementsCount() == 0;
     }
-    return value is StructLiteralExpressionNode;
+    return value is StructLiteralExpressionNode || value is LambdaExpressionNode;
 }
 
 enumOrdinal(EnumType enumType, string memberName) -> long {
@@ -7426,7 +7978,7 @@ nullabilityHint(Type target, Type source) -> string {
     }
     if (source is NullType && !(target is OptionalType)) {
         return ". '{types.display(target)}' can never be null; write the type as "
-            + "'{types.display(target)}?' if it should allow null.";
+            + "'{types.displayNullable(target)}' if it should allow null.";
     }
     return "";
 }
@@ -7518,7 +8070,7 @@ nullComparisonHint(Type left, Type right) -> string {
         return "";
     }
     return ". A value of type '{types.display(other)}' can never be null; make its type "
-        + "nullable ('{types.display(other)}?') if it should allow null.";
+        + "nullable ('{types.displayNullable(other)}') if it should allow null.";
 }
 
 isNullLiteral(Expression expression) -> bool {

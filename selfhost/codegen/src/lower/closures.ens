@@ -1,0 +1,378 @@
+// Function values: the closure object a lambda evaluates to, the body that object points at, and
+// the call through one.
+//
+// A lambda's body becomes an ordinary EIR function whose receiver is the closure object. The
+// captures arrive inside that object rather than as parameters, so the body reads each one out of
+// a slot filled at entry, exactly as it reads a parameter. The captures themselves are written by
+// ordinary stores through closure_capture addresses, so a captured reference changes hands
+// through the same barrier a field's does and no reference counting lives here.
+//
+// A lambda inside a generic body is a different function per instance, because its captures and
+// its parameters take that instance's type arguments; that is what puts the instance's arguments
+// in the symbol.
+import LambdaExpressionNode from @ens.frontend.syntax.generated.nodes;
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import Expression from @ens.frontend.syntax.generated.nodes;
+import BlockNode from @ens.frontend.syntax.generated.nodes;
+import FieldDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import MemberListNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxNode from @ens.frontend.syntax.node;
+import LambdaCapture from @ens.sema.model.lambdas;
+import LambdaInfo from @ens.sema.model.lambdas;
+import Parameter from @ens.sema.model.types;
+import Type from @ens.sema.model.types;
+import @ens.sema.model.types;
+import EirClosureCall from eir.model;
+import EirClosureCapture from eir.model;
+import EirClosureNew from eir.model;
+import EirLoadSlot from eir.model;
+import EirReturn from eir.model;
+import EirStoreSlot from eir.model;
+import EirUnreachable from eir.model;
+import LoweringContext from lower.context;
+import lower.calls;
+import lower.classes;
+import lower.defaults;
+import lower.expressions;
+import lower.ownership;
+import lower.places;
+import lower.statements;
+import lower.stores;
+import support.primitives;
+import List from @std.collections.list;
+
+// Every lambda a node holds, in source order, nested ones included. The order is what the
+// per-module numbering is built on, so it has to be the same walk everywhere.
+public lambdasIn(SyntaxNode owner) -> List<LambdaExpressionNode> {
+    let found = new List<LambdaExpressionNode>();
+    collect(owner, found);
+    return found;
+}
+
+// Every lambda a record's field defaults hold, in source order. A default is lowered wherever the
+// record is built, so its lambda belongs to the record rather than to any one function.
+public lambdasInFieldDefaults(MemberListNode members) -> List<LambdaExpressionNode> {
+    let found = new List<LambdaExpressionNode>();
+    for (long i = 0; i < members.membersCount(); i++) {
+        let member = members.members(i);
+        if (member is FieldDeclarationNode) {
+            collect(member, found);
+        }
+    }
+    return found;
+}
+
+collect(SyntaxNode node, List<LambdaExpressionNode> found) {
+    if (node is LambdaExpressionNode) {
+        found.push(node);
+    }
+    let children = node.childNodes();
+    for (long i = 0; i < children.length(); i++) {
+        collect(children.get(i), found);
+    }
+}
+
+// The symbol of the destructor that gives a closure's captured references back, or "" when its
+// captures hold none and the object header carries no finalizer at all. The one home for the
+// question, so the creation site and the synthesis never disagree about whether the symbol exists.
+public destructorSymbolOf(string lambdaSymbol, Type[] captureTypes) -> string {
+    for (let captureType in captureTypes) {
+        if (primitives.hasArcContent(captureType)) {
+            return lambdaSymbol + "$dtor";
+        }
+    }
+    return "";
+}
+
+// A fresh function value: the closure object, then one store per capture. The object is zeroed,
+// so a capture is written into storage that holds nothing yet.
+public lowerCreation(LoweringContext lowering, LambdaExpressionNode node) -> long {
+    let info = lowering.result().lambdaOf(node.green());
+    if (info == null) {
+        lowering.internalError("this lambda has no checked shape to lower", node.span());
+        return -1;
+    }
+    Type functionType = lowering.substituted(info.type());
+    if (!lowering.supportsValueType(functionType)) {
+        lowering.unsupported("a function value of type '{types.display(functionType)}'",
+            node.span());
+        return -1;
+    }
+    let symbol = lowering.index().lambdaSymbolOf(node.green(), lowering.substitution());
+    if (symbol == null) {
+        lowering.internalError("this lambda has no lowered body to point at", node.span());
+        return -1;
+    }
+    LambdaCapture[] captures = info.captures();
+    let layout = captureLayout(lowering, node, info);
+    if (layout == null) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    long closure = builder.newTemp(functionType);
+    builder.append(new EirClosureNew(closure, functionType, symbol,
+        destructorSymbolOf(symbol, layout), layout));
+    for (long i = 0; i < captures.length; i++) {
+        if (!storeCapture(lowering, node, closure, captures[i], layout, i)) {
+            return -1;
+        }
+    }
+    return closure;
+}
+
+// The type of each capture under the active substitution, in capture order, which is what the
+// closure object's payload holds after the code pointer. Null when a capture is a shape code
+// generation cannot represent, with the reason already reported.
+captureLayout(LoweringContext lowering, LambdaExpressionNode node, LambdaInfo info) -> Type[]? {
+    let captureTypes = new List<Type>();
+    for (let capture in info.captures()) {
+        Type captureType = lowering.substituted(capture.type());
+        if (!lowering.supportsValueType(captureType)) {
+            lowering.unsupported("a lambda capturing a value of type "
+                + "'{types.display(captureType)}'", node.span());
+            return null;
+        }
+        captureTypes.push(captureType);
+    }
+    return captureTypes.toArray();
+}
+
+// Copies one captured value into the closure object. The value is read out of the storage the
+// enclosing body already holds it in, so the object takes a reference of its own to whatever it
+// keeps.
+storeCapture(LoweringContext lowering, LambdaExpressionNode node, long closure,
+             LambdaCapture capture, Type[] layout, long index) -> bool {
+    let builder = lowering.builder();
+    Type captureType = layout[index];
+    long value = capturedValue(lowering, node, capture, captureType);
+    if (value < 0) {
+        return false;
+    }
+    long address = builder.newTemp(captureType);
+    builder.append(new EirClosureCapture(address, captureType, closure, index, layout));
+    let operand = stores.operandFor(lowering, value, false, captureType);
+    if (!stores.initializeThroughAddress(lowering, address, captureType, operand)) {
+        lowering.internalError("a captured value has no storage to retain from", node.span());
+        return false;
+    }
+    return true;
+}
+
+// The value a capture copies: the enclosing receiver, the contents of the local's own slot, or
+// the sibling field a lambda inside a field default reads, which the record being built already
+// holds because the defaults fill in declaration order.
+capturedValue(LoweringContext lowering, LambdaExpressionNode node, LambdaCapture capture,
+              Type captureType) -> long {
+    let binding = capture.binding();
+    if (binding == null) {
+        return classes.lowerReceiver(lowering);
+    }
+    let slot = lowering.slotFor(binding);
+    if (slot == null) {
+        long sibling = defaults.siblingFieldAddress(lowering, binding);
+        if (sibling < 0) {
+            lowering.internalError("captured local '{binding.name()}' has no storage slot",
+                node.span());
+            return -1;
+        }
+        return places.loadFrom(lowering, sibling, captureType);
+    }
+    let builder = lowering.builder();
+    long value = builder.newTemp(captureType);
+    builder.append(new EirLoadSlot(value, captureType, slot));
+    return value;
+}
+
+// The prologue of a lambda's body: one slot per capture, filled from the closure object the
+// receiver names. A captured reference stays the object's, so its slot borrows; a captured struct
+// is this call's own copy, so it retains what it holds and gives it back when the body ends.
+public bindCaptures(LoweringContext lowering, LambdaExpressionNode node, LambdaInfo info)
+        -> bool {
+    let builder = lowering.builder();
+    LambdaCapture[] captures = info.captures();
+    let layout = captureLayout(lowering, node, info);
+    if (layout == null) {
+        return false;
+    }
+    for (long i = 0; i < captures.length; i++) {
+        let capture = captures[i];
+        Type captureType = layout[i];
+        long address = builder.newTemp(captureType);
+        builder.append(new EirClosureCapture(address, captureType, 0, i, layout));
+        long value = places.loadFrom(lowering, address, captureType);
+        bool borrowing = primitives.isReferenceType(captureType);
+        let binding = capture.binding();
+        long slot = -1;
+        if (binding == null) {
+            bool zeroed = (primitives.hasArcContent(captureType)
+                || primitives.structOf(captureType) != null) && !borrowing;
+            slot = builder.addSlot("this", captureType, zeroed, borrowing);
+        } else {
+            slot = lowering.defineSlotAs(binding, binding.name(), captureType, borrowing);
+        }
+        builder.append(new EirStoreSlot(slot, value));
+        if (!borrowing && primitives.hasArcContent(captureType)) {
+            long slotAddress = ownership.slotAddress(lowering, slot, captureType);
+            ownership.retainAt(lowering, slotAddress, captureType);
+            ownership.trackSlot(lowering, slot, captureType);
+        }
+        if (binding == null) {
+            lowering.setCapturedReceiver(slot, captureType);
+        }
+    }
+    return true;
+}
+
+// A call through a function value. The callee is the code pointer the closure object leads with,
+// so nothing here names a symbol; a function type never throws, so the call needs no unwind edge.
+public lowerCall(LoweringContext lowering, CallExpressionNode call, Type calleeType) -> long {
+    let callee = call.callee();
+    let functionType = primitives.functionOf(calleeType);
+    if (functionType == null) {
+        lowering.internalError("a call through a value of type "
+            + "'{types.display(calleeType)}', which is not a function value", callee.span());
+        return -1;
+    }
+    if (!lowering.supportsValueType(calleeType)) {
+        lowering.unsupported("calling a value of type '{types.display(calleeType)}'",
+            call.span());
+        return -1;
+    }
+    Type[] parameterTypes = lowering.substitutedAll(functionType.parameterTypes());
+    Type returnType = lowering.substituted(functionType.returnType());
+    let arguments = call.arguments();
+    if (arguments.argumentsCount() != parameterTypes.length) {
+        lowering.internalError("a call through '{types.display(functionType)}' passes "
+            + "{arguments.argumentsCount()} argument(s)", call.span());
+        return -1;
+    }
+    long closure = classes.borrowedReference(lowering, callee, calleeType);
+    if (closure < 0) {
+        return -1;
+    }
+    let temporaries = new List<long>();
+    let values = new List<long>();
+    for (long i = 0; i < parameterTypes.length; i++) {
+        let argument = arguments.arguments(i);
+        if (!(argument is Expression)) {
+            lowering.internalError("a function value takes only positional arguments",
+                call.span());
+            return -1;
+        }
+        long value = calls.lowerArgument(lowering, argument, parameterTypes[i], temporaries);
+        if (value < 0) {
+            return -1;
+        }
+        values.push(value);
+    }
+    let builder = lowering.builder();
+    long result = -1;
+    if (!types.isVoidType(returnType)) {
+        result = builder.newTemp(returnType);
+    }
+    builder.append(new EirClosureCall(result, returnType, closure, values.toArray(),
+        parameterTypes, lowering.lineAt(call.span())));
+    for (long i = 0; i < temporaries.length(); i++) {
+        lowering.unprotectValue(temporaries.get(i));
+        ownership.releaseValue(lowering, temporaries.get(i));
+    }
+    return result;
+}
+
+// The body of one lambda, as its own function: the captures out of the closure object the
+// receiver names, then the parameters, then the body itself. A block body returns the way any
+// function body does; an expression body is the returned value, or is evaluated and dropped when
+// the function type returns nothing.
+public lowerBody(LoweringContext lowering, LambdaExpressionNode node) -> bool {
+    let info = lowering.result().lambdaOf(node.green());
+    if (info == null) {
+        lowering.internalError("this lambda has no checked shape to lower", node.span());
+        return false;
+    }
+    lowering.pushScope();
+    if (!bindCaptures(lowering, node, info)) {
+        return false;
+    }
+    if (!bindParameters(lowering, node, info)) {
+        return false;
+    }
+    let builder = lowering.builder();
+    Type returnType = lowering.substituted(info.signature().returnType());
+    let body = node.body();
+    if (body is BlockNode) {
+        statements.lowerBlock(lowering, body);
+        if (lowering.failed()) {
+            return false;
+        }
+        if (!builder.terminated()) {
+            if (types.isVoidType(returnType)) {
+                ownership.releaseAllScopes(lowering);
+                builder.terminate(new EirReturn(-1));
+            } else {
+                builder.terminate(new EirUnreachable());
+            }
+        }
+        lowering.popScope();
+        return true;
+    }
+    if (!(body is Expression)) {
+        lowering.internalError("this lambda's body is neither a block nor an expression",
+            node.span());
+        return false;
+    }
+    if (types.isVoidType(returnType)) {
+        long value = expressions.lower(lowering, body);
+        if (lowering.failed()) {
+            return false;
+        }
+        statements.discardValue(lowering, body, value);
+        if (!builder.terminated()) {
+            ownership.releaseAllScopes(lowering);
+            builder.terminate(new EirReturn(-1));
+        }
+        lowering.popScope();
+        return true;
+    }
+    if (!statements.returnValue(lowering, body, returnType)) {
+        return false;
+    }
+    lowering.popScope();
+    return true;
+}
+
+// Every parameter of a lambda gets a slot holding its incoming temp, exactly as a function's
+// does: a reference arrives borrowed and stays the caller's, and a struct is this call's own copy.
+// The closure object is temp 0, so the parameters start at temp 1.
+bindParameters(LoweringContext lowering, LambdaExpressionNode node, LambdaInfo info) -> bool {
+    let builder = lowering.builder();
+    Parameter[] parameters = info.signature().parameters();
+    for (long i = 0; i < parameters.length; i++) {
+        let parameter = parameters[i];
+        Type parameterType = lowering.substituted(parameter.type());
+        if (!lowering.supportsValueType(parameterType)) {
+            lowering.unsupported("a lambda parameter of type "
+                + "'{types.display(parameterType)}'", parameter.span());
+            return false;
+        }
+        if (i >= node.parametersCount()) {
+            lowering.internalError("this lambda has fewer written parameters than its shape",
+                node.span());
+            return false;
+        }
+        let binding = lowering.result().bindingOf(node.parameters(i).green());
+        if (binding == null) {
+            lowering.internalError("lambda parameter '{parameter.name()}' has no binding",
+                parameter.span());
+            return false;
+        }
+        bool borrowing = primitives.isReferenceType(parameterType);
+        long slot = lowering.defineSlotAs(binding, parameter.name(), parameterType, borrowing);
+        builder.append(new EirStoreSlot(slot, i + 1));
+        if (!borrowing && primitives.hasArcContent(parameterType)) {
+            long address = ownership.slotAddress(lowering, slot, parameterType);
+            ownership.retainAt(lowering, address, parameterType);
+            ownership.trackSlot(lowering, slot, parameterType);
+        }
+    }
+    return true;
+}

@@ -81,7 +81,7 @@ bool LetStatement::isConst() const {
 // === TypedVarDeclStatement ===
 
 std::optional<TypeReference> TypedVarDeclStatement::typeReference() const {
-    if (auto tr = firstChildNode(node, SyntaxKind::TypeRef)) {
+    if (auto tr = firstTypeChild(node)) {
         return TypeReference::cast(*tr);
     }
     return std::nullopt;
@@ -91,7 +91,7 @@ std::optional<SyntaxNode> TypedVarDeclStatement::nameToken() const {
     bool seenType = false;
     for (auto& c : node.children()) {
         if (isTrivia(c.kind())) continue;
-        if (c.kind() == SyntaxKind::TypeRef) { seenType = true; continue; }
+        if (isTypeNode(c.kind())) { seenType = true; continue; }
         if (seenType && c.kind() == SyntaxKind::Identifier) return c;
     }
     return std::nullopt;
@@ -197,7 +197,7 @@ std::optional<Block> ForStatement::body() const {
 // === ForEachStatement ===
 
 std::optional<TypeReference> ForEachStatement::elementTypeRef() const {
-    if (auto tr = firstChildNode(node, SyntaxKind::TypeRef)) return TypeReference::cast(*tr);
+    if (auto tr = firstTypeChild(node)) return TypeReference::cast(*tr);
     return std::nullopt;
 }
 
