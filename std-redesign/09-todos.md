@@ -37,10 +37,6 @@ Declaring `print<T>(T value)` reports that the name cannot be overloaded because
 A switch arm's value-label list does not stop at `default` or `is` after a comma, so it reads the keyword as another label (found 2026-08-30, reproducing on the pinned seed).
 `switch (v) { 1, default -> 0, }` reports three problems for one mistake: a missing expression, a missing `->`, and a missing expression again.
 
-Pre-existing compiler bugs found during the A7 review (2026-08-29), reproducing on the pinned seed as well, none caused by the migration.
-`??` whose right operand produces an owned value fails lowering with an unbalanced-ownership message when the result type stays nullable.
-A checked cast (`fallback ?? (x as? Foo)`) and a call returning a nullable (`fallback ?? value.maybe()`) both hit it; a borrowed right operand and a non-nullable result both compile (measured 2026-08-30).
-
 A ruling on bounding tree depth for chains and statement nesting (found 2026-08-30).
 The A8 work bounded nesting for parenthesized expressions and types, but four shapes still exhaust the stack in the phases that walk the tree: long infix chains, postfix call chains, deeply nested blocks, and long type-suffix chains.
 The first three do the same on the pinned seed, so only the suffix chain is new, and bounding them changes the diagnostics any long chain produces, which is why it needs a decision rather than a quiet limit.
