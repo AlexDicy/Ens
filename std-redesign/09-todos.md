@@ -17,6 +17,9 @@ A modification counter in `Map`, `Set`, `SortedMap`, and their views, aborting o
 The compiler's rejected-key-type list for map and set keys: arrays, external handles, mutable collections, and function types.
 Function types are the verified case (2026-08-30): `Set<(int) -> char>` compiles, because the `Hashable` bound is treated as universally satisfied, and the elements then hash by object identity, so two identical lambdas written at two sites are two keys while a capturing lambda evaluated twice is also two keys.
 Writing `hash()` on a function value directly is already refused, so the generic path is the inconsistency, and the real work is making `Hashable` a bound with an exclusion list rather than special-casing one type.
+Ratified 2026-08-30: keep the direct rejection and make the bound honest, so the generic path refuses too, rather than granting every value an identity.
+A function value's identity is not stable under the compiler's freedom to share one closure object per capture-free lambda site or to allocate a fresh one per evaluation, so equality on it would answer questions about code generation rather than about the function; a class holding the function is how a program that needs identity gets it.
+The work belongs to C4, which designs the containers and their key rules.
 A test that ARC releases live locals on the throw path.
 A pinning fixture for file-next-to-folder module resolution, plus a spec line.
 A fixture for a cross-package subclass calling a protected constructor.
