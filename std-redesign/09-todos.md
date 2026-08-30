@@ -27,8 +27,10 @@ A fixture for a cross-package subclass calling a protected constructor.
 The 23 `new Error(...)` sites that break when `Error` goes abstract, most of which should throw `TestFailure`.
 OS-level redirection for `run(captureOutput: true)`, wait-with-timeout, and kill in the native bridges.
 The toString marker flip: after the Phase B seed and the C6 text rewrite give `StringBuilder` its `export override toString()`, Phase D makes an unmarked class method named `toString` an error, closing the A4 transition rule (ratified 2026-08-28).
-A ruling on `new T[n]` in generic bodies: it bypasses element-defaultability checking and is never re-checked at monomorphization, so `List<Pair>` today materializes struct values whose non-defaulted `const` fields hold zeros nobody assigned (verified 2026-08-27, pre-existing).
-The naive fix, re-checking at monomorphization, would reject the collections' own backing arrays (`new T[4]` in `List`), so the containers need a sanctioned raw-storage story first.
+Ratified 2026-08-30 and built: `new T[n]` in a generic body is judged once per instantiation through the obligations pass, and the containers hold their slots in `@std.collections.rawarray.RawArray<T>`, a package-wide struct over one `T[]` whose methods the compiler lowers to the array operations they stand for.
+Reading a slot nothing has written is the one unchecked operation in the language and is reachable only from `@std`, by the visibility ladder rather than by a compiler rule; a container elsewhere holds `T?[]` and pays a tag on each slot.
+`RawArray` is created through the free function `rawarray.allocate<T>(n)` rather than a static, because no published seed compiles `static` yet; move it to `RawArray<T>.allocate(n)` once a seed does.
+That seed refresh is on the migration's critical path anyway: at least fifteen static factories the design specifies cannot be written until a seed carries the feature.
 
 A dedicated review pass over the diagnostic messages introduced across the whole migration, once the plan completes (requested 2026-08-27).
 

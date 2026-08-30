@@ -1380,6 +1380,7 @@ let n = xs.length;            // long
 - The **innermost** element type must be one whose default value is meaningful, unless the array is filled as it is created (see the fill loop below).
   A non-nullable reference type (class, array, external, string) is otherwise rejected as the element; use the nullable form, `Box?[]` rather than `Box[]`.
   The same rule extends through struct fields: a struct containing a non-nullable reference field cannot be used as an array element.
+  An element type that is a type parameter is judged once per instantiation the program actually uses, and the message names the instantiation it was judged for, because whether a freshly allocated slot is a valid value depends on the type argument.
 - `new T[a][b]` allocates a fully-populated multidimensional grid in one call: an outer array of length `a`, each slot holding a freshly-allocated `T[]` of length `b`. The same shape extends to higher dimensions (`new T[a][b][c]`). Because every intermediate level is allocated, types like `int[][]` are valid here even though no intermediate slot is nullable.
 - `new T[a][]` allocates only the outer array; inner slots stay `null`. The result type is `T[]?[]`, the deepest unallocated level is reflected in the type by adding a `?`. Trailing empty brackets compose: `new T[a][b][]` produces `T[]?[][]`. Sized brackets must come before any empty ones in a single `new` expression.
 - `arr[i]` reads or writes an element. Bounds are checked at every access; an out-of-range index aborts the program.

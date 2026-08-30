@@ -138,6 +138,7 @@ import ObligationRegistry from phases.obligations;
 import Obligation from phases.obligations;
 import InterpolationObligation from phases.obligations;
 import TypeTestObligation from phases.obligations;
+import ArrayElementObligation from phases.obligations;
 import EqualityObligation from phases.obligations;
 import phases.obligations;
 import List from @std.collections.list;
@@ -7112,10 +7113,10 @@ class BodyChecker implements NoreturnCalls {
         }
         Type slotElement = element;
         if (unsized == 0) {
+            // A canonical fill loop assigns every slot whatever the element type turns out to be,
+            // so the proof holds for a type parameter as much as for a reference.
             bool singleDimension = sizes.length() == 1;
-            bool referenceElement = isReferenceElement(element);
-            bool proven = singleDimension && referenceElement
-                && this.fillProvenNews.contains(node.green());
+            bool proven = singleDimension && this.fillProvenNews.contains(node.green());
             string fillName = "items";
             let declared = this.arrayNewNames.get(node.green());
             if (declared != null) {
@@ -7151,55 +7152,33 @@ class BodyChecker implements NoreturnCalls {
         }
     }
 
+    // An element type that mentions a type parameter says nothing here about whether a freshly
+    // allocated slot is a valid value, so the judgment waits for the concrete arguments of every
+    // instantiation that occurs. The raw store's own allocation is the one place where slots
+    // holding no value is the point; see @std.collections.rawarray.
     validateArrayElement(Type element, Span span, bool hasFillName, string fillName)
             -> bool {
         if (element is ErrorType) {
             return false;
         }
-        if (convert.isDefaultable(element)) {
+        if (convert.containsTypeParam(element)) {
+            if (!this.inRawStorageAllocator()) {
+                this.recordObligation(new ArrayElementObligation(element, hasFillName, fillName,
+                    span));
+            }
             return true;
         }
-        if (element is TypeParamType) {
+        let issue = obligations.arrayElementIssue(element, hasFillName, fillName);
+        if (issue == null) {
             return true;
         }
-        string shown = types.display(element);
-        string hint = "";
-        if (isReferenceElement(element)) {
-            if (hasFillName) {
-                this.reporter.report("An array of non-nullable '{shown}' must be filled as "
-                    + "it is created: assign it to a new variable and follow the declaration "
-                    + "with `for (long i = 0; i < {fillName}.length; i++) \{ {fillName}[i] = "
-                    + "...; \}` (the update may be written 'i++', '++i', or 'i = i + 1'). "
-                    + "Alternatively use '{shown}?[]' so slots can start as null.", span);
-                return false;
-            }
-            hint = " Use '{shown}?[]' so freshly-allocated slots can start as null.";
-        } else if (isStructValue(element)) {
-            let fields = types.fieldsOf(element);
-            if (fields != null) {
-                for (long i = 0; i < fields.length(); i++) {
-                    let field = fields.get(i);
-                    if (field.hasDefault()) {
-                        continue;
-                    }
-                    if (field.isConst()) {
-                        hint = " Field '{field.name()}' of '{shown}' is 'const' with no "
-                            + "default value, so a freshly-allocated slot would hold a zero "
-                            + "it was never assigned. Give the field a default value.";
-                        break;
-                    }
-                    if (!convert.isDefaultable(field.type())) {
-                        hint = " Field '{field.name()}' of '{shown}' has type "
-                            + "'{types.display(field.type())}' which cannot start as a "
-                            + "default zero value. Make that field nullable.";
-                        break;
-                    }
-                }
-            }
-        }
-        this.reporter.report("Cannot use '{shown}' as an array element type because "
-            + "freshly-allocated slots would not be valid values of '{shown}'.{hint}", span);
+        this.reporter.report(issue, span);
         return false;
+    }
+
+    inRawStorageAllocator() -> bool {
+        return this.modulePath == "std.collections.rawarray"
+            && this.obligationOwnerName == "allocate";
     }
 
     // Records single-dimension array-new declaration initializers (for diagnostic wording)
@@ -7917,11 +7896,6 @@ isFinalClass(Type type) -> bool {
         return authority.isFinal();
     }
     return false;
-}
-
-isReferenceElement(Type element) -> bool {
-    return types.isClassLike(element) || element is ArrayType || element is StringType
-        || element is ExternalType;
 }
 
 // A floating-point type converts to text, but `decimal` is reserved rather than
