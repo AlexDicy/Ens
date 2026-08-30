@@ -28,6 +28,7 @@ import lower.bindings;
 import lower.builtins;
 import lower.classes;
 import lower.closures;
+import lower.conversions;
 import lower.exceptions;
 import lower.expressions;
 import lower.foreign;
@@ -410,7 +411,9 @@ public lowerArgument(LoweringContext lowering, Expression argument, Type paramet
 public emitCall(LoweringContext lowering, FunctionInfo info, Type? receiverType, long receiver,
                 long[] arguments, long dispatchSlot, Type? dispatchInterface, Span span) -> long {
     let signature = info.signature();
-    let returnType = calleeType(lowering, info, signature.returnType());
+    let promisedType = calleeType(lowering, info, signature.returnType());
+    let returnType = dispatchedReturnType(lowering, info, dispatchSlot, dispatchInterface,
+        promisedType);
     let builder = lowering.builder();
     let callee = new EirCallee(info.symbol(), receiverType,
         parameterTypesOf(lowering, info, signature), returnType, throwing.abiThrows(info));
@@ -422,7 +425,7 @@ public emitCall(LoweringContext lowering, FunctionInfo info, Type? receiverType,
     if (!throwing.contractThrows(info)) {
         builder.append(new EirCall(resultTemp, returnType, callee, receiver, arguments,
             dispatchSlot, dispatchInterface, line));
-        return resultTemp;
+        return narrowedResult(lowering, resultTemp, promisedType, span);
     }
     let errorType = lowering.errorType();
     if (errorType == null) {
@@ -437,7 +440,38 @@ public emitCall(LoweringContext lowering, FunctionInfo info, Type? receiverType,
     builder.moveTo(unwindBlock);
     exceptions.emitUnwindPath(lowering, error, span);
     builder.moveTo(normalBlock);
-    return resultTemp;
+    return narrowedResult(lowering, resultTemp, promisedType, span);
+}
+
+// A dispatched class call reads its table slot, whose one calling convention is the topmost
+// declaration's, and an override may return a shape that declaration did not promise. So the call
+// is built at the slot's shape rather than the statically resolved target's, under the same test
+// the slot's entry is chosen by, which is what keeps the two from disagreeing. An interface call
+// already resolves to the interface's own declaration, which is its table's shape.
+dispatchedReturnType(LoweringContext lowering, FunctionInfo info, long dispatchSlot,
+                     Type? dispatchInterface, Type promisedType) -> Type {
+    if (dispatchSlot < 0 || dispatchInterface != null) {
+        return promisedType;
+    }
+    let declared = lowering.tables().slotReturnTypeOf(info.signature());
+    if (declared == null) {
+        return promisedType;
+    }
+    Type slotType = calleeType(lowering, info, declared);
+    if (primitives.sameReturnShape(slotType, promisedType)) {
+        return promisedType;
+    }
+    return slotType;
+}
+
+// The slot's shape brought back to what the resolved target promised, which is the type the
+// expression around the call was checked at. The value is always there to read: every override
+// reachable through this slot returns something that reaches the promised type.
+narrowedResult(LoweringContext lowering, long result, Type promisedType, Span span) -> long {
+    if (result < 0 || lowering.builder().tempType(result) == promisedType) {
+        return result;
+    }
+    return conversions.convert(lowering, result, promisedType, span);
 }
 
 parameterTypesOf(LoweringContext lowering, FunctionInfo info, Signature signature) -> Type[] {

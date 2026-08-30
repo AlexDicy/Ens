@@ -19,7 +19,9 @@ import InstantiationType from @ens.sema.model.types;
 import InterfaceType from @ens.sema.model.types;
 import Method from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
+import TypeStore from @ens.sema.model.types;
 import @ens.sema.model.types;
+import ReturnAdapters from layout.adapters;
 import DispatchTables from layout.vtables;
 import layout.behaviors;
 import layout.vtables;
@@ -115,14 +117,21 @@ public final class DescriptorPlan {
     }
 }
 
-// The planned descriptors of the whole program, queried by interned type.
+// The planned descriptors of the whole program, queried by interned type, together with the
+// forwarding entries the slots name where no implementation fits at its own shape.
 public final class DescriptorPlans {
     Map<Type, DescriptorPlan> byType;
     List<DescriptorPlan> ordered;
+    ReturnAdapters slotAdapters;
 
     public constructor() {
         this.byType = new Map<Type, DescriptorPlan>();
         this.ordered = new List<DescriptorPlan>();
+        this.slotAdapters = new ReturnAdapters();
+    }
+
+    public adapters() -> ReturnAdapters {
+        return this.slotAdapters;
     }
 
     public planFor(Type type) -> DescriptorPlan? {
@@ -140,7 +149,8 @@ public final class DescriptorPlans {
 }
 
 // Plans every class and interface descriptor of the indexed program, instantiations included.
-public planProgram(ProgramIndex index, DispatchTables tables) -> DescriptorPlans {
+public planProgram(ProgramIndex index, DispatchTables tables,
+                   TypeStore store) -> DescriptorPlans {
     let plans = new DescriptorPlans();
     let modules = index.modules();
     for (long m = 0; m < modules.length(); m++) {
@@ -158,12 +168,13 @@ public planProgram(ProgramIndex index, DispatchTables tables) -> DescriptorPlans
     for (long m = 0; m < modules.length(); m++) {
         let classes = modules.get(m).classes();
         for (long i = 0; i < classes.length(); i++) {
-            plans.add(planClass(classes.get(i), index, tables));
+            plans.add(planClass(classes.get(i), index, tables, plans.adapters(), store));
         }
         let instantiations = modules.get(m).instantiations();
         for (long i = 0; i < instantiations.length(); i++) {
             if (primitives.classOf(instantiations.get(i)) != null) {
-                plans.add(planClass(instantiations.get(i), index, tables));
+                plans.add(planClass(instantiations.get(i), index, tables, plans.adapters(),
+                    store));
             }
         }
     }
@@ -176,15 +187,17 @@ planInterface(Type interfaceType) -> DescriptorPlan {
         declaringModuleOf(interfaceType), typeIdOf(symbol), null, [], []);
 }
 
-planClass(Type classType, ProgramIndex index, DispatchTables tables) -> DescriptorPlan {
+planClass(Type classType, ProgramIndex index, DispatchTables tables, ReturnAdapters adapters,
+          TypeStore store) -> DescriptorPlan {
     string symbol = descriptorSymbol(classType);
     let vtable = new FunctionInfo?[tables.vtableSizeOf(classType)];
     for (long slot = 0; slot < vtable.length; slot++) {
-        vtable[slot] = slotImplementation(classType, slot, index, tables);
+        vtable[slot] = vtableEntry(classType, slot, index, tables, adapters, store);
     }
     return new DescriptorPlan(classType, symbol, types.display(classType),
         declaringModuleOf(classType), typeIdOf(symbol), vtables.baseClassOf(classType), vtable,
-        planConformances(classType, index, tables), behaviorSlot(classType, "hash", index),
+        planConformances(classType, index, tables, adapters, store),
+        behaviorSlot(classType, "hash", index),
         behaviorSlot(classType, "equals", index), behaviorSlot(classType, "toString", index));
 }
 
@@ -203,6 +216,21 @@ behaviorSlot(Type classType, string name, ProgramIndex index) -> FunctionInfo? {
         return null;
     }
     return info;
+}
+
+// The entry a class's vtable holds at one slot: the implementation itself, or the forwarding entry
+// that gives it the shape the slot is called at.
+vtableEntry(Type classType, long slot, ProgramIndex index, DispatchTables tables,
+            ReturnAdapters adapters, TypeStore store) -> FunctionInfo? {
+    let implementation = slotImplementation(classType, slot, index, tables);
+    if (implementation == null) {
+        return null;
+    }
+    let declared = tables.slotReturnTypeOf(implementation.signature());
+    if (declared == null) {
+        return implementation;
+    }
+    return adapters.entryFor(implementation, declared, store);
 }
 
 // The implementation a class's vtable holds at one slot: the nearest declaration down the chain
@@ -236,8 +264,8 @@ slotImplementation(Type classType, long slot, ProgramIndex index, DispatchTables
 // One entry per interface the class or a base implements - the interfaces those extend
 // included - nearest declaration first, each carrying the most-derived implementation of every
 // interface method.
-planConformances(Type classType, ProgramIndex index, DispatchTables tables)
-        -> ConformancePlan[] {
+planConformances(Type classType, ProgramIndex index, DispatchTables tables,
+                 ReturnAdapters adapters, TypeStore store) -> ConformancePlan[] {
     let plans = new List<ConformancePlan>();
     let seen = new Set<Type>();
     Type? current = classType;
@@ -248,7 +276,7 @@ planConformances(Type classType, ProgramIndex index, DispatchTables tables)
                     continue;
                 }
                 plans.push(new ConformancePlan(level,
-                    interfaceImplementations(classType, level, index, tables)));
+                    interfaceImplementations(classType, level, index, tables, adapters, store)));
             }
         }
         current = vtables.baseClassOf(current);
@@ -257,18 +285,25 @@ planConformances(Type classType, ProgramIndex index, DispatchTables tables)
 }
 
 interfaceImplementations(Type classType, Type interfaceType, ProgramIndex index,
-                         DispatchTables tables) -> FunctionInfo?[] {
+                         DispatchTables tables, ReturnAdapters adapters,
+                         TypeStore store) -> FunctionInfo?[] {
     let methods = types.methodsOf(interfaceType);
     if (methods == null) {
         return [];
     }
     let implementations = new FunctionInfo?[methods.length()];
     for (long i = 0; i < methods.length(); i++) {
-        long slot = tables.itableSlotOf(methods.get(i).signature());
+        let required = methods.get(i);
+        long slot = tables.itableSlotOf(required.signature());
         if (slot < 0 || slot >= implementations.length) {
             continue;
         }
-        implementations[slot] = implementationOf(classType, methods.get(i), index);
+        let implementation = implementationOf(classType, required, index);
+        if (implementation == null) {
+            continue;
+        }
+        implementations[slot] = adapters.entryFor(implementation,
+            required.signature().returnType(), store);
     }
     return implementations;
 }
