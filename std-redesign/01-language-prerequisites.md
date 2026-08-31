@@ -16,6 +16,16 @@ The keyword `function` is not used and not reserved.
 
 Ratified 2026-08-29.
 A function type never throws, so a lambda whose body can throw is rejected against such a target and told to handle the failure inside itself; the throwing form can be added later without invalidating any code that compiles today.
+Superseded 2026-08-31: the throwing form is what `assertThrows` needs, so a function type may carry a `throws` list, written after the return type with the function type in parentheses, as in `(() -> void throws E)`.
+The list is required rather than optional there, for the same reason an abstract method's is: a function type has no body to infer one from.
+Two decisions were ratified alongside it, and both hold everywhere rather than only in a function type: an explicit `throws` list is legal wherever `throws` is written, meaning the body raises no more than the listed types, and a type parameter is allowed where a class type is required for a runtime type test, which is `catch`, `is`, `as?`, and `switch` `is`-arms.
+The first replaces the older rule that a list was legal only where a method could be overridden; a list bounds the body that carries it, and binding overrides is that same bound applied to an inherited list.
+
+Ratified 2026-08-31.
+An array compares by content, element by element through each element's own `==`, hashes by its contents, and formats as its contents, so `[1, 2, 3] == [1, 2, 3]` is true and an array fills an interpolation hole.
+This is the rule 04-collections.md already gives the containers, and an array is the same kind of value, so the two agree instead of splitting on whether the sequence is a builtin.
+An array stays refused as a map or set key for the reason a mutable collection is: its contents, and so its hash, can change while it sits in the table.
+A struct with an array field therefore compares memberwise and serializes, which removes the exception spec.md carried for it.
 A lambda may capture `this`, by value like any other reference, so field writes and method calls through the captured reference are legal while the rule against mutating an enclosing local stands.
 The three shapes the library needs are `(T, T) -> int`, `(T) -> bool`, and `() -> V`.
 

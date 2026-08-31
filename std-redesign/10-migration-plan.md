@@ -54,6 +54,8 @@ Within each milestone the std change and its consumer updates are one commit, so
   `StackFrame` needs a seed release of its own, found while implementing it: the seed compiles this tree's `libs/std`, and the trace runtime it carries builds every frame as a class object with a type descriptor, which a struct has none of.
   So the flip is three steps, since the seed used across it has to read both shapes: the trace runtime learns to build frames from whichever shape the library declares, that seed is published, and `core.ens` flips after it.
 - C2: `@std.testing` rewritten on the new `Error`, including `assertThrows` and structured diffs.
+  Writing the surface 08-testing.md specifies needs four language changes first, each its own commit, because a library may only use what the seed already compiles: an explicit `throws` list legal wherever `throws` is written, a function type able to carry one, a type parameter allowed where a class type is required for a runtime type test, and an array comparing and formatting by its contents.
+  A seed release then follows, and the library commit lands last, so the order is C2a through C2d, the seed, and C2e.
 - C3: the iterator flip, one coordinated commit: `Iterator.next() -> T?`, the `for`-in lowering, every iterator in std, and every hand-written iterator elsewhere in the tree.
   This is the one cross-cutting break that cannot be staged, which is why it comes before the container rewrite rather than with it.
 - C4: `@std.collections` rewritten: the ladder, `Entry`, the six containers, conditional `sort`, `getOrInsert`, views, the modification counter.
