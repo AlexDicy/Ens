@@ -2087,7 +2087,14 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
                     "A destructor cannot be marked 'throws'.");
             continue;
         }
-        bool overridable = !isCtor && !m.isFinal() && !si->isFinal;
+        // What can actually be overridden: not a constructor, not marked 'final', not a member
+        // of a final class, and not private, since a private member is not inherited at all.
+        bool overridable = !isCtor && !m.isFinal() && !si->isFinal
+            && methodVisibility != Visibility::Private;
+        if (m.isFinal() && methodVisibility == Visibility::Private)
+            errorAtNode(m.node, "Method '" + asciiOf(mname) + "' cannot be 'final': it is "
+                "private to '" + asciiOf(si->name) + "', so it is not inherited and there is no "
+                "override to forbid. Remove 'final'.");
         checkFieldMethodCollision(si, mname, isCtor, m.node);
         checkThrowsClausePlacement(m, overridable, isCtor);
         checkHashMethodSignature(m, sym, isCtor);
