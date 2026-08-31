@@ -13,14 +13,16 @@ An unmarked top-level declaration is visible only within its file, and an unmark
 `export` makes a declaration visible to the packages that consume this one through `@` imports, including programs using `@std`.
 `protected` keeps its own meaning for class and struct members: the declaring file, plus subclasses in the case of classes.
 Top-level `protected` is not allowed.
-Struct fields follow their struct's visibility; a field that writes its own modifier, such as `private`, opts out.
-Class members never follow their class: they stay private unless marked.
-The one exception is a method that replaces a behavior the language already provides for its type: a struct's or a class's `toString`, `hash`, and `equals`.
-The language calls such a method wherever the type is used, so it follows its type's visibility when unmarked and may not be marked less visible than its type.
+Members never follow the type that contains them, whether that type is a class or a struct: they stay private unless marked.
+`private` is therefore never written; a member or a top-level declaration is already private with no modifier on it, and writing the word is an error.
+A private member belongs to its own type alone, so it is not inherited: a subclass cannot call it, cannot override it, and may declare a method of its own under the same name with no relation to the base's.
+Overriding a base method therefore requires that method to be at least `protected`, and an abstract method must be at least `protected` too, since a subclass has to implement it.
+A method that provides an interface requirement must be as visible as its own class, because anyone who can hold one of its values as the interface can call it through the interface.
+One kind of method follows its type's visibility instead of the default: a method that replaces a behavior the language already provides, meaning a struct's or a class's `toString`, `hash`, and `equals`.
+The language calls such a method wherever the type is used, so it may not be marked less visible than its type either.
 Interface members carry no visibility of their own: they always follow the interface, and writing a visibility modifier on an interface member is an error.
 Enum cases follow their enum.
 A member may not be declared more visible than the type that contains it: an `export` method on a `public` class is an error, never a silent cap.
-Writing the default explicitly, such as `private` on a class member, is allowed.
 A declaration's signature may not mention a type less visible than the declaration itself; this covers parameter types, the return type, declared thrown types, field types, a base class, implemented interfaces, and generic arguments and bounds.
 A protected member is held to the same rule at the widest scope its class can be subclassed from: the file for a `final`, `sealed`, or file-private class, the package for an open `public` class, and everywhere for an open `export` class, whose external subclassers must be able to name every type its protected members mention.
 A `test` declaration sees its file's private top-level declarations like any other code in the file, but not the private members of types.
@@ -129,7 +131,7 @@ calculateArea(Rectangle rectangle) -> uint {
 
 ```ens
 class Animation<S: Shape + Comparable> {
-    private S? shape;
+    S? shape;
 
     // A constructor is introduced by the `constructor` keyword. It can be a full method or a shorthand which initializes the fields. Methods can have optional parameters, optional parameters must provide a default value. This syntax allows to use either new Animation(); or new Animation(myShape);
     // the default expression must be assignable to the field's declared type.
@@ -302,8 +304,8 @@ A method does not declare type parameters of its own; a type-parameter list on a
 
 ```ens
 class List<T> {
-    private T[] items;
-    private long count;
+    T[] items;
+    long count;
 
     constructor() { this.items = new T[4]; this.count = 0; }
 
@@ -341,7 +343,7 @@ The `Animation<S: Shape + Comparable>` example above uses exactly this form.
 
 ```ens
 class Drawer<T: Shape> {
-    private T shape;
+    T shape;
     constructor(T s) { this.shape = s; }
     area() -> int { return this.shape.area(); }
 }
@@ -359,7 +361,7 @@ abstract class Source<T> {
 }
 
 class Constant<T> extends Source<T> {
-    private T value;
+    T value;
     constructor(this.value);
     override read() -> T { return this.value; }
 }
@@ -452,7 +454,7 @@ orElse(string? text, () -> string make) -> string {
 }
 
 class Counter {
-    private long total;
+    long total;
 
     constructor() { this.total = 0; }
 
@@ -1215,8 +1217,8 @@ import Iterable from @std.collections.iterator;
 import Iterator from @std.collections.iterator;
 
 class Range implements Iterable<int> {
-    private int low;
-    private int high;
+    int low;
+    int high;
     constructor(this.low, this.high);
     override makeIterator() -> Iterator<int> { return new RangeIterator(this.low, this.high); }
 }

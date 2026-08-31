@@ -238,6 +238,11 @@ Visibility Analyzer::topLevelVisibility(const std::optional<ast::VisibilityModif
             "private to this file.");
         return Visibility::Private;
     }
+    if (v == Visibility::Private) {
+        errorAtNode(modifier->node, "A top-level declaration is private to its file unless it "
+            "is marked, so 'private' is never written. Remove it from '" + declName + "'.");
+        return Visibility::Private;
+    }
     return v;
 }
 
@@ -247,6 +252,11 @@ Visibility Analyzer::memberVisibility(const std::optional<ast::VisibilityModifie
                                       const std::u16string& memberName) {
     if (!modifier) return defaultVisibility;
     Visibility v = toSemanticVisibility(modifier->visibility());
+    if (v == Visibility::Private) {
+        errorAtNode(modifier->node, "A member is private to its type unless it is marked, so "
+            "'private' is never written. Remove it from '" + asciiOf(memberName) + "'.");
+        return defaultVisibility;
+    }
     if (v != Visibility::Protected && owner &&
         visibilityTier(v) > visibilityTier(owner->visibility)) {
         errorAtNode(modifier->node, memberKindWord + " '" + asciiOf(memberName) +
@@ -833,17 +843,21 @@ void Analyzer::registerExternalTypeNames(const ast::SourceFile& file) {
         Visibility visibility = Visibility::Private;
         if (auto modifier = ed.visibilityModifier()) {
             Visibility marked = toSemanticVisibility(modifier->visibility());
-            if (marked == Visibility::Public || marked == Visibility::Private) {
-                visibility = marked;
+            if (marked == Visibility::Public) {
+                visibility = Visibility::Public;
+            } else if (marked == Visibility::Private) {
+                errorAtNode(modifier->node, "An external type is private to its file unless it "
+                    "is marked, so 'private' is never written. Remove it from '" +
+                    asciiOf(*name) + "'.");
             } else if (marked == Visibility::Protected) {
-                errorAtNode(modifier->node, "An external type may be 'private' or 'public'; "
-                    "'protected' is only meaningful for class and struct members. Mark '" +
-                    asciiOf(*name) + "' 'public' to share it across the package, or leave it "
-                    "unmarked.");
+                errorAtNode(modifier->node, "An external type may be left unmarked or made "
+                    "'public'; 'protected' is only meaningful for class and struct members. "
+                    "Mark '" + asciiOf(*name) + "' 'public' to share it across the package, or "
+                    "leave it unmarked.");
             } else {
-                errorAtNode(modifier->node, "An external type may be 'private' or 'public'; it "
-                    "can never be exported. Wrap '" + asciiOf(*name) + "' in an Ens type to share "
-                    "it beyond the package.");
+                errorAtNode(modifier->node, "An external type may be left unmarked or made "
+                    "'public'; it can never be exported. Wrap '" + asciiOf(*name) +
+                    "' in an Ens type to share it beyond the package.");
             }
         }
         Type* t = typeCtx.registerExternalType(modulePath_, *name);
@@ -1431,8 +1445,7 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             if (fname) fi.name = *fname;
             Type* ft = f.typeReference() ? resolveTypeReference(*f.typeReference()) : typeCtx.getError();
             fi.type = ft;
-            fi.visibility = memberVisibility(f.visibilityModifier(),
-                                             followedMemberVisibility(t->structInfo->visibility),
+            fi.visibility = memberVisibility(f.visibilityModifier(), Visibility::Private,
                                              t->structInfo, "Field", fi.name);
             fi.isWeak = f.isWeak();
             if (fi.isWeak) {
@@ -1891,6 +1904,40 @@ static bool equalsSignatureConforms(const Symbol* sym) {
     return sym->returnType && sym->returnType->kind == TypeKind::Bool;
 }
 
+// The base declaration a member of this class would replace. A private one is skipped: only
+// the class that declared it can name it, so it is not inherited, and this class's own member
+// of that name is an unrelated one of its own. A visible declaration further up the chain is
+// still what an override replaces. `base` is the class this class extends, not the class
+// itself; `StructInfo::classDeclaringMethod` starts at itself and does not skip private, so it
+// is not reused here.
+static StructInfo* visibleBaseDeclaringMethod(StructInfo* base, const std::u16string& methodName) {
+    for (StructInfo* s = base; s; s = s->baseInfo) {
+        int idx = s->findMethodIndex(methodName);
+        if (idx >= 0 && s->methods[idx].visibility != Visibility::Private) return s;
+    }
+    return nullptr;
+}
+
+static StructInfo* visibleBaseDeclaringMethodBySignature(StructInfo* base,
+                                                          const std::u16string& methodName,
+                                                          const Symbol* like) {
+    for (StructInfo* s = base; s; s = s->baseInfo) {
+        int idx = s->findMethodIndexBySignature(methodName, like);
+        if (idx >= 0 && s->methods[idx].visibility != Visibility::Private) return s;
+    }
+    return nullptr;
+}
+
+// A base class's private method of this name, which is what a mistaken 'override' was aiming
+// at when nothing visible declares the name.
+static StructInfo* privateBaseDeclaringMethod(StructInfo* base, const std::u16string& methodName) {
+    for (StructInfo* s = base; s; s = s->baseInfo) {
+        int idx = s->findMethodIndex(methodName);
+        if (idx >= 0 && s->methods[idx].visibility == Visibility::Private) return s;
+    }
+    return nullptr;
+}
+
 void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
     Type* t = analysis.typeOf(cd.node.greenNode());
     if (!t || !t->structInfo) return;
@@ -2005,15 +2052,16 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
 
         const char* behavior = isDtor ? nullptr
                                       : builtinBehaviorReplaced(t, mname, sym, m.isOverride());
-        MethodInfo mi;
-        mi.name = mname;
-        mi.symbol = sym;
-        mi.declaration = const_cast<GreenElement*>(m.node.greenNode());
-        mi.visibility = isDtor ? Visibility::Private
+        Visibility methodVisibility = isDtor ? Visibility::Private
                      : behavior ? builtinReplacementVisibility(m.visibilityModifier(), t, mname,
                                                                behavior)
                                 : memberVisibility(m.visibilityModifier(), Visibility::Private,
                                                    si, isCtor ? "Constructor" : "Method", mname);
+        MethodInfo mi;
+        mi.name = mname;
+        mi.symbol = sym;
+        mi.declaration = const_cast<GreenElement*>(m.node.greenNode());
+        mi.visibility = methodVisibility;
         mi.isConstructor = isCtor;
         mi.isDestructor = isDtor;
         mi.isOverride = m.isOverride();
@@ -2049,15 +2097,22 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
                 errorAtNode(m.node, "A constructor cannot be 'override' or 'abstract'.");
             continue;
         }
-        StructInfo* baseByName = si->baseInfo ? si->baseInfo->classDeclaringMethod(mname) : nullptr;
+        StructInfo* baseByName = si->baseInfo ? visibleBaseDeclaringMethod(si->baseInfo, mname)
+                                              : nullptr;
         StructInfo* baseBySig = si->baseInfo
-            ? si->baseInfo->classDeclaringMethodBySignature(mname, sym) : nullptr;
+            ? visibleBaseDeclaringMethodBySignature(si->baseInfo, mname, sym) : nullptr;
         if (m.isAbstract()) {
             if (!si->isAbstract)
                 errorAtNode(m.node, "Abstract method '" + asciiOf(mname) + "' requires class '" +
                     asciiOf(si->name) + "' to be declared 'abstract'");
             if (m.body().has_value())
                 errorAtNode(m.node, "Abstract method '" + asciiOf(mname) + "' cannot have a body");
+            // An unmarked member is private to its own type, and a subclass has to implement
+            // an abstract method, so the two ask for opposite things.
+            if (methodVisibility == Visibility::Private)
+                errorAtNode(m.node, "Abstract method '" + asciiOf(mname) + "' must be at least "
+                    "'protected': a subclass has to implement it, and an unmarked member is "
+                    "private to '" + asciiOf(si->name) + "'. Mark it 'protected'.");
         }
         // A conforming `hash` or `equals` overrides the compiler's built-in
         // identity hash/equality, so it is written with 'override' like any
@@ -2106,6 +2161,13 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
             } else if (reservedIntent) {
                 // Overrides the compiler's built-in identity hash/equality; no
                 // base declares it, but 'override' is the required marker.
+            } else if (StructInfo* privateBase = si->baseInfo
+                           ? privateBaseDeclaringMethod(si->baseInfo, mname) : nullptr) {
+                errorAtNode(m.node, "Cannot override '" + asciiOf(mname) + "': '" +
+                    asciiOf(privateBase->name) + "' declares it privately, so it is not "
+                    "inherited and nothing here can call it. Mark it 'protected' in '" +
+                    asciiOf(privateBase->name) + "' to allow overriding, or drop 'override' to "
+                    "declare a method of this class's own.");
             } else {
                 errorAtNode(m.node, "Method '" + asciiOf(mname) + "' is marked 'override' but no "
                     "base class or implemented interface declares it.");
@@ -2155,6 +2217,20 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
                     asciiOf(si->name) + "' must be marked 'noreturn' because interface '" +
                     ifaceT->toString() + "' declares it 'noreturn'; callers rely on it never "
                     "returning.");
+            }
+            // Anyone who can name the class, or hold one of its values as the interface, can
+            // call the method through the interface. So it has to reach as far as the class
+            // does, the same rule 'toString', 'hash', and 'equals' already follow. 'protected'
+            // and private share one tier, so the narrowest case is named on its own.
+            Visibility wantedReach = followedMemberVisibility(si->visibility);
+            if (cm.visibility == Visibility::Private ||
+                visibilityTier(cm.visibility) < visibilityTier(wantedReach)) {
+                errorAtNode(cd.node, "Method '" + asciiOf(im.name) + "' of '" +
+                    asciiOf(si->name) + "' is " + visibilityWord(cm.visibility) +
+                    ", but it provides '" + interfaceMethodSignature(im) + "' required by '" +
+                    ifaceT->toString() + "', and a call through '" + ifaceT->toString() +
+                    "' reaches it wherever '" + asciiOf(si->name) + "' itself reaches. Mark it '" +
+                    visibilityWord(wantedReach) + "'.");
             }
         }
     }

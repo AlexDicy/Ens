@@ -47,10 +47,15 @@ Opening `tests/inheritance.ens` says `main` may only be defined in the main modu
 Folder programs and packages are both clean; only a single file is affected, so this is worth carrying to the language server's replacement rather than fixing in the one being retired.
 Its parser also bounds no nesting at all, so all four deep shapes reach its stack the way they used to reach the compiler's (found 2026-08-30); the replacement needs the bound the compiler's parser now has.
 
-A private method can be overridden from a subclass, and the override answers the base class's own calls (found 2026-08-31, pre-existing).
-`private secret()` on a base, `override secret()` on a subclass in another file, and the base's own `this.secret()` reaches the subclass, so a member the subclass cannot even see decides what the declaring type does.
-Surfaced by C1, whose `Error.typeName` is private and was overridable this way; `final` closes that one member, and the rule itself is untouched.
-The fix has to settle whether a private member takes a dispatch slot at all, so it wants a ruling before code.
+A private base field is still treated as inherited, unlike a private base method (found 2026-08-31, pre-existing).
+A subclass declaring a field whose name a private base field already uses is refused with "Field is already declared in base class", and because that ends the subclass's own field collection, its own reads of the name are rewired onto the base's private field and refused a second time for privacy, from inside the subclass.
+Methods gained the opposite rule on 2026-08-31: a private base method is not inherited, so a subclass may reuse the name for a member of its own.
+The field fix is more than a filter, because base fields flatten into the subclass's layout: the duplicate check has to skip private base fields, and field resolution inside the subclass has to prefer its own, which means two slots carrying one name.
+
+An override may still be marked less visible than the method it overrides (found 2026-08-31).
+`protected override greet()` on a middle class whose base declares `greet()` publicly compiles, and the method stays reachable through the base's dispatch slot, so the marker narrows who may name it and nothing else.
+Virtual dispatch itself is right: a further subclass overriding the same method answers for its own instances.
+What is unsettled is whether the narrowing marker should be legal at all, which is the override-visibility question the visibility ladder deliberately set aside, so it wants a ruling rather than a fix.
 
 ## Reminders
 
