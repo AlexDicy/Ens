@@ -15,16 +15,16 @@ Shortest round-trip float formatting, for `StringBuilder.append(double)` and int
 Number formatting beyond decimal (radix, width, padding) and parsing/formatting for `decimal`.
 A modification counter in `Map`, `Set`, `SortedMap`, and their views, aborting on mutation during a walk.
 The compiler's rejected-key-type list for map and set keys: arrays, external handles, mutable collections, and function types.
-Function types are the verified case (2026-08-30): `Set<(int) -> char>` compiles, because the `Hashable` bound is treated as universally satisfied, and the elements then hash by object identity, so two identical lambdas written at two sites are two keys while a capturing lambda evaluated twice is also two keys.
-Writing `hash()` on a function value directly is already refused, so the generic path is the inconsistency, and the real work is making `Hashable` a bound with an exclusion list rather than special-casing one type.
-External handles are refused by code generation as of 2026-08-30, in both the `Handle` and the `Handle?` spelling, with a message naming the type; sema still accepts the call, so making the bound honest is what moves the refusal to where it belongs.
-Ratified 2026-08-30: keep the direct rejection and make the bound honest, so the generic path refuses too, rather than granting every value an identity.
+`@std.hash` retired on 2026-08-31 and `Map` and `Set` name their key types with no bound, so there is no bound left to make honest: the judgment is the compiler's own, and it has to be made where a value is hashed and against the type argument an instantiation supplies.
+Function types are the verified case (2026-08-30): `Set<(int) -> char>` compiles, and the elements hash by object identity, so two identical lambdas written at two sites are two keys while a capturing lambda evaluated twice is also two keys.
+Writing `hash()` on a function value directly is already refused, so the generic path is the inconsistency.
+External handles are refused by code generation as of 2026-08-30, in both the `Handle` and the `Handle?` spelling, with a message naming the type; sema still accepts the call, so moving that refusal to where it belongs is the same piece of work.
+Ratified 2026-08-30: keep the direct rejection and refuse the generic path too, rather than granting every value an identity.
 A function value's identity is not stable under the compiler's freedom to share one closure object per capture-free lambda site or to allocate a fresh one per evaluation, so equality on it would answer questions about code generation rather than about the function; a class holding the function is how a program that needs identity gets it.
 The work belongs to C4, which designs the containers and their key rules.
 A test that ARC releases live locals on the throw path.
 A pinning fixture for file-next-to-folder module resolution, plus a spec line.
 A fixture for a cross-package subclass calling a protected constructor.
-The 23 `new Error(...)` sites that break when `Error` goes abstract, most of which should throw `TestFailure`.
 OS-level redirection for `run(captureOutput: true)`, wait-with-timeout, and kill in the native bridges.
 The toString marker flip: after the Phase B seed and the C6 text rewrite give `StringBuilder` its `export override toString()`, Phase D makes an unmarked class method named `toString` an error, closing the A4 transition rule (ratified 2026-08-28).
 `Map.keys` and `Map.values` copy each element twice, once into a capacity-reserved list and once into the array they hand out, because a sparse gather cannot be written as the canonical fill loop the array-element check recognizes.

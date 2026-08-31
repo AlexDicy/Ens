@@ -1728,8 +1728,8 @@ A method named `hash` must have exactly that signature, and neither `hash` nor `
 When a class declares such an `equals`, `==` and `!=` on that class compare by content - an identity and null check first, then `equals` - rather than by reference identity; when a struct declares one, `==` and `!=` call it instead of comparing the fields.
 Both `hash` and `equals` are written with `override`, since they replace behavior the language provides: a class's identity hash and equality, a struct's content hash and memberwise equality.
 The two are a matched pair: a type that declares one must declare the other, so equal values always hash equally.
-A declared `hash` decides the hashing of its type everywhere the value appears, including as a field of an enclosing struct, as an array element, and behind a `Hashable` bound; a declared `equals` decides `==` the same way.
-The `Hashable` interface from `@std.hash` names the hashing contract for generic bounds, and every type satisfies it.
+A declared `hash` decides the hashing of its type everywhere the value appears, including as a field of an enclosing struct, as an array element, and through a type parameter; a declared `equals` decides `==` the same way.
+A type parameter needs no bound to be hashed, since every type answers `hash()`, which is why `Map` and `Set` name their key types without one.
 Because the language calls `hash` and `equals` wherever the type is used, both follow their type's visibility when unmarked and may not be marked less visible than the type itself.
 
 For a class, which implementation runs is decided by the value's type at run time, not by the type written in the source.
