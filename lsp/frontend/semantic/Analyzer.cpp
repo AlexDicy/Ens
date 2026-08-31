@@ -1495,7 +1495,7 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             sym->isConstructor = isCtor;
             sym->isNoreturn = m.isNoreturn();
             checkFieldMethodCollision(t->structInfo, mname, isCtor, m.node);
-            checkThrowsClausePlacement(m, /*isOverridable=*/false, /*isConstructor=*/isCtor);
+            checkThrowsClausePlacement(m, /*isConstructor=*/isCtor);
             checkNoreturnPlacement(m, /*isConstructor=*/isCtor, /*isDestructor=*/false);
             resolveMethodParams(m, t, sym);
             checkHashMethodSignature(m, sym, isCtor);
@@ -2087,16 +2087,12 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
                     "A destructor cannot be marked 'throws'.");
             continue;
         }
-        // What can actually be overridden: not a constructor, not marked 'final', not a member
-        // of a final class, and not private, since a private member is not inherited at all.
-        bool overridable = !isCtor && !m.isFinal() && !si->isFinal
-            && methodVisibility != Visibility::Private;
         if (m.isFinal() && methodVisibility == Visibility::Private)
             errorAtNode(m.node, "Method '" + asciiOf(mname) + "' cannot be 'final': it is "
                 "private to '" + asciiOf(si->name) + "', so it is not inherited and there is no "
                 "override to forbid. Remove 'final'.");
         checkFieldMethodCollision(si, mname, isCtor, m.node);
-        checkThrowsClausePlacement(m, overridable, isCtor);
+        checkThrowsClausePlacement(m, isCtor);
         checkHashMethodSignature(m, sym, isCtor);
         checkEqualsMethodSignature(m, sym, isCtor);
         if (isCtor) {
@@ -2382,7 +2378,7 @@ void Analyzer::collectFunctions(const ast::SourceFile& file) {
         sym->returnType = fn.returnType() && fn.returnType()->typeReference()
             ? resolveTypeReference(*fn.returnType()->typeReference())
             : typeCtx.getPrimitive(TypeKind::Void);
-        checkThrowsClausePlacement(fn, /*isOverridable=*/false, /*isConstructor=*/false);
+        checkThrowsClausePlacement(fn, /*isConstructor=*/false);
         checkNoreturnPlacement(fn, /*isConstructor=*/false, /*isDestructor=*/false);
         resolveFunctionParams(fn, sym);
         popTypeParams(tpCount);
@@ -2860,8 +2856,7 @@ bool Analyzer::findNonJsonableField(Type* structT, std::vector<StructInfo*>& vis
     return false;
 }
 
-void Analyzer::checkThrowsClausePlacement(const ast::FuncDecl& fn, bool isOverridable,
-                                          bool isConstructor) {
+void Analyzer::checkThrowsClausePlacement(const ast::FuncDecl& fn, bool isConstructor) {
     if (!fn.isThrows()) return;
     SyntaxNode at = fn.throwsToken().value_or(fn.node);
     if (isConstructor) {
@@ -2869,16 +2864,9 @@ void Analyzer::checkThrowsClausePlacement(const ast::FuncDecl& fn, bool isOverri
             "exceptions escape; handle them with a 'catch' clause after the constructor body.");
         return;
     }
-    bool hasTypes = !fn.declaredThrowsTypes().empty();
-    if (fn.isAbstract()) {
-        if (!hasTypes)
-            errorAtNode(at, "An abstract method marked 'throws' must list its exception types, "
-                "e.g. 'throws IOError'.");
-        return;
-    }
-    if (hasTypes && !isOverridable) {
-        errorAtNode(at, "Explicit 'throws' types are only allowed where the method can be "
-            "overridden; the thrown types here are inferred. Write 'throws' with no type list.");
+    if (fn.isAbstract() && fn.declaredThrowsTypes().empty()) {
+        errorAtNode(at, "An abstract method marked 'throws' must list its exception types, "
+            "e.g. 'throws IOError'.");
     }
 }
 

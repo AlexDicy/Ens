@@ -235,7 +235,7 @@ private:
                              bool isInterfaceMethod = false);
     void resolveFunctionParams(const ast::FuncDecl& fn, Symbol* sym);
     bool overrideSignaturesCompatible(const MethodInfo& base, Symbol* derived);
-    void checkThrowsClausePlacement(const ast::FuncDecl& fn, bool isOverridable, bool isConstructor);
+    void checkThrowsClausePlacement(const ast::FuncDecl& fn, bool isConstructor);
     void checkNoreturnPlacement(const ast::FuncDecl& fn, bool isConstructor, bool isDestructor);
     void checkEntrySignature(const ast::FuncDecl& fn, Symbol* sym);
     void checkFieldMethodCollision(StructInfo* owner, const std::u16string& methodName,

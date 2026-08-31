@@ -695,7 +695,13 @@ The command line reaches the other toolchain exactly as it was written, and a to
 
 ---
 
-Methods that can throw exceptions are marked with `throws`; any other method can be considered safe. Every thrown value must be an instance of a subclass of `Error`. `Error` itself is abstract and cannot be instantiated, so every failure a program raises says which failure it is. For most methods the set of throwable types is computed by the compiler and shown by IDEs on hover. A method may also declare its thrown types explicitly - `read() -> bytes throws IOError` or `read() -> bytes throws IOError, ParseError`, which is required for abstract methods and forms a contract: an override may throw those types or their subclasses, never others.
+Methods that can throw exceptions are marked with `throws`; any other method can be considered safe.
+Every thrown value must be an instance of a subclass of `Error`.
+`Error` itself is abstract and cannot be instantiated, so every failure a program raises says which failure it is.
+For most methods the set of throwable types is computed by the compiler and shown by IDEs on hover.
+Any function or method may also declare its thrown types explicitly, as in `read() -> bytes throws IOError` or `read() -> bytes throws IOError, ParseError`.
+The list is an upper bound: the body may raise those types or their subclasses and nothing else, and callers see the list rather than what the body happens to raise today, so widening it is a deliberate edit.
+A list is required on an abstract method, which has no body to infer one from, and where a method can be overridden the list binds every override to the same bound.
 
 If any exception is not handled and the method is not marked as `throws`, this should result in a compilation error explaining which exceptions were not handled and how to handle them (either with a `catch` block or via the `throws` keyword).
 
