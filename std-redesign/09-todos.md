@@ -52,10 +52,6 @@ A private method can be overridden from a subclass, and the override answers the
 Surfaced by C1, whose `Error.typeName` is private and was overridable this way; `final` closes that one member, and the rule itself is untouched.
 The fix has to settle whether a private member takes a dispatch slot at all, so it wants a ruling before code.
 
-Error declares `frames` ahead of `cause` only until the C1 seed lands.
-The seed pinned before C1 reads the frames field at a hardcoded index 1, so a `cause` declared there makes a seed-built program store the captured `long[]` into the `Error? cause` slot and read it back as an error, which segfaults.
-The compiler now resolves both fields by name, so the declaration order goes back to the one 03-core.md gives once a seed carrying that lookup is pinned.
-
 ## Reminders
 
 When `@std.time` is designed, replace `Metadata.modifiedMillis` and `wait(long timeoutMillis)` with a proper duration/instant type; the names carry the unit until then.
