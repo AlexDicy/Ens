@@ -504,7 +504,7 @@ The implicitly imported modules described below are the one exception: no import
 Two modules may import each other: circular imports are allowed, and declarations resolve across the cycle like any other import.
 
 A short list of standard-library modules is imported implicitly, today just `@std.core`.
-Every exported name of such a module is in scope in every module with no import written: its types `Error` and `StackFrame` are used by name, and its exported functions are called unqualified.
+Every exported name of such a module is in scope in every module with no import written: its types `Error`, `StackFrame`, `Comparable`, and `Copyable` are used by name, and its exported functions are called unqualified.
 A declaration of your own with one of those names takes precedence inside the module that declares it.
 That precedence goes by name and not by signature: a `describe(int)` of your own hides every implicitly imported `describe`, so a call that does not fit yours is an error rather than a call to theirs, and the hidden one is reached by importing its module and qualifying the call.
 Every other module of the standard library has to be imported.
@@ -693,7 +693,7 @@ The command line reaches the other toolchain exactly as it was written, and a to
 
 ---
 
-Methods that can throw exceptions are marked with `throws`; any other method can be considered safe. Every thrown value must be an instance of `Error` or a subclass of it. For most methods the set of throwable types is computed by the compiler and shown by IDEs on hover. A method may also declare its thrown types explicitly - `read() -> bytes throws IOError` or `read() -> bytes throws IOError, ParseError`, which is required for abstract methods and forms a contract: an override may throw those types or their subclasses, never others.
+Methods that can throw exceptions are marked with `throws`; any other method can be considered safe. Every thrown value must be an instance of a subclass of `Error`. `Error` itself is abstract and cannot be instantiated, so every failure a program raises says which failure it is. For most methods the set of throwable types is computed by the compiler and shown by IDEs on hover. A method may also declare its thrown types explicitly - `read() -> bytes throws IOError` or `read() -> bytes throws IOError, ParseError`, which is required for abstract methods and forms a contract: an override may throw those types or their subclasses, never others.
 
 If any exception is not handled and the method is not marked as `throws`, this should result in a compilation error explaining which exceptions were not handled and how to handle them (either with a `catch` block or via the `throws` keyword).
 
@@ -734,6 +734,19 @@ class TestRepository {
     }
 }
 ```
+
+Every error carries a `message` saying what failed and a `cause`, the error it was raised in response to, or null when it wraps nothing.
+Both are `const`, so what an error carries is fixed when it is raised, and a subclass passes them up with `super(message)` or `super(message, cause)`.
+An error's text form is its message, then each cause on its own line innermost last, each introduced by `caused by` and the cause's own type name:
+
+```
+request failed
+caused by OpenError: could not open config.toml
+caused by ReadError: no such file or directory
+```
+
+The text writes a bounded number of causes and ends with `and further causes` when the chain runs longer, so an error handed itself as its own cause still produces text.
+`stackTrace`, `stackFrames`, and the text of an error's own type are answered by the compiler rather than by any body, so a subclass cannot replace them.
 
 Every `Error` carries a **stack trace** captured at the point it is thrown, recording the throwing call and each caller above it. The trace travels with the exception as it propagates, so a handler always sees where the error originated rather than where it was caught. `panic()` captures a trace the same way.
 

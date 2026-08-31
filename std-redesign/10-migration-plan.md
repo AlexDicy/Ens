@@ -51,6 +51,8 @@ Within each milestone the std change and its consumer updates are one commit, so
 
 - C1: `@std.core` rewritten: abstract `Error` with `const` fields and `cause`, `StackFrame` as a struct, `Comparable`, `Copyable`.
   The same commit fixes the 23 `new Error(...)` sites, most of which become `TestFailure`, and retires `@std.hash`.
+  `StackFrame` needs a seed release of its own, found while implementing it: the seed compiles this tree's `libs/std`, and the trace runtime it carries builds every frame as a class object with a type descriptor, which a struct has none of.
+  So the flip is three steps, since the seed used across it has to read both shapes: the trace runtime learns to build frames from whichever shape the library declares, that seed is published, and `core.ens` flips after it.
 - C2: `@std.testing` rewritten on the new `Error`, including `assertThrows` and structured diffs.
 - C3: the iterator flip, one coordinated commit: `Iterator.next() -> T?`, the `for`-in lowering, every iterator in std, and every hand-written iterator elsewhere in the tree.
   This is the one cross-cutting break that cannot be staged, which is why it comes before the container rewrite rather than with it.
