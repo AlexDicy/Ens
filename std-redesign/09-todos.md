@@ -29,13 +29,13 @@ OS-level redirection for `run(captureOutput: true)`, wait-with-timeout, and kill
 The toString marker flip: after the Phase B seed and the C6 text rewrite give `StringBuilder` its `export override toString()`, Phase D makes an unmarked class method named `toString` an error, closing the A4 transition rule (ratified 2026-08-28).
 Ratified 2026-08-30 and built: `new T[n]` in a generic body is judged once per instantiation through the obligations pass, and the containers hold their slots in `@std.collections.rawarray.RawArray<T>`, a package-wide struct over one `T[]` whose methods the compiler lowers to the array operations they stand for.
 Reading a slot nothing has written is the one unchecked operation in the language and is reachable only from `@std`, by the visibility ladder rather than by a compiler rule; a container elsewhere holds `T?[]` and pays a tag on each slot.
-`RawArray` is created through the free function `rawarray.allocate<T>(n)` rather than a static, because no published seed compiles `static` yet; move it to `RawArray<T>.allocate(n)` once a seed does.
-That seed refresh is on the migration's critical path anyway: at least fifteen static factories the design specifies cannot be written until a seed carries the feature.
+`RawArray` is still created through the free function `rawarray.allocate<T>(n)` rather than `RawArray<T>.allocate(n)`, even though the v0.2.0-beta seed compiles a static.
+That seed carries the per-instantiation check together with an exemption keyed on a free function named `allocate`, so moving the sources to the static now would make the pinned seed reject `libs/std`.
+The compiler in this tree exempts the whole `std.collections.rawarray` module instead, which covers either spelling, so the sources may switch in any commit after the next seed refresh.
 `Map.keys` and `Map.values` still copy each element twice, once into a capacity-reserved list and once into the array it hands out, because a sparse gather cannot be written as the canonical fill loop the proof recognizes and nothing else may hand a raw store out as an array.
 Measured with class keys at -O2, that is 301ms against 351ms for a growing list and 401ms for a walk through the pair-building iterator, so the reserved list is the best of the three available forms and still about half again the single copy the unchecked version did.
 `Set.items` has no such cost because its iterator yields the element itself rather than a pair, so it fills the result directly: 132ms against 299ms for the reserved list.
 The residual disappears when C4 turns `keys` and `values` into the `Iterable` views 04-collections.md specifies, which copy nothing; a key-only cursor would close it sooner at the price of code that those views delete.
-`List`'s capacity constructor is package-wide for the same seed reason, and becomes `List.withCapacity` when a seed compiles a static.
 
 A dedicated review pass over the diagnostic messages introduced across the whole migration, once the plan completes (requested 2026-08-27).
 
