@@ -407,6 +407,7 @@ The return type may be `void`, which means the call produces no value; a paramet
 
 A `?` or `[]` suffix written after a function type belongs to the return type, so `(int) -> bool?` is a function returning `bool?`.
 A nullable or arrayed function type is therefore written in parentheses: `((int) -> bool)?` and `((int) -> bool)[]`.
+A `throws` list reads the same way, which is the other reason parentheses are allowed here.
 A function type is the only type parentheses are allowed around, and nothing else needs them: a function type returning a function type reads right to left, so `(int) -> (int) -> int` returns `(int) -> int`, and a function type is written directly as another's parameter type, as in `((int) -> bool, int) -> int`.
 Parentheses around any other type, as in `(int) x = 1;`, are an error naming the plain spelling, so every type keeps one written form.
 
@@ -432,11 +433,18 @@ The lambda's own parameters and locals are ordinary storage and may be written f
 `this` is captured like any other reference, so a lambda inside a class's method may read the object's fields, write them, and call its methods.
 A struct's method cannot hand its `this` to a lambda, because a struct is a value: the lambda would capture a copy, and a write through that copy would not reach the struct the method runs over.
 
-A function type never throws.
-A lambda whose body can raise is refused against one, and the fix is to handle the failure inside the lambda: move the throwing work into a named function whose own `catch` clause turns the failure into a value, and call that function from the lambda.
+A function type raises nothing unless it says what it raises, with a `throws` list written after the return type.
+The function type carrying the list is written in parentheses, as in `(() -> void throws ParseError)`, which is what keeps the list from reading as the throws list of the declaration the type is written in.
+The list is required rather than optional, for the same reason an abstract method's is: a function type has no body to infer one from.
 
-Assignability between function types is exact.
+A lambda's body is held to its target's list, so a lambda written against `(() -> void throws ParseError)` may raise a `ParseError` and nothing else.
+A lambda whose body can raise something its target does not list is refused, and so is one written against a target with no list at all; the fix in either case is to add the type to the target's list, or to handle the failure inside the lambda by moving the throwing work into a named function whose own `catch` clause turns it into a value.
+
+A call through a function value that declares a list needs `try`, and the caller handles the declared types, exactly as a call to a declaration with that list would.
+
+Assignability between function types is exact, and the throws list is part of the type.
 A `(long, long) -> long` is not accepted where a `(int, int) -> int` is expected, and neither is the reverse, whatever the parameter and return types would allow on their own.
+A `() -> void` and a `(() -> void throws ParseError)` are likewise two different types, in either direction.
 
 A function value is called with ordinary call syntax on the value itself, wherever that value comes from: a local, a field, an array element, or the result of another call.
 A function type has no parameter names, so the arguments are positional and named arguments are an error, and the call passes exactly as many arguments as the type declares.

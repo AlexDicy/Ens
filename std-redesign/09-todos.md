@@ -46,6 +46,14 @@ The language server reports a spurious entry-point placement error on a single-f
 Opening `tests/inheritance.ens` says `main` may only be defined in the main module, because the server names a lone file's module after the file rather than treating the file as the program's main module, which is what `ens build <file>` does.
 Folder programs and packages are both clean; only a single file is affected, so this is worth carrying to the language server's replacement rather than fixing in the one being retired.
 Its parser also bounds no nesting at all, so all four deep shapes reach its stack the way they used to reach the compiler's (found 2026-08-30); the replacement needs the bound the compiler's parser now has.
+It no longer checks what a lambda's body throws at all (2026-09-01), because a lambda is now held to the throws list of its target function type and the server does not track a lambda's target: the target arrives from a parameter, a declared local, a field, an array element, or an aggregate field, and reporting without it would flag valid code.
+The compiler owns the rule, so the cost is one missing editor diagnostic rather than a wrong one, and the replacement should carry it.
+
+Three diagnostics the server anchors to the wrong node, so the message is right and the squiggle is not (found 2026-09-01, all pre-existing, deliberately not fixed since the server is temporary).
+The interface-widening error anchors to the whole class declaration instead of the implementing method's name, at `ThrowsAnalyzer.cpp:470`, where the compiler uses the method's name span.
+"'try' is not needed here" anchors to the call instead of the `try` keyword, at `ThrowsAnalyzer.cpp:261`.
+"cannot be 'final'" anchors to the whole method declaration instead of its name, in `Analyzer.cpp` near the private-final check.
+Underneath the first of those, `lsp/server/DiagnosticBridge.cpp` computes a range as `startCh + length` on one line, so any diagnostic anchored to a multi-line node produces a range running past the end of its line; the replacement's bridge should measure the node's real end position.
 
 A private base field is still treated as inherited, unlike a private base method (found 2026-08-31, pre-existing).
 A subclass declaring a field whose name a private base field already uses is refused with "Field is already declared in base class", and because that ends the subclass's own field collection, its own reads of the name are rewired onto the base's private field and refused a second time for privacy, from inside the subclass.

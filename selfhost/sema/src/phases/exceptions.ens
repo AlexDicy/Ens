@@ -41,6 +41,7 @@ import ModuleContext from context;
 import SemaResult from result;
 import phases.members;
 import model.types;
+import FunctionType from model.types;
 import Type from model.types;
 import ErrorType from model.types;
 import DeclaredType from model.types;
@@ -154,15 +155,20 @@ public class ThrowsRegistry {
     }
 }
 
+// A declared list of thrown types as a set.
+public throwSetOf(Type[] declared) -> ThrowSet {
+    let members = new ThrowSet();
+    for (let thrown in declared) {
+        members.add(thrown);
+    }
+    return members;
+}
+
 // What a call to the signature may raise at the caller: the declared throws list when it names
 // types, the computed outward set otherwise.
 public contractOf(Signature signature, ThrowsRegistry registry) -> ThrowSet {
     if (signature.declaresThrows() && signature.throwsTypes().length > 0) {
-        let declared = new ThrowSet();
-        for (let thrown in signature.throwsTypes()) {
-            declared.add(thrown);
-        }
-        return declared;
+        return throwSetOf(signature.throwsTypes());
     }
     let declaration = signature.declaration();
     if (declaration == null) {
@@ -548,10 +554,7 @@ class ModuleExceptions {
                 }
             },
             is CallExpressionNode call -> {
-                let target = this.calleeSignatureOf(call);
-                if (target != null) {
-                    into.addAll(contractOf(target, this.registry));
-                }
+                into.addAll(this.callContract(call));
             },
             // A lambda is a callable of its own: what its body raises belongs to the lambda's
             // set, never to the function the lambda is written inside.
@@ -613,18 +616,42 @@ class ModuleExceptions {
         }
     }
 
-    // A function type never throws, so neither may the body of a lambda written against one. A
-    // lambda carries no catch clauses of its own, so the fix lives in a named function.
+    // A lambda's body is held to its target's throws list, and to nothing when the target has
+    // none. A lambda carries no catch clauses of its own, so the fix for an unlisted failure
+    // lives in a named function.
     validateLambda(LambdaExpressionNode lambda) {
         let outward = this.registry.outwardFor(lambda.green());
         if (outward.isEmpty()) {
             return;
         }
-        this.reporter.report("This lambda's body can throw {nameList(outward)}, and a function "
-            + "type never throws, so nothing can report it to the caller. Handle the failure "
-            + "inside the lambda: move the throwing work into a named function whose own "
-            + "'catch' clause turns the failure into a value, and call that function here.",
-            lambda.arrow().span());
+        Type[] allowed = this.lambdaTargetThrows(lambda);
+        if (allowed.length == 0) {
+            this.reporter.report("This lambda's body can throw {nameList(outward)}, and its "
+                + "target function type declares no 'throws' list, so nothing can report the "
+                + "failure to the caller. Add the type to the target's 'throws' list, written "
+                + "after its return type as in '(() -> void throws IOError)', or handle the "
+                + "failure inside the lambda by moving the throwing work into a named function "
+                + "whose own 'catch' clause turns it into a value.", lambda.arrow().span());
+            return;
+        }
+        let strays = strayMembers(outward, throwSetOf(allowed));
+        if (!strays.isEmpty()) {
+            this.reporter.report("This lambda's body can throw {nameList(strays)}, which its "
+                + "target function type does not list. Add it to the target's 'throws' list, or "
+                + "handle it inside the lambda.", lambda.arrow().span());
+        }
+    }
+
+    lambdaTargetThrows(LambdaExpressionNode lambda) -> Type[] {
+        let info = this.result.lambdaOf(lambda.green());
+        if (info == null) {
+            return [];
+        }
+        let target = info.type();
+        if (target is FunctionType) {
+            return target.thrownTypes();
+        }
+        return [];
     }
 
     validateFunction(FunctionItem item) {
@@ -678,15 +705,7 @@ class ModuleExceptions {
     }
 
     validateCall(CallExpressionNode call, bool tried, Span triedAt) {
-        let target = this.calleeSignatureOf(call);
-        if (target == null) {
-            if (tried) {
-                this.reporter.report("'try' is not needed here: '{callNameOf(call)}' cannot "
-                    + "throw. Remove 'try'.", triedAt);
-            }
-            return;
-        }
-        let contract = contractOf(target, this.registry);
+        let contract = this.callContract(call);
         if (!contract.isEmpty() && !tried) {
             this.reporter.report("Call to '{callNameOf(call)}' can throw "
                 + "{nameList(contract)}; prefix it with 'try' (and handle it with a 'catch' "
@@ -696,6 +715,24 @@ class ModuleExceptions {
             this.reporter.report("'try' is not needed here: '{callNameOf(call)}' cannot "
                 + "throw. Remove 'try'.", triedAt);
         }
+    }
+
+    // What this call may raise at its caller: the callee's contract when the call names a
+    // declaration, and otherwise the throws list of the function type it calls through.
+    callContract(CallExpressionNode call) -> ThrowSet {
+        let target = this.calleeSignatureOf(call);
+        if (target != null) {
+            return contractOf(target, this.registry);
+        }
+        return throwSetOf(this.calleeFunctionThrows(call));
+    }
+
+    calleeFunctionThrows(CallExpressionNode call) -> Type[] {
+        let calleeType = this.result.typeOf(call.callee().green());
+        if (calleeType != null && calleeType is FunctionType) {
+            return calleeType.thrownTypes();
+        }
+        return [];
     }
 
     // A constructor or destructor must handle everything its body can raise.
@@ -836,14 +873,10 @@ class ModuleExceptions {
 
     validateDefaultExpression(SyntaxNode node, string label) {
         if (node is CallExpressionNode) {
-            let target = this.calleeSignatureOf(node);
-            if (target != null) {
-                let contract = contractOf(target, this.registry);
-                if (!contract.isEmpty()) {
-                    this.reporter.report("{label} cannot call '{callNameOf(node)}' because "
-                        + "it can throw {nameList(contract)}; it must not throw.",
-                        node.span());
-                }
+            let contract = this.callContract(node);
+            if (!contract.isEmpty()) {
+                this.reporter.report("{label} cannot call '{callNameOf(node)}' because "
+                    + "it can throw {nameList(contract)}; it must not throw.", node.span());
             }
         }
         let children = node.childNodes();

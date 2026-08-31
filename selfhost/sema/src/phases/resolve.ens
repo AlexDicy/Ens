@@ -20,6 +20,7 @@ import ModuleLinkTable from phases.link;
 import ImportedType from phases.link;
 import ImportedNamespace from phases.link;
 import InstantiationMention from phases.obligations;
+import FunctionThrowsMention from phases.obligations;
 import program.implicit;
 import SemaResult from result;
 import model.convert;
@@ -53,6 +54,7 @@ public class TypeResolver {
     List<FileDiagnostic> collected;
     List<DeferredBoundCheck> deferredBoundChecks;
     List<InstantiationMention> instantiationMentions;
+    List<FunctionThrowsMention> functionThrowsMentions;
     Map<InstantiationType, List<MemberConstraint[]>> mentionScopes;
     bool checkBoundsImmediately;
 
@@ -72,6 +74,7 @@ public class TypeResolver {
         this.collected = new List<FileDiagnostic>();
         this.deferredBoundChecks = new List<DeferredBoundCheck>();
         this.instantiationMentions = new List<InstantiationMention>();
+        this.functionThrowsMentions = new List<FunctionThrowsMention>();
         this.mentionScopes = new Map<InstantiationType, List<MemberConstraint[]>>();
         this.checkBoundsImmediately = false;
     }
@@ -201,7 +204,7 @@ public class TypeResolver {
                 return this.store.optionalOf(inner);
             },
             is FunctionTypeNode functionType -> {
-                return this.resolveFunctionType(functionType);
+                return this.resolveFunctionType(functionType, false);
             },
             // Parentheses exist in a type so a '?' or '[]' suffix can apply to a function type,
             // which is why they are allowed around nothing else: every other type already has
@@ -209,8 +212,12 @@ public class TypeResolver {
             // ways. The inner type still resolves, so one rejected pair of parentheses does not
             // cost the declaration its meaning.
             is ParenthesizedTypeNode grouped -> {
-                Type inner = this.resolveType(grouped.inner());
-                if (!(grouped.inner() is FunctionTypeNode) && !(inner is ErrorType)) {
+                let innerNode = grouped.inner();
+                if (innerNode is FunctionTypeNode) {
+                    return this.resolveFunctionType(innerNode, true);
+                }
+                Type inner = this.resolveType(innerNode);
+                if (!(inner is ErrorType)) {
                     this.report("Remove the parentheses around '{types.display(inner)}': in a "
                         + "type, parentheses are only allowed around a function type, for "
                         + "example '((int) -> bool)?'.", grouped.span());
@@ -223,7 +230,7 @@ public class TypeResolver {
         }
     }
 
-    resolveFunctionType(FunctionTypeNode reference) -> Type {
+    resolveFunctionType(FunctionTypeNode reference, bool parenthesized) -> Type {
         let parameters = new List<Type>();
         bool failed = false;
         for (long i = 0; i < reference.parameterTypesCount(); i++) {
@@ -240,10 +247,45 @@ public class TypeResolver {
             parameters.push(parameter);
         }
         Type returned = this.resolveType(reference.returnedType());
+        let thrown = this.resolveFunctionThrows(reference);
         if (failed || returned is ErrorType) {
             return this.store.errorType();
         }
-        return this.store.functionOf(parameters.toArray(), returned);
+        Type resolved = this.store.functionOf(parameters.toArray(), returned, thrown);
+        // Parentheses are what keep the clause from reading as the throws list of the declaration
+        // the function type is written in.
+        if (thrown.length > 0 && !parenthesized && !(resolved is ErrorType)) {
+            this.report("A function type's 'throws' list needs the function type in "
+                + "parentheses: write '({types.display(resolved)})'. If the list was meant for "
+                + "the declaration itself, move it after that declaration's own return type.",
+                reference.span());
+        }
+        return resolved;
+    }
+
+    // A function type must list what it throws, because it has no body the compiler could infer
+    // the list from, which is the rule an abstract method already carries.
+    resolveFunctionThrows(FunctionTypeNode reference) -> Type[] {
+        let clause = reference.throwsClause();
+        if (clause == null) {
+            return [];
+        }
+        if (clause.typesCount() == 0) {
+            this.report("A function type marked 'throws' must list its exception types, because "
+                + "it has no body to infer them from, for example "
+                + "'(() -> void throws IOError)'.", clause.throwsKeyword().span());
+            return [];
+        }
+        let resolved = new List<Type>();
+        let spans = new List<Span>();
+        for (long i = 0; i < clause.typesCount(); i++) {
+            let listed = clause.types(i);
+            resolved.push(this.resolveType(listed));
+            spans.push(listed.span());
+        }
+        this.functionThrowsMentions.push(
+            new FunctionThrowsMention(resolved.toArray(), spans.toArray()));
+        return resolved.toArray();
     }
 
     resolveNamed(NamedTypeNode named) -> Type {
@@ -378,6 +420,15 @@ public class TypeResolver {
         let created = new List<MemberConstraint[]>();
         this.mentionScopes.set(instantiation, created);
         return created;
+    }
+
+    // Drains the function-type throws lists recorded so far. Each one is validated by the checks
+    // phase rather than here, because whether a listed type is an 'Error' subclass reads a base
+    // chain that a class sets while signatures are still being resolved.
+    public takeFunctionThrowsMentions() -> FunctionThrowsMention[] {
+        FunctionThrowsMention[] taken = this.functionThrowsMentions.toArray();
+        this.functionThrowsMentions = new List<FunctionThrowsMention>();
+        return taken;
     }
 
     // Drains the instantiation mentions recorded so far.

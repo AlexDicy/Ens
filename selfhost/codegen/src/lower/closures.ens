@@ -23,6 +23,7 @@ import Parameter from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
 import @ens.sema.model.types;
 import EirClosureCall from eir.model;
+import EirTryClosureCall from eir.model;
 import EirClosureCapture from eir.model;
 import EirClosureNew from eir.model;
 import EirLoadSlot from eir.model;
@@ -33,6 +34,7 @@ import LoweringContext from lower.context;
 import lower.calls;
 import lower.classes;
 import lower.defaults;
+import lower.exceptions;
 import lower.expressions;
 import lower.ownership;
 import lower.places;
@@ -224,7 +226,9 @@ public bindCaptures(LoweringContext lowering, LambdaExpressionNode node, LambdaI
 }
 
 // A call through a function value. The callee is the code pointer the closure object leads with,
-// so nothing here names a symbol; a function type never throws, so the call needs no unwind edge.
+// so nothing here names a symbol. A target type that declares throws ends the block exactly as a
+// throwing direct call does: the unwind edge gets the cleanup owed at this point, and lowering
+// continues in the normal successor.
 public lowerCall(LoweringContext lowering, CallExpressionNode call, Type calleeType) -> long {
     let callee = call.callee();
     let functionType = primitives.functionOf(calleeType);
@@ -270,8 +274,25 @@ public lowerCall(LoweringContext lowering, CallExpressionNode call, Type calleeT
     if (!types.isVoidType(returnType)) {
         result = builder.newTemp(returnType);
     }
-    builder.append(new EirClosureCall(result, returnType, closure, values.toArray(),
-        parameterTypes, lowering.lineAt(call.span())));
+    long line = lowering.lineAt(call.span());
+    if (!functionType.declaresThrows()) {
+        builder.append(new EirClosureCall(result, returnType, closure, values.toArray(),
+            parameterTypes, line));
+    } else {
+        let errorType = lowering.errorType();
+        if (errorType == null) {
+            lowering.internalError("the standard library declares no Error class", call.span());
+            return -1;
+        }
+        long error = builder.newTemp(errorType);
+        long normalBlock = builder.newBlock("try.ok");
+        long unwindBlock = builder.newBlock("try.unwind");
+        builder.terminate(new EirTryClosureCall(result, returnType, closure, values.toArray(),
+            parameterTypes, error, normalBlock, unwindBlock, line));
+        builder.moveTo(unwindBlock);
+        exceptions.emitUnwindPath(lowering, error, call.span());
+        builder.moveTo(normalBlock);
+    }
     for (long i = 0; i < temporaries.length(); i++) {
         lowering.unprotectValue(temporaries.get(i));
         ownership.releaseValue(lowering, temporaries.get(i));

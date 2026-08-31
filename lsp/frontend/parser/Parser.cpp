@@ -1039,6 +1039,7 @@ void Parser::parseFunctionType() {
     expect(SyntaxKind::RParen, "')' to close the function type's parameter types");
     expect(SyntaxKind::Arrow, "'->' after the parameter types, e.g. '(int, int) -> int'");
     parseType();
+    if (at(SyntaxKind::KwThrows)) parseThrowsClause();
     builder.finishNode();
 }
 

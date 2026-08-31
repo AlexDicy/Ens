@@ -65,7 +65,6 @@ private:
 
     void validateFunction(Symbol* sym, const ast::FuncDecl& fn, bool isConstructor,
                           StructInfo* receiver);
-    void validateLambdas(const SyntaxNode& node);
     void validateTryUsage(const SyntaxNode& node, bool triedOperand);
     void validateNoThrowingCalls(const SyntaxNode& node, const char* contextDescription);
 };
