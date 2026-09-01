@@ -434,7 +434,8 @@ The lambda's own parameters and locals are ordinary storage and may be written f
 A struct's method cannot hand its `this` to a lambda, because a struct is a value: the lambda would capture a copy, and a write through that copy would not reach the struct the method runs over.
 
 A function type raises nothing unless it says what it raises, with a `throws` list written after the return type.
-The function type carrying the list is written in parentheses, as in `(() -> void throws ParseError)`, which is what keeps the list from reading as the throws list of the declaration the type is written in.
+The function type carrying the list is always written in parentheses, as in `(() -> void throws ParseError)`, so the two readings a trailing `throws` could have always look different and there is no precedence rule to know.
+A declaration returning a function type puts the parentheses where the list belongs: `handler() -> ((int) -> int throws ParseError)` returns a function that raises, `handler() -> ((int) -> int) throws ParseError` raises itself, and the bare spelling with no parentheses is an error naming both forms.
 The list is required rather than optional, for the same reason an abstract method's is: a function type has no body to infer one from.
 
 A lambda's body is held to its target's list, so a lambda written against `(() -> void throws ParseError)` may raise a `ParseError` and nothing else.
