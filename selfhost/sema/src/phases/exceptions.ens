@@ -42,6 +42,8 @@ import SemaResult from result;
 import phases.members;
 import model.types;
 import FunctionType from model.types;
+import TypeParamType from model.types;
+import MemberConstraint from model.types;
 import Type from model.types;
 import ErrorType from model.types;
 import DeclaredType from model.types;
@@ -93,8 +95,10 @@ public class ThrowSet {
         this.memberTypes = new List<Type>();
     }
 
+    // A type parameter belongs in a set until substitution replaces it: a generic declaring
+    // 'throws E' raises whatever its instantiation named, and the set carries E to say so.
     public add(Type candidate) -> bool {
-        if (!types.isClassLike(candidate)) {
+        if (!types.isClassLike(candidate) && !(candidate is TypeParamType)) {
             return false;
         }
         for (long i = 0; i < this.memberTypes.length(); i++) {
@@ -116,10 +120,10 @@ public class ThrowSet {
         return grew;
     }
 
-    // True when some member is the thrown type or a superclass of it.
+    // True when some member is the thrown type or a superclass of it, in every instantiation.
     public covers(Type thrown) -> bool {
         for (long i = 0; i < this.memberTypes.length(); i++) {
-            if (types.isSubclassOf(thrown, this.memberTypes.get(i))) {
+            if (types.isAlwaysSubclassOf(thrown, this.memberTypes.get(i))) {
                 return true;
             }
         }
@@ -175,18 +179,6 @@ public contractOf(Signature signature, ThrowsRegistry registry) -> ThrowSet {
         return new ThrowSet();
     }
     return registry.outwardFor(declaration);
-}
-
-// The members of the thrown set that the allowed set does not cover.
-public strayMembers(ThrowSet thrown, ThrowSet allowed) -> ThrowSet {
-    let strays = new ThrowSet();
-    for (long i = 0; i < thrown.members().length(); i++) {
-        let member = thrown.members().get(i);
-        if (!allowed.covers(member)) {
-            strays.add(member);
-        }
-    }
-    return strays;
 }
 
 // Which callables carry the trailing error-slot parameter in their machine interface. One
@@ -299,6 +291,12 @@ class ModuleExceptions {
     string modulePath;
     ClassType? errorClass;
 
+    // The constraint scope of the conditional member being computed or validated: inside it, the
+    // restated parameter carries the member's extra bounds. Set per item, mirroring the
+    // resolver's single-slot scope.
+    GreenNode? scopeOwner;
+    MemberConstraint[] scopeConstraints;
+
     List<FunctionItem> functionItems;
     List<TestDeclarationNode> testItems;
     List<TypeItem> typeItems;
@@ -315,10 +313,95 @@ class ModuleExceptions {
         this.store = context.resolver().typeStore();
         this.modulePath = context.module().canonicalPath();
         this.errorClass = context.resolver().errorClass();
+        this.scopeOwner = null;
+        this.scopeConstraints = [];
         this.functionItems = new List<FunctionItem>();
         this.testItems = new List<TestDeclarationNode>();
         this.typeItems = new List<TypeItem>();
         this.lambdaItems = new List<LambdaExpressionNode>();
+    }
+
+    // isAlwaysSubclassOf under the active item's constraint scope, so a conditional member's
+    // restated bound counts wherever a judgment removes an obligation.
+    alwaysSubclass(Type derived, Type ancestor) -> bool {
+        return types.isAlwaysSubclassOfUnder(derived, ancestor, this.scopeOwner,
+            this.scopeConstraints);
+    }
+
+    caughtBefore(Type thrown, List<Type?> clauseTypes, long limit) -> bool {
+        for (long i = 0; i < limit; i++) {
+            let clauseType = clauseTypes.get(i);
+            if (clauseType != null && this.alwaysSubclass(thrown, clauseType)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    shadowedByEarlier(Type clauseType, List<Type?> clauseTypes, long index) -> bool {
+        for (long i = 0; i < index; i++) {
+            let earlier = clauseTypes.get(i);
+            if (earlier != null && this.alwaysSubclass(clauseType, earlier)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Whether some instantiation could relate the two: each side judged by the class its values
+    // are known to live under, which for a type parameter is its class bound.
+    mightOverlap(Type left, Type right) -> bool {
+        Type leftClass = types.boundClassOfUnder(left, this.scopeOwner, this.scopeConstraints);
+        Type rightClass = types.boundClassOfUnder(right, this.scopeOwner,
+            this.scopeConstraints);
+        return types.isSubclassOf(leftClass, rightClass)
+            || types.isSubclassOf(rightClass, leftClass);
+    }
+
+    relatedToAny(Type clauseType, ThrowSet bodySet) -> bool {
+        for (long i = 0; i < bodySet.members().length(); i++) {
+            if (this.mightOverlap(clauseType, bodySet.members().get(i))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // The stray members of the thrown set under the active scope: what the allowed set does not
+    // cover in every instantiation.
+    strayUnderScope(ThrowSet thrown, ThrowSet allowed) -> ThrowSet {
+        let strays = new ThrowSet();
+        for (long i = 0; i < thrown.members().length(); i++) {
+            let member = thrown.members().get(i);
+            bool covered = false;
+            for (long a = 0; a < allowed.members().length(); a++) {
+                if (this.alwaysSubclass(member, allowed.members().get(a))) {
+                    covered = true;
+                }
+            }
+            if (!covered) {
+                strays.add(member);
+            }
+        }
+        return strays;
+    }
+
+    enterItemScope(FunctionItem item) {
+        this.scopeOwner = null;
+        this.scopeConstraints = [];
+        let method = item.method;
+        if (method != null && method.isConditional()) {
+            let authority = types.authorityOf(method.definingType());
+            if (authority != null) {
+                this.scopeOwner = authority.declaration();
+                this.scopeConstraints = method.constraints();
+            }
+        }
+    }
+
+    leaveItemScope() {
+        this.scopeOwner = null;
+        this.scopeConstraints = [];
     }
 
     protected collect() {
@@ -435,7 +518,9 @@ class ModuleExceptions {
         bool changed = false;
         for (long i = 0; i < this.functionItems.length(); i++) {
             let item = this.functionItems.get(i);
+            this.enterItemScope(item);
             let outward = this.computeOutward(item.declaration);
+            this.leaveItemScope();
             if (this.registry.outwardFor(item.declaration.green()).addAll(outward)) {
                 changed = true;
             }
@@ -475,7 +560,7 @@ class ModuleExceptions {
         let outward = new ThrowSet();
         for (long m = 0; m < bodySet.members().length(); m++) {
             let thrown = bodySet.members().get(m);
-            if (!caughtBefore(thrown, clauseTypes, clauseTypes.length())) {
+            if (!this.caughtBefore(thrown, clauseTypes, clauseTypes.length())) {
                 outward.add(thrown);
             }
         }
@@ -498,12 +583,12 @@ class ModuleExceptions {
         bool partial = false;
         for (long m = 0; m < bodySet.members().length(); m++) {
             let thrown = bodySet.members().get(m);
-            if (caughtBefore(thrown, clauseTypes, index)) {
+            if (this.caughtBefore(thrown, clauseTypes, index)) {
                 continue;
             }
-            if (types.isSubclassOf(thrown, clauseType)) {
+            if (types.isAlwaysSubclassOf(thrown, clauseType)) {
                 outward.add(thrown);
-            } else if (types.isSubclassOf(clauseType, thrown)) {
+            } else if (this.mightOverlap(clauseType, thrown)) {
                 partial = true;
             }
         }
@@ -530,7 +615,8 @@ class ModuleExceptions {
     }
 
     // The clause's caught type, or null when it is not a valid exception type; the invalid
-    // clause is diagnosed separately and handles nothing.
+    // clause is diagnosed separately and handles nothing. A type parameter is valid through its
+    // class bound, exactly as validateCaughtTypes accepts it.
     caughtTypeOf(CatchClauseNode clause) -> Type? {
         let binding = this.result.bindingOf(clause.green());
         if (binding == null) {
@@ -538,8 +624,10 @@ class ModuleExceptions {
         }
         Type caught = binding.type();
         let errorBase = this.errorClass;
-        if (errorBase == null || !types.isClassLike(caught)
-                || !types.isSubclassOf(caught, errorBase)) {
+        if (errorBase == null || !this.alwaysSubclass(caught, errorBase)) {
+            return null;
+        }
+        if (!types.isClassLike(caught) && !(caught is TypeParamType)) {
             return null;
         }
         return caught;
@@ -634,7 +722,7 @@ class ModuleExceptions {
                 + "whose own 'catch' clause turns it into a value.", lambda.arrow().span());
             return;
         }
-        let strays = strayMembers(outward, throwSetOf(allowed));
+        let strays = this.strayUnderScope(outward, throwSetOf(allowed));
         if (!strays.isEmpty()) {
             this.reporter.report("This lambda's body can throw {nameList(strays)}, which its "
                 + "target function type does not list. Add it to the target's 'throws' list, or "
@@ -655,6 +743,7 @@ class ModuleExceptions {
     }
 
     validateFunction(FunctionItem item) {
+        this.enterItemScope(item);
         let declaration = item.declaration;
         let body = declaration.body();
         if (body != null) {
@@ -674,6 +763,7 @@ class ModuleExceptions {
             this.validateOverride(item);
         }
         this.validateCatchClauses(item);
+        this.leaveItemScope();
     }
 
     validateExpressions(SyntaxNode node) {
@@ -718,13 +808,25 @@ class ModuleExceptions {
     }
 
     // What this call may raise at its caller: the callee's contract when the call names a
-    // declaration, and otherwise the throws list of the function type it calls through.
+    // declaration, and otherwise the throws list of the function type it calls through. A generic
+    // callee's contract may mention its type parameters, and this call named their arguments, so
+    // the contract is read with those substituted; 'throws E' becomes what the caller wrote.
     callContract(CallExpressionNode call) -> ThrowSet {
         let target = this.calleeSignatureOf(call);
-        if (target != null) {
-            return contractOf(target, this.registry);
+        if (target == null) {
+            return throwSetOf(this.calleeFunctionThrows(call));
         }
-        return throwSetOf(this.calleeFunctionThrows(call));
+        let contract = contractOf(target, this.registry);
+        let arguments = this.result.callTypeArgumentsOf(call.green());
+        let owner = target.declaration();
+        if (arguments == null || owner == null) {
+            return contract;
+        }
+        let substituted = new ThrowSet();
+        for (long i = 0; i < contract.members().length(); i++) {
+            substituted.add(this.store.substitute(contract.members().get(i), owner, arguments));
+        }
+        return substituted;
     }
 
     calleeFunctionThrows(CallExpressionNode call) -> Type[] {
@@ -759,7 +861,7 @@ class ModuleExceptions {
     validateContract(FunctionItem item, ThrowSet outward) {
         let signature = item.signature;
         if (signature.declaresThrows() && signature.throwsTypes().length > 0) {
-            let strays = strayMembers(outward, contractOf(signature, this.registry));
+            let strays = this.strayUnderScope(outward, contractOf(signature, this.registry));
             if (!strays.isEmpty()) {
                 this.reporter.report("'{signature.name()}' can throw {nameList(strays)}, "
                     + "which is not in its declared throws list. Add it to the list, or "
@@ -797,7 +899,7 @@ class ModuleExceptions {
             return;
         }
         let allowed = contractOf(baseMethod.signature(), this.registry);
-        let strays = strayMembers(contractOf(item.signature, this.registry), allowed);
+        let strays = this.strayUnderScope(contractOf(item.signature, this.registry), allowed);
         if (!strays.isEmpty()) {
             this.reporter.report("Override '{method.name()}' can throw {nameList(strays)}, "
                 + "which '{types.display(baseMethod.definingType())}' does not allow. An "
@@ -818,8 +920,20 @@ class ModuleExceptions {
                 continue;
             }
             let errorBase = this.errorClass;
-            if (errorBase == null || !types.isClassLike(caught)
-                    || !types.isSubclassOf(caught, errorBase)) {
+            if (errorBase == null) {
+                continue;
+            }
+            if (caught is TypeParamType) {
+                if (!this.alwaysSubclass(caught, errorBase)) {
+                    this.reporter.report("Cannot catch '{types.display(caught)}': a type "
+                        + "parameter is caught through its class bound, and "
+                        + "'{types.display(caught)}' has none under 'Error'. Bound it as "
+                        + "'{types.display(caught)}: Error' or by an 'Error' subclass.",
+                        clause.caughtType().span());
+                }
+                continue;
+            }
+            if (!types.isClassLike(caught) || !types.isSubclassOf(caught, errorBase)) {
                 this.reporter.report("Cannot catch '{types.display(caught)}'; only 'Error' "
                     + "or a subclass of it can be caught.", clause.caughtType().span());
             }
@@ -847,13 +961,13 @@ class ModuleExceptions {
                 continue;
             }
             string shown = types.display(clauseType);
-            if (shadowedByEarlier(clauseType, clauseTypes, i)) {
+            if (this.shadowedByEarlier(clauseType, clauseTypes, i)) {
                 this.reporter.report("This 'catch ({shown} ...)' is unreachable: an earlier "
                     + "'catch' clause already handles it. Move it before the broader clause, "
                     + "or remove it.", clause.caughtType().span());
                 continue;
             }
-            if (!relatedToAny(clauseType, bodySet)) {
+            if (!this.relatedToAny(clauseType, bodySet)) {
                 this.reporter.report("This 'catch ({shown} ...)' is dead: the body of "
                     + "'{item.signature.name()}' cannot throw '{shown}' or a subclass. "
                     + "Remove the clause.", clause.caughtType().span());
@@ -935,7 +1049,7 @@ class ModuleExceptions {
                 continue;
             }
             let allowed = contractOf(required.signature(), this.registry);
-            let strays = strayMembers(contractOf(provided.signature(), this.registry),
+            let strays = this.strayUnderScope(contractOf(provided.signature(), this.registry),
                 allowed);
             if (strays.isEmpty()) {
                 continue;
@@ -985,35 +1099,6 @@ rootDeclarationOf(DeclaredType owner, Method method) -> Method {
     return root;
 }
 
-caughtBefore(Type thrown, List<Type?> clauseTypes, long limit) -> bool {
-    for (long i = 0; i < limit; i++) {
-        let clauseType = clauseTypes.get(i);
-        if (clauseType != null && types.isSubclassOf(thrown, clauseType)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-shadowedByEarlier(Type clauseType, List<Type?> clauseTypes, long index) -> bool {
-    for (long i = 0; i < index; i++) {
-        let earlier = clauseTypes.get(i);
-        if (earlier != null && types.isSubclassOf(clauseType, earlier)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-relatedToAny(Type clauseType, ThrowSet bodySet) -> bool {
-    for (long i = 0; i < bodySet.members().length(); i++) {
-        let thrown = bodySet.members().get(i);
-        if (types.isSubclassOf(thrown, clauseType) || types.isSubclassOf(clauseType, thrown)) {
-            return true;
-        }
-    }
-    return false;
-}
 
 hasRethrow(SyntaxNode node) -> bool {
     if (node is RethrowStatementNode) {

@@ -105,6 +105,11 @@ public:
     bool declaredThrows = false;
     // Empty for a bare `throws` whose set is inferred from the body.
     std::vector<StructInfo*> declaredThrowsTypes;
+    // True when the declared throws list named only type parameters (their bound carries
+    // the promise, checked by the compiler, not tracked here) or the body throws through an
+    // opaque call; the server then treats this function as throwing an unknown set rather
+    // than reporting try/catch/throws mismatches it cannot actually verify.
+    bool throwsOpaquely = false;
     // Computed outward throw set, sorted by pointer and deduped; keeps both a base and its subclass when both occur.
     std::vector<StructInfo*> throwsSet;
     // True if takes an error-slot parameter in the ABI.

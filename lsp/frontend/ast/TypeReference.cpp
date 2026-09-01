@@ -1,4 +1,5 @@
 #include "TypeReference.h"
+#include "Common.h"
 
 namespace ast {
 
@@ -74,6 +75,11 @@ std::optional<TypeReference> TypeReference::returnedType() const {
         if (auto t = TypeReference::cast(c)) return t;
     }
     return std::nullopt;
+}
+
+bool TypeReference::hasThrowsClause() const {
+    if (!isFunctionType()) return false;
+    return firstChildNode(node, SyntaxKind::ThrowsClause).has_value();
 }
 
 std::optional<TypeReference> TypeReference::innerType() const {

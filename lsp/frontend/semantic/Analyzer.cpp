@@ -1238,12 +1238,25 @@ void Analyzer::analyzeBodies() {
 
     auto resolveThrows = [&](const ast::FuncDecl& fn) {
         auto* info = analysis.find(fn.node.greenNode());
-        if (info && info->resolvedSymbol) resolveDeclaredThrows(fn, info->resolvedSymbol);
+        if (!info || !info->resolvedSymbol) return;
+        Symbol* sym = info->resolvedSymbol;
+        size_t tpCount = sym->isTemplate ? pushTypeParams(sym, sym->typeParamNames, sym->typeParamBounds) : 0;
+        resolveDeclaredThrows(fn, sym);
+        popTypeParams(tpCount);
+    };
+    // Declared throws lists are resolved with their owner's type parameters in scope, the same
+    // way field and parameter types are, so 'throws E' resolves E rather than reporting it unknown.
+    auto resolveOwnedThrows = [&](const SyntaxNode& ownerNode, const std::vector<ast::TypeParam>& tps,
+                                   auto methods) {
+        Type* t = analysis.typeOf(ownerNode.greenNode());
+        size_t tpCount = t && t->structInfo ? enterTemplateScope(t->structInfo, tps) : 0;
+        for (auto& m : methods) resolveThrows(m);
+        popTypeParams(tpCount);
     };
     for (auto& fn : sf.functions()) resolveThrows(fn);
-    for (auto& sd : sf.structs()) for (auto& m : sd.methods()) resolveThrows(m);
-    for (auto& cd : sf.classes()) for (auto& m : cd.methods()) resolveThrows(m);
-    for (auto& id : sf.interfaces()) for (auto& m : id.methods()) resolveThrows(m);
+    for (auto& sd : sf.structs()) resolveOwnedThrows(sd.node, sd.typeParams(), sd.methods());
+    for (auto& cd : sf.classes()) resolveOwnedThrows(cd.node, cd.typeParams(), cd.methods());
+    for (auto& id : sf.interfaces()) resolveOwnedThrows(id.node, id.typeParams(), id.methods());
 
     // A test's implicit declared contract is `throws Error`.
     for (auto& td : sf.tests()) {
@@ -1266,6 +1279,13 @@ void Analyzer::resolveDeclaredThrows(const ast::FuncDecl& fn, Symbol* sym) {
     for (auto& tr : fn.declaredThrowsTypes()) {
         Type* t = resolveTypeReference(tr);
         if (t->isError()) continue;
+        // A type parameter's bound carries the promise; the compiler checks it. The server
+        // cannot name what a given instantiation throws, so it treats the function as
+        // throwing an unknown set instead of a tracked one.
+        if (t->isTypeParam()) {
+            sym->throwsOpaquely = true;
+            continue;
+        }
         bool isErrorSubclass = t->isClass() && t->structInfo && errorClassInfo_ &&
             t->structInfo->isSubclassOf(errorClassInfo_);
         if (!isErrorSubclass) {
@@ -3274,6 +3294,7 @@ Type* Analyzer::resolveTypeReference(const ast::TypeReference& tr) {
         auto returned = tr.returnedType();
         Type* returnType = returned ? resolveTypeReference(*returned) : typeCtx.getError();
         Type* result = typeCtx.getFunction(std::move(params), returnType);
+        if (tr.hasThrowsClause() && !result->isError()) result->hasThrowsClause = true;
         analysis.setType(tr.node.greenNode(), result);
         return result;
     }
@@ -3524,8 +3545,10 @@ void Analyzer::analyzeCatchClause(const ast::CatchClause& clause, Scope* funcSco
     Type* clauseType = clause.typeReference()
         ? resolveTypeReference(*clause.typeReference()) : typeCtx.getError();
     if (!clauseType->isError()) {
-        bool isErrorSubclass = clauseType->isClass() && clauseType->structInfo && errorClassInfo_ &&
-            clauseType->structInfo->isSubclassOf(errorClassInfo_);
+        // A type parameter is caught through its class bound; the compiler checks the bound.
+        bool isErrorSubclass = clauseType->isTypeParam()
+            || (clauseType->isClass() && clauseType->structInfo && errorClassInfo_ &&
+                clauseType->structInfo->isSubclassOf(errorClassInfo_));
         if (!isErrorSubclass) {
             SyntaxNode diag = clause.typeReference() ? clause.typeReference()->node : clause.node;
             errorAtNode(diag, "Cannot catch '" + clauseType->toString() +
@@ -7284,11 +7307,8 @@ bool Analyzer::checkClassTypeTest(Type* srcT, Type* dstT, bool isCast,
             "' that remains.");
         return false;
     }
-    if (dstT->isTypeParam()) {
-        errorAtNode(diagNode, "The target of '" + op + "' must be a concrete class; '" +
-            dstT->toString() + "' is a type parameter.");
-        return false;
-    }
+    // A type parameter target is judged per instantiation by the compiler.
+    if (dstT->isTypeParam()) return true;
     if (!dstT->isClass() || !dstT->structInfo) {
         errorAtNode(diagNode, "The target of '" + op + "' must be a class or an interface, got '" +
             dstT->toString() + "'.");
@@ -7356,11 +7376,9 @@ StructInfo* Analyzer::checkTypeArmTarget(Type* scrutType, Type* inner, Type* arm
             "arm.");
         return nullptr;
     }
-    if (armT->isTypeParam()) {
-        errorAtNode(diagNode, "The type of an 'is' arm must be a concrete class; '" +
-            armT->toString() + "' is a type parameter.");
-        return nullptr;
-    }
+    // A type parameter arm is judged per instantiation by the compiler; nothing is reported and
+    // the arm's own checks are skipped, so the binding types silently.
+    if (armT->isTypeParam()) return nullptr;
     if (!armT->isClass() || !armT->structInfo) {
         errorAtNode(diagNode, "The type of an 'is' arm must be a class or an interface, got '" +
             armT->toString() + "'.");

@@ -19,6 +19,8 @@ public:
     // returned type are the nested types; a written `?` or `[]` binds to the returned
     // type instead, so a function type carries no suffix chain of its own.
     bool isFunctionType() const { return node.kind() == SyntaxKind::FuncType; }
+    // A function type's own `throws Boom` clause, e.g. `(() -> void throws Boom) body`.
+    bool hasThrowsClause() const;
     // A type in parentheses: `(T)`. It is what lets a suffix apply to a function type,
     // which is the only type it is allowed around.
     bool isParenthesized() const { return node.kind() == SyntaxKind::ParenType; }

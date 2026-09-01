@@ -86,6 +86,35 @@ Symbol* ThrowsAnalyzer::calleeSymbolOf(const ast::CallExpression& call) const {
     return nullptr;
 }
 
+bool ThrowsAnalyzer::isOpaqueCall(const ast::CallExpression& call) const {
+    if (Symbol* sym = calleeSymbolOf(call); sym && sym->throwsOpaquely) return true;
+    auto callee = call.callee();
+    if (!callee) return false;
+    Type* calleeType = analysis.typeOf(callee->node.greenNode());
+    while (calleeType && calleeType->isOptional()) calleeType = calleeType->inner;
+    return calleeType && calleeType->isFunction() && calleeType->hasThrowsClause;
+}
+
+bool ThrowsAnalyzer::hasOpaqueTriedCall(const SyntaxNode& node, bool triedOperand) const {
+    SyntaxKind k = node.kind();
+    if (k == SyntaxKind::LambdaExpr) return false;
+    if (k == SyntaxKind::TryExpr) {
+        for (auto& c : node.children()) {
+            if (ast::Expression::cast(c) && hasOpaqueTriedCall(c, /*triedOperand=*/true)) return true;
+        }
+        return false;
+    }
+    if (k == SyntaxKind::CallExpr) {
+        if (triedOperand) {
+            if (auto call = ast::CallExpression::cast(node); call && isOpaqueCall(*call)) return true;
+        }
+        for (auto& c : node.children()) if (hasOpaqueTriedCall(c, false)) return true;
+        return false;
+    }
+    for (auto& c : node.children()) if (hasOpaqueTriedCall(c, triedOperand)) return true;
+    return false;
+}
+
 const ThrowsAnalyzer::TypeSet& ThrowsAnalyzer::contractOf(const Symbol* sym) const {
     static const TypeSet kEmpty;
     if (!sym) return kEmpty;
@@ -181,6 +210,14 @@ void ThrowsAnalyzer::runOnceForFunction(Symbol* sym, const ast::FuncDecl& fn) {
     for (StructInfo* m : outward) {
         if (addType(sym->throwsSet, m)) changed = true;
     }
+    // A try on an opaque call may raise types this pass cannot enumerate; its catch
+    // clauses may or may not handle them, so the enclosing function is opaque too.
+    if (!sym->throwsOpaquely) {
+        if (auto b = fn.body(); b && hasOpaqueTriedCall(b->node)) {
+            sym->throwsOpaquely = true;
+            changed = true;
+        }
+    }
 }
 
 // A test body has no catch clauses; everything it throws goes outward, and the
@@ -257,7 +294,7 @@ void ThrowsAnalyzer::validateTryUsage(const SyntaxNode& node, bool triedOperand)
                 errorAt(node, "Call to '" + name + "' can throw " + nameList(contract) +
                     "; prefix it with 'try' (and handle it with a 'catch' clause or mark the "
                     "function 'throws').");
-            } else if (contract.empty() && triedOperand) {
+            } else if (contract.empty() && triedOperand && !isOpaqueCall(*call)) {
                 errorAt(node, "'try' is not needed here: '" + name +
                     "' cannot throw. Remove 'try'.");
             }
@@ -326,7 +363,7 @@ void ThrowsAnalyzer::validateFunction(Symbol* sym, const ast::FuncDecl& fn, bool
                     ", which is not in its declared throws list. Add it to the list, or handle it "
                     "with 'catch' clauses.");
             }
-        } else if (outward.empty() && !fn.isAbstract()) {
+        } else if (outward.empty() && !fn.isAbstract() && !sym->throwsOpaquely) {
             errorAt(fn.throwsToken().value_or(fn.node), "'" + asciiOf(sym->name) +
                 "' is marked 'throws' but cannot throw; remove 'throws'.");
         }
@@ -366,7 +403,7 @@ void ThrowsAnalyzer::validateFunction(Symbol* sym, const ast::FuncDecl& fn, bool
             if (auto tr = cc.typeReference()) ct = structOfType(analysis.typeOf(tr->node.greenNode()));
             clauseTypes.push_back(ct);
         }
-        if (body.empty()) {
+        if (body.empty() && !sym->throwsOpaquely) {
             errorAt(clauses[0].node, "'" + asciiOf(sym->name) +
                 "' has 'catch' clauses but its body cannot throw; remove them.");
         }
@@ -383,7 +420,9 @@ void ThrowsAnalyzer::validateFunction(Symbol* sym, const ast::FuncDecl& fn, bool
                     "the broader clause, or remove it.");
                 continue;
             }
-            if (body.empty()) continue;  // already reported above
+            // An opaque body may throw types this pass cannot enumerate, so it cannot
+            // rule out a clause as dead.
+            if (body.empty() || sym->throwsOpaquely) continue;
             bool live = false;
             for (StructInfo* m : body) {
                 if (m->isSubclassOf(ci) || ci->isSubclassOf(m)) { live = true; break; }

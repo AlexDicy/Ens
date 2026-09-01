@@ -711,6 +711,8 @@ For most methods the set of throwable types is computed by the compiler and show
 Any function or method may also declare its thrown types explicitly, as in `read() -> bytes throws IOError` or `read() -> bytes throws IOError, ParseError`.
 The list is an upper bound: the body may raise those types or their subclasses and nothing else, and callers see the list rather than what the body happens to raise today, so widening it is a deliberate edit.
 A list is required on an abstract method, which has no body to infer one from, and where a method can be overridden the list binds every override to the same bound.
+A generic may list one of its type parameters, as in `run<E: Error>((() -> void throws E) body) throws E`, provided the parameter has a class bound under `Error`; each caller's contract then names the type that caller supplied.
+The same bound lets a `catch (E caught)` clause catch the parameter, selecting on the concrete type each instantiation names.
 
 If any exception is not handled and the method is not marked as `throws`, this should result in a compilation error explaining which exceptions were not handled and how to handle them (either with a `catch` block or via the `throws` keyword).
 
@@ -1118,6 +1120,9 @@ The scrutinee must be a class, an interface, or a nullable form of either, and t
 A nullable scrutinee tested against a type it already satisfies is the exception: for `Base? x`, the test `x is Base` is a combined null-plus-type check and is allowed.
 An interface target over a class scrutinee is an error only in the impossible case, a `final` class that does not implement it (any other class could have an implementing subclass), or the always-true case where the static class already implements it.
 An interface scrutinee may be tested against any class or interface target; the outcome is decided by the value's runtime type.
+
+A type parameter may be the target of `is`, `as?`, and a switch `is`-arm, and the test is judged per instantiation against the concrete type argument, following every rule above.
+So `value is T` narrows `value` to `T` where it matches, an instantiation whose argument makes the test vacuous or impossible is a compile error naming that instantiation, and one whose argument is not a class or an interface is refused the same way.
 
 `if (x is Derived)` narrows `x` to `Derived` inside the branch, following the same rules as null narrowing above: the same paths narrow (locals, member chains, subscripts), `x is Derived && x.derivedMethod()` narrows the right side of `&&`, conjunctions narrow the branch, a loop condition narrows the body, and the same writes and calls drop the narrowing.
 Failing the test proves nothing about the value's type, so the plain else branch of a positive `is` does not narrow.

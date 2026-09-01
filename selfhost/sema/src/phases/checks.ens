@@ -35,6 +35,7 @@ import StructType from model.types;
 import InterfaceType from model.types;
 import PrimitiveBinding from model.types;
 import TypeParamType from model.types;
+import MemberConstraint from model.types;
 import Field from model.types;
 import Method from model.types;
 import Signature from model.types;
@@ -70,6 +71,7 @@ class ModuleChecks {
     ModuleContext context;
     Reporter reporter;
     string modulePath;
+    MemberConstraint[] noConstraints;
 
     List<StructDeclarationNode> structNodes;
     List<ClassDeclarationNode> classNodes;
@@ -80,6 +82,7 @@ class ModuleChecks {
         this.context = context;
         this.reporter = new Reporter(context.module().filePath(), collected);
         this.modulePath = context.module().canonicalPath();
+        this.noConstraints = [];
         this.structNodes = new List<StructDeclarationNode>();
         this.classNodes = new List<ClassDeclarationNode>();
         this.interfaceNodes = new List<InterfaceDeclarationNode>();
@@ -542,15 +545,16 @@ class ModuleChecks {
             }
             switch (owned) {
                 is StructType structType -> {
-                    this.validateMethodThrows(structType.methods());
-                    this.validateMethodThrows(structType.staticMethods());
+                    this.validateMethodThrows(structType.methods(), owned.declaration());
+                    this.validateMethodThrows(structType.staticMethods(),
+                        owned.declaration());
                 },
                 is ClassType classType -> {
-                    this.validateMethodThrows(classType.methods());
-                    this.validateMethodThrows(classType.staticMethods());
+                    this.validateMethodThrows(classType.methods(), owned.declaration());
+                    this.validateMethodThrows(classType.staticMethods(), owned.declaration());
                 },
                 is InterfaceType interfaceType -> {
-                    this.validateMethodThrows(interfaceType.methods());
+                    this.validateMethodThrows(interfaceType.methods(), owned.declaration());
                 },
                 default -> { },
             }
@@ -558,24 +562,36 @@ class ModuleChecks {
         this.validateFunctionTypeThrows();
     }
 
-    validateMethodThrows(List<Method> methods) {
+    // A conditional member's list is judged under its constraints, whose restated parameter
+    // carries bounds the enclosing type did not give it.
+    validateMethodThrows(List<Method> methods, GreenNode owner) {
         for (long i = 0; i < methods.length(); i++) {
-            this.validateThrows(methods.get(i).signature());
+            let method = methods.get(i);
+            if (method.isConditional()) {
+                this.validateThrowsList(method.signature().throwsTypes(),
+                    method.signature().throwsTypeSpans(), owner, method.constraints());
+            } else {
+                this.validateThrows(method.signature());
+            }
         }
     }
 
     validateThrows(Signature signature) {
-        this.validateThrowsList(signature.throwsTypes(), signature.throwsTypeSpans());
+        this.validateThrowsList(signature.throwsTypes(), signature.throwsTypeSpans(),
+            null, this.noConstraints);
     }
 
-    // Every throws list a function type carries, held to the same rules a declaration's list is.
+    // Every throws list a function type carries, held to the same rules a declaration's list is,
+    // under the constraint scope it was written in.
     validateFunctionTypeThrows() {
         for (let mention in this.context.resolver().takeFunctionThrowsMentions()) {
-            this.validateThrowsList(mention.thrownTypes(), mention.spans());
+            this.validateThrowsList(mention.thrownTypes(), mention.spans(),
+                mention.scopeOwner(), mention.scopeConstraints());
         }
     }
 
-    validateThrowsList(Type[] declared, Span[] spans) {
+    validateThrowsList(Type[] declared, Span[] spans, GreenNode? scopeOwner,
+                       MemberConstraint[] scopeConstraints) {
         if (declared.length == 0) {
             return;
         }
@@ -586,7 +602,15 @@ class ModuleChecks {
             if (thrown is ErrorType) {
                 continue;
             }
-            if (errorClass == null || !types.isSubclassOf(thrown, errorClass)) {
+            if (errorClass == null || !types.isAlwaysSubclassOfUnder(thrown, errorClass, scopeOwner, scopeConstraints)) {
+                if (thrown is TypeParamType) {
+                    this.reporter.report("A declared throws type must be 'Error' or a "
+                        + "subclass; '{types.display(thrown)}' promises that only through a "
+                        + "class bound, and it has none under 'Error'. Bound it as "
+                        + "'{types.display(thrown)}: Error' or by an 'Error' subclass.",
+                        spans[i]);
+                    continue;
+                }
                 this.reporter.report("A declared throws type must be 'Error' or a subclass; "
                     + "'{types.display(thrown)}' is not.", spans[i]);
                 continue;
@@ -594,8 +618,8 @@ class ModuleChecks {
             bool overlaps = false;
             for (long a = 0; a < accepted.length(); a++) {
                 let previous = accepted.get(a);
-                if (thrown == previous || types.isSubclassOf(thrown, previous)
-                        || types.isSubclassOf(previous, thrown)) {
+                if (thrown == previous || types.isAlwaysSubclassOfUnder(thrown, previous, scopeOwner, scopeConstraints)
+                        || types.isAlwaysSubclassOfUnder(previous, thrown, scopeOwner, scopeConstraints)) {
                     this.reporter.report("Declared throws type '{types.display(thrown)}' "
                         + "overlaps with another type in the list; list each exception "
                         + "once.", spans[i]);

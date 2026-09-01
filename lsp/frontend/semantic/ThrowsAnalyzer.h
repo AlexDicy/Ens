@@ -45,6 +45,15 @@ private:
     Symbol* calleeSymbolOf(const ast::CallExpression& call) const;
     const TypeSet& contractOf(const Symbol* sym) const;
 
+    // A call whose thrown types the server cannot enumerate: either its callee is a
+    // function-typed value (a parameter, local, or field) whose type carries a `throws`
+    // clause, or it names a symbol whose own declared throws list named only type
+    // parameters. Such a call may throw, but validation must not guess what.
+    bool isOpaqueCall(const ast::CallExpression& call) const;
+    // True if some call directly under a `try` in this subtree is opaque (does not
+    // descend into a nested lambda body, mirroring collectBlockThrows).
+    bool hasOpaqueTriedCall(const SyntaxNode& node, bool triedOperand = false) const;
+
     // Collect throw-operand types and called-function contracts over a block's
     // subtree (does not descend into sibling catch clauses).
     void collectBlockThrows(const SyntaxNode& blockNode, TypeSet& out) const;

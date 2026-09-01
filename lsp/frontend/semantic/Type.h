@@ -211,10 +211,13 @@ public:
     std::vector<StructInfo*> paramBounds;
 
     // Function type (kind == Function): its parameter types in order and the type it
-    // returns. A function type never throws, and two of them are the same type only when
-    // every part matches, so assignability between them is identity.
+    // returns. Two of them are the same type only when every part matches, so
+    // assignability between them is identity. `hasThrowsClause` records that some
+    // reference to this shape carried a `throws` clause; the server does not track which
+    // types, so it treats a call through such a value as possibly throwing.
     std::vector<Type*> functionParams;
     Type* functionReturn = nullptr;
+    bool hasThrowsClause = false;
 
     explicit Type(TypeKind k) : kind(k) {}
     Type(TypeKind k, Type* i) : kind(k), inner(i) {}
