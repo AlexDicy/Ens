@@ -1,0 +1,1084 @@
+﻿// Arrays hash and compare by content, and render as a JSON-style list. Both operands of a runtime
+// loop that no fixed unrolling could replace, so each is a genuine function - one per element type,
+// built directly over an EirFunctionBuilder rather than a full LoweringContext, because nothing here
+// runs inside a checked syntax tree: it is compiled straight from the element's Type, exactly as a
+// class's destructor is. Internal linkage lets every module that needs one build its own private
+// copy, so no module has to "own" a structural type the way it owns a declared class.
+//
+// A plan is scoped to one module's lowering pass. Requesting a symbol builds the function the first
+// time and remembers its name afterwards; the memo is written before the body is, so an element type
+// that reaches its own array type again - a struct holding an array of itself - recurses into the
+// same symbol instead of looping forever.
+//
+// Every synthesized function is null-safe on its own: an absent array is equal only to another
+// absent one, hashes as -1, and renders as 'null'. That is what lets a nested array element, which
+// may be absent under a nullable spelling, call straight into the next level with no guard at the
+// call site. Nothing here special-cases the same array against itself: a float element compares by
+// IEEE rules even against itself, so the loop - not an identity shortcut - is what has to answer
+// for every element type alike.
+import Span from @ens.frontend.support.source;
+import Type from @ens.sema.model.types;
+import ArrayType from @ens.sema.model.types;
+import EnumType from @ens.sema.model.types;
+import OptionalType from @ens.sema.model.types;
+import PrimitiveKind from @ens.sema.model.types;
+import Method from @ens.sema.model.types;
+import TypeStore from @ens.sema.model.types;
+import @ens.sema.model.types;
+import EirBinary from eir.model;
+import EirBinaryOp from eir.model;
+import EirBranch from eir.model;
+import EirCall from eir.model;
+import EirCallee from eir.model;
+import EirCast from eir.model;
+import EirCastOp from eir.model;
+import EirCharToString from eir.model;
+import EirConstBool from eir.model;
+import EirConstInt from eir.model;
+import EirConstNull from eir.model;
+import EirConstString from eir.model;
+import EirDoubleToString from eir.model;
+import EirBoolToString from eir.model;
+import EirDynamicEquals from eir.model;
+import EirDynamicHash from eir.model;
+import EirDynamicToString from eir.model;
+import EirElementAddress from eir.model;
+import EirEnumToString from eir.model;
+import EirFieldAddress from eir.model;
+import EirFunction from eir.model;
+import EirFunctionBuilder from eir.model;
+import EirHashValue from eir.model;
+import EirIntToString from eir.model;
+import EirJump from eir.model;
+import EirJsonEscape from eir.model;
+import EirLoadPtr from eir.model;
+import EirLoadSlot from eir.model;
+import EirOptionalPayload from eir.model;
+import EirOptionalPayloadAddress from eir.model;
+import EirOptionalPresence from eir.model;
+import EirParameter from eir.model;
+import EirRelease from eir.model;
+import EirReleasePtr from eir.model;
+import EirRetain from eir.model;
+import EirSlotAddress from eir.model;
+import EirReturn from eir.model;
+import EirStoreSlot from eir.model;
+import EirStringConcat from eir.model;
+import EirTakeSlot from eir.model;
+import EirStringEqual from eir.model;
+import EirUnary from eir.model;
+import EirUnaryOp from eir.model;
+import EirArrayLength from eir.model;
+import FunctionInfo from lower.index;
+import ProgramIndex from lower.index;
+import LoweringContext from lower.context;
+import lower.symbols;
+import support.primitives;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+
+// One module's array-content requests, resolved once each and kept for the driver to collect once
+// the module's functions have all lowered.
+public final class ArrayContentPlan {
+    ProgramIndex planIndex;
+    TypeStore planStore;
+    Map<Type, string> equalsSymbols;
+    Map<Type, string> hashSymbols;
+    Map<Type, string> textSymbols;
+    List<EirFunction> synthesized;
+
+    public constructor(ProgramIndex index, TypeStore store) {
+        this.planIndex = index;
+        this.planStore = store;
+        this.equalsSymbols = new Map<Type, string>();
+        this.hashSymbols = new Map<Type, string>();
+        this.textSymbols = new Map<Type, string>();
+        this.synthesized = new List<EirFunction>();
+    }
+
+    public index() -> ProgramIndex {
+        return this.planIndex;
+    }
+
+    public store() -> TypeStore {
+        return this.planStore;
+    }
+
+    // Every function the plan has built so far, in the order requests first reached them.
+    public builtFunctions() -> EirFunction[] {
+        return this.synthesized.toArray();
+    }
+
+    // The symbol of 'bool(T[], T[])' for this element type, building it the first time it is
+    // asked for.
+    public equalsSymbol(Type elementType) -> string {
+        let cached = this.equalsSymbols.get(elementType);
+        if (cached != null) {
+            return cached;
+        }
+        string symbol = "_arreq_" + symbols.mangleTypeForName(elementType);
+        this.equalsSymbols.set(elementType, symbol);
+        this.synthesized.push(buildEquals(this, elementType, symbol));
+        return symbol;
+    }
+
+    // The symbol of 'long(T[])' for this element type, building it the first time it is asked
+    // for.
+    public hashSymbol(Type elementType) -> string {
+        let cached = this.hashSymbols.get(elementType);
+        if (cached != null) {
+            return cached;
+        }
+        string symbol = "_arrhash_" + symbols.mangleTypeForName(elementType);
+        this.hashSymbols.set(elementType, symbol);
+        this.synthesized.push(buildHash(this, elementType, symbol));
+        return symbol;
+    }
+
+    // The symbol of 'string(T[])' for this element type, building it the first time it is asked
+    // for.
+    public textSymbol(Type elementType) -> string {
+        let cached = this.textSymbols.get(elementType);
+        if (cached != null) {
+            return cached;
+        }
+        string symbol = "_arrtext_" + symbols.mangleTypeForName(elementType);
+        this.textSymbols.set(elementType, symbol);
+        this.synthesized.push(buildText(this, elementType, symbol));
+        return symbol;
+    }
+}
+
+// A value already typed at some array-of-this-element spelling, renamed to the bare array type a
+// synthesized function's parameter declares - the same pointer, since every spelling of an array
+// shares its representation.
+public reinterpretArray(EirFunctionBuilder builder, long value, Type bareArrayType) -> long {
+    return reinterpretTo(builder, value, bareArrayType);
+}
+
+// A value already typed at some nullable spelling of a reference type, renamed to the bare
+// referent type - the same pointer, since a nullable reference shares its referent's
+// representation. A string element declared 'string?' is what this is for: the instructions
+// that read a string's content, such as EirStringEqual and EirHashValue, are shaped around the
+// bare type, and dispatch elsewhere keys off the declared type rather than the bits.
+reinterpretTo(EirFunctionBuilder builder, long value, Type bareType) -> long {
+    if (builder.tempType(value) == bareType) {
+        return value;
+    }
+    long renamed = builder.newTemp(bareType);
+    builder.append(new EirCast(renamed, bareType, EirCastOp.Reinterpret, value));
+    return renamed;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Call sites: used from lower.equality, lower.hashes, lower.strings, and lower.json wherever an
+// operand, a field, or a payload is array-typed. Each borrows its argument for the call - the
+// caller still owns it afterward, exactly as it does around any other leaf comparison or
+// conversion.
+
+// 'left == right' over two arrays of the same type, by content. 'negated' gives '!='.
+public lowerEqual(LoweringContext lowering, long left, long right, Type arrayType, bool negated,
+                  Type resultType, Span span) -> long {
+    let array = primitives.arrayOf(arrayType);
+    if (array == null) {
+        lowering.internalError("array content equality asked about a non-array type", span);
+        return -1;
+    }
+    let bareArrayType = lowering.store().arrayOf(array.element());
+    string symbol = lowering.arrayContent().equalsSymbol(array.element());
+    let builder = lowering.builder();
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    let callee = new EirCallee(symbol, null, [bareArrayType, bareArrayType], boolType);
+    long leftBare = reinterpretArray(builder, left, bareArrayType);
+    long rightBare = reinterpretArray(builder, right, bareArrayType);
+    long result = builder.newTemp(boolType);
+    builder.append(new EirCall(result, boolType, callee, -1, [leftBare, rightBare], -1, null,
+        lowering.lineAt(span)));
+    if (!negated) {
+        return result;
+    }
+    long inverted = builder.newTemp(resultType);
+    builder.append(new EirUnary(inverted, resultType, EirUnaryOp.Not, result));
+    return inverted;
+}
+
+// 'value.hash()' over an array, by content.
+public lowerHash(LoweringContext lowering, long value, Type arrayType, Span span) -> long {
+    let array = primitives.arrayOf(arrayType);
+    if (array == null) {
+        lowering.internalError("array content hash asked about a non-array type", span);
+        return -1;
+    }
+    let bareArrayType = lowering.store().arrayOf(array.element());
+    string symbol = lowering.arrayContent().hashSymbol(array.element());
+    let builder = lowering.builder();
+    let longType = lowering.store().primitive(PrimitiveKind.Long);
+    let callee = new EirCallee(symbol, null, [bareArrayType], longType);
+    long bare = reinterpretArray(builder, value, bareArrayType);
+    long result = builder.newTemp(longType);
+    builder.append(new EirCall(result, longType, callee, -1, [bare], -1, null,
+        lowering.lineAt(span)));
+    return result;
+}
+
+// The text form of an array, as a fresh string the caller owns.
+public lowerToString(LoweringContext lowering, long value, Type arrayType, Span span) -> long {
+    let array = primitives.arrayOf(arrayType);
+    if (array == null) {
+        lowering.internalError("array content text asked about a non-array type", span);
+        return -1;
+    }
+    let bareArrayType = lowering.store().arrayOf(array.element());
+    string symbol = lowering.arrayContent().textSymbol(array.element());
+    let builder = lowering.builder();
+    let stringType = lowering.store().stringType();
+    let callee = new EirCallee(symbol, null, [bareArrayType], stringType);
+    long bare = reinterpretArray(builder, value, bareArrayType);
+    long result = builder.newTemp(stringType);
+    builder.append(new EirCall(result, stringType, callee, -1, [bare], -1, null,
+        lowering.lineAt(span)));
+    return result;
+}
+
+// bool _arreq_<T>(T[] left, T[] right): both absent is equal, one absent is not, a length
+// mismatch is unequal, and otherwise every element in order decides it. The same object is not
+// special-cased: a float element compares by IEEE rules even against itself, so a NaN anywhere
+// still answers false, and the loop is what gets that right for every element type at once.
+// Neither operand's elements are retained or released - the loop only ever reads them.
+buildEquals(ArrayContentPlan plan, Type elementType, string symbol) -> EirFunction {
+    let store = plan.store();
+    let arrayType = store.arrayOf(elementType);
+    let boolType = store.primitive(PrimitiveKind.Bool);
+    let longType = store.primitive(PrimitiveKind.Long);
+    let builder = new EirFunctionBuilder(symbol, true, null,
+        [new EirParameter("left", arrayType), new EirParameter("right", arrayType)], boolType);
+    long left = 0;
+    long right = 1;
+
+    long falseBlock = builder.newBlock("arreq.false");
+    long trueBlock = builder.newBlock("arreq.true");
+    long leftAbsent = isNull(builder, boolType, left, arrayType);
+    long rightAbsent = isNull(builder, boolType, right, arrayType);
+    long eitherAbsent = boolTemp(builder, boolType, EirBinaryOp.Or, leftAbsent, rightAbsent);
+    long bothAbsentBlock = builder.newBlock("arreq.bothabsent");
+    long lengthBlock = builder.newBlock("arreq.length");
+    builder.terminate(new EirBranch(eitherAbsent, bothAbsentBlock, lengthBlock));
+
+    builder.moveTo(bothAbsentBlock);
+    long bothAbsent = boolTemp(builder, boolType, EirBinaryOp.And, leftAbsent, rightAbsent);
+    builder.terminate(new EirBranch(bothAbsent, trueBlock, falseBlock));
+
+    builder.moveTo(lengthBlock);
+    long leftLength = arrayLength(builder, longType, left);
+    long rightLength = arrayLength(builder, longType, right);
+    long sameLength = boolTemp(builder, boolType, EirBinaryOp.CmpEq, leftLength, rightLength);
+    long loopInit = builder.newBlock("arreq.init");
+    builder.terminate(new EirBranch(sameLength, loopInit, falseBlock));
+
+    builder.moveTo(loopInit);
+    long indexSlot = builder.addSlot("index", longType, false, false);
+    storeConst(builder, indexSlot, constInt(builder, longType, 0));
+    long testBlock = builder.newBlock("arreq.test");
+    builder.terminate(new EirJump(testBlock));
+
+    builder.moveTo(testBlock);
+    long index = loadSlot(builder, longType, indexSlot);
+    long more = boolTemp(builder, boolType, EirBinaryOp.CmpLtSigned, index, leftLength);
+    long bodyBlock = builder.newBlock("arreq.body");
+    builder.terminate(new EirBranch(more, bodyBlock, trueBlock));
+
+    builder.moveTo(bodyBlock);
+    long leftAddress = elementAddress(builder, elementType, left, index);
+    long rightAddress = elementAddress(builder, elementType, right, index);
+    long elementsEqual = elementEqualAt(builder, plan, leftAddress, rightAddress, elementType);
+    long stepBlock = builder.newBlock("arreq.step");
+    builder.terminate(new EirBranch(elementsEqual, stepBlock, falseBlock));
+
+    builder.moveTo(stepBlock);
+    storeConst(builder, indexSlot, boolTemp(builder, boolType, EirBinaryOp.Add, index,
+        constInt(builder, longType, 1)));
+    builder.terminate(new EirJump(testBlock));
+
+    builder.moveTo(trueBlock);
+    builder.terminate(new EirReturn(constBool(builder, boolType, true)));
+
+    builder.moveTo(falseBlock);
+    builder.terminate(new EirReturn(constBool(builder, boolType, false)));
+
+    return builder.finish();
+}
+
+// long _arrhash_<T>(T[] array): -1 for an absent array, otherwise the 31-multiply fold of every
+// element's own hash, seeded at 17 so an empty array still answers a fixed value.
+buildHash(ArrayContentPlan plan, Type elementType, string symbol) -> EirFunction {
+    let store = plan.store();
+    let arrayType = store.arrayOf(elementType);
+    let longType = store.primitive(PrimitiveKind.Long);
+    let boolType = store.primitive(PrimitiveKind.Bool);
+    let builder = new EirFunctionBuilder(symbol, true, null,
+        [new EirParameter("array", arrayType)], longType);
+    long array = 0;
+
+    long absentBlock = builder.newBlock("arrhash.absent");
+    long presentBlock = builder.newBlock("arrhash.present");
+    builder.terminate(new EirBranch(isNull(builder, boolType, array, arrayType), absentBlock, presentBlock));
+
+    builder.moveTo(absentBlock);
+    builder.terminate(new EirReturn(constInt(builder, longType, -1)));
+
+    builder.moveTo(presentBlock);
+    long length = arrayLength(builder, longType, array);
+    long hashSlot = builder.addSlot("hash", longType, false, false);
+    storeConst(builder, hashSlot, constInt(builder, longType, 17));
+    long indexSlot = builder.addSlot("index", longType, false, false);
+    storeConst(builder, indexSlot, constInt(builder, longType, 0));
+    long testBlock = builder.newBlock("arrhash.test");
+    builder.terminate(new EirJump(testBlock));
+
+    builder.moveTo(testBlock);
+    long index = loadSlot(builder, longType, indexSlot);
+    long more = boolTemp(builder, boolType, EirBinaryOp.CmpLtSigned, index, length);
+    long bodyBlock = builder.newBlock("arrhash.body");
+    long doneBlock = builder.newBlock("arrhash.done");
+    builder.terminate(new EirBranch(more, bodyBlock, doneBlock));
+
+    builder.moveTo(bodyBlock);
+    long address = elementAddress(builder, elementType, array, index);
+    long elementHash = elementHashAt(builder, plan, address, elementType);
+    long hash = loadSlot(builder, longType, hashSlot);
+    long scaled = boolTemp(builder, boolType, EirBinaryOp.Mul, hash, constInt(builder, longType, 31));
+    storeConst(builder, hashSlot, boolTemp(builder, boolType, EirBinaryOp.Add, scaled, elementHash));
+    storeConst(builder, indexSlot, boolTemp(builder, boolType, EirBinaryOp.Add, index,
+        constInt(builder, longType, 1)));
+    builder.terminate(new EirJump(testBlock));
+
+    builder.moveTo(doneBlock);
+    builder.terminate(new EirReturn(loadSlot(builder, longType, hashSlot)));
+
+    return builder.finish();
+}
+
+// string _arrtext_<T>(T[] array): 'null' for an absent array, otherwise '[' every element's own
+// text joined by ', ' ']'. The accumulator owns a reference throughout, released into every piece
+// it joins with.
+buildText(ArrayContentPlan plan, Type elementType, string symbol) -> EirFunction {
+    let store = plan.store();
+    let arrayType = store.arrayOf(elementType);
+    let stringType = store.stringType();
+    let longType = store.primitive(PrimitiveKind.Long);
+    let boolType = store.primitive(PrimitiveKind.Bool);
+    let builder = new EirFunctionBuilder(symbol, true, null,
+        [new EirParameter("array", arrayType)], stringType);
+    long array = 0;
+
+    long absentBlock = builder.newBlock("arrtext.absent");
+    long presentBlock = builder.newBlock("arrtext.present");
+    builder.terminate(new EirBranch(isNull(builder, boolType, array, arrayType), absentBlock, presentBlock));
+
+    builder.moveTo(absentBlock);
+    builder.terminate(new EirReturn(ownedLiteral(builder, stringType, "null")));
+
+    builder.moveTo(presentBlock);
+    long length = arrayLength(builder, longType, array);
+    long textSlot = builder.addSlot("text", stringType, true, false);
+    storeConst(builder, textSlot, ownedLiteral(builder, stringType, "["));
+    long indexSlot = builder.addSlot("index", longType, false, false);
+    storeConst(builder, indexSlot, constInt(builder, longType, 0));
+    long testBlock = builder.newBlock("arrtext.test");
+    builder.terminate(new EirJump(testBlock));
+
+    builder.moveTo(testBlock);
+    long index = loadSlot(builder, longType, indexSlot);
+    long more = boolTemp(builder, boolType, EirBinaryOp.CmpLtSigned, index, length);
+    long bodyBlock = builder.newBlock("arrtext.body");
+    long doneBlock = builder.newBlock("arrtext.done");
+    builder.terminate(new EirBranch(more, bodyBlock, doneBlock));
+
+    builder.moveTo(bodyBlock);
+    long separatorBlock = builder.newBlock("arrtext.sep");
+    long elementBlock = builder.newBlock("arrtext.element");
+    long isFirst = boolTemp(builder, boolType, EirBinaryOp.CmpEq, index, constInt(builder, longType, 0));
+    builder.terminate(new EirBranch(isFirst, elementBlock, separatorBlock));
+
+    builder.moveTo(separatorBlock);
+    appendOwnedInto(builder, stringType, textSlot, literal(builder, stringType, ", "), false);
+    builder.terminate(new EirJump(elementBlock));
+
+    builder.moveTo(elementBlock);
+    long address = elementAddress(builder, elementType, array, index);
+    long elementText = elementTextAt(builder, plan, address, elementType);
+    appendOwnedInto(builder, stringType, textSlot, elementText, true);
+    storeConst(builder, indexSlot, boolTemp(builder, boolType, EirBinaryOp.Add, index,
+        constInt(builder, longType, 1)));
+    builder.terminate(new EirJump(testBlock));
+
+    builder.moveTo(doneBlock);
+    appendOwnedInto(builder, stringType, textSlot, literal(builder, stringType, "]"), false);
+    builder.terminate(new EirReturn(takeSlot(builder, stringType, textSlot)));
+
+    return builder.finish();
+}
+
+// '==' over one element the address of each operand names. Reads both sides once and dispatches
+// on the element's shape; a tagged optional and a struct are the only shapes that need the
+// address rather than the loaded value.
+elementEqualAt(EirFunctionBuilder builder, ArrayContentPlan plan, long leftAddress,
+              long rightAddress, Type type) -> long {
+    let store = plan.store();
+    let boolType = store.primitive(PrimitiveKind.Bool);
+    let payload = primitives.taggedPayloadOf(type);
+    if (payload != null) {
+        return taggedEqualAt(builder, plan, leftAddress, rightAddress, type, payload);
+    }
+    let structType = primitives.structOf(type);
+    if (structType != null) {
+        return structEqualAt(builder, plan, leftAddress, rightAddress, structType);
+    }
+    long left = loadAt(builder, leftAddress, type);
+    long right = loadAt(builder, rightAddress, type);
+    let arrayType = primitives.arrayOf(type);
+    if (arrayType != null) {
+        return callArrayEquals(builder, plan, left, right, arrayType.element());
+    }
+    let stringType = primitives.stringOf(type);
+    if (stringType != null) {
+        long result = builder.newTemp(boolType);
+        builder.append(new EirStringEqual(result, boolType, reinterpretTo(builder, left,
+            stringType), reinterpretTo(builder, right, stringType)));
+        return result;
+    }
+    if (primitives.isClassLike(type)) {
+        long result = builder.newTemp(boolType);
+        builder.append(new EirDynamicEquals(result, boolType, left, right));
+        return result;
+    }
+    let op = primitives.isFloatType(type) ? EirBinaryOp.FloatCmpEq : EirBinaryOp.CmpEq;
+    return boolTemp(builder, boolType, op, left, right);
+}
+
+// The '==' of two tagged pairs the given addresses name: both absent is equal, one absent is not,
+// and two present pairs compare their payloads through elementEqualAt - by address in place for a
+// struct payload, and by address into a scratch spill otherwise, so a payload that is itself a
+// nested optional, a string, a class, or a nested array recurses exactly as it would anywhere
+// else. The payload is only ever read once presence is proven, since a struct payload may hold a
+// reference field over storage that was never written.
+taggedEqualAt(EirFunctionBuilder builder, ArrayContentPlan plan, long leftAddress,
+             long rightAddress, Type optionalType, Type payloadType) -> long {
+    let store = plan.store();
+    let boolType = store.primitive(PrimitiveKind.Bool);
+    long leftPair = loadAt(builder, leftAddress, optionalType);
+    long rightPair = loadAt(builder, rightAddress, optionalType);
+    long leftPresent = builder.newTemp(boolType);
+    builder.append(new EirOptionalPresence(leftPresent, boolType, leftPair));
+    long rightPresent = builder.newTemp(boolType);
+    builder.append(new EirOptionalPresence(rightPresent, boolType, rightPair));
+    long samePresence = boolTemp(builder, boolType, EirBinaryOp.CmpEq, leftPresent, rightPresent);
+
+    long answer = builder.addSlot("opteq", boolType, false, false);
+    storeConst(builder, answer, samePresence);
+    long bothPresent = boolTemp(builder, boolType, EirBinaryOp.And, samePresence, leftPresent);
+    long payloadBlock = builder.newBlock("opteq.payload");
+    long endBlock = builder.newBlock("opteq.end");
+    builder.terminate(new EirBranch(bothPresent, payloadBlock, endBlock));
+
+    builder.moveTo(payloadBlock);
+    long payloadEqual = -1;
+    if (primitives.structOf(payloadType) != null) {
+        long leftPayloadAddress = builder.newTemp(payloadType);
+        builder.append(new EirOptionalPayloadAddress(leftPayloadAddress, payloadType,
+            leftAddress));
+        long rightPayloadAddress = builder.newTemp(payloadType);
+        builder.append(new EirOptionalPayloadAddress(rightPayloadAddress, payloadType,
+            rightAddress));
+        payloadEqual = elementEqualAt(builder, plan, leftPayloadAddress, rightPayloadAddress,
+            payloadType);
+    } else {
+        long leftPayload = builder.newTemp(payloadType);
+        builder.append(new EirOptionalPayload(leftPayload, payloadType, leftPair));
+        long rightPayload = builder.newTemp(payloadType);
+        builder.append(new EirOptionalPayload(rightPayload, payloadType, rightPair));
+        payloadEqual = elementEqualAt(builder, plan, addressOfValue(builder, leftPayload,
+            payloadType), addressOfValue(builder, rightPayload, payloadType), payloadType);
+    }
+    storeConst(builder, answer, payloadEqual);
+    builder.terminate(new EirJump(endBlock));
+
+    builder.moveTo(endBlock);
+    return loadSlot(builder, boolType, answer);
+}
+
+// '==' over the structs the given addresses name: the struct's own 'equals' when it declared one,
+// otherwise every field in order, short-circuiting to unequal at the first difference.
+structEqualAt(EirFunctionBuilder builder, ArrayContentPlan plan, long leftAddress,
+             long rightAddress, Type structType) -> long {
+    let store = plan.store();
+    let boolType = store.primitive(PrimitiveKind.Bool);
+    let declared = declaredEqualsOf(structType);
+    if (declared != null) {
+        long other = loadAt(builder, rightAddress, structType);
+        return callDeclared(builder, plan, declared, leftAddress, [other], boolType);
+    }
+    let fields = types.fieldsOf(structType);
+    if (fields == null) {
+        return constBool(builder, boolType, true);
+    }
+    long answer = builder.addSlot("structeq", boolType, false, false);
+    storeConst(builder, answer, constBool(builder, boolType, true));
+    long differBlock = builder.newBlock("structeq.differ");
+    long endBlock = builder.newBlock("structeq.end");
+    for (long i = 0; i < fields.length(); i++) {
+        let field = fields.get(i);
+        long leftField = builder.newTemp(field.type());
+        builder.append(new EirFieldAddress(leftField, field.type(), leftAddress, i));
+        long rightField = builder.newTemp(field.type());
+        builder.append(new EirFieldAddress(rightField, field.type(), rightAddress, i));
+        long fieldEqual = elementEqualAt(builder, plan, leftField, rightField, field.type());
+        long next = builder.newBlock("structeq.next");
+        builder.terminate(new EirBranch(fieldEqual, next, differBlock));
+        builder.moveTo(next);
+    }
+    builder.terminate(new EirJump(endBlock));
+    builder.moveTo(differBlock);
+    storeConst(builder, answer, constBool(builder, boolType, false));
+    builder.terminate(new EirJump(endBlock));
+    builder.moveTo(endBlock);
+    return loadSlot(builder, boolType, answer);
+}
+
+// The hash of one element the given address names.
+elementHashAt(EirFunctionBuilder builder, ArrayContentPlan plan, long address, Type type)
+        -> long {
+    let store = plan.store();
+    let longType = store.primitive(PrimitiveKind.Long);
+    let payload = primitives.taggedPayloadOf(type);
+    if (payload != null) {
+        return taggedHashAt(builder, plan, address, type, payload);
+    }
+    let structType = primitives.structOf(type);
+    if (structType != null) {
+        return structHashAt(builder, plan, address, structType);
+    }
+    long value = loadAt(builder, address, type);
+    let arrayType = primitives.arrayOf(type);
+    if (arrayType != null) {
+        return callArrayHash(builder, plan, value, arrayType.element());
+    }
+    let stringType = primitives.stringOf(type);
+    if (stringType != null) {
+        long result = builder.newTemp(longType);
+        builder.append(new EirHashValue(result, longType, reinterpretTo(builder, value,
+            stringType)));
+        return result;
+    }
+    if (primitives.isClassLike(type)) {
+        long result = builder.newTemp(longType);
+        builder.append(new EirDynamicHash(result, longType, value));
+        return result;
+    }
+    long result = builder.newTemp(longType);
+    builder.append(new EirHashValue(result, longType, value));
+    return result;
+}
+
+// -1 for an absent tagged pair, otherwise its payload's own hash.
+taggedHashAt(EirFunctionBuilder builder, ArrayContentPlan plan, long address, Type optionalType,
+            Type payloadType) -> long {
+    let store = plan.store();
+    let longType = store.primitive(PrimitiveKind.Long);
+    let boolType = store.primitive(PrimitiveKind.Bool);
+    long pair = loadAt(builder, address, optionalType);
+    long present = builder.newTemp(boolType);
+    builder.append(new EirOptionalPresence(present, boolType, pair));
+    long answer = builder.addSlot("opthash", longType, false, false);
+    long presentBlock = builder.newBlock("opthash.present");
+    long absentBlock = builder.newBlock("opthash.absent");
+    long endBlock = builder.newBlock("opthash.end");
+    builder.terminate(new EirBranch(present, presentBlock, absentBlock));
+
+    builder.moveTo(presentBlock);
+    long payloadHash = -1;
+    if (primitives.structOf(payloadType) != null) {
+        long payloadAddress = builder.newTemp(payloadType);
+        builder.append(new EirOptionalPayloadAddress(payloadAddress, payloadType, address));
+        payloadHash = elementHashAt(builder, plan, payloadAddress, payloadType);
+    } else {
+        long payload = builder.newTemp(payloadType);
+        builder.append(new EirOptionalPayload(payload, payloadType, pair));
+        payloadHash = elementHashAt(builder, plan, addressOfValue(builder, payload, payloadType),
+            payloadType);
+    }
+    storeConst(builder, answer, payloadHash);
+    builder.terminate(new EirJump(endBlock));
+
+    builder.moveTo(absentBlock);
+    storeConst(builder, answer, constInt(builder, longType, -1));
+    builder.terminate(new EirJump(endBlock));
+
+    builder.moveTo(endBlock);
+    return loadSlot(builder, longType, answer);
+}
+
+// The FNV-1a fold of a struct's fields, each by its own hash, or the struct's own 'hash' when it
+// declared one - the same algorithm hashAt uses for a struct reached any other way.
+structHashAt(EirFunctionBuilder builder, ArrayContentPlan plan, long address, Type structType)
+        -> long {
+    let store = plan.store();
+    let longType = store.primitive(PrimitiveKind.Long);
+    let declared = declaredHashOf(structType);
+    if (declared != null) {
+        return callDeclared(builder, plan, declared, address, [], longType);
+    }
+    long hash = constInt(builder, longType, -3750763034362895579);
+    let fields = types.fieldsOf(structType);
+    if (fields == null) {
+        return hash;
+    }
+    for (long i = 0; i < fields.length(); i++) {
+        let field = fields.get(i);
+        long fieldAddress = builder.newTemp(field.type());
+        builder.append(new EirFieldAddress(fieldAddress, field.type(), address, i));
+        long fieldHash = elementHashAt(builder, plan, fieldAddress, field.type());
+        long mixed = boolTemp(builder, longType, EirBinaryOp.Xor, hash, fieldHash);
+        hash = boolTemp(builder, longType, EirBinaryOp.Mul, mixed, constInt(builder, longType,
+            1099511628211));
+    }
+    return hash;
+}
+
+// The text of one element the given address names, as a string the caller owns.
+elementTextAt(EirFunctionBuilder builder, ArrayContentPlan plan, long address, Type type)
+        -> long {
+    let store = plan.store();
+    let payload = primitives.taggedPayloadOf(type);
+    if (payload != null) {
+        return taggedTextAt(builder, plan, address, type, payload);
+    }
+    let structType = primitives.structOf(type);
+    if (structType != null) {
+        return structTextAt(builder, plan, address, structType);
+    }
+    long value = loadAt(builder, address, type);
+    let arrayType = primitives.arrayOf(type);
+    if (arrayType != null) {
+        return callArrayText(builder, plan, value, arrayType.element());
+    }
+    let stringType = store.stringType();
+    if (primitives.stringOf(type) != null) {
+        long bare = reinterpretTo(builder, value, stringType);
+        if (!(type is OptionalType)) {
+            long result = builder.newTemp(stringType);
+            builder.append(new EirJsonEscape(result, stringType, bare));
+            return result;
+        }
+        // A nullable string is not tagged - it shares the string's own pointer shape - so an
+        // absent one has to be told apart here, before EirJsonEscape, which renders a null
+        // string as "" rather than the JSON 'null' this element form needs.
+        let boolType = store.primitive(PrimitiveKind.Bool);
+        long absent = isNull(builder, boolType, bare, stringType);
+        long answer = builder.addSlot("strtext", stringType, true, false);
+        long presentBlock = builder.newBlock("strtext.present");
+        long absentBlock = builder.newBlock("strtext.absent");
+        long endBlock = builder.newBlock("strtext.end");
+        builder.terminate(new EirBranch(absent, absentBlock, presentBlock));
+
+        builder.moveTo(presentBlock);
+        long escaped = builder.newTemp(stringType);
+        builder.append(new EirJsonEscape(escaped, stringType, bare));
+        storeConst(builder, answer, escaped);
+        builder.terminate(new EirJump(endBlock));
+
+        builder.moveTo(absentBlock);
+        storeConst(builder, answer, ownedLiteral(builder, stringType, "null"));
+        builder.terminate(new EirJump(endBlock));
+
+        builder.moveTo(endBlock);
+        return takeSlot(builder, stringType, answer);
+    }
+    if (primitives.isClassLike(type)) {
+        long result = builder.newTemp(stringType);
+        builder.append(new EirDynamicToString(result, stringType, value));
+        return result;
+    }
+    if (primitives.isCharType(type) || type is EnumType) {
+        long text = leafToString(builder, plan, value, type);
+        long quoted = builder.newTemp(stringType);
+        builder.append(new EirJsonEscape(quoted, stringType, text));
+        builder.append(new EirRelease(text));
+        return quoted;
+    }
+    return leafToString(builder, plan, value, type);
+}
+
+// 'null' for an absent tagged pair, otherwise its payload's own text.
+taggedTextAt(EirFunctionBuilder builder, ArrayContentPlan plan, long address, Type optionalType,
+            Type payloadType) -> long {
+    let store = plan.store();
+    let stringType = store.stringType();
+    let boolType = store.primitive(PrimitiveKind.Bool);
+    long pair = loadAt(builder, address, optionalType);
+    long present = builder.newTemp(boolType);
+    builder.append(new EirOptionalPresence(present, boolType, pair));
+    long answer = builder.addSlot("opttext", stringType, true, false);
+    long presentBlock = builder.newBlock("opttext.present");
+    long absentBlock = builder.newBlock("opttext.absent");
+    long endBlock = builder.newBlock("opttext.end");
+    builder.terminate(new EirBranch(present, presentBlock, absentBlock));
+
+    builder.moveTo(presentBlock);
+    long rendered = -1;
+    if (primitives.structOf(payloadType) != null) {
+        long payloadAddress = builder.newTemp(payloadType);
+        builder.append(new EirOptionalPayloadAddress(payloadAddress, payloadType, address));
+        rendered = structTextAt(builder, plan, payloadAddress, payloadType);
+    } else {
+        long payload = builder.newTemp(payloadType);
+        builder.append(new EirOptionalPayload(payload, payloadType, pair));
+        rendered = elementTextAt(builder, plan, addressOfValue(builder, payload, payloadType),
+            payloadType);
+    }
+    storeConst(builder, answer, rendered);
+    builder.terminate(new EirJump(endBlock));
+
+    builder.moveTo(absentBlock);
+    storeConst(builder, answer, ownedLiteral(builder, stringType, "null"));
+    builder.terminate(new EirJump(endBlock));
+
+    builder.moveTo(endBlock);
+    return takeSlot(builder, stringType, answer);
+}
+
+// The JSON object of a struct the given address names: '{' every field as '"name": value'
+// joined by ', ' '}' - the same shape json.renderAt builds for a struct reached any other way. A
+// struct never renders through a declared 'toString' here, matching struct JSON serialization
+// everywhere else it nests: a nested struct is always its JSON object. A field type this cannot
+// render is unreachable here: sema only allows an array to hold a struct whose own fields are
+// already checked against the same rule.
+structTextAt(EirFunctionBuilder builder, ArrayContentPlan plan, long address, Type structType)
+        -> long {
+    let store = plan.store();
+    let stringType = store.stringType();
+    long accumulator = literal(builder, stringType, "\{");
+    builder.append(new EirRetain(accumulator));
+    let fields = types.fieldsOf(structType);
+    if (fields == null) {
+        return accumulator;
+    }
+    for (long i = 0; i < fields.length(); i++) {
+        let field = fields.get(i);
+        string separator = "";
+        if (i > 0) {
+            separator = ", ";
+        }
+        accumulator = concatOwned(builder, stringType, accumulator,
+            literal(builder, stringType, separator + "\"" + field.name() + "\": "), false);
+        long fieldAddress = builder.newTemp(field.type());
+        builder.append(new EirFieldAddress(fieldAddress, field.type(), address, i));
+        long rendered = jsonValueAt(builder, plan, fieldAddress, field.type());
+        accumulator = concatOwned(builder, stringType, accumulator, rendered, true);
+    }
+    return concatOwned(builder, stringType, accumulator, literal(builder, stringType, "\}"),
+        false);
+}
+
+// One struct field's JSON value: a char and an enum member are quoted text, a string is quoted
+// and escaped, a nested struct is its own object, and everything else is its plain text form.
+jsonValueAt(EirFunctionBuilder builder, ArrayContentPlan plan, long address, Type type) -> long {
+    let store = plan.store();
+    let stringType = store.stringType();
+    let payload = primitives.taggedPayloadOf(type);
+    if (payload != null) {
+        return taggedTextAt(builder, plan, address, type, payload);
+    }
+    let arrayType = primitives.arrayOf(type);
+    if (arrayType != null) {
+        long value = loadAt(builder, address, type);
+        return callArrayText(builder, plan, value, arrayType.element());
+    }
+    if (type is OptionalType && primitives.isStringType(type.inner())) {
+        return elementTextAt(builder, plan, address, type.inner());
+    }
+    let structType = primitives.structOf(type);
+    if (structType != null) {
+        return structTextAt(builder, plan, address, structType);
+    }
+    return elementTextAt(builder, plan, address, type);
+}
+
+// A synthesized function's own version of a leaf conversion to text: integers and floats through
+// the numeric formatters, bool as a literal, and char and enum through their own instructions.
+leafToString(EirFunctionBuilder builder, ArrayContentPlan plan, long value, Type type) -> long {
+    let store = plan.store();
+    let stringType = store.stringType();
+    if (primitives.isBoolType(type)) {
+        long text = builder.newTemp(stringType);
+        builder.append(new EirBoolToString(text, stringType, value));
+        return text;
+    }
+    if (type is EnumType) {
+        long text = builder.newTemp(stringType);
+        builder.append(new EirEnumToString(text, stringType, value, type));
+        return text;
+    }
+    if (primitives.isCharType(type)) {
+        long text = builder.newTemp(stringType);
+        builder.append(new EirCharToString(text, stringType, value));
+        return text;
+    }
+    if (primitives.isFloatType(type)) {
+        long widened = value;
+        if (primitives.bitWidth(type) != 64) {
+            widened = builder.newTemp(store.primitive(PrimitiveKind.Double));
+            builder.append(new EirCast(widened, store.primitive(PrimitiveKind.Double),
+                EirCastOp.FloatExtend, value));
+        }
+        long text = builder.newTemp(stringType);
+        builder.append(new EirDoubleToString(text, stringType, widened));
+        return text;
+    }
+    long widened = value;
+    if (primitives.bitWidth(type) != 64) {
+        let target = store.primitive(PrimitiveKind.Long);
+        widened = builder.newTemp(target);
+        let op = primitives.isSignedType(type) ? EirCastOp.SignExtend : EirCastOp.ZeroExtend;
+        builder.append(new EirCast(widened, target, op, value));
+    }
+    long text = builder.newTemp(stringType);
+    builder.append(new EirIntToString(text, stringType, widened, primitives.isSignedType(type)));
+    return text;
+}
+
+// A call into the equals/hash/text helper of a nested array element, requesting it from the plan
+// first so every module needs each nested helper built exactly once.
+callArrayEquals(EirFunctionBuilder builder, ArrayContentPlan plan, long left, long right,
+                Type innerElementType) -> long {
+    string symbol = plan.equalsSymbol(innerElementType);
+    let store = plan.store();
+    let innerArrayType = store.arrayOf(innerElementType);
+    let boolType = store.primitive(PrimitiveKind.Bool);
+    long leftBare = reinterpretArray(builder, left, innerArrayType);
+    long rightBare = reinterpretArray(builder, right, innerArrayType);
+    let callee = new EirCallee(symbol, null, [innerArrayType, innerArrayType], boolType);
+    long result = builder.newTemp(boolType);
+    builder.append(new EirCall(result, boolType, callee, -1, [leftBare, rightBare], -1, null));
+    return result;
+}
+
+callArrayHash(EirFunctionBuilder builder, ArrayContentPlan plan, long value,
+             Type innerElementType) -> long {
+    string symbol = plan.hashSymbol(innerElementType);
+    let store = plan.store();
+    let innerArrayType = store.arrayOf(innerElementType);
+    let longType = store.primitive(PrimitiveKind.Long);
+    long bare = reinterpretArray(builder, value, innerArrayType);
+    let callee = new EirCallee(symbol, null, [innerArrayType], longType);
+    long result = builder.newTemp(longType);
+    builder.append(new EirCall(result, longType, callee, -1, [bare], -1, null));
+    return result;
+}
+
+callArrayText(EirFunctionBuilder builder, ArrayContentPlan plan, long value,
+             Type innerElementType) -> long {
+    string symbol = plan.textSymbol(innerElementType);
+    let store = plan.store();
+    let innerArrayType = store.arrayOf(innerElementType);
+    let stringType = store.stringType();
+    long bare = reinterpretArray(builder, value, innerArrayType);
+    let callee = new EirCallee(symbol, null, [innerArrayType], stringType);
+    long result = builder.newTemp(stringType);
+    builder.append(new EirCall(result, stringType, callee, -1, [bare], -1, null));
+    return result;
+}
+
+// A struct's own zero-argument or one-argument behavior, called by symbol the way a class
+// destructor calls a base's declared destructor: no dispatch, because a struct has no runtime
+// type beyond its own.
+callDeclared(EirFunctionBuilder builder, ArrayContentPlan plan, Method declared, long receiver,
+            long[] arguments, Type returnType) -> long {
+    let info = plan.index().infoFor(declared.signature());
+    if (info == null) {
+        return fallbackFor(builder, returnType);
+    }
+    let parameterTypes = new List<Type>();
+    for (let parameter in declared.signature().parameters()) {
+        parameterTypes.push(parameter.type());
+    }
+    let callee = new EirCallee(info.symbol(), declared.definingType(), parameterTypes.toArray(),
+        returnType);
+    long result = builder.newTemp(returnType);
+    builder.append(new EirCall(result, returnType, callee, receiver, arguments, -1, null));
+    return result;
+}
+
+fallbackFor(EirFunctionBuilder builder, Type returnType) -> long {
+    if (primitives.isBoolType(returnType)) {
+        return constBool(builder, returnType, false);
+    }
+    if (primitives.isStringType(returnType)) {
+        return ownedLiteral(builder, returnType, "");
+    }
+    return constInt(builder, returnType, 0);
+}
+
+// A struct's declared 'equals', or null when memberwise folding stands in - the same rule
+// lower.equality applies to a struct reached any other way.
+declaredEqualsOf(Type structType) -> Method? {
+    let methods = types.methodsOf(structType);
+    if (methods == null) {
+        return null;
+    }
+    for (long i = 0; i < methods.length(); i++) {
+        let method = methods.get(i);
+        if (method.isConstructor() || method.name() != "equals") {
+            continue;
+        }
+        let signature = method.signature();
+        if (signature.parameters().length != 1 || signature.declaresThrows()) {
+            continue;
+        }
+        if (primitives.structOf(signature.parameters()[0].type()) != structType) {
+            continue;
+        }
+        if (primitives.isBoolType(signature.returnType())) {
+            return method;
+        }
+    }
+    return null;
+}
+
+// A struct's declared 'hash', or null when the FNV fold stands in.
+declaredHashOf(Type structType) -> Method? {
+    let methods = types.methodsOf(structType);
+    if (methods == null) {
+        return null;
+    }
+    for (long i = 0; i < methods.length(); i++) {
+        let method = methods.get(i);
+        if (!method.isConstructor() && method.name() == "hash") {
+            return method;
+        }
+    }
+    return null;
+}
+
+loadAt(EirFunctionBuilder builder, long address, Type type) -> long {
+    long value = builder.newTemp(type);
+    builder.append(new EirLoadPtr(value, type, address));
+    return value;
+}
+
+// The address a value with no storage of its own is given, so a payload read out of a tagged pair
+// can recurse through the same address-taking helpers a struct or array payload needs. Only ever
+// asked for a leaf type, which addresses itself through a slot.
+addressOfValue(EirFunctionBuilder builder, long value, Type type) -> long {
+    long slot = builder.addSlot("scratch", type, false, false);
+    builder.append(new EirStoreSlot(slot, value));
+    long address = builder.newTemp(type);
+    builder.append(new EirSlotAddress(address, type, slot));
+    return address;
+}
+
+isNull(EirFunctionBuilder builder, Type booleanType, long value, Type type) -> long {
+    long absent = builder.newTemp(type);
+    builder.append(new EirConstNull(absent, type));
+    return boolTemp(builder, booleanType, EirBinaryOp.CmpEq, value, absent);
+}
+
+arrayLength(EirFunctionBuilder builder, Type longType, long array) -> long {
+    long length = builder.newTemp(longType);
+    builder.append(new EirArrayLength(length, longType, array));
+    return length;
+}
+
+elementAddress(EirFunctionBuilder builder, Type elementType, long array, long index) -> long {
+    long address = builder.newTemp(elementType);
+    builder.append(new EirElementAddress(address, elementType, array, index));
+    return address;
+}
+
+boolTemp(EirFunctionBuilder builder, Type booleanType, EirBinaryOp op, long left,
+        long right) -> long {
+    Type resultType = builder.tempType(left);
+    if (op == EirBinaryOp.CmpEq || op == EirBinaryOp.CmpNe || op == EirBinaryOp.CmpLtSigned
+            || op == EirBinaryOp.FloatCmpEq || op == EirBinaryOp.Or || op == EirBinaryOp.And) {
+        resultType = booleanType;
+    }
+    long result = builder.newTemp(resultType);
+    builder.append(new EirBinary(result, resultType, op, left, right));
+    return result;
+}
+
+constInt(EirFunctionBuilder builder, Type type, long value) -> long {
+    long temp = builder.newTemp(type);
+    builder.append(new EirConstInt(temp, type, value));
+    return temp;
+}
+
+constBool(EirFunctionBuilder builder, Type type, bool value) -> long {
+    long temp = builder.newTemp(type);
+    builder.append(new EirConstBool(temp, type, value));
+    return temp;
+}
+
+literal(EirFunctionBuilder builder, Type stringType, string text) -> long {
+    long temp = builder.newTemp(stringType);
+    builder.append(new EirConstString(temp, stringType, text.toBytes()));
+    return temp;
+}
+
+// A literal with its own reference, safe to return from a function whose result is owned.
+ownedLiteral(EirFunctionBuilder builder, Type stringType, string text) -> long {
+    long temp = literal(builder, stringType, text);
+    builder.append(new EirRetain(temp));
+    return temp;
+}
+
+storeConst(EirFunctionBuilder builder, long slot, long value) {
+    builder.append(new EirStoreSlot(slot, value));
+}
+
+loadSlot(EirFunctionBuilder builder, Type type, long slot) -> long {
+    long temp = builder.newTemp(type);
+    builder.append(new EirLoadSlot(temp, type, slot));
+    return temp;
+}
+
+// Hands the +1 a merge slot owns to the result, the way any other place a value merges through a
+// slot and is then handed onward - owned - has to: a plain load only borrows, so the last read of
+// a slot whose value is about to be returned or consumed as owned takes it instead.
+takeSlot(EirFunctionBuilder builder, Type type, long slot) -> long {
+    long temp = builder.newTemp(type);
+    builder.append(new EirTakeSlot(temp, type, slot));
+    return temp;
+}
+
+// Concatenates a piece into a text slot, releasing the slot's old value and the piece when it
+// owned one.
+appendOwnedInto(EirFunctionBuilder builder, Type stringType, long slot, long piece,
+               bool pieceOwned) {
+    long current = loadSlot(builder, stringType, slot);
+    long joined = builder.newTemp(stringType);
+    builder.append(new EirStringConcat(joined, stringType, current, piece));
+    if (pieceOwned) {
+        builder.append(new EirRelease(piece));
+    }
+    // The slot, not the borrowed value just read out of it, owns the reference being replaced;
+    // releasing it through the slot's own address is what gives that +1 up, the same barrier
+    // every other slot overwrite uses.
+    long slotAddress = builder.newTemp(stringType);
+    builder.append(new EirSlotAddress(slotAddress, stringType, slot));
+    builder.append(new EirReleasePtr(slotAddress));
+    storeConst(builder, slot, joined);
+}
+
+// Joins two strings, giving up the left operand's reference and the right one's when it owned
+// one. The result owns the only reference to the joined text.
+concatOwned(EirFunctionBuilder builder, Type stringType, long left, long right, bool rightOwned)
+        -> long {
+    long joined = builder.newTemp(stringType);
+    builder.append(new EirStringConcat(joined, stringType, left, right));
+    builder.append(new EirRelease(left));
+    if (rightOwned) {
+        builder.append(new EirRelease(right));
+    }
+    return joined;
+}

@@ -685,6 +685,9 @@ public interpolationIssue(Type analyzed) -> string? {
     if (types.isClassLike(analyzed)) {
         return null;
     }
+    if (analyzed is ArrayType) {
+        return arrayTextIssue(analyzed);
+    }
     if (analyzed is FunctionType) {
         return "Cannot interpolate a value of type '{types.display(analyzed)}': a function "
             + "value has no text form. Interpolate what the function returns, or a name you "
@@ -704,6 +707,39 @@ public interpolationIssue(Type analyzed) -> string? {
     return "Cannot interpolate a value of type '{types.display(analyzed)}'; only string, "
         + "integer, bool, enum, class, and JSON-serializable struct values are supported here. "
         + "Convert it with '.toString()' first.";
+}
+
+// The innermost element type an array bottoms out at, through nested arrays and the elements'
+// nullable wrappers.
+innermostElementOf(ArrayType array) -> Type {
+    Type element = convert.coreOf(array.element());
+    while (element is ArrayType) {
+        element = convert.coreOf(element.element());
+    }
+    return element;
+}
+
+// Why a value of this array type has no text form, or null when it does. Elements format the way
+// struct serialization writes them: value types, strings, and enums directly, a struct as its
+// JSON form even when it declares its own 'toString', an absent nullable element as 'null', and
+// a nested array by these same rules; a class or interface element renders from its runtime type.
+arrayTextIssue(ArrayType array) -> string? {
+    Type element = innermostElementOf(array);
+    if (convert.containsTypeParam(element)) {
+        return null;
+    }
+    if (isJsonableLeaf(element) || types.isClassLike(element)) {
+        return null;
+    }
+    if (isStructValue(element)) {
+        return structJsonabilityIssue(element);
+    }
+    if (element is FunctionType) {
+        return "Cannot interpolate a value of type '{types.display(array)}': its elements are "
+            + "function values, which have no text form.";
+    }
+    return "Cannot interpolate a value of type '{types.display(array)}'; its element type "
+        + "'{types.display(element)}' has no text form.";
 }
 
 // A value type, string, or enum that has a direct JSON form.
@@ -809,9 +845,32 @@ isFinalClass(Type type) -> bool {
     return false;
 }
 
-// Why two values of struct type 'structType' cannot be compared memberwise with '==', or null
-// when every field has its own '=='. Names the offending field's dotted path and its type.
+// Why two values of this struct or array type cannot be compared with '==', or null when every
+// field or element has its own '=='. Names the offending field's dotted path and its type.
 public equalityComparabilityIssue(Type structType) -> string? {
+    if (structType is ArrayType) {
+        Type leaf = innermostElementOf(structType);
+        if (convert.containsTypeParam(leaf)) {
+            return null;
+        }
+        if (leaf is ExternalType || leaf is FunctionType) {
+            return "'{types.display(structType)}' cannot be compared with '==': an array "
+                + "compares element by element, and its element type '{types.display(leaf)}' "
+                + "has no '=='; {noEqualityReason(leaf)}. Compare the elements you need "
+                + "directly instead.";
+        }
+        if (isStructValue(leaf)) {
+            let inElement = firstNonComparableField(leaf, new Set<Type>());
+            if (inElement != null) {
+                return "'{types.display(structType)}' cannot be compared with '==': an array "
+                    + "compares element by element, and element field '{inElement.path()}' has "
+                    + "type '{types.display(inElement.leaf())}', which has no '=='; "
+                    + "{noEqualityReason(inElement.leaf())}. Compare the elements you need "
+                    + "directly instead.";
+            }
+        }
+        return null;
+    }
     let authority = types.authorityOf(structType);
     if (authority == null) {
         return null;
@@ -867,13 +926,17 @@ noEqualityReason(Type leaf) -> string {
     if (leaf is FunctionType) {
         return "a function value has no identity";
     }
+    if (leaf is ArrayType) {
+        return "an array compares element by element, and its elements have no '==' of "
+            + "their own";
+    }
     return "external types have no value equality";
 }
 
 // Walks a struct's fields for the first whose type has no '=='. Descends through nullable
-// wrappers and nested structs; external and function types are the concrete leaves without
-// '==', since arrays and classes compare by identity. A field mentioning a type parameter is
-// left for the per-instantiation replay.
+// wrappers, nested structs, and array elements; external and function types are the concrete
+// leaves without '==', while classes compare by identity. A field mentioning a type parameter
+// is left for the per-instantiation replay.
 firstNonComparableField(Type structType, Set<Type> visiting) -> OffendingField? {
     if (!visiting.add(structType)) {
         return null;
@@ -889,6 +952,19 @@ firstNonComparableField(Type structType, Set<Type> visiting) -> OffendingField? 
             continue;
         }
         Type core = convert.coreOf(fieldType);
+        if (core is ArrayType) {
+            Type element = innermostElementOf(core);
+            if (element is ExternalType || element is FunctionType) {
+                return new OffendingField(field.name(), core);
+            }
+            if (isStructValue(element)) {
+                let inElement = firstNonComparableField(element, visiting);
+                if (inElement != null) {
+                    return new OffendingField(field.name(), core);
+                }
+            }
+            continue;
+        }
         if (core is ExternalType || core is FunctionType) {
             return new OffendingField(field.name(), core);
         }
@@ -903,9 +979,9 @@ firstNonComparableField(Type structType, Set<Type> visiting) -> OffendingField? 
 }
 
 // Walks a struct's fields for the first with no JSON form. Value types, strings, and enums (and
-// their nullable forms) serialize; a class, interface, array, or external field does not.
-// Descends through nested structs. A field mentioning a type parameter is left for the
-// per-instantiation replay.
+// their nullable forms) serialize, and an array serializes as a JSON list when its elements do;
+// a class, interface, or external field does not. Descends through nested structs and array
+// elements. A field mentioning a type parameter is left for the per-instantiation replay.
 firstNonJsonableField(Type structType, Set<Type> visiting) -> OffendingField? {
     if (!visiting.add(structType)) {
         return null;
@@ -923,6 +999,21 @@ firstNonJsonableField(Type structType, Set<Type> visiting) -> OffendingField? {
         Type core = convert.coreOf(fieldType);
         if (isJsonableLeaf(core)) {
             continue;
+        }
+        if (core is ArrayType) {
+            Type element = innermostElementOf(core);
+            if (isJsonableLeaf(element)) {
+                continue;
+            }
+            if (isStructValue(element)) {
+                let inElement = firstNonJsonableField(element, visiting);
+                if (inElement == null) {
+                    continue;
+                }
+                return new OffendingField(field.name() + "." + inElement.path(),
+                    inElement.leaf());
+            }
+            return new OffendingField(field.name(), element);
         }
         if (isStructValue(core)) {
             let nested = firstNonJsonableField(core, visiting);

@@ -94,8 +94,8 @@ A struct with such a field has no default value of its own, so it cannot be an a
 A `const` field without a default value removes the struct's default the same way, whatever the field's type: a default-built value would hold a zero that no constructor or aggregate literal ever assigned.
 
 Two values of the same struct type compare with `==` and `!=` field by field, in declaration order, stopping at the first field that differs.
-Each field compares by its own `==`: primitives and enums by value (so IEEE rules hold, and a `float` or `double` field that is `NaN` never equals itself), strings by content, class and array fields by reference identity unless the two objects' run-time class opted into content equality, a nested struct memberwise unless it declared its own equality, and a nullable field null-aware (both `null` are equal, one `null` is unequal, otherwise the inner values compare).
-Comparing two different struct types is an error, and so is comparing structs whose type has a field with no `==` of its own, such as an `external` handle; the error names the offending field.
+Each field compares by its own `==`: primitives and enums by value (so IEEE rules hold, and a `float` or `double` field that is `NaN` never equals itself), strings by content, class fields by reference identity unless the two objects' run-time class opted into content equality, array fields element by element, a nested struct memberwise unless it declared its own equality, and a nullable field null-aware (both `null` are equal, one `null` is unequal, otherwise the inner values compare).
+Comparing two different struct types is an error, and so is comparing structs whose type has a field with no `==` of its own, such as an `external` handle or an array of them; the error names the offending field.
 A struct customizes equality by declaring `equals(S other) -> bool` - a method taking a single parameter of the struct's own type `S` - which then decides `==` and `!=` for that struct everywhere it is compared, including as a field of another struct, as an array element and as a collection key.
 Such an `equals` replaces the memberwise comparison the language provides, so it is written `override`, and it must be paired with an `override hash() -> long`: a struct that declares one must declare the other, exactly as a class must, so equal values always hash equally.
 A method named `equals` whose single parameter is some other type is an ordinary method, and `==` on that struct stays memberwise.
@@ -104,8 +104,8 @@ A struct serializes to a JSON string through `.toString()` and in interpolation 
 The form is a JSON object listing every field, including private and protected ones, in declaration order: `{"field": value, ...}`.
 Numbers render as decimals, `bool` as `true` or `false`, strings and enum members as JSON-quoted text (with `"`, `\`, and control characters escaped), a `char` as a one-character quoted string with its scalar encoded to UTF-8 and escaped the same way, an absent nullable field as `null`, and a nested struct as its own JSON object.
 A struct that declares its own `toString` method uses that method instead; because it replaces the built-in form, it is written `override toString() -> string`, taking no arguments and never `throws` - an interpolation hole has nowhere to write a `try`.
-A struct is serializable only when every field is: a value type, a string, an enum, one of those made nullable, or a nested such struct.
-A field that is a class, an array, or an external handle has no JSON form and makes serializing the struct an error that names the offending field, mirroring the `==` rule.
+A struct is serializable only when every field is: a value type, a string, an enum, one of those made nullable, a nested such struct, or an array of any of these, which serializes as a JSON list.
+A field that is a class or an external handle has no JSON form, and neither does an array whose elements are; such a field makes serializing the struct an error that names it, mirroring the `==` rule.
 
 Overloading is allowed, best match arguments first, then visibility.
 Two declarations of the same name must differ in parameter count or parameter types.
@@ -1402,6 +1402,9 @@ switch (shape) {                  // an open hierarchy needs default
 ---
 
 Arrays are written with `T[]` and are reference types: declaring an array variable binds a pointer to a heap allocation, and copying the variable copies the pointer.
+Two arrays of the same type compare with `==` and `!=` by content: unequal lengths are unequal, and equal lengths compare element by element, each element by its own `==`, so IEEE rules hold for float elements, strings compare by content, classes by identity unless their run-time class opted into content equality, and nested arrays recurse.
+An element type with no `==` of its own, such as an external handle or a function value, makes the comparison an error naming that type.
+An array cannot be a `Map` or `Set` key, because its contents, and so its hash, can change while it sits in the table.
 
 ```ens
 int[] xs = new int[5];        // 5 ints, zero-initialized
@@ -1494,7 +1497,7 @@ The accepted escapes are `\n`, `\r`, `\t`, `\b`, `\f`, `\0`, `\\`, `\"`, `\'`, `
 - `==` and `!=` compare **contents**, not identity, so `"ab" == "a" + "b"` is true.
 - `s.length` returns the number of UTF-8 **bytes** as a `long`.
 - `+` concatenates strings. When one side is a string, a number (integer, `char`, or floating-point) or a `bool` on the other side is converted to text implicitly (the same way `.toString()` would). Every other type is rejected here, structs and classes included even though they have a text form; interpolate those or call `.toString()` instead.
-- `.toString()` produces a string from a value explicitly: integer types format as decimal, floating-point types by the rule below, a `char` as the one character it denotes (its Unicode scalar encoded as UTF-8 bytes, so `'A'` is `"A"` and `'7'` is `"7"`, not their code points; write `c as int` first for the number), `bool` as `true` or `false`, a string returns itself, a struct produces its JSON form or what its own `toString` returns, and a class or interface value produces what its runtime type's `toString` override returns, or that type's name when no class in its chain declares one.
+- `.toString()` produces a string from a value explicitly: integer types format as decimal, floating-point types by the rule below, a `char` as the one character it denotes (its Unicode scalar encoded as UTF-8 bytes, so `'A'` is `"A"` and `'7'` is `"7"`, not their code points; write `c as int` first for the number), `bool` as `true` or `false`, a string returns itself, a struct produces its JSON form or what its own `toString` returns, a class or interface value produces what its runtime type's `toString` override returns, or that type's name when no class in its chain declares one, and an array produces the same JSON-style list interpolation renders.
   It can be written directly on a literal, as in `42.toString()`.
 - `s.toBytes()` returns the UTF-8 bytes as a `byte[]`, and `string.fromBytes(bytes)` builds a string from a `byte[]` by interpreting it as UTF-8.
 - `s.contains(needle)` reports whether `needle` occurs in `s`.
@@ -1541,7 +1544,9 @@ let status = "done={finished}, items={count}";                // bool and intege
 let braces = "use \{these\} verbatim";                        // "use {these} verbatim"
 ```
 
-Holes accept string, integer (including `char`), floating-point, `bool`, and enum values, structs whose fields are all serializable (rendered as JSON) or that declare their own `toString`, and class and interface values, rendered from the runtime type: its `toString` override, or its type name when no class in the chain declares one; convert other types explicitly with `.toString()` first.
+Holes accept string, integer (including `char`), floating-point, `bool`, and enum values, structs whose fields are all serializable (rendered as JSON) or that declare their own `toString`, class and interface values, rendered from the runtime type: its `toString` override, or its type name when no class in the chain declares one, and arrays of any of these; convert other types explicitly with `.toString()` first.
+An array renders as a JSON-style list, `[` its elements joined by `, ` and `]`: each element as struct serialization would write it, so strings arrive quoted and escaped, an absent nullable element reads `null`, and a struct element is its JSON object even when the struct declares its own `toString`, exactly as a struct nested in another struct is.
+A class or interface element renders through its runtime type's `toString`, and a struct element whose fields have no JSON form makes the array an error naming the field, whatever `toString` the struct declares.
 A `char` hole renders as its character rather than its numeric code point, so `"{'A'}"` is `"A"`; interpolate `c as int` when the number is wanted.
 Inside a generic body a hole may hold a value of a type-parameter type; the requirement is then checked against the concrete type of each instantiation.
 An explicit `.toString()` on a type-parameter value is checked the same way, against the concrete type of each instantiation.
@@ -1743,7 +1748,7 @@ The platform is named by the caller rather than read from the running program, s
 
 ---
 
-Every value has a `hash()` method returning a `long`. Value types (primitives, enums, strings, structs) hash by their contents, so equal values hash equally; classes and arrays hash by identity, matching how `==` compares them.
+Every value has a `hash()` method returning a `long`. Value types (primitives, enums, strings, structs) and arrays hash by their contents, so equal values hash equally; classes hash by identity, matching how `==` compares them.
 An optional hashes as its payload does while it is present and as one fixed value once it is absent, so every absent value hashes equally whatever its type.
 A class or a struct can declare its own `hash() -> long` to control its hashing, paired with `equals(T other) -> bool` - a method taking a single parameter of the declaring type `T` itself - to control equality.
 A method named `hash` must have exactly that signature, and neither `hash` nor `equals` can be `throws`, because the language takes a value's hash and compares two values where there is no room for a `try`; `equals` must return `bool`.
@@ -1786,6 +1791,7 @@ Keys are matched with `==` and bucketed with `hash()`: strings by contents, valu
 A map or set keyed by a base class or an interface therefore finds the entry a derived key stored, because the key's own class decides how it is matched and bucketed; two keys of different run-time classes never match.
 Struct keys are supported and match by content: their fields compare with `==` and hash by content, so a key rebuilt from equal field values finds the entry stored under the original.
 A struct key that declares its own `equals` and `hash` is matched and bucketed by that pair instead, so a field the pair ignores does not change which entry a key finds.
+An array cannot be a key: it compares and hashes by content, and its content can change while it sits in the table, so the entry would silently become unfindable.
 
 The `@std.text.strings` module takes text apart and puts it back together.
 `split(text, separator)` returns the parts between the occurrences of the separator, so two neighboring separators give an empty part and text holding none gives one part.
