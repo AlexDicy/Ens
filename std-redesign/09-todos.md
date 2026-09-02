@@ -22,6 +22,8 @@ External handles are refused by code generation as of 2026-08-30, in both the `H
 Ratified 2026-08-30: keep the direct rejection and refuse the generic path too, rather than granting every value an identity.
 A function value's identity is not stable under the compiler's freedom to share one closure object per capture-free lambda site or to allocate a fresh one per evaluation, so equality on it would answer questions about code generation rather than about the function; a class holding the function is how a program that needs identity gets it.
 The work belongs to C4, which designs the containers and their key rules.
+Ratified 2026-09-02, as two rules: a type with no hash at all (an external handle, a function value) is refused by a per-instantiation obligation at every `hash()` call on a type parameter, the way `==` is checked today, so user generics are covered and the code-generation refusal of handles moves into sema; a type that hashes by content but can change (an array, or any collection) is refused as a key at the instantiation site, by the compiler's by-name list of the standard containers' key parameters, extended to every C4 container.
+A struct key is refused when any field, transitively, holds an array or a collection, naming the field, the way the comparability walk already descends into struct fields.
 A test that ARC releases live locals on the throw path.
 A pinning fixture for file-next-to-folder module resolution, plus a spec line.
 A fixture for a cross-package subclass calling a protected constructor.
@@ -72,6 +74,7 @@ The clean fix is a language ruling, not a library one: whether an interpolation 
 Type-argument inference binds a parameter only where it appears directly as a parameter type or as an array's element type, never inside an instantiation (re-surfaced 2026-09-02 by the C3b std tests).
 `assertExhausted<T>(Iterator<T> walk)` called with an `Iterator<string>`, and `firstOf<T>(List<T> items)` called with a `List<string>`, both report `Cannot infer type argument 'T'`, so the caller writes the argument out.
 The spec states the direct-position rule, so this is a design limit rather than a bug, and C4's free functions over `Iterable<T>` will meet it; unifying the argument's instantiation with the parameter's is the natural extension and wants a ruling.
+Ratified 2026-09-02: inference unifies the argument's type with the parameter's through instantiations, nested, and through implemented interfaces and base classes, so a class implementing `Iterable<int>` binds `T` for an `Iterable<T>` parameter; it lands as its own sema-only milestone before C4.
 
 ## Reminders
 

@@ -62,6 +62,8 @@ Within each milestone the std change and its consumer updates are one commit, so
   So C3a teaches the lowering to drive whichever shape the library's `Iterator<T>` contract declares, a seed release follows, and C3b flips the interface, every iterator, the fixtures, and the spec in one commit and deletes the gated branch.
 - C4: `@std.collections` rewritten: the ladder, `Entry`, the six containers, conditional `sort`, `getOrInsert`, views, the modification counter.
   `Pair` dies here; consumers of `Map` iteration move to `Entry`.
+  Before it, one sema-only language milestone: type-argument inference through instantiations and conformance (ratified 2026-09-02), which needs no seed because the library does not depend on it.
+  The `new T[n]` question the plan carried is closed: the array-fill check already runs per instantiation, and the containers' backing stores use the std-only `RawArray<T>`, so no ruling is needed.
 - C5: `@std.io` written from scratch: `io.ens` plus the four submodules; `print`/`eprint` rerouted through the prelude onto `io.out()`.
 - C6: `@std.text` rewritten: the `string` binding replaces `@std.text.strings`, `StringBuilder` loses `appendByte`, `parse` lands; consumers move from `strings.split(text, sep)` to `text.split(sep)`.
 - C7: `@std.fs` written: `Path` absorbs `@std.path` as methods, `File` moves onto the stream contracts, metadata, entries, walk, temp guards.

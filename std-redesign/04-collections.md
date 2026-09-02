@@ -283,6 +283,7 @@ Mutating a map or set while walking it aborts the program, detected by a modific
 No `firstOrNull`, `lastOrNull`, or `popOrNull`; `first`, `last`, and `pop` abort on empty per the contract rule.
 `push`, `pop`, and `pushAll` on `List`; `add` on `Set`, deliberately, since a set has no position.
 Collections compare structurally and cannot be map keys; mutable collections join the rejected-key-type list in the compiler.
+A struct is refused as a key when any of its fields, transitively, holds an array or a collection (ratified 2026-09-02).
 Sorting lives on `List` as a comparator overload plus a conditional natural-order overload; there is no sorting module.
 `binarySearch` was cut and can return later.
 `PriorityQueue` is a min-heap and its iteration order is unspecified; both facts are documented because a max-heap default and an ordered-looking iterator are recurring surprises elsewhere.

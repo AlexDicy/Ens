@@ -158,3 +158,12 @@ The protected-constructor case had no test fixture before this investigation; on
 A bound may name a class: `<E: Error>` accepts `Error` or any subclass.
 At most one class per bound list, mirroring single inheritance, combinable with interfaces via `+`.
 Naming a `final` class is an error, since only the class itself could satisfy it.
+
+## Type-argument inference through instantiations
+
+Ratified 2026-09-02, after the C3b std tests had to write `assertExhausted<string>(walk)` for an `Iterator<string>` argument.
+A call infers a type argument wherever the parameter type mentions it, not only where the parameter is the bare type parameter or an array of it: `firstOf<T>(List<T> items)` binds `T` from a `List<string>`, and the match is structural and nested, so `Map<K, List<V>>` binds both.
+Conformance takes part: a class implementing `Iterable<int>`, or extending a class that does, binds `T` for an `Iterable<T>` parameter, walking the same ladder the for-in loop already walks.
+The first argument that mentions a parameter binds it, and a later argument that disagrees is reported against that argument with the binding's provenance, which is the rule generic statics already follow.
+The generic-function path and the generic-static path (`List.of(items)`) share one inference, so the two rules the spec states today become one; the static path already matched structurally through arrays, optionals, and same-template instantiations, and the function path only bound a bare type parameter.
+It lands as its own sema-only milestone before C4 and needs no seed, because the library does not depend on it.
