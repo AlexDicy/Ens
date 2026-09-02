@@ -1226,8 +1226,10 @@ for (int x in xs) {     // x takes each element in turn
 }
 ```
 
-A class is iterable when it implements the `Iterable<T>` interface from `@std.collections.iterator`, directly or through an interface that extends it; its single method `makeIterator() -> Iterator<T>` returns an `Iterator<T>` (an interface with `hasNext() -> bool` and `next() -> T`).
-The loop calls `makeIterator()` once, then draws values with `next()` while `hasNext()` is true.
+A class is iterable when it implements the `Iterable<T>` interface from `@std.collections.iterator`, directly or through an interface that extends it; its single method `makeIterator() -> Iterator<T>` returns an `Iterator<T>`, an interface with the single method `next() -> T?`.
+The loop calls `makeIterator()` once, then draws values with `next()` until it answers null.
+`next()` answers the value it moved onto, or null once the walk is over, and every call after that answers null too.
+When the element type is itself nullable, `next()` answers a nested optional, so a `null` held by a present result is an element and only an absent result ends the loop.
 A value whose static type is `Iterable<T>` itself, or an interface extending it, can also be iterated.
 Text is not a sequence of its own, so a `string` cannot be iterated directly: a walk over text says which view it reads, and the loop takes the array that view produces.
 
@@ -1238,8 +1240,28 @@ import Iterator from @std.collections.iterator;
 class Range implements Iterable<int> {
     int low;
     int high;
+
     constructor(this.low, this.high);
-    override makeIterator() -> Iterator<int> { return new RangeIterator(this.low, this.high); }
+
+    override makeIterator() -> Iterator<int> {
+        return new RangeIterator(this.low, this.high);
+    }
+}
+
+class RangeIterator implements Iterator<int> {
+    int current;
+    int high;
+
+    constructor(this.current, this.high);
+
+    override next() -> int? {
+        if (this.current > this.high) {
+            return null;
+        }
+        int value = this.current;
+        this.current = this.current + 1;
+        return value;
+    }
 }
 
 for (let n in new Range(1, 10)) {

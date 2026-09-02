@@ -69,6 +69,10 @@ A nullable type argument cannot use `assertEqual` or `assertNotEqual` (pre-exist
 The failure path interpolates the values, interpolation refuses a possibly-null value, and a generic body has no way to peel one level off an arbitrary `T`, so `assertEqual<string?>` is refused per instantiation and a test over an optional result unwraps by hand first.
 The clean fix is a language ruling, not a library one: whether an interpolation hole accepts a single-level nullable and prints `null` for the absent case, the way an array element already does inside the array text form.
 
+Type-argument inference binds a parameter only where it appears directly as a parameter type or as an array's element type, never inside an instantiation (re-surfaced 2026-09-02 by the C3b std tests).
+`assertExhausted<T>(Iterator<T> walk)` called with an `Iterator<string>`, and `firstOf<T>(List<T> items)` called with a `List<string>`, both report `Cannot infer type argument 'T'`, so the caller writes the argument out.
+The spec states the direct-position rule, so this is a design limit rather than a bug, and C4's free functions over `Iterable<T>` will meet it; unifying the argument's instantiation with the parameter's is the natural extension and wants a ruling.
+
 ## Reminders
 
 When `@std.time` is designed, replace `Metadata.modifiedMillis` and `wait(long timeoutMillis)` with a proper duration/instant type; the names carry the unit until then.

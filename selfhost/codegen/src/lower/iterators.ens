@@ -1,13 +1,9 @@
-// 'for (x in value)' over an object: the value's 'makeIterator()' runs once, then the iterator
-// drives the loop through one of two protocols. Which one is a property of the standard
-// library's 'Iterator<T>' contract the iterator type conforms to, never of the iterator's own
-// members: a contract with a zero-argument 'hasNext()' is gated, so 'hasNext()' gates each pass
-// and 'next()' yields the element; a contract without one is optional-driven, so each pass calls
-// 'next()' once, and the result's outer optional level decides, a present result carrying the
-// element and an absent one ending the loop, which makes a null inside a present element an
-// element. The standard library a program compiles against declares exactly one of the two
-// shapes; the gated protocol stays until the seed that reads the optional shape has compiled the
-// flipped library.
+// 'for (x in value)' over an object: the value's 'makeIterator()' runs once, then each pass calls
+// the iterator's 'next()' once, and the result's outer optional level decides: a present result
+// carries the element and an absent one ends the loop, which makes a null inside a present
+// element an element. The element type is read from the standard library's 'Iterator<T>'
+// contract the iterator type conforms to, never from the iterator's own members, so an unrelated
+// method on the iterator cannot change how the loop is driven.
 //
 // Resolution is structural over the checked types (sema already proved the value iterable): a
 // class receiver finds the methods down its chain and dispatches through its vtable where an
@@ -102,14 +98,8 @@ public lowerForEach(LoweringContext lowering, ForEachStatementNode loop, Type it
     long exitBlock = builder.newBlock("foreach.end");
     builder.terminate(new EirJump(conditionBlock));
     builder.moveTo(conditionBlock);
-    long element = -1;
-    if (zeroArgumentMethod(contract, "hasNext") != null) {
-        element = emitGatedElement(lowering, loop, iteratorType, next, iteratorSlot, bodyBlock,
-            exitBlock);
-    } else {
-        element = emitOptionalElement(lowering, loop, contract, iteratorType, next,
-            iteratorSlot, bodyBlock, exitBlock);
-    }
+    long element = emitElement(lowering, loop, contract, iteratorType, next, iteratorSlot,
+        bodyBlock, exitBlock);
     if (element < 0) {
         return;
     }
@@ -133,41 +123,16 @@ public lowerForEach(LoweringContext lowering, ForEachStatementNode loop, Type it
     builder.moveTo(exitBlock);
 }
 
-// The gated protocol: 'hasNext()' answers in the condition block whether a value remains, and
-// the body calls 'next()' for the element it was promised. Answers the owned element temp,
-// positioned at the start of the body block, or -1 when lowering failed.
-emitGatedElement(LoweringContext lowering, ForEachStatementNode loop, Type iteratorType,
-                 IterationCall next, long iteratorSlot, long bodyBlock, long exitBlock) -> long {
-    let hasNext = resolveCall(lowering, iteratorType, "hasNext", loop.span());
-    if (hasNext == null) {
-        return -1;
-    }
-    let builder = lowering.builder();
-    long conditionIterator = builder.newTemp(iteratorType);
-    builder.append(new EirLoadSlot(conditionIterator, iteratorType, iteratorSlot));
-    long more = calls.emitCall(lowering, hasNext.info, iteratorType, conditionIterator, [],
-        hasNext.dispatchSlot, hasNext.dispatchInterface, loop.name().span());
-    if (more < 0) {
-        return -1;
-    }
-    builder.terminate(new EirBranch(more, bodyBlock, exitBlock));
-    builder.moveTo(bodyBlock);
-    long bodyIterator = builder.newTemp(iteratorType);
-    builder.append(new EirLoadSlot(bodyIterator, iteratorType, iteratorSlot));
-    return calls.emitCall(lowering, next.info, iteratorType, bodyIterator, [],
-        next.dispatchSlot, next.dispatchInterface, loop.name().span());
-}
-
-// The optional protocol: the condition block calls 'next()' once and branches on its result's
-// presence, so only the outer optional level of the result ends the walk. The result is read at
-// the contract's return type, because the override the receiver resolves to may have narrowed
-// it. The result arrives owned, and each path settles it exactly once: the body hands it to the
-// element binding, and the absent path gives it up, where a reference is null and a tagged
-// payload is zeroed anyway. Answers the owned element temp, positioned at the start of the body
-// block, or -1 when lowering failed.
-emitOptionalElement(LoweringContext lowering, ForEachStatementNode loop, Type contract,
-                    Type iteratorType, IterationCall next, long iteratorSlot, long bodyBlock,
-                    long exitBlock) -> long {
+// The condition block calls 'next()' once and branches on its result's presence, so only the
+// outer optional level of the result ends the walk. The result is read at the contract's return
+// type, because the override the receiver resolves to may have narrowed it. The result arrives
+// owned, and each path settles it exactly once: the body hands it to the element binding, and
+// the absent path gives it up, where a reference is null and a tagged payload is zeroed anyway.
+// Answers the owned element temp, positioned at the start of the body block, or -1 when lowering
+// failed.
+emitElement(LoweringContext lowering, ForEachStatementNode loop, Type contract,
+            Type iteratorType, IterationCall next, long iteratorSlot, long bodyBlock,
+            long exitBlock) -> long {
     let contractNext = zeroArgumentMethod(contract, "next");
     if (contractNext == null) {
         lowering.internalError("'{types.display(contract)}' declares no 'next()' to iterate with",
@@ -176,9 +141,9 @@ emitOptionalElement(LoweringContext lowering, ForEachStatementNode loop, Type co
     }
     let elementType = lowering.substituted(contractNext.signature().returnType());
     if (!primitives.isOptionalType(elementType)) {
-        lowering.internalError("'{types.display(contract)}' declares no 'hasNext()', so its "
-            + "'next()' must return an optional, not '{types.display(elementType)}'",
-            loop.span());
+        lowering.internalError("'{types.display(contract)}' declares 'next()' returning "
+            + "'{types.display(elementType)}', and the loop needs an optional to know when the "
+            + "walk is over", loop.span());
         return -1;
     }
     let builder = lowering.builder();
