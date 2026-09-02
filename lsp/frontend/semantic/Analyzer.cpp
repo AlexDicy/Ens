@@ -6733,6 +6733,81 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
     return result;
 }
 
+// The instantiation of `templ` that `info` is or conforms to, nearest first: the type itself,
+// then at each link of its base chain the interfaces that link implements and the interfaces
+// they extend.
+static StructInfo* conformingInstantiation(StructInfo* info, const StructInfo* templ) {
+    for (StructInfo* link = info; link; link = link->baseInfo) {
+        if (link->templateOf == templ) return link;
+        for (Type* iface : link->implementedInterfaces) {
+            for (StructInfo* level = iface ? iface->structInfo : nullptr; level;
+                 level = level->baseInfo) {
+                if (level->templateOf == templ) return level;
+            }
+        }
+    }
+    return nullptr;
+}
+
+// One-way structural match of a generic function's parameter type against an argument type,
+// binding each still-open type parameter of `owner` where it first appears: through arrays,
+// optionals, function types, and instantiations of the template the argument's type is or
+// conforms to. An array, function, or instantiation parameter type looks through the argument's
+// optional levels, so the argument check reports the nullability rather than a failed inference.
+// A mismatch binds nothing, and so does a `null` argument.
+static void inferTypeArguments(Type* paramType, Type* argType, const Symbol* owner,
+                               std::vector<Type*>& typeArgs) {
+    if (!paramType || !argType || argType->isError()) return;
+    while (argType->isOptional() && !paramType->isOptional() && !paramType->isTypeParam()) {
+        argType = argType->inner;
+    }
+    switch (paramType->kind) {
+        case TypeKind::TypeParam:
+            if (paramType->paramOwner == owner && paramType->paramIndex >= 0 &&
+                paramType->paramIndex < static_cast<int>(typeArgs.size()) &&
+                !typeArgs[paramType->paramIndex] && !argType->isNull()) {
+                typeArgs[paramType->paramIndex] = argType;
+            }
+            return;
+        case TypeKind::Array:
+            if (argType->isArray()) {
+                inferTypeArguments(paramType->inner, argType->inner, owner, typeArgs);
+            }
+            return;
+        case TypeKind::Optional:
+            inferTypeArguments(paramType->inner, argType->isOptional() ? argType->inner : argType,
+                               owner, typeArgs);
+            return;
+        case TypeKind::Function: {
+            if (!argType->isFunction()) return;
+            size_t n = std::min(paramType->functionParams.size(), argType->functionParams.size());
+            for (size_t i = 0; i < n; ++i) {
+                inferTypeArguments(paramType->functionParams[i], argType->functionParams[i],
+                                   owner, typeArgs);
+            }
+            inferTypeArguments(paramType->functionReturn, argType->functionReturn, owner,
+                               typeArgs);
+            return;
+        }
+        case TypeKind::Struct:
+        case TypeKind::Class: {
+            StructInfo* paramInfo = paramType->structInfo;
+            if (!paramInfo || !paramInfo->templateOf || !argType->structInfo) return;
+            StructInfo* conforming =
+                conformingInstantiation(argType->structInfo, paramInfo->templateOf);
+            if (!conforming) return;
+            size_t n = std::min(paramInfo->typeArgs.size(), conforming->typeArgs.size());
+            for (size_t i = 0; i < n; ++i) {
+                inferTypeArguments(paramInfo->typeArgs[i], conforming->typeArgs[i], owner,
+                                   typeArgs);
+            }
+            return;
+        }
+        default:
+            return;
+    }
+}
+
 Type* Analyzer::analyzeGenericCall(const ast::CallExpression& expr, Symbol* sym,
                                    const std::u16string& funcName) {
     auto args = expr.arguments();
@@ -6768,16 +6843,9 @@ Type* Analyzer::analyzeGenericCall(const ast::CallExpression& expr, Symbol* sym,
     argTypes.reserve(args.size());
     for (auto& a : args) argTypes.push_back(analyzeExpr(a));
 
-    // Infer unspecified type args from arguments whose parameter is exactly a
-    // type-parameter placeholder of this function (single-level inference).
     if (explicitArgs.empty()) {
         for (size_t i = 0; i < std::min(args.size(), sym->paramTypes.size()); ++i) {
-            Type* pt = sym->paramTypes[i];
-            if (pt && pt->isTypeParam() && pt->paramOwner == sym &&
-                pt->paramIndex >= 0 && pt->paramIndex < static_cast<int>(arity) &&
-                !typeArgs[pt->paramIndex] && argTypes[i] && !argTypes[i]->isError()) {
-                typeArgs[pt->paramIndex] = argTypes[i];
-            }
+            inferTypeArguments(sym->paramTypes[i], argTypes[i], sym, typeArgs);
         }
     }
 

@@ -1,0 +1,195 @@
+// Type-argument inference for one call of a generic function or of a static of a generic type.
+// Each argument fills the type parameters its parameter type mentions, the first argument to
+// mention a parameter binds it, and what the arguments leave open may be filled from the
+// surrounding context. The per-slot record of where each binding came from lets a later mismatch
+// be reported against the argument that decided the type.
+import GreenNode from @ens.frontend.syntax.green;
+import model.convert;
+import model.types;
+import Type from model.types;
+import ErrorType from model.types;
+import NullType from model.types;
+import OptionalType from model.types;
+import ArrayType from model.types;
+import FunctionType from model.types;
+import TypeParamType from model.types;
+import InstantiationType from model.types;
+import List from @std.collections.list;
+
+public class TypeArgumentInference {
+    static const long unbound = -2;
+    static const long fromContext = -1;
+
+    GreenNode owner;
+    List<Type?> slotBindings;
+    List<long> slotSources;
+
+    public constructor(GreenNode owner, long arity) {
+        this.owner = owner;
+        this.slotBindings = new List<Type?>();
+        this.slotSources = new List<long>();
+        for (long i = 0; i < arity; i++) {
+            this.slotBindings.push(null);
+            this.slotSources.push(TypeArgumentInference.unbound);
+        }
+    }
+
+    // What the argument at 'argumentIndex' determines: a one-way structural match of the
+    // parameter type against the argument's type, binding each still-open type parameter of the
+    // owner at the position it first appears. The match walks arrays, optionals, function types,
+    // and generic types, and a generic parameter type also matches through what the argument's
+    // type conforms to, so a class implementing 'Iterable<int>' fills an 'Iterable<T>'. An array,
+    // function, or generic parameter type matches through the argument's optional levels, so a
+    // nullable argument in a non-nullable slot still binds and the argument check reports the
+    // nullability itself. A mismatch binds nothing and stays quiet, and so does an argument with
+    // no type of its own: the ordinary argument check reports against whatever the other sources
+    // determined.
+    public unifyArgument(long argumentIndex, Type parameterType, Type argumentType) {
+        switch (parameterType) {
+            is TypeParamType parameter -> {
+                if (parameter.owner() == this.owner
+                        && parameter.index() < this.slotBindings.length()
+                        && this.slotBindings.get(parameter.index()) == null
+                        && !(argumentType is NullType) && !(argumentType is ErrorType)) {
+                    this.slotBindings.set(parameter.index(), argumentType);
+                    this.slotSources.set(parameter.index(), argumentIndex);
+                }
+            },
+            is OptionalType optional -> {
+                Type inner = argumentType;
+                if (inner is OptionalType) {
+                    inner = inner.inner();
+                }
+                this.unifyArgument(argumentIndex, optional.inner(), inner);
+            },
+            is ArrayType array -> {
+                let core = convert.coreOf(argumentType);
+                if (core is ArrayType) {
+                    this.unifyArgument(argumentIndex, array.element(), core.element());
+                }
+            },
+            is FunctionType functionType -> {
+                let core = convert.coreOf(argumentType);
+                if (core is FunctionType) {
+                    this.unifyEach(argumentIndex, functionType.parameterTypes(),
+                        core.parameterTypes());
+                    this.unifyArgument(argumentIndex, functionType.returnType(),
+                        core.returnType());
+                    this.unifyEach(argumentIndex, functionType.thrownTypes(),
+                        core.thrownTypes());
+                }
+            },
+            is InstantiationType instantiation -> {
+                let conforming = types.conformingInstantiationOf(convert.coreOf(argumentType),
+                    instantiation.template());
+                if (conforming != null) {
+                    this.unifyEach(argumentIndex, instantiation.arguments(),
+                        conforming.arguments());
+                }
+            },
+            default -> { },
+        }
+    }
+
+    unifyEach(long argumentIndex, Type[] parameterTypes, Type[] argumentTypes) {
+        for (long i = 0; i < parameterTypes.length && i < argumentTypes.length; i++) {
+            this.unifyArgument(argumentIndex, parameterTypes[i], argumentTypes[i]);
+        }
+    }
+
+    // Fills the slot from the surrounding context when no argument determined it.
+    public fillFromContext(long index, Type type) {
+        if (this.slotBindings.get(index) == null) {
+            this.slotBindings.set(index, type);
+            this.slotSources.set(index, TypeArgumentInference.fromContext);
+        }
+    }
+
+    public binding(long index) -> Type? {
+        return this.slotBindings.get(index);
+    }
+
+    // Every slot's binding in order, or null while any slot is still open.
+    public bindings() -> Type[]? {
+        let resolved = new List<Type>();
+        for (long i = 0; i < this.slotBindings.length(); i++) {
+            let bound = this.slotBindings.get(i);
+            if (bound == null) {
+                return null;
+            }
+            resolved.push(bound);
+        }
+        return resolved.toArray();
+    }
+
+    // The provenance sentence for an argument mismatch whose expected type mentions an inferred
+    // type argument: which parameter, what it was bound to, where the binding came from, and the
+    // explicit form that overrides inference. Empty when the expected type mentions no bound
+    // parameter; the caller joins it with sentenceSeparator.
+    public provenance(Type templateParameterType, string explicitForm) -> string {
+        let parameter = this.firstBoundParameter(templateParameterType);
+        if (parameter == null) {
+            return "";
+        }
+        let bound = this.slotBindings.get(parameter.index());
+        if (bound == null) {
+            return "";
+        }
+        long source = this.slotSources.get(parameter.index());
+        string origin = "from the surrounding context";
+        if (source >= 0) {
+            origin = "from argument {source + 1}";
+        }
+        return "'{parameter.name()}' was inferred as '{types.display(bound)}' {origin}; "
+            + "{explicitForm}.";
+    }
+
+    // The first type parameter of the owner inside the type that inference bound, walking the
+    // same shapes unifyArgument walks.
+    firstBoundParameter(Type templateType) -> TypeParamType? {
+        switch (templateType) {
+            is TypeParamType parameter -> {
+                if (parameter.owner() == this.owner
+                        && parameter.index() < this.slotSources.length()
+                        && this.slotSources.get(parameter.index())
+                            != TypeArgumentInference.unbound) {
+                    return parameter;
+                }
+                return null;
+            },
+            is ArrayType array -> {
+                return this.firstBoundParameter(array.element());
+            },
+            is OptionalType optional -> {
+                return this.firstBoundParameter(optional.inner());
+            },
+            is FunctionType functionType -> {
+                let inParameters = this.firstBoundParameterIn(functionType.parameterTypes());
+                if (inParameters != null) {
+                    return inParameters;
+                }
+                let inReturn = this.firstBoundParameter(functionType.returnType());
+                if (inReturn != null) {
+                    return inReturn;
+                }
+                return this.firstBoundParameterIn(functionType.thrownTypes());
+            },
+            is InstantiationType instantiation -> {
+                return this.firstBoundParameterIn(instantiation.arguments());
+            },
+            default -> {
+                return null;
+            },
+        }
+    }
+
+    firstBoundParameterIn(Type[] templateTypes) -> TypeParamType? {
+        for (let templateType in templateTypes) {
+            let found = this.firstBoundParameter(templateType);
+            if (found != null) {
+                return found;
+            }
+        }
+        return null;
+    }
+}

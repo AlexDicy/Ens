@@ -57,6 +57,11 @@ The interface-widening error anchors to the whole class declaration instead of t
 "cannot be 'final'" anchors to the whole method declaration instead of its name, in `Analyzer.cpp` near the private-final check.
 Underneath the first of those, `lsp/server/DiagnosticBridge.cpp` computes a range as `startCh + length` on one line, so any diagnostic anchored to a multi-line node produces a range running past the end of its line; the replacement's bridge should measure the node's real end position.
 
+Three more false errors the server shows on valid code, all pre-existing and all left for its replacement (found 2026-09-02 by the inference review, on `tests/generics_inference.ens`).
+Its type model carries no thrown-type list on a function type, only a flag, so a type argument that appears only in a `throws` list can never be inferred there.
+It does not treat a value of `Bag<int>`, where `Bag<T> extends Iterable<T>`, as an `Iterable<int>`, which `tests/interface_extends.ens` already showed as spurious assignment and `override` errors before this change.
+Its parser rejects a local declaration whose type is a parenthesized function type with a `throws` list, `(() -> int throws Failure) safe = ...`, and every statement after it in the block is then misread.
+
 A private base field is still treated as inherited, unlike a private base method (found 2026-08-31, pre-existing).
 A subclass declaring a field whose name a private base field already uses is refused with "Field is already declared in base class", and because that ends the subclass's own field collection, its own reads of the name are rewired onto the base's private field and refused a second time for privacy, from inside the subclass.
 Methods gained the opposite rule on 2026-08-31: a private base method is not inherited, so a subclass may reuse the name for a member of its own.

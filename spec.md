@@ -327,11 +327,31 @@ let names = new List<string>();
 
 A generic type is specialized for each set of type arguments, so a `List<int>` stores its integers directly (no boxing) while a `List<Shape>` stores and reference counts `Shape` objects. Using a generic type without its arguments (just `List`) is an error.
 
-For a generic function, the type arguments can be passed explicitly or, where each one appears directly as a parameter type, inferred from the call:
+For a generic function, the type arguments can be passed explicitly or inferred from the call.
+A type argument is inferred wherever a parameter type mentions it, so `T` is inferred from a parameter of type `T`, `T[]`, `T?`, `List<T>`, `(T) -> bool`, or any nesting of these.
+The match is structural, so a `Map<K, List<V>>` parameter binds both `K` and `V` from a `Map<string, List<int>>` argument.
+It also looks through the interfaces a class implements and the classes it extends, so a class implementing `Iterable<int>` binds `T` for an `Iterable<T>` parameter, and so does a value of an interface extending `Iterable<int>`.
+The first argument that mentions a type parameter binds it, and a later argument that disagrees is an error naming that binding and the argument it came from.
+Explicit type arguments always win over what the call would infer.
+A type argument no argument mentions, such as one that appears only in the return type, must be passed explicitly.
 
 ```ens
-swap<int>(1, 2);   // explicit
-swap(1, 2);        // T inferred as int
+firstOf<T>(List<T> items) -> T {
+    return items.get(0);
+}
+
+count<T>(Iterable<T> items) -> long {
+    long total = 0;
+    for (let item in items) {
+        total = total + 1;
+    }
+    return total;
+}
+
+swap<int>(1, 2);          // explicit
+swap(1, 2);               // T inferred as int
+firstOf(names);           // T inferred as string from the List<string>
+count(new Range(1, 3));   // T inferred as int because Range implements Iterable<int>
 ```
 
 A type parameter may declare bounds with `T: Base + Comparable`, joined by `+`: at most one bound may be a class (conventionally written first) and every other bound must be an interface, and listing the same bound twice is an error.
