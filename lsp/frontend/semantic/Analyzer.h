@@ -536,6 +536,11 @@ private:
     std::vector<std::pair<std::u16string, Type*>> typeParamScope_;
     std::vector<std::vector<StructInfo*>> resolveTypeParamBounds(
         const void* owner, const std::vector<ast::TypeParam>& params);
+    // Resolve a declaration's own bounds with the whole list in scope, so a bound may name the
+    // parameter it constrains or a sibling ('<T: Comparable<T>>').
+    std::vector<std::vector<StructInfo*>> resolveDeclaredTypeParamBounds(
+        const void* owner, const std::vector<std::u16string>& names,
+        const std::vector<ast::TypeParam>& params);
     size_t pushTypeParams(const void* owner, const std::vector<std::u16string>& names,
                           const std::vector<std::vector<StructInfo*>>& bounds);
     // Resolve a template's bounds (once) from its AST params, then push its scope.
@@ -545,8 +550,12 @@ private:
     // and bounds; reports against `diag`. Returns the error type on failure.
     Type* instantiateFromArgs(Type* templateType, const std::vector<ast::TypeReference>& args,
                               const SyntaxNode& diag);
+    // Check the argument standing for one parameter of `owner` against that parameter's bounds,
+    // with the list's `args` substituted into each bound.
     bool checkTypeArgBound(Type* arg, const std::vector<StructInfo*>& bounds,
-                           const std::u16string& paramName, const SyntaxNode& diag);
+                           const std::u16string& paramName, const SyntaxNode& diag,
+                           const void* owner, const std::vector<Type*>& args);
+    StructInfo* boundHere(StructInfo* bound, const void* owner, const std::vector<Type*>& args);
     bool isLValue(const ast::Expression& expr) const;
 
     bool isMemberAccessAllowed(Visibility visibility, StructInfo* definingClass);

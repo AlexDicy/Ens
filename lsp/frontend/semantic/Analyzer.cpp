@@ -1785,13 +1785,16 @@ void Analyzer::resolveClassBases(const ast::SourceFile& file) {
                 for (size_t i = 0; i < baseArgs.size(); ++i) {
                     Type* at = resolveTypeReference(baseArgs[i]);
                     if (at->isError()) ok = false;
+                    argTypes.push_back(at);
+                }
+                for (size_t i = 0; ok && i < baseArgs.size(); ++i) {
                     const std::vector<StructInfo*>& bounds =
                         i < baseT->structInfo->typeParamBounds.size()
                             ? baseT->structInfo->typeParamBounds[i] : kNoBounds;
                     std::u16string pname = i < baseT->structInfo->typeParamNames.size()
                         ? baseT->structInfo->typeParamNames[i] : std::u16string{};
-                    if (ok && !checkTypeArgBound(at, bounds, pname, baseArgs[i].node)) ok = false;
-                    argTypes.push_back(at);
+                    if (!checkTypeArgBound(argTypes[i], bounds, pname, baseArgs[i].node,
+                                           baseT->structInfo, argTypes)) ok = false;
                 }
                 popTypeParams(tpCount);
                 if (!ok) continue;
@@ -2392,7 +2395,7 @@ void Analyzer::collectFunctions(const ast::SourceFile& file) {
         if (!tparams.empty()) {
             sym->isTemplate = true;
             for (auto& tp : tparams) sym->typeParamNames.push_back(tp.nameText().value_or(std::u16string{}));
-            sym->typeParamBounds = resolveTypeParamBounds(sym, tparams);
+            sym->typeParamBounds = resolveDeclaredTypeParamBounds(sym, sym->typeParamNames, tparams);
             tpCount = pushTypeParams(sym, sym->typeParamNames, sym->typeParamBounds);
         }
         sym->returnType = fn.returnType() && fn.returnType()->typeReference()
@@ -3115,6 +3118,15 @@ std::vector<std::vector<StructInfo*>> Analyzer::resolveTypeParamBounds(
     return all;
 }
 
+std::vector<std::vector<StructInfo*>> Analyzer::resolveDeclaredTypeParamBounds(
+        const void* owner, const std::vector<std::u16string>& names,
+        const std::vector<ast::TypeParam>& params) {
+    size_t tpCount = pushTypeParams(owner, names, {});
+    auto bounds = resolveTypeParamBounds(owner, params);
+    popTypeParams(tpCount);
+    return bounds;
+}
+
 size_t Analyzer::pushTypeParams(const void* owner, const std::vector<std::u16string>& names,
                                 const std::vector<std::vector<StructInfo*>>& bounds) {
     static const std::vector<StructInfo*> kNoBounds;
@@ -3129,7 +3141,7 @@ size_t Analyzer::pushTypeParams(const void* owner, const std::vector<std::u16str
 size_t Analyzer::enterTemplateScope(StructInfo* si, const std::vector<ast::TypeParam>& astParams) {
     if (!si || !si->isTemplate) return 0;
     if (si->typeParamBounds.empty() && !astParams.empty()) {
-        si->typeParamBounds = resolveTypeParamBounds(si, astParams);
+        si->typeParamBounds = resolveDeclaredTypeParamBounds(si, si->typeParamNames, astParams);
     }
     return pushTypeParams(si, si->typeParamNames, si->typeParamBounds);
 }
@@ -3153,10 +3165,23 @@ static std::vector<StructInfo*> boundsOfTypeParam(const Type* t) {
     return {};
 }
 
+// The bound with the list's arguments substituted for the parameters it names, so
+// '<T: Comparable<T>>' asks 'Item' for 'Comparable<Item>'.
+StructInfo* Analyzer::boundHere(StructInfo* bound, const void* owner,
+                                const std::vector<Type*>& args) {
+    if (!bound || !bound->templateOf) return bound;
+    Type* boundType = typeCtx.classTypeFor(bound);
+    if (!boundType) return bound;
+    Type* substituted = typeCtx.substitute(boundType, owner, args);
+    return substituted && substituted->structInfo ? substituted->structInfo : bound;
+}
+
 bool Analyzer::checkTypeArgBound(Type* arg, const std::vector<StructInfo*>& bounds,
-                                 const std::u16string& paramName, const SyntaxNode& diag) {
+                                 const std::u16string& paramName, const SyntaxNode& diag,
+                                 const void* owner, const std::vector<Type*>& args) {
     bool ok = true;
-    for (StructInfo* bound : bounds) {
+    for (StructInfo* declared : bounds) {
+        StructInfo* bound = boundHere(declared, owner, args);
         if (!bound) continue;
         // Every type satisfies the compiler-known hashing contract.
         if (isHashableClass(bound)) continue;
@@ -3206,10 +3231,13 @@ Type* Analyzer::instantiateFromArgs(Type* templateType,
         Type* at = resolveTypeReference(args[i]);
         if (!at || at->isError()) { ok = false; argTypes.push_back(typeCtx.getError()); continue; }
         argTypes.push_back(at);
+    }
+    if (!ok) return typeCtx.getError();
+    for (size_t i = 0; i < args.size(); ++i) {
         const std::vector<StructInfo*>& bounds =
             i < tmpl->typeParamBounds.size() ? tmpl->typeParamBounds[i] : kNoBounds;
         std::u16string pname = i < tmpl->typeParamNames.size() ? tmpl->typeParamNames[i] : std::u16string{};
-        if (!checkTypeArgBound(at, bounds, pname, args[i].node)) ok = false;
+        if (!checkTypeArgBound(argTypes[i], bounds, pname, args[i].node, tmpl, argTypes)) ok = false;
     }
     if (!ok) return typeCtx.getError();
     return typeCtx.instantiate(templateType, argTypes);
@@ -6864,7 +6892,9 @@ Type* Analyzer::analyzeGenericCall(const ast::CallExpression& expr, Symbol* sym,
         const std::vector<StructInfo*>& bounds =
             i < sym->typeParamBounds.size() ? sym->typeParamBounds[i] : kNoBounds;
         SyntaxNode diag = (i < explicitArgs.size()) ? explicitArgs[i].node : expr.node;
-        if (!checkTypeArgBound(typeArgs[i], bounds, sym->typeParamNames[i], diag)) ok = false;
+        if (!checkTypeArgBound(typeArgs[i], bounds, sym->typeParamNames[i], diag, sym, typeArgs)) {
+            ok = false;
+        }
     }
 
     size_t req = requiredArgCount(sym);
@@ -8059,8 +8089,10 @@ void Analyzer::analyzeThrowStmt(const ast::ThrowStatement& stmt) {
     Type* t = analyzeExpr(*value);
     flowTerminated_ = true;
     if (t->isError()) return;
-    bool isErrorSubclass = t->isClass() && t->structInfo && errorClassInfo_ &&
-        t->structInfo->isSubclassOf(errorClassInfo_);
+    // A type parameter is thrown through its class bound; the compiler checks the bound.
+    bool isErrorSubclass = t->isTypeParam()
+        || (t->isClass() && t->structInfo && errorClassInfo_ &&
+            t->structInfo->isSubclassOf(errorClassInfo_));
     if (!isErrorSubclass) {
         errorAtNode(value->node, "Cannot throw a value of type '" + t->toString() +
             "'; only 'Error' or a subclass of it can be thrown.");
