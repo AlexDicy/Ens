@@ -58,6 +58,8 @@ Within each milestone the std change and its consumer updates are one commit, so
   A seed release then follows, and the library commit lands last, so the order is C2a through C2d, the seed, and C2e.
 - C3: the iterator flip, one coordinated commit: `Iterator.next() -> T?`, the `for`-in lowering, every iterator in std, and every hand-written iterator elsewhere in the tree.
   This is the one cross-cutting break that cannot be staged, which is why it comes before the container rewrite rather than with it.
+  The seed constraint splits it the way it split `StackFrame`: the pinned seed lowers every `for`-in loop in the compiler's own sources against this tree's `libs/std`, and its lowering reads only the `hasNext` shape, so the library cannot flip until a seed reads the new one.
+  So C3a teaches the lowering to drive whichever shape the library's `Iterator<T>` contract declares, a seed release follows, and C3b flips the interface, every iterator, the fixtures, and the spec in one commit and deletes the gated branch.
 - C4: `@std.collections` rewritten: the ladder, `Entry`, the six containers, conditional `sort`, `getOrInsert`, views, the modification counter.
   `Pair` dies here; consumers of `Map` iteration move to `Entry`.
 - C5: `@std.io` written from scratch: `io.ens` plus the four submodules; `print`/`eprint` rerouted through the prelude onto `io.out()`.

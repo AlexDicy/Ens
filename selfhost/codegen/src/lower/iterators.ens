@@ -1,15 +1,26 @@
-// 'for (x in value)' over an object: the value's 'makeIterator()' runs once, then 'hasNext()'
-// gates each pass and 'next()' yields the element. Resolution is structural over the checked
-// types - sema already proved the value iterable - so a class receiver finds the three methods
-// down its chain and dispatches through its vtable where an override forces it, while an
-// interface-typed receiver reads them from the interface's own method table.
+// 'for (x in value)' over an object: the value's 'makeIterator()' runs once, then the iterator
+// drives the loop through one of two protocols. Which one is a property of the standard
+// library's 'Iterator<T>' contract the iterator type conforms to, never of the iterator's own
+// members: a contract with a zero-argument 'hasNext()' is gated, so 'hasNext()' gates each pass
+// and 'next()' yields the element; a contract without one is optional-driven, so each pass calls
+// 'next()' once, and the result's outer optional level decides, a present result carrying the
+// element and an absent one ending the loop, which makes a null inside a present element an
+// element. The standard library a program compiles against declares exactly one of the two
+// shapes; the gated protocol stays until the seed that reads the optional shape has compiled the
+// flipped library.
 //
-// The iterator lives in a slot the loop's scope owns; each 'next()' result lands in the element
+// Resolution is structural over the checked types (sema already proved the value iterable): a
+// class receiver finds the methods down its chain and dispatches through its vtable where an
+// override forces it, while an interface-typed receiver reads them from the interface's own
+// method table.
+//
+// The iterator lives in a slot the loop's scope owns; each element lands in the element
 // binding's slot through the ordinary store barrier, which gives up the previous element first.
 import ForEachStatementNode from @ens.frontend.syntax.generated.nodes;
 import Span from @ens.frontend.support.source;
+import InstantiationType from @ens.sema.model.types;
+import InterfaceType from @ens.sema.model.types;
 import Method from @ens.sema.model.types;
-import PrimitiveKind from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
 import @ens.sema.model.types;
 import EirBranch from eir.model;
@@ -20,6 +31,7 @@ import LoweringContext from lower.context;
 import lower.calls;
 import lower.classes;
 import lower.conversions;
+import lower.optionals;
 import lower.ownership;
 import lower.statements;
 import lower.stores;
@@ -45,9 +57,14 @@ public lowerForEach(LoweringContext lowering, ForEachStatementNode loop, Type it
         return;
     }
     let iteratorType = makeIterator.method.signature().returnType();
-    let hasNext = resolveCall(lowering, iteratorType, "hasNext", loop.span());
+    let contract = iteratorContractOf(iteratorType);
+    if (contract == null) {
+        lowering.internalError("'{types.display(iteratorType)}' implements no 'Iterator<T>' from "
+            + "'@std.collections.iterator' to iterate with", loop.span());
+        return;
+    }
     let next = resolveCall(lowering, iteratorType, "next", loop.span());
-    if (hasNext == null || next == null) {
+    if (next == null) {
         return;
     }
     let binding = lowering.result().bindingOf(loop.green());
@@ -63,7 +80,6 @@ public lowerForEach(LoweringContext lowering, ForEachStatementNode loop, Type it
         return;
     }
     let builder = lowering.builder();
-    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
     long receiver = classes.borrowedReference(lowering, loop.iterable(), iterableType);
     if (receiver < 0) {
         return;
@@ -86,19 +102,14 @@ public lowerForEach(LoweringContext lowering, ForEachStatementNode loop, Type it
     long exitBlock = builder.newBlock("foreach.end");
     builder.terminate(new EirJump(conditionBlock));
     builder.moveTo(conditionBlock);
-    long conditionIterator = builder.newTemp(iteratorType);
-    builder.append(new EirLoadSlot(conditionIterator, iteratorType, iteratorSlot));
-    long more = calls.emitCall(lowering, hasNext.info, iteratorType, conditionIterator, [],
-        hasNext.dispatchSlot, hasNext.dispatchInterface, loop.name().span());
-    if (more < 0) {
-        return;
+    long element = -1;
+    if (zeroArgumentMethod(contract, "hasNext") != null) {
+        element = emitGatedElement(lowering, loop, iteratorType, next, iteratorSlot, bodyBlock,
+            exitBlock);
+    } else {
+        element = emitOptionalElement(lowering, loop, contract, iteratorType, next,
+            iteratorSlot, bodyBlock, exitBlock);
     }
-    builder.terminate(new EirBranch(more, bodyBlock, exitBlock));
-    builder.moveTo(bodyBlock);
-    long bodyIterator = builder.newTemp(iteratorType);
-    builder.append(new EirLoadSlot(bodyIterator, iteratorType, iteratorSlot));
-    long element = calls.emitCall(lowering, next.info, iteratorType, bodyIterator, [],
-        next.dispatchSlot, next.dispatchInterface, loop.name().span());
     if (element < 0) {
         return;
     }
@@ -120,6 +131,121 @@ public lowerForEach(LoweringContext lowering, ForEachStatementNode loop, Type it
         return;
     }
     builder.moveTo(exitBlock);
+}
+
+// The gated protocol: 'hasNext()' answers in the condition block whether a value remains, and
+// the body calls 'next()' for the element it was promised. Answers the owned element temp,
+// positioned at the start of the body block, or -1 when lowering failed.
+emitGatedElement(LoweringContext lowering, ForEachStatementNode loop, Type iteratorType,
+                 IterationCall next, long iteratorSlot, long bodyBlock, long exitBlock) -> long {
+    let hasNext = resolveCall(lowering, iteratorType, "hasNext", loop.span());
+    if (hasNext == null) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    long conditionIterator = builder.newTemp(iteratorType);
+    builder.append(new EirLoadSlot(conditionIterator, iteratorType, iteratorSlot));
+    long more = calls.emitCall(lowering, hasNext.info, iteratorType, conditionIterator, [],
+        hasNext.dispatchSlot, hasNext.dispatchInterface, loop.name().span());
+    if (more < 0) {
+        return -1;
+    }
+    builder.terminate(new EirBranch(more, bodyBlock, exitBlock));
+    builder.moveTo(bodyBlock);
+    long bodyIterator = builder.newTemp(iteratorType);
+    builder.append(new EirLoadSlot(bodyIterator, iteratorType, iteratorSlot));
+    return calls.emitCall(lowering, next.info, iteratorType, bodyIterator, [],
+        next.dispatchSlot, next.dispatchInterface, loop.name().span());
+}
+
+// The optional protocol: the condition block calls 'next()' once and branches on its result's
+// presence, so only the outer optional level of the result ends the walk. The result is read at
+// the contract's return type, because the override the receiver resolves to may have narrowed
+// it. The result arrives owned, and each path settles it exactly once: the body hands it to the
+// element binding, and the absent path gives it up, where a reference is null and a tagged
+// payload is zeroed anyway. Answers the owned element temp, positioned at the start of the body
+// block, or -1 when lowering failed.
+emitOptionalElement(LoweringContext lowering, ForEachStatementNode loop, Type contract,
+                    Type iteratorType, IterationCall next, long iteratorSlot, long bodyBlock,
+                    long exitBlock) -> long {
+    let contractNext = zeroArgumentMethod(contract, "next");
+    if (contractNext == null) {
+        lowering.internalError("'{types.display(contract)}' declares no 'next()' to iterate with",
+            loop.span());
+        return -1;
+    }
+    let elementType = lowering.substituted(contractNext.signature().returnType());
+    if (!primitives.isOptionalType(elementType)) {
+        lowering.internalError("'{types.display(contract)}' declares no 'hasNext()', so its "
+            + "'next()' must return an optional, not '{types.display(elementType)}'",
+            loop.span());
+        return -1;
+    }
+    let builder = lowering.builder();
+    long conditionIterator = builder.newTemp(iteratorType);
+    builder.append(new EirLoadSlot(conditionIterator, iteratorType, iteratorSlot));
+    long produced = calls.emitCall(lowering, next.info, iteratorType, conditionIterator, [],
+        next.dispatchSlot, next.dispatchInterface, loop.name().span());
+    if (produced < 0) {
+        return -1;
+    }
+    long element = conversions.convert(lowering, produced, elementType, loop.name().span());
+    if (element < 0) {
+        return -1;
+    }
+    long present = optionals.presenceOf(lowering, element, elementType);
+    long absentBlock = builder.newBlock("foreach.absent");
+    builder.terminate(new EirBranch(present, bodyBlock, absentBlock));
+    builder.moveTo(absentBlock);
+    if (primitives.isReferenceType(elementType)) {
+        ownership.releaseValue(lowering, element);
+    }
+    builder.terminate(new EirJump(exitBlock));
+    builder.moveTo(bodyBlock);
+    return element;
+}
+
+// The 'Iterator<T>' contract from '@std.collections.iterator' the iterator type conforms to, or
+// null when it conforms to none. An interface receiver climbs its own ladder; a class receiver
+// climbs its chain and, at each class, the ladder of every interface it implements.
+iteratorContractOf(Type iteratorType) -> Type? {
+    let interfaceType = primitives.interfaceOf(iteratorType);
+    if (interfaceType != null) {
+        return iteratorContractInLadder(interfaceType);
+    }
+    Type? current = primitives.classOf(iteratorType);
+    while (current != null) {
+        for (let implemented in types.interfacesOf(current)) {
+            let found = iteratorContractInLadder(implemented);
+            if (found != null) {
+                return found;
+            }
+        }
+        current = types.baseOf(current);
+    }
+    return null;
+}
+
+iteratorContractInLadder(Type interfaceType) -> Type? {
+    for (let level in types.interfaceLadderOf(interfaceType)) {
+        if (isIteratorContract(level)) {
+            return level;
+        }
+    }
+    return null;
+}
+
+// Matched by name and declaring module rather than by declaration identity, the way sema picks
+// 'Iterable<T>' out of a conformance.
+isIteratorContract(Type candidate) -> bool {
+    if (candidate is InstantiationType) {
+        let template = candidate.template();
+        if (template is InterfaceType && template.name() == "Iterator"
+                && template.modulePath() == "std.collections.iterator") {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Finds one zero-parameter iteration method on the receiver's type and decides its dispatch: an
