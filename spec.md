@@ -813,20 +813,19 @@ A test fails by throwing.
 The runner catches the error, reports it, and moves on, so one failure never stops the run.
 A `panic()` or a crash still aborts the whole run; tests are not isolated in separate processes yet.
 
-The `@std.testing` module provides `TestFailure`, an `Error` subclass, and assertion helpers that throw it:
+The `@std.testing` module provides `TestFailure`, an `Error` subclass whose constructor takes a message and an optional cause, and assertion helpers that throw it:
 
-- `testing.assertEqual(actual, expected)` and `testing.assertNotEqual(actual, expected)` compare two values of the same type with `==`; the failure message shows both values.
+- `testing.assertEqual(actual, expected)` and `testing.assertNotEqual(actual, expected)` compare two values of the same type with `==`.
+  A failure over short values shows both; over multi-line text it names the first line that differs, and over long single-line text the first differing offset with an excerpt around it, so two long values are never printed whole.
 - `testing.assertTrue(condition, message)` and `testing.assertFalse(condition, message)` check a condition; the message is optional, and interpolation at the call site can add context (`"sum was {sum}"`).
 - `testing.fail(message)` fails unconditionally.
-
-To assert that some code throws, write a helper whose catch clause swallows the expected type, and fail after the call:
+- `testing.assertNear(actual, expected, tolerance)` accepts a `double` within `tolerance` of the expected value, for results that arrive through arithmetic rather than exactly; a NaN on either side is never within any tolerance.
+- `testing.assertThrows<E>(body)` runs a `(() -> void throws E)` body and answers the `E` it threw, so the test goes on to check its kind or its message; a body that returns without throwing fails the test.
 
 ```ens
-expectParseFailure(string input) throws {
-    let unused = try parse(input);
-    try testing.fail("expected a ParseError for '{input}'");
-} catch (ParseError expected) {
-    return;
+test "empty input is refused" {
+    let failure = try testing.assertThrows<ParseError>(() -> { try parse(""); });
+    try testing.assertEqual(failure.message, "nothing to parse");
 }
 ```
 

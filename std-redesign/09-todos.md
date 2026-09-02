@@ -65,6 +65,10 @@ An override may still be marked less visible than the method it overrides (found
 Virtual dispatch itself is right: a further subclass overriding the same method answers for its own instances.
 What is unsettled is whether the narrowing marker should be legal at all, which is the override-visibility question the visibility ladder deliberately set aside, so it wants a ruling rather than a fix.
 
+A nullable type argument cannot use `assertEqual` or `assertNotEqual` (pre-existing, re-surfaced 2026-09-01 by the C2e review).
+The failure path interpolates the values, interpolation refuses a possibly-null value, and a generic body has no way to peel one level off an arbitrary `T`, so `assertEqual<string?>` is refused per instantiation and a test over an optional result unwraps by hand first.
+The clean fix is a language ruling, not a library one: whether an interpolation hole accepts a single-level nullable and prints `null` for the absent case, the way an array element already does inside the array text form.
+
 ## Reminders
 
 When `@std.time` is designed, replace `Metadata.modifiedMillis` and `wait(long timeoutMillis)` with a proper duration/instant type; the names carry the unit until then.
