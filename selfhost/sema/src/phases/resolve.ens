@@ -394,7 +394,7 @@ public class TypeResolver {
             TypeParamType[] parameters = base.typeParameterTypes();
             bool bounded = true;
             for (long i = 0; i < parameters.length && i < given; i++) {
-                if (!this.checkArgumentBounds(argumentTypes[i], parameters[i],
+                if (!this.checkArgumentBounds(parameters[i], argumentTypes,
                         argumentList.arguments(i).span())) {
                     bounded = false;
                 }
@@ -511,13 +511,16 @@ public class TypeResolver {
         return null;
     }
 
-    // Every type argument must satisfy every bound of its parameter: a class bound through the
-    // subclass chain, an interface bound through conformance, and a type-parameter argument
-    // through its own declared bounds plus whatever the active constraint scope adds. Generic
-    // calls check inferred arguments through here too.
-    public checkArgumentBounds(Type argument, TypeParamType parameter, Span span) -> bool {
+    // The argument standing for one parameter must satisfy every bound of that parameter: a class
+    // bound through the subclass chain, an interface bound through conformance, and a
+    // type-parameter argument through its own declared bounds plus whatever the active constraint
+    // scope adds. A bound that names a parameter of the same list is judged with the arguments
+    // substituted in, so '<T: Comparable<T>>' asks 'Item' for 'Comparable<Item>'. Generic calls
+    // check inferred arguments through here too.
+    public checkArgumentBounds(TypeParamType parameter, Type[] arguments, Span span) -> bool {
+        Type argument = arguments[parameter.index()];
         bool satisfied = true;
-        for (let bound in parameter.bounds()) {
+        for (let bound in this.boundsHere(parameter, arguments)) {
             if (types.satisfiesBound(argument, bound, this.extraBoundsOf(argument))) {
                 continue;
             }
@@ -537,13 +540,22 @@ public class TypeResolver {
 
     // The quiet twin of checkArgumentBounds, for callers that filter candidates before deciding
     // which failure to report.
-    public boundsSatisfied(Type argument, TypeParamType parameter) -> bool {
-        for (let bound in parameter.bounds()) {
+    public boundsSatisfied(TypeParamType parameter, Type[] arguments) -> bool {
+        Type argument = arguments[parameter.index()];
+        for (let bound in this.boundsHere(parameter, arguments)) {
             if (!types.satisfiesBound(argument, bound, this.extraBoundsOf(argument))) {
                 return false;
             }
         }
         return true;
+    }
+
+    boundsHere(TypeParamType parameter, Type[] arguments) -> Type[] {
+        let substituted = new List<Type>();
+        for (let bound in parameter.bounds()) {
+            substituted.push(this.store.substitute(bound, parameter.owner(), arguments));
+        }
+        return substituted.toArray();
     }
 
     extraBoundsOf(Type argument) -> Type[] {
@@ -571,7 +583,7 @@ public class TypeResolver {
             Type[] arguments = check.arguments();
             Span[] spans = check.spans();
             for (long a = 0; a < parameters.length && a < arguments.length; a++) {
-                this.checkArgumentBounds(arguments[a], parameters[a], spans[a]);
+                this.checkArgumentBounds(parameters[a], arguments, spans[a]);
             }
             if (recordedOwner != null) {
                 this.popMemberConstraints();
@@ -624,26 +636,29 @@ public class TypeResolver {
         };
     }
 
-    // Resolves one declaration's type parameter list: bounds resolve before any parameter is in
-    // scope, each bound must be an interface or one non-generic class, and each is listed once.
-    // Call once per declaration; the interned parameters keep their bounds.
+    // Resolves one declaration's type parameter list. The whole list is in scope while its bounds
+    // resolve, so a bound may name the parameter it constrains or a sibling, as in
+    // '<T: Comparable<T>>'; each bound must be an interface or one non-generic class, and each is
+    // listed once. Call once per declaration; the interned parameters keep their bounds.
     public resolveTypeParameters(GreenNode owner, TypeParameterListNode? list) -> TypeParamType[] {
         if (list == null) {
             return [];
         }
-        let parameters = new List<TypeParamType>();
+        let interned = new List<TypeParamType>();
         for (long i = 0; i < list.parametersCount(); i++) {
-            let declaration = list.parameters(i);
-            string name = declaration.name().text();
-            let parameter = this.store.typeParameter(owner, i, name);
-            parameters.push(parameter);
-            let boundsClause = declaration.bounds();
-            if (boundsClause == null) {
-                continue;
-            }
-            parameter.setBounds(this.resolveBoundList(name, boundsClause));
+            interned.push(this.store.typeParameter(owner, i, list.parameters(i).name().text()));
         }
-        return parameters.toArray();
+        TypeParamType[] parameters = interned.toArray();
+        this.pushTypeParameters(parameters);
+        for (long i = 0; i < parameters.length; i++) {
+            let boundsClause = list.parameters(i).bounds();
+            if (boundsClause != null) {
+                parameters[i].setBounds(
+                    this.resolveBoundList(parameters[i].name(), boundsClause));
+            }
+        }
+        this.popTypeParameters(parameters.length);
+        return parameters;
     }
 
     // Resolves and validates one bound list under the shared bound rules: interfaces
