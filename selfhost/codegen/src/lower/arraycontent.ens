@@ -1,21 +1,9 @@
-﻿// Arrays hash and compare by content, and render as a JSON-style list. Both operands of a runtime
-// loop that no fixed unrolling could replace, so each is a genuine function - one per element type,
-// built directly over an EirFunctionBuilder rather than a full LoweringContext, because nothing here
-// runs inside a checked syntax tree: it is compiled straight from the element's Type, exactly as a
-// class's destructor is. Internal linkage lets every module that needs one build its own private
-// copy, so no module has to "own" a structural type the way it owns a declared class.
-//
-// A plan is scoped to one module's lowering pass. Requesting a symbol builds the function the first
-// time and remembers its name afterwards; the memo is written before the body is, so an element type
-// that reaches its own array type again - a struct holding an array of itself - recurses into the
-// same symbol instead of looping forever.
-//
-// Every synthesized function is null-safe on its own: an absent array is equal only to another
-// absent one, hashes as -1, and renders as 'null'. That is what lets a nested array element, which
-// may be absent under a nullable spelling, call straight into the next level with no guard at the
-// call site. Nothing here special-cases the same array against itself: a float element compares by
-// IEEE rules even against itself, so the loop - not an identity shortcut - is what has to answer
-// for every element type alike.
+﻿// Arrays compare, hash, and render by content through one synthesized function per element
+// type, built straight from the element's Type with internal linkage so no module has to own a
+// structural type. A plan memoizes a symbol before building its body, so a struct holding an
+// array of itself recurses into the same symbol instead of looping forever. Every synthesized
+// function is null-safe on its own, so a nested array element calls straight into the next
+// level with no guard at the call site.
 import Span from @ens.frontend.support.source;
 import Type from @ens.sema.model.types;
 import ArrayType from @ens.sema.model.types;
@@ -77,8 +65,8 @@ import support.primitives;
 import List from @std.collections.list;
 import Map from @std.collections.map;
 
-// One module's array-content requests, resolved once each and kept for the driver to collect once
-// the module's functions have all lowered.
+// One module's array-content functions, built once each and collected by the driver after the
+// module's functions have all lowered.
 public final class ArrayContentPlan {
     ProgramIndex planIndex;
     TypeStore planStore;
@@ -109,8 +97,7 @@ public final class ArrayContentPlan {
         return this.synthesized.toArray();
     }
 
-    // The symbol of 'bool(T[], T[])' for this element type, building it the first time it is
-    // asked for.
+    // The symbol of 'bool(T[], T[])' for this element type, built on first request.
     public equalsSymbol(Type elementType) -> string {
         let cached = this.equalsSymbols.get(elementType);
         if (cached != null) {
@@ -122,8 +109,7 @@ public final class ArrayContentPlan {
         return symbol;
     }
 
-    // The symbol of 'long(T[])' for this element type, building it the first time it is asked
-    // for.
+    // The symbol of 'long(T[])' for this element type, built on first request.
     public hashSymbol(Type elementType) -> string {
         let cached = this.hashSymbols.get(elementType);
         if (cached != null) {
@@ -135,8 +121,7 @@ public final class ArrayContentPlan {
         return symbol;
     }
 
-    // The symbol of 'string(T[])' for this element type, building it the first time it is asked
-    // for.
+    // The symbol of 'string(T[])' for this element type, built on first request.
     public textSymbol(Type elementType) -> string {
         let cached = this.textSymbols.get(elementType);
         if (cached != null) {
@@ -149,18 +134,15 @@ public final class ArrayContentPlan {
     }
 }
 
-// A value already typed at some array-of-this-element spelling, renamed to the bare array type a
-// synthesized function's parameter declares - the same pointer, since every spelling of an array
-// shares its representation.
+// Retypes an array value to the bare array type a synthesized function declares. Every spelling
+// of an array shares one representation, so the pointer is unchanged.
 public reinterpretArray(EirFunctionBuilder builder, long value, Type bareArrayType) -> long {
     return reinterpretTo(builder, value, bareArrayType);
 }
 
-// A value already typed at some nullable spelling of a reference type, renamed to the bare
-// referent type - the same pointer, since a nullable reference shares its referent's
-// representation. A string element declared 'string?' is what this is for: the instructions
-// that read a string's content, such as EirStringEqual and EirHashValue, are shaped around the
-// bare type, and dispatch elsewhere keys off the declared type rather than the bits.
+// Retypes a nullable reference to its bare referent type, which shares its representation. The
+// string instructions are shaped around the bare type, so a 'string?' element passes through
+// here first.
 reinterpretTo(EirFunctionBuilder builder, long value, Type bareType) -> long {
     if (builder.tempType(value) == bareType) {
         return value;
@@ -171,10 +153,8 @@ reinterpretTo(EirFunctionBuilder builder, long value, Type bareType) -> long {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Call sites: used from lower.equality, lower.hashes, lower.strings, and lower.json wherever an
-// operand, a field, or a payload is array-typed. Each borrows its argument for the call - the
-// caller still owns it afterward, exactly as it does around any other leaf comparison or
-// conversion.
+// Entry points for the lowering passes. Each borrows its argument; the caller still owns it
+// afterward.
 
 // 'left == right' over two arrays of the same type, by content. 'negated' gives '!='.
 public lowerEqual(LoweringContext lowering, long left, long right, Type arrayType, bool negated,
@@ -240,11 +220,8 @@ public lowerToString(LoweringContext lowering, long value, Type arrayType, Span 
     return result;
 }
 
-// bool _arreq_<T>(T[] left, T[] right): both absent is equal, one absent is not, a length
-// mismatch is unequal, and otherwise every element in order decides it. The same object is not
-// special-cased: a float element compares by IEEE rules even against itself, so a NaN anywhere
-// still answers false, and the loop is what gets that right for every element type at once.
-// Neither operand's elements are retained or released - the loop only ever reads them.
+// bool _arreq_<T>(T[] left, T[] right). The same object is not special-cased, since a float
+// element compares by IEEE rules even against itself, and the loop only reads the elements.
 buildEquals(ArrayContentPlan plan, Type elementType, string symbol) -> EirFunction {
     let store = plan.store();
     let arrayType = store.arrayOf(elementType);
@@ -257,8 +234,8 @@ buildEquals(ArrayContentPlan plan, Type elementType, string symbol) -> EirFuncti
 
     long falseBlock = builder.newBlock("arreq.false");
     long trueBlock = builder.newBlock("arreq.true");
-    long leftAbsent = isNull(builder, boolType, left, arrayType);
-    long rightAbsent = isNull(builder, boolType, right, arrayType);
+    long leftAbsent = absentTest(builder, boolType, left, arrayType);
+    long rightAbsent = absentTest(builder, boolType, right, arrayType);
     long eitherAbsent = boolTemp(builder, boolType, EirBinaryOp.Or, leftAbsent, rightAbsent);
     long bothAbsentBlock = builder.newBlock("arreq.bothabsent");
     long lengthBlock = builder.newBlock("arreq.length");
@@ -308,8 +285,8 @@ buildEquals(ArrayContentPlan plan, Type elementType, string symbol) -> EirFuncti
     return builder.finish();
 }
 
-// long _arrhash_<T>(T[] array): -1 for an absent array, otherwise the 31-multiply fold of every
-// element's own hash, seeded at 17 so an empty array still answers a fixed value.
+// long _arrhash_<T>(T[] array): -1 for an absent array, otherwise the 31-multiply fold of the
+// element hashes seeded at 17.
 buildHash(ArrayContentPlan plan, Type elementType, string symbol) -> EirFunction {
     let store = plan.store();
     let arrayType = store.arrayOf(elementType);
@@ -321,7 +298,7 @@ buildHash(ArrayContentPlan plan, Type elementType, string symbol) -> EirFunction
 
     long absentBlock = builder.newBlock("arrhash.absent");
     long presentBlock = builder.newBlock("arrhash.present");
-    builder.terminate(new EirBranch(isNull(builder, boolType, array, arrayType), absentBlock, presentBlock));
+    builder.terminate(new EirBranch(absentTest(builder, boolType, array, arrayType), absentBlock, presentBlock));
 
     builder.moveTo(absentBlock);
     builder.terminate(new EirReturn(constInt(builder, longType, -1)));
@@ -358,9 +335,8 @@ buildHash(ArrayContentPlan plan, Type elementType, string symbol) -> EirFunction
     return builder.finish();
 }
 
-// string _arrtext_<T>(T[] array): 'null' for an absent array, otherwise '[' every element's own
-// text joined by ', ' ']'. The accumulator owns a reference throughout, released into every piece
-// it joins with.
+// string _arrtext_<T>(T[] array): 'null' for an absent array, otherwise the elements' text in
+// brackets. The accumulator slot owns its reference throughout.
 buildText(ArrayContentPlan plan, Type elementType, string symbol) -> EirFunction {
     let store = plan.store();
     let arrayType = store.arrayOf(elementType);
@@ -373,7 +349,7 @@ buildText(ArrayContentPlan plan, Type elementType, string symbol) -> EirFunction
 
     long absentBlock = builder.newBlock("arrtext.absent");
     long presentBlock = builder.newBlock("arrtext.present");
-    builder.terminate(new EirBranch(isNull(builder, boolType, array, arrayType), absentBlock, presentBlock));
+    builder.terminate(new EirBranch(absentTest(builder, boolType, array, arrayType), absentBlock, presentBlock));
 
     builder.moveTo(absentBlock);
     builder.terminate(new EirReturn(ownedLiteral(builder, stringType, "null")));
@@ -419,8 +395,7 @@ buildText(ArrayContentPlan plan, Type elementType, string symbol) -> EirFunction
     return builder.finish();
 }
 
-// '==' over one element the address of each operand names. Reads both sides once and dispatches
-// on the element's shape; a tagged optional and a struct are the only shapes that need the
+// '==' over the elements the two addresses name. Only a tagged optional and a struct need the
 // address rather than the loaded value.
 elementEqualAt(EirFunctionBuilder builder, ArrayContentPlan plan, long leftAddress,
               long rightAddress, Type type) -> long {
@@ -456,12 +431,8 @@ elementEqualAt(EirFunctionBuilder builder, ArrayContentPlan plan, long leftAddre
     return boolTemp(builder, boolType, op, left, right);
 }
 
-// The '==' of two tagged pairs the given addresses name: both absent is equal, one absent is not,
-// and two present pairs compare their payloads through elementEqualAt - by address in place for a
-// struct payload, and by address into a scratch spill otherwise, so a payload that is itself a
-// nested optional, a string, a class, or a nested array recurses exactly as it would anywhere
-// else. The payload is only ever read once presence is proven, since a struct payload may hold a
-// reference field over storage that was never written.
+// '==' over the tagged pairs the two addresses name. The payload is read only once presence is
+// proven, since a struct payload may hold a reference field over storage that was never written.
 taggedEqualAt(EirFunctionBuilder builder, ArrayContentPlan plan, long leftAddress,
              long rightAddress, Type optionalType, Type payloadType) -> long {
     let store = plan.store();
@@ -507,8 +478,8 @@ taggedEqualAt(EirFunctionBuilder builder, ArrayContentPlan plan, long leftAddres
     return loadSlot(builder, boolType, answer);
 }
 
-// '==' over the structs the given addresses name: the struct's own 'equals' when it declared one,
-// otherwise every field in order, short-circuiting to unequal at the first difference.
+// '==' over the structs the two addresses name, through the struct's own 'equals' when it
+// declared one.
 structEqualAt(EirFunctionBuilder builder, ArrayContentPlan plan, long leftAddress,
              long rightAddress, Type structType) -> long {
     let store = plan.store();
@@ -618,8 +589,8 @@ taggedHashAt(EirFunctionBuilder builder, ArrayContentPlan plan, long address, Ty
     return loadSlot(builder, longType, answer);
 }
 
-// The FNV-1a fold of a struct's fields, each by its own hash, or the struct's own 'hash' when it
-// declared one - the same algorithm hashAt uses for a struct reached any other way.
+// The FNV-1a fold of a struct's fields, or the struct's own 'hash' when it declared one. Matches
+// hashAt for a struct reached any other way.
 structHashAt(EirFunctionBuilder builder, ArrayContentPlan plan, long address, Type structType)
         -> long {
     let store = plan.store();
@@ -670,11 +641,10 @@ elementTextAt(EirFunctionBuilder builder, ArrayContentPlan plan, long address, T
             builder.append(new EirJsonEscape(result, stringType, bare));
             return result;
         }
-        // A nullable string is not tagged - it shares the string's own pointer shape - so an
-        // absent one has to be told apart here, before EirJsonEscape, which renders a null
-        // string as "" rather than the JSON 'null' this element form needs.
+        // EirJsonEscape renders a null string as "" rather than 'null', so an absent string is
+        // told apart first.
         let boolType = store.primitive(PrimitiveKind.Bool);
-        long absent = isNull(builder, boolType, bare, stringType);
+        long absent = absentTest(builder, boolType, bare, stringType);
         long answer = builder.addSlot("strtext", stringType, true, false);
         long presentBlock = builder.newBlock("strtext.present");
         long absentBlock = builder.newBlock("strtext.absent");
@@ -747,12 +717,9 @@ taggedTextAt(EirFunctionBuilder builder, ArrayContentPlan plan, long address, Ty
     return takeSlot(builder, stringType, answer);
 }
 
-// The JSON object of a struct the given address names: '{' every field as '"name": value'
-// joined by ', ' '}' - the same shape json.renderAt builds for a struct reached any other way. A
-// struct never renders through a declared 'toString' here, matching struct JSON serialization
-// everywhere else it nests: a nested struct is always its JSON object. A field type this cannot
-// render is unreachable here: sema only allows an array to hold a struct whose own fields are
-// already checked against the same rule.
+// The JSON object of the struct the address names, in the shape json.renderAt builds. A nested
+// struct never renders through a declared 'toString', and sema already refused any field type
+// this cannot render.
 structTextAt(EirFunctionBuilder builder, ArrayContentPlan plan, long address, Type structType)
         -> long {
     let store = plan.store();
@@ -780,8 +747,7 @@ structTextAt(EirFunctionBuilder builder, ArrayContentPlan plan, long address, Ty
         false);
 }
 
-// One struct field's JSON value: a char and an enum member are quoted text, a string is quoted
-// and escaped, a nested struct is its own object, and everything else is its plain text form.
+// One struct field's JSON value.
 jsonValueAt(EirFunctionBuilder builder, ArrayContentPlan plan, long address, Type type) -> long {
     let store = plan.store();
     let stringType = store.stringType();
@@ -804,8 +770,7 @@ jsonValueAt(EirFunctionBuilder builder, ArrayContentPlan plan, long address, Typ
     return elementTextAt(builder, plan, address, type);
 }
 
-// A synthesized function's own version of a leaf conversion to text: integers and floats through
-// the numeric formatters, bool as a literal, and char and enum through their own instructions.
+// A leaf value's text form, built without a LoweringContext.
 leafToString(EirFunctionBuilder builder, ArrayContentPlan plan, long value, Type type) -> long {
     let store = plan.store();
     let stringType = store.stringType();
@@ -847,8 +812,7 @@ leafToString(EirFunctionBuilder builder, ArrayContentPlan plan, long value, Type
     return text;
 }
 
-// A call into the equals/hash/text helper of a nested array element, requesting it from the plan
-// first so every module needs each nested helper built exactly once.
+// Calls a nested array element's helper, requested from the plan so each is built once per module.
 callArrayEquals(EirFunctionBuilder builder, ArrayContentPlan plan, long left, long right,
                 Type innerElementType) -> long {
     string symbol = plan.equalsSymbol(innerElementType);
@@ -889,9 +853,8 @@ callArrayText(EirFunctionBuilder builder, ArrayContentPlan plan, long value,
     return result;
 }
 
-// A struct's own zero-argument or one-argument behavior, called by symbol the way a class
-// destructor calls a base's declared destructor: no dispatch, because a struct has no runtime
-// type beyond its own.
+// Calls a struct's declared method by symbol. A struct has no runtime type beyond its own, so
+// there is nothing to dispatch on.
 callDeclared(EirFunctionBuilder builder, ArrayContentPlan plan, Method declared, long receiver,
             long[] arguments, Type returnType) -> long {
     let info = plan.index().infoFor(declared.signature());
@@ -919,8 +882,8 @@ fallbackFor(EirFunctionBuilder builder, Type returnType) -> long {
     return constInt(builder, returnType, 0);
 }
 
-// A struct's declared 'equals', or null when memberwise folding stands in - the same rule
-// lower.equality applies to a struct reached any other way.
+// A struct's declared 'equals', or null when memberwise folding stands in. Matches the rule in
+// lower.equality.
 declaredEqualsOf(Type structType) -> Method? {
     let methods = types.methodsOf(structType);
     if (methods == null) {
@@ -966,9 +929,8 @@ loadAt(EirFunctionBuilder builder, long address, Type type) -> long {
     return value;
 }
 
-// The address a value with no storage of its own is given, so a payload read out of a tagged pair
-// can recurse through the same address-taking helpers a struct or array payload needs. Only ever
-// asked for a leaf type, which addresses itself through a slot.
+// Spills a value into a scratch slot so it can go through the address-taking helpers. Only ever
+// asked for a leaf type.
 addressOfValue(EirFunctionBuilder builder, long value, Type type) -> long {
     long slot = builder.addSlot("scratch", type, false, false);
     builder.append(new EirStoreSlot(slot, value));
@@ -977,7 +939,7 @@ addressOfValue(EirFunctionBuilder builder, long value, Type type) -> long {
     return address;
 }
 
-isNull(EirFunctionBuilder builder, Type booleanType, long value, Type type) -> long {
+absentTest(EirFunctionBuilder builder, Type booleanType, long value, Type type) -> long {
     long absent = builder.newTemp(type);
     builder.append(new EirConstNull(absent, type));
     return boolTemp(builder, booleanType, EirBinaryOp.CmpEq, value, absent);
@@ -1042,9 +1004,8 @@ loadSlot(EirFunctionBuilder builder, Type type, long slot) -> long {
     return temp;
 }
 
-// Hands the +1 a merge slot owns to the result, the way any other place a value merges through a
-// slot and is then handed onward - owned - has to: a plain load only borrows, so the last read of
-// a slot whose value is about to be returned or consumed as owned takes it instead.
+// Moves the +1 a merge slot owns into the result. A plain load only borrows, so the last read of
+// a slot about to be handed on as owned takes it instead.
 takeSlot(EirFunctionBuilder builder, Type type, long slot) -> long {
     long temp = builder.newTemp(type);
     builder.append(new EirTakeSlot(temp, type, slot));
@@ -1061,9 +1022,8 @@ appendOwnedInto(EirFunctionBuilder builder, Type stringType, long slot, long pie
     if (pieceOwned) {
         builder.append(new EirRelease(piece));
     }
-    // The slot, not the borrowed value just read out of it, owns the reference being replaced;
-    // releasing it through the slot's own address is what gives that +1 up, the same barrier
-    // every other slot overwrite uses.
+    // The slot owns the reference being replaced, not the borrowed value just read from it, so
+    // the release goes through the slot's address.
     long slotAddress = builder.newTemp(stringType);
     builder.append(new EirSlotAddress(slotAddress, stringType, slot));
     builder.append(new EirReleasePtr(slotAddress));
