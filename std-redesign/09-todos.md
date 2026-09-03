@@ -1,32 +1,15 @@
 # Open questions and deferred items
 
-## Blocking decisions
-
-All five were decided on 2026-08-05 and folded into the other documents; nothing blocks implementation.
-
-## Still to write
-
-The prelude mechanism for `print`/`eprint`.
-The migration order is written: see 10-migration-plan.md.
-
 ## Implementation work items surfaced by the design
 
 Shortest round-trip float formatting, for `StringBuilder.append(double)` and interpolation; exists nowhere today.
 Number formatting beyond decimal (radix, width, padding) and parsing/formatting for `decimal`.
 A modification counter in `Map`, `Set`, `SortedMap`, and their views, aborting on mutation during a walk.
-The compiler's rejected-key-type list for map and set keys: arrays, external handles, mutable collections, and function types.
-`@std.hash` retired on 2026-08-31 and `Map` and `Set` name their key types with no bound, so there is no bound left to make honest: the judgment is the compiler's own, and it has to be made where a value is hashed and against the type argument an instantiation supplies.
-Function types are the verified case (2026-08-30): `Set<(int) -> char>` compiles, and the elements hash by object identity, so two identical lambdas written at two sites are two keys while a capturing lambda evaluated twice is also two keys.
-Writing `hash()` on a function value directly is already refused, so the generic path is the inconsistency.
-External handles are refused by code generation as of 2026-08-30, in both the `Handle` and the `Handle?` spelling, with a message naming the type; sema still accepts the call, so moving that refusal to where it belongs is the same piece of work.
-Ratified 2026-08-30: keep the direct rejection and refuse the generic path too, rather than granting every value an identity.
-A function value's identity is not stable under the compiler's freedom to share one closure object per capture-free lambda site or to allocate a fresh one per evaluation, so equality on it would answer questions about code generation rather than about the function; a class holding the function is how a program that needs identity gets it.
-The work belongs to C4, which designs the containers and their key rules.
-Ratified 2026-09-02, as two rules: a type with no hash at all (an external handle, a function value) is refused by a per-instantiation obligation at every `hash()` call on a type parameter, the way `==` is checked today, so user generics are covered and the code-generation refusal of handles moves into sema; a type that hashes by content but can change (an array, or any collection) is refused as a key at the instantiation site, by the compiler's by-name list of the standard containers' key parameters, extended to every C4 container.
+The compiler's key-type rules, ratified 2026-09-02 and scheduled as C4a.
+A type with no hash at all (an external handle, a function value) is refused by a per-instantiation obligation at every `hash()` call on a type parameter, the way `==` is checked today, which also moves the code-generation refusal of handles into sema.
+A type that hashes by content but can change (an array, or any collection) is refused as a key at the instantiation site, by the compiler's by-name list of the standard containers' key parameters, extended to every C4 container.
 A struct key is refused when any field, transitively, holds an array or a collection, naming the field, the way the comparability walk already descends into struct fields.
-A test that ARC releases live locals on the throw path.
-A pinning fixture for file-next-to-folder module resolution, plus a spec line.
-A fixture for a cross-package subclass calling a protected constructor.
+Today only arrays are refused as `Map` and `Set` keys, an external handle fails only in code generation, and `Set<(int) -> char>` compiles and hashes by identity.
 OS-level redirection for `run(captureOutput: true)`, wait-with-timeout, and kill in the native bridges.
 The toString marker flip: after the Phase B seed and the C6 text rewrite give `StringBuilder` its `export override toString()`, Phase D makes an unmarked class method named `toString` an error, closing the A4 transition rule (ratified 2026-08-28).
 `Map.keys` and `Map.values` copy each element twice, once into a capacity-reserved list and once into the array they hand out, because a sparse gather cannot be written as the canonical fill loop the array-element check recognizes.
@@ -75,11 +58,6 @@ What is unsettled is whether the narrowing marker should be legal at all, which 
 A nullable type argument cannot use `assertEqual` or `assertNotEqual` (pre-existing, re-surfaced 2026-09-01 by the C2e review).
 The failure path interpolates the values, interpolation refuses a possibly-null value, and a generic body has no way to peel one level off an arbitrary `T`, so `assertEqual<string?>` is refused per instantiation and a test over an optional result unwraps by hand first.
 The clean fix is a language ruling, not a library one: whether an interpolation hole accepts a single-level nullable and prints `null` for the absent case, the way an array element already does inside the array text form.
-
-Type-argument inference binds a parameter only where it appears directly as a parameter type or as an array's element type, never inside an instantiation (re-surfaced 2026-09-02 by the C3b std tests).
-`assertExhausted<T>(Iterator<T> walk)` called with an `Iterator<string>`, and `firstOf<T>(List<T> items)` called with a `List<string>`, both report `Cannot infer type argument 'T'`, so the caller writes the argument out.
-The spec states the direct-position rule, so this is a design limit rather than a bug, and C4's free functions over `Iterable<T>` will meet it; unifying the argument's instantiation with the parameter's is the natural extension and wants a ruling.
-Ratified 2026-09-02: inference unifies the argument's type with the parameter's through instantiations, nested, and through implemented interfaces and base classes, so a class implementing `Iterable<int>` binds `T` for an `Iterable<T>` parameter; it lands as its own sema-only milestone before C4.
 
 ## Reminders
 
