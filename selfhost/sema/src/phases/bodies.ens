@@ -141,6 +141,7 @@ import InterpolationObligation from phases.obligations;
 import TypeTestObligation from phases.obligations;
 import ArrayElementObligation from phases.obligations;
 import EqualityObligation from phases.obligations;
+import HashObligation from phases.obligations;
 import phases.obligations;
 import List from @std.collections.list;
 import Map from @std.collections.map;
@@ -527,8 +528,8 @@ class BodyChecker implements NoreturnCalls {
         let owner = this.obligationOwner;
         if (owner != null) {
             obligation.setGuards(this.activeGuardsFor(owner));
-            this.deferredObligations.recordObligation(owner, this.obligationOwnerName,
-                this.context.module().filePath(), obligation);
+            this.deferredObligations.recordObligation(owner, this.context.module().filePath(),
+                obligation);
         }
     }
 
@@ -545,9 +546,8 @@ class BodyChecker implements NoreturnCalls {
         }
         let owner = this.obligationOwner;
         if (owner != null) {
-            this.deferredObligations.recordOpenCall(owner, this.obligationOwnerName,
-                this.context.module().filePath(), signature, arguments,
-                this.activeGuardsFor(owner));
+            this.deferredObligations.recordOpenCall(owner, this.context.module().filePath(),
+                signature, arguments, this.activeGuardsFor(owner));
         }
     }
 
@@ -3548,9 +3548,7 @@ class BodyChecker implements NoreturnCalls {
     // A function value has nothing to reach into: no fields, no methods, no identity and no text
     // form. The one home for saying so, whether the name was read or called.
     reportFunctionMember(string name, Type functionType, Span at) -> Type {
-        this.reporter.report("A function value has no members, so '{name}' cannot be used on "
-            + "'{types.display(functionType)}': it has no identity and no text form. Call the "
-            + "value with '(...)', or keep the data you need beside it.", at);
+        this.reporter.report(obligations.functionMemberIssue(name, functionType), at);
         return this.store.errorType();
     }
 
@@ -5497,6 +5495,9 @@ class BodyChecker implements NoreturnCalls {
                             DeclaredType template, long staticIndex, Type[] typeArguments,
                             List<Type> argumentTypes, Method templateCandidate,
                             TypeArgumentInference inference) -> Type {
+        if (!this.resolver.acceptsKeyType(template, typeArguments, node.span())) {
+            return this.store.errorType();
+        }
         let instantiation = this.store.instantiationOf(template, typeArguments);
         this.resolver.recordInstantiationMention(instantiation);
         let resolved = this.staticAtIndex(instantiation, staticIndex);
@@ -5583,6 +5584,9 @@ class BodyChecker implements NoreturnCalls {
         let resolvedMethods = new List<Method>();
         let resolvedOwners = new List<Type>();
         for (long c = 0; c < staticIndexes.length(); c++) {
+            if (!this.resolver.acceptsKeyType(template, vectors.get(c), node.span())) {
+                return this.store.errorType();
+            }
             let instantiation = this.store.instantiationOf(template, vectors.get(c));
             this.resolver.recordInstantiationMention(instantiation);
             let resolved = this.staticAtIndex(instantiation, staticIndexes.get(c));
@@ -6445,6 +6449,8 @@ class BodyChecker implements NoreturnCalls {
             this.analyzeArgumentsOnly(arguments);
             return this.reportFunctionMember(name, core, node.span());
         }
+        // An optional hashes as its payload does while present, whatever its inner type, so only
+        // 'hash' reads through the wrapper here.
         if (core is OptionalType) {
             if (name == "slice" && core.inner() is ArrayType) {
                 this.reporter.report("Cannot call 'slice' on '{types.display(core)}' because "
@@ -6453,11 +6459,9 @@ class BodyChecker implements NoreturnCalls {
                 this.analyzeArgumentsOnly(arguments);
                 return this.store.errorType();
             }
-            if (name == "hash") {
-                this.checkNoArguments(node, "hash");
-                return this.store.primitive(PrimitiveKind.Long);
+            if (name != "hash") {
+                return null;
             }
-            return null;
         }
         if (name == "toString") {
             if (convert.isIntegerType(core) || convert.isBoolType(core) || core is StringType
@@ -6581,21 +6585,39 @@ class BodyChecker implements NoreturnCalls {
             this.analyzeArgumentsOnly(arguments);
             return this.store.errorType();
         }
-        bool declaresHash = false;
-        if (core is TypeParamType) {
-            for (let bound in this.effectiveBoundsOf(core)) {
-                if (methodCandidates(bound, "hash").length() > 0) {
-                    declaresHash = true;
-                }
-            }
-        } else if (isRecordLike(core)) {
-            declaresHash = this.availableMethods(core, "hash").length() > 0;
-        }
-        if (declaresHash) {
+        if (!(core is OptionalType) && this.declaresHash(core)) {
             return null;
         }
         this.checkNoArguments(node, "hash");
+        this.checkHashable(core, node.span());
         return this.store.primitive(PrimitiveKind.Long);
+    }
+
+    // Whether a written 'hash' answers on this receiver: a bound of a type parameter, or a member
+    // of a record; anything else gets the synthesized content hash.
+    declaresHash(Type core) -> bool {
+        if (core is TypeParamType) {
+            for (let bound in this.effectiveBoundsOf(core)) {
+                if (methodCandidates(bound, "hash").length() > 0) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        return isRecordLike(core) && this.availableMethods(core, "hash").length() > 0;
+    }
+
+    // The synthesized content hash needs every leaf the receiver folds to have a hash. A receiver
+    // mentioning a type parameter is judged per instantiation.
+    checkHashable(Type receiver, Span span) {
+        if (convert.containsTypeParam(receiver)) {
+            this.recordObligation(new HashObligation(receiver, span));
+            return;
+        }
+        let issue = obligations.hashabilityIssue(receiver);
+        if (issue != null) {
+            this.reporter.report(issue, span);
+        }
     }
 
     checkNoArguments(CallExpressionNode node, string name) {

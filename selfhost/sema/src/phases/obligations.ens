@@ -1,9 +1,10 @@
-// Per-instantiation validation of the judgments a generic body defers because a type mentions a
-// type parameter: interpolation holes and 'is'/'as?' tests. Body checking records each deferred
-// judgment on its enclosing template or generic function; once every body is checked, the pass
-// replays each obligation against the concrete type arguments of every instantiation that
-// actually occurs, cascading through generic calls and through instantiations that only become
-// concrete inside another instantiation.
+// Per-instantiation validation of the judgments a generic declaration defers because a type
+// mentions a type parameter: interpolation holes, 'is'/'as?' tests, '==' and 'hash()' on
+// structs, and the key arguments of keyed containers. Body checking and type resolution record
+// each deferred judgment on its enclosing template or generic function; once every body is
+// checked, the pass replays each obligation against the concrete type arguments of every
+// instantiation that actually occurs, cascading through generic calls and through
+// instantiations that only become concrete inside another instantiation.
 import GreenNode from @ens.frontend.syntax.green;
 import Span from @ens.frontend.support.source;
 import FileDiagnostic from support.diagnostics;
@@ -13,6 +14,7 @@ import model.types;
 import Type from model.types;
 import TypeStore from model.types;
 import Signature from model.types;
+import DeclaredType from model.types;
 import InstantiationType from model.types;
 import TypeParamType from model.types;
 import OptionalType from model.types;
@@ -105,6 +107,41 @@ public class EqualityObligation extends Obligation {
 
     protected structType() -> Type {
         return this.comparedStruct;
+    }
+}
+
+// 'value.hash()' on a receiver whose type still names a type parameter and whose bounds declare
+// no 'hash'; each instantiation says whether the concrete receiver has one.
+public class HashObligation extends Obligation {
+    Type hashedReceiver;
+
+    public constructor(Type receiver, Span span) {
+        super(span);
+        this.hashedReceiver = receiver;
+    }
+
+    protected receiver() -> Type {
+        return this.hashedReceiver;
+    }
+}
+
+// A keyed standard container instantiated at a key that still names a type parameter.
+public class KeyTypeObligation extends Obligation {
+    DeclaredType keyedContainer;
+    Type openKey;
+
+    public constructor(DeclaredType container, Type key, Span span) {
+        super(span);
+        this.keyedContainer = container;
+        this.openKey = key;
+    }
+
+    protected container() -> DeclaredType {
+        return this.keyedContainer;
+    }
+
+    protected key() -> Type {
+        return this.openKey;
     }
 }
 
@@ -212,20 +249,14 @@ class ConcreteCall {
 // Everything recorded against one generic owner: a class or struct template, or a generic
 // function, identified by its declaration node.
 class OwnerEntry {
-    string entryName;
     string entryFile;
     List<Obligation> entryObligations;
     List<OpenCall> entryOpenCalls;
 
-    protected constructor(string name, string filePath) {
-        this.entryName = name;
+    protected constructor(string filePath) {
         this.entryFile = filePath;
         this.entryObligations = new List<Obligation>();
         this.entryOpenCalls = new List<OpenCall>();
-    }
-
-    name() -> string {
-        return this.entryName;
     }
 
     protected file() -> string {
@@ -241,7 +272,9 @@ class OwnerEntry {
     }
 }
 
-// Collects deferred judgments and generic calls while bodies are checked; the pass reads it.
+// Collects deferred judgments and generic calls while types are resolved and bodies are checked;
+// the pass reads it. An owner's file is where its declaration sits, which is also where every
+// mention of its type parameters sits.
 public final class ObligationRegistry {
     Map<GreenNode, OwnerEntry> owners;
     List<ConcreteCall> concreteCalls;
@@ -251,14 +284,13 @@ public final class ObligationRegistry {
         this.concreteCalls = new List<ConcreteCall>();
     }
 
-    public recordObligation(GreenNode owner, string name, string filePath, Obligation obligation) {
-        this.entryFor(owner, name, filePath).obligations().push(obligation);
+    public recordObligation(GreenNode owner, string filePath, Obligation obligation) {
+        this.entryFor(owner, filePath).obligations().push(obligation);
     }
 
-    public recordOpenCall(GreenNode owner, string name, string filePath, Signature callee,
-                   Type[] arguments, MemberConstraint[] guards) {
-        this.entryFor(owner, name, filePath).openCalls().push(
-            new OpenCall(callee, arguments, guards));
+    public recordOpenCall(GreenNode owner, string filePath, Signature callee, Type[] arguments,
+                   MemberConstraint[] guards) {
+        this.entryFor(owner, filePath).openCalls().push(new OpenCall(callee, arguments, guards));
     }
 
     public recordConcreteCall(Signature callee, Type[] arguments) {
@@ -277,12 +309,12 @@ public final class ObligationRegistry {
         return this.concreteCalls;
     }
 
-    entryFor(GreenNode owner, string name, string filePath) -> OwnerEntry {
+    entryFor(GreenNode owner, string filePath) -> OwnerEntry {
         let existing = this.owners.get(owner);
         if (existing != null) {
             return existing;
         }
-        let created = new OwnerEntry(name, filePath);
+        let created = new OwnerEntry(filePath);
         this.owners.set(owner, created);
         return created;
     }
@@ -387,6 +419,9 @@ class ObligationPass {
         this.computeProductive();
         for (long i = 0; i < concreteInstantiations.length(); i++) {
             let instantiation = concreteInstantiations.get(i);
+            if (hasRefusedKey(instantiation.template(), instantiation.arguments())) {
+                continue;
+            }
             this.push(instantiation.template().declaration(),
                 instantiation.template().name(), instantiation.arguments(), 0);
         }
@@ -514,7 +549,8 @@ class ObligationPass {
                     continue;
                 }
                 let substituted = this.substituteAll(instantiation.arguments(), assignment);
-                if (substituted != null) {
+                if (substituted != null
+                        && !hasRefusedKey(instantiation.template(), substituted)) {
                     this.push(declaration, instantiation.template().name(), substituted,
                         assignment.depth + 1);
                 }
@@ -595,6 +631,20 @@ class ObligationPass {
                         obligation.span());
                 }
             },
+            is HashObligation hashed -> {
+                let concrete = this.substituteOne(hashed.receiver(), assignment);
+                if (concrete != null) {
+                    this.report(entry, assignment, hashabilityIssue(concrete),
+                        obligation.span());
+                }
+            },
+            is KeyTypeObligation keyed -> {
+                let concrete = this.substituteOne(keyed.key(), assignment);
+                if (concrete != null) {
+                    this.report(entry, assignment, keyTypeIssue(keyed.container(), concrete),
+                        obligation.span());
+                }
+            },
             is ArrayElementObligation created -> {
                 let concrete = this.substituteOne(created.element(), assignment);
                 if (concrete != null) {
@@ -625,7 +675,8 @@ maxCascadeDepth() -> long {
     return 200;
 }
 
-collectOwners(Type type, Set<GreenNode> owners) {
+// The generic declarations whose type parameters a type names.
+public collectOwners(Type type, Set<GreenNode> owners) {
     switch (type) {
         is TypeParamType parameter -> {
             owners.add(parameter.owner());
@@ -857,7 +908,7 @@ public equalityComparabilityIssue(Type structType) -> string? {
                 + "directly instead.";
         }
         if (isStructValue(leaf)) {
-            let inElement = firstNonComparableField(leaf, new Set<Type>());
+            let inElement = firstExternalOrFunctionField(leaf, new Set<Type>());
             if (inElement != null) {
                 return "'{types.display(structType)}' cannot be compared with '==': an array "
                     + "compares element by element, and element field '{inElement.path()}' has "
@@ -872,13 +923,193 @@ public equalityComparabilityIssue(Type structType) -> string? {
     if (authority == null) {
         return null;
     }
-    let found = firstNonComparableField(structType, new Set<Type>());
+    let found = firstExternalOrFunctionField(structType, new Set<Type>());
     if (found == null) {
         return null;
     }
     return "Struct '{authority.name()}' cannot be compared with '=='. Field '{found.path()}' "
         + "has type '{types.display(found.leaf())}', which has no '=='; "
         + "{noEqualityReason(found.leaf())}. Compare the fields you need directly instead.";
+}
+
+// Why a value of this type has no 'hash', or null when it has one. An optional hashes as its
+// payload does, so the payload's type decides.
+public hashabilityIssue(Type receiver) -> string? {
+    Type core = convert.coreOf(receiver);
+    if (core is FunctionType) {
+        return functionMemberIssue("hash", receiver);
+    }
+    if (core is ExternalType) {
+        return "Cannot hash a value of type '{types.display(receiver)}': {noHashReason(core)}. "
+            + "Wrap the handle in a class, which hashes by identity, or hash a value you keep "
+            + "beside it.";
+    }
+    if (core is ArrayType) {
+        Type leaf = innermostElementOf(core);
+        if (convert.containsTypeParam(leaf)) {
+            return null;
+        }
+        if (leaf is ExternalType || leaf is FunctionType) {
+            return "'{types.display(receiver)}' cannot be hashed: an array hashes element by "
+                + "element, and its element type '{types.display(leaf)}' has no hash; "
+                + "{noHashReason(leaf)}. Hash a value you keep beside the elements instead.";
+        }
+        if (isStructValue(leaf)) {
+            let inElement = firstExternalOrFunctionField(leaf, new Set<Type>());
+            if (inElement != null) {
+                return "'{types.display(receiver)}' cannot be hashed: an array hashes element "
+                    + "by element, and element field '{inElement.path()}' has type "
+                    + "'{types.display(inElement.leaf())}', which has no hash; "
+                    + "{noHashReason(inElement.leaf())}. Hash the fields you need directly "
+                    + "instead.";
+            }
+        }
+        return null;
+    }
+    if (!isStructValue(core)) {
+        return null;
+    }
+    let authority = types.authorityOf(core);
+    let found = firstExternalOrFunctionField(core, new Set<Type>());
+    if (authority == null || found == null) {
+        return null;
+    }
+    return "Struct '{authority.name()}' cannot be hashed. Field '{found.path()}' has type "
+        + "'{types.display(found.leaf())}', which has no hash; {noHashReason(found.leaf())}. "
+        + "Hash the fields you need directly instead.";
+}
+
+// Why a member cannot be read or called on a function value, whatever the member.
+public functionMemberIssue(string name, Type functionType) -> string {
+    return "A function value has no members, so '{name}' cannot be used on "
+        + "'{types.display(functionType)}': it has no identity and no text form. Call the "
+        + "value with '(...)', or keep the data you need beside it.";
+}
+
+// A standard container that hashes or orders its entries by one type argument, and how a
+// diagnostic names that argument's role, the container, and what a changing key would upset.
+public final class KeyedContainer {
+    long keyArgumentIndex;
+    string roleText;
+    string nounText;
+    string homeText;
+    string upsetText;
+
+    protected constructor(this.keyArgumentIndex, this.roleText, this.nounText, this.homeText,
+        this.upsetText);
+
+    public keyIndex() -> long {
+        return this.keyArgumentIndex;
+    }
+
+    public role() -> string {
+        return this.roleText;
+    }
+
+    public noun() -> string {
+        return this.nounText;
+    }
+
+    public home() -> string {
+        return this.homeText;
+    }
+
+    public upset() -> string {
+        return this.upsetText;
+    }
+}
+
+// The keyed standard containers, by template name and declaring module, the way sema picks
+// 'Iterable<T>'; 'SortedMap' is named ahead of the library that adds it.
+public keyedContainerOf(DeclaredType template) -> KeyedContainer? {
+    if (!(template is ClassType)) {
+        return null;
+    }
+    if (isDeclaredAs(template, "Map", "map")) {
+        return new KeyedContainer(0, "a Map key", "key", "the table", "its hash");
+    }
+    if (isDeclaredAs(template, "Set", "set")) {
+        return new KeyedContainer(0, "a Set element", "element", "the set", "its hash");
+    }
+    if (isDeclaredAs(template, "SortedMap", "sortedmap")) {
+        return new KeyedContainer(0, "a SortedMap key", "key", "the map",
+            "its place in the order");
+    }
+    return null;
+}
+
+// Why a value of this type cannot be the key argument of this container, or null when it can. A
+// key that hashes by content must not change while it sits in the container, and a key with no
+// hash at all is refused here so the error lands on the mention rather than inside the library.
+public keyTypeIssue(DeclaredType container, Type key) -> string? {
+    let keyed = keyedContainerOf(container);
+    if (keyed == null) {
+        return null;
+    }
+    Type core = convert.coreOf(key);
+    string refused = "Cannot use '{types.display(key)}' as {keyed.role()}: ";
+    if (core is ArrayType) {
+        return refused + "an array's contents, and so {keyed.upset()}, can change while it "
+            + "sits in {keyed.home()}.";
+    }
+    if (isStandardCollection(core)) {
+        return refused + "a collection's contents, and so {keyed.upset()}, can change while "
+            + "it sits in {keyed.home()}.";
+    }
+    if (core is ExternalType) {
+        return refused + "{noHashReason(core)}. Wrap the handle in a class, which hashes by "
+            + "identity, or key by a value you keep beside it.";
+    }
+    if (core is FunctionType) {
+        return refused + "{noHashReason(core)}. Keep a name or tag beside each function and "
+            + "key by that instead.";
+    }
+    if (!isStructValue(core)) {
+        return null;
+    }
+    let changeable = firstChangeableField(core, new Set<Type>());
+    if (changeable != null) {
+        return refused + "its field '{changeable.path()}' has type "
+            + "'{types.display(changeable.leaf())}', whose contents can change while the "
+            + "{keyed.noun()} sits in {keyed.home()}.";
+    }
+    let opaque = firstExternalOrFunctionField(core, new Set<Type>());
+    if (opaque != null) {
+        return refused + "its field '{opaque.path()}' has type "
+            + "'{types.display(opaque.leaf())}', which has no hash; "
+            + "{noHashReason(opaque.leaf())}.";
+    }
+    return null;
+}
+
+// True for a keyed container instantiated at a refused key. The mention that formed it was
+// reported where it was written, so the container's own bodies are never judged for it.
+hasRefusedKey(DeclaredType template, Type[] arguments) -> bool {
+    let keyed = keyedContainerOf(template);
+    if (keyed == null || keyed.keyIndex() >= arguments.length) {
+        return false;
+    }
+    return keyTypeIssue(template, arguments[keyed.keyIndex()]) != null;
+}
+
+// The standard collections by template name and declaring module; 'Deque', 'PriorityQueue', and
+// 'SortedMap' are named ahead of the library that adds them.
+isStandardCollection(Type core) -> bool {
+    if (!(core is InstantiationType)) {
+        return false;
+    }
+    let template = core.template();
+    if (!(template is ClassType)) {
+        return false;
+    }
+    return isDeclaredAs(template, "List", "list") || isDeclaredAs(template, "Map", "map")
+        || isDeclaredAs(template, "Set", "set") || isDeclaredAs(template, "Deque", "deque")
+        || isDeclaredAs(template, "PriorityQueue", "priorityqueue")
+        || isDeclaredAs(template, "SortedMap", "sortedmap");
+}
+
+isDeclaredAs(DeclaredType template, string name, string module) -> bool {
+    return template.name() == name && template.modulePath() == "std.collections." + module;
 }
 
 // Why two values of struct type 'structType' cannot serialize to JSON, or null when every field
@@ -930,10 +1161,23 @@ noEqualityReason(Type leaf) -> string {
     return "external types have no value equality";
 }
 
-// The first field, at any depth, whose type has no '=='. A field mentioning a type parameter is
-// left for the per-instantiation replay.
-firstNonComparableField(Type structType, Set<Type> visiting) -> OffendingField? {
-    if (!visiting.add(structType)) {
+// Why a leaf type has no 'hash'.
+noHashReason(Type leaf) -> string {
+    if (leaf is FunctionType) {
+        return "a function value has no identity, so it has no hash";
+    }
+    if (leaf is ArrayType) {
+        return "an array hashes element by element, and its elements have no hash of their own";
+    }
+    return "an external type is an address with no value to hash";
+}
+
+// The first field, at any depth, whose type is an external type or a function type, which have
+// neither '==' nor 'hash'. A struct that declares its own 'equals' and 'hash' answers for itself,
+// so the walk never looks inside one; a field mentioning a type parameter is left for the
+// per-instantiation replay.
+firstExternalOrFunctionField(Type structType, Set<Type> visiting) -> OffendingField? {
+    if (declaresOwnPair(structType) || !visiting.add(structType)) {
         return null;
     }
     let fields = types.fieldsOf(structType);
@@ -953,7 +1197,7 @@ firstNonComparableField(Type structType, Set<Type> visiting) -> OffendingField? 
                 return new OffendingField(field.name(), core);
             }
             if (isStructValue(element)) {
-                let inElement = firstNonComparableField(element, visiting);
+                let inElement = firstExternalOrFunctionField(element, visiting);
                 if (inElement != null) {
                     return new OffendingField(field.name(), core);
                 }
@@ -964,13 +1208,59 @@ firstNonComparableField(Type structType, Set<Type> visiting) -> OffendingField? 
             return new OffendingField(field.name(), core);
         }
         if (isStructValue(core)) {
-            let nested = firstNonComparableField(core, visiting);
+            let nested = firstExternalOrFunctionField(core, visiting);
             if (nested != null) {
                 return new OffendingField(field.name() + "." + nested.path(), nested.leaf());
             }
         }
     }
     return null;
+}
+
+// The first field, at any depth through nullable wrappers and nested structs, whose type is an
+// array or a standard collection. A field mentioning a type parameter is left for the
+// per-instantiation replay.
+firstChangeableField(Type structType, Set<Type> visiting) -> OffendingField? {
+    if (!visiting.add(structType)) {
+        return null;
+    }
+    let fields = types.fieldsOf(structType);
+    if (fields == null) {
+        return null;
+    }
+    for (long i = 0; i < fields.length(); i++) {
+        let field = fields.get(i);
+        let fieldType = field.type();
+        if (convert.containsTypeParam(fieldType)) {
+            continue;
+        }
+        Type core = convert.coreOf(fieldType);
+        if (core is ArrayType || isStandardCollection(core)) {
+            return new OffendingField(field.name(), core);
+        }
+        if (isStructValue(core)) {
+            let nested = firstChangeableField(core, visiting);
+            if (nested != null) {
+                return new OffendingField(field.name() + "." + nested.path(), nested.leaf());
+            }
+        }
+    }
+    return null;
+}
+
+// Sema holds a struct's 'hash' and 'equals' to a matched pair, so either name proves both.
+declaresOwnPair(Type structType) -> bool {
+    let methods = types.methodsOf(structType);
+    if (methods == null) {
+        return false;
+    }
+    for (long i = 0; i < methods.length(); i++) {
+        let method = methods.get(i);
+        if (!method.isConstructor() && method.name() == "hash") {
+            return true;
+        }
+    }
+    return false;
 }
 
 // The first field, at any depth, with no JSON form. A field mentioning a type parameter is left

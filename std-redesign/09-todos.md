@@ -5,11 +5,7 @@
 Shortest round-trip float formatting, for `StringBuilder.append(double)` and interpolation; exists nowhere today.
 Number formatting beyond decimal (radix, width, padding) and parsing/formatting for `decimal`.
 A modification counter in `Map`, `Set`, `SortedMap`, and their views, aborting on mutation during a walk.
-The compiler's key-type rules, ratified 2026-09-02 and scheduled as C4a.
-A type with no hash at all (an external handle, a function value) is refused by a per-instantiation obligation at every `hash()` call on a type parameter, the way `==` is checked today, which also moves the code-generation refusal of handles into sema.
-A type that hashes by content but can change (an array, or any collection) is refused as a key at the instantiation site, by the compiler's by-name list of the standard containers' key parameters, extended to every C4 container.
-A struct key is refused when any field, transitively, holds an array or a collection, naming the field, the way the comparability walk already descends into struct fields.
-Today only arrays are refused as `Map` and `Set` keys, an external handle fails only in code generation, and `Set<(int) -> char>` compiles and hashes by identity.
+The obligation registry is one per program, written by every module's resolver (since C4a) and body checker in sequential loops; sema running modules in parallel needs one registry per module, merged before the replay.
 OS-level redirection for `run(captureOutput: true)`, wait-with-timeout, and kill in the native bridges.
 The toString marker flip: after the Phase B seed and the C6 text rewrite give `StringBuilder` its `export override toString()`, Phase D makes an unmarked class method named `toString` an error, closing the A4 transition rule (ratified 2026-08-28).
 `Map.keys` and `Map.values` copy each element twice, once into a capacity-reserved list and once into the array they hand out, because a sparse gather cannot be written as the canonical fill loop the array-element check recognizes.

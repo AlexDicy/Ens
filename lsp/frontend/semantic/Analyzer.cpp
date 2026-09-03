@@ -2797,10 +2797,14 @@ void Analyzer::checkStructEquatable(Type* structT, const SyntaxNode& node) {
 // Walks a struct's fields for one whose type has no '=='. Descends through
 // nullable wrappers and nested structs, recording the dotted path to the leaf.
 // External and function-typed fields are the concrete leaves without '=='; arrays
-// and classes compare by identity, so they are fine.
+// and classes compare by identity, so they are fine. A struct that declares its
+// own 'equals' answers for itself and is never walked into.
 bool Analyzer::findNonComparableField(Type* structT, std::vector<StructInfo*>& visiting,
                                       std::string& fieldPath, Type*& leaf) {
     if (!structT || !structT->structInfo) return false;
+    for (auto& m : structT->structInfo->methods) {
+        if (m.name == u"equals") return false;
+    }
     for (StructInfo* seen : visiting) {
         if (seen == structT->structInfo) return false;
     }

@@ -1446,6 +1446,8 @@ Arrays are written with `T[]` and are reference types: declaring an array variab
 Two arrays of the same type compare with `==` and `!=` by content: unequal lengths are unequal, and equal lengths compare element by element, each element by its own `==`, so IEEE rules hold for float elements, strings compare by content, classes by identity unless their run-time class opted into content equality, and nested arrays recurse.
 An element type with no `==` of its own, such as an external handle or a function value, makes the comparison an error naming that type.
 An array cannot be a `Map` or `Set` key, because its contents, and so its hash, can change while it sits in the table.
+The same holds for a `List`, `Map`, or `Set` used as a key, and for a struct key whose fields, at any depth, hold an array or a collection; the error names the field.
+An external handle or a function value has no hash at all, so neither can be a key, and calling `hash()` on one, directly or through a type parameter, is an error naming the type.
 
 ```ens
 int[] xs = new int[5];        // 5 ints, zero-initialized
@@ -1797,7 +1799,7 @@ When a class declares such an `equals`, `==` and `!=` on that class compare by c
 Both `hash` and `equals` are written with `override`, since they replace behavior the language provides: a class's identity hash and equality, a struct's content hash and memberwise equality.
 The two are a matched pair: a type that declares one must declare the other, so equal values always hash equally.
 A declared `hash` decides the hashing of its type everywhere the value appears, including as a field of an enclosing struct, as an array element, and through a type parameter; a declared `equals` decides `==` the same way.
-A type parameter needs no bound to be hashed, since every type answers `hash()`, which is why `Map` and `Set` name their key types without one.
+A type parameter needs no bound to be hashed, since every type but an external handle or a function value answers `hash()`, which is why `Map` and `Set` name their key types without one; an instantiation at one of those two types is an error naming the type.
 Because the language calls `hash` and `equals` wherever the type is used, both follow their type's visibility when unmarked and may not be marked less visible than the type itself.
 
 For a class, which implementation runs is decided by the value's type at run time, not by the type written in the source.
@@ -1833,6 +1835,8 @@ A map or set keyed by a base class or an interface therefore finds the entry a d
 Struct keys are supported and match by content: their fields compare with `==` and hash by content, so a key rebuilt from equal field values finds the entry stored under the original.
 A struct key that declares its own `equals` and `hash` is matched and bucketed by that pair instead, so a field the pair ignores does not change which entry a key finds.
 An array cannot be a key: it compares and hashes by content, and its content can change while it sits in the table, so the entry would silently become unfindable.
+A collection cannot be a key for the same reason, nor can a struct whose fields, at any depth, hold an array or a collection; the error names the field.
+An external handle or a function value cannot be a key either, because neither has a hash to bucket by.
 
 The `@std.text.strings` module takes text apart and puts it back together.
 `split(text, separator)` returns the parts between the occurrences of the separator, so two neighboring separators give an empty part and text holding none gives one part.

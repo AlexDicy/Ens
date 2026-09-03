@@ -21,6 +21,9 @@ import ImportedType from phases.link;
 import ImportedNamespace from phases.link;
 import InstantiationMention from phases.obligations;
 import FunctionThrowsMention from phases.obligations;
+import ObligationRegistry from phases.obligations;
+import KeyTypeObligation from phases.obligations;
+import phases.obligations;
 import program.implicit;
 import SemaResult from result;
 import model.convert;
@@ -38,6 +41,7 @@ import FailedConstraint from model.types;
 import PrimitiveKind from model.types;
 import List from @std.collections.list;
 import Map from @std.collections.map;
+import Set from @std.collections.set;
 
 public class TypeResolver {
     TypeStore store;
@@ -47,6 +51,7 @@ public class TypeResolver {
     ModuleLinkTable moduleImports;
     ClassType? implicitErrorClass;
     SemaResult semaResult;
+    ObligationRegistry deferredObligations;
     List<TypeParamType> parameterScope;
     GreenNode? constraintScopeOwner;
     MemberConstraint[] constraintScope;
@@ -60,7 +65,8 @@ public class TypeResolver {
     bool inReturnPosition;
 
     public constructor(TypeStore store, string modulePath, string packagePrefix, string filePath,
-                ModuleLinkTable imports, ClassType? errorClass, SemaResult result) {
+                ModuleLinkTable imports, ClassType? errorClass, SemaResult result,
+                ObligationRegistry deferred) {
         this.store = store;
         this.resolverModulePath = modulePath;
         this.resolverPackagePrefix = packagePrefix;
@@ -68,6 +74,7 @@ public class TypeResolver {
         this.moduleImports = imports;
         this.implicitErrorClass = errorClass;
         this.semaResult = result;
+        this.deferredObligations = deferred;
         this.parameterScope = new List<TypeParamType>();
         this.constraintScopeOwner = null;
         this.noConstraints = [];
@@ -400,6 +407,11 @@ public class TypeResolver {
             if (!bounded) {
                 return this.store.errorType();
             }
+            let keyed = obligations.keyedContainerOf(base);
+            if (keyed != null && !this.acceptsKeyType(base, argumentTypes,
+                    argumentList.arguments(keyed.keyIndex()).span())) {
+                return this.store.errorType();
+            }
         } else {
             let spans = new List<Span>();
             for (long i = 0; i < given; i++) {
@@ -439,6 +451,41 @@ public class TypeResolver {
         scopes.push(guards);
         this.instantiationMentions.push(new InstantiationMention(instantiation, guardOwner,
             guards));
+    }
+
+    // The key argument of a keyed standard container, judged where its instantiation forms: a
+    // concrete key is judged here, and one naming a type parameter is judged per instantiation.
+    // True when the instantiation may form.
+    public acceptsKeyType(DeclaredType template, Type[] arguments, Span keySpan) -> bool {
+        let keyed = obligations.keyedContainerOf(template);
+        if (keyed == null || keyed.keyIndex() >= arguments.length) {
+            return true;
+        }
+        Type key = arguments[keyed.keyIndex()];
+        if (convert.containsTypeParam(key)) {
+            this.recordKeyTypeObligation(template, key, keySpan);
+            return true;
+        }
+        let issue = obligations.keyTypeIssue(template, key);
+        if (issue == null) {
+            return true;
+        }
+        this.report(issue, keySpan);
+        return false;
+    }
+
+    // Records the judgment against every generic owner the key names, guarded by the active
+    // member constraints where they speak about that owner, as a body records its own.
+    recordKeyTypeObligation(DeclaredType template, Type key, Span keySpan) {
+        let owners = new Set<GreenNode>();
+        obligations.collectOwners(key, owners);
+        for (let owner in owners.items()) {
+            let obligation = new KeyTypeObligation(template, key, keySpan);
+            if (owner == this.constraintScopeOwner) {
+                obligation.setGuards(this.constraintScope);
+            }
+            this.deferredObligations.recordObligation(owner, this.resolverFilePath, obligation);
+        }
     }
 
     mentionScopesFor(InstantiationType instantiation) -> List<MemberConstraint[]> {
@@ -575,8 +622,15 @@ public class TypeResolver {
             TypeParamType[] parameters = check.template().typeParameterTypes();
             Type[] arguments = check.arguments();
             Span[] spans = check.spans();
+            bool bounded = true;
             for (long a = 0; a < parameters.length && a < arguments.length; a++) {
-                this.checkArgumentBounds(parameters[a], arguments, spans[a]);
+                if (!this.checkArgumentBounds(parameters[a], arguments, spans[a])) {
+                    bounded = false;
+                }
+            }
+            let keyed = obligations.keyedContainerOf(check.template());
+            if (bounded && keyed != null && keyed.keyIndex() < spans.length) {
+                this.acceptsKeyType(check.template(), arguments, spans[keyed.keyIndex()]);
             }
             if (recordedOwner != null) {
                 this.popMemberConstraints();
