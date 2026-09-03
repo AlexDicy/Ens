@@ -8,7 +8,6 @@ A modification counter in `SortedMap` and its views, aborting on mutation during
 The 16 `List<string>` sorts in selfhost and libs pass `(a, b) -> a.compareTo(b)` because `string` does not implement `Comparable<string>` yet; C6 binds it and lets them drop the lambda for `sort()`.
 `types.display` of a generic template shows the bare name, so the mismatch message for `this` handed where a different instantiation is expected reads "got 'Box'" where "got 'Box<T>'" would be clearer.
 Inside a generic body, `identity(this)` against `identity<U>(U value)` binds `U` to the bare template rather than to the instantiation at the class's own parameters, and code generation then refuses the call with "does not support a parameter of type 'Box' yet" (pre-existing, confirmed on the baseline by the 2026-09-02 review); binding the self-instantiation in the type-parameter arm of `unifyArgument` is the fix, and the language server already does that, so the two disagree on this one shape until then.
-The obligation registry is one per program, written by every module's resolver (since C4a) and body checker in sequential loops; sema running modules in parallel needs one registry per module, merged before the replay.
 OS-level redirection for `run(captureOutput: true)`, wait-with-timeout, and kill in the native bridges.
 The toString marker flip: after the Phase B seed and the C6 text rewrite give `StringBuilder` its `export override toString()`, Phase D makes an unmarked class method named `toString` an error, closing the A4 transition rule (ratified 2026-08-28).
 
