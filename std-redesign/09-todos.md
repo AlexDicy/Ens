@@ -14,6 +14,9 @@ The toString marker flip: after the Phase B seed and the C6 text rewrite give `S
 
 A dedicated review pass over the diagnostic messages introduced across the whole migration, once the plan completes (requested 2026-08-27).
 
+`ens test libs/std --tests libs/std/tests` fails to compile two existing std tests that name `public` symbols of the package, while the suite's `ens test libs/std` passes them (found 2026-09-03, pre-existing).
+A tests folder handed through `--tests` seems to compile outside the package it tests, so whether such tests should see the package's `public` surface, as the in-package `tests/` folder does, wants a ruling before C7 and C8 write theirs.
+
 Two external handles compared with each other are accepted by sema and refused by code generation (found 2026-08-30, pre-existing).
 `h1 == h2` over two handles reports `The self-hosted code generator does not support comparing 'Handle?' with 'Handle' yet`, while the spec says a handle is passed around and compared with `null`, which is the only comparison it names.
 So either sema should refuse the handle-to-handle comparison and say why, or code generation should answer it by identity the way a presence check already does.
