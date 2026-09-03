@@ -1,0 +1,464 @@
+import Entry from @std.collections.entry;
+import Iterable from @std.collections.iterator;
+import Iterator from @std.collections.iterator;
+import List from @std.collections.list;
+
+// Values found by key and walked in the order the keys sort, which is what a Map does not promise.
+// Lookup costs more than a Map's in exchange for that order.
+//
+// The entries are the nodes of an AVL tree: the two subtrees under any node differ in height by at
+// most one, so every path from the root is O(log n) long, and one rotation at each node on the way
+// back up from an insertion or a removal keeps it so.
+export final class SortedMap<K, V> implements Iterable<Entry<K, V>>, Copyable<SortedMap<K, V>> {
+    protected TreeNode<K, V>? root;
+    protected long count;
+    (K, K) -> int order;
+
+    // How many times entries were added or removed, which is how a walk learns the map moved under
+    // it. Overwriting a value moves nothing, so it does not count.
+    protected long changes;
+
+    export constructor<K: Comparable<K>>() {
+        this.root = null;
+        this.count = 0;
+        this.changes = 0;
+        this.order = (a, b) -> a.compareTo(b);
+    }
+
+    // A map whose keys sort as `order` says: negative when its first argument sorts first, zero
+    // when neither does, positive when the second does. Two keys the order calls equal are one key.
+    export constructor((K, K) -> int order) {
+        this.root = null;
+        this.count = 0;
+        this.changes = 0;
+        this.order = order;
+    }
+
+    export length() -> long {
+        return this.count;
+    }
+
+    export isEmpty() -> bool {
+        return this.count == 0;
+    }
+
+    // The value stored under `key`, or null when the map holds no such key. For a map whose values
+    // are themselves nullable, a stored null and a missing key are told apart by the two levels:
+    // the outer null means the key is absent.
+    export get(K key) -> V? {
+        let node = this.findNode(this.root, key);
+        if (node == null) {
+            return null;
+        }
+        return node.value;
+    }
+
+    export set(K key, V value) {
+        this.root = this.inserted(this.root, key, value);
+    }
+
+    export contains(K key) -> bool {
+        return this.findNode(this.root, key) != null;
+    }
+
+    // Removes the key and its value, and answers whether there was one.
+    export remove(K key) -> bool {
+        long countBefore = this.count;
+        this.root = this.without(this.root, key);
+        return this.count < countBefore;
+    }
+
+    // Removes every entry the test accepts, in one pass, and answers how many went. The entries
+    // that stay are rebuilt into a tree with the middle key on top.
+    export removeWhere((K, V) -> bool test) -> long {
+        let kept = new List<TreeNode<K, V>>();
+        let walk = new NodeWalk<K, V>(this);
+        let node = walk.nextNode();
+        while (node != null) {
+            if (!test(node.key, node.value)) {
+                kept.push(node);
+            }
+            node = walk.nextNode();
+        }
+        long removed = this.count - kept.length();
+        if (removed > 0) {
+            this.root = treeOf(kept, 0, kept.length() - 1);
+            this.count = kept.length();
+            this.changes = this.changes + 1;
+        }
+        return removed;
+    }
+
+    export clear() {
+        if (this.count == 0) {
+            return;
+        }
+        this.root = null;
+        this.count = 0;
+        this.changes = this.changes + 1;
+    }
+
+    // The value under `key`, storing what `make` builds when the key is absent. `make` runs only
+    // then.
+    export getOrInsert(K key, () -> V make) -> V {
+        let node = this.findNode(this.root, key);
+        if (node != null) {
+            return node.value;
+        }
+        let made = make();
+        this.root = this.inserted(this.root, key, made);
+        return made;
+    }
+
+    // The smallest and largest keys. Both abort the program on an empty map.
+    export firstKey() -> K {
+        let root = this.root;
+        if (root == null) {
+            panic("firstKey of an empty sorted map: check isEmpty() first");
+        }
+        return leftmost(root).key;
+    }
+
+    export lastKey() -> K {
+        let root = this.root;
+        if (root == null) {
+            panic("lastKey of an empty sorted map: check isEmpty() first");
+        }
+        return rightmost(root).key;
+    }
+
+    // Views onto the live map, walked in key order without copying anything. Adding or removing
+    // entries while one of these is being walked aborts the program; overwriting a value does not.
+    export keys() -> Iterable<K> {
+        return new KeyView<K, V>(this);
+    }
+
+    export values() -> Iterable<V> {
+        return new ValueView<K, V>(this);
+    }
+
+    export override makeIterator() -> Iterator<Entry<K, V>> {
+        return new EntryIterator<K, V>(new NodeWalk<K, V>(this));
+    }
+
+    export override copy() -> SortedMap<K, V> {
+        let copied = new SortedMap<K, V>(this.order);
+        copied.root = copyOf(this.root);
+        copied.count = this.count;
+        return copied;
+    }
+
+    // The node under `node` holding `key`, or null. It recurses rather than loops because a loop
+    // would retain and release every node it moves onto.
+    findNode(TreeNode<K, V>? node, K key) -> TreeNode<K, V>? {
+        if (node == null) {
+            return null;
+        }
+        int comparison = this.order(key, node.key);
+        if (comparison == 0) {
+            return node;
+        }
+        if (comparison < 0) {
+            return this.findNode(node.left, key);
+        }
+        return this.findNode(node.right, key);
+    }
+
+    // The subtree `node` with `value` stored under `key`: a node added and the path back up
+    // rebalanced when the key is new, the value overwritten when it is not.
+    inserted(TreeNode<K, V>? node, K key, V value) -> TreeNode<K, V> {
+        if (node == null) {
+            this.count = this.count + 1;
+            this.changes = this.changes + 1;
+            return new TreeNode<K, V>(key, value);
+        }
+        int comparison = this.order(key, node.key);
+        if (comparison == 0) {
+            node.value = value;
+            return node;
+        }
+        if (comparison < 0) {
+            node.left = this.inserted(node.left, key, value);
+        } else {
+            node.right = this.inserted(node.right, key, value);
+        }
+        return rebalanced(node);
+    }
+
+    // The subtree `node` without the entry under `key`, rebalanced on the way back up. A node with
+    // two children takes over the entry of the next key after its own and gives up that node
+    // instead, so the order around it holds.
+    without(TreeNode<K, V>? node, K key) -> TreeNode<K, V>? {
+        if (node == null) {
+            return null;
+        }
+        int comparison = this.order(key, node.key);
+        if (comparison < 0) {
+            node.left = this.without(node.left, key);
+        } else if (comparison > 0) {
+            node.right = this.without(node.right, key);
+        } else {
+            this.count = this.count - 1;
+            this.changes = this.changes + 1;
+            let left = node.left;
+            let right = node.right;
+            if (left == null) {
+                return right;
+            }
+            if (right == null) {
+                return left;
+            }
+            let successor = leftmost(right);
+            node.key = successor.key;
+            node.value = successor.value;
+            node.right = withoutLeftmost(right);
+        }
+        return rebalanced(node);
+    }
+}
+
+class TreeNode<K, V> {
+    protected K key;
+    protected V value;
+    protected TreeNode<K, V>? left;
+    protected TreeNode<K, V>? right;
+    protected int height;
+
+    protected constructor(this.key, this.value) {
+        this.left = null;
+        this.right = null;
+        this.height = 1;
+    }
+}
+
+// A walk over the nodes of a sorted map in key order, which aborts the program on the first step
+// after the map changed. `pending` holds the path down to the next node, deepest last, so no step
+// recurses.
+class NodeWalk<K, V> {
+    SortedMap<K, V> map;
+    long changesAtStart;
+    List<TreeNode<K, V>> pending;
+
+    protected constructor(this.map) {
+        this.changesAtStart = this.map.changes;
+        this.pending = new List<TreeNode<K, V>>();
+        this.descend(this.map.root);
+    }
+
+    // The next node in key order, or null once the walk is over.
+    protected nextNode() -> TreeNode<K, V>? {
+        if (this.map.changes != this.changesAtStart) {
+            panic("sorted map changed during a walk: finish the walk before changing it, "
+                + "or use removeWhere");
+        }
+        if (this.pending.isEmpty()) {
+            return null;
+        }
+        let node = this.pending.pop();
+        this.descend(node.right);
+        return node;
+    }
+
+    // Pushes `node` and the nodes down its left spine, the smallest of them last.
+    descend(TreeNode<K, V>? node) {
+        let current = node;
+        while (current != null) {
+            this.pending.push(current);
+            current = current.left;
+        }
+    }
+}
+
+class EntryIterator<K, V> implements Iterator<Entry<K, V>> {
+    NodeWalk<K, V> walk;
+
+    protected constructor(this.walk);
+
+    protected override next() -> Entry<K, V>? {
+        let node = this.walk.nextNode();
+        if (node == null) {
+            return null;
+        }
+        Entry<K, V> entry = {key: node.key, value: node.value};
+        return entry;
+    }
+}
+
+class KeyIterator<K, V> implements Iterator<K> {
+    NodeWalk<K, V> walk;
+
+    protected constructor(this.walk);
+
+    protected override next() -> K? {
+        let node = this.walk.nextNode();
+        if (node == null) {
+            return null;
+        }
+        return node.key;
+    }
+}
+
+class ValueIterator<K, V> implements Iterator<V> {
+    NodeWalk<K, V> walk;
+
+    protected constructor(this.walk);
+
+    protected override next() -> V? {
+        let node = this.walk.nextNode();
+        if (node == null) {
+            return null;
+        }
+        return node.value;
+    }
+}
+
+class KeyView<K, V> implements Iterable<K> {
+    SortedMap<K, V> map;
+
+    protected constructor(this.map);
+
+    protected override makeIterator() -> Iterator<K> {
+        return new KeyIterator<K, V>(new NodeWalk<K, V>(this.map));
+    }
+}
+
+class ValueView<K, V> implements Iterable<V> {
+    SortedMap<K, V> map;
+
+    protected constructor(this.map);
+
+    protected override makeIterator() -> Iterator<V> {
+        return new ValueIterator<K, V>(new NodeWalk<K, V>(this.map));
+    }
+}
+
+// The subtree `node` without its leftmost node, rebalanced on the way back up.
+withoutLeftmost<K, V>(TreeNode<K, V> node) -> TreeNode<K, V>? {
+    let left = node.left;
+    if (left == null) {
+        return node.right;
+    }
+    node.left = withoutLeftmost(left);
+    return rebalanced(node);
+}
+
+leftmost<K, V>(TreeNode<K, V> node) -> TreeNode<K, V> {
+    let current = node;
+    let left = current.left;
+    while (left != null) {
+        current = left;
+        left = current.left;
+    }
+    return current;
+}
+
+rightmost<K, V>(TreeNode<K, V> node) -> TreeNode<K, V> {
+    let current = node;
+    let right = current.right;
+    while (right != null) {
+        current = right;
+        right = current.right;
+    }
+    return current;
+}
+
+heightOf<K, V>(TreeNode<K, V>? node) -> int {
+    if (node == null) {
+        return 0;
+    }
+    return node.height;
+}
+
+updateHeight<K, V>(TreeNode<K, V> node) {
+    int leftHeight = heightOf(node.left);
+    int rightHeight = heightOf(node.right);
+    node.height = 1 + (leftHeight > rightHeight ? leftHeight : rightHeight);
+}
+
+// `node` with its height brought up to date, rotated first when its subtrees' heights differ by
+// two, which is the most one insertion or removal can put them apart.
+rebalanced<K, V>(TreeNode<K, V> node) -> TreeNode<K, V> {
+    int leftHeight = heightOf(node.left);
+    int rightHeight = heightOf(node.right);
+    if (leftHeight - rightHeight > 1) {
+        return rotatedRightAt(node);
+    }
+    if (rightHeight - leftHeight > 1) {
+        return rotatedLeftAt(node);
+    }
+    node.height = 1 + (leftHeight > rightHeight ? leftHeight : rightHeight);
+    return node;
+}
+
+// `node` rotated right to bring its taller left subtree up. A left subtree leaning right is
+// rotated left first, so that the one rotation at `node` then balances it.
+rotatedRightAt<K, V>(TreeNode<K, V> node) -> TreeNode<K, V> {
+    let pivot = node.left;
+    if (pivot == null) {
+        return node;
+    }
+    let pivotRight = pivot.right;
+    if (pivotRight != null && heightOf(pivotRight) > heightOf(pivot.left)) {
+        node.left = rotatedLeft(pivot, pivotRight);
+        return rotatedRight(node, pivotRight);
+    }
+    return rotatedRight(node, pivot);
+}
+
+// `node` rotated left to bring its taller right subtree up. A right subtree leaning left is
+// rotated right first, so that the one rotation at `node` then balances it.
+rotatedLeftAt<K, V>(TreeNode<K, V> node) -> TreeNode<K, V> {
+    let pivot = node.right;
+    if (pivot == null) {
+        return node;
+    }
+    let pivotLeft = pivot.left;
+    if (pivotLeft != null && heightOf(pivotLeft) > heightOf(pivot.right)) {
+        node.right = rotatedRight(pivot, pivotLeft);
+        return rotatedLeft(node, pivotLeft);
+    }
+    return rotatedLeft(node, pivot);
+}
+
+// The subtree rooted at `pivot`, the right child of `node`, once `node` has become its left child.
+rotatedLeft<K, V>(TreeNode<K, V> node, TreeNode<K, V> pivot) -> TreeNode<K, V> {
+    node.right = pivot.left;
+    pivot.left = node;
+    updateHeight(node);
+    updateHeight(pivot);
+    return pivot;
+}
+
+// The subtree rooted at `pivot`, the left child of `node`, once `node` has become its right child.
+rotatedRight<K, V>(TreeNode<K, V> node, TreeNode<K, V> pivot) -> TreeNode<K, V> {
+    node.left = pivot.right;
+    pivot.right = node;
+    updateHeight(node);
+    updateHeight(pivot);
+    return pivot;
+}
+
+// A tree of `nodes[low..high]`, which are in key order, with the middle one on top of each part.
+treeOf<K, V>(List<TreeNode<K, V>> nodes, long low, long high) -> TreeNode<K, V>? {
+    if (low > high) {
+        return null;
+    }
+    long middle = (low + high) / 2;
+    let node = nodes.get(middle);
+    node.left = treeOf(nodes, low, middle - 1);
+    node.right = treeOf(nodes, middle + 1, high);
+    updateHeight(node);
+    return node;
+}
+
+// A duplicate of the subtree `node` sharing its keys and values.
+copyOf<K, V>(TreeNode<K, V>? node) -> TreeNode<K, V>? {
+    if (node == null) {
+        return null;
+    }
+    let copied = new TreeNode<K, V>(node.key, node.value);
+    copied.left = copyOf(node.left);
+    copied.right = copyOf(node.right);
+    copied.height = node.height;
+    return copied;
+}

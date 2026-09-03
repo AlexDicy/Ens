@@ -4,8 +4,9 @@
 
 Shortest round-trip float formatting, for `StringBuilder.append(double)` and interpolation; exists nowhere today.
 Number formatting beyond decimal (radix, width, padding) and parsing/formatting for `decimal`.
-A modification counter in `SortedMap` and its views, aborting on mutation during a walk, as `Map` and `Set` have since C4b.
 The 16 `List<string>` sorts in selfhost and libs pass `(a, b) -> a.compareTo(b)` because `string` does not implement `Comparable<string>` yet; C6 binds it and lets them drop the lambda for `sort()`.
+A call through a function value held in a field retains and releases the closure around every call, and a function-typed parameter is retained at entry and released at exit, so a comparator handed down a recursion pays two atomics per level (measured 2026-09-03 at -O2: 2ns per call through a parameter inside one function, 16ns through a field).
+Escape analysis should elide both; until it does, `SortedMap` reads `this.order` at every step and recurses in its lookup rather than looping, since a loop retains and releases every node it moves onto (a million lookups took 0.35s looping and 0.07s recursing).
 `types.display` of a generic template shows the bare name, so the mismatch message for `this` handed where a different instantiation is expected reads "got 'Box'" where "got 'Box<T>'" would be clearer.
 Inside a generic body, `identity(this)` against `identity<U>(U value)` binds `U` to the bare template rather than to the instantiation at the class's own parameters, and code generation then refuses the call with "does not support a parameter of type 'Box' yet" (pre-existing, confirmed on the baseline by the 2026-09-02 review); binding the self-instantiation in the type-parameter arm of `unifyArgument` is the fix, and the language server already does that, so the two disagree on this one shape until then.
 OS-level redirection for `run(captureOutput: true)`, wait-with-timeout, and kill in the native bridges.

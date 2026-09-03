@@ -1816,6 +1816,13 @@ The collection modules build on hashing and iteration:
   Make the change after the walk, or remove with `removeWhere`.
 - `Set<T>` from `@std.collections.set` stores each value once: `add(value)` returns whether the value was new, plus `contains(value)`, `remove(value)`, `length()`, and `toArray()`.
   Iterating a set yields its values.
+- `Deque<T>` from `@std.collections.deque` grows and shrinks at either end: `pushFront(value)` and `pushBack(value)`, `popFront()` and `popBack()` removing and returning a value, `first()`, `last()`, and `get(index)` counting from the front, plus `toArray()`.
+  Iterating a deque yields its values from the front to the back.
+- `PriorityQueue<T>` from `@std.collections.priorityqueue` takes values out smallest first: `push(value)`, `pop()` removing and returning the smallest value, and `peek()` reading it without removing it.
+  "Smallest" follows the natural order of a `Comparable` element, or the comparison given to the constructor.
+  Iterating a priority queue yields every value once, in no particular order.
+- `SortedMap<K, V>` from `@std.collections.sortedmap` has the operations of `Map` plus `firstKey()` and `lastKey()`, and walks its entries in key order, following the natural order of a `Comparable` key or the comparison given to the constructor.
+  Adding or removing entries while a sorted map or one of its views is being walked aborts the program, as it does for a `Map`.
 - `List.sort(order)` puts a list in the order a comparison describes, and `sort()` with no argument uses the natural order when the element type implements `Comparable`.
   Whether values the order calls equal keep the order they arrived in is not promised.
 
