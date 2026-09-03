@@ -4,13 +4,13 @@
 
 Shortest round-trip float formatting, for `StringBuilder.append(double)` and interpolation; exists nowhere today.
 Number formatting beyond decimal (radix, width, padding) and parsing/formatting for `decimal`.
-A modification counter in `Map`, `Set`, `SortedMap`, and their views, aborting on mutation during a walk.
+A modification counter in `SortedMap` and its views, aborting on mutation during a walk, as `Map` and `Set` have since C4b.
+The 16 `List<string>` sorts in selfhost and libs pass `(a, b) -> a.compareTo(b)` because `string` does not implement `Comparable<string>` yet; C6 binds it and lets them drop the lambda for `sort()`.
+`types.display` of a generic template shows the bare name, so the mismatch message for `this` handed where a different instantiation is expected reads "got 'Box'" where "got 'Box<T>'" would be clearer.
+Inside a generic body, `identity(this)` against `identity<U>(U value)` binds `U` to the bare template rather than to the instantiation at the class's own parameters, and code generation then refuses the call with "does not support a parameter of type 'Box' yet" (pre-existing, confirmed on the baseline by the 2026-09-02 review); binding the self-instantiation in the type-parameter arm of `unifyArgument` is the fix, and the language server already does that, so the two disagree on this one shape until then.
 The obligation registry is one per program, written by every module's resolver (since C4a) and body checker in sequential loops; sema running modules in parallel needs one registry per module, merged before the replay.
 OS-level redirection for `run(captureOutput: true)`, wait-with-timeout, and kill in the native bridges.
 The toString marker flip: after the Phase B seed and the C6 text rewrite give `StringBuilder` its `export override toString()`, Phase D makes an unmarked class method named `toString` an error, closing the A4 transition rule (ratified 2026-08-28).
-`Map.keys` and `Map.values` copy each element twice, once into a capacity-reserved list and once into the array they hand out, because a sparse gather cannot be written as the canonical fill loop the array-element check recognizes.
-Measured with class keys at -O2 that is 301ms, against 351ms for a growing list and 401ms for a walk through the pair-building iterator, so the reserved list is the best of the three available forms; `Set.items` pays nothing because its iterator yields the element itself and fills the result directly.
-C4 removes the copy entirely by turning both into the `Iterable` views 04-collections.md specifies, and a key-only cursor would close it sooner at the price of code those views delete.
 
 A dedicated review pass over the diagnostic messages introduced across the whole migration, once the plan completes (requested 2026-08-27).
 
@@ -40,6 +40,8 @@ Three more false errors the server shows on valid code, all pre-existing and all
 Its type model carries no thrown-type list on a function type, only a flag, so a type argument that appears only in a `throws` list can never be inferred there.
 It does not treat a value of `Bag<int>`, where `Bag<T> extends Iterable<T>`, as an `Iterable<int>`, which `tests/interface_extends.ens` already showed as spurious assignment and `override` errors before this change.
 Its parser rejects a local declaration whose type is a parenthesized function type with a `throws` list, `(() -> int throws Failure) safe = ...`, and every statement after it in the block is then misread.
+
+A generic static call result does not feed the server's type-argument inference (found 2026-09-02, pre-existing, left for the replacement): after `let words = List<string>.of([...])`, `countOf(words)` against `countOf<T>(Collection<T> items)` reports "Cannot infer type argument 'T'", while the same call infers from a local with a written type or from `new List<string>()`; the compiler infers all three.
 
 A private base field is still treated as inherited, unlike a private base method (found 2026-08-31, pre-existing).
 A subclass declaring a field whose name a private base field already uses is refused with "Field is already declared in base class", and because that ends the subclass's own field collection, its own reads of the name are rewired onto the base's private field and refused a second time for privacy, from inside the subclass.

@@ -140,8 +140,8 @@ export final class Map<K, V> implements Iterable<Entry<K, V>>, Copyable<Map<K, V
     // then, and the key is found once rather than once per step.
     export getOrInsert(K key, () -> V make) -> V;
 
-    // Views onto the live map, walked without copying anything. Changing the map while one of these
-    // is being walked aborts the program.
+    // Views onto the live map, walked without copying anything. Adding or removing entries while one
+    // of these is being walked aborts the program; overwriting a value does not.
     export keys() -> Iterable<K>;
     export values() -> Iterable<V>;
 
@@ -272,8 +272,8 @@ export final class SortedMap<K, V> implements Iterable<Entry<K, V>>, Copyable<So
     export firstKey() -> K;
     export lastKey() -> K;
 
-    // Views onto the live map, walked in key order without copying anything. Changing the map while
-    // one of these is being walked aborts the program.
+    // Views onto the live map, walked in key order without copying anything. Adding or removing
+    // entries while one of these is being walked aborts the program; overwriting a value does not.
     export keys() -> Iterable<K>;
     export values() -> Iterable<V>;
 
@@ -288,6 +288,7 @@ The ladder is two levels and read-only; no MutableCollection split, no indexed S
 `Map` implements `Iterable<Entry>` but not `Collection<Entry>`, because inheriting a contains over entries is useless when callers want it over keys.
 `Pair` is renamed `Entry<K, V>` with `const` fields.
 Mutating a map or set while walking it aborts the program, detected by a modification counter; today it silently returns wrong results.
+Only a structural change counts (ratified 2026-09-03): inserting, removing, clearing, and `removeWhere` abort a walk in progress, while `set` on a key the map already holds does not, so values can be updated in place during a walk.
 `indexOf` answers -1 rather than `long?`, matching `string.indexOf`.
 No `firstOrNull`, `lastOrNull`, or `popOrNull`; `first`, `last`, and `pop` abort on empty per the contract rule.
 `push`, `pop`, and `pushAll` on `List`; `add` on `Set`, deliberately, since a set has no position.

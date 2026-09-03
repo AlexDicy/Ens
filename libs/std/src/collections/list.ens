@@ -1,22 +1,17 @@
+import Collection from @std.collections.iterator;
 import Iterable from @std.collections.iterator;
 import Iterator from @std.collections.iterator;
 import RawArray from @std.collections.rawarray;
 
-// A growable, generic array. The store doubles when full, so only the first `count` slots hold
-// pushed values and every indexed operation answers to `count` rather than to the store's size.
-export class List<T> implements Iterable<T> {
-    RawArray<T> items;
-    long count;
+// A growable sequence of values, kept in the order they were put in. Only the first `count` slots
+// of the store hold values, so every indexed operation answers to `count` rather than to the store.
+export final class List<T> implements Collection<T>, Copyable<List<T>> {
+    protected RawArray<T> items;
+    protected long count;
 
     export constructor() {
         this.items = RawArray<T>.allocate(4);
         this.count = 0;
-    }
-
-    // A list with room for this many values before its store has to grow, for a caller that
-    // knows the count it is about to push.
-    export static withCapacity(long capacity) -> List<T> {
-        return new List<T>(capacity);
     }
 
     constructor(long capacity) {
@@ -24,40 +19,247 @@ export class List<T> implements Iterable<T> {
         this.count = 0;
     }
 
-    export push(T value) {
-        if (this.count == this.items.length()) {
-            this.grow();
-        }
-        this.items.write(this.count, value);
-        this.count = this.count + 1;
+    // A list that can hold `capacity` values before it has to grow. The length is still zero.
+    export static withCapacity(long capacity) -> List<T> {
+        return new List<T>(capacity);
     }
 
-    export pop() -> T {
-        if (this.count == 0) {
-            panic("pop from an empty list");
+    // A list holding `values`, in that order.
+    export static of(T[] values) -> List<T> {
+        let list = new List<T>(values.length);
+        for (let value in values) {
+            list.push(value);
         }
-        let value = this.items.read(this.count - 1);
-        this.count = this.count - 1;
-        this.items.clear(this.count);
-        return value;
+        return list;
     }
 
+    export override length() -> long {
+        return this.count;
+    }
+
+    export override isEmpty() -> bool {
+        return this.count == 0;
+    }
+
+    export override contains(T value) -> bool {
+        return this.indexOf(value) >= 0;
+    }
+
+    export override makeIterator() -> Iterator<T> {
+        return new ListIterator<T>(this);
+    }
+
+    // The value at `index`. An index outside the list aborts the program, because reading past the
+    // end is a mistake in the caller rather than a condition to recover from.
     export get(long index) -> T {
-        if (index < 0 || index >= this.count) {
-            panic("list index {index} is out of bounds for length {this.count}");
-        }
+        this.checkIndex(index);
         return this.items.read(index);
     }
 
     export set(long index, T value) {
-        if (index < 0 || index >= this.count) {
-            panic("list index {index} is out of bounds for length {this.count}");
-        }
+        this.checkIndex(index);
         this.items.write(index, value);
     }
 
-    export length() -> long {
-        return this.count;
+    // The first and last values. Either one aborts the program on an empty list.
+    export first() -> T {
+        if (this.count == 0) {
+            panic("first of an empty list: check isEmpty() first");
+        }
+        return this.items.read(0);
+    }
+
+    export last() -> T {
+        if (this.count == 0) {
+            panic("last of an empty list: check isEmpty() first");
+        }
+        return this.items.read(this.count - 1);
+    }
+
+    export push(T value) {
+        this.reserve(this.count + 1);
+        this.items.write(this.count, value);
+        this.count = this.count + 1;
+    }
+
+    export pushAll(Iterable<T> values) {
+        for (let value in values) {
+            this.push(value);
+        }
+    }
+
+    // Takes the last value off and answers it. Aborts the program on an empty list.
+    export pop() -> T {
+        if (this.count == 0) {
+            panic("pop from an empty list: check isEmpty() first");
+        }
+        this.count = this.count - 1;
+        let value = this.items.read(this.count);
+        this.items.clear(this.count);
+        return value;
+    }
+
+    // Puts `value` at `index` and moves the values from there on one place up. An index equal to
+    // the length appends; one beyond that aborts the program.
+    export insert(long index, T value) {
+        if (index < 0 || index > this.count) {
+            panic("list index {index} is out of bounds for length {this.count}");
+        }
+        this.reserve(this.count + 1);
+        for (long i = this.count; i > index; i--) {
+            this.items.write(i, this.items.read(i - 1));
+        }
+        this.items.write(index, value);
+        this.count = this.count + 1;
+    }
+
+    // Takes the value at `index` out, moves the values after it one place down, and answers it.
+    export removeAt(long index) -> T {
+        this.checkIndex(index);
+        let removed = this.items.read(index);
+        this.count = this.count - 1;
+        for (long i = index; i < this.count; i++) {
+            this.items.write(i, this.items.read(i + 1));
+        }
+        this.items.clear(this.count);
+        return removed;
+    }
+
+    // Removes the first value equal to `value`, and answers whether there was one.
+    export remove(T value) -> bool {
+        long index = this.indexOf(value);
+        if (index < 0) {
+            return false;
+        }
+        this.removeAt(index);
+        return true;
+    }
+
+    // Removes every value the test accepts, in one pass, and answers how many went.
+    export removeWhere((T) -> bool test) -> long {
+        long kept = 0;
+        for (long i = 0; i < this.count; i++) {
+            let value = this.items.read(i);
+            if (!test(value)) {
+                this.items.write(kept, value);
+                kept = kept + 1;
+            }
+        }
+        long removed = this.count - kept;
+        this.dropFrom(kept);
+        return removed;
+    }
+
+    export clear() {
+        this.dropFrom(0);
+    }
+
+    // Makes room for `capacity` values before the store has to grow again.
+    export reserve(long capacity) {
+        if (capacity <= this.items.length()) {
+            return;
+        }
+        long size = this.items.length();
+        while (size < capacity) {
+            size = size * 2;
+        }
+        let grown = RawArray<T>.allocate(size);
+        for (long i = 0; i < this.count; i++) {
+            grown.write(i, this.items.read(i));
+        }
+        this.items = grown;
+    }
+
+    // Where the first value equal to `value` sits, or -1 when the list holds none.
+    export indexOf(T value) -> long {
+        for (long i = 0; i < this.count; i++) {
+            if (this.items.read(i) == value) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    // Where the first value the test accepts sits, or -1 when the test accepts none.
+    export indexWhere((T) -> bool test) -> long {
+        for (long i = 0; i < this.count; i++) {
+            if (test(this.items.read(i))) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    // Puts the values in the order `order` describes: negative when its first argument sorts
+    // first, zero when neither does, positive when the second does. Whether values the order calls
+    // equal keep the order they arrived in is not promised.
+    export sort((T, T) -> int order) {
+        if (this.count < 2) {
+            return;
+        }
+        RawArray<T> source = this.items;
+        RawArray<T> target = RawArray<T>.allocate(this.count);
+        bool sortedInScratch = false;
+        long width = 1;
+        while (width < this.count) {
+            long start = 0;
+            while (start < this.count) {
+                mergeRuns(source, target, start, smaller(start + width, this.count),
+                    smaller(start + width * 2, this.count), order);
+                start = start + width * 2;
+            }
+            let merged = target;
+            target = source;
+            source = merged;
+            sortedInScratch = !sortedInScratch;
+            width = width * 2;
+        }
+        if (sortedInScratch) {
+            for (long i = 0; i < this.count; i++) {
+                this.items.write(i, source.read(i));
+            }
+        }
+    }
+
+    export sort<T: Comparable<T>>() {
+        this.sort((a, b) -> a.compareTo(b));
+    }
+
+    export sorted((T, T) -> int order) -> List<T> {
+        let result = this.copy();
+        result.sort(order);
+        return result;
+    }
+
+    export sorted<T: Comparable<T>>() -> List<T> {
+        return this.sorted((a, b) -> a.compareTo(b));
+    }
+
+    export reverse() {
+        long low = 0;
+        long high = this.count - 1;
+        while (low < high) {
+            let value = this.items.read(low);
+            this.items.write(low, this.items.read(high));
+            this.items.write(high, value);
+            low = low + 1;
+            high = high - 1;
+        }
+    }
+
+    export reversed() -> List<T> {
+        let result = this.copy();
+        result.reverse();
+        return result;
+    }
+
+    export override copy() -> List<T> {
+        let result = new List<T>(this.count);
+        for (long i = 0; i < this.count; i++) {
+            result.items.write(i, this.items.read(i));
+        }
+        result.count = this.count;
+        return result;
     }
 
     export toArray() -> T[] {
@@ -68,36 +270,59 @@ export class List<T> implements Iterable<T> {
         return copied;
     }
 
-    export override makeIterator() -> Iterator<T> {
-        return new ListIterator<T>(this.items, this.count);
+    checkIndex(long index) {
+        if (index < 0 || index >= this.count) {
+            panic("list index {index} is out of bounds for length {this.count}");
+        }
     }
 
-    grow() {
-        let grown = RawArray<T>.allocate(this.items.length() * 2);
-        long i = 0;
-        while (i < this.count) {
-            grown.write(i, this.items.read(i));
-            i = i + 1;
+    // Gives up every value from `kept` on, so each one is released there and then.
+    dropFrom(long kept) {
+        for (long i = kept; i < this.count; i++) {
+            this.items.clear(i);
         }
-        this.items = grown;
+        this.count = kept;
     }
 }
 
 class ListIterator<T> implements Iterator<T> {
-    RawArray<T> items;
-    long count;
+    List<T> list;
     long position;
 
-    protected constructor(this.items, this.count) {
+    protected constructor(this.list) {
         this.position = 0;
     }
 
     protected override next() -> T? {
-        if (this.position >= this.count) {
+        if (this.position >= this.list.count) {
             return null;
         }
-        let value = this.items.read(this.position);
+        let value = this.list.items.read(this.position);
         this.position = this.position + 1;
         return value;
     }
+}
+
+// Merges the runs [start, middle) and [middle, end) of `source` into the same range of `target`,
+// keeping a value from the first run ahead of an equal one from the second.
+mergeRuns<T>(RawArray<T> source, RawArray<T> target, long start, long middle, long end,
+        (T, T) -> int order) {
+    long left = start;
+    long right = middle;
+    for (long at = start; at < end; at++) {
+        if (left < middle && (right >= end || order(source.read(left), source.read(right)) <= 0)) {
+            target.write(at, source.read(left));
+            left = left + 1;
+        } else {
+            target.write(at, source.read(right));
+            right = right + 1;
+        }
+    }
+}
+
+smaller(long value, long limit) -> long {
+    if (value > limit) {
+        return limit;
+    }
+    return value;
 }

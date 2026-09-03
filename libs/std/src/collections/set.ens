@@ -1,150 +1,127 @@
-import Iterable from @std.collections.iterator;
+import Collection from @std.collections.iterator;
 import Iterator from @std.collections.iterator;
-import RawArray from @std.collections.rawarray;
+import KeyIterator from @std.collections.map;
+import Map from @std.collections.map;
+import SlotWalk from @std.collections.map;
 
-// A hash set with open addressing and linear probing, sharing Map's slot
-// layout: states are 0 = empty, 1 = occupied, 2 = removed. Items compare
-// with '==' and hash with hash(). A slot holds an item only while its state
-// says so, which is why the items are a raw store.
-export class Set<T> implements Iterable<T> {
-    RawArray<T> slotItems;
-    byte[] slotStates;
-    long count;
-    long capacity;
+// A collection that holds each value once. The order a walk visits them in is not specified.
+//
+// The values are the keys of a map, so the table, its probing, and its change counting live there.
+export final class Set<T> implements Collection<T>, Copyable<Set<T>> {
+    Map<T, bool> table;
 
     export constructor() {
-        this.capacity = 16;
-        this.slotItems = RawArray<T>.allocate(this.capacity);
-        this.slotStates = new byte[this.capacity];
-        this.count = 0;
+        this.table = new Map<T, bool>();
     }
 
-    export add(T item) -> bool {
-        if (this.findSlot(item) >= 0) {
-            return false;
+    constructor(Map<T, bool> table) {
+        this.table = table;
+    }
+
+    // A set that can hold `capacity` values before its table has to grow.
+    export static withCapacity(long capacity) -> Set<T> {
+        return new Set<T>(Map<T, bool>.withCapacity(capacity));
+    }
+
+    // A set holding `values`, each once.
+    export static of(T[] values) -> Set<T> {
+        let set = Set<T>.withCapacity(values.length);
+        for (let value in values) {
+            set.add(value);
         }
-        if ((this.count + 1) * 4 > this.capacity * 3) {
-            this.resize();
-        }
-        long slot = this.freeSlot(item);
-        this.slotItems.write(slot, item);
-        this.slotStates[slot] = 1;
-        this.count = this.count + 1;
-        return true;
+        return set;
     }
 
-    export contains(T item) -> bool {
-        return this.findSlot(item) >= 0;
+    export override length() -> long {
+        return this.table.length();
     }
 
-    export remove(T item) -> bool {
-        long slot = this.findSlot(item);
-        if (slot < 0) {
-            return false;
-        }
-        this.slotStates[slot] = 2;
-        this.slotItems.clear(slot);
-        this.count = this.count - 1;
-        return true;
+    export override isEmpty() -> bool {
+        return this.table.isEmpty();
     }
 
-    export length() -> long {
-        return this.count;
+    export override contains(T value) -> bool {
+        return this.table.contains(value);
     }
 
-    // Filled by walking the occupied slots in order, which is what the iterator does, so the
-    // result is written once per slot from front to back.
-    export items() -> T[] {
-        let walk = new SetIterator<T>(this.slotItems, this.slotStates, this.capacity);
-        T[] result = new T[this.count];
-        for (long i = 0; i < result.length; i++) {
-            result[i] = walk.take();
+    export override makeIterator() -> Iterator<T> {
+        return new KeyIterator<T, bool>(this.walk());
+    }
+
+    // Adds `value`, and answers whether it was not already there.
+    export add(T value) -> bool {
+        return this.table.add(value, true);
+    }
+
+    // Removes `value`, and answers whether it was there.
+    export remove(T value) -> bool {
+        return this.table.remove(value);
+    }
+
+    // Removes every value the test accepts, in one pass, and answers how many went.
+    export removeWhere((T) -> bool test) -> long {
+        return this.table.removeWhere((value, present) -> test(value));
+    }
+
+    export clear() {
+        this.table.clear();
+    }
+
+    // The values in this set, in `other`, or in both.
+    export union(Set<T> other) -> Set<T> {
+        let result = this.copy();
+        for (let value in other) {
+            result.add(value);
         }
         return result;
     }
 
-    export override makeIterator() -> Iterator<T> {
-        return new SetIterator<T>(this.slotItems, this.slotStates, this.capacity);
-    }
-
-    findSlot(T item) -> long {
-        long slot = item.hash() & (this.capacity - 1);
-        long probed = 0;
-        while (probed < this.capacity) {
-            if (this.slotStates[slot] == 0) {
-                return -1;
+    // The values in both this set and `other`.
+    export intersection(Set<T> other) -> Set<T> {
+        let result = new Set<T>();
+        for (let value in this) {
+            if (other.contains(value)) {
+                result.add(value);
             }
-            if (this.slotStates[slot] == 1 && this.slotItems.read(slot) == item) {
-                return slot;
+        }
+        return result;
+    }
+
+    // The values in this set that `other` does not hold.
+    export difference(Set<T> other) -> Set<T> {
+        let result = new Set<T>();
+        for (let value in this) {
+            if (!other.contains(value)) {
+                result.add(value);
             }
-            slot = (slot + 1) & (this.capacity - 1);
-            probed = probed + 1;
         }
-        return -1;
+        return result;
     }
 
-    freeSlot(T item) -> long {
-        long slot = item.hash() & (this.capacity - 1);
-        while (this.slotStates[slot] == 1) {
-            slot = (slot + 1) & (this.capacity - 1);
-        }
-        return slot;
-    }
-
-    resize() {
-        long oldCapacity = this.capacity;
-        let oldItems = this.slotItems;
-        byte[] oldStates = this.slotStates;
-
-        this.capacity = this.capacity * 2;
-        this.slotItems = RawArray<T>.allocate(this.capacity);
-        this.slotStates = new byte[this.capacity];
-
-        long slot = 0;
-        while (slot < oldCapacity) {
-            if (oldStates[slot] == 1) {
-                let moved = oldItems.read(slot);
-                long target = moved.hash() & (this.capacity - 1);
-                while (this.slotStates[target] == 1) {
-                    target = (target + 1) & (this.capacity - 1);
-                }
-                this.slotItems.write(target, moved);
-                this.slotStates[target] = 1;
+    // Whether `other` holds every value in this set.
+    export isSubsetOf(Set<T> other) -> bool {
+        for (let value in this) {
+            if (!other.contains(value)) {
+                return false;
             }
-            slot = slot + 1;
         }
-    }
-}
-
-class SetIterator<T> implements Iterator<T> {
-    RawArray<T> slotItems;
-    byte[] slotStates;
-    long capacity;
-    long position;
-
-    protected constructor(this.slotItems, this.slotStates, this.capacity) {
-        this.position = 0;
-        this.skipToOccupied();
+        return true;
     }
 
-    protected override next() -> T? {
-        if (this.position >= this.capacity) {
-            return null;
+    export override copy() -> Set<T> {
+        return new Set<T>(this.table.copy());
+    }
+
+    export toArray() -> T[] {
+        let walk = this.walk();
+        T[] values = new T[this.table.length()];
+        for (long i = 0; i < values.length; i++) {
+            values[i] = walk.keyAt(walk.nextSlot());
         }
-        return this.take();
+        return values;
     }
 
-    // The item in the current occupied slot, unchecked: the caller knows the walk is not over.
-    protected take() -> T {
-        T item = this.slotItems.read(this.position);
-        this.position = this.position + 1;
-        this.skipToOccupied();
-        return item;
-    }
-
-    skipToOccupied() {
-        while (this.position < this.capacity && this.slotStates[this.position] != 1) {
-            this.position = this.position + 1;
-        }
+    walk() -> SlotWalk<T, bool> {
+        return new SlotWalk<T, bool>(this.table, "set");
     }
 }

@@ -1810,9 +1810,14 @@ A class that declares neither method - including a base class whose subclasses d
 The collection modules build on hashing and iteration:
 
 - `List<T>` from `@std.collections.list` is a growable array: `push(value)`, `pop()` removing and returning the last value, `get(index)`, `set(index, value)`, and `length()`, plus `toArray()` returning a fresh right-sized `T[]` holding the current contents. Iterating a list yields its values in insertion order.
-- `Map<K, V>` from `@std.collections.map` maps keys to values: `set(key, value)` inserts or overwrites, `get(key)` returns `V?` (`null` when absent), plus `contains(key)`, `remove(key)`, `length()`, and `keys()` / `values()` snapshots. Iterating a map yields `Pair<K, V>` entries (from `@std.collections.pair`) with `key` and `value` fields.
-- `Set<T>` from `@std.collections.set` stores each value once: `add(value)` returns whether the value was new, plus `contains(value)`, `remove(value)`, `length()`, and `items()`. Iterating a set yields its values.
-- `sort(values)` from `@std.collections.sorting` puts a `List<string>` in ascending order in place, by the order `compareTo` defines. The sort is stable.
+- `Map<K, V>` from `@std.collections.map` maps keys to values: `set(key, value)` inserts or overwrites, `get(key)` returns `V?` (`null` when absent), plus `contains(key)`, `remove(key)`, `length()`, and `keys()` / `values()`, which are views onto the live map.
+  Iterating a map yields `Entry<K, V>` entries (from `@std.collections.entry`) with `key` and `value` fields.
+  Adding or removing entries in a map or a set while it, or one of a map's views, is being walked aborts the program; overwriting the value under a key the map already holds does not.
+  Make the change after the walk, or remove with `removeWhere`.
+- `Set<T>` from `@std.collections.set` stores each value once: `add(value)` returns whether the value was new, plus `contains(value)`, `remove(value)`, `length()`, and `toArray()`.
+  Iterating a set yields its values.
+- `List.sort(order)` puts a list in the order a comparison describes, and `sort()` with no argument uses the natural order when the element type implements `Comparable`.
+  Whether values the order calls equal keep the order they arrived in is not promised.
 
 ```ens
 import Map from @std.collections.map;

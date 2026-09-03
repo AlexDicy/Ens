@@ -1,43 +1,62 @@
-import List from @std.collections.list;
+import Entry from @std.collections.entry;
 import Iterable from @std.collections.iterator;
 import Iterator from @std.collections.iterator;
-import Pair from @std.collections.pair;
 import RawArray from @std.collections.rawarray;
 
-// A hash table with open addressing and linear probing. Slot states are
-// 0 = empty, 1 = occupied, 2 = removed; removed slots are reused on insert
-// and cleared by resize. Keys compare with '==' and hash with hash().
-export class Map<K, V> implements Iterable<Pair<K, V>> {
-    RawArray<K> slotKeys;
-    RawArray<V> slotValues;
-    byte[] slotStates;
-    long count;
-    long capacity;
+// Values found by key. The order a walk visits them in is not specified and may change between
+// releases, so a program that needs an order sorts, or holds a SortedMap instead.
+//
+// The table is open addressing with linear probing. A slot's state is 0 when empty, 1 when it
+// holds an entry, and 2 when its entry was removed, which keeps the probe chains through it intact
+// until the next rebuild.
+export final class Map<K, V> implements Iterable<Entry<K, V>>, Copyable<Map<K, V>> {
+    protected RawArray<K> slotKeys;
+    protected RawArray<V> slotValues;
+    protected byte[] slotStates;
+    protected long count;
+
+    // Slots that are not empty. Removed slots count toward the load until a rebuild clears them, so
+    // a table that keeps removing and inserting is rebuilt instead of probed end to end.
+    protected long used;
+
+    // How many times entries were added or removed, which is how a walk learns the map moved under
+    // it. Overwriting a value moves nothing, so it does not count.
+    protected long changes;
 
     export constructor() {
-        this.capacity = 16;
-        this.slotKeys = RawArray<K>.allocate(this.capacity);
-        this.slotValues = RawArray<V>.allocate(this.capacity);
-        this.slotStates = new byte[this.capacity];
+        this.slotKeys = RawArray<K>.allocate(16);
+        this.slotValues = RawArray<V>.allocate(16);
+        this.slotStates = new byte[16];
         this.count = 0;
+        this.used = 0;
+        this.changes = 0;
     }
 
-    export set(K key, V value) {
-        long existing = this.findSlot(key);
-        if (existing >= 0) {
-            this.slotValues.write(existing, value);
-            return;
-        }
-        if ((this.count + 1) * 4 > this.capacity * 3) {
-            this.resize();
-        }
-        long slot = this.freeSlot(key);
-        this.slotKeys.write(slot, key);
-        this.slotValues.write(slot, value);
-        this.slotStates[slot] = 1;
-        this.count = this.count + 1;
+    constructor(long slots) {
+        this.slotKeys = RawArray<K>.allocate(slots);
+        this.slotValues = RawArray<V>.allocate(slots);
+        this.slotStates = new byte[slots];
+        this.count = 0;
+        this.used = 0;
+        this.changes = 0;
     }
 
+    // A map that can hold `capacity` entries before its table has to grow.
+    export static withCapacity(long capacity) -> Map<K, V> {
+        return new Map<K, V>(tableSizeFor(capacity, 16));
+    }
+
+    export length() -> long {
+        return this.count;
+    }
+
+    export isEmpty() -> bool {
+        return this.count == 0;
+    }
+
+    // The value stored under `key`, or null when the map holds no such key. For a map whose values
+    // are themselves nullable, a stored null and a missing key are told apart by the two levels:
+    // the outer null means the key is absent.
     export get(K key) -> V? {
         long slot = this.findSlot(key);
         if (slot < 0) {
@@ -46,139 +65,295 @@ export class Map<K, V> implements Iterable<Pair<K, V>> {
         return this.slotValues.read(slot);
     }
 
+    export set(K key, V value) {
+        long slot = this.findSlot(key);
+        if (slot >= 0) {
+            this.slotValues.write(slot, value);
+            return;
+        }
+        this.place(key, value);
+    }
+
     export contains(K key) -> bool {
         return this.findSlot(key) >= 0;
     }
 
+    // Stores `value` under `key` unless the map already holds the key, and answers whether it did.
+    // A set is a map that adds its values this way.
+    public add(K key, V value) -> bool {
+        if (this.findSlot(key) >= 0) {
+            return false;
+        }
+        this.place(key, value);
+        return true;
+    }
+
+    // Removes the key and its value, and answers whether there was one.
     export remove(K key) -> bool {
         long slot = this.findSlot(key);
         if (slot < 0) {
             return false;
         }
-        this.slotStates[slot] = 2;
-        this.slotKeys.clear(slot);
-        this.slotValues.clear(slot);
-        this.count = this.count - 1;
+        this.removeSlot(slot);
+        this.changes = this.changes + 1;
         return true;
     }
 
-    export length() -> long {
-        return this.count;
-    }
-
-    // Reserved to the exact count, so the store never grows and each key is read once.
-    export keys() -> K[] {
-        let gathered = List<K>.withCapacity(this.count);
-        long slot = 0;
-        while (slot < this.capacity) {
-            if (this.slotStates[slot] == 1) {
-                gathered.push(this.slotKeys.read(slot));
+    // Removes every entry the test accepts, in one pass, and answers how many went.
+    export removeWhere((K, V) -> bool test) -> long {
+        long removed = 0;
+        for (long slot = 0; slot < this.slotStates.length; slot++) {
+            if (this.slotStates[slot] != 1) {
+                continue;
             }
-            slot = slot + 1;
-        }
-        return gathered.toArray();
-    }
-
-    export values() -> V[] {
-        let gathered = List<V>.withCapacity(this.count);
-        long slot = 0;
-        while (slot < this.capacity) {
-            if (this.slotStates[slot] == 1) {
-                gathered.push(this.slotValues.read(slot));
+            if (test(this.slotKeys.read(slot), this.slotValues.read(slot))) {
+                this.removeSlot(slot);
+                removed = removed + 1;
             }
-            slot = slot + 1;
         }
-        return gathered.toArray();
+        if (removed > 0) {
+            this.changes = this.changes + 1;
+        }
+        return removed;
     }
 
-    export override makeIterator() -> Iterator<Pair<K, V>> {
-        return new MapIterator<K, V>(this.slotKeys, this.slotValues, this.slotStates, this.capacity);
+    export clear() {
+        if (this.count == 0) {
+            return;
+        }
+        for (long slot = 0; slot < this.slotStates.length; slot++) {
+            if (this.slotStates[slot] == 1) {
+                this.slotKeys.clear(slot);
+                this.slotValues.clear(slot);
+            }
+            this.slotStates[slot] = 0;
+        }
+        this.count = 0;
+        this.used = 0;
+        this.changes = this.changes + 1;
     }
 
-    // First occupied slot holding this key, or -1. Removed slots are probed
-    // through; an empty slot ends the chain.
+    // The value under `key`, storing what `make` builds when the key is absent. `make` runs only
+    // then, and the key is found once rather than once per step.
+    export getOrInsert(K key, () -> V make) -> V {
+        long slot = this.findSlot(key);
+        if (slot >= 0) {
+            return this.slotValues.read(slot);
+        }
+        long changesBefore = this.changes;
+        let made = make();
+        if (this.changes == changesBefore) {
+            this.place(key, made);
+        } else {
+            this.set(key, made);
+        }
+        return made;
+    }
+
+    // Views onto the live map, walked without copying anything. Adding or removing entries while
+    // one of these is being walked aborts the program; overwriting a value does not.
+    export keys() -> Iterable<K> {
+        return new KeyView<K, V>(this);
+    }
+
+    export values() -> Iterable<V> {
+        return new ValueView<K, V>(this);
+    }
+
+    export override makeIterator() -> Iterator<Entry<K, V>> {
+        return new EntryIterator<K, V>(new SlotWalk<K, V>(this, "map"));
+    }
+
+    export override copy() -> Map<K, V> {
+        let copied = new Map<K, V>(this.slotStates.length);
+        for (long slot = 0; slot < this.slotStates.length; slot++) {
+            copied.slotStates[slot] = this.slotStates[slot];
+            if (this.slotStates[slot] == 1) {
+                copied.slotKeys.write(slot, this.slotKeys.read(slot));
+                copied.slotValues.write(slot, this.slotValues.read(slot));
+            }
+        }
+        copied.count = this.count;
+        copied.used = this.used;
+        return copied;
+    }
+
+    // The slot holding `key`, or -1. Removed slots are probed through, and the load bound keeps an
+    // empty slot on every chain to end it.
     findSlot(K key) -> long {
-        long slot = key.hash() & (this.capacity - 1);
-        long probed = 0;
-        while (probed < this.capacity) {
-            if (this.slotStates[slot] == 0) {
-                return -1;
-            }
+        long mask = this.slotStates.length - 1;
+        long slot = key.hash() & mask;
+        while (this.slotStates[slot] != 0) {
             if (this.slotStates[slot] == 1 && this.slotKeys.read(slot) == key) {
                 return slot;
             }
-            slot = (slot + 1) & (this.capacity - 1);
-            probed = probed + 1;
+            slot = (slot + 1) & mask;
         }
         return -1;
     }
 
-    // First insertable slot (empty or removed) on the key's probe chain. The
-    // caller has already ruled out an occupied slot holding this key.
-    freeSlot(K key) -> long {
-        long slot = key.hash() & (this.capacity - 1);
-        while (this.slotStates[slot] == 1) {
-            slot = (slot + 1) & (this.capacity - 1);
+    // Stores an entry whose key the map does not hold, on the first slot of its chain that holds
+    // no entry.
+    place(K key, V value) {
+        if ((this.used + 1) * 4 > this.slotStates.length * 3) {
+            this.rebuild(tableSizeFor(this.count + 1, this.slotStates.length));
         }
-        return slot;
+        long mask = this.slotStates.length - 1;
+        long slot = key.hash() & mask;
+        while (this.slotStates[slot] == 1) {
+            slot = (slot + 1) & mask;
+        }
+        if (this.slotStates[slot] == 0) {
+            this.used = this.used + 1;
+        }
+        this.slotKeys.write(slot, key);
+        this.slotValues.write(slot, value);
+        this.slotStates[slot] = 1;
+        this.count = this.count + 1;
+        this.changes = this.changes + 1;
     }
 
-    resize() {
-        long oldCapacity = this.capacity;
+    removeSlot(long slot) {
+        this.slotStates[slot] = 2;
+        this.slotKeys.clear(slot);
+        this.slotValues.clear(slot);
+        this.count = this.count - 1;
+    }
+
+    // Moves every entry into a fresh table of `size` slots, leaving the removed slots behind.
+    rebuild(long size) {
         let oldKeys = this.slotKeys;
         let oldValues = this.slotValues;
         byte[] oldStates = this.slotStates;
-
-        this.capacity = this.capacity * 2;
-        this.slotKeys = RawArray<K>.allocate(this.capacity);
-        this.slotValues = RawArray<V>.allocate(this.capacity);
-        this.slotStates = new byte[this.capacity];
-
-        long slot = 0;
-        while (slot < oldCapacity) {
-            if (oldStates[slot] == 1) {
-                let movedKey = oldKeys.read(slot);
-                long target = movedKey.hash() & (this.capacity - 1);
-                while (this.slotStates[target] == 1) {
-                    target = (target + 1) & (this.capacity - 1);
-                }
-                this.slotKeys.write(target, movedKey);
-                this.slotValues.write(target, oldValues.read(slot));
-                this.slotStates[target] = 1;
+        this.slotKeys = RawArray<K>.allocate(size);
+        this.slotValues = RawArray<V>.allocate(size);
+        this.slotStates = new byte[size];
+        long mask = size - 1;
+        for (long slot = 0; slot < oldStates.length; slot++) {
+            if (oldStates[slot] != 1) {
+                continue;
             }
-            slot = slot + 1;
+            let key = oldKeys.read(slot);
+            long target = key.hash() & mask;
+            while (this.slotStates[target] == 1) {
+                target = (target + 1) & mask;
+            }
+            this.slotKeys.write(target, key);
+            this.slotValues.write(target, oldValues.read(slot));
+            this.slotStates[target] = 1;
         }
+        this.used = this.count;
     }
 }
 
-class MapIterator<K, V> implements Iterator<Pair<K, V>> {
-    RawArray<K> slotKeys;
-    RawArray<V> slotValues;
-    byte[] slotStates;
-    long capacity;
+// A walk over the slots of a map that hold an entry, shared by the map's own iterators and by the
+// containers built on it. It aborts the program on the first step after the map changed, naming
+// `container` in the message.
+public class SlotWalk<K, V> {
+    Map<K, V> map;
+    string container;
+    long changesAtStart;
     long position;
 
-    protected constructor(this.slotKeys, this.slotValues, this.slotStates, this.capacity) {
+    public constructor(this.map, this.container) {
+        this.changesAtStart = this.map.changes;
         this.position = 0;
-        this.skipToOccupied();
     }
 
-    protected override next() -> Pair<K, V>? {
-        if (this.position >= this.capacity) {
+    // The next slot holding an entry, or -1 once the walk is over.
+    public nextSlot() -> long {
+        if (this.map.changes != this.changesAtStart) {
+            panic("{this.container} changed during a walk: finish the walk before changing it, "
+                + "or use removeWhere");
+        }
+        while (this.position < this.map.slotStates.length) {
+            long slot = this.position;
+            this.position = this.position + 1;
+            if (this.map.slotStates[slot] == 1) {
+                return slot;
+            }
+        }
+        return -1;
+    }
+
+    public keyAt(long slot) -> K {
+        return this.map.slotKeys.read(slot);
+    }
+
+    public valueAt(long slot) -> V {
+        return this.map.slotValues.read(slot);
+    }
+}
+
+// Yields the key of every slot a walk visits. A set walks its map this way.
+public class KeyIterator<K, V> implements Iterator<K> {
+    SlotWalk<K, V> walk;
+
+    public constructor(this.walk);
+
+    public override next() -> K? {
+        long slot = this.walk.nextSlot();
+        if (slot < 0) {
             return null;
         }
-        Pair<K, V> entry = {
-            key: this.slotKeys.read(this.position),
-            value: this.slotValues.read(this.position),
-        };
-        this.position = this.position + 1;
-        this.skipToOccupied();
+        return this.walk.keyAt(slot);
+    }
+}
+
+class ValueIterator<K, V> implements Iterator<V> {
+    SlotWalk<K, V> walk;
+
+    protected constructor(this.walk);
+
+    protected override next() -> V? {
+        long slot = this.walk.nextSlot();
+        if (slot < 0) {
+            return null;
+        }
+        return this.walk.valueAt(slot);
+    }
+}
+
+class EntryIterator<K, V> implements Iterator<Entry<K, V>> {
+    SlotWalk<K, V> walk;
+
+    protected constructor(this.walk);
+
+    protected override next() -> Entry<K, V>? {
+        long slot = this.walk.nextSlot();
+        if (slot < 0) {
+            return null;
+        }
+        Entry<K, V> entry = {key: this.walk.keyAt(slot), value: this.walk.valueAt(slot)};
         return entry;
     }
+}
 
-    skipToOccupied() {
-        while (this.position < this.capacity && this.slotStates[this.position] != 1) {
-            this.position = this.position + 1;
-        }
+class KeyView<K, V> implements Iterable<K> {
+    Map<K, V> map;
+
+    protected constructor(this.map);
+
+    protected override makeIterator() -> Iterator<K> {
+        return new KeyIterator<K, V>(new SlotWalk<K, V>(this.map, "map"));
     }
+}
+
+class ValueView<K, V> implements Iterable<V> {
+    Map<K, V> map;
+
+    protected constructor(this.map);
+
+    protected override makeIterator() -> Iterator<V> {
+        return new ValueIterator<K, V>(new SlotWalk<K, V>(this.map, "map"));
+    }
+}
+
+// The smallest power of two from `atLeast` up whose three quarters hold `entries`.
+tableSizeFor(long entries, long atLeast) -> long {
+    long size = atLeast;
+    while (size * 3 < entries * 4) {
+        size = size * 2;
+    }
+    return size;
 }
