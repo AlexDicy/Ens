@@ -78,6 +78,9 @@ export final class List<T> implements Collection<T>, Copyable<List<T>> {
     // Removes the first value equal to `value`, and answers whether there was one.
     export remove(T value) -> bool;
 
+    // Removes every value the test accepts, in one pass, and answers how many went.
+    export removeWhere((T) -> bool test) -> long;
+
     export clear();
     export reserve(long capacity);
 
@@ -127,6 +130,10 @@ export final class Map<K, V> implements Iterable<Entry<K, V>>, Copyable<Map<K, V
 
     // Removes the key and its value, and answers whether there was one.
     export remove(K key) -> bool;
+
+    // Removes every entry the test accepts, in one pass, and answers how many went.
+    export removeWhere((K, V) -> bool test) -> long;
+
     export clear();
 
     // The value under `key`, storing what `make` builds when the key is absent. `make` runs only
@@ -161,6 +168,7 @@ export final class Set<T> implements Collection<T>, Copyable<Set<T>> {
     // Adds `value`, and answers whether it was not already there.
     export add(T value) -> bool;
     export remove(T value) -> bool;
+    export removeWhere((T) -> bool test) -> long;
     export clear();
 
     export union(Set<T> other) -> Set<T>;
@@ -256,6 +264,7 @@ export final class SortedMap<K, V> implements Iterable<Entry<K, V>>, Copyable<So
     export set(K key, V value);
     export contains(K key) -> bool;
     export remove(K key) -> bool;
+    export removeWhere((K, V) -> bool test) -> long;
     export clear();
     export getOrInsert(K key, () -> V make) -> V;
 
@@ -282,6 +291,9 @@ Mutating a map or set while walking it aborts the program, detected by a modific
 `indexOf` answers -1 rather than `long?`, matching `string.indexOf`.
 No `firstOrNull`, `lastOrNull`, or `popOrNull`; `first`, `last`, and `pop` abort on empty per the contract rule.
 `push`, `pop`, and `pushAll` on `List`; `add` on `Set`, deliberately, since a set has no position.
+`removeWhere` on `List`, `Set`, `Map`, and `SortedMap` (ratified 2026-09-02) removes every match in one pass, because a walk that removes from its own container aborts once walks are live views.
+Removing the first match or the first few stays index and key based (`indexWhere` plus `removeAt`, `remove(key)`, `firstKey`), so no walk is involved and nothing aborts.
+It was weighed against the standing worry that closures get overused: it is a leaf predicate like `indexWhere`, and no further closure-taking method is added without the same weighing.
 Collections compare structurally and cannot be map keys; mutable collections join the rejected-key-type list in the compiler.
 A struct is refused as a key when any of its fields, transitively, holds an array or a collection (ratified 2026-09-02).
 Sorting lives on `List` as a comparator overload plus a conditional natural-order overload; there is no sorting module.
