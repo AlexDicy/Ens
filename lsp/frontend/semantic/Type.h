@@ -245,6 +245,9 @@ public:
 
     bool equals(const Type* other) const;
     bool assignableFrom(const Type* source) const;
+    // True when this is `declared` instantiated at its own type parameters, which is the type
+    // a generic body spells while `this` inside it carries the bare declared type.
+    bool isSelfInstantiationOf(const Type* declared) const;
     bool widensTo(const Type* target) const;
     bool isSignedInteger() const;
     bool isUnsignedInteger() const;

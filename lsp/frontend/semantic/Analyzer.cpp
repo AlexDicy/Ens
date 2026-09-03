@@ -6840,6 +6840,22 @@ static void inferTypeArguments(Type* paramType, Type* argType, const Symbol* own
     }
 }
 
+// A bare template type, which `this` carries inside a generic body, read as the template at its
+// own type parameters. Any other type is answered unchanged.
+Type* Analyzer::selfInstantiationOf(Type* type) {
+    static const std::vector<StructInfo*> kNoBounds;
+    StructInfo* info = type ? type->structInfo : nullptr;
+    if (!info || !info->isTemplate || !type->hasRecordLayout()) return type;
+    std::vector<Type*> placeholders;
+    for (size_t i = 0; i < info->typeParamNames.size(); ++i) {
+        const std::vector<StructInfo*>& bounds =
+            i < info->typeParamBounds.size() ? info->typeParamBounds[i] : kNoBounds;
+        placeholders.push_back(typeCtx.getTypeParam(info, static_cast<int>(i),
+                                                    info->typeParamNames[i], bounds));
+    }
+    return typeCtx.instantiate(type, placeholders);
+}
+
 Type* Analyzer::analyzeGenericCall(const ast::CallExpression& expr, Symbol* sym,
                                    const std::u16string& funcName) {
     auto args = expr.arguments();
@@ -6877,7 +6893,8 @@ Type* Analyzer::analyzeGenericCall(const ast::CallExpression& expr, Symbol* sym,
 
     if (explicitArgs.empty()) {
         for (size_t i = 0; i < std::min(args.size(), sym->paramTypes.size()); ++i) {
-            inferTypeArguments(sym->paramTypes[i], argTypes[i], sym, typeArgs);
+            inferTypeArguments(sym->paramTypes[i], selfInstantiationOf(argTypes[i]), sym,
+                               typeArgs);
         }
     }
 

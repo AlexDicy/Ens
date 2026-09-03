@@ -156,9 +156,23 @@ bool Type::equals(const Type* other) const {
     return true;
 }
 
+bool Type::isSelfInstantiationOf(const Type* declared) const {
+    if (!declared || kind != declared->kind || !structInfo || !declared->structInfo) return false;
+    if (structInfo->templateOf != declared->structInfo) return false;
+    const auto& args = structInfo->typeArgs;
+    if (args.size() != declared->structInfo->typeParamNames.size()) return false;
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (!args[i] || !args[i]->isTypeParam() || args[i]->paramOwner != declared->structInfo ||
+            args[i]->paramIndex != static_cast<int>(i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool Type::assignableFrom(const Type* source) const {
     if (!source || source->isError() || isError()) return true;
-    if (equals(source)) return true;
+    if (equals(source) || isSelfInstantiationOf(source)) return true;
     if (source->widensTo(this)) return true;
     // Class upcast: a derived class is assignable to any of its ancestors, and
     // a class converts implicitly to each interface it implements.

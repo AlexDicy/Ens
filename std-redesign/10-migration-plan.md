@@ -65,6 +65,8 @@ Within each milestone the std change and its consumer updates are one commit, so
   Before it, one sema-only language milestone: type-argument inference through instantiations and conformance (ratified 2026-09-02), which needs no seed because the library does not depend on it.
   The `new T[n]` question the plan carried is closed: the array-fill check already runs per instantiation, and the containers' backing stores use the std-only `RawArray<T>`, so no ruling is needed.
   Split into three commits: C4a, the compiler's key-type and hash rules; C4b, `List`, `Map`, and `Set` rewritten with `Entry`, `Collection`, the views, the modification counter, `removeWhere`, and every consumer, deleting `Pair` and the sorting module; C4c, `Deque`, `PriorityQueue`, and `SortedMap`.
+  C4b surfaced two compiler bugs the seed has to carry before the library can land: `this` inside a generic body was typed as the bare template, so a container could not hand itself to its iterator, and the synthesized array-content helpers were named without their module, so two modules comparing the same array type collided at link time.
+  Both are fixed in their own commits and a seed release sits between them and the library.
 - C5: `@std.io` written from scratch: `io.ens` plus the four submodules; `print`/`eprint` rerouted through the prelude onto `io.out()`.
 - C6: `@std.text` rewritten: the `string` binding replaces `@std.text.strings`, `StringBuilder` loses `appendByte`, `parse` lands; consumers move from `strings.split(text, sep)` to `text.split(sep)`.
 - C7: `@std.fs` written: `Path` absorbs `@std.path` as methods, `File` moves onto the stream contracts, metadata, entries, walk, temp guards.
