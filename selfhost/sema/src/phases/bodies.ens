@@ -477,6 +477,7 @@ class BodyChecker implements NoreturnCalls {
         if (found is StructType && found.declaration() == node.green()) {
             this.enterObligationOwner(found);
             this.checkFieldDefaults(found, node.body());
+            this.checkLazyInitializers(found, node.body());
             this.checkMemberBodies(found, found.methods(), found.staticMethods(), node.body());
             this.leaveObligationOwner();
         }
@@ -487,6 +488,7 @@ class BodyChecker implements NoreturnCalls {
         if (found is ClassType && found.declaration() == node.green()) {
             this.enterObligationOwner(found);
             this.checkFieldDefaults(found, node.body());
+            this.checkLazyInitializers(found, node.body());
             this.checkMemberBodies(found, found.methods(), found.staticMethods(), node.body());
             this.leaveObligationOwner();
         }
@@ -993,12 +995,12 @@ class BodyChecker implements NoreturnCalls {
         this.enclosingOwner = owner;
         this.inStaticMethod = false;
         this.currentReturnType = null;
-        // Static const fields stay out on both sides: their initializers are compile-time
-        // constants the constants phase evaluates, never expressions over sibling fields.
+        // Type-level fields stay out on both sides: a static const's initializer is the
+        // compile-time constant the constants phase evaluates, and a lazy const's runs on the
+        // first read with no instance in reach, so neither is an expression over sibling fields.
         for (long i = 0; i < body.membersCount(); i++) {
             let member = body.members(i);
-            if (member is FieldDeclarationNode
-                    && !members.fieldModifiers(member).declaresStatic) {
+            if (member is FieldDeclarationNode && !members.isTypeLevelField(member)) {
                 let sink = this.scope;
                 if (sink != null) {
                     sink.define(new LocalBinding(member.name().text(),
@@ -1009,8 +1011,7 @@ class BodyChecker implements NoreturnCalls {
         }
         for (long i = 0; i < body.membersCount(); i++) {
             let member = body.members(i);
-            if (member is FieldDeclarationNode
-                    && !members.fieldModifiers(member).declaresStatic) {
+            if (member is FieldDeclarationNode && !members.isTypeLevelField(member)) {
                 let defaultValue = member.defaultValue();
                 if (defaultValue != null) {
                     Type expected = this.fieldTypeOrError(fields, member.name().text());
@@ -1025,6 +1026,47 @@ class BodyChecker implements NoreturnCalls {
                             value.span());
                     }
                 }
+            }
+        }
+        this.scope = null;
+    }
+
+    // A lazy const's initializer types against the declared type at module scope: it runs on the
+    // first read with no instance in reach, so neither 'this' nor a sibling field is visible.
+    checkLazyInitializers(DeclaredType owner, MemberListNode body) {
+        this.parameterScope = null;
+        this.scope = new Scope(null);
+        this.narrowing = new NarrowingState();
+        this.thisBinding = null;
+        this.thisType = null;
+        this.enclosingOwner = owner;
+        this.inStaticMethod = false;
+        this.currentReturnType = null;
+        for (long i = 0; i < body.membersCount(); i++) {
+            let member = body.members(i);
+            if (!(member is FieldDeclarationNode)
+                    || !members.fieldModifiers(member).declaresLazy) {
+                continue;
+            }
+            let field = members.findField(types.staticFieldsOf(owner), member.name().text());
+            let initializer = member.defaultValue();
+            if (field == null || initializer == null) {
+                continue;
+            }
+            // A type the shape check already refused stands for nothing the value could match,
+            // so the read below judges the initializer on its own.
+            Type expected = field.type();
+            if (convert.containsTypeParam(expected) || types.isVoidType(expected)) {
+                expected = this.store.errorType();
+            }
+            let value = initializer.value();
+            Type actual = this.analyzeExpressionAdapt(value, expected);
+            if (!(expected is ErrorType) && !(actual is ErrorType)
+                    && !convert.isAssignableStrict(expected, actual)) {
+                this.reporter.report("The initializer of lazy const "
+                    + "'{owner.name()}.{field.name()}': expected '{types.display(expected)}', "
+                    + "got '{types.display(actual)}'"
+                    + "{this.valueAssignabilityHint(expected, actual, value)}", value.span());
             }
         }
         this.scope = null;
@@ -3758,8 +3800,9 @@ class BodyChecker implements NoreturnCalls {
             let staticField = this.result.staticConstFieldOf(operand.green());
             if (staticField != null) {
                 this.reporter.report("The '{operator}' operator cannot change "
-                    + "'{staticConstDisplay(staticField)}': a static const takes its one "
-                    + "value from its initializer and never changes.", span);
+                    + "'{staticConstDisplay(staticField)}': a "
+                    + "{members.typeLevelFieldWord(staticField)} takes its one value from its "
+                    + "initializer and never changes.", span);
                 return operandType;
             }
             let objectType = this.result.typeOf(operand.object().green());
@@ -3828,9 +3871,10 @@ class BodyChecker implements NoreturnCalls {
             let staticTarget = this.result.staticConstFieldOf(target.green());
             if (staticTarget != null) {
                 this.reporter.report("Cannot assign to "
-                    + "'{staticConstDisplay(staticTarget)}': a static const takes its one "
-                    + "value from its initializer and never changes. Change the initializer, "
-                    + "or use an instance field.", node.span());
+                    + "'{staticConstDisplay(staticTarget)}': a "
+                    + "{members.typeLevelFieldWord(staticTarget)} takes its one value from its "
+                    + "initializer and never changes. Change the initializer, or use an "
+                    + "instance field.", node.span());
             }
         }
         Type assignTarget = this.declaredTargetType(node.target(), targetType);
@@ -4932,7 +4976,8 @@ class BodyChecker implements NoreturnCalls {
         Type? current = receiver;
         while (current != null) {
             bool isMethod = staticsNamed(current, name).length() > 0;
-            if (isMethod || members.findField(types.staticFieldsOf(current), name) != null) {
+            let field = members.findField(types.staticFieldsOf(current), name);
+            if (isMethod || field != null) {
                 let authority = types.authorityOf(current);
                 string ownerName = types.display(current);
                 if (authority != null) {
@@ -4942,7 +4987,11 @@ class BodyChecker implements NoreturnCalls {
                 if (isMethod) {
                     spelled = "'{ownerName}.{name}(...)'";
                 }
-                this.reporter.report("Use {spelled}; a static belongs to the type, not to an "
+                string belongs = "a static";
+                if (field != null && field.isLazy()) {
+                    belongs = "a lazy const";
+                }
+                this.reporter.report("Use {spelled}; {belongs} belongs to the type, not to an "
                     + "instance.", at);
                 return true;
             }
@@ -5265,8 +5314,9 @@ class BodyChecker implements NoreturnCalls {
         }
         let constField = members.findField(types.staticFieldsOf(head), name);
         if (constField != null) {
-            this.reporter.report("'{owner.name()}.{name}' is a static const, not a method, so "
-                + "it cannot be called. Remove the parentheses.", node.span());
+            this.reporter.report("'{owner.name()}.{name}' is a "
+                + "{members.typeLevelFieldWord(constField)}, not a method, so it cannot be "
+                + "called. Remove the parentheses.", node.span());
             this.analyzeArgumentsOnly(arguments);
             return this.store.errorType();
         }

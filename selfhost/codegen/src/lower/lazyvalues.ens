@@ -1,0 +1,163 @@
+// Lazy consts: the two globals one keeps its value and its state byte in, the function that
+// builds the value on the first read, and the guard every read is fronted by.
+//
+// The state byte reads 0 not started, 1 being built, 2 ready. A read tests for ready and
+// branches, so the settled path is one compare and a load, and the initializer runs behind the
+// cold edge in a function every module reading the value calls. The refusal of a read that
+// arrives while the value is still being built lives in that function, so it never costs a read
+// anything.
+//
+// The storage owns a reference the program never gives up, so a read hands back a borrowed one
+// and nothing releases the value.
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import Field from @ens.sema.model.types;
+import PrimitiveKind from @ens.sema.model.types;
+import Type from @ens.sema.model.types;
+import EirBinary from eir.model;
+import EirBinaryOp from eir.model;
+import EirBranch from eir.model;
+import EirCall from eir.model;
+import EirCallee from eir.model;
+import EirConstInt from eir.model;
+import EirGlobalAddress from eir.model;
+import EirJump from eir.model;
+import EirPanic from eir.model;
+import EirReturn from eir.model;
+import EirStorePtr from eir.model;
+import EirUnreachable from eir.model;
+import LazyValueInfo from lower.index;
+import LoweringContext from lower.context;
+import lower.ownership;
+import lower.places;
+import lower.stores;
+import lower.strings;
+
+// The two states anything names. Nothing names the pending state, which is the zero the
+// storage starts at.
+stateBuilding() -> long {
+    return 1;
+}
+
+stateReady() -> long {
+    return 2;
+}
+
+// Reads one lazy const: ready on the settled path, the initializer call on the cold one. Returns
+// the address of the value, which the caller reads at the type the expression was recorded at.
+public lowerReadAddress(LoweringContext lowering, MemberExpressionNode member,
+                        Field field) -> long {
+    let lazyValue = lowering.index().lazyValueOf(field);
+    if (lazyValue == null) {
+        lowering.internalError("lazy const '{field.name()}' reached lowering with no storage "
+            + "planned for it", member.span());
+        return -1;
+    }
+    let builder = lowering.builder();
+    long state = loadState(lowering, lazyValue);
+    long ready = stateTest(lowering, state, stateReady());
+    let readyBlock = builder.newBlock("lazy.ready");
+    let buildBlock = builder.newBlock("lazy.build");
+    builder.terminate(new EirBranch(ready, readyBlock, buildBlock));
+    builder.moveTo(buildBlock);
+    builder.append(new EirCall(-1, voidType(lowering), initializerCallee(lowering, lazyValue),
+        -1, [], -1, null, lowering.lineAt(member.span())));
+    builder.terminate(new EirJump(readyBlock));
+    builder.moveTo(readyBlock);
+    return valueAddress(lowering, lazyValue);
+}
+
+// Builds one lazy const's value, in the module that declares it: the cycle refusal, the mark
+// that the building has begun, the initializer, and the mark that the value is there.
+public lowerInitializer(LoweringContext lowering, LazyValueInfo lazyValue) -> bool {
+    let builder = lowering.builder();
+    long state = loadState(lowering, lazyValue);
+    long building = stateTest(lowering, state, stateBuilding());
+    let cycleBlock = builder.newBlock("lazy.cycle");
+    let buildBlock = builder.newBlock("lazy.build");
+    builder.terminate(new EirBranch(building, cycleBlock, buildBlock));
+    builder.moveTo(cycleBlock);
+    long message = strings.literalText(lowering, "'{lazyValue.display()}' was read while it "
+        + "was still being initialized");
+    builder.append(new EirPanic(message, lowering.lineAt(lazyValue.initializer().span())));
+    builder.terminate(new EirUnreachable());
+    builder.moveTo(buildBlock);
+    storeState(lowering, lazyValue, stateBuilding());
+    Type valueType = lowering.substituted(lazyValue.field().type());
+    lowering.pushScope();
+    let operand = stores.lowerOperand(lowering, lazyValue.initializer(), valueType);
+    if (operand == null) {
+        return false;
+    }
+    long address = valueAddress(lowering, lazyValue);
+    if (!stores.initializeThroughAddress(lowering, address, valueType, operand)) {
+        lowering.internalError("the initializer of lazy const '{lazyValue.display()}' borrows "
+            + "a value with no storage to retain", lazyValue.initializer().span());
+        return false;
+    }
+    storeState(lowering, lazyValue, stateReady());
+    ownership.releaseAllScopes(lowering);
+    builder.terminate(new EirReturn(-1));
+    lowering.popScope();
+    return true;
+}
+
+// The one compare a read costs: whether the state byte holds the state asked about.
+stateTest(LoweringContext lowering, long state, long against) -> long {
+    let builder = lowering.builder();
+    long wanted = builder.newTemp(stateType(lowering));
+    builder.append(new EirConstInt(wanted, stateType(lowering), against));
+    long result = builder.newTemp(booleanType(lowering));
+    builder.append(new EirBinary(result, booleanType(lowering), EirBinaryOp.CmpEq, state,
+        wanted));
+    return result;
+}
+
+loadState(LoweringContext lowering, LazyValueInfo lazyValue) -> long {
+    return places.loadFrom(lowering, stateAddress(lowering, lazyValue), stateType(lowering));
+}
+
+storeState(LoweringContext lowering, LazyValueInfo lazyValue, long state) {
+    let builder = lowering.builder();
+    long value = builder.newTemp(stateType(lowering));
+    builder.append(new EirConstInt(value, stateType(lowering), state));
+    builder.append(new EirStorePtr(stateAddress(lowering, lazyValue), value));
+}
+
+stateAddress(LoweringContext lowering, LazyValueInfo lazyValue) -> long {
+    let builder = lowering.builder();
+    long address = builder.newTemp(stateType(lowering));
+    builder.append(new EirGlobalAddress(address, stateType(lowering), lazyValue.stateSymbol(),
+        definesStorage(lowering, lazyValue)));
+    return address;
+}
+
+valueAddress(LoweringContext lowering, LazyValueInfo lazyValue) -> long {
+    let builder = lowering.builder();
+    Type valueType = lowering.substituted(lazyValue.field().type());
+    long address = builder.newTemp(valueType);
+    builder.append(new EirGlobalAddress(address, valueType, lazyValue.valueSymbol(),
+        definesStorage(lowering, lazyValue)));
+    return address;
+}
+
+// True while lowering this value's own initializer, which only its declaring module does, so
+// that is the module whose object file carries the storage.
+definesStorage(LoweringContext lowering, LazyValueInfo lazyValue) -> bool {
+    return lowering.info().lazyValue() == lazyValue;
+}
+
+initializerCallee(LoweringContext lowering, LazyValueInfo lazyValue) -> EirCallee {
+    return new EirCallee(lazyValue.initializerSymbol(), null, [], voidType(lowering));
+}
+
+stateType(LoweringContext lowering) -> Type {
+    return lowering.store().primitive(PrimitiveKind.Byte);
+}
+
+booleanType(LoweringContext lowering) -> Type {
+    return lowering.store().primitive(PrimitiveKind.Bool);
+}
+
+voidType(LoweringContext lowering) -> Type {
+    return lowering.store().primitive(PrimitiveKind.Void);
+}

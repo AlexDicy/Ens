@@ -182,6 +182,8 @@ public:
     std::optional<VisibilityModifier> visibilityModifier() const;
     Visibility visibility() const;
     bool isWeak() const;
+    // A `lazy const` field: type-level, with a value its initializer builds on the first read.
+    bool isLazy() const;
     std::optional<TypeReference> typeReference() const;
     std::optional<SyntaxNode> nameToken() const;
     std::optional<std::u16string> nameText() const;

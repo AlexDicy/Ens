@@ -329,6 +329,14 @@ bool FieldDecl::isWeak() const {
     return false;
 }
 
+bool FieldDecl::isLazy() const {
+    for (auto& c : node.children()) {
+        if (c.kind() == SyntaxKind::KwLazy) return true;
+        if (isTypeNode(c.kind())) break;
+    }
+    return false;
+}
+
 std::optional<TypeReference> FieldDecl::typeReference() const {
     if (auto tr = firstTypeChild(node)) return TypeReference::cast(*tr);
     return std::nullopt;

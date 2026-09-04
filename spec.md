@@ -214,7 +214,7 @@ A const field with a default value keeps the default when construction does not 
 Everything else is an error: assigning from a method, a destructor, or a free function, assigning through any reference other than `this`, assigning an inherited const field from a subclass constructor, and `++`, `--`, or a compound assignment anywhere.
 A const field may be nullable, and it cannot also be `weak`, because a weak field resets to null when its target is destroyed while a const field never changes.
 
-A field carries visibility modifiers, `const`, and `static` (which requires `const`), and in a class also `weak`; no other modifier applies to one.
+A field carries visibility modifiers, `const`, `static` (which requires `const`), `lazy` (which requires `const` too), and in a class also `weak`; no other modifier applies to one.
 A method carries visibility, the markers that govern overriding (`abstract`, `override`, `final`), `noreturn`, and `static`, while a constructor and a destructor carry visibility alone, and a function declared at the top level carries visibility and `noreturn` alone, because nothing inherits it.
 `sealed` belongs to a class, so it does not apply to a field or a callable; `const` belongs to a field or a variable inside a function, so it does not apply to a callable.
 Writing a modifier where it does not belong is an error that names where it does.
@@ -235,6 +235,15 @@ The initializer is a compile-time constant: literals, unary `+` and `-`, arithme
 A cycle between static const initializers is an error, and so are function calls, `new`, aggregate literals, and array literals inside one.
 A static const's type is therefore a primitive, `char`, `bool`, or `string`, and on a generic type it cannot mention the type's parameters, so every instantiation shares one value.
 Reads go through the type name, as in `Path.separator`, and each read compiles to the constant's value; assigning to a static const, or applying `++` or `--` to one, is an error.
+
+A `lazy const` field is a type-level value with a written type and a mandatory initializer: `export lazy const BufferedReader input = makeInput();`.
+The initializer runs on the first read and the value is kept for the rest of the program, so unlike a static const's it may call functions, allocate, and build aggregates.
+It may not throw, which is what keeps a read from needing `try`.
+A lazy const is read through the type name, as in `Streams.input`, and it is type-level already, so writing `static` beside `lazy` is an error.
+The value's destructor never runs, because the program holds the value to the end.
+On a generic type a lazy const's type cannot mention the type's parameters, so every instantiation shares one value.
+Assigning to a lazy const, or applying `++` or `--` to one, is an error.
+A cycle between two lazy const initializers is a compile error where the initializers read each other directly; one that closes through a function call stops the program on the read that closes it, naming the value.
 
 A static of a generic type takes the type's arguments in one of three ways.
 They may be written on the type name: `List<int>.withCapacity(8)`.

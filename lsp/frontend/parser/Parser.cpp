@@ -931,7 +931,8 @@ bool Parser::looksLikeKeywordNamedMethod() const {
 void Parser::parseFieldDecl() {
     builder.startNode(SyntaxKind::FieldDecl);
     parseVisibilityModifier();
-    while (at(SyntaxKind::KwWeak) || at(SyntaxKind::KwConst) || at(SyntaxKind::KwStatic)) bump();
+    while (at(SyntaxKind::KwWeak) || at(SyntaxKind::KwConst) || at(SyntaxKind::KwStatic) ||
+           at(SyntaxKind::KwLazy)) bump();
     if (isTypeOrGroupStart(kindAt())) parseType();
     else emitMissing(SyntaxKind::Identifier, "field type");
     expect(SyntaxKind::Identifier, "field name");

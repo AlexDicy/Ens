@@ -1,7 +1,7 @@
-// Static members through the sema phases: the model lists they land in, the evaluated constants
-// on static const fields, the three ways a generic type's arguments reach a static call, the
-// type-name-only access rule, the constant initializer's visibility rules, and the checked
-// exceptions a throwing static factory carries.
+// Type-level members through the sema phases: the model lists they land in, the evaluated
+// constants on static const fields, the three ways a generic type's arguments reach a static
+// call, the type-name-only access rule, the constant initializer's visibility rules, the shape
+// and cycle rules of a lazy const, and the checked exceptions a throwing static factory carries.
 import @std.testing;
 import ProgramAnalysis from pipeline;
 import ConstantKind from model.literalvalues;
@@ -169,6 +169,100 @@ test "a static const evaluates across modules in dependency order" {
     if (total != null) {
         try testing.assertEqual(total.integerBits(), 42L);
     }
+}
+
+test "a lazy const lands beside the statics and takes no compile-time value" {
+    let analysis = try analyzeOne(
+        "public class Reader \{\n"
+        + "    public const string text;\n"
+        + "\n"
+        + "    public constructor(this.text);\n"
+        + "\}\n"
+        + "makeReader() -> Reader \{\n"
+        + "    return new Reader(\"in\");\n"
+        + "\}\n"
+        + "public class Streams \{\n"
+        + "    public lazy const Reader input = makeReader();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return Streams.input.text.length as int;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.checkDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+    try sema_support.assertNoDiagnostics(analysis.exceptionDiagnostics());
+    let streams = try sema_support.classNamed(analysis, "main", "Streams");
+    try testing.assertEqual(streams.fields().length(), 0L);
+    try testing.assertEqual(streams.staticFields().length(), 1L);
+    let input = streams.staticFields().get(0);
+    try testing.assertTrue(input.isLazy(), "the lazy marker must reach the model");
+    try testing.assertTrue(!input.isStatic(), "'lazy' is not 'static'");
+    try testing.assertTrue(input.constantValue() == null,
+        "a lazy const holds no compile-time value");
+}
+
+test "a lazy const field refuses 'static', a missing 'const', and a missing initializer" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens",
+        "public class Refused \{\n"
+        + "    public static lazy const long both = 1;\n"
+        + "    public lazy long unmarked = 2;\n"
+        + "    public lazy const long missing;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertMentions(analysis.layoutDiagnostics(),
+        "A 'lazy const' field already belongs to the type itself, so it cannot also be "
+        + "'static': a static const holds a compile-time constant, while a lazy const builds "
+        + "its value on the first read. Remove 'static'.");
+    try sema_support.assertMentions(analysis.layoutDiagnostics(),
+        "A 'lazy' field must also be 'const'; its value is built once on the first read and "
+        + "never changes. Write 'lazy const long unmarked = ...', or make 'unmarked' an "
+        + "instance field.");
+    try sema_support.assertMentions(analysis.layoutDiagnostics(),
+        "Lazy const 'missing' needs its value on the declaration, because nothing else ever "
+        + "assigns it: write 'lazy const long missing = ...'.");
+}
+
+test "two lazy const initializers that read each other close a cycle" {
+    let analysis = try analyzeOne(
+        "public class Cycle \{\n"
+        + "    public lazy const long first = Cycle.second + 1;\n"
+        + "    public lazy const long second = Cycle.first + 1;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return Cycle.first as int;\n"
+        + "\}\n");
+    try sema_support.assertMentions(analysis.checkDiagnostics(),
+        "'Cycle.second' cannot take its value from 'Cycle.first' here: the chain of lazy "
+        + "consts between them closes a cycle. Break the cycle by building one of the two "
+        + "values without reading the other.");
+}
+
+test "a lazy const initializer may not throw and its value never takes an assignment" {
+    let analysis = try analyzeOne(
+        "class Boom extends Error \{\n"
+        + "    protected constructor(string message) \{\n"
+        + "        super(message);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "risky() -> long throws \{\n"
+        + "    throw new Boom(\"no\");\n"
+        + "\}\n"
+        + "public class Refused \{\n"
+        + "    public lazy const long value = risky();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Refused.value = 3;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertMentions(analysis.exceptionDiagnostics(),
+        "The initializer of lazy const 'Refused.value' cannot call 'risky' because it can "
+        + "throw 'Boom'; it must not throw.");
+    try sema_support.assertMentions(analysis.bodyDiagnostics(),
+        "Cannot assign to 'Refused.value': a lazy const takes its one value from its "
+        + "initializer and never changes. Change the initializer, or use an instance field.");
 }
 
 test "a throwing static factory demands 'try' at its call sites" {

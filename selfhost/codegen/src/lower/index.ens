@@ -12,15 +12,19 @@ import ProgramAnalysis from @ens.sema.pipeline;
 import BuiltinFunction from @ens.sema.context;
 import ModuleContext from @ens.sema.context;
 import ClassType from @ens.sema.model.types;
+import Field from @ens.sema.model.types;
 import InterfaceType from @ens.sema.model.types;
 import InstantiationType from @ens.sema.model.types;
 import Method from @ens.sema.model.types;
+import PrimitiveKind from @ens.sema.model.types;
 import Signature from @ens.sema.model.types;
 import StructType from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
 import Visibility from @ens.sema.model.types;
 import @ens.sema.model.types;
 import ClassDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import Expression from @ens.frontend.syntax.generated.nodes;
+import FieldDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import InterfaceDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import PrimitiveDeclarationNode from @ens.frontend.syntax.generated.nodes;
@@ -55,6 +59,7 @@ public final class FunctionInfo {
     FunctionDeclarationNode? redDeclaration;
     TestDeclarationNode? testRedDeclaration;
     LambdaExpressionNode? lambdaRedDeclaration;
+    LazyValueInfo? lazyValueEntry;
     string linkSymbol;
     Substitution? instanceSubstitution;
 
@@ -62,7 +67,7 @@ public final class FunctionInfo {
                 bool isExternal, BuiltinFunction? provided, Type? receiverType, Method? method,
                 FunctionDeclarationNode? declaration, string symbol,
                 Substitution? substitution = null, TestDeclarationNode? test = null,
-                LambdaExpressionNode? lambda = null) {
+                LambdaExpressionNode? lambda = null, LazyValueInfo? lazyValue = null) {
         this.owningContext = context;
         this.functionSignature = signature;
         this.functionVisibility = visibility;
@@ -73,6 +78,7 @@ public final class FunctionInfo {
         this.redDeclaration = declaration;
         this.testRedDeclaration = test;
         this.lambdaRedDeclaration = lambda;
+        this.lazyValueEntry = lazyValue;
         this.linkSymbol = symbol;
         this.instanceSubstitution = substitution;
     }
@@ -135,6 +141,12 @@ public final class FunctionInfo {
         return this.lambdaRedDeclaration;
     }
 
+    // The lazy const whose value this entry builds, or null for everything else. The entry has
+    // no declaration of its own: what it lowers is one field's initializer.
+    public lazyValue() -> LazyValueInfo? {
+        return this.lazyValueEntry;
+    }
+
     public symbol() -> string {
         return this.linkSymbol;
     }
@@ -155,6 +167,49 @@ public final class FunctionInfo {
         return this.functionVisibility == Visibility.Private && !this.externalFunction
             && this.providedFunction == null && this.methodReceiverType == null
             && this.instanceSubstitution == null;
+    }
+}
+
+// One lazy const of the program: its field, the initializer that builds its value on the first
+// read, and the three symbols it owns. A generic type's instantiations share the template's.
+public final class LazyValueInfo {
+    Field declaredField;
+    Expression valueInitializer;
+    Type owningType;
+    string initializerLinkSymbol;
+    string valueLinkSymbol;
+    string stateLinkSymbol;
+
+    public constructor(this.declaredField, this.valueInitializer, this.owningType,
+                this.initializerLinkSymbol, this.valueLinkSymbol, this.stateLinkSymbol);
+
+    public field() -> Field {
+        return this.declaredField;
+    }
+
+    public initializer() -> Expression {
+        return this.valueInitializer;
+    }
+
+    public owner() -> Type {
+        return this.owningType;
+    }
+
+    // 'Streams.input', the way a read of this value reads in a panic.
+    public display() -> string {
+        return "{nameOf(this.owningType)}.{this.declaredField.name()}";
+    }
+
+    public initializerSymbol() -> string {
+        return this.initializerLinkSymbol;
+    }
+
+    public valueSymbol() -> string {
+        return this.valueLinkSymbol;
+    }
+
+    public stateSymbol() -> string {
+        return this.stateLinkSymbol;
     }
 }
 
@@ -274,6 +329,7 @@ public final class ProgramIndex {
     Map<Type, RecordInfo> recordByType;
     List<ModuleFunctions> moduleList;
     Map<GreenNode, LambdaSite> lambdaSites;
+    Map<Field, LazyValueInfo> lazyValuesByField;
     FunctionInfo? mainInfo;
 
     public constructor() {
@@ -282,7 +338,18 @@ public final class ProgramIndex {
         this.recordByType = new Map<Type, RecordInfo>();
         this.moduleList = new List<ModuleFunctions>();
         this.lambdaSites = new Map<GreenNode, LambdaSite>();
+        this.lazyValuesByField = new Map<Field, LazyValueInfo>();
         this.mainInfo = null;
+    }
+
+    public registerLazyValue(LazyValueInfo info) {
+        this.lazyValuesByField.set(info.field(), info);
+    }
+
+    // The lazy const a read resolved to, or null when the program declares none for that field.
+    // An instantiation's read arrives with the template's field, which is the one key there is.
+    public lazyValueOf(Field field) -> LazyValueInfo? {
+        return this.lazyValuesByField.get(field);
     }
 
     public registerLambdaSite(GreenNode node, LambdaSite site) {
@@ -540,6 +607,8 @@ indexRecords(ProgramAnalysis analysis, ProgramIndex index, ModuleContext context
                 continue;
             }
             index.registerRecord(declared, new RecordInfo(context, item.body()));
+            indexLazyValues(index, context, analysis.store(), declared, item.body(),
+                moduleFunctions);
             if (!declared.isGeneric()) {
                 indexMethods(index, context, declared, declared.methods(), item.body(),
                     moduleFunctions, true);
@@ -552,6 +621,8 @@ indexRecords(ProgramAnalysis analysis, ProgramIndex index, ModuleContext context
                 continue;
             }
             index.registerRecord(declared, new RecordInfo(context, item.body()));
+            indexLazyValues(index, context, analysis.store(), declared, item.body(),
+                moduleFunctions);
             if (!primitives.isRepresentableClass(declared)) {
                 continue;
             }
@@ -584,6 +655,48 @@ indexRecords(ProgramAnalysis analysis, ProgramIndex index, ModuleContext context
             indexMethods(index, context, primitive, binding.staticMethods(), item.body(),
                 moduleFunctions, false);
         }
+    }
+}
+
+// The lazy consts one record declares. Each becomes an entry in the declaring module's function
+// list, the initializer every module that reads the value calls.
+indexLazyValues(ProgramIndex index, ModuleContext context, TypeStore store, Type recordType,
+                MemberListNode body, ModuleFunctions moduleFunctions) {
+    let staticFields = types.staticFieldsOf(recordType);
+    if (staticFields == null) {
+        return;
+    }
+    string modulePath = context.module().canonicalPath();
+    for (long i = 0; i < body.membersCount(); i++) {
+        let member = body.members(i);
+        if (!(member is FieldDeclarationNode)) {
+            continue;
+        }
+        let initializer = member.defaultValue();
+        if (initializer == null) {
+            continue;
+        }
+        Field? field = null;
+        for (long f = 0; f < staticFields.length(); f++) {
+            let candidate = staticFields.get(f);
+            if (candidate.isLazy() && candidate.nameSpan() == member.name().span()) {
+                field = candidate;
+                break;
+            }
+        }
+        if (field == null) {
+            continue;
+        }
+        string typeName = nameOf(recordType);
+        let info = new LazyValueInfo(field, initializer.value(), recordType,
+            symbols.lazyInitializerLinkName(modulePath, typeName, field.name()),
+            symbols.lazyValueLinkName(modulePath, typeName, field.name()),
+            symbols.lazyStateLinkName(modulePath, typeName, field.name()));
+        index.registerLazyValue(info);
+        let signature = types.synthesizedSignature(info.display(),
+            store.primitive(PrimitiveKind.Void), field.nameSpan());
+        moduleFunctions.functions().push(new FunctionInfo(context, signature, Visibility.Public,
+            false, null, null, null, null, info.initializerSymbol(), null, null, null, info));
     }
 }
 

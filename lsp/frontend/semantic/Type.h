@@ -62,6 +62,8 @@ struct FieldInfo {
     Type* type;
     Visibility visibility = Visibility::Private;
     bool isWeak = false;
+    // A `lazy const` field, which is read through the declaring type's name.
+    bool isLazyConst = false;
     int line = 0;
     int column = 0;
     const GreenElement* declaration = nullptr;

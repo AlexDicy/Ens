@@ -1468,6 +1468,7 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             fi.visibility = memberVisibility(f.visibilityModifier(), Visibility::Private,
                                              t->structInfo, "Field", fi.name);
             fi.isWeak = f.isWeak();
+            fi.isLazyConst = f.isLazy();
             if (fi.isWeak) {
                 errorAtNode(f.node, "'weak' fields are not allowed on structs");
             }
@@ -1987,6 +1988,7 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
         fi.visibility = memberVisibility(f.visibilityModifier(), Visibility::Private, si,
                                          "Field", fi.name);
         fi.isWeak = f.isWeak();
+        fi.isLazyConst = f.isLazy();
         fi.definingClass = si;
         if (fi.isWeak) {
             bool ok = ft && ft->isOptional() && ft->inner && ft->inner->isClass();
@@ -7121,6 +7123,20 @@ Type* Analyzer::analyzeExternalCall(const ast::CallExpression& expr, Symbol* sym
     return sym->returnType ? sym->returnType : typeCtx.getError();
 }
 
+// The type a read through a type name answers with: the field's own for a lazy const, and the
+// error type for every other static member, which is what leaves the checking to the compiler.
+Type* Analyzer::lazyConstType(Type* head, const ast::MemberExpression& expr) {
+    if (!head || !head->structInfo) return typeCtx.getError();
+    auto memberName = expr.memberText();
+    if (!memberName) return typeCtx.getError();
+    int index = head->structInfo->findFieldIndex(*memberName);
+    if (index < 0) return typeCtx.getError();
+    const FieldInfo& field = head->structInfo->fields[static_cast<size_t>(index)];
+    if (!field.isLazyConst || !field.type) return typeCtx.getError();
+    analysis.setType(expr.node.greenNode(), field.type);
+    return field.type;
+}
+
 Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
     auto obj = expr.object();
     if (!obj) return typeCtx.getError();
@@ -7183,13 +7199,14 @@ Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
 
     // Static member access ('Path.separator', 'List.withCapacity(8)', 'List<int>.of(...)'):
     // this temporary front end parses the shape and leaves the checking to the compiler, so a
-    // type-name head produces no diagnostic here.
+    // type-name head produces no diagnostic here. A lazy const answers with the field's own
+    // type, which is what a read of one is worth.
     if (auto idObj = obj->asIdent()) {
         if (auto idName = idObj->nameText()) {
             Symbol* typeSym = currentScope ? currentScope->lookup(*idName) : nullptr;
             if (typeSym && typeSym->isTypeName) {
                 analysis.setSymbol(idObj->node.greenNode(), typeSym);
-                return typeCtx.getError();
+                return lazyConstType(typeSym->type, expr);
             }
             // A type this module declares is not in the value scope, so the head carries no
             // symbol. Recording the type it denotes is what lets go-to-definition and hover
@@ -7197,7 +7214,7 @@ Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
             if (!typeSym) {
                 if (Type* named = typeCtx.lookupNamedType(modulePath_, *idName)) {
                     analysis.setType(idObj->node.greenNode(), named);
-                    return typeCtx.getError();
+                    return lazyConstType(named, expr);
                 }
             }
         }

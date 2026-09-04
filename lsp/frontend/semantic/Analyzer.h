@@ -395,6 +395,7 @@ private:
     Type* analyzeGenericCall(const ast::CallExpression& expr, Symbol* sym,
                              const std::u16string& funcName);
     Type* analyzeMember(const ast::MemberExpression& expr);
+    Type* lazyConstType(Type* head, const ast::MemberExpression& expr);
     Type* analyzeSafeMember(const ast::SafeMemberExpression& expr);
     Type* analyzeSubscript(const ast::SubscriptExpression& expr);
     Type* analyzeSafeSubscript(const ast::SafeSubscriptExpression& expr);

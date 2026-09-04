@@ -5,6 +5,9 @@
 // chain of references evaluates in dependency order whatever the module order, and a cycle is
 // reported at the reference that closes it. The evaluated values land on the Field objects,
 // where the body phase reads them to fold every use site.
+//
+// A lazy const takes no value here, because its initializer runs at run time. Its initializer is
+// walked all the same, for a cycle it closes with another lazy const.
 import StructDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import ClassDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import FieldDeclarationNode from @ens.frontend.syntax.generated.nodes;
@@ -22,7 +25,9 @@ import NewExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ArrayLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
 import StructLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
 import InterpolatedStringExpressionNode from @ens.frontend.syntax.generated.nodes;
+import LambdaExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SyntaxKind from @ens.frontend.syntax.generated.kind;
+import SyntaxNode from @ens.frontend.syntax.node;
 import Span from @ens.frontend.support.source;
 import FileDiagnostic from support.diagnostics;
 import support.diagnostics;
@@ -123,7 +128,8 @@ class ConstantEvaluator {
             if (!(member is FieldDeclarationNode)) {
                 continue;
             }
-            if (!members.fieldModifiers(member).declaresStatic) {
+            let modifiers = members.fieldModifiers(member);
+            if (!modifiers.declaresStatic && !modifiers.declaresLazy) {
                 continue;
             }
             let field = members.findField(types.staticFieldsOf(owner), member.name().text());
@@ -142,7 +148,12 @@ class ConstantEvaluator {
 
     protected evaluateAll() {
         for (long i = 0; i < this.items.length(); i++) {
-            this.evaluateItem(this.items.get(i));
+            let item = this.items.get(i);
+            if (item.field.isLazy()) {
+                this.walkLazyItem(item);
+            } else {
+                this.evaluateItem(item);
+            }
         }
     }
 
@@ -159,6 +170,60 @@ class ConstantEvaluator {
             }
         }
         item.state = stateFinished();
+    }
+
+    // A lazy const builds its value at run time, so nothing here evaluates one. What this phase
+    // does judge is a cycle its initializers close between themselves, which no read can break.
+    walkLazyItem(ConstantItem item) {
+        if (item.state != statePending()) {
+            return;
+        }
+        item.state = stateEvaluating();
+        this.walkLazyReferences(item, item.initializer);
+        item.state = stateFinished();
+    }
+
+    // Every read the initializer performs on its way to a value. A lambda's body is left out
+    // because it runs when something calls it, not while the value is being built.
+    walkLazyReferences(ConstantItem item, SyntaxNode node) {
+        if (node is LambdaExpressionNode) {
+            return;
+        }
+        if (node is MemberExpressionNode) {
+            this.followLazyReference(item, node);
+        }
+        let children = node.childNodes();
+        for (long i = 0; i < children.length(); i++) {
+            this.walkLazyReferences(item, children.get(i));
+        }
+    }
+
+    followLazyReference(ConstantItem item, MemberExpressionNode member) {
+        let object = member.object();
+        if (!(object is IdentifierExpressionNode)) {
+            return;
+        }
+        let named = this.resolveTypeName(item, object.name().text());
+        if (named == null) {
+            return;
+        }
+        string memberName = member.member().text();
+        let field = members.findField(types.staticFieldsOf(named), memberName);
+        if (field == null || !field.isLazy()) {
+            return;
+        }
+        let target = this.itemsByField.get(field);
+        if (target == null) {
+            return;
+        }
+        if (target.state == stateEvaluating()) {
+            this.report(item, "'{item.owner.name()}.{item.field.name()}' cannot take its value "
+                + "from '{named.name()}.{memberName}' here: the chain of lazy consts between "
+                + "them closes a cycle. Break the cycle by building one of the two values "
+                + "without reading the other.", member.span());
+            return;
+        }
+        this.walkLazyItem(target);
     }
 
     report(ConstantItem item, string message, Span span) {
@@ -469,6 +534,11 @@ class ConstantEvaluator {
         if (field == null) {
             this.reportNotConstant(item, member.span(), "'{named.name()}.{memberName}' is "
                 + "not a static const");
+            return null;
+        }
+        if (field.isLazy()) {
+            this.reportNotConstant(item, member.span(), "'{named.name()}.{memberName}' is a "
+                + "lazy const, whose value is built on its first read at run time");
             return null;
         }
         if (!this.referenceVisible(item, field, member.member().span())) {

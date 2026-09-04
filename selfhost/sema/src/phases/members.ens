@@ -46,7 +46,9 @@ public final class MemberModifiers {
     protected bool declaresConst;
     public bool declaresNoreturn;
     public bool declaresStatic;
+    public bool declaresLazy;
     protected Span? staticMark;
+    protected Span? lazyMark;
     protected Span? abstractMark;
     protected Span? finalMark;
 
@@ -95,6 +97,10 @@ public final class MemberModifiers {
                 this.declaresStatic = true;
                 this.staticMark = span;
             },
+            LazyKeyword -> {
+                this.declaresLazy = true;
+                this.lazyMark = span;
+            },
             default -> { },
         }
     }
@@ -115,6 +121,15 @@ public final class MemberModifiers {
     // Where a diagnostic about the 'static' modifier points.
     public staticModifierSpan(Span fallback) -> Span {
         let mark = this.staticMark;
+        if (mark == null) {
+            return fallback;
+        }
+        return mark;
+    }
+
+    // Where a diagnostic about the 'lazy' modifier points.
+    public lazyModifierSpan(Span fallback) -> Span {
+        let mark = this.lazyMark;
         if (mark == null) {
             return fallback;
         }
@@ -184,6 +199,13 @@ public fieldModifiers(FieldDeclarationNode declaration) -> MemberModifiers {
         modifiers.add(declaration.modifiers(i).kind(), declaration.modifiers(i).span());
     }
     return modifiers;
+}
+
+// True for a field that belongs to the type itself rather than to an instance, so it takes no
+// layout slot and its initializer is no part of an instance's initialization.
+public isTypeLevelField(FieldDeclarationNode declaration) -> bool {
+    let modifiers = fieldModifiers(declaration);
+    return modifiers.declaresStatic || modifiers.declaresLazy;
 }
 
 // What a declaration is, for the modifiers that suit one kind and not another. A member is a
@@ -258,6 +280,14 @@ modifierProblem(SyntaxKind kind, DeclarationShape shape) -> string? {
             return "'static' goes on a method or a 'const' field of a class or a struct, "
                 + "where it makes the member belong to the type itself; a top-level function "
                 + "already belongs to no instance";
+        },
+        LazyKeyword -> {
+            if (shape == DeclarationShape.Field) {
+                return null;
+            }
+            return "'lazy' goes on a 'const' field of a class or a struct, where it makes the "
+                + "field's value belong to the type itself and be built on its first read, as "
+                + "in 'lazy const Reader input = makeInput()'";
         },
         default -> {
             return "no field, method, or function takes it";
@@ -494,7 +524,8 @@ public readField(TypeResolver resolver, Reporter reporter, FieldDeclarationNode 
         declaration.name().text(), reporter);
     return new Field(declaration.name().text(), fieldType, visibility,
         modifiers.declaresWeak, modifiers.declaresConst, modifiers.declaresStatic,
-        declaration.defaultValue() != null, declaration.name().span(), owner);
+        modifiers.declaresLazy, declaration.defaultValue() != null, declaration.name().span(),
+        owner);
 }
 
 // The shape of a static const field: 'const' and an initializer are mandatory because nothing
@@ -529,6 +560,59 @@ public checkStaticFieldShape(Reporter reporter, FieldDeclarationNode declaration
             + "belongs to the type itself, which every instantiation shares, so its type "
             + "cannot use a type parameter.", at);
     }
+}
+
+// The shape of a lazy const field: 'const' and an initializer are mandatory because nothing else
+// ever assigns it, and the value belongs to the type itself, kept to the end of the program.
+// What the initializer may contain is the body phase's rule, not this one's.
+public checkLazyFieldShape(Reporter reporter, FieldDeclarationNode declaration, Field field) {
+    let modifiers = fieldModifiers(declaration);
+    string name = field.name();
+    Span at = field.nameSpan();
+    string shownType = types.display(field.type());
+    if (modifiers.declaresStatic) {
+        reporter.report("A 'lazy const' field already belongs to the type itself, so it cannot "
+            + "also be 'static': a static const holds a compile-time constant, while a lazy "
+            + "const builds its value on the first read. Remove 'static'.",
+            modifiers.staticModifierSpan(at));
+    }
+    if (!field.isConst()) {
+        reporter.report("A 'lazy' field must also be 'const'; its value is built once on the "
+            + "first read and never changes. Write 'lazy const {shownType} {name} = ...', or "
+            + "make '{name}' an instance field.", modifiers.lazyModifierSpan(at));
+    }
+    if (field.isWeak()) {
+        reporter.report("A lazy const field cannot be 'weak': the program keeps its value to "
+            + "the end, so nothing ever releases it. Remove 'weak'.", at);
+    }
+    if (declaration.defaultValue() == null) {
+        reporter.report("Lazy const '{name}' needs its value on the declaration, because "
+            + "nothing else ever assigns it: write 'lazy const {shownType} {name} = ...'.", at);
+    }
+    if (types.isVoidType(field.type())) {
+        reporter.report("Lazy const '{name}' cannot have type 'void'; 'void' means no value, so "
+            + "there is nothing to keep. Give '{name}' the type of the value its initializer "
+            + "builds.", at);
+    } else if (convert.containsTypeParam(field.type())) {
+        reporter.report("Lazy const '{name}' cannot have type '{shownType}': a lazy const "
+            + "belongs to the type itself, which every instantiation shares, so its type "
+            + "cannot use a type parameter.", at);
+    }
+}
+
+// How a diagnostic names a type-level const field, at the start of a sentence and inside one.
+public typeLevelFieldNoun(Field field) -> string {
+    if (field.isLazy()) {
+        return "Lazy const";
+    }
+    return "Static const";
+}
+
+public typeLevelFieldWord(Field field) -> string {
+    if (field.isLazy()) {
+        return "lazy const";
+    }
+    return "static const";
 }
 
 // The types a compile-time constant can have. 'void' is excluded because it names no value, and
@@ -604,9 +688,9 @@ public checkStaticInstanceCollision(Reporter reporter, DeclaredType owner, strin
     }
     let staticField = findField(types.staticFieldsOf(owner), memberName);
     if (staticField != null) {
-        reporter.report("'{memberName}' is already declared as a static const of "
-            + "'{owner.name()}'; a static and an instance member cannot share a name. Rename "
-            + "one of the two.", span);
+        reporter.report("'{memberName}' is already declared as a "
+            + "{typeLevelFieldWord(staticField)} of '{owner.name()}'; a static and an instance "
+            + "member cannot share a name. Rename one of the two.", span);
         return;
     }
     let staticMethod = findMethodNamed(types.staticMethodsOf(owner), memberName);
@@ -658,8 +742,9 @@ public checkStaticFieldMethodCollision(Reporter reporter, DeclaredType owner, st
                                        Span span) {
     let collided = findField(types.staticFieldsOf(owner), methodName);
     if (collided != null) {
-        reporter.report("'{methodName}' is already declared as a static const of "
-            + "'{owner.name()}'; a field and a method cannot share a name.", span);
+        reporter.report("'{methodName}' is already declared as a "
+            + "{typeLevelFieldWord(collided)} of '{owner.name()}'; a field and a method cannot "
+            + "share a name.", span);
     }
 }
 
