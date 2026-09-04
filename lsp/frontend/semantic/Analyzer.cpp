@@ -7123,8 +7123,8 @@ Type* Analyzer::analyzeExternalCall(const ast::CallExpression& expr, Symbol* sym
     return sym->returnType ? sym->returnType : typeCtx.getError();
 }
 
-// The type a read through a type name answers with: the field's own for a lazy const, and the
-// error type for every other static member, which is what leaves the checking to the compiler.
+// A read through a type name answers with the field's own type for a lazy const. Every other
+// static member answers with the error type, which leaves the checking to the compiler.
 Type* Analyzer::lazyConstType(Type* head, const ast::MemberExpression& expr) {
     if (!head || !head->structInfo) return typeCtx.getError();
     auto memberName = expr.memberText();
