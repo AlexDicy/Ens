@@ -3010,11 +3010,16 @@ void Analyzer::checkFieldDefaults(const ast::ClassDecl& cd) {
     currentScope = globalScope;
     Scope* fieldScope = pushScope();
 
+    // A class's own fields sit after its inherited ones in the flattened layout, so the
+    // declaration's position counts from there.
     auto fields = cd.fields();
+    size_t own = static_cast<size_t>(t->structInfo->baseFieldCount);
     for (size_t i = 0; i < fields.size(); ++i) {
         auto& f = fields[i];
         auto dv = f.defaultValue();
-        Type* expected = (i < t->structInfo->fields.size()) ? t->structInfo->fields[i].type : typeCtx.getError();
+        size_t slot = own + i;
+        Type* expected = (slot < t->structInfo->fields.size()) ? t->structInfo->fields[slot].type
+                                                               : typeCtx.getError();
         if (dv) {
             if (auto dvExpr = dv->expression()) {
                 Type* actual = analyzeExprAdapt(*dvExpr, expected);
@@ -3029,7 +3034,7 @@ void Analyzer::checkFieldDefaults(const ast::ClassDecl& cd) {
         if (fname && !fname->empty()) {
             uint32_t fOffset = f.nameToken() ? f.nameToken()->startOffset() : f.node.startOffset();
             Symbol* sib = makeSymbol(SymbolKind::SiblingField, *fname, expected, fOffset);
-            sib->siblingFieldIndex = static_cast<int>(i);
+            sib->siblingFieldIndex = static_cast<int>(slot);
             fieldScope->define(sib);
         }
     }
