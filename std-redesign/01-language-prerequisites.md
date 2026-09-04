@@ -159,6 +159,16 @@ A bound may name a class: `<E: Error>` accepts `Error` or any subclass.
 At most one class per bound list, mirroring single inheritance, combinable with interfaces via `+`.
 Naming a `final` class is an error, since only the class itself could satisfy it.
 
+## `lazy const` fields
+
+Ratified 2026-09-04, after C5 found that `io.in()` cannot answer the same reader every call: a `static` field must be `const` with a compile-time constant of primitive type, and a top-level variable is refused, so nothing can hold a value that outlives a call.
+The spelling is a class member, `export lazy const BufferedReader input = makeInput();`, reached through the type name as `Streams.input`.
+It is type-level like a `static const`, so writing `static` alongside is an error.
+The initializer runs on the first read and the value is kept for the rest of the program; it may call functions and allocate, and it may not throw, which keeps a read from needing `try`.
+A read compiles to a flag test and a branch, so `static const` keeps its meaning and its folding.
+A cycle between two initializers stays a compile error; one that goes through a function call aborts on the read that closes it, naming the value, which is the one entry the closed panic list gains.
+The value's destructor never runs, since the program holds it to the end.
+
 ## Type-argument inference through instantiations
 
 Ratified 2026-09-02, after the C3b std tests had to write `assertExhausted<string>(walk)` for an `Iterator<string>` argument.
