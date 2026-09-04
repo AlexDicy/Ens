@@ -6,7 +6,6 @@ Every item names when it is done: a milestone of 10-migration-plan.md, a phase, 
 
 An array literal holding `this` inside a generic body (`[this, this]` for a `T[]` parameter, or `Box<T>[] xs = [this];`) is refused, because the literal's element type is the bare template and assignability equates the template with its self-instantiation only at the top level, not under `[]`; since 2026-09-04 the refusal even reads "expected 'Box<T>[]', got 'Box<T>[]'". The clean resolution is `this` carrying the self-instantiation itself, or the equation applying structurally.
 A parameter whose type is unreadable still floods the parameter list (a 600-level nested bound reports 409 problems); the same classifier pathology fix 8 closed for statements, queued as its own fix.
-A local declared doubly nullable but assigned a single-level value passes the interpolation check through flow narrowing and then reaches code generation at its real type, producing internal errors ("retain of %6, which holds string??"); `int[]??` through the same shape is silently accepted (found 2026-09-04 by the fix 6 review, pre-existing, queued as its own fix).
 A subclass method whose name a private base field uses is still refused, since `checkFieldMethodCollision` searches the flattened field list without the exemption private base fields gained on 2026-09-04; consistency would let it through, and it is a conservative refusal rather than an unsoundness.
 
 ## C6
