@@ -154,9 +154,19 @@ mergeDiagnostics(Diagnostic[] first, Diagnostic[] second) -> Diagnostic[] {
     return merged.toArray();
 }
 
+// True when the same limit was already reached at the same place, which is what one construct's
+// nested readings all report.
+hasDepthLimit(Diagnostic[] limits, Diagnostic limit) -> bool {
+    for (let seen in limits) {
+        if (seen.span().start == limit.span().start && seen.message() == limit.message()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // A snapshot of everything speculation can change: the token cursor (including split state), the
-// event list, the diagnostics, and the recoveries. The depth-limit count rides along because
-// clean reads it apart from the diagnostic count.
+// event list, the diagnostics, the depth limits, and the recoveries.
 struct ParserMark {
     protected long position;
     protected long splitOffset;
@@ -196,8 +206,13 @@ class Parser {
     // How deeply expressions and types are nested at this point; see maximumNestingDepth.
     long nestingDepth;
 
-    // How many of the diagnostics reported so far are depth limits; see clean.
-    long depthLimits;
+    // The depth limits reached so far, kept apart from the other diagnostics because they answer
+    // a different question: a limit says how big a construct is, not which construct it is, so a
+    // reading given up for depth is still that reading (see clean). They rewind like everything
+    // else, since the reading the parser settles on reports the limit again on its own way past
+    // it; a classifier that drops a reading without re-reading its tokens carries them instead.
+    RewindableList<Diagnostic> depthLimits;
+    List<Diagnostic> carriedDepthLimits;
 
     // True while a switch arm's labels are being parsed. There a '->' ends the labels, so
     // 'Circle -> ...' and '(1) -> ...' are the arm rather than a lambda; a label is a constant,
@@ -215,7 +230,8 @@ class Parser {
         this.diagnostics = new RewindableList<Diagnostic>();
         this.recoveries = new RewindableList<Recovery>();
         this.nestingDepth = 0;
-        this.depthLimits = 0;
+        this.depthLimits = new RewindableList<Diagnostic>();
+        this.carriedDepthLimits = new List<Diagnostic>();
         this.inArmLabels = false;
     }
 
@@ -223,8 +239,16 @@ class Parser {
         return this.events.toArray();
     }
 
+    // A carried limit is there so a file the parser gave up on for depth cannot come out silent
+    // about it. Where a reading did report a limit, the file has been told how deeply it nests,
+    // and the carried ones say the same about the same text a link apart, so they are dropped.
     protected collectedDiagnostics() -> Diagnostic[] {
-        return this.diagnostics.toArray();
+        Diagnostic[] live = this.depthLimits.toArray();
+        if (live.length > 0 || this.carriedDepthLimits.length() == 0) {
+            return mergeDiagnostics(this.diagnostics.toArray(), live);
+        }
+        return mergeDiagnostics(this.diagnostics.toArray(),
+            this.carriedDepthLimits.toArray());
     }
 
     protected collectedRecoveries() -> Recovery[] {
@@ -421,6 +445,24 @@ class Parser {
         this.diagnostics.push(new Diagnostic(message, span));
     }
 
+    reportDepthLimit(string message, Span span) {
+        this.depthLimits.push(new Diagnostic(message, span));
+    }
+
+    // Keeps the depth limits a speculation reached past its rewind, for a classifier that gives
+    // up a reading without re-reading its tokens: the limit is the whole account of why the
+    // construct could not be read, so dropping it would leave only the recovery's own message.
+    // One entry per place and message, since the readings of one construct nest inside each other
+    // and each of them reaches the same limit.
+    carryDepthLimits(ParserMark restore) {
+        for (long i = restore.depthLimitCount; i < this.depthLimits.count(); i++) {
+            let limit = this.depthLimits.get(i);
+            if (!hasDepthLimit(this.carriedDepthLimits.toArray(), limit)) {
+                this.carriedDepthLimits.push(limit);
+            }
+        }
+    }
+
     reportAtCurrent(string message) {
         let token = this.tokens[this.position];
         let start = token.offset + this.splitOffset;
@@ -470,7 +512,7 @@ class Parser {
             lastContentEnd: this.lastContentEnd,
             eventCount: this.events.count(),
             diagnosticCount: this.diagnostics.count(),
-            depthLimitCount: this.depthLimits,
+            depthLimitCount: this.depthLimits.count(),
             recoveryCount: this.recoveries.count(),
         };
     }
@@ -481,7 +523,7 @@ class Parser {
         this.lastContentEnd = restore.lastContentEnd;
         this.events.truncate(restore.eventCount);
         this.diagnostics.truncate(restore.diagnosticCount);
-        this.depthLimits = restore.depthLimitCount;
+        this.depthLimits.truncate(restore.depthLimitCount);
         this.recoveries.truncate(restore.recoveryCount);
     }
 
@@ -490,11 +532,9 @@ class Parser {
     // stopped reporting would otherwise let a speculation look clean while leaving an invented
     // token in the tree it kept.
     //
-    // A depth limit is not counted: it says how big the construct is and not which construct it
-    // is, so a reading given up for depth is still that reading.
+    // A depth limit never lands here, so a reading given up for depth is still that reading.
     clean(ParserMark restore) -> bool {
-        return this.diagnostics.count() - this.depthLimits
-                == restore.diagnosticCount - restore.depthLimitCount
+        return this.diagnostics.count() == restore.diagnosticCount
             && this.recoveries.count() == restore.recoveryCount;
     }
 
@@ -583,8 +623,7 @@ class Parser {
     // contain the other, so neither can carry the pair past the limit on its own.
     enterNesting(string message) -> bool {
         if (this.nestingDepth >= maximumNestingDepth()) {
-            this.report(message, source.makeSpan(this.lastContentEnd, 0));
-            this.depthLimits++;
+            this.reportDepthLimit(message, source.makeSpan(this.lastContentEnd, 0));
             return false;
         }
         this.nestingDepth++;
@@ -1644,6 +1683,11 @@ class Parser {
                     || (allowBodiless && after == SyntaxKind.Semicolon);
             }
         }
+        // Nothing re-reads these tokens as a declaration once this answers no, so a depth limit
+        // reached inside the header would go unsaid.
+        if (!result) {
+            this.carryDepthLimits(restore);
+        }
         this.rewind(restore);
         return result;
     }
@@ -1666,6 +1710,9 @@ class Parser {
                 headerOk = this.clean(restore);
             }
             result = headerOk && this.at(SyntaxKind.OpenParenthesis);
+        }
+        if (!result) {
+            this.carryDepthLimits(restore);
         }
         this.rewind(restore);
         return result;
@@ -1852,17 +1899,25 @@ class Parser {
 
     // True at `Type name = ...` or `Type name;`, the typed variable-declaration shape. The type
     // is parsed speculatively and always rewound; the caller re-parses it for real.
+    //
+    // A type the parser could not read keeps the reading it was written as, so the type reports
+    // its own problem once. Dropping the statement to the expression path instead would re-read
+    // the same text as an expression and report per link: every '?[]' of a broken chain becomes
+    // an empty safe subscript with a problem of its own.
     atTypedVariableDeclaration() -> bool {
         if (!isTypeOrGroupStart(this.currentKind())) {
             return false;
         }
         let restore = this.mark();
         this.parseType("");
-        bool result = this.clean(restore) && this.at(SyntaxKind.Identifier);
-        if (result) {
-            let after = this.peekKind(1);
-            result = after == SyntaxKind.Equals || after == SyntaxKind.Semicolon;
-        }
+        bool named = this.at(SyntaxKind.Identifier)
+            && (this.peekKind(1) == SyntaxKind.Equals
+                || this.peekKind(1) == SyntaxKind.Semicolon);
+        // A chain that ran into the end of the file has no name to look for, and nothing more was
+        // written to say what it was: the tokens already read as a type stay one. A single name
+        // there is left to the expression path, which is what an unfinished statement usually is.
+        bool truncatedChain = this.atEnd() && this.position - restore.position > 1;
+        bool result = named || truncatedChain;
         this.rewind(restore);
         return result;
     }
@@ -2276,7 +2331,8 @@ class Parser {
     }
 
     // A type given up for depth, as one error type holding the tokens it was written with. The
-    // parse ends where the type ended, so the declaration around it keeps its shape.
+    // parse ends where the type ended, so the declaration around it keeps its shape. The rewind
+    // above dropped the limit the nested parse reported, so it is reported here, at the type.
     abandonedDeepType(long end) -> long {
         let marker = this.start();
         long start = this.tokens[this.position].offset;
@@ -2285,8 +2341,7 @@ class Parser {
             this.bump();
         }
         this.complete(skipped, SyntaxKind.List);
-        this.report(deeplyNestedType(), source.makeSpan(start, 0));
-        this.depthLimits++;
+        this.reportDepthLimit(deeplyNestedType(), source.makeSpan(start, 0));
         return this.complete(marker, SyntaxKind.ErrorType);
     }
 
@@ -2452,12 +2507,15 @@ class Parser {
     }
 
     // Commits the type argument list when it parses without diagnostics, and rewinds otherwise.
+    // A list given up for depth keeps that limit: in a type position nothing re-reads the '<',
+    // and where a comparison does, how deep the text nests is worth saying either way.
     tryParseTypeArgumentList() -> bool {
         let restore = this.mark();
         this.parseTypeArgumentList();
         if (this.clean(restore)) {
             return true;
         }
+        this.carryDepthLimits(restore);
         this.rewind(restore);
         return false;
     }
