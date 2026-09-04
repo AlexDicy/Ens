@@ -1,0 +1,271 @@
+// Wrappers that turn many small reads and writes into few large ones. The reader adds the
+// line-shaped and read-everything calls a raw source cannot offer.
+import BytesWriter from @std.io.memory;
+import ErrorKind from @std.io.streams;
+import IoError from @std.io.streams;
+import Reader from @std.io.streams;
+import Writer from @std.io.streams;
+
+// Reads ahead into a buffer, so a caller taking a few bytes at a time reaches the source once per
+// bufferful. A capacity below one byte is raised to one.
+export final class BufferedReader implements Reader {
+    const Reader source;
+
+    byte[] held;
+    long start;
+    long end;
+    bool ended;
+
+    export constructor(this.source, long capacity = 8192) {
+        this.held = new byte[capacity < 1 ? 1 : capacity];
+        this.start = 0;
+        this.end = 0;
+        this.ended = false;
+    }
+
+    // Bytes out of the buffer, refilling it first when it is empty, and 0 only at the end of the
+    // stream. A request at least a bufferful wide is read straight from the source.
+    export override read(byte[] buffer) -> long throws IoError {
+        if (buffer.length == 0) {
+            return 0;
+        }
+        if (this.start == this.end && buffer.length >= this.held.length) {
+            return try this.bytesFromSource(buffer);
+        }
+        bool ready = try this.holdsBytes();
+        if (!ready) {
+            return 0;
+        }
+        long count = this.end - this.start;
+        if (count > buffer.length) {
+            count = buffer.length;
+        }
+        for (long i = 0; i < count; i++) {
+            buffer[i] = this.held[this.start + i];
+        }
+        this.start = this.start + count;
+        return count;
+    }
+
+    // The next line without its ending, or null once the stream has ended. A carriage return
+    // before the newline belongs to the ending, and a last line without one is a line of its own.
+    export readLine() -> string? throws IoError {
+        bool ready = try this.holdsBytes();
+        if (!ready) {
+            return null;
+        }
+        long at = this.newlineIndex();
+        if (at < 0) {
+            return try this.lineAcrossFills();
+        }
+        byte[] line = this.held.slice(this.start, at);
+        this.start = at + 1;
+        return string.fromBytes(withoutReturn(line));
+    }
+
+    // Everything left in the stream, as bytes.
+    export readAll() -> byte[] throws IoError {
+        let collected = new BytesWriter();
+        while (true) {
+            bool ready = try this.holdsBytes();
+            if (!ready) {
+                return collected.toBytes();
+            }
+            collected.write(this.held.slice(this.start, this.end));
+            this.start = this.end;
+        }
+    }
+
+    // Everything left in the stream, as text. Bytes that do not spell UTF-8 are refused, since
+    // text in Ens is always valid UTF-8.
+    export readAllText() -> string throws IoError {
+        byte[] raw = try this.readAll();
+        long at = firstInvalidUtf8(raw);
+        if (at >= 0) {
+            throw new IoError("the stream is not valid UTF-8 text: the byte at offset {at} fits "
+                + "no character. Read it with readAll() and decode the bytes yourself",
+                ErrorKind.Other);
+        }
+        return string.fromBytes(raw);
+    }
+
+    // A line whose bytes did not all arrive in one fill, assembled out of every fill it spans.
+    lineAcrossFills() -> string throws IoError {
+        let assembled = new BytesWriter();
+        while (true) {
+            long at = this.newlineIndex();
+            if (at >= 0) {
+                assembled.write(this.held.slice(this.start, at));
+                this.start = at + 1;
+                break;
+            }
+            assembled.write(this.held.slice(this.start, this.end));
+            this.start = this.end;
+            bool ready = try this.holdsBytes();
+            if (!ready) {
+                break;
+            }
+        }
+        return string.fromBytes(withoutReturn(assembled.toBytes()));
+    }
+
+    // Whether the buffer holds a byte to take, reading more into it when it is empty. False once
+    // the source has ended and nothing is left over.
+    holdsBytes() -> bool throws IoError {
+        if (this.start < this.end) {
+            return true;
+        }
+        this.start = 0;
+        this.end = try this.bytesFromSource(this.held);
+        return this.end > 0;
+    }
+
+    // How many bytes the source itself put into `buffer`, with the end of the stream remembered so
+    // nothing asks it again afterwards.
+    bytesFromSource(byte[] buffer) -> long throws IoError {
+        if (this.ended) {
+            return 0;
+        }
+        long count = try this.source.read(buffer);
+        if (count == 0) {
+            this.ended = true;
+        }
+        return count;
+    }
+
+    // Where the next newline sits among the held bytes, or -1 when none of them ends a line.
+    newlineIndex() -> long {
+        for (long i = this.start; i < this.end; i++) {
+            if (this.held[i] == '\n') {
+                return i;
+            }
+        }
+        return -1;
+    }
+}
+
+// Collects writes into a buffer and passes them on when it fills, when `flush` is called, or when
+// the wrapper is dropped. A capacity below one byte is raised to one.
+export final class BufferedWriter implements Writer {
+    const Writer target;
+
+    byte[] held;
+    long count;
+
+    export constructor(this.target, long capacity = 8192) {
+        this.held = new byte[capacity < 1 ? 1 : capacity];
+        this.count = 0;
+    }
+
+    // `data` into the buffer, handing on what is already there when the two together would not
+    // fit. Data at least a bufferful wide goes to the target directly.
+    export override write(byte[] data) throws IoError {
+        if (this.count + data.length > this.held.length) {
+            try this.handOver();
+        }
+        if (data.length >= this.held.length) {
+            try this.target.write(data);
+            return;
+        }
+        for (long i = 0; i < data.length; i++) {
+            this.held[this.count + i] = data[i];
+        }
+        this.count = this.count + data.length;
+    }
+
+    // Everything the buffer holds, written to the target and then flushed through it, so a flush
+    // here reaches wherever the bytes were going.
+    export override flush() throws IoError {
+        try this.handOver();
+        try this.target.flush();
+    }
+
+    // The buffer's bytes written to the target and forgotten here. Bytes the target refuses are
+    // dropped, so no later call offers them a second time.
+    handOver() throws IoError {
+        if (this.count == 0) {
+            return;
+        }
+        byte[] pending = this.held.slice(0, this.count);
+        this.count = 0;
+        try this.target.write(pending);
+    }
+
+    // Flushes what the buffer still holds, keeping any failure to itself. A program that has to
+    // know whether the bytes arrived calls `flush` itself.
+    destructor() {
+        try this.flush();
+    } catch (IoError ignored) {
+    }
+}
+
+// `raw` without a carriage return at its end, which a Windows line ending writes before the
+// newline and which belongs to the ending rather than to the line.
+withoutReturn(byte[] raw) -> byte[] {
+    if (raw.length > 0 && raw[raw.length - 1] == '\r') {
+        return raw.slice(0, raw.length - 1);
+    }
+    return raw;
+}
+
+// Where `raw` first stops spelling UTF-8, or -1 when all of it does. Overlong forms, the surrogate
+// range and anything above U+10FFFF are refused along with the malformed sequences.
+firstInvalidUtf8(byte[] raw) -> long {
+    long at = 0;
+    while (at < raw.length) {
+        long width = characterWidth(raw, at);
+        if (width == 0) {
+            return at;
+        }
+        at = at + width;
+    }
+    return -1;
+}
+
+// How many bytes the character at `at` spans, or 0 when the bytes there spell none.
+characterWidth(byte[] raw, long at) -> long {
+    long width = leadWidth(raw[at]);
+    if (width == 0 || at + width > raw.length) {
+        return 0;
+    }
+    if (width == 1) {
+        return 1;
+    }
+    // The range the second byte may fall in narrows for four leads, which is what rules out an
+    // overlong form, a surrogate and a value above U+10FFFF.
+    byte lowest = 0x80;
+    byte highest = 0xBF;
+    switch (raw[at]) {
+        0xE0 -> { lowest = 0xA0; },
+        0xED -> { highest = 0x9F; },
+        0xF0 -> { lowest = 0x90; },
+        0xF4 -> { highest = 0x8F; },
+        default -> { },
+    }
+    if (raw[at + 1] < lowest || raw[at + 1] > highest) {
+        return 0;
+    }
+    for (long i = at + 2; i < at + width; i++) {
+        if (raw[i] < 0x80 || raw[i] > 0xBF) {
+            return 0;
+        }
+    }
+    return width;
+}
+
+// How many bytes a character beginning with `lead` spans, or 0 when none begins with it.
+leadWidth(byte lead) -> long {
+    if (lead < 0x80) {
+        return 1;
+    }
+    if (lead >= 0xC2 && lead <= 0xDF) {
+        return 2;
+    }
+    if (lead >= 0xE0 && lead <= 0xEF) {
+        return 3;
+    }
+    if (lead >= 0xF0 && lead <= 0xF4) {
+        return 4;
+    }
+    return 0;
+}

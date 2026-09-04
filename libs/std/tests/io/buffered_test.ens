@@ -1,0 +1,179 @@
+// Tests for the two buffering wrappers: the lines and bulk reads the reader adds, and when the
+// writer passes what it holds on.
+import @std.testing;
+import BufferedReader from @std.io.buffered;
+import BufferedWriter from @std.io.buffered;
+import BytesReader from @std.io.memory;
+import ErrorKind from @std.io.streams;
+import IoError from @std.io.streams;
+import ChunkedReader from io.support;
+import CountingWriter from io.support;
+import FailingWriter from io.support;
+
+// A reader over `text`, filling `capacity` bytes at a time, which is how a test puts a line or a
+// character across a fill boundary.
+readerOver(string text, long capacity) -> BufferedReader {
+    return new BufferedReader(new BytesReader(text.toBytes()), capacity);
+}
+
+// Every line the reader has left, joined with '|' so one assertion covers a whole stream.
+allLines(BufferedReader reader) -> string throws IoError {
+    string joined = "";
+    long taken = 0;
+    string? line = try reader.readLine();
+    while (line != null) {
+        if (taken > 0) {
+            joined = joined + "|";
+        }
+        joined = joined + line;
+        taken = taken + 1;
+        line = try reader.readLine();
+    }
+    return joined;
+}
+
+// A writer written to and then dropped without a flush, so only its destructor can pass the bytes
+// on.
+dropAfterWriting(CountingWriter target, string text) throws IoError {
+    let buffered = new BufferedWriter(target, 64);
+    try buffered.write(text.toBytes());
+}
+
+test "readLine hands over a last line that does not end in a newline" {
+    try testing.assertEqual(try allLines(readerOver("one\ntwo", 64)), "one|two");
+}
+
+test "readLine over text ending in a newline adds no empty line after it" {
+    try testing.assertEqual(try allLines(readerOver("one\ntwo\n", 64)), "one|two");
+}
+
+test "readLine drops a carriage return written before the newline" {
+    try testing.assertEqual(try allLines(readerOver("one\r\ntwo\r\n", 64)), "one|two");
+}
+
+test "readLine answers an empty line for a newline with nothing before it" {
+    try testing.assertEqual(try allLines(readerOver("\nsecond\n\n", 64)), "|second|");
+}
+
+test "readLine assembles a line that spans several fills" {
+    try testing.assertEqual(try allLines(readerOver("abcdefghij\nnext\n", 4)), "abcdefghij|next");
+}
+
+test "readLine drops a carriage return that lands in an earlier fill than its newline" {
+    try testing.assertEqual(try allLines(readerOver("abc\r\nd", 4)), "abc|d");
+}
+
+test "readLine answers null once the stream has ended, and keeps answering null" {
+    let reader = readerOver("", 64);
+    try testing.assertEqual<string?>(try reader.readLine(), null);
+    try testing.assertEqual<string?>(try reader.readLine(), null);
+}
+
+test "read answers what is ready and only answers 0 at the end of the stream" {
+    let reader = new BufferedReader(new ChunkedReader("abcd".toBytes(), 1), 8);
+    byte[] buffer = new byte[4];
+    try testing.assertEqual(try reader.read(buffer), 1);
+    try testing.assertEqual(string.fromBytes(buffer.slice(0, 1)), "a");
+    try testing.assertEqual(try reader.read(buffer), 1);
+    try testing.assertEqual(try reader.read(buffer), 1);
+    try testing.assertEqual(try reader.read(buffer), 1);
+    try testing.assertEqual(try reader.read(buffer), 0);
+}
+
+test "a read at least a bufferful wide is answered by the source itself" {
+    let reader = new BufferedReader(new ChunkedReader("abcdefghij".toBytes(), 100), 4);
+    try testing.assertEqual(try reader.read(new byte[16]), 10);
+}
+
+test "readAll answers everything left, after lines have already been taken" {
+    let reader = readerOver("first\nrest of it", 4);
+    try testing.assertEqual<string?>(try reader.readLine(), "first");
+    try testing.assertEqual(string.fromBytes(try reader.readAll()), "rest of it");
+    byte[] nothingLeft = try reader.readAll();
+    try testing.assertEqual(nothingLeft.length, 0);
+}
+
+test "readAllText answers the whole stream as text, multi-byte characters included" {
+    try testing.assertEqual(try readerOver("héllo wörld", 4).readAllText(), "héllo wörld");
+}
+
+test "readAllText refuses bytes that are not UTF-8 and says where they stop being it" {
+    byte[] raw = [0x61, 0x62, 0x63, 0xFF];
+    let reader = new BufferedReader(new BytesReader(raw), 8);
+    let failure = try testing.assertThrows<IoError>(() -> {
+        try reader.readAllText();
+    });
+    try testing.assertEqual(failure.kind, ErrorKind.Other);
+    try testing.assertEqual(failure.message, "the stream is not valid UTF-8 text: the byte at "
+        + "offset 3 fits no character. Read it with readAll() and decode the bytes yourself");
+}
+
+test "readAllText refuses a surrogate and an overlong form, which spell no character" {
+    byte[] surrogate = [0xED, 0xA0, 0x80];
+    byte[] overlong = [0x41, 0xE0, 0x80, 0xAF];
+    try testing.assertThrows<IoError>(() -> {
+        try new BufferedReader(new BytesReader(surrogate), 8).readAllText();
+    });
+    let failure = try testing.assertThrows<IoError>(() -> {
+        try new BufferedReader(new BytesReader(overlong), 8).readAllText();
+    });
+    try testing.assertTrue(failure.message.contains("offset 1"), "the lead byte is named");
+}
+
+test "a capacity below one byte is raised to one" {
+    try testing.assertEqual(try allLines(readerOver("ab\ncd\n", 0)), "ab|cd");
+}
+
+test "the writer holds what it is given until the buffer would overflow" {
+    let target = new CountingWriter();
+    let buffered = new BufferedWriter(target, 8);
+    try buffered.write("1234".toBytes());
+    try testing.assertEqual(target.length(), 0);
+    try buffered.write("5678".toBytes());
+    try testing.assertEqual(target.length(), 0);
+    try buffered.write("9".toBytes());
+    try testing.assertEqual(target.text(), "12345678");
+    try testing.assertEqual(target.writes, 1);
+    try testing.assertEqual(target.flushes, 0);
+}
+
+test "a write at least a bufferful wide reaches the target after what was held" {
+    let target = new CountingWriter();
+    let buffered = new BufferedWriter(target, 4);
+    try buffered.write("ab".toBytes());
+    try buffered.write("cdefghij".toBytes());
+    try testing.assertEqual(target.text(), "abcdefghij");
+    try testing.assertEqual(target.writes, 2);
+}
+
+test "flush hands the buffer over and flushes the target under it" {
+    let target = new CountingWriter();
+    let buffered = new BufferedWriter(target, 64);
+    try buffered.write("held".toBytes());
+    try buffered.flush();
+    try testing.assertEqual(target.text(), "held");
+    try testing.assertEqual(target.flushes, 1);
+    try buffered.flush();
+    try testing.assertEqual(target.writes, 1);
+    try testing.assertEqual(target.flushes, 2);
+}
+
+test "dropping the writer flushes what its buffer still held" {
+    let target = new CountingWriter();
+    try dropAfterWriting(target, "written and dropped");
+    try testing.assertEqual(target.text(), "written and dropped");
+}
+
+test "a target that refuses is reported, and its bytes are not offered a second time" {
+    let target = new FailingWriter(ErrorKind.Closed);
+    let buffered = new BufferedWriter(target, 64);
+    try buffered.write("doomed".toBytes());
+    let failure = try testing.assertThrows<IoError>(() -> {
+        try buffered.flush();
+    });
+    try testing.assertEqual(failure.kind, ErrorKind.Closed);
+    try testing.assertThrows<IoError>(() -> {
+        try buffered.flush();
+    });
+    try testing.assertEqual(target.offers, 1);
+}
