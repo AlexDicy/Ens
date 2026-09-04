@@ -2836,14 +2836,22 @@ bool Analyzer::findNonComparableField(Type* structT, std::vector<StructInfo*>& v
 // JSON form. Reports the offending field's dotted path and type when one does
 // not. A field mentioning a type parameter is judged per instantiation during
 // code generation, so it is skipped here.
-void Analyzer::checkStructJsonable(Type* structT, const SyntaxNode& node) {
+// `shown` is the type the value was written with, which a hole holding the struct behind a
+// nullable level names in place of the struct itself; it is the struct for every other caller.
+void Analyzer::checkStructJsonable(Type* structT, const SyntaxNode& node, Type* shown) {
     if (!structT || !structT->structInfo) return;
+    if (!shown) shown = structT;
     std::vector<StructInfo*> visiting;
     std::string fieldPath;
     Type* leaf = nullptr;
     if (findNonJsonableField(structT, visiting, fieldPath, leaf) && leaf) {
-        errorAtNode(node, "Struct '" + asciiOf(structT->structInfo->name) +
-            "' cannot be converted to a string. Field '" + fieldPath + "' has type '" +
+        std::string subject = "Struct '" + asciiOf(structT->structInfo->name) +
+            "' cannot be converted to a string.";
+        if (shown != structT) {
+            subject = "Cannot interpolate a value of type '" + shown->toString() +
+                "': struct '" + asciiOf(structT->structInfo->name) + "' has no text form.";
+        }
+        errorAtNode(node, subject + " Field '" + fieldPath + "' has type '" +
             leaf->toString() + "', which has no string form; only value types, strings, enums, "
             "their nullable forms, and nested such structs serialize to JSON. Convert or drop the field.");
     }
@@ -5130,7 +5138,9 @@ Type* Analyzer::analyzeInterpString(const ast::InterpStringExpression& expr) {
         Type* ht = analyzeExpr(hole);
         if (ht->isError()) continue;
         // One nullable level renders the value's text or `null`, so what it wraps decides. A
-        // second level has no text of its own and falls through to the refusal below.
+        // second level has no text of its own and falls through to the refusal below. Every
+        // refusal names the type the hole holds, which is the level the author wrote.
+        Type* shown = ht;
         if (ht->isOptional() && ht->inner && !ht->inner->isOptional()) ht = ht->inner;
         // A bare type parameter or a generic struct is judged per instantiation during code
         // generation, the same way its equality and JSON emission are.
@@ -5142,13 +5152,13 @@ Type* Analyzer::analyzeInterpString(const ast::InterpStringExpression& expr) {
             // never serialized; without one it interpolates as its JSON form, which is valid
             // when every field is JSON-able.
             if (declaredToString(ht->structInfo)) continue;
-            checkStructJsonable(ht, hole.node);
+            checkStructJsonable(ht, hole.node, shown);
             continue;
         }
         // A class or interface value renders through its runtime type: the `toString` override
         // that type declared, or its type name when no class in the chain declares one.
         if (ht->isClass()) continue;
-        errorAtNode(hole.node, "Cannot interpolate a value of type '" + ht->toString() +
+        errorAtNode(hole.node, "Cannot interpolate a value of type '" + shown->toString() +
             "'; only string, integer, bool, enum, class, and JSON-serializable struct values are "
             "supported here. Convert it with '.toString()' first.");
     }
