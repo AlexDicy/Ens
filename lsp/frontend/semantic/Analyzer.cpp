@@ -2785,20 +2785,18 @@ void Analyzer::checkStructEquatable(Type* structT, const SyntaxNode& node) {
     std::string fieldPath;
     Type* leaf = nullptr;
     if (findNonComparableField(structT, visiting, fieldPath, leaf) && leaf) {
-        std::string reason = leaf->isFunction() ? "a function value has no identity"
-                                               : "external types have no value equality";
         errorAtNode(node, "Struct '" + asciiOf(structT->structInfo->name) +
             "' cannot be compared with '=='. Field '" + fieldPath + "' has type '" +
-            leaf->toString() + "', which has no '=='; " + reason +
+            leaf->toString() + "', which has no '=='; a function value has no identity"
             ". Compare the fields you need directly instead.");
     }
 }
 
 // Walks a struct's fields for one whose type has no '=='. Descends through
 // nullable wrappers and nested structs, recording the dotted path to the leaf.
-// External and function-typed fields are the concrete leaves without '=='; arrays
-// and classes compare by identity, so they are fine. A struct that declares its
-// own 'equals' answers for itself and is never walked into.
+// A function-typed field is the concrete leaf without '=='; arrays, classes, and
+// external handles compare by identity, so they are fine. A struct that declares
+// its own 'equals' answers for itself and is never walked into.
 bool Analyzer::findNonComparableField(Type* structT, std::vector<StructInfo*>& visiting,
                                       std::string& fieldPath, Type*& leaf) {
     if (!structT || !structT->structInfo) return false;
@@ -2814,7 +2812,7 @@ bool Analyzer::findNonComparableField(Type* structT, std::vector<StructInfo*>& v
         if (!ft || TypeContext::containsTypeParam(ft)) continue;
         Type* core = ft;
         while (core->isOptional() && core->inner) core = core->inner;
-        if (core->isExternal() || core->isFunction()) {
+        if (core->isFunction()) {
             fieldPath = asciiOf(f.name);
             leaf = core;
             return true;
