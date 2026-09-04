@@ -1501,6 +1501,21 @@ task("test")
             -- '--tests' names where the tests of one target live
             run({"test", suite, "--tests", path.join(suite, "tests")}, nil, 0, "2/2 tests passed")
 
+            -- the folder '--tests' names is part of the package it tests wherever it sits, so a
+            -- test there reaches the package's 'public' members the way one inside it does
+            local outside = path.join(root, "outside")
+            writePackage(outside, 'package demo.outside {\n    ens "0.1";\n}\n', {
+                ["src/math.ens"] = 'public tripled(long n) -> long {\n    return n * 3;\n}\n',
+            })
+            local elsewhere = path.join(root, "elsewheretests")
+            os.mkdir(elsewhere)
+            io.writefile(path.join(elsewhere, "math_test.ens"),
+                'import @std.testing;\nimport math;\n\n'
+                .. 'test "tripling a small number" {\n'
+                .. '    try testing.assertEqual(math.tripled(2), 6L);\n}\n')
+            run({"test", outside, "--tests", elsewhere}, nil, 0, "PASS tripling a small number",
+                "1/1 tests passed")
+
             -- a file is not a folder of tests, and a workspace root tests its members
             run({"test", path.join(tests_dir, "hello.ens")}, nil, 2, "is one file",
                 "folder the tests live in")
