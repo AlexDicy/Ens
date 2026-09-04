@@ -5,7 +5,6 @@ Every item names when it is done: a milestone of 10-migration-plan.md, a phase, 
 ## Before C5
 
 An array literal holding `this` inside a generic body (`[this, this]` for a `T[]` parameter, or `Box<T>[] xs = [this];`) is refused, because the literal's element type is the bare template and assignability equates the template with its self-instantiation only at the top level, not under `[]`; since 2026-09-04 the refusal even reads "expected 'Box<T>[]', got 'Box<T>[]'". The clean resolution is `this` carrying the self-instantiation itself, or the equation applying structurally.
-An interpolation hole refuses a possibly-null value; ratified 2026-09-04: a single-level nullable prints its text or `null`, a doubly nullable value stays refused, and `assertEqual<string?>` works as a consequence.
 A private base field is still treated as inherited, unlike a private base method: the duplicate check has to skip private base fields, and field resolution inside the subclass has to prefer its own, which means two slots carrying one name.
 A type the statement classifier cannot read floods the statement with one problem per suffix, because `atTypedVariableDeclaration` drops to the expression path on any diagnostic other than a depth limit; the classifier keeps its reading whenever the type is unreadable.
 `ens test <package> --tests <folder>` compiles the folder outside the package, so two std tests that name `public` members fail there while the in-package run passes; ratified 2026-09-04: the folder is part of the package, and those two tests are the pin.

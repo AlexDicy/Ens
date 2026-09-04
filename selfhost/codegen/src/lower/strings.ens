@@ -9,11 +9,17 @@ import Span from @ens.frontend.support.source;
 import Method from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
 import EnumType from @ens.sema.model.types;
+import OptionalType from @ens.sema.model.types;
 import StructType from @ens.sema.model.types;
 import PrimitiveKind from @ens.sema.model.types;
 import @ens.sema.model.types;
+import EirBranch from eir.model;
+import EirCast from eir.model;
+import EirCastOp from eir.model;
 import EirConstString from eir.model;
 import EirDynamicToString from eir.model;
+import EirJump from eir.model;
+import EirLoadSlot from eir.model;
 import EirStringConcat from eir.model;
 import EirStringEqual from eir.model;
 import EirIntToString from eir.model;
@@ -31,8 +37,10 @@ import lower.conversions;
 import lower.expressions;
 import lower.json;
 import lower.literals;
+import lower.optionals;
 import lower.ownership;
 import lower.places;
+import lower.stores;
 import lower.structs;
 import support.primitives;
 
@@ -131,6 +139,11 @@ public lowerToString(LoweringContext lowering, Expression node) -> long {
     if (type == null) {
         return -1;
     }
+    // One nullable level renders its payload or the text 'null'. An array answers for its own
+    // absence, so a nullable array stays on the array path.
+    if (type is OptionalType && primitives.arrayOf(type) == null) {
+        return lowerOptionalToString(lowering, node, type, type.inner());
+    }
     if (primitives.isStringType(type)) {
         long value = expressions.lower(lowering, node);
         if (value < 0) {
@@ -170,6 +183,94 @@ public lowerToString(LoweringContext lowering, Expression node) -> long {
         return -1;
     }
     return convertToString(lowering, value, type, node.span());
+}
+
+// A value that may be absent: the payload's own text where it is there, and the text 'null'
+// where it is not. Both arms merge through a slot that owns the text, so the caller receives one
+// reference whichever way the branch went.
+lowerOptionalToString(LoweringContext lowering, Expression node, Type type, Type payloadType)
+        -> long {
+    let builder = lowering.builder();
+    let stringType = lowering.store().stringType();
+    long value = expressions.lowerConverted(lowering, node, type);
+    if (value < 0) {
+        return -1;
+    }
+    // A value the expression produced is parked in a slot its scope owns, so both paths read it
+    // borrowed and its reference is given up once however the branch went.
+    if (places.producesOwnedValue(lowering, node)) {
+        long parked = ownership.defineMergeSlot(lowering, "optvalue", type);
+        if (!stores.assignSlot(lowering, parked, type, new stores.Operand(value, true, -1))) {
+            return -1;
+        }
+        value = builder.newTemp(type);
+        builder.append(new EirLoadSlot(value, type, parked));
+    }
+    long present = optionals.presenceOf(lowering, value, type);
+    long slot = ownership.defineMergeSlot(lowering, "opttext", stringType);
+    long presentBlock = builder.newBlock("opttext.present");
+    long absentBlock = builder.newBlock("opttext.absent");
+    long mergeBlock = builder.newBlock("opttext.end");
+    builder.terminate(new EirBranch(present, presentBlock, absentBlock));
+
+    builder.moveTo(presentBlock);
+    long rendered = payloadToString(lowering, value, payloadType, node.span());
+    if (rendered < 0) {
+        return -1;
+    }
+    if (!stores.assignSlot(lowering, slot, stringType,
+            new stores.Operand(rendered, true, -1))) {
+        return -1;
+    }
+    builder.terminate(new EirJump(mergeBlock));
+
+    builder.moveTo(absentBlock);
+    if (!stores.assignSlot(lowering, slot, stringType,
+            new stores.Operand(literalText(lowering, "null"), false, -1))) {
+        return -1;
+    }
+    builder.terminate(new EirJump(mergeBlock));
+
+    builder.moveTo(mergeBlock);
+    long merged = builder.newTemp(stringType);
+    builder.append(new EirLoadSlot(merged, stringType, slot));
+    ownership.retainValue(lowering, merged);
+    return merged;
+}
+
+// The text of a payload the present path has proven is there, as a string the caller owns. A
+// struct renders over the address of a scratch copy, the way every other reader of an optional's
+// payload reaches it.
+payloadToString(LoweringContext lowering, long value, Type payloadType, Span span) -> long {
+    let builder = lowering.builder();
+    let structType = primitives.structOf(payloadType);
+    if (structType != null) {
+        long address = optionals.taggedScratchAddress(lowering, value, payloadType);
+        if (address < 0) {
+            return -1;
+        }
+        let own = types.declaredToString(structType);
+        if (own != null) {
+            return structs.lowerDeclaredToStringAt(lowering, payloadType, own, address, span);
+        }
+        return json.renderAt(lowering, address, payloadType, span);
+    }
+    long payload = conversions.convert(lowering, value, payloadType, span);
+    if (payload < 0) {
+        return -1;
+    }
+    // The payload is the borrowed string itself, so the retain the caller's ownership needs
+    // lands on a temp of its own rather than on the value the branch read.
+    if (primitives.isStringType(payloadType)) {
+        long text = builder.newTemp(payloadType);
+        builder.append(new EirCast(text, payloadType, EirCastOp.Reinterpret, payload));
+        ownership.retainValue(lowering, text);
+        return text;
+    }
+    if (primitives.isClassLike(payloadType)) {
+        return classTextOfValue(lowering, payload, payloadType, span);
+    }
+    return convertToString(lowering, payload, payloadType, span);
 }
 
 // A class or interface value's text form: the 'toString' its runtime type declared, or that

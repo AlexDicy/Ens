@@ -5121,6 +5121,9 @@ Type* Analyzer::analyzeInterpString(const ast::InterpStringExpression& expr) {
     for (auto& hole : expr.holes()) {
         Type* ht = analyzeExpr(hole);
         if (ht->isError()) continue;
+        // One nullable level renders the value's text or `null`, so what it wraps decides. A
+        // second level has no text of its own and falls through to the refusal below.
+        if (ht->isOptional() && ht->inner && !ht->inner->isOptional()) ht = ht->inner;
         // A bare type parameter or a generic struct is judged per instantiation during code
         // generation, the same way its equality and JSON emission are.
         if (ht->isTypeParam() || (ht->isStruct() && TypeContext::containsTypeParam(ht))) continue;
