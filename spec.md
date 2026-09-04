@@ -18,6 +18,7 @@ Members never follow the type that contains them, whether that type is a class o
 A private member belongs to its own type alone, so it is not inherited: a subclass cannot call it, cannot override it, and may declare a method of its own under the same name with no relation to the base's.
 Overriding a base method therefore requires that method to be at least `protected`, and an abstract method must be at least `protected` too, since a subclass has to implement it.
 A method that provides an interface requirement must be as visible as its own class, because anyone who can hold one of its values as the interface can call it through the interface.
+A method that overrides a base class method writes the visibility of the method it overrides, capped at what its own class can hold (`protected` in a file-private class, `public` in a `public` one), and an override with no marker or a different one is an error naming the required marker.
 One kind of method follows its type's visibility instead of the default: a method that replaces a behavior the language already provides, meaning a struct's or a class's `toString`, `hash`, and `equals`.
 The language calls such a method wherever the type is used, so it may not be marked less visible than its type either.
 Interface members carry no visibility of their own: they always follow the interface, and writing a visibility modifier on an interface member is an error.
@@ -180,6 +181,7 @@ class Square extends Shape {
 ```
 
 Methods are overridable by default. An override must be marked `override` and must match a method declared in a base class; this catches typos and accidental shadowing. Mark a method or a class `final` to forbid overriding or extending it.
+An override also carries the visibility marker of the method it overrides, as the visibility section describes, so `protected override sound()` replaces a `protected sound()`.
 An override's parameter types must match exactly, while its return type may be narrower where a value of it is held the same way: a class, interface, array, string, function or external handle reference, or one of those with its `?` dropped, because both spellings are one pointer.
 A narrower number, a nullable value type with its `?` dropped, and one level dropped from a doubly nullable type are each rejected, because a caller reaching the method through the type that declared it would read the declared shape and find the other one.
 The same rule governs the method a class provides for an interface requirement.
