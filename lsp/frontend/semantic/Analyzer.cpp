@@ -1998,9 +1998,12 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
                     "'weak' fields must be nullable class types (e.g. `weak Foo? f`)");
             }
         }
-        if (!fi.name.empty() && si->findFieldIndex(fi.name) >= 0) {
-            int existing = si->findFieldIndex(fi.name);
-            bool inherited = existing < si->baseFieldCount;
+        int existing = fi.name.empty() ? -1 : si->findFieldIndex(fi.name);
+        bool inherited = existing >= 0 && existing < si->baseFieldCount;
+        // A private base field is not inherited, so its name is free for a subclass field of
+        // its own, and the two hold slots of their own in the flattened layout.
+        if (inherited && si->fields[existing].visibility == Visibility::Private) existing = -1;
+        if (existing >= 0) {
             errorAtNode(f.node, "Field '" + asciiOf(fi.name) + "' is already declared" +
                 (inherited ? " in base class '" + asciiOf(si->baseInfo->name) + "'" : " in '" + asciiOf(si->name) + "'"));
             continue;

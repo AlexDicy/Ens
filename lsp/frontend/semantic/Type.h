@@ -128,9 +128,11 @@ struct StructInfo {
     StructInfo* templateOf = nullptr;           // instantiation -> its template
     std::vector<Type*> typeArgs;                // instantiation -> concrete type args
 
+    // Searched most derived first: the flattened layout holds inherited fields before own ones,
+    // and a subclass field may reuse the name of a private base field, which is not inherited.
     int findFieldIndex(const std::u16string& fieldName) const {
-        for (size_t i = 0; i < fields.size(); ++i) {
-            if (fields[i].name == fieldName) return static_cast<int>(i);
+        for (size_t i = fields.size(); i > 0; --i) {
+            if (fields[i - 1].name == fieldName) return static_cast<int>(i - 1);
         }
         return -1;
     }

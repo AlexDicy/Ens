@@ -16,6 +16,7 @@ Top-level `protected` is not allowed.
 Members never follow the type that contains them, whether that type is a class or a struct: they stay private unless marked.
 `private` is therefore never written; a member or a top-level declaration is already private with no modifier on it, and writing the word is an error.
 A private member belongs to its own type alone, so it is not inherited: a subclass cannot call it, cannot override it, and may declare a method of its own under the same name with no relation to the base's.
+The same holds for a field: a subclass may declare a field whose name a private base field uses, the two hold storage of their own, and each class's code reaches the one it declared.
 Overriding a base method therefore requires that method to be at least `protected`, and an abstract method must be at least `protected` too, since a subclass has to implement it.
 A method that provides an interface requirement must be as visible as its own class, because anyone who can hold one of its values as the interface can call it through the interface.
 A method that overrides a base class method writes the visibility of the method it overrides, capped at what its own class can hold (`protected` in a file-private class, `public` in a `public` one), and an override with no marker or a different one is an error naming the required marker.
