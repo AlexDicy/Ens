@@ -4,8 +4,6 @@ Every item names when it is done: a milestone of 10-migration-plan.md, a phase, 
 
 ## Before C5
 
-`Collection<T>` moves to its own module, `@std.collections.collection` (ratified 2026-09-04); `iterator.ens` keeps `Iterator` and `Iterable`.
-`types.display` of a generic template shows the bare name, so the mismatch message for `this` handed where a different instantiation is expected reads "got 'Box'" where "got 'Box<T>'" is right.
 Inside a generic body, `identity(this)` against `identity<U>(U value)` binds `U` to the bare template rather than to the instantiation at the class's own parameters, and code generation then refuses the call; the type-parameter arm of `unifyArgument` binds the self-instantiation, as the language server already does.
 Two external handles compared with `==` are accepted by sema and refused by code generation; ratified 2026-09-04: code generation compares them by identity, the way a presence check already does, and the spec says so.
 An override may be marked less visible than the method it overrides and stays reachable through the base; ratified 2026-09-04: an override takes the overridden method's visibility, and a marker that narrows it is an error, matching the rule that an interface implementation inherits its visibility.
