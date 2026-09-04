@@ -20,7 +20,10 @@ export interface Iterator<T> {
 export interface Iterable<T> {
     makeIterator() -> Iterator<T>;
 }
+```
 
+```ens
+// @std.collections.collection
 // An iterable that knows how many values it holds and can answer whether it holds a given one.
 export interface Collection<T> extends Iterable<T> {
     length() -> long;
@@ -28,6 +31,8 @@ export interface Collection<T> extends Iterable<T> {
     contains(T value) -> bool;
 }
 ```
+
+`Collection` has its own module (ratified 2026-09-04) because a module named for iterators should hold only the walking contracts.
 
 ```ens
 // @std.collections.entry

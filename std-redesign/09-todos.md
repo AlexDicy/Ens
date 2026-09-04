@@ -1,68 +1,54 @@
 # Open questions and deferred items
 
-## Implementation work items surfaced by the design
+Every item names when it is done: a milestone of 10-migration-plan.md, a phase, or the work that follows the redesign.
 
-Shortest round-trip float formatting, for `StringBuilder.append(double)` and interpolation; exists nowhere today.
-Number formatting beyond decimal (radix, width, padding) and parsing/formatting for `decimal`.
-The 16 `List<string>` sorts in selfhost and libs pass `(a, b) -> a.compareTo(b)` because `string` does not implement `Comparable<string>` yet; C6 binds it and lets them drop the lambda for `sort()`.
-A call through a function value held in a field retains and releases the closure around every call, and a function-typed parameter is retained at entry and released at exit, so a comparator handed down a recursion pays two atomics per level (measured 2026-09-03 at -O2: 2ns per call through a parameter inside one function, 16ns through a field).
-Escape analysis should elide both; until it does, `SortedMap` reads `this.order` at every step and recurses in its lookup rather than looping, since a loop retains and releases every node it moves onto (a million lookups took 0.35s looping and 0.07s recursing).
-`types.display` of a generic template shows the bare name, so the mismatch message for `this` handed where a different instantiation is expected reads "got 'Box'" where "got 'Box<T>'" would be clearer.
-Inside a generic body, `identity(this)` against `identity<U>(U value)` binds `U` to the bare template rather than to the instantiation at the class's own parameters, and code generation then refuses the call with "does not support a parameter of type 'Box' yet" (pre-existing, confirmed on the baseline by the 2026-09-02 review); binding the self-instantiation in the type-parameter arm of `unifyArgument` is the fix, and the language server already does that, so the two disagree on this one shape until then.
+## Before C5
+
+`Collection<T>` moves to its own module, `@std.collections.collection` (ratified 2026-09-04); `iterator.ens` keeps `Iterator` and `Iterable`.
+`types.display` of a generic template shows the bare name, so the mismatch message for `this` handed where a different instantiation is expected reads "got 'Box'" where "got 'Box<T>'" is right.
+Inside a generic body, `identity(this)` against `identity<U>(U value)` binds `U` to the bare template rather than to the instantiation at the class's own parameters, and code generation then refuses the call; the type-parameter arm of `unifyArgument` binds the self-instantiation, as the language server already does.
+Two external handles compared with `==` are accepted by sema and refused by code generation; ratified 2026-09-04: code generation compares them by identity, the way a presence check already does, and the spec says so.
+An override may be marked less visible than the method it overrides and stays reachable through the base; ratified 2026-09-04: an override takes the overridden method's visibility, and a marker that narrows it is an error, matching the rule that an interface implementation inherits its visibility.
+An interpolation hole refuses a possibly-null value; ratified 2026-09-04: a single-level nullable prints its text or `null`, a doubly nullable value stays refused, and `assertEqual<string?>` works as a consequence.
+A private base field is still treated as inherited, unlike a private base method: the duplicate check has to skip private base fields, and field resolution inside the subclass has to prefer its own, which means two slots carrying one name.
+A type the statement classifier cannot read floods the statement with one problem per suffix, because `atTypedVariableDeclaration` drops to the expression path on any diagnostic other than a depth limit; the classifier keeps its reading whenever the type is unreadable.
+`ens test <package> --tests <folder>` compiles the folder outside the package, so two std tests that name `public` members fail there while the in-package run passes; ratified 2026-09-04: the folder is part of the package, and those two tests are the pin.
+
+## C6
+
+`StringBuilder.append(double)` reuses the runtime's shortest round-trip formatting, which interpolation already has; a `float` prints today as its double expansion (`0.1` prints `0.10000000149011612`), so C6 decides whether a float gets the shortest text for a float.
+Integer formatting in other bases (hex, binary, octal) with width and zero padding joins 05-text.md (ratified 2026-09-04); the spelling is signed off before C6 writes it.
+The 16 `List<string>` sorts in selfhost and libs pass `(a, b) -> a.compareTo(b)` because `string` does not implement `Comparable<string>` yet; C6 binds it and they drop the lambda for `sort()`.
+
+## C8 and C9
+
 OS-level redirection for `run(captureOutput: true)`, wait-with-timeout, and kill in the native bridges.
-The toString marker flip: after the Phase B seed and the C6 text rewrite give `StringBuilder` its `export override toString()`, Phase D makes an unmarked class method named `toString` an error, closing the A4 transition rule (ratified 2026-08-28).
 
-A dedicated review pass over the diagnostic messages introduced across the whole migration, once the plan completes (requested 2026-08-27).
+## Phase D
 
-`ens test libs/std --tests libs/std/tests` fails to compile two existing std tests that name `public` symbols of the package, while the suite's `ens test libs/std` passes them (found 2026-09-03, pre-existing).
-A tests folder handed through `--tests` seems to compile outside the package it tests, so whether such tests should see the package's `public` surface, as the in-package `tests/` folder does, wants a ruling before C7 and C8 write theirs.
+The toString marker flip: after the C6 text rewrite gives `StringBuilder` its `export override toString()`, an unmarked class method named `toString` becomes an error, closing the A4 transition rule (ratified 2026-08-28).
+A dedicated review pass over the diagnostic messages introduced across the whole migration (requested 2026-08-27).
 
-Two external handles compared with each other are accepted by sema and refused by code generation (found 2026-08-30, pre-existing).
-`h1 == h2` over two handles reports `The self-hosted code generator does not support comparing 'Handle?' with 'Handle' yet`, while the spec says a handle is passed around and compared with `null`, which is the only comparison it names.
-So either sema should refuse the handle-to-handle comparison and say why, or code generation should answer it by identity the way a presence check already does.
+## After Phase D
 
-A type the statement classifier cannot read floods the statement with one problem per suffix (found 2026-08-30, pre-existing, unchanged by the suffix bound).
-`atTypedVariableDeclaration` parses the type speculatively and requires `clean`, so any diagnostic other than a depth limit makes the statement not-a-declaration and drops it to the expression path, where each `?[]` reads as an empty safe subscript and reports.
-Three measured shapes: a parenthesized head missing its `)` followed by 600 suffixes gives 499 problems instead of 2; a chain truncated at end of file gives 5 problems at 6 suffixes and 302 at 600; and an over-deep type-parameter bound reports only `Expected a top-level declaration` because `looksLikeFunctionDeclaration` discards the depth diagnostic on rewind and the real parse never runs.
-Every message is individually true, so this is noise rather than a wrong answer, and the fix is a classifier that keeps its reading when the type is unreadable for any reason rather than only for depth.
+A call through a function value held in a field retains and releases the closure around every call, and a function-typed parameter is retained at entry and released at exit, so a comparator handed down a recursion pays two atomics per level (measured 2026-09-03 at -O2: 2ns per call through a parameter inside one function, 16ns through a field).
+Escape analysis in code generation elides both (ratified 2026-09-04 as a post-redesign pass); until then `SortedMap` reads `this.order` at every step and recurses in its lookup rather than looping, since a loop retains and releases every node it moves onto.
+When `@std.time` is designed, `Metadata.modifiedMillis` and `wait(long timeoutMillis)` take a proper duration or instant type; the names carry the unit until then.
 
-The language server reports a spurious entry-point placement error on a single-file program (found 2026-08-30, pre-existing).
-Opening `tests/inheritance.ens` says `main` may only be defined in the main module, because the server names a lone file's module after the file rather than treating the file as the program's main module, which is what `ens build <file>` does.
-Folder programs and packages are both clean; only a single file is affected, so this is worth carrying to the language server's replacement rather than fixing in the one being retired.
-Its parser also bounds no nesting at all, so all four deep shapes reach its stack the way they used to reach the compiler's (found 2026-08-30); the replacement needs the bound the compiler's parser now has.
-It no longer checks what a lambda's body throws at all (2026-09-01), because a lambda is now held to the throws list of its target function type and the server does not track a lambda's target: the target arrives from a parameter, a declared local, a field, an array element, or an aggregate field, and reporting without it would flag valid code.
-The compiler owns the rule, so the cost is one missing editor diagnostic rather than a wrong one, and the replacement should carry it.
+## The language server's replacement
 
-Three diagnostics the server anchors to the wrong node, so the message is right and the squiggle is not (found 2026-09-01, all pre-existing, deliberately not fixed since the server is temporary).
-The interface-widening error anchors to the whole class declaration instead of the implementing method's name, at `ThrowsAnalyzer.cpp:470`, where the compiler uses the method's name span.
-"'try' is not needed here" anchors to the call instead of the `try` keyword, at `ThrowsAnalyzer.cpp:261`.
-"cannot be 'final'" anchors to the whole method declaration instead of its name, in `Analyzer.cpp` near the private-final check.
-Underneath the first of those, `lsp/server/DiagnosticBridge.cpp` computes a range as `startCh + length` on one line, so any diagnostic anchored to a multi-line node produces a range running past the end of its line; the replacement's bridge should measure the node's real end position.
-
-Three more false errors the server shows on valid code, all pre-existing and all left for its replacement (found 2026-09-02 by the inference review, on `tests/generics_inference.ens`).
-Its type model carries no thrown-type list on a function type, only a flag, so a type argument that appears only in a `throws` list can never be inferred there.
-It does not treat a value of `Bag<int>`, where `Bag<T> extends Iterable<T>`, as an `Iterable<int>`, which `tests/interface_extends.ens` already showed as spurious assignment and `override` errors before this change.
-Its parser rejects a local declaration whose type is a parenthesized function type with a `throws` list, `(() -> int throws Failure) safe = ...`, and every statement after it in the block is then misread.
-
-A generic static call result does not feed the server's type-argument inference (found 2026-09-02, pre-existing, left for the replacement): after `let words = List<string>.of([...])`, `countOf(words)` against `countOf<T>(Collection<T> items)` reports "Cannot infer type argument 'T'", while the same call infers from a local with a written type or from `new List<string>()`; the compiler infers all three.
-
-A private base field is still treated as inherited, unlike a private base method (found 2026-08-31, pre-existing).
-A subclass declaring a field whose name a private base field already uses is refused with "Field is already declared in base class", and because that ends the subclass's own field collection, its own reads of the name are rewired onto the base's private field and refused a second time for privacy, from inside the subclass.
-Methods gained the opposite rule on 2026-08-31: a private base method is not inherited, so a subclass may reuse the name for a member of its own.
-The field fix is more than a filter, because base fields flatten into the subclass's layout: the duplicate check has to skip private base fields, and field resolution inside the subclass has to prefer its own, which means two slots carrying one name.
-
-An override may still be marked less visible than the method it overrides (found 2026-08-31).
-`protected override greet()` on a middle class whose base declares `greet()` publicly compiles, and the method stays reachable through the base's dispatch slot, so the marker narrows who may name it and nothing else.
-Virtual dispatch itself is right: a further subclass overriding the same method answers for its own instances.
-What is unsettled is whether the narrowing marker should be legal at all, which is the override-visibility question the visibility ladder deliberately set aside, so it wants a ruling rather than a fix.
-
-A nullable type argument cannot use `assertEqual` or `assertNotEqual` (pre-existing, re-surfaced 2026-09-01 by the C2e review).
-The failure path interpolates the values, interpolation refuses a possibly-null value, and a generic body has no way to peel one level off an arbitrary `T`, so `assertEqual<string?>` is refused per instantiation and a test over an optional result unwraps by hand first.
-The clean fix is a language ruling, not a library one: whether an interpolation hole accepts a single-level nullable and prints `null` for the absent case, the way an array element already does inside the array text form.
+The current C++ server is temporary; these are carried to its replacement rather than fixed in it.
+It reports a spurious entry-point placement error on a single-file program, because it names a lone file's module after the file rather than treating the file as the program's main module, which is what `ens build <file>` does.
+Its parser bounds no nesting, so deep shapes reach its stack; the replacement needs the bound the compiler's parser has.
+It no longer checks what a lambda's body throws, because a lambda is held to the throws list of its target function type and the server does not track a lambda's target; the compiler owns the rule, so the cost is one missing diagnostic rather than a wrong one.
+Three diagnostics anchor to the wrong node: the interface-widening error to the whole class declaration (`ThrowsAnalyzer.cpp:470`), "'try' is not needed here" to the call instead of the keyword (`ThrowsAnalyzer.cpp:261`), and "cannot be 'final'" to the whole method declaration; underneath, `lsp/server/DiagnosticBridge.cpp` computes a range as `startCh + length` on one line, so a multi-line node's range runs past its line.
+Its type model carries no thrown-type list on a function type, so a type argument that appears only in a `throws` list can never be inferred there.
+It does not treat a value of `Bag<int>`, where `Bag<T> extends Iterable<T>`, as an `Iterable<int>`, which `tests/interface_extends.ens` shows as spurious assignment and `override` errors.
+Its parser rejects a local declaration whose type is a parenthesized function type with a `throws` list, `(() -> int throws Failure) safe = ...`, and misreads every statement after it in the block.
+A generic static call result does not feed its type-argument inference: after `let words = List<string>.of([...])`, `countOf(words)` reports "Cannot infer type argument 'T'" while the compiler infers it.
 
 ## Reminders
 
-When `@std.time` is designed, replace `Metadata.modifiedMillis` and `wait(long timeoutMillis)` with a proper duration/instant type; the names carry the unit until then.
 Constructors cannot be `throws` (selfhost/sema/src/phases/members.ens:501, deliberate), which is why anything whose creation does I/O uses a static factory: `TemporaryDirectory.create()`, `TemporaryFile.create()`, `Path.open()`.
 Threads are coming (outside this redesign): they unlock separate-stream reading without deadlock hazard, a possible live merged-output mode, and parallel test isolation.
 

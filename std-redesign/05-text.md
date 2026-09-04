@@ -132,7 +132,8 @@ Parsers return `T?` and there is no `ParseError` class: nothing in the module th
 `chars()` and `bytes()` are non-copying views; `toBytes()` keeps the copying contract of `to`.
 `joined` is a static on `string`, not a free function.
 `string` implements `Comparable<string>` but not `Iterable<char>`; `for (let c in text)` does not compile.
-`StringBuilder.append(double)` creates a work item: shortest round-trip float formatting exists nowhere yet.
+`StringBuilder.append(double)` reuses the runtime's shortest round-trip formatting, which interpolation already has; whether a `float` gets the shortest text for a float rather than its double expansion is decided here.
+Integer formatting in other bases (hex, binary, octal) with width and zero padding joins this surface (ratified 2026-09-04); the spelling is signed off before C6 writes it.
 Case conversion beyond ASCII, locale collation, and Unicode normalization are all out of scope for v1.
 
 ## EncodingError
