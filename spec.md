@@ -1571,8 +1571,8 @@ The accepted escapes are `\n`, `\r`, `\t`, `\b`, `\f`, `\0`, `\\`, `\"`, `\'`, `
 
 A `float` or `double` renders as decimal text that reads back as exactly the same value, so nothing is lost between printing a number and reading it again.
 The text is kept short where that costs nothing, but it is the reading back, not the shortness, that is promised.
-Concretely the text carries the fewest of 15, 16, and 17 significant digits that still reads back exactly, with trailing zeros left off: `2.5` is `"2.5"` and `0.1` is `"0.1"`, while `0.1 + 0.2` is `"0.30000000000000004"` because that sum genuinely is not three tenths.
-A `float` renders through the same rule after widening to `double`, which is lossless, so both types print the same text for the same value.
+Concretely a `double`'s text carries the fewest of 15, 16, and 17 significant digits that still reads back exactly, with trailing zeros left off: `2.5` is `"2.5"` and `0.1` is `"0.1"`, while `0.1 + 0.2` is `"0.30000000000000004"` because that sum genuinely is not three tenths.
+A `float`'s text carries the fewest of 6, 7, 8, and 9 significant digits that reads back as that same `float`, so it is the shortest text for the value the type actually holds: `0.1f` is `"0.1"` rather than the `"0.10000000149011612"` its widening to `double` would spell, and `1.0f / 3.0f` is `"0.33333334"`.
 A value with nothing after its decimal point loses the point too, so `3.0` is `"3"` and `0.0` is `"0"`; negative zero keeps its sign as `"-0"`.
 Exponent form is used when the value's decimal exponent is below -4 or reaches the number of significant digits shown, and is written as `e`, a sign, and at least two digits: `1e-5` is `"1e-05"` and `1e21` is `"1e+21"`, while `0.0001` and `1234567` are written out in full.
 The three values that are not numbers render as `"inf"`, `"-inf"` and `"nan"`, whatever the C library underneath would have called them.

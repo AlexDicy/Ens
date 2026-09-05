@@ -448,38 +448,52 @@ public integerText(Runtime runtime) -> RuntimeFunction {
 }
 
 // ptr ens_double_to_string(double value): the fewest of 15, 16, and 17 significant digits that
-// reads back as the same value, stopping at the first that does. Fifteen settles the ordinary
-// cases and keeps their text short; seventeen always round-trips, so it needs no check of its own.
+// reads back as the same value. Fifteen settles the ordinary cases and keeps their text short;
+// seventeen always round-trips, so it needs no check of its own.
 public doubleText(Runtime runtime) -> RuntimeFunction {
-    let type = runtime.pointerType.functionType([runtime.doubleType]);
-    let known = runtime.existing("ens_double_to_string", type);
+    return decimalText(runtime, "ens_double_to_string", false, [15, 16, 17]);
+}
+
+// ptr ens_float_to_string(float value): the same ladder judged at float precision, where nine
+// significant digits always round-trip. The text reads back as this float rather than as the
+// double it would widen to, so a float holding a tenth prints as 0.1.
+public floatText(Runtime runtime) -> RuntimeFunction {
+    return decimalText(runtime, "ens_float_to_string", true, [6, 7, 8, 9]);
+}
+
+// The shared body of the two, over a value of the given precision.
+decimalText(Runtime runtime, string symbol, bool single, long[] precisions) -> RuntimeFunction {
+    let valueType = single ? runtime.floatType : runtime.doubleType;
+    let type = runtime.pointerType.functionType([valueType]);
+    let known = runtime.existing(symbol, type);
     if (known != null) {
         return known;
     }
     let allocator = allocateString(runtime);
-    let definition = runtime.beginDefinition("ens_double_to_string", type);
+    let definition = runtime.beginDefinition(symbol, type);
     let value = runtime.parameter(definition, 0);
     let builder = runtime.builder;
 
-    let at15 = runtime.block(definition, "d2s.at15");
-    let at16 = runtime.block(definition, "d2s.at16");
-    let at17 = runtime.block(definition, "d2s.at17");
-    let done = runtime.block(definition, "d2s.done");
+    BasicBlock[] attempts = new BasicBlock[precisions.length];
+    for (long i = 0; i < attempts.length; i++) {
+        attempts[i] = runtime.block(definition, "dec.at{precisions[i]}");
+    }
+    let done = runtime.block(definition, "dec.done");
 
     let buffer = memory.buildAlloca(builder,
-        runtime.int8Type.arrayType(DoubleFormat.bufferCapacity as ulong), "d2s.buffer");
-    let textSlot = memory.buildAlloca(builder, runtime.pointerType, "d2s.text");
-    let lengthSlot = memory.buildAlloca(builder, runtime.int64Type, "d2s.length");
+        runtime.int8Type.arrayType(DecimalFormat.bufferCapacity as ulong), "dec.buffer");
+    let textSlot = memory.buildAlloca(builder, runtime.pointerType, "dec.text");
+    let lengthSlot = memory.buildAlloca(builder, runtime.int64Type, "dec.length");
 
     // The special values get one spelling of their own, decided before the ladder runs. A C
     // library is free to write them differently, a program should not have to know which one it
     // linked against, and no number of digits ever reads a NaN back as itself.
     let isNotANumber = instructions.buildNot(builder,
-        instructions.buildFCmpOEQ(builder, value, value, ""), "d2s.nan");
+        instructions.buildFCmpOEQ(builder, value, value, ""), "dec.nan");
     let isPositiveInfinity = instructions.buildFCmpOEQ(builder, value,
-        runtime.doubleType.constReal(infinity()), "d2s.pinf");
+        valueType.constReal(infinity()), "dec.pinf");
     let isNegativeInfinity = instructions.buildFCmpOEQ(builder, value,
-        runtime.doubleType.constReal(0.0 - infinity()), "d2s.ninf");
+        valueType.constReal(0.0 - infinity()), "dec.ninf");
     let notANumberText = globals.buildGlobalString(builder, "nan", ".text.nan");
     let positiveText = globals.buildGlobalString(builder, "inf", ".text.inf");
     let negativeText = globals.buildGlobalString(builder, "-inf", ".text.negative.inf");
@@ -490,47 +504,76 @@ public doubleText(Runtime runtime) -> RuntimeFunction {
         instructions.buildSelect(builder, isPositiveInfinity, runtime.int64(3),
             runtime.int64(4), ""), ""), lengthSlot);
     let isSpecial = instructions.buildOr(builder, isNotANumber,
-        instructions.buildOr(builder, isPositiveInfinity, isNegativeInfinity, ""), "d2s.special");
+        instructions.buildOr(builder, isPositiveInfinity, isNegativeInfinity, ""), "dec.special");
+
+    // A variadic C call takes a float as a double, so what is printed is widened while what the
+    // read-back is judged against keeps the operand's own precision.
+    let printed = value;
+    if (single) {
+        printed = instructions.buildFPExt(builder, value, runtime.doubleType, "dec.widened");
+    }
+    let ladder = new DecimalLadder(runtime, buffer, textSlot, lengthSlot, printed, value,
+        single ? runtime.strtof() : runtime.strtod(), done);
 
     // Each attempt sits on the path that needs it, so an ordinary value pays one format and one
     // read-back, and a special value pays neither.
-    instructions.buildCondBr(builder, isSpecial, done, at15);
-    builder.positionAtEnd(at15);
-    formatInto(runtime, buffer, textSlot, lengthSlot, "%.15g", ".format.g15", value, at16, done);
-    builder.positionAtEnd(at16);
-    formatInto(runtime, buffer, textSlot, lengthSlot, "%.16g", ".format.g16", value, at17, done);
-    builder.positionAtEnd(at17);
-    formatInto(runtime, buffer, textSlot, lengthSlot, "%.17g", ".format.g17", value, null, done);
+    instructions.buildCondBr(builder, isSpecial, done, attempts[0]);
+    for (long i = 0; i < attempts.length; i++) {
+        builder.positionAtEnd(attempts[i]);
+        BasicBlock? next = null;
+        if (i + 1 < attempts.length) {
+            next = attempts[i + 1];
+        }
+        ladder.attempt(precisions[i], next);
+    }
 
     builder.positionAtEnd(done);
-    let text = memory.buildLoad(builder, runtime.pointerType, textSlot, "d2s.text.value");
-    let length = memory.buildLoad(builder, runtime.int64Type, lengthSlot, "d2s.length.value");
+    let text = memory.buildLoad(builder, runtime.pointerType, textSlot, "dec.text.value");
+    let length = memory.buildLoad(builder, runtime.int64Type, lengthSlot, "dec.length.value");
     instructions.buildRet(builder, copyOfBytes(runtime, allocator, text, length));
     return runtime.endDefinition(definition);
 }
 
-// Renders the value at one precision into the shared buffer and records it. When there is a
-// next attempt, control passes to it unless the text already reads back as the same value.
-formatInto(Runtime runtime, Value buffer, Value textSlot, Value lengthSlot, string specifier,
-           string specifierName, Value value, BasicBlock? next, BasicBlock done) {
-    let builder = runtime.builder;
-    let written = runtime.call(runtime.snprintf(), [buffer,
-        runtime.int64(DoubleFormat.bufferCapacity),
-        globals.buildGlobalString(builder, specifier, specifierName), value], "written");
-    memory.buildStore(builder, buffer, textSlot);
-    memory.buildStore(builder,
-        instructions.buildSExt(builder, written, runtime.int64Type, ""), lengthSlot);
-    if (next == null) {
-        instructions.buildBr(builder, done);
-        return;
+// What every attempt of one ladder shares: the buffer the text goes into, the two forms of the
+// value, and the block a successful attempt lands on.
+final class DecimalLadder {
+    Runtime runtime;
+    Value buffer;
+    Value textSlot;
+    Value lengthSlot;
+
+    Value printed;
+    Value compared;
+    RuntimeFunction parse;
+    BasicBlock done;
+
+    protected constructor(this.runtime, this.buffer, this.textSlot, this.lengthSlot, this.printed,
+                this.compared, this.parse, this.done);
+
+    // Renders the value at one precision into the buffer and records it. When there is a next
+    // attempt, control passes to it unless the text already reads back as the same value.
+    protected attempt(long precision, BasicBlock? next) {
+        let builder = this.runtime.builder;
+        let specifier = globals.buildGlobalString(builder, "%.{precision}g",
+            ".format.g{precision}");
+        let written = this.runtime.call(this.runtime.snprintf(), [this.buffer,
+            this.runtime.int64(DecimalFormat.bufferCapacity), specifier, this.printed], "written");
+        memory.buildStore(builder, this.buffer, this.textSlot);
+        memory.buildStore(builder,
+            instructions.buildSExt(builder, written, this.runtime.int64Type, ""), this.lengthSlot);
+        if (next == null) {
+            instructions.buildBr(builder, this.done);
+            return;
+        }
+        let parsed = this.runtime.call(this.parse, [this.buffer,
+            this.runtime.pointerType.constNull()], "parsed");
+        instructions.buildCondBr(builder,
+            instructions.buildFCmpOEQ(builder, parsed, this.compared, "dec.exact"), this.done,
+            next);
     }
-    let parsed = runtime.call(runtime.strtod(), [buffer, runtime.pointerType.constNull()],
-        "parsed");
-    instructions.buildCondBr(builder,
-        instructions.buildFCmpOEQ(builder, parsed, value, "d2s.exact"), done, next);
 }
 
-final class DoubleFormat {
+final class DecimalFormat {
     // '-1.2345678901234567e-308' is the longest a double reaches, so this holds every rendering
     // with room for the terminator snprintf writes.
     protected static const long bufferCapacity = 40;
