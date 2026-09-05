@@ -7,9 +7,19 @@ The `string` primitive binding, `StringBuilder`, and number parsing.
 
 ```ens
 // @std.text.string
-// What text can do. These are the members of `string` itself; the compiler provides only length,
-// byte access, `+`, and `==`, and everything here is ordinary Ens code over those.
+// What text can do. These are the members of `string` itself. The compiler provides `length`, `+`,
+// `==`, and the four members marked below; everything else here is ordinary Ens code over them.
 primitive string implements Comparable<string> {
+    // The intrinsic core. A member with no body names something the compiler provides, so this
+    // list is complete and the rest of the binding is Ens code over it.
+    export byteAt(long index) -> byte;
+    export toBytes() -> byte[];
+
+    // The only unexported members, and the one place the valid-UTF-8 guarantee could be broken.
+    // Both check their bounds; neither checks encoding, which is their caller's job.
+    public static fromBytesUnchecked(byte[] bytes) -> string;
+    public sliceUnchecked(long start, long end) -> string;
+
     export isEmpty() -> bool;
 
     // Search, by exact bytes. `indexOf` answers the byte offset of the first occurrence, or -1
@@ -151,6 +161,10 @@ A `float` prints the shortest text that reads back as that float rather than its
 Integer formatting in another base is a method on the numeric binding, `count.toString(16)`, ratified 2026-09-05.
 Width and zero padding need no new surface, because `padStart(width, filler)` already composes with it: `count.toString(16).padStart(4, '0')`.
 Case conversion beyond ASCII, locale collation, and Unicode normalization are all out of scope for v1.
+The intrinsic core is listed inside the declaration rather than described above it (ratified 2026-09-05), because prose above a code block let this document look complete while omitting the operations every other member stands on; the same applies to every future binding.
+`substring` slices the receiver directly instead of going through a `byte[]`, so the library's most used member allocates once rather than twice.
+`fromBytesUnchecked` is `public` rather than file-private so `StringBuilder.toString()` does not revalidate a buffer it kept valid by construction.
+A binding member declared with no body names an intrinsic, and naming one the compiler does not provide is an error; a member with a body replaces the provided one at the same parameter list, which is B0's rule applied to bindings.
 
 ## EncodingError
 
