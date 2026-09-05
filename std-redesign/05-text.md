@@ -107,6 +107,20 @@ export final class StringBuilder {
 }
 ```
 
+## The numeric bindings
+
+```ens
+// @std.text.numbers
+// What the integer types can do beyond the operators the compiler provides.
+primitive long {
+    // The value in `radix`, from 2 through 36, using lowercase digits; a radix outside that range
+    // aborts the program. A negative value keeps its sign.
+    export toString(int radix) -> string;
+}
+```
+
+The same member is declared for every integer type, and decimal keeps the no-argument `toString` the language already provides.
+
 ## Parsing
 
 ```ens
@@ -132,8 +146,10 @@ Parsers return `T?` and there is no `ParseError` class: nothing in the module th
 `chars()` and `bytes()` are non-copying views; `toBytes()` keeps the copying contract of `to`.
 `joined` is a static on `string`, not a free function.
 `string` implements `Comparable<string>` but not `Iterable<char>`; `for (let c in text)` does not compile.
-`StringBuilder.append(double)` reuses the runtime's shortest round-trip formatting, which interpolation already has; whether a `float` gets the shortest text for a float rather than its double expansion is decided here.
-Integer formatting in other bases (hex, binary, octal) with width and zero padding joins this surface (ratified 2026-09-04); the spelling is signed off before C6 writes it.
+`StringBuilder.append(double)` reuses the runtime's shortest round-trip formatting, which interpolation already has.
+A `float` prints the shortest text that reads back as that float rather than its double expansion, so `0.1` prints as `0.1` (ratified 2026-09-05); the formatting runs at float precision instead of widening first.
+Integer formatting in another base is a method on the numeric binding, `count.toString(16)`, ratified 2026-09-05.
+Width and zero padding need no new surface, because `padStart(width, filler)` already composes with it: `count.toString(16).padStart(4, '0')`.
 Case conversion beyond ASCII, locale collation, and Unicode normalization are all out of scope for v1.
 
 ## EncodingError

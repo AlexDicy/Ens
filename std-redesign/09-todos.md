@@ -10,8 +10,6 @@ A subclass method whose name a private base field uses is still refused, since `
 
 ## C6
 
-`StringBuilder.append(double)` reuses the runtime's shortest round-trip formatting, which interpolation already has; a `float` prints today as its double expansion (`0.1` prints `0.10000000149011612`), so C6 decides whether a float gets the shortest text for a float.
-Integer formatting in other bases (hex, binary, octal) with width and zero padding joins 05-text.md (ratified 2026-09-04); the spelling is signed off before C6 writes it.
 The 16 `List<string>` sorts in selfhost and libs pass `(a, b) -> a.compareTo(b)` because `string` does not implement `Comparable<string>` yet; C6 binds it and they drop the lambda for `sort()`.
 `BufferedReader.readAllText` validates UTF-8 through a file-private validator, because today's `string.fromBytes` is a builtin that copies without checking; C6 makes that call throwing, so the validator goes and the `EncodingError` becomes the `cause` of the same `IoError`.
 
