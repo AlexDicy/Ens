@@ -14,3 +14,12 @@ inline constexpr std::u16string_view kCoreModulePath = u"std.core";
 inline constexpr std::array<std::u16string_view, 1> kImplicitImportPaths = {
     kCoreModulePath,
 };
+
+// The modules declaring what a primitive's members are, loaded for every compilation so a value
+// reaches those members with no import written. Nothing else about these modules is in scope,
+// which is what keeps them apart from the implicitly imported ones, and a standard library that
+// declares no binding simply has none of them.
+inline constexpr std::array<std::u16string_view, 2> kBindingModulePaths = {
+    u"std.text.string",
+    u"std.text.numbers",
+};

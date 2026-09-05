@@ -1688,7 +1688,9 @@ The standard library is an external package, imported with `@`, and is opt-in ap
 
 The standard library also declares members of the primitive types, so what a `string`, a `bool`, a `char`, or a numeric type can do is written there in ordinary Ens source rather than built into the compiler.
 Such a member is called like any other, on a literal as readily as on a variable, and a static of a primitive is reached through the type name, as in `string.fromBytes(bytes)`.
+A few of those members are the compiler's own work, such as reading one byte of a string, and the library declares them without a body rather than writing them out; which member is which makes no difference at a call site.
 Reaching one from another package follows the ordinary visibility rules, so a program sees the members the library exported and nothing else.
+The modules declaring these members are read for every program, so a value reaches them with no import written.
 The library may also declare that a primitive implements an interface, which is how a primitive satisfies a generic bound: a `<T: Comparable<T>>` parameter accepts `string` once `string` is declared to implement `Comparable<string>`.
 That conformance is a compile-time judgment and nothing more, because a primitive value is never wrapped in an object.
 Storing a primitive in an interface-typed variable, field, array element, or parameter is an error, and so is `is` or `as?` against an interface; each message names the bound the conformance does serve.

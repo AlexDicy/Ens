@@ -257,6 +257,19 @@ bool buildModuleGraphFromSeeds(Workspace& root,
         enqueue(stdlib, stdlib->srcRoot, rel, canonical);
     }
 
+    // The binding modules load the same way, and a missing one is no error: a binding is an offer
+    // rather than a requirement, so a library that declares none gives its primitives no members.
+    if (!stdlibRoot.empty()) {
+        Workspace* stdlib = registry.getOrLoad(stdlibRoot / "std", u"std");
+        for (std::u16string_view bindingPath : kBindingModulePaths) {
+            std::u16string canonical(bindingPath);
+            fs::path rel = stdlibRelativePath(canonical);
+            bool haveOverride = overrides && overrides->count(overrideKey(stdlib->srcRoot / rel)) > 0;
+            if (!haveOverride && !fs::exists(stdlib->srcRoot / rel)) continue;
+            enqueue(stdlib, stdlib->srcRoot, rel, canonical);
+        }
+    }
+
     for (const auto& seed : seeds) {
         enqueue(&root, seed.first, seed.second, canonicalModulePath(root, seed.second));
     }
@@ -451,8 +464,14 @@ Module* analyzeStandaloneSource(const std::u16string& modulePath, const std::str
     if (!stdlibRoot.empty()) {
         WorkspaceRegistry registry;
         Workspace* stdlib = registry.getOrLoad(stdlibRoot / "std", u"std");
+        std::vector<std::u16string> alwaysLoaded;
         for (std::u16string_view implicitPath : kImplicitImportPaths) {
-            std::u16string canonical(implicitPath);
+            alwaysLoaded.emplace_back(implicitPath);
+        }
+        for (std::u16string_view bindingPath : kBindingModulePaths) {
+            alwaysLoaded.emplace_back(bindingPath);
+        }
+        for (const std::u16string& canonical : alwaysLoaded) {
             fs::path rel = stdlibRelativePath(canonical);
             if (!fs::exists(stdlib->srcRoot / rel)) continue;
             auto loaded = loadModule(stdlib->srcRoot, rel, canonical);

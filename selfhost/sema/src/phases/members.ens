@@ -26,6 +26,8 @@ import TypeParamType from model.types;
 import PrimitiveKind from model.types;
 import PrimitiveType from model.types;
 import StringType from model.types;
+import TypeStore from model.types;
+import PrimitiveIntrinsic from model.types;
 import Visibility from model.types;
 import List from @std.collections.list;
 
@@ -163,26 +165,90 @@ public methodDeclaredBy(List<Method> methods, GreenNode declaration) -> Method? 
     return null;
 }
 
-// The members the compiler itself answers for on a primitive, ahead of any lookup: '.length' on
-// text, the search and trimming members it still owns, and the universal text and hash forms.
-// A binding cannot declare one, because the compiler's answer would come first and leave the
-// declaration unreachable. The set has to agree with what the body checker intercepts, in
-// interceptBuiltinCall; it shrinks as the library takes members over.
-public compilerOwnedMember(Type primitive, string name) -> bool {
-    if (name == "toString" || name == "hash") {
-        return true;
+// Why a binding cannot declare this member, or null when it may. A member the compiler provides
+// is otherwise replaceable: a declaration with the same parameter list answers every call to it,
+// which is how the library takes a member over. The exceptions are the property that is read
+// without a call at all, and the two members a value also reaches through interpolation, struct
+// serialization, and the type descriptors, where a replacement would answer some of those and
+// not others.
+public unreplaceableMember(Type primitive, string name, Signature signature) -> string? {
+    if (primitive is StringType && name == "length") {
+        return "'string.length' is the byte count, read without parentheses, so a method named "
+            + "'length' could never be called. Choose another name.";
     }
-    if (!(primitive is StringType)) {
-        return false;
+    if (signature.parameters().length > 0) {
+        return null;
     }
-    return name == "length" || name == "toBytes" || name == "indexOf" || name == "contains"
-        || name == "compareTo" || name == "startsWith" || name == "endsWith" || name == "trim"
-        || name == "trimStart" || name == "substring";
+    if (name == "toString") {
+        return "the text form of a '{types.display(primitive)}' is what interpolation and struct "
+            + "serialization answer with as well, so a binding cannot replace it. Declare an "
+            + "overload that takes arguments, such as 'toString(int radix)', instead.";
+    }
+    if (name == "hash") {
+        return "the hash of a '{types.display(primitive)}' is what a map keyed by one answers "
+            + "with as well, so a binding cannot replace it. Choose another name.";
+    }
+    return null;
 }
 
-// The statics the compiler answers for on a primitive; 'string.fromBytes' is the only one.
-public compilerOwnedStatic(Type primitive, string name) -> bool {
-    return primitive is StringType && name == "fromBytes";
+// The intrinsic a bodiless binding member names, or null when the compiler implements none under
+// that name at that exact shape.
+public primitiveIntrinsic(TypeStore store, Type primitive, string name, Signature signature,
+                          bool isStatic) -> PrimitiveIntrinsic? {
+    if (!(primitive is StringType)) {
+        return null;
+    }
+    let byteType = store.primitive(PrimitiveKind.Byte);
+    let longType = store.primitive(PrimitiveKind.Long);
+    let bytesType = store.arrayOf(byteType);
+    let textType = store.stringType();
+    if (isStatic) {
+        if (name == "fromBytesUnchecked" && hasShape(signature, [bytesType], textType)) {
+            return PrimitiveIntrinsic.StringFromBytesUnchecked;
+        }
+        return null;
+    }
+    if (name == "byteAt" && hasShape(signature, [longType], byteType)) {
+        return PrimitiveIntrinsic.StringByteAt;
+    }
+    if (name == "toBytes" && hasShape(signature, [], bytesType)) {
+        return PrimitiveIntrinsic.StringToBytes;
+    }
+    if (name == "sliceUnchecked" && hasShape(signature, [longType, longType], textType)) {
+        return PrimitiveIntrinsic.StringSliceUnchecked;
+    }
+    return null;
+}
+
+// How the intrinsics of a primitive are written, for the diagnostic a bodiless member that names
+// none of them reports.
+public primitiveIntrinsicForms(Type primitive) -> string[] {
+    if (primitive is StringType) {
+        return ["'byteAt(long) -> byte'", "'toBytes() -> byte[]'",
+            "'sliceUnchecked(long, long) -> string'",
+            "'static fromBytesUnchecked(byte[]) -> string'"];
+    }
+    return [];
+}
+
+// Whether a declaration is exactly the shape an intrinsic is provided at. A default, a 'throws'
+// clause, or an 'out' parameter is a shape the compiler does not implement, so each one fails
+// here and reads as the mismatch it is.
+hasShape(Signature signature, Type[] parameterTypes, Type returnType) -> bool {
+    let parameters = signature.parameters();
+    if (parameters.length != parameterTypes.length || signature.returnType() != returnType) {
+        return false;
+    }
+    if (signature.declaresThrows() || signature.isGeneric()) {
+        return false;
+    }
+    for (long i = 0; i < parameters.length; i++) {
+        if (parameters[i].type() != parameterTypes[i] || parameters[i].hasDefault()
+                || parameters[i].isOut()) {
+            return false;
+        }
+    }
+    return true;
 }
 
 public functionModifiers(FunctionDeclarationNode declaration) -> MemberModifiers {
@@ -710,14 +776,15 @@ public checkStaticInstanceCollision(Reporter reporter, DeclaredType owner, strin
 // methods, and a static is never overridable.
 public collectStaticMethod(TypeResolver resolver, Reporter reporter, DeclaredType owner,
                            List<Method> staticMethods, FunctionDeclarationNode member,
-                           string methodName, Span nameSpan, MemberModifiers modifiers) {
+                           string methodName, Span nameSpan, MemberModifiers modifiers,
+                           bool allowBodiless = false) {
     MemberConstraint[] constraints = readMemberConstraints(resolver, reporter, owner, member,
         "Static method '{methodName}' of '{owner.name()}'");
     if (constraints.length > 0) {
         resolver.pushMemberConstraints(owner.declaration(), constraints);
     }
     let signature = buildSignature(resolver, reporter, member, methodName, nameSpan, false,
-        false, false, modifiers.declaresNoreturn, null, owner.name(), []);
+        false, allowBodiless, modifiers.declaresNoreturn, null, owner.name(), []);
     if (constraints.length > 0) {
         resolver.popMemberConstraints();
     }

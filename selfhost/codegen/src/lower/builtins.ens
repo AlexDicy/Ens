@@ -11,6 +11,7 @@ import Span from @ens.frontend.support.source;
 import BuiltinFunction from @ens.sema.context;
 import Type from @ens.sema.model.types;
 import PrimitiveKind from @ens.sema.model.types;
+import PrimitiveIntrinsic from @ens.sema.model.types;
 import StructType from @ens.sema.model.types;
 import @ens.sema.model.types;
 import EirStringCompare from eir.model;
@@ -18,6 +19,7 @@ import EirStringHasAffix from eir.model;
 import EirStringTrim from eir.model;
 import EirStringIndexOf from eir.model;
 import EirStringSubstring from eir.model;
+import EirStringByteAt from eir.model;
 import EirStringToBytes from eir.model;
 import EirStringFromBytes from eir.model;
 import EirStringLength from eir.model;
@@ -107,15 +109,86 @@ public lowerMemberCall(LoweringContext lowering, CallExpressionNode call) -> lon
     return BuiltinResult.notIntercepted;
 }
 
+// A call to a binding member the compiler implements. The declaration carries no body, so this is
+// where its body is: the instruction the intrinsic names, in place of a call to a symbol that
+// nothing defines.
+public lowerIntrinsicMember(LoweringContext lowering, CallExpressionNode call, Expression object,
+                            PrimitiveIntrinsic intrinsic) -> long {
+    switch (intrinsic) {
+        StringByteAt -> {
+            return lowerByteAt(lowering, call, object);
+        },
+        StringToBytes -> {
+            return lowerToBytes(lowering, call, object);
+        },
+        StringSliceUnchecked -> {
+            return lowerSubstring(lowering, call, object, "sliceUnchecked");
+        },
+        StringFromBytesUnchecked -> {
+            lowering.internalError("the intrinsic '{intrinsic}' is a static, called here with a "
+                + "receiver", call.span());
+            return -1;
+        },
+    }
+}
+
+public lowerIntrinsicStatic(LoweringContext lowering, CallExpressionNode call,
+                            PrimitiveIntrinsic intrinsic) -> long {
+    if (intrinsic != PrimitiveIntrinsic.StringFromBytesUnchecked) {
+        lowering.internalError("the intrinsic '{intrinsic}' takes a receiver, called here as a "
+            + "static", call.span());
+        return -1;
+    }
+    return lowerFromBytes(lowering, call, "fromBytesUnchecked");
+}
+
+// One byte of a string's bytes, read at a byte offset the instruction guards.
+lowerByteAt(LoweringContext lowering, CallExpressionNode call, Expression object) -> long {
+    let argument = singleArgument(call.arguments());
+    if (argument == null) {
+        lowering.internalError("'byteAt' reached lowering with "
+            + "{call.arguments().argumentsCount()} argument(s)", call.span());
+        return -1;
+    }
+    let longType = lowering.store().primitive(PrimitiveKind.Long);
+    long text = expressions.lower(lowering, object);
+    if (text < 0) {
+        return -1;
+    }
+    bool textOwned = places.producesOwnedValue(lowering, object);
+    if (textOwned) {
+        lowering.protectValue(text);
+    }
+    long index = expressions.lowerConverted(lowering, argument, longType);
+    if (textOwned) {
+        lowering.unprotectValue(text);
+    }
+    if (index < 0) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    let byteType = lowering.store().primitive(PrimitiveKind.Byte);
+    long result = builder.newTemp(byteType);
+    builder.append(new EirStringByteAt(result, byteType, text, index,
+        lowering.lineAt(call.span())));
+    expressions.releaseTemporary(lowering, object, text);
+    return result;
+}
+
 // 'string.fromBytes(bytes)' reads a byte array as UTF-8 text.
 lowerStringStatic(LoweringContext lowering, CallExpressionNode call, string name) -> long {
     if (name != "fromBytes") {
         lowering.unsupported("the static member 'string.{name}'", call.span());
         return -1;
     }
+    return lowerFromBytes(lowering, call, "fromBytes");
+}
+
+// A byte array read as text, with no encoding check of its own.
+lowerFromBytes(LoweringContext lowering, CallExpressionNode call, string member) -> long {
     let argument = singleArgument(call.arguments());
     if (argument == null) {
-        lowering.internalError("'string.fromBytes' reached lowering with "
+        lowering.internalError("'string.{member}' reached lowering with "
             + "{call.arguments().argumentsCount()} argument(s)", call.span());
         return -1;
     }
@@ -165,7 +238,7 @@ lowerStringMember(LoweringContext lowering, CallExpressionNode call, Expression 
             return lowerTrim(lowering, call, object, false);
         },
         "substring" -> {
-            return lowerSubstring(lowering, call, object);
+            return lowerSubstring(lowering, call, object, "substring");
         },
         default -> {
             lowering.unsupported("the string member '{name}'", call.span());
@@ -330,11 +403,13 @@ lowerTrim(LoweringContext lowering, CallExpressionNode call, Expression object, 
     return trimmed;
 }
 
-// 'substring' copies a byte range, aborting when the range is not inside the string.
-lowerSubstring(LoweringContext lowering, CallExpressionNode call, Expression object) -> long {
+// A byte range copied into fresh text, aborting when the range is not inside the string. The
+// member is named by the guard's message, since the guard is what reports the broken range.
+lowerSubstring(LoweringContext lowering, CallExpressionNode call, Expression object,
+               string member) -> long {
     let arguments = argumentValues(call.arguments());
     if (arguments == null || arguments.length() != 2) {
-        lowering.internalError("'substring' reached lowering with "
+        lowering.internalError("'{member}' reached lowering with "
             + "{call.arguments().argumentsCount()} argument(s)", call.span());
         return -1;
     }
@@ -362,8 +437,8 @@ lowerSubstring(LoweringContext lowering, CallExpressionNode call, Expression obj
     let builder = lowering.builder();
     long length = builder.newTemp(longType);
     builder.append(new EirStringLength(length, longType, text));
-    builder.append(new EirRangeCheck(start, end, length,
-        "substring range out of bounds", lowering.lineAt(call.span())));
+    builder.append(new EirRangeCheck(start, end, length, "{member} range out of bounds",
+        lowering.lineAt(call.span())));
     long result = builder.newTemp(stringType);
     builder.append(new EirStringSubstring(result, stringType, text, start, end));
     expressions.releaseTemporary(lowering, object, text);

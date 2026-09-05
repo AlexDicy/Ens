@@ -232,7 +232,7 @@ private:
     void collectTests(const ast::SourceFile& file);
     void collectExternalFunctions(const ast::SourceFile& file);
     void resolveMethodParams(const ast::FuncDecl& fn, ::Type* receiverType, Symbol* sym,
-                             bool isInterfaceMethod = false);
+                             bool isInterfaceMethod = false, bool allowShorthand = false);
     void resolveFunctionParams(const ast::FuncDecl& fn, Symbol* sym);
     bool overrideSignaturesCompatible(const MethodInfo& base, Symbol* derived);
     void checkThrowsClausePlacement(const ast::FuncDecl& fn, bool isConstructor);

@@ -1433,7 +1433,7 @@ void Analyzer::collectPrimitiveBindings(const ast::SourceFile& file) {
             sym->abiThrows = m.isThrows();
             sym->methodOwner = si;
             sym->isNoreturn = m.isNoreturn();
-            resolveMethodParams(m, t, sym);
+            resolveMethodParams(m, t, sym, /*isInterfaceMethod=*/false, /*allowShorthand=*/true);
             analysis.setSymbol(m.node.greenNode(), sym);
             analysis.setReceiver(m.node.greenNode(), t);
 
@@ -2499,10 +2499,12 @@ void Analyzer::collectTests(const ast::SourceFile& file) {
 }
 
 void Analyzer::resolveMethodParams(const ast::FuncDecl& fn, ::Type* receiverType, Symbol* sym,
-                                   bool isInterfaceMethod) {
+                                   bool isInterfaceMethod, bool allowShorthand) {
     bool isCtor = fn.isConstructor();
 
-    if (fn.isShorthand() && !isCtor && !fn.isAbstract() && !isInterfaceMethod) {
+    // A member of a primitive binding may stand without a body: it names an intrinsic the
+    // compiler implements, and which names those are is the compiler's to say.
+    if (fn.isShorthand() && !isCtor && !fn.isAbstract() && !isInterfaceMethod && !allowShorthand) {
         errorAtNode(fn.node, "Shorthand declaration ';' is only allowed on a constructor");
     }
 
@@ -6278,17 +6280,17 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
         // Built-in conversion methods on primitive and string receivers. These
         // have no Symbol; codegen recognizes them structurally. Intercept before
         // generic member resolution, which would reject a primitive receiver.
+        //
+        // Each is intercepted only at the argument count the compiler provides it at. The
+        // standard library's binding may declare a member of the same name at another count, and
+        // that one is the library's own, so such a call goes to ordinary resolution instead.
         if (auto objExpr = member.object()) {
             auto memberName = member.memberText();
-            if (memberName && *memberName == u"toString") {
+            if (memberName && *memberName == u"toString" && args.empty()) {
                 Type* recvT = analyzeExpr(*objExpr);
                 if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }
                 if (recvT->isInteger() || recvT->isBool() || recvT->isString() ||
                     recvT->isEnum() || isTextualFloat(recvT)) {
-                    if (!args.empty()) {
-                        errorAtNode(expr.node, "'toString' takes no arguments.");
-                        for (auto& a : args) analyzeExpr(a);
-                    }
                     return typeCtx.getPrimitive(TypeKind::String);
                 }
                 if (recvT->kind == TypeKind::Decimal) {
@@ -6301,10 +6303,6 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                 // that declares one falls through to normal method resolution.
                 if (recvT->isStruct() && recvT->structInfo &&
                     !declaredToString(recvT->structInfo)) {
-                    if (!args.empty()) {
-                        errorAtNode(expr.node, "'toString' takes no arguments.");
-                        for (auto& a : args) analyzeExpr(a);
-                    }
                     // A generic struct is judged per instantiation during code generation.
                     if (!TypeContext::containsTypeParam(recvT)) checkStructJsonable(recvT, expr.node);
                     return typeCtx.getPrimitive(TypeKind::String);
@@ -6318,10 +6316,6 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                         if (declaredToString(s)) { chainDeclares = true; break; }
                     }
                     if (!chainDeclares) {
-                        if (!args.empty()) {
-                            errorAtNode(expr.node, "'toString' takes no arguments.");
-                            for (auto& a : args) analyzeExpr(a);
-                        }
                         return typeCtx.getPrimitive(TypeKind::String);
                     }
                 }
@@ -6336,23 +6330,15 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                         }
                     }
                     if (!declaresToString) {
-                        if (!args.empty()) {
-                            errorAtNode(expr.node, "'toString' takes no arguments.");
-                            for (auto& a : args) analyzeExpr(a);
-                        }
                         return typeCtx.getPrimitive(TypeKind::String);
                     }
                 }
                 // Records may declare their own toString: fall through to resolution.
             }
-            if (memberName && *memberName == u"toBytes") {
+            if (memberName && *memberName == u"toBytes" && args.empty()) {
                 Type* recvT = analyzeExpr(*objExpr);
                 if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }
                 if (recvT->isString()) {
-                    if (!args.empty()) {
-                        errorAtNode(expr.node, "'toBytes' takes no arguments.");
-                        for (auto& a : args) analyzeExpr(a);
-                    }
                     return typeCtx.getArray(typeCtx.getPrimitive(TypeKind::Byte));
                 }
                 // Records may declare their own toBytes: fall through to resolution.
@@ -6360,19 +6346,14 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
             // String builtins over one other string: indexOf -> long, contains -> bool,
             // compareTo -> int.
             auto checkStringArgument = [&](const std::string& name) {
-                if (args.size() != 1) {
-                    errorAtNode(expr.node, "'" + name + "' expects 1 argument (a string), got " +
-                        std::to_string(args.size()) + ".");
-                    for (auto& a : args) analyzeExpr(a);
-                    return;
-                }
                 Type* argT = analyzeExpr(args[0]);
                 if (!argT->isError() && !argT->isString()) {
                     errorAtNode(args[0].node, "'" + name + "' expects a string argument, got '" +
                         argT->toString() + "'.");
                 }
             };
-            if (memberName && (*memberName == u"indexOf" || *memberName == u"contains")) {
+            if (memberName && (*memberName == u"indexOf" || *memberName == u"contains")
+                    && args.size() == 1) {
                 Type* recvT = analyzeExpr(*objExpr);
                 if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }
                 if (recvT->isString()) {
@@ -6382,7 +6363,7 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                 }
                 // Records may declare their own indexOf/contains: fall through to resolution.
             }
-            if (memberName && *memberName == u"compareTo") {
+            if (memberName && *memberName == u"compareTo" && args.size() == 1) {
                 Type* recvT = analyzeExpr(*objExpr);
                 if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }
                 if (recvT->isString()) {
@@ -6391,7 +6372,8 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                 }
                 // Records may declare their own compareTo: fall through to resolution.
             }
-            if (memberName && (*memberName == u"startsWith" || *memberName == u"endsWith")) {
+            if (memberName && (*memberName == u"startsWith" || *memberName == u"endsWith")
+                    && args.size() == 1) {
                 Type* recvT = analyzeExpr(*objExpr);
                 if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }
                 if (recvT->isString()) {
@@ -6400,15 +6382,11 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                 }
                 // Records may declare their own startsWith/endsWith: fall through to resolution.
             }
-            if (memberName && (*memberName == u"trim" || *memberName == u"trimStart")) {
+            if (memberName && (*memberName == u"trim" || *memberName == u"trimStart")
+                    && args.empty()) {
                 Type* recvT = analyzeExpr(*objExpr);
                 if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }
                 if (recvT->isString()) {
-                    std::string name = *memberName == u"trim" ? "trim" : "trimStart";
-                    if (!args.empty()) {
-                        errorAtNode(expr.node, "'" + name + "' takes no arguments.");
-                        for (auto& a : args) analyzeExpr(a);
-                    }
                     return typeCtx.getPrimitive(TypeKind::String);
                 }
                 // Records may declare their own trim/trimStart: fall through to resolution.
@@ -6430,7 +6408,7 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                     }
                 }
             };
-            if (memberName && *memberName == u"substring") {
+            if (memberName && *memberName == u"substring" && args.size() == 2) {
                 Type* recvT = analyzeExpr(*objExpr);
                 if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }
                 if (recvT->isString()) {

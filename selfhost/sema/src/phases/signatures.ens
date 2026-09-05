@@ -26,6 +26,7 @@ import BuiltinFunction from context;
 import ModuleContext from context;
 import ClassItem from context;
 import FunctionEntry from context;
+import phases.layout;
 import phases.members;
 import MemberModifiers from phases.members;
 import TypeResolver from phases.resolve;
@@ -568,24 +569,18 @@ class SignatureCollector {
         let modifiers = members.functionModifiers(member);
         members.checkMemberModifiers(this.reporter, member);
         if (modifiers.declaresStatic) {
-            if (this.reportOwnedMember(binding, name, nameSpan, true)) {
-                return;
-            }
             members.collectStaticMethod(this.resolver, this.reporter, binding,
-                binding.staticMethods(), member, name, nameSpan, modifiers);
-            return;
-        }
-        if (this.reportOwnedMember(binding, name, nameSpan, false)) {
+                binding.staticMethods(), member, name, nameSpan, modifiers, true);
+            if (!modifiers.declaresAbstract) {
+                this.markIntrinsic(binding, binding.staticMethods(), member, name, nameSpan,
+                    true);
+            }
             return;
         }
         if (modifiers.declaresAbstract) {
             this.reporter.report("Method '{name}' of the '{binding.name()}' binding cannot be "
                 + "'abstract': a primitive has no subclass to supply a body, so every member "
                 + "here is written out.", modifiers.abstractModifierSpan(nameSpan));
-        } else if (member.body() == null) {
-            this.reporter.report("Method '{name}' of the '{binding.name()}' binding needs a "
-                + "body: a primitive's members are ordinary Ens code, and nothing else supplies "
-                + "one.", nameSpan);
         }
         if (modifiers.declaresFinal) {
             this.reporter.report("Method '{name}' of the '{binding.name()}' binding cannot be "
@@ -611,26 +606,62 @@ class SignatureCollector {
         binding.methods().push(new Method(signature, visibility, false, false,
             modifiers.declaresOverride, false, false, false, member.body() != null, constraints,
             binding.primitive()));
+        // An 'abstract' member was already refused for the modifier, and its missing body is that
+        // same mistake, so it is not read as naming an intrinsic on top.
+        if (!modifiers.declaresAbstract) {
+            this.markIntrinsic(binding, binding.methods(), member, name, nameSpan, false);
+        }
     }
 
-    // A member the compiler answers for on this primitive already. Declaring it in a binding
-    // would leave the declaration unreachable, since the compiler's own answer comes first, so
-    // it is refused by name until the library takes the member over.
-    reportOwnedMember(PrimitiveBinding binding, string name, Span at, bool isStatic) -> bool {
-        if (isStatic) {
-            if (!members.compilerOwnedStatic(binding.primitive(), name)) {
-                return false;
+    // What a binding member without a body means: it names an intrinsic the compiler implements,
+    // and the declaration is where its signature is written. A member with a body is ordinary Ens
+    // and replaces the compiler's own member of the same shape, so the only refusals left are the
+    // few members a call site is not the only way to reach.
+    markIntrinsic(PrimitiveBinding binding, List<Method> declared, FunctionDeclarationNode member,
+                  string name, Span nameSpan, bool isStatic) {
+        let method = members.methodDeclaredBy(declared, member.green());
+        if (method == null) {
+            return;
+        }
+        if (member.body() != null) {
+            if (isStatic) {
+                return;
             }
-            this.reporter.report("'{binding.name()}.{name}' is provided by the compiler, so a "
-                + "binding cannot declare it. Choose another name.", at);
-            return true;
+            let refused = members.unreplaceableMember(binding.primitive(), name,
+                method.signature());
+            if (refused != null) {
+                this.reporter.report("Method '{name}' of the '{binding.name()}' binding cannot "
+                    + "be declared: {refused}", nameSpan);
+            }
+            return;
         }
-        if (!members.compilerOwnedMember(binding.primitive(), name)) {
-            return false;
+        let intrinsic = members.primitiveIntrinsic(this.resolver.typeStore(),
+            binding.primitive(), name, method.signature(), isStatic);
+        if (intrinsic == null) {
+            this.reportUnknownIntrinsic(binding, method, nameSpan);
+            return;
         }
-        this.reporter.report("'{name}' is provided by the compiler on every "
-            + "'{binding.name()}', so a binding cannot declare it. Choose another name.", at);
-        return true;
+        method.setIntrinsic(intrinsic);
+    }
+
+    // A bodiless member the compiler implements nothing for. Naming one wrongly is a typo far more
+    // often than it is a missing feature, so the message says what was written, lists the
+    // intrinsics that do exist, and offers the other reading: that the member wanted a body.
+    reportUnknownIntrinsic(PrimitiveBinding binding, Method method, Span at) {
+        string name = method.name();
+        let forms = members.primitiveIntrinsicForms(binding.primitive());
+        if (forms.length == 0) {
+            this.reporter.report("Method '{name}' of the '{binding.name()}' binding has no "
+                + "body, so it names an intrinsic the compiler implements, and the compiler "
+                + "implements none for '{binding.name()}'. Give '{name}' a body to write it in "
+                + "Ens.", at);
+            return;
+        }
+        this.reporter.report("Method '{name}' of the '{binding.name()}' binding has no body, so "
+            + "it names an intrinsic the compiler implements, and "
+            + "'{layout.methodDisplay(method)}' is not one of them. The intrinsics of "
+            + "'{binding.name()}' are {listed(forms)}. Correct the name or the signature to "
+            + "match one of those, or give '{name}' a body to write it in Ens.", at);
     }
 
     collectInterfaces() {
@@ -1493,4 +1524,18 @@ signedIntegerLiteral(Expression expr) -> LiteralExpressionNode? {
 
 isEnumIntegerLiteralKind(SyntaxKind kind) -> bool {
     return kind == SyntaxKind.IntLiteral || kind == SyntaxKind.LongLiteral;
+}
+
+// The items as they read in a sentence: "a, b, and c", or "a and b" for two.
+listed(string[] items) -> string {
+    let builder = new StringBuilder();
+    for (long i = 0; i < items.length; i++) {
+        if (i > 0 && i + 1 < items.length) {
+            builder.append(", ");
+        } else if (i > 0) {
+            builder.append(items.length > 2 ? ", and " : " and ");
+        }
+        builder.append(items[i]);
+    }
+    return builder.toString();
 }
