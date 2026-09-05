@@ -8,11 +8,6 @@ Two consistency items the C4 and pre-C5 work surfaced, both independent of the l
 An array literal holding `this` inside a generic body (`[this, this]` for a `T[]` parameter, or `Box<T>[] xs = [this];`) is refused, because the literal's element type is the bare template and assignability equates the template with its self-instantiation only at the top level, not under `[]`; since 2026-09-04 the refusal even reads "expected 'Box<T>[]', got 'Box<T>[]'". The clean resolution is `this` carrying the self-instantiation itself, or the equation applying structurally.
 A subclass method whose name a private base field uses is still refused, since `checkFieldMethodCollision` searches the flattened field list without the exemption private base fields gained on 2026-09-04; consistency would let it through, and it is a conservative refusal rather than an unsoundness.
 
-## C6
-
-The 16 `List<string>` sorts in selfhost and libs pass `(a, b) -> a.compareTo(b)` because `string` does not implement `Comparable<string>` yet; C6 binds it and they drop the lambda for `sort()`.
-`BufferedReader.readAllText` validates UTF-8 through a file-private validator, because today's `string.fromBytes` is a builtin that copies without checking; C6 makes that call throwing, so the validator goes and the `EncodingError` becomes the `cause` of the same `IoError`.
-
 ## C8 and C9
 
 OS-level redirection for `run(captureOutput: true)`, wait-with-timeout, and kill in the native bridges.

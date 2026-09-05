@@ -1870,6 +1870,26 @@ print("7".padStart(3, '0'));            // "007"
 for (let character in "héllo".chars()) { /* ... */ }
 ```
 
+Every integer type declares `toString(radix)` beside the no-argument `toString()` the language provides, writing the value in a base from 2 through 36 with lowercase digits; a radix outside that range aborts the program, and a negative value keeps its sign.
+There is no width argument, because `padStart` already composes with it: `count.toString(16).padStart(4, '0')`.
+
+The `@std.text.parse` module reads values out of text.
+`parseLong(text)`, `parseLong(text, radix)`, `parseInt(text)`, `parseDouble(text)` and `parseBool(text)` each answer the value the text spells, or `null` when it spells anything else, which includes a number the type cannot hold.
+Surrounding whitespace, a radix prefix such as `0x`, and digit grouping are all refused rather than guessed at, so text a program means to accept in those shapes is trimmed or rewritten before it is parsed.
+An integer is at most one `-` or `+` and then digits; in another base the letters stand for the digits above nine, in either case.
+A double has the shape a floating-point literal has, without the underscores a literal may group its digits with, and reads back exactly what the text form of a `double` wrote.
+`parseBool` reads `true` and `false` spelled exactly that way and nothing else.
+A radix outside 2 through 36 aborts, as it does when writing: the radix is the caller's own, where the text is the data.
+
+```ens
+import @std.text.parse;
+
+long? count = parse.parseLong("42");
+long? mask = parse.parseLong("ff", 16);         // 255
+double? ratio = parse.parseDouble("2.5");
+long? refused = parse.parseLong(" 42");        // null, whitespace is not trimmed
+```
+
 `StringBuilder` from `@std.text.stringbuilder` accumulates text in a growable buffer, so building a string piece by piece stays linear where repeated `+` on immutable strings would re-copy the whole prefix.
 `append(value)` accepts a string, a `char`, an integer, a `double`, or a `bool`; `appendLine(value)` and `appendLine()` add a newline after it; `length()` and `isEmpty()` report what is held so far; `clear()` forgets it; `reserve(capacity)` and `StringBuilder.withCapacity(capacity)` ask for room ahead of time; `toString()` returns the accumulated text and leaves the builder usable.
 Every append takes text or a value with a text form, so what a builder holds is valid UTF-8 and `toString` needs no check of its own.
