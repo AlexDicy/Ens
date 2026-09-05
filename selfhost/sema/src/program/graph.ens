@@ -29,6 +29,14 @@ import Map from @std.collections.map;
 import Set from @std.collections.set;
 import StringBuilder from @std.text.stringbuilder;
 
+// One file read: its text, or the loader's own account of why there is none.
+final class FileRead {
+    protected string? text;
+    protected string problem;
+
+    protected constructor(this.text, this.problem);
+}
+
 // One loaded and parsed module. The parse result is kept for the later sema phases; red trees are
 // rebuilt over it on demand and never stored.
 export class Module {
@@ -42,6 +50,7 @@ export class Module {
     bool restrictedNatives;
     string[] moduleNativeNames;
     string moduleManifestPath;
+    string modulePackageName;
 
     public constructor(string canonicalPath, string filePath, string packagePrefix, Source source,
                 ParseResult parseResult, string[] imports, string?[] importTargets) {
@@ -55,6 +64,7 @@ export class Module {
         this.restrictedNatives = false;
         this.moduleNativeNames = [];
         this.moduleManifestPath = "";
+        this.modulePackageName = "";
     }
 
     // Native-library policy from the owning workspace: when a package manifest governs the
@@ -64,6 +74,17 @@ export class Module {
         this.restrictedNatives = restricted;
         this.moduleNativeNames = nativeNames;
         this.moduleManifestPath = manifestPath;
+    }
+
+    // The package this module belongs to, as its manifest declares it. The prefix says how the
+    // module is addressed, which is empty for the program being built, so the two are apart: a
+    // rule about which package a declaration belongs to reads this one.
+    public setPackageName(string name) {
+        this.modulePackageName = name;
+    }
+
+    public packageName() -> string {
+        return this.modulePackageName;
     }
 
     public nativesRestricted() -> bool {
@@ -359,16 +380,10 @@ class GraphBuilder {
 
     process(WorkItem item) {
         string filePath = path.join(item.baseFolder, item.relativePath);
-        string? text = this.readOrNull(filePath);
+        let read = this.readFile(filePath);
+        let text = read.text;
         if (text == null) {
-            this.report(filePath, source.makeSpan(0, 0), "Could not read {filePath}.");
-            return;
-        }
-        let problem = source.firstUtf8Problem(text);
-        if (problem != null) {
-            this.report(filePath, source.makeSpan(problem.offset(), 1),
-                "This file is not valid UTF-8 text: byte {problem.byteText()} "
-                + "{problem.reason()}. Save the file with UTF-8 encoding.");
+            this.report(filePath, source.makeSpan(0, 0), read.problem);
             return;
         }
         let moduleSource = new Source(filePath, text);
@@ -379,13 +394,14 @@ class GraphBuilder {
             scan.declarationTargets);
         loaded.setNativePolicy(item.owner.hasPackageManifest(), item.owner.nativeNames(),
             item.owner.manifestPath());
+        loaded.setPackageName(item.owner.packageName());
         this.loadedModules.push(loaded);
     }
 
-    readOrNull(string path) -> string? {
-        return try this.loader.readText(path);
+    readFile(string filePath) -> FileRead {
+        return new FileRead(try this.loader.readText(filePath), "");
     } catch (FileError error) {
-        return null;
+        return new FileRead(null, error.message);
     }
 
     // Resolves every import declaration in the parsed file, enqueuing newly reached modules, and
@@ -588,34 +604,15 @@ isStdlibPath(string modulePath) -> bool {
 // "a/b/c.ens" -> "a.b.c"
 modulePathOfRelative(string relativePath) -> string {
     string bare = relativePath;
-    if (bare.length >= 4 && bare.substring(bare.length - 4, bare.length) == ".ens") {
+    if (bare.endsWith(".ens")) {
         bare = bare.substring(0, bare.length - 4);
     }
-    let builder = new StringBuilder();
-    byte[] bytes = bare.toBytes();
-    for (long i = 0; i < bytes.length; i++) {
-        if (bytes[i] == '/') {
-            builder.append(".");
-        } else {
-            builder.appendByte(bytes[i]);
-        }
-    }
-    return builder.toString();
+    return bare.replace("/", ".");
 }
 
 // "a.b.c" -> "a/b/c.ens"
 relativeOfModulePath(string modulePath) -> string {
-    let builder = new StringBuilder();
-    byte[] bytes = modulePath.toBytes();
-    for (long i = 0; i < bytes.length; i++) {
-        if (bytes[i] == '.') {
-            builder.append("/");
-        } else {
-            builder.appendByte(bytes[i]);
-        }
-    }
-    builder.append(".ens");
-    return builder.toString();
+    return modulePath.replace(".", "/") + ".ens";
 }
 
 relativeOfSegments(string[] segments, long from) -> string {

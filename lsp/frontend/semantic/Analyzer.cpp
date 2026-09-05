@@ -6180,29 +6180,12 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
     if (callee && callee->asMember()) {
         auto member = *callee->asMember();
 
-        // Static builtin on the `string` type keyword: string.fromBytes(byte[]).
+        // A static reached through the `string` type keyword. Every one of them is a static the
+        // standard library's binding declares, and this front end does not model statics, so it
+        // leaves the checking to the compiler exactly as it does for a static on a type name.
         if (auto objExpr = member.object()) {
             if (auto idObj = objExpr->asIdent()) {
                 if (idObj->node.firstToken(SyntaxKind::KwString)) {
-                    auto memberName = member.memberText();
-                    if (memberName && *memberName == u"fromBytes") {
-                        Type* byteArr = typeCtx.getArray(typeCtx.getPrimitive(TypeKind::Byte));
-                        if (args.size() != 1) {
-                            errorAtNode(expr.node, "'string.fromBytes' expects 1 argument (a byte[]), got " +
-                                std::to_string(args.size()) + ".");
-                            for (auto& a : args) analyzeExpr(a);
-                        } else {
-                            Type* argT = analyzeExpr(args[0]);
-                            if (!argT->isError() && !byteArr->assignableFrom(argT)) {
-                                errorAtNode(args[0].node, "'string.fromBytes' expects a byte[], got '" +
-                                    argT->toString() + "'.");
-                            }
-                        }
-                        return typeCtx.getPrimitive(TypeKind::String);
-                    }
-                    // Every other name is a static the standard library's binding may declare;
-                    // this front end does not model statics, so it leaves the checking to the
-                    // compiler exactly as it does for a static on a type name.
                     for (auto& a : args) analyzeExpr(a);
                     if (typeCtx.getPrimitive(TypeKind::String)->structInfo) {
                         return typeCtx.getError();
@@ -6277,13 +6260,13 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
             }
         }
 
-        // Built-in conversion methods on primitive and string receivers. These
-        // have no Symbol; codegen recognizes them structurally. Intercept before
-        // generic member resolution, which would reject a primitive receiver.
+        // The conversions the compiler still answers for on a primitive or string receiver. These
+        // have no Symbol; codegen recognizes them structurally. Intercept before generic member
+        // resolution, which would reject a primitive receiver.
         //
-        // Each is intercepted only at the argument count the compiler provides it at. The
-        // standard library's binding may declare a member of the same name at another count, and
-        // that one is the library's own, so such a call goes to ordinary resolution instead.
+        // Each is intercepted only at the argument count the compiler provides it at, so a
+        // binding member of the same name at another count is the library's own and goes to
+        // ordinary resolution. Everything the library took over is resolved that way now.
         if (auto objExpr = member.object()) {
             auto memberName = member.memberText();
             if (memberName && *memberName == u"toString" && args.empty()) {
@@ -6335,64 +6318,7 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                 }
                 // Records may declare their own toString: fall through to resolution.
             }
-            if (memberName && *memberName == u"toBytes" && args.empty()) {
-                Type* recvT = analyzeExpr(*objExpr);
-                if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }
-                if (recvT->isString()) {
-                    return typeCtx.getArray(typeCtx.getPrimitive(TypeKind::Byte));
-                }
-                // Records may declare their own toBytes: fall through to resolution.
-            }
-            // String builtins over one other string: indexOf -> long, contains -> bool,
-            // compareTo -> int.
-            auto checkStringArgument = [&](const std::string& name) {
-                Type* argT = analyzeExpr(args[0]);
-                if (!argT->isError() && !argT->isString()) {
-                    errorAtNode(args[0].node, "'" + name + "' expects a string argument, got '" +
-                        argT->toString() + "'.");
-                }
-            };
-            if (memberName && (*memberName == u"indexOf" || *memberName == u"contains")
-                    && args.size() == 1) {
-                Type* recvT = analyzeExpr(*objExpr);
-                if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }
-                if (recvT->isString()) {
-                    bool isIndexOf = *memberName == u"indexOf";
-                    checkStringArgument(isIndexOf ? "indexOf" : "contains");
-                    return typeCtx.getPrimitive(isIndexOf ? TypeKind::Long : TypeKind::Bool);
-                }
-                // Records may declare their own indexOf/contains: fall through to resolution.
-            }
-            if (memberName && *memberName == u"compareTo" && args.size() == 1) {
-                Type* recvT = analyzeExpr(*objExpr);
-                if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }
-                if (recvT->isString()) {
-                    checkStringArgument("compareTo");
-                    return typeCtx.getPrimitive(TypeKind::Int);
-                }
-                // Records may declare their own compareTo: fall through to resolution.
-            }
-            if (memberName && (*memberName == u"startsWith" || *memberName == u"endsWith")
-                    && args.size() == 1) {
-                Type* recvT = analyzeExpr(*objExpr);
-                if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }
-                if (recvT->isString()) {
-                    checkStringArgument(*memberName == u"startsWith" ? "startsWith" : "endsWith");
-                    return typeCtx.getPrimitive(TypeKind::Bool);
-                }
-                // Records may declare their own startsWith/endsWith: fall through to resolution.
-            }
-            if (memberName && (*memberName == u"trim" || *memberName == u"trimStart")
-                    && args.empty()) {
-                Type* recvT = analyzeExpr(*objExpr);
-                if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }
-                if (recvT->isString()) {
-                    return typeCtx.getPrimitive(TypeKind::String);
-                }
-                // Records may declare their own trim/trimStart: fall through to resolution.
-            }
-            // Range builtins: string.substring(start, end) -> string and
-            // array slice(start, end) -> T[], both half-open ranges.
+            // Array slicing takes a start and an end index, both half-open.
             auto checkRangeArguments = [&](const std::string& name) {
                 if (args.size() != 2) {
                     errorAtNode(expr.node, "'" + name + "' expects 2 arguments (start and end), got " +
@@ -6408,15 +6334,6 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                     }
                 }
             };
-            if (memberName && *memberName == u"substring" && args.size() == 2) {
-                Type* recvT = analyzeExpr(*objExpr);
-                if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }
-                if (recvT->isString()) {
-                    checkRangeArguments("substring");
-                    return typeCtx.getPrimitive(TypeKind::String);
-                }
-                // Records may declare their own substring: fall through to resolution.
-            }
             if (memberName && *memberName == u"slice") {
                 Type* recvT = analyzeExpr(*objExpr);
                 if (recvT->isError()) { for (auto& a : args) analyzeExpr(a); return typeCtx.getError(); }

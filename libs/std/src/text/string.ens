@@ -1,0 +1,593 @@
+// What text can do. The compiler provides `length`, `+`, `==` and the four members declared here
+// without a body; everything else is ordinary Ens over those. Offsets are byte offsets, and every
+// string is valid UTF-8, which is the one thing the two unchecked members leave to their callers.
+import Iterable from @std.collections.iterator;
+import Iterator from @std.collections.iterator;
+import EncodingError from @std.text;
+
+primitive string implements Comparable<string> {
+    // One of the UTF-8 bytes. An index outside the string aborts the program.
+    export byteAt(long index) -> byte;
+
+    // The UTF-8 bytes, copied.
+    export toBytes() -> byte[];
+
+    // Text from bytes the caller has already found to be UTF-8, and the bytes of a range the
+    // caller has already checked. Both refuse a range outside the value they are given; neither
+    // looks at the encoding, so this module is the only place the UTF-8 guarantee could break.
+    public static fromBytesUnchecked(byte[] bytes) -> string;
+
+    public sliceUnchecked(long start, long end) -> string;
+
+    export isEmpty() -> bool {
+        return this.length == 0;
+    }
+
+    export contains(string needle) -> bool {
+        return this.indexOf(needle) >= 0;
+    }
+
+    // The byte offset of the first occurrence of `needle`, or -1 when there is none. An empty
+    // needle is found at offset 0.
+    export indexOf(string needle) -> long {
+        return this.indexOf(needle, 0);
+    }
+
+    // The same search, started at `from`. An offset before the text is read as 0, an empty needle
+    // is found wherever the search starts, and an offset past the end finds nothing at all.
+    export indexOf(string needle, long from) -> long {
+        long start = from < 0 ? 0 : from;
+        if (start + needle.length > this.length) {
+            return -1;
+        }
+        for (long at = start; at + needle.length <= this.length; at++) {
+            if (this.matchesAt(at, needle)) {
+                return at;
+            }
+        }
+        return -1;
+    }
+
+    // The byte offset of the last occurrence of `needle`, or -1 when there is none. An empty
+    // needle is found at the end, since that is the last place it occurs.
+    export lastIndexOf(string needle) -> long {
+        for (long at = this.length - needle.length; at >= 0; at--) {
+            if (this.matchesAt(at, needle)) {
+                return at;
+            }
+        }
+        return -1;
+    }
+
+    // Whether the first or the last bytes are exactly that part. An empty part always matches, and
+    // a part longer than the text never does.
+    export startsWith(string prefix) -> bool {
+        return prefix.length <= this.length && this.matchesAt(0, prefix);
+    }
+
+    export endsWith(string suffix) -> bool {
+        return suffix.length <= this.length && this.matchesAt(this.length - suffix.length, suffix);
+    }
+
+    // The bytes in [start, end) as new text. A range that reaches outside the text, or that cuts
+    // through the middle of a character, aborts the program.
+    export substring(long start, long end) -> string {
+        if (start < 0 || end > this.length || start > end) {
+            panic("substring range {start}..{end} is outside a string of {this.length} bytes");
+        }
+        this.checkBoundary(start);
+        this.checkBoundary(end);
+        return this.sliceUnchecked(start, end);
+    }
+
+    // The bytes from `start` to the end.
+    export substring(long start) -> string {
+        return this.substring(start, this.length);
+    }
+
+    // The text without the whitespace at either end, or at one end. Whitespace is a space or one
+    // of the ASCII layout controls: tab, line feed, vertical tab, form feed, and carriage return.
+    export trim() -> string {
+        long from = this.firstKept();
+        long to = this.lastKept();
+        if (from >= to) {
+            return "";
+        }
+        return this.sliceUnchecked(from, to);
+    }
+
+    export trimStart() -> string {
+        return this.sliceUnchecked(this.firstKept(), this.length);
+    }
+
+    export trimEnd() -> string {
+        return this.sliceUnchecked(0, this.lastKept());
+    }
+
+    // Every occurrence of `needle` replaced by `replacement`. An empty needle occurs nowhere to
+    // replace, so the text comes back as it was.
+    export replace(string needle, string replacement) -> string {
+        if (needle.isEmpty()) {
+            return this;
+        }
+        long found = this.countOf(needle);
+        if (found == 0) {
+            return this;
+        }
+        long width = this.length + found * (replacement.length - needle.length);
+        byte[] built = new byte[width];
+        long at = 0;
+        long written = 0;
+        while (at < this.length) {
+            if (at + needle.length <= this.length && this.matchesAt(at, needle)) {
+                written = copyInto(built, written, replacement);
+                at = at + needle.length;
+            } else {
+                built[written] = this.byteAt(at);
+                written = written + 1;
+                at = at + 1;
+            }
+        }
+        return string.fromBytesUnchecked(built);
+    }
+
+    // The text `times` over, and empty text for zero. A negative count aborts the program.
+    export repeat(long times) -> string {
+        if (times < 0) {
+            panic("repeat count {times} is negative");
+        }
+        byte[] built = new byte[this.length * times];
+        long written = 0;
+        for (long i = 0; i < times; i++) {
+            written = copyInto(built, written, this);
+        }
+        return string.fromBytesUnchecked(built);
+    }
+
+    // The text with `filler` repeated before or after it until it is `width` bytes wide. Text
+    // already that wide comes back as it is, and a filler of several bytes is only ever added
+    // whole, so text can stop one byte short of a width its filler does not divide.
+    export padStart(long width, char filler) -> string {
+        string fill = filler.toString();
+        long count = fillerCount(this.length, width, fill.length);
+        if (count == 0) {
+            return this;
+        }
+        byte[] built = new byte[this.length + count * fill.length];
+        long written = 0;
+        for (long i = 0; i < count; i++) {
+            written = copyInto(built, written, fill);
+        }
+        written = copyInto(built, written, this);
+        return string.fromBytesUnchecked(built);
+    }
+
+    export padEnd(long width, char filler) -> string {
+        string fill = filler.toString();
+        long count = fillerCount(this.length, width, fill.length);
+        if (count == 0) {
+            return this;
+        }
+        byte[] built = new byte[this.length + count * fill.length];
+        long written = copyInto(built, 0, this);
+        for (long i = 0; i < count; i++) {
+            written = copyInto(built, written, fill);
+        }
+        return string.fromBytesUnchecked(built);
+    }
+
+    // The parts between the occurrences of `separator`, in order. Two neighboring separators give
+    // an empty part, text holding no separator gives one part, the text itself, and an empty
+    // separator has nothing to split on and does the same.
+    export split(string separator) -> string[] {
+        let found = this.partsOn(separator);
+        string[] parts = new string[found.starts.length];
+        for (long i = 0; i < parts.length; i++) {
+            parts[i] = this.sliceUnchecked(found.starts[i], found.ends[i]);
+        }
+        return parts;
+    }
+
+    // The lines, split on a line feed with a carriage return before it dropped, so text written
+    // with either line ending reads the same. Text ending in a newline has a last, empty line.
+    export lines() -> string[] {
+        let found = this.partsOn("\n");
+        string[] parts = new string[found.starts.length];
+        for (long i = 0; i < parts.length; i++) {
+            parts[i] = this.sliceUnchecked(found.starts[i], this.lineEnd(found.ends[i]));
+        }
+        return parts;
+    }
+
+    // ASCII case only: 'A' through 'Z' and 'a' through 'z' convert and every other byte is kept.
+    // The names say so because the full Unicode rules are a different operation, with locale
+    // questions this one refuses to guess at.
+    export toLowerAscii() -> string {
+        return this.withCase(true);
+    }
+
+    export toUpperAscii() -> string {
+        return this.withCase(false);
+    }
+
+    // Whether the two hold the same bytes once ASCII letters are folded together. Every other
+    // byte still has to match exactly.
+    export equalsIgnoreCaseAscii(string other) -> bool {
+        if (this.length != other.length) {
+            return false;
+        }
+        for (long i = 0; i < this.length; i++) {
+            if (lowerByte(this.byteAt(i)) != lowerByte(other.byteAt(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Byte order: negative when the receiver sorts first, zero on the same bytes, positive when it
+    // sorts after. This equals code point order, which is not alphabetical order in any language
+    // with accents.
+    export override compareTo(string other) -> int {
+        long shared = this.length < other.length ? this.length : other.length;
+        for (long i = 0; i < shared; i++) {
+            if (this.byteAt(i) != other.byteAt(i)) {
+                return this.byteAt(i) < other.byteAt(i) ? -1 : 1;
+            }
+        }
+        if (this.length == other.length) {
+            return 0;
+        }
+        return this.length < other.length ? -1 : 1;
+    }
+
+    // The characters and the raw bytes, walked without copying either. Text does not iterate on
+    // its own, so a walk always names which view it reads.
+    export chars() -> Iterable<char> {
+        return new CharacterView(this);
+    }
+
+    export bytes() -> Iterable<byte> {
+        return new ByteView(this);
+    }
+
+    // Text from UTF-8 bytes. `fromBytes` refuses bytes that spell no character and names where
+    // they start; `fromBytesLossy` writes U+FFFD in place of each such sequence and never fails.
+    export static fromBytes(byte[] bytes) -> string throws EncodingError {
+        long at = firstInvalidUtf8(bytes);
+        if (at >= 0) {
+            throw new EncodingError("the byte at offset {at} begins no UTF-8 character; read the "
+                + "bytes with fromBytesLossy to replace what is malformed", at);
+        }
+        return string.fromBytesUnchecked(bytes);
+    }
+
+    export static fromBytesLossy(byte[] bytes) -> string {
+        long at = firstInvalidUtf8(bytes);
+        if (at < 0) {
+            return string.fromBytesUnchecked(bytes);
+        }
+        // Every replacement is three bytes and stands for at least one, so this holds the worst
+        // case; the exact bytes are taken out of it once the length is known.
+        byte[] built = new byte[bytes.length * 3];
+        long written = 0;
+        long read = 0;
+        while (read < bytes.length) {
+            long width = characterWidth(bytes, read);
+            if (width > 0) {
+                for (long i = 0; i < width; i++) {
+                    built[written + i] = bytes[read + i];
+                }
+                written = written + width;
+                read = read + width;
+                continue;
+            }
+            built[written] = 0xEF;
+            built[written + 1] = 0xBF;
+            built[written + 2] = 0xBD;
+            written = written + 3;
+            read = read + malformedWidth(bytes, read);
+        }
+        return string.fromBytesUnchecked(built.slice(0, written));
+    }
+
+    // `parts` with `separator` between neighbors, and nothing before the first part or after the
+    // last.
+    export static joined(string[] parts, string separator) -> string {
+        if (parts.length == 0) {
+            return "";
+        }
+        long width = separator.length * (parts.length - 1);
+        for (let part in parts) {
+            width = width + part.length;
+        }
+        byte[] built = new byte[width];
+        long written = copyInto(built, 0, parts[0]);
+        for (long i = 1; i < parts.length; i++) {
+            written = copyInto(built, written, separator);
+            written = copyInto(built, written, parts[i]);
+        }
+        return string.fromBytesUnchecked(built);
+    }
+
+    // Whether the bytes of `part` sit at `at`. The caller has checked that they fit.
+    matchesAt(long at, string part) -> bool {
+        for (long i = 0; i < part.length; i++) {
+            if (this.byteAt(at + i) != part.byteAt(i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // How many times `needle` occurs, counting from the left and never overlapping.
+    countOf(string needle) -> long {
+        long found = 0;
+        long at = 0;
+        while (at + needle.length <= this.length) {
+            if (this.matchesAt(at, needle)) {
+                found = found + 1;
+                at = at + needle.length;
+            } else {
+                at = at + 1;
+            }
+        }
+        return found;
+    }
+
+    // Aborts unless `at` is where a character starts, which is what keeps a substring valid UTF-8.
+    checkBoundary(long at) {
+        if (at < this.length && insideCharacter(this.byteAt(at))) {
+            panic("substring offset {at} is inside a character, not at its start");
+        }
+    }
+
+    // The first and the last offsets that are not whitespace, as a half-open range. Empty text and
+    // text that is all whitespace give an empty range.
+    firstKept() -> long {
+        for (long i = 0; i < this.length; i++) {
+            if (!isWhitespace(this.byteAt(i))) {
+                return i;
+            }
+        }
+        return this.length;
+    }
+
+    lastKept() -> long {
+        for (long i = this.length; i > 0; i--) {
+            if (!isWhitespace(this.byteAt(i - 1))) {
+                return i;
+            }
+        }
+        return 0;
+    }
+
+    // Where a line's text ends before the newline at `end`: one byte earlier when a carriage
+    // return sits there, because a Windows line ending writes both and neither belongs to the line.
+    lineEnd(long end) -> long {
+        if (end > 0 && this.byteAt(end - 1) == '\r') {
+            return end - 1;
+        }
+        return end;
+    }
+
+    // The same bytes with the ASCII letters in one case. Every letter is one byte, so the length
+    // never changes.
+    withCase(bool lower) -> string {
+        byte[] built = new byte[this.length];
+        for (long i = 0; i < this.length; i++) {
+            built[i] = lower ? lowerByte(this.byteAt(i)) : upperByte(this.byteAt(i));
+        }
+        return string.fromBytesUnchecked(built);
+    }
+
+    // Where each part of a split begins and ends. The occurrences are counted first so the parts
+    // are found once, whichever member is filling an array from them.
+    partsOn(string separator) -> PartBounds {
+        long count = separator.isEmpty() ? 0 : this.countOf(separator);
+        long[] starts = new long[count + 1];
+        long[] ends = new long[count + 1];
+        long part = 0;
+        long at = 0;
+        while (part < count) {
+            long found = this.indexOf(separator, at);
+            starts[part] = at;
+            ends[part] = found;
+            at = found + separator.length;
+            part = part + 1;
+        }
+        starts[part] = at;
+        ends[part] = this.length;
+        return {starts: starts, ends: ends};
+    }
+}
+
+// Where the parts of a split begin and end, one entry per part.
+struct PartBounds {
+    protected long[] starts;
+    protected long[] ends;
+}
+
+// The characters of one string, decoded as the walk reaches them. The text is valid UTF-8, so each
+// lead byte says how many bytes its character spans and the walk needs no checking of its own.
+final class CharacterView implements Iterable<char>, Iterator<char> {
+    const string text;
+    long at;
+
+    protected constructor(this.text) {
+        this.at = 0;
+    }
+
+    protected override makeIterator() -> Iterator<char> {
+        return new CharacterView(this.text);
+    }
+
+    protected override next() -> char? {
+        if (this.at >= this.text.length) {
+            return null;
+        }
+        long width = leadWidth(this.text.byteAt(this.at));
+        long scalar = (this.text.byteAt(this.at) as long) & leadMask(width);
+        for (long i = 1; i < width; i++) {
+            scalar = scalar * 64 + ((this.text.byteAt(this.at + i) as long) & 0x3F);
+        }
+        this.at = this.at + width;
+        return scalar as char;
+    }
+}
+
+// The bytes of one string, read where they lie.
+final class ByteView implements Iterable<byte>, Iterator<byte> {
+    const string text;
+    long at;
+
+    protected constructor(this.text) {
+        this.at = 0;
+    }
+
+    protected override makeIterator() -> Iterator<byte> {
+        return new ByteView(this.text);
+    }
+
+    protected override next() -> byte? {
+        if (this.at >= this.text.length) {
+            return null;
+        }
+        let value = this.text.byteAt(this.at);
+        this.at = this.at + 1;
+        return value;
+    }
+}
+
+// The bytes of `text` written into `built` at `at`, answering where the next write goes.
+copyInto(byte[] built, long at, string text) -> long {
+    for (long i = 0; i < text.length; i++) {
+        built[at + i] = text.byteAt(i);
+    }
+    return at + text.length;
+}
+
+// How many fillers fit between a text of `length` bytes and a width of `width`, without passing it.
+fillerCount(long length, long width, long fillWidth) -> long {
+    if (width <= length || fillWidth == 0) {
+        return 0;
+    }
+    return (width - length) / fillWidth;
+}
+
+// True for a space or one of the ASCII layout controls, tab through carriage return.
+isWhitespace(byte value) -> bool {
+    return value == ' ' || (value >= '\t' && value <= '\r');
+}
+
+lowerByte(byte value) -> byte {
+    if (value >= 'A' && value <= 'Z') {
+        return value + ('a' - 'A') as byte;
+    }
+    return value;
+}
+
+upperByte(byte value) -> byte {
+    if (value >= 'a' && value <= 'z') {
+        return value - ('a' - 'A') as byte;
+    }
+    return value;
+}
+
+// True for a byte that continues a character, the shape every byte inside one has and no byte that
+// starts one does. An offset pointing at one is inside a character rather than at its start.
+insideCharacter(byte value) -> bool {
+    return value >= 0x80 && value <= 0xBF;
+}
+
+// The bits a lead byte carries of its character's value: all of them for one byte, and what the
+// marker leaves for the wider forms.
+leadMask(long width) -> long {
+    return switch (width) {
+        1 -> 0x7F,
+        2 -> 0x1F,
+        3 -> 0x0F,
+        default -> 0x07,
+    };
+}
+
+// How many bytes a character beginning with `lead` spans, or 0 when none begins with it.
+leadWidth(byte lead) -> long {
+    if (lead < 0x80) {
+        return 1;
+    }
+    if (lead >= 0xC2 && lead <= 0xDF) {
+        return 2;
+    }
+    if (lead >= 0xE0 && lead <= 0xEF) {
+        return 3;
+    }
+    if (lead >= 0xF0 && lead <= 0xF4) {
+        return 4;
+    }
+    return 0;
+}
+
+// How many bytes the character at `at` spans, or 0 when the bytes there spell none. Overlong forms,
+// the surrogate range and anything above U+10FFFF are refused along with the malformed sequences.
+characterWidth(byte[] raw, long at) -> long {
+    long width = leadWidth(raw[at]);
+    if (width == 0 || at + width > raw.length) {
+        return 0;
+    }
+    if (width == 1) {
+        return 1;
+    }
+    if (!followsLead(raw[at], raw[at + 1])) {
+        return 0;
+    }
+    for (long i = at + 2; i < at + width; i++) {
+        if (!insideCharacter(raw[i])) {
+            return 0;
+        }
+    }
+    return width;
+}
+
+// Whether `second` can follow `lead`. The range narrows for four leads, which is what rules out an
+// overlong form, a surrogate and a value above U+10FFFF.
+followsLead(byte lead, byte second) -> bool {
+    byte lowest = 0x80;
+    byte highest = 0xBF;
+    switch (lead) {
+        0xE0 -> { lowest = 0xA0; },
+        0xED -> { highest = 0x9F; },
+        0xF0 -> { lowest = 0x90; },
+        0xF4 -> { highest = 0x8F; },
+        default -> { },
+    }
+    return second >= lowest && second <= highest;
+}
+
+// Where `raw` first stops spelling UTF-8, or -1 when all of it does.
+firstInvalidUtf8(byte[] raw) -> long {
+    long at = 0;
+    while (at < raw.length) {
+        long width = characterWidth(raw, at);
+        if (width == 0) {
+            return at;
+        }
+        at = at + width;
+    }
+    return -1;
+}
+
+// How many bytes one malformed sequence at `at` covers, which is what a single replacement stands
+// for: the bytes that could still have been the start of a character, and never fewer than one. A
+// byte that could not follow what came before it starts a sequence of its own, so 'ED A0 80', where
+// the second byte is outside what that lead accepts, is three replacements rather than one.
+malformedWidth(byte[] raw, long at) -> long {
+    long width = leadWidth(raw[at]);
+    if (width < 2 || at + 1 >= raw.length || !followsLead(raw[at], raw[at + 1])) {
+        return 1;
+    }
+    long taken = 2;
+    while (taken < width && at + taken < raw.length && insideCharacter(raw[at + taken])) {
+        taken = taken + 1;
+    }
+    return taken;
+}

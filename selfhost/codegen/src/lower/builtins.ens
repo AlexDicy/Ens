@@ -4,20 +4,12 @@
 import Expression from @ens.frontend.syntax.generated.nodes;
 import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
 import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
-import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ArgumentListNode from @ens.frontend.syntax.generated.nodes;
-import SyntaxKind from @ens.frontend.syntax.generated.kind;
-import Span from @ens.frontend.support.source;
 import BuiltinFunction from @ens.sema.context;
 import Type from @ens.sema.model.types;
 import PrimitiveKind from @ens.sema.model.types;
 import PrimitiveIntrinsic from @ens.sema.model.types;
-import StructType from @ens.sema.model.types;
 import @ens.sema.model.types;
-import EirStringCompare from eir.model;
-import EirStringHasAffix from eir.model;
-import EirStringTrim from eir.model;
-import EirStringIndexOf from eir.model;
 import EirStringSubstring from eir.model;
 import EirStringByteAt from eir.model;
 import EirStringToBytes from eir.model;
@@ -26,9 +18,6 @@ import EirStringLength from eir.model;
 import EirArrayLength from eir.model;
 import EirArraySlice from eir.model;
 import EirRangeCheck from eir.model;
-import EirBinary from eir.model;
-import EirBinaryOp from eir.model;
-import EirConstInt from eir.model;
 import EirPanic from eir.model;
 import LoweringContext from lower.context;
 import lower.expressions;
@@ -81,9 +70,6 @@ public lowerMemberCall(LoweringContext lowering, CallExpressionNode call) -> lon
     }
     string name = callee.member().text();
     let object = callee.object();
-    if (isStringTypeKeyword(object)) {
-        return lowerStringStatic(lowering, call, name);
-    }
     let receiverType = lowering.typeOf(object);
     if (receiverType == null) {
         return -1;
@@ -94,7 +80,11 @@ public lowerMemberCall(LoweringContext lowering, CallExpressionNode call) -> lon
         return hashes.lowerSynthesizedHash(lowering, call, object, receiverType);
     }
     if (primitives.isStringType(receiverType)) {
-        return lowerStringMember(lowering, call, object, name);
+        if (name == "toString") {
+            return strings.lowerToString(lowering, object);
+        }
+        lowering.unsupported("the string member '{name}'", call.span());
+        return -1;
     }
     if (name == "toString") {
         return lowerValueToString(lowering, object);
@@ -175,15 +165,6 @@ lowerByteAt(LoweringContext lowering, CallExpressionNode call, Expression object
     return result;
 }
 
-// 'string.fromBytes(bytes)' reads a byte array as UTF-8 text.
-lowerStringStatic(LoweringContext lowering, CallExpressionNode call, string name) -> long {
-    if (name != "fromBytes") {
-        lowering.unsupported("the static member 'string.{name}'", call.span());
-        return -1;
-    }
-    return lowerFromBytes(lowering, call, "fromBytes");
-}
-
 // A byte array read as text, with no encoding check of its own.
 lowerFromBytes(LoweringContext lowering, CallExpressionNode call, string member) -> long {
     let argument = singleArgument(call.arguments());
@@ -202,49 +183,6 @@ lowerFromBytes(LoweringContext lowering, CallExpressionNode call, string member)
     builder.append(new EirStringFromBytes(text, stringType, bytes));
     expressions.releaseTemporary(lowering, argument, bytes);
     return text;
-}
-
-lowerStringMember(LoweringContext lowering, CallExpressionNode call, Expression object, string name) -> long {
-    switch (name) {
-        "toString" -> {
-            return strings.lowerToString(lowering, object);
-        },
-        "length" -> {
-            lowering.unsupported("calling 'length', which is not a method", call.span());
-            return -1;
-        },
-        "toBytes" -> {
-            return lowerToBytes(lowering, call, object);
-        },
-        "indexOf" -> {
-            return lowerSearch(lowering, call, object, false);
-        },
-        "contains" -> {
-            return lowerSearch(lowering, call, object, true);
-        },
-        "compareTo" -> {
-            return lowerCompare(lowering, call, object);
-        },
-        "startsWith" -> {
-            return lowerAffix(lowering, call, object, false);
-        },
-        "endsWith" -> {
-            return lowerAffix(lowering, call, object, true);
-        },
-        "trim" -> {
-            return lowerTrim(lowering, call, object, true);
-        },
-        "trimStart" -> {
-            return lowerTrim(lowering, call, object, false);
-        },
-        "substring" -> {
-            return lowerSubstring(lowering, call, object, "substring");
-        },
-        default -> {
-            lowering.unsupported("the string member '{name}'", call.span());
-            return -1;
-        },
-    }
 }
 
 // A value's own text form, for '.toString()' on a value whose type declares no 'toString'.
@@ -278,129 +216,6 @@ lowerToBytes(LoweringContext lowering, CallExpressionNode call, Expression objec
     builder.append(new EirStringToBytes(bytes, resultType, text));
     expressions.releaseTemporary(lowering, object, text);
     return bytes;
-}
-
-// 'indexOf' hands back the byte offset; 'contains' compares that offset against zero.
-lowerSearch(LoweringContext lowering, CallExpressionNode call, Expression object, bool asContains) -> long {
-    let argument = singleArgument(call.arguments());
-    if (argument == null) {
-        lowering.internalError("a string search reached lowering with "
-            + "{call.arguments().argumentsCount()} argument(s)", call.span());
-        return -1;
-    }
-    long haystack = expressions.lower(lowering, object);
-    if (haystack < 0) {
-        return -1;
-    }
-    bool haystackOwned = places.producesOwnedValue(lowering, object);
-    if (haystackOwned) {
-        lowering.protectValue(haystack);
-    }
-    long needle = expressions.lower(lowering, argument);
-    if (haystackOwned) {
-        lowering.unprotectValue(haystack);
-    }
-    if (needle < 0) {
-        return -1;
-    }
-    let builder = lowering.builder();
-    let longType = lowering.store().primitive(PrimitiveKind.Long);
-    long offset = builder.newTemp(longType);
-    builder.append(new EirStringIndexOf(offset, longType, haystack, needle));
-    expressions.releaseTemporary(lowering, object, haystack);
-    expressions.releaseTemporary(lowering, argument, needle);
-    if (!asContains) {
-        return offset;
-    }
-    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
-    long zero = builder.newTemp(longType);
-    builder.append(new EirConstInt(zero, longType, 0));
-    long found = builder.newTemp(boolType);
-    builder.append(new EirBinary(found, boolType, EirBinaryOp.CmpGeSigned, offset, zero));
-    return found;
-}
-
-// 'compareTo' answers where the receiver sorts relative to the argument.
-lowerCompare(LoweringContext lowering, CallExpressionNode call, Expression object) -> long {
-    let argument = singleArgument(call.arguments());
-    if (argument == null) {
-        lowering.internalError("'compareTo' reached lowering with "
-            + "{call.arguments().argumentsCount()} argument(s)", call.span());
-        return -1;
-    }
-    long left = expressions.lower(lowering, object);
-    if (left < 0) {
-        return -1;
-    }
-    bool leftOwned = places.producesOwnedValue(lowering, object);
-    if (leftOwned) {
-        lowering.protectValue(left);
-    }
-    long right = expressions.lower(lowering, argument);
-    if (leftOwned) {
-        lowering.unprotectValue(left);
-    }
-    if (right < 0) {
-        return -1;
-    }
-    let builder = lowering.builder();
-    let intType = lowering.store().primitive(PrimitiveKind.Int);
-    long order = builder.newTemp(intType);
-    builder.append(new EirStringCompare(order, intType, left, right));
-    expressions.releaseTemporary(lowering, object, left);
-    expressions.releaseTemporary(lowering, argument, right);
-    return order;
-}
-
-// 'startsWith' and 'endsWith' test the text's leading or trailing bytes against the argument.
-lowerAffix(LoweringContext lowering, CallExpressionNode call, Expression object, bool atEnd) -> long {
-    let argument = singleArgument(call.arguments());
-    if (argument == null) {
-        lowering.internalError("a string edge test reached lowering with "
-            + "{call.arguments().argumentsCount()} argument(s)", call.span());
-        return -1;
-    }
-    long text = expressions.lower(lowering, object);
-    if (text < 0) {
-        return -1;
-    }
-    bool textOwned = places.producesOwnedValue(lowering, object);
-    if (textOwned) {
-        lowering.protectValue(text);
-    }
-    long part = expressions.lower(lowering, argument);
-    if (textOwned) {
-        lowering.unprotectValue(text);
-    }
-    if (part < 0) {
-        return -1;
-    }
-    let builder = lowering.builder();
-    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
-    long found = builder.newTemp(boolType);
-    builder.append(new EirStringHasAffix(found, boolType, text, part, atEnd));
-    expressions.releaseTemporary(lowering, object, text);
-    expressions.releaseTemporary(lowering, argument, part);
-    return found;
-}
-
-// 'trim' and 'trimStart' copy the text without the whitespace at its edges.
-lowerTrim(LoweringContext lowering, CallExpressionNode call, Expression object, bool trailing) -> long {
-    if (call.arguments().argumentsCount() != 0) {
-        lowering.internalError("a string trim reached lowering with "
-            + "{call.arguments().argumentsCount()} argument(s)", call.span());
-        return -1;
-    }
-    long text = expressions.lower(lowering, object);
-    if (text < 0) {
-        return -1;
-    }
-    let builder = lowering.builder();
-    let stringType = lowering.store().stringType();
-    long trimmed = builder.newTemp(stringType);
-    builder.append(new EirStringTrim(trimmed, stringType, text, trailing));
-    expressions.releaseTemporary(lowering, object, text);
-    return trimmed;
 }
 
 // A byte range copied into fresh text, aborting when the range is not inside the string. The
@@ -493,14 +308,6 @@ lowerSlice(LoweringContext lowering, CallExpressionNode call, Expression object,
     builder.append(new EirArraySlice(result, receiverType, array, start, end));
     expressions.releaseTemporary(lowering, object, array);
     return result;
-}
-
-// True for the 'string' keyword standing in for the type itself, as in 'string.fromBytes'.
-isStringTypeKeyword(Expression object) -> bool {
-    if (!(object is IdentifierExpressionNode)) {
-        return false;
-    }
-    return object.name().kind() == SyntaxKind.StringKeyword;
 }
 
 singleArgument(ArgumentListNode arguments) -> Expression? {

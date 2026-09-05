@@ -1555,19 +1555,8 @@ The accepted escapes are `\n`, `\r`, `\t`, `\b`, `\f`, `\0`, `\\`, `\"`, `\'`, `
 - `+` concatenates strings. When one side is a string, a number (integer, `char`, or floating-point) or a `bool` on the other side is converted to text implicitly (the same way `.toString()` would). Every other type is rejected here, structs and classes included even though they have a text form; interpolate those or call `.toString()` instead.
 - `.toString()` produces a string from a value explicitly: integer types format as decimal, floating-point types by the rule below, a `char` as the one character it denotes (its Unicode scalar encoded as UTF-8 bytes, so `'A'` is `"A"` and `'7'` is `"7"`, not their code points; write `c as int` first for the number), `bool` as `true` or `false`, a string returns itself, a struct produces its JSON form or what its own `toString` returns, a class or interface value produces what its runtime type's `toString` override returns, or that type's name when no class in its chain declares one, and an array produces the same JSON-style list interpolation renders.
   It can be written directly on a literal, as in `42.toString()`.
-- `s.toBytes()` returns the UTF-8 bytes as a `byte[]`, and `string.fromBytes(bytes)` builds a string from a `byte[]` by interpreting it as UTF-8.
-- `s.contains(needle)` reports whether `needle` occurs in `s`.
-  `s.indexOf(needle)` returns the byte offset of the first occurrence as a `long`, or `-1` when absent; an empty needle is found at offset `0`.
-- `s.startsWith(prefix)` and `s.endsWith(suffix)` report whether the first or last bytes of `s` are exactly that part; an empty part always matches, and a part longer than `s` never does.
-- `s.trim()` returns `s` without the whitespace at either end, and `s.trimStart()` returns it without the whitespace at the start only.
-  Whitespace is a space or one of the ASCII layout controls: tab, line feed, vertical tab, form feed, and carriage return.
-- `s.substring(start, end)` returns the bytes in the half-open range `[start, end)` as a new string.
-  Offsets are byte offsets, like `length` and `indexOf`.
-  An invalid range (a negative start, a start past the end, or an end past the length) aborts the program.
-- `s.compareTo(other)` returns an `int` that is negative when `s` sorts before `other`, zero when they hold the same bytes, and positive when `s` sorts after `other`.
-  The order is the order of the UTF-8 bytes, and a string that is a prefix of another sorts before it.
-  Only the sign of the result is meaningful.
-  Strings have no `<`, `<=`, `>` or `>=` operators; write the comparison against `compareTo` instead.
+- Everything else text can do is a member the standard library declares, described with the rest of the library: searching, substrings, trimming, splitting, case conversion, padding, `toBytes` and `string.fromBytes`, and the character and byte views.
+  Strings have no `<`, `<=`, `>` or `>=` operators; order them with `compareTo`, which the library declares as well.
 
 A `float` or `double` renders as decimal text that reads back as exactly the same value, so nothing is lost between printing a number and reading it again.
 The text is kept short where that costs nothing, but it is the reading back, not the shortness, that is promised.
@@ -1582,13 +1571,8 @@ let greeting = "Hello, " + name + "!";
 let n = greeting.length;            // long, the byte count
 if (name == "world") { /* ... */ }
 let label = count.toString();       // "0", "42", "-7"
-let raw = greeting.toBytes();       // byte[]
-let back = string.fromBytes(raw);   // string
-let at = greeting.indexOf("llo");   // 2
-let has = greeting.contains("!");   // true
-let word = greeting.substring(0, 5); // "Hello"
-let intro = greeting.startsWith("Hello"); // true
-let clean = "  spaced  ".trim();    // "spaced"
+let raw = greeting.toBytes();       // byte[], from the library's member
+let at = greeting.indexOf("llo");   // 2, likewise
 if (name.compareTo("world") < 0) { /* name sorts first */ }
 ```
 
@@ -1866,23 +1850,29 @@ An array cannot be a key: it compares and hashes by content, and its content can
 A collection cannot be a key for the same reason, nor can a struct whose fields, at any depth, hold an array or a collection; the error names the field.
 An external handle or a function value cannot be a key either, because neither has a hash to bucket by.
 
-The `@std.text.strings` module takes text apart and puts it back together.
-`split(text, separator)` returns the parts between the occurrences of the separator, so two neighboring separators give an empty part and text holding none gives one part.
-`lines(text)` splits on `\n` and drops a trailing `\r` from each line, so text written with either line ending reads the same.
-`joined(parts, separator)` puts the separator between neighboring parts and nothing before the first or after the last.
-`parseInteger(text)` returns the `long` the text spells, or `null` when it spells anything else: at most one leading `-` or `+`, then nothing but digits, and a value a `long` can hold, so surrounding whitespace and a value too large are refused rather than guessed at.
+What text can do is declared on `string` itself, so every member below is called on the text and needs no import.
+`isEmpty()`, `contains(needle)`, `indexOf(needle)`, `indexOf(needle, from)` and `lastIndexOf(needle)` search by exact bytes, answering the byte offset of an occurrence or `-1`; an empty needle is found at offset `0`, and looking back, at the end.
+`startsWith(prefix)` and `endsWith(suffix)` report whether the first or last bytes are exactly that part; an empty part always matches, and a part longer than the text never does.
+`substring(start, end)` and `substring(start)` answer the bytes of a half-open byte range as new text; a range outside the text, or one that cuts through the middle of a character, aborts the program.
+`trim()`, `trimStart()` and `trimEnd()` drop the whitespace at both ends or at one, where whitespace is a space or one of the ASCII layout controls: tab, line feed, vertical tab, form feed, and carriage return.
+`replace(needle, replacement)`, `repeat(times)`, `padStart(width, filler)` and `padEnd(width, filler)` build new text; a negative `times` aborts, text already `width` bytes wide is returned as it is, and a filler of several bytes is only ever added whole.
+`split(separator)` answers the parts between the occurrences of the separator, so two neighboring separators give an empty part and text holding none gives one part, and an empty separator does the same.
+`lines()` splits on `\n` and drops a carriage return before it, so text written with either line ending reads the same; text ending in a newline has a last, empty line.
+`toLowerAscii()`, `toUpperAscii()` and `equalsIgnoreCaseAscii(other)` convert or compare the ASCII letters only and keep every other byte as it is; the names say so because the full Unicode rules are a different operation.
+`compareTo(other)` orders text by its bytes, which is code point order.
+`toBytes()` answers the UTF-8 bytes as a copy, while `chars()` and `bytes()` walk the characters or the bytes without copying; text does not iterate on its own, so a walk always names which view it reads.
+`string.fromBytes(bytes)` builds text from UTF-8 bytes and throws `EncodingError` at the offset where the bytes spell no character, `string.fromBytesLossy(bytes)` writes U+FFFD in place of each such sequence instead, and `string.joined(parts, separator)` puts the separator between neighboring parts and nothing before the first or after the last.
 
 ```ens
-import @std.text.strings;
-
-string[] fields = strings.split("name,age,city", ",");
-long? count = strings.parseInteger("42");
-print(strings.joined(fields, " | "));
+string[] fields = "name,age,city".split(",");
+print(string.joined(fields, " | "));
+print("7".padStart(3, '0'));            // "007"
+for (let character in "héllo".chars()) { /* ... */ }
 ```
 
 `StringBuilder` from `@std.text.stringbuilder` accumulates text in a growable buffer, so building a string piece by piece stays linear where repeated `+` on immutable strings would re-copy the whole prefix.
-`append(value)` accepts a string, an integer, or a `bool`; `length()` returns the number of bytes written so far; `toString()` returns the accumulated text and leaves the builder usable.
-`appendByte(value)` appends one raw byte to the buffer, where `append` on the same value would format it as decimal text.
+`append(value)` accepts a string, a `char`, an integer, a `double`, or a `bool`; `appendLine(value)` and `appendLine()` add a newline after it; `length()` and `isEmpty()` report what is held so far; `clear()` forgets it; `reserve(capacity)` and `StringBuilder.withCapacity(capacity)` ask for room ahead of time; `toString()` returns the accumulated text and leaves the builder usable.
+Every append takes text or a value with a text form, so what a builder holds is valid UTF-8 and `toString` needs no check of its own.
 
 ```ens
 import StringBuilder from @std.text.stringbuilder;
