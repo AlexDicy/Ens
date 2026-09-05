@@ -546,13 +546,14 @@ The implicitly imported modules described below are the one exception: no import
 
 Two modules may import each other: circular imports are allowed, and declarations resolve across the cycle like any other import.
 
-A short list of standard-library modules is imported implicitly, today just `@std.core`.
-Every exported name of such a module is in scope in every module with no import written: its types `Error`, `StackFrame`, `Comparable`, and `Copyable` are used by name, and its exported functions are called unqualified.
+A short list of standard-library modules is imported implicitly: `@std.core` and `@std.io.print`.
+Every exported name of such a module is in scope in every module with no import written: `@std.core`'s types `Error`, `StackFrame`, `Comparable`, and `Copyable` are used by name, and both modules' exported functions are called unqualified.
+So `print(message)` and `eprint(message)`, which write a line to standard output and to standard error, come from the standard library rather than from the language, and no program imports anything to say something.
 A declaration of your own with one of those names takes precedence inside the module that declares it.
 That precedence goes by name and not by signature: a `describe(int)` of your own hides every implicitly imported `describe`, so a call that does not fit yours is an error rather than a call to theirs, and the hidden one is reached by importing its module and qualifying the call.
 Every other module of the standard library has to be imported.
 
-A module may also declare a function with the same name and parameter types as one the language itself provides, such as `print`.
+A module may also declare a function with the same name and parameter types as one the language itself provides, such as `panic`.
 The declaration answers every call to that name in the module that writes it, and every other module keeps the function the language provides.
 Such a declaration is an ordinary function and takes nothing from the one it stands in for: a `panic` of your own never returns only if you write `noreturn` on it.
 A declaration whose parameter types differ is an ordinary overload alongside the provided function, exactly as two declarations of your own overload each other.
@@ -1738,7 +1739,7 @@ Any other system the compiler can target reports `"linux"`, whose behavior it sh
 
 `system.writeError(message)` writes `message` and a newline to standard error, the stream a program reports its problems on, the way `print` writes to standard output.
 
-What `print` writes is buffered, so a line it wrote may still be inside the program when the next statement runs, but the order a program can observe is guaranteed: everything printed before a `system.writeError`, before a child process starts, and before a panic is reported has left the program first, whichever stream those go to and whether the streams are a terminal or the same file.
+What `print` writes is buffered, so a line it wrote may still be inside the program when the next statement runs, but the order a program can observe is guaranteed: everything printed before an `eprint`, before a `system.writeError`, before a child process starts, and before a panic is reported has left the program first, whichever stream those go to and whether the streams are a terminal or the same file.
 A panic therefore never loses what was printed before it.
 `system.flush()` hands over what is still buffered on demand, for an order only the program itself knows about.
 

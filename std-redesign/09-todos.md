@@ -2,8 +2,9 @@
 
 Every item names when it is done: a milestone of 10-migration-plan.md, a phase, or the work that follows the redesign.
 
-## Before C5
+## Any time before Phase D
 
+Two consistency items the C4 and pre-C5 work surfaced, both independent of the library migration, so they wait on nothing and block nothing.
 An array literal holding `this` inside a generic body (`[this, this]` for a `T[]` parameter, or `Box<T>[] xs = [this];`) is refused, because the literal's element type is the bare template and assignability equates the template with its self-instantiation only at the top level, not under `[]`; since 2026-09-04 the refusal even reads "expected 'Box<T>[]', got 'Box<T>[]'". The clean resolution is `this` carrying the self-instantiation itself, or the equation applying structurally.
 A subclass method whose name a private base field uses is still refused, since `checkFieldMethodCollision` searches the flattened field list without the exemption private base fields gained on 2026-09-04; consistency would let it through, and it is a conservative refusal rather than an unsoundness.
 
@@ -17,6 +18,7 @@ The 16 `List<string>` sorts in selfhost and libs pass `(a, b) -> a.compareTo(b)`
 ## C8 and C9
 
 OS-level redirection for `run(captureOutput: true)`, wait-with-timeout, and kill in the native bridges.
+Every failure from the standard streams carries `ErrorKind.Other`, because telling `Closed` apart needs errno; C9's `errorKindFromErrno` lets `io.ens` and the buffered wrappers name the kind, and the message carries the detail until then.
 
 ## Phase D
 
