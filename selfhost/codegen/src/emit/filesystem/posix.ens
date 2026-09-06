@@ -7,6 +7,7 @@ import BasicBlock from @ens.llvm.blocks;
 import @ens.llvm.globals;
 import @ens.llvm.instructions;
 import @ens.llvm.memory;
+import Errno from emit.errorkinds;
 import DarwinStat from emit.nativeshapes;
 import DirentKind from emit.nativeshapes;
 import FileKind from emit.nativeshapes;
@@ -42,8 +43,8 @@ public linuxMetadata(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let flags = instructions.buildSelect(builder,
         instructions.buildICmpNE(builder, runtime.parameter(definition, 1), runtime.int32(0), ""),
         runtime.int64(0), runtime.int64(Statx.noFollowFlag), "flags");
-    let status = statxCall(runtime, number, runtime.parameter(definition, 0), flags, requested,
-        answer);
+    let status = statxCall(runtime, number, runtime.int64(Statx.currentDirectory),
+        runtime.parameter(definition, 0), flags, requested, answer);
     let why = runtime.lastError();
     instructions.buildCondBr(builder,
         instructions.buildICmpEQ(builder, status, runtime.int64(0), ""), checkBlock, failedBlock);
@@ -225,6 +226,9 @@ public posixOpen(Runtime runtime, TypeRef type) -> RuntimeFunction {
         runtime.int32Type.functionType([runtime.int32Type]));
     let definition = runtime.beginDefinition("ens_fs_open", type);
     let builder = runtime.builder;
+    let readingBlock = runtime.block(definition, "open.reading");
+    let checkBlock = runtime.block(definition, "open.check");
+    let refusedBlock = runtime.block(definition, "open.refused");
     let streamBlock = runtime.block(definition, "open.stream");
     let closeBlock = runtime.block(definition, "open.close");
     let doneBlock = runtime.block(definition, "open.done");
@@ -236,7 +240,23 @@ public posixOpen(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let openError = runtime.lastError();
     instructions.buildCondBr(builder,
         instructions.buildICmpSLT(builder, descriptor, runtime.int32(0), ""),
-        failedBlock, streamBlock);
+        failedBlock, readingBlock);
+
+    // Every mode that writes is refused a directory by the open itself, and reading is not, so only
+    // reading asks. The descriptor is asked rather than the path, since a second lookup is both a
+    // syscall and a window in which the path can become something else.
+    builder.positionAtEnd(readingBlock);
+    instructions.buildCondBr(builder, filesystem.isMode(runtime, mode, OpenMode.read), checkBlock,
+        streamBlock);
+
+    builder.positionAtEnd(checkBlock);
+    instructions.buildCondBr(builder, descriptorIsDirectory(runtime, descriptor), refusedBlock,
+        streamBlock);
+
+    builder.positionAtEnd(refusedBlock);
+    runtime.call(closeDescriptor, [descriptor], "");
+    memory.buildStore(builder, runtime.int32(Errno.isADirectory), errorSlot);
+    instructions.buildRet(builder, runtime.nullPointer());
 
     builder.positionAtEnd(streamBlock);
     let stream = runtime.call(openStream, [descriptor, filesystem.streamMode(runtime, mode)],
@@ -343,8 +363,8 @@ public linuxCopyPermissions(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let failedBlock = runtime.block(definition, "mode.failed");
     let answer = memory.buildAlloca(builder,
         runtime.int8Type.arrayType(Statx.structBytes as ulong), "statx");
-    let status = statxCall(runtime, number, runtime.parameter(definition, 0), runtime.int64(0),
-        Statx.permissionsRequest, answer);
+    let status = statxCall(runtime, number, runtime.int64(Statx.currentDirectory),
+        runtime.parameter(definition, 0), runtime.int64(0), Statx.permissionsRequest, answer);
     let why = runtime.lastError();
     instructions.buildCondBr(builder,
         instructions.buildICmpEQ(builder, status, runtime.int64(0), ""), claimedBlock,
@@ -534,13 +554,74 @@ emitModeCopy(Runtime runtime, RuntimeDefinition definition, Value mode) {
     answerStatus(runtime, status, runtime.lastError());
 }
 
-// One statx call over the path, answering the status the kernel reported.
-statxCall(Runtime runtime, long number, Value path, Value flags, long requested, Value answer)
-        -> Value {
+// One statx call, answering the status the kernel reported. `base` is what a relative path is read
+// against, and is the subject itself where the flags carry AT_EMPTY_PATH.
+statxCall(Runtime runtime, long number, Value base, Value path, Value flags, long requested,
+          Value answer) -> Value {
     let systemCall = runtime.libc("syscall",
         runtime.int64Type.variadicFunctionType([runtime.int64Type]));
-    return runtime.call(systemCall, [runtime.int64(number), runtime.int64(Statx.currentDirectory),
-        path, flags, runtime.int64(requested), answer], "status");
+    return runtime.call(systemCall, [runtime.int64(number), base, path, flags,
+        runtime.int64(requested), answer], "status");
+}
+
+// True when the descriptor is known to hold a directory. A system that would not say answers
+// false, which leaves the open to succeed as it did before.
+descriptorIsDirectory(Runtime runtime, Value descriptor) -> Value {
+    if (runtime.onDarwin()) {
+        return darwinDescriptorIsDirectory(runtime, descriptor);
+    }
+    return linuxDescriptorIsDirectory(runtime, descriptor);
+}
+
+linuxDescriptorIsDirectory(Runtime runtime, Value descriptor) -> Value {
+    let builder = runtime.builder;
+    long number = nativeshapes.statxSystemCall(runtime.targetTriple);
+    if (number == 0) {
+        return runtime.int1Type.constInt(0, false);
+    }
+    let answer = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType(Statx.structBytes as ulong), "statx");
+
+    // The mask and the mode are zeroed first, so a call that answered nothing cannot read as a
+    // directory. A null path is not accepted with this flag, and an empty string is what asks
+    // about the descriptor itself.
+    memory.buildStore(builder, runtime.int32(0),
+        runtime.offsetPointer(answer, Statx.maskOffset, ""));
+    memory.buildStore(builder, runtime.int16Type.constInt(0, false),
+        runtime.offsetPointer(answer, Statx.modeOffset, ""));
+    let status = statxCall(runtime, number,
+        instructions.buildSExt(builder, descriptor, runtime.int64Type, ""),
+        globals.buildGlobalString(builder, "", ".statx.descriptor"),
+        runtime.int64(Statx.emptyPathFlag), Statx.typeRequest, answer);
+    return instructions.buildAnd(builder,
+        instructions.buildICmpEQ(builder, status, runtime.int64(0), ""),
+        instructions.buildAnd(builder, statxClaimed(runtime, answer, Statx.typeRequest),
+            modeIsDirectory(runtime, answer, Statx.modeOffset), ""), "descriptor.directory");
+}
+
+darwinDescriptorIsDirectory(Runtime runtime, Value descriptor) -> Value {
+    let builder = runtime.builder;
+    let describe = runtime.libc(nativeshapes.entryPointName(runtime.targetTriple, "fstat"),
+        runtime.int32Type.functionType([runtime.int32Type, runtime.pointerType]));
+    let answer = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType(DarwinStat.structBytes as ulong), "stat");
+
+    // The mode is zeroed first, so a call that answered nothing cannot read as a directory.
+    memory.buildStore(builder, runtime.int16Type.constInt(0, false),
+        runtime.offsetPointer(answer, DarwinStat.modeOffset, ""));
+    let status = runtime.call(describe, [descriptor, answer], "status");
+    return instructions.buildAnd(builder,
+        instructions.buildICmpEQ(builder, status, runtime.int32(0), ""),
+        modeIsDirectory(runtime, answer, DarwinStat.modeOffset), "descriptor.directory");
+}
+
+modeIsDirectory(Runtime runtime, Value answer, long modeOffset) -> Value {
+    let builder = runtime.builder;
+    let mode = instructions.buildZExt(builder, memory.buildLoad(builder, runtime.int16Type,
+        runtime.offsetPointer(answer, modeOffset, ""), "mode"), runtime.int64Type, "");
+    return instructions.buildICmpEQ(builder,
+        instructions.buildAnd(builder, mode, runtime.int64(FileMode.typeMask), ""),
+        runtime.int64(FileMode.directory), "");
 }
 
 // True when the answer's mask claims every field that was asked for.

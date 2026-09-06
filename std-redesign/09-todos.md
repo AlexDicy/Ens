@@ -22,6 +22,12 @@ An architecture the compiler can target but whose `statx` number is unknown answ
 
 Win32 has no error code meaning `IsADirectory`, so a call that is refused a directory reports `PermissionDenied` on Windows and `IsADirectory` elsewhere.
 
+`ens_fs_open` refuses a directory in every mode, which POSIX only requires of the modes that write.
+POSIX.1 gives `open` the error `[EISDIR]` when "the named file is a directory and oflag includes O_WRONLY or O_RDWR", and says nothing of `O_RDONLY`, leaving `read` to answer `[EISDIR]` later when the implementation will not read a directory that way.
+So the read mode asks `statx` with `AT_EMPTY_PATH` on Linux and `fstat` on macOS about the descriptor it already holds, and closes it before answering.
+The check is on the descriptor rather than on the path, because a second lookup is both another system call and a window in which the path can become something else.
+A system that will not say what the descriptor holds leaves the open to succeed, so the check never turns an ordinary file away.
+
 `moveTo`'s promise to move in one step rests on `renameat2(RENAME_NOREPLACE)` on Linux and `renamex_np(RENAME_EXCL)` on macOS, both reached under the same rule as `statx`, so no libc has to carry a wrapper for either.
 Where a file system will not carry the request out, and on an architecture whose `renameat2` number is unknown, the bridge falls back to reading the destination and renaming after it.
 Two programs racing for the same name can then both be told they moved it, over a window of a few microseconds.
