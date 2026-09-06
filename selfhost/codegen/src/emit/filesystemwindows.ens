@@ -1,14 +1,21 @@
-// The Windows halves of the file bridges std.fs reads a path through. Every path crosses as UTF-16,
-// and every failure answers the Win32 error code read before anything else runs.
+// The Windows halves of the file bridges std.fs reads, changes and enumerates a path through. Every
+// path crosses as UTF-16, and every failure answers the Win32 error code read before anything else
+// runs.
 import Value from @ens.llvm.values;
 import TypeRef from @ens.llvm.types;
+import @ens.llvm.globals;
 import @ens.llvm.instructions;
 import @ens.llvm.memory;
 import FileKind from emit.nativeshapes;
+import OpenMode from emit.nativeshapes;
+import Rename from emit.nativeshapes;
 import Runtime from emit.runtime;
 import RuntimeDefinition from emit.runtime;
 import RuntimeFunction from emit.runtime;
+import emit.directories;
+import emit.filesystem;
 import emit.widetext;
+import List from @std.collections.list;
 
 // The attribute bits and call arguments this file's bridges share.
 public final class Win32 {
@@ -23,15 +30,55 @@ public final class Win32 {
     public static const long attributeTagClass = 9;
 
     public static const long shareEverything = 7;
+
+    // What the C library's own open shares, which keeps an opened file behaving as it always has.
+    public static const long shareFile = 3;
+
+    public static const long genericRead = 0x80000000;
+    public static const long genericWrite = 0x40000000;
+
+    public static const long createNew = 1;
+    public static const long createAlways = 2;
     public static const long openExisting = 3;
+    public static const long openAlways = 4;
+
     public static const long backupSemantics = 0x02000000;
     public static const long openReparsePoint = 0x00200000;
 
+    // _O_APPEND, the one flag the C library needs told about a handle it takes over.
+    public static const long appendFlag = 0x8;
+
+    public static const long invalidAttributes = 0xFFFFFFFF;
+
     public static const long outOfMemory = 8;
     public static const long bufferTooSmall = 122;
+    public static const long noMoreFiles = 18;
 
     // The longest path Windows reports is 32767 characters and a terminator.
     public static const long pathCharacters = 32768;
+}
+
+// Where WIN32_FIND_DATAW holds what an enumeration answers with, in 592 bytes.
+public final class FindData {
+    public static const long attributes = 0;
+    public static const long reparseTag = 36;
+    public static const long fileName = 44;
+    public static const long structBytes = 592;
+}
+
+// The block one open folder is read through, holding the search, whether the entry already in the
+// block has been handed over, four bytes of padding that keep the block eight-byte aligned at
+// index 2, the block itself, and room for the narrowing of its name.
+public final class DirectoryStream {
+    public static const uint search = 0;
+    public static const uint pending = 1;
+    public static const uint found = 3;
+    public static const uint name = 4;
+
+    // A found name is at most 259 UTF-16 units, and UTF-8 costs at most three bytes for each.
+    public static const long nameBytes = 1024;
+
+    public static const long headerBytes = 16;
 }
 
 // Where WIN32_FILE_ATTRIBUTE_DATA holds what a metadata answer needs, in 36 bytes.
@@ -424,4 +471,433 @@ answerMetadata(Runtime runtime, RuntimeDefinition definition, Value kind, Value 
     memory.buildStore(builder, length, runtime.parameter(definition, 3));
     memory.buildStore(builder, millis, runtime.parameter(definition, 4));
     instructions.buildRet(builder, runtime.int32(0));
+}
+
+// The stream a caller reads or writes through is the C library's, so the handle Win32 opened is
+// handed to the C library and closing the stream is what closes all three.
+public windowsOpen(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let openFile = createFileFunction(runtime);
+    let closeHandle = closeHandleFunction(runtime);
+    let takeHandle = runtime.libc("_open_osfhandle",
+        runtime.int32Type.functionType([runtime.int64Type, runtime.int32Type]));
+    let openStream = runtime.libc("_fdopen",
+        runtime.pointerType.functionType([runtime.int32Type, runtime.pointerType]));
+    let closeDescriptor = runtime.libc("_close",
+        runtime.int32Type.functionType([runtime.int32Type]));
+    let widen = widetext.wideFromUtf8(runtime);
+    let release = runtime.free();
+    let definition = runtime.beginDefinition("ens_fs_open", type);
+    let builder = runtime.builder;
+    let openBlock = runtime.block(definition, "open.wide");
+    let descriptorBlock = runtime.block(definition, "open.descriptor");
+    let streamBlock = runtime.block(definition, "open.stream");
+    let closeHandleBlock = runtime.block(definition, "open.close.handle");
+    let closeDescriptorBlock = runtime.block(definition, "open.close.descriptor");
+    let doneBlock = runtime.block(definition, "open.done");
+    let failedBlock = runtime.block(definition, "open.failed");
+    let noMemoryBlock = runtime.block(definition, "open.no.memory");
+    let mode = runtime.parameter(definition, 1);
+    let errorSlot = runtime.parameter(definition, 2);
+    let wide = runtime.call(widen, [runtime.parameter(definition, 0), runtime.int32(-1)],
+        "path.wide");
+    instructions.buildCondBr(builder, runtime.isNull(wide), noMemoryBlock, openBlock);
+
+    builder.positionAtEnd(openBlock);
+    let handle = runtime.call(openFile, [wide, desiredAccess(runtime, mode),
+        runtime.int32(Win32.shareFile), runtime.nullPointer(), creationDisposition(runtime, mode),
+        runtime.int32(0), runtime.nullPointer()], "handle");
+    let openError = runtime.lastError();
+    runtime.call(release, [wide], "");
+    instructions.buildCondBr(builder, invalidHandle(runtime, handle), failedBlock,
+        descriptorBlock);
+
+    builder.positionAtEnd(failedBlock);
+    memory.buildStore(builder, openError, errorSlot);
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    builder.positionAtEnd(descriptorBlock);
+    let descriptor = runtime.call(takeHandle,
+        [instructions.buildPtrToInt(builder, handle, runtime.int64Type, ""),
+        descriptorFlags(runtime, mode)], "descriptor");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, descriptor, runtime.int32(0), ""),
+        closeHandleBlock, streamBlock);
+
+    builder.positionAtEnd(closeHandleBlock);
+    runtime.call(closeHandle, [handle], "");
+    instructions.buildBr(builder, noMemoryBlock);
+
+    builder.positionAtEnd(streamBlock);
+    let stream = runtime.call(openStream, [descriptor, filesystem.streamMode(runtime, mode)],
+        "stream");
+    instructions.buildCondBr(builder, runtime.isNull(stream), closeDescriptorBlock, doneBlock);
+
+    builder.positionAtEnd(closeDescriptorBlock);
+    runtime.call(closeDescriptor, [descriptor], "");
+    instructions.buildBr(builder, noMemoryBlock);
+
+    builder.positionAtEnd(doneBlock);
+    memory.buildStore(builder, runtime.int32(0), errorSlot);
+    instructions.buildRet(builder, stream);
+
+    builder.positionAtEnd(noMemoryBlock);
+    memory.buildStore(builder, runtime.int32(Win32.outOfMemory), errorSlot);
+    instructions.buildRet(builder, runtime.nullPointer());
+    return runtime.endDefinition(definition);
+}
+
+public windowsCreateDirectory(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let makeDirectory = runtime.libc("CreateDirectoryW",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
+    let definition = runtime.beginDefinition("ens_fs_create_directory", type);
+    return onePathCall(runtime, definition, makeDirectory.function, makeDirectory.type,
+        [runtime.nullPointer()]);
+}
+
+// Windows deletes a link naming a folder through the call that removes a folder, so the bridge
+// reads what is there before choosing which of the two to reach.
+public windowsRemoveFile(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let attributesOf = runtime.libc("GetFileAttributesW",
+        runtime.int32Type.functionType([runtime.pointerType]));
+    let deleteFile = runtime.libc("DeleteFileW",
+        runtime.int32Type.functionType([runtime.pointerType]));
+    let removeDirectory = removeDirectoryFunction(runtime);
+    let widen = widetext.wideFromUtf8(runtime);
+    let release = runtime.free();
+    let definition = runtime.beginDefinition("ens_fs_remove_file", type);
+    let builder = runtime.builder;
+    let probeBlock = runtime.block(definition, "remove.probe");
+    let removeBlock = runtime.block(definition, "remove.chosen");
+    let unreadableBlock = runtime.block(definition, "remove.unreadable");
+    let noMemoryBlock = runtime.block(definition, "remove.no.memory");
+    let wide = runtime.call(widen, [runtime.parameter(definition, 0), runtime.int32(-1)],
+        "path.wide");
+    instructions.buildCondBr(builder, runtime.isNull(wide), noMemoryBlock, probeBlock);
+
+    builder.positionAtEnd(probeBlock);
+    let attributes = instructions.buildZExt(builder,
+        runtime.call(attributesOf, [wide], "attributes"), runtime.int64Type, "");
+    let probeError = runtime.lastError();
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, attributes,
+        runtime.int64(0xFFFFFFFF), ""), unreadableBlock, removeBlock);
+
+    builder.positionAtEnd(unreadableBlock);
+    runtime.call(release, [wide], "");
+    instructions.buildRet(builder, probeError);
+
+    builder.positionAtEnd(removeBlock);
+    let directoryLink = instructions.buildAnd(builder,
+        hasBit(runtime, attributes, Win32.directoryAttribute),
+        hasBit(runtime, attributes, Win32.reparseAttribute), "directory.link");
+    let chosen = instructions.buildSelect(builder, directoryLink, removeDirectory.function,
+        deleteFile.function, "remove");
+    let removed = instructions.buildCall(builder, deleteFile.type, chosen, [wide], "removed");
+    let removeError = runtime.lastError();
+    runtime.call(release, [wide], "");
+    answerFlag(runtime, removed, removeError);
+
+    builder.positionAtEnd(noMemoryBlock);
+    instructions.buildRet(builder, runtime.int32(Win32.outOfMemory));
+    return runtime.endDefinition(definition);
+}
+
+public windowsRemoveDirectory(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let removeDirectory = removeDirectoryFunction(runtime);
+    let definition = runtime.beginDefinition("ens_fs_remove_directory", type);
+    return onePathCall(runtime, definition, removeDirectory.function, removeDirectory.type, []);
+}
+
+// Win32 refuses a destination that is taken unless it is asked to replace one, so both modes are
+// one call and neither has to read the destination first.
+public windowsRename(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let moveFile = runtime.libc("MoveFileExW", runtime.int32Type.functionType(
+        [runtime.pointerType, runtime.pointerType, runtime.int32Type]));
+    let widen = widetext.wideFromUtf8(runtime);
+    let release = runtime.free();
+    let definition = runtime.beginDefinition("ens_fs_rename", type);
+    let builder = runtime.builder;
+    let destinationBlock = runtime.block(definition, "rename.destination");
+    let moveBlock = runtime.block(definition, "rename.move");
+    let releaseFromBlock = runtime.block(definition, "rename.release.from");
+    let noMemoryBlock = runtime.block(definition, "rename.no.memory");
+    let wideFrom = runtime.call(widen, [runtime.parameter(definition, 0), runtime.int32(-1)],
+        "from.wide");
+    instructions.buildCondBr(builder, runtime.isNull(wideFrom), noMemoryBlock, destinationBlock);
+
+    builder.positionAtEnd(destinationBlock);
+    let wideTo = runtime.call(widen, [runtime.parameter(definition, 1), runtime.int32(-1)],
+        "to.wide");
+    instructions.buildCondBr(builder, runtime.isNull(wideTo), releaseFromBlock, moveBlock);
+
+    builder.positionAtEnd(releaseFromBlock);
+    runtime.call(release, [wideFrom], "");
+    instructions.buildBr(builder, noMemoryBlock);
+
+    builder.positionAtEnd(moveBlock);
+    let flags = instructions.buildSelect(builder,
+        instructions.buildICmpNE(builder, runtime.parameter(definition, 2), runtime.int32(0), ""),
+        runtime.int32(Rename.windowsReplace), runtime.int32(0), "flags");
+    let moved = runtime.call(moveFile, [wideFrom, wideTo, flags], "moved");
+    let moveError = runtime.lastError();
+    runtime.call(release, [wideFrom], "");
+    runtime.call(release, [wideTo], "");
+    answerFlag(runtime, moved, moveError);
+
+    builder.positionAtEnd(noMemoryBlock);
+    instructions.buildRet(builder, runtime.int32(Win32.outOfMemory));
+    return runtime.endDefinition(definition);
+}
+
+// Windows carries no permission bits a copy could hand over, so there is nothing here to do.
+public windowsCopyPermissions(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let definition = runtime.beginDefinition("ens_fs_copy_permissions", type);
+    instructions.buildRet(runtime.builder, runtime.int32(0));
+    return runtime.endDefinition(definition);
+}
+
+public windowsOpenDirectory(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let findFirst = runtime.libc("FindFirstFileW",
+        runtime.pointerType.functionType([runtime.pointerType, runtime.pointerType]));
+    let widen = widetext.wideFromUtf8(runtime);
+    let measure = runtime.strlen();
+    let copy = runtime.memcpy();
+    let allocate = runtime.malloc();
+    let release = runtime.free();
+    let definition = runtime.beginDefinition("ens_fs_open_directory", type);
+    let builder = runtime.builder;
+    let patternBlock = runtime.block(definition, "dir.pattern");
+    let widenedBlock = runtime.block(definition, "dir.widened");
+    let searchBlock = runtime.block(definition, "dir.search");
+    let openedBlock = runtime.block(definition, "dir.opened");
+    let unreadableBlock = runtime.block(definition, "dir.unreadable");
+    let releaseWideBlock = runtime.block(definition, "dir.release.wide");
+    let noMemoryBlock = runtime.block(definition, "dir.no.memory");
+    let errorSlot = runtime.parameter(definition, 1);
+    let streamType = directoryStreamType(runtime);
+
+    // The folder with "/*" after it, the pattern that matches everything directly inside it.
+    let folder = runtime.parameter(definition, 0);
+    let length = runtime.call(measure, [folder], "folder.length");
+    let pattern = runtime.call(allocate, [instructions.buildAdd(builder, length, runtime.int64(3),
+        "")], "pattern");
+    instructions.buildCondBr(builder, runtime.isNull(pattern), noMemoryBlock, patternBlock);
+
+    builder.positionAtEnd(patternBlock);
+    runtime.call(copy, [pattern, folder, length], "");
+    let tail = memory.buildGEP(builder, runtime.int8Type, pattern, [length], "pattern.tail");
+    memory.buildStore(builder, runtime.int8('/'), tail);
+    memory.buildStore(builder, runtime.int8('*'),
+        memory.buildGEP(builder, runtime.int8Type, tail, [runtime.int64(1)], ""));
+    memory.buildStore(builder, runtime.int8(0),
+        memory.buildGEP(builder, runtime.int8Type, tail, [runtime.int64(2)], ""));
+    let wide = runtime.call(widen, [pattern, runtime.int32(-1)], "pattern.wide");
+    runtime.call(release, [pattern], "");
+    instructions.buildCondBr(builder, runtime.isNull(wide), noMemoryBlock, widenedBlock);
+
+    builder.positionAtEnd(widenedBlock);
+    let stream = runtime.call(allocate, [runtime.int64(streamBytes())], "stream");
+    instructions.buildCondBr(builder, runtime.isNull(stream), releaseWideBlock, searchBlock);
+
+    builder.positionAtEnd(releaseWideBlock);
+    runtime.call(release, [wide], "");
+    instructions.buildBr(builder, noMemoryBlock);
+
+    builder.positionAtEnd(searchBlock);
+    let search = runtime.call(findFirst, [wide,
+        memory.buildStructGEP(builder, streamType, stream, DirectoryStream.found, "found")],
+        "search");
+    let searchError = runtime.lastError();
+    runtime.call(release, [wide], "");
+    instructions.buildCondBr(builder, invalidHandle(runtime, search), unreadableBlock,
+        openedBlock);
+
+    builder.positionAtEnd(unreadableBlock);
+    runtime.call(release, [stream], "");
+    memory.buildStore(builder, searchError, errorSlot);
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    // The search hands over its first entry, which the next call answers with before asking for
+    // another.
+    builder.positionAtEnd(openedBlock);
+    memory.buildStore(builder, search,
+        memory.buildStructGEP(builder, streamType, stream, DirectoryStream.search, ""));
+    memory.buildStore(builder, runtime.int32(1),
+        memory.buildStructGEP(builder, streamType, stream, DirectoryStream.pending, ""));
+    memory.buildStore(builder, runtime.int32(0), errorSlot);
+    instructions.buildRet(builder, stream);
+
+    builder.positionAtEnd(noMemoryBlock);
+    memory.buildStore(builder, runtime.int32(Win32.outOfMemory), errorSlot);
+    instructions.buildRet(builder, runtime.nullPointer());
+    return runtime.endDefinition(definition);
+}
+
+public windowsNextEntry(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let findNext = runtime.libc("FindNextFileW",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
+    let narrow = widetext.narrowFunction(runtime);
+    let definition = runtime.beginDefinition("ens_fs_next_entry", type);
+    let builder = runtime.builder;
+    let testBlock = runtime.block(definition, "entry.test");
+    let advanceBlock = runtime.block(definition, "entry.advance");
+    let haveBlock = runtime.block(definition, "entry.have");
+    let keptBlock = runtime.block(definition, "entry.kept");
+    let namedBlock = runtime.block(definition, "entry.named");
+    let unconvertibleBlock = runtime.block(definition, "entry.unconvertible");
+    let endBlock = runtime.block(definition, "entry.end");
+    let streamType = directoryStreamType(runtime);
+    let stream = runtime.parameter(definition, 0);
+    let kindSlot = runtime.parameter(definition, 1);
+    let errorSlot = runtime.parameter(definition, 2);
+    memory.buildStore(builder, runtime.int64(FileKind.unknown), kindSlot);
+    memory.buildStore(builder, runtime.int32(0), errorSlot);
+    let pendingSlot = memory.buildStructGEP(builder, streamType, stream, DirectoryStream.pending,
+        "pending");
+    let found = memory.buildStructGEP(builder, streamType, stream, DirectoryStream.found, "found");
+    instructions.buildBr(builder, testBlock);
+
+    builder.positionAtEnd(testBlock);
+    instructions.buildCondBr(builder, instructions.buildICmpNE(builder,
+        memory.buildLoad(builder, runtime.int32Type, pendingSlot, "pending.read"),
+        runtime.int32(0), ""), haveBlock, advanceBlock);
+
+    builder.positionAtEnd(advanceBlock);
+    let more = runtime.call(findNext, [memory.buildLoad(builder, runtime.pointerType,
+        memory.buildStructGEP(builder, streamType, stream, DirectoryStream.search, ""), "search"),
+        found], "more");
+    let advanceError = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpNE(builder, more, runtime.int32(0), ""), haveBlock, endBlock);
+
+    // Running out of entries is how a whole folder ends, and every other reason is a failure.
+    builder.positionAtEnd(endBlock);
+    memory.buildStore(builder, instructions.buildSelect(builder,
+        instructions.buildICmpEQ(builder, advanceError, runtime.int32(Win32.noMoreFiles), ""),
+        runtime.int32(0), advanceError, ""), errorSlot);
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    builder.positionAtEnd(haveBlock);
+    memory.buildStore(builder, runtime.int32(0), pendingSlot);
+    let wideName = runtime.offsetPointer(found, FindData.fileName, "entry.wide");
+    instructions.buildCondBr(builder,
+        directories.dotEntry(runtime, wideName, runtime.int16Type), testBlock, keptBlock);
+
+    builder.positionAtEnd(keptBlock);
+    let name = memory.buildStructGEP(builder, streamType, stream, DirectoryStream.name, "name");
+    let bytes = runtime.call(narrow, [widetext.utf8CodePage(runtime), runtime.int32(0), wideName,
+        runtime.int32(-1), name, runtime.int32(DirectoryStream.nameBytes),
+        runtime.nullPointer(), runtime.nullPointer()], "bytes");
+    let narrowError = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSGT(builder, bytes, runtime.int32(0), ""), namedBlock,
+        unconvertibleBlock);
+
+    builder.positionAtEnd(unconvertibleBlock);
+    memory.buildStore(builder, narrowError, errorSlot);
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    builder.positionAtEnd(namedBlock);
+    let attributes = loadDoubleWord(runtime, found, FindData.attributes);
+    let surrogate = instructions.buildAnd(builder,
+        hasBit(runtime, attributes, Win32.reparseAttribute),
+        hasBit(runtime, loadDoubleWord(runtime, found, FindData.reparseTag),
+            Win32.nameSurrogateTag), "link");
+    let directory = hasBit(runtime, attributes, Win32.directoryAttribute);
+    memory.buildStore(builder, instructions.buildSelect(builder, surrogate,
+        runtime.int64(FileKind.symbolicLink),
+        instructions.buildSelect(builder, directory, runtime.int64(FileKind.directory),
+            runtime.int64(FileKind.file), ""), "kind"), kindSlot);
+    instructions.buildRet(builder, name);
+    return runtime.endDefinition(definition);
+}
+
+public windowsCloseDirectory(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let findClose = runtime.libc("FindClose",
+        runtime.int32Type.functionType([runtime.pointerType]));
+    let release = runtime.free();
+    let definition = runtime.beginDefinition("ens_fs_close_directory", type);
+    let builder = runtime.builder;
+    let stream = runtime.parameter(definition, 0);
+    runtime.call(findClose, [memory.buildLoad(builder, runtime.pointerType,
+        memory.buildStructGEP(builder, directoryStreamType(runtime), stream,
+        DirectoryStream.search, ""), "search")], "");
+    runtime.call(release, [stream], "");
+    instructions.buildRetVoid(builder);
+    return runtime.endDefinition(definition);
+}
+
+removeDirectoryFunction(Runtime runtime) -> RuntimeFunction {
+    return runtime.libc("RemoveDirectoryW",
+        runtime.int32Type.functionType([runtime.pointerType]));
+}
+
+// A bridge that widens its one path, runs a call over it, and answers 0 or the Win32 code.
+onePathCall(Runtime runtime, RuntimeDefinition definition, Value callee, TypeRef calleeType,
+            Value[] extra) -> RuntimeFunction {
+    let widen = widetext.wideFromUtf8(runtime);
+    let release = runtime.free();
+    let builder = runtime.builder;
+    let callBlock = runtime.block(definition, "call.wide");
+    let noMemoryBlock = runtime.block(definition, "call.no.memory");
+    let wide = runtime.call(widen, [runtime.parameter(definition, 0), runtime.int32(-1)],
+        "path.wide");
+    instructions.buildCondBr(builder, runtime.isNull(wide), noMemoryBlock, callBlock);
+
+    builder.positionAtEnd(callBlock);
+    let arguments = new List<Value>();
+    arguments.push(wide);
+    for (let value in extra) {
+        arguments.push(value);
+    }
+    let done = instructions.buildCall(builder, calleeType, callee, arguments.toArray(), "done");
+    let why = runtime.lastError();
+    runtime.call(release, [wide], "");
+    answerFlag(runtime, done, why);
+
+    builder.positionAtEnd(noMemoryBlock);
+    instructions.buildRet(builder, runtime.int32(Win32.outOfMemory));
+    return runtime.endDefinition(definition);
+}
+
+// Answers 0 for a Win32 call that reported success, and the code it left behind otherwise.
+answerFlag(Runtime runtime, Value done, Value why) {
+    let builder = runtime.builder;
+    instructions.buildRet(builder, instructions.buildSelect(builder,
+        instructions.buildICmpNE(builder, done, runtime.int32(0), ""), runtime.int32(0), why, ""));
+}
+
+desiredAccess(Runtime runtime, Value mode) -> Value {
+    return instructions.buildSelect(runtime.builder,
+        filesystem.isMode(runtime, mode, OpenMode.read), runtime.int32(Win32.genericRead),
+        runtime.int32(Win32.genericWrite), "access");
+}
+
+creationDisposition(Runtime runtime, Value mode) -> Value {
+    let builder = runtime.builder;
+    return instructions.buildSelect(builder, filesystem.isMode(runtime, mode, OpenMode.read),
+        runtime.int32(Win32.openExisting),
+        instructions.buildSelect(builder, filesystem.isMode(runtime, mode, OpenMode.writeTruncated),
+            runtime.int32(Win32.createAlways),
+            instructions.buildSelect(builder, filesystem.isMode(runtime, mode, OpenMode.appended),
+                runtime.int32(Win32.openAlways), runtime.int32(Win32.createNew), ""), ""),
+        "disposition");
+}
+
+// The C library takes over the handle in binary mode, and only appending needs a flag of its own.
+descriptorFlags(Runtime runtime, Value mode) -> Value {
+    return instructions.buildSelect(runtime.builder,
+        filesystem.isMode(runtime, mode, OpenMode.appended), runtime.int32(Win32.appendFlag),
+        runtime.int32(0), "flags");
+}
+
+// The block one open folder is read through, whose name buffer holds the narrowing of whichever
+// entry the search last handed over.
+directoryStreamType(Runtime runtime) -> TypeRef {
+    return runtime.context.structType([runtime.pointerType, runtime.int32Type, runtime.int32Type,
+        runtime.int8Type.arrayType(FindData.structBytes as ulong),
+        runtime.int8Type.arrayType(DirectoryStream.nameBytes as ulong)], false);
+}
+
+streamBytes() -> long {
+    return DirectoryStream.headerBytes + FindData.structBytes + DirectoryStream.nameBytes;
 }

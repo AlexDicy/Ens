@@ -1,13 +1,32 @@
-// The bridges that ask about one path. Windows answers through the wide entry points, so a path
-// outside the system code page still reaches the file system.
+// The bridges that read, change and enumerate what is at one path. Windows answers through the wide
+// entry points, so a path outside the system code page still reaches the file system.
+import Value from @ens.llvm.values;
 import TypeRef from @ens.llvm.types;
+import @ens.llvm.globals;
 import @ens.llvm.instructions;
+import OpenMode from emit.nativeshapes;
 import Runtime from emit.runtime;
 import RuntimeFunction from emit.runtime;
 import emit.directories;
 import emit.filesystemposix;
 import emit.filesystemwindows;
 import emit.widetext;
+
+// The mode text the C library takes for a descriptor already opened, which is the same text on
+// every platform.
+public streamMode(Runtime runtime, Value mode) -> Value {
+    let builder = runtime.builder;
+    let reading = globals.buildGlobalString(builder, "rb", ".open.read");
+    let writing = globals.buildGlobalString(builder, "wb", ".open.write");
+    let appending = globals.buildGlobalString(builder, "ab", ".open.append");
+    return instructions.buildSelect(builder, isMode(runtime, mode, OpenMode.read), reading,
+        instructions.buildSelect(builder, isMode(runtime, mode, OpenMode.appended), appending,
+            writing, ""), "mode.text");
+}
+
+public isMode(Runtime runtime, Value mode, long wanted) -> Value {
+    return instructions.buildICmpEQ(runtime.builder, mode, runtime.int32(wanted), "");
+}
 
 // i32 ens_fs_metadata(ptr path, i32 followLinks, ptr kind, ptr length, ptr modifiedMillis): 0 with
 // the three answers written, or the platform's own error number with none of them written. The kind
@@ -207,4 +226,150 @@ windowsCreateDirectory(Runtime runtime, TypeRef type) -> RuntimeFunction {
     builder.positionAtEnd(failedBlock);
     instructions.buildRet(builder, runtime.int32(-1));
     return runtime.endDefinition(definition);
+}
+
+// ptr ens_fs_open(ptr path, i32 mode, ptr error): the C library stream the path is open on, or null
+// with the platform's own error number written to `error`. The mode is 0 to read, 1 to write from
+// empty, 2 to write at the end, and 3 to create and refuse a path that is already there. Modes 1,
+// 2 and 3 create what is missing, and the stream is closed with the C library's own fclose.
+public openRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([runtime.pointerType, runtime.int32Type,
+        runtime.pointerType]);
+    let known = runtime.existing("ens_fs_open", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        return filesystemwindows.windowsOpen(runtime, type);
+    }
+    return filesystemposix.posixOpen(runtime, type);
+}
+
+// i32 ens_fs_create_directory(ptr path): 0 when this call created the one level the path names, or
+// the platform's own error number, which names a path that was already there as its own kind of
+// failure. Every parent above it is the caller's to create first.
+public makeDirectoryRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int32Type.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_fs_create_directory", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        return filesystemwindows.windowsCreateDirectory(runtime, type);
+    }
+    return filesystemposix.posixCreateDirectory(runtime, type);
+}
+
+// i32 ens_fs_remove_file(ptr path): 0 when the path is gone, or the platform's own error number. A
+// link naming a folder is removed as the link it is, and a folder itself is refused, which Windows
+// reports as a permission it does not have and POSIX as a kind it will not remove.
+public removeFileRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int32Type.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_fs_remove_file", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        return filesystemwindows.windowsRemoveFile(runtime, type);
+    }
+    return filesystemposix.posixRemoveFile(runtime, type);
+}
+
+// i32 ens_fs_remove_directory(ptr path): 0 when the folder is gone, or the platform's own error
+// number, which names a folder still holding something as its own kind of failure. What is inside
+// is the caller's to remove first.
+public removeDirectoryRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int32Type.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_fs_remove_directory", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        return filesystemwindows.windowsRemoveDirectory(runtime, type);
+    }
+    return filesystemposix.posixRemoveDirectory(runtime, type);
+}
+
+// i32 ens_fs_rename(ptr from, ptr to, i32 replaceExisting): 0 when the move happened, or the
+// platform's own error number. A replaceExisting of 0 refuses a destination that is taken and
+// reports that as its own kind of failure, and 1 replaces whatever is there in one step. Both paths
+// have to be on one volume, since nothing here copies.
+public renameRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType,
+        runtime.int32Type]);
+    let known = runtime.existing("ens_fs_rename", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        return filesystemwindows.windowsRename(runtime, type);
+    }
+    return filesystemposix.posixRename(runtime, type, metadataRuntime(runtime));
+}
+
+// i32 ens_fs_copy_permissions(ptr from, ptr to): 0 when the destination carries the source's
+// permission bits, or the platform's own error number. Windows answers 0 without doing anything,
+// because it carries no bits a copy could hand over.
+public copyPermissionsRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]);
+    let known = runtime.existing("ens_fs_copy_permissions", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        return filesystemwindows.windowsCopyPermissions(runtime, type);
+    }
+    if (runtime.onDarwin()) {
+        return filesystemposix.darwinCopyPermissions(runtime, type);
+    }
+    return filesystemposix.linuxCopyPermissions(runtime, type);
+}
+
+// ptr ens_fs_open_directory(ptr path, ptr error): a stream over what the folder holds, or null with
+// the platform's own error number written to `error`. The stream is handed to every call below and
+// released by exactly one call to the close bridge.
+public openDirectoryRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([runtime.pointerType, runtime.pointerType]);
+    let known = runtime.existing("ens_fs_open_directory", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        return filesystemwindows.windowsOpenDirectory(runtime, type);
+    }
+    return filesystemposix.posixOpenDirectory(runtime, type);
+}
+
+// ptr ens_fs_next_entry(ptr stream, ptr kind, ptr error): the next name inside the folder, or null
+// once every name has been handed over and null with the platform's own error number written to
+// `error` where the reading failed. The entries naming the folder itself and its parent are never
+// answered, and the order is whatever the file system enumerates in. The kind is 1 for a file, 2
+// for a directory, 3 for a symbolic link, 4 for anything else, and 0 where the file system
+// classified nothing, which leaves the caller to ask about the entry itself. The name is the
+// stream's own and lasts until the next call.
+public nextEntryRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([runtime.pointerType, runtime.pointerType,
+        runtime.pointerType]);
+    let known = runtime.existing("ens_fs_next_entry", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        return filesystemwindows.windowsNextEntry(runtime, type);
+    }
+    return filesystemposix.posixNextEntry(runtime, type);
+}
+
+// void ens_fs_close_directory(ptr stream): hands the folder back to the operating system along with
+// the stream itself, which no call may touch afterwards.
+public closeDirectoryRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_fs_close_directory", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        return filesystemwindows.windowsCloseDirectory(runtime, type);
+    }
+    return filesystemposix.posixCloseDirectory(runtime, type);
 }

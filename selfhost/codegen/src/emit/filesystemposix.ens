@@ -1,14 +1,23 @@
-// The POSIX halves of the file bridges std.fs reads a path through. Every failure answers the errno
-// read before anything else runs, since a later call is free to leave a reason of its own behind.
+// The POSIX halves of the file bridges std.fs reads, changes and enumerates a path through. Every
+// failure answers the errno read before anything else runs, since a later call is free to leave a
+// reason of its own behind.
 import Value from @ens.llvm.values;
 import TypeRef from @ens.llvm.types;
+import BasicBlock from @ens.llvm.blocks;
+import @ens.llvm.globals;
 import @ens.llvm.instructions;
 import @ens.llvm.memory;
 import DarwinStat from emit.nativeshapes;
+import DirentKind from emit.nativeshapes;
 import FileKind from emit.nativeshapes;
 import FileMode from emit.nativeshapes;
+import FilePermissions from emit.nativeshapes;
+import OpenMode from emit.nativeshapes;
+import Rename from emit.nativeshapes;
 import Statx from emit.nativeshapes;
 import emit.nativeshapes;
+import emit.directories;
+import emit.filesystem;
 import Runtime from emit.runtime;
 import RuntimeDefinition from emit.runtime;
 import RuntimeFunction from emit.runtime;
@@ -20,8 +29,6 @@ public linuxMetadata(Runtime runtime, TypeRef type) -> RuntimeFunction {
     if (number == 0) {
         return unsupportedMetadata(runtime, type);
     }
-    let systemCall = runtime.libc("syscall",
-        runtime.int64Type.variadicFunctionType([runtime.int64Type]));
     let definition = runtime.beginDefinition("ens_fs_metadata", type);
     let builder = runtime.builder;
     let checkBlock = runtime.block(definition, "meta.check");
@@ -35,20 +42,14 @@ public linuxMetadata(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let flags = instructions.buildSelect(builder,
         instructions.buildICmpNE(builder, runtime.parameter(definition, 1), runtime.int32(0), ""),
         runtime.int64(0), runtime.int64(Statx.noFollowFlag), "flags");
-    let status = runtime.call(systemCall, [runtime.int64(number),
-        runtime.int64(Statx.currentDirectory), runtime.parameter(definition, 0), flags,
-        runtime.int64(requested), answer], "status");
+    let status = statxCall(runtime, number, runtime.parameter(definition, 0), flags, requested,
+        answer);
     let why = runtime.lastError();
     instructions.buildCondBr(builder,
         instructions.buildICmpEQ(builder, status, runtime.int64(0), ""), checkBlock, failedBlock);
 
     builder.positionAtEnd(checkBlock);
-    let claimed = instructions.buildAnd(builder,
-        memory.buildLoad(builder, runtime.int32Type,
-            runtime.offsetPointer(answer, Statx.maskOffset, ""), "mask"),
-        runtime.int32(requested), "claimed");
-    instructions.buildCondBr(builder,
-        instructions.buildICmpEQ(builder, claimed, runtime.int32(requested), ""),
+    instructions.buildCondBr(builder, statxClaimed(runtime, answer, requested),
         answerBlock, incompleteBlock);
 
     builder.positionAtEnd(answerBlock);
@@ -213,4 +214,383 @@ answerMetadata(Runtime runtime, RuntimeDefinition definition, Value mode, Value 
         runtime.int64(0), size, "length"), runtime.parameter(definition, 3));
     memory.buildStore(builder, millis, runtime.parameter(definition, 4));
     instructions.buildRet(builder, runtime.int32(0));
+}
+
+public posixOpen(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let openDescriptor = runtime.libc("open",
+        runtime.int32Type.variadicFunctionType([runtime.pointerType, runtime.int32Type]));
+    let openStream = runtime.libc("fdopen",
+        runtime.pointerType.functionType([runtime.int32Type, runtime.pointerType]));
+    let closeDescriptor = runtime.libc("close",
+        runtime.int32Type.functionType([runtime.int32Type]));
+    let definition = runtime.beginDefinition("ens_fs_open", type);
+    let builder = runtime.builder;
+    let streamBlock = runtime.block(definition, "open.stream");
+    let closeBlock = runtime.block(definition, "open.close");
+    let doneBlock = runtime.block(definition, "open.done");
+    let failedBlock = runtime.block(definition, "open.failed");
+    let mode = runtime.parameter(definition, 1);
+    let errorSlot = runtime.parameter(definition, 2);
+    let descriptor = runtime.call(openDescriptor, [runtime.parameter(definition, 0),
+        descriptorFlags(runtime, mode), runtime.int32(FilePermissions.created)], "descriptor");
+    let openError = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, descriptor, runtime.int32(0), ""),
+        failedBlock, streamBlock);
+
+    builder.positionAtEnd(streamBlock);
+    let stream = runtime.call(openStream, [descriptor, filesystem.streamMode(runtime, mode)],
+        "stream");
+    let streamError = runtime.lastError();
+    instructions.buildCondBr(builder, runtime.isNull(stream), closeBlock, doneBlock);
+
+    builder.positionAtEnd(closeBlock);
+    runtime.call(closeDescriptor, [descriptor], "");
+    memory.buildStore(builder, streamError, errorSlot);
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    builder.positionAtEnd(doneBlock);
+    memory.buildStore(builder, runtime.int32(0), errorSlot);
+    instructions.buildRet(builder, stream);
+
+    builder.positionAtEnd(failedBlock);
+    memory.buildStore(builder, openError, errorSlot);
+    instructions.buildRet(builder, runtime.nullPointer());
+    return runtime.endDefinition(definition);
+}
+
+public posixCreateDirectory(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let makeDirectory = runtime.libc("mkdir",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type]));
+    let definition = runtime.beginDefinition("ens_fs_create_directory", type);
+    let status = runtime.call(makeDirectory, [runtime.parameter(definition, 0),
+        runtime.int32(FilePermissions.created)], "status");
+    answerStatus(runtime, status, runtime.lastError());
+    return runtime.endDefinition(definition);
+}
+
+public posixRemoveFile(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let removeFile = runtime.libc("unlink",
+        runtime.int32Type.functionType([runtime.pointerType]));
+    let definition = runtime.beginDefinition("ens_fs_remove_file", type);
+    let status = runtime.call(removeFile, [runtime.parameter(definition, 0)], "status");
+    answerStatus(runtime, status, runtime.lastError());
+    return runtime.endDefinition(definition);
+}
+
+public posixRemoveDirectory(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let removeDirectory = runtime.libc("rmdir",
+        runtime.int32Type.functionType([runtime.pointerType]));
+    let definition = runtime.beginDefinition("ens_fs_remove_directory", type);
+    let status = runtime.call(removeDirectory, [runtime.parameter(definition, 0)], "status");
+    answerStatus(runtime, status, runtime.lastError());
+    return runtime.endDefinition(definition);
+}
+
+// Renaming without replacing is a call of its own, and a file system that will not carry it out
+// sends this bridge to reading the destination and renaming after, which two programs racing for
+// the same name can both come through.
+public posixRename(Runtime runtime, TypeRef type, RuntimeFunction metadata) -> RuntimeFunction {
+    let rename = runtime.libc("rename",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
+    let definition = runtime.beginDefinition("ens_fs_rename", type);
+    let builder = runtime.builder;
+    let replaceBlock = runtime.block(definition, "rename.replace");
+    let exclusiveBlock = runtime.block(definition, "rename.exclusive");
+    let fallbackBlock = runtime.block(definition, "rename.fallback");
+    let takenBlock = runtime.block(definition, "rename.taken");
+    let retryBlock = runtime.block(definition, "rename.retry");
+    let from = runtime.parameter(definition, 0);
+    let to = runtime.parameter(definition, 1);
+    let kind = memory.buildAlloca(builder, runtime.int64Type, "kind");
+    let length = memory.buildAlloca(builder, runtime.int64Type, "length");
+    let millis = memory.buildAlloca(builder, runtime.int64Type, "millis");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpNE(builder, runtime.parameter(definition, 2), runtime.int32(0), ""),
+        replaceBlock, exclusiveBlock);
+
+    builder.positionAtEnd(replaceBlock);
+    let replaced = runtime.call(rename, [from, to], "replaced");
+    answerStatus(runtime, replaced, runtime.lastError());
+
+    builder.positionAtEnd(exclusiveBlock);
+    emitExclusiveRename(runtime, definition, from, to, fallbackBlock);
+
+    builder.positionAtEnd(fallbackBlock);
+    let present = runtime.call(metadata, [to, runtime.int32(0), kind, length, millis], "present");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, present, runtime.int32(0), ""), takenBlock, retryBlock);
+
+    builder.positionAtEnd(takenBlock);
+    instructions.buildRet(builder, runtime.int32(Rename.destinationExists));
+
+    builder.positionAtEnd(retryBlock);
+    let renamed = runtime.call(rename, [from, to], "renamed");
+    answerStatus(runtime, renamed, runtime.lastError());
+    return runtime.endDefinition(definition);
+}
+
+public linuxCopyPermissions(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    long number = nativeshapes.statxSystemCall(runtime.targetTriple);
+    if (number == 0) {
+        return unsupportedPermissions(runtime, type);
+    }
+    let definition = runtime.beginDefinition("ens_fs_copy_permissions", type);
+    let builder = runtime.builder;
+    let claimedBlock = runtime.block(definition, "mode.claimed");
+    let copyBlock = runtime.block(definition, "mode.copy");
+    let incompleteBlock = runtime.block(definition, "mode.incomplete");
+    let failedBlock = runtime.block(definition, "mode.failed");
+    let answer = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType(Statx.structBytes as ulong), "statx");
+    let status = statxCall(runtime, number, runtime.parameter(definition, 0), runtime.int64(0),
+        Statx.permissionsRequest, answer);
+    let why = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, status, runtime.int64(0), ""), claimedBlock,
+        failedBlock);
+
+    builder.positionAtEnd(claimedBlock);
+    instructions.buildCondBr(builder,
+        statxClaimed(runtime, answer, Statx.permissionsRequest), copyBlock, incompleteBlock);
+
+    builder.positionAtEnd(copyBlock);
+    emitModeCopy(runtime, definition, memory.buildLoad(builder, runtime.int16Type,
+        runtime.offsetPointer(answer, Statx.modeOffset, ""), "mode"));
+
+    builder.positionAtEnd(incompleteBlock);
+    instructions.buildRet(builder, runtime.int32(Statx.incompleteError));
+
+    builder.positionAtEnd(failedBlock);
+    instructions.buildRet(builder, why);
+    return runtime.endDefinition(definition);
+}
+
+public darwinCopyPermissions(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let describe = runtime.libc(nativeshapes.entryPointName(runtime.targetTriple, "stat"),
+        runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
+    let definition = runtime.beginDefinition("ens_fs_copy_permissions", type);
+    let builder = runtime.builder;
+    let copyBlock = runtime.block(definition, "mode.copy");
+    let failedBlock = runtime.block(definition, "mode.failed");
+    let answer = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType(DarwinStat.structBytes as ulong), "stat");
+    let status = runtime.call(describe, [runtime.parameter(definition, 0), answer], "status");
+    let why = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, status, runtime.int32(0), ""), copyBlock, failedBlock);
+
+    builder.positionAtEnd(copyBlock);
+    emitModeCopy(runtime, definition, memory.buildLoad(builder, runtime.int16Type,
+        runtime.offsetPointer(answer, DarwinStat.modeOffset, ""), "mode"));
+
+    builder.positionAtEnd(failedBlock);
+    instructions.buildRet(builder, why);
+    return runtime.endDefinition(definition);
+}
+
+public posixOpenDirectory(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let openFolder = directories.openFolderFunction(runtime);
+    let definition = runtime.beginDefinition("ens_fs_open_directory", type);
+    let builder = runtime.builder;
+    let openedBlock = runtime.block(definition, "dir.opened");
+    let failedBlock = runtime.block(definition, "dir.failed");
+    let stream = runtime.call(openFolder, [runtime.parameter(definition, 0)], "stream");
+    let why = runtime.lastError();
+    instructions.buildCondBr(builder, runtime.isNull(stream), failedBlock, openedBlock);
+
+    builder.positionAtEnd(openedBlock);
+    memory.buildStore(builder, runtime.int32(0), runtime.parameter(definition, 1));
+    instructions.buildRet(builder, stream);
+
+    builder.positionAtEnd(failedBlock);
+    memory.buildStore(builder, why, runtime.parameter(definition, 1));
+    instructions.buildRet(builder, runtime.nullPointer());
+    return runtime.endDefinition(definition);
+}
+
+public posixNextEntry(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let readFolder = runtime.libc(nativeshapes.entryPointName(runtime.targetTriple, "readdir"),
+        runtime.pointerType.functionType([runtime.pointerType]));
+    let definition = runtime.beginDefinition("ens_fs_next_entry", type);
+    let builder = runtime.builder;
+    let testBlock = runtime.block(definition, "entry.test");
+    let bodyBlock = runtime.block(definition, "entry.body");
+    let keptBlock = runtime.block(definition, "entry.kept");
+    let endBlock = runtime.block(definition, "entry.end");
+    let kindSlot = runtime.parameter(definition, 1);
+    let errorSlot = runtime.parameter(definition, 2);
+    memory.buildStore(builder, runtime.int64(FileKind.unknown), kindSlot);
+    memory.buildStore(builder, runtime.int32(0), errorSlot);
+    let errnoSlot = runtime.call(runtime.errnoLocation(), [], "errno.slot");
+    instructions.buildBr(builder, testBlock);
+
+    // Reading answers null both at the end of the folder and on a failure, and leaves errno alone
+    // at the end, so the cell is cleared before each read to tell the two apart.
+    builder.positionAtEnd(testBlock);
+    memory.buildStore(builder, runtime.int32(0), errnoSlot);
+    let entry = runtime.call(readFolder, [runtime.parameter(definition, 0)], "entry");
+    let why = memory.buildLoad(builder, runtime.int32Type, errnoSlot, "why");
+    instructions.buildCondBr(builder, runtime.isNull(entry), endBlock, bodyBlock);
+
+    builder.positionAtEnd(endBlock);
+    memory.buildStore(builder, why, errorSlot);
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    builder.positionAtEnd(bodyBlock);
+    let name = memory.buildGEP(builder, runtime.int8Type, entry,
+        [runtime.int64(nativeshapes.direntNameOffset(runtime.targetTriple))], "entry.name");
+    instructions.buildCondBr(builder, directories.dotEntry(runtime, name, runtime.int8Type),
+        testBlock, keptBlock);
+
+    builder.positionAtEnd(keptBlock);
+    let reported = memory.buildLoad(builder, runtime.int8Type, memory.buildGEP(builder,
+        runtime.int8Type, entry,
+        [runtime.int64(nativeshapes.direntKindOffset(runtime.targetTriple))], ""), "entry.type");
+    memory.buildStore(builder, direntFileKind(runtime, reported), kindSlot);
+    instructions.buildRet(builder, name);
+    return runtime.endDefinition(definition);
+}
+
+public posixCloseDirectory(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let closeFolder = directories.closeFolderFunction(runtime);
+    let definition = runtime.beginDefinition("ens_fs_close_directory", type);
+    runtime.call(closeFolder, [runtime.parameter(definition, 0)], "");
+    instructions.buildRetVoid(runtime.builder);
+    return runtime.endDefinition(definition);
+}
+
+// An architecture with no statx number has no permission bits this bridge can read, which a caller
+// sees exactly as it sees a kernel too old to carry one.
+unsupportedPermissions(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let definition = runtime.beginDefinition("ens_fs_copy_permissions", type);
+    instructions.buildRet(runtime.builder, runtime.int32(Statx.unsupportedError));
+    return runtime.endDefinition(definition);
+}
+
+// The no-replace rename this target reaches, branching to the fallback where the file system
+// refuses the request or the architecture has no such call at all.
+emitExclusiveRename(Runtime runtime, RuntimeDefinition definition, Value from, Value to,
+                    BasicBlock fallbackBlock) {
+    let builder = runtime.builder;
+    long number = nativeshapes.renameSystemCall(runtime.targetTriple);
+    if (!runtime.onDarwin() && number == 0) {
+        instructions.buildBr(builder, fallbackBlock);
+        return;
+    }
+    let movedBlock = runtime.block(definition, "rename.moved");
+    let refusedBlock = runtime.block(definition, "rename.refused");
+    let failedBlock = runtime.block(definition, "rename.failed");
+    Value status = runtime.int32(0);
+    if (runtime.onDarwin()) {
+        let renameExclusive = runtime.libc("renamex_np", runtime.int32Type.functionType(
+            [runtime.pointerType, runtime.pointerType, runtime.int32Type]));
+        status = runtime.call(renameExclusive, [from, to,
+            runtime.int32(Rename.darwinExclusive)], "status");
+    } else {
+        let systemCall = runtime.libc("syscall",
+            runtime.int64Type.variadicFunctionType([runtime.int64Type]));
+        status = instructions.buildTrunc(builder, runtime.call(systemCall,
+            [runtime.int64(number), runtime.int64(Statx.currentDirectory), from,
+            runtime.int64(Statx.currentDirectory), to, runtime.int64(Rename.linuxNoReplace)],
+            "status"), runtime.int32Type, "");
+    }
+    let why = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, status, runtime.int32(0), ""), movedBlock, refusedBlock);
+
+    builder.positionAtEnd(movedBlock);
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(refusedBlock);
+    instructions.buildCondBr(builder, refusedRequest(runtime, why), fallbackBlock, failedBlock);
+
+    builder.positionAtEnd(failedBlock);
+    instructions.buildRet(builder, why);
+}
+
+// True when the number names a file system that will not carry out a no-replace rename, rather
+// than anything about the two paths.
+refusedRequest(Runtime runtime, Value why) -> Value {
+    let builder = runtime.builder;
+    Value refused = runtime.int1Type.constInt(0, false);
+    for (let code in nativeshapes.unsupportedRenameErrors(runtime.targetTriple)) {
+        refused = instructions.buildOr(builder, refused,
+            instructions.buildICmpEQ(builder, why, runtime.int32(code), ""), "");
+    }
+    return refused;
+}
+
+// Gives the destination the permission bits the source carries, which is all a copy hands over.
+emitModeCopy(Runtime runtime, RuntimeDefinition definition, Value mode) {
+    let builder = runtime.builder;
+    let changeMode = runtime.libc("chmod",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type]));
+    let permissions = instructions.buildAnd(builder,
+        instructions.buildZExt(builder, mode, runtime.int32Type, ""),
+        runtime.int32(FilePermissions.mask), "permissions");
+    let status = runtime.call(changeMode, [runtime.parameter(definition, 1), permissions],
+        "status");
+    answerStatus(runtime, status, runtime.lastError());
+}
+
+// One statx call over the path, answering the status the kernel reported.
+statxCall(Runtime runtime, long number, Value path, Value flags, long requested, Value answer)
+        -> Value {
+    let systemCall = runtime.libc("syscall",
+        runtime.int64Type.variadicFunctionType([runtime.int64Type]));
+    return runtime.call(systemCall, [runtime.int64(number), runtime.int64(Statx.currentDirectory),
+        path, flags, runtime.int64(requested), answer], "status");
+}
+
+// True when the answer's mask claims every field that was asked for.
+statxClaimed(Runtime runtime, Value answer, long requested) -> Value {
+    let builder = runtime.builder;
+    return instructions.buildICmpEQ(builder, instructions.buildAnd(builder,
+        memory.buildLoad(builder, runtime.int32Type,
+            runtime.offsetPointer(answer, Statx.maskOffset, ""), "mask"),
+        runtime.int32(requested), "claimed"), runtime.int32(requested), "claimed.all");
+}
+
+// The flags an open of this mode asks for, where every mode but reading creates what is missing.
+descriptorFlags(Runtime runtime, Value mode) -> Value {
+    let builder = runtime.builder;
+    let flags = nativeshapes.openFlags(runtime.targetTriple);
+    long truncated = flags.writeOnly | flags.create | flags.truncate;
+    long appended = flags.writeOnly | flags.create | flags.append;
+    long created = flags.writeOnly | flags.create | flags.exclusive;
+    return instructions.buildSelect(builder, filesystem.isMode(runtime, mode, OpenMode.read),
+        runtime.int32(flags.readOnly),
+        instructions.buildSelect(builder, filesystem.isMode(runtime, mode, OpenMode.writeTruncated),
+            runtime.int32(truncated),
+            instructions.buildSelect(builder, filesystem.isMode(runtime, mode, OpenMode.appended),
+                runtime.int32(appended), runtime.int32(created), ""), ""), "flags");
+}
+
+// The kind a directory entry reported, where a file system that classified nothing leaves the
+// caller to ask about the entry itself.
+direntFileKind(Runtime runtime, Value reported) -> Value {
+    let builder = runtime.builder;
+    let value = instructions.buildZExt(builder, reported, runtime.int64Type, "");
+    return instructions.buildSelect(builder,
+        isKind(runtime, value, DirentKind.regular), runtime.int64(FileKind.file),
+        instructions.buildSelect(builder, isKind(runtime, value, DirentKind.directory),
+            runtime.int64(FileKind.directory),
+            instructions.buildSelect(builder, isKind(runtime, value, DirentKind.symbolicLink),
+                runtime.int64(FileKind.symbolicLink),
+                instructions.buildSelect(builder, isKind(runtime, value, DirentKind.unknown),
+                    runtime.int64(FileKind.unknown), runtime.int64(FileKind.other), ""),
+                ""), ""), "kind");
+}
+
+isKind(Runtime runtime, Value reported, long wanted) -> Value {
+    return instructions.buildICmpEQ(runtime.builder, reported, runtime.int64(wanted), "");
+}
+
+// Answers 0 for a call that reported success, and the number it left behind otherwise.
+answerStatus(Runtime runtime, Value status, Value why) {
+    let builder = runtime.builder;
+    instructions.buildRet(builder, instructions.buildSelect(builder,
+        instructions.buildICmpEQ(builder, status, runtime.int32(0), ""), runtime.int32(0), why,
+        ""));
 }

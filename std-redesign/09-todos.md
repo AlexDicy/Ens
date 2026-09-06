@@ -22,6 +22,11 @@ An architecture the compiler can target but whose `statx` number is unknown answ
 
 Win32 has no error code meaning `IsADirectory`, so a call that is refused a directory reports `PermissionDenied` on Windows and `IsADirectory` elsewhere.
 
+`moveTo`'s promise to move in one step rests on `renameat2(RENAME_NOREPLACE)` on Linux and `renamex_np(RENAME_EXCL)` on macOS, both reached under the same rule as `statx`, so no libc has to carry a wrapper for either.
+Where a file system will not carry the request out, and on an architecture whose `renameat2` number is unknown, the bridge falls back to reading the destination and renaming after it.
+Two programs racing for the same name can then both be told they moved it, over a window of a few microseconds.
+The exposure is none at all on ext4, xfs, btrfs, apfs and ntfs, and real on overlay and network file systems.
+
 The emitter tests that retarget a module prove a platform's half builds well-formed IR, and prove nothing about whether its numbers are true.
 A negative control settled it.
 Moving `Statx.modeOffset` from 28 to 29 in a disposable copy of the tree left every retarget test passing, while a wrong return type failed loudly.
