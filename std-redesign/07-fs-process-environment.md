@@ -145,7 +145,8 @@ export struct Path implements Comparable<Path> {
     // same volume, because a move across volumes would have to copy.
     export moveTo(Path destination) -> bool throws FileSystemError;
 
-    // Copies the file at this path to `destination`, replacing what was there.
+    // Copies the file at this path to `destination`, replacing what was there. The copy carries
+    // the source's permissions, and never its set-user-id, set-group-id or sticky bits.
     export copyTo(Path destination) throws FileSystemError;
 
     // Removing a file refuses a directory, and removing a directory requires it empty; what is
@@ -241,6 +242,8 @@ export final class TemporaryFile {
 `modifiedMillis` is the no-time-type interim; see the reminder in the TODOs.
 `removeRecursively` is included because `TemporaryDirectory`'s destructor needs the operation anyway; the name is long on purpose.
 UNC: `\server\share` arrives via `fromNative` as `//server/share`, is absolute, and `normalize` keeps a leading `//`. Drive-relative `C:foo` is unsupported and documented as relative text; `C:/foo` stays absolute.
+`copyTo` carries permissions and not privileges.
+The set-user-id, set-group-id and sticky bits are never copied, since a copy would otherwise hand a caller a privilege transfer it never asked for, and since the destination belongs to whoever ran the copy rather than to the source's owner.
 `Entry.kind` says "usually" because a POSIX enumeration may answer `DT_UNKNOWN`, and the library then fills that rare entry in with one metadata call.
 `entries()` promises ascending byte order of name, each directory read fully and sorted before yielding; determinism is worth the freeze.
 One `File` type for both directions; writing a read-opened file throws `IoError`.
