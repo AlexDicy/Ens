@@ -1,0 +1,205 @@
+// What the metadata, real-path and current-directory bridges answer on the host running the suite.
+// A field read at a wrong offset lands on a neighbor, so every answer here is pinned to a value no
+// neighboring field of the same structure carries.
+import @std.path;
+import @std.system;
+import @std.testing;
+import Failure from bridges;
+import Kind from bridges;
+import bridges;
+import scratch;
+
+// The window every file this fixture writes falls inside, from 2025-01-01 to 2050-01-01 UTC. A
+// nanosecond count read as a second count stays below it, and a length or a mode never reaches it.
+public final class Window {
+    public static const long earliest = 1735689600000;
+    public static const long latest = 2524608000000;
+}
+
+// A file of exactly this many bytes, whose length no other field of a stat answer shares.
+knownBytes(long count) -> byte[] {
+    byte[] content = new byte[count];
+    for (long i = 0; i < count; i++) {
+        content[i] = (i % 251) as byte;
+    }
+    return content;
+}
+
+test "metadata answers a file's own length and nothing beside it" {
+    string folder = try scratch.folder("length");
+    string file = path.join(folder, "known.bin");
+    try system.writeAllBytes(file, knownBytes(12345));
+    let answer = bridges.metadataOf(file, true);
+    try testing.assertEqual(answer.error, 0);
+    try testing.assertEqual(answer.kind, Kind.file);
+    try testing.assertEqual(answer.length, 12345);
+}
+
+test "metadata answers an empty file as empty rather than as unreadable" {
+    string folder = try scratch.folder("empty");
+    string file = path.join(folder, "empty.bin");
+    try system.writeAllBytes(file, new byte[0]);
+    let answer = bridges.metadataOf(file, true);
+    try testing.assertEqual(answer.error, 0);
+    try testing.assertEqual(answer.kind, Kind.file);
+    try testing.assertEqual(answer.length, 0);
+}
+
+test "metadata answers a directory with no length of its own" {
+    string folder = try scratch.folder("directory");
+    let answer = bridges.metadataOf(folder, true);
+    try testing.assertEqual(answer.error, 0);
+    try testing.assertEqual(answer.kind, Kind.directory);
+    try testing.assertEqual(answer.length, 0);
+}
+
+test "metadata answers a modification time inside a plausible window" {
+    string folder = try scratch.folder("window");
+    string file = path.join(folder, "dated.bin");
+    try system.writeAllBytes(file, knownBytes(64));
+    let answer = bridges.metadataOf(file, true);
+    try testing.assertEqual(answer.error, 0);
+    try testing.assertTrue(answer.modifiedMillis >= Window.earliest,
+        "a file written now reports {answer.modifiedMillis}, before 2025");
+    try testing.assertTrue(answer.modifiedMillis < Window.latest,
+        "a file written now reports {answer.modifiedMillis}, after 2050");
+}
+
+// The time a creation or an access carries does not move when content is appended, so a field read
+// at the wrong timestamp's offset reports no change here.
+test "a modification time moves when the content changes" {
+    string folder = try scratch.folder("moves");
+    string file = path.join(folder, "growing.bin");
+    try system.writeAllBytes(file, knownBytes(16));
+    let before = bridges.metadataOf(file, true);
+    try testing.assertEqual(before.error, 0);
+    try waited();
+    try system.writeAllBytes(file, knownBytes(32));
+    let after = bridges.metadataOf(file, true);
+    try testing.assertEqual(after.error, 0);
+    try testing.assertEqual(after.length, 32);
+    try testing.assertTrue(after.modifiedMillis - before.modifiedMillis >= 1000,
+        "the time moved by {after.modifiedMillis - before.modifiedMillis}ms over a longer wait");
+}
+
+// Following a link reads the structure a handle answers with, and reading the target directly
+// reads the one a path answers with, so the two agreeing pins each against the other.
+test "a link answers for itself and for what it points to" {
+    string folder = try scratch.folder("link");
+    string target = path.join(folder, "target");
+    try system.createDirectory(target);
+    string link = path.join(folder, "link");
+    try testing.assertTrue(try linked(target, link),
+        "this system would not make a link under '{folder}' to test with");
+
+    let direct = bridges.metadataOf(target, true);
+    try testing.assertEqual(direct.error, 0);
+
+    let followed = bridges.metadataOf(link, true);
+    try testing.assertEqual(followed.error, 0);
+    try testing.assertEqual(followed.kind, Kind.directory);
+    try testing.assertEqual(followed.length, 0);
+    try testing.assertEqual(followed.modifiedMillis, direct.modifiedMillis);
+
+    let itself = bridges.metadataOf(link, false);
+    try testing.assertEqual(itself.error, 0);
+    try testing.assertEqual(itself.kind, Kind.symbolicLink);
+    try testing.assertTrue(itself.modifiedMillis >= Window.earliest,
+        "a link made now reports {itself.modifiedMillis}, before 2025");
+}
+
+test "metadata says why it could not answer" {
+    string folder = try scratch.folder("missing");
+    let answer = bridges.metadataOf(path.join(folder, "nothing"), true);
+    try testing.assertNotEqual(answer.error, 0);
+    try testing.assertEqual(bridges.failureOf(answer.error), Failure.notFound);
+}
+
+// Walking through a file rather than a directory is the one failure whose kind the two platforms
+// spell differently, because Win32 reports a path that cannot exist rather than a wrong kind.
+test "a path leading through a file says so in each platform's own terms" {
+    string folder = try scratch.folder("through");
+    string file = path.join(folder, "barrier.bin");
+    try system.writeAllBytes(file, knownBytes(8));
+    let answer = bridges.metadataOf(path.join(file, "child"), true);
+    try testing.assertNotEqual(answer.error, 0);
+    long expected = Failure.notADirectory;
+    if (system.platform() == "windows") {
+        expected = Failure.notFound;
+    }
+    try testing.assertEqual(bridges.failureOf(answer.error), expected);
+}
+
+test "the real path resolves the dots a path is written with" {
+    string folder = try scratch.folder("dots");
+    string nested = path.join(folder, "one/two");
+    try system.createDirectory(nested);
+    let direct = bridges.realPathOf(nested);
+    try testing.assertEqual(direct.error, 0);
+    try testing.assertTrue(direct.text.length > 0, "the real path of '{nested}' is empty");
+
+    let dotted = bridges.realPathOf(path.join(folder, "one/./two/../two"));
+    try testing.assertEqual(dotted.error, 0);
+    try testing.assertEqual(dotted.text, direct.text);
+}
+
+test "the real path says how much room it needs when it is given none" {
+    string folder = try scratch.folder("room");
+    let whole = bridges.realPathOf(folder);
+    try testing.assertEqual(whole.error, 0);
+
+    let probe = bridges.realPathAttempt(folder, 0);
+    try testing.assertEqual(probe.error, 0);
+    try testing.assertEqual(probe.text, "");
+    try testing.assertEqual(probe.needed, whole.needed);
+    try testing.assertEqual(probe.needed, whole.text.toBytes().length);
+}
+
+test "the real path says why there is none" {
+    string folder = try scratch.folder("unreal");
+    let answer = bridges.realPathOf(path.join(folder, "nothing"));
+    try testing.assertNotEqual(answer.error, 0);
+    try testing.assertEqual(bridges.failureOf(answer.error), Failure.notFound);
+}
+
+test "the current directory is a directory this program can read" {
+    string here = bridges.currentDirectory();
+    try testing.assertTrue(here.length > 0, "nothing answered for the working directory");
+    let answer = bridges.metadataOf(here, true);
+    try testing.assertEqual(answer.error, 0);
+    try testing.assertEqual(answer.kind, Kind.directory);
+    try testing.assertEqual(path.fromNative(here, system.platform()),
+        system.currentDirectory());
+}
+
+test "a number no file call reports classifies as Other" {
+    try testing.assertEqual(bridges.failureOf(1000000), Failure.other);
+    try testing.assertEqual(bridges.failureOf(-1), Failure.other);
+}
+
+// Long enough that a file system storing whole seconds still reports a later time afterwards.
+waited() throws {
+    string command = "sleep 2";
+    if (system.platform() == "windows") {
+        command = "ping -n 3 127.0.0.1 > nul";
+    }
+    int status = try system.run(command);
+    try testing.assertEqual(status, 0);
+}
+
+// A link at `link` naming `target`, made through the system's own command so no bridge under test
+// takes part. Windows makes a junction, which needs no privilege that a test run may lack.
+linked(string target, string link) -> bool throws {
+    string command = "ln -s '{target}' '{link}'";
+    if (system.platform() == "windows") {
+        command = "mklink /J \"{native(link)}\" \"{native(target)}\" > nul";
+    }
+    if (try system.run(command) != 0) {
+        return false;
+    }
+    return bridges.metadataOf(link, false).error == 0;
+}
+
+native(string text) -> string {
+    return text.replace("/", "\\");
+}

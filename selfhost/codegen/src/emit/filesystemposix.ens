@@ -1,0 +1,216 @@
+// The POSIX halves of the file bridges std.fs reads a path through. Every failure answers the errno
+// read before anything else runs, since a later call is free to leave a reason of its own behind.
+import Value from @ens.llvm.values;
+import TypeRef from @ens.llvm.types;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import DarwinStat from emit.nativeshapes;
+import FileKind from emit.nativeshapes;
+import FileMode from emit.nativeshapes;
+import Statx from emit.nativeshapes;
+import emit.nativeshapes;
+import Runtime from emit.runtime;
+import RuntimeDefinition from emit.runtime;
+import RuntimeFunction from emit.runtime;
+
+// A Linux target asks the kernel directly, so one structure layout serves every architecture and no
+// libc has to carry a matching one.
+public linuxMetadata(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    long number = nativeshapes.statxSystemCall(runtime.targetTriple);
+    if (number == 0) {
+        return unsupportedMetadata(runtime, type);
+    }
+    let systemCall = runtime.libc("syscall",
+        runtime.int64Type.variadicFunctionType([runtime.int64Type]));
+    let definition = runtime.beginDefinition("ens_fs_metadata", type);
+    let builder = runtime.builder;
+    let checkBlock = runtime.block(definition, "meta.check");
+    let answerBlock = runtime.block(definition, "meta.answer");
+    let incompleteBlock = runtime.block(definition, "meta.incomplete");
+    let failedBlock = runtime.block(definition, "meta.failed");
+
+    long requested = Statx.typeRequest | Statx.modifiedRequest | Statx.sizeRequest;
+    let answer = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType(Statx.structBytes as ulong), "statx");
+    let flags = instructions.buildSelect(builder,
+        instructions.buildICmpNE(builder, runtime.parameter(definition, 1), runtime.int32(0), ""),
+        runtime.int64(0), runtime.int64(Statx.noFollowFlag), "flags");
+    let status = runtime.call(systemCall, [runtime.int64(number),
+        runtime.int64(Statx.currentDirectory), runtime.parameter(definition, 0), flags,
+        runtime.int64(requested), answer], "status");
+    let why = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, status, runtime.int64(0), ""), checkBlock, failedBlock);
+
+    builder.positionAtEnd(checkBlock);
+    let claimed = instructions.buildAnd(builder,
+        memory.buildLoad(builder, runtime.int32Type,
+            runtime.offsetPointer(answer, Statx.maskOffset, ""), "mask"),
+        runtime.int32(requested), "claimed");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, claimed, runtime.int32(requested), ""),
+        answerBlock, incompleteBlock);
+
+    builder.positionAtEnd(answerBlock);
+    let mode = instructions.buildZExt(builder, memory.buildLoad(builder, runtime.int16Type,
+        runtime.offsetPointer(answer, Statx.modeOffset, ""), ""), runtime.int64Type, "mode");
+    let nanoseconds = instructions.buildZExt(builder, memory.buildLoad(builder, runtime.int32Type,
+        runtime.offsetPointer(answer, Statx.nanosecondsOffset, ""), ""), runtime.int64Type, "");
+    answerMetadata(runtime, definition, mode,
+        loadWord(runtime, answer, Statx.sizeOffset),
+        millisecondsOf(runtime, loadWord(runtime, answer, Statx.secondsOffset), nanoseconds));
+
+    builder.positionAtEnd(incompleteBlock);
+    instructions.buildRet(builder, runtime.int32(Statx.incompleteError));
+
+    builder.positionAtEnd(failedBlock);
+    instructions.buildRet(builder, why);
+    return runtime.endDefinition(definition);
+}
+
+public darwinMetadata(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let statType = runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]);
+    let followed = runtime.libc(nativeshapes.entryPointName(runtime.targetTriple, "stat"),
+        statType);
+    let unfollowed = runtime.libc(nativeshapes.entryPointName(runtime.targetTriple, "lstat"),
+        statType);
+    let definition = runtime.beginDefinition("ens_fs_metadata", type);
+    let builder = runtime.builder;
+    let answerBlock = runtime.block(definition, "meta.answer");
+    let failedBlock = runtime.block(definition, "meta.failed");
+
+    let answer = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType(DarwinStat.structBytes as ulong), "stat");
+    let chosen = instructions.buildSelect(builder,
+        instructions.buildICmpNE(builder, runtime.parameter(definition, 1), runtime.int32(0), ""),
+        followed.function, unfollowed.function, "ask");
+    let status = instructions.buildCall(builder, statType, chosen,
+        [runtime.parameter(definition, 0), answer], "status");
+    let why = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, status, runtime.int32(0), ""), answerBlock, failedBlock);
+
+    builder.positionAtEnd(answerBlock);
+    let mode = instructions.buildZExt(builder, memory.buildLoad(builder, runtime.int16Type,
+        runtime.offsetPointer(answer, DarwinStat.modeOffset, ""), ""), runtime.int64Type, "mode");
+    answerMetadata(runtime, definition, mode,
+        loadWord(runtime, answer, DarwinStat.sizeOffset),
+        millisecondsOf(runtime, loadWord(runtime, answer, DarwinStat.secondsOffset),
+            loadWord(runtime, answer, DarwinStat.nanosecondsOffset)));
+
+    builder.positionAtEnd(failedBlock);
+    instructions.buildRet(builder, why);
+    return runtime.endDefinition(definition);
+}
+
+// An architecture with no statx number has no metadata call this bridge can reach, which a caller
+// sees exactly as it sees a kernel too old to carry one.
+unsupportedMetadata(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let definition = runtime.beginDefinition("ens_fs_metadata", type);
+    instructions.buildRet(runtime.builder, runtime.int32(Statx.unsupportedError));
+    return runtime.endDefinition(definition);
+}
+
+public posixRealPath(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let resolve = runtime.libc("realpath",
+        runtime.pointerType.functionType([runtime.pointerType, runtime.pointerType]));
+    let measure = runtime.strlen();
+    let copy = runtime.memcpy();
+    let release = runtime.free();
+    let definition = runtime.beginDefinition("ens_fs_real_path", type);
+    let builder = runtime.builder;
+    let measuredBlock = runtime.block(definition, "real.measured");
+    let copyBlock = runtime.block(definition, "real.copy");
+    let doneBlock = runtime.block(definition, "real.done");
+    let failedBlock = runtime.block(definition, "real.failed");
+
+    // Resolving into a buffer of the caller's cannot be done safely, because a resolved path may
+    // outgrow every fixed bound a system publishes.
+    let resolved = runtime.call(resolve, [runtime.parameter(definition, 0),
+        runtime.nullPointer()], "resolved");
+    let why = runtime.lastError();
+    instructions.buildCondBr(builder, runtime.isNull(resolved), failedBlock, measuredBlock);
+
+    builder.positionAtEnd(measuredBlock);
+    let bytes = runtime.call(measure, [resolved], "bytes");
+    memory.buildStore(builder, bytes, runtime.parameter(definition, 3));
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLE(builder, bytes, runtime.parameter(definition, 2), "fits"),
+        copyBlock, doneBlock);
+
+    builder.positionAtEnd(copyBlock);
+    runtime.call(copy, [runtime.parameter(definition, 1), resolved, bytes], "");
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(doneBlock);
+    runtime.call(release, [resolved], "");
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(failedBlock);
+    instructions.buildRet(builder, why);
+    return runtime.endDefinition(definition);
+}
+
+public posixCurrentDirectory(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let workingDirectory = runtime.libc("getcwd",
+        runtime.pointerType.functionType([runtime.pointerType, runtime.int64Type]));
+    let measure = runtime.strlen();
+    let definition = runtime.beginDefinition("ens_current_directory", type);
+    let builder = runtime.builder;
+    let measuredBlock = runtime.block(definition, "cwd.measured");
+    let unknownBlock = runtime.block(definition, "cwd.unknown");
+    let buffer = runtime.parameter(definition, 0);
+    let answer = runtime.call(workingDirectory, [buffer, runtime.parameter(definition, 1)],
+        "answer");
+    instructions.buildCondBr(builder, runtime.isNull(answer), unknownBlock, measuredBlock);
+
+    builder.positionAtEnd(measuredBlock);
+    instructions.buildRet(builder, runtime.call(measure, [buffer], "bytes"));
+
+    builder.positionAtEnd(unknownBlock);
+    instructions.buildRet(builder, runtime.int64(-1));
+    return runtime.endDefinition(definition);
+}
+
+loadWord(Runtime runtime, Value base, long offset) -> Value {
+    let builder = runtime.builder;
+    return memory.buildLoad(builder, runtime.int64Type,
+        runtime.offsetPointer(base, offset, ""), "");
+}
+
+// A negative second still floors correctly, because a nanosecond count is never negative.
+millisecondsOf(Runtime runtime, Value seconds, Value nanoseconds) -> Value {
+    let builder = runtime.builder;
+    return instructions.buildAdd(builder,
+        instructions.buildMul(builder, seconds, runtime.int64(1000), ""),
+        instructions.buildUDiv(builder, nanoseconds, runtime.int64(1000000), ""), "millis");
+}
+
+// The kind a mode word names, which every POSIX system spells with the same bits.
+fileKindOf(Runtime runtime, Value mode) -> Value {
+    let builder = runtime.builder;
+    let named = instructions.buildAnd(builder, mode, runtime.int64(FileMode.typeMask), "");
+    return instructions.buildSelect(builder,
+        instructions.buildICmpEQ(builder, named, runtime.int64(FileMode.directory), ""),
+        runtime.int64(FileKind.directory),
+        instructions.buildSelect(builder,
+            instructions.buildICmpEQ(builder, named, runtime.int64(FileMode.symbolicLink), ""),
+            runtime.int64(FileKind.symbolicLink),
+            instructions.buildSelect(builder,
+                instructions.buildICmpEQ(builder, named, runtime.int64(FileMode.regular), ""),
+                runtime.int64(FileKind.file), runtime.int64(FileKind.other), ""), ""), "kind");
+}
+
+// The three answers a metadata bridge writes back, and the 0 saying it answered. A directory's own
+// length is what the file system happens to hold for it, so nothing reports it.
+answerMetadata(Runtime runtime, RuntimeDefinition definition, Value mode, Value size,
+               Value millis) {
+    let builder = runtime.builder;
+    let kind = fileKindOf(runtime, mode);
+    memory.buildStore(builder, kind, runtime.parameter(definition, 2));
+    memory.buildStore(builder, instructions.buildSelect(builder,
+        instructions.buildICmpEQ(builder, kind, runtime.int64(FileKind.directory), ""),
+        runtime.int64(0), size, "length"), runtime.parameter(definition, 3));
+    memory.buildStore(builder, millis, runtime.parameter(definition, 4));
+    instructions.buildRet(builder, runtime.int32(0));
+}

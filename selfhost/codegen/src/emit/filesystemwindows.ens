@@ -1,0 +1,427 @@
+// The Windows halves of the file bridges std.fs reads a path through. Every path crosses as UTF-16,
+// and every failure answers the Win32 error code read before anything else runs.
+import Value from @ens.llvm.values;
+import TypeRef from @ens.llvm.types;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import FileKind from emit.nativeshapes;
+import Runtime from emit.runtime;
+import RuntimeDefinition from emit.runtime;
+import RuntimeFunction from emit.runtime;
+import emit.widetext;
+
+// The attribute bits and call arguments this file's bridges share.
+public final class Win32 {
+    public static const long directoryAttribute = 0x10;
+    public static const long reparseAttribute = 0x400;
+
+    // The bit marking a reparse tag that names another location rather than describing the file's
+    // own storage. A cloud placeholder and a deduplicated file both carry a tag without it.
+    public static const long nameSurrogateTag = 0x20000000;
+
+    public static const long standardInfoLevel = 0;
+    public static const long attributeTagClass = 9;
+
+    public static const long shareEverything = 7;
+    public static const long openExisting = 3;
+    public static const long backupSemantics = 0x02000000;
+    public static const long openReparsePoint = 0x00200000;
+
+    public static const long outOfMemory = 8;
+    public static const long bufferTooSmall = 122;
+
+    // The longest path Windows reports is 32767 characters and a terminator.
+    public static const long pathCharacters = 32768;
+}
+
+// Where WIN32_FILE_ATTRIBUTE_DATA holds what a metadata answer needs, in 36 bytes.
+public final class AttributeData {
+    public static const long attributes = 0;
+    public static const long lastWriteTime = 20;
+    public static const long sizeHigh = 28;
+    public static const long sizeLow = 32;
+    public static const long structBytes = 36;
+}
+
+// Where BY_HANDLE_FILE_INFORMATION holds what a metadata answer needs, in 52 bytes. Its size sits
+// four bytes further along than the same field of WIN32_FILE_ATTRIBUTE_DATA.
+public final class HandleInformation {
+    public static const long attributes = 0;
+    public static const long lastWriteTime = 20;
+    public static const long sizeHigh = 32;
+    public static const long sizeLow = 36;
+    public static const long structBytes = 52;
+}
+
+// Where FILE_ATTRIBUTE_TAG_INFO holds the reparse tag, in 8 bytes.
+public final class AttributeTag {
+    public static const long reparseTag = 4;
+    public static const long structBytes = 8;
+}
+
+// A path that is not a reparse point is answered from its attributes alone, so the common case
+// opens nothing.
+public windowsMetadata(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let attributesOf = runtime.libc("GetFileAttributesExW",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type,
+        runtime.pointerType]));
+    let openFile = createFileFunction(runtime);
+    let informationOf = runtime.libc("GetFileInformationByHandle",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
+    let extendedInformationOf = runtime.libc("GetFileInformationByHandleEx",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type,
+        runtime.pointerType, runtime.int32Type]));
+    let closeHandle = closeHandleFunction(runtime);
+    let widen = widetext.wideFromUtf8(runtime);
+    let release = runtime.free();
+    let definition = runtime.beginDefinition("ens_fs_metadata", type);
+    let builder = runtime.builder;
+    let probeBlock = runtime.block(definition, "meta.probe");
+    let unreadableBlock = runtime.block(definition, "meta.unreadable");
+    let classifyBlock = runtime.block(definition, "meta.classify");
+    let plainBlock = runtime.block(definition, "meta.plain");
+    let linkBlock = runtime.block(definition, "meta.link");
+    let unopenableBlock = runtime.block(definition, "meta.unopenable");
+    let openedBlock = runtime.block(definition, "meta.opened");
+    let uninformativeBlock = runtime.block(definition, "meta.uninformative");
+    let describedBlock = runtime.block(definition, "meta.described");
+    let noMemoryBlock = runtime.block(definition, "meta.no.memory");
+
+    let data = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType(AttributeData.structBytes as ulong), "attributes");
+    let information = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType(HandleInformation.structBytes as ulong), "information");
+    let tag = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType(AttributeTag.structBytes as ulong), "tag");
+    memory.buildStore(builder, runtime.int32(0),
+        runtime.offsetPointer(tag, AttributeTag.reparseTag, ""));
+    let following = instructions.buildICmpNE(builder, runtime.parameter(definition, 1),
+        runtime.int32(0), "following");
+    let wide = runtime.call(widen, [runtime.parameter(definition, 0), runtime.int32(-1)],
+        "path.wide");
+    instructions.buildCondBr(builder, runtime.isNull(wide), noMemoryBlock, probeBlock);
+
+    builder.positionAtEnd(probeBlock);
+    let probed = runtime.call(attributesOf, [wide, runtime.int32(Win32.standardInfoLevel), data],
+        "probed");
+    let probeError = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpNE(builder, probed, runtime.int32(0), ""),
+        classifyBlock, unreadableBlock);
+
+    builder.positionAtEnd(unreadableBlock);
+    runtime.call(release, [wide], "");
+    instructions.buildRet(builder, probeError);
+
+    builder.positionAtEnd(classifyBlock);
+    let attributes = loadDoubleWord(runtime, data, AttributeData.attributes);
+    instructions.buildCondBr(builder, hasBit(runtime, attributes, Win32.reparseAttribute),
+        linkBlock, plainBlock);
+
+    builder.positionAtEnd(plainBlock);
+    runtime.call(release, [wide], "");
+    let plainDirectory = hasBit(runtime, attributes, Win32.directoryAttribute);
+    answerMetadata(runtime, definition,
+        instructions.buildSelect(builder, plainDirectory, runtime.int64(FileKind.directory),
+            runtime.int64(FileKind.file), "kind"),
+        instructions.buildSelect(builder, plainDirectory, runtime.int64(0),
+            unsignedPair(runtime, data, AttributeData.sizeHigh, AttributeData.sizeLow), "length"),
+        fileTimeMillis(runtime, data, AttributeData.lastWriteTime));
+
+    builder.positionAtEnd(linkBlock);
+    let openFlags = instructions.buildOr(builder, runtime.int32(Win32.backupSemantics),
+        instructions.buildSelect(builder, following, runtime.int32(0),
+            runtime.int32(Win32.openReparsePoint), ""), "flags");
+    let handle = runtime.call(openFile, [wide, runtime.int32(0),
+        runtime.int32(Win32.shareEverything), runtime.nullPointer(),
+        runtime.int32(Win32.openExisting), openFlags, runtime.nullPointer()], "handle");
+    let openError = runtime.lastError();
+    runtime.call(release, [wide], "");
+    instructions.buildCondBr(builder, invalidHandle(runtime, handle), unopenableBlock,
+        openedBlock);
+
+    builder.positionAtEnd(unopenableBlock);
+    instructions.buildRet(builder, openError);
+
+    builder.positionAtEnd(openedBlock);
+    let informed = runtime.call(informationOf, [handle, information], "informed");
+    let informationError = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpNE(builder, informed, runtime.int32(0), ""),
+        describedBlock, uninformativeBlock);
+
+    builder.positionAtEnd(uninformativeBlock);
+    runtime.call(closeHandle, [handle], "");
+    instructions.buildRet(builder, informationError);
+
+    // A tag that could not be read counts as naming another location, so a walk over a reparse
+    // point nothing can describe still ends. A followed answer never names a link at all.
+    builder.positionAtEnd(describedBlock);
+    let described = runtime.call(extendedInformationOf, [handle,
+        runtime.int32(Win32.attributeTagClass), tag,
+        runtime.int32(AttributeTag.structBytes)], "described");
+    let surrogate = instructions.buildAnd(builder,
+        instructions.buildOr(builder,
+            instructions.buildICmpEQ(builder, described, runtime.int32(0), ""),
+            hasBit(runtime, loadDoubleWord(runtime, tag, AttributeTag.reparseTag),
+                Win32.nameSurrogateTag), ""),
+        instructions.buildNot(builder, following, ""), "link");
+    runtime.call(closeHandle, [handle], "");
+    let linkAttributes = loadDoubleWord(runtime, information, HandleInformation.attributes);
+    let linkDirectory = hasBit(runtime, linkAttributes, Win32.directoryAttribute);
+    answerMetadata(runtime, definition,
+        instructions.buildSelect(builder, surrogate, runtime.int64(FileKind.symbolicLink),
+            instructions.buildSelect(builder, linkDirectory, runtime.int64(FileKind.directory),
+                runtime.int64(FileKind.file), ""), "kind"),
+        instructions.buildSelect(builder, linkDirectory, runtime.int64(0),
+            unsignedPair(runtime, information, HandleInformation.sizeHigh,
+                HandleInformation.sizeLow), "length"),
+        fileTimeMillis(runtime, information, HandleInformation.lastWriteTime));
+
+    builder.positionAtEnd(noMemoryBlock);
+    instructions.buildRet(builder, runtime.int32(Win32.outOfMemory));
+    return runtime.endDefinition(definition);
+}
+
+// Windows resolves a path only through a handle on the thing it names, so a path nothing can be
+// opened on has no real form to answer with.
+public windowsRealPath(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let openFile = createFileFunction(runtime);
+    let finalNameOf = runtime.libc("GetFinalPathNameByHandleW",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType,
+        runtime.int32Type, runtime.int32Type]));
+    let closeHandle = closeHandleFunction(runtime);
+    let narrow = widetext.narrowFunction(runtime);
+    let widen = widetext.wideFromUtf8(runtime);
+    let allocate = runtime.malloc();
+    let release = runtime.free();
+    let definition = runtime.beginDefinition("ens_fs_real_path", type);
+    let builder = runtime.builder;
+    let openBlock = runtime.block(definition, "real.open");
+    let unopenableBlock = runtime.block(definition, "real.unopenable");
+    let roomBlock = runtime.block(definition, "real.room");
+    let closeNoMemoryBlock = runtime.block(definition, "real.close.no.memory");
+    let namedBlock = runtime.block(definition, "real.named");
+    let unnamedBlock = runtime.block(definition, "real.unnamed");
+    let prefixBlock = runtime.block(definition, "real.prefix");
+    let shareBlock = runtime.block(definition, "real.share");
+    let skipBlock = runtime.block(definition, "real.skip");
+    let unmeasuredBlock = runtime.block(definition, "real.unmeasured");
+    let fitBlock = runtime.block(definition, "real.fit");
+    let writeBlock = runtime.block(definition, "real.write");
+    let doneBlock = runtime.block(definition, "real.done");
+    let noMemoryBlock = runtime.block(definition, "real.no.memory");
+
+    let capacity = runtime.parameter(definition, 2);
+    let wide = runtime.call(widen, [runtime.parameter(definition, 0), runtime.int32(-1)],
+        "path.wide");
+    instructions.buildCondBr(builder, runtime.isNull(wide), noMemoryBlock, openBlock);
+
+    builder.positionAtEnd(openBlock);
+    let handle = runtime.call(openFile, [wide, runtime.int32(0),
+        runtime.int32(Win32.shareEverything), runtime.nullPointer(),
+        runtime.int32(Win32.openExisting), runtime.int32(Win32.backupSemantics),
+        runtime.nullPointer()], "handle");
+    let openError = runtime.lastError();
+    runtime.call(release, [wide], "");
+    instructions.buildCondBr(builder, invalidHandle(runtime, handle), unopenableBlock, roomBlock);
+
+    builder.positionAtEnd(unopenableBlock);
+    instructions.buildRet(builder, openError);
+
+    builder.positionAtEnd(roomBlock);
+    let room = runtime.call(allocate, [runtime.int64(Win32.pathCharacters * 2)], "room");
+    instructions.buildCondBr(builder, runtime.isNull(room), closeNoMemoryBlock, namedBlock);
+
+    builder.positionAtEnd(closeNoMemoryBlock);
+    runtime.call(closeHandle, [handle], "");
+    instructions.buildRet(builder, runtime.int32(Win32.outOfMemory));
+
+    builder.positionAtEnd(namedBlock);
+    let characters = runtime.call(finalNameOf, [handle, room,
+        runtime.int32(Win32.pathCharacters), runtime.int32(0)], "characters");
+    let nameError = runtime.lastError();
+    runtime.call(closeHandle, [handle], "");
+    instructions.buildCondBr(builder, instructions.buildAnd(builder,
+        instructions.buildICmpSGT(builder, characters, runtime.int32(0), ""),
+        instructions.buildICmpSLT(builder, characters, runtime.int32(Win32.pathCharacters), ""),
+        "named"), prefixBlock, unnamedBlock);
+
+    builder.positionAtEnd(unnamedBlock);
+    runtime.call(release, [room], "");
+    instructions.buildRet(builder, instructions.buildSelect(builder,
+        instructions.buildICmpEQ(builder, characters, runtime.int32(0), ""), nameError,
+        runtime.int32(Win32.bufferTooSmall), ""));
+
+    builder.positionAtEnd(prefixBlock);
+    let prefixed = matchesWide(runtime, room, 0, "\\\\?\\");
+    let share = instructions.buildAnd(builder, prefixed,
+        matchesWide(runtime, room, 4, "UNC\\"), "share");
+    instructions.buildCondBr(builder, share, shareBlock, skipBlock);
+
+    // A share arrives as '\\?\UNC\server\share', whose two leading separators are recovered by
+    // overwriting the character before the server's name.
+    builder.positionAtEnd(shareBlock);
+    memory.buildStore(builder, runtime.int16Type.constInt('\\' as ulong, false),
+        memory.buildGEP(builder, runtime.int16Type, room, [runtime.int64(6)], ""));
+    instructions.buildBr(builder, skipBlock);
+
+    builder.positionAtEnd(skipBlock);
+    let skipped = instructions.buildSelect(builder, share, runtime.int32(6),
+        instructions.buildSelect(builder, prefixed, runtime.int32(4), runtime.int32(0), ""),
+        "skipped");
+    let start = memory.buildGEP(builder, runtime.int16Type, room, [skipped], "start");
+    let startCharacters = instructions.buildSub(builder, characters, skipped, "start.characters");
+    let bytes = runtime.call(narrow, [widetext.utf8CodePage(runtime), runtime.int32(0), start,
+        startCharacters, runtime.nullPointer(), runtime.int32(0), runtime.nullPointer(),
+        runtime.nullPointer()], "bytes");
+    let measureError = runtime.lastError();
+    let needed = instructions.buildSExt(builder, bytes, runtime.int64Type, "needed");
+    memory.buildStore(builder, needed, runtime.parameter(definition, 3));
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSGT(builder, bytes, runtime.int32(0), ""), fitBlock,
+        unmeasuredBlock);
+
+    builder.positionAtEnd(unmeasuredBlock);
+    runtime.call(release, [room], "");
+    instructions.buildRet(builder, measureError);
+
+    builder.positionAtEnd(fitBlock);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLE(builder, needed, capacity, "fits"), writeBlock, doneBlock);
+
+    builder.positionAtEnd(writeBlock);
+    runtime.call(narrow, [widetext.utf8CodePage(runtime), runtime.int32(0), start,
+        startCharacters, runtime.parameter(definition, 1),
+        instructions.buildTrunc(builder, capacity, runtime.int32Type, ""),
+        runtime.nullPointer(), runtime.nullPointer()], "");
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(doneBlock);
+    runtime.call(release, [room], "");
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(noMemoryBlock);
+    instructions.buildRet(builder, runtime.int32(Win32.outOfMemory));
+    return runtime.endDefinition(definition);
+}
+
+public windowsCurrentDirectory(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let currentDirectoryOf = runtime.libc("GetCurrentDirectoryW",
+        runtime.int32Type.functionType([runtime.int32Type, runtime.pointerType]));
+    let narrow = widetext.narrowFunction(runtime);
+    let allocate = runtime.malloc();
+    let release = runtime.free();
+    let definition = runtime.beginDefinition("ens_current_directory", type);
+    let builder = runtime.builder;
+    let askBlock = runtime.block(definition, "cwd.ask");
+    let narrowBlock = runtime.block(definition, "cwd.narrow");
+    let releaseBlock = runtime.block(definition, "cwd.release");
+    let unknownBlock = runtime.block(definition, "cwd.unknown");
+    let room = runtime.call(allocate, [runtime.int64(Win32.pathCharacters * 2)], "room");
+    instructions.buildCondBr(builder, runtime.isNull(room), unknownBlock, askBlock);
+
+    builder.positionAtEnd(askBlock);
+    let characters = runtime.call(currentDirectoryOf,
+        [runtime.int32(Win32.pathCharacters), room], "characters");
+    instructions.buildCondBr(builder, instructions.buildAnd(builder,
+        instructions.buildICmpSGT(builder, characters, runtime.int32(0), ""),
+        instructions.buildICmpSLT(builder, characters, runtime.int32(Win32.pathCharacters), ""),
+        "reported"), narrowBlock, releaseBlock);
+
+    builder.positionAtEnd(narrowBlock);
+    let bytes = runtime.call(narrow, [widetext.utf8CodePage(runtime), runtime.int32(0), room,
+        characters, runtime.parameter(definition, 0),
+        instructions.buildTrunc(builder, runtime.parameter(definition, 1), runtime.int32Type, ""),
+        runtime.nullPointer(), runtime.nullPointer()], "bytes");
+    runtime.call(release, [room], "");
+    instructions.buildRet(builder, instructions.buildSelect(builder,
+        instructions.buildICmpSGT(builder, bytes, runtime.int32(0), ""),
+        instructions.buildSExt(builder, bytes, runtime.int64Type, ""), runtime.int64(-1), ""));
+
+    builder.positionAtEnd(releaseBlock);
+    runtime.call(release, [room], "");
+    instructions.buildBr(builder, unknownBlock);
+
+    builder.positionAtEnd(unknownBlock);
+    instructions.buildRet(builder, runtime.int64(-1));
+    return runtime.endDefinition(definition);
+}
+
+createFileFunction(Runtime runtime) -> RuntimeFunction {
+    return runtime.libc("CreateFileW", runtime.pointerType.functionType([runtime.pointerType,
+        runtime.int32Type, runtime.int32Type, runtime.pointerType, runtime.int32Type,
+        runtime.int32Type, runtime.pointerType]));
+}
+
+closeHandleFunction(Runtime runtime) -> RuntimeFunction {
+    return runtime.libc("CloseHandle", runtime.int32Type.functionType([runtime.pointerType]));
+}
+
+// INVALID_HANDLE_VALUE, which is what a failed open answers instead of a null pointer.
+invalidHandle(Runtime runtime, Value handle) -> Value {
+    let builder = runtime.builder;
+    return instructions.buildICmpEQ(builder,
+        instructions.buildPtrToInt(builder, handle, runtime.int64Type, ""),
+        runtime.int64(-1), "invalid");
+}
+
+hasBit(Runtime runtime, Value word, long bit) -> Value {
+    let builder = runtime.builder;
+    return instructions.buildICmpNE(builder,
+        instructions.buildAnd(builder, word, runtime.int64(bit), ""), runtime.int64(0), "");
+}
+
+// One DWORD of a structure, widened so every test and sum over it is 64-bit.
+loadDoubleWord(Runtime runtime, Value base, long offset) -> Value {
+    let builder = runtime.builder;
+    return instructions.buildZExt(builder, memory.buildLoad(builder, runtime.int32Type,
+        runtime.offsetPointer(base, offset, ""), ""), runtime.int64Type, "");
+}
+
+// The 64-bit value a pair of DWORDs holds.
+unsignedPair(Runtime runtime, Value base, long highOffset, long lowOffset) -> Value {
+    let builder = runtime.builder;
+    return instructions.buildOr(builder,
+        instructions.buildShl(builder, loadDoubleWord(runtime, base, highOffset),
+            runtime.int64(32), ""),
+        loadDoubleWord(runtime, base, lowOffset), "");
+}
+
+// A FILETIME counts hundreds of nanoseconds from 1601, and its low half comes first in memory. The
+// epoch a caller wants is 11644473600 seconds further along.
+fileTimeMillis(Runtime runtime, Value base, long offset) -> Value {
+    let builder = runtime.builder;
+    return instructions.buildSub(builder,
+        instructions.buildUDiv(builder, unsignedPair(runtime, base, offset + 4, offset),
+            runtime.int64(10000), ""), runtime.int64(11644473600000), "millis");
+}
+
+wideCharacterAt(Runtime runtime, Value text, long index) -> Value {
+    let builder = runtime.builder;
+    return memory.buildLoad(builder, runtime.int16Type, memory.buildGEP(builder,
+        runtime.int16Type, text, [runtime.int64(index)], ""), "");
+}
+
+// True when the wide text carries exactly these ASCII characters from the index onwards.
+matchesWide(Runtime runtime, Value text, long index, string expected) -> Value {
+    let builder = runtime.builder;
+    let characters = expected.toBytes();
+    Value matched = runtime.int1Type.constInt(1, false);
+    for (long i = 0; i < characters.length; i++) {
+        matched = instructions.buildAnd(builder, matched,
+            instructions.buildICmpEQ(builder, wideCharacterAt(runtime, text, index + i),
+                runtime.int16Type.constInt(characters[i] as ulong, false), ""), "");
+    }
+    return matched;
+}
+
+// The three answers a metadata bridge writes back, and the 0 saying it answered.
+answerMetadata(Runtime runtime, RuntimeDefinition definition, Value kind, Value length,
+               Value millis) {
+    let builder = runtime.builder;
+    memory.buildStore(builder, kind, runtime.parameter(definition, 2));
+    memory.buildStore(builder, length, runtime.parameter(definition, 3));
+    memory.buildStore(builder, millis, runtime.parameter(definition, 4));
+    instructions.buildRet(builder, runtime.int32(0));
+}

@@ -201,8 +201,8 @@ export enum EntryKind {
 
 ```ens
 // @std.fs.entry
-// One thing inside a directory: where it is, its own name, and what it is, known without another
-// look at the disk. A symbolic link reports Symlink, never what it points to.
+// One thing inside a directory: where it is, its own name, and what it is, usually known without
+// another look at the disk. A symbolic link reports Symlink, never what it points to.
 export struct Entry {
     export const Path path;
     export const string name;
@@ -241,6 +241,7 @@ export final class TemporaryFile {
 `modifiedMillis` is the no-time-type interim; see the reminder in the TODOs.
 `removeRecursively` is included because `TemporaryDirectory`'s destructor needs the operation anyway; the name is long on purpose.
 UNC: `\server\share` arrives via `fromNative` as `//server/share`, is absolute, and `normalize` keeps a leading `//`. Drive-relative `C:foo` is unsupported and documented as relative text; `C:/foo` stays absolute.
+`Entry.kind` says "usually" because a POSIX enumeration may answer `DT_UNKNOWN`, and the library then fills that rare entry in with one metadata call.
 `entries()` promises ascending byte order of name, each directory read fully and sorted before yielding; determinism is worth the freeze.
 One `File` type for both directions; writing a read-opened file throws `IoError`.
 `metadata()` returns null for the one expected absence and throws for everything else, which keeps `exists()` a non-throwing shorthand.
@@ -415,4 +416,5 @@ The old public merge machinery stops being API; block building moves to `@std.pr
 ## @std.system (internal)
 
 One file, every `external` declaration in the library, all `public`, nothing `export`.
-Contents: the file bridges (open, read, write, close, metadata, listing, create, remove, rename, realpath), the process bridges (spawn with OS-level redirection, pipe read, wait with and without timeout, kill, release), the environment bridges (variables snapshot, argv, executable path, cwd), and `errorKindFromErrno(int)` so the errno mapping exists in exactly one place.
+Contents: the file bridges (open, read, write, close, metadata, listing, create, remove, rename, realpath), the process bridges (spawn with OS-level redirection, pipe read, wait with and without timeout, kill, release), the environment bridges (variables snapshot, argv, executable path, cwd), and `errorKindFromCode(int)` so the mapping from a platform's own error number exists in exactly one place.
+The name says code rather than errno because Windows reports Win32 error codes there, not errno.

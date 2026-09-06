@@ -1,0 +1,145 @@
+// The map from a platform's own error number to a std.fs ErrorKind. The table is a value derived
+// from the target triple, and the bridge below is that table turned into one switch.
+import BasicBlock from @ens.llvm.blocks;
+import @ens.llvm.instructions;
+import Runtime from emit.runtime;
+import RuntimeFunction from emit.runtime;
+import emit.nativeshapes;
+import List from @std.collections.list;
+
+// The ErrorKind ordinals, in the order std.fs declares its members.
+public final class ErrorKind {
+    public static const long notFound = 0;
+    public static const long permissionDenied = 1;
+    public static const long alreadyExists = 2;
+    public static const long notADirectory = 3;
+    public static const long isADirectory = 4;
+    public static const long directoryNotEmpty = 5;
+    public static const long noSpace = 6;
+    public static const long other = 7;
+
+    public static const long count = 8;
+}
+
+// The errno numbers a POSIX file call reports. Everything below 32 is the historic set Linux and
+// Darwin share, and the numbers above it are each system's own.
+public final class Errno {
+    public static const long notOwner = 1;
+    public static const long noEntry = 2;
+    public static const long accessDenied = 13;
+    public static const long exists = 17;
+    public static const long notADirectory = 20;
+    public static const long isADirectory = 21;
+    public static const long noSpace = 28;
+    public static const long readOnlyFileSystem = 30;
+
+    public static const long linuxNotEmpty = 39;
+    public static const long linuxQuotaExceeded = 122;
+
+    public static const long darwinNotEmpty = 66;
+    public static const long darwinQuotaExceeded = 69;
+}
+
+// The Win32 error codes a file call reports. Nothing here means IsADirectory, which Win32 has no
+// code for and answers as ERROR_ACCESS_DENIED instead.
+public final class Win32Error {
+    public static const long fileNotFound = 2;
+    public static const long pathNotFound = 3;
+    public static const long accessDenied = 5;
+    public static const long invalidDrive = 15;
+    public static const long writeProtected = 19;
+    public static const long sharingViolation = 32;
+    public static const long lockViolation = 33;
+    public static const long handleDiskFull = 39;
+    public static const long badNetworkPath = 53;
+    public static const long fileExists = 80;
+    public static const long diskFull = 112;
+    public static const long directoryNotEmpty = 145;
+    public static const long badPathName = 161;
+    public static const long alreadyExists = 183;
+    public static const long notADirectory = 267;
+}
+
+// One error number and the kind it means.
+public final class ErrorMapping {
+    public const long code;
+    public const long kind;
+
+    public constructor(this.code, this.kind);
+}
+
+// Every error number this target's file bridges report that means more than that something failed.
+// A number missing from the answer is an Other, so nothing has to be listed twice.
+public errorMappings(string targetTriple) -> ErrorMapping[] {
+    if (nativeshapes.onWindowsTriple(targetTriple)) {
+        return windowsMappings();
+    }
+    return posixMappings(nativeshapes.onDarwinTriple(targetTriple));
+}
+
+windowsMappings() -> ErrorMapping[] {
+    let mappings = new List<ErrorMapping>();
+    mappings.push(new ErrorMapping(Win32Error.fileNotFound, ErrorKind.notFound));
+    mappings.push(new ErrorMapping(Win32Error.pathNotFound, ErrorKind.notFound));
+    mappings.push(new ErrorMapping(Win32Error.invalidDrive, ErrorKind.notFound));
+    mappings.push(new ErrorMapping(Win32Error.badNetworkPath, ErrorKind.notFound));
+    mappings.push(new ErrorMapping(Win32Error.badPathName, ErrorKind.notFound));
+    mappings.push(new ErrorMapping(Win32Error.accessDenied, ErrorKind.permissionDenied));
+    mappings.push(new ErrorMapping(Win32Error.writeProtected, ErrorKind.permissionDenied));
+    mappings.push(new ErrorMapping(Win32Error.sharingViolation, ErrorKind.permissionDenied));
+    mappings.push(new ErrorMapping(Win32Error.lockViolation, ErrorKind.permissionDenied));
+    mappings.push(new ErrorMapping(Win32Error.fileExists, ErrorKind.alreadyExists));
+    mappings.push(new ErrorMapping(Win32Error.alreadyExists, ErrorKind.alreadyExists));
+    mappings.push(new ErrorMapping(Win32Error.notADirectory, ErrorKind.notADirectory));
+    mappings.push(new ErrorMapping(Win32Error.directoryNotEmpty, ErrorKind.directoryNotEmpty));
+    mappings.push(new ErrorMapping(Win32Error.handleDiskFull, ErrorKind.noSpace));
+    mappings.push(new ErrorMapping(Win32Error.diskFull, ErrorKind.noSpace));
+    return mappings.toArray();
+}
+
+posixMappings(bool onDarwin) -> ErrorMapping[] {
+    let mappings = new List<ErrorMapping>();
+    mappings.push(new ErrorMapping(Errno.noEntry, ErrorKind.notFound));
+    mappings.push(new ErrorMapping(Errno.notOwner, ErrorKind.permissionDenied));
+    mappings.push(new ErrorMapping(Errno.accessDenied, ErrorKind.permissionDenied));
+    mappings.push(new ErrorMapping(Errno.readOnlyFileSystem, ErrorKind.permissionDenied));
+    mappings.push(new ErrorMapping(Errno.exists, ErrorKind.alreadyExists));
+    mappings.push(new ErrorMapping(Errno.notADirectory, ErrorKind.notADirectory));
+    mappings.push(new ErrorMapping(Errno.isADirectory, ErrorKind.isADirectory));
+    mappings.push(new ErrorMapping(Errno.noSpace, ErrorKind.noSpace));
+    if (onDarwin) {
+        mappings.push(new ErrorMapping(Errno.darwinNotEmpty, ErrorKind.directoryNotEmpty));
+        mappings.push(new ErrorMapping(Errno.darwinQuotaExceeded, ErrorKind.noSpace));
+    } else {
+        mappings.push(new ErrorMapping(Errno.linuxNotEmpty, ErrorKind.directoryNotEmpty));
+        mappings.push(new ErrorMapping(Errno.linuxQuotaExceeded, ErrorKind.noSpace));
+    }
+    return mappings.toArray();
+}
+
+// i32 ens_fs_error_kind(i32 code): the ErrorKind the platform's own error number means, from 0 for
+// NotFound to 7 for Other. Every number this target's file calls do not report answers 7.
+public errorKindRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int32Type.functionType([runtime.int32Type]);
+    let known = runtime.existing("ens_fs_error_kind", type);
+    if (known != null) {
+        return known;
+    }
+    let mappings = errorMappings(runtime.targetTriple);
+    let definition = runtime.beginDefinition("ens_fs_error_kind", type);
+    let builder = runtime.builder;
+    let answers = new BasicBlock[ErrorKind.count];
+    for (long kind = 0; kind < answers.length; kind++) {
+        answers[kind] = runtime.block(definition, "kind.{kind}");
+    }
+    let chosen = instructions.buildSwitch(builder, runtime.parameter(definition, 0),
+        answers[ErrorKind.other], mappings.length as uint);
+    for (let mapping in mappings) {
+        instructions.addCase(chosen, runtime.int32(mapping.code), answers[mapping.kind]);
+    }
+    for (long kind = 0; kind < answers.length; kind++) {
+        builder.positionAtEnd(answers[kind]);
+        instructions.buildRet(builder, runtime.int32(kind));
+    }
+    return runtime.endDefinition(definition);
+}

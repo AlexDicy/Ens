@@ -1,14 +1,54 @@
-// The std.system bridges that ask about one path. Windows answers through the wide entry points,
-// so a path outside the system code page still reaches the file system. Elsewhere opening the path
-// as a directory is what tells the two kinds apart, which spares this code a 'struct stat'.
+// The bridges that ask about one path. Windows answers through the wide entry points, so a path
+// outside the system code page still reaches the file system.
 import TypeRef from @ens.llvm.types;
 import @ens.llvm.instructions;
-import @ens.llvm.memory;
 import Runtime from emit.runtime;
 import RuntimeFunction from emit.runtime;
 import emit.directories;
-import emit.system;
+import emit.filesystemposix;
+import emit.filesystemwindows;
 import emit.widetext;
+
+// i32 ens_fs_metadata(ptr path, i32 followLinks, ptr kind, ptr length, ptr modifiedMillis): 0 with
+// the three answers written, or the platform's own error number with none of them written. The kind
+// is 1 for a file, 2 for a directory, 3 for a symbolic link and 4 for anything else, so 0 is never
+// an answer. A directory's length is 0 on every platform, and the time is milliseconds since
+// 1970-01-01 UTC. A followLinks of 1 answers for what a link points to, and 0 answers for the link
+// itself, which is what keeps a walk over a tree of links finite.
+public metadataRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type,
+        runtime.pointerType, runtime.pointerType, runtime.pointerType]);
+    let known = runtime.existing("ens_fs_metadata", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        return filesystemwindows.windowsMetadata(runtime, type);
+    }
+    if (runtime.onDarwin()) {
+        return filesystemposix.darwinMetadata(runtime, type);
+    }
+    return filesystemposix.linuxMetadata(runtime, type);
+}
+
+// i32 ens_fs_real_path(ptr path, ptr buffer, i64 capacity, ptr needed): 0 when the path was
+// resolved, or the platform's own error number. A 0 answer does not by itself mean the text was
+// written. `needed` always holds the byte count the answer takes, and the buffer is left untouched
+// whenever that count is above `capacity`, so a caller compares the two on every call and asks
+// again with the room it was told. The text is the operating system's own and carries no
+// terminator.
+public realPathRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType,
+        runtime.int64Type, runtime.pointerType]);
+    let known = runtime.existing("ens_fs_real_path", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        return filesystemwindows.windowsRealPath(runtime, type);
+    }
+    return filesystemposix.posixRealPath(runtime, type);
+}
 
 // i32 ens_path_kind(ptr path): 0 when nothing is there, 1 for a file, 2 for a directory.
 public pathKindRuntime(Runtime runtime) -> RuntimeFunction {
@@ -123,8 +163,7 @@ posixCreateDirectory(Runtime runtime, TypeRef type) -> RuntimeFunction {
 
     // EEXIST.
     builder.positionAtEnd(refusedBlock);
-    let why = memory.buildLoad(builder, runtime.int32Type,
-        runtime.call(system.errnoLocation(runtime), [], "errno.slot"), "why");
+    let why = runtime.lastError();
     instructions.buildRet(builder, instructions.buildSelect(builder,
         instructions.buildICmpEQ(builder, why, runtime.int32(17), ""), runtime.int32(1),
         runtime.int32(-1), ""));

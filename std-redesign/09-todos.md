@@ -11,7 +11,21 @@ A subclass method whose name a private base field uses is still refused, since `
 ## C8 and C9
 
 OS-level redirection for `run(captureOutput: true)`, wait-with-timeout, and kill in the native bridges.
-Every failure from the standard streams carries `ErrorKind.Other`, because telling `Closed` apart needs errno; C9's `errorKindFromErrno` lets `io.ens` and the buffered wrappers name the kind, and the message carries the detail until then.
+Every failure from the standard streams carries `ErrorKind.Other`, because telling `Closed` apart needs errno; C9's `errorKindFromCode` lets `io.ens` and the buffered wrappers name the kind, and the message carries the detail until then.
+
+## Limits the C7b bridges accept
+
+A Linux target reads metadata through the raw `statx` system call, which needs kernel 4.11 or newer.
+There is no fallback: an older kernel answers `ENOSYS`, which surfaces as an ordinary `FileSystemError` of kind `Other`.
+Should that floor ever matter, the fallback is `newfstatat` with one `struct stat` layout per architecture, which is what `statx` was chosen to avoid.
+An architecture the compiler can target but whose `statx` number is unknown answers `ENOSYS` the same way, rather than reaching another call under a guessed number.
+
+Win32 has no error code meaning `IsADirectory`, so a call that is refused a directory reports `PermissionDenied` on Windows and `IsADirectory` elsewhere.
+
+The emitter tests that retarget a module prove a platform's half builds well-formed IR, and prove nothing about whether its numbers are true.
+A negative control settled it.
+Moving `Statx.modeOffset` from 28 to 29 in a disposable copy of the tree left every retarget test passing, while a wrong return type failed loudly.
+So the verified triples are that many well-formed halves rather than that many checked layouts, and only `tests/fs_bridges` running on a host of that platform can say whether an offset or a system-call number is right.
 
 ## Phase D
 
