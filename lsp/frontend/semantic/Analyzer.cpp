@@ -1674,6 +1674,13 @@ void Analyzer::resolveInterfaceBase(const ast::InterfaceDecl& id, StructInfo* si
     auto baseName = id.baseInterfaceName();
     if (!baseName) return;
     Type* baseT = typeCtx.lookupNamedType(modulePath_, *baseName);
+    // An interface from another module is a name this one imported rather than one it
+    // declares, so the extended interface is looked for in scope as well.
+    if (!baseT && globalScope) {
+        if (Symbol* sym = globalScope->lookupLocal(*baseName)) {
+            if (sym->type && sym->type->isInterface()) baseT = sym->type;
+        }
+    }
     if (!baseT || !baseT->isInterface() || !baseT->structInfo) return;
     auto baseArgs = id.baseTypeArguments();
     if (baseT->structInfo->isTemplate) {
