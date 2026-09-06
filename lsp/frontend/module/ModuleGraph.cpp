@@ -559,6 +559,10 @@ bool analyzeModuleGraph(std::vector<std::unique_ptr<Module>>& modules,
     sharedCtx.materializeInstantiations();
     sharedCtx.refreshInstantiationInheritance();
 
+    // Every module's signatures are resolved now, so a struct's 'override' markers can be
+    // judged against interfaces declared in another module.
+    for (auto& m : modules) m->analyzer->checkStructConformanceMarkers();
+
     // Every module's struct fields are resolved now, so a by-value containment
     // cycle can be detected across module boundaries.
     for (auto& m : modules) m->analyzer->checkStructValueCycles();

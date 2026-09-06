@@ -2,7 +2,29 @@
 // writes, methods over a receiver address, and the field-wise ARC a struct holding a string needs.
 // The goldens pin where a field's reference changes hands.
 import @std.testing;
+import MemoryFileLoader from support;
 import support;
+
+// A program whose interface, conforming struct, and bounded generic function are all one file.
+conformanceProgram() -> string {
+    return "interface Measured \{\n"
+        + "    size() -> long;\n"
+        + "\}\n"
+        + "struct Box implements Measured \{\n"
+        + "    protected long count;\n"
+        + "\n"
+        + "    protected override size() -> long \{\n"
+        + "        return this.count;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "sizeOf<T: Measured>(T value) -> long \{\n"
+        + "    return value.size();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Box box = \{count: 3\};\n"
+        + "    return sizeOf<Box>(box) as int - 3;\n"
+        + "\}\n";
+}
 
 test "a literal fills the written fields then the omitted ones from their defaults" {
     let dumped = try support.loweredDump(
@@ -369,4 +391,73 @@ test "an optional struct field compares behind a presence guard" {
         "the comparison should branch on presence: {dumped}");
     try testing.assertTrue(dumped.indexOf("safepayload") >= 0,
         "the present payloads should be parked in scratch slots: {dumped}");
+}
+
+test "a call through a generic bound reaches the struct's own method directly" {
+    let analysis = try support.analyzeMain(conformanceProgram());
+    let dumped = try support.loweredLoadedSymbolDump(analysis, "main$sizeOf__main_Box__");
+    try testing.assertTrue(dumped.indexOf("call @main$Box$size(this %") > 0,
+        "the instance at 'Box' calls the struct's own method: {dumped}");
+    try testing.assertTrue(dumped.indexOf("dispatch") < 0,
+        "nothing looks the target up in a dispatch table: {dumped}");
+}
+
+test "a struct that conforms gets no type descriptor and no method table" {
+    let analysis = try support.analyzeMain(conformanceProgram());
+    let program = try support.lowerLoadedProgram(analysis);
+    let box = try support.structNamed(analysis, "Box");
+    try testing.assertTrue(program.plans.planFor(box) == null,
+        "a struct carries no runtime type identity, so nothing plans a descriptor for it");
+}
+
+test "a for-in over an Iterable struct calls makeIterator directly over the receiver address" {
+    let loader = new MemoryFileLoader();
+    loader.add("/stdlib/std/src/collections/iterator.ens",
+        "export interface Iterator<T> \{\n"
+        + "    next() -> T?;\n"
+        + "\}\n"
+        + "export interface Iterable<T> \{\n"
+        + "    makeIterator() -> Iterator<T>;\n"
+        + "\}\n");
+    loader.add("/src/main.ens",
+        "import Iterable from @std.collections.iterator;\n"
+        + "import Iterator from @std.collections.iterator;\n"
+        + "class CountUp implements Iterator<int> \{\n"
+        + "    int current;\n"
+        + "    int limit;\n"
+        + "    protected constructor(this.current, this.limit);\n"
+        + "    protected override next() -> int? \{\n"
+        + "        if (this.current > this.limit) \{\n"
+        + "            return null;\n"
+        + "        \}\n"
+        + "        int value = this.current;\n"
+        + "        this.current = this.current + 1;\n"
+        + "        return value;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "struct Range implements Iterable<int> \{\n"
+        + "    protected int low;\n"
+        + "    protected int high;\n"
+        + "    protected override makeIterator() -> Iterator<int> \{\n"
+        + "        return new CountUp(this.low, this.high);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    int total = 0;\n"
+        + "    Range range = \{low: 1, high: 3\};\n"
+        + "    for (let n in range) \{\n"
+        + "        total = total + n;\n"
+        + "    \}\n"
+        + "    return total;\n"
+        + "\}\n");
+    let analysis = try support.analyzeLoaded(loader);
+    let dumped = try support.loweredLoadedDump(analysis, "main");
+    try testing.assertTrue(dumped.indexOf("call @main$Range$makeIterator(this %") > 0,
+        "the walk opens with a direct call to the struct's own method: {dumped}");
+    try testing.assertTrue(dumped.indexOf("slot_addr $1: &Range  ; range") >= 0,
+        "the receiver is the address of the struct's storage: {dumped}");
+    try testing.assertTrue(dumped.indexOf("itable[Iterable<int>") < 0,
+        "nothing consults a method table for the struct: {dumped}");
+    try testing.assertTrue(dumped.indexOf("itable[Iterator<int>, 0]") >= 0,
+        "the iterator it answers still dispatches as a class: {dumped}");
 }

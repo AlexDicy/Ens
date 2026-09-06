@@ -790,10 +790,7 @@ void Parser::parseStructOrClassDecl(SyntaxKind nodeKind, SyntaxKind keywordKind)
         expect(SyntaxKind::Identifier, "base class name after 'extends'");
         if (at(SyntaxKind::Lt)) parseTypeArgList();
     }
-    if (at(SyntaxKind::KwImplements)) {
-        if (!isClass) reportAtCurrent("Structs cannot implement interfaces; only classes can use 'implements'");
-        parseImplementsClause();
-    }
+    if (at(SyntaxKind::KwImplements)) parseImplementsClause();
     expect(SyntaxKind::LBrace, "'{'");
     builder.startNode(SyntaxKind::MemberList);
     while (!at(SyntaxKind::RBrace) && !atEnd()) {

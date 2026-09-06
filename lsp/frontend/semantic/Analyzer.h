@@ -42,6 +42,10 @@ public:
     void resolveSignatures();
     void bindTypeImports(const ModuleResolver& resolver);
     void bindValueImports(const ModuleResolver& resolver);
+    // Validates the `override` marker on every struct member of this module against the
+    // interfaces the struct implements. Runs after all modules resolved their signatures,
+    // because an implemented interface may be declared in another module.
+    void checkStructConformanceMarkers();
     // Reports every struct declared in this module that contains itself by value,
     // possibly through structs from other modules. Runs after all modules' struct
     // fields are resolved and generic instantiations are materialized.
@@ -243,6 +247,9 @@ private:
     void checkHashMethodSignature(const ast::FuncDecl& fn, Symbol* sym, bool isConstructor);
     void checkEqualsMethodSignature(const ast::FuncDecl& fn, Symbol* sym, bool isConstructor);
     void checkToStringMethodSignature(const ast::FuncDecl& fn, Symbol* sym, bool isConstructor);
+    Type* interfaceDeclaringMethod(StructInfo* si, const std::u16string& memberName, Symbol* sym,
+                                   bool bySignature);
+    void resolveImplementsClause(StructInfo* si, const std::vector<ast::TypeReference>& refs);
     void checkStructOverrideMarker(const ast::FuncDecl& fn, const Type* owner,
                                    const std::u16string& memberName, Symbol* sym,
                                    bool isConstructor, const char* behavior);

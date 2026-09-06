@@ -20,6 +20,7 @@ import lower.optionals;
 import lower.ownership;
 import lower.statements;
 import lower.stores;
+import lower.structs;
 import support.primitives;
 
 // One resolved iteration method: the entry to call and how to dispatch it.
@@ -33,7 +34,8 @@ final class IterationCall {
 }
 
 public lowerForEach(LoweringContext lowering, ForEachStatementNode loop, Type iterableType) {
-    if (!primitives.isClassLike(iterableType) || primitives.isOptionalType(iterableType)) {
+    bool walkable = primitives.isClassLike(iterableType) || primitives.isStructType(iterableType);
+    if (!walkable || primitives.isOptionalType(iterableType)) {
         lowering.unsupported("iterating '{types.display(iterableType)}'", loop.span());
         return;
     }
@@ -65,7 +67,7 @@ public lowerForEach(LoweringContext lowering, ForEachStatementNode loop, Type it
         return;
     }
     let builder = lowering.builder();
-    long receiver = classes.borrowedReference(lowering, loop.iterable(), iterableType);
+    long receiver = iterationReceiver(lowering, loop, iterableType);
     if (receiver < 0) {
         return;
     }
@@ -110,6 +112,16 @@ public lowerForEach(LoweringContext lowering, ForEachStatementNode loop, Type it
         return;
     }
     builder.moveTo(exitBlock);
+}
+
+// What an iteration call runs over. A class or interface value is the reference itself, while a
+// struct's receiver is the address of the storage it sits in, materialized into a slot when the
+// expression names none of its own.
+iterationReceiver(LoweringContext lowering, ForEachStatementNode loop, Type iterableType) -> long {
+    if (primitives.isStructType(iterableType)) {
+        return structs.addressOf(lowering, loop.iterable(), iterableType);
+    }
+    return classes.borrowedReference(lowering, loop.iterable(), iterableType);
 }
 
 // The 'next()' result is read at the contract's return type, since the resolved override may
@@ -188,9 +200,35 @@ isIteratorContract(Type candidate) -> bool {
 
 // Finds one zero-parameter iteration method on the receiver's type and decides its dispatch: an
 // interface receiver reads the method table entry, a class receiver takes the vtable slot its
-// override discipline assigned, or calls directly when nothing forces the indirection.
+// override discipline assigned, or calls directly when nothing forces the indirection. A struct
+// carries no runtime type identity, so its own method is always the direct call.
 resolveCall(LoweringContext lowering, Type receiverType, string name, Span span)
         -> IterationCall? {
+    let structType = primitives.structOf(receiverType);
+    if (structType != null) {
+        if (!lowering.supportsValueType(structType)) {
+            lowering.unsupported("iterating '{types.display(receiverType)}'", span);
+            return null;
+        }
+        let found = zeroArgumentMethod(structType, name);
+        if (found == null) {
+            lowering.internalError("'{types.display(receiverType)}' declares no '{name}()' to "
+                + "iterate with", span);
+            return null;
+        }
+        let info = lowering.index().infoFor(found.signature());
+        if (info == null) {
+            lowering.internalError("the iteration method "
+                + "'{types.display(receiverType)}.{name}' resolves to no indexed function",
+                span);
+            return null;
+        }
+        if (!calls.supportedCallee(lowering, info,
+                "iteration method '{types.display(receiverType)}.{name}'", span)) {
+            return null;
+        }
+        return new IterationCall(info, found, -1, null);
+    }
     let interfaceType = primitives.interfaceOf(receiverType);
     if (interfaceType != null) {
         Method? found = null;

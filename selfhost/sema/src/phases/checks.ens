@@ -116,6 +116,7 @@ class ModuleChecks {
         this.checkFieldInitialization();
         this.checkInterfaceRedeclarations();
         this.checkPrimitiveConformances();
+        this.checkStructConformances();
         this.checkDeclaredThrows();
         this.checkVisibilityLeaks();
     }
@@ -220,7 +221,7 @@ class ModuleChecks {
             if (nameToken == null) {
                 continue;
             }
-            let answered = this.requirementAnswered(binding, declared);
+            let answered = this.requirementAnswered(binding.interfaces(), declared);
             if (declared.isOverride()) {
                 if (answered == null) {
                     this.reporter.report("Method '{declared.name()}' of the '{binding.name()}' "
@@ -238,9 +239,140 @@ class ModuleChecks {
         }
     }
 
+    // Every method an interface a struct implements requires must be a method of that struct,
+    // with a matching signature and the 'override' marker. The interfaces the implemented one
+    // extends require their methods too. Whole-program, because the interface may be declared in
+    // another module.
+    checkStructConformances() {
+        for (long n = 0; n < this.structNodes.length(); n++) {
+            let node = this.structNodes.get(n);
+            let structType = this.structFor(node);
+            if (structType == null) {
+                continue;
+            }
+            Span at = node.name().span();
+            let checked = new Set<Type>();
+            for (let implemented in structType.interfaces()) {
+                for (let level in types.interfaceLadderOf(implemented)) {
+                    if (!checked.add(level)) {
+                        continue;
+                    }
+                    this.checkStructLevelSatisfied(structType, implemented, level, at);
+                }
+            }
+            this.checkStructOverrideMarkers(structType, node);
+        }
+    }
+
+    // One rung of an implemented interface's ladder. A struct's own members are its whole
+    // answer, because a struct has no base to inherit a requirement from.
+    checkStructLevelSatisfied(StructType structType, Type implemented, Type level, Span at) {
+        let required = types.methodsOf(level);
+        if (required == null) {
+            return;
+        }
+        string interfaceName = types.display(implemented);
+        string levelName = types.display(level);
+        for (long i = 0; i < required.length(); i++) {
+            let wanted = required.get(i);
+            string requiredBy = "";
+            if (level != implemented) {
+                requiredBy = ", required by '{levelName}', which '{interfaceName}' extends";
+            }
+            let provided = members.findSameSignature(structType.methods(), wanted.name(),
+                wanted.signature());
+            if (provided == null) {
+                this.reporter.report("Struct '{structType.name()}' implements "
+                    + "'{interfaceName}' but does not provide "
+                    + "'{layout.methodDisplay(wanted)}'{requiredBy}. Declare the method here, "
+                    + "or stop implementing '{interfaceName}'.", at);
+                continue;
+            }
+            if (provided.isConditional()) {
+                this.reporter.report("Struct '{structType.name()}' implements "
+                    + "'{interfaceName}' but provides '{layout.methodDisplay(wanted)}'"
+                    + "{requiredBy} only conditionally; an interface requirement must exist on "
+                    + "every instantiation, so a conditional member cannot satisfy it. Remove "
+                    + "the '<...>' constraint list from '{wanted.name()}', or stop implementing "
+                    + "'{interfaceName}'.", at);
+                continue;
+            }
+            if (layout.narrowsReturnShape(wanted.signature(), provided.signature())) {
+                this.reporter.report("Method '{wanted.name()}' of struct "
+                    + "'{structType.name()}' returns "
+                    + "'{types.display(provided.signature().returnType())}', but interface "
+                    + "'{levelName}' requires "
+                    + "'{types.display(wanted.signature().returnType())}', "
+                    + layout.narrowedReturnAdvice(wanted.signature().returnType()) + ".", at);
+            } else if (!layout.overrideCompatible(wanted.signature(), provided.signature())) {
+                this.reporter.report("Method '{wanted.name()}' of struct "
+                    + "'{structType.name()}' does not match '{layout.methodDisplay(wanted)}' "
+                    + "declared in interface '{levelName}'.", at);
+            }
+            if (wanted.isNoreturn() && !provided.isNoreturn()) {
+                this.reporter.report("Method '{wanted.name()}' of struct "
+                    + "'{structType.name()}' must be marked 'noreturn' because interface "
+                    + "'{levelName}' declares it 'noreturn'; callers rely on it never "
+                    + "returning.", at);
+            }
+            // A bound the struct satisfies is written wherever the struct is nameable, and the
+            // generic body behind that bound calls the requirement, so the implementation has
+            // to reach as far as the struct does.
+            Visibility wantedReach = types.followedMemberVisibility(structType.visibility());
+            if (provided.visibility() == Visibility.Private
+                    || types.visibilityTier(provided.visibility())
+                        < types.visibilityTier(wantedReach)) {
+                this.reporter.report("Method '{wanted.name()}' of struct "
+                    + "'{structType.name()}' is "
+                    + "{types.visibilityWord(provided.visibility())}, but it provides "
+                    + "'{layout.methodDisplay(wanted)}' required by '{interfaceName}', and a "
+                    + "generic body reaching '{structType.name()}' through "
+                    + "'{interfaceName}' calls it, so it must reach as far as "
+                    + "'{structType.name()}' itself. Mark it "
+                    + "'{types.visibilityWord(wantedReach)}'.", at);
+            }
+        }
+    }
+
+    // A struct member marked 'override' has to answer something, either a built-in behavior of
+    // the struct or a method an implemented interface declares, and one that answers a
+    // requirement has to carry the marker.
+    checkStructOverrideMarkers(StructType structType, StructDeclarationNode node) {
+        let body = node.body();
+        for (long i = 0; i < body.membersCount(); i++) {
+            let member = body.members(i);
+            if (!(member is FunctionDeclarationNode)) {
+                continue;
+            }
+            let declared = members.methodDeclaredBy(structType.methods(), member.green());
+            if (declared == null || declared.isConstructor()) {
+                continue;
+            }
+            let nameToken = member.name();
+            if (nameToken == null) {
+                continue;
+            }
+            let behavior = members.builtinBehaviorReplaced(structType, declared.name(),
+                declared.signature(), declared.isOverride());
+            let answered = this.requirementAnswered(structType.interfaces(), declared);
+            if (declared.isOverride()) {
+                if (behavior == null && answered == null) {
+                    this.reporter.report(nothingToOverrideMessage(structType, declared),
+                        nameToken.span());
+                }
+                continue;
+            }
+            if (behavior == null && answered != null) {
+                this.reporter.report("Method '{declared.name()}' of struct "
+                    + "'{structType.name()}' implements a method declared in interface "
+                    + "'{answered}'; mark it 'override'.", nameToken.span());
+            }
+        }
+    }
+
     // The interface whose requirement this member answers, as it reads in a diagnostic, or null.
-    requirementAnswered(PrimitiveBinding binding, Method declared) -> string? {
-        for (let implemented in binding.interfaces()) {
+    requirementAnswered(Type[] interfaces, Method declared) -> string? {
+        for (let implemented in interfaces) {
             for (let level in types.interfaceLadderOf(implemented)) {
                 let methods = types.methodsOf(level);
                 if (methods == null) {
@@ -895,6 +1027,20 @@ class ModuleChecks {
             + "'{worst.name()}', which is {notNameablePhrase(worst)}. Mark '{worst.name()}' "
             + "as '{needed}', or lower the declaration.", at);
     }
+}
+
+// Why a struct member marked 'override' replaces and implements nothing. A struct that declares
+// conformances is told they were searched too.
+nothingToOverrideMessage(StructType structType, Method declared) -> string {
+    if (structType.interfaces().length == 0) {
+        return "Method '{declared.name()}' of '{structType.name()}' is marked 'override' but "
+            + "structs do not inherit, so there is nothing to override; only 'toString', "
+            + "'hash', and 'equals' replace a built-in behavior of a struct. Remove 'override'.";
+    }
+    return "Method '{declared.name()}' of '{structType.name()}' is marked 'override' but no "
+        + "interface that '{structType.name()}' implements declares '{declared.name()}', and a "
+        + "struct inherits nothing; only 'toString', 'hash', and 'equals' replace a built-in "
+        + "behavior of a struct. Remove 'override'.";
 }
 
 // The widest scope from which a class can legally be subclassed, which is the leakage floor

@@ -73,9 +73,20 @@ Within each milestone the std change and its consumer updates are one commit, so
   The streams need `lazy const`, because `io.in()` answers one shared reader, and they need the three standard-handle bridges, because the seed compiles `libs/std/src/system.ens` when it builds the compiler and would emit a reference to a runtime symbol it cannot synthesize.
   So the order is the streams, the `lazy const` feature and its seed, the bridges in the compiler and their seed, then `io.ens` with the library bridges, then the prelude flip.
 - C6: `@std.text` rewritten: the `string` binding replaces `@std.text.strings`, `StringBuilder` loses `appendByte`, `parse` lands; consumers move from `strings.split(text, sep)` to `text.split(sep)`.
-- C7: `@std.fs` written: `Path` absorbs `@std.path` as methods, `File` moves onto the stream contracts, metadata, entries, walk, temp guards.
-- C8: `@std.process` and `@std.environment` written: `run`/`runShell`/`spawn`, `ExitStatus`, `Environment`; the old `run`/`runCaptured`/`start` family keeps working until D1.
-- C9: the internal `@std.system` native module: every `external` declaration moves in, `errorKindFromErrno` lands, and the old bridges are aliased from it so C7 and C8 could build on it retroactively if ordering demands.
+- C7: `@std.fs` and `@std.environment` written: `Path` absorbs `@std.path` as methods, `File` moves onto the stream contracts, metadata, entries, walk, the temporary guards, and the environment snapshot.
+  `@std.environment` moves here from C8, because `Path.absolute()` reads `currentDirectory()`, `fromNative` takes a `Platform`, and the temporary guards find their root among the environment variables.
+  Two prerequisites land before the library, and one seed carries both.
+  C7a: a struct may declare `implements`, naming any interface, checked at the declaration, satisfying a generic bound as a direct call and never carrying an interface value, which is the rule primitive bindings already live under (ratified 2026-09-06).
+  C7b: the native bridges the module needs, since `ens_path_kind` answers a kind alone: metadata carrying length and modification time, a kind that does not follow a symbolic link, `realPath`, `copyTo`, and the mapping from a platform's own error number to an `ErrorKind`.
+  That mapping moves here from C9, because `FileSystemError.kind` has to tell `NotFound` from `PermissionDenied`, `DirectoryNotEmpty` and the rest, and nothing but the platform's error number does.
+  It is named `errorKindFromCode`, because a Win32 error is not an errno, and its table is a pure function of the target triple so every platform's mapping is unit-tested from any host.
+  A Linux target reads metadata through the raw `statx` system call (ratified 2026-09-06), since one kernel-defined layout serves every architecture and every C library, and a wrong system-call number fails loudly where a wrong field offset would not; macOS keeps libc `stat`, whose layout is documented and stable.
+  Three corrections the design pass made: copying a file is an Ens loop over the streams with only the permission bits bridged, there is no bridge for the system's own error text since it is localized and a fixture could then not pin the module's messages, and a bridge answers through `out` parameters rather than an array, which spares `exists()` an allocation.
+  Two bridges the plan had missed: a wide current-directory call, since the narrow one loses a directory outside the system code page and `Path.absolute()` reads it, and an exclusive-create open mode, without which `TemporaryFile.create()` cannot claim a name.
+  C7c: the two modules and every consumer in one commit, with `Path` carried through the compiler's own signatures rather than built at each call, so the compiler uses the type it ships.
+- C8: `@std.process` written: `run`/`runShell`/`spawn`, `ExitStatus`, `ChildProcess`; the old `run`/`runCaptured`/`start` family keeps working until D1.
+  Its own native bridges land with it, capture through pipes, wait with a timeout, and kill, since a bridge written before the library that uses it is a bridge written blind.
+- C9: the internal `@std.system` native module: every `external` declaration moves in, and the old bridges are aliased from it so C7 and C8 could build on it retroactively if ordering demands.
 
 Consumer migration inside C means the selfhost compiler, build, cli, and lsp sources plus `tests/` fixtures, area by area, in the same commits as their std milestone.
 

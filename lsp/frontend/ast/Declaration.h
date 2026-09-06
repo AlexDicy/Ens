@@ -214,6 +214,8 @@ public:
     std::optional<std::u16string> nameText() const;
     std::optional<TypeParamList> typeParamList() const;
     std::vector<TypeParam> typeParams() const;
+    std::optional<ImplementsClause> implementsClause() const;
+    std::vector<TypeReference> implementedInterfaceRefs() const;
     std::optional<MemberList> memberList() const;
     std::vector<FieldDecl> fields() const;
     std::vector<FuncDecl> methods() const;

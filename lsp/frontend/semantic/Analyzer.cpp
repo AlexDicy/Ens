@@ -1457,6 +1457,16 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
 
     for (auto& sd : structs) {
         Type* t = analysis.typeOf(sd.node.greenNode());
+        if (!t || !t->structInfo) continue;
+        auto ifaceRefs = sd.implementedInterfaceRefs();
+        if (ifaceRefs.empty()) continue;
+        size_t tpCount = enterTemplateScope(t->structInfo, sd.typeParams());
+        resolveImplementsClause(t->structInfo, ifaceRefs);
+        popTypeParams(tpCount);
+    }
+
+    for (auto& sd : structs) {
+        Type* t = analysis.typeOf(sd.node.greenNode());
         if (!t) continue;
         size_t tpCount = t->structInfo ? enterTemplateScope(t->structInfo, sd.typeParams()) : 0;
         for (auto& f : sd.fields()) {
@@ -1830,35 +1840,7 @@ void Analyzer::resolveClassBases(const ast::SourceFile& file) {
         auto ifaceRefs = cd.implementedInterfaceRefs();
         if (!ifaceRefs.empty()) {
             size_t tpCount = enterTemplateScope(si, cd.typeParams());
-            for (auto& tr : ifaceRefs) {
-                Type* it = resolveTypeReference(tr);
-                if (it->isError()) continue;
-                if (it->isOptional() || it->isArray()) {
-                    errorAtNode(tr.node, "'implements' takes plain interface names; '" +
-                        it->toString() + "' is not an interface type.");
-                    continue;
-                }
-                if (!it->isInterface()) {
-                    if (it->isClass()) {
-                        errorAtNode(tr.node, "'" + it->toString() + "' is a class, not an "
-                            "interface; use 'extends " + it->toString() + "' for a base class.");
-                    } else {
-                        errorAtNode(tr.node, "'" + it->toString() + "' is not an interface; "
-                            "'implements' takes interfaces only.");
-                    }
-                    continue;
-                }
-                bool dup = false;
-                for (Type* prev : si->implementedInterfaces) {
-                    if (prev == it) { dup = true; break; }
-                }
-                if (dup) {
-                    errorAtNode(tr.node, "Interface '" + it->toString() +
-                        "' is listed more than once in the 'implements' clause.");
-                    continue;
-                }
-                si->implementedInterfaces.push_back(it);
-            }
+            resolveImplementsClause(si, ifaceRefs);
             popTypeParams(tpCount);
         }
     }
@@ -2018,25 +2000,6 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
         si->fields.push_back(std::move(fi));
     }
 
-    // Interface methods a locally-declared method may implement, the interfaces the
-    // implemented ones extend included; used to validate 'override' markers the same way
-    // base-class methods are. Returns the type of the interface declaring the method.
-    auto interfaceDeclaring = [&](const std::u16string& name, Symbol* sym,
-                                  bool bySignature) -> Type* {
-        for (Type* ifaceT : si->implementedInterfaces) {
-            if (!ifaceT || !ifaceT->structInfo) continue;
-            for (StructInfo* iface = ifaceT->structInfo; iface; iface = iface->baseInfo) {
-                if (iface->templateOf) typeCtx.ensureFilled(iface);
-                int idx = bySignature ? iface->findMethodIndexBySignature(name, sym)
-                                      : iface->findMethodIndex(name);
-                if (idx < 0) continue;
-                if (iface == ifaceT->structInfo) return ifaceT;
-                if (Type* level = typeCtx.classTypeFor(iface)) return level;
-            }
-        }
-        return nullptr;
-    };
-
     // Methods: collect own methods, then validate override/abstract.
     for (auto& m : cd.methods()) {
         bool isCtor = m.isConstructor();
@@ -2175,7 +2138,7 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
                         "'noreturn' because the method it overrides in '" + asciiOf(baseBySig->name) +
                         "' is 'noreturn'; callers rely on it never returning. Add 'noreturn' "
                         "before the method name.");
-            } else if (interfaceDeclaring(mname, sym, /*bySignature=*/true)) {
+            } else if (interfaceDeclaringMethod(si, mname, sym, /*bySignature=*/true)) {
                 // Implements an interface method; the implements clause check
                 // below validates the return type and throws conformance.
             } else if (baseByName) {
@@ -2183,7 +2146,8 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
                 errorAtNode(m.node, "Override of '" + asciiOf(mname) +
                     "' does not match the signature declared in '" + asciiOf(baseByName->name) +
                     "'; expected '" + interfaceMethodSignature(bnm) + "'.");
-            } else if (Type* ifaceByName = interfaceDeclaring(mname, sym, /*bySignature=*/false)) {
+            } else if (Type* ifaceByName =
+                           interfaceDeclaringMethod(si, mname, sym, /*bySignature=*/false)) {
                 StructInfo* ifaceInfo = ifaceByName->structInfo;
                 const MethodInfo& ifm = ifaceInfo->methods[ifaceInfo->findMethodIndex(mname)];
                 errorAtNode(m.node, "Override of '" + asciiOf(mname) +
@@ -2208,7 +2172,7 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
             // same-signature redeclaration hides the base method.
             errorAtNode(m.node, "Method '" + asciiOf(mname) + "' hides a method inherited from '" +
                 asciiOf(baseBySig->name) + "'; mark it 'override' to replace it, or rename it");
-        } else if (Type* ifaceT = interfaceDeclaring(mname, sym, /*bySignature=*/true)) {
+        } else if (Type* ifaceT = interfaceDeclaringMethod(si, mname, sym, /*bySignature=*/true)) {
             errorAtNode(m.node, "Method '" + asciiOf(mname) + "' of '" + asciiOf(si->name) +
                 "' implements a method declared in interface '" + ifaceT->toString() +
                 "'; mark it 'override'");
@@ -2687,11 +2651,73 @@ Visibility Analyzer::builtinReplacementVisibility(
     return required;
 }
 
-// A struct inherits nothing, so `override` on a struct member marks a method that
-// replaces a built-in behavior, and the behaviors a struct has of its own - its text
-// form, its content hash, its memberwise equality - must carry the marker exactly as a
-// class's `hash` and `equals` do. A near-miss shape gets its own signature diagnostic
-// instead.
+// The interface method a locally-declared method may implement, searched through the
+// implemented interfaces and the ones those extend. Returns the type of the interface
+// declaring the method, which is what validates an `override` marker the way a base-class
+// method does.
+Type* Analyzer::interfaceDeclaringMethod(StructInfo* si, const std::u16string& memberName,
+                                         Symbol* sym, bool bySignature) {
+    if (!si) return nullptr;
+    for (Type* ifaceT : si->implementedInterfaces) {
+        if (!ifaceT || !ifaceT->structInfo) continue;
+        for (StructInfo* iface = ifaceT->structInfo; iface; iface = iface->baseInfo) {
+            if (iface->templateOf) typeCtx.ensureFilled(iface);
+            int idx = bySignature ? iface->findMethodIndexBySignature(memberName, sym)
+                                  : iface->findMethodIndex(memberName);
+            if (idx < 0) continue;
+            if (iface == ifaceT->structInfo) return ifaceT;
+            if (Type* level = typeCtx.classTypeFor(iface)) return level;
+        }
+    }
+    return nullptr;
+}
+
+// The interfaces an `implements` clause names, each accepted once. A class names a base with
+// `extends` while a struct has no base at all, so the advice for a name that is a class differs
+// by what is implementing.
+void Analyzer::resolveImplementsClause(StructInfo* si,
+                                       const std::vector<ast::TypeReference>& refs) {
+    bool isStruct = si->declKind == DeclKind::Struct;
+    for (auto& tr : refs) {
+        Type* it = resolveTypeReference(tr);
+        if (it->isError()) continue;
+        if (it->isOptional() || it->isArray()) {
+            errorAtNode(tr.node, "'implements' takes plain interface names; '" +
+                it->toString() + "' is not an interface type.");
+            continue;
+        }
+        if (!it->isInterface()) {
+            if (it->isClass() && isStruct) {
+                errorAtNode(tr.node, "'" + it->toString() + "' is a class, not an interface, "
+                    "and a struct never extends one. Name an interface here, or hold a '" +
+                    it->toString() + "' in a field of '" + asciiOf(si->name) + "'.");
+            } else if (it->isClass()) {
+                errorAtNode(tr.node, "'" + it->toString() + "' is a class, not an "
+                    "interface; use 'extends " + it->toString() + "' for a base class.");
+            } else {
+                errorAtNode(tr.node, "'" + it->toString() + "' is not an interface; "
+                    "'implements' takes interfaces only.");
+            }
+            continue;
+        }
+        bool dup = false;
+        for (Type* prev : si->implementedInterfaces) {
+            if (prev == it) { dup = true; break; }
+        }
+        if (dup) {
+            errorAtNode(tr.node, "Interface '" + it->toString() +
+                "' is listed more than once in the 'implements' clause.");
+            continue;
+        }
+        si->implementedInterfaces.push_back(it);
+    }
+}
+
+// The behaviors a struct has of its own - its text form, its content hash, its memberwise
+// equality - must carry `override` exactly as a class's `hash` and `equals` do. A near-miss
+// shape gets its own signature diagnostic instead. Whether a marked member replaces or
+// implements anything at all waits for checkStructConformanceMarkers, since an interface a
+// struct implements may be declared in another module.
 void Analyzer::checkStructOverrideMarker(const ast::FuncDecl& fn, const Type* owner,
                                          const std::u16string& memberName, Symbol* sym,
                                          bool isConstructor, const char* behavior) {
@@ -2701,22 +2727,57 @@ void Analyzer::checkStructOverrideMarker(const ast::FuncDecl& fn, const Type* ow
             errorAtNode(fn.node, "A constructor cannot be 'override' or 'abstract'.");
         return;
     }
-    if (fn.isOverride()) {
-        if (!behavior) {
-            errorAtNode(fn.node, "Method '" + asciiOf(memberName) + "' of '" + ownerName +
-                "' is marked 'override' but structs do not inherit, so there is nothing to "
-                "override; only 'toString', 'hash', and 'equals' replace a built-in behavior "
-                "of a struct. Remove 'override'.");
-        }
-        return;
-    }
-    if (!behavior) return;
+    if (fn.isOverride() || !behavior) return;
     bool conforms = memberName == u"hash"   ? hashSignatureConforms(sym)
                   : memberName == u"equals" ? equalsSignatureConforms(sym)
                                             : toStringSignatureConforms(sym);
     if (conforms) {
         errorAtNode(fn.node, "Method '" + asciiOf(memberName) + "' overrides the built-in " +
             behavior + " of struct '" + ownerName + "'; mark it 'override'.");
+    }
+}
+
+// A struct member marked `override` has to answer something, either a built-in behavior of the
+// struct or a method an implemented interface declares, and one that answers a requirement has
+// to carry the marker. Runs once every module resolved its signatures, so an interface declared
+// elsewhere already has its methods.
+void Analyzer::checkStructConformanceMarkers() {
+    if (!astRoot) return;
+    for (auto& sd : astRoot->structs()) {
+        Type* t = analysis.typeOf(sd.node.greenNode());
+        if (!t || !t->structInfo) continue;
+        StructInfo* si = t->structInfo;
+        std::string ownerName = asciiOf(si->name);
+        for (auto& m : sd.methods()) {
+            if (m.isConstructor() || m.isDestructor()) continue;
+            auto memberName = m.nameText();
+            if (!memberName) continue;
+            auto* info = analysis.find(m.node.greenNode());
+            Symbol* sym = info ? info->resolvedSymbol : nullptr;
+            if (!sym) continue;
+            const char* behavior = builtinBehaviorReplaced(t, *memberName, sym, m.isOverride());
+            Type* declaring = interfaceDeclaringMethod(si, *memberName, sym,
+                                                       /*bySignature=*/true);
+            if (behavior || (declaring && m.isOverride())) continue;
+            if (m.isOverride()) {
+                if (si->implementedInterfaces.empty()) {
+                    errorAtNode(m.node, "Method '" + asciiOf(*memberName) + "' of '" +
+                        ownerName + "' is marked 'override' but structs do not inherit, so "
+                        "there is nothing to override; only 'toString', 'hash', and 'equals' "
+                        "replace a built-in behavior of a struct. Remove 'override'.");
+                } else {
+                    errorAtNode(m.node, "Method '" + asciiOf(*memberName) + "' of '" +
+                        ownerName + "' is marked 'override' but no interface that '" +
+                        ownerName + "' implements declares '" + asciiOf(*memberName) +
+                        "', and a struct inherits nothing; only 'toString', 'hash', and "
+                        "'equals' replace a built-in behavior of a struct. Remove 'override'.");
+                }
+            } else if (declaring) {
+                errorAtNode(m.node, "Method '" + asciiOf(*memberName) + "' of struct '" +
+                    ownerName + "' implements a method declared in interface '" +
+                    declaring->toString() + "'; mark it 'override'.");
+            }
+        }
     }
 }
 
@@ -3208,10 +3269,10 @@ bool Analyzer::checkTypeArgBound(Type* arg, const std::vector<StructInfo*>& boun
         // Every type satisfies the compiler-known hashing contract.
         if (isHashableClass(bound)) continue;
         bool satisfied = false;
-        if (arg && arg->structInfo && (arg->isClass() ||
+        if (arg && arg->structInfo && (arg->isClass() || arg->isStruct() ||
                 arg->structInfo->declKind == DeclKind::Primitive)) {
-            // A primitive satisfies a bound through the conformances its binding declares. It
-            // still has no interface value, and the compiler is what enforces that.
+            // A struct and a primitive each satisfy a bound through the conformances they
+            // declare. Neither has an interface value, and the compiler is what enforces that.
             satisfied = arg->structInfo->isSubclassOrConforms(bound);
         } else if (arg && arg->isTypeParam()) {
             // A type-parameter argument satisfies a bound its own bounds imply.
@@ -4847,10 +4908,11 @@ static bool isIterableInterface(const StructInfo* si) {
     return authority->name == u"Iterable" && authority->modulePath == u"std.collections.iterator";
 }
 
-// The element type a class yields in a for-in loop. Iteration is nominal: the
-// class (or a base class) must implement 'Iterable<T>' from @std.collections.iterator, and
-// the element type is that instantiation's type argument. An 'Iterable<T>'
-// value itself is iterable too. Reports and returns the error type otherwise.
+// The element type a value yields in a for-in loop. Iteration is nominal: the type must
+// implement 'Iterable<T>' from @std.collections.iterator, and the element type is that
+// instantiation's type argument. For a class a base class's conformance counts, an 'Iterable<T>'
+// value itself is iterable, and so is a struct that declares the conformance. Reports and
+// returns the error type otherwise.
 Type* Analyzer::resolveIterableElement(Type* iterT, const SyntaxNode& diag) {
     StructInfo* si = iterT->structInfo;
     StructInfo* iterableInst = nullptr;
@@ -4890,12 +4952,12 @@ void Analyzer::analyzeForEachStmt(const ast::ForEachStatement& stmt) {
     if (!iterT->isError()) {
         if (iterT->isArray() && iterT->inner) {
             elemT = iterT->inner;
-        } else if (iterT->isClass() && iterT->structInfo) {
+        } else if ((iterT->isClass() || iterT->isStruct()) && iterT->structInfo) {
             elemT = resolveIterableElement(iterT, stmt.node);
         } else {
             errorAtNode(stmt.node, "'for (... in ...)' requires an array or an iterable "
-                "object, got '" + iterT->toString() + "'. A class is iterable when it "
-                "implements 'Iterable<T>' from '@std.collections.iterator'.");
+                "value, got '" + iterT->toString() + "'. A class or a struct is iterable when "
+                "it implements 'Iterable<T>' from '@std.collections.iterator'.");
         }
     }
     Type* bindingT = elemT;

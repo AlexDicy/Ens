@@ -394,6 +394,14 @@ std::vector<TypeParam> StructDecl::typeParams() const {
     if (auto l = typeParamList()) return l->params();
     return {};
 }
+std::optional<ImplementsClause> StructDecl::implementsClause() const {
+    if (auto n = firstChildNode(node, SyntaxKind::ImplementsClause)) return ImplementsClause::cast(*n);
+    return std::nullopt;
+}
+std::vector<TypeReference> StructDecl::implementedInterfaceRefs() const {
+    if (auto ic = implementsClause()) return ic->types();
+    return {};
+}
 std::optional<MemberList> StructDecl::memberList() const {
     if (auto m = firstChildNode(node, SyntaxKind::MemberList)) return MemberList::cast(*m);
     return std::nullopt;

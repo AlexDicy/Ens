@@ -109,6 +109,16 @@ A struct that declares its own `toString` method uses that method instead; becau
 A struct is serializable only when every field is: a value type, a string, an enum, one of those made nullable, a nested such struct, or an array of any of these, which serializes as a JSON list.
 A field that is a class or an external handle has no JSON form, and neither does an array whose elements are; such a field makes serializing the struct an error that names it, mirroring the `==` rule.
 
+A struct may declare `implements` and name any interface, which is how a struct satisfies a generic bound: a `<T: Comparable<T>>` parameter accepts `Path` once `Path` is declared to implement `Comparable<Path>`, so `paths.sorted()` and `SortedMap<Path, V>` work over a value type.
+A struct cannot use `extends`, because a struct has no base type.
+The conformance is checked where it is declared: the struct must provide every method the interface, and every interface it extends, requires, with a matching signature and the `override` marker, exactly as a class implementing the same interface does.
+A method that answers a requirement must be as visible as the struct itself, since the generic body behind the bound calls it wherever the struct can be named.
+A conditional member cannot satisfy a requirement, because a requirement has to exist for every instantiation.
+That conformance is a compile-time judgment and nothing more, because a struct value is never wrapped in an object.
+Storing a struct in an interface-typed variable, field, array element, or parameter is an error, and so is `is` or `as?` against an interface; each message names the bound the conformance does serve.
+A call on a bound type parameter therefore reaches the struct's own method directly, with no allocation and no dispatch.
+A struct that implements `Iterable<T>` can be walked by a for-each loop for the same reason, since the loop calls `makeIterator()` on the struct itself.
+
 Overloading is allowed, best match arguments first, then visibility.
 Two declarations of the same name must differ in parameter count or parameter types.
 A call picks the overload whose parameter types match the arguments exactly; when there is no exact match, an overload reachable through implicit widening is chosen.
@@ -185,9 +195,10 @@ Methods are overridable by default. An override must be marked `override` and mu
 An override also carries the visibility marker of the method it overrides, as the visibility section describes, so `protected override sound()` replaces a `protected sound()`.
 An override's parameter types must match exactly, while its return type may be narrower where a value of it is held the same way: a class, interface, array, string, function or external handle reference, or one of those with its `?` dropped, because both spellings are one pointer.
 A narrower number, a nullable value type with its `?` dropped, and one level dropped from a doubly nullable type are each rejected, because a caller reaching the method through the type that declared it would read the declared shape and find the other one.
-The same rule governs the method a class provides for an interface requirement.
+The same rule governs the method a class or a struct provides for an interface requirement.
 `override` on a method that overrides nothing is an error, so the marker always names something real: a base or interface method, or a behavior the language provides for the type, which means `toString`, `hash`, and `equals` for a struct and for a class alike.
 The marker is required for all three on a struct, so a struct that declares a `toString`, a `hash`, or an `equals` always writes it as an `override`.
+A struct has no base class, so on a struct the marker names either one of those three behaviors or a method an interface the struct implements declares.
 
 Every class value has a text form, rendered from the value's runtime type wherever `.toString()` is called or an interpolation hole holds the value.
 A class with no `toString` override anywhere in its chain answers with its runtime type's name, so a subclass prints its own name even through a base-class-typed or interface-typed reference.
@@ -294,7 +305,7 @@ The class must provide every method of every listed interface with the exact sig
 A method declared in the implementing class that provides an interface method must be marked `override`, exactly like the override of an abstract base method; a satisfying method inherited from a base class needs no marker.
 An abstract class may declare an interface method `abstract override` and leave the body to its concrete subclasses.
 A method satisfying a throwing interface method may throw the declared types or their subclasses, never others; satisfying a non-throwing interface method means not throwing at all.
-Structs cannot implement interfaces.
+A struct names the interfaces it implements the same way, and is held to the same requirements and the same `override` marker; what a struct's conformance does and does not buy is described in the struct section.
 
 An interface name is a reference type usable wherever a class type is: variables, parameters, returns, fields, generic type arguments, `I?`, and arrays under the same element rules as classes.
 A value of an implementing class converts implicitly to each interface it implements and to every interface those extend (and to `I?`); there are no implicit conversions between unrelated interfaces.
@@ -1243,7 +1254,7 @@ greeting += ", world";  // "Hello, world"
 greeting += 2;          // "Hello, world2": '+=' appends whatever '+' concatenates
 ```
 
-`while` repeats its body while the condition holds. A `for` loop comes in two forms. The C-style form has an initializer, a condition, and an update, any of which may be omitted; the initializer is scoped to the loop. The for-each form walks an array element by element, or any iterable object value by value.
+`while` repeats its body while the condition holds. A `for` loop comes in two forms. The C-style form has an initializer, a condition, and an update, any of which may be omitted; the initializer is scoped to the loop. The for-each form walks an array element by element, or any iterable value one element at a time.
 
 ```ens
 while (i < n) {
@@ -1259,7 +1270,8 @@ for (int x in xs) {     // x takes each element in turn
 }
 ```
 
-A class is iterable when it implements the `Iterable<T>` interface from `@std.collections.iterator`, directly or through an interface that extends it; its single method `makeIterator() -> Iterator<T>` returns an `Iterator<T>`, an interface with the single method `next() -> T?`.
+A class or a struct is iterable when it implements the `Iterable<T>` interface from `@std.collections.iterator`, directly or through an interface that extends it; its single method `makeIterator() -> Iterator<T>` returns an `Iterator<T>`, an interface with the single method `next() -> T?`.
+Iterating a struct needs no interface value, because the loop calls `makeIterator()` on the struct itself; the iterator it answers is a class or an interface value as any other iterator is.
 The loop calls `makeIterator()` once, then draws values with `next()` until it answers null.
 `next()` answers the value it moved onto, or null once the walk is over, and every call after that answers null too.
 When the element type is itself nullable, `next()` answers a nested optional, so a `null` held by a present result is an element and only an absent result ends the loop.
