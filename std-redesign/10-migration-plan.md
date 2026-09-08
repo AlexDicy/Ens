@@ -99,6 +99,8 @@ Within each milestone the std change and its consumer updates are one commit, so
   Qualified member access, `module.Type.member`, stays out for now even though `module.Type` already resolves as a type.
   A seed release follows, since the library uses the spelling.
   Its own native bridges land with it, capture through pipes, wait with a timeout, and kill, since a bridge written before the library that uses it is a bridge written blind.
+  Four rulings of 2026-09-08 shape the bridges: the runtime ignores SIGPIPE at startup so a closed pipe is an `IoError` rather than a silent death that skips every destructor; `kill()` passes 137 on Windows and the status reports `signal 9` only when that kill is what ended the child; `run` finds executables only, never a script and never in the current directory; and the design assumes the threads that are coming, so no bridge holds process-global state.
+  They land in the same seed as import aliasing, one release rather than two.
 - C9: the internal `@std.system` native module: every `external` declaration moves in, and the old bridges are aliased from it so C7 and C8 could build on it retroactively if ordering demands.
 
 Consumer migration inside C means the selfhost compiler, build, cli, and lsp sources plus `tests/` fixtures, area by area, in the same commits as their std milestone.

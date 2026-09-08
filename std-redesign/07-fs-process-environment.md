@@ -287,7 +287,9 @@ export enum ErrorKind {
 
 // How a program ended: its exit code when it exited, or the signal that ended it. Exactly one of
 // the two is meaningful, and `succeeded` is the question most callers ask. On Windows the signal
-// is always 0 and an abnormal end surfaces through the code.
+// is 0, except that a child ended by this library's own `kill()` reports 9, the number POSIX
+// reports for the same act, so one check tells a landed kill from an exit on every platform. An
+// abnormal end of any other kind surfaces through the code.
 export struct ExitStatus {
     export const int code;
     export const int signal;
@@ -360,6 +362,11 @@ Child streams are separate (`stdout()`/`stderr()`), with the single-threaded dea
 `run(captureOutput: true)` redirects at the operating-system level internally, so capture cannot deadlock and stdout and stderr stay separate.
 The destructor detaches and never kills or waits; ending a child is explicit.
 PATH rule: a program name with no separator is searched in the PATH of the environment the child will receive, falling back to the parent's when none was given.
+The search lives in the library and the bridge never searches, only PATH directories are searched and never the current directory, and on Windows the candidate is the name as written when it has an extension and the name with `.exe` otherwise (ratified 2026-09-08).
+So a `.cmd` or `.bat` is not found by `run` and goes through `runShell`, because launching one through `CreateProcess` runs `cmd.exe` without the caller having asked for a shell.
+`kill()` passes 137 to the operating system on Windows, and `wait()` reports `signal 9, code 0` only when that call succeeded and the child's code is the one it passed, so a child that exited on its own first keeps its own code (ratified 2026-09-08).
+The runtime ignores SIGPIPE before any user code runs, so a write to a pipe whose reader has gone fails with an `IoError` of kind `Closed` on every platform instead of ending the program with its destructors unrun; what `print` does on a closed standard output is ruled in C9 (ratified 2026-09-08).
+The library is designed for the threads that are coming: the bridges hold no process-global state, capture multiplexes the two pipes the way a threaded runtime does underneath, and the separate streams are the design rather than a stand-in for it.
 `environment:` replaces rather than merges: patching is `Environment.current()` plus `set`, a clean slate is `Environment.empty(platform)` plus `set`, and what is passed is exactly what the child sees.
 Python and Go use the same replace semantics for a child's environment; Rust's override-style Command needed four methods to express the same two intents.
 `runShell` is the shell escape hatch, named so it is greppable.

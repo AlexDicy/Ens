@@ -13,6 +13,8 @@ A bare function reference stored into a local with no declared type, `let callba
 
 OS-level redirection for `run(captureOutput: true)`, wait-with-timeout, and kill in the native bridges.
 Every failure from the standard streams carries `ErrorKind.Other`, because telling `Closed` apart needs errno; C9's `errorKindFromCode` lets `io.ens` and the buffered wrappers name the kind, and the message carries the detail until then.
+A child is owned by one thread at a time until the threaded runtime gives it a lock or a documented single-owner rule.
+The Windows output record's `pending`, `filled`, `consumed` and `ended` fields are plain stores, correct under that ownership and a race once two threads touch one child.
 
 ## Limits the C7b bridges accept
 

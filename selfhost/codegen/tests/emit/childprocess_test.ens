@@ -1,0 +1,137 @@
+// Tests for the bridges that start and drive a child, each defined from inside a host function
+// exactly as emission does and checked with the real LLVM verifier. A retarget that passes proves
+// the half builds well-formed IR and proves nothing about whether a number in it is true.
+import @std.testing;
+import @ens.llvm.memory;
+import @ens.llvm.target;
+import EmissionHost from support;
+import OutputRecord from emit.childprocess;
+import PosixChild from emit.childprocess;
+import WindowsChild from emit.childprocess;
+import emit.childprocess;
+import emit.clock;
+
+// One call of every child bridge, with the arguments a start takes in the order it takes them.
+callEveryBridge(EmissionHost host) {
+    let runtime = host.runtime;
+    let text = runtime.payloadData(runtime.stringLiteral("git".toBytes()));
+    let error = memory.buildAlloca(host.builder, runtime.int32Type, "error");
+    let count = memory.buildAlloca(host.builder, runtime.int64Type, "count");
+    let code = memory.buildAlloca(host.builder, runtime.int32Type, "code");
+    let signal = memory.buildAlloca(host.builder, runtime.int32Type, "signal");
+    let child = runtime.call(childprocess.startRuntime(runtime), [text, text, runtime.int64(1),
+        text, text, runtime.int64(0), runtime.int64(2), runtime.int32(1), text, runtime.int32(1),
+        runtime.int32(1), runtime.int32(1), error], "child");
+    runtime.call(childprocess.readRuntime(runtime), [child, runtime.int32(1), text,
+        runtime.int64(3), count], "read");
+    runtime.call(childprocess.writeRuntime(runtime), [child, text, runtime.int64(3), count],
+        "written");
+    runtime.call(childprocess.closeInputRuntime(runtime), [child], "closed");
+    runtime.call(childprocess.waitRuntime(runtime), [child, code, signal], "waited");
+    runtime.call(childprocess.killRuntime(runtime), [child], "stopped");
+    runtime.call(childprocess.releaseRuntime(runtime), [child], "");
+    runtime.call(clock.monotonicMillisRuntime(runtime), [], "now");
+}
+
+test "the child bridges and the clock verify on the host" {
+    let host = new EmissionHost("childprocess_host");
+    callEveryBridge(host);
+    try host.finish();
+}
+
+test "each child bridge is defined once however often it is called" {
+    let host = new EmissionHost("childprocess_reuse");
+    let first = childprocess.startRuntime(host.runtime);
+    let second = childprocess.startRuntime(host.runtime);
+    try testing.assertTrue(first.function == second.function,
+        "the second use redefined the start");
+    let firstRead = childprocess.readRuntime(host.runtime);
+    try testing.assertTrue(
+        firstRead.function == childprocess.readRuntime(host.runtime).function,
+        "the second use redefined the read");
+    let firstClock = clock.monotonicMillisRuntime(host.runtime);
+    try testing.assertTrue(
+        firstClock.function == clock.monotonicMillisRuntime(host.runtime).function,
+        "the second use redefined the clock");
+    string text = host.text();
+    try testing.assertTrue(text.indexOf("define internal ptr @ens_process_start(") >= 0,
+        "the start was never defined: {text}");
+    try testing.assertTrue(text.indexOf("define internal i32 @ens_process_read(") >= 0,
+        "the read was never defined: {text}");
+    try testing.assertTrue(text.indexOf("define internal i64 @ens_monotonic_millis()") >= 0,
+        "the clock was never defined: {text}");
+    try host.finish();
+}
+
+// Only the host platform's half of a bridge reaches an object file, so the other halves are held
+// to the verifier here instead.
+test "every target's child bridges build code the verifier accepts" {
+    for (let triple in coveredTriples()) {
+        let host = new EmissionHost("childprocess_{triple}");
+        host.retarget(triple);
+        callEveryBridge(host);
+        try host.finish();
+    }
+}
+
+// Every target with a half of its own and this machine's own triple, which is the half its object
+// files actually hold.
+coveredTriples() -> string[] {
+    return [target.hostTargetTriple(), "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc",
+        "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-musl",
+        "x86_64-apple-darwin23", "aarch64-apple-darwin23"];
+}
+
+// A field read at an offset another field also uses would answer for both, so the layouts are held
+// to being disjoint and inside the block rather than to their numbers.
+test "a POSIX child's block holds its fields apart and inside the block" {
+    long[] offsets = [PosixChild.pid, PosixChild.pidDescriptor, PosixChild.input,
+        PosixChild.output, PosixChild.errors, PosixChild.outputEnded, PosixChild.errorsEnded,
+        PosixChild.reaped, PosixChild.code, PosixChild.signal];
+    try assertDisjoint(offsets, 4, PosixChild.structBytes);
+}
+
+test "a Windows child's block holds its handles, two records and its status apart" {
+    long[] wide = [WindowsChild.process, WindowsChild.input];
+    try assertDisjoint(wide, 8, WindowsChild.output);
+    try testing.assertTrue(
+        WindowsChild.output + OutputRecord.structBytes <= WindowsChild.errors,
+        "the output record runs into the errors record");
+    try testing.assertTrue(
+        WindowsChild.errors + OutputRecord.structBytes <= WindowsChild.reaped,
+        "the errors record runs into the status");
+    long[] status = [WindowsChild.reaped, WindowsChild.code, WindowsChild.signal,
+        WindowsChild.killed];
+    try assertDisjoint(status, 4, WindowsChild.structBytes);
+    try testing.assertEqual(WindowsChild.structBytes % 8, 0);
+}
+
+test "an output record holds its handles, its OVERLAPPED and its counters apart" {
+    try testing.assertTrue(OutputRecord.event >= OutputRecord.pipe + 8, "the event overlaps the pipe");
+    try testing.assertTrue(OutputRecord.overlapped >= OutputRecord.event + 8,
+        "the OVERLAPPED overlaps the event");
+    try testing.assertTrue(OutputRecord.staging >= OutputRecord.overlapped + 32,
+        "the staging pointer sits inside the OVERLAPPED");
+    long[] counters = [OutputRecord.filled, OutputRecord.consumed, OutputRecord.pending,
+        OutputRecord.ended];
+    try testing.assertTrue(OutputRecord.filled >= OutputRecord.staging + 8,
+        "the counters overlap the staging pointer");
+    try assertDisjoint(counters, 4, OutputRecord.structBytes);
+    try testing.assertEqual(OutputRecord.structBytes % 8, 0);
+}
+
+// Every offset at least `width` bytes from every other and at most `limit` minus `width`.
+assertDisjoint(long[] offsets, long width, long limit) throws {
+    for (long i = 0; i < offsets.length; i++) {
+        try testing.assertTrue(offsets[i] + width <= limit,
+            "the field at {offsets[i]} runs past the block of {limit} bytes");
+        for (long j = i + 1; j < offsets.length; j++) {
+            long apart = offsets[i] - offsets[j];
+            if (apart < 0) {
+                apart = 0 - apart;
+            }
+            try testing.assertTrue(apart >= width,
+                "the fields at {offsets[i]} and {offsets[j]} overlap");
+        }
+    }
+}

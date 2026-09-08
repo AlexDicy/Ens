@@ -1,0 +1,71 @@
+// The bridge that reads a clock nothing sets back, so a deadline can be measured across calls that
+// each wait a while.
+import TypeRef from @ens.llvm.types;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import Timespec from emit.nativeshapes;
+import emit.nativeshapes;
+import Runtime from emit.runtime;
+import RuntimeFunction from emit.runtime;
+
+// i64 ens_monotonic_millis(): milliseconds on a clock that never goes backwards, counted from an
+// origin no caller may rely on.
+public monotonicMillisRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int64Type.functionType([]);
+    let known = runtime.existing("ens_monotonic_millis", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        return windowsMonotonicMillis(runtime, type);
+    }
+    return posixMonotonicMillis(runtime, type);
+}
+
+// The whole seconds and the remainder are scaled apart, so the product never outgrows 64 bits.
+windowsMonotonicMillis(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let counter = runtime.libc("QueryPerformanceCounter",
+        runtime.int32Type.functionType([runtime.pointerType]));
+    let frequency = runtime.libc("QueryPerformanceFrequency",
+        runtime.int32Type.functionType([runtime.pointerType]));
+    let definition = runtime.beginDefinition("ens_monotonic_millis", type);
+    let builder = runtime.builder;
+    let countSlot = memory.buildAlloca(builder, runtime.int64Type, "count");
+    let perSecondSlot = memory.buildAlloca(builder, runtime.int64Type, "per.second");
+    memory.buildStore(builder, runtime.int64(0), countSlot);
+    memory.buildStore(builder, runtime.int64(1), perSecondSlot);
+    runtime.call(counter, [countSlot], "");
+    runtime.call(frequency, [perSecondSlot], "");
+    let count = memory.buildLoad(builder, runtime.int64Type, countSlot, "count");
+    let perSecond = memory.buildLoad(builder, runtime.int64Type, perSecondSlot, "per.second");
+    let seconds = instructions.buildSDiv(builder, count, perSecond, "seconds");
+    let rest = instructions.buildSRem(builder, count, perSecond, "rest");
+    instructions.buildRet(builder, instructions.buildAdd(builder,
+        instructions.buildMul(builder, seconds, runtime.int64(1000), ""),
+        instructions.buildSDiv(builder, instructions.buildMul(builder, rest, runtime.int64(1000),
+            ""), perSecond, ""), "millis"));
+    return runtime.endDefinition(definition);
+}
+
+posixMonotonicMillis(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let readClock = runtime.libc("clock_gettime",
+        runtime.int32Type.functionType([runtime.int32Type, runtime.pointerType]));
+    let definition = runtime.beginDefinition("ens_monotonic_millis", type);
+    let builder = runtime.builder;
+    let answer = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType(Timespec.structBytes as ulong), "timespec");
+    memory.buildStore(builder, runtime.int64(0),
+        runtime.offsetPointer(answer, Timespec.seconds, ""));
+    memory.buildStore(builder, runtime.int64(0),
+        runtime.offsetPointer(answer, Timespec.nanoseconds, ""));
+    runtime.call(readClock, [runtime.int32(nativeshapes.monotonicClock(runtime.targetTriple)),
+        answer], "");
+    let seconds = memory.buildLoad(builder, runtime.int64Type,
+        runtime.offsetPointer(answer, Timespec.seconds, ""), "seconds");
+    let nanoseconds = memory.buildLoad(builder, runtime.int64Type,
+        runtime.offsetPointer(answer, Timespec.nanoseconds, ""), "nanoseconds");
+    instructions.buildRet(builder, instructions.buildAdd(builder,
+        instructions.buildMul(builder, seconds, runtime.int64(1000), ""),
+        instructions.buildSDiv(builder, nanoseconds, runtime.int64(1000000), ""), "millis"));
+    return runtime.endDefinition(definition);
+}

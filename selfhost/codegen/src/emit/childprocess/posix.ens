@@ -1,0 +1,654 @@
+// The POSIX halves of the child bridges. Every pipe end is close-on-exec and nothing between fork
+// and exec allocates or locks, so a second thread starting a child at the same moment sees none of
+// this one's descriptors and a child that could not exec reports why through a pipe of its own.
+import Value from @ens.llvm.values;
+import TypeRef from @ens.llvm.types;
+import BasicBlock from @ens.llvm.blocks;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import ChildStream from emit.nativeshapes;
+import DescriptorControl from emit.nativeshapes;
+import Signal from emit.nativeshapes;
+import StdioMode from emit.nativeshapes;
+import WaitStatus from emit.nativeshapes;
+import emit.nativeshapes;
+import Errno from emit.errorkinds;
+import PosixChild from emit.childprocess;
+import emit.childprocess;
+import Runtime from emit.runtime;
+import RuntimeDefinition from emit.runtime;
+import RuntimeFunction from emit.runtime;
+import emit.spawnposix;
+import emit.system;
+
+// The slots of the descriptor table a start fills, two per pipe, in the order pipe writes them.
+final class PipeEnds {
+    protected static const long inputRead = 0;
+    protected static const long inputWrite = 1;
+    protected static const long outputRead = 2;
+    protected static const long outputWrite = 3;
+    protected static const long errorsRead = 4;
+    protected static const long errorsWrite = 5;
+    protected static const long reportRead = 6;
+    protected static const long reportWrite = 7;
+    protected static const long count = 8;
+}
+
+public posixStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let makePipe = runtime.libc("pipe", runtime.int32Type.functionType([runtime.pointerType]));
+    let control = runtime.libc("fcntl",
+        runtime.int32Type.variadicFunctionType([runtime.int32Type, runtime.int32Type]));
+    let forkProcess = runtime.libc("fork", runtime.int32Type.functionType([]));
+    let changeDirectory = runtime.libc("chdir",
+        runtime.int32Type.functionType([runtime.pointerType]));
+    let execProgram = runtime.libc("execve", runtime.int32Type.functionType([runtime.pointerType,
+        runtime.pointerType, runtime.pointerType]));
+    let exitChild = runtime.libc("_exit", runtime.voidType.functionType([runtime.int32Type]));
+    let writeDescriptor = runtime.libc("write", runtime.int64Type.functionType([runtime.int32Type,
+        runtime.pointerType, runtime.int64Type]));
+    let readDescriptor = runtime.libc("read", runtime.int64Type.functionType([runtime.int32Type,
+        runtime.pointerType, runtime.int64Type]));
+    let allocate = runtime.malloc();
+    let release = runtime.free();
+    let definition = runtime.beginDefinition("ens_process_start", type);
+    let builder = runtime.builder;
+    let allocateBlock = runtime.block(definition, "start.allocate");
+    let invalidBlock = runtime.block(definition, "start.invalid");
+    let noMemoryBlock = runtime.block(definition, "start.no.memory");
+    let pipesBlock = runtime.block(definition, "start.pipes");
+    let forkBlock = runtime.block(definition, "start.fork");
+    let childBlock = runtime.block(definition, "start.child");
+    let reportBlock = runtime.block(definition, "start.child.report");
+    let parentBlock = runtime.block(definition, "start.parent");
+    let heldBlock = runtime.block(definition, "start.held");
+    let execFailedBlock = runtime.block(definition, "start.exec.failed");
+    let startedBlock = runtime.block(definition, "start.started");
+    let failedBlock = runtime.block(definition, "start.failed");
+
+    let program = runtime.parameter(definition, 0);
+    let argumentCount = runtime.parameter(definition, 2);
+    let environmentCount = runtime.parameter(definition, 5);
+    let environmentGiven = runtime.parameter(definition, 7);
+    let workingDirectory = runtime.parameter(definition, 8);
+    let modes = [runtime.parameter(definition, 9), runtime.parameter(definition, 10),
+        runtime.parameter(definition, 11)];
+    let errorSlot = runtime.parameter(definition, 12);
+
+    // The child inherits a copy of whatever is still buffered in this process's streams, which it
+    // would write out a second time.
+    runtime.flushBuffered();
+    let ends = memory.buildAlloca(builder,
+        runtime.int32Type.arrayType(PipeEnds.count as ulong), "ends");
+    for (long slot = 0; slot < PipeEnds.count; slot++) {
+        memory.buildStore(builder, runtime.int32(-1), endSlot(runtime, ends, slot));
+    }
+    let reasonSlot = memory.buildAlloca(builder, runtime.int32Type, "reason");
+    let reportedSlot = memory.buildAlloca(builder, runtime.int32Type, "reported");
+    memory.buildStore(builder, runtime.int32(0), reasonSlot);
+    memory.buildStore(builder, runtime.int32(0), reportedSlot);
+    let argumentVector = memory.buildArrayAlloca(builder, runtime.pointerType,
+        instructions.buildAdd(builder, argumentCount, runtime.int64(1), ""), "argv");
+    let environmentVector = memory.buildArrayAlloca(builder, runtime.pointerType,
+        instructions.buildAdd(builder, environmentCount, runtime.int64(1), ""), "envp");
+    instructions.buildCondBr(builder, childprocess.validModes(runtime, modes), allocateBlock, invalidBlock);
+
+    builder.positionAtEnd(invalidBlock);
+    memory.buildStore(builder, runtime.int32(Errno.invalidArgument), errorSlot);
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    builder.positionAtEnd(allocateBlock);
+    let block = runtime.call(allocate, [runtime.int64(PosixChild.structBytes)], "child.block");
+    instructions.buildCondBr(builder, runtime.isNull(block), noMemoryBlock, pipesBlock);
+
+    builder.positionAtEnd(noMemoryBlock);
+    memory.buildStore(builder, runtime.int32(Errno.outOfMemory), errorSlot);
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    // Everything the child will need is built before the fork, so nothing after it allocates.
+    builder.positionAtEnd(pipesBlock);
+    for (long offset = 0; offset < PosixChild.structBytes; offset = offset + 4) {
+        memory.buildStore(builder, runtime.int32(0), childprocess.childField(runtime, block, offset));
+    }
+    memory.buildStore(builder, runtime.int32(-1),
+        childprocess.childField(runtime, block, PosixChild.pidDescriptor));
+    spawnposix.blockVector(runtime, definition, argumentVector, runtime.int64(0),
+        runtime.parameter(definition, 1), argumentCount, "argv");
+    spawnposix.blockVector(runtime, definition, environmentVector, runtime.int64(0),
+        runtime.parameter(definition, 4), environmentCount, "envp");
+    openPipe(runtime, definition, makePipe, control, ends, PipeEnds.inputRead, modes[0],
+        reasonSlot, failedBlock, "input");
+    openPipe(runtime, definition, makePipe, control, ends, PipeEnds.outputRead, modes[1],
+        reasonSlot, failedBlock, "output");
+    openPipe(runtime, definition, makePipe, control, ends, PipeEnds.errorsRead, modes[2],
+        reasonSlot, failedBlock, "errors");
+    openPipe(runtime, definition, makePipe, control, ends, PipeEnds.reportRead, runtime.int32(1),
+        reasonSlot, failedBlock, "report");
+    instructions.buildBr(builder, forkBlock);
+
+    builder.positionAtEnd(forkBlock);
+    let child = runtime.call(forkProcess, [], "child");
+    memory.buildStore(builder, runtime.lastError(), reasonSlot);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, child, runtime.int32(0), ""), childBlock, parentBlock);
+
+    // Only calls that are safe after a fork run in the child, and any refusal goes back through the
+    // report pipe before the child ends.
+    builder.positionAtEnd(childBlock);
+    changeWorkingDirectory(runtime, definition, changeDirectory, workingDirectory, reasonSlot,
+        reportBlock);
+    let dupCommand = nativeshapes.duplicateCloseOnExecCommand(runtime.targetTriple);
+    liftLowEnd(runtime, definition, control, dupCommand, ends, PipeEnds.inputRead, modes[0],
+        reasonSlot, reportBlock, "input");
+    liftLowEnd(runtime, definition, control, dupCommand, ends, PipeEnds.outputWrite, modes[1],
+        reasonSlot, reportBlock, "output");
+    liftLowEnd(runtime, definition, control, dupCommand, ends, PipeEnds.errorsWrite, modes[2],
+        reasonSlot, reportBlock, "errors");
+    attachEnd(runtime, definition, ends, PipeEnds.inputRead, 0, modes[0], reasonSlot,
+        reportBlock, "input");
+    attachEnd(runtime, definition, ends, PipeEnds.outputWrite, 1, modes[1], reasonSlot,
+        reportBlock, "output");
+    attachEnd(runtime, definition, ends, PipeEnds.errorsWrite, 2, modes[2], reasonSlot,
+        reportBlock, "errors");
+    let inherited = memory.buildLoad(builder, runtime.pointerType, system.environGlobal(runtime),
+        "environ");
+    let environment = instructions.buildSelect(builder,
+        instructions.buildICmpNE(builder, environmentGiven, runtime.int32(0), ""),
+        environmentVector, inherited, "environment");
+    runtime.call(execProgram, [program, argumentVector, environment], "");
+    memory.buildStore(builder, runtime.lastError(), reasonSlot);
+    instructions.buildBr(builder, reportBlock);
+
+    builder.positionAtEnd(reportBlock);
+    runtime.call(writeDescriptor, [loadEnd(runtime, ends, PipeEnds.reportWrite), reasonSlot,
+        runtime.int64(4)], "");
+    runtime.call(exitChild, [runtime.int32(127)], "");
+    instructions.buildUnreachable(builder);
+
+    // The parent hands back every end the child holds and reads the report pipe. Nothing arrives
+    // when the exec replaced the child, and an errno arrives when it did not.
+    builder.positionAtEnd(parentBlock);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, child, runtime.int32(0), ""), failedBlock, heldBlock);
+
+    builder.positionAtEnd(heldBlock);
+    closeEnd(runtime, definition, ends, PipeEnds.inputRead, "held.input");
+    closeEnd(runtime, definition, ends, PipeEnds.outputWrite, "held.output");
+    closeEnd(runtime, definition, ends, PipeEnds.errorsWrite, "held.errors");
+    closeEnd(runtime, definition, ends, PipeEnds.reportWrite, "held.report");
+    let reportLength = retryingRead(runtime, definition, readDescriptor,
+        loadEnd(runtime, ends, PipeEnds.reportRead), reportedSlot, "report");
+    closeEnd(runtime, definition, ends, PipeEnds.reportRead, "read.report");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSGT(builder, reportLength, runtime.int64(0), ""), execFailedBlock,
+        startedBlock);
+
+    builder.positionAtEnd(execFailedBlock);
+    let discarded = memory.buildAlloca(builder, runtime.int32Type, "discarded");
+    let unreachedBlock = runtime.block(definition, "start.exec.failed.lost");
+    spawnposix.awaitChild(runtime, definition, child, discarded, unreachedBlock, "collect");
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.int32Type, reportedSlot, ""),
+        reasonSlot);
+    instructions.buildBr(builder, failedBlock);
+
+    builder.positionAtEnd(unreachedBlock);
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.int32Type, reportedSlot, ""),
+        reasonSlot);
+    instructions.buildBr(builder, failedBlock);
+
+    builder.positionAtEnd(startedBlock);
+    memory.buildStore(builder, child, childprocess.childField(runtime, block, PosixChild.pid));
+    memory.buildStore(builder, loadEnd(runtime, ends, PipeEnds.inputWrite),
+        childprocess.childField(runtime, block, PosixChild.input));
+    memory.buildStore(builder, loadEnd(runtime, ends, PipeEnds.outputRead),
+        childprocess.childField(runtime, block, PosixChild.output));
+    memory.buildStore(builder, loadEnd(runtime, ends, PipeEnds.errorsRead),
+        childprocess.childField(runtime, block, PosixChild.errors));
+    memory.buildStore(builder, runtime.int32(0), errorSlot);
+    instructions.buildRet(builder, block);
+
+    builder.positionAtEnd(failedBlock);
+    for (long slot = 0; slot < PipeEnds.count; slot++) {
+        closeEnd(runtime, definition, ends, slot, "failed.{slot}");
+    }
+    runtime.call(release, [block], "");
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.int32Type, reasonSlot, ""),
+        errorSlot);
+    instructions.buildRet(builder, runtime.nullPointer());
+    return runtime.endDefinition(definition);
+}
+
+public posixRead(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let readDescriptor = runtime.libc("read", runtime.int64Type.functionType([runtime.int32Type,
+        runtime.pointerType, runtime.int64Type]));
+    let definition = runtime.beginDefinition("ens_process_read", type);
+    let builder = runtime.builder;
+    let readBlock = runtime.block(definition, "read.ask");
+    let refusedBlock = runtime.block(definition, "read.refused");
+    let doneBlock = runtime.block(definition, "read.done");
+    let invalidBlock = runtime.block(definition, "read.invalid");
+    let failedBlock = runtime.block(definition, "read.failed");
+    let block = runtime.parameter(definition, 0);
+    let stream = runtime.parameter(definition, 1);
+    let descriptor = streamDescriptor(runtime, block, stream);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, descriptor, runtime.int32(0), ""), invalidBlock,
+        readBlock);
+
+    builder.positionAtEnd(invalidBlock);
+    instructions.buildRet(builder, runtime.int32(Errno.invalidArgument));
+
+    builder.positionAtEnd(readBlock);
+    let count = runtime.call(readDescriptor, [descriptor, runtime.parameter(definition, 2),
+        runtime.parameter(definition, 3)], "count");
+    let why = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, count, runtime.int64(0), ""), refusedBlock, doneBlock);
+
+    builder.positionAtEnd(refusedBlock);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, why, runtime.int32(Errno.interrupted), ""), readBlock,
+        failedBlock);
+
+    builder.positionAtEnd(failedBlock);
+    instructions.buildRet(builder, why);
+
+    builder.positionAtEnd(doneBlock);
+    let endedSlot = streamEndedSlot(runtime, block, stream);
+    memory.buildStore(builder, instructions.buildSelect(builder,
+        instructions.buildICmpEQ(builder, count, runtime.int64(0), ""), runtime.int32(1),
+        memory.buildLoad(builder, runtime.int32Type, endedSlot, ""), "ended"), endedSlot);
+    memory.buildStore(builder, count, runtime.parameter(definition, 4));
+    instructions.buildRet(builder, runtime.int32(0));
+    return runtime.endDefinition(definition);
+}
+
+public posixWrite(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let writeDescriptor = runtime.libc("write", runtime.int64Type.functionType([runtime.int32Type,
+        runtime.pointerType, runtime.int64Type]));
+    let definition = runtime.beginDefinition("ens_process_write", type);
+    let builder = runtime.builder;
+    let writeBlock = runtime.block(definition, "write.ask");
+    let refusedBlock = runtime.block(definition, "write.refused");
+    let doneBlock = runtime.block(definition, "write.done");
+    let closedBlock = runtime.block(definition, "write.closed");
+    let failedBlock = runtime.block(definition, "write.failed");
+    let descriptor = childprocess.loadField(runtime, runtime.parameter(definition, 0), PosixChild.input);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, descriptor, runtime.int32(0), ""), closedBlock,
+        writeBlock);
+
+    builder.positionAtEnd(closedBlock);
+    instructions.buildRet(builder, runtime.int32(Errno.brokenPipe));
+
+    builder.positionAtEnd(writeBlock);
+    let written = runtime.call(writeDescriptor, [descriptor, runtime.parameter(definition, 1),
+        runtime.parameter(definition, 2)], "written");
+    let why = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, written, runtime.int64(0), ""), refusedBlock,
+        doneBlock);
+
+    builder.positionAtEnd(refusedBlock);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, why, runtime.int32(Errno.interrupted), ""), writeBlock,
+        failedBlock);
+
+    builder.positionAtEnd(failedBlock);
+    instructions.buildRet(builder, why);
+
+    builder.positionAtEnd(doneBlock);
+    memory.buildStore(builder, written, runtime.parameter(definition, 3));
+    instructions.buildRet(builder, runtime.int32(0));
+    return runtime.endDefinition(definition);
+}
+
+public posixCloseInput(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let closeDescriptor = runtime.libc("close",
+        runtime.int32Type.functionType([runtime.int32Type]));
+    let definition = runtime.beginDefinition("ens_process_close_input", type);
+    let builder = runtime.builder;
+    let closeBlock = runtime.block(definition, "close.ask");
+    let closedBlock = runtime.block(definition, "close.done");
+    let slot = childprocess.childField(runtime, runtime.parameter(definition, 0),
+        PosixChild.input);
+    let descriptor = memory.buildLoad(builder, runtime.int32Type, slot, "input");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, descriptor, runtime.int32(0), ""), closedBlock,
+        closeBlock);
+
+    builder.positionAtEnd(closeBlock);
+    let status = runtime.call(closeDescriptor, [descriptor], "status");
+    let why = runtime.lastError();
+    memory.buildStore(builder, runtime.int32(-1), slot);
+    instructions.buildRet(builder, instructions.buildSelect(builder,
+        instructions.buildICmpEQ(builder, status, runtime.int32(0), ""), runtime.int32(0), why,
+        ""));
+
+    builder.positionAtEnd(closedBlock);
+    instructions.buildRet(builder, runtime.int32(0));
+    return runtime.endDefinition(definition);
+}
+
+public posixWait(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let waitForChild = runtime.libc("waitpid", runtime.int32Type.functionType([runtime.int32Type,
+        runtime.pointerType, runtime.int32Type]));
+    let definition = runtime.beginDefinition("ens_process_wait", type);
+    let builder = runtime.builder;
+    let rememberedBlock = runtime.block(definition, "wait.remembered");
+    let askBlock = runtime.block(definition, "wait.ask");
+    let refusedBlock = runtime.block(definition, "wait.refused");
+    let decodeBlock = runtime.block(definition, "wait.decode");
+    let failedBlock = runtime.block(definition, "wait.failed");
+    let block = runtime.parameter(definition, 0);
+    let codeSlot = runtime.parameter(definition, 1);
+    let signalSlot = runtime.parameter(definition, 2);
+    let statusSlot = memory.buildAlloca(builder, runtime.int32Type, "status");
+    memory.buildStore(builder, runtime.int32(0), statusSlot);
+    instructions.buildCondBr(builder, instructions.buildICmpNE(builder,
+        childprocess.loadField(runtime, block, PosixChild.reaped), runtime.int32(0), ""), rememberedBlock,
+        askBlock);
+
+    builder.positionAtEnd(rememberedBlock);
+    memory.buildStore(builder, childprocess.loadField(runtime, block, PosixChild.code), codeSlot);
+    memory.buildStore(builder, childprocess.loadField(runtime, block, PosixChild.signal), signalSlot);
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(askBlock);
+    let answer = runtime.call(waitForChild, [childprocess.loadField(runtime, block, PosixChild.pid),
+        statusSlot, runtime.int32(0)], "answer");
+    let why = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, answer, runtime.int32(0), ""), refusedBlock,
+        decodeBlock);
+
+    builder.positionAtEnd(refusedBlock);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, why, runtime.int32(Errno.interrupted), ""), askBlock,
+        failedBlock);
+
+    builder.positionAtEnd(failedBlock);
+    instructions.buildRet(builder, why);
+
+    // The low seven bits name the signal that ended the child, and are zero for one that exited
+    // with the code held eight bits up.
+    builder.positionAtEnd(decodeBlock);
+    let status = memory.buildLoad(builder, runtime.int32Type, statusSlot, "raw");
+    let low = instructions.buildAnd(builder, status, runtime.int32(WaitStatus.signalMask), "low");
+    let exited = instructions.buildICmpEQ(builder, low, runtime.int32(0), "exited");
+    let code = instructions.buildSelect(builder, exited, instructions.buildAnd(builder,
+        instructions.buildLShr(builder, status, runtime.int32(WaitStatus.codeShift), ""),
+        runtime.int32(WaitStatus.codeMask), ""), runtime.int32(0), "code");
+    let signal = instructions.buildSelect(builder, exited, runtime.int32(0), low, "signal");
+    memory.buildStore(builder, runtime.int32(1),
+        childprocess.childField(runtime, block, PosixChild.reaped));
+    memory.buildStore(builder, code, childprocess.childField(runtime, block, PosixChild.code));
+    memory.buildStore(builder, signal,
+        childprocess.childField(runtime, block, PosixChild.signal));
+    memory.buildStore(builder, code, codeSlot);
+    memory.buildStore(builder, signal, signalSlot);
+    instructions.buildRet(builder, runtime.int32(0));
+    return runtime.endDefinition(definition);
+}
+
+// A child already collected is nothing to stop, and so is one the system no longer knows.
+public posixKill(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let killProcess = runtime.libc("kill",
+        runtime.int32Type.functionType([runtime.int32Type, runtime.int32Type]));
+    let definition = runtime.beginDefinition("ens_process_kill", type);
+    let builder = runtime.builder;
+    let stopBlock = runtime.block(definition, "kill.stop");
+    let refusedBlock = runtime.block(definition, "kill.refused");
+    let goneBlock = runtime.block(definition, "kill.gone");
+    let block = runtime.parameter(definition, 0);
+    instructions.buildCondBr(builder, instructions.buildICmpNE(builder,
+        childprocess.loadField(runtime, block, PosixChild.reaped), runtime.int32(0), ""), goneBlock, stopBlock);
+
+    builder.positionAtEnd(stopBlock);
+    let status = runtime.call(killProcess, [childprocess.loadField(runtime, block, PosixChild.pid),
+        runtime.int32(Signal.kill)], "status");
+    let why = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, status, runtime.int32(0), ""), goneBlock, refusedBlock);
+
+    builder.positionAtEnd(refusedBlock);
+    instructions.buildRet(builder, instructions.buildSelect(builder,
+        instructions.buildICmpEQ(builder, why, runtime.int32(Errno.noSuchProcess), ""),
+        runtime.int32(0), why, ""));
+
+    builder.positionAtEnd(goneBlock);
+    instructions.buildRet(builder, runtime.int32(0));
+    return runtime.endDefinition(definition);
+}
+
+public posixRelease(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let waitForChild = runtime.libc("waitpid", runtime.int32Type.functionType([runtime.int32Type,
+        runtime.pointerType, runtime.int32Type]));
+    let release = runtime.free();
+    let definition = runtime.beginDefinition("ens_process_release", type);
+    let builder = runtime.builder;
+    let collectBlock = runtime.block(definition, "release.collect");
+    let freeBlock = runtime.block(definition, "release.free");
+    let block = runtime.parameter(definition, 0);
+    closeField(runtime, definition, block, PosixChild.input, "release.input");
+    closeField(runtime, definition, block, PosixChild.output, "release.output");
+    closeField(runtime, definition, block, PosixChild.errors, "release.errors");
+    closeField(runtime, definition, block, PosixChild.pidDescriptor, "release.pidfd");
+    instructions.buildCondBr(builder, instructions.buildICmpNE(builder,
+        childprocess.loadField(runtime, block, PosixChild.reaped), runtime.int32(0), ""), freeBlock,
+        collectBlock);
+
+    // A child that has ended is collected here, and one still running is left to the system.
+    builder.positionAtEnd(collectBlock);
+    runtime.call(waitForChild, [childprocess.loadField(runtime, block, PosixChild.pid), runtime.nullPointer(),
+        runtime.int32(WaitStatus.noHang)], "");
+    instructions.buildBr(builder, freeBlock);
+
+    builder.positionAtEnd(freeBlock);
+    runtime.call(release, [block], "");
+    instructions.buildRetVoid(builder);
+    return runtime.endDefinition(definition);
+}
+
+// Opens the pipe the slot pair begins at when the mode asks for one, marking both ends
+// close-on-exec, and goes to `failedBlock` with the reason kept when either call refuses.
+openPipe(Runtime runtime, RuntimeDefinition definition, RuntimeFunction makePipe,
+         RuntimeFunction control, Value ends, long firstSlot, Value mode, Value reasonSlot,
+         BasicBlock failedBlock, string label) {
+    let builder = runtime.builder;
+    let openBlock = runtime.block(definition, "pipe.{label}.open");
+    let flagBlock = runtime.block(definition, "pipe.{label}.flags");
+    let refusedBlock = runtime.block(definition, "pipe.{label}.refused");
+    let doneBlock = runtime.block(definition, "pipe.{label}.done");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, mode, runtime.int32(StdioMode.inherit), ""), doneBlock,
+        openBlock);
+
+    builder.positionAtEnd(openBlock);
+    let piped = runtime.call(makePipe, [endSlot(runtime, ends, firstSlot)], "piped");
+    let pipeError = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, piped, runtime.int32(0), ""), flagBlock, refusedBlock);
+
+    builder.positionAtEnd(flagBlock);
+    let first = runtime.call(control, [loadEnd(runtime, ends, firstSlot),
+        runtime.int32(DescriptorControl.setFlags), runtime.int32(DescriptorControl.closeOnExec)],
+        "flagged.read");
+    let second = runtime.call(control, [loadEnd(runtime, ends, firstSlot + 1),
+        runtime.int32(DescriptorControl.setFlags), runtime.int32(DescriptorControl.closeOnExec)],
+        "flagged.write");
+    let flagError = runtime.lastError();
+    let flagged = instructions.buildAnd(builder,
+        instructions.buildICmpSGE(builder, first, runtime.int32(0), ""),
+        instructions.buildICmpSGE(builder, second, runtime.int32(0), ""), "flagged");
+    memory.buildStore(builder, flagError, reasonSlot);
+    instructions.buildCondBr(builder, flagged, doneBlock, failedBlock);
+
+    builder.positionAtEnd(refusedBlock);
+    memory.buildStore(builder, pipeError, reasonSlot);
+    instructions.buildBr(builder, failedBlock);
+
+    builder.positionAtEnd(doneBlock);
+}
+
+// Changes to the working directory when one was given, reporting a refusal through the pipe.
+changeWorkingDirectory(Runtime runtime, RuntimeDefinition definition,
+                       RuntimeFunction changeDirectory, Value directory, Value reasonSlot,
+                       BasicBlock reportBlock) {
+    let builder = runtime.builder;
+    let changeBlock = runtime.block(definition, "child.directory.change");
+    let doneBlock = runtime.block(definition, "child.directory.done");
+    let first = memory.buildLoad(builder, runtime.int8Type, directory, "directory.first");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, first, runtime.int8(0), ""), doneBlock, changeBlock);
+
+    builder.positionAtEnd(changeBlock);
+    let status = runtime.call(changeDirectory, [directory], "changed");
+    memory.buildStore(builder, runtime.lastError(), reasonSlot);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, status, runtime.int32(0), ""), doneBlock, reportBlock);
+
+    builder.positionAtEnd(doneBlock);
+}
+
+// Moves a child's end that sits at one of the three standard descriptors up above them, so that
+// aiming another end at that descriptor cannot close it first. The copy is close-on-exec like the
+// original, and the original closes itself at exec.
+liftLowEnd(Runtime runtime, RuntimeDefinition definition, RuntimeFunction control,
+           long dupCommand, Value ends, long slot, Value mode, Value reasonSlot,
+           BasicBlock reportBlock, string label) {
+    let builder = runtime.builder;
+    let checkBlock = runtime.block(definition, "child.lift.{label}.check");
+    let liftBlock = runtime.block(definition, "child.lift.{label}.lift");
+    let doneBlock = runtime.block(definition, "child.lift.{label}.done");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, mode, runtime.int32(StdioMode.inherit), ""), doneBlock,
+        checkBlock);
+
+    builder.positionAtEnd(checkBlock);
+    let end = loadEnd(runtime, ends, slot);
+    instructions.buildCondBr(builder, instructions.buildICmpSLT(builder, end,
+        runtime.int32(DescriptorControl.lowestFreeDescriptor), ""), liftBlock, doneBlock);
+
+    builder.positionAtEnd(liftBlock);
+    let lifted = runtime.call(control, [end, runtime.int32(dupCommand),
+        runtime.int32(DescriptorControl.lowestFreeDescriptor)], "lifted");
+    memory.buildStore(builder, runtime.lastError(), reasonSlot);
+    memory.buildStore(builder, lifted, endSlot(runtime, ends, slot));
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSGE(builder, lifted, runtime.int32(0), ""), doneBlock, reportBlock);
+
+    builder.positionAtEnd(doneBlock);
+}
+
+// Aims the child's standard descriptor at its end of the pipe. dup2 clears close-on-exec on the
+// target, so the child keeps exactly the three it is meant to.
+attachEnd(Runtime runtime, RuntimeDefinition definition, Value ends, long slot, long target,
+          Value mode, Value reasonSlot, BasicBlock reportBlock, string label) {
+    let builder = runtime.builder;
+    let duplicate = runtime.libc("dup2",
+        runtime.int32Type.functionType([runtime.int32Type, runtime.int32Type]));
+    let attachBlock = runtime.block(definition, "child.attach.{label}.aim");
+    let doneBlock = runtime.block(definition, "child.attach.{label}.done");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, mode, runtime.int32(StdioMode.inherit), ""), doneBlock,
+        attachBlock);
+
+    builder.positionAtEnd(attachBlock);
+    let aimed = runtime.call(duplicate, [loadEnd(runtime, ends, slot), runtime.int32(target)],
+        "aimed");
+    memory.buildStore(builder, runtime.lastError(), reasonSlot);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSGE(builder, aimed, runtime.int32(0), ""), doneBlock, reportBlock);
+
+    builder.positionAtEnd(doneBlock);
+}
+
+// Reads up to four bytes into the slot, asking again after a signal interrupts, and answers how
+// many arrived. A read the pipe itself refused answers as nothing arriving, since the child has
+// either exec'd or ended with 127 and a wait tells the two apart.
+retryingRead(Runtime runtime, RuntimeDefinition definition, RuntimeFunction readDescriptor,
+             Value descriptor, Value slot, string label) -> Value {
+    let builder = runtime.builder;
+    let askBlock = runtime.block(definition, "{label}.read.ask");
+    let refusedBlock = runtime.block(definition, "{label}.read.refused");
+    let doneBlock = runtime.block(definition, "{label}.read.done");
+    let lengthSlot = memory.buildAlloca(builder, runtime.int64Type, "{label}.length");
+    instructions.buildBr(builder, askBlock);
+
+    builder.positionAtEnd(askBlock);
+    let count = runtime.call(readDescriptor, [descriptor, slot, runtime.int64(4)], "count");
+    let why = runtime.lastError();
+    memory.buildStore(builder, count, lengthSlot);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, count, runtime.int64(0), ""), refusedBlock, doneBlock);
+
+    builder.positionAtEnd(refusedBlock);
+    memory.buildStore(builder, runtime.int64(0), lengthSlot);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, why, runtime.int32(Errno.interrupted), ""), askBlock,
+        doneBlock);
+
+    builder.positionAtEnd(doneBlock);
+    return memory.buildLoad(builder, runtime.int64Type, lengthSlot, "{label}.arrived");
+}
+
+// Closes the descriptor the table slot holds when it holds one, and marks the slot empty.
+closeEnd(Runtime runtime, RuntimeDefinition definition, Value ends, long slot, string label) {
+    closeSlot(runtime, definition, endSlot(runtime, ends, slot), label);
+}
+
+// Closes the descriptor the block field holds when it holds one, and marks the field empty.
+closeField(Runtime runtime, RuntimeDefinition definition, Value block, long offset,
+           string label) {
+    closeSlot(runtime, definition, childprocess.childField(runtime, block, offset), label);
+}
+
+closeSlot(Runtime runtime, RuntimeDefinition definition, Value slot, string label) {
+    let builder = runtime.builder;
+    let closeDescriptor = runtime.libc("close",
+        runtime.int32Type.functionType([runtime.int32Type]));
+    let closeBlock = runtime.block(definition, "{label}.close");
+    let doneBlock = runtime.block(definition, "{label}.kept");
+    let descriptor = memory.buildLoad(builder, runtime.int32Type, slot, "held");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, descriptor, runtime.int32(0), ""), doneBlock,
+        closeBlock);
+
+    builder.positionAtEnd(closeBlock);
+    runtime.call(closeDescriptor, [descriptor], "");
+    memory.buildStore(builder, runtime.int32(-1), slot);
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(doneBlock);
+}
+
+// The descriptor a read of the stream uses, or -1 for a stream that is no pipe.
+streamDescriptor(Runtime runtime, Value block, Value stream) -> Value {
+    let builder = runtime.builder;
+    return instructions.buildSelect(builder, isStream(runtime, stream, ChildStream.output),
+        childprocess.loadField(runtime, block, PosixChild.output),
+        instructions.buildSelect(builder, isStream(runtime, stream, ChildStream.errors),
+            childprocess.loadField(runtime, block, PosixChild.errors), runtime.int32(-1), ""), "descriptor");
+}
+
+// The field recording whether the stream has ended.
+streamEndedSlot(Runtime runtime, Value block, Value stream) -> Value {
+    return instructions.buildSelect(runtime.builder,
+        isStream(runtime, stream, ChildStream.output),
+        childprocess.childField(runtime, block, PosixChild.outputEnded),
+        childprocess.childField(runtime, block, PosixChild.errorsEnded), "ended.slot");
+}
+
+isStream(Runtime runtime, Value stream, long wanted) -> Value {
+    return instructions.buildICmpEQ(runtime.builder, stream, runtime.int32(wanted), "");
+}
+
+endSlot(Runtime runtime, Value ends, long slot) -> Value {
+    return memory.buildGEP(runtime.builder, runtime.int32Type, ends, [runtime.int64(slot)],
+        "end.slot");
+}
+
+loadEnd(Runtime runtime, Value ends, long slot) -> Value {
+    return memory.buildLoad(runtime.builder, runtime.int32Type, endSlot(runtime, ends, slot),
+        "end");
+}

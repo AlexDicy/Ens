@@ -1,0 +1,936 @@
+// The Windows halves of the child bridges. The child is told which handles it inherits through a
+// handle list, so two threads starting children at once share no handle by accident and no lock is
+// needed, and each output pipe is a named pipe whose reading end can be waited on.
+import Value from @ens.llvm.values;
+import TypeRef from @ens.llvm.types;
+import BasicBlock from @ens.llvm.blocks;
+import @ens.llvm.globals;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import ChildExit from emit.nativeshapes;
+import ChildStream from emit.nativeshapes;
+import NamedPipe from emit.nativeshapes;
+import Overlapped from emit.nativeshapes;
+import ProcessCreation from emit.nativeshapes;
+import ProcessInformation from emit.nativeshapes;
+import SecurityAttributes from emit.nativeshapes;
+import Signal from emit.nativeshapes;
+import StandardHandle from emit.nativeshapes;
+import StartupInfo from emit.nativeshapes;
+import StdioMode from emit.nativeshapes;
+import Win32Error from emit.errorkinds;
+import Win32 from emit.filesystem.windows;
+import OutputRecord from emit.childprocess;
+import WindowsChild from emit.childprocess;
+import emit.childprocess;
+import Runtime from emit.runtime;
+import RuntimeDefinition from emit.runtime;
+import RuntimeFunction from emit.runtime;
+import emit.widetext;
+
+public windowsStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let createProcess = runtime.libc("CreateProcessW", runtime.int32Type.functionType([
+        runtime.pointerType, runtime.pointerType, runtime.pointerType, runtime.pointerType,
+        runtime.int32Type, runtime.int32Type, runtime.pointerType, runtime.pointerType,
+        runtime.pointerType, runtime.pointerType]));
+    let sizeList = runtime.libc("InitializeProcThreadAttributeList",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type,
+        runtime.int32Type, runtime.pointerType]));
+    let updateList = runtime.libc("UpdateProcThreadAttribute", runtime.int32Type.functionType([
+        runtime.pointerType, runtime.int32Type, runtime.int64Type, runtime.pointerType,
+        runtime.int64Type, runtime.pointerType, runtime.pointerType]));
+    let deleteList = runtime.libc("DeleteProcThreadAttributeList",
+        runtime.voidType.functionType([runtime.pointerType]));
+    let widen = widetext.wideFromUtf8(runtime);
+    let allocate = runtime.malloc();
+    let release = runtime.free();
+    let definition = runtime.beginDefinition("ens_process_start", type);
+    let builder = runtime.builder;
+    let invalidBlock = runtime.block(definition, "start.invalid");
+    let allocateBlock = runtime.block(definition, "start.allocate");
+    let noMemoryBlock = runtime.block(definition, "start.no.memory");
+    let widenBlock = runtime.block(definition, "start.widen");
+    let streamsBlock = runtime.block(definition, "start.streams");
+    let listBlock = runtime.block(definition, "start.list");
+    let sizedBlock = runtime.block(definition, "start.list.sized");
+    let uninitializedBlock = runtime.block(definition, "start.list.uninitialized");
+    let initializedBlock = runtime.block(definition, "start.list.initialized");
+    let createBlock = runtime.block(definition, "start.create");
+    let cleanupBlock = runtime.block(definition, "start.cleanup");
+    let startedBlock = runtime.block(definition, "start.started");
+    let failedBlock = runtime.block(definition, "start.failed");
+
+    let modes = [runtime.parameter(definition, 9), runtime.parameter(definition, 10),
+        runtime.parameter(definition, 11)];
+    let environmentGiven = runtime.parameter(definition, 7);
+    let errorSlot = runtime.parameter(definition, 12);
+
+    // The child inherits a copy of whatever is still buffered in this process's streams, which it
+    // would write out a second time.
+    runtime.flushBuffered();
+    let reasonSlot = memory.buildAlloca(builder, runtime.int32Type, "reason");
+    let startedSlot = memory.buildAlloca(builder, runtime.int32Type, "started");
+    let sizeSlot = memory.buildAlloca(builder, runtime.int64Type, "list.size");
+    let listSlot = memory.buildAlloca(builder, runtime.pointerType, "list");
+    let wideSlots = [memory.buildAlloca(builder, runtime.pointerType, "program.wide"),
+        memory.buildAlloca(builder, runtime.pointerType, "command.wide"),
+        memory.buildAlloca(builder, runtime.pointerType, "directory.wide"),
+        memory.buildAlloca(builder, runtime.pointerType, "environment.wide")];
+    let childHandles = [memory.buildAlloca(builder, runtime.pointerType, "child.input"),
+        memory.buildAlloca(builder, runtime.pointerType, "child.output"),
+        memory.buildAlloca(builder, runtime.pointerType, "child.errors")];
+    let handleList = memory.buildAlloca(builder, runtime.pointerType.arrayType(3 as ulong),
+        "handles");
+    let security = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType(SecurityAttributes.structBytes as ulong), "security");
+    let startup = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType(StartupInfo.extendedBytes as ulong), "startup");
+    let process = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType(ProcessInformation.structBytes as ulong), "process");
+    memory.buildStore(builder, runtime.int32(0), reasonSlot);
+    memory.buildStore(builder, runtime.int32(0), startedSlot);
+    memory.buildStore(builder, runtime.int64(0), sizeSlot);
+    memory.buildStore(builder, runtime.nullPointer(), listSlot);
+    for (let slot in wideSlots) {
+        memory.buildStore(builder, runtime.nullPointer(), slot);
+    }
+    for (let slot in childHandles) {
+        memory.buildStore(builder, runtime.nullPointer(), slot);
+    }
+    zeroBytes(runtime, security, SecurityAttributes.structBytes);
+    zeroBytes(runtime, startup, StartupInfo.extendedBytes);
+    zeroBytes(runtime, process, ProcessInformation.structBytes);
+    memory.buildStore(builder, runtime.int32(SecurityAttributes.structBytes),
+        runtime.offsetPointer(security, SecurityAttributes.length, ""));
+    memory.buildStore(builder, runtime.int32(1),
+        runtime.offsetPointer(security, SecurityAttributes.inheritHandle, ""));
+    instructions.buildCondBr(builder, childprocess.validModes(runtime, modes), allocateBlock, invalidBlock);
+
+    builder.positionAtEnd(invalidBlock);
+    memory.buildStore(builder, runtime.int32(Win32Error.invalidParameter), errorSlot);
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    builder.positionAtEnd(allocateBlock);
+    let block = runtime.call(allocate, [runtime.int64(WindowsChild.structBytes)], "child.block");
+    instructions.buildCondBr(builder, runtime.isNull(block), noMemoryBlock, widenBlock);
+
+    builder.positionAtEnd(noMemoryBlock);
+    memory.buildStore(builder, runtime.int32(Win32Error.outOfMemory), errorSlot);
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    // Every text crosses as UTF-16, and the two optional ones stay null when not given.
+    builder.positionAtEnd(widenBlock);
+    zeroBytes(runtime, block, WindowsChild.structBytes);
+    widenInto(runtime, definition, widen, runtime.parameter(definition, 0), runtime.int32(-1),
+        runtime.int1Type.constInt(1, false), wideSlots[0], reasonSlot, cleanupBlock, "program");
+    widenInto(runtime, definition, widen, runtime.parameter(definition, 3), runtime.int32(-1),
+        runtime.int1Type.constInt(1, false), wideSlots[1], reasonSlot, cleanupBlock, "command");
+    let directory = runtime.parameter(definition, 8);
+    widenInto(runtime, definition, widen, directory, runtime.int32(-1),
+        instructions.buildICmpNE(builder, memory.buildLoad(builder, runtime.int8Type, directory,
+            ""), runtime.int8(0), "directory.given"), wideSlots[2], reasonSlot, cleanupBlock,
+        "directory");
+    widenInto(runtime, definition, widen, runtime.parameter(definition, 4),
+        instructions.buildTrunc(builder, runtime.parameter(definition, 6), runtime.int32Type, ""),
+        instructions.buildICmpNE(builder, environmentGiven, runtime.int32(0), ""), wideSlots[3],
+        reasonSlot, cleanupBlock, "environment");
+    instructions.buildBr(builder, streamsBlock);
+
+    builder.positionAtEnd(streamsBlock);
+    inputStream(runtime, definition, block, security, modes[0], childHandles[0], reasonSlot,
+        cleanupBlock);
+    outputStream(runtime, definition, block, WindowsChild.output, security, modes[1],
+        childHandles[1], StandardHandle.output, reasonSlot, cleanupBlock, "output");
+    outputStream(runtime, definition, block, WindowsChild.errors, security, modes[2],
+        childHandles[2], StandardHandle.error, reasonSlot, cleanupBlock, "errors");
+    let count = packHandles(runtime, childHandles, handleList);
+    let listed = instructions.buildICmpSGT(builder, count, runtime.int64(0), "listed");
+    memory.buildStore(builder, instructions.buildSelect(builder, listed,
+        runtime.int32(StartupInfo.extendedBytes), runtime.int32(StartupInfo.plainBytes), ""),
+        runtime.offsetPointer(startup, StartupInfo.size, ""));
+    memory.buildStore(builder, runtime.int32(ProcessCreation.useStandardHandles),
+        runtime.offsetPointer(startup, StartupInfo.flags, ""));
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.pointerType, childHandles[0], ""),
+        runtime.offsetPointer(startup, StartupInfo.standardInput, ""));
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.pointerType, childHandles[1], ""),
+        runtime.offsetPointer(startup, StartupInfo.standardOutput, ""));
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.pointerType, childHandles[2], ""),
+        runtime.offsetPointer(startup, StartupInfo.standardError, ""));
+    instructions.buildCondBr(builder, listed, listBlock, createBlock);
+
+    // The list names the child's handles and nothing else, which is what keeps a handle another
+    // thread is passing to its own child out of this one.
+    builder.positionAtEnd(listBlock);
+    runtime.call(sizeList, [runtime.nullPointer(), runtime.int32(1), runtime.int32(0), sizeSlot],
+        "");
+    let list = runtime.call(allocate, [memory.buildLoad(builder, runtime.int64Type, sizeSlot, "")],
+        "list");
+    memory.buildStore(builder, list, listSlot);
+    memory.buildStore(builder, runtime.int32(Win32Error.outOfMemory), reasonSlot);
+    instructions.buildCondBr(builder, runtime.isNull(list), cleanupBlock, sizedBlock);
+
+    builder.positionAtEnd(sizedBlock);
+    let initialized = runtime.call(sizeList, [list, runtime.int32(1), runtime.int32(0), sizeSlot],
+        "initialized");
+    memory.buildStore(builder, runtime.lastError(), reasonSlot);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, initialized, runtime.int32(0), ""), uninitializedBlock,
+        initializedBlock);
+
+    // A list the system never wrote is not one it may be asked to delete.
+    builder.positionAtEnd(uninitializedBlock);
+    runtime.call(release, [list], "");
+    memory.buildStore(builder, runtime.nullPointer(), listSlot);
+    instructions.buildBr(builder, cleanupBlock);
+
+    builder.positionAtEnd(initializedBlock);
+    let updated = runtime.call(updateList, [list, runtime.int32(0),
+        runtime.int64(ProcessCreation.handleListAttribute), handleList,
+        instructions.buildMul(builder, count, runtime.int64(8), ""), runtime.nullPointer(),
+        runtime.nullPointer()], "updated");
+    memory.buildStore(builder, runtime.lastError(), reasonSlot);
+    memory.buildStore(builder, list, runtime.offsetPointer(startup, StartupInfo.attributeList, ""));
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, updated, runtime.int32(0), ""), cleanupBlock,
+        createBlock);
+
+    builder.positionAtEnd(createBlock);
+    let wideEnvironment = memory.buildLoad(builder, runtime.pointerType, wideSlots[3], "");
+    let flags = instructions.buildOr(builder,
+        instructions.buildSelect(builder, listed,
+            runtime.int32(ProcessCreation.extendedStartupInfo), runtime.int32(0), ""),
+        instructions.buildSelect(builder, runtime.isNull(wideEnvironment), runtime.int32(0),
+            runtime.int32(ProcessCreation.unicodeEnvironment), ""), "flags");
+    let started = runtime.call(createProcess, [
+        memory.buildLoad(builder, runtime.pointerType, wideSlots[0], ""),
+        memory.buildLoad(builder, runtime.pointerType, wideSlots[1], ""),
+        runtime.nullPointer(), runtime.nullPointer(),
+        instructions.buildSelect(builder, listed, runtime.int32(1), runtime.int32(0), ""), flags,
+        wideEnvironment, memory.buildLoad(builder, runtime.pointerType, wideSlots[2], ""),
+        startup, process], "started");
+    memory.buildStore(builder, runtime.lastError(), reasonSlot);
+    memory.buildStore(builder, started, startedSlot);
+    instructions.buildBr(builder, cleanupBlock);
+
+    // Whatever was made for the child alone is given back whether or not it started.
+    builder.positionAtEnd(cleanupBlock);
+    let deleteBlock = runtime.block(definition, "start.cleanup.list");
+    let releasedBlock = runtime.block(definition, "start.cleanup.released");
+    let heldList = memory.buildLoad(builder, runtime.pointerType, listSlot, "list.held");
+    instructions.buildCondBr(builder, runtime.isNull(heldList), releasedBlock, deleteBlock);
+
+    builder.positionAtEnd(deleteBlock);
+    runtime.call(deleteList, [heldList], "");
+    runtime.call(release, [heldList], "");
+    instructions.buildBr(builder, releasedBlock);
+
+    builder.positionAtEnd(releasedBlock);
+    for (let slot in wideSlots) {
+        runtime.call(release, [memory.buildLoad(builder, runtime.pointerType, slot, "")], "");
+    }
+    for (long i = 0; i < childHandles.length; i++) {
+        closeHandleSlot(runtime, definition, childHandles[i], "start.child.{i}");
+    }
+    instructions.buildCondBr(builder, instructions.buildICmpNE(builder,
+        memory.buildLoad(builder, runtime.int32Type, startedSlot, ""), runtime.int32(0), ""),
+        startedBlock, failedBlock);
+
+    builder.positionAtEnd(startedBlock);
+    runtime.call(closeHandleFunction(runtime), [memory.buildLoad(builder, runtime.pointerType,
+        runtime.offsetPointer(process, ProcessInformation.thread, ""), "thread")], "");
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.pointerType,
+        runtime.offsetPointer(process, ProcessInformation.process, ""), "process"),
+        childprocess.childField(runtime, block, WindowsChild.process));
+    memory.buildStore(builder, runtime.int32(0), errorSlot);
+    instructions.buildRet(builder, block);
+
+    builder.positionAtEnd(failedBlock);
+    releaseRecord(runtime, definition, recordAt(runtime, block, WindowsChild.output),
+        "failed.output");
+    releaseRecord(runtime, definition, recordAt(runtime, block, WindowsChild.errors),
+        "failed.errors");
+    closeHandleSlot(runtime, definition, childprocess.childField(runtime, block,
+        WindowsChild.input), "failed.input");
+    runtime.call(release, [block], "");
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.int32Type, reasonSlot, ""),
+        errorSlot);
+    instructions.buildRet(builder, runtime.nullPointer());
+    return runtime.endDefinition(definition);
+}
+
+public windowsRead(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let waitForOne = waitForOneFunction(runtime);
+    let copy = runtime.memcpy();
+    let definition = runtime.beginDefinition("ens_process_read", type);
+    let builder = runtime.builder;
+    let invalidBlock = runtime.block(definition, "read.invalid");
+    let checkBlock = runtime.block(definition, "read.check");
+    let loopBlock = runtime.block(definition, "read.loop");
+    let fetchBlock = runtime.block(definition, "read.fetch");
+    let issueBlock = runtime.block(definition, "read.issue");
+    let issueFailedBlock = runtime.block(definition, "read.issue.failed");
+    let awaitBlock = runtime.block(definition, "read.await");
+    let completeFailedBlock = runtime.block(definition, "read.complete.failed");
+    let copyBlock = runtime.block(definition, "read.copy");
+    let endedBlock = runtime.block(definition, "read.ended");
+    let failedBlock = runtime.block(definition, "read.failed");
+    let block = runtime.parameter(definition, 0);
+    let stream = runtime.parameter(definition, 1);
+    let capacity = runtime.parameter(definition, 3);
+    let failureSlot = memory.buildAlloca(builder, runtime.int32Type, "failure");
+    memory.buildStore(builder, runtime.int32(0), failureSlot);
+    let record = streamRecord(runtime, block, stream);
+    let pipe = memory.buildLoad(builder, runtime.pointerType,
+        runtime.offsetPointer(record, OutputRecord.pipe, ""), "pipe");
+    instructions.buildCondBr(builder, instructions.buildAnd(builder,
+        knownStream(runtime, stream), instructions.buildNot(builder, runtime.isNull(pipe), ""),
+        ""), checkBlock, invalidBlock);
+
+    builder.positionAtEnd(invalidBlock);
+    instructions.buildRet(builder, runtime.int32(Win32Error.invalidParameter));
+
+    builder.positionAtEnd(checkBlock);
+    instructions.buildCondBr(builder, instructions.buildICmpNE(builder,
+        loadRecordField(runtime, record, OutputRecord.ended), runtime.int32(0), ""), endedBlock,
+        loopBlock);
+
+    builder.positionAtEnd(loopBlock);
+    let available = instructions.buildSub(builder,
+        loadRecordField(runtime, record, OutputRecord.filled),
+        loadRecordField(runtime, record, OutputRecord.consumed), "available");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSGT(builder, available, runtime.int32(0), ""), copyBlock, fetchBlock);
+
+    builder.positionAtEnd(fetchBlock);
+    instructions.buildCondBr(builder, instructions.buildICmpNE(builder,
+        loadRecordField(runtime, record, OutputRecord.pending), runtime.int32(0), ""), awaitBlock,
+        issueBlock);
+
+    builder.positionAtEnd(issueBlock);
+    let issued = issueRead(runtime, record);
+    memory.buildStore(builder, issued, failureSlot);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, issued, runtime.int32(0), ""), awaitBlock,
+        issueFailedBlock);
+
+    builder.positionAtEnd(issueFailedBlock);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, issued, runtime.int32(Win32Error.brokenPipe), ""),
+        endedBlock, failedBlock);
+
+    // A completion of no bytes is a zero-length write by the child, and the loop asks again.
+    builder.positionAtEnd(awaitBlock);
+    runtime.call(waitForOne, [memory.buildLoad(builder, runtime.pointerType,
+        runtime.offsetPointer(record, OutputRecord.event, ""), "event"),
+        runtime.int32(ProcessCreation.infinite)], "");
+    let completed = completeRead(runtime, record);
+    memory.buildStore(builder, completed, failureSlot);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, completed, runtime.int32(0), ""), loopBlock,
+        completeFailedBlock);
+
+    builder.positionAtEnd(completeFailedBlock);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, completed, runtime.int32(Win32Error.brokenPipe), ""),
+        endedBlock, failedBlock);
+
+    builder.positionAtEnd(copyBlock);
+    let wide = instructions.buildSExt(builder, available, runtime.int64Type, "");
+    let taken = instructions.buildSelect(builder,
+        instructions.buildICmpSLT(builder, capacity, wide, ""), capacity, wide, "taken");
+    let consumed = loadRecordField(runtime, record, OutputRecord.consumed);
+    let source = memory.buildGEP(builder, runtime.int8Type, memory.buildLoad(builder,
+        runtime.pointerType, runtime.offsetPointer(record, OutputRecord.staging, ""), "staging"),
+        [instructions.buildSExt(builder, consumed, runtime.int64Type, "")], "source");
+    runtime.call(copy, [runtime.parameter(definition, 2), source, taken], "");
+    memory.buildStore(builder, instructions.buildAdd(builder, consumed,
+        instructions.buildTrunc(builder, taken, runtime.int32Type, ""), ""),
+        runtime.offsetPointer(record, OutputRecord.consumed, ""));
+    memory.buildStore(builder, taken, runtime.parameter(definition, 4));
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(endedBlock);
+    memory.buildStore(builder, runtime.int32(1),
+        runtime.offsetPointer(record, OutputRecord.ended, ""));
+    memory.buildStore(builder, runtime.int64(0), runtime.parameter(definition, 4));
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(failedBlock);
+    instructions.buildRet(builder, memory.buildLoad(builder, runtime.int32Type, failureSlot, ""));
+    return runtime.endDefinition(definition);
+}
+
+public windowsWrite(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let writeFile = runtime.libc("WriteFile", runtime.int32Type.functionType([runtime.pointerType,
+        runtime.pointerType, runtime.int32Type, runtime.pointerType, runtime.pointerType]));
+    let definition = runtime.beginDefinition("ens_process_write", type);
+    let builder = runtime.builder;
+    let writeBlock = runtime.block(definition, "write.ask");
+    let closedBlock = runtime.block(definition, "write.closed");
+    let writtenBlock = runtime.block(definition, "write.done");
+    let failedBlock = runtime.block(definition, "write.failed");
+    let input = memory.buildLoad(builder, runtime.pointerType,
+        childprocess.childField(runtime, runtime.parameter(definition, 0), WindowsChild.input),
+        "input");
+    let writtenSlot = memory.buildAlloca(builder, runtime.int32Type, "written");
+    memory.buildStore(builder, runtime.int32(0), writtenSlot);
+    instructions.buildCondBr(builder, runtime.isNull(input), closedBlock, writeBlock);
+
+    builder.positionAtEnd(closedBlock);
+    instructions.buildRet(builder, runtime.int32(Win32Error.noData));
+
+    builder.positionAtEnd(writeBlock);
+    let count = runtime.parameter(definition, 2);
+    let offered = instructions.buildSelect(builder,
+        instructions.buildICmpSGT(builder, count, runtime.int64(0x7FFFFFFF), ""),
+        runtime.int32(0x7FFFFFFF), instructions.buildTrunc(builder, count, runtime.int32Type, ""),
+        "offered");
+    let wrote = runtime.call(writeFile, [input, runtime.parameter(definition, 1), offered,
+        writtenSlot, runtime.nullPointer()], "wrote");
+    let why = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, wrote, runtime.int32(0), ""), failedBlock, writtenBlock);
+
+    builder.positionAtEnd(failedBlock);
+    instructions.buildRet(builder, why);
+
+    builder.positionAtEnd(writtenBlock);
+    memory.buildStore(builder, instructions.buildZExt(builder,
+        memory.buildLoad(builder, runtime.int32Type, writtenSlot, ""), runtime.int64Type, ""),
+        runtime.parameter(definition, 3));
+    instructions.buildRet(builder, runtime.int32(0));
+    return runtime.endDefinition(definition);
+}
+
+public windowsCloseInput(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let definition = runtime.beginDefinition("ens_process_close_input", type);
+    closeHandleSlot(runtime, definition, childprocess.childField(runtime,
+        runtime.parameter(definition, 0), WindowsChild.input), "close.input");
+    instructions.buildRet(runtime.builder, runtime.int32(0));
+    return runtime.endDefinition(definition);
+}
+
+// A child this library's own kill stopped reports the stopping signal, provided the code the system
+// reports is the one kill passed; a child that beat the kill to its own end keeps its own code.
+public windowsWait(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let waitForOne = waitForOneFunction(runtime);
+    let exitCodeOf = runtime.libc("GetExitCodeProcess",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
+    let definition = runtime.beginDefinition("ens_process_wait", type);
+    let builder = runtime.builder;
+    let rememberedBlock = runtime.block(definition, "wait.remembered");
+    let askBlock = runtime.block(definition, "wait.ask");
+    let codeBlock = runtime.block(definition, "wait.code");
+    let decodeBlock = runtime.block(definition, "wait.decode");
+    let waitFailedBlock = runtime.block(definition, "wait.failed");
+    let codeFailedBlock = runtime.block(definition, "wait.code.failed");
+    let block = runtime.parameter(definition, 0);
+    let codeSlot = runtime.parameter(definition, 1);
+    let signalSlot = runtime.parameter(definition, 2);
+    let reportedSlot = memory.buildAlloca(builder, runtime.int32Type, "reported");
+    memory.buildStore(builder, runtime.int32(0), reportedSlot);
+    let process = memory.buildLoad(builder, runtime.pointerType,
+        childprocess.childField(runtime, block, WindowsChild.process), "process");
+    instructions.buildCondBr(builder, instructions.buildICmpNE(builder,
+        childprocess.loadField(runtime, block, WindowsChild.reaped), runtime.int32(0), ""), rememberedBlock,
+        askBlock);
+
+    builder.positionAtEnd(rememberedBlock);
+    memory.buildStore(builder, childprocess.loadField(runtime, block, WindowsChild.code), codeSlot);
+    memory.buildStore(builder, childprocess.loadField(runtime, block, WindowsChild.signal), signalSlot);
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(askBlock);
+    let waited = runtime.call(waitForOne, [process, runtime.int32(ProcessCreation.infinite)],
+        "waited");
+    let waitError = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, waited, runtime.int32(ProcessCreation.waitFailed), ""),
+        waitFailedBlock, codeBlock);
+
+    builder.positionAtEnd(waitFailedBlock);
+    instructions.buildRet(builder, waitError);
+
+    builder.positionAtEnd(codeBlock);
+    let reported = runtime.call(exitCodeOf, [process, reportedSlot], "reported");
+    let codeError = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, reported, runtime.int32(0), ""), codeFailedBlock,
+        decodeBlock);
+
+    builder.positionAtEnd(codeFailedBlock);
+    instructions.buildRet(builder, codeError);
+
+    builder.positionAtEnd(decodeBlock);
+    let exitCode = memory.buildLoad(builder, runtime.int32Type, reportedSlot, "exit.code");
+    let stopped = instructions.buildAnd(builder,
+        instructions.buildICmpNE(builder, childprocess.loadField(runtime, block, WindowsChild.killed),
+            runtime.int32(0), ""),
+        instructions.buildICmpEQ(builder, exitCode, runtime.int32(ChildExit.stopped), ""),
+        "stopped");
+    let code = instructions.buildSelect(builder, stopped, runtime.int32(0), exitCode, "code");
+    let signal = instructions.buildSelect(builder, stopped, runtime.int32(Signal.kill),
+        runtime.int32(0), "signal");
+    memory.buildStore(builder, runtime.int32(1),
+        childprocess.childField(runtime, block, WindowsChild.reaped));
+    memory.buildStore(builder, code, childprocess.childField(runtime, block, WindowsChild.code));
+    memory.buildStore(builder, signal,
+        childprocess.childField(runtime, block, WindowsChild.signal));
+    memory.buildStore(builder, code, codeSlot);
+    memory.buildStore(builder, signal, signalSlot);
+    instructions.buildRet(builder, runtime.int32(0));
+    return runtime.endDefinition(definition);
+}
+
+// Asking the system to end a process that has ended is a failure on Windows, so the child is asked
+// first whether it is still running, and asked again when the ending itself is refused.
+public windowsKill(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let waitForOne = waitForOneFunction(runtime);
+    let terminate = runtime.libc("TerminateProcess",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type]));
+    let definition = runtime.beginDefinition("ens_process_kill", type);
+    let builder = runtime.builder;
+    let askBlock = runtime.block(definition, "kill.ask");
+    let stopBlock = runtime.block(definition, "kill.stop");
+    let refusedBlock = runtime.block(definition, "kill.refused");
+    let stoppedBlock = runtime.block(definition, "kill.stopped");
+    let goneBlock = runtime.block(definition, "kill.gone");
+    let block = runtime.parameter(definition, 0);
+    let process = memory.buildLoad(builder, runtime.pointerType,
+        childprocess.childField(runtime, block, WindowsChild.process), "process");
+    instructions.buildCondBr(builder, instructions.buildICmpNE(builder,
+        childprocess.loadField(runtime, block, WindowsChild.reaped), runtime.int32(0), ""), goneBlock,
+        askBlock);
+
+    builder.positionAtEnd(askBlock);
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder,
+        runtime.call(waitForOne, [process, runtime.int32(0)], "ended"),
+        runtime.int32(ProcessCreation.waitObject), ""), goneBlock, stopBlock);
+
+    builder.positionAtEnd(stopBlock);
+    let stopped = runtime.call(terminate, [process, runtime.int32(ChildExit.stopped)], "stopped");
+    let why = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, stopped, runtime.int32(0), ""), refusedBlock,
+        stoppedBlock);
+
+    builder.positionAtEnd(stoppedBlock);
+    memory.buildStore(builder, runtime.int32(1),
+        childprocess.childField(runtime, block, WindowsChild.killed));
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(refusedBlock);
+    instructions.buildRet(builder, instructions.buildSelect(builder,
+        instructions.buildICmpEQ(builder, runtime.call(waitForOne, [process, runtime.int32(0)],
+            "ended.since"), runtime.int32(ProcessCreation.waitObject), ""), runtime.int32(0), why,
+        ""));
+
+    builder.positionAtEnd(goneBlock);
+    instructions.buildRet(builder, runtime.int32(0));
+    return runtime.endDefinition(definition);
+}
+
+public windowsRelease(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let release = runtime.free();
+    let definition = runtime.beginDefinition("ens_process_release", type);
+    let builder = runtime.builder;
+    let block = runtime.parameter(definition, 0);
+    releaseRecord(runtime, definition, recordAt(runtime, block, WindowsChild.output),
+        "release.output");
+    releaseRecord(runtime, definition, recordAt(runtime, block, WindowsChild.errors),
+        "release.errors");
+    closeHandleSlot(runtime, definition, childprocess.childField(runtime, block,
+        WindowsChild.input), "release.input");
+    closeHandleSlot(runtime, definition, childprocess.childField(runtime, block,
+        WindowsChild.process), "release.process");
+    runtime.call(release, [block], "");
+    instructions.buildRetVoid(builder);
+    return runtime.endDefinition(definition);
+}
+
+// Widens the text into the slot when `wanted` holds, going to `failedBlock` with the out-of-memory
+// code kept when the conversion fails.
+widenInto(Runtime runtime, RuntimeDefinition definition, RuntimeFunction widen, Value text,
+          Value bytes, Value wanted, Value slot, Value reasonSlot, BasicBlock failedBlock,
+          string label) {
+    let builder = runtime.builder;
+    let widenBlock = runtime.block(definition, "widen.{label}.convert");
+    let doneBlock = runtime.block(definition, "widen.{label}.done");
+    instructions.buildCondBr(builder, wanted, widenBlock, doneBlock);
+
+    builder.positionAtEnd(widenBlock);
+    let wide = runtime.call(widen, [text, bytes], "{label}.wide");
+    memory.buildStore(builder, wide, slot);
+    memory.buildStore(builder, runtime.int32(Win32Error.outOfMemory), reasonSlot);
+    instructions.buildCondBr(builder, runtime.isNull(wide), failedBlock, doneBlock);
+
+    builder.positionAtEnd(doneBlock);
+}
+
+// The child's input: the reading end of a pipe whose writing end this process keeps, or a copy of
+// this process's own standard input it may inherit.
+inputStream(Runtime runtime, RuntimeDefinition definition, Value block, Value security,
+            Value mode, Value childSlot, Value reasonSlot, BasicBlock failedBlock) {
+    let builder = runtime.builder;
+    let createPipe = runtime.libc("CreatePipe", runtime.int32Type.functionType([
+        runtime.pointerType, runtime.pointerType, runtime.pointerType, runtime.int32Type]));
+    let handleInformation = runtime.libc("SetHandleInformation", runtime.int32Type.functionType(
+        [runtime.pointerType, runtime.int32Type, runtime.int32Type]));
+    let pipeBlock = runtime.block(definition, "input.pipe");
+    let pipedBlock = runtime.block(definition, "input.piped");
+    let inheritBlock = runtime.block(definition, "input.inherit");
+    let doneBlock = runtime.block(definition, "input.done");
+    let parentSlot = childprocess.childField(runtime, block, WindowsChild.input);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, mode, runtime.int32(StdioMode.pipe), ""), pipeBlock,
+        inheritBlock);
+
+    builder.positionAtEnd(pipeBlock);
+    let piped = runtime.call(createPipe, [childSlot, parentSlot, security,
+        runtime.int32(NamedPipe.bufferBytes)], "piped");
+    memory.buildStore(builder, runtime.lastError(), reasonSlot);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, piped, runtime.int32(0), ""), failedBlock, pipedBlock);
+
+    builder.positionAtEnd(pipedBlock);
+    runtime.call(handleInformation, [memory.buildLoad(builder, runtime.pointerType, parentSlot,
+        ""), runtime.int32(ProcessCreation.inheritFlag), runtime.int32(0)], "");
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(inheritBlock);
+    standardHandleCopy(runtime, definition, StandardHandle.input, childSlot, reasonSlot,
+        failedBlock, "input");
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(doneBlock);
+}
+
+// One of the child's output streams: the writing end of a named pipe whose reading end, event and
+// staging buffer go into the record, or a copy of this process's own handle it may inherit.
+outputStream(Runtime runtime, RuntimeDefinition definition, Value block, long recordOffset,
+             Value security, Value mode, Value childSlot, long standard, Value reasonSlot,
+             BasicBlock failedBlock, string label) {
+    let builder = runtime.builder;
+    let createEvent = runtime.libc("CreateEventW", runtime.pointerType.functionType([
+        runtime.pointerType, runtime.int32Type, runtime.int32Type, runtime.pointerType]));
+    let allocate = runtime.malloc();
+    let pipeBlock = runtime.block(definition, "{label}.pipe");
+    let stagingBlock = runtime.block(definition, "{label}.staging");
+    let inheritBlock = runtime.block(definition, "{label}.inherit");
+    let doneBlock = runtime.block(definition, "{label}.done");
+    let record = recordAt(runtime, block, recordOffset);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, mode, runtime.int32(StdioMode.pipe), ""), pipeBlock,
+        inheritBlock);
+
+    builder.positionAtEnd(pipeBlock);
+    outputPipe(runtime, definition, security, record, childSlot, reasonSlot, failedBlock, label);
+    let staging = runtime.call(allocate, [runtime.int64(OutputRecord.stagingBytes)],
+        "{label}.staging");
+    memory.buildStore(builder, staging, runtime.offsetPointer(record, OutputRecord.staging, ""));
+    memory.buildStore(builder, runtime.int32(Win32Error.outOfMemory), reasonSlot);
+    instructions.buildCondBr(builder, runtime.isNull(staging), failedBlock, stagingBlock);
+
+    builder.positionAtEnd(stagingBlock);
+    let event = runtime.call(createEvent, [runtime.nullPointer(), runtime.int32(1),
+        runtime.int32(0), runtime.nullPointer()], "{label}.event");
+    memory.buildStore(builder, runtime.lastError(), reasonSlot);
+    memory.buildStore(builder, event, runtime.offsetPointer(record, OutputRecord.event, ""));
+    memory.buildStore(builder, event, runtime.offsetPointer(record,
+        OutputRecord.overlapped + Overlapped.event, ""));
+    instructions.buildCondBr(builder, runtime.isNull(event), failedBlock, doneBlock);
+
+    builder.positionAtEnd(inheritBlock);
+    standardHandleCopy(runtime, definition, standard, childSlot, reasonSlot, failedBlock, label);
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(doneBlock);
+}
+
+// A named pipe pair under a name no other pipe on this machine is likely to carry, made again
+// under another name when it turns out one does: the first-instance flag refuses a taken name, and
+// a client that reached the name first leaves ours busy.
+outputPipe(Runtime runtime, RuntimeDefinition definition, Value security, Value record,
+           Value childSlot, Value reasonSlot, BasicBlock failedBlock, string label) {
+    let builder = runtime.builder;
+    let processId = runtime.libc("GetCurrentProcessId", runtime.int32Type.functionType([]));
+    let counter = runtime.libc("QueryPerformanceCounter",
+        runtime.int32Type.functionType([runtime.pointerType]));
+    let createPipe = runtime.libc("CreateNamedPipeW", runtime.pointerType.functionType([
+        runtime.pointerType, runtime.int32Type, runtime.int32Type, runtime.int32Type,
+        runtime.int32Type, runtime.int32Type, runtime.int32Type, runtime.pointerType]));
+    let openFile = runtime.libc("CreateFileW", runtime.pointerType.functionType([
+        runtime.pointerType, runtime.int32Type, runtime.int32Type, runtime.pointerType,
+        runtime.int32Type, runtime.int32Type, runtime.pointerType]));
+    let closeHandle = closeHandleFunction(runtime);
+    let format = runtime.snprintf();
+    let widen = widetext.wideFromUtf8(runtime);
+    let release = runtime.free();
+    let nameBlock = runtime.block(definition, "{label}.name");
+    let serverBlock = runtime.block(definition, "{label}.server");
+    let serverRefusedBlock = runtime.block(definition, "{label}.server.refused");
+    let clientBlock = runtime.block(definition, "{label}.client");
+    let clientRefusedBlock = runtime.block(definition, "{label}.client.refused");
+    let againBlock = runtime.block(definition, "{label}.again");
+    let doneBlock = runtime.block(definition, "{label}.paired");
+    let attemptSlot = memory.buildAlloca(builder, runtime.int32Type, "{label}.attempt");
+    let tickSlot = memory.buildAlloca(builder, runtime.int64Type, "{label}.tick");
+    let name = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType(NamedPipe.nameBytes as ulong), "{label}.name");
+    memory.buildStore(builder, runtime.int32(0), attemptSlot);
+    memory.buildStore(builder, runtime.int64(0), tickSlot);
+    let pattern = globals.buildGlobalString(builder, "\\\\.\\pipe\\ens.%u.%llu", ".pipe.name");
+    instructions.buildBr(builder, nameBlock);
+
+    builder.positionAtEnd(nameBlock);
+    runtime.call(counter, [tickSlot], "");
+    runtime.call(format, [name, runtime.int64(NamedPipe.nameBytes), pattern,
+        runtime.call(processId, [], "pid"),
+        memory.buildLoad(builder, runtime.int64Type, tickSlot, "tick")], "");
+    let wide = runtime.call(widen, [name, runtime.int32(-1)], "{label}.wide");
+    memory.buildStore(builder, runtime.int32(Win32Error.outOfMemory), reasonSlot);
+    instructions.buildCondBr(builder, runtime.isNull(wide), failedBlock, serverBlock);
+
+    builder.positionAtEnd(serverBlock);
+    let server = runtime.call(createPipe, [wide,
+        runtime.int32(NamedPipe.accessInbound | NamedPipe.overlappedFlag
+            | NamedPipe.firstInstance),
+        runtime.int32(NamedPipe.byteStream | NamedPipe.rejectRemoteClients), runtime.int32(1),
+        runtime.int32(NamedPipe.bufferBytes), runtime.int32(NamedPipe.bufferBytes),
+        runtime.int32(0), runtime.nullPointer()], "{label}.server");
+    let serverError = runtime.lastError();
+    memory.buildStore(builder, serverError, reasonSlot);
+    instructions.buildCondBr(builder, invalidHandle(runtime, server), serverRefusedBlock,
+        clientBlock);
+
+    builder.positionAtEnd(serverRefusedBlock);
+    runtime.call(release, [wide], "");
+    instructions.buildCondBr(builder, instructions.buildAnd(builder,
+        instructions.buildICmpEQ(builder, serverError, runtime.int32(Win32Error.accessDenied), ""),
+        attemptsLeft(runtime, attemptSlot), ""), againBlock, failedBlock);
+
+    builder.positionAtEnd(clientBlock);
+    let client = runtime.call(openFile, [wide, runtime.int32(Win32.genericWrite),
+        runtime.int32(0), security, runtime.int32(Win32.openExisting),
+        runtime.int32(NamedPipe.attributeNormal), runtime.nullPointer()], "{label}.client");
+    let clientError = runtime.lastError();
+    runtime.call(release, [wide], "");
+    memory.buildStore(builder, clientError, reasonSlot);
+    instructions.buildCondBr(builder, invalidHandle(runtime, client), clientRefusedBlock,
+        doneBlock);
+
+    builder.positionAtEnd(clientRefusedBlock);
+    runtime.call(closeHandle, [server], "");
+    instructions.buildCondBr(builder, instructions.buildAnd(builder,
+        instructions.buildICmpEQ(builder, clientError, runtime.int32(Win32Error.pipeBusy), ""),
+        attemptsLeft(runtime, attemptSlot), ""), againBlock, failedBlock);
+
+    builder.positionAtEnd(againBlock);
+    memory.buildStore(builder, instructions.buildAdd(builder,
+        memory.buildLoad(builder, runtime.int32Type, attemptSlot, ""), runtime.int32(1), ""),
+        attemptSlot);
+    instructions.buildBr(builder, nameBlock);
+
+    builder.positionAtEnd(doneBlock);
+    memory.buildStore(builder, server, runtime.offsetPointer(record, OutputRecord.pipe, ""));
+    memory.buildStore(builder, client, childSlot);
+}
+
+attemptsLeft(Runtime runtime, Value attemptSlot) -> Value {
+    let builder = runtime.builder;
+    return instructions.buildICmpSLT(builder,
+        memory.buildLoad(builder, runtime.int32Type, attemptSlot, "attempt"),
+        runtime.int32(NamedPipe.nameAttempts - 1), "attempts.left");
+}
+
+// A copy of one of this process's standard handles the child may inherit, or null in the slot
+// when this process has no such handle. A copy rather than the handle itself, because the list a
+// child is given accepts only handles marked inheritable and a parent's may not be.
+standardHandleCopy(Runtime runtime, RuntimeDefinition definition, long standard, Value slot,
+                   Value reasonSlot, BasicBlock failedBlock, string label) {
+    let builder = runtime.builder;
+    let standardHandle = runtime.libc("GetStdHandle",
+        runtime.pointerType.functionType([runtime.int32Type]));
+    let currentProcess = runtime.libc("GetCurrentProcess", runtime.pointerType.functionType([]));
+    let duplicate = runtime.libc("DuplicateHandle", runtime.int32Type.functionType([
+        runtime.pointerType, runtime.pointerType, runtime.pointerType, runtime.pointerType,
+        runtime.int32Type, runtime.int32Type, runtime.int32Type]));
+    let copyBlock = runtime.block(definition, "{label}.standard.copy");
+    let doneBlock = runtime.block(definition, "{label}.standard.done");
+    let handle = runtime.call(standardHandle, [runtime.int32(standard)], "{label}.standard");
+    let absent = instructions.buildOr(builder, runtime.isNull(handle),
+        invalidHandle(runtime, handle), "absent");
+    memory.buildStore(builder, runtime.nullPointer(), slot);
+    instructions.buildCondBr(builder, absent, doneBlock, copyBlock);
+
+    builder.positionAtEnd(copyBlock);
+    let self = runtime.call(currentProcess, [], "self");
+    let copied = runtime.call(duplicate, [self, handle, self, slot, runtime.int32(0),
+        runtime.int32(1), runtime.int32(ProcessCreation.duplicateSameAccess)], "copied");
+    memory.buildStore(builder, runtime.lastError(), reasonSlot);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, copied, runtime.int32(0), ""), failedBlock, doneBlock);
+
+    builder.positionAtEnd(doneBlock);
+}
+
+// Packs the child's handles that exist into the list, answering how many there are.
+packHandles(Runtime runtime, Value[] slots, Value list) -> Value {
+    let builder = runtime.builder;
+    Value count = runtime.int64(0);
+    for (let slot in slots) {
+        let handle = memory.buildLoad(builder, runtime.pointerType, slot, "handle");
+        memory.buildStore(builder, handle,
+            memory.buildGEP(builder, runtime.pointerType, list, [count], "list.slot"));
+        count = instructions.buildAdd(builder, count, instructions.buildSelect(builder,
+            runtime.isNull(handle), runtime.int64(0), runtime.int64(1), ""), "count");
+    }
+    return count;
+}
+
+// Posts a read into the record's staging buffer, marking it pending, and answers 0, or the code
+// the posting was refused with.
+issueRead(Runtime runtime, Value record) -> Value {
+    let builder = runtime.builder;
+    let readFile = runtime.libc("ReadFile", runtime.int32Type.functionType([runtime.pointerType,
+        runtime.pointerType, runtime.int32Type, runtime.pointerType, runtime.pointerType]));
+    let overlapped = runtime.offsetPointer(record, OutputRecord.overlapped, "overlapped");
+    for (long offset = 0; offset < Overlapped.event; offset = offset + 8) {
+        memory.buildStore(builder, runtime.int64(0), runtime.offsetPointer(overlapped, offset, ""));
+    }
+    let issued = runtime.call(readFile, [memory.buildLoad(builder, runtime.pointerType,
+        runtime.offsetPointer(record, OutputRecord.pipe, ""), "pipe"),
+        memory.buildLoad(builder, runtime.pointerType,
+            runtime.offsetPointer(record, OutputRecord.staging, ""), "staging"),
+        runtime.int32(OutputRecord.stagingBytes), runtime.nullPointer(), overlapped], "issued");
+    let why = runtime.lastError();
+    let inFlight = instructions.buildOr(builder,
+        instructions.buildICmpNE(builder, issued, runtime.int32(0), ""),
+        instructions.buildICmpEQ(builder, why, runtime.int32(Win32Error.ioPending), ""),
+        "in.flight");
+    memory.buildStore(builder, instructions.buildSelect(builder, inFlight, runtime.int32(1),
+        runtime.int32(0), ""), runtime.offsetPointer(record, OutputRecord.pending, ""));
+    return instructions.buildSelect(builder, inFlight, runtime.int32(0), why, "issue.status");
+}
+
+// Takes the bytes a pending read delivered into the record, marking it no longer pending, and
+// answers 0, or the code the read ended with.
+completeRead(Runtime runtime, Value record) -> Value {
+    let builder = runtime.builder;
+    let overlappedResult = runtime.libc("GetOverlappedResult", runtime.int32Type.functionType([
+        runtime.pointerType, runtime.pointerType, runtime.pointerType, runtime.int32Type]));
+    let countSlot = memory.buildAlloca(builder, runtime.int32Type, "delivered");
+    memory.buildStore(builder, runtime.int32(0), countSlot);
+    let completed = runtime.call(overlappedResult, [memory.buildLoad(builder, runtime.pointerType,
+        runtime.offsetPointer(record, OutputRecord.pipe, ""), "pipe"),
+        runtime.offsetPointer(record, OutputRecord.overlapped, ""), countSlot, runtime.int32(0)],
+        "completed");
+    let why = runtime.lastError();
+    let delivered = instructions.buildICmpNE(builder, completed, runtime.int32(0), "delivered");
+    memory.buildStore(builder, runtime.int32(0),
+        runtime.offsetPointer(record, OutputRecord.pending, ""));
+    memory.buildStore(builder, instructions.buildSelect(builder, delivered,
+        memory.buildLoad(builder, runtime.int32Type, countSlot, ""), runtime.int32(0), ""),
+        runtime.offsetPointer(record, OutputRecord.filled, ""));
+    memory.buildStore(builder, runtime.int32(0),
+        runtime.offsetPointer(record, OutputRecord.consumed, ""));
+    return instructions.buildSelect(builder, delivered, runtime.int32(0), why, "complete.status");
+}
+
+// Hands an output record's pipe, event and buffer back, after a read still in flight has been
+// stopped and has finished touching the buffer.
+releaseRecord(Runtime runtime, RuntimeDefinition definition, Value record, string label) {
+    let builder = runtime.builder;
+    let cancel = runtime.libc("CancelIoEx",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
+    let overlappedResult = runtime.libc("GetOverlappedResult", runtime.int32Type.functionType([
+        runtime.pointerType, runtime.pointerType, runtime.pointerType, runtime.int32Type]));
+    let release = runtime.free();
+    let pendingBlock = runtime.block(definition, "{label}.pending");
+    let closeBlock = runtime.block(definition, "{label}.close");
+    let pipeSlot = runtime.offsetPointer(record, OutputRecord.pipe, "");
+    let pipe = memory.buildLoad(builder, runtime.pointerType, pipeSlot, "pipe");
+    let cancelledSlot = memory.buildAlloca(builder, runtime.int32Type, "{label}.cancelled");
+    instructions.buildCondBr(builder, instructions.buildAnd(builder,
+        instructions.buildNot(builder, runtime.isNull(pipe), ""),
+        instructions.buildICmpNE(builder, loadRecordField(runtime, record, OutputRecord.pending),
+            runtime.int32(0), ""), ""), pendingBlock, closeBlock);
+
+    builder.positionAtEnd(pendingBlock);
+    let overlapped = runtime.offsetPointer(record, OutputRecord.overlapped, "");
+    runtime.call(cancel, [pipe, overlapped], "");
+    runtime.call(overlappedResult, [pipe, overlapped, cancelledSlot, runtime.int32(1)], "");
+    instructions.buildBr(builder, closeBlock);
+
+    builder.positionAtEnd(closeBlock);
+    closeHandleSlot(runtime, definition, pipeSlot, "{label}.pipe");
+    closeHandleSlot(runtime, definition, runtime.offsetPointer(record, OutputRecord.event, ""),
+        "{label}.event");
+    runtime.call(release, [memory.buildLoad(builder, runtime.pointerType,
+        runtime.offsetPointer(record, OutputRecord.staging, ""), "staging")], "");
+    memory.buildStore(builder, runtime.nullPointer(),
+        runtime.offsetPointer(record, OutputRecord.staging, ""));
+}
+
+// Closes the handle the slot holds when it holds one, and empties the slot.
+closeHandleSlot(Runtime runtime, RuntimeDefinition definition, Value slot, string label) {
+    let builder = runtime.builder;
+    let closeBlock = runtime.block(definition, "{label}.close");
+    let doneBlock = runtime.block(definition, "{label}.kept");
+    let handle = memory.buildLoad(builder, runtime.pointerType, slot, "handle");
+    instructions.buildCondBr(builder, runtime.isNull(handle), doneBlock, closeBlock);
+
+    builder.positionAtEnd(closeBlock);
+    runtime.call(closeHandleFunction(runtime), [handle], "");
+    memory.buildStore(builder, runtime.nullPointer(), slot);
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(doneBlock);
+}
+
+// The record of the stream a read names, which is the output's for any number but the errors'.
+streamRecord(Runtime runtime, Value block, Value stream) -> Value {
+    return instructions.buildSelect(runtime.builder,
+        instructions.buildICmpEQ(runtime.builder, stream, runtime.int32(ChildStream.errors), ""),
+        recordAt(runtime, block, WindowsChild.errors), recordAt(runtime, block, WindowsChild.output),
+        "record");
+}
+
+knownStream(Runtime runtime, Value stream) -> Value {
+    let builder = runtime.builder;
+    return instructions.buildOr(builder,
+        instructions.buildICmpEQ(builder, stream, runtime.int32(ChildStream.output), ""),
+        instructions.buildICmpEQ(builder, stream, runtime.int32(ChildStream.errors), ""), "known");
+}
+
+recordAt(Runtime runtime, Value block, long offset) -> Value {
+    return childprocess.childField(runtime, block, offset);
+}
+
+loadRecordField(Runtime runtime, Value record, long offset) -> Value {
+    return memory.buildLoad(runtime.builder, runtime.int32Type,
+        runtime.offsetPointer(record, offset, ""), "record.field");
+}
+
+zeroBytes(Runtime runtime, Value base, long bytes) {
+    for (long offset = 0; offset < bytes; offset = offset + 8) {
+        memory.buildStore(runtime.builder, runtime.int64(0), runtime.offsetPointer(base, offset, ""));
+    }
+}
+
+// INVALID_HANDLE_VALUE, which is what a failed open answers instead of a null pointer.
+invalidHandle(Runtime runtime, Value handle) -> Value {
+    let builder = runtime.builder;
+    return instructions.buildICmpEQ(builder,
+        instructions.buildPtrToInt(builder, handle, runtime.int64Type, ""), runtime.int64(-1),
+        "invalid");
+}
+
+waitForOneFunction(Runtime runtime) -> RuntimeFunction {
+    return runtime.libc("WaitForSingleObject",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type]));
+}
+
+closeHandleFunction(Runtime runtime) -> RuntimeFunction {
+    return runtime.libc("CloseHandle", runtime.int32Type.functionType([runtime.pointerType]));
+}

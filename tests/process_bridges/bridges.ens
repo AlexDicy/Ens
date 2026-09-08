@@ -1,0 +1,321 @@
+// The process bridges the compiler synthesizes wherever they are named, declared here because
+// nothing in the standard library reaches them yet, and the blocks a start takes built the way the
+// library will build them.
+import BytesWriter from @std.io.memory;
+import List from @std.collections.list;
+import StringBuilder from @std.text.stringbuilder;
+import TestFailure from @std.testing;
+
+// A child this process started.
+external type Child;
+
+external from libc {
+    ens_process_start(string program, byte[] argumentBlock, long argumentCount,
+                      string commandLine, byte[] environmentBlock, long environmentCount,
+                      long environmentBytes, int environmentGiven, string workingDirectory,
+                      int stdinMode, int stdoutMode, int stderrMode, out int error) -> Child?;
+    ens_process_read(Child child, int stream, byte[] buffer, long capacity,
+                     out long count) -> int;
+    ens_process_write(Child child, byte[] data, long count, out long written) -> int;
+    ens_process_close_input(Child child) -> int;
+    ens_process_wait(Child child, out int code, out int signal) -> int;
+    ens_process_kill(Child child) -> int;
+    ens_process_release(Child child);
+    ens_process_error_kind(int code) -> int;
+    ens_monotonic_millis() -> long;
+}
+
+// What a start is asked to do with one of the child's streams.
+public final class Mode {
+    public static const int inherit = 0;
+    public static const int pipe = 1;
+}
+
+// The child's output streams as a read names them.
+public final class Stream {
+    public static const int output = 1;
+    public static const int errors = 2;
+}
+
+// The kinds a failure classifies into, in the order std.process declares them.
+public final class Failure {
+    public static const long notFound = 0;
+    public static const long permissionDenied = 1;
+    public static const long other = 2;
+}
+
+// What a start is asked for beyond its program and arguments. A null environment hands this
+// process's own on, and an empty working directory keeps this process's own.
+public final class Request {
+    public const string workingDirectory;
+    public const string[]? environment;
+    public const int stdinMode;
+    public const int stdoutMode;
+    public const int stderrMode;
+
+    public constructor(this.workingDirectory, this.environment, this.stdinMode,
+                       this.stdoutMode, this.stderrMode);
+
+    // Every stream inherited.
+    public static inherited() -> Request {
+        return new Request("", null, Mode.inherit, Mode.inherit, Mode.inherit);
+    }
+
+    // Every stream a pipe.
+    public static piped() -> Request {
+        return new Request("", null, Mode.pipe, Mode.pipe, Mode.pipe);
+    }
+
+    // Both outputs a pipe and the input inherited, the shape of a run that captures.
+    public static reading() -> Request {
+        return new Request("", null, Mode.inherit, Mode.pipe, Mode.pipe);
+    }
+
+    public withWorkingDirectory(string directory) -> Request {
+        return new Request(directory, this.environment, this.stdinMode, this.stdoutMode,
+            this.stderrMode);
+    }
+
+    public withEnvironment(string[] variables) -> Request {
+        return new Request(this.workingDirectory, variables, this.stdinMode, this.stdoutMode,
+            this.stderrMode);
+    }
+}
+
+// The child a start answered, or the platform's own number for why there is none.
+public final class Started {
+    public const Running? child;
+    public const int error;
+
+    public constructor(this.child, this.error);
+}
+
+// What a read answered.
+public final class Read {
+    public const int error;
+    public const long count;
+
+    public constructor(this.error, this.count);
+}
+
+// Everything a stream held until it ended, or the number the reading stopped with.
+public final class Content {
+    public const int error;
+    public const byte[] bytes;
+
+    public constructor(this.error, this.bytes);
+}
+
+// What a write answered.
+public final class Written {
+    public const int error;
+    public const long written;
+
+    public constructor(this.error, this.written);
+}
+
+// How a child ended, or the number the wait failed with.
+public final class Status {
+    public const int error;
+    public const int code;
+    public const int signal;
+
+    public constructor(this.error, this.code, this.signal);
+}
+
+// A child this fixture started, let go when the value is dropped so a failing assertion leaks
+// nothing.
+public final class Running {
+    Child child;
+
+    protected constructor(this.child);
+
+    public read(int stream, byte[] buffer) -> Read {
+        long count = 0;
+        int error = ens_process_read(this.child, stream, buffer, buffer.length, out count);
+        return new Read(error, count);
+    }
+
+    public readAll(int stream) -> Content {
+        let collected = new BytesWriter();
+        byte[] buffer = new byte[8192];
+        while (true) {
+            let read = this.read(stream, buffer);
+            if (read.error != 0) {
+                return new Content(read.error, collected.toBytes());
+            }
+            if (read.count == 0) {
+                return new Content(0, collected.toBytes());
+            }
+            collected.write(buffer.slice(0, read.count));
+        }
+    }
+
+    public write(byte[] data) -> Written {
+        long written = 0;
+        int error = ens_process_write(this.child, data, data.length, out written);
+        return new Written(error, written);
+    }
+
+    // Writes all of `data`, answering 0 or the number the writing stopped with.
+    public writeAll(byte[] data) -> int {
+        long offered = 0;
+        while (offered < data.length) {
+            let written = this.write(data.slice(offered, data.length));
+            if (written.error != 0) {
+                return written.error;
+            }
+            offered = offered + written.written;
+        }
+        return 0;
+    }
+
+    public closeInput() -> int {
+        return ens_process_close_input(this.child);
+    }
+
+    public wait() -> Status {
+        int code = 0;
+        int signal = 0;
+        int error = ens_process_wait(this.child, out code, out signal);
+        return new Status(error, code, signal);
+    }
+
+    public kill() -> int {
+        return ens_process_kill(this.child);
+    }
+
+    destructor() {
+        ens_process_release(this.child);
+    }
+}
+
+// Starts `program` with `arguments` after it, handing a Windows target the command line as it is.
+public start(string program, string[] arguments, string commandLine, Request request) -> Started {
+    let vector = new List<string>();
+    vector.push(program);
+    for (let argument in arguments) {
+        vector.push(argument);
+    }
+    string[] variables = [];
+    int given = 0;
+    string[]? environment = request.environment;
+    if (environment != null) {
+        variables = environment;
+        given = 1;
+    }
+    byte[] argumentBlock = separatedBlock(vector.toArray(), 0);
+    byte[] environmentBlock = environmentBytes(variables);
+    int error = 0;
+    Child? child = ens_process_start(program, argumentBlock, vector.length(), commandLine,
+        environmentBlock, variables.length, environmentBlock.length, given,
+        request.workingDirectory, request.stdinMode, request.stdoutMode, request.stderrMode,
+        out error);
+    if (child == null) {
+        return new Started(null, error);
+    }
+    return new Started(new Running(child), 0);
+}
+
+// The child a start answered, or a failure naming the number it answered instead.
+public running(Started attempt) -> Running throws {
+    let child = attempt.child;
+    if (child == null) {
+        throw new TestFailure("the child was not started, the start answered {attempt.error}");
+    }
+    return child;
+}
+
+public failureOf(int code) -> long {
+    return ens_process_error_kind(code) as long;
+}
+
+public monotonicMillis() -> long {
+    return ens_monotonic_millis();
+}
+
+// The bytes as text without the carriage returns a Windows child writes before its newlines.
+public text(byte[] bytes) -> string {
+    return string.fromBytesLossy(bytes).replace("\r", "");
+}
+
+// The lines the bytes hold, without their endings.
+public lines(byte[] bytes) -> string[] {
+    string[] split = text(bytes).split("\n");
+    if (split.length > 0 && split[split.length - 1].length == 0) {
+        return split.slice(0, split.length - 1);
+    }
+    return split;
+}
+
+// Every variable's bytes with a NUL after each of them and one more closing the block. No variables
+// at all is the closing NUL and the empty entry before it, which is the smallest block Windows reads
+// as an environment.
+environmentBytes(string[] variables) -> byte[] {
+    if (variables.length == 0) {
+        return [0, 0];
+    }
+    return separatedBlock(variables, 1);
+}
+
+// Every value's bytes with a NUL after each of them, and `trailing` more NULs closing the block.
+separatedBlock(string[] values, long trailing) -> byte[] {
+    long total = trailing;
+    for (long i = 0; i < values.length; i++) {
+        total = total + values[i].length + 1;
+    }
+    byte[] block = new byte[total];
+    long at = 0;
+    for (long i = 0; i < values.length; i++) {
+        byte[] raw = values[i].toBytes();
+        for (long b = 0; b < raw.length; b++) {
+            block[at] = raw[b];
+            at = at + 1;
+        }
+        block[at] = 0;
+        at = at + 1;
+    }
+    return block;
+}
+
+// The program and its arguments as one command line, each part quoted so that a program started
+// with it splits the parts back into exactly these values.
+public commandLineOf(string program, string[] arguments) -> string {
+    let line = new StringBuilder();
+    line.append(quoted(program));
+    for (long i = 0; i < arguments.length; i++) {
+        line.append(" ");
+        line.append(quoted(arguments[i]));
+    }
+    return line.toString();
+}
+
+// One part in double quotes. A backslash is literal except where it would escape the closing
+// quote, so a run of backslashes before a quote or at the very end is doubled.
+quoted(string value) -> string {
+    let part = new StringBuilder();
+    part.append('"');
+    long backslashes = 0;
+    for (let character in value.chars()) {
+        if (character == '\\') {
+            backslashes = backslashes + 1;
+            continue;
+        }
+        if (character == '"') {
+            appendBackslashes(part, backslashes * 2 + 1);
+        } else {
+            appendBackslashes(part, backslashes);
+        }
+        part.append(character);
+        backslashes = 0;
+    }
+    appendBackslashes(part, backslashes * 2);
+    part.append('"');
+    return part.toString();
+}
+
+appendBackslashes(StringBuilder part, long count) {
+    for (long i = 0; i < count; i++) {
+        part.append('\\');
+    }
+}

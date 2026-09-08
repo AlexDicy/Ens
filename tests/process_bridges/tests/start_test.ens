@@ -1,0 +1,205 @@
+// What a start hands the child, and what it answers when it cannot start one, on the host running
+// the suite.
+import @std.path;
+import @std.system;
+import @std.testing;
+import Path from @std.fs;
+import @std.environment;
+import List from @std.collections.list;
+import Failure from bridges;
+import Mode from bridges;
+import Request from bridges;
+import Stream from bridges;
+import bridges;
+import scratch;
+import shell;
+
+// The variables a child is given on top of the ones a test names. cmd.exe reaches its own program
+// files through SystemRoot, so a Windows child keeps that one.
+givenEnvironment(string[] named) -> string[] {
+    let variables = new List<string>();
+    for (let variable in named) {
+        variables.push(variable);
+    }
+    if (shell.onWindows()) {
+        variables.push("SystemRoot=" + (system.getEnvironmentVariable("SystemRoot") ?? ""));
+    }
+    return variables.toArray();
+}
+
+// cmd.exe re-reads its own command line, so what reaches it on Windows is that line rather than
+// the argument vector, and the vector is pinned where a program receives one.
+test "arguments reach the program exactly as written" {
+    if (shell.onWindows()) {
+        let child = try bridges.running(shell.start("", "echo one two", Request.reading()));
+        let output = child.readAll(Stream.output);
+        try testing.assertEqual(output.error, 0);
+        try testing.assertEqual(bridges.lines(output.bytes), ["one two"]);
+        try testing.assertEqual(child.wait().code, 0);
+        return;
+    }
+    string[] passed = ["with space", "quo\"ted", "back\\slash", "ends\\", "$HOME", "*"];
+    let extra = new List<string>();
+    extra.push("sh");
+    for (let value in passed) {
+        extra.push(value);
+    }
+    let child = try bridges.running(shell.startWith("printf '%s\\n' \"$@\"", extra.toArray(), "",
+        Request.reading()));
+    let output = child.readAll(Stream.output);
+    try testing.assertEqual(output.error, 0);
+    try testing.assertEqual(bridges.lines(output.bytes), passed);
+    try testing.assertEqual(child.wait().code, 0);
+}
+
+test "a given environment replaces this process's own" {
+    let request = Request.reading().withEnvironment(givenEnvironment(["ENS_PROBE=one"]));
+    let child = try bridges.running(shell.start("echo \"$ENS_PROBE-$\{HOME-unset\}\"",
+        "echo %ENS_PROBE%-%USERPROFILE%", request));
+    let output = child.readAll(Stream.output);
+    try testing.assertEqual(output.error, 0);
+    string expected = "one-unset";
+    if (shell.onWindows()) {
+        expected = "one-%USERPROFILE%";
+    }
+    try testing.assertEqual(bridges.lines(output.bytes), [expected]);
+    try testing.assertEqual(child.wait().code, 0);
+}
+
+test "an inherited environment reaches the child" {
+    string name = "HOME";
+    if (shell.onWindows()) {
+        name = "USERPROFILE";
+    }
+    string? expected = system.getEnvironmentVariable(name);
+    try testing.assertTrue(expected != null, "this process has no {name} to hand on");
+    let child = try bridges.running(shell.start("echo \"$HOME\"", "echo %USERPROFILE%",
+        Request.reading()));
+    let output = child.readAll(Stream.output);
+    try testing.assertEqual(output.error, 0);
+    try testing.assertEqual(bridges.lines(output.bytes), [expected ?? ""]);
+    try testing.assertEqual(child.wait().code, 0);
+}
+
+test "a given environment with no variables reaches the child as none" {
+    let request = Request.reading().withEnvironment([]);
+    let child = try bridges.running(shell.start("echo \"$\{HOME-unset\}\"", "echo %USERPROFILE%",
+        request));
+    let output = child.readAll(Stream.output);
+    try testing.assertEqual(output.error, 0);
+    string expected = "unset";
+    if (shell.onWindows()) {
+        expected = "%USERPROFILE%";
+    }
+    try testing.assertEqual(bridges.lines(output.bytes), [expected]);
+    try testing.assertEqual(child.wait().code, 0);
+}
+
+test "the working directory is the child's" {
+    string folder = try scratch.folder("cwd");
+    let child = try bridges.running(shell.start("pwd", "cd", Request.reading().withWorkingDirectory(folder)));
+    let output = child.readAll(Stream.output);
+    try testing.assertEqual(output.error, 0);
+    string[] printed = bridges.lines(output.bytes);
+    try testing.assertEqual(printed.length, 1);
+    let reported = try Path.fromNative(printed[0], environment.platform()).realPath();
+    let expected = try Path(folder).realPath();
+    try testing.assertEqual(reported.toString(), expected.toString());
+    try testing.assertEqual(child.wait().code, 0);
+}
+
+// The number a start answers for a program that is not there is one condition on each platform,
+// so the kind is pinned exactly.
+test "a program that is not there says so" {
+    string folder = try scratch.folder("missing");
+    string program = path.join(folder, "missing-program");
+    let attempt = bridges.start(program, [], bridges.commandLineOf(program, []),
+        Request.reading());
+    try testing.assertTrue(attempt.child == null, "a program that is not there was started");
+    try testing.assertNotEqual(attempt.error, 0);
+    try testing.assertEqual(bridges.failureOf(attempt.error), Failure.notFound);
+}
+
+// Windows may answer either of two numbers for a path that runs through a file, and both classify
+// as a program that is not there, so the kind is exact whichever it answers.
+test "a program path leading through a file says so" {
+    string folder = try scratch.folder("through");
+    string file = path.join(folder, "plain.txt");
+    try system.writeAllBytes(file, "not a folder".toBytes());
+    string program = path.join(file, "child");
+    let attempt = bridges.start(program, [], bridges.commandLineOf(program, []),
+        Request.reading());
+    try testing.assertTrue(attempt.child == null, "a program under a file was started");
+    try testing.assertEqual(bridges.failureOf(attempt.error), Failure.notFound);
+}
+
+test "a working directory that is not there says so" {
+    string folder = try scratch.folder("nowhere");
+    string program = shell.interpreter();
+    let attempt = bridges.start(program, [], bridges.commandLineOf(program, []),
+        Request.reading().withWorkingDirectory(path.join(folder, "gone")));
+    try testing.assertTrue(attempt.child == null, "a child was started in a missing directory");
+    try testing.assertEqual(bridges.failureOf(attempt.error), Failure.notFound);
+}
+
+// POSIX refuses to run a file nobody may execute as a permission, and Windows refuses a file that
+// is no program image as its own kind of failure, which is an Other.
+test "a data file is refused as a program in each platform's own terms" {
+    string folder = try scratch.folder("data");
+    string program = path.join(folder, "data.bin");
+    try system.writeAllBytes(program, "not a program".toBytes());
+    let attempt = bridges.start(program, [], bridges.commandLineOf(program, []),
+        Request.reading());
+    try testing.assertTrue(attempt.child == null, "a data file was started");
+    try testing.assertNotEqual(attempt.error, 0);
+    long expected = Failure.permissionDenied;
+    if (shell.onWindows()) {
+        expected = Failure.other;
+    }
+    try testing.assertEqual(bridges.failureOf(attempt.error), expected);
+}
+
+test "a directory is refused as a program" {
+    string folder = try scratch.folder("directory.program");
+    let attempt = bridges.start(folder, [], bridges.commandLineOf(folder, []),
+        Request.reading());
+    try testing.assertTrue(attempt.child == null, "a directory was started");
+    try testing.assertNotEqual(attempt.error, 0);
+    try testing.assertEqual(bridges.failureOf(attempt.error), Failure.permissionDenied);
+}
+
+// The number is the bridge's own answer rather than the system's, so it is pinned by value.
+test "a stream mode the bridge does not know is refused" {
+    string program = shell.interpreter();
+    let attempt = bridges.start(program, [], bridges.commandLineOf(program, []),
+        new Request("", null, 7, Mode.pipe, Mode.pipe));
+    try testing.assertTrue(attempt.child == null, "a child was started with an unknown mode");
+    int expected = 22;
+    if (shell.onWindows()) {
+        expected = 87;
+    }
+    try testing.assertEqual(attempt.error, expected);
+    try testing.assertEqual(bridges.failureOf(attempt.error), Failure.other);
+}
+
+test "a number no start reports classifies as Other" {
+    try testing.assertEqual(bridges.failureOf(999999), Failure.other);
+}
+
+// Had the sleeper inherited this process's end of the drain's input, the drain would never see
+// that input end and this test would never finish.
+test "a second child does not inherit the first child's pipes" {
+    let drain = try bridges.running(shell.startDrain(Request.piped()));
+    let sleeper = try bridges.running(shell.startSleeper(3, Request.piped()));
+    long before = bridges.monotonicMillis();
+    try testing.assertEqual(drain.closeInput(), 0);
+    let output = drain.readAll(Stream.output);
+    try testing.assertEqual(output.error, 0);
+    try testing.assertEqual(output.bytes.length, 0);
+    try testing.assertEqual(drain.wait().code, 0);
+    try testing.assertTrue(bridges.monotonicMillis() - before < 2000,
+        "the drain waited for the sleeper to let go of its input");
+    try testing.assertEqual(sleeper.kill(), 0);
+    let stopped = sleeper.wait();
+    try testing.assertEqual(stopped.error, 0);
+}

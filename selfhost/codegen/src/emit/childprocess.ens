@@ -1,0 +1,204 @@
+// The std.process bridges that start a child with each of its three streams inherited or piped,
+// and drive it while it runs. A started child is a block whose layout is the bridge's own, and
+// every failure answers the platform's own error number read before anything else runs.
+import Value from @ens.llvm.values;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import StdioMode from emit.nativeshapes;
+import Runtime from emit.runtime;
+import RuntimeFunction from emit.runtime;
+import emit.childprocess.posix;
+import emit.childprocess.windows;
+
+// Where a POSIX child's block holds each field, every one a 32-bit integer. A descriptor of -1 is
+// a stream that was inherited or has been closed.
+public final class PosixChild {
+    public static const long pid = 0;
+    public static const long pidDescriptor = 4;
+    public static const long input = 8;
+    public static const long output = 12;
+    public static const long errors = 16;
+    public static const long outputEnded = 20;
+    public static const long errorsEnded = 24;
+    public static const long reaped = 28;
+    public static const long code = 32;
+    public static const long signal = 36;
+    public static const long structBytes = 40;
+}
+
+// Where a Windows child's block holds each field: the handles, one record per output pipe, and the
+// status once it is known.
+public final class WindowsChild {
+    public static const long process = 0;
+    public static const long input = 8;
+    public static const long output = 16;
+    public static const long errors = 88;
+    public static const long reaped = 160;
+    public static const long code = 164;
+    public static const long signal = 168;
+    public static const long killed = 172;
+    public static const long structBytes = 176;
+}
+
+// Where one output pipe's record inside a Windows block holds the pipe, the event a read signals,
+// the OVERLAPPED that read runs under, the staging buffer bytes land in, and how far a caller has
+// taken them.
+public final class OutputRecord {
+    public static const long pipe = 0;
+    public static const long event = 8;
+    public static const long overlapped = 16;
+    public static const long staging = 48;
+    public static const long filled = 56;
+    public static const long consumed = 60;
+    public static const long pending = 64;
+    public static const long ended = 68;
+    public static const long structBytes = 72;
+    public static const long stagingBytes = 65536;
+}
+
+// ptr ens_process_start(ptr program, ptr argumentBlock, i64 argumentCount, ptr commandLine,
+// ptr environmentBlock, i64 environmentCount, i64 environmentBytes, i32 environmentGiven,
+// ptr workingDirectory, i32 stdinMode, i32 stdoutMode, i32 stderrMode, ptr error): the started
+// child, or null with the platform's own error number written to `error`. The program is a path
+// and is never searched for. The argument block is the whole argument vector, argv[0] included, as
+// NUL separated values; a POSIX target execs it and a Windows target hands the command line to
+// CreateProcessW instead. An environmentGiven of 1 hands the child exactly the block's variables,
+// even none, and 0 hands this process's own on. The block closes with an empty entry, so a Windows
+// block of two NUL bytes is an environment with no variables. An empty working directory keeps
+// this process's own. Each stream mode is 0 to inherit this process's stream and 1 to connect a
+// pipe this process holds; any other value answers EINVAL or ERROR_INVALID_PARAMETER. A program
+// that could not be started leaves no child behind, since a POSIX child that failed to exec is
+// collected before this answers, and the number reported is the one exec or chdir failed with.
+public startRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([runtime.pointerType, runtime.pointerType,
+        runtime.int64Type, runtime.pointerType, runtime.pointerType, runtime.int64Type,
+        runtime.int64Type, runtime.int32Type, runtime.pointerType, runtime.int32Type,
+        runtime.int32Type, runtime.int32Type, runtime.pointerType]);
+    let known = runtime.existing("ens_process_start", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        return windows.windowsStart(runtime, type);
+    }
+    return posix.posixStart(runtime, type);
+}
+
+// i32 ens_process_read(ptr child, i32 stream, ptr buffer, i64 capacity, ptr count): 0 with how many
+// bytes of the stream were written into the buffer, 0 of them once the stream has ended, or the
+// platform's own error number. The stream is 1 for the child's output and 2 for its errors, and
+// waits for the child to write. A stream that is not a pipe answers EINVAL or
+// ERROR_INVALID_PARAMETER.
+public readRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type,
+        runtime.pointerType, runtime.int64Type, runtime.pointerType]);
+    let known = runtime.existing("ens_process_read", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        return windows.windowsRead(runtime, type);
+    }
+    return posix.posixRead(runtime, type);
+}
+
+// i32 ens_process_write(ptr child, ptr data, i64 count, ptr written): 0 with how many of the bytes
+// the child's input took, which may be fewer than offered, or the platform's own error number. A
+// child that has closed its input, or an input this process has already closed, answers EPIPE on
+// POSIX and ERROR_NO_DATA or ERROR_BROKEN_PIPE on Windows.
+public writeRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType,
+        runtime.int64Type, runtime.pointerType]);
+    let known = runtime.existing("ens_process_write", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        return windows.windowsWrite(runtime, type);
+    }
+    return posix.posixWrite(runtime, type);
+}
+
+// i32 ens_process_close_input(ptr child): 0 once this process holds no end of the child's input, so
+// the child reads the end of it, or the platform's own error number. Asking again answers 0.
+public closeInputRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int32Type.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_process_close_input", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        return windows.windowsCloseInput(runtime, type);
+    }
+    return posix.posixCloseInput(runtime, type);
+}
+
+// i32 ens_process_wait(ptr child, ptr code, ptr signal): 0 with how the child ended written, waiting
+// for it to end first, or the platform's own error number. A child that exited writes its code and
+// a signal of 0, and one ended by a signal writes the signal and a code of 0. Windows has no
+// signals, so a crash writes its NTSTATUS as a negative code, and a child this library's own kill
+// stopped writes signal 9 and code 0, provided the code the system reports is the one kill passed.
+// Asking again answers the same without asking the system.
+public waitRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType,
+        runtime.pointerType]);
+    let known = runtime.existing("ens_process_wait", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        return windows.windowsWait(runtime, type);
+    }
+    return posix.posixWait(runtime, type);
+}
+
+// i32 ens_process_kill(ptr child): 0 once the child is no longer running, whether this call ended it
+// or it had ended already, or the platform's own error number. Nothing here waits.
+public killRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int32Type.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_process_kill", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        return windows.windowsKill(runtime, type);
+    }
+    return posix.posixKill(runtime, type);
+}
+
+// void ens_process_release(ptr child): every pipe end and handle given back and the block freed. A
+// child that has already ended is collected, and one still running is left to the system, since
+// nothing here waits.
+public releaseRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_process_release", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        return windows.windowsRelease(runtime, type);
+    }
+    return posix.posixRelease(runtime, type);
+}
+
+// The address of the field at the byte offset inside a child's block.
+public childField(Runtime runtime, Value block, long offset) -> Value {
+    return runtime.offsetPointer(block, offset, "child.field");
+}
+
+// The 32-bit field at the byte offset inside a child's block.
+public loadField(Runtime runtime, Value block, long offset) -> Value {
+    return memory.buildLoad(runtime.builder, runtime.int32Type, childField(runtime, block, offset),
+        "field");
+}
+
+// True when every mode is one of the two a start knows.
+public validModes(Runtime runtime, Value[] modes) -> Value {
+    let builder = runtime.builder;
+    Value valid = runtime.int1Type.constInt(1, false);
+    for (let mode in modes) {
+        valid = instructions.buildAnd(builder, valid,
+            instructions.buildICmpULE(builder, mode, runtime.int32(StdioMode.pipe), ""), "");
+    }
+    return valid;
+}

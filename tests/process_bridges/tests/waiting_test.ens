@@ -1,0 +1,107 @@
+// How a child's end is reported, what stopping one does, and what letting one go does, on the host
+// running the suite.
+import @std.testing;
+import @std.text.parse;
+import Request from bridges;
+import Stream from bridges;
+import bridges;
+import shell;
+
+test "the status is answered once and then remembered" {
+    let child = try bridges.running(shell.startExiting(7, Request.reading()));
+    let first = child.wait();
+    try testing.assertEqual(first.error, 0);
+    try testing.assertEqual(first.code, 7);
+    try testing.assertEqual(first.signal, 0);
+    let second = child.wait();
+    try testing.assertEqual(second.error, 0);
+    try testing.assertEqual(second.code, 7);
+    try testing.assertEqual(second.signal, 0);
+}
+
+// Windows has no signals, and what it reports for a child this process stopped is pinned below.
+test "a signal is reported as the signal" {
+    if (shell.onWindows()) {
+        return;
+    }
+    let child = try bridges.running(shell.start("kill -9 $$", "", Request.reading()));
+    let status = child.wait();
+    try testing.assertEqual(status.error, 0);
+    try testing.assertEqual(status.code, 0);
+    try testing.assertEqual(status.signal, 9);
+}
+
+// The same act reports the same status on every platform. A child this process stopped ended with
+// signal 9, which on Windows is what the code the stop passed is read back as.
+test "a child this process stopped reports the stopping signal" {
+    let child = try bridges.running(shell.startSleeper(5, Request.piped()));
+    try testing.assertEqual(child.kill(), 0);
+    let status = child.wait();
+    try testing.assertEqual(status.error, 0);
+    try testing.assertEqual(status.code, 0);
+    try testing.assertEqual(status.signal, 9);
+}
+
+test "stopping a child that has finished is not a failure and keeps its code" {
+    let child = try bridges.running(shell.startExiting(7, Request.reading()));
+    try testing.assertEqual(child.wait().code, 7);
+    try testing.assertEqual(child.kill(), 0);
+    let again = child.wait();
+    try testing.assertEqual(again.code, 7);
+    try testing.assertEqual(again.signal, 0);
+}
+
+// On POSIX the child becomes a zombie when it ends until this process exits, since nothing is left
+// to collect it, and nothing here can observe that.
+test "a child let go without waiting is allowed" {
+    let attempt = shell.startSleeper(1, Request.piped());
+    try testing.assertTrue(attempt.child != null, "the sleeper was not started");
+}
+
+// A descriptor or handle leaked per child would move the count between the two readings. Each
+// reading is taken by a child of the same shape, so that child's own pipes are in both alike, and a
+// few children run first so whatever the first start sets up once is in both as well.
+test "starting many children leaks nothing" {
+    long count = 300;
+    if (shell.onWindows()) {
+        count = 30;
+    }
+    try startChildren(3);
+    long before = try heldNow();
+    try startChildren(count);
+    long after = try heldNow();
+    try testing.assertEqual(after, before);
+}
+
+// Starts and finishes that many children, each with every stream piped.
+startChildren(long count) throws {
+    for (long i = 0; i < count; i++) {
+        let child = try bridges.running(shell.startExiting(0, Request.piped()));
+        let output = child.readAll(Stream.output);
+        try testing.assertEqual(output.error, 0);
+        try testing.assertEqual(child.wait().code, 0);
+    }
+}
+
+// How many descriptors or handles this process holds, as a child of it counts them.
+heldNow() -> long throws {
+    let child = try bridges.running(shell.startCountingHeld(Request.reading()));
+    let output = child.readAll(Stream.output);
+    try testing.assertEqual(output.error, 0);
+    try testing.assertEqual(child.wait().code, 0);
+    string[] printed = bridges.lines(output.bytes);
+    try testing.assertEqual(printed.length, 1);
+    long? held = parse.parseLong(printed[0].trim());
+    try testing.assertTrue(held != null, "the child answered '{printed[0]}' rather than a count");
+    return held ?? 0;
+}
+
+test "the clock never goes backwards and moves while a child runs" {
+    long before = bridges.monotonicMillis();
+    let child = try bridges.running(shell.startSleeper(1, Request.piped()));
+    try testing.assertEqual(child.wait().code, 0);
+    long after = bridges.monotonicMillis();
+    try testing.assertTrue(after >= before + 500,
+        "a second of sleeping moved the clock from {before} to {after}");
+    try testing.assertTrue(bridges.monotonicMillis() >= after, "the clock went backwards");
+}
