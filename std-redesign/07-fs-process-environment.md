@@ -8,7 +8,7 @@ libs/std/src/fs/error.ens    FileSystemError, ErrorKind
 libs/std/src/fs/file.ens     File
 libs/std/src/fs/metadata.ens Metadata, EntryKind
 libs/std/src/fs/entry.ens    Entry
-libs/std/src/fs/temp.ens     TemporaryDirectory, TemporaryFile
+libs/std/src/fs/temporary.ens TemporaryDirectory, TemporaryFile
 ```
 
 ```ens
@@ -161,7 +161,7 @@ export struct Path implements Comparable<Path> {
 }
 ```
 
-## File, Metadata, Entry, temp guards
+## File, Metadata, Entry, temporary guards
 
 ```ens
 // @std.fs.file
@@ -215,7 +215,7 @@ export struct Entry {
 ```
 
 ```ens
-// @std.fs.temp
+// @std.fs.temporary
 // A directory or file that exists for as long as the value does. Made under the system's temporary
 // location with a name no other call answers, and removed when the value is dropped.
 export final class TemporaryDirectory {
