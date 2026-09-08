@@ -1,9 +1,8 @@
 // Building a target: one unit at a time, each loaded, analyzed, emitted into object files and
 // linked. A unit whose main module defines main() produces a program, and one that does not is a
 // library compiled just as thoroughly. Building a unit is a function of its inputs alone.
-import @std.system;
-import SystemError from @std.system;
-import @std.path;
+import Path from @std.fs;
+import FileSystemError from @std.fs.error;
 import List from @std.collections.list;
 import FileDiagnostic from @ens.sema.support.diagnostics;
 import FileLoader from @ens.sema.support.loader;
@@ -42,7 +41,7 @@ export enum BuildOutcome {
 // What building one unit came to.
 export final class UnitReport {
     BuildOutcome result;
-    string producedArtifact;
+    Path producedArtifact;
     string[] problemLines;
     long modules;
     long objects;
@@ -57,7 +56,7 @@ export final class UnitReport {
     }
 
     // The executable that was written, or empty text when the unit produced none.
-    export artifact() -> string {
+    export artifact() -> Path {
         return this.producedArtifact;
     }
 
@@ -93,7 +92,7 @@ export run(FileLoader loader, BuildOptions options, Packaging packaging, BuildTa
     }
     reporter.step("building for {options.targetTriple()}");
     return runUnit(loader, options, packaging, program.unitOf(resolved), resolved.artifactName(),
-        options.output(), discoverToolchain(options), reporter, 1, 1, "");
+        options.output(), discoverToolchain(options), reporter, 1, 1, Path(""));
 }
 
 // Builds every member of a workspace, each one after the members it depends on.
@@ -123,12 +122,12 @@ runWorkspace(FileLoader loader, BuildOptions options, Packaging packaging, Build
     // conventionally named after the program it holds, so the two names are the same one. Keeping a
     // member's artifact where its objects are is what stops a build writing an executable over the
     // folder it just read the sources from.
-    string artifacts = objectsFolderFor(options);
+    Path artifacts = objectsFolderFor(options);
     for (long i = 0; i < members.length; i++) {
         let member = members[i];
         int code = runUnit(loader, options, packaging,
             program.memberUnit(member, resolved.root()),
-            target.artifactStem(member.packageName()), "", toolchain, reporter, i + 1,
+            target.artifactStem(member.packageName()), Path(""), toolchain, reporter, i + 1,
             members.length, artifacts);
         if (code != 0) {
             return code;
@@ -139,8 +138,8 @@ runWorkspace(FileLoader loader, BuildOptions options, Packaging packaging, Build
 
 // Builds one unit and reports it, answering with the exit code its outcome deserves.
 runUnit(FileLoader loader, BuildOptions options, Packaging packaging, Unit unit,
-        string artifactStem, string namedOutput, Toolchain toolchain, Reporter reporter,
-        long index, long total, string artifactFolder) -> int {
+        string artifactStem, Path namedOutput, Toolchain toolchain, Reporter reporter,
+        long index, long total, Path artifactFolder) -> int {
     string label = report.progress(index, total, unit.label());
     reporter.step("{label}: reading {unit.sourceFolder()}");
     let built = buildUnit(loader, options, packaging, unit, artifactStem, namedOutput, toolchain,
@@ -161,8 +160,9 @@ reportFailure(Reporter reporter, string label, UnitReport built) -> int {
     return 1;
 }
 
-reportLibrary(Reporter reporter, string label, Unit unit, string namedOutput, UnitReport built) -> int {
-    if (namedOutput.length > 0) {
+reportLibrary(Reporter reporter, string label, Unit unit, Path namedOutput,
+              UnitReport built) -> int {
+    if (!namedOutput.isEmpty()) {
         reporter.problem("'{unit.label()}' does not define main() in its main module, so it builds "
             + "as a library and there is no executable to write; drop '--output' to compile and "
             + "check it");
@@ -183,8 +183,8 @@ reportExecutable(Reporter reporter, string label, UnitReport built) -> int {
 // Compiles one unit and links it when it is an application. Nothing here writes to a stream: the
 // report carries every line the caller may want to show.
 export buildUnit(FileLoader loader, BuildOptions options, Packaging packaging, Unit unit,
-                 string artifactStem, string namedOutput, Toolchain toolchain,
-                 string artifactFolder = "") -> UnitReport {
+                 string artifactStem, Path namedOutput, Toolchain toolchain,
+                 Path artifactFolder = Path("")) -> UnitReport {
     return finishUnit(options, packaging, program.load(loader, options, packaging, unit),
         artifactStem, namedOutput, toolchain, artifactFolder);
 }
@@ -192,8 +192,8 @@ export buildUnit(FileLoader loader, BuildOptions options, Packaging packaging, U
 // Everything a build does to a unit that is already loaded and analyzed. A caller with a rule of
 // its own about what it loaded, as a test run has, checks that first and then comes here.
 export finishUnit(BuildOptions options, Packaging packaging, Loaded loaded, string artifactStem,
-                  string namedOutput, Toolchain toolchain,
-                  string artifactFolder = "") -> UnitReport {
+                  Path namedOutput, Toolchain toolchain,
+                  Path artifactFolder = Path("")) -> UnitReport {
     let analysis = loaded.analysis();
     if (analysis == null) {
         return failed(loaded.problems(), loaded.moduleCount(), loaded.notices());
@@ -202,28 +202,28 @@ export finishUnit(BuildOptions options, Packaging packaging, Loaded loaded, stri
         return buildLibrary(options, analysis, loaded, artifactStem);
     }
 
-    string output = namedOutput;
-    if (output.length == 0) {
-        string folder = artifactFolder;
-        if (folder.length == 0) {
+    Path output = namedOutput;
+    if (output.isEmpty()) {
+        Path folder = artifactFolder;
+        if (folder.isEmpty()) {
             folder = options.workingFolder();
         }
-        output = path.join(folder, platform.executableNamed(artifactStem, options.targetTriple()));
+        output = folder.join(platform.executableNamed(artifactStem, options.targetTriple()));
     }
     // Asked to write a program over a folder, the linker stops the whole process on the spot and
     // takes its own account of why with it, so the one thing said about it has to be said here.
-    if (system.isDirectory(output)) {
+    if (output.isDirectory()) {
         return failed(["'{output}' is a folder, so the program cannot be written there; name the "
             + "program with '--output' or build from a folder that holds no '"
-            + path.fileName(output) + "'"], loaded.moduleCount(), loaded.notices());
+            + output.fileName() + "'"], loaded.moduleCount(), loaded.notices());
     }
-    string objectsFolder = objectsFolderFor(options);
+    Path objectsFolder = objectsFolderFor(options);
     string prepared = prepareObjectsFolder(options, objectsFolder);
     if (prepared.length > 0) {
         return failed([prepared], loaded.moduleCount(), loaded.notices());
     }
 
-    let emitted = emitObjects(options, analysis, objectsFolder, path.stem(output) + ".");
+    let emitted = emitObjects(options, analysis, objectsFolder, output.stem() + ".");
     if (emitted.failure.length > 0) {
         return failed([emitted.failure], loaded.moduleCount(), loaded.notices());
     }
@@ -247,7 +247,7 @@ export finishUnit(BuildOptions options, Packaging packaging, Loaded loaded, stri
     }
 
     let linked = linker.link(new LinkRequest(emitted.objects, plan.libraries(),
-        prebuiltFiles.files(), output, options.targetTriple()), toolchain);
+        prebuiltFiles.files(), output.toString(), options.targetTriple()), toolchain);
     if (!linked.linked()) {
         return failed(linkFailureLines(output, linked.output()), loaded.moduleCount(),
             loaded.notices());
@@ -261,7 +261,7 @@ export finishUnit(BuildOptions options, Packaging packaging, Loaded loaded, stri
 // because a library's objects are the ones most worth having again.
 buildLibrary(BuildOptions options, ProgramAnalysis analysis, Loaded loaded,
              string artifactStem) -> UnitReport {
-    string objectsFolder = objectsFolderFor(options);
+    Path objectsFolder = objectsFolderFor(options);
     string prepared = prepareObjectsFolder(options, objectsFolder);
     if (prepared.length > 0) {
         return failed([prepared], loaded.moduleCount(), loaded.notices());
@@ -275,7 +275,7 @@ buildLibrary(BuildOptions options, ProgramAnalysis analysis, Loaded loaded,
             loaded.moduleCount(), loaded.notices());
     }
     string[] clean = [];
-    return new UnitReport(BuildOutcome.ValidatedLibrary, "", clean, loaded.moduleCount(),
+    return new UnitReport(BuildOutcome.ValidatedLibrary, Path(""), clean, loaded.moduleCount(),
         emitted.objects.length, emitted.account, loaded.notices());
 }
 
@@ -290,7 +290,7 @@ export discoverToolchain(BuildOptions options) -> Toolchain {
         return toolchain.bareToolchain();
     }
     let discovered = discovery.discover(flavor.flavorOf(triple), triple,
-        path.join(probes.folder(), "probe"));
+        probes.folder().join("probe").toString());
     scratch.discard(probes.folder());
     return discovered;
 }
@@ -320,13 +320,14 @@ final class Emitted {
 // moved to where it belongs once it is whole, so what sits at an object's path is never a
 // half-written object. The staging folder is inside the target folder, so the move is a rename
 // within one volume.
-emitObjects(BuildOptions options, ProgramAnalysis analysis, string objectsFolder,
+emitObjects(BuildOptions options, ProgramAnalysis analysis, Path objectsFolder,
             string filePrefix) -> Emitted {
     let staging = scratch.createUnder(objectsFolder, FolderPrefixes.staging);
     if (staging.failure().length > 0) {
         return failedEmission("the object files could not be assembled: " + staging.failure());
     }
-    let emitted = driver.emitProgram(analysis, staging.folder(), filePrefix, options.codegen());
+    let emitted = driver.emitProgram(analysis, staging.folder().toString(), filePrefix,
+        options.codegen());
     string[] nothing = [];
     if (!emitted.succeeded()) {
         scratch.discard(staging.folder());
@@ -351,17 +352,17 @@ final class PlacedObjects {
     protected constructor(this.files, this.failure);
 }
 
-placeObjects(string objectsFolder, List<string> staged) -> PlacedObjects {
+placeObjects(Path objectsFolder, List<string> staged) -> PlacedObjects {
     let placed = new List<string>();
     for (long i = 0; i < staged.length(); i++) {
         string from = staged.get(i);
-        string to = path.join(objectsFolder, path.fileName(from));
-        string problem = placeObject(from, to);
+        Path to = objectsFolder.join(Path(from).fileName());
+        string problem = placeObject(Path(from), to);
         if (problem.length > 0) {
             string[] nothing = [];
             return new PlacedObjects(nothing, problem);
         }
-        placed.push(to);
+        placed.push(to.toString());
     }
     return new PlacedObjects(placed.toArray(), "");
 }
@@ -369,17 +370,17 @@ placeObjects(string objectsFolder, List<string> staged) -> PlacedObjects {
 // Puts one finished object at its own path. What an earlier build left there goes first, because a
 // move answers rather than replaces when a name is taken; across the two steps the path holds either
 // that whole earlier object or this whole new one, and never a part of either.
-placeObject(string from, string to) -> string {
-    if (system.exists(to)) {
-        try system.removeFile(to);
+placeObject(Path from, Path to) -> string {
+    if (to.exists()) {
+        try to.removeFile();
     }
-    if (try system.move(from, to)) {
+    if (try from.moveTo(to)) {
         return "";
     }
     return "the object file '{to}' was written by something else while this build was building it; "
         + "run one build of these sources at a time";
-} catch (SystemError error) {
-    return "the object file could not be put at '{to}': {error.message}";
+} catch (FileSystemError refused) {
+    return "the object file could not be put at '{to}': {refused.message}";
 }
 
 failedEmission(string problem) -> Emitted {
@@ -391,24 +392,24 @@ failedEmission(string problem) -> Emitted {
 // The folder Ens keeps what a build root produces under. The name is dotted and tool-owned, so it
 // cannot be read as a folder of sources and cannot be confused with a package of a workspace, and it
 // leaves room beside the objects for whatever else a build root comes to keep.
-export artifactsFolderIn(string artifactRoot) -> string {
-    return path.join(artifactRoot, ".ens");
+export artifactsFolderIn(Path artifactRoot) -> Path {
+    return artifactRoot.join(".ens");
 }
 
 // Where the object files go: the folder the command line named, else a folder under the build root
 // named after the target and the optimization level they were built for. Nothing built for one
 // configuration ever shares a folder with another, so an object emitted for a different target or a
 // different level can never be picked up by mistake.
-export objectsFolderFor(BuildOptions options) -> string {
-    if (options.objects().length > 0) {
+export objectsFolderFor(BuildOptions options) -> Path {
+    if (!options.objects().isEmpty()) {
         return options.objects();
     }
-    string root = options.artifactRoot();
-    if (root.length == 0) {
+    Path root = options.artifactRoot();
+    if (root.isEmpty()) {
         root = options.workingFolder();
     }
-    string configured = path.join(artifactsFolderIn(root), options.targetTriple());
-    return path.join(configured, "O" + settings.levelText(options.codegen().optimizationLevel()));
+    Path configured = artifactsFolderIn(root).join(options.targetTriple());
+    return configured.join("O" + settings.levelText(options.codegen().optimizationLevel()));
 }
 
 // Anything the linker said on a link that still succeeded, which is worth passing on unchanged. The
@@ -426,7 +427,7 @@ public linkerNoise(string reported) -> string[] {
 // A failed link, in the linker's own words: they are the only description of what went wrong worth
 // showing, and swallowing them would leave nothing to act on. It is one problem however many lines
 // the linker spent on it, so it is reported as one.
-public linkFailureLines(string output, string reported) -> string[] {
+public linkFailureLines(Path output, string reported) -> string[] {
     string said = reported.trim();
     if (said.length == 0) {
         return ["linking '{output}' failed and the linker reported no reason"];
@@ -438,43 +439,43 @@ public linkFailureLines(string output, string reported) -> string[] {
 // .gitignore beside it saying to ignore everything under it. What a build produces is not something
 // anyone commits, and a file that says so where the files are needs nothing of whoever cloned the
 // repository and nothing of anybody's memory.
-prepareObjectsFolder(BuildOptions options, string objectsFolder) -> string {
+prepareObjectsFolder(BuildOptions options, Path objectsFolder) -> string {
     string problem = prepareFolder(objectsFolder);
     if (problem.length > 0) {
         return problem;
     }
-    if (options.objects().length == 0) {
+    if (options.objects().isEmpty()) {
         ignoreEverythingIn(artifactsFolderIn(ownedRoot(options)));
     }
     return "";
 }
 
-ownedRoot(BuildOptions options) -> string {
-    if (options.artifactRoot().length > 0) {
+ownedRoot(BuildOptions options) -> Path {
+    if (!options.artifactRoot().isEmpty()) {
         return options.artifactRoot();
     }
     return options.workingFolder();
 }
 
-prepareFolder(string folder) -> string {
-    if (system.isDirectory(folder)) {
+prepareFolder(Path folder) -> string {
+    if (folder.isDirectory()) {
         return "";
     }
-    try system.createDirectory(folder);
+    try folder.createDirectories();
     return "";
-} catch (SystemError error) {
-    return "could not create '{folder}' to hold the object files: {error.message}";
+} catch (FileSystemError refused) {
+    return "could not create '{folder}' to hold the object files: {refused.message}";
 }
 
 // A build that could not write the file goes on regardless: an ignore file is a courtesy to whoever
 // reads the tree, and no build should fail over one.
-ignoreEverythingIn(string folder) {
-    string file = path.join(folder, ".gitignore");
-    if (system.isFile(file)) {
+ignoreEverythingIn(Path folder) {
+    Path file = folder.join(".gitignore");
+    if (file.isFile()) {
         return;
     }
-    try system.writeAllText(file, "*\n");
-} catch (SystemError error) { }
+    try file.writeText("*\n");
+} catch (FileSystemError refused) { }
 
 // A unit that never reached an artifact, for the problems a caller found in it before a build did.
 export failedUnit(string[] problems, long moduleCount, string[] notices) -> UnitReport {
@@ -483,5 +484,6 @@ export failedUnit(string[] problems, long moduleCount, string[] notices) -> Unit
 
 failed(string[] problems, long moduleCount, string[] notices) -> UnitReport {
     string[] nothing = [];
-    return new UnitReport(BuildOutcome.Failed, "", problems, moduleCount, 0, nothing, notices);
+    return new UnitReport(BuildOutcome.Failed, Path(""), problems, moduleCount, 0, nothing,
+        notices);
 }

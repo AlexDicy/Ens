@@ -1,10 +1,10 @@
 import List from @std.collections.list;
-import @std.path;
 import @std.process;
 import LineBuffer from @std.text.lines;
 import EncodingError from @std.text;
 
 public external type CFile;
+public external type Folder;
 external type ChildHandle;
 
 // The compiler defines the 'ens_' bridges wherever they are referenced. The two bridges that start a
@@ -43,6 +43,20 @@ external from libc {
     ens_path_kind(string path) -> int;
     ens_list_directory(string folder) -> string[]?;
     ens_create_directory(string path) -> int;
+    ens_fs_error_kind(int code) -> int;
+    ens_fs_metadata(string path, int followLinks, out long kind, out long length,
+                    out long modifiedMillis) -> int;
+    ens_fs_real_path(string path, byte[] buffer, long capacity, out long needed) -> int;
+    ens_fs_open(string path, int mode, out int code) -> CFile?;
+    ens_fs_create_directory(string path) -> int;
+    ens_fs_remove_file(string path) -> int;
+    ens_fs_remove_directory(string path) -> int;
+    ens_fs_rename(string from, string to, int replaceExisting) -> int;
+    ens_fs_copy_permissions(string from, string to) -> int;
+    ens_fs_open_directory(string path, out int code) -> Folder?;
+    ens_fs_next_entry(Folder folder, out long kind, out int code) -> string?;
+    ens_fs_close_directory(Folder folder);
+    ens_current_directory(byte[] buffer, long capacity) -> long;
     ens_executable_path(byte[] buffer, long capacity) -> long;
     ens_environment() -> string[];
     ens_platform() -> int;
@@ -121,8 +135,163 @@ public flushHandle(CFile handle) -> bool {
     return fflush(handle) == 0;
 }
 
+// Hands `handle` back to the operating system and answers whether everything written to it got
+// there. The handle must not be touched afterwards.
+public closeHandle(CFile handle) -> bool {
+    return fclose(handle) == 0;
+}
+
 public handleFailed(CFile handle) -> bool {
     return ferror(handle) != 0;
+}
+
+// What a metadata bridge answered. A `code` of 0 means the other three were written, and any other
+// value is the platform's own error number with none of them written.
+public struct NativeMetadata {
+    public const int code;
+    public const long kind;
+    public const long length;
+    public const long modifiedMillis;
+}
+
+// What a real-path bridge answered. A `code` of 0 means the bridge resolved the path, `needed`
+// always holds the room the answer takes, and the buffer is left untouched whenever that room is
+// above what the caller offered.
+public struct NativeRealPath {
+    public const int code;
+    public const long needed;
+}
+
+// The stream a path was opened on, or the platform's own error number in `code` for why it was not.
+public struct NativeStream {
+    public const CFile? handle;
+    public const int code;
+}
+
+// The folder a path was opened as, or the platform's own error number in `code` for why it was not.
+public struct NativeFolder {
+    public const Folder? handle;
+    public const int code;
+}
+
+// One name a folder handed over, and null for `name` once it has handed over every name or the
+// reading failed, which the platform's own error number in `code` tells apart. The `kind` is what
+// the file system classified the entry as while enumerating, and 0 where it classified nothing.
+public struct NativeEntry {
+    public const string? name;
+    public const long kind;
+    public const int code;
+}
+
+// The std.fs ErrorKind ordinal a platform's own error number means, from 0 for NotFound to 7 for
+// Other.
+public fsErrorKind(int code) -> int {
+    return ens_fs_error_kind(code);
+}
+
+// What is at `path`, where a `followLinks` of true answers for what a symbolic link points to and
+// false answers for the link itself.
+public fsMetadata(string path, bool followLinks) -> NativeMetadata {
+    long kind = 0;
+    long length = 0;
+    long modifiedMillis = 0;
+    int code = ens_fs_metadata(path, followLinks ? 1 : 0, out kind, out length,
+        out modifiedMillis);
+    NativeMetadata answer = {code: code, kind: kind, length: length,
+        modifiedMillis: modifiedMillis};
+    return answer;
+}
+
+// One attempt at the real form of `path`, written into `buffer` with `capacity` bytes of room. The
+// text is the operating system's own and carries no terminator.
+public fsRealPath(string path, byte[] buffer, long capacity) -> NativeRealPath {
+    long needed = 0;
+    int code = ens_fs_real_path(path, buffer, capacity, out needed);
+    NativeRealPath answer = {code: code, needed: needed};
+    return answer;
+}
+
+// The C library stream `path` is open on. The mode is 0 to read, 1 to write from empty, 2 to write
+// at the end, and 3 to create and refuse a path that is already there.
+public fsOpen(string path, int mode) -> NativeStream {
+    int code = 0;
+    CFile? handle = ens_fs_open(path, mode, out code);
+    NativeStream answer = {handle: handle, code: code};
+    return answer;
+}
+
+// Creates the one level `path` names, answering 0 or the platform's own error number. Every level
+// above it is the caller's to create first.
+public fsCreateDirectory(string path) -> int {
+    return ens_fs_create_directory(path);
+}
+
+// Removes the file `path` names, answering 0 or the platform's own error number.
+public fsRemoveFile(string path) -> int {
+    return ens_fs_remove_file(path);
+}
+
+// Removes the folder `path` names, answering 0 or the platform's own error number.
+public fsRemoveDirectory(string path) -> int {
+    return ens_fs_remove_directory(path);
+}
+
+// Moves `from` to `to` in one step, answering 0 or the platform's own error number. Both paths have
+// to be on one volume, since nothing here copies.
+public fsRename(string from, string to, bool replaceExisting) -> int {
+    return ens_fs_rename(from, to, replaceExisting ? 1 : 0);
+}
+
+// Hands the nine permission bits of `from` over to `to`, answering 0 or the platform's own error
+// number. Windows answers 0 without doing anything, because it carries no bits a copy could hand
+// over.
+public fsCopyPermissions(string from, string to) -> int {
+    return ens_fs_copy_permissions(from, to);
+}
+
+// A stream over what the folder at `path` holds, released by exactly one call to
+// 'fsCloseDirectory'.
+public fsOpenDirectory(string path) -> NativeFolder {
+    int code = 0;
+    Folder? handle = ens_fs_open_directory(path, out code);
+    NativeFolder answer = {handle: handle, code: code};
+    return answer;
+}
+
+// The next name inside `folder`. The entries naming the folder itself and its parent are never
+// answered, and the order is whatever the file system enumerates in.
+public fsNextEntry(Folder folder) -> NativeEntry {
+    long kind = 0;
+    int code = 0;
+    string? name = ens_fs_next_entry(folder, out kind, out code);
+    NativeEntry answer = {name: name, kind: kind, code: code};
+    return answer;
+}
+
+// Hands `folder` back to the operating system along with the stream itself, which no call may touch
+// afterwards.
+public fsCloseDirectory(Folder folder) {
+    ens_fs_close_directory(folder);
+}
+
+// How many bytes of the directory the program was started in were written into `buffer`, and -1
+// where the operating system would not report it or the buffer is too small to hold it. The text is
+// the operating system's own, so a Windows answer carries '\'.
+public currentDirectoryInto(byte[] buffer, long capacity) -> long {
+    return ens_current_directory(buffer, capacity);
+}
+
+// How many bytes of the running program's own path were written into `buffer`, and -1 where the
+// operating system would not report it or the buffer is too small to hold it. The text is the
+// operating system's own, so a Windows answer carries '\'.
+public executablePathInto(byte[] buffer, long capacity) -> long {
+    return ens_executable_path(buffer, capacity);
+}
+
+// The system the program was built for, as the number the bridge answers with: 0 for Windows, 2 for
+// macOS, and 1 for everything else, which behaves as Linux does.
+public platformCode() -> int {
+    return ens_platform();
 }
 
 // The value the text spells, converted the way the C library converts one, so a value written out
@@ -277,7 +446,7 @@ export currentDirectory() -> string {
         byte[] buffer = new byte[capacity];
         string? folder = getcwd(buffer, capacity as int);
         if (folder != null) {
-            return path.fromNative(folder, platform());
+            return nativePathText(folder);
         }
         capacity = capacity * 8;
     }
@@ -292,11 +461,21 @@ export executablePath() -> string {
         byte[] buffer = new byte[capacity];
         long written = ens_executable_path(buffer, capacity);
         if (written > 0) {
-            return path.fromNative(string.fromBytesLossy(buffer.slice(0, written)), platform());
+            return nativePathText(string.fromBytesLossy(buffer.slice(0, written)));
         }
         capacity = capacity * 8;
     }
     return "";
+}
+
+// Text the operating system reported, written the way the two functions above have always
+// answered a path: with '/' between the parts on Windows, and byte for byte everywhere else,
+// where '\' is an ordinary character in a name.
+nativePathText(string text) -> string {
+    if (platform() != "windows") {
+        return text;
+    }
+    return text.replace("\\", "/");
 }
 
 // The environment this process inherited, as 'NAME=VALUE' entries in ascending order by their

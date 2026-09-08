@@ -1,0 +1,196 @@
+// What surrounds the running program, which is the variables it was given, the arguments it was
+// started with, and where it runs.
+import Path from @std.fs;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+import @std.system;
+
+// A system a program can be built for. The members are exactly the systems the compiler can build
+// for, so a new one grows this enum rather than being reported as one of these.
+export enum Platform {
+    // Windows, where a path is written with '\' and two variable names differing only in ASCII
+    // case are one variable.
+    Windows,
+
+    // Linux, and every other system whose behavior the compiler treats as Linux's.
+    Linux,
+
+    // macOS.
+    MacOS,
+}
+
+// The system this program was built for, which was fixed when it was compiled and cannot change
+// while it runs.
+export platform() -> Platform {
+    return switch (system.platformCode()) {
+        0 -> Platform.Windows,
+        2 -> Platform.MacOS,
+        default -> Platform.Linux,
+    };
+}
+
+// The arguments the program was started with, not counting the program's own name, which every
+// system passes as the first of them. The program's own identity is 'executablePath'.
+export arguments() -> string[] {
+    string[] argv = system.arguments();
+    if (argv.length == 0) {
+        return [];
+    }
+    return argv.slice(1, argv.length);
+}
+
+// The path of the running program itself, or null when the operating system would not report it.
+export executablePath() -> Path? {
+    return pathFrom((buffer, capacity) -> system.executablePathInto(buffer, capacity));
+}
+
+// The directory the program was started in, or "." when the operating system would not report it.
+// It is read and never written, so a program that wants to work somewhere else joins this onto
+// the paths it uses.
+export currentDirectory() -> Path {
+    Path? here = pathFrom((buffer, capacity) -> system.currentDirectoryInto(buffer, capacity));
+    if (here == null) {
+        return Path(".");
+    }
+    return here;
+}
+
+// A set of variables, matched by name the way one system matches them. On Windows two names that
+// differ only in ASCII case are the same variable. The matching is a rule about the values, so a
+// set built for any system behaves the same on every system.
+export final class Environment {
+    const Platform matching;
+    const Map<string, Variable> held;
+
+    protected constructor(this.matching, this.held);
+
+    // The variables this process inherited, as a snapshot. Changing it changes nothing outside,
+    // and a child is given the variables it should see at the moment it is started. An inherited
+    // entry whose name would be empty is left out, since Windows keeps a few such entries that
+    // name no variable a program can read.
+    export static current() -> Environment {
+        let snapshot = new Environment(platform(), new Map<string, Variable>());
+        for (let entry in system.environment()) {
+            long at = entry.indexOf("=");
+            if (at <= 0) {
+                continue;
+            }
+            snapshot.set(entry.substring(0, at), entry.substring(at + 1));
+        }
+        return snapshot;
+    }
+
+    // No variables at all, matched by `platform`'s rule.
+    export static empty(Platform platform) -> Environment {
+        return new Environment(platform, new Map<string, Variable>());
+    }
+
+    // The system whose name matching this set uses. A set that matches names by one system's rule
+    // can say which system it means, so a caller holding the set need not carry the answer
+    // alongside it.
+    export platform() -> Platform {
+        return this.matching;
+    }
+
+    // The value of `name`, or null when this set holds no such variable.
+    export get(string name) -> string? {
+        Variable? found = this.held.get(this.matched(name));
+        if (found == null) {
+            return null;
+        }
+        return found.value;
+    }
+
+    // Gives `name` the value `value`, replacing whatever it held. The name is kept as it was
+    // written here, so a Windows set holding PATH that is given "path" reports "path" from then
+    // on.
+    export set(string name, string value) {
+        Variable written = {name: name, value: value};
+        this.held.set(this.matched(name), written);
+    }
+
+    // Takes `name` out of this set and answers whether it was there.
+    export remove(string name) -> bool {
+        return this.held.remove(this.matched(name));
+    }
+
+    // Whether this set holds a variable named `name`.
+    export contains(string name) -> bool {
+        return this.held.contains(this.matched(name));
+    }
+
+    // How many variables this set holds.
+    export length() -> long {
+        return this.held.length();
+    }
+
+    // Whether this set holds no variables at all.
+    export isEmpty() -> bool {
+        return this.held.isEmpty();
+    }
+
+    // The names, in ascending byte order, so a walk over them is deterministic.
+    export names() -> string[] {
+        let found = new List<string>();
+        for (let variable in this.held.values()) {
+            found.push(variable.name);
+        }
+        found.sort();
+        return found.toArray();
+    }
+
+    // A second set holding the same variables under the same matching rule. Changing either one
+    // leaves the other as it was.
+    export copy() -> Environment {
+        return new Environment(this.matching, this.held.copy());
+    }
+
+    // The name a lookup matches on, which is the name itself everywhere but Windows, where two
+    // names differing only in ASCII case are one variable.
+    matched(string name) -> string {
+        if (this.matching == Platform.Windows) {
+            return name.toLowerAscii();
+        }
+        return name;
+    }
+}
+
+// One variable as it was last written, which is the name a caller reads back together with the
+// value under it. The name is kept beside the value because a lookup matches on a name the caller
+// may have spelled differently.
+public struct Variable {
+    public const string name;
+    public const string value;
+}
+
+// How much room a path from the operating system is read into. Neither bridge says how much it
+// needs, so a buffer that was too small is grown and asked again.
+final class Room {
+    // The first buffer a path is read into, which holds every path a system reports in practice.
+    protected static const long firstAttempt = 4096;
+
+    // The largest buffer a path is read into, which is above the longest path Windows reports.
+    protected static const long limit = 65536;
+}
+
+// The path `into` writes into a buffer, or null where the operating system would not report it.
+// The buffer is grown and offered again until the answer fits, because a bridge that was given too
+// little room says so rather than saying how much it needs.
+pathFrom((byte[], long) -> long into) -> Path? {
+    long capacity = Room.firstAttempt;
+    while (capacity <= Room.limit) {
+        byte[] buffer = new byte[capacity];
+        long written = into(buffer, capacity);
+        if (written > 0) {
+            return nativePath(buffer, written);
+        }
+        capacity = capacity * 8;
+    }
+    return null;
+}
+
+// A path the operating system wrote into a buffer, converted once here at the boundary. The bytes
+// are the system's own, so a Windows answer carries '\' until 'fromNative' rewrites it.
+nativePath(byte[] buffer, long written) -> Path {
+    return Path.fromNative(string.fromBytesLossy(buffer.slice(0, written)), platform());
+}

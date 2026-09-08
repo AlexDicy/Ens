@@ -1272,6 +1272,37 @@ task("test")
             run({"build", split}, nil, 2, "disagree on the Ens version", "split.app", "split.lib",
                 '"0.1"', '"0.2"')
 
+            -- a source folder reached through a symbolic link is compiled, which is how a checkout
+            -- that shares one folder between two packages builds at all. The link is made with the
+            -- system's own command, and Windows makes a junction, which needs no privilege a test
+            -- run may lack; a system that refuses to make one leaves the case unasserted rather
+            -- than failing the run.
+            local linked_root = path.join(root, "linked")
+            os.mkdir(path.join(linked_root, "src"))
+            os.mkdir(path.join(linked_root, "shared", "deeper"))
+            io.writefile(path.join(linked_root, "ens.package"),
+                'package demo.linked {\n    ens "0.1";\n}\n')
+            io.writefile(path.join(linked_root, "src", "main.ens"),
+                'import shared.deeper.greet;\n\nmain() -> int {\n'
+                .. '    print(greet.text());\n    return 0;\n}\n')
+            io.writefile(path.join(linked_root, "shared", "deeper", "greet.ens"),
+                'export text() -> string {\n    return "through the link";\n}\n')
+            local link_target = path.join(linked_root, "shared")
+            local link_name = path.join(linked_root, "src", "shared")
+            local link_made
+            if is_host("windows") then
+                link_made = os.execv("cmd", {"/c", "mklink", "/J", link_name, link_target},
+                    {stdout = log, stderr = log}) == 0
+            else
+                link_made = os.execv("ln", {"-s", link_target, link_name},
+                    {stdout = log, stderr = log}) == 0
+            end
+            if link_made then
+                run({"build", linked_root, "--output", path.join(root, "linked.exe")}, nil, 0,
+                    "built")
+                run_program(path.join(root, "linked.exe"), 0, "through the link")
+            end
+
             -- the hidden syntax tools
             run({"cst-dump", hello}, nil, 0, "SourceFile")
             run({"cst-analyze", hello}, nil, 0)

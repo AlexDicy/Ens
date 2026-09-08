@@ -1,9 +1,12 @@
 // Looking around the machine for what a link line needs from it. This is the only part of linking
 // that reads the environment or runs a program, and everything it finds becomes a Toolchain value,
 // so the line itself is built from values alone. The flavor decides what is worth asking for.
+import Path from @std.fs;
+import FileSystemError from @std.fs.error;
+import Environment from @std.environment;
 import @std.system;
 import SystemError from @std.system;
-import @std.path;
+
 import List from @std.collections.list;
 import LinkerFlavor from flavor;
 import Toolchain from toolchain;
@@ -17,10 +20,13 @@ import triple;
 // the machine cannot answer leaves its part of the toolchain empty, and the link line then simply
 // says less.
 export discover(LinkerFlavor selectedFlavor, string targetTriple, string probePath) -> Toolchain {
+    // The variables are read once here, at this layer's own boundary, so nothing below asks the
+    // process about itself.
+    let variables = Environment.current();
     let discovered = switch (selectedFlavor) {
         LinkerFlavor.Coff -> toolchain.bareToolchain(),
-        LinkerFlavor.Elf -> elfToolchain(targetTriple, probePath),
-        LinkerFlavor.MachO -> machoToolchain(probePath),
+        LinkerFlavor.Elf -> elfToolchain(variables, targetTriple, probePath),
+        LinkerFlavor.MachO -> machoToolchain(variables, probePath),
     };
     removeProbeFiles(probePath);
     return discovered;
@@ -45,7 +51,7 @@ export searchPathsFrom(string? libraryPath) -> string[] {
 // The version an SDK folder's name spells out: 'MacOSX14.0.sdk' is 14.0. Empty when the name
 // carries no version, and the link then reports the deployment target as the SDK version.
 export sdkVersionFromRoot(string root) -> string {
-    string name = path.fileName(root);
+    string name = Path(root).fileName();
     if (!name.startsWith("MacOSX") || !name.endsWith(".sdk")) {
         return "";
     }
@@ -62,15 +68,15 @@ export sdkVersionFromRoot(string root) -> string {
     return version;
 }
 
-elfToolchain(string targetTriple, string probePath) -> Toolchain {
-    return new Toolchain(searchPathsFrom(system.getEnvironmentVariable("LIBRARY_PATH")),
+elfToolchain(Environment variables, string targetTriple, string probePath) -> Toolchain {
+    return new Toolchain(searchPathsFrom(variables.get("LIBRARY_PATH")),
         firstExistingFile(triple.dynamicLinkerCandidates(targetTriple)), elfRuntime(probePath),
         new MacosSdk("", ""));
 }
 
-machoToolchain(string probePath) -> Toolchain {
-    return new Toolchain(searchPathsFrom(system.getEnvironmentVariable("LIBRARY_PATH")), "",
-        new ElfRuntime("", "", "", ""), macosSdk(probePath));
+machoToolchain(Environment variables, string probePath) -> Toolchain {
+    return new Toolchain(searchPathsFrom(variables.get("LIBRARY_PATH")), "",
+        new ElfRuntime("", "", "", ""), macosSdk(variables, probePath));
 }
 
 // The C runtime pieces of the first of cc, clang and gcc this machine can run. One compiler answers
@@ -109,7 +115,7 @@ compilerFile(string compiler, string fileName, string probePath) -> string? {
     if (printed == null) {
         return null;
     }
-    if (printed == fileName || !system.isFile(printed)) {
+    if (printed == fileName || !Path(printed).isFile()) {
         return "";
     }
     return printed;
@@ -117,12 +123,12 @@ compilerFile(string compiler, string fileName, string probePath) -> string? {
 
 // The macOS SDK to link against: the one SDKROOT names, else the one xcrun selects. Empty when
 // neither answers, and the link then reaches the system libraries by their absolute paths.
-macosSdk(string probePath) -> MacosSdk {
-    string root = system.getEnvironmentVariable("SDKROOT") ?? "";
+macosSdk(Environment variables, string probePath) -> MacosSdk {
+    string root = variables.get("SDKROOT") ?? "";
     if (root.length == 0) {
         root = printedByProgram("xcrun", ["--show-sdk-path"], probePath) ?? "";
     }
-    if (root.length == 0 || !system.isDirectory(root)) {
+    if (root.length == 0 || !Path(root).isDirectory()) {
         return new MacosSdk("", "");
     }
     return new MacosSdk(root, sdkVersionFromRoot(root));
@@ -136,15 +142,17 @@ printedByProgram(string program, string[] arguments, string probePath) -> string
     if (status != 0) {
         return null;
     }
-    string printed = try system.readAllText(probePath + ".out");
+    string printed = try Path(probePath + ".out").readText();
     return printed.trim();
 } catch (SystemError error) {
+    return null;
+} catch (FileSystemError refused) {
     return null;
 }
 
 firstExistingFile(string[] candidates) -> string {
     for (let candidate in candidates) {
-        if (system.isFile(candidate)) {
+        if (Path(candidate).isFile()) {
             return candidate;
         }
     }
@@ -157,7 +165,7 @@ removeProbeFiles(string probePath) {
 }
 
 removeQuietly(string file) {
-    if (system.isFile(file)) {
-        try system.removeFile(file);
+    if (Path(file).isFile()) {
+        try Path(file).removeFile();
     }
-} catch (SystemError error) { }
+} catch (FileSystemError refused) { }

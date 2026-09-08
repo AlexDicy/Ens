@@ -84,6 +84,15 @@ Within each milestone the std change and its consumer updates are one commit, so
   Three corrections the design pass made: copying a file is an Ens loop over the streams with only the permission bits bridged, there is no bridge for the system's own error text since it is localized and a fixture could then not pin the module's messages, and a bridge answers through `out` parameters rather than an array, which spares `exists()` an allocation.
   Two bridges the plan had missed: a wide current-directory call, since the narrow one loses a directory outside the system code page and `Path.absolute()` reads it, and an exclusive-create open mode, without which `TemporaryFile.create()` cannot claim a name.
   C7c: the two modules and every consumer in one commit, with `Path` carried through the compiler's own signatures rather than built at each call, so the compiler uses the type it ships.
+  Four rulings shaped it, all of 2026-09-06.
+  `Path` is a struct whose text field carries a default of `""`, since a `const` field with no default would make `Path[]` and `List<Path>.toArray()` illegal, and the empty path is a real value the surface already names.
+  `Environment` gains `platform()`, because a set that matches names by a platform's rule can say which rule, and every holder would otherwise thread a `Platform` alongside it.
+  `TemporaryDirectory.create` and `TemporaryFile.create` take a prefix, so a temporary directory left behind by a crash says what made it.
+  `@std.path` becomes a delegating shim over `Path`, while the old `@std.system`'s file calls stay as they are and die at D1, since they carry no rule that could drift.
+  Three more were settled while the modules were written, also 2026-09-06.
+  `entries()` and `walk()` answer `Iterable<Entry>` rather than the `Iterator<Entry>` the surface document wrote, since a for-in loop is nominal on `Iterable` and `Iterator.next()` carries no `throws`, which makes both calls eager whichever type they answer.
+  The thirteen native declarations the two modules need live in `@std.system` behind thin wrappers, chosen over declaring each one in the `@std.fs` file that calls it; the per-program cost that choice accepts is measured in 09-todos.md.
+  `realPath` resolves the way the operating system resolves and never normalizes the text first, so every part of the path has to be there, because a `..` written after a symbolic link names a different place than removing it from the text would.
 - C8: `@std.process` written: `run`/`runShell`/`spawn`, `ExitStatus`, `ChildProcess`; the old `run`/`runCaptured`/`start` family keeps working until D1.
   Its own native bridges land with it, capture through pipes, wait with a timeout, and kill, since a bridge written before the library that uses it is a bridge written blind.
 - C9: the internal `@std.system` native module: every `external` declaration moves in, and the old bridges are aliased from it so C7 and C8 could build on it retroactively if ordering demands.

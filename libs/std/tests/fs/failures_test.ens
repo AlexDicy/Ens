@@ -1,0 +1,299 @@
+// Tests for what Path reports when a file-system operation cannot be carried out: the kind a
+// program acts on, the message a person reads, and the path the failure names.
+import @std.testing;
+import Path from @std.fs;
+import ErrorKind from @std.fs.error;
+import FileSystemError from @std.fs.error;
+import TemporaryDirectory from @std.fs.temp;
+import EncodingError from @std.text;
+import Platform from @std.environment;
+import @std.environment;
+
+test "opening a path where nothing is there says nothing is there" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-absent");
+    Path missing = scratch.path().join("nothing.txt");
+
+    let refused = try testing.assertThrows<FileSystemError>(() -> {
+        let stream = try missing.open();
+    });
+    try testing.assertEqual(refused.kind, ErrorKind.NotFound);
+    try testing.assertEqual(refused.message, "could not open '{missing}': nothing is there");
+    try testing.assertEqual(refused.path, missing);
+
+    let reading = try testing.assertThrows<FileSystemError>(() -> {
+        let text = try missing.readText();
+    });
+    try testing.assertEqual(reading.kind, ErrorKind.NotFound);
+
+    let bytes = try testing.assertThrows<FileSystemError>(() -> {
+        let content = try missing.readBytes();
+    });
+    try testing.assertEqual(bytes.kind, ErrorKind.NotFound);
+}
+
+test "writing under a directory that is not there says nothing is there" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-no-parent");
+    Path under = scratch.path().join("missing/notes.txt");
+
+    let refused = try testing.assertThrows<FileSystemError>(() -> {
+        try under.writeText("content");
+    });
+    try testing.assertEqual(refused.kind, ErrorKind.NotFound);
+    try testing.assertEqual(refused.message, "could not create '{under}': nothing is there");
+}
+
+// A directory is refused at the open on every system, so no caller is handed a file that fails on
+// its first read. The number that refusal carries is not the same on both: POSIX has an error
+// number meaning a directory was named, and Win32 has none and reports a permission it does not
+// have instead.
+test "opening a directory is refused at the open" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-open-directory");
+    Path directory = scratch.path();
+
+    let refused = try testing.assertThrows<FileSystemError>(() -> {
+        let stream = try directory.open();
+    });
+    if (environment.platform() == Platform.Windows) {
+        try testing.assertEqual(refused.kind, ErrorKind.PermissionDenied);
+        try testing.assertEqual(refused.message,
+            "could not open '{directory}': permission was refused");
+        return;
+    }
+    try testing.assertEqual(refused.kind, ErrorKind.IsADirectory);
+    try testing.assertEqual(refused.message, "could not open '{directory}': it is a directory");
+}
+
+// Removing a directory as a file is refused everywhere, and the three systems do not agree on the
+// number. Linux answers with an error number meaning a directory was named, while macOS and
+// Windows answer with a permission they do not have, because neither unlink nor DeleteFile has a
+// number for the condition.
+test "removing a directory as a file is refused" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-remove-directory");
+    Path directory = scratch.path().join("bare");
+    try directory.createDirectories();
+
+    let refused = try testing.assertThrows<FileSystemError>(() -> {
+        try directory.removeFile();
+    });
+    try testing.assertTrue(directory.isDirectory(), "the directory was left alone");
+    if (environment.platform() == Platform.Linux) {
+        try testing.assertEqual(refused.kind, ErrorKind.IsADirectory);
+        try testing.assertEqual(refused.message,
+            "could not remove the file '{directory}': it is a directory");
+        return;
+    }
+    try testing.assertEqual(refused.kind, ErrorKind.PermissionDenied);
+    try testing.assertEqual(refused.message,
+        "could not remove the file '{directory}': permission was refused");
+}
+
+test "removing a directory that still holds something says so" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-not-empty");
+    Path directory = scratch.path().join("full");
+    try directory.createDirectories();
+    try directory.join("inside.txt").writeText("inside");
+
+    let refused = try testing.assertThrows<FileSystemError>(() -> {
+        try directory.removeDirectory();
+    });
+    try testing.assertEqual(refused.kind, ErrorKind.DirectoryNotEmpty);
+    try testing.assertEqual(refused.message,
+        "could not remove the directory '{directory}': the directory is not empty");
+    try testing.assertEqual(refused.path, directory);
+}
+
+test "removing what is not there says nothing is there" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-remove-absent");
+    Path missing = scratch.path().join("nothing");
+
+    let file = try testing.assertThrows<FileSystemError>(() -> {
+        try missing.removeFile();
+    });
+    try testing.assertEqual(file.kind, ErrorKind.NotFound);
+    try testing.assertEqual(file.message,
+        "could not remove the file '{missing}': nothing is there");
+
+    let directory = try testing.assertThrows<FileSystemError>(() -> {
+        try missing.removeDirectory();
+    });
+    try testing.assertEqual(directory.kind, ErrorKind.NotFound);
+    try testing.assertEqual(directory.message,
+        "could not remove the directory '{missing}': nothing is there");
+
+    let tree = try testing.assertThrows<FileSystemError>(() -> {
+        try missing.removeRecursively();
+    });
+    try testing.assertEqual(tree.kind, ErrorKind.NotFound);
+    try testing.assertEqual(tree.message, "could not remove '{missing}': nothing is there");
+}
+
+// A file with the name a directory was asked for is the one case where being told the name is
+// taken is a failure rather than an answer, so the message says what is in the way and what to do
+// about it.
+test "creating a directory where a file has that name says a file is in the way" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-file-in-the-way");
+    Path taken = scratch.path().join("taken");
+    try taken.writeText("a file, not a directory");
+
+    let refused = try testing.assertThrows<FileSystemError>(() -> {
+        try taken.createDirectories();
+    });
+    try testing.assertEqual(refused.kind, ErrorKind.AlreadyExists);
+    try testing.assertEqual(refused.message, "could not create the directory '{taken}': a file "
+        + "of that name is already there. Remove it, or ask for a directory under another name");
+    try testing.assertEqual(refused.path, taken);
+}
+
+test "creating a directory with no path given is refused" {
+    let refused = try testing.assertThrows<FileSystemError>(() -> {
+        try Path("").createDirectories();
+    });
+    try testing.assertEqual(refused.kind, ErrorKind.NotFound);
+    try testing.assertEqual(refused.message, "could not create a directory: no path was given");
+}
+
+// The message names both paths, and the error carries the source, because that is the path the
+// caller named the operation on.
+test "moving what is not there says nothing is there" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-move-absent");
+    Path missing = scratch.path().join("nothing.txt");
+    Path destination = scratch.path().join("somewhere.txt");
+
+    let refused = try testing.assertThrows<FileSystemError>(() -> {
+        let moved = try missing.moveTo(destination);
+    });
+    try testing.assertEqual(refused.kind, ErrorKind.NotFound);
+    try testing.assertEqual(refused.message,
+        "could not move '{missing}' to '{destination}': nothing is there");
+    try testing.assertEqual(refused.path, missing);
+}
+
+test "copying what is not there says nothing is there" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-copy-absent");
+    Path missing = scratch.path().join("nothing.txt");
+    Path destination = scratch.path().join("copy.txt");
+
+    let refused = try testing.assertThrows<FileSystemError>(() -> {
+        try missing.copyTo(destination);
+    });
+    try testing.assertEqual(refused.kind, ErrorKind.NotFound);
+    try testing.assertEqual(refused.message, "could not open '{missing}': nothing is there");
+    try testing.assertFalse(destination.exists(), "nothing was written at the destination");
+}
+
+// Reading text is reading bytes and decoding them, so the decoding failure arrives as this
+// module's own failure with the encoding error beneath it, and reading the bytes themselves still
+// answers them.
+test "reading bytes that spell no character is refused as a text read" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-not-text");
+    Path blob = scratch.path().join("blob.bin");
+    byte[] content = [0x61, 0x62, 0x63, 0xFF];
+    try blob.writeBytes(content);
+
+    let refused = try testing.assertThrows<FileSystemError>(() -> {
+        let text = try blob.readText();
+    });
+    try testing.assertEqual(refused.kind, ErrorKind.Other);
+    try testing.assertEqual(refused.message, "could not read '{blob}' as text: the byte at "
+        + "offset 3 begins no UTF-8 character");
+    try testing.assertEqual(refused.path, blob);
+    let cause = refused.cause;
+    if (cause == null) {
+        try testing.fail("the encoding failure should arrive as the cause");
+    } else {
+        try testing.assertTrue(cause is EncodingError, "the cause names the encoding failure");
+    }
+    try testing.assertEqual(try blob.readBytes(), content);
+}
+
+// Resolving reads every part of the path, because a symbolic link is resolved only by reading it,
+// and a '..' written after one names a different place than removing it from the text would.
+// Windows is the one exception, since Win32 removes '..' before it resolves anything, so a path
+// whose middle part is missing still resolves there.
+test "a part of a path that is not there stops the resolution" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-real-through");
+    Path root = try scratch.path().realPath();
+    Path notes = scratch.path().join("notes.txt");
+    try notes.writeText("real");
+    Path through = scratch.path().join("missing/../notes.txt");
+
+    if (environment.platform() == Platform.Windows) {
+        try testing.assertEqual(try through.realPath(), root.join("notes.txt"));
+        return;
+    }
+    let refused = try testing.assertThrows<FileSystemError>(() -> {
+        let real = try through.realPath();
+    });
+    try testing.assertEqual(refused.kind, ErrorKind.NotFound);
+    try testing.assertEqual(refused.message, "could not resolve '{through}': nothing is there");
+    // Removing the '..' from the text is what 'normalize' is for, and the answer then resolves.
+    try testing.assertEqual(try through.normalize().realPath(), root.join("notes.txt"));
+}
+
+test "resolving a path where nothing is there says nothing is there" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-real-absent");
+    Path missing = scratch.path().join("nothing.txt");
+
+    let refused = try testing.assertThrows<FileSystemError>(() -> {
+        let real = try missing.realPath();
+    });
+    try testing.assertEqual(refused.kind, ErrorKind.NotFound);
+    try testing.assertEqual(refused.message, "could not resolve '{missing}': nothing is there");
+}
+
+// A path written through a file cannot be reached, and the systems do not agree on whether that
+// reads as an absence or as a directory that is not one. Neither answer may reach a caller of
+// these three, since none of them can throw.
+test "a path written through a file answers false rather than failing" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-through-file");
+    Path notes = scratch.path().join("notes.txt");
+    try notes.writeText("content");
+    Path through = notes.join("inside");
+
+    try testing.assertFalse(through.exists(), "nothing can be reached through a file");
+    try testing.assertFalse(through.isFile(), "no file can be reached through a file");
+    try testing.assertFalse(through.isDirectory(), "no directory can be reached through a file");
+}
+
+// Every failure carries a kind a program can switch on, and the set is closed, so a program that
+// answers for each member answers for everything this module reports.
+test "a kind a program acts on comes with every failure" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-kinds");
+    Path missing = scratch.path().join("nothing.txt");
+
+    let refused = try testing.assertThrows<FileSystemError>(() -> {
+        let stream = try missing.open();
+    });
+    string named = switch (refused.kind) {
+        ErrorKind.NotFound -> "absent",
+        ErrorKind.PermissionDenied -> "refused",
+        ErrorKind.AlreadyExists -> "taken",
+        ErrorKind.NotADirectory -> "not a directory",
+        ErrorKind.IsADirectory -> "a directory",
+        ErrorKind.DirectoryNotEmpty -> "not empty",
+        ErrorKind.NoSpace -> "full",
+        ErrorKind.Other -> "something else",
+    };
+    try testing.assertEqual(named, "absent");
+}
+
+// The file an atomic write goes through first is a name this library invented, so a caller that
+// could not have known about it is told about the path it did name, with the refusal underneath.
+test "an atomic write that cannot claim its sibling reports the path the caller named" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-atomic-refused");
+    Path under = scratch.path().join("missing/notes.txt");
+
+    let refused = try testing.assertThrows<FileSystemError>(() -> {
+        try under.writeTextAtomic("content");
+    });
+    try testing.assertEqual(refused.kind, ErrorKind.NotFound);
+    try testing.assertEqual(refused.message, "could not write '{under}': the file it would be "
+        + "written through first could not be created");
+    try testing.assertEqual(refused.path, under);
+    let cause = refused.cause;
+    if (cause == null) {
+        try testing.fail("the refusal the sibling was met with should arrive as the cause");
+    } else {
+        try testing.assertTrue(cause is FileSystemError, "the cause names the refusal itself");
+    }
+}

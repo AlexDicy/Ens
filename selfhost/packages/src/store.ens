@@ -1,70 +1,71 @@
 // The cache every build on this machine shares. A folder is named after the digest of what is
 // inside it, so two builds that fetched the same package agree on where it is. A fetch is assembled
 // elsewhere and moved into place in one step, so no build ever reads a half-written package.
-import @std.system;
-import SystemError from @std.system;
-import @std.path;
-import Environment from @ens.host.environment;
+import Path from @std.fs;
+import ErrorKind from @std.fs.error;
+import FileSystemError from @std.fs.error;
+import Environment from @std.environment;
+import Platform from @std.environment;
 import Scratch from @ens.host.scratch;
 import @ens.host.scratch;
 import @ens.host.home;
 import hashing;
 
 export final class ContentStore {
-    string rootFolder;
+    Path rootFolder;
 
     export constructor(this.rootFolder);
 
-    export root() -> string {
+    export root() -> Path {
         return this.rootFolder;
     }
 
     // Where a tree with this digest lives, whether or not it is there yet.
-    export treeFolder(string digest) -> string {
-        return path.join(path.join(this.rootFolder, "trees"), "sha256-" + hashing.digits(digest));
+    export treeFolder(string digest) -> Path {
+        return this.rootFolder.join("trees").join("sha256-" + hashing.digits(digest));
     }
 
     // Where an artifact with this digest lives. The file keeps its own name inside a folder named
     // after the digest, so what a link line names still reads as the library it is.
-    export artifactFile(string digest, string fileName) -> string {
-        return path.join(path.join(path.join(this.rootFolder, "artifacts"),
-            hashing.digits(digest)), fileName);
+    export artifactFile(string digest, string fileName) -> Path {
+        return this.rootFolder.join("artifacts").join(hashing.digits(digest)).join(fileName);
     }
 
     export hasTree(string digest) -> bool {
-        return system.isDirectory(this.treeFolder(digest));
+        return this.treeFolder(digest).isDirectory();
     }
 
     export hasArtifact(string digest, string fileName) -> bool {
-        return system.isFile(this.artifactFile(digest, fileName));
+        return this.artifactFile(digest, fileName).isFile();
     }
 
     // Somewhere under the store to assemble a fetch. It sits under the store's own root so that
     // publishing it is a move rather than a copy, which is what lets the store never hold a
     // half-written tree.
     export stage(string prefix) -> Scratch {
-        return scratch.createUnder(path.join(this.rootFolder, "staging"), prefix);
+        return scratch.createUnder(this.rootFolder.join("staging"), prefix);
     }
 
     // Puts an assembled tree into the store under its digest. A tree another run published first is
     // the one that stays, and the assembled copy is dropped.
-    export publishTree(string staged, string digest) -> Published throws {
-        string destination = this.treeFolder(digest);
+    export publishTree(Path staged, string digest) -> Published throws FileSystemError {
+        Path destination = this.treeFolder(digest);
         string problem = claim(staged, destination);
         if (problem.length > 0) {
             let dropped = scratch.discard(staged);
-            throw new SystemError(problem);
+            throw new FileSystemError(problem, ErrorKind.Other, destination);
         }
         return new Published(destination, scratch.discard(staged));
     }
 
     // Puts a single fetched file into the store under its digest, which is what a native artifact
     // is. A file another run published first is the one that stays.
-    export publishArtifact(string stagedFile, string digest, string fileName) -> Published throws {
-        string destination = this.artifactFile(digest, fileName);
+    export publishArtifact(Path stagedFile, string digest,
+                           string fileName) -> Published throws FileSystemError {
+        Path destination = this.artifactFile(digest, fileName);
         string problem = claim(stagedFile, destination);
         if (problem.length > 0) {
-            throw new SystemError(problem);
+            throw new FileSystemError(problem, ErrorKind.Other, destination);
         }
         return new Published(destination, discardFile(stagedFile));
     }
@@ -74,12 +75,12 @@ export final class ContentStore {
 // leftover is reported without being allowed to decide the run's outcome: what was asked for is in
 // the store either way, and a staging folder nothing removed is stepped over rather than read.
 export final class Published {
-    string storedPath;
+    Path storedPath;
     string leftover;
 
     protected constructor(this.storedPath, this.leftover);
 
-    export path() -> string {
+    export path() -> Path {
         return this.storedPath;
     }
 
@@ -89,19 +90,19 @@ export final class Published {
 }
 
 // Where the store lives: what ENS_CACHE says, else the 'cache' folder Ens keeps for this user, and
-// empty text when nothing says where either of them is.
-export rootFor(Environment environment) -> string {
-    string named = environment.value("ENS_CACHE");
-    if (named.length > 0) {
-        return path.normalize(path.fromNative(named, environment.platform()));
+// null when nothing says where either of them is.
+export rootFor(Environment environment) -> Path? {
+    string? named = environment.get("ENS_CACHE");
+    if (named != null && named.length > 0) {
+        return Path.fromNative(named, environment.platform()).normalize();
     }
     return home.ensFolder(environment, "cache");
 }
 
 // The store for this run, or null when nothing says where it would live.
 export locate(Environment environment) -> ContentStore? {
-    string root = rootFor(environment);
-    if (root.length == 0) {
+    Path? root = rootFor(environment);
+    if (root == null) {
         return null;
     }
     return new ContentStore(root);
@@ -110,7 +111,7 @@ export locate(Environment environment) -> ContentStore? {
 // What to tell a user whose run found nowhere to cache what it fetched.
 export missingRootMessage(Environment environment) -> string {
     string variable = "HOME";
-    if (environment.platform() == "windows") {
+    if (environment.platform() == Platform.Windows) {
         variable = "USERPROFILE";
     }
     return "there is nowhere to keep what a build fetches: nothing in the environment says where "
@@ -121,27 +122,27 @@ export missingRootMessage(Environment environment) -> string {
 // Moves what was assembled into its place in the store, when nothing is there yet. Something already
 // there was published by another run and stays as it is, since the digest named it and both hold the
 // same bytes. Answers with "" when the store now holds it, or with what stopped that.
-claim(string staged, string destination) -> string {
-    if (system.exists(destination)) {
+claim(Path staged, Path destination) -> string {
+    if (destination.exists()) {
         return "";
     }
-    string parent = path.parentFolder(destination);
-    if (parent.length > 0) {
-        try system.createDirectory(parent);
+    Path? parent = destination.parent();
+    if (parent != null) {
+        try parent.createDirectories();
     }
-    let mine = try system.move(staged, destination);
+    let mine = try staged.moveTo(destination);
     return "";
-} catch (SystemError error) {
-    return "'{destination}' could not be written: {error.message}";
+} catch (FileSystemError refused) {
+    return "'{destination}' could not be written: {refused.message}";
 }
 
 // Removes a staged file the store did not take, doing nothing when the move already took it.
-discardFile(string file) -> string {
-    if (!system.isFile(file)) {
+discardFile(Path file) -> string {
+    if (!file.isFile()) {
         return "";
     }
-    try system.removeFile(file);
+    try file.removeFile();
     return "";
-} catch (SystemError error) {
-    return "'{file}' could not be removed after it was cached: {error.message}";
+} catch (FileSystemError refused) {
+    return "'{file}' could not be removed after it was cached: {refused.message}";
 }

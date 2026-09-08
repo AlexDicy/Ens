@@ -51,6 +51,19 @@ Together they cost 21% of suite wall time and 34% of `codegencheck`'s, measured 
 C9 removes the `@std.system` half by shrinking that module, but the binding half is permanent, since bindings load implicitly into every program.
 Ratified 2026-09-05: carry both until after Phase D, then make emission reachability-based, rooted at the entry point plus what data can reach (vtable and interface-table slots, the `hash`/`equals`/`toString` descriptor slots, and every `export` in a library build).
 
+C7c added a third charge of the same kind, and it is recorded here so it is visible to whoever lifts it rather than argued from memory.
+The twelve `ens_fs_*` bridges plus `ens_current_directory` are declared in `@std.system` rather than in the `@std.fs` files that call them, so every program synthesizes all thirteen though a hello-world reaches none of them.
+Measured on 2026-09-06 at -O2, with the declarations first in the `@std.fs` files and then in `@std.system`: a hello-world went from 167,771 to 177,901 bytes of objects and from 276,480 to 282,624 bytes of executable on windows-x64, and from 207,376 to 217,088 bytes of objects on linux-x64.
+The module count did not move, staying at 15 either way, because `@std.system` is already in every program through the `@std.io.print` prelude.
+The single place was chosen over the per-program cost with that measurement in hand (ratified 2026-09-06), so the `@std.system` half of the charge grows before C9 shrinks it, and what removes it in the end is reachability-based emission rather than the module's size.
+Moving the consumers then paid the charge back and more, because `@std.path` became a shim over `Path` and so could no longer be reached from `@std.system`, which took `std.path` out of the prelude chain: a hello-world ended at 14 modules and 166,543 bytes of objects on windows-x64 and 202,400 on linux-x64, below the 15 modules and 167,771 bytes it started C7c at.
+
+`Path.walk` offers no way to leave a folder out, so a caller that must not descend into one writes its own descent, and with it its own cycle guard.
+`selfhost/packages/src/hashing.ens` is that caller: a tree's digest leaves `.git` out, and that has to be decided before the folder is entered rather than after everything under it has been handed over.
+A lazy walk would let such a caller prune as it iterates, but the iterator protocol's `next()` carries no `throws`, so a walk that reads the file system while it is being consumed cannot report a folder it could not read.
+Whoever revisits the walk surface therefore has two things to offer before that second cycle guard can go: a way to name the folders a walk does not enter, and an iterator that is allowed to fail.
+The other thing a real consumer wanted is a relative path: `selfhost/build/src/sources.ens` answers paths relative to the folder it scanned, and with no `relativeTo` on `Path` it measures how much of an entry's path the folder wrote by joining a name to that folder and subtracting the name's length.
+
 A call through a function value held in a field retains and releases the closure around every call, and a function-typed parameter is retained at entry and released at exit, so a comparator handed down a recursion pays two atomics per level (measured 2026-09-03 at -O2: 2ns per call through a parameter inside one function, 16ns through a field).
 Escape analysis in code generation elides both (ratified 2026-09-04 as a post-redesign pass); until then `SortedMap` reads `this.order` at every step and recurses in its lookup rather than looping, since a loop retains and releases every node it moves onto.
 When `@std.time` is designed, `Metadata.modifiedMillis` and `wait(long timeoutMillis)` take a proper duration or instant type; the names carry the unit until then.

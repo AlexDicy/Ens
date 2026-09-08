@@ -126,8 +126,11 @@ export struct Path implements Comparable<Path> {
     export entries() -> Iterator<Entry> throws FileSystemError;
 
     // Every entry under this directory, depth first, each directory's entries in the same order as
-    // `entries`. A symbolic link is reported and not followed, so a cycle cannot trap the walk.
-    export walk() -> Iterator<Entry> throws FileSystemError;
+    // `entries`. A symbolic link is reported and not descended into, so a walk over a tree of
+    // links visits each place once. A `followLinks` of true descends into a link that names a
+    // directory, and a link reaching a place the walk has already been is reported and not entered
+    // twice, so a cycle cannot trap the walk either way.
+    export walk(bool followLinks = false) -> Iterator<Entry> throws FileSystemError;
 
     // Creates this directory and every missing parent. A path that is already a directory is left
     // alone.
@@ -241,6 +244,11 @@ export final class TemporaryFile {
 `metadata()` follows symbolic links; `Entry.kind` does not, which is what makes `walk` cycle-proof; a followed answer can never say Symlink, so `Metadata` has no isSymlink and an lstat-shaped call is deferred.
 `modifiedMillis` is the no-time-type interim; see the reminder in the TODOs.
 `removeRecursively` is included because `TemporaryDirectory`'s destructor needs the operation anyway; the name is long on purpose.
+`walk` takes `followLinks` because a source folder or a package tree reached through a link holds files that belong to what is being read, and a walk that never followed one would leave them out.
+It defaults to false, so the safe answer needs no thought, and `entries` never takes it because one directory has nowhere to descend.
+`removeRecursively` never takes it either, since not following is exactly what stops a removal reaching out of the tree it was asked to remove.
+A walk that follows resolves each directory before entering it and steps over one it has already been in, so a link back into the tree is reported without being walked round again.
+Stepping over is right rather than failing, because those entries are already in the answer and a legal tree must not break a build.
 UNC: `\server\share` arrives via `fromNative` as `//server/share`, is absolute, and `normalize` keeps a leading `//`. Drive-relative `C:foo` is unsupported and documented as relative text; `C:/foo` stays absolute.
 `copyTo` carries permissions and not privileges.
 The set-user-id, set-group-id and sticky bits are never copied, since a copy would otherwise hand a caller a privilege transfer it never asked for, and since the destination belongs to whoever ran the copy rather than to the source's owner.

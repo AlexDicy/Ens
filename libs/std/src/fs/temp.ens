@@ -1,0 +1,165 @@
+// A directory or a file that exists for as long as the value guarding it does, and is removed
+// again when that value dies.
+import Path from @std.fs;
+import ErrorKind from @std.fs.error;
+import FileSystemError from @std.fs.error;
+import File from @std.fs.file;
+import Environment from @std.environment;
+import Platform from @std.environment;
+
+// A directory that exists for as long as this value does. It is made under the system's temporary
+// location with a name no other call answers, and removed with everything in it when the value
+// dies.
+export final class TemporaryDirectory {
+    const Path location;
+    bool dismissed;
+
+    protected constructor(this.location) {
+        this.dismissed = false;
+    }
+
+    // A directory of its own under the system's temporary location, whose name starts with
+    // `prefix` so a directory left behind by a program that crashed says what made it.
+    export static create(string prefix) -> TemporaryDirectory throws FileSystemError {
+        Path base = try baseUnderTemporaryRoot(prefix);
+        for (long attempt = 1; attempt <= Naming.attempts; attempt++) {
+            Path candidate = Path("{base}-{attempt}");
+            bool mine = try candidate.createDirectoryExclusive();
+            if (mine) {
+                return new TemporaryDirectory(candidate);
+            }
+        }
+        throw noFreeName(base);
+    }
+
+    // Where the directory is.
+    export path() -> Path {
+        return this.location;
+    }
+
+    // Dismisses the removal and answers the path, which the caller now owns.
+    export keep() -> Path {
+        this.dismissed = true;
+        return this.location;
+    }
+
+    // Removes the directory and everything in it, keeping any failure to itself.
+    destructor() {
+        if (this.dismissed) {
+            return;
+        }
+        try this.location.removeRecursively();
+    } catch (FileSystemError refused) { }
+}
+
+// A file that exists for as long as this value does. It is claimed under the system's temporary
+// location with a name no other call answers, holds nothing to begin with, and is removed when
+// the value dies.
+export final class TemporaryFile {
+    const Path location;
+    bool dismissed;
+
+    protected constructor(this.location) {
+        this.dismissed = false;
+    }
+
+    // A file of its own under the system's temporary location, whose name starts with `prefix` so
+    // a file left behind by a program that crashed says what made it.
+    export static create(string prefix) -> TemporaryFile throws FileSystemError {
+        Path base = try baseUnderTemporaryRoot(prefix);
+        return try claimedFileFrom(base);
+    }
+
+    // A file beside `target` whose name no other call answers, for a write that has to land on
+    // the target in one step. It is beside the target because a move within one directory is a
+    // rename rather than a copy across volumes.
+    public static claimedBeside(Path target) -> TemporaryFile throws FileSystemError {
+        return try claimedFileFrom(Path(target.toString() + Naming.stagingSuffix));
+    }
+
+    // Where the file is.
+    export path() -> Path {
+        return this.location;
+    }
+
+    // Dismisses the removal and answers the path, which the caller now owns.
+    export keep() -> Path {
+        this.dismissed = true;
+        return this.location;
+    }
+
+    // Removes the file, keeping any failure to itself.
+    destructor() {
+        if (this.dismissed) {
+            return;
+        }
+        try this.location.removeFile();
+    } catch (FileSystemError refused) { }
+}
+
+// How a temporary name is found.
+final class Naming {
+    // How many names are tried before a call gives up on finding a free one. Enough that a
+    // machine running many programs at once never runs out, and few enough that a directory full
+    // of leftovers is reported rather than scanned forever.
+    protected static const long attempts = 512;
+
+    // What a file written for one atomic write is named beside its target.
+    protected static const string stagingSuffix = ".tmp";
+}
+
+// The first name of the form '<base>-<n>' that this call could claim as a file. Names are tried in
+// turn because there is no clock to build one from, and each is claimed in one step, so two
+// programs asking at the same instant take two names.
+claimedFileFrom(Path base) -> TemporaryFile throws FileSystemError {
+    for (long attempt = 1; attempt <= Naming.attempts; attempt++) {
+        Path candidate = Path("{base}-{attempt}");
+        bool mine = try File.claim(candidate);
+        if (mine) {
+            return new TemporaryFile(candidate);
+        }
+    }
+    throw noFreeName(base);
+}
+
+// The system's temporary location joined with `prefix`, which is what the numbered names are built
+// from.
+baseUnderTemporaryRoot(string prefix) -> Path throws FileSystemError {
+    Path root = try temporaryRoot();
+    return root.join(prefix);
+}
+
+// The directory this system keeps work in progress in. Windows names it TMP and TEMP, every other
+// system names it TMPDIR, and all of them are read wherever the program runs so a machine set up
+// the other way still answers.
+temporaryRoot() -> Path throws FileSystemError {
+    let variables = Environment.current();
+    for (let name in temporaryNames(variables.platform())) {
+        string? named = variables.get(name);
+        if (named != null && named.length > 0) {
+            return Path.fromNative(named, variables.platform()).normalize();
+        }
+    }
+    if (variables.platform() != Platform.Windows) {
+        return Path("/tmp");
+    }
+    throw new FileSystemError("could not find where this system keeps work in progress: nothing "
+        + "in the environment says where. Set TEMP to a directory that can be written to",
+        ErrorKind.NotFound, Path(""));
+}
+
+// The variables that name the temporary location, most likely first for this platform. All of them
+// are read on every platform, since a machine set up the other way still answers.
+temporaryNames(Platform platform) -> string[] {
+    if (platform == Platform.Windows) {
+        return ["TMP", "TEMP", "TMPDIR"];
+    }
+    return ["TMPDIR", "TMP", "TEMP"];
+}
+
+// The failure for a temporary name that could not be found, which names the leftovers to remove.
+noFreeName(Path base) -> FileSystemError {
+    return new FileSystemError("could not claim a temporary name: every name from '{base}-1' "
+        + "through '{base}-{Naming.attempts}' is taken. Remove what programs that did not finish "
+        + "left behind", ErrorKind.AlreadyExists, base);
+}

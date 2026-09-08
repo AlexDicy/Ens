@@ -1,0 +1,581 @@
+// A location in the file system, the rules about the text that names it, and the operations that
+// read or change what is there. '/' separates the parts of a path on every platform, and text that
+// arrives from the operating system or a command line is converted once with 'fromNative'.
+import Entry from @std.fs.entry;
+import @std.fs.entry;
+import ErrorKind from @std.fs.error;
+import FileSystemError from @std.fs.error;
+import @std.fs.error;
+import File from @std.fs.file;
+import EntryKind from @std.fs.metadata;
+import Metadata from @std.fs.metadata;
+import TemporaryFile from @std.fs.temp;
+import Platform from @std.environment;
+import @std.environment;
+import Iterable from @std.collections.iterator;
+import List from @std.collections.list;
+import BytesWriter from @std.io.memory;
+import IoError from @std.io.streams;
+import @std.io.streams;
+import EncodingError from @std.text;
+import @std.system;
+
+// A location in the file system. The rules about the text never touch the disk, so their answers
+// are the same whatever exists; the operations under them do, and report failure as a
+// FileSystemError.
+export struct Path implements Comparable<Path> {
+    const string text = "";
+
+    // The path `text` names, read as text alone. Nothing here looks at the disk, so any text is a
+    // path, including the empty one.
+    export constructor(this.text);
+
+    // Whether the path names nothing at all. The empty path is a real value, and it is what a Path
+    // holds where nothing was written to it.
+    export isEmpty() -> bool {
+        return this.text.length == 0;
+    }
+
+    // This path and `part` with one separator between them. Joining an absolute part answers the
+    // part alone, because an absolute path names its place on its own.
+    export join(string part) -> Path {
+        return this.join(Path(part));
+    }
+
+    // This path and `part` with one separator between them. Joining an absolute part answers the
+    // part alone, because an absolute path names its place on its own.
+    export join(Path part) -> Path {
+        if (part.isAbsolute() || this.isEmpty()) {
+            return part;
+        }
+        if (part.isEmpty()) {
+            return this;
+        }
+        if (this.text.endsWith("/")) {
+            return Path(this.text + part.text);
+        }
+        return Path(this.text + "/" + part.text);
+    }
+
+    // The directory one level up, and null at a root and for a name with no directory written
+    // before it. A path that ends in a separator names the same place as one that does not, so
+    // both answer the same.
+    export parent() -> Path? {
+        long root = this.rootLength();
+        long end = this.nameEnd(root);
+        if (end <= root) {
+            return null;
+        }
+        long cut = this.lastSeparatorIn(root, end);
+        if (cut < 0) {
+            if (root == 0) {
+                return null;
+            }
+            return Path(this.text.substring(0, root));
+        }
+        while (cut > root && this.text.byteAt(cut - 1) == '/') {
+            cut = cut - 1;
+        }
+        if (cut <= root) {
+            return Path(this.text.substring(0, root));
+        }
+        return Path(this.text.substring(0, cut));
+    }
+
+    // The last part of the path, which is the file or directory it names, and "" at a root.
+    export fileName() -> string {
+        long root = this.rootLength();
+        long end = this.nameEnd(root);
+        if (end <= root) {
+            return "";
+        }
+        return this.text.substring(this.lastSeparatorIn(0, end) + 1, end);
+    }
+
+    // The extension of the name the path ends in, which is the text after its last '.' without
+    // the dot. A name with no '.' has none, and neither has one whose only '.' starts it, the way
+    // a hidden file is named.
+    export extension() -> string {
+        string name = this.fileName();
+        long dot = name.lastIndexOf(".");
+        if (dot <= 0) {
+            return "";
+        }
+        return name.substring(dot + 1, name.length);
+    }
+
+    // The name the path ends in without its extension, so "notes" for "notes.txt", and the whole
+    // name where there is no extension to drop.
+    export stem() -> string {
+        string name = this.fileName();
+        long dot = name.lastIndexOf(".");
+        if (dot <= 0) {
+            return name;
+        }
+        return name.substring(0, dot);
+    }
+
+    // Whether the path names a place on its own, with no directory needed to read it against. A
+    // path starting at a root, at a drive letter with a separator after it, or at a server share
+    // does; drive-relative text such as 'C:foo' does not, because it names a place only against
+    // whatever that drive's current directory happens to be.
+    export isAbsolute() -> bool {
+        return this.rootLength() > 0;
+    }
+
+    // The path with its '.' parts, its repeated separators, and every '..' that has a part to
+    // remove dropped. A '..' with nothing left to remove is kept in a relative path and dropped
+    // at a root, a path that turns out to name nowhere in particular becomes ".", and a path
+    // starting '//' keeps both of those separators. Symbolic links are text like any other here,
+    // so the answer can name a different place than the original; resolving what is really on
+    // disk is 'realPath'.
+    export normalize() -> Path {
+        long root = this.rootLength();
+        string start = this.text.substring(0, root);
+        let kept = new List<string>();
+        for (let part in this.partsAfter(root)) {
+            if (part.isEmpty() || part == ".") {
+                continue;
+            }
+            if (part == "..") {
+                if (kept.length() > 0 && kept.get(kept.length() - 1) != "..") {
+                    kept.pop();
+                    continue;
+                }
+                if (root > 0) {
+                    continue;
+                }
+            }
+            kept.push(part);
+        }
+        string body = string.joined(kept.toArray(), "/");
+        if (body.isEmpty()) {
+            if (start.isEmpty()) {
+                return Path(".");
+            }
+            return Path(start);
+        }
+        if (start.isEmpty() || start.endsWith("/")) {
+            return Path(start + body);
+        }
+        return Path(start + "/" + body);
+    }
+
+    // This path read against `workingDirectory` and normalized, so a relative path becomes the
+    // absolute one it names from there. An absolute path is only normalized, since it already
+    // names its place.
+    export absolute(Path workingDirectory) -> Path {
+        if (this.isAbsolute()) {
+            return this.normalize();
+        }
+        return workingDirectory.join(this).normalize();
+    }
+
+    // This path read against the directory the program was started in, and normalized. That
+    // directory is read here rather than passed in, so a caller that already holds a working
+    // directory passes it to 'absolute(workingDirectory)' instead.
+    export absolute() -> Path {
+        return this.absolute(environment.currentDirectory());
+    }
+
+    // Byte order of the text. Two paths are equal only when their text is equal, so "a/b" and
+    // "a/./b" name the same place but are different paths until they are normalized.
+    export override compareTo(Path other) -> int {
+        return this.text.compareTo(other.text);
+    }
+
+    // The text the path is written with, which is the text it was built from.
+    export override toString() -> string {
+        return this.text;
+    }
+
+    // Text written the way `platform` writes a path, converted to the form where '/' separates
+    // the parts. On Windows '\' becomes '/', and everywhere else the text is kept exactly, because
+    // '\' is an ordinary character in a name there.
+    export static fromNative(string text, Platform platform) -> Path {
+        if (platform != Platform.Windows) {
+            return Path(text);
+        }
+        return Path(text.replace("\\", "/"));
+    }
+
+    // What is at this path, or null when nothing is. A symbolic link describes what it points to.
+    // Asking is one call, so 'exists', 'isFile' and 'isDirectory' are shorthands over it.
+    export metadata() -> Metadata? throws FileSystemError {
+        return try Metadata.read(this, true);
+    }
+
+    // Whether something is at this path. Answering true proves nothing about a moment later, so
+    // opening and catching NotFound beats asking first and opening second. A failure that is not
+    // an absence answers false as well, since a question that cannot throw has no other answer.
+    export exists() -> bool {
+        Metadata? found = try this.metadata();
+        return found != null;
+    } catch (FileSystemError refused) {
+        return false;
+    }
+
+    // Whether a file is at this path. A symbolic link to a file counts as one, since the answer
+    // describes what the link points to. A failure that is not an absence answers false as well,
+    // since a question that cannot throw has no other answer.
+    export isFile() -> bool {
+        Metadata? found = try this.metadata();
+        return found != null && found.kind == EntryKind.File;
+    } catch (FileSystemError refused) {
+        return false;
+    }
+
+    // Whether a directory is at this path. A symbolic link to a directory counts as one, since
+    // the answer describes what the link points to. A failure that is not an absence answers
+    // false as well, since a question that cannot throw has no other answer.
+    export isDirectory() -> bool {
+        Metadata? found = try this.metadata();
+        return found != null && found.kind == EntryKind.Directory;
+    } catch (FileSystemError refused) {
+        return false;
+    }
+
+    // The path with every symbolic link resolved, as the operating system resolves it. Every part
+    // of the path has to be there, because a link is resolved only by reading it, and a '..' is
+    // then resolved against whatever the part before it points at rather than removed from the
+    // text. Windows may still answer for a path whose middle part is missing, since Win32 removes
+    // '..' before it resolves anything. Removing '..' from the text alone is 'normalize'.
+    export realPath() -> Path throws FileSystemError {
+        long capacity = Room.firstAttempt;
+        // Two passes are enough, because the first says how much room the answer takes and the
+        // second asks with exactly that much. A third would mean the answer changed under the
+        // call.
+        for (long attempt = 0; attempt < 2; attempt++) {
+            byte[] buffer = new byte[capacity];
+            let answer = system.fsRealPath(this.text, buffer, capacity);
+            if (answer.code != 0) {
+                throw error.failed("resolve", this, answer.code);
+            }
+            if (answer.needed <= capacity) {
+                return Path.fromNative(string.fromBytesLossy(buffer.slice(0, answer.needed)),
+                    environment.platform());
+            }
+            capacity = answer.needed;
+        }
+        throw new FileSystemError("could not resolve '{this}': its real path grew while it was "
+            + "being read", ErrorKind.Other, this);
+    }
+
+    // Everything the file at this path holds.
+    export readBytes() -> byte[] throws FileSystemError {
+        let stream = try this.open();
+        let collected = new BytesWriter();
+        let moved = try streams.copy(stream, collected);
+        try stream.close();
+        return collected.toBytes();
+    } catch (IoError problem) {
+        throw new FileSystemError("could not read '{this}'", ErrorKind.Other, this, problem);
+    }
+
+    // Everything the file at this path holds, as text. Bytes that spell no character are refused,
+    // since text in Ens is always valid UTF-8.
+    export readText() -> string throws FileSystemError {
+        return try string.fromBytes(try this.readBytes());
+    } catch (EncodingError problem) {
+        throw new FileSystemError("could not read '{this}' as text: the byte at offset "
+            + "{problem.offset} begins no UTF-8 character", ErrorKind.Other, this, problem);
+    }
+
+    // Writes `content` as everything the file at this path holds, creating the file when nothing
+    // is there and replacing what was there when something is.
+    export writeBytes(byte[] content) throws FileSystemError {
+        let stream = try this.create();
+        try stream.write(content);
+        try stream.close();
+    } catch (IoError problem) {
+        throw new FileSystemError("could not write '{this}'", ErrorKind.Other, this, problem);
+    }
+
+    // Writes `content` as everything the file at this path holds, creating the file when nothing
+    // is there and replacing what was there when something is.
+    export writeText(string content) throws FileSystemError {
+        try this.writeBytes(content.toBytes());
+    }
+
+    // Writes `content` to a file beside this path and moves it over this path in one step, so a
+    // reader sees the old content or the new and never a half-written file. The file it writes
+    // first is a sibling, because a move within one directory is a rename rather than a copy
+    // across volumes.
+    export writeBytesAtomic(byte[] content) throws FileSystemError {
+        let staging = try this.stagingSibling();
+        Path written = staging.path();
+        try written.writeBytes(content);
+        try written.replacing(this);
+        // The move took the sibling's name with it, so the guard is dismissed rather than left to
+        // remove a path another program could have created there since.
+        let kept = staging.keep();
+    }
+
+    // Writes `content` to a file beside this path and moves it over this path in one step, so a
+    // reader sees the old text or the new and never a half-written file. The file it writes first
+    // is a sibling, because a move within one directory is a rename rather than a copy across
+    // volumes.
+    export writeTextAtomic(string content) throws FileSystemError {
+        try this.writeBytesAtomic(content.toBytes());
+    }
+
+    // The file at this path, open for reading. A directory is refused here rather than on the
+    // first read.
+    export open() -> File throws FileSystemError {
+        return try File.opened(this);
+    }
+
+    // The file at this path, open for writing and holding nothing, created when nothing is there
+    // yet.
+    export create() -> File throws FileSystemError {
+        return try File.created(this);
+    }
+
+    // The file at this path, open for writing at its end, created when nothing is there yet.
+    export append() -> File throws FileSystemError {
+        return try File.appended(this);
+    }
+
+    // What is directly inside this directory, in ascending byte order of name, so a walk visits
+    // the same names in the same order however the file system enumerates them. The entries
+    // naming the directory itself and its parent are not among them.
+    export entries() -> Iterable<Entry> throws FileSystemError {
+        return try entry.entriesOf(this);
+    }
+
+    // Every entry under this directory, depth first, each directory's entries in the order
+    // 'entries' answers. A symbolic link is reported and not descended into, so a walk over a
+    // tree of links visits each place once. A `followLinks` of true descends into a link that
+    // names a directory, and a link reaching a place the walk has already been is reported and
+    // not entered twice, so a cycle cannot trap the walk either way.
+    export walk(bool followLinks = false) -> Iterable<Entry> throws FileSystemError {
+        return try entry.walkOf(this, followLinks);
+    }
+
+    // Creates this directory and every missing directory above it. A path that is already a
+    // directory is left alone.
+    export createDirectories() throws FileSystemError {
+        let mine = try this.createDirectoryExclusive();
+    }
+
+    // Creates this directory and every missing directory above it, and answers whether this call
+    // is the one that created the directory itself. Two programs racing for the same name get
+    // different answers, and the one answered true may treat the directory as its own.
+    export createDirectoryExclusive() -> bool throws FileSystemError {
+        if (this.isEmpty()) {
+            throw new FileSystemError("could not create a directory: no path was given",
+                ErrorKind.NotFound, this);
+        }
+        try this.createDirectoriesAbove();
+        int code = system.fsCreateDirectory(this.text);
+        if (code == 0) {
+            return true;
+        }
+        if (!error.meansPathTaken(code)) {
+            throw error.failed("create the directory", this, code);
+        }
+        if (this.isDirectory()) {
+            return false;
+        }
+        throw new FileSystemError("could not create the directory '{this}': a file of that name "
+            + "is already there. Remove it, or ask for a directory under another name",
+            ErrorKind.AlreadyExists, this);
+    }
+
+    // Moves what is at this path to `destination` in one step, and answers whether this call is
+    // the one that moved it, which is false when something was already there. Both paths have to
+    // be on the same volume, because a move across volumes would have to copy.
+    export moveTo(Path destination) -> bool throws FileSystemError {
+        int code = system.fsRename(this.text, destination.text, false);
+        if (code == 0) {
+            return true;
+        }
+        if (error.meansPathTaken(code)) {
+            return false;
+        }
+        throw error.failedBetween("move", this, destination, code);
+    }
+
+    // Copies the file at this path to `destination`, replacing what was there. The copy carries
+    // the source's permissions, and never its set-user-id, set-group-id or sticky bits, because a
+    // copy hands over permissions and not privileges.
+    export copyTo(Path destination) throws FileSystemError {
+        let source = try this.open();
+        let target = try destination.create();
+        let moved = try streams.copy(source, target);
+        try target.close();
+        try source.close();
+        int code = system.fsCopyPermissions(this.text, destination.text);
+        if (code != 0) {
+            throw error.failedBetween("copy the permissions of", this, destination, code);
+        }
+    } catch (IoError problem) {
+        throw new FileSystemError("could not copy '{this}' to '{destination}'", ErrorKind.Other,
+            this, problem);
+    }
+
+    // Removes the file at this path. A directory is refused, since what is inside one is the
+    // caller's to decide about, and a symbolic link naming a directory is removed as the link it
+    // is.
+    export removeFile() throws FileSystemError {
+        int code = system.fsRemoveFile(this.text);
+        if (code != 0) {
+            throw error.failed("remove the file", this, code);
+        }
+    }
+
+    // Removes the directory at this path, which has to be empty already. What is inside it is the
+    // caller's to decide about, and 'removeRecursively' is the decision to remove all of it.
+    export removeDirectory() throws FileSystemError {
+        int code = system.fsRemoveDirectory(this.text);
+        if (code != 0) {
+            throw error.failed("remove the directory", this, code);
+        }
+    }
+
+    // Removes everything under this path and then the path itself. A symbolic link is removed as
+    // the link it is and never followed, so a link into a tree does not take the removal with it.
+    export removeRecursively() throws FileSystemError {
+        Metadata? found = try Metadata.read(this, false);
+        if (found == null) {
+            throw new FileSystemError("could not remove '{this}': nothing is there",
+                ErrorKind.NotFound, this);
+        }
+        if (found.kind != EntryKind.Directory) {
+            try this.removeFile();
+            return;
+        }
+        for (let child in try this.entries()) {
+            if (child.kind == EntryKind.Directory) {
+                try child.path.removeRecursively();
+                continue;
+            }
+            try child.path.removeFile();
+        }
+        try this.removeDirectory();
+    }
+
+    // The sibling an atomic write goes through. A claim that failed is reported against the path
+    // the caller named, since the name this call invents for itself is not one a caller could act
+    // on, and the failure it was refused with arrives underneath as the cause.
+    stagingSibling() -> TemporaryFile throws FileSystemError {
+        return try TemporaryFile.claimedBeside(this);
+    } catch (FileSystemError refused) {
+        throw new FileSystemError("could not write '{this}': the file it would be written "
+            + "through first could not be created", refused.kind, this, refused);
+    }
+
+    // Moves what is at this path over `destination` in one step, replacing whatever was there.
+    // Only an atomic write asks for this, because replacing what a caller did not name is not
+    // something 'moveTo' may do quietly.
+    replacing(Path destination) throws FileSystemError {
+        int code = system.fsRename(this.text, destination.text, true);
+        if (code != 0) {
+            throw error.failedBetween("move", this, destination, code);
+        }
+    }
+
+    // Every directory written above this path, created where it is missing. A level that is
+    // already there is left alone, and one that could not be created is reported at itself rather
+    // than as a missing parent of the level below.
+    createDirectoriesAbove() throws FileSystemError {
+        long root = this.rootLength();
+        for (long at = root + 1; at < this.text.length; at++) {
+            if (this.text.byteAt(at) == '/') {
+                try Path(this.text.substring(0, at)).createLevel();
+            }
+        }
+    }
+
+    // Creates one level of a path, leaving a level that is already there alone. A name taken by a
+    // file is left alone too, because the level below it then reports the failure against the
+    // whole path a caller asked for.
+    createLevel() throws FileSystemError {
+        int code = system.fsCreateDirectory(this.text);
+        if (code == 0 || error.meansPathTaken(code)) {
+            return;
+        }
+        throw error.failed("create the directory", this, code);
+    }
+
+    // How many bytes of the text name the place the path starts from. A leading '/' is one, a
+    // drive letter with a separator after it is three, a path starting '//' is a server and a
+    // share, and a relative path has none.
+    rootLength() -> long {
+        if (this.text.startsWith("//")) {
+            return this.serverRootLength();
+        }
+        if (this.text.startsWith("/")) {
+            return 1;
+        }
+        if (this.text.length >= 3 && this.text.byteAt(1) == ':' && this.text.byteAt(2) == '/'
+                && isDriveLetter(this.text.byteAt(0))) {
+            return 3;
+        }
+        return 0;
+    }
+
+    // How many bytes of a path starting '//' name its server and its share, which is all of the
+    // text where it writes only one of the two.
+    serverRootLength() -> long {
+        long server = this.text.indexOf("/", 2);
+        if (server < 0) {
+            return this.text.length;
+        }
+        long share = this.text.indexOf("/", server + 1);
+        if (share < 0) {
+            return this.text.length;
+        }
+        return share;
+    }
+
+    // Where the name the path ends in stops, with the separators the text happens to end in left
+    // out, since 'a/' and 'a' name the same place.
+    nameEnd(long root) -> long {
+        long end = this.text.length;
+        while (end > root && this.text.byteAt(end - 1) == '/') {
+            end = end - 1;
+        }
+        return end;
+    }
+
+    // The greatest offset of a separator in [from, end), and -1 where the text writes none there.
+    lastSeparatorIn(long from, long end) -> long {
+        for (long at = end - 1; at >= from; at--) {
+            if (this.text.byteAt(at) == '/') {
+                return at;
+            }
+        }
+        return -1;
+    }
+
+    // The parts between the separators after the root, empty ones included, since a repeated
+    // separator is a part with no name in it.
+    partsAfter(long root) -> string[] {
+        long at = root;
+        if (at < this.text.length && this.text.byteAt(at) == '/') {
+            at = at + 1;
+        }
+        let found = new List<string>();
+        long start = at;
+        for (long i = at; i < this.text.length; i++) {
+            if (this.text.byteAt(i) == '/') {
+                found.push(this.text.substring(start, i));
+                start = i + 1;
+            }
+        }
+        found.push(this.text.substring(start, this.text.length));
+        return found.toArray();
+    }
+}
+
+// How much room the real form of a path is read into. The bridge does not say how much it needs
+// until it is asked, so a buffer that was too small is grown to exactly what it reported.
+final class Room {
+    protected static const long firstAttempt = 512;
+}
+
+// Whether the byte is a letter a drive can be named by, which Windows writes in either case.
+isDriveLetter(byte value) -> bool {
+    return (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z');
+}

@@ -1,0 +1,477 @@
+// Tests for what Path does to a real file system when the operation succeeds: files read and
+// written, directories made and walked, and the guards that remove what they made.
+import @std.testing;
+import Path from @std.fs;
+import EntryKind from @std.fs.metadata;
+import Metadata from @std.fs.metadata;
+import FileSystemError from @std.fs.error;
+import TemporaryDirectory from @std.fs.temp;
+import TemporaryFile from @std.fs.temp;
+import Platform from @std.environment;
+import @std.environment;
+import @std.system;
+import List from @std.collections.list;
+
+test "a file written is a file read back" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-write");
+    Path notes = scratch.path().join("notes.txt");
+    try notes.writeText("hello");
+    try testing.assertEqual(try notes.readText(), "hello");
+    try testing.assertEqual(try notes.readBytes(), "hello".toBytes());
+
+    try testing.assertTrue(notes.exists(), "'{notes}' is there once it has been written");
+    try testing.assertTrue(notes.isFile(), "'{notes}' is a file");
+    try testing.assertFalse(notes.isDirectory(), "'{notes}' is not a directory");
+    try testing.assertTrue(scratch.path().isDirectory(), "the scratch root is a directory");
+}
+
+test "writing over a file replaces everything it held" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-replace");
+    Path notes = scratch.path().join("notes.txt");
+    try notes.writeText("a much longer first version");
+    try notes.writeText("short");
+    try testing.assertEqual(try notes.readText(), "short");
+}
+
+test "appending adds to what a file already holds" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-append");
+    Path log = scratch.path().join("log.txt");
+    try log.writeText("first\n");
+    let stream = try log.append();
+    try stream.write("second\n".toBytes());
+    try stream.close();
+    try testing.assertEqual(try log.readText(), "first\nsecond\n");
+}
+
+test "bytes with no text in them survive a write and a read" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-bytes");
+    Path blob = scratch.path().join("blob.bin");
+    byte[] content = new byte[512];
+    for (long i = 0; i < content.length; i++) {
+        content[i] = (i % 256) as byte;
+    }
+    try blob.writeBytes(content);
+    try testing.assertEqual(try blob.readBytes(), content);
+    Metadata? found = try blob.metadata();
+    if (found == null) {
+        try testing.fail("'{blob}' should be there right after it was written");
+    } else {
+        try testing.assertEqual(found.length, 512L);
+    }
+}
+
+test "metadata says what is at a path and answers null where nothing is" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-metadata");
+    Path notes = scratch.path().join("notes.txt");
+    try notes.writeText("12345");
+
+    Metadata? file = try notes.metadata();
+    if (file == null) {
+        try testing.fail("'{notes}' should be there right after it was written");
+    } else {
+        try testing.assertEqual(file.kind, EntryKind.File);
+        try testing.assertEqual(file.length, 5L);
+        try testing.assertTrue(file.modifiedMillis >= Window.earliest,
+            "a file written now reports {file.modifiedMillis}, which is before 2025");
+    }
+
+    Metadata? directory = try scratch.path().metadata();
+    if (directory == null) {
+        try testing.fail("the scratch root should be there");
+    } else {
+        try testing.assertEqual(directory.kind, EntryKind.Directory);
+        try testing.assertEqual(directory.length, 0L);
+    }
+
+    try testing.assertTrue(try scratch.path().join("nothing").metadata() == null,
+        "an absence is the one answer metadata gives instead of failing");
+    try testing.assertFalse(scratch.path().join("nothing").exists(),
+        "nothing is at a name nothing was written to");
+}
+
+// A reader of the target sees the old content or the new, so what has to be true afterwards is
+// that the content moved over in one piece and that the sibling the write went through is gone.
+test "an atomic write replaces the content and leaves no sibling behind" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-atomic");
+    Path notes = scratch.path().join("notes.txt");
+    try notes.writeText("old");
+    try notes.writeTextAtomic("new");
+    try testing.assertEqual(try notes.readText(), "new");
+    try testing.assertEqual(try namesUnder(scratch.path()), ["notes.txt"]);
+
+    try notes.writeBytesAtomic("newer".toBytes());
+    try testing.assertEqual(try notes.readText(), "newer");
+    try testing.assertEqual(try namesUnder(scratch.path()), ["notes.txt"]);
+}
+
+test "an atomic write creates a file that was not there yet" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-atomic-new");
+    Path notes = scratch.path().join("fresh.txt");
+    try notes.writeTextAtomic("content");
+    try testing.assertEqual(try notes.readText(), "content");
+    try testing.assertEqual(try namesUnder(scratch.path()), ["fresh.txt"]);
+}
+
+test "createDirectories makes every level and leaves an existing one alone" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-levels");
+    Path deep = scratch.path().join("a/b/c");
+    try deep.createDirectories();
+    try testing.assertTrue(deep.isDirectory(), "'{deep}' is there");
+    try testing.assertTrue(scratch.path().join("a").isDirectory(), "the first level is there");
+    try testing.assertTrue(scratch.path().join("a/b").isDirectory(), "the second level is there");
+    try deep.createDirectories();
+    try testing.assertTrue(deep.isDirectory(), "asking again leaves the directory alone");
+}
+
+// Two programs racing for one name both come through this call, and the answer is what tells them
+// apart, so exactly one of any two calls over the same name may be answered true.
+test "createDirectoryExclusive answers true only for the call that created the directory" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-exclusive");
+    Path claimed = scratch.path().join("claimed");
+    try testing.assertTrue(try claimed.createDirectoryExclusive(),
+        "the first call is the one that created it");
+    try testing.assertFalse(try claimed.createDirectoryExclusive(),
+        "the second call finds a directory already there");
+}
+
+// The order is the file system's to enumerate in and the library's to answer in, so what is pinned
+// here is byte order rather than any order a particular file system happens to hand over.
+test "entries answers what is directly inside in ascending byte order of name" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-entries");
+    Path root = scratch.path();
+    try root.join("b.txt").writeText("b");
+    try root.join("a.txt").writeText("a");
+    try root.join("C.txt").writeText("c");
+    try root.join("sub").createDirectories();
+    try root.join("sub/deep.txt").writeText("d");
+
+    try testing.assertEqual(try namesUnder(root), ["C.txt", "a.txt", "b.txt", "sub"]);
+    try testing.assertEqual(try namesUnder(root.join("sub")), ["deep.txt"]);
+
+    let kinds = new List<string>();
+    for (let child in try root.entries()) {
+        kinds.push("{child.name}:{child.kind}");
+        try testing.assertEqual(child.path, root.join(child.name));
+    }
+    try testing.assertEqual(kinds.toArray(),
+        ["C.txt:File", "a.txt:File", "b.txt:File", "sub:Directory"]);
+}
+
+test "an empty directory has no entries at all" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-empty");
+    Path bare = scratch.path().join("bare");
+    try bare.createDirectories();
+    try testing.assertEqual(try namesUnder(bare), []);
+}
+
+test "walk visits a tree depth first, each level in the order entries answers" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-walk");
+    Path root = scratch.path();
+    try root.join("one/two").createDirectories();
+    try root.join("one/two/leaf.txt").writeText("leaf");
+    try root.join("one/beside.txt").writeText("beside");
+    try root.join("zz.txt").writeText("last");
+
+    try testing.assertEqual(try walkedNames(root),
+        ["one", "beside.txt", "two", "leaf.txt", "zz.txt"]);
+}
+
+// A link pointing at its own parent is a cycle, so a walk that followed it would never end. The
+// link is made through the system's own command, and Windows makes a junction, which needs no
+// privilege a test run may lack.
+test "walk reports a symbolic link and does not follow it" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-link");
+    Path tree = scratch.path().join("tree");
+    try tree.join("inner").createDirectories();
+    try tree.join("inner/file.txt").writeText("inner");
+    Path loop = tree.join("loop");
+    try testing.assertTrue(try linked(tree, loop),
+        "this system would not make a link under '{tree}' to test with");
+
+    try testing.assertEqual(try walkedNames(tree), ["inner", "file.txt", "loop"]);
+    for (let child in try tree.entries()) {
+        if (child.name == "loop") {
+            try testing.assertEqual(child.kind, EntryKind.Symlink);
+        }
+    }
+
+    // Removing a tree must remove a link as the link it is, so what the link pointed at is still
+    // there after the removal, and nothing else is.
+    try loop.removeRecursively();
+    try testing.assertFalse(loop.exists(), "the link itself is gone");
+    try testing.assertEqual(try tree.join("inner/file.txt").readText(), "inner");
+}
+
+// The link points at its own parent, so a walk that entered it twice would never end. It is
+// entered once, which is what the walk's answer shows, and the link is still reported as the link
+// it is.
+test "a walk that follows links enters a place it has already been only once" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-follow-loop");
+    Path tree = scratch.path().join("tree");
+    try tree.join("inner").createDirectories();
+    try tree.join("inner/file.txt").writeText("inner");
+    Path loop = tree.join("loop");
+    try testing.assertTrue(try linked(tree, loop),
+        "this system would not make a link under '{tree}' to test with");
+
+    try testing.assertEqual(try followedNames(tree), ["inner", "file.txt", "loop"]);
+    // A walk that follows nothing answers the same over this tree, since the link is its only
+    // entry that could be entered at all.
+    try testing.assertEqual(try walkedNames(tree), ["inner", "file.txt", "loop"]);
+}
+
+// A link out of the tree is where following is worth having, since the entries it reaches are
+// there under a path the walk was given and nowhere else in the answer.
+test "a walk that follows links enters one that leaves the tree" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-follow-out");
+    Path tree = scratch.path().join("tree");
+    Path beside = scratch.path().join("beside");
+    try tree.createDirectories();
+    try beside.join("deeper").createDirectories();
+    try beside.join("held.txt").writeText("held");
+    try beside.join("deeper/deep.txt").writeText("deep");
+    Path linkedBeside = tree.join("beside-link");
+    try testing.assertTrue(try linked(beside, linkedBeside),
+        "this system would not make a link under '{tree}' to test with");
+
+    try testing.assertEqual(try followedNames(tree),
+        ["beside-link", "deeper", "deep.txt", "held.txt"]);
+    // A walk that follows nothing reports the link and stops there.
+    try testing.assertEqual(try walkedNames(tree), ["beside-link"]);
+
+    // Removing the tree never follows the link, whatever a walk over it was asked to do, so what
+    // sits outside the tree is still there afterwards.
+    try tree.removeRecursively();
+    try testing.assertFalse(tree.exists(), "the tree is gone");
+    try testing.assertEqual(try beside.join("held.txt").readText(), "held");
+    try testing.assertEqual(try beside.join("deeper/deep.txt").readText(), "deep");
+}
+
+test "removeRecursively removes a whole tree and leaves nothing behind" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-remove-tree");
+    Path tree = scratch.path().join("tree");
+    try tree.join("a/b").createDirectories();
+    try tree.join("a/b/deep.txt").writeText("deep");
+    try tree.join("a/beside.txt").writeText("beside");
+    try tree.join("top.txt").writeText("top");
+
+    try tree.removeRecursively();
+    try testing.assertFalse(tree.exists(), "'{tree}' is gone");
+    try testing.assertEqual(try namesUnder(scratch.path()), []);
+}
+
+test "removeFile and removeDirectory each remove one thing" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-remove-one");
+    Path root = scratch.path();
+    Path notes = root.join("notes.txt");
+    Path bare = root.join("bare");
+    try notes.writeText("gone soon");
+    try bare.createDirectories();
+
+    try notes.removeFile();
+    try testing.assertFalse(notes.exists(), "the file is gone");
+    try bare.removeDirectory();
+    try testing.assertFalse(bare.exists(), "the directory is gone");
+    try testing.assertEqual(try namesUnder(root), []);
+}
+
+// The answer is what tells two programs racing for one name apart, so a destination that is taken
+// is an answer rather than a failure.
+test "moveTo moves in one step and answers false where something is already there" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-move");
+    Path root = scratch.path();
+    Path from = root.join("from.txt");
+    Path to = root.join("to.txt");
+    try from.writeText("content");
+
+    try testing.assertTrue(try from.moveTo(to), "the move happened");
+    try testing.assertFalse(from.exists(), "the source is gone");
+    try testing.assertEqual(try to.readText(), "content");
+
+    try from.writeText("second");
+    try testing.assertFalse(try from.moveTo(to), "the destination was already taken");
+    // The destination and the source are both left exactly as they were.
+    try testing.assertEqual(try to.readText(), "content");
+    try testing.assertEqual(try from.readText(), "second");
+}
+
+test "copyTo copies the content and replaces what was at the destination" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-copy");
+    Path root = scratch.path();
+    Path from = root.join("from.txt");
+    Path to = root.join("to.txt");
+    try from.writeText("copied");
+    try to.writeText("a much longer thing that was there before");
+
+    try from.copyTo(to);
+    try testing.assertEqual(try to.readText(), "copied");
+    try testing.assertEqual(try from.readText(), "copied");
+}
+
+// The answer is compared against the real path of the directory the test made, because the
+// operating system is free to answer with a different spelling of the same place than the one it
+// was given. The directory the '..' walks through is created first, since resolving reads every
+// part of the path rather than removing '..' from the text.
+test "realPath resolves the parts of a path away" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-real");
+    Path root = try scratch.path().realPath();
+    Path notes = scratch.path().join("notes.txt");
+    try notes.writeText("real");
+    try scratch.path().join("through").createDirectories();
+
+    try testing.assertEqual(try scratch.path().join("./notes.txt").realPath(),
+        root.join("notes.txt"));
+    try testing.assertEqual(try scratch.path().join("through/../notes.txt").realPath(),
+        root.join("notes.txt"));
+    try testing.assertTrue((try notes.realPath()).isAbsolute(),
+        "a resolved path names its place on its own");
+}
+
+test "a file goes wherever a reader or a writer goes" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-stream");
+    Path notes = scratch.path().join("notes.txt");
+    let target = try notes.create();
+    try target.write("streamed".toBytes());
+    try target.flush();
+    // Closing a file twice is allowed, and the second answer is silence.
+    try target.close();
+    try target.close();
+
+    let source = try notes.open();
+    byte[] buffer = new byte[64];
+    long count = try source.read(buffer);
+    try testing.assertEqual(count, 8L);
+    try testing.assertEqual(buffer.slice(0, count), "streamed".toBytes());
+    // A read answers 0 only once the stream has ended, so a caller can stop on that alone.
+    try testing.assertEqual(try source.read(buffer), 0L);
+    try source.close();
+}
+
+test "a temporary directory is removed when its guard dies" {
+    Path made = try madeAndDroppedDirectory();
+    try testing.assertFalse(made.exists(), "'{made}' should be gone once its guard died");
+}
+
+test "a kept temporary directory survives its guard" {
+    Path kept = try madeAndKeptDirectory();
+    try testing.assertTrue(kept.isDirectory(), "a kept directory is the caller's to remove");
+    try testing.assertEqual(try kept.join("inside.txt").readText(), "content");
+    try kept.removeRecursively();
+}
+
+test "a temporary file is claimed empty and removed when its guard dies" {
+    let guard = try TemporaryFile.create("ens-std-fs-file");
+    Path made = guard.path();
+    try testing.assertTrue(made.isFile(), "'{made}' is a file the moment it is claimed");
+    Metadata? found = try made.metadata();
+    if (found == null) {
+        try testing.fail("'{made}' should be there right after it was claimed");
+    } else {
+        try testing.assertEqual(found.length, 0L);
+    }
+
+    Path dropped = try madeAndDroppedFile();
+    try testing.assertFalse(dropped.exists(), "'{dropped}' should be gone once its guard died");
+}
+
+test "a kept temporary file survives its guard" {
+    Path kept = try madeAndKeptFile();
+    try testing.assertTrue(kept.isFile(), "a kept file is the caller's to remove");
+    try testing.assertEqual(try kept.readText(), "content");
+    try kept.removeFile();
+}
+
+// A name no other call answers is what the guards promise, and two calls under one prefix are the
+// smallest way to see that promise kept.
+test "two temporary guards under one prefix take two names" {
+    let first = try TemporaryDirectory.create("ens-std-fs-twice");
+    let second = try TemporaryDirectory.create("ens-std-fs-twice");
+    try testing.assertNotEqual(first.path(), second.path());
+
+    let firstFile = try TemporaryFile.create("ens-std-fs-twice-file");
+    let secondFile = try TemporaryFile.create("ens-std-fs-twice-file");
+    try testing.assertNotEqual(firstFile.path(), secondFile.path());
+}
+
+// The guard is built and dropped inside a call of its own, so its destructor has run by the time
+// the caller looks at the path it answered.
+madeAndDroppedDirectory() -> Path throws {
+    let guard = try TemporaryDirectory.create("ens-std-fs-dropped");
+    Path made = guard.path();
+    try made.join("inside.txt").writeText("content");
+    try testing.assertTrue(made.isDirectory(), "the directory is there while its guard lives");
+    return made;
+}
+
+// The guard is built, dismissed and dropped inside a call of its own, so a path that outlived its
+// guard is what the caller is handed.
+madeAndKeptDirectory() -> Path throws {
+    let guard = try TemporaryDirectory.create("ens-std-fs-kept");
+    try guard.path().join("inside.txt").writeText("content");
+    return guard.keep();
+}
+
+// The guard is built and dropped inside a call of its own, so its destructor has run by the time
+// the caller looks at the path it answered.
+madeAndDroppedFile() -> Path throws {
+    let guard = try TemporaryFile.create("ens-std-fs-dropped-file");
+    Path made = guard.path();
+    try testing.assertTrue(made.isFile(), "the file is there while its guard lives");
+    return made;
+}
+
+// The guard is built, dismissed and dropped inside a call of its own, so a path that outlived its
+// guard is what the caller is handed.
+madeAndKeptFile() -> Path throws {
+    let guard = try TemporaryFile.create("ens-std-fs-kept-file");
+    try guard.path().writeText("content");
+    return guard.keep();
+}
+
+// The names 'entries' answered, in the order it answered them.
+namesUnder(Path directory) -> string[] throws FileSystemError {
+    let found = new List<string>();
+    for (let child in try directory.entries()) {
+        found.push(child.name);
+    }
+    return found.toArray();
+}
+
+// The names 'walk' answered, in the order it answered them.
+walkedNames(Path directory) -> string[] throws FileSystemError {
+    let found = new List<string>();
+    for (let child in try directory.walk()) {
+        found.push(child.name);
+    }
+    return found.toArray();
+}
+
+// The names a walk that follows links answered, in the order it answered them.
+followedNames(Path directory) -> string[] throws FileSystemError {
+    let found = new List<string>();
+    for (let child in try directory.walk(followLinks: true)) {
+        found.push(child.name);
+    }
+    return found.toArray();
+}
+
+// A link at `link` naming `target`, made through the system's own command so nothing under test
+// takes part in making it.
+linked(Path target, Path link) -> bool throws {
+    string command = "ln -s '{target}' '{link}'";
+    if (environment.platform() == Platform.Windows) {
+        command = "mklink /J \"{nativeText(link)}\" \"{nativeText(target)}\" > nul";
+    }
+    return try system.run(command) == 0;
+}
+
+nativeText(Path path) -> string {
+    return path.toString().replace("/", "\\");
+}
+
+// The window a modification time has to fall in to be milliseconds since 1970 rather than seconds
+// or some other unit.
+final class Window {
+    // 2025-01-01T00:00:00Z in milliseconds, which every file these tests write is later than.
+    protected static const long earliest = 1735689600000;
+}
