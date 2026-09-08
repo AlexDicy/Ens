@@ -1160,32 +1160,33 @@ void Analyzer::bindTypeImports(const ModuleResolver& resolver) {
             continue;
         }
 
-        if (auto alias = imp.aliasText()) {
-            // Named import: `import Alias from path;`, bring `Alias` into scope.
-            Type* importedType = typeCtx.lookupNamedType(targetPath, *alias);
+        auto bound = imp.boundName();
+        if (!bound) continue;
+        auto boundToken = imp.boundNameToken();
+        uint32_t namePos = boundToken ? boundToken->startOffset() : imp.node.startOffset();
+        if (auto name = imp.importedNameText()) {
+            // Named import: `import Name from path;`, bound under `Name` or its alias.
+            Type* importedType = typeCtx.lookupNamedType(targetPath, *name);
             if (importedType && !isTypeVisibleFrom(importedType)) {
-                errorAtNode(imp.node, invisibleTypeMessage(*alias, importedType));
+                errorAtNode(imp.node, invisibleTypeMessage(*name, importedType));
                 continue;
             }
             if (importedType) {
-                uint32_t namePos = imp.aliasToken() ? imp.aliasToken()->startOffset() : imp.node.startOffset();
-                Symbol* sym = makeSymbol(SymbolKind::Variable, *alias, importedType, namePos);
+                Symbol* sym = makeSymbol(SymbolKind::Variable, *bound, importedType, namePos);
                 sym->isTypeName = true;
                 analysis.setSymbol(imp.node.greenNode(), sym);
                 if (!globalScope->define(sym)) {
-                    errorAtNode(imp.node, "Imported name '" + asciiOf(*alias) +
+                    errorAtNode(imp.node, "Imported name '" + asciiOf(*bound) +
                         "' conflicts with an existing declaration");
                 }
             }
         } else {
-            // Namespace import: `import path;`, last path segment becomes the alias.
-            auto nsName = imp.namespaceName();
-            if (!nsName) continue;
-            Symbol* sym = makeSymbol(SymbolKind::Namespace, *nsName, nullptr, imp.node.startOffset());
+            // Namespace import: `import path;`, bound under the last segment or its alias.
+            Symbol* sym = makeSymbol(SymbolKind::Namespace, *bound, nullptr, namePos);
             sym->namespaceModulePath = targetPath;
             sym->namespaceTarget = target;
             if (!globalScope->define(sym)) {
-                errorAtNode(imp.node, "Namespace alias '" + asciiOf(*nsName) +
+                errorAtNode(imp.node, "Namespace alias '" + asciiOf(*bound) +
                     "' conflicts with an existing declaration");
             }
         }
@@ -1198,25 +1199,24 @@ void Analyzer::bindTypeImports(const ModuleResolver& resolver) {
 void Analyzer::bindValueImports(const ModuleResolver& resolver) {
     if (!astRoot) return;
     for (auto& imp : astRoot->imports()) {
-        auto alias = imp.aliasText();
-        if (!alias) continue;            // namespace imports bound in bindTypeImports
+        auto name = imp.importedNameText();
+        if (!name) continue;             // namespace imports bound in bindTypeImports
         std::u16string targetPath = importTargetPath(imp);
         const Analyzer* target = resolver(targetPath);
         if (!target) continue;           // unresolved import already diagnosed in the module graph
-        if (typeCtx.lookupNamedType(targetPath, *alias)) continue;  // bound as a type in bindTypeImports
+        if (typeCtx.lookupNamedType(targetPath, *name)) continue;  // bound as a type in bindTypeImports
 
-        Symbol* fnSym = target->globalSymbol(*alias);
+        Symbol* fnSym = target->globalSymbol(*name);
         if (fnSym && fnSym->kind == SymbolKind::Function) {
-            auto segs = imp.pathSegments();
-            std::u16string ns = segs.empty() ? std::u16string() : segs.back();
+            std::u16string ns = imp.namespaceName().value_or(std::u16string());
             std::string moduleImport = (imp.isPackage() ? "@" : "") + asciiOf(targetPath);
-            errorAtNode(imp.node, "Function '" + asciiOf(*alias) +
+            errorAtNode(imp.node, "Function '" + asciiOf(*name) +
                 "' cannot be imported by name. Import the module instead: 'import " +
-                moduleImport + ";' then call it as '" + asciiOf(ns) + "." + asciiOf(*alias) + "'.");
+                moduleImport + ";' then call it as '" + asciiOf(ns) + "." + asciiOf(*name) + "'.");
             continue;
         }
         errorAtNode(imp.node, "Module '" + asciiOf(targetPath) +
-            "' has no top-level declaration named '" + asciiOf(*alias) + "'.");
+            "' has no top-level declaration named '" + asciiOf(*name) + "'.");
     }
 }
 

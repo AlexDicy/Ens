@@ -94,6 +94,10 @@ Within each milestone the std change and its consumer updates are one commit, so
   The thirteen native declarations the two modules need live in `@std.system` behind thin wrappers, chosen over declaring each one in the `@std.fs` file that calls it; the per-program cost that choice accepts is measured in 09-todos.md.
   `realPath` resolves the way the operating system resolves and never normalizes the text first, so every part of the path has to be there, because a `..` written after a symbolic link names a different place than removing it from the text would.
 - C8: `@std.process` written: `run`/`runShell`/`spawn`, `ExitStatus`, `ChildProcess`; the old `run`/`runCaptured`/`start` family keeps working until D1.
+  Before it, one language milestone: import aliasing with `as` (ratified 2026-09-08), `import @library.rendering as lib;` and `import ErrorKind as IoErrorKind from @std.io.streams;`.
+  A file that raises both an `IoError` and a `ProcessError` needs two enums named `ErrorKind`, and today two same-named imports, or two modules sharing a last segment, cannot coexist in one file, while a function is reachable only through its module's alias, so a collision has no escape but moving code to another file.
+  Qualified member access, `module.Type.member`, stays out for now even though `module.Type` already resolves as a type.
+  A seed release follows, since the library uses the spelling.
   Its own native bridges land with it, capture through pipes, wait with a timeout, and kill, since a bridge written before the library that uses it is a bridge written blind.
 - C9: the internal `@std.system` native module: every `external` declaration moves in, and the old bridges are aliased from it so C7 and C8 could build on it retroactively if ordering demands.
 

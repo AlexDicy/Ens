@@ -177,3 +177,17 @@ Conformance takes part: a class implementing `Iterable<int>`, or extending a cla
 The first argument that mentions a parameter binds it, and a later argument that disagrees is reported against that argument with the binding's provenance, which is the rule generic statics already follow.
 The generic-function path and the generic-static path (`List.of(items)`) share one inference, so the two rules the spec states today become one; the static path already matched structurally through arrays, optionals, and same-template instantiations, and the function path only bound a bare type parameter.
 It lands as its own sema-only milestone before C4 and needs no seed, because the library does not depend on it.
+
+## Import aliasing
+
+Ratified 2026-09-08, after the standard library collided with itself: `@std.io.streams`, `@std.fs.error` and the coming `@std.process` each declare an `ErrorKind`, a file raising both an `IoError` and a `ProcessError` needs two of them, and `meansPathTaken` in `fs/error.ens` exists only because `fs/file.ens` could not name both.
+Both import forms take `as`, written right after the name it replaces: `import @library.rendering as lib;` and `import ErrorKind as IoErrorKind from @std.io.streams;`.
+The alias replaces the default name rather than adding to it, so an aliased module import binds nothing under its last segment and an aliased named import binds nothing under the type's own name.
+`as` is already a keyword, so the feature adds none, and the order `Name as Alias from path` keeps `as` from reading as an alias of the module; an alias written after the path of a named import is a syntax error that names the right spelling.
+An alias is an ordinary identifier: it collides with the other imports and declarations of its file under the existing messages, which name the alias, it may not be a keyword, and a function import stays refused with or without one, with a message that says nothing about aliasing.
+Aliasing is allowed with no conflict present, an alias equal to the name it replaces is accepted and changes nothing, and two aliases for one module in one file are the caller's business.
+One name per import statement stays the rule; multi-name imports remain deferred.
+Everything the default name resolves through, the alias resolves through: calls, static members, types in type position, generic arguments, `throws` lists, `is` and `as?` operands, and the language server's navigation as far as it already goes.
+Qualified member access through a module, `module.Type.member`, stays out: `beta.Kind` resolves in type position while `beta.Kind.Three` and `beta.Limits.ceiling` are refused, and that stays as it is for now.
+The library and the compiler's own sources may use `as` only after the next seed, because the pinned seed compiles both and does not know the spelling.
+Alongside it, a diagnostic that names two types whose display names are identical qualifies each with the module that declares it, so 'Kind' against 'Kind' reads as 'alpha.kinds.Kind' against 'beta.kinds.Kind'.

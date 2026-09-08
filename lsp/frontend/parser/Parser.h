@@ -106,6 +106,8 @@ private:
     void parseTypeParamList();
     void parseTypeParam();
     void parseImportDecl();
+    bool atImportBinding() const;
+    void parseImportAlias();
     void parseImportPath();
     void parseExternalDecl();
     void parseExternalBlock();

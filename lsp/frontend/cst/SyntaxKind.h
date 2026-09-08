@@ -78,6 +78,7 @@ enum class SyntaxKind : uint16_t {
     VisibilityModifier,
     ImportDecl,
     ImportPath,
+    ImportAlias,         // `as Alias` on either import form
     ExternalTypeDecl,
     ExternalBlock,
     LibrarySpec,

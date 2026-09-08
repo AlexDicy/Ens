@@ -545,6 +545,20 @@ Allows `new Renderer();`
 
 In both cases, the path is `/src/engine/renderer.ens` and the file contains a public `Renderer` class.
 
+Either form may rename what it brings into scope with `as`, written right after the name it replaces.
+
+```ens
+import engine.renderer as gfx;
+import Renderer as Canvas from engine.renderer;
+```
+
+The first binds the module to `gfx`, so its declarations are reached as `gfx.Renderer` and `gfx.configure()`, and that import binds nothing under `renderer`.
+The second binds the type to `Canvas`, and that import binds nothing under `Renderer`.
+An alias is an ordinary identifier, so it may not be a keyword, and it collides with the file's other imports and declarations exactly as the name it replaces would.
+Aliasing is how one file uses two modules that share a last segment, or two types that share a name: `import ErrorKind as IoErrorKind from @std.io.streams;` beside `import ErrorKind as FileErrorKind from @std.fs.error;` gives the file both.
+An alias may be written whether or not a conflict exists, an alias equal to the name it replaces changes nothing, and one file may alias the same module more than once.
+A function cannot be imported by name with an alias any more than without one.
+
 A file and a folder with the same name may sit side by side: `io.ens` next to an `io/` folder makes `import io;` resolve to the file, while `import io.streams;` resolves to `streams.ens` inside the folder.
 
 Source files are UTF-8 text.

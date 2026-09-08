@@ -467,14 +467,47 @@ void Parser::parseImportDecl() {
     builder.startNode(SyntaxKind::ImportDecl);
     expect(SyntaxKind::KwImport, "'import'");
 
-    // Optional alias: `import Identifier from path;`
-    if (peekKind(0) == SyntaxKind::Identifier && peekIsContextualFrom(1)) {
-        bump();  // alias identifier
+    // Named form: `import Name from path;` or `import Name as Alias from path;`
+    bool named = atImportBinding();
+    if (named) {
+        bump();  // imported name
+        if (at(SyntaxKind::KwAs)) parseImportAlias();
         bumpAs(SyntaxKind::KwFrom);  // 'from'
     }
 
     parseImportPath();
+    if (at(SyntaxKind::KwAs)) {
+        if (named) {
+            reportAtCurrent("Write the alias right after the name it renames, as in "
+                "'import Name as Alias from path;'.");
+        }
+        parseImportAlias();
+    }
     expect(SyntaxKind::Semi, "';' after import");
+    builder.finishNode();
+}
+
+// Whether the tokens after `import` spell a named import. A keyword in the alias position still
+// counts, so it is reported as a bad alias rather than read as a module named like the type.
+bool Parser::atImportBinding() const {
+    if (peekKind(0) != SyntaxKind::Identifier) return false;
+    if (peekIsContextualFrom(1)) return true;
+    if (peekKind(1) != SyntaxKind::KwAs) return false;
+    SyntaxKind aliasKind = peekKind(2);
+    if (aliasKind != SyntaxKind::Identifier && !isKeyword(aliasKind)) return false;
+    return peekIsContextualFrom(3);
+}
+
+void Parser::parseImportAlias() {
+    builder.startNode(SyntaxKind::ImportAlias);
+    bump();  // 'as'
+    if (isKeyword(kindAt())) {
+        reportAtCurrent("'" + asciiTokenText() + "' is a keyword and cannot be used as an "
+            "import alias; choose a different name");
+        bumpAs(SyntaxKind::Identifier);
+    } else {
+        expect(SyntaxKind::Identifier, "the alias name after 'as'");
+    }
     builder.finishNode();
 }
 

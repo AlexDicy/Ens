@@ -600,7 +600,7 @@ bool ImportDecl::isPackage() const {
     return false;
 }
 
-std::optional<SyntaxNode> ImportDecl::aliasToken() const {
+std::optional<SyntaxNode> ImportDecl::importedNameToken() const {
     bool seenImport = false;
     for (auto& c : node.children()) {
         if (isTrivia(c.kind())) continue;
@@ -608,7 +608,25 @@ std::optional<SyntaxNode> ImportDecl::aliasToken() const {
         if (!seenImport) continue;
         if (c.kind() == SyntaxKind::Identifier) return c;
         // Anything else after `import` (including `ImportPath`) means this is the
-        // bare-path form with no alias.
+        // bare-path form with no imported name.
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::u16string> ImportDecl::importedNameText() const {
+    if (auto t = importedNameToken()) return std::u16string(t->tokenText());
+    return std::nullopt;
+}
+
+std::optional<SyntaxNode> ImportDecl::aliasToken() const {
+    // The named form carries its alias before the path and the module form after it, so the
+    // first alias node is the one that counts.
+    for (auto& c : node.children()) {
+        if (c.kind() != SyntaxKind::ImportAlias) continue;
+        for (auto& inner : c.children()) {
+            if (inner.isToken() && inner.kind() == SyntaxKind::Identifier) return inner;
+        }
         return std::nullopt;
     }
     return std::nullopt;
@@ -619,13 +637,27 @@ std::optional<std::u16string> ImportDecl::aliasText() const {
     return std::nullopt;
 }
 
+std::optional<SyntaxNode> ImportDecl::boundNameToken() const {
+    if (auto alias = aliasToken()) return alias;
+    if (auto name = importedNameToken()) return name;
+    if (auto p = importPath()) {
+        auto tokens = p->segmentTokens();
+        if (!tokens.empty()) return tokens.back();
+    }
+    return std::nullopt;
+}
+
+std::optional<std::u16string> ImportDecl::boundName() const {
+    if (auto t = boundNameToken()) return std::u16string(t->tokenText());
+    return std::nullopt;
+}
+
 std::vector<std::u16string> ImportDecl::pathSegments() const {
     if (auto p = importPath()) return p->segments();
     return {};
 }
 
 std::optional<std::u16string> ImportDecl::namespaceName() const {
-    if (aliasText()) return std::nullopt;
     auto segs = pathSegments();
     if (segs.empty()) return std::nullopt;
     return segs.back();

@@ -316,9 +316,18 @@ public:
     }
     std::optional<ImportPath> importPath() const;
     bool isPackage() const;
+    // `Name` in `import Name from path;`, absent on the module form.
+    std::optional<SyntaxNode> importedNameToken() const;
+    std::optional<std::u16string> importedNameText() const;
+    // The name written after `as`, on either form.
     std::optional<SyntaxNode> aliasToken() const;
     std::optional<std::u16string> aliasText() const;
+    // The name this import binds in its file: the alias when written, otherwise the imported
+    // name or the last path segment.
+    std::optional<SyntaxNode> boundNameToken() const;
+    std::optional<std::u16string> boundName() const;
     std::vector<std::u16string> pathSegments() const;
+    // The last path segment, which qualifies calls into a module imported whole.
     std::optional<std::u16string> namespaceName() const;
     std::u16string modulePath() const;
 };

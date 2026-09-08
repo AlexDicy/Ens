@@ -7,6 +7,7 @@ Every item names when it is done: a milestone of 10-migration-plan.md, a phase, 
 Two consistency items the C4 and pre-C5 work surfaced, both independent of the library migration, so they wait on nothing and block nothing.
 An array literal holding `this` inside a generic body (`[this, this]` for a `T[]` parameter, or `Box<T>[] xs = [this];`) is refused, because the literal's element type is the bare template and assignability equates the template with its self-instantiation only at the top level, not under `[]`; since 2026-09-04 the refusal even reads "expected 'Box<T>[]', got 'Box<T>[]'". The clean resolution is `this` carrying the self-instantiation itself, or the equation applying structurally.
 A subclass method whose name a private base field uses is still refused, since `checkFieldMethodCollision` searches the flattened field list without the exemption private base fields gained on 2026-09-04; consistency would let it through, and it is a conservative refusal rather than an unsoundness.
+A bare function reference stored into a local with no declared type, `let callback = twice;`, passes sema and then fails in codegen with "does not support a local of type '<error>' yet" (found 2026-09-08, no imports involved); an accepted program that cannot be compiled is a soundness matter, so it does not wait for the diagnostics review.
 
 ## C8 and C9
 
@@ -42,6 +43,8 @@ So the verified triples are that many well-formed halves rather than that many c
 
 The toString marker flip: after the C6 text rewrite gives `StringBuilder` its `export override toString()`, an unmarked class method named `toString` becomes an error, closing the A4 transition rule (ratified 2026-08-28).
 A dedicated review pass over the diagnostic messages introduced across the whole migration (requested 2026-08-27).
+Its first item, ruled 2026-09-08 with import aliasing: a diagnostic names a type as the file it is reported in can name it, the alias where one is bound, `alias.Type` where the type is reached through a module alias, and the module-qualified name only where the file has no name for it, because today a suggested fix such as "write '((int) -> void throws Boom)'" can name a type the file bound under another name and so fail to compile when followed.
+Two import-binding gaps go to that review (found 2026-09-08 while reviewing import aliasing): a local `class Box {}` silently shadows an `import Box from lib.box;` while a local function colliding with an import is refused, and that refusal says "imported or built-in type" even when the import is a module.
 A failed bound on a library generic is reported at the consumer's own line, while a failed obligation such as an array element that cannot be defaulted is reported at the library's line under an `In 'Slots<Path>'` prefix, so a user is pointed into source they did not write (found 2026-09-08); the review decides whether an obligation failure moves to the instantiation mention with the library's line as a second location, following the bound check.
 
 ## After Phase D

@@ -214,6 +214,7 @@ static constexpr std::pair<SyntaxKind, std::string_view> KIND_NAMES[] = {
     {SyntaxKind::VisibilityModifier, "VisibilityModifier"},
     {SyntaxKind::ImportDecl,        "ImportDecl"},
     {SyntaxKind::ImportPath,        "ImportPath"},
+    {SyntaxKind::ImportAlias,       "ImportAlias"},
     {SyntaxKind::ExternalTypeDecl,  "ExternalTypeDecl"},
     {SyntaxKind::ExternalBlock,     "ExternalBlock"},
     {SyntaxKind::LibrarySpec,       "LibrarySpec"},
