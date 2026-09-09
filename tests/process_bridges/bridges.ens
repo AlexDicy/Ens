@@ -18,6 +18,7 @@ external from libc {
                      out long count) -> int;
     ens_process_write(Child child, byte[] data, long count, out long written) -> int;
     ens_process_close_input(Child child) -> int;
+    ens_process_poll(Child child, long millis, out int ready) -> int;
     ens_process_wait(Child child, out int code, out int signal) -> int;
     ens_process_kill(Child child) -> int;
     ens_process_release(Child child);
@@ -35,6 +36,13 @@ public final class Mode {
 public final class Stream {
     public static const int output = 1;
     public static const int errors = 2;
+}
+
+// What a poll answers, one bit per thing a caller can do without waiting.
+public final class Ready {
+    public static const int output = 1;
+    public static const int errors = 2;
+    public static const int ended = 4;
 }
 
 // The kinds a failure classifies into, in the order std.process declares them.
@@ -123,6 +131,26 @@ public final class Status {
     public constructor(this.error, this.code, this.signal);
 }
 
+// What a poll answered.
+public final class Polled {
+    public const int error;
+    public const int ready;
+
+    public constructor(this.error, this.ready);
+}
+
+// Everything both streams held and how the child ended, or the number the capture stopped with.
+// The fixture's own -1 says a poll answered nothing for the whole quiet bound.
+public final class Captured {
+    public const int error;
+    public const int code;
+    public const int signal;
+    public const byte[] stdout;
+    public const byte[] stderr;
+
+    public constructor(this.error, this.code, this.signal, this.stdout, this.stderr);
+}
+
 // A child this fixture started, let go when the value is dropped so a failing assertion leaks
 // nothing.
 public final class Running {
@@ -172,6 +200,78 @@ public final class Running {
 
     public closeInput() -> int {
         return ens_process_close_input(this.child);
+    }
+
+    public poll(long millis) -> Polled {
+        int ready = 0;
+        int error = ens_process_poll(this.child, millis, out ready);
+        return new Polled(error, ready);
+    }
+
+    // Both streams read to their ends together, so the child never waits on a full pipe while this
+    // process waits on the other one, then how the child ended. A poll that answers nothing for
+    // `quietMillis` is the fixture's own failure, -1, so a bridge that stopped reporting fails
+    // loudly rather than hanging the run.
+    public capture(long quietMillis) -> Captured {
+        let output = new BytesWriter();
+        let errors = new BytesWriter();
+        bool outputEnded = false;
+        bool errorsEnded = false;
+        byte[] buffer = new byte[65536];
+        while (!outputEnded || !errorsEnded) {
+            let polled = this.poll(quietMillis);
+            if (polled.error != 0) {
+                return new Captured(polled.error, 0, 0, output.toBytes(), errors.toBytes());
+            }
+            if (polled.ready == 0) {
+                return new Captured(-1, 0, 0, output.toBytes(), errors.toBytes());
+            }
+            if ((polled.ready & Ready.output) != 0 && !outputEnded) {
+                let read = this.read(Stream.output, buffer);
+                if (read.error != 0) {
+                    return new Captured(read.error, 0, 0, output.toBytes(), errors.toBytes());
+                }
+                outputEnded = read.count == 0;
+                output.write(buffer.slice(0, read.count));
+            }
+            if ((polled.ready & Ready.errors) != 0 && !errorsEnded) {
+                let read = this.read(Stream.errors, buffer);
+                if (read.error != 0) {
+                    return new Captured(read.error, 0, 0, output.toBytes(), errors.toBytes());
+                }
+                errorsEnded = read.count == 0;
+                errors.write(buffer.slice(0, read.count));
+            }
+        }
+        let status = this.wait();
+        return new Captured(status.error, status.code, status.signal, output.toBytes(),
+            errors.toBytes());
+    }
+
+    // How the child ended, waiting at most `millis` for it and throwing away whatever it writes
+    // meanwhile, or null when it is still running as the bound passes.
+    public waitFor(long millis) -> Status? {
+        byte[] buffer = new byte[65536];
+        long deadline = monotonicMillis() + millis;
+        while (true) {
+            long remaining = deadline - monotonicMillis();
+            if (remaining <= 0) {
+                return null;
+            }
+            let polled = this.poll(remaining);
+            if (polled.error != 0) {
+                return new Status(polled.error, 0, 0);
+            }
+            if ((polled.ready & Ready.output) != 0) {
+                let discarded = this.read(Stream.output, buffer);
+            }
+            if ((polled.ready & Ready.errors) != 0) {
+                let discarded = this.read(Stream.errors, buffer);
+            }
+            if ((polled.ready & Ready.ended) != 0) {
+                return this.wait();
+            }
+        }
     }
 
     public wait() -> Status {

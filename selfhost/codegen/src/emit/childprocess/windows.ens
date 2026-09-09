@@ -11,6 +11,7 @@ import ChildExit from emit.nativeshapes;
 import ChildStream from emit.nativeshapes;
 import NamedPipe from emit.nativeshapes;
 import Overlapped from emit.nativeshapes;
+import PollReady from emit.nativeshapes;
 import ProcessCreation from emit.nativeshapes;
 import ProcessInformation from emit.nativeshapes;
 import SecurityAttributes from emit.nativeshapes;
@@ -266,6 +267,7 @@ public windowsRead(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let invalidBlock = runtime.block(definition, "read.invalid");
     let checkBlock = runtime.block(definition, "read.check");
     let loopBlock = runtime.block(definition, "read.loop");
+    let closedBlock = runtime.block(definition, "read.closed");
     let fetchBlock = runtime.block(definition, "read.fetch");
     let issueBlock = runtime.block(definition, "read.issue");
     let issueFailedBlock = runtime.block(definition, "read.issue.failed");
@@ -299,7 +301,13 @@ public windowsRead(Runtime runtime, TypeRef type) -> RuntimeFunction {
         loadRecordField(runtime, record, OutputRecord.filled),
         loadRecordField(runtime, record, OutputRecord.consumed), "available");
     instructions.buildCondBr(builder,
-        instructions.buildICmpSGT(builder, available, runtime.int32(0), ""), copyBlock, fetchBlock);
+        instructions.buildICmpSGT(builder, available, runtime.int32(0), ""), copyBlock,
+        closedBlock);
+
+    builder.positionAtEnd(closedBlock);
+    instructions.buildCondBr(builder, instructions.buildICmpNE(builder,
+        loadRecordField(runtime, record, OutputRecord.closed), runtime.int32(0), ""), endedBlock,
+        fetchBlock);
 
     builder.positionAtEnd(fetchBlock);
     instructions.buildCondBr(builder, instructions.buildICmpNE(builder,
@@ -810,7 +818,18 @@ issueRead(Runtime runtime, Value record) -> Value {
         "in.flight");
     memory.buildStore(builder, instructions.buildSelect(builder, inFlight, runtime.int32(1),
         runtime.int32(0), ""), runtime.offsetPointer(record, OutputRecord.pending, ""));
+    noteClosed(runtime, record, instructions.buildAnd(builder,
+        instructions.buildNot(builder, inFlight, ""),
+        instructions.buildICmpEQ(builder, why, runtime.int32(Win32Error.brokenPipe), ""), ""));
     return instructions.buildSelect(builder, inFlight, runtime.int32(0), why, "issue.status");
+}
+
+// Marks the record's writer gone when `gone` holds, and leaves the mark alone otherwise.
+noteClosed(Runtime runtime, Value record, Value gone) {
+    let builder = runtime.builder;
+    memory.buildStore(builder, instructions.buildSelect(builder, gone, runtime.int32(1),
+        loadRecordField(runtime, record, OutputRecord.closed), ""),
+        runtime.offsetPointer(record, OutputRecord.closed, ""));
 }
 
 // Takes the bytes a pending read delivered into the record, marking it no longer pending, and
@@ -834,7 +853,232 @@ completeRead(Runtime runtime, Value record) -> Value {
         runtime.offsetPointer(record, OutputRecord.filled, ""));
     memory.buildStore(builder, runtime.int32(0),
         runtime.offsetPointer(record, OutputRecord.consumed, ""));
+    noteClosed(runtime, record, instructions.buildAnd(builder,
+        instructions.buildNot(builder, delivered, ""),
+        instructions.buildICmpEQ(builder, why, runtime.int32(Win32Error.brokenPipe), ""), ""));
     return instructions.buildSelect(builder, delivered, runtime.int32(0), why, "complete.status");
+}
+
+// One wait over the pending reads of both pipes and the child itself. Whatever needs no wait is
+// reported at once, and the wait then only gathers what else has happened by now.
+public windowsPoll(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let waitForMany = runtime.libc("WaitForMultipleObjects", runtime.int32Type.functionType([
+        runtime.int32Type, runtime.pointerType, runtime.int32Type, runtime.int32Type]));
+    let waitForOne = waitForOneFunction(runtime);
+    let definition = runtime.beginDefinition("ens_process_poll", type);
+    let builder = runtime.builder;
+    let waitBlock = runtime.block(definition, "poll.wait");
+    let waitFailedBlock = runtime.block(definition, "poll.wait.failed");
+    let waitedBlock = runtime.block(definition, "poll.waited");
+    let endedBlock = runtime.block(definition, "poll.child.ended");
+    let doneBlock = runtime.block(definition, "poll.done");
+    let failedBlock = runtime.block(definition, "poll.failed");
+    let block = runtime.parameter(definition, 0);
+    let millis = runtime.parameter(definition, 1);
+    let readySlot = runtime.parameter(definition, 2);
+    let handles = memory.buildAlloca(builder, runtime.pointerType.arrayType(3 as ulong),
+        "waitables");
+    let countSlot = memory.buildAlloca(builder, runtime.int32Type, "count");
+    let failureSlot = memory.buildAlloca(builder, runtime.int32Type, "failure");
+    memory.buildStore(builder, runtime.int32(0), countSlot);
+    memory.buildStore(builder, runtime.int32(0), failureSlot);
+    let reaped = instructions.buildICmpNE(builder,
+        childprocess.loadField(runtime, block, WindowsChild.reaped), runtime.int32(0), "reaped");
+    memory.buildStore(builder, instructions.buildSelect(builder, reaped,
+        runtime.int32(PollReady.ended), runtime.int32(0), ""), readySlot);
+    let process = memory.buildLoad(builder, runtime.pointerType,
+        childprocess.childField(runtime, block, WindowsChild.process), "process");
+    let output = recordAt(runtime, block, WindowsChild.output);
+    let errors = recordAt(runtime, block, WindowsChild.errors);
+    stageRecord(runtime, definition, output, PollReady.output, handles, countSlot, readySlot,
+        failureSlot, failedBlock, "output");
+    stageRecord(runtime, definition, errors, PollReady.errors, handles, countSlot, readySlot,
+        failureSlot, failedBlock, "errors");
+    addWaitable(runtime, definition, handles, countSlot, process,
+        instructions.buildNot(builder, reaped, ""), "process");
+    let count = memory.buildLoad(builder, runtime.int32Type, countSlot, "count");
+    let readyNow = instructions.buildICmpNE(builder,
+        memory.buildLoad(builder, runtime.int32Type, readySlot, ""), runtime.int32(0), "ready.now");
+    let bound = instructions.buildSelect(builder,
+        instructions.buildICmpSLT(builder, millis, runtime.int64(0), ""),
+        runtime.int32(ProcessCreation.infinite),
+        instructions.buildSelect(builder,
+            instructions.buildICmpSGT(builder, millis, runtime.int64(0x7FFFFFFE), ""),
+            runtime.int32(0x7FFFFFFE),
+            instructions.buildTrunc(builder, millis, runtime.int32Type, ""), ""), "bound");
+    let timeout = instructions.buildSelect(builder, readyNow, runtime.int32(0), bound, "timeout");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, count, runtime.int32(0), ""), doneBlock, waitBlock);
+
+    builder.positionAtEnd(waitBlock);
+    let woken = runtime.call(waitForMany, [count, handles, runtime.int32(0), timeout], "woken");
+    let why = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, woken, runtime.int32(ProcessCreation.waitFailed), ""),
+        waitFailedBlock, waitedBlock);
+
+    builder.positionAtEnd(waitFailedBlock);
+    instructions.buildRet(builder, why);
+
+    // The wait names only the first waitable that is signaled, so each is asked afterwards.
+    builder.positionAtEnd(waitedBlock);
+    settleRecord(runtime, definition, output, PollReady.output, readySlot, failureSlot,
+        failedBlock, "output");
+    settleRecord(runtime, definition, errors, PollReady.errors, readySlot, failureSlot,
+        failedBlock, "errors");
+    let childEnded = instructions.buildAnd(builder, instructions.buildNot(builder, reaped, ""),
+        instructions.buildICmpEQ(builder, runtime.call(waitForOne, [process, runtime.int32(0)],
+            "ended"), runtime.int32(ProcessCreation.waitObject), ""), "child.ended");
+    instructions.buildCondBr(builder, childEnded, endedBlock, doneBlock);
+
+    builder.positionAtEnd(endedBlock);
+    markReady(runtime, readySlot, PollReady.ended);
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(doneBlock);
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(failedBlock);
+    instructions.buildRet(builder, memory.buildLoad(builder, runtime.int32Type, failureSlot, ""));
+    return runtime.endDefinition(definition);
+}
+
+// Reports a live pipe that already holds bytes or has lost its writer, and otherwise makes sure a
+// read is in flight on it and adds its event to the waitables.
+stageRecord(Runtime runtime, RuntimeDefinition definition, Value record, long bit, Value handles,
+            Value countSlot, Value readySlot, Value failureSlot, BasicBlock failedBlock,
+            string label) {
+    let builder = runtime.builder;
+    let checkBlock = runtime.block(definition, "stage.{label}.check");
+    let markBlock = runtime.block(definition, "stage.{label}.mark");
+    let fetchBlock = runtime.block(definition, "stage.{label}.fetch");
+    let issueBlock = runtime.block(definition, "stage.{label}.issue");
+    let issueFailedBlock = runtime.block(definition, "stage.{label}.issue.failed");
+    let listBlock = runtime.block(definition, "stage.{label}.list");
+    let doneBlock = runtime.block(definition, "stage.{label}.done");
+    instructions.buildCondBr(builder, liveRecord(runtime, record), checkBlock, doneBlock);
+
+    builder.positionAtEnd(checkBlock);
+    let held = instructions.buildICmpSGT(builder, instructions.buildSub(builder,
+        loadRecordField(runtime, record, OutputRecord.filled),
+        loadRecordField(runtime, record, OutputRecord.consumed), ""), runtime.int32(0), "held");
+    let closed = instructions.buildICmpNE(builder,
+        loadRecordField(runtime, record, OutputRecord.closed), runtime.int32(0), "closed");
+    instructions.buildCondBr(builder, instructions.buildOr(builder, held, closed, ""), markBlock,
+        fetchBlock);
+
+    builder.positionAtEnd(markBlock);
+    markReady(runtime, readySlot, bit);
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(fetchBlock);
+    instructions.buildCondBr(builder, instructions.buildICmpNE(builder,
+        loadRecordField(runtime, record, OutputRecord.pending), runtime.int32(0), ""), listBlock,
+        issueBlock);
+
+    builder.positionAtEnd(issueBlock);
+    let issued = issueRead(runtime, record);
+    memory.buildStore(builder, issued, failureSlot);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, issued, runtime.int32(0), ""), listBlock,
+        issueFailedBlock);
+
+    builder.positionAtEnd(issueFailedBlock);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, issued, runtime.int32(Win32Error.brokenPipe), ""),
+        markBlock, failedBlock);
+
+    builder.positionAtEnd(listBlock);
+    addWaitable(runtime, definition, handles, countSlot, memory.buildLoad(builder,
+        runtime.pointerType, runtime.offsetPointer(record, OutputRecord.event, ""), "event"),
+        runtime.int1Type.constInt(1, false), "stage.{label}");
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(doneBlock);
+}
+
+// Takes what a pending read on a live pipe has delivered once its event is signaled, reporting the
+// pipe when bytes arrived or its writer is gone. A completion of no bytes reports nothing, since a
+// read would post again and wait.
+settleRecord(Runtime runtime, RuntimeDefinition definition, Value record, long bit,
+             Value readySlot, Value failureSlot, BasicBlock failedBlock, string label) {
+    let builder = runtime.builder;
+    let waitForOne = waitForOneFunction(runtime);
+    let checkBlock = runtime.block(definition, "settle.{label}.check");
+    let completeBlock = runtime.block(definition, "settle.{label}.complete");
+    let deliveredBlock = runtime.block(definition, "settle.{label}.delivered");
+    let completeFailedBlock = runtime.block(definition, "settle.{label}.failed");
+    let markBlock = runtime.block(definition, "settle.{label}.mark");
+    let doneBlock = runtime.block(definition, "settle.{label}.done");
+    instructions.buildCondBr(builder, instructions.buildAnd(builder, liveRecord(runtime, record),
+        instructions.buildICmpNE(builder, loadRecordField(runtime, record, OutputRecord.pending),
+            runtime.int32(0), ""), ""), checkBlock, doneBlock);
+
+    builder.positionAtEnd(checkBlock);
+    let signaled = instructions.buildICmpEQ(builder, runtime.call(waitForOne, [
+        memory.buildLoad(builder, runtime.pointerType,
+            runtime.offsetPointer(record, OutputRecord.event, ""), "event"), runtime.int32(0)],
+        "signaled"), runtime.int32(ProcessCreation.waitObject), "");
+    instructions.buildCondBr(builder, signaled, completeBlock, doneBlock);
+
+    builder.positionAtEnd(completeBlock);
+    let completed = completeRead(runtime, record);
+    memory.buildStore(builder, completed, failureSlot);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, completed, runtime.int32(0), ""), deliveredBlock,
+        completeFailedBlock);
+
+    builder.positionAtEnd(deliveredBlock);
+    instructions.buildCondBr(builder, instructions.buildICmpSGT(builder,
+        loadRecordField(runtime, record, OutputRecord.filled), runtime.int32(0), ""), markBlock,
+        doneBlock);
+
+    builder.positionAtEnd(completeFailedBlock);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, completed, runtime.int32(Win32Error.brokenPipe), ""),
+        markBlock, failedBlock);
+
+    builder.positionAtEnd(markBlock);
+    markReady(runtime, readySlot, bit);
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(doneBlock);
+}
+
+// True for a record whose pipe exists and whose end no read has reported yet.
+liveRecord(Runtime runtime, Value record) -> Value {
+    let builder = runtime.builder;
+    return instructions.buildAnd(builder, instructions.buildNot(builder, runtime.isNull(
+        memory.buildLoad(builder, runtime.pointerType,
+            runtime.offsetPointer(record, OutputRecord.pipe, ""), "pipe")), ""),
+        instructions.buildICmpEQ(builder, loadRecordField(runtime, record, OutputRecord.ended),
+            runtime.int32(0), ""), "live");
+}
+
+// Puts the handle at the next free slot of the waitables when `wanted` holds.
+addWaitable(Runtime runtime, RuntimeDefinition definition, Value handles, Value countSlot,
+            Value handle, Value wanted, string label) {
+    let builder = runtime.builder;
+    let addBlock = runtime.block(definition, "{label}.add");
+    let doneBlock = runtime.block(definition, "{label}.added");
+    instructions.buildCondBr(builder, wanted, addBlock, doneBlock);
+
+    builder.positionAtEnd(addBlock);
+    let count = memory.buildLoad(builder, runtime.int32Type, countSlot, "count");
+    memory.buildStore(builder, handle, memory.buildGEP(builder, runtime.pointerType, handles,
+        [instructions.buildSExt(builder, count, runtime.int64Type, "")], "waitable"));
+    memory.buildStore(builder, instructions.buildAdd(builder, count, runtime.int32(1), ""),
+        countSlot);
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(doneBlock);
+}
+
+markReady(Runtime runtime, Value readySlot, long bit) {
+    let builder = runtime.builder;
+    memory.buildStore(builder, instructions.buildOr(builder,
+        memory.buildLoad(builder, runtime.int32Type, readySlot, "ready"), runtime.int32(bit), ""),
+        readySlot);
 }
 
 // Hands an output record's pipe, event and buffer back, after a read still in flight has been

@@ -1,0 +1,149 @@
+// The poll that drains a child's two streams and waits on the child together, on the host running
+// the suite.
+import @std.system;
+import @std.testing;
+import @std.text.parse;
+import Ready from bridges;
+import Request from bridges;
+import Stream from bridges;
+import bridges;
+import Flood from shell;
+import shell;
+
+// Each stream gets 4096 lines of 64 characters, 266,240 bytes with LF endings and 270,336 with
+// CRLF, against a pipe of 65,536 bytes on Linux and Windows and at most that on Darwin. A parent
+// reading either stream to its end while the child filled the other would therefore wait forever,
+// and so would the child. A poll answering nothing for 20 seconds is the fixture's own failure,
+// so a bridge that stopped reporting fails here rather than hanging the run.
+test "capture keeps both streams whole when each outgrows the pipe" {
+    let child = try bridges.running(shell.startFlooding(4096, Request.reading()));
+    let captured = child.capture(20000);
+    try testing.assertEqual(captured.error, 0);
+    string[] output = bridges.lines(captured.stdout);
+    string[] errors = bridges.lines(captured.stderr);
+    try testing.assertEqual(output.length, 4096);
+    try testing.assertEqual(errors.length, 4096);
+    for (let line in output) {
+        try testing.assertEqual(line, Flood.output);
+    }
+    for (let line in errors) {
+        try testing.assertEqual(line, Flood.errors);
+    }
+    try testing.assertEqual(captured.code, 0);
+    try testing.assertEqual(captured.signal, 0);
+}
+
+// The child's own outputs may stay open after it is stopped where a grandchild inherited them, so
+// the last poll asks about this moment alone and only the child's end is pinned.
+test "a timed wait says still running and then answers" {
+    let child = try bridges.running(shell.startSleeper(5, Request.piped()));
+    long before = bridges.monotonicMillis();
+    let polled = child.poll(100);
+    long elapsed = bridges.monotonicMillis() - before;
+    try testing.assertEqual(polled.error, 0);
+    try testing.assertEqual(polled.ready, 0);
+    try testing.assertTrue(elapsed >= 100 && elapsed < 2000,
+        "a poll bounded at 100 milliseconds took {elapsed}");
+    let still = child.waitFor(50);
+    try testing.assertTrue(still == null, "the sleeper ended inside 50 milliseconds");
+    try testing.assertEqual(child.kill(), 0);
+    let status = child.wait();
+    try testing.assertEqual(status.error, 0);
+    try testing.assertEqual(status.code, 0);
+    try testing.assertEqual(status.signal, 9);
+    let after = child.poll(0);
+    try testing.assertEqual(after.error, 0);
+    try testing.assertEqual(after.ready & Ready.ended, Ready.ended);
+}
+
+// A child that never stops writing answers every poll at once, so only the clock can hold the wait
+// to its bound.
+test "a timed wait honors its bound across a chatty child" {
+    let child = try bridges.running(shell.startChattering(Request.piped()));
+    long before = bridges.monotonicMillis();
+    let still = child.waitFor(100);
+    long elapsed = bridges.monotonicMillis() - before;
+    try testing.assertTrue(still == null, "the chatty child ended");
+    try testing.assertTrue(elapsed >= 100 && elapsed < 1000,
+        "a wait bounded at 100 milliseconds took {elapsed} across a chatty child");
+    try testing.assertEqual(child.kill(), 0);
+    let status = child.wait();
+    try testing.assertEqual(status.error, 0);
+    try testing.assertEqual(status.signal, 9);
+}
+
+// Once both streams have ended, only the child is left to wait on, and a poll that kept reporting
+// an ended stream would answer at once with the wrong bit.
+test "a child that closed its outputs and kept running still answers a wait" {
+    let child = try bridges.running(shell.startSilentSleeper(1, Request.piped()));
+    byte[] buffer = new byte[8192];
+    bool outputEnded = false;
+    bool errorsEnded = false;
+    while (!outputEnded || !errorsEnded) {
+        let polled = child.poll(20000);
+        try testing.assertEqual(polled.error, 0);
+        try testing.assertNotEqual(polled.ready, 0);
+        if ((polled.ready & Ready.output) != 0 && !outputEnded) {
+            outputEnded = child.read(Stream.output, buffer).count == 0;
+        }
+        if ((polled.ready & Ready.errors) != 0 && !errorsEnded) {
+            errorsEnded = child.read(Stream.errors, buffer).count == 0;
+        }
+        if ((polled.ready & Ready.ended) != 0) {
+            break;
+        }
+    }
+    let last = child.poll(-1);
+    try testing.assertEqual(last.error, 0);
+    try testing.assertEqual(last.ready, Ready.ended);
+    let status = child.wait();
+    try testing.assertEqual(status.error, 0);
+    try testing.assertEqual(status.code, 0);
+}
+
+// A poll that blocks once for its whole bound gives the processor up a handful of times, one that
+// turns every 5 milliseconds a couple of hundred, and one that spins thousands. Only Linux keeps
+// the count where a child can read it.
+test "a quiet child costs the poll few turns" {
+    if (system.platform() != "linux") {
+        return;
+    }
+    let sleeper = try bridges.running(shell.startSleeper(3, Request.piped()));
+    long before = try switchesNow();
+    let polled = sleeper.poll(1000);
+    long after = try switchesNow();
+    long turns = after - before;
+    try testing.assertEqual(polled.error, 0);
+    try testing.assertEqual(polled.ready, 0);
+    try testing.assertTrue(turns < 300,
+        "a second of polling a quiet child gave the processor up {turns} times");
+    try testing.assertEqual(sleeper.kill(), 0);
+    let stopped = sleeper.wait();
+    try testing.assertEqual(stopped.error, 0);
+}
+
+test "a poll on a collected child answers at once" {
+    let child = try bridges.running(shell.startExiting(0, Request.piped()));
+    try testing.assertEqual(child.wait().code, 0);
+    long before = bridges.monotonicMillis();
+    let polled = child.poll(-1);
+    long elapsed = bridges.monotonicMillis() - before;
+    try testing.assertEqual(polled.error, 0);
+    try testing.assertEqual(polled.ready & Ready.ended, Ready.ended);
+    try testing.assertTrue(elapsed < 500, "a poll on a collected child took {elapsed}");
+}
+
+// How many times this process has given up the processor of its own accord, as a child reads it
+// from this process's status file.
+switchesNow() -> long throws {
+    let child = try bridges.running(shell.startCountingSwitches(Request.reading()));
+    let output = child.readAll(Stream.output);
+    try testing.assertEqual(output.error, 0);
+    try testing.assertEqual(child.wait().code, 0);
+    string[] printed = bridges.lines(output.bytes);
+    try testing.assertEqual(printed.length, 1);
+    long? switches = parse.parseLong(printed[0].trim());
+    try testing.assertTrue(switches != null,
+        "the child answered '{printed[0]}' rather than a count");
+    return switches ?? 0;
+}

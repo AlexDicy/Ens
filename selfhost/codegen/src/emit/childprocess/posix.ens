@@ -8,13 +8,20 @@ import @ens.llvm.instructions;
 import @ens.llvm.memory;
 import ChildStream from emit.nativeshapes;
 import DescriptorControl from emit.nativeshapes;
+import Kevent from emit.nativeshapes;
+import PollEvent from emit.nativeshapes;
+import PollReady from emit.nativeshapes;
+import PollTurn from emit.nativeshapes;
+import Pollfd from emit.nativeshapes;
 import Signal from emit.nativeshapes;
 import StdioMode from emit.nativeshapes;
+import Timespec from emit.nativeshapes;
 import WaitStatus from emit.nativeshapes;
 import emit.nativeshapes;
 import Errno from emit.errorkinds;
 import PosixChild from emit.childprocess;
 import emit.childprocess;
+import emit.clock;
 import Runtime from emit.runtime;
 import RuntimeDefinition from emit.runtime;
 import RuntimeFunction from emit.runtime;
@@ -197,6 +204,7 @@ public posixStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
 
     builder.positionAtEnd(startedBlock);
     memory.buildStore(builder, child, childprocess.childField(runtime, block, PosixChild.pid));
+    openPidDescriptor(runtime, block, child);
     memory.buildStore(builder, loadEnd(runtime, ends, PipeEnds.inputWrite),
         childprocess.childField(runtime, block, PosixChild.input));
     memory.buildStore(builder, loadEnd(runtime, ends, PipeEnds.outputRead),
@@ -369,23 +377,263 @@ public posixWait(Runtime runtime, TypeRef type) -> RuntimeFunction {
     builder.positionAtEnd(failedBlock);
     instructions.buildRet(builder, why);
 
-    // The low seven bits name the signal that ended the child, and are zero for one that exited
-    // with the code held eight bits up.
     builder.positionAtEnd(decodeBlock);
-    let status = memory.buildLoad(builder, runtime.int32Type, statusSlot, "raw");
-    let low = instructions.buildAnd(builder, status, runtime.int32(WaitStatus.signalMask), "low");
-    let exited = instructions.buildICmpEQ(builder, low, runtime.int32(0), "exited");
-    let code = instructions.buildSelect(builder, exited, instructions.buildAnd(builder,
-        instructions.buildLShr(builder, status, runtime.int32(WaitStatus.codeShift), ""),
-        runtime.int32(WaitStatus.codeMask), ""), runtime.int32(0), "code");
-    let signal = instructions.buildSelect(builder, exited, runtime.int32(0), low, "signal");
-    memory.buildStore(builder, runtime.int32(1),
-        childprocess.childField(runtime, block, PosixChild.reaped));
-    memory.buildStore(builder, code, childprocess.childField(runtime, block, PosixChild.code));
-    memory.buildStore(builder, signal,
-        childprocess.childField(runtime, block, PosixChild.signal));
-    memory.buildStore(builder, code, codeSlot);
-    memory.buildStore(builder, signal, signalSlot);
+    cacheStatus(runtime, block, memory.buildLoad(builder, runtime.int32Type, statusSlot, "raw"));
+    memory.buildStore(builder, childprocess.loadField(runtime, block, PosixChild.code), codeSlot);
+    memory.buildStore(builder, childprocess.loadField(runtime, block, PosixChild.signal),
+        signalSlot);
+    instructions.buildRet(builder, runtime.int32(0));
+    return runtime.endDefinition(definition);
+}
+
+public posixPoll(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    if (runtime.onDarwin()) {
+        return darwinPoll(runtime, type);
+    }
+    return linuxPoll(runtime, type);
+}
+
+// One poll over the two pipes and the pidfd, whose readiness is the child's end. Without a pidfd
+// the child's end has nothing to wait on, so the poll turns every few milliseconds and asks
+// waitpid between turns, and that is the only place this bridge turns.
+linuxPoll(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let pollDescriptors = runtime.libc("poll", runtime.int32Type.functionType([runtime.pointerType,
+        runtime.int64Type, runtime.int32Type]));
+    let waitForChild = runtime.libc("waitpid", runtime.int32Type.functionType([runtime.int32Type,
+        runtime.pointerType, runtime.int32Type]));
+    let now = clock.monotonicMillisRuntime(runtime);
+    let definition = runtime.beginDefinition("ens_process_poll", type);
+    let builder = runtime.builder;
+    let turnBlock = runtime.block(definition, "poll.turn");
+    let idleBlock = runtime.block(definition, "poll.idle");
+    let pollBlock = runtime.block(definition, "poll.ask");
+    let refusedBlock = runtime.block(definition, "poll.refused");
+    let collectBlock = runtime.block(definition, "poll.collect");
+    let askBlock = runtime.block(definition, "poll.ask.child");
+    let collectedBlock = runtime.block(definition, "poll.collected");
+    let decideBlock = runtime.block(definition, "poll.decide");
+    let doneBlock = runtime.block(definition, "poll.done");
+    let failedBlock = runtime.block(definition, "poll.failed");
+    let block = runtime.parameter(definition, 0);
+    let millis = runtime.parameter(definition, 1);
+    let readySlot = runtime.parameter(definition, 2);
+    let watched = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType((Pollfd.structBytes * 3) as ulong), "watched");
+    let statusSlot = memory.buildAlloca(builder, runtime.int32Type, "status");
+    let bounded = instructions.buildICmpSGE(builder, millis, runtime.int64(0), "bounded");
+    let deadline = instructions.buildAdd(builder, runtime.call(now, [], "started"), millis,
+        "deadline");
+    memory.buildStore(builder, runtime.int32(0), readySlot);
+    instructions.buildBr(builder, turnBlock);
+
+    builder.positionAtEnd(turnBlock);
+    let remaining = remainingMillis(runtime, now, bounded, deadline);
+    let reaped = instructions.buildICmpNE(builder,
+        childprocess.loadField(runtime, block, PosixChild.reaped), runtime.int32(0), "reaped");
+    let pidDescriptor = childprocess.loadField(runtime, block, PosixChild.pidDescriptor);
+    let turning = instructions.buildAnd(builder,
+        instructions.buildICmpSLT(builder, pidDescriptor, runtime.int32(0), ""),
+        instructions.buildNot(builder, reaped, ""), "turning");
+    let turn = instructions.buildSelect(builder, reaped, runtime.int64(0),
+        instructions.buildSelect(builder, turning, boundedTurn(runtime, bounded, remaining),
+            remaining, ""), "turn");
+    let outputLive = watchDescriptor(runtime, watched, 0, streamDescriptor(runtime, block,
+        runtime.int32(ChildStream.output)), block, PosixChild.outputEnded);
+    let errorsLive = watchDescriptor(runtime, watched, 1, streamDescriptor(runtime, block,
+        runtime.int32(ChildStream.errors)), block, PosixChild.errorsEnded);
+    memory.buildStore(builder, instructions.buildSelect(builder, reaped, runtime.int32(-1),
+        pidDescriptor, ""), runtime.offsetPointer(watched, Pollfd.structBytes * 2, ""));
+    let idle = instructions.buildAnd(builder, reaped, instructions.buildNot(builder,
+        instructions.buildOr(builder, outputLive, errorsLive, ""), ""), "idle");
+    instructions.buildCondBr(builder, idle, idleBlock, pollBlock);
+
+    // A collected child whose streams have both ended leaves nothing to ask the system about.
+    builder.positionAtEnd(idleBlock);
+    memory.buildStore(builder, runtime.int32(PollReady.ended), readySlot);
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(pollBlock);
+    memory.buildStore(builder, runtime.int16Type.constInt(PollEvent.input as ulong, false),
+        runtime.offsetPointer(watched, Pollfd.structBytes * 2 + Pollfd.events, ""));
+    memory.buildStore(builder, runtime.int16Type.constInt(0, false),
+        runtime.offsetPointer(watched, Pollfd.structBytes * 2 + Pollfd.revents, ""));
+    let woken = runtime.call(pollDescriptors, [watched, runtime.int64(3),
+        instructions.buildTrunc(builder, turn, runtime.int32Type, "")], "woken");
+    let why = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, woken, runtime.int32(0), ""), refusedBlock,
+        collectBlock);
+
+    builder.positionAtEnd(refusedBlock);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, why, runtime.int32(Errno.interrupted), ""), turnBlock,
+        failedBlock);
+
+    builder.positionAtEnd(failedBlock);
+    instructions.buildRet(builder, why);
+
+    builder.positionAtEnd(collectBlock);
+    Value mask = instructions.buildSelect(builder, reaped, runtime.int32(PollReady.ended),
+        runtime.int32(0), "");
+    mask = instructions.buildOr(builder, mask, reportedBit(runtime, watched, 0, PollReady.output),
+        "");
+    mask = instructions.buildOr(builder, mask, reportedBit(runtime, watched, 1, PollReady.errors),
+        "");
+    mask = instructions.buildOr(builder, mask, reportedBit(runtime, watched, 2, PollReady.ended),
+        "mask");
+    memory.buildStore(builder, mask, readySlot);
+    instructions.buildCondBr(builder, turning, askBlock, decideBlock);
+
+    builder.positionAtEnd(askBlock);
+    let answer = runtime.call(waitForChild, [childprocess.loadField(runtime, block,
+        PosixChild.pid), statusSlot, runtime.int32(WaitStatus.noHang)], "answer");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSGT(builder, answer, runtime.int32(0), ""), collectedBlock,
+        decideBlock);
+
+    builder.positionAtEnd(collectedBlock);
+    cacheStatus(runtime, block, memory.buildLoad(builder, runtime.int32Type, statusSlot, "raw"));
+    memory.buildStore(builder, instructions.buildOr(builder, mask,
+        runtime.int32(PollReady.ended), ""), readySlot);
+    instructions.buildBr(builder, decideBlock);
+
+    builder.positionAtEnd(decideBlock);
+    instructions.buildCondBr(builder, finished(runtime, now, readySlot, bounded, deadline),
+        doneBlock, turnBlock);
+
+    builder.positionAtEnd(doneBlock);
+    instructions.buildRet(builder, runtime.int32(0));
+    return runtime.endDefinition(definition);
+}
+
+// One kqueue per call over the two pipes and the child's exit note. A child that has already ended
+// is collected first, so a zombie is reported without depending on how the note treats one, and a
+// note the system refuses because the child is gone counts as its end too.
+darwinPoll(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let makeQueue = runtime.libc("kqueue", runtime.int32Type.functionType([]));
+    let queueEvents = runtime.libc("kevent", runtime.int32Type.functionType([runtime.int32Type,
+        runtime.pointerType, runtime.int32Type, runtime.pointerType, runtime.int32Type,
+        runtime.pointerType]));
+    let closeDescriptor = runtime.libc("close",
+        runtime.int32Type.functionType([runtime.int32Type]));
+    let waitForChild = runtime.libc("waitpid", runtime.int32Type.functionType([runtime.int32Type,
+        runtime.pointerType, runtime.int32Type]));
+    let now = clock.monotonicMillisRuntime(runtime);
+    let definition = runtime.beginDefinition("ens_process_poll", type);
+    let builder = runtime.builder;
+    let turnBlock = runtime.block(definition, "poll.turn");
+    let askBlock = runtime.block(definition, "poll.ask.child");
+    let collectedBlock = runtime.block(definition, "poll.collected");
+    let registerBlock = runtime.block(definition, "poll.register");
+    let idleBlock = runtime.block(definition, "poll.idle");
+    let queueBlock = runtime.block(definition, "poll.queue");
+    let queueFailedBlock = runtime.block(definition, "poll.queue.failed");
+    let refusedBlock = runtime.block(definition, "poll.refused");
+    let collectBlock = runtime.block(definition, "poll.collect");
+    let decideBlock = runtime.block(definition, "poll.decide");
+    let doneBlock = runtime.block(definition, "poll.done");
+    let failedBlock = runtime.block(definition, "poll.failed");
+    let block = runtime.parameter(definition, 0);
+    let millis = runtime.parameter(definition, 1);
+    let readySlot = runtime.parameter(definition, 2);
+    let changes = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType((Kevent.structBytes * 3) as ulong), "changes");
+    let events = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType((Kevent.structBytes * 3) as ulong), "events");
+    let timeout = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType(Timespec.structBytes as ulong), "timeout");
+    let statusSlot = memory.buildAlloca(builder, runtime.int32Type, "status");
+    let countSlot = memory.buildAlloca(builder, runtime.int32Type, "count");
+    let failureSlot = memory.buildAlloca(builder, runtime.int32Type, "failure");
+    let bounded = instructions.buildICmpSGE(builder, millis, runtime.int64(0), "bounded");
+    let deadline = instructions.buildAdd(builder, runtime.call(now, [], "started"), millis,
+        "deadline");
+    memory.buildStore(builder, runtime.int32(0), readySlot);
+    memory.buildStore(builder, runtime.int32(0), failureSlot);
+    instructions.buildBr(builder, turnBlock);
+
+    builder.positionAtEnd(turnBlock);
+    instructions.buildCondBr(builder, instructions.buildICmpNE(builder,
+        childprocess.loadField(runtime, block, PosixChild.reaped), runtime.int32(0), ""),
+        registerBlock, askBlock);
+
+    builder.positionAtEnd(askBlock);
+    let answer = runtime.call(waitForChild, [childprocess.loadField(runtime, block,
+        PosixChild.pid), statusSlot, runtime.int32(WaitStatus.noHang)], "answer");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSGT(builder, answer, runtime.int32(0), ""), collectedBlock,
+        registerBlock);
+
+    builder.positionAtEnd(collectedBlock);
+    cacheStatus(runtime, block, memory.buildLoad(builder, runtime.int32Type, statusSlot, "raw"));
+    instructions.buildBr(builder, registerBlock);
+
+    builder.positionAtEnd(registerBlock);
+    let reaped = instructions.buildICmpNE(builder,
+        childprocess.loadField(runtime, block, PosixChild.reaped), runtime.int32(0), "reaped");
+    memory.buildStore(builder, instructions.buildSelect(builder, reaped,
+        runtime.int32(PollReady.ended), runtime.int32(0), ""), readySlot);
+    memory.buildStore(builder, runtime.int32(0), countSlot);
+    registerStream(runtime, definition, changes, countSlot, streamDescriptor(runtime, block,
+        runtime.int32(ChildStream.output)), block, PosixChild.outputEnded, PollReady.output,
+        "output");
+    registerStream(runtime, definition, changes, countSlot, streamDescriptor(runtime, block,
+        runtime.int32(ChildStream.errors)), block, PosixChild.errorsEnded, PollReady.errors,
+        "errors");
+    registerExit(runtime, definition, changes, countSlot, block, reaped);
+    let count = memory.buildLoad(builder, runtime.int32Type, countSlot, "count");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, count, runtime.int32(0), ""), idleBlock, queueBlock);
+
+    builder.positionAtEnd(idleBlock);
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(queueBlock);
+    let remaining = remainingMillis(runtime, now, bounded, deadline);
+    let effective = instructions.buildSelect(builder, reaped, runtime.int64(0), remaining, "");
+    memory.buildStore(builder, instructions.buildSDiv(builder, effective, runtime.int64(1000), ""),
+        runtime.offsetPointer(timeout, Timespec.seconds, ""));
+    memory.buildStore(builder, instructions.buildMul(builder,
+        instructions.buildSRem(builder, effective, runtime.int64(1000), ""),
+        runtime.int64(1000000), ""), runtime.offsetPointer(timeout, Timespec.nanoseconds, ""));
+    let timeoutPointer = instructions.buildSelect(builder,
+        instructions.buildOr(builder, bounded, reaped, ""), timeout, runtime.nullPointer(),
+        "timeout.pointer");
+    let queue = runtime.call(makeQueue, [], "queue");
+    let queueError = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, queue, runtime.int32(0), ""), queueFailedBlock,
+        collectBlock);
+
+    builder.positionAtEnd(queueFailedBlock);
+    instructions.buildRet(builder, queueError);
+
+    builder.positionAtEnd(collectBlock);
+    let woken = runtime.call(queueEvents, [queue, changes, count, events, runtime.int32(3),
+        timeoutPointer], "woken");
+    let why = runtime.lastError();
+    runtime.call(closeDescriptor, [queue], "");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, woken, runtime.int32(0), ""), refusedBlock,
+        decideBlock);
+
+    builder.positionAtEnd(refusedBlock);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, why, runtime.int32(Errno.interrupted), ""), turnBlock,
+        failedBlock);
+
+    builder.positionAtEnd(failedBlock);
+    instructions.buildRet(builder, why);
+
+    builder.positionAtEnd(decideBlock);
+    for (long index = 0; index < 3; index++) {
+        collectEvent(runtime, definition, events, index, woken, readySlot, failureSlot,
+            failedBlock);
+    }
+    instructions.buildCondBr(builder, finished(runtime, now, readySlot, bounded, deadline),
+        doneBlock, turnBlock);
+
+    builder.positionAtEnd(doneBlock);
     instructions.buildRet(builder, runtime.int32(0));
     return runtime.endDefinition(definition);
 }
@@ -651,4 +899,210 @@ endSlot(Runtime runtime, Value ends, long slot) -> Value {
 loadEnd(Runtime runtime, Value ends, long slot) -> Value {
     return memory.buildLoad(runtime.builder, runtime.int32Type, endSlot(runtime, ends, slot),
         "end");
+}
+
+// Records how the child ended from its raw wait status. The low seven bits name the signal that
+// ended it, and are zero for a child that exited with the code held eight bits up.
+cacheStatus(Runtime runtime, Value block, Value status) {
+    let builder = runtime.builder;
+    let low = instructions.buildAnd(builder, status, runtime.int32(WaitStatus.signalMask), "low");
+    let exited = instructions.buildICmpEQ(builder, low, runtime.int32(0), "exited");
+    let code = instructions.buildSelect(builder, exited, instructions.buildAnd(builder,
+        instructions.buildLShr(builder, status, runtime.int32(WaitStatus.codeShift), ""),
+        runtime.int32(WaitStatus.codeMask), ""), runtime.int32(0), "code");
+    let signal = instructions.buildSelect(builder, exited, runtime.int32(0), low, "signal");
+    memory.buildStore(builder, runtime.int32(1),
+        childprocess.childField(runtime, block, PosixChild.reaped));
+    memory.buildStore(builder, code, childprocess.childField(runtime, block, PosixChild.code));
+    memory.buildStore(builder, signal,
+        childprocess.childField(runtime, block, PosixChild.signal));
+}
+
+// Opens a pidfd on the child where the target has the call, keeping -1 where the kernel has not.
+// The child is still uncollected here, so the number cannot yet name another process.
+openPidDescriptor(Runtime runtime, Value block, Value child) {
+    long number = nativeshapes.pidfdOpenSystemCall(runtime.targetTriple);
+    if (number == 0) {
+        return;
+    }
+    let builder = runtime.builder;
+    let systemCall = runtime.libc("syscall",
+        runtime.int64Type.variadicFunctionType([runtime.int64Type]));
+    let opened = instructions.buildTrunc(builder, runtime.call(systemCall, [runtime.int64(number),
+        instructions.buildSExt(builder, child, runtime.int64Type, ""), runtime.int64(0)],
+        "pidfd"), runtime.int32Type, "");
+    memory.buildStore(builder, instructions.buildSelect(builder,
+        instructions.buildICmpSLT(builder, opened, runtime.int32(0), ""), runtime.int32(-1),
+        opened, ""), childprocess.childField(runtime, block, PosixChild.pidDescriptor));
+}
+
+// How many milliseconds are left before the deadline, at least 0, or -1 when there is no bound.
+remainingMillis(Runtime runtime, RuntimeFunction now, Value bounded, Value deadline) -> Value {
+    let builder = runtime.builder;
+    let left = instructions.buildSub(builder, deadline, runtime.call(now, [], "now"), "left");
+    let clamped = instructions.buildSelect(builder,
+        instructions.buildICmpSLT(builder, left, runtime.int64(0), ""), runtime.int64(0),
+        instructions.buildSelect(builder,
+            instructions.buildICmpSGT(builder, left, runtime.int64(0x7FFFFFFF), ""),
+            runtime.int64(0x7FFFFFFF), left, ""), "");
+    return instructions.buildSelect(builder, bounded, clamped, runtime.int64(-1), "remaining");
+}
+
+// One turn's length where the child's end cannot be waited on, which is the turn bound or what is
+// left of the deadline, whichever is shorter.
+boundedTurn(Runtime runtime, Value bounded, Value remaining) -> Value {
+    let builder = runtime.builder;
+    let shorter = instructions.buildICmpSLT(builder, remaining, runtime.int64(PollTurn.millis), "");
+    return instructions.buildSelect(builder, instructions.buildAnd(builder, bounded, shorter, ""),
+        remaining, runtime.int64(PollTurn.millis), "turn");
+}
+
+// True when the mask holds anything or the deadline has passed, which is when a poll answers.
+finished(Runtime runtime, RuntimeFunction now, Value readySlot, Value bounded, Value deadline)
+        -> Value {
+    let builder = runtime.builder;
+    let ready = instructions.buildICmpNE(builder,
+        memory.buildLoad(builder, runtime.int32Type, readySlot, "ready"), runtime.int32(0), "");
+    let passed = instructions.buildAnd(builder, bounded, instructions.buildICmpSLE(builder,
+        deadline, runtime.call(now, [], "now"), ""), "passed");
+    return instructions.buildOr(builder, ready, passed, "finished");
+}
+
+// Fills one 'struct pollfd' with the stream's descriptor, or with -1 where the stream is no pipe or
+// has ended, which poll skips, and answers whether the stream is live.
+watchDescriptor(Runtime runtime, Value watched, long index, Value descriptor, Value block,
+                long endedOffset) -> Value {
+    let builder = runtime.builder;
+    let entry = runtime.offsetPointer(watched, Pollfd.structBytes * index, "");
+    let live = instructions.buildAnd(builder,
+        instructions.buildICmpSGE(builder, descriptor, runtime.int32(0), ""),
+        instructions.buildICmpEQ(builder, childprocess.loadField(runtime, block, endedOffset),
+            runtime.int32(0), ""), "live");
+    memory.buildStore(builder, instructions.buildSelect(builder, live, descriptor,
+        runtime.int32(-1), ""), runtime.offsetPointer(entry, Pollfd.descriptor, ""));
+    memory.buildStore(builder, runtime.int16Type.constInt(PollEvent.input as ulong, false),
+        runtime.offsetPointer(entry, Pollfd.events, ""));
+    memory.buildStore(builder, runtime.int16Type.constInt(0, false),
+        runtime.offsetPointer(entry, Pollfd.revents, ""));
+    return live;
+}
+
+// The bit for an entry whose returned events say a read would not wait.
+reportedBit(Runtime runtime, Value watched, long index, long bit) -> Value {
+    let builder = runtime.builder;
+    let returned = memory.buildLoad(builder, runtime.int16Type, runtime.offsetPointer(watched,
+        Pollfd.structBytes * index + Pollfd.revents, ""), "revents");
+    return instructions.buildSelect(builder,
+        instructions.buildICmpNE(builder, returned, runtime.int16Type.constInt(0, false), ""),
+        runtime.int32(bit), runtime.int32(0), "bit");
+}
+
+// Registers a read filter on the stream's descriptor when the stream is a pipe that has not ended,
+// naming the bit it answers with in the event's user data.
+registerStream(Runtime runtime, RuntimeDefinition definition, Value changes, Value countSlot,
+               Value descriptor, Value block, long endedOffset, long bit, string label) {
+    let builder = runtime.builder;
+    let addBlock = runtime.block(definition, "poll.register.{label}");
+    let doneBlock = runtime.block(definition, "poll.registered.{label}");
+    let live = instructions.buildAnd(builder,
+        instructions.buildICmpSGE(builder, descriptor, runtime.int32(0), ""),
+        instructions.buildICmpEQ(builder, childprocess.loadField(runtime, block, endedOffset),
+            runtime.int32(0), ""), "live");
+    instructions.buildCondBr(builder, live, addBlock, doneBlock);
+
+    builder.positionAtEnd(addBlock);
+    writeEvent(runtime, changes, countSlot,
+        instructions.buildSExt(builder, descriptor, runtime.int64Type, ""), Kevent.readFilter, 0,
+        bit);
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(doneBlock);
+}
+
+// Registers the child's exit note when the child has not been collected.
+registerExit(Runtime runtime, RuntimeDefinition definition, Value changes, Value countSlot,
+             Value block, Value reaped) {
+    let builder = runtime.builder;
+    let addBlock = runtime.block(definition, "poll.register.exit");
+    let doneBlock = runtime.block(definition, "poll.registered.exit");
+    instructions.buildCondBr(builder, reaped, doneBlock, addBlock);
+
+    builder.positionAtEnd(addBlock);
+    writeEvent(runtime, changes, countSlot, instructions.buildSExt(builder,
+        childprocess.loadField(runtime, block, PosixChild.pid), runtime.int64Type, ""),
+        Kevent.processFilter, Kevent.exitNote, PollReady.ended);
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(doneBlock);
+}
+
+// Writes one one-shot kevent at the next free slot of the change list and counts it.
+writeEvent(Runtime runtime, Value changes, Value countSlot, Value ident, long filter,
+           long filterFlags, long bit) {
+    let builder = runtime.builder;
+    let count = memory.buildLoad(builder, runtime.int32Type, countSlot, "count");
+    let entry = memory.buildGEP(builder, runtime.int8Type, changes, [instructions.buildMul(builder,
+        instructions.buildSExt(builder, count, runtime.int64Type, ""),
+        runtime.int64(Kevent.structBytes), "")], "event");
+    memory.buildStore(builder, ident, runtime.offsetPointer(entry, Kevent.ident, ""));
+    memory.buildStore(builder, runtime.int16Type.constInt(filter as ulong, true),
+        runtime.offsetPointer(entry, Kevent.filter, ""));
+    memory.buildStore(builder, runtime.int16Type.constInt((Kevent.add | Kevent.oneShot) as ulong,
+        false), runtime.offsetPointer(entry, Kevent.flags, ""));
+    memory.buildStore(builder, runtime.int32(filterFlags),
+        runtime.offsetPointer(entry, Kevent.filterFlags, ""));
+    memory.buildStore(builder, runtime.int64(0), runtime.offsetPointer(entry, Kevent.data, ""));
+    memory.buildStore(builder, runtime.int64(bit), runtime.offsetPointer(entry, Kevent.userData, ""));
+    memory.buildStore(builder, instructions.buildAdd(builder, count, runtime.int32(1), ""),
+        countSlot);
+}
+
+// Adds the bit a returned event carries to the mask. An error event carries an errno in its data,
+// and one saying the child is gone counts as the child's end, since waitpid then answers at once.
+collectEvent(Runtime runtime, RuntimeDefinition definition, Value events, long index, Value woken,
+             Value readySlot, Value failureSlot, BasicBlock failedBlock) {
+    let builder = runtime.builder;
+    let readBlock = runtime.block(definition, "poll.event.{index}");
+    let errorBlock = runtime.block(definition, "poll.event.{index}.error");
+    let goneBlock = runtime.block(definition, "poll.event.{index}.gone");
+    let bitBlock = runtime.block(definition, "poll.event.{index}.bit");
+    let doneBlock = runtime.block(definition, "poll.event.{index}.done");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, runtime.int32(index), woken, ""), readBlock, doneBlock);
+
+    builder.positionAtEnd(readBlock);
+    let entry = runtime.offsetPointer(events, Kevent.structBytes * index, "");
+    let flags = memory.buildLoad(builder, runtime.int16Type,
+        runtime.offsetPointer(entry, Kevent.flags, ""), "flags");
+    let erred = instructions.buildICmpNE(builder, instructions.buildAnd(builder, flags,
+        runtime.int16Type.constInt(Kevent.error as ulong, false), ""),
+        runtime.int16Type.constInt(0, false), "erred");
+    instructions.buildCondBr(builder, erred, errorBlock, bitBlock);
+
+    builder.positionAtEnd(errorBlock);
+    let reason = instructions.buildTrunc(builder, memory.buildLoad(builder, runtime.int64Type,
+        runtime.offsetPointer(entry, Kevent.data, ""), "data"), runtime.int32Type, "reason");
+    let filter = memory.buildLoad(builder, runtime.int16Type,
+        runtime.offsetPointer(entry, Kevent.filter, ""), "filter");
+    memory.buildStore(builder, reason, failureSlot);
+    instructions.buildCondBr(builder, instructions.buildAnd(builder,
+        instructions.buildICmpEQ(builder, filter,
+            runtime.int16Type.constInt(Kevent.processFilter as ulong, true), ""),
+        instructions.buildICmpEQ(builder, reason, runtime.int32(Errno.noSuchProcess), ""), ""),
+        goneBlock, failedBlock);
+
+    builder.positionAtEnd(goneBlock);
+    memory.buildStore(builder, instructions.buildOr(builder,
+        memory.buildLoad(builder, runtime.int32Type, readySlot, ""),
+        runtime.int32(PollReady.ended), ""), readySlot);
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(bitBlock);
+    let bit = instructions.buildTrunc(builder, memory.buildLoad(builder, runtime.int64Type,
+        runtime.offsetPointer(entry, Kevent.userData, ""), "bit"), runtime.int32Type, "");
+    memory.buildStore(builder, instructions.buildOr(builder,
+        memory.buildLoad(builder, runtime.int32Type, readySlot, ""), bit, ""), readySlot);
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(doneBlock);
 }

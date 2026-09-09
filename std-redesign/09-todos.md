@@ -36,6 +36,8 @@ Where a file system will not carry the request out, and on an architecture whose
 Two programs racing for the same name can then both be told they moved it, over a window of a few microseconds.
 The exposure is none at all on ext4, xfs, btrfs, apfs and ntfs, and real on overlay and network file systems.
 
+Nothing tells a caller or a test whether a Linux `ens_process_poll` is on the pidfd path or the 5 ms fallback a kernel without `pidfd_open` gets, so the fallback runs unmeasured on every supported machine.
+
 The emitter tests that retarget a module prove a platform's half builds well-formed IR, and prove nothing about whether its numbers are true.
 A negative control settled it.
 Moving `Statx.modeOffset` from 28 to 29 in a disposable copy of the tree left every retarget test passing, while a wrong return type failed loudly.
