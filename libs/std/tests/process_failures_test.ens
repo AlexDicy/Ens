@@ -1,0 +1,189 @@
+// Tests for what @std.process reports when a program cannot be started or driven: the kind a
+// program acts on, the message a person reads, and the program the failure names.
+import @std.testing;
+import Path from @std.fs;
+import TemporaryDirectory from @std.fs.temporary;
+import Environment from @std.environment;
+import BufferedReader from @std.io.buffered;
+import ErrorKind as IoErrorKind from @std.io.streams;
+import IoError from @std.io.streams;
+import ErrorKind from @std.process;
+import ProcessError from @std.process;
+import @std.process;
+import CurrentDirectoryFile from process.support;
+import process.support;
+
+test "a program that is not there says nothing is there" {
+    let scratch = try TemporaryDirectory.create("ens-std-process-missing");
+    Path missing = scratch.path().join("missing-program");
+    let refused = try testing.assertThrows<ProcessError>(() -> {
+        let answer = try process.run(missing);
+    });
+    try testing.assertEqual(refused.kind, ErrorKind.NotFound);
+    try testing.assertEqual(refused.message, "could not start '{missing}': nothing is there");
+    try testing.assertEqual(refused.program, missing.toString());
+}
+
+test "a name no PATH directory holds says so without starting anything" {
+    string name = "ens-std-process-no-such-program";
+    let refused = try testing.assertThrows<ProcessError>(() -> {
+        let answer = try process.run(Path(name));
+    });
+    try testing.assertEqual(refused.kind, ErrorKind.NotFound);
+    try testing.assertEqual(refused.message,
+        "could not start '{name}': no program of that name is in a PATH directory");
+    try testing.assertEqual(refused.program, name);
+}
+
+test "a program with no name is refused" {
+    let refused = try testing.assertThrows<ProcessError>(() -> {
+        let child = try process.spawn(Path(""));
+    });
+    try testing.assertEqual(refused.kind, ErrorKind.NotFound);
+    try testing.assertEqual(refused.message, "could not start a program: no name was given");
+    try testing.assertEqual(refused.program, "");
+}
+
+// POSIX refuses to run a file nobody may execute as a permission, and Windows refuses a file that
+// is no program image as its own kind of failure, which is an Other carrying the system's number.
+test "a data file is refused as a program in each platform's own terms" {
+    let scratch = try TemporaryDirectory.create("ens-std-process-data");
+    Path data = scratch.path().join("data.bin");
+    try data.writeText("not a program");
+    let refused = try testing.assertThrows<ProcessError>(() -> {
+        let answer = try process.run(data);
+    });
+    try testing.assertEqual(refused.program, data.toString());
+    if (support.onWindows()) {
+        try testing.assertEqual(refused.kind, ErrorKind.Other);
+        try testing.assertTrue(refused.message.startsWith(
+            "could not start '{data}': the system reported error "),
+            "the message was '{refused.message}'");
+        return;
+    }
+    try testing.assertEqual(refused.kind, ErrorKind.PermissionDenied);
+    try testing.assertEqual(refused.message, "could not start '{data}': permission was refused");
+}
+
+// The system's number does not say whether the program or the directory was missing, so the
+// message names both.
+test "a working directory that is not there is named" {
+    let scratch = try TemporaryDirectory.create("ens-std-process-nowhere");
+    Path gone = scratch.path().join("gone");
+    let refused = try testing.assertThrows<ProcessError>(() -> {
+        let answer = try process.runShell("exit 0", workingDirectory: gone);
+    });
+    try testing.assertEqual(refused.kind, ErrorKind.NotFound);
+    try testing.assertTrue(refused.message.startsWith("could not start '"),
+        "the message was '{refused.message}'");
+    try testing.assertTrue(refused.message.endsWith(
+        "': nothing is there, or the working directory '{gone}' is missing"),
+        "the message was '{refused.message}'");
+}
+
+// A file of the name sits in this process's current directory, and the PATH the child is given
+// names an empty directory instead, so finding it would mean the current directory was searched.
+test "the current directory is never searched for a program" {
+    string name = "ens-std-process-cwd-probe";
+    string fileName = name;
+    if (support.onWindows()) {
+        fileName = name + ".exe";
+    }
+    let probe = try CurrentDirectoryFile.create(fileName);
+    let scratch = try TemporaryDirectory.create("ens-std-process-empty-path");
+    let given = Environment.current();
+    given.set("PATH", scratch.path().toString());
+    let refused = try testing.assertThrows<ProcessError>(() -> {
+        let answer = try process.run(Path(name), environment: given);
+    });
+    try testing.assertEqual(refused.kind, ErrorKind.NotFound);
+    try testing.assertTrue(probe.path().isFile(), "the probe was there to be found");
+}
+
+// Every PATH directory holds a file of the name nobody may execute, so a start passes over each
+// and reports the first refusal once the last has been tried.
+test "a program refused in every PATH directory reports the first refusal" {
+    if (support.onWindows()) {
+        return;
+    }
+    let scratch = try TemporaryDirectory.create("ens-std-process-refused");
+    Path first = scratch.path().join("first");
+    Path second = scratch.path().join("second");
+    try first.createDirectories();
+    try second.createDirectories();
+    try first.join("ens-std-process-probe").writeText("not a program");
+    try second.join("ens-std-process-probe").writeText("not a program either");
+    let given = Environment.current();
+    given.set("PATH", first.toString() + ":" + second.toString());
+    let refused = try testing.assertThrows<ProcessError>(() -> {
+        let answer = try process.run(Path("ens-std-process-probe"), environment: given);
+    });
+    try testing.assertEqual(refused.kind, ErrorKind.PermissionDenied);
+    try testing.assertEqual(refused.message,
+        "could not start 'ens-std-process-probe': permission was refused");
+    try testing.assertEqual(refused.program, "ens-std-process-probe");
+}
+
+// A script is found by name only through the interpreter, which reads PATHEXT; the search of `run`
+// looks for `name.exe` alone, because starting a script directly would run cmd.exe without the
+// caller having asked for a shell.
+test "on Windows a script is not found by name without its extension" {
+    if (!support.onWindows()) {
+        return;
+    }
+    let scratch = try TemporaryDirectory.create("ens-std-process-script");
+    try scratch.path().join("tool.cmd").writeText("@echo tool\r\n");
+    let given = Environment.current();
+    given.set("PATH", scratch.path().toString());
+    let refused = try testing.assertThrows<ProcessError>(() -> {
+        let answer = try process.run(Path("tool"), environment: given);
+    });
+    try testing.assertEqual(refused.kind, ErrorKind.NotFound);
+    let answer = try process.runShell("tool", environment: given, captureOutput: true);
+    try testing.assertTrue(answer.status.succeeded(), "the shell failed: {answer.stderr}");
+    try testing.assertEqual(support.lines(answer.stdout), ["tool"]);
+}
+
+test "writing to a child that has gone says the input is closed" {
+    let child = try process.spawn(support.interpreter(), support.scriptArguments("exit 0",
+        "exit 0"));
+    let ended = try child.wait();
+    try testing.assertEqual(ended.code, 0);
+    let refused = try testing.assertThrows<IoError>(() -> {
+        try child.input().write("late\n".toBytes());
+    });
+    try testing.assertEqual(refused.kind, IoErrorKind.Closed);
+    try testing.assertEqual(refused.message,
+        "could not write to the input of '{support.interpreter()}': the input is closed");
+}
+
+test "writing after closing the input says the input is closed" {
+    let child = try process.spawn(support.interpreter(), support.scriptArguments(
+        "cat >/dev/null", "set /p a=& exit 0"));
+    try child.closeInput();
+    try child.closeInput();
+    let refused = try testing.assertThrows<IoError>(() -> {
+        try child.input().write("late\n".toBytes());
+    });
+    try testing.assertEqual(refused.kind, IoErrorKind.Closed);
+    let ended = try child.wait();
+    try testing.assertEqual(ended.code, 0);
+}
+
+// The child value dies when this returns, and the reader taken from it outlives it.
+orphanReader() -> BufferedReader throws {
+    let child = try process.spawn(support.interpreter(), support.scriptArguments("exit 0",
+        "exit 0"));
+    let status = try child.wait();
+    return child.stdout();
+}
+
+test "a reader kept after the child value was dropped says the child has been let go" {
+    let orphan = try orphanReader();
+    let refused = try testing.assertThrows<IoError>(() -> {
+        let line = try orphan.readLine();
+    });
+    try testing.assertEqual(refused.kind, IoErrorKind.Closed);
+    try testing.assertEqual(refused.message, "could not read the standard output of "
+        + "'{support.interpreter()}': the child has been let go");
+}

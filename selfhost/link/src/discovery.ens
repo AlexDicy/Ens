@@ -2,10 +2,9 @@
 // that reads the environment or runs a program, and everything it finds becomes a Toolchain value,
 // so the line itself is built from values alone. The flavor decides what is worth asking for.
 import Path from @std.fs;
-import FileSystemError from @std.fs.error;
 import Environment from @std.environment;
-import @std.system;
-import SystemError from @std.system;
+import ProcessError from @std.process;
+import @std.process;
 
 import List from @std.collections.list;
 import LinkerFlavor from flavor;
@@ -15,21 +14,18 @@ import MacosSdk from toolchain;
 import toolchain;
 import triple;
 
-// Everything this machine contributes to a link for the given target. `probePath` is a path prefix
-// the probes write their captured output to; nothing is left behind. Nothing here fails: a question
-// the machine cannot answer leaves its part of the toolchain empty, and the link line then simply
-// says less.
-export discover(LinkerFlavor selectedFlavor, string targetTriple, string probePath) -> Toolchain {
+// Everything this machine contributes to a link for the given target. Nothing here fails: a
+// question the machine cannot answer leaves its part of the toolchain empty, and the link line then
+// simply says less.
+export discover(LinkerFlavor selectedFlavor, string targetTriple) -> Toolchain {
     // The variables are read once here, at this layer's own boundary, so nothing below asks the
     // process about itself.
     let variables = Environment.current();
-    let discovered = switch (selectedFlavor) {
+    return switch (selectedFlavor) {
         LinkerFlavor.Coff -> toolchain.bareToolchain(),
-        LinkerFlavor.Elf -> elfToolchain(variables, targetTriple, probePath),
-        LinkerFlavor.MachO -> machoToolchain(variables, probePath),
+        LinkerFlavor.Elf -> elfToolchain(variables, targetTriple),
+        LinkerFlavor.MachO -> machoToolchain(variables),
     };
-    removeProbeFiles(probePath);
-    return discovered;
 }
 
 // The folders a LIBRARY_PATH value names, in the order it names them, with empty entries dropped.
@@ -68,38 +64,38 @@ export sdkVersionFromRoot(string root) -> string {
     return version;
 }
 
-elfToolchain(Environment variables, string targetTriple, string probePath) -> Toolchain {
+elfToolchain(Environment variables, string targetTriple) -> Toolchain {
     return new Toolchain(searchPathsFrom(variables.get("LIBRARY_PATH")),
-        firstExistingFile(triple.dynamicLinkerCandidates(targetTriple)), elfRuntime(probePath),
+        firstExistingFile(triple.dynamicLinkerCandidates(targetTriple)), elfRuntime(),
         new MacosSdk("", ""));
 }
 
-machoToolchain(Environment variables, string probePath) -> Toolchain {
+machoToolchain(Environment variables) -> Toolchain {
     return new Toolchain(searchPathsFrom(variables.get("LIBRARY_PATH")), "",
-        new ElfRuntime("", "", "", ""), macosSdk(variables, probePath));
+        new ElfRuntime("", "", "", ""), macosSdk(variables));
 }
 
 // The C runtime pieces of the first of cc, clang and gcc this machine can run. One compiler answers
 // every question, so a machine with several of them never ends up mixing two C runtimes.
-elfRuntime(string probePath) -> ElfRuntime {
+elfRuntime() -> ElfRuntime {
     for (let compiler in ["cc", "clang", "gcc"]) {
-        let startupObject = compilerFile(compiler, "Scrt1.o", probePath);
+        let startupObject = compilerFile(compiler, "Scrt1.o");
         if (startupObject == null) {
             continue;
         }
         return new ElfRuntime(startupObject,
-            compilerFile(compiler, "crti.o", probePath) ?? "",
-            compilerFile(compiler, "crtn.o", probePath) ?? "",
-            unwinderArchive(compiler, probePath));
+            compilerFile(compiler, "crti.o") ?? "",
+            compilerFile(compiler, "crtn.o") ?? "",
+            unwinderArchive(compiler));
     }
     return new ElfRuntime("", "", "", "");
 }
 
 // The static unwinder to link, preferring LLVM's over GCC's. Empty when the compiler ships neither,
 // and the link falls back to the shared libgcc_s.
-unwinderArchive(string compiler, string probePath) -> string {
+unwinderArchive(string compiler) -> string {
     for (let archive in ["libunwind.a", "libgcc_eh.a"]) {
-        string found = compilerFile(compiler, archive, probePath) ?? "";
+        string found = compilerFile(compiler, archive) ?? "";
         if (found.length > 0) {
             return found;
         }
@@ -110,8 +106,8 @@ unwinderArchive(string compiler, string probePath) -> string {
 // Where the C compiler keeps one of its own files, as it reports it: null when the compiler could
 // not be run at all, so the next candidate gets a turn, and empty when it ran but has no such
 // file - which it says by echoing the name back unchanged.
-compilerFile(string compiler, string fileName, string probePath) -> string? {
-    let printed = printedByProgram(compiler, ["-print-file-name=" + fileName], probePath);
+compilerFile(string compiler, string fileName) -> string? {
+    let printed = printedByProgram(compiler, ["-print-file-name=" + fileName]);
     if (printed == null) {
         return null;
     }
@@ -123,10 +119,10 @@ compilerFile(string compiler, string fileName, string probePath) -> string? {
 
 // The macOS SDK to link against: the one SDKROOT names, else the one xcrun selects. Empty when
 // neither answers, and the link then reaches the system libraries by their absolute paths.
-macosSdk(Environment variables, string probePath) -> MacosSdk {
+macosSdk(Environment variables) -> MacosSdk {
     string root = variables.get("SDKROOT") ?? "";
     if (root.length == 0) {
-        root = printedByProgram("xcrun", ["--show-sdk-path"], probePath) ?? "";
+        root = printedByProgram("xcrun", ["--show-sdk-path"]) ?? "";
     }
     if (root.length == 0 || !Path(root).isDirectory()) {
         return new MacosSdk("", "");
@@ -136,17 +132,13 @@ macosSdk(Environment variables, string probePath) -> MacosSdk {
 
 // What a program printed on its standard output, trimmed: null when it could not be run or
 // reported failure, so a machine without the program is never mistaken for one that said nothing.
-printedByProgram(string program, string[] arguments, string probePath) -> string? {
-    long status = try system.runCaptured(program, arguments, probePath + ".out",
-        probePath + ".err");
-    if (status != 0) {
+printedByProgram(string program, string[] arguments) -> string? {
+    let asked = try process.run(Path(program), arguments, captureOutput: true);
+    if (!asked.status.succeeded()) {
         return null;
     }
-    string printed = try Path(probePath + ".out").readText();
-    return printed.trim();
-} catch (SystemError error) {
-    return null;
-} catch (FileSystemError refused) {
+    return asked.stdout.trim();
+} catch (ProcessError refused) {
     return null;
 }
 
@@ -158,14 +150,3 @@ firstExistingFile(string[] candidates) -> string {
     }
     return "";
 }
-
-removeProbeFiles(string probePath) {
-    removeQuietly(probePath + ".out");
-    removeQuietly(probePath + ".err");
-}
-
-removeQuietly(string file) {
-    if (Path(file).isFile()) {
-        try Path(file).removeFile();
-    }
-} catch (FileSystemError refused) { }

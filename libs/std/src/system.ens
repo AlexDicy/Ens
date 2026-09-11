@@ -1,10 +1,11 @@
 import List from @std.collections.list;
-import @std.process;
+import @std.process.native;
 import LineBuffer from @std.text.lines;
 import EncodingError from @std.text;
 
 public external type CFile;
 public external type Folder;
+public external type Child;
 external type ChildHandle;
 
 // The compiler defines the 'ens_' bridges wherever they are referenced. The two bridges that start a
@@ -56,6 +57,20 @@ external from libc {
     ens_fs_open_directory(string path, out int code) -> Folder?;
     ens_fs_next_entry(Folder folder, out long kind, out int code) -> string?;
     ens_fs_close_directory(Folder folder);
+    ens_process_start(string program, byte[] argumentBlock, long argumentCount,
+                      string commandLine, byte[] environmentBlock, long environmentCount,
+                      long environmentBytes, int environmentGiven, string workingDirectory,
+                      int stdinMode, int stdoutMode, int stderrMode, out int error) -> Child?;
+    ens_process_read(Child child, int stream, byte[] buffer, long capacity,
+                     out long count) -> int;
+    ens_process_write(Child child, byte[] data, long count, out long written) -> int;
+    ens_process_close_input(Child child) -> int;
+    ens_process_poll(Child child, long millis, out int ready) -> int;
+    ens_process_wait(Child child, out int code, out int signal) -> int;
+    ens_process_kill(Child child) -> int;
+    ens_process_release(Child child);
+    ens_process_error_kind(int code) -> int;
+    ens_monotonic_millis() -> long;
     ens_current_directory(byte[] buffer, long capacity) -> long;
     ens_executable_path(byte[] buffer, long capacity) -> long;
     ens_environment() -> string[];
@@ -272,6 +287,126 @@ public fsNextEntry(Folder folder) -> NativeEntry {
 // afterwards.
 public fsCloseDirectory(Folder folder) {
     ens_fs_close_directory(folder);
+}
+
+// The child a start answered, or the platform's own error number in `code` for why there is none.
+public struct NativeChild {
+    public const Child? child;
+    public const int code;
+}
+
+// How many bytes a read or a write moved. A `code` of 0 means `count` was written, and any other
+// value is the platform's own error number with nothing moved.
+public struct NativeCount {
+    public const int code;
+    public const long count;
+}
+
+// What a poll answered. A `code` of 0 means `ready` holds the mask, and any other value is the
+// platform's own error number.
+public struct NativePoll {
+    public const int code;
+    public const int ready;
+}
+
+// How a child ended. A `code` of 0 means the other two were written, and any other value is the
+// platform's own error number with neither written.
+public struct NativeStatus {
+    public const int code;
+    public const int exitCode;
+    public const int signal;
+}
+
+// A child started from `program`, which is a path and is never searched for. The argument block
+// holds the whole argument vector as NUL separated values, `program` itself first; a POSIX target
+// executes it and a Windows target hands `commandLine` to the system instead. With
+// `environmentGiven` the child sees exactly the block's variables, even none, and without it this
+// process's own. An empty `workingDirectory` keeps this process's own. Each mode is 0 to inherit
+// this process's stream and 1 to connect a pipe this process holds.
+public processStart(string program, byte[] argumentBlock, long argumentCount, string commandLine,
+                    byte[] environmentBlock, long environmentCount, bool environmentGiven,
+                    string workingDirectory, int stdinMode, int stdoutMode,
+                    int stderrMode) -> NativeChild {
+    int code = 0;
+    Child? child = ens_process_start(program, argumentBlock, argumentCount, commandLine,
+        environmentBlock, environmentCount, environmentBlock.length, environmentGiven ? 1 : 0,
+        workingDirectory, stdinMode, stdoutMode, stderrMode, out code);
+    NativeChild answer = {child: child, code: code};
+    return answer;
+}
+
+// Bytes of one of the child's piped output streams, 1 for its output and 2 for its errors, waiting
+// for the child to write. A count of 0 says the stream has ended.
+public processRead(Child child, int stream, byte[] buffer) -> NativeCount {
+    long count = 0;
+    int code = ens_process_read(child, stream, buffer, buffer.length, out count);
+    NativeCount answer = {code: code, count: count};
+    return answer;
+}
+
+// As many of `data`'s bytes as the child's input took, which may be fewer than offered. A child
+// that has closed its input, or an input this process has closed, answers EPIPE on POSIX and
+// ERROR_NO_DATA or ERROR_BROKEN_PIPE on Windows.
+public processWrite(Child child, byte[] data) -> NativeCount {
+    long written = 0;
+    int code = ens_process_write(child, data, data.length, out written);
+    NativeCount answer = {code: code, count: written};
+    return answer;
+}
+
+// Gives up this process's end of the child's input, so the child reads the end of it, answering 0
+// or the platform's own error number. Asking again answers 0.
+public processCloseInput(Child child) -> int {
+    return ens_process_close_input(child);
+}
+
+// What a caller can do with the child without waiting, as a mask: 1 when its output has bytes or
+// has ended, 2 the same for its errors, and 4 when the child has ended, or 0 when `millis` passed
+// with none of them. A negative `millis` waits without bound. The system may answer before the
+// bound as 'monotonicMillis' measures it, so a caller holding a deadline reads the clock and asks
+// again for the remainder. A collected child leaves only its streams to wait on, and its mask
+// always carries 4.
+public processPoll(Child child, long millis) -> NativePoll {
+    int ready = 0;
+    int code = ens_process_poll(child, millis, out ready);
+    NativePoll answer = {code: code, ready: ready};
+    return answer;
+}
+
+// How the child ended, waiting for it to end first. An exit writes its code and a signal of 0, and
+// a signal writes the signal and a code of 0. Windows has no signals, so a crash there writes its
+// NTSTATUS as a negative code, and a child stopped by 'processKill' writes signal 9 and code 0
+// when the code the system reports is the one the kill passed. Asking again answers the same.
+public processWait(Child child) -> NativeStatus {
+    int exitCode = 0;
+    int signal = 0;
+    int code = ens_process_wait(child, out exitCode, out signal);
+    NativeStatus answer = {code: code, exitCode: exitCode, signal: signal};
+    return answer;
+}
+
+// Ends the child, answering 0 once it is no longer running, whether this call ended it or it had
+// ended already, or the platform's own error number. Nothing here waits.
+public processKill(Child child) -> int {
+    return ens_process_kill(child);
+}
+
+// Gives every pipe end and handle back and frees the child's block, which no call may touch
+// afterwards. A child that has already ended is collected, and one still running is left to the
+// system.
+public processRelease(Child child) {
+    ens_process_release(child);
+}
+
+// The std.process ErrorKind ordinal a platform's own error number means: 0 for NotFound, 1 for
+// PermissionDenied and 2 for Other.
+public processErrorKind(int code) -> int {
+    return ens_process_error_kind(code);
+}
+
+// Milliseconds on a clock that never goes backwards, counted from an origin no caller may rely on.
+public monotonicMillis() -> long {
+    return ens_monotonic_millis();
 }
 
 // How many bytes of the directory the program was started in were written into `buffer`, and -1
@@ -784,14 +919,14 @@ childVariables(string[] environmentOverrides) -> string[] {
     if (environmentOverrides.length == 0) {
         return inherited();
     }
-    return process.mergedEnvironment(ens_environment(), environmentOverrides, platform());
+    return native.mergedEnvironment(ens_environment(), environmentOverrides, platform());
 }
 
 startedChild(string program, string[] arguments, string[] environmentOverrides) -> ChildProcess throws {
     string[] variables = childVariables(environmentOverrides);
-    byte[] block = process.environmentBlock(variables);
-    ChildHandle? child = ens_start_process(program, process.argumentBlock(arguments),
-        arguments.length, process.commandLineOf(program, arguments), block, variables.length,
+    byte[] block = native.environmentBlock(variables);
+    ChildHandle? child = ens_start_process(program, native.argumentBlock(arguments),
+        arguments.length, native.commandLineOf(program, arguments), block, variables.length,
         block.length);
     if (child == null) {
         throw new SystemError("could not start '{program}': check that the name is right and that "
@@ -803,9 +938,9 @@ startedChild(string program, string[] arguments, string[] environmentOverrides) 
 started(string program, string[] arguments, string[] environmentOverrides, string stdoutPath,
         string stderrPath) -> int throws {
     string[] variables = childVariables(environmentOverrides);
-    byte[] block = process.environmentBlock(variables);
-    long status = ens_spawn_process(program, process.argumentBlock(arguments), arguments.length,
-        process.commandLineOf(program, arguments), block, variables.length, block.length,
+    byte[] block = native.environmentBlock(variables);
+    long status = ens_spawn_process(program, native.argumentBlock(arguments), arguments.length,
+        native.commandLineOf(program, arguments), block, variables.length, block.length,
         stdoutPath, stderrPath);
     if (status == -2) {
         throw new SystemError("could not wait for '{program}' to finish");

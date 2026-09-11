@@ -339,6 +339,13 @@ export final class ChildProcess {
     export input() -> Writer;
     export closeInput() throws IoError;
 
+    // Whether reading a stream can go ahead without waiting for the child: true when either
+    // stream has bytes or has ended, false when `timeoutMillis` passed with neither. A bound of 0
+    // asks about this moment alone. Reading is unchanged, so a caller content to wait as long as
+    // the child takes never has to ask. Once threads land a reader of each stream bounds its own
+    // wait, and this becomes an ordinary call rather than the only way to bound one.
+    export waitForOutput(long timeoutMillis) -> bool throws ProcessError;
+
     // The exit status, waiting for the child to finish first. Output not yet read is read and
     // thrown away, because asking for the status is asking for the child to be finished with.
     // Asking again answers the same status.
@@ -359,6 +366,9 @@ export final class ChildProcess {
 ## process decisions
 
 Child streams are separate (`stdout()`/`stderr()`), with the single-threaded deadlock hazard documented as interim until threads land; no merged mode exists.
+`waitForOutput(timeoutMillis)` exists because a single-threaded caller has no other way to bound how long it waits for a child to say anything, and it is the one call that lets such a caller watch a child rather than block on one stream of it.
+It becomes an ordinary call once threads land, since a reader of each stream then bounds its own wait and needs nothing from the child itself.
+A merged mode stays deferred, so a caller that needs both streams in the order they were written sends them into one file through `runShell` and reads that file back, and a caller that needs them as they arrive waits for threads and a reader of each stream.
 `run(captureOutput: true)` redirects at the operating-system level internally, so capture cannot deadlock and stdout and stderr stay separate.
 The destructor detaches and never kills or waits; ending a child is explicit.
 PATH rule: a program name with no separator is searched in the PATH of the environment the child will receive, falling back to the parent's when none was given.

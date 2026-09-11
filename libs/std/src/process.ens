@@ -1,131 +1,653 @@
-// The shapes a spawned process needs its inputs in: the NUL separated blocks a C argument vector
-// and a Win32 environment block point into, the merge of an inherited environment with a caller's
-// overrides, and the one command line Win32 accepts. Nothing here touches the operating system.
-import StringBuilder from @std.text.stringbuilder;
+// Starting other programs. No shell takes part unless asked for by name, so an argument reaches
+// the program exactly as written, spaces, quotes and all.
+import Environment from @std.environment;
+import Platform from @std.environment;
+import @std.environment;
+import Path from @std.fs;
+import BufferedReader from @std.io.buffered;
+import BytesWriter from @std.io.memory;
+import ErrorKind as IoErrorKind from @std.io.streams;
+import IoError from @std.io.streams;
+import Reader from @std.io.streams;
+import Writer from @std.io.streams;
 import List from @std.collections.list;
+import @std.process.native;
+import Child from @std.system;
+import NativeCount from @std.system;
+import @std.system;
 
-// Every value's bytes with a NUL after each of them, which is the block a C argument vector points
-// into. A value holding a NUL byte cannot cross into a C string and is cut there.
-public argumentBlock(string[] arguments) -> byte[] {
-    return separatedBlock(arguments, 0);
+// What starting or driving a program could not do. `kind` is the condition a program acts on, and
+// the message says what was attempted, on which program, and why it did not happen.
+export class ProcessError extends Error {
+    // The condition that stopped the operation.
+    export const ErrorKind kind;
+
+    // The program the operation named, as the caller wrote it.
+    export const string program;
+
+    // A failure of `kind` on `program`, where `message` says what was attempted and why it did not
+    // happen, and `cause` carries the error this one was raised in response to.
+    export constructor(string message, this.kind, this.program, Error? cause = null) {
+        super(message, cause);
+    }
 }
 
-// Every variable's bytes with a NUL after each of them and one more NUL closing the block, which
-// is the block a Win32 environment is passed as. A variable holding a NUL byte cannot cross into a
-// C string and is cut there. An empty environment gives an empty block, which a spawn reads as
-// "inherit unchanged".
-public environmentBlock(string[] variables) -> byte[] {
-    if (variables.length == 0) {
-        return new byte[0];
-    }
-    return separatedBlock(variables, 1);
+// The conditions starting a program fails under. The set is closed, so a program that answers for
+// every member answers for everything this library reports.
+export enum ErrorKind {
+    // No file of that name is in a PATH directory, or nothing is at the path written.
+    NotFound,
+
+    // The system refused to run the file, which on POSIX is a file nobody may execute.
+    PermissionDenied,
+
+    // Anything else the system reported, whose own error number the message carries.
+    Other,
 }
 
-separatedBlock(string[] values, long trailing) -> byte[] {
-    long total = trailing;
-    for (long i = 0; i < values.length; i++) {
-        total = total + values[i].length + 1;
+// How a program ended. Exactly one of the two numbers means something: a program that exited has
+// its code and a signal of 0, and one a signal ended has the signal and a code of 0. Windows has
+// no signals, so a child that crashed there reports its NTSTATUS as a negative code, and one ended
+// by this library's `kill()` reports signal 9 and code 0, the numbers POSIX reports for the same
+// act, so one check tells a landed kill from an exit on every platform. The exit code a Windows
+// kill hands the system is this library's own choice and never reaches the caller.
+export struct ExitStatus {
+    // The code the program exited with, and 0 when a signal ended it.
+    export const int code;
+
+    // The signal that ended the program, and 0 when it exited.
+    export const int signal;
+
+    // Whether the program exited by itself with a code of 0.
+    export succeeded() -> bool {
+        return this.code == 0 && this.signal == 0;
     }
-    byte[] block = new byte[total];
-    long at = 0;
-    for (long i = 0; i < values.length; i++) {
-        byte[] raw = values[i].toBytes();
-        for (long b = 0; b < raw.length; b++) {
-            block[at] = raw[b];
-            at = at + 1;
+}
+
+// What a finished program left behind. The two texts are empty unless the run captured them, and
+// a captured byte that spells no UTF-8 is read as the replacement character.
+export struct CommandOutput {
+    // How the program ended.
+    export const ExitStatus status;
+
+    // Everything the program wrote to its standard output, when the run captured it.
+    export const string stdout;
+
+    // Everything the program wrote to its standard error, when the run captured it.
+    export const string stderr;
+}
+
+// Runs `program` and waits for it to finish. The child reads and writes this process's own three
+// streams, so its output appears as it is written; with `captureOutput` its two output streams are
+// collected into the answer instead, and only the input stays this process's own. A `program` with
+// no separator is looked for in the PATH directories of the environment the child will receive,
+// never in the current directory, and on Windows as `name.exe` unless the name has an extension,
+// so a `.cmd` or `.bat` file is run through `runShell`. A relative path with a separator is read
+// against this process's directory. `environment` gives the child exactly those variables, and
+// null hands this process's own on unchanged. Failing to start is an error; a program that started
+// and failed is a `status` to inspect. A captured run answers once both output streams have ended,
+// so a grandchild that inherited them delays the answer until it lets go of them too.
+export run(Path program, string[] arguments = [], Path? workingDirectory = null,
+           Environment? environment = null, bool captureOutput = false)
+        -> CommandOutput throws ProcessError {
+    let invocation = try programInvocation(program, arguments, environment);
+    return try completed(invocation, workingDirectory, environment, captureOutput);
+}
+
+// Runs `commandLine` through the operating system's command interpreter, with everything that
+// implies: the shell splits, expands and interprets the line. An argument built from input belongs
+// in `run`, which interprets nothing. The interpreter is /bin/sh with the line after -c, and on
+// Windows the program %ComSpec% names, or cmd.exe found on PATH when it is not set, with the line
+// after /S /C so cmd runs it as written. The child reads and writes this process's own three
+// streams; with `captureOutput` its two output streams are collected into the answer instead, once
+// both have ended. `environment` gives the child exactly those variables, and null hands this
+// process's own on unchanged. Failing to start the interpreter is an error; a line that ran and
+// failed is a `status` to inspect.
+export runShell(string commandLine, Path? workingDirectory = null,
+                Environment? environment = null, bool captureOutput = false)
+        -> CommandOutput throws ProcessError {
+    let invocation = try shellInvocation(commandLine, environment);
+    return try completed(invocation, workingDirectory, environment, captureOutput);
+}
+
+// Starts `program` and hands it back while it runs, with a pipe on each of its three streams, so
+// this process writes what the child reads and reads what it writes. A `program` with no
+// separator is looked for in the PATH directories of the environment the child will receive,
+// never in the current directory, and on Windows as `name.exe` unless the name has an extension,
+// so a `.cmd` or `.bat` file is run through `runShell`. A relative path with a separator is read
+// against this process's directory. `environment` gives the child exactly those variables, and
+// null hands this process's own on unchanged. Failing to start is an error.
+export spawn(Path program, string[] arguments = [], Path? workingDirectory = null,
+             Environment? environment = null) -> ChildProcess throws ProcessError {
+    let invocation = try programInvocation(program, arguments, environment);
+    return try start(invocation, workingDirectory, environment, StreamMode.pipe, StreamMode.pipe,
+        StreamMode.pipe);
+}
+
+// A program this one started and is still running, with a pipe on each of its three streams. One
+// thread owns the value at a time, until the threaded runtime gives it a lock: its streams, its
+// input and its waits all move the same child, so none of them is called from two threads at once.
+export final class ChildProcess {
+    const Child child;
+    const string program;
+    BufferedReader? outputReader;
+    BufferedReader? errorsReader;
+    Writer? inputWriter;
+    ExitStatus? collected;
+    bool outputDrained;
+    bool errorsDrained;
+
+    // Each stream's wrapper is made on first use, so a run whose streams are inherited pays for
+    // none of them.
+    protected constructor(Child child, string program) {
+        this.child = child;
+        this.program = program;
+        this.outputReader = null;
+        this.errorsReader = null;
+        this.inputWriter = null;
+        this.collected = null;
+        this.outputDrained = false;
+        this.errorsDrained = false;
+    }
+
+    // What the child writes to its standard output, read as it is written. Until threads land,
+    // draining one stream to its end while the child fills the other can leave both sides waiting,
+    // since a full pipe stops the child; reading the stream the child actually writes to, or
+    // capturing through `run`, avoids that.
+    export stdout() -> BufferedReader {
+        BufferedReader? held = this.outputReader;
+        if (held != null) {
+            return held;
         }
-        block[at] = 0;
-        at = at + 1;
+        let reader = new BufferedReader(new PipeReader(this, Stream.output, this.program,
+            "standard output"));
+        this.outputReader = reader;
+        return reader;
     }
-    return block;
-}
 
-// The inherited environment with the overrides applied over it, in order, so the child sees one
-// entry per name and keeps everything it was not given a new value for. On "windows" two names
-// match without regard to case, the way that system matches them, so an override reaches the
-// inherited entry however that entry spells its name; everywhere else 'PATH' and 'path' are two
-// variables and both survive. The system is passed in rather than asked for, so both rules are a
-// rule about the values handed to this function.
-public mergedEnvironment(string[] inherited, string[] overrides, string platform) -> string[] {
-    bool ignoringCase = platform == "windows";
-    let merged = new List<string>();
-    for (let entry in inherited) {
-        if (!overriddenName(overrides, nameOf(entry), ignoringCase)) {
-            merged.push(entry);
+    // What the child writes to its standard error, read as it is written. Until threads land,
+    // draining one stream to its end while the child fills the other can leave both sides waiting,
+    // since a full pipe stops the child; reading the stream the child actually writes to, or
+    // capturing through `run`, avoids that.
+    export stderr() -> BufferedReader {
+        BufferedReader? held = this.errorsReader;
+        if (held != null) {
+            return held;
+        }
+        let reader = new BufferedReader(new PipeReader(this, Stream.errors, this.program,
+            "standard error"));
+        this.errorsReader = reader;
+        return reader;
+    }
+
+    // The child's standard input. A write to a child that has closed its input, or a write after
+    // `closeInput`, raises an IoError of kind Closed. Flushing has nothing to do, since a pipe
+    // holds nothing back on this side.
+    export input() -> Writer {
+        Writer? held = this.inputWriter;
+        if (held != null) {
+            return held;
+        }
+        let writer = new PipeWriter(this, this.program);
+        this.inputWriter = writer;
+        return writer;
+    }
+
+    // Closes the child's input, which is how the child learns the input has ended. Asking twice is
+    // allowed and the second answer is silence.
+    export closeInput() throws IoError {
+        int code = system.processCloseInput(this.child);
+        if (code != 0) {
+            throw new IoError("could not close the input of '{this.program}': the system reported "
+                + "error {code}", IoErrorKind.Other);
         }
     }
-    for (let entry in overrides) {
-        merged.push(entry);
-    }
-    merged.sort();
-    return merged.toArray();
-}
 
-// The name an environment entry sets, which is everything before the first '='. An entry with no
-// '=' names itself.
-public nameOf(string entry) -> string {
-    long separator = entry.indexOf("=");
-    if (separator < 0) {
-        return entry;
-    }
-    return entry.substring(0, separator);
-}
-
-overriddenName(string[] overrides, string name, bool ignoringCase) -> bool {
-    for (let entry in overrides) {
-        if (sameName(nameOf(entry), name, ignoringCase)) {
+    // Whether reading a stream can go ahead without waiting for the child: true when either
+    // stream has bytes or has ended, false when `timeoutMillis` passed with neither. A bound of 0
+    // asks about this moment alone. Reading is unchanged, so a caller content to wait as long as
+    // the child takes never has to ask. Once threads land a reader of each stream bounds its own
+    // wait, and this becomes an ordinary call rather than the only way to bound one.
+    export waitForOutput(long timeoutMillis) -> bool throws ProcessError {
+        if (this.outputDrained || this.errorsDrained) {
             return true;
         }
-    }
-    return false;
-}
-
-sameName(string left, string right, bool ignoringCase) -> bool {
-    if (!ignoringCase) {
-        return left == right;
-    }
-    return left.equalsIgnoreCaseAscii(right);
-}
-
-// The program and its arguments as one command line, each part quoted so that a program started
-// with it splits the parts back into exactly these values. This is the form Win32 takes; a POSIX
-// target runs the argument vector instead and never reads it.
-public commandLineOf(string program, string[] arguments) -> string {
-    let line = new StringBuilder();
-    line.append(quoted(program));
-    for (long i = 0; i < arguments.length; i++) {
-        line.append(" ");
-        line.append(quoted(arguments[i]));
-    }
-    return line.toString();
-}
-
-// One part in double quotes. A backslash is literal except where it would escape the closing
-// quote, so a run of backslashes before a quote or at the very end is doubled.
-quoted(string value) -> string {
-    let part = new StringBuilder();
-    part.append('"');
-    long backslashes = 0;
-    for (let character in value.chars()) {
-        if (character == '\\') {
-            backslashes = backslashes + 1;
-            continue;
+        long deadline = system.monotonicMillis() + timeoutMillis;
+        long remaining = timeoutMillis;
+        while (true) {
+            int ready = try this.poll(remaining < 0 ? 0 : remaining);
+            if ((ready & (Ready.output | Ready.errors)) != 0) {
+                return true;
+            }
+            remaining = deadline - system.monotonicMillis();
+            if (remaining <= 0) {
+                return false;
+            }
         }
-        if (character == '"') {
-            appendBackslashes(part, backslashes * 2 + 1);
-        } else {
-            appendBackslashes(part, backslashes);
-        }
-        part.append(character);
-        backslashes = 0;
     }
-    appendBackslashes(part, backslashes * 2);
-    part.append('"');
-    return part.toString();
+
+    // The exit status, waiting for the child to finish first. Output not yet read is read and
+    // thrown away meanwhile, because a child nobody reads is stopped by a full pipe, and asking
+    // for the status is asking for the child to be finished with. Asking again answers the same
+    // status.
+    export wait() -> ExitStatus throws ProcessError {
+        ExitStatus? known = this.collected;
+        if (known != null) {
+            return known;
+        }
+        byte[] buffer = new byte[Pipe.chunk];
+        while (true) {
+            int ready = try this.poll(-1);
+            try this.discard(ready, buffer);
+            if ((ready & Ready.ended) != 0) {
+                return try this.collect();
+            }
+        }
+    }
+
+    // The same, giving up once `timeoutMillis` have passed on the clock: null means the child was
+    // still running when they had. Output not yet read is read and thrown away meanwhile, and
+    // asking again after an answer gives the same status.
+    export wait(long timeoutMillis) -> ExitStatus? throws ProcessError {
+        ExitStatus? known = this.collected;
+        if (known != null) {
+            return known;
+        }
+        byte[] buffer = new byte[Pipe.chunk];
+        long deadline = system.monotonicMillis() + timeoutMillis;
+        long remaining = timeoutMillis;
+        while (true) {
+            int ready = try this.poll(remaining < 0 ? 0 : remaining);
+            try this.discard(ready, buffer);
+            if ((ready & Ready.ended) != 0) {
+                return try this.collect();
+            }
+            remaining = deadline - system.monotonicMillis();
+            if (remaining <= 0) {
+                return null;
+            }
+        }
+    }
+
+    // Ends the child now and answers without waiting; `wait` then reports how it ended. A child
+    // that has already ended is left as it is and keeps its own code.
+    export kill() throws ProcessError {
+        int code = system.processKill(this.child);
+        if (code != 0) {
+            throw new ProcessError("could not stop '{this.program}': the system reported error "
+                + "{code}", ErrorKind.Other, this.program);
+        }
+    }
+
+    // Lets the child go: it keeps running with nothing reading it, and on POSIX becomes a zombie
+    // when it ends, until this process exits, since nothing is left to collect it. That is why
+    // ending a child is explicit, with `kill` or `wait`. A reader or writer taken from this value
+    // answers Closed from here on.
+    destructor() {
+        system.processRelease(this.child);
+    }
+
+    // What the child's `stream` has written, waiting for it to write, and a count of 0 once the
+    // stream has ended. A stream that has answered its end is remembered, because reading it
+    // again answers at once while the poll stops reporting it.
+    protected readStream(int stream, byte[] buffer) -> NativeCount {
+        let read = system.processRead(this.child, stream, buffer);
+        if (read.code == 0 && read.count == 0) {
+            if (stream == Stream.output) {
+                this.outputDrained = true;
+            } else {
+                this.errorsDrained = true;
+            }
+        }
+        return read;
+    }
+
+    // As many of `data`'s bytes as the child's input took.
+    protected writeInput(byte[] data) -> NativeCount {
+        return system.processWrite(this.child, data);
+    }
+
+    // The mask of what can be done without waiting, asked with a bound of `millis` or without one
+    // when it is negative.
+    protected poll(long millis) -> int throws ProcessError {
+        let polled = system.processPoll(this.child, millis);
+        if (polled.code != 0) {
+            throw new ProcessError("could not wait for '{this.program}': the system reported "
+                + "error {polled.code}", ErrorKind.Other, this.program);
+        }
+        return polled.ready;
+    }
+
+    // The bytes of every stream `ready` reports, read and thrown away.
+    protected discard(int ready, byte[] buffer) throws ProcessError {
+        if ((ready & Ready.output) != 0) {
+            let taken = try this.take(Stream.output, buffer);
+        }
+        if ((ready & Ready.errors) != 0) {
+            let taken = try this.take(Stream.errors, buffer);
+        }
+    }
+
+    // How many bytes of `stream` arrived in `buffer`, and 0 once the stream has ended.
+    protected take(int stream, byte[] buffer) -> long throws ProcessError {
+        let read = this.readStream(stream, buffer);
+        if (read.code != 0) {
+            throw new ProcessError("could not read the output of '{this.program}': the system "
+                + "reported error {read.code}", ErrorKind.Other, this.program);
+        }
+        return read.count;
+    }
+
+    // How the child ended, asked of the system once and remembered.
+    protected collect() -> ExitStatus throws ProcessError {
+        ExitStatus? known = this.collected;
+        if (known != null) {
+            return known;
+        }
+        let status = system.processWait(this.child);
+        if (status.code != 0) {
+            throw new ProcessError("could not wait for '{this.program}' to finish: the system "
+                + "reported error {status.code}", ErrorKind.Other, this.program);
+        }
+        ExitStatus ended = {code: status.exitCode, signal: status.signal};
+        this.collected = ended;
+        return ended;
+    }
 }
 
-appendBackslashes(StringBuilder part, long count) {
-    for (long i = 0; i < count; i++) {
-        part.append('\\');
+// One of the child's output pipes as a Reader. The child is held weakly, so a reader kept after the
+// child value is dropped reports Closed rather than reading a pipe that has been given back.
+final class PipeReader implements Reader {
+    weak ChildProcess? owner;
+    const int stream;
+    const string name;
+    const string program;
+
+    protected constructor(ChildProcess owner, int stream, string program, string name) {
+        this.owner = owner;
+        this.stream = stream;
+        this.program = program;
+        this.name = name;
     }
+
+    protected override read(byte[] buffer) -> long throws IoError {
+        ChildProcess? owner = this.owner;
+        if (owner == null) {
+            throw new IoError("could not read the {this.name} of '{this.program}': the child has "
+                + "been let go", IoErrorKind.Closed);
+        }
+        let read = owner.readStream(this.stream, buffer);
+        if (read.code != 0) {
+            throw new IoError("could not read the {this.name} of '{this.program}': the system "
+                + "reported error {read.code}", IoErrorKind.Other);
+        }
+        return read.count;
+    }
+}
+
+// The child's input pipe as a Writer. The child is held weakly, so a writer kept after the child
+// value is dropped reports Closed rather than writing to a pipe that has been given back.
+final class PipeWriter implements Writer {
+    weak ChildProcess? owner;
+    const string program;
+
+    protected constructor(ChildProcess owner, string program) {
+        this.owner = owner;
+        this.program = program;
+    }
+
+    // All of `data`, over as many writes as the pipe takes it in.
+    protected override write(byte[] data) throws IoError {
+        ChildProcess? owner = this.owner;
+        if (owner == null) {
+            throw new IoError("could not write to the input of '{this.program}': the child has "
+                + "been let go", IoErrorKind.Closed);
+        }
+        long offered = 0;
+        while (offered < data.length) {
+            byte[] rest = data;
+            if (offered > 0) {
+                rest = data.slice(offered, data.length);
+            }
+            let written = owner.writeInput(rest);
+            if (written.code != 0) {
+                throw this.refused(written.code);
+            }
+            offered = offered + written.count;
+        }
+    }
+
+    // Nothing is held back on this side of a pipe, so there is nothing to hand over.
+    protected override flush() { }
+
+    refused(int code) -> IoError {
+        if (native.meansPipeClosed(code, environment.platform())) {
+            return new IoError("could not write to the input of '{this.program}': the input is "
+                + "closed", IoErrorKind.Closed);
+        }
+        return new IoError("could not write to the input of '{this.program}': the system reported "
+            + "error {code}", IoErrorKind.Other);
+    }
+}
+
+// A program as its start names it: the text the caller wrote, which is the child's argv[0], the
+// paths the system is handed for it, tried in order until one runs, the arguments after it, and
+// the one line Win32 takes instead.
+struct Invocation {
+    protected const string program;
+    protected const string[] paths;
+    protected const string[] arguments;
+    protected const string commandLine;
+}
+
+// What a start is asked to do with one of the child's streams.
+final class StreamMode {
+    protected static const int inherit = 0;
+    protected static const int pipe = 1;
+}
+
+// The child's output streams as a read names them.
+final class Stream {
+    protected static const int output = 1;
+    protected static const int errors = 2;
+}
+
+// What a poll answers, one bit per thing a caller can do without waiting.
+final class Ready {
+    protected static const int output = 1;
+    protected static const int errors = 2;
+    protected static const int ended = 4;
+}
+
+// How many bytes one read takes from a pipe, which is what a pipe holds on Linux and Windows.
+final class Pipe {
+    protected static const long chunk = 65536;
+}
+
+// The interpreters a command line runs through.
+final class Shell {
+    protected static const string posix = "/bin/sh";
+    protected static const string windows = "cmd.exe";
+}
+
+// `program` resolved to the paths the system is handed, with `arguments` after it.
+programInvocation(Path program, string[] arguments, Environment? given)
+        -> Invocation throws ProcessError {
+    string text = program.toString();
+    string[] paths = try resolve(program, given);
+    Invocation invocation = {program: text, paths: paths, arguments: arguments,
+        commandLine: native.commandLineOf(native.commandLineProgram(text,
+            environment.platform()), arguments)};
+    return invocation;
+}
+
+// The command interpreter with `line` as the command it runs. On Windows the line goes after /S /C
+// in one pair of quotes, which cmd strips before running the rest as written.
+shellInvocation(string line, Environment? given) -> Invocation throws ProcessError {
+    if (environment.platform() != Platform.Windows) {
+        Invocation shell = {program: Shell.posix, paths: [Shell.posix], arguments: ["-c", line],
+            commandLine: ""};
+        return shell;
+    }
+    string interpreter = try commandInterpreter(given);
+    Invocation shell = {program: interpreter, paths: [interpreter],
+        arguments: ["/S", "/C", line], commandLine: native.shellCommandLine(interpreter, line)};
+    return shell;
+}
+
+// The program %ComSpec% names, or cmd.exe found on PATH when it is not set.
+commandInterpreter(Environment? given) -> string throws ProcessError {
+    string? named = Environment.current().get("ComSpec");
+    if (named != null) {
+        return named;
+    }
+    string[] found = try resolve(Path(Shell.windows), given);
+    if (found.length == 0) {
+        throw notOnPath(Shell.windows);
+    }
+    return found[0];
+}
+
+// The paths the system is handed for `program`, tried in order. Text with a separator names one
+// place, read against this process's directory when relative; a bare name is every file of that
+// name in a PATH directory of the environment the child will receive, or of this process's own
+// when none is given, and none at all when no directory holds one.
+resolve(Path program, Environment? given) -> string[] throws ProcessError {
+    string text = program.toString();
+    if (text.isEmpty()) {
+        throw new ProcessError("could not start a program: no name was given", ErrorKind.NotFound,
+            text);
+    }
+    if (text.contains("/")) {
+        return [program.absolute().toString()];
+    }
+    string? searched = (given ?? Environment.current()).get("PATH");
+    let found = new List<string>();
+    for (let candidate in native.programsOnPath(text, searched, environment.platform())) {
+        found.push(candidate.toString());
+    }
+    return found.toArray();
+}
+
+// The failure for a bare name no PATH directory holds a program under.
+notOnPath(string program) -> ProcessError {
+    return new ProcessError("could not start '{program}': no program of that name is in a PATH "
+        + "directory", ErrorKind.NotFound, program);
+}
+
+// The run of `invocation` to its end, with its two output streams captured or left with this
+// process.
+completed(Invocation invocation, Path? workingDirectory, Environment? given, bool captureOutput)
+        -> CommandOutput throws ProcessError {
+    if (captureOutput) {
+        let child = try start(invocation, workingDirectory, given, StreamMode.inherit,
+            StreamMode.pipe, StreamMode.pipe);
+        return try captured(child);
+    }
+    let child = try start(invocation, workingDirectory, given, StreamMode.inherit,
+        StreamMode.inherit, StreamMode.inherit);
+    ExitStatus status = try child.collect();
+    return {status: status, stdout: "", stderr: ""};
+}
+
+// The child the system started for `invocation`, or the failure that stopped it. Each path is
+// tried in turn, and one the system refuses as a permission is passed over for the next, the way
+// execvp passes over a file nobody may execute, so that refusal is reported only when no later
+// path runs. The working directory crosses absolute, so both platforms read a relative one against
+// this process's directory, and the environment crosses as the block the child's platform reads.
+start(Invocation invocation, Path? workingDirectory, Environment? given, int stdinMode,
+      int stdoutMode, int stderrMode) -> ChildProcess throws ProcessError {
+    let vector = new List<string>();
+    vector.push(invocation.program);
+    for (let argument in invocation.arguments) {
+        vector.push(argument);
+    }
+    string[] variables = [];
+    byte[] environmentBlock = new byte[0];
+    if (given != null) {
+        variables = native.environmentEntries(given, environment.platform());
+        environmentBlock = native.givenEnvironmentBlock(variables);
+    }
+    string directory = "";
+    if (workingDirectory != null) {
+        directory = workingDirectory.absolute().toString();
+    }
+    byte[] argumentBlock = native.argumentBlock(vector.toArray());
+    ProcessError? refused = null;
+    for (let path in invocation.paths) {
+        let started = system.processStart(path, argumentBlock, vector.length(),
+            invocation.commandLine, environmentBlock, variables.length, given != null, directory,
+            stdinMode, stdoutMode, stderrMode);
+        Child? child = started.child;
+        if (child != null) {
+            return new ChildProcess(child, invocation.program);
+        }
+        let failure = failedToStart(invocation.program, directory, started.code);
+        if (failure.kind != ErrorKind.PermissionDenied) {
+            throw failure;
+        }
+        if (refused == null) {
+            refused = failure;
+        }
+    }
+    if (refused != null) {
+        throw refused;
+    }
+    throw notOnPath(invocation.program);
+}
+
+// Both output streams read to their ends together, so the child never waits on a full pipe while
+// this process waits on the other one, and then how the child ended. The child is collected as
+// soon as its end is reported, because only a collected child's poll waits on the streams alone
+// rather than answering at once.
+captured(ChildProcess child) -> CommandOutput throws ProcessError {
+    let output = new BytesWriter();
+    let errors = new BytesWriter();
+    bool outputEnded = false;
+    bool errorsEnded = false;
+    byte[] buffer = new byte[Pipe.chunk];
+    while (!outputEnded || !errorsEnded) {
+        int ready = try child.poll(-1);
+        if ((ready & Ready.output) != 0 && !outputEnded) {
+            long count = try child.take(Stream.output, buffer);
+            outputEnded = count == 0;
+            output.write(buffer.slice(0, count));
+        }
+        if ((ready & Ready.errors) != 0 && !errorsEnded) {
+            long count = try child.take(Stream.errors, buffer);
+            errorsEnded = count == 0;
+            errors.write(buffer.slice(0, count));
+        }
+        if ((ready & Ready.ended) != 0) {
+            let status = try child.collect();
+        }
+    }
+    ExitStatus status = try child.collect();
+    return {status: status, stdout: string.fromBytesLossy(output.toBytes()),
+        stderr: string.fromBytesLossy(errors.toBytes())};
+}
+
+// The failure a system's own error number stands for when `program` could not be started. The
+// number does not say whether the program or the working directory was missing, so a start given a
+// directory names both.
+failedToStart(string program, string directory, int code) -> ProcessError {
+    let kind = kindFromCode(code);
+    string reason = switch (kind) {
+        ErrorKind.NotFound -> "nothing is there",
+        ErrorKind.PermissionDenied -> "permission was refused",
+        ErrorKind.Other -> "the system reported error {code}",
+    };
+    if (kind == ErrorKind.NotFound && !directory.isEmpty()) {
+        reason = "nothing is there, or the working directory '{directory}' is missing";
+    }
+    return new ProcessError("could not start '{program}': {reason}", kind, program);
+}
+
+// The kind the bridge's ordinal for a system's own error number names.
+kindFromCode(int code) -> ErrorKind {
+    return switch (system.processErrorKind(code)) {
+        0 -> ErrorKind.NotFound,
+        1 -> ErrorKind.PermissionDenied,
+        default -> ErrorKind.Other,
+    };
 }

@@ -16,6 +16,13 @@ Every failure from the standard streams carries `ErrorKind.Other`, because telli
 A child is owned by one thread at a time until the threaded runtime gives it a lock or a documented single-owner rule.
 The Windows output record's `pending`, `filled`, `consumed` and `ended` fields are plain stores, correct under that ownership and a race once two threads touch one child.
 
+`selfhost/packages/src/tools.ens` stays on the old `@std.system` process family, and it is the one thing standing between D1 and deleting that family.
+It relays both of a program's streams in the order they were written and bounds how long it waits for the program to say anything, and a single-threaded caller cannot do both over two separate streams.
+A bounded wait that answers whether either stream is readable cannot say which one to read, and reading the other blocks until the child exits, which for a `git fetch` speaking on its error stream is a build that never comes back.
+It moves when threads land and a reader of each stream carries its own bound.
+It therefore keeps the old merged reader and that family's own `waitForOutput(milliseconds)`.
+That call is a different one from the new `ChildProcess.waitForOutput(timeoutMillis)` despite the name, since the old one asks about one merged stream and the new one asks whether either of two separate streams can be read.
+
 ## Limits the C7b bridges accept
 
 A Linux target reads metadata through the raw `statx` system call, which needs kernel 4.11 or newer.

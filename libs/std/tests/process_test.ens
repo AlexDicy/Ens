@@ -1,73 +1,312 @@
-// Tests for the shapes a spawn hands the operating system. The environment merge is the one with a
-// rule that differs per system, and because it is given the system's name rather than asking for it,
-// both rules are checked here whatever system runs these tests.
+// Tests for what @std.process does when a program starts and runs: its arguments, environment and
+// working directory, what it writes and reads, how it ends, and how it is let go.
 import @std.testing;
+import Path from @std.fs;
+import TemporaryDirectory from @std.fs.temporary;
+import Environment from @std.environment;
+import @std.environment;
+import List from @std.collections.list;
+import CommandOutput from @std.process;
+import ExitStatus from @std.process;
 import @std.process;
+import @std.system;
+import Flood from process.support;
+import process.support;
 
-// The merged variables as one line, so an assertion reads as the environment a child would see.
-shown(string[] variables) -> string {
-    return string.joined(variables, " ");
+// The arguments echoed back one per line by a program that receives them as a vector: sh on POSIX,
+// and on Windows PowerShell running a script, since cmd.exe re-reads its own command line.
+echoed(string[] passed) -> CommandOutput throws {
+    let arguments = new List<string>();
+    if (support.onWindows()) {
+        let scratch = try TemporaryDirectory.create("ens-std-process-arguments");
+        Path script = scratch.path().join("arguments.ps1");
+        try script.writeText("foreach ($argument in $args) \{ [Console]::Out.WriteLine($argument) \}\n");
+        arguments.push("-NoProfile");
+        arguments.push("-ExecutionPolicy");
+        arguments.push("Bypass");
+        arguments.push("-File");
+        arguments.push(script.toString());
+        for (let value in passed) {
+            arguments.push(value);
+        }
+        return try process.run(Path("powershell"), arguments.toArray(), captureOutput: true);
+    }
+    arguments.push("-c");
+    arguments.push("printf '%s\\n' \"$@\"");
+    arguments.push("sh");
+    for (let value in passed) {
+        arguments.push(value);
+    }
+    return try process.run(Path("/bin/sh"), arguments.toArray(), captureOutput: true);
 }
 
-test "an override replaces the inherited entry naming the same variable" {
-    string[] merged = process.mergedEnvironment(["HOME=/h", "PATH=/a"], ["PATH=/b"], "linux");
-    try testing.assertEqual(shown(merged), "HOME=/h PATH=/b");
+test "arguments reach the program exactly as written" {
+    string[] passed = ["with space", "quo\"ted", "back\\slash", "ends\\", "$HOME", "*", "",
+        "last"];
+    let answer = try echoed(passed);
+    try testing.assertTrue(answer.status.succeeded(), "the child failed: {answer.stderr}");
+    try testing.assertEqual(support.lines(answer.stdout), passed);
 }
 
-test "an override naming nothing inherited joins the environment" {
-    string[] merged = process.mergedEnvironment(["HOME=/h"], ["ENS_TOOLCHAIN=local"], "linux");
-    try testing.assertEqual(shown(merged), "ENS_TOOLCHAIN=local HOME=/h");
+// cmd.exe reaches its own program files through SystemRoot, so a Windows child keeps that one.
+test "a given environment replaces this process's own" {
+    let given = Environment.empty(environment.platform());
+    given.set("ENS_PROBE", "one");
+    if (support.onWindows()) {
+        given.set("SystemRoot", Environment.current().get("SystemRoot") ?? "");
+    }
+    let answer = try process.runShell(support.probeScript("ENS_PROBE"), environment: given,
+        captureOutput: true);
+    try testing.assertTrue(answer.status.succeeded(), "the child failed: {answer.stderr}");
+    string expected = "one-unset";
+    if (support.onWindows()) {
+        expected = "one-%USERPROFILE%";
+    }
+    try testing.assertEqual(support.lines(answer.stdout), [expected]);
 }
 
-test "no overrides leave the inherited environment as it was" {
-    string[] merged = process.mergedEnvironment(["PATH=/a", "HOME=/h"], [], "linux");
-    try testing.assertEqual(shown(merged), "HOME=/h PATH=/a");
+test "no environment given hands this process's own on" {
+    string? home = Environment.current().get(support.homeName());
+    try testing.assertTrue(home != null, "this process has no {support.homeName()} to hand on");
+    let answer = try process.runShell(support.script("echo \"$HOME\"", "echo %USERPROFILE%"),
+        captureOutput: true);
+    try testing.assertTrue(answer.status.succeeded(), "the child failed: {answer.stderr}");
+    try testing.assertEqual(support.lines(answer.stdout), [home ?? ""]);
 }
 
-test "on windows an override reaches an inherited name spelled in another case" {
-    string[] merged = process.mergedEnvironment(["Path=/a", "HOME=/h"], ["PATH=/b"], "windows");
-    try testing.assertEqual(shown(merged), "HOME=/h PATH=/b");
+test "an empty environment reaches the child as no variables at all" {
+    let answer = try process.runShell(support.script("echo \"$\{HOME-unset\}\"",
+        "echo %USERPROFILE%"), environment: Environment.empty(environment.platform()),
+        captureOutput: true);
+    try testing.assertTrue(answer.status.succeeded(), "the child failed: {answer.stderr}");
+    string expected = "unset";
+    if (support.onWindows()) {
+        expected = "%USERPROFILE%";
+    }
+    try testing.assertEqual(support.lines(answer.stdout), [expected]);
 }
 
-test "on linux a name differing only in case is a second variable and both survive" {
-    string[] merged = process.mergedEnvironment(["path=/a", "HOME=/h"], ["PATH=/b"], "linux");
-    try testing.assertEqual(shown(merged), "HOME=/h PATH=/b path=/a");
+test "the working directory is the child's" {
+    let scratch = try TemporaryDirectory.create("ens-std-process-directory");
+    let answer = try process.runShell(support.script("pwd", "cd"),
+        workingDirectory: scratch.path(), captureOutput: true);
+    try testing.assertTrue(answer.status.succeeded(), "the child failed: {answer.stderr}");
+    string[] printed = support.lines(answer.stdout);
+    try testing.assertEqual(printed.length, 1);
+    let reported = try Path.fromNative(printed[0], environment.platform()).realPath();
+    try testing.assertEqual(reported, try scratch.path().realPath());
 }
 
-test "on macos names match exactly, the way they do on linux" {
-    string[] merged = process.mergedEnvironment(["path=/a"], ["PATH=/b"], "macos");
-    try testing.assertEqual(shown(merged), "PATH=/b path=/a");
+// cmd's echo keeps a space written before an operator, so the line holds none there.
+test "a run through the shell interprets the line" {
+    let answer = try process.runShell(support.script("echo one && echo two",
+        "echo one&& echo two"), captureOutput: true);
+    try testing.assertTrue(answer.status.succeeded(), "the child failed: {answer.stderr}");
+    try testing.assertEqual(support.lines(answer.stdout), ["one", "two"]);
+    try testing.assertEqual(answer.stderr, "");
 }
 
-test "an entry's name is what stands before its first '='" {
-    try testing.assertEqual(process.nameOf("PATH=/a=b"), "PATH");
-    try testing.assertEqual(process.nameOf("BARE"), "BARE");
+test "a run without capture answers the status and no text" {
+    let answer = try process.runShell(support.script("exit 3", "exit 3"));
+    try testing.assertEqual(answer.status.code, 3);
+    try testing.assertEqual(answer.status.signal, 0);
+    try testing.assertFalse(answer.status.succeeded(), "a code of 3 is not a success");
+    try testing.assertEqual(answer.stdout, "");
+    try testing.assertEqual(answer.stderr, "");
 }
 
-test "an environment block ends every entry and closes with one more terminator" {
-    byte[] block = process.environmentBlock(["A=1", "B=2"]);
-    try testing.assertTrue(block.length == 9,
-        "the block is {block.length} bytes, expected 9 for 'A=1' and 'B=2'");
-    try testing.assertTrue(block[3] == 0 && block[7] == 0 && block[8] == 0,
-        "the entries and the block itself must each end in a terminator");
+// Each stream gets 4096 lines of 66 characters, which is more than a pipe holds on any platform, so
+// a capture reading one stream to its end before the other would wait forever, and so would the
+// child.
+test "captured output keeps the two streams apart when each outgrows a pipe" {
+    let answer = try process.runShell(support.floodScript(4096), captureOutput: true);
+    try testing.assertTrue(answer.status.succeeded(), "the flood failed with {answer.status.code}");
+    string[] output = support.lines(answer.stdout);
+    string[] errors = support.lines(answer.stderr);
+    try testing.assertEqual(output.length, 4096);
+    try testing.assertEqual(errors.length, 4096);
+    for (let line in output) {
+        try testing.assertEqual(line, Flood.output);
+    }
+    for (let line in errors) {
+        try testing.assertEqual(line, Flood.errors);
+    }
 }
 
-test "no variables give an empty block, which a spawn reads as inherit unchanged" {
-    try testing.assertTrue(process.environmentBlock([]).length == 0,
-        "an empty environment must give an empty block");
+// The child exits at once and leaves a grandchild holding its output, which writes a line about a
+// second later.
+test "output a grandchild writes after the child ended is still captured" {
+    let answer = try process.runShell(support.script("(sleep 1; echo late) & exit 0",
+        "start /b cmd /c ping -n 2 127.0.0.1 ^>nul ^& echo late"), captureOutput: true);
+    try testing.assertTrue(answer.status.succeeded(), "the child failed: {answer.stderr}");
+    try testing.assertEqual(support.lines(answer.stdout), ["late"]);
 }
 
-test "an argument block ends every argument and nothing more" {
-    byte[] block = process.argumentBlock(["one", "two"]);
-    try testing.assertTrue(block.length == 8,
-        "the block is {block.length} bytes, expected 8 for 'one' and 'two'");
-    try testing.assertTrue(block[3] == 0 && block[7] == 0,
-        "every argument must end in a terminator");
+// The child writes the line it was given only once its input has ended, so the output proves both
+// that the line arrived and that the close was seen. cmd's prompt keeps the first line of what a
+// pipe holds and a second prompt takes the rest, and its echo keeps a space written before a
+// redirection, so the redirection comes first.
+test "a spawned child reads its input and its two outputs are read apart" {
+    let child = try process.spawn(support.interpreter(), support.scriptArguments(
+        "read a; cat >/dev/null; echo \"$a\"; echo err >&2",
+        "set /p a=& set /p b=& call echo %a%& 1>&2 echo err"));
+    try child.input().write("hello\n".toBytes());
+    try child.input().flush();
+    try child.closeInput();
+    try testing.assertEqual(try child.stdout().readLine(), "hello");
+    try testing.assertEqual(try child.stderr().readLine(), "err");
+    let status = try child.wait();
+    try testing.assertTrue(status.succeeded(), "the child ended with code {status.code}");
+    string? rest = try child.stdout().readLine();
+    try testing.assertTrue(rest == null, "the output has ended");
 }
 
-test "a command line quotes every part so it splits back into the same values" {
-    try testing.assertEqual(process.commandLineOf("git", ["commit", "-m", "a message"]),
-        "\"git\" \"commit\" \"-m\" \"a message\"");
-    try testing.assertEqual(process.commandLineOf("c:/a b/ens.exe", ["x\"y"]),
-        "\"c:/a b/ens.exe\" \"x\\\"y\"");
+// The bound belongs to the clock rather than to one call of it, since the system may answer a
+// little before it as the clock measures it.
+test "a child that says nothing answers false once the bound is spent" {
+    let child = try process.spawn(support.interpreter(), support.scriptArguments("sleep 5",
+        "ping -n 6 127.0.0.1 >nul"));
+    long before = system.monotonicMillis();
+    bool speaking = try child.waitForOutput(100);
+    long waited = system.monotonicMillis() - before;
+    try testing.assertFalse(speaking, "the sleeper wrote something");
+    try testing.assertTrue(waited >= 100 && waited < 2000,
+        "a bound of 100 milliseconds took {waited}");
+    try child.kill();
+    let status = try child.wait();
+}
+
+test "a child that writes answers true" {
+    let child = try process.spawn(support.interpreter(), support.scriptArguments("echo said",
+        "echo said"));
+    try testing.assertTrue(try child.waitForOutput(20000), "the child wrote a line");
+    try testing.assertEqual(try child.stdout().readLine(), "said");
+    let status = try child.wait();
+    try testing.assertTrue(status.succeeded(), "the child ended with code {status.code}");
+}
+
+// A stream that has ended answers at once, because reading it answers null without waiting.
+test "a child that has ended answers true" {
+    let child = try process.spawn(support.interpreter(), support.scriptArguments("exit 0",
+        "exit 0"));
+    let status = try child.wait();
+    long before = system.monotonicMillis();
+    try testing.assertTrue(try child.waitForOutput(20000), "the child has ended");
+    try testing.assertTrue(system.monotonicMillis() - before < 500,
+        "an ended child was asked about and took a while to answer");
+    try testing.assertTrue(try child.stdout().readLine() == null, "there is nothing to read");
+}
+
+test "a bound of 0 asks about this moment alone" {
+    let child = try process.spawn(support.interpreter(), support.scriptArguments("sleep 5",
+        "ping -n 6 127.0.0.1 >nul"));
+    long before = system.monotonicMillis();
+    bool speaking = try child.waitForOutput(0);
+    try testing.assertFalse(speaking, "the sleeper wrote something at once");
+    try testing.assertTrue(system.monotonicMillis() - before < 500,
+        "a bound of 0 waited for the child");
+    try child.kill();
+    let status = try child.wait();
+}
+
+test "waiting twice answers the same status" {
+    let child = try process.spawn(support.interpreter(), support.scriptArguments("exit 7",
+        "exit 7"));
+    let first = try child.wait();
+    let second = try child.wait();
+    try testing.assertEqual(first.code, 7);
+    try testing.assertEqual(first.signal, 0);
+    try testing.assertEqual(second, first);
+    try testing.assertFalse(first.succeeded(), "a code of 7 is not a success");
+}
+
+// A child this process stopped reports signal 9 and code 0 on every platform, which on Windows is
+// what the code the stop passed is read back as.
+test "a timed wait says still running and a kill then reports the stopping signal" {
+    let child = try process.spawn(support.interpreter(), support.scriptArguments("sleep 5",
+        "ping -n 6 127.0.0.1 >nul"));
+    long before = system.monotonicMillis();
+    ExitStatus? still = try child.wait(100);
+    long waited = system.monotonicMillis() - before;
+    try testing.assertTrue(still == null, "the sleeper ended inside 100 milliseconds");
+    try testing.assertTrue(waited >= 100 && waited < 2000,
+        "a wait bounded at 100 milliseconds took {waited}");
+    try child.kill();
+    let status = try child.wait();
+    try testing.assertEqual(status.signal, 9);
+    try testing.assertEqual(status.code, 0);
+    try testing.assertFalse(status.succeeded(), "a stopped child did not succeed");
+    ExitStatus? again = try child.wait(0);
+    if (again == null) {
+        try testing.fail("a child already collected is still running");
+    } else {
+        try testing.assertEqual(again, status);
+    }
+}
+
+test "a child that exited on its own keeps its code after a later kill" {
+    let child = try process.spawn(support.interpreter(), support.scriptArguments("exit 7",
+        "exit 7"));
+    let ended = try child.wait();
+    try testing.assertEqual(ended.code, 7);
+    try child.kill();
+    let again = try child.wait();
+    try testing.assertEqual(again.code, 7);
+    try testing.assertEqual(again.signal, 0);
+}
+
+// Starts a child that stays for about three seconds and drops it at once.
+letGo() throws {
+    let child = try process.spawn(support.interpreter(), support.scriptArguments("sleep 3",
+        "ping -n 4 127.0.0.1 >nul"));
+}
+
+test "letting a child go waits for nothing" {
+    long before = system.monotonicMillis();
+    try letGo();
+    long elapsed = system.monotonicMillis() - before;
+    try testing.assertTrue(elapsed < 2000, "dropping a sleeping child took {elapsed} milliseconds");
+}
+
+// The program on PATH is a copy of the interpreter under a name of the test's own, made where
+// only the environment the child is given points, so finding it proves the search read that PATH.
+test "a program named without a separator is found in a PATH directory" {
+    let scratch = try TemporaryDirectory.create("ens-std-process-path");
+    string name = "ens-std-process-probe";
+    string fileName = name;
+    if (support.onWindows()) {
+        fileName = name + ".exe";
+    }
+    try support.interpreter().copyTo(scratch.path().join(fileName));
+    let given = Environment.current();
+    given.set("PATH", scratch.path().toString());
+    let answer = try process.run(Path(name), support.scriptArguments("echo found", "echo found"),
+        environment: given, captureOutput: true);
+    try testing.assertTrue(answer.status.succeeded(), "the copy failed: {answer.stderr}");
+    try testing.assertEqual(support.lines(answer.stdout), ["found"]);
+    let asWritten = try process.run(Path(fileName), support.scriptArguments("echo found",
+        "echo found"), environment: given, captureOutput: true);
+    try testing.assertEqual(support.lines(asWritten.stdout), ["found"]);
+}
+
+// The first PATH directory holds a file of the name nobody may execute, and the second the
+// program; a start passes over the first the way execvp does, so the program still runs. Windows
+// has no execute bit, so there the first match is the one tried.
+test "a file nobody may execute earlier on PATH does not hide the program behind it" {
+    if (support.onWindows()) {
+        return;
+    }
+    let scratch = try TemporaryDirectory.create("ens-std-process-shadow");
+    Path first = scratch.path().join("first");
+    Path second = scratch.path().join("second");
+    try first.createDirectories();
+    try second.createDirectories();
+    try first.join("ens-std-process-probe").writeText("not a program");
+    try support.interpreter().copyTo(second.join("ens-std-process-probe"));
+    let given = Environment.current();
+    given.set("PATH", first.toString() + ":" + second.toString());
+    let answer = try process.run(Path("ens-std-process-probe"), ["-c", "echo found"],
+        environment: given, captureOutput: true);
+    try testing.assertTrue(answer.status.succeeded(), "the copy failed: {answer.stderr}");
+    try testing.assertEqual(support.lines(answer.stdout), ["found"]);
 }

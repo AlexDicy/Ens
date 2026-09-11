@@ -1,8 +1,9 @@
 // Running a target's tests: find them, build them into one program with a runner around them, run
 // it, and answer with what it came to. The output is read line by line and passed straight on, so
 // a result appears the moment its test finishes and the count names where a dying run stopped.
-import @std.system;
-import SystemError from @std.system;
+import ProcessError from @std.process;
+import @std.process;
+import IoError from @std.io.streams;
 import Path from @std.fs;
 import List from @std.collections.list;
 import FileLoader from @ens.sema.support.loader;
@@ -21,6 +22,7 @@ import program;
 import BuildOutcome from build;
 import UnitReport from build;
 import build;
+import @ens.host.childexit;
 import platform;
 import DiscoveredTest from testing.discovery;
 import TestPlan from testing.discovery;
@@ -210,16 +212,16 @@ runIn(FileLoader loader, BuildOptions options, Packaging packaging, Path folder,
     return started(suite, plan, announced, reporter);
 }
 
-// Runs the built suite and passes every line it writes on as it arrives, so a result appears as the
-// test that produced it finishes. The results are counted on the way past, which is what lets a run
-// that stopped partway name the test it stopped in. What a test wrote to the error stream arrives
-// among the results in the order it was written rather than apart from them.
+// Runs the built suite and passes every result on as it arrives, so a result appears as the test
+// that produced it finishes. The results are counted on the way past, which is what lets a run that
+// stopped partway name the test it stopped in. What a test wrote to the error stream follows the
+// results, since a suite ends before its error stream can be read without holding up the results.
 started(Path suite, TestPlan plan, string announced, Reporter reporter) -> SuiteResult {
     DiscoveredTest[] tests = plan.tests();
-    let suiteRun = try system.start(suite.toString(), noArguments());
+    let suiteRun = try process.spawn(suite);
     long finished = 0;
     long passed = 0;
-    string? line = try suiteRun.readLine();
+    string? line = try suiteRun.stdout().readLine();
     while (line != null) {
         reporter.relayed(line);
         if (finished < tests.length && runner.reportsResult(line, tests[finished])) {
@@ -228,16 +230,24 @@ started(Path suite, TestPlan plan, string announced, Reporter reporter) -> Suite
             }
             finished = finished + 1;
         }
-        line = try suiteRun.readLine();
+        line = try suiteRun.stdout().readLine();
     }
-    int code = try suiteRun.wait();
+    string? reported = try suiteRun.stderr().readLine();
+    while (reported != null) {
+        reporter.relayed(reported);
+        reported = try suiteRun.stderr().readLine();
+    }
+    int code = childexit.exitCodeOf(try suiteRun.wait());
     let outcome = runner.outcomeOf(code, tests, finished);
     if (outcome.failure().length > 0) {
         reporter.problem("{announced}: " + outcome.failure());
     }
     return new SuiteResult(outcome.exitCode(), passed, tests.length, outcome.exitCode() != 2);
-} catch (SystemError error) {
+} catch (ProcessError error) {
     reporter.problem("{announced}: the tests were built but could not be run: {error.message}");
+    return new SuiteResult(2, 0, plan.tests().length, false);
+} catch (IoError error) {
+    reporter.problem("{announced}: the tests were built but could not be read: {error.message}");
     return new SuiteResult(2, 0, plan.tests().length, false);
 }
 
@@ -290,9 +300,4 @@ secondEntryPoint(Loaded loaded) -> string {
         }
     }
     return "";
-}
-
-noArguments() -> string[] {
-    string[] none = [];
-    return none;
 }

@@ -1,0 +1,199 @@
+// Tests for the shapes a child's start hands the operating system, the search for a program on PATH,
+// and the numbers a closed pipe is told by. A rule that differs per system is given the system rather
+// than asking for it, so every system's rule is checked whatever system runs these tests.
+import @std.testing;
+import @std.process.native;
+import Path from @std.fs;
+import TemporaryDirectory from @std.fs.temporary;
+import Environment from @std.environment;
+import Platform from @std.environment;
+import @std.environment;
+import List from @std.collections.list;
+
+// The merged variables as one line, so an assertion reads as the environment a child would see.
+shown(string[] variables) -> string {
+    return string.joined(variables, " ");
+}
+
+test "an override replaces the inherited entry naming the same variable" {
+    string[] merged = native.mergedEnvironment(["HOME=/h", "PATH=/a"], ["PATH=/b"], "linux");
+    try testing.assertEqual(shown(merged), "HOME=/h PATH=/b");
+}
+
+test "an override naming nothing inherited joins the environment" {
+    string[] merged = native.mergedEnvironment(["HOME=/h"], ["ENS_TOOLCHAIN=local"], "linux");
+    try testing.assertEqual(shown(merged), "ENS_TOOLCHAIN=local HOME=/h");
+}
+
+test "no overrides leave the inherited environment as it was" {
+    string[] merged = native.mergedEnvironment(["PATH=/a", "HOME=/h"], [], "linux");
+    try testing.assertEqual(shown(merged), "HOME=/h PATH=/a");
+}
+
+test "on windows an override reaches an inherited name spelled in another case" {
+    string[] merged = native.mergedEnvironment(["Path=/a", "HOME=/h"], ["PATH=/b"], "windows");
+    try testing.assertEqual(shown(merged), "HOME=/h PATH=/b");
+}
+
+test "on linux a name differing only in case is a second variable and both survive" {
+    string[] merged = native.mergedEnvironment(["path=/a", "HOME=/h"], ["PATH=/b"], "linux");
+    try testing.assertEqual(shown(merged), "HOME=/h PATH=/b path=/a");
+}
+
+test "on macos names match exactly, the way they do on linux" {
+    string[] merged = native.mergedEnvironment(["path=/a"], ["PATH=/b"], "macos");
+    try testing.assertEqual(shown(merged), "PATH=/b path=/a");
+}
+
+test "an entry's name is what stands before its first '='" {
+    try testing.assertEqual(native.nameOf("PATH=/a=b"), "PATH");
+    try testing.assertEqual(native.nameOf("BARE"), "BARE");
+}
+
+test "an environment block ends every entry and closes with one more terminator" {
+    byte[] block = native.environmentBlock(["A=1", "B=2"]);
+    try testing.assertTrue(block.length == 9,
+        "the block is {block.length} bytes, expected 9 for 'A=1' and 'B=2'");
+    try testing.assertTrue(block[3] == 0 && block[7] == 0 && block[8] == 0,
+        "the entries and the block itself must each end in a terminator");
+}
+
+test "no variables give an empty block, which a spawn reads as inherit unchanged" {
+    try testing.assertTrue(native.environmentBlock([]).length == 0,
+        "an empty environment must give an empty block");
+}
+
+test "an argument block ends every argument and nothing more" {
+    byte[] block = native.argumentBlock(["one", "two"]);
+    try testing.assertTrue(block.length == 8,
+        "the block is {block.length} bytes, expected 8 for 'one' and 'two'");
+    try testing.assertTrue(block[3] == 0 && block[7] == 0,
+        "every argument must end in a terminator");
+}
+
+
+// A part is left bare where a program would read it back whole, so cmd.exe's own switches reach
+// it as it expects them, and quoted where a space, a tab, a quote or emptiness would split or lose
+// it.
+test "a command line quotes only the parts a program would split" {
+    try testing.assertEqual(native.commandLineOf("git", ["commit", "-m", "a message"]),
+        "git commit -m \"a message\"");
+    try testing.assertEqual(native.commandLineOf("c:/a b/ens.exe", ["/S", "x\"y", "", "tab\there",
+        "back\\slash", "ends\\", "dir with space\\"]),
+        "\"c:/a b/ens.exe\" /S \"x\\\"y\" \"\" \"tab\there\" back\\slash ends\\ "
+        + "\"dir with space\\\\\"");
+}
+
+// cmd.exe reads a '/' in its own name as a switch, so the head of a Windows line is spelled the way
+// Windows spells a path; nothing else reads the line, so the text stays as written elsewhere.
+test "the program at the head of a windows command line is spelled with backslashes" {
+    try testing.assertEqual(native.commandLineProgram("C:/Windows/cmd.exe", Platform.Windows),
+        "C:\\Windows\\cmd.exe");
+    try testing.assertEqual(native.commandLineProgram("git", Platform.Windows), "git");
+    try testing.assertEqual(native.commandLineProgram("/bin/sh", Platform.Linux), "/bin/sh");
+    try testing.assertEqual(native.commandLineProgram("/bin/sh", Platform.MacOS), "/bin/sh");
+}
+
+test "a shell command line puts the line after /S /C in one pair of quotes" {
+    try testing.assertEqual(native.shellCommandLine("C:\\Windows\\cmd.exe", "echo \"a b\" & dir"),
+        "\"C:\\Windows\\cmd.exe\" /S /C \"echo \"a b\" & dir\"");
+}
+
+test "a given environment block closes with an empty entry, even with no variables" {
+    byte[] none = [0, 0];
+    byte[] single = [65, 61, 49, 0, 0];
+    try testing.assertEqual(native.givenEnvironmentBlock([]), none);
+    try testing.assertEqual(native.givenEnvironmentBlock(["A=1"]), single);
+}
+
+// Windows looks a variable up without regard to case, so its block has to be sorted that way; byte
+// order puts every capital before every small letter, which everywhere else is the order wanted.
+test "environment entries are ordered the way the child's platform requires" {
+    let variables = Environment.empty(Platform.Linux);
+    variables.set("b", "2");
+    variables.set("A", "1");
+    variables.set("C", "3");
+    try testing.assertEqual(native.environmentEntries(variables, Platform.Windows),
+        ["A=1", "b=2", "C=3"]);
+    try testing.assertEqual(native.environmentEntries(variables, Platform.Linux),
+        ["A=1", "C=3", "b=2"]);
+    try testing.assertEqual(native.environmentEntries(variables, Platform.MacOS),
+        ["A=1", "C=3", "b=2"]);
+}
+
+test "the candidates for a bare name are one per PATH directory, in PATH's order" {
+    try testing.assertEqual(shownPaths(native.candidatesOnPath("tool", "/usr/bin::/opt/x/bin",
+        Platform.Linux)), "/usr/bin/tool /opt/x/bin/tool");
+    try testing.assertEqual(shownPaths(native.candidatesOnPath("tool", "/usr/bin:/opt/x/bin:",
+        Platform.MacOS)), "/usr/bin/tool /opt/x/bin/tool");
+    try testing.assertEqual(shownPaths(native.candidatesOnPath("tool", "", Platform.Linux)), "");
+}
+
+// On Windows the name is looked for as written when it has an extension and as an executable
+// otherwise, never through PATHEXT, and a directory written in quotes is read without them.
+test "on windows a bare name is looked for as an executable and a directory may be quoted" {
+    string pathValue = "C:\\Windows\\system32;\"C:\\Program Files\\x\";;D:\\tools";
+    try testing.assertEqual(shownPaths(native.candidatesOnPath("tool", pathValue,
+        Platform.Windows)),
+        "C:/Windows/system32/tool.exe C:/Program Files/x/tool.exe D:/tools/tool.exe");
+    try testing.assertEqual(shownPaths(native.candidatesOnPath("tool.cmd", "C:\\bin",
+        Platform.Windows)), "C:/bin/tool.cmd");
+    try testing.assertEqual(shownPaths(native.candidatesOnPath("python3.12", "C:\\bin",
+        Platform.Windows)), "C:/bin/python3.12");
+}
+
+test "a PATH that is not set holds no program" {
+    try testing.assertEqual(native.programsOnPath("tool", null, Platform.Linux).length, 0);
+    try testing.assertEqual(native.programsOnPath("tool", null, Platform.Windows).length, 0);
+}
+
+// Two directories each hold a file of the name. POSIX answers both, since a start passes over one
+// it may not execute, and Windows the first alone, since CreateProcess would stop there.
+test "the programs on PATH are every file of the name, or on windows the first" {
+    let scratch = try TemporaryDirectory.create("ens-std-process-programs");
+    Path first = scratch.path().join("first");
+    Path second = scratch.path().join("second");
+    try first.createDirectories();
+    try second.createDirectories();
+    try first.join("tool.exe").writeText("first");
+    try second.join("tool.exe").writeText("second");
+    string separator = ":";
+    if (environment.platform() == Platform.Windows) {
+        separator = ";";
+    }
+    string pathValue = first.toString() + separator + second.toString();
+    Path[] found = native.programsOnPath("tool.exe", pathValue, environment.platform());
+    if (environment.platform() == Platform.Windows) {
+        try testing.assertEqual(shownPaths(found), first.join("tool.exe").toString());
+    } else {
+        try testing.assertEqual(shownPaths(found),
+            first.join("tool.exe").toString() + " " + second.join("tool.exe").toString());
+    }
+    try testing.assertEqual(native.programsOnPath("tool.exe", second.toString(),
+        environment.platform()).length, 1);
+    try testing.assertEqual(native.programsOnPath("absent.exe", pathValue,
+        environment.platform()).length, 0);
+}
+
+// The numbers are the ones each system gives a writer whose reader has gone, and no system's
+// number means that on another.
+test "a closed pipe is told apart by each platform's own number" {
+    try testing.assertTrue(native.meansPipeClosed(32, Platform.Linux), "EPIPE on Linux");
+    try testing.assertTrue(native.meansPipeClosed(32, Platform.MacOS), "EPIPE on macOS");
+    try testing.assertFalse(native.meansPipeClosed(32, Platform.Windows),
+        "32 is not a Win32 pipe number");
+    try testing.assertTrue(native.meansPipeClosed(232, Platform.Windows), "ERROR_NO_DATA");
+    try testing.assertTrue(native.meansPipeClosed(109, Platform.Windows), "ERROR_BROKEN_PIPE");
+    try testing.assertFalse(native.meansPipeClosed(109, Platform.Linux),
+        "109 is no closed pipe on Linux");
+    try testing.assertFalse(native.meansPipeClosed(0, Platform.Linux), "success is no failure");
+}
+
+// The candidates as one line, so an assertion reads as the places a search would look.
+shownPaths(Path[] candidates) -> string {
+    let texts = new List<string>();
+    for (let candidate in candidates) {
+        texts.push(candidate.toString());
+    }
+    return string.joined(texts.toArray(), " ");
+}
