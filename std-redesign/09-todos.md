@@ -23,6 +23,10 @@ It moves when threads land and a reader of each stream carries its own bound.
 It therefore keeps the old merged reader and that family's own `waitForOutput(milliseconds)`.
 That call is a different one from the new `ChildProcess.waitForOutput(timeoutMillis)` despite the name, since the old one asks about one merged stream and the new one asks whether either of two separate streams can be read.
 
+Two things follow from that family outliving D1, both of them limits on what D1 can reach.
+`@std.text.lines` and its `LineBuffer` survive it, because the old `ChildProcess` is their only consumer and D1 cannot delete that, so the module goes when the threaded reader replaces it and not before.
+And `@std.system` keeps exported names for as long as `selfhost/packages/src/tools.ens` reaches `SystemError`, `start` and `ChildProcess` across a package boundary, so the "all `public`, nothing `export`" that 07-fs-process-environment.md describes is not reachable at D1 either.
+
 ## Limits the C7b bridges accept
 
 A Linux target reads metadata through the raw `statx` system call, which needs kernel 4.11 or newer.
@@ -72,6 +76,9 @@ Measured on 2026-09-06 at -O2, with the declarations first in the `@std.fs` file
 The module count did not move, staying at 15 either way, because `@std.system` is already in every program through the `@std.io.print` prelude.
 The single place was chosen over the per-program cost with that measurement in hand (ratified 2026-09-06), so the `@std.system` half of the charge grows before C9 shrinks it, and what removes it in the end is reachability-based emission rather than the module's size.
 Moving the consumers then paid the charge back and more, because `@std.path` became a shim over `Path` and so could no longer be reached from `@std.system`, which took `std.path` out of the prelude chain: a hello-world ended at 14 modules and 166,543 bytes of objects on windows-x64 and 202,400 on linux-x64, below the 15 modules and 167,771 bytes it started C7c at.
+C8 then lost all of that and more, unmeasured at the time: it pointed `@std.system` at `@std.process.native`, which imports `Environment`, `Platform` and `Path`, so every program loaded `@std.environment` and the whole of `@std.fs` behind it, and a hello-world reached 26 modules and 420,360 bytes of objects on windows-x64 and 506,792 on linux-x64.
+Splitting the shapes that are a rule about values alone into `@std.process.blocks`, which imports only `List` and `StringBuilder`, put it back to 14 modules and 180,987 bytes on windows-x64 and 215,248 on linux-x64 (measured 2026-09-16 at -O2).
+What stands above the C7c figure is `@std.system`'s own object, 71,027 bytes of the 180,987, which is where C8's ten new bridges and their wrappers sit and what the single-place ruling accepts.
 
 `Path.walk` offers no way to leave a folder out, so a caller that must not descend into one writes its own descent, and with it its own cycle guard.
 `selfhost/packages/src/hashing.ens` is that caller: a tree's digest leaves `.git` out, and that has to be decided before the folder is entered rather than after everything under it has been handed over.

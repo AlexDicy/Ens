@@ -1,0 +1,158 @@
+// The shapes a child's start needs its inputs in: the NUL separated blocks a C argument vector and
+// a Win32 environment point into, the merge of an inherited environment with a caller's overrides,
+// and the quoting that turns a program and its arguments into the one line Win32 takes. Nothing
+// here reads the environment or the disk, so every rule below is about the values it was given.
+import List from @std.collections.list;
+import StringBuilder from @std.text.stringbuilder;
+
+// Every value's bytes with a NUL after each of them, which is the block a C argument vector points
+// into. A value holding a NUL byte cannot cross into a C string and is cut there.
+public argumentBlock(string[] arguments) -> byte[] {
+    return separatedBlock(arguments, 0);
+}
+
+// Every variable's bytes with a NUL after each of them and one more NUL closing the block, which
+// is the block a Win32 environment is passed as. A variable holding a NUL byte cannot cross into a
+// C string and is cut there. An empty environment gives an empty block, which a spawn reads as
+// "inherit unchanged".
+public environmentBlock(string[] variables) -> byte[] {
+    if (variables.length == 0) {
+        return new byte[0];
+    }
+    return separatedBlock(variables, 1);
+}
+
+// Every variable's bytes with a NUL after each of them and one more NUL closing the block. No
+// variables at all is the closing NUL and the empty entry before it, which is the smallest block
+// Windows reads as an environment.
+public givenEnvironmentBlock(string[] variables) -> byte[] {
+    if (variables.length == 0) {
+        return [0, 0];
+    }
+    return separatedBlock(variables, 1);
+}
+
+separatedBlock(string[] values, long trailing) -> byte[] {
+    long total = trailing;
+    for (long i = 0; i < values.length; i++) {
+        total = total + values[i].length + 1;
+    }
+    byte[] block = new byte[total];
+    long at = 0;
+    for (long i = 0; i < values.length; i++) {
+        byte[] raw = values[i].toBytes();
+        for (long b = 0; b < raw.length; b++) {
+            block[at] = raw[b];
+            at = at + 1;
+        }
+        block[at] = 0;
+        at = at + 1;
+    }
+    return block;
+}
+
+// The inherited environment with the overrides applied over it, in order, so the child sees one
+// entry per name and keeps everything it was not given a new value for. On "windows" two names
+// match without regard to case, the way that system matches them, so an override reaches the
+// inherited entry however that entry spells its name; everywhere else 'PATH' and 'path' are two
+// variables and both survive. The system is passed in rather than asked for, so both rules are a
+// rule about the values handed to this function.
+public mergedEnvironment(string[] inherited, string[] overrides, string platform) -> string[] {
+    bool ignoringCase = platform == "windows";
+    let merged = new List<string>();
+    for (let entry in inherited) {
+        if (!overriddenName(overrides, nameOf(entry), ignoringCase)) {
+            merged.push(entry);
+        }
+    }
+    for (let entry in overrides) {
+        merged.push(entry);
+    }
+    merged.sort();
+    return merged.toArray();
+}
+
+// The name an environment entry sets, which is everything before the first '='. An entry with no
+// '=' names itself.
+public nameOf(string entry) -> string {
+    long separator = entry.indexOf("=");
+    if (separator < 0) {
+        return entry;
+    }
+    return entry.substring(0, separator);
+}
+
+overriddenName(string[] overrides, string name, bool ignoringCase) -> bool {
+    for (let entry in overrides) {
+        if (sameName(nameOf(entry), name, ignoringCase)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+sameName(string left, string right, bool ignoringCase) -> bool {
+    if (!ignoringCase) {
+        return left == right;
+    }
+    return left.equalsIgnoreCaseAscii(right);
+}
+
+// The program and its arguments as one command line, which is the form Win32 hands a program. A
+// part is quoted only where the program would otherwise split it differently, so the parts come
+// back as exactly these values and a bare switch such as /C stays bare, which is how cmd.exe
+// reads its own.
+public commandLineOf(string program, string[] arguments) -> string {
+    let line = new StringBuilder();
+    line.append(quoted(program));
+    for (long i = 0; i < arguments.length; i++) {
+        line.append(" ");
+        line.append(quoted(arguments[i]));
+    }
+    return line.toString();
+}
+
+// The command line that runs `line` through cmd.exe as written. After /S cmd strips the first and
+// last quote of what follows /C and runs the rest, so the line inside may hold quotes of its own.
+public shellCommandLine(string interpreter, string line) -> string {
+    return "\"" + interpreter + "\" /S /C \"" + line + "\"";
+}
+
+// One part, in double quotes when it is empty or holds a space, a tab or a quote. A backslash is
+// literal except where it would escape the closing quote, so a run of backslashes before a quote
+// or at the very end is doubled.
+quoted(string value) -> string {
+    if (!needsQuotes(value)) {
+        return value;
+    }
+    let part = new StringBuilder();
+    part.append('"');
+    long backslashes = 0;
+    for (let character in value.chars()) {
+        if (character == '\\') {
+            backslashes = backslashes + 1;
+            continue;
+        }
+        if (character == '"') {
+            appendBackslashes(part, backslashes * 2 + 1);
+        } else {
+            appendBackslashes(part, backslashes);
+        }
+        part.append(character);
+        backslashes = 0;
+    }
+    appendBackslashes(part, backslashes * 2);
+    part.append('"');
+    return part.toString();
+}
+
+needsQuotes(string value) -> bool {
+    return value.isEmpty() || value.contains(" ") || value.contains("\t")
+        || value.contains("\"");
+}
+
+appendBackslashes(StringBuilder part, long count) {
+    for (long i = 0; i < count; i++) {
+        part.append('\\');
+    }
+}
