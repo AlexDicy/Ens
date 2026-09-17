@@ -3018,8 +3018,8 @@ void Analyzer::checkEntrySignature(const ast::FuncDecl& fn, Symbol* sym) {
         errorAtNode(params.front().node, "Function 'main' is the program entry point and takes no "
             "parameters, so it cannot declare '" +
             asciiOf(params.front().nameText().value_or(std::u16string{})) + "'. Declare it as "
-            "'main() -> int' (or 'main()') and read the command line with 'system.arguments()' "
-            "after 'import @std.system;'.");
+            "'main() -> int' (or 'main()') and read the command line with "
+            "'environment.arguments()' after 'import @std.environment;'.");
     }
     Type* returned = sym->returnType;
     if (returned && !returned->isVoid() && !returned->isError() &&
