@@ -1,0 +1,120 @@
+// The wait each platform is given, held to the verifier from whichever host runs the suite. What a
+// wait actually costs is the fixture's to measure. These say which call each half reaches and which
+// count reaches none.
+import @std.testing;
+import @ens.llvm.target;
+import EmissionHost from support;
+import emit.clock;
+
+// Every target a wait is emitted for, the host's own first so a run always covers it.
+triples() -> string[] {
+    return [target.hostTargetTriple(), "x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu", "x86_64-apple-darwin23", "aarch64-apple-darwin23"];
+}
+
+// The body of one target's wait, from its definition to the brace that closes it.
+waitBody(string triple) -> string throws {
+    let host = new EmissionHost("sleep_{triple}");
+    host.retarget(triple);
+    host.runtime.call(clock.sleepMillisRuntime(host.runtime), [host.runtime.int64(1)], "");
+    string text = host.text();
+    try host.finish();
+    long start = text.indexOf("define internal void @ens_sleep_millis(");
+    try testing.assertTrue(start >= 0, "'{triple}' never defined the wait: {text}");
+    string rest = text.substring(start, text.length);
+    long end = rest.indexOf("\n}");
+    try testing.assertTrue(end >= 0, "'{triple}' left the wait unclosed: {rest}");
+    return rest.substring(0, end);
+}
+
+test "a Windows wait reaches Sleep and no POSIX call" {
+    string body = try waitBody("x86_64-pc-windows-msvc");
+    try testing.assertTrue(body.indexOf("call void @Sleep(") >= 0,
+        "a Windows wait does not call Sleep: {body}");
+    try testing.assertTrue(body.indexOf("nanosleep") < 0,
+        "a Windows wait reaches nanosleep: {body}");
+}
+
+// A signal must not shorten the wait, so the call is made again with the time the system wrote
+// back, which is what the second argument carries.
+test "a POSIX wait reaches nanosleep and asks again with what it wrote back" {
+    for (let triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
+            "x86_64-apple-darwin23", "aarch64-apple-darwin23"]) {
+        string body = try waitBody(triple);
+        try testing.assertTrue(body.indexOf("call i32 @nanosleep(ptr %request, ptr %rest)") >= 0,
+            "'{triple}' does not wait through nanosleep over a request and a rest: {body}");
+        try testing.assertTrue(body.indexOf("Sleep(") < 0,
+            "'{triple}' reaches the Win32 wait: {body}");
+        try testing.assertTrue(body.indexOf("sleep.restart:") >= 0,
+            "'{triple}' has nowhere to ask again from: {body}");
+        try testing.assertTrue(body.indexOf("%left.seconds") >= 0
+            && body.indexOf("%left.nanoseconds") >= 0,
+            "'{triple}' does not read back what the system left: {body}");
+    }
+}
+
+// One block's own text, from its label to the blank line that ends it.
+blockText(string body, string label) -> string throws {
+    long start = body.indexOf("{label}:");
+    try testing.assertTrue(start >= 0, "there is no block '{label}': {body}");
+    string rest = body.substring(start, body.length);
+    long end = rest.indexOf("\n\n");
+    if (end < 0) {
+        return rest;
+    }
+    return rest.substring(0, end);
+}
+
+// A count of zero or less is answered before any call, so a caller that works out a remainder of
+// nothing pays nothing for asking.
+test "no target reaches a call for a count of zero or less" {
+    for (let triple in triples()) {
+        string body = try waitBody(triple);
+        string exit = try blockText(body, "sleep.done");
+        try testing.assertTrue(exit.indexOf("call") < 0,
+            "'{triple}' reaches a call on the way out: {exit}");
+        try testing.assertTrue(exit.indexOf("ret void") >= 0,
+            "'{triple}' does not return from its own exit: {exit}");
+        try testing.assertTrue(body.indexOf("icmp sgt i64") >= 0,
+            "'{triple}' does not test the count before waiting: {body}");
+    }
+}
+
+// The slice clears the value Win32 reads as a wait without end, so the longest count a caller can
+// give is still a wait that returns.
+test "a Windows slice stays below the count that would wait forever" {
+    string body = try waitBody("x86_64-pc-windows-msvc");
+    try testing.assertTrue(body.indexOf("2147483647") >= 0,
+        "a Windows wait does not slice below the forever value: {body}");
+    try testing.assertTrue(body.indexOf("4294967295") < 0,
+        "a Windows wait can be given the forever value: {body}");
+}
+
+test "every target's wait builds code the verifier accepts" {
+    for (let triple in triples()) {
+        let host = new EmissionHost("sleep_verify_{triple}");
+        host.retarget(triple);
+        host.runtime.call(clock.sleepMillisRuntime(host.runtime), [host.runtime.int64(5)], "");
+        try host.finish();
+    }
+}
+
+// The clock and the wait are two bridges, since a caller measuring a deadline needs both and
+// neither answers for the other.
+test "the clock and the wait are two functions, each defined once" {
+    let host = new EmissionHost("clock_and_sleep");
+    let runtime = host.runtime;
+    let clockFirst = clock.monotonicMillisRuntime(runtime);
+    let clockAgain = clock.monotonicMillisRuntime(runtime);
+    let waitFirst = clock.sleepMillisRuntime(runtime);
+    let waitAgain = clock.sleepMillisRuntime(runtime);
+    try testing.assertTrue(clockFirst.function == clockAgain.function,
+        "the second use redefined the clock");
+    try testing.assertTrue(waitFirst.function == waitAgain.function,
+        "the second use redefined the wait");
+    try testing.assertTrue(clockFirst.function != waitFirst.function,
+        "the clock and the wait share one bridge");
+    runtime.call(clockFirst, [], "now");
+    runtime.call(waitFirst, [runtime.int64(1)], "");
+    try host.finish();
+}

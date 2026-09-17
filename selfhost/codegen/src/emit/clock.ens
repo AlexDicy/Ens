@@ -1,12 +1,19 @@
-// The bridge that reads a clock nothing sets back, so a deadline can be measured across calls that
-// each wait a while.
+// The clock nothing sets back and the wait a caller builds on it. A deadline measured across calls
+// that each wait a while needs both of them.
 import TypeRef from @ens.llvm.types;
 import @ens.llvm.instructions;
 import @ens.llvm.memory;
+import Errno from emit.errorkinds;
 import Timespec from emit.nativeshapes;
 import emit.nativeshapes;
 import Runtime from emit.runtime;
 import RuntimeFunction from emit.runtime;
+
+// The largest count one Win32 wait is given. Its argument is 32 bits wide. A value of 0xFFFFFFFF
+// reads as a wait without end. A slice therefore stays below the width rather than filling it.
+final class Slice {
+    protected static const long widest = 0x7FFFFFFF;
+}
 
 // i64 ens_monotonic_millis(): milliseconds on a clock that never goes backwards, counted from an
 // origin no caller may rely on.
@@ -67,5 +74,107 @@ posixMonotonicMillis(Runtime runtime, TypeRef type) -> RuntimeFunction {
     instructions.buildRet(builder, instructions.buildAdd(builder,
         instructions.buildMul(builder, seconds, runtime.int64(1000), ""),
         instructions.buildSDiv(builder, nanoseconds, runtime.int64(1000000), ""), "millis"));
+    return runtime.endDefinition(definition);
+}
+
+// void ens_sleep_millis(i64 millis): blocks the calling thread for `millis` milliseconds as the
+// platform measures them. A count of zero or less returns without waiting at all. The floor a
+// caller can rely on is the platform's own. A caller that owes a deadline reads the clock and asks
+// again for the remainder.
+public sleepMillisRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.int64Type]);
+    let known = runtime.existing("ens_sleep_millis", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        return windowsSleepMillis(runtime, type);
+    }
+    return posixSleepMillis(runtime, type);
+}
+
+// One wait per slice, since Win32 takes a count narrower than a long. A count of zero or less fails
+// the loop's own test. No wait is reached for one.
+windowsSleepMillis(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let wait = runtime.libc("Sleep", runtime.voidType.functionType([runtime.int32Type]));
+    let definition = runtime.beginDefinition("ens_sleep_millis", type);
+    let builder = runtime.builder;
+    let leftSlot = memory.buildAlloca(builder, runtime.int64Type, "left");
+    memory.buildStore(builder, runtime.parameter(definition, 0), leftSlot);
+    let test = runtime.block(definition, "sleep.test");
+    let body = runtime.block(definition, "sleep.body");
+    let done = runtime.block(definition, "sleep.done");
+    instructions.buildBr(builder, test);
+
+    builder.positionAtEnd(test);
+    let left = memory.buildLoad(builder, runtime.int64Type, leftSlot, "left");
+    instructions.buildCondBr(builder, instructions.buildICmpSGT(builder, left, runtime.int64(0),
+        "more"), body, done);
+
+    builder.positionAtEnd(body);
+    let slice = instructions.buildSelect(builder, instructions.buildICmpSGT(builder, left,
+        runtime.int64(Slice.widest), "wide"), runtime.int64(Slice.widest), left, "slice");
+    runtime.call(wait, [instructions.buildTrunc(builder, slice, runtime.int32Type, "count")], "");
+    memory.buildStore(builder, instructions.buildSub(builder, left, slice, "rest"), leftSlot);
+    instructions.buildBr(builder, test);
+
+    builder.positionAtEnd(done);
+    instructions.buildRetVoid(builder);
+    return runtime.endDefinition(definition);
+}
+
+// A signal must not shorten the wait, so a call the system cut short is made again with the time it
+// wrote back. Anything else it refuses ends the wait, since the floor is the caller's to hold. A
+// refusal this loop could not read would otherwise never return.
+posixSleepMillis(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let wait = runtime.libc("nanosleep",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
+    let definition = runtime.beginDefinition("ens_sleep_millis", type);
+    let builder = runtime.builder;
+    let millis = runtime.parameter(definition, 0);
+    let setup = runtime.block(definition, "sleep.setup");
+    let done = runtime.block(definition, "sleep.done");
+    instructions.buildCondBr(builder, instructions.buildICmpSGT(builder, millis, runtime.int64(0),
+        "more"), setup, done);
+
+    builder.positionAtEnd(setup);
+    let request = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType(Timespec.structBytes as ulong), "request");
+    let rest = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType(Timespec.structBytes as ulong), "rest");
+    memory.buildStore(builder, instructions.buildSDiv(builder, millis, runtime.int64(1000),
+        "seconds"), runtime.offsetPointer(request, Timespec.seconds, ""));
+    memory.buildStore(builder, instructions.buildMul(builder,
+        instructions.buildSRem(builder, millis, runtime.int64(1000), ""), runtime.int64(1000000),
+        "nanoseconds"), runtime.offsetPointer(request, Timespec.nanoseconds, ""));
+    memory.buildStore(builder, runtime.int64(0), runtime.offsetPointer(rest, Timespec.seconds, ""));
+    memory.buildStore(builder, runtime.int64(0),
+        runtime.offsetPointer(rest, Timespec.nanoseconds, ""));
+    let attempt = runtime.block(definition, "sleep.attempt");
+    let refused = runtime.block(definition, "sleep.refused");
+    let restart = runtime.block(definition, "sleep.restart");
+    instructions.buildBr(builder, attempt);
+
+    builder.positionAtEnd(attempt);
+    let outcome = runtime.call(wait, [request, rest], "outcome");
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, outcome, runtime.int32(0),
+        "slept"), done, refused);
+
+    builder.positionAtEnd(refused);
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, runtime.errnoValue(),
+        runtime.int32(Errno.interrupted), "interrupted"), restart, done);
+
+    // What the system wrote back is what is left to wait, so it becomes the next request.
+    builder.positionAtEnd(restart);
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.int64Type,
+        runtime.offsetPointer(rest, Timespec.seconds, ""), "left.seconds"),
+        runtime.offsetPointer(request, Timespec.seconds, ""));
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.int64Type,
+        runtime.offsetPointer(rest, Timespec.nanoseconds, ""), "left.nanoseconds"),
+        runtime.offsetPointer(request, Timespec.nanoseconds, ""));
+    instructions.buildBr(builder, attempt);
+
+    builder.positionAtEnd(done);
+    instructions.buildRetVoid(builder);
     return runtime.endDefinition(definition);
 }
