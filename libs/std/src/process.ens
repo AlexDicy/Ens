@@ -26,11 +26,30 @@ export class ProcessError extends Error {
     // The program the operation named, as the caller wrote it.
     export const string program;
 
+    // The number the system itself reported, which is a Win32 number on Windows and errno
+    // everywhere else, since starting a program is the system's own call. It is 0 where nothing was
+    // asked of the system, as it is for a name no PATH directory holds. A program acts on `kind`
+    // and logs this.
+    export const int nativeError;
+
     // A failure of `kind` on `program`, where `message` says what was attempted and why it did not
     // happen, and `cause` carries the error this one was raised in response to.
-    export constructor(string message, this.kind, this.program, Error? cause = null) {
+    export constructor(string message, this.kind, this.program, this.nativeError,
+                       Error? cause = null) {
         super(message, cause);
     }
+}
+
+// The stream failure a child's own error number stands for, where `attempt` reads on from
+// "could not". A process bridge answers the platform's own number rather than the C library's, so
+// the one condition this can name is told by 'meansPipeClosed' rather than through the errno table
+// '@std.io.streams' reads. Naming the rest needs a bridge over this numbering.
+pipeFailure(string attempt, int code) -> IoError {
+    if (native.meansPipeClosed(code, environment.platform())) {
+        return new IoError("could not {attempt}: the pipe is closed", IoErrorKind.Closed, code);
+    }
+    return new IoError("could not {attempt}: the system reported error {code}", IoErrorKind.Other,
+        code);
 }
 
 // The conditions starting a program fails under. The set is closed, so a program that answers for
@@ -199,8 +218,7 @@ export final class ChildProcess {
     export closeInput() throws IoError {
         int code = system.processCloseInput(this.child);
         if (code != 0) {
-            throw new IoError("could not close the input of '{this.program}': the system reported "
-                + "error {code}", IoErrorKind.Other);
+            throw pipeFailure("close the input of '{this.program}'", code);
         }
     }
 
@@ -276,7 +294,7 @@ export final class ChildProcess {
         int code = system.processKill(this.child);
         if (code != 0) {
             throw new ProcessError("could not stop '{this.program}': the system reported error "
-                + "{code}", ErrorKind.Other, this.program);
+                + "{code}", ErrorKind.Other, this.program, code);
         }
     }
 
@@ -314,7 +332,7 @@ export final class ChildProcess {
         let polled = system.processPoll(this.child, millis);
         if (polled.code != 0) {
             throw new ProcessError("could not wait for '{this.program}': the system reported "
-                + "error {polled.code}", ErrorKind.Other, this.program);
+                + "error {polled.code}", ErrorKind.Other, this.program, polled.code);
         }
         return polled.ready;
     }
@@ -334,7 +352,7 @@ export final class ChildProcess {
         let read = this.readStream(stream, buffer);
         if (read.code != 0) {
             throw new ProcessError("could not read the output of '{this.program}': the system "
-                + "reported error {read.code}", ErrorKind.Other, this.program);
+                + "reported error {read.code}", ErrorKind.Other, this.program, read.code);
         }
         return read.count;
     }
@@ -348,7 +366,7 @@ export final class ChildProcess {
         let status = system.processWait(this.child);
         if (status.code != 0) {
             throw new ProcessError("could not wait for '{this.program}' to finish: the system "
-                + "reported error {status.code}", ErrorKind.Other, this.program);
+                + "reported error {status.code}", ErrorKind.Other, this.program, status.code);
         }
         ExitStatus ended = {code: status.exitCode, signal: status.signal};
         this.collected = ended;
@@ -375,12 +393,11 @@ final class PipeReader implements Reader {
         ChildProcess? owner = this.owner;
         if (owner == null) {
             throw new IoError("could not read the {this.name} of '{this.program}': the child has "
-                + "been let go", IoErrorKind.Closed);
+                + "been let go", IoErrorKind.Closed, 0);
         }
         let read = owner.readStream(this.stream, buffer);
         if (read.code != 0) {
-            throw new IoError("could not read the {this.name} of '{this.program}': the system "
-                + "reported error {read.code}", IoErrorKind.Other);
+            throw pipeFailure("read the {this.name} of '{this.program}'", read.code);
         }
         return read.count;
     }
@@ -402,7 +419,7 @@ final class PipeWriter implements Writer {
         ChildProcess? owner = this.owner;
         if (owner == null) {
             throw new IoError("could not write to the input of '{this.program}': the child has "
-                + "been let go", IoErrorKind.Closed);
+                + "been let go", IoErrorKind.Closed, 0);
         }
         long offered = 0;
         while (offered < data.length) {
@@ -422,12 +439,7 @@ final class PipeWriter implements Writer {
     protected override flush() { }
 
     refused(int code) -> IoError {
-        if (native.meansPipeClosed(code, environment.platform())) {
-            return new IoError("could not write to the input of '{this.program}': the input is "
-                + "closed", IoErrorKind.Closed);
-        }
-        return new IoError("could not write to the input of '{this.program}': the system reported "
-            + "error {code}", IoErrorKind.Other);
+        return pipeFailure("write to the input of '{this.program}'", code);
     }
 }
 
@@ -517,7 +529,7 @@ resolve(Path program, Environment? given) -> string[] throws ProcessError {
     string text = program.toString();
     if (text.isEmpty()) {
         throw new ProcessError("could not start a program: no name was given", ErrorKind.NotFound,
-            text);
+            text, 0);
     }
     if (text.contains("/")) {
         return [program.absolute().toString()];
@@ -533,7 +545,7 @@ resolve(Path program, Environment? given) -> string[] throws ProcessError {
 // The failure for a bare name no PATH directory holds a program under.
 notOnPath(string program) -> ProcessError {
     return new ProcessError("could not start '{program}': no program of that name is in a PATH "
-        + "directory", ErrorKind.NotFound, program);
+        + "directory", ErrorKind.NotFound, program, 0);
 }
 
 // The run of `invocation` to its end, with its two output streams captured or left with this
@@ -641,7 +653,7 @@ failedToStart(string program, string directory, int code) -> ProcessError {
     if (kind == ErrorKind.NotFound && !directory.isEmpty()) {
         reason = "nothing is there, or the working directory '{directory}' is missing";
     }
-    return new ProcessError("could not start '{program}': {reason}", kind, program);
+    return new ProcessError("could not start '{program}': {reason}", kind, program, code);
 }
 
 // The kind the bridge's ordinal for a system's own error number names.

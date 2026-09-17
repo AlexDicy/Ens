@@ -16,7 +16,14 @@ libs/std/src/fs/temporary.ens TemporaryDirectory, TemporaryFile
 export class FileSystemError extends Error {
     export const ErrorKind kind;
     export const Path path;
-    export constructor(this.message, this.kind, this.path, Error? cause = null);
+
+    // The number the system itself reported. On Windows a failure a file-system call reported
+    // carries a Win32 number and one a stream call reported carries the C library's errno, since
+    // that is what each of them answers; every other platform carries errno throughout. It is 0
+    // where nothing was asked of the system.
+    export const int nativeError;
+
+    export constructor(this.message, this.kind, this.path, this.nativeError, Error? cause = null);
 }
 
 export enum ErrorKind {
@@ -276,7 +283,14 @@ libs/std/src/process/native.ens   argument blocks, Win32 quoting (package-intern
 export class ProcessError extends Error {
     export const ErrorKind kind;
     export const string program;
-    export constructor(this.message, this.kind, this.program, Error? cause = null);
+
+    // The number the system itself reported, which is a Win32 number on Windows and errno
+    // everywhere else. It is 0 where nothing was asked of the system, as it is for a name no PATH
+    // directory holds.
+    export const int nativeError;
+
+    export constructor(this.message, this.kind, this.program, this.nativeError,
+                       Error? cause = null);
 }
 
 export enum ErrorKind {
@@ -376,6 +390,9 @@ The search lives in the library and the bridge never searches, only PATH directo
 So a `.cmd` or `.bat` is not found by `run` and goes through `runShell`, because launching one through `CreateProcess` runs `cmd.exe` without the caller having asked for a shell.
 `kill()` passes 137 to the operating system on Windows, and `wait()` reports `signal 9, code 0` only when that call succeeded and the child's code is the one it passed, so a child that exited on its own first keeps its own code (ratified 2026-09-08).
 The runtime ignores SIGPIPE before any user code runs, so a write to a pipe whose reader has gone fails with an `IoError` of kind `Closed` on every platform instead of ending the program with its destructors unrun; what `print` does on a closed standard output is ruled in C9 (ratified 2026-09-08).
+`kind` is what a program acts on, and it is the same on every platform, but the `nativeError` beside it is not: a child's pipes are the system's own rather than the C library's, so a closed one reports `ERROR_BROKEN_PIPE` or `ERROR_NO_DATA` on Windows and `EPIPE` elsewhere.
+That is the one place an `IoError` carries a number that is not an errno.
+It is also why `Closed` is the only condition a pipe failure can name, since the rest of the numbers a pipe reports have no table in that numbering space and arrive as `Other` carrying the number.
 The library is designed for the threads that are coming: the bridges hold no process-global state, capture multiplexes the two pipes the way a threaded runtime does underneath, and the separate streams are the design rather than a stand-in for it.
 `environment:` replaces rather than merges: patching is `Environment.current()` plus `set`, a clean slate is `Environment.empty(platform)` plus `set`, and what is passed is exactly what the child sees.
 Python and Go use the same replace semantics for a child's environment; Rust's override-style Command needed four methods to express the same two intents.
@@ -444,5 +461,8 @@ The old public merge machinery stops being API; block building moves to `@std.pr
 ## @std.system (internal)
 
 One file, every `external` declaration in the library, all `public`, nothing `export`.
-Contents: the file bridges (open, read, write, close, metadata, listing, create, remove, rename, realpath), the process bridges (spawn with OS-level redirection, pipe read, wait with and without timeout, kill, release), the environment bridges (variables snapshot, argv, executable path, cwd), and `errorKindFromCode(int)` so the mapping from a platform's own error number exists in exactly one place.
-The name says code rather than errno because Windows reports Win32 error codes there, not errno.
+Contents: the file bridges (open, read, write, close, metadata, listing, create, remove, rename, realpath), the stream bridges (write, read, flush, close over one of the C library's own handles), the process bridges (spawn with OS-level redirection, pipe read, wait with and without timeout, kill, release), the environment bridges (variables snapshot, argv, executable path, cwd), and the three error-number tables.
+The name `errorKindFromCode` says code rather than errno because Windows reports Win32 error codes there, not errno.
+It has a companion, `errorKindFromErrno`, because the two numbering spaces meet inside `@std.fs`: a file-system call on Windows answers Win32 while a stream call there answers the C library's errno, so a failure has to be read through the table belonging to the call that produced it.
+Reading one for the other would not merely lose a kind, it would name the wrong one, since 21 is `EISDIR` as an errno and `ERROR_NOT_READY` as a Win32 code.
+On every other platform the two tables are one.
