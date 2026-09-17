@@ -65,6 +65,13 @@ bool callDriver(int flavor, llvm::ArrayRef<const char*> arguments, llvm::raw_ost
     }
 }
 
+// Crash recovery is switched on the first time a link needs it and never switched off. The switch
+// is one per process rather than one per link. Switching it off at the end of a step would decide
+// for every later link as well.
+struct CrashRecoverySwitch {
+    CrashRecoverySwitch() { llvm::CrashRecoveryContext::Enable(); }
+};
+
 // Runs one step of a link where lld giving up is a return rather than the end of the process. lld
 // reports a corrupted input, or an output it cannot open, through fatal(), and fatal() leaves
 // through llvm::sys::Process::Exit however exitEarly was answered: the caller never hears back, and
@@ -73,7 +80,7 @@ bool callDriver(int flavor, llvm::ArrayRef<const char*> arguments, llvm::raw_ost
 // whenever there is one, and nothing puts one in place by default, so the bridge puts one around
 // every step it runs lld under.
 void runWithoutExiting(llvm::function_ref<void()> step) {
-    llvm::CrashRecoveryContext::Enable();
+    static const CrashRecoverySwitch switchedOn;
     llvm::CrashRecoveryContext recovery;
     recovery.RunSafely(step);
 }

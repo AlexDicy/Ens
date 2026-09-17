@@ -63,7 +63,6 @@ Ruled 2026-09-17: `scratch.discard` retries while the kind is `PermissionDenied`
 Windows only, because no open handle can refuse unlink or rmdir elsewhere, so a refusal there is genuine and a retry would only delay the report.
 `Path.removeRecursively` keeps stopping at the first refusal (ruled 2026-09-17, the Rust shape rather than Go's remove-what-you-can), so a refusal that outlasts the budget still costs the whole folder rather than one file.
 Unmeasured: the hold for a binary larger than 431 KB, whether a machine without Malwarebytes shows it at all, and why a native repro outside the compiler never fired.
-`runWithoutExiting` in runtime/lld/ens_lld.cpp calls `CrashRecoveryContext::Enable()` on every step and never `Disable()`, a counter that only grows; harmless, to be paired in its own commit.
 
 ## Phase D
 
