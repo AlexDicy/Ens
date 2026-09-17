@@ -1,4 +1,4 @@
-# @std.fs, @std.process, @std.environment
+# @std.fs, @std.process, @std.environment, @std.thread
 
 ## @std.fs layout
 
@@ -457,6 +457,29 @@ export final class Environment {
 `Environment` is not Iterable in v1; `names()` plus `get` covers enumeration deterministically.
 `arguments()` excludes the program's own name; the program's identity is `executablePath()`.
 The old public merge machinery stops being API; block building moves to `@std.process.native` and name matching lives inside `Environment.set`.
+
+## @std.thread
+
+```ens
+// @std.thread
+// Letting time pass before a program goes on.
+
+// The thread this code is running on.
+export final class Thread {
+    // Blocks this thread until the monotonic clock has advanced by `millis` milliseconds. The wait
+    // can last longer. Nothing bounds how long a loaded machine leaves a thread waiting. A count of
+    // zero or less returns without waiting. A platform wait that ends early is repeated with
+    // whatever the clock says is left. The count is a floor on every platform.
+    export static sleep(long millis);
+}
+```
+
+## thread decisions
+
+The count is a floor and never a ceiling, so a caller that must not go on early can rely on it while a caller needing an upper bound has no promise to read.
+The floor is held against the monotonic clock rather than against the platform's own wait, because a Windows wait can end one system timer tick short of the count.
+The module holds a wait and nothing else, since threads themselves are outside this redesign.
+Naming it for the thread rather than for the wait leaves the place the rest of them will be added.
 
 ## @std.system (internal)
 

@@ -14,7 +14,7 @@ The language prerequisites in `01-language-prerequisites.md` must land before th
 | `04-collections.md` | `@std.collections`: protocol ladder and the six containers |
 | `05-text.md` | `@std.text`: the `string` primitive binding, `StringBuilder`, parsing |
 | `06-io.md` | `@std.io`: `Reader`/`Writer`, buffering, memory streams, standard streams |
-| `07-fs-process-environment.md` | `@std.fs`, `@std.process`, `@std.environment`: rulings so far, signatures pending |
+| `07-fs-process-environment.md` | `@std.fs`, `@std.process`, `@std.environment`, `@std.thread`: rulings so far, signatures pending |
 | `08-testing.md` | `@std.testing` rulings |
 | `09-todos.md` | Open questions and deferred items |
 | `10-migration-plan.md` | Phase 0/A/B/C/D migration order from today's tree to this design |

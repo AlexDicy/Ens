@@ -94,6 +94,7 @@ Non-resource cleanup gets a guard type, such as a temporary directory that remov
 @std.fs           Path, File, Metadata, Entry, EntryKind, ErrorKind
 @std.process      run, spawn, ChildProcess, ExitStatus, ErrorKind
 @std.environment  Environment, arguments, platform, executablePath
+@std.thread       Thread.sleep
 @std.testing      assertions
 @std.system       every external declaration, internal only (public, never export)
 ```
