@@ -12,7 +12,7 @@ A bare function reference stored into a local with no declared type, `let callba
 ## C8 and C9
 
 OS-level redirection for `run(captureOutput: true)`, wait-with-timeout, and kill in the native bridges.
-Every failure from the standard streams carries `ErrorKind.Other`, because telling `Closed` apart needs errno; C9's `errorKindFromCode` lets `io.ens` and the buffered wrappers name the kind, and the message carries the detail until then.
+Every failure from the standard streams carries `ErrorKind.Other` until the library half of the error-kind milestone lands; the five stream bridges (12546a4) already answer the errno, and `io.ens` names `Closed` and `Interrupted` from it once the seed carries them.
 A child is owned by one thread at a time until the threaded runtime gives it a lock or a documented single-owner rule.
 The Windows output record's `pending`, `filled`, `consumed` and `ended` fields are plain stores, correct under that ownership and a race once two threads touch one child.
 
@@ -53,6 +53,17 @@ The emitter tests that retarget a module prove a platform's half builds well-for
 A negative control settled it.
 Moving `Statx.modeOffset` from 28 to 29 in a disposable copy of the tree left every retarget test passing, while a wrong return type failed loudly.
 So the verified triples are that many well-formed halves rather than that many checked layouts, and only `tests/fs_bridges` running on a host of that platform can say whether an offset or a system-call number is right.
+
+## Scratch folders on Windows
+
+`ens test` and `ens run` on Windows sometimes leave their scratch folder behind, measured 2026-09-17 at about 2.3 percent of suites.
+The cause is Malwarebytes holding the executable that just ran for under two milliseconds with a share mode that denies delete, so `DeleteFileW` answers ERROR_SHARING_VIOLATION (32), which the library reports as `PermissionDenied`.
+It is not the image section, not the linker's output mapping, and not this process: a linked executable that is never run was refused zero times in 400 suites, and the holder was named by sampling `FileProcessIdsUsingFileInformation`.
+Ruled 2026-09-17: `scratch.discard` retries while the kind is `PermissionDenied`, on Windows only, through a fixed schedule of `Thread.sleep` calls that doubles from one millisecond to a 64 ms cap and adds up to about two seconds; the budget is counted in sleeps, so no clock is exported for it.
+Windows only, because no open handle can refuse unlink or rmdir elsewhere, so a refusal there is genuine and a retry would only delay the report.
+`Path.removeRecursively` keeps stopping at the first refusal (ruled 2026-09-17, the Rust shape rather than Go's remove-what-you-can), so a refusal that outlasts the budget still costs the whole folder rather than one file.
+Unmeasured: the hold for a binary larger than 431 KB, whether a machine without Malwarebytes shows it at all, and why a native repro outside the compiler never fired.
+`runWithoutExiting` in runtime/lld/ens_lld.cpp calls `CrashRecoveryContext::Enable()` on every step and never `Disable()`, a counter that only grows; harmless, to be paired in its own commit.
 
 ## Phase D
 
