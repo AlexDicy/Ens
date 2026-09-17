@@ -103,7 +103,10 @@ Within each milestone the std change and its consumer updates are one commit, so
   They land in the same seed as import aliasing, one release rather than two.
   `Environment.set` panics on an empty name or a name containing `=`, since neither can cross an environment block and the ratified signature has no `throws`; a programmer error, like an index out of range (ruled 2026-09-10).
   The helpers the old `@std.system` still imports from `process.ens` move to `process/native.ens`, so the old family keeps compiling until D1, and every consumer of that family moves in the same commit, as C7c did for `Path`.
-- C9: the internal `@std.system` native module: every `external` declaration moves in, and the old bridges are aliased from it so C7 and C8 could build on it retroactively if ordering demands.
+- C9: the internal `@std.system` native module, which C7c and C8 built as they went, so that by 2026-09-16 every `external` declaration already lived in that file and the milestone as written had nothing left.
+  Its one measurable finding was a regression C8 introduced: `@std.system` had come to import `@std.process.native`, which imports `Environment`, `Platform` and `Path`, so every program loaded `@std.environment` and all of `@std.fs`, and a hello world had grown from 14 modules to 26; splitting `@std.process.blocks` out by dependency put it back at 14 (673a29d) and took between 94 and 157 seconds off a suite that had been running 429 to 480.
+  What remains of C9's purpose, the one place for the error-number mapping, is the error-kind milestone that follows D1's preparation: four stream bridges answering errno, an io classifier, `nativeError` on `IoError`, `FileSystemError` and `ProcessError`, and `@std.fs`'s write paths classifying through their own table so a full disk reaches a caller as `NoSpace`.
+  The preparation that needs no seed, internal names for what the library reads from the system and selfhost moved off the old `writeError` and `flush`, lands as D1's first commits, since each exists only so a deletion can happen.
 
 Consumer migration inside C means the selfhost compiler, build, cli, and lsp sources plus `tests/` fixtures, area by area, in the same commits as their std milestone.
 

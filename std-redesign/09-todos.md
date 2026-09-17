@@ -79,6 +79,10 @@ Moving the consumers then paid the charge back and more, because `@std.path` bec
 C8 then lost all of that and more, unmeasured at the time: it pointed `@std.system` at `@std.process.native`, which imports `Environment`, `Platform` and `Path`, so every program loaded `@std.environment` and the whole of `@std.fs` behind it, and a hello-world reached 26 modules and 420,360 bytes of objects on windows-x64 and 506,792 on linux-x64.
 Splitting the shapes that are a rule about values alone into `@std.process.blocks`, which imports only `List` and `StringBuilder`, put it back to 14 modules and 180,987 bytes on windows-x64 and 215,248 on linux-x64 (measured 2026-09-16 at -O2).
 What stands above the C7c figure is `@std.system`'s own object, 71,027 bytes of the 180,987, which is where C8's ten new bridges and their wrappers sit and what the single-place ruling accepts.
+The suite was timed across that split as well, two runs at each commit with a checkout before every run so all four met the same caches: 335s and 323s after it, 480s and 429s before it (2026-09-17).
+So the split took between 94 and 157 seconds off a suite that had been running 429 to 480, a fifth to a third of it, almost all of it in `codegencheck` at -O2; the repeats differ by 12s after and 51s before, so the direction and the rough size hold while the precise figure does not.
+That is no recomputation of the 21% above, which was measured against a 177-second baseline on an older tree, and it is not a second saving beside the object numbers either, since an executable carries what the linker keeps of those objects and nothing passes a dead-strip flag.
+What it says is that until 673a29d the charge reachability-based emission is meant to lift had grown to about a quarter of this suite.
 
 `Path.walk` offers no way to leave a folder out, so a caller that must not descend into one writes its own descent, and with it its own cycle guard.
 `selfhost/packages/src/hashing.ens` is that caller: a tree's digest leaves `.git` out, and that has to be decided before the folder is entered rather than after everything under it has been handed over.
