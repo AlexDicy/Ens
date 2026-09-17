@@ -1,0 +1,95 @@
+// The four stream bridges, exercised on the host running the suite. What they answer on a healthy
+// stream is pinned exactly; what a refused call answers is pinned as the property a caller acts on,
+// since the number a library reports for one is its own business and differs between platforms.
+import @std.testing;
+import Path from @std.fs;
+import TemporaryDirectory from @std.fs.temporary;
+import IoErrorKind from bridges;
+import OpenMode from bridges;
+import bridges;
+
+// A folder of this fixture's own, removed when the test that made it ends.
+scratch(string name) -> TemporaryDirectory throws {
+    return try TemporaryDirectory.create("ens-io-bridges-{name}");
+}
+
+test "a write answers nothing wrong and the whole count it was given" {
+    let folder = try scratch("write");
+    let handle = try bridges.mustOpen(folder.path().join("written").toString(),
+        OpenMode.fromEmpty);
+    let wrote = bridges.written(handle, "hello".toBytes());
+    try testing.assertEqual(wrote.code, 0);
+    try testing.assertEqual(wrote.count, 5);
+    try testing.assertEqual(bridges.flushed(handle), 0);
+    try testing.assertEqual(bridges.closed(handle), 0);
+}
+
+test "a read answers the bytes a write left, then answers the end of the stream" {
+    let folder = try scratch("read");
+    Path path = folder.path().join("read-back");
+    let writing = try bridges.mustOpen(path.toString(), OpenMode.fromEmpty);
+    try testing.assertEqual(bridges.written(writing, "abcdef".toBytes()).code, 0);
+    try testing.assertEqual(bridges.closed(writing), 0);
+
+    let reading = try bridges.mustOpen(path.toString(), OpenMode.reading);
+    byte[] buffer = new byte[16];
+    let first = bridges.read(reading, buffer);
+    try testing.assertEqual(first.code, 0);
+    try testing.assertEqual(first.count, 6);
+    try testing.assertEqual(string.fromBytesLossy(buffer.slice(0, first.count)), "abcdef");
+    let second = bridges.read(reading, buffer);
+    try testing.assertEqual(second.code, 0);
+    try testing.assertEqual(second.count, 0);
+    try testing.assertEqual(bridges.closed(reading), 0);
+}
+
+// An open at the end adds to what is there, so a second stream over one path shows the bridge
+// writing where the library left off rather than where the file begins.
+test "a write through a second stream adds to what the first left" {
+    let folder = try scratch("append");
+    Path path = folder.path().join("appended");
+    let opening = try bridges.mustOpen(path.toString(), OpenMode.fromEmpty);
+    try testing.assertEqual(bridges.written(opening, "one".toBytes()).code, 0);
+    try testing.assertEqual(bridges.closed(opening), 0);
+
+    let adding = try bridges.mustOpen(path.toString(), OpenMode.atTheEnd);
+    try testing.assertEqual(bridges.written(adding, "two".toBytes()).code, 0);
+    try testing.assertEqual(bridges.closed(adding), 0);
+    try testing.assertEqual(try path.readText(), "onetwo");
+}
+
+// A stream opened to read alone is what every C library refuses a write, so it is the one refusal
+// this fixture can provoke on every platform without a pipe or a full file system. The refusal is
+// neither a reader that has gone nor a call the system cut short, which are the only two numbers
+// the table maps, so it classifies as Other whichever number the library reports.
+test "a write a stream will not take answers a number and no stream condition" {
+    let folder = try scratch("refused");
+    Path path = folder.path().join("read-only");
+    try path.writeText("already here");
+    let handle = try bridges.mustOpen(path.toString(), OpenMode.reading);
+    let refused = bridges.written(handle, "denied".toBytes());
+    try testing.assertNotEqual(refused.code, 0);
+    try testing.assertTrue(refused.count < 6,
+        "the write was refused and still claims {refused.count} of 6 bytes went");
+    try testing.assertEqual(bridges.kindOf(refused.code), IoErrorKind.other);
+    try testing.assertEqual(bridges.closed(handle), 0);
+}
+
+// No C library clears its error number, so one left by an earlier failure is still there when the
+// next call succeeds. Each bridge reads it on its own failure branch alone, and this says so.
+test "a healthy call after a refused one answers nothing wrong" {
+    let folder = try scratch("stale");
+    Path path = folder.path().join("stale-number");
+    try path.writeText("already here");
+    let refused = try bridges.mustOpen(path.toString(), OpenMode.reading);
+    try testing.assertNotEqual(bridges.written(refused, "denied".toBytes()).code, 0);
+
+    let handle = try bridges.mustOpen(folder.path().join("willing").toString(),
+        OpenMode.fromEmpty);
+    let wrote = bridges.written(handle, "fine".toBytes());
+    try testing.assertEqual(wrote.code, 0);
+    try testing.assertEqual(wrote.count, 4);
+    try testing.assertEqual(bridges.flushed(handle), 0);
+    try testing.assertEqual(bridges.closed(handle), 0);
+    try testing.assertEqual(bridges.closed(refused), 0);
+}

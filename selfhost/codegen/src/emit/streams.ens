@@ -1,0 +1,139 @@
+// The bridges over the C library's own streams. Each one makes its call and reads the library's
+// error number inside the same function, because a number read any later is a number some other
+// call is free to have written first. The number is the library's errno on every target, including
+// Windows, since a C stream call is what reports it and the Microsoft runtime sets it too.
+import TypeRef from @ens.llvm.types;
+import Value from @ens.llvm.values;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import Runtime from emit.runtime;
+import RuntimeDefinition from emit.runtime;
+import RuntimeFunction from emit.runtime;
+
+// What a stream call answers when it failed and the library named no reason. Every target this
+// compiler builds for numbers EIO the same, which is what lets one number serve all of them.
+public final class Unnamed {
+    public static const long failure = 5;
+}
+
+// i32 ens_stream_write(ptr handle, ptr data, i64 count, ptr written): 0 once all `count` bytes are
+// the stream's, or the library's own number for why they are not. `written` always holds how many
+// bytes went, so a caller can say how far it got.
+public writeRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType,
+        runtime.int64Type, runtime.pointerType]);
+    let known = runtime.existing("ens_stream_write", type);
+    if (known != null) {
+        return known;
+    }
+    let write = runtime.libc("fwrite", runtime.int64Type.functionType([runtime.pointerType,
+        runtime.int64Type, runtime.int64Type, runtime.pointerType]));
+    let definition = runtime.beginDefinition("ens_stream_write", type);
+    let builder = runtime.builder;
+    let handle = runtime.parameter(definition, 0);
+    let count = runtime.parameter(definition, 2);
+    let taken = runtime.call(write, [runtime.parameter(definition, 1), runtime.int64(1), count,
+        handle], "taken");
+    memory.buildStore(builder, taken, runtime.parameter(definition, 3));
+    let whole = runtime.block(definition, "write.whole");
+    let partial = runtime.block(definition, "write.partial");
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, taken, count, "whole"),
+        whole, partial);
+
+    builder.positionAtEnd(whole);
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(partial);
+    instructions.buildRet(builder, reason(runtime));
+    return runtime.endDefinition(definition);
+}
+
+// i32 ens_stream_read(ptr handle, ptr buffer, i64 capacity, ptr count): 0 with `count` holding what
+// arrived, which is 0 once the stream has ended, or the library's own number where nothing arrived
+// because the stream failed. A read that got some of what it asked for is not a failure, so the
+// bytes are answered and the stream is asked again.
+public readRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType,
+        runtime.int64Type, runtime.pointerType]);
+    let known = runtime.existing("ens_stream_read", type);
+    if (known != null) {
+        return known;
+    }
+    let read = runtime.libc("fread", runtime.int64Type.functionType([runtime.pointerType,
+        runtime.int64Type, runtime.int64Type, runtime.pointerType]));
+    let failed = runtime.libc("ferror", runtime.int32Type.functionType([runtime.pointerType]));
+    let definition = runtime.beginDefinition("ens_stream_read", type);
+    let builder = runtime.builder;
+    let handle = runtime.parameter(definition, 0);
+    let arrived = runtime.call(read, [runtime.parameter(definition, 1), runtime.int64(1),
+        runtime.parameter(definition, 2), handle], "arrived");
+    memory.buildStore(builder, arrived, runtime.parameter(definition, 3));
+    let none = runtime.block(definition, "read.none");
+    let some = runtime.block(definition, "read.some");
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, arrived, runtime.int64(0),
+        "none"), none, some);
+
+    builder.positionAtEnd(some);
+    instructions.buildRet(builder, runtime.int32(0));
+
+    // Nothing arrived, which is the end of the stream unless the library also raised its flag.
+    builder.positionAtEnd(none);
+    let ended = runtime.block(definition, "read.ended");
+    let broken = runtime.block(definition, "read.broken");
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder,
+        runtime.call(failed, [handle], "failed"), runtime.int32(0), "ended"), ended, broken);
+
+    builder.positionAtEnd(ended);
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(broken);
+    instructions.buildRet(builder, reason(runtime));
+    return runtime.endDefinition(definition);
+}
+
+// i32 ens_stream_flush(ptr handle): 0 once everything written has reached the operating system, or
+// the library's own number for why it has not.
+public flushRuntime(Runtime runtime) -> RuntimeFunction {
+    return oneCall(runtime, "ens_stream_flush", runtime.fflush());
+}
+
+// i32 ens_stream_close(ptr handle): 0 once the stream is the library's again and everything written
+// reached the operating system, or the library's own number for why it did not. The handle must not
+// be touched afterwards either way, since a close gives it back whether or not it could finish.
+public closeRuntime(Runtime runtime) -> RuntimeFunction {
+    return oneCall(runtime, "ens_stream_close",
+        runtime.libc("fclose", runtime.int32Type.functionType([runtime.pointerType])));
+}
+
+// A bridge over one C call that answers 0 or a number of its own, which is the shape both a flush
+// and a close have.
+oneCall(Runtime runtime, string name, RuntimeFunction call) -> RuntimeFunction {
+    let type = runtime.int32Type.functionType([runtime.pointerType]);
+    let known = runtime.existing(name, type);
+    if (known != null) {
+        return known;
+    }
+    let definition = runtime.beginDefinition(name, type);
+    let builder = runtime.builder;
+    let outcome = runtime.call(call, [runtime.parameter(definition, 0)], "outcome");
+    let done = runtime.block(definition, "call.done");
+    let refused = runtime.block(definition, "call.refused");
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, outcome, runtime.int32(0),
+        "done"), done, refused);
+
+    builder.positionAtEnd(done);
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(refused);
+    instructions.buildRet(builder, reason(runtime));
+    return runtime.endDefinition(definition);
+}
+
+// The number a failure answers, which is the library's own wherever it left one. A library that
+// named none still has to answer nonzero, because a caller told 0 would take the call for done.
+reason(Runtime runtime) -> Value {
+    let why = runtime.errnoValue();
+    return instructions.buildSelect(runtime.builder,
+        instructions.buildICmpEQ(runtime.builder, why, runtime.int32(0), "unnamed"),
+        runtime.int32(Unnamed.failure as int), why, "reason");
+}
