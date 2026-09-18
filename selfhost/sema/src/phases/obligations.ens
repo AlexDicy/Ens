@@ -969,7 +969,7 @@ public hashabilityIssue(Type receiver) -> string? {
         if (convert.containsTypeParam(leaf)) {
             return null;
         }
-        if (isOpaqueLeaf(leaf, true, true)) {
+        if (isOpaqueLeaf(leaf, true)) {
             return "'{types.display(receiver)}' cannot be hashed: an array hashes element by "
                 + "element, and its element type '{types.display(leaf)}' has no hash; "
                 + "{noHashReason(leaf)}. Hash a value you keep beside the elements instead.";
@@ -1083,18 +1083,23 @@ public keyTypeIssue(DeclaredType container, Type key) -> string? {
         return refused + "a collection's contents, and so {keyed.upset()}, can change while "
             + "it sits in {keyed.home()}.";
     }
-    if (core is ExternalType) {
-        return refused + "{noHashReason(core)}. Wrap the handle in a class, which hashes by "
-            + "identity, or key by a value you keep beside it.";
-    }
-    if (core is FunctionType) {
-        return refused + "{noHashReason(core)}. Keep a name or tag beside each function and "
-            + "key by that instead.";
-    }
-    if (convert.isFloatType(core) && keyed.keysByHash()) {
-        return refused + "{noHashReason(core)}. Use a SortedMap, which finds a key by its order "
-            + "rather than by its hash, or key by an exact value such as the integer the number "
-            + "came from.";
+    // A type with no hash is refused only by a container that finds a key by hashing it. One
+    // that walks an order asks its key for 'Comparable' instead, which a struct answers with a
+    // 'compareTo' of its own, whatever its fields hold, and the constructor's bound judges that.
+    if (keyed.keysByHash()) {
+        if (core is ExternalType) {
+            return refused + "{noHashReason(core)}. Wrap the handle in a class, which hashes by "
+                + "identity, or key by a value you keep beside it.";
+        }
+        if (core is FunctionType) {
+            return refused + "{noHashReason(core)}. Keep a name or tag beside each function and "
+                + "key by that instead.";
+        }
+        if (convert.isFloatType(core)) {
+            return refused + "{noHashReason(core)}. Use a SortedMap, which finds a key by its "
+                + "order rather than by its hash, or key by an exact value such as the integer "
+                + "the number came from.";
+        }
     }
     if (!types.isStructLike(core)) {
         return null;
@@ -1105,7 +1110,10 @@ public keyTypeIssue(DeclaredType container, Type key) -> string? {
             + "'{types.display(changeable.leaf())}', whose contents can change while the "
             + "{keyed.noun()} sits in {keyed.home()}.";
     }
-    let opaque = firstUnkeyableField(core, keyed.keysByHash());
+    if (!keyed.keysByHash()) {
+        return null;
+    }
+    let opaque = firstUnhashableField(core, new Set<Type>());
     if (opaque != null) {
         string fix = "";
         if (convert.isFloatType(opaque.leaf())) {
@@ -1225,25 +1233,18 @@ noHashReason(Type leaf) -> string {
 // The first field, at any depth, whose type has no '==': a function value or an array of them. An
 // external handle compares by identity, so it never offends here.
 firstIncomparableField(Type structType, Set<Type> visiting) -> OffendingField? {
-    return firstOpaqueField(structType, visiting, false, false);
+    return firstOpaqueField(structType, visiting, false);
 }
 
 // The first field, at any depth, whose type has no 'hash'. An external handle, a function value
 // and a floating-point number are the kinds that offend, as is an array of any of them.
 firstUnhashableField(Type structType, Set<Type> visiting) -> OffendingField? {
-    return firstOpaqueField(structType, visiting, true, true);
-}
-
-// The first field that keeps the struct out of a keyed container. A container that walks an order
-// never hashes its keys, so a floating-point field only offends the ones that do.
-firstUnkeyableField(Type structType, bool byHash) -> OffendingField? {
-    return firstOpaqueField(structType, new Set<Type>(), true, byHash);
+    return firstOpaqueField(structType, visiting, true);
 }
 
 // A struct that declares its own 'equals' and 'hash' answers for itself, so the walk never looks
 // inside one; a field mentioning a type parameter is left for the per-instantiation replay.
-firstOpaqueField(Type structType, Set<Type> visiting, bool externalOffends,
-                 bool floatOffends) -> OffendingField? {
+firstOpaqueField(Type structType, Set<Type> visiting, bool hashing) -> OffendingField? {
     if (declaresOwnPair(structType) || !visiting.add(structType)) {
         return null;
     }
@@ -1260,22 +1261,22 @@ firstOpaqueField(Type structType, Set<Type> visiting, bool externalOffends,
         Type core = convert.coreOf(fieldType);
         if (core is ArrayType) {
             Type element = innermostElementOf(core);
-            if (isOpaqueLeaf(element, externalOffends, floatOffends)) {
+            if (isOpaqueLeaf(element, hashing)) {
                 return new OffendingField(field.name(), core);
             }
             if (types.isStructLike(element)) {
-                let inElement = firstOpaqueField(element, visiting, externalOffends, floatOffends);
+                let inElement = firstOpaqueField(element, visiting, hashing);
                 if (inElement != null) {
                     return new OffendingField(field.name(), core);
                 }
             }
             continue;
         }
-        if (isOpaqueLeaf(core, externalOffends, floatOffends)) {
+        if (isOpaqueLeaf(core, hashing)) {
             return new OffendingField(field.name(), core);
         }
         if (types.isStructLike(core)) {
-            let nested = firstOpaqueField(core, visiting, externalOffends, floatOffends);
+            let nested = firstOpaqueField(core, visiting, hashing);
             if (nested != null) {
                 return new OffendingField(field.name() + "." + nested.path(), nested.leaf());
             }
@@ -1285,16 +1286,13 @@ firstOpaqueField(Type structType, Set<Type> visiting, bool externalOffends,
 }
 
 // A function value has neither operator, so it always offends. An external handle compares by
-// identity, and a floating-point value compares by IEEE rules that hashing cannot follow, so each
-// of those offends only the walks that say so.
-isOpaqueLeaf(Type leaf, bool externalOffends, bool floatOffends) -> bool {
+// identity and a floating-point value compares by IEEE rules, so each of those has an '==' and
+// offends the hash walk alone.
+isOpaqueLeaf(Type leaf, bool hashing) -> bool {
     if (leaf is FunctionType) {
         return true;
     }
-    if (leaf is ExternalType) {
-        return externalOffends;
-    }
-    return floatOffends && convert.isFloatType(leaf);
+    return hashing && (leaf is ExternalType || convert.isFloatType(leaf));
 }
 
 // The first field, at any depth through nullable wrappers and nested structs, whose type is an
