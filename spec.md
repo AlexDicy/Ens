@@ -198,6 +198,7 @@ A narrower number, a nullable value type with its `?` dropped, and one level dro
 The same rule governs the method a class or a struct provides for an interface requirement.
 `override` on a method that overrides nothing is an error, so the marker always names something real: a base or interface method, or a behavior the language provides for the type, which means `toString`, `hash`, and `equals` for a struct and for a class alike.
 The marker is required for all three on a struct, so a struct that declares a `toString`, a `hash`, or an `equals` always writes it as an `override`.
+On a class it is required wherever the declaration has the shape the behavior needs, so a class method named `toString` that takes no arguments and answers a `string` writes it as an `override` too.
 A struct has no base class, so on a struct the marker names either one of those three behaviors or a method an interface the struct implements declares.
 
 Every class value has a text form, rendered from the value's runtime type wherever `.toString()` is called or an interpolation hole holds the value.
@@ -206,7 +207,8 @@ A generic class renders with its arguments the way diagnostics spell them, such 
 A class replaces that default by declaring `override toString() -> string` with a body, under the same shape rules as a struct's `toString`: no parameters, a `string` result, and never `throws`.
 The replacement dispatches from the runtime type, so a subclass's `toString` wins through a base-class-typed or interface-typed reference, and a subclass may override an ancestor's `toString` like any other method.
 A `toString` override cannot be `abstract`: every class already answers with its type name, so there is no text form left unwritten.
-A class method named `toString` that does not write `override` is an ordinary method; calls reach it by name, but interpolation holes and the built-in text form do not use it.
+A class method that has the text form's shape and does not write `override` is an error, because it would replace the default every class already answers with while reading as though it did not.
+A method named `toString` whose shape differs, such as one that takes an argument, is an ordinary method; calls reach it by name, and interpolation holes and the built-in text form do not use it.
 Like a `toString` on a struct, one written `override` follows its class's visibility when unmarked and may not be marked less visible than the class itself.
 
 `super.method(...)` calls the base class's implementation, bypassing any override. A constructor may call `super(...)` as its first statement to run the base constructor; if it does not, the base class must be constructible with no arguments. `protected` members (see above) are reachable from subclasses.

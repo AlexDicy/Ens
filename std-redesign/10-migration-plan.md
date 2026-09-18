@@ -26,6 +26,7 @@ The order puts independent small features first and the two big ones last, so a 
 - A2: interfaces extending interfaces; conformance and monomorphization follow the flattened set.
 - A3: `static` members, reachable only through the type name.
 - A4: `toString` overridable on classes; dispatch already exists through the descriptor slots.
+  Its transition rule, which let an unmarked class `toString` pass as an ordinary method, closed in Phase D once `StringBuilder` carried the marker: a class method with the text form's shape now has to write `override`, and one whose shape differs is still an ordinary method.
 - A5: class-typed generic bounds (`E: Error`); bounds today name interfaces only.
 - A6: conditional members: the constraint-vs-declaration rules for member type-parameter lists, monomorphization filtering, and the unmet-bound diagnostic.
 - A7: nested optionals: remove the collapse, audit the six places that assume one level, rewrite the two tests that assert collapsing, add the spec section for the level rules.
