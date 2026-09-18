@@ -3182,7 +3182,8 @@ std::vector<std::vector<StructInfo*>> Analyzer::resolveTypeParamBounds(
                 b = bt->structInfo;
             } else {
                 errorAtNode(br.node, "A type-parameter bound must be a non-generic class or "
-                    "an interface; '" + bt->toString() + "' is not");
+                    "an interface; '" + bt->toString() + "' is not. Replace it with a class or "
+                    "an interface, or remove the bound.");
                 continue;
             }
             bool dup = false;
@@ -3198,7 +3199,7 @@ std::vector<std::vector<StructInfo*>> Analyzer::resolveTypeParamBounds(
                 if (classBound) {
                     errorAtNode(br.node, "Type parameter '" + pname + "' already has the class "
                         "bound '" + asciiOf(classBound->name) + "'; at most one bound can be a "
-                        "class, every other bound must be an interface.");
+                        "class. Keep one class bound and make the rest interfaces.");
                     continue;
                 }
                 classBound = b;
@@ -5084,7 +5085,8 @@ Type* Analyzer::analyzeExpr(const ast::Expression& expr) {
     else if (auto cc = expr.asCheckedCast()) t = analyzeCheckedCast(*cc);
     else if (auto tt = expr.asTypeTest()) t = analyzeTypeTest(*tt);
     else if (auto oa = expr.asOutArgument()) {
-        errorAtNode(expr.node, "'out' can only be used when calling an external function.");
+        errorAtNode(expr.node, "'out' can only be used when calling an external "
+            "function. Remove 'out' from the argument.");
         t = typeCtx.getError();
     }
     else if (expr.asNamedArgument()) {
@@ -5284,7 +5286,9 @@ Type* Analyzer::analyzeIdent(const ast::IdentExpression& expr) {
 
 Type* Analyzer::analyzeThis(const ast::ThisExpression& expr) {
     if (!currentThis) {
-        errorAtNode(expr.node, "'this' is only valid inside a method");
+        errorAtNode(expr.node, "'this' names the object a method was called on, and a function "
+            "has none. Take the object as a parameter, or move the code into a method of its "
+            "type.");
         return typeCtx.getError();
     }
     analysis.setSymbol(expr.node.greenNode(), currentThis);
@@ -5293,7 +5297,8 @@ Type* Analyzer::analyzeThis(const ast::ThisExpression& expr) {
 
 Type* Analyzer::analyzeSuper(const ast::SuperExpression& expr) {
     if (!currentThis || !currentThis->type || !currentThis->type->structInfo) {
-        errorAtNode(expr.node, "'super' is only valid inside a method");
+        errorAtNode(expr.node, "'super' reaches the base class of the object a method was called "
+            "on, and a function has none. Move the code into a method of the subclass.");
         return typeCtx.getError();
     }
     StructInfo* cls = currentThis->type->structInfo;
@@ -6955,7 +6960,8 @@ Type* Analyzer::checkFromCStringCall(const ast::CallExpression& expr) {
         return result;
     }
     if (args[0].asOutArgument()) {
-        errorAtNode(args[0].node, "'out' can only be used when calling an external function.");
+        errorAtNode(args[0].node, "'out' can only be used when calling an external "
+            "function. Remove 'out' from the argument.");
         return result;
     }
     Type* argT = analyzeExpr(args[0]);
@@ -6980,7 +6986,8 @@ Type* Analyzer::checkDirectCallArguments(const ast::CallExpression& expr, Symbol
     size_t n = std::min(args.size(), sym->paramTypes.size());
     for (size_t i = 0; i < n; ++i) {
         if (args[i].asOutArgument()) {
-            errorAtNode(args[i].node, "'out' can only be used when calling an external function.");
+            errorAtNode(args[i].node, "'out' can only be used when calling an external "
+                "function. Remove 'out' from the argument.");
             continue;
         }
         Type* paramT = sym->paramTypes[i];
@@ -6992,7 +6999,8 @@ Type* Analyzer::checkDirectCallArguments(const ast::CallExpression& expr, Symbol
     }
     for (size_t i = n; i < args.size(); ++i) {
         if (args[i].asOutArgument()) {
-            errorAtNode(args[i].node, "'out' can only be used when calling an external function.");
+            errorAtNode(args[i].node, "'out' can only be used when calling an external "
+                "function. Remove 'out' from the argument.");
         } else {
             analyzeExpr(args[i]);
         }
@@ -8332,7 +8340,8 @@ Type* Analyzer::analyzeSwitchArms(const std::optional<ast::Expression>& scrutine
                         Type* lt = analyzeExpr(label);
                         if (!lt->isError() && !lt->equals(inner)) {
                             errorAtNode(label.node, "Switch label of type '" + lt->toString() +
-                                "' does not match the switch value of type '" + inner->toString() + "'.");
+                                "' does not match the switch value of type '" + inner->toString() +
+                                "'. Write a label of type '" + inner->toString() + "'.");
                         }
                         if (auto ec = analysis.enumConstantOf(label.node.greenNode())) value = *ec;
                     }
@@ -8364,7 +8373,8 @@ Type* Analyzer::analyzeSwitchArms(const std::optional<ast::Expression>& scrutine
                     } else if (!lt->isError()) {
                         if (!inner->assignableFrom(lt) && !lt->assignableFrom(inner)) {
                             errorAtNode(label.node, "Switch label of type '" + lt->toString() +
-                                "' does not match the switch value of type '" + inner->toString() + "'.");
+                                "' does not match the switch value of type '" + inner->toString() +
+                                "'. Write a label of type '" + inner->toString() + "'.");
                         } else {
                             errorAtNode(label.node, "Switch labels for an integer switch must be integer constants.");
                         }
@@ -8374,7 +8384,8 @@ Type* Analyzer::analyzeSwitchArms(const std::optional<ast::Expression>& scrutine
                     std::u16string text;
                     if (!lt->isError() && !lt->isString()) {
                         errorAtNode(label.node, "Switch label of type '" + lt->toString() +
-                            "' does not match the switch value of type 'string'.");
+                            "' does not match the switch value of type 'string'. Write a string "
+                            "literal label.");
                     } else if (stringLabelText(label, text)) {
                         bool dup = false;
                         for (auto& s : seenStrings) if (s == text) { dup = true; break; }
