@@ -1,88 +1,11 @@
-// The POSIX half of the spawn bridge: the argument and environment vectors point into the NUL
-// separated blocks the caller built, and the child takes only the streams and the environment it
-// was given before it execs.
+// The POSIX pieces both child families share: the wait that a signal cannot cut short, the status
+// it leaves, and the vectors that point into the NUL separated blocks the caller built.
 import Value from @ens.llvm.values;
 import BasicBlock from @ens.llvm.blocks;
 import @ens.llvm.instructions;
 import @ens.llvm.memory;
 import Runtime from emit.runtime;
 import RuntimeDefinition from emit.runtime;
-import emit.system;
-
-// The argument and environment vectors point into the NUL separated blocks; the child aims a
-// captured stream at the file the parent opened, leaves an inherited one alone, takes the
-// environment as its own where it was given one, and execs. The parent normalizes the wait status
-// the way the shell runner does.
-public posixSpawn(Runtime runtime, RuntimeDefinition definition, Value outSlot, Value errSlot,
-                  Value statusSlot, BasicBlock closeBlock) {
-    let builder = runtime.builder;
-    let forkProcess = runtime.libc("fork", runtime.int32Type.functionType([]));
-    let execProgram = runtime.libc("execvp",
-        runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
-    let exitChild = runtime.libc("_exit", runtime.voidType.functionType([runtime.int32Type]));
-    let childBlock = runtime.block(definition, "spawn.child");
-    let parentBlock = runtime.block(definition, "spawn.parent");
-    let failedBlock = runtime.block(definition, "spawn.failed");
-    let waitBlock = runtime.block(definition, "spawn.wait");
-    let lostBlock = runtime.block(definition, "spawn.lost");
-
-    let program = runtime.parameter(definition, 0);
-    let argumentCount = runtime.parameter(definition, 2);
-    let environmentCount = runtime.parameter(definition, 5);
-    let argumentVector = memory.buildArrayAlloca(builder, runtime.pointerType,
-        instructions.buildAdd(builder, argumentCount, runtime.int64(2), ""), "argv");
-    memory.buildStore(builder, program, argumentVector);
-    blockVector(runtime, definition, argumentVector, runtime.int64(1),
-        runtime.parameter(definition, 1), argumentCount, "argv");
-    let environmentVector = memory.buildArrayAlloca(builder, runtime.pointerType,
-        instructions.buildAdd(builder, environmentCount, runtime.int64(1), ""), "envp");
-    blockVector(runtime, definition, environmentVector, runtime.int64(0),
-        runtime.parameter(definition, 4), environmentCount, "envp");
-    let outDescriptor = streamDescriptor(runtime, definition, outSlot, "out.fd");
-    let errDescriptor = streamDescriptor(runtime, definition, errSlot, "err.fd");
-
-    let child = runtime.call(forkProcess, [], "child");
-    instructions.buildCondBr(builder,
-        instructions.buildICmpEQ(builder, child, runtime.int32(0), ""), childBlock, parentBlock);
-
-    builder.positionAtEnd(childBlock);
-    redirect(runtime, definition, outDescriptor, 1, "child.out");
-    redirect(runtime, definition, errDescriptor, 2, "child.err");
-    let takeBlock = runtime.block(definition, "child.environment");
-    let execBlock = runtime.block(definition, "child.exec");
-    instructions.buildCondBr(builder, instructions.buildICmpSGT(builder, environmentCount,
-        runtime.int64(0), ""), takeBlock, execBlock);
-
-    builder.positionAtEnd(takeBlock);
-    memory.buildStore(builder, environmentVector, system.environGlobal(runtime));
-    instructions.buildBr(builder, execBlock);
-
-    builder.positionAtEnd(execBlock);
-    runtime.call(execProgram, [program, argumentVector], "");
-    runtime.call(exitChild, [runtime.int32(127)], "");
-    instructions.buildUnreachable(builder);
-
-    builder.positionAtEnd(parentBlock);
-    instructions.buildCondBr(builder,
-        instructions.buildICmpSLT(builder, child, runtime.int32(0), ""), failedBlock, waitBlock);
-
-    builder.positionAtEnd(failedBlock);
-    memory.buildStore(builder, runtime.int64(127), statusSlot);
-    instructions.buildBr(builder, closeBlock);
-
-    builder.positionAtEnd(waitBlock);
-    let waitedSlot = memory.buildAlloca(builder, runtime.int32Type, "wait.status");
-    awaitChild(runtime, definition, child, waitedSlot, lostBlock, "wait");
-    let waited = memory.buildLoad(builder, runtime.int32Type, waitedSlot, "wait.cur");
-    memory.buildStore(builder,
-        instructions.buildSExt(builder, normalizedStatus(runtime, waited), runtime.int64Type, ""),
-        statusSlot);
-    instructions.buildBr(builder, closeBlock);
-
-    builder.positionAtEnd(lostBlock);
-    memory.buildStore(builder, runtime.int64(-2), statusSlot);
-    instructions.buildBr(builder, closeBlock);
-}
 
 // Waits for the child and leaves its raw wait status in the slot, going on to `lostBlock` when no
 // status could be read at all and leaving the builder where the status is known. A signal arriving
@@ -130,48 +53,6 @@ public normalizedStatus(Runtime runtime, Value status) -> Value {
     let signalCode = instructions.buildAdd(builder, signal, runtime.int32(128), "signal.code");
     return instructions.buildSelect(builder, exited, exitCode,
         instructions.buildSelect(builder, signaled, signalCode, status, ""), "normalized");
-}
-
-// The file descriptor a captured stream writes to, or -1 when the stream is inherited and the child
-// leaves it alone. An inherited stream has no file to ask, which is why this branches rather than
-// choosing between two values it would both have to compute.
-streamDescriptor(Runtime runtime, RuntimeDefinition definition, Value slot, string label) -> Value {
-    let builder = runtime.builder;
-    let fileNumber = runtime.libc("fileno", runtime.int32Type.functionType([runtime.pointerType]));
-    let fileBlock = runtime.block(definition, label + ".file");
-    let inheritBlock = runtime.block(definition, label + ".inherit");
-    let readyBlock = runtime.block(definition, label + ".ready");
-    let descriptorSlot = memory.buildAlloca(builder, runtime.int32Type, label);
-    let file = memory.buildLoad(builder, runtime.pointerType, slot, "stream");
-    instructions.buildCondBr(builder, runtime.isNull(file), inheritBlock, fileBlock);
-
-    builder.positionAtEnd(fileBlock);
-    memory.buildStore(builder, runtime.call(fileNumber, [file], "fd"), descriptorSlot);
-    instructions.buildBr(builder, readyBlock);
-
-    builder.positionAtEnd(inheritBlock);
-    memory.buildStore(builder, runtime.int32(-1), descriptorSlot);
-    instructions.buildBr(builder, readyBlock);
-
-    builder.positionAtEnd(readyBlock);
-    return memory.buildLoad(builder, runtime.int32Type, descriptorSlot, "fd.ready");
-}
-
-redirect(Runtime runtime, RuntimeDefinition definition, Value descriptor, long target, string label) {
-    let builder = runtime.builder;
-    let duplicate = runtime.libc("dup2",
-        runtime.int32Type.functionType([runtime.int32Type, runtime.int32Type]));
-    let redirectBlock = runtime.block(definition, label + ".redirect");
-    let keepBlock = runtime.block(definition, label + ".keep");
-    instructions.buildCondBr(builder,
-        instructions.buildICmpSGE(builder, descriptor, runtime.int32(0), ""), redirectBlock,
-        keepBlock);
-
-    builder.positionAtEnd(redirectBlock);
-    runtime.call(duplicate, [descriptor, runtime.int32(target)], "");
-    instructions.buildBr(builder, keepBlock);
-
-    builder.positionAtEnd(keepBlock);
 }
 
 // Fills a pointer vector from a NUL separated block: the block holds the values one after another,
