@@ -70,7 +70,6 @@ A native reproduction outside the compiler never fired over 200 iterations, so t
 
 A dedicated review pass over the diagnostic messages introduced across the whole migration (requested 2026-08-27).
 Its first item, ruled 2026-09-08 with import aliasing: a diagnostic names a type as the file it is reported in can name it, the alias where one is bound, `alias.Type` where the type is reached through a module alias, and the module-qualified name only where the file has no name for it, because today a suggested fix such as "write '((int) -> void throws Boom)'" can name a type the file bound under another name and so fail to compile when followed.
-Two import-binding gaps go to that review (found 2026-09-08 while reviewing import aliasing): a local `class Box {}` silently shadows an `import Box from lib.box;` while a local function colliding with an import is refused, and that refusal says "imported or built-in type" even when the import is a module.
 A failed bound on a library generic is reported at the consumer's own line, while a failed obligation such as an array element that cannot be defaulted is reported at the library's line under an `In 'Slots<Path>'` prefix, so a user is pointed into source they did not write (found 2026-09-08); the review decides whether an obligation failure moves to the instantiation mention with the library's line as a second location, following the bound check.
 
 ## After Phase D

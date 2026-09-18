@@ -57,6 +57,19 @@ inline const char* declKindWord(DeclKind k) {
     return "class";
 }
 
+// The same, with the article a sentence naming one declaration needs.
+inline const char* declKindPhrase(DeclKind k) {
+    switch (k) {
+        case DeclKind::Struct:    return "a struct";
+        case DeclKind::Interface: return "an interface";
+        case DeclKind::Enum:      return "an enum";
+        case DeclKind::External:  return "an external type";
+        case DeclKind::Primitive: return "a primitive";
+        case DeclKind::Class:     return "a class";
+    }
+    return "a class";
+}
+
 struct FieldInfo {
     std::u16string name;
     Type* type;

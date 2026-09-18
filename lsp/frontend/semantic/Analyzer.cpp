@@ -1140,6 +1140,17 @@ void Analyzer::collectEnums(const ast::SourceFile& file) {
     }
 }
 
+// The same import written under another name. For a type the new name is the colliding one with
+// `Lib` in front. For a module it is the colliding one with `Module` after.
+static std::string aliasedImport(const ast::ImportDecl& imp) {
+    std::string path = (imp.isPackage() ? "@" : "") + asciiOf(imp.modulePath());
+    std::string bound = asciiOf(imp.boundName().value_or(std::u16string{}));
+    if (auto name = imp.importedNameText()) {
+        return "import " + asciiOf(*name) + " as Lib" + bound + " from " + path + ";";
+    }
+    return "import " + path + " as " + bound + "Module;";
+}
+
 std::u16string Analyzer::importTargetPath(const ast::ImportDecl& imp) const {
     std::u16string mp = imp.modulePath();
     if (imp.isPackage() || packagePrefix_.empty()) return mp;
@@ -1164,6 +1175,18 @@ void Analyzer::bindTypeImports(const ModuleResolver& resolver) {
         if (!bound) continue;
         auto boundToken = imp.boundNameToken();
         uint32_t namePos = boundToken ? boundToken->startOffset() : imp.node.startOffset();
+        // A name this file declares as a type is not shadowed by an import of the same name; the
+        // import has to be bound to another one, and only the import can move.
+        if (Type* declared = typeCtx.lookupNamedType(modulePath_, *bound)) {
+            if (declared->structInfo) {
+                std::string what = imp.importedNameText() ? "Imported name" : "Imported module name";
+                errorAtNode(boundToken ? *boundToken : imp.node, what + " '" + asciiOf(*bound) +
+                    "' is already declared as " + declKindPhrase(declared->structInfo->declKind) +
+                    " in this file; bind the import to another name, as in '" +
+                    aliasedImport(imp) + "'.");
+                continue;
+            }
+        }
         if (auto name = imp.importedNameText()) {
             // Named import: `import Name from path;`, bound under `Name` or its alias.
             Type* importedType = typeCtx.lookupNamedType(targetPath, *name);
