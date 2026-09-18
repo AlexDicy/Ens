@@ -17,7 +17,7 @@ bool sameParameterTypes(const Symbol* a, const Symbol* b) {
 const MethodInfo* declaredToString(const StructInfo* info) {
     if (!info) return nullptr;
     for (const MethodInfo& m : info->methods) {
-        if (m.name == u"toString") return &m;
+        if (m.name == u"toString" && m.symbol && m.symbol->paramTypes.empty()) return &m;
     }
     return nullptr;
 }

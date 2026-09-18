@@ -20,7 +20,7 @@ The same holds for a field: a subclass may declare a field whose name a private 
 Overriding a base method therefore requires that method to be at least `protected`, and an abstract method must be at least `protected` too, since a subclass has to implement it.
 A method that provides an interface requirement must be as visible as its own class, because anyone who can hold one of its values as the interface can call it through the interface.
 A method that overrides a base class method writes the visibility of the method it overrides, capped at what its own class can hold (`protected` in a file-private class, `public` in a `public` one), and an override with no marker or a different one is an error naming the required marker.
-One kind of method follows its type's visibility instead of the default: a method that replaces a behavior the language already provides, meaning a struct's or a class's `toString`, `hash`, and `equals`.
+One kind of method follows its type's visibility instead of the default: a method that replaces a behavior the language already provides, meaning a struct's or a class's `toString`, `hash`, and `equals`, where the `toString` is one that takes no parameters.
 The language calls such a method wherever the type is used, so it may not be marked less visible than its type either.
 Interface members carry no visibility of their own: they always follow the interface, and writing a visibility modifier on an interface member is an error.
 Enum cases follow their enum.
@@ -105,7 +105,7 @@ A method named `equals` whose single parameter is some other type is an ordinary
 A struct serializes to a JSON string through `.toString()` and in interpolation holes, honoring the default-serialization promise.
 The form is a JSON object listing every field, including private and protected ones, in declaration order: `{"field": value, ...}`.
 Numbers render as decimals, `bool` as `true` or `false`, strings and enum members as JSON-quoted text (with `"`, `\`, and control characters escaped), a `char` as a one-character quoted string with its scalar encoded to UTF-8 and escaped the same way, an absent nullable field as `null`, and a nested struct as its own JSON object.
-A struct that declares its own `toString` method uses that method instead; because it replaces the built-in form, it is written `override toString() -> string`, taking no arguments and never `throws`, since an interpolation hole has nowhere to write a `try`.
+A struct that declares a `toString` taking no parameters uses that method instead; because it replaces the built-in form, it is written `override toString() -> string` and never `throws`, since an interpolation hole has nowhere to write a `try`.
 A struct is serializable only when every field is: a value type, a string, an enum, one of those made nullable, a nested such struct, or an array of any of these, which serializes as a JSON list.
 A field that is a class or an external handle has no JSON form, and neither does an array whose elements are; such a field makes serializing the struct an error that names it, mirroring the `==` rule.
 
@@ -198,18 +198,18 @@ An override's parameter types must match exactly, while its return type may be n
 A narrower number, a nullable value type with its `?` dropped, and one level dropped from a doubly nullable type are each rejected, because a caller reaching the method through the type that declared it would read the declared shape and find the other one.
 The same rule governs the method a class or a struct provides for an interface requirement.
 `override` on a method that overrides nothing is an error, so the marker always names something real: a base or interface method, or a behavior the language provides for the type, which means `toString`, `hash`, and `equals` for a struct and for a class alike.
-The marker is required for all three on a struct, so a struct that declares a `toString`, a `hash`, or an `equals` always writes it as an `override`.
-On a class it is required wherever the declaration has the shape the behavior needs, so a class method named `toString` that takes no arguments and answers a `string` writes it as an `override` too.
+The marker is required wherever a declaration has the shape the behavior needs, on a struct and on a class alike, so a `hash` that takes no arguments and answers a `long`, an `equals` that takes one value of the declaring type, and a `toString` that takes no arguments each write it as an `override`.
 A struct has no base class, so on a struct the marker names either one of those three behaviors or a method an interface the struct implements declares.
 
 Every class value has a text form, rendered from the value's runtime type wherever `.toString()` is called or an interpolation hole holds the value.
 A class with no `toString` override anywhere in its chain answers with its runtime type's name, so a subclass prints its own name even through a base-class-typed or interface-typed reference.
 A generic class renders with its arguments the way diagnostics spell them, such as `Box<int>`.
-A class replaces that default by declaring `override toString() -> string` with a body, under the same shape rules as a struct's `toString`: no parameters, a `string` result, and never `throws`.
+A class replaces that default by declaring `override toString() -> string` with a body, under the shape rule below: no parameters, a `string` result, and never `throws`.
 The replacement dispatches from the runtime type, so a subclass's `toString` wins through a base-class-typed or interface-typed reference, and a subclass may override an ancestor's `toString` like any other method.
 A `toString` override cannot be `abstract`: every class already answers with its type name, so there is no text form left unwritten.
-A class method that has the text form's shape and does not write `override` is an error, because it would replace the default every class already answers with while reading as though it did not.
-A method named `toString` whose shape differs, such as one that takes an argument, is an ordinary method; calls reach it by name, and interpolation holes and the built-in text form do not use it.
+The name `toString` is reserved for the text form wherever a declaration under it takes no parameters, on a struct and on a class alike: such a declaration must read `override toString() -> string`, and every other shape a parameterless one could have is an error naming that form.
+So a parameterless `toString` that answers something other than a `string`, one that declares `throws`, and one that leaves the marker off are each refused, the last because it would replace the text form the type already has while reading as though it did not.
+A method named `toString` that takes parameters is an ordinary method of either kind, so calls reach it by name, and interpolation holes and the built-in text form do not use it.
 Like a `toString` on a struct, one written `override` follows its class's visibility when unmarked and may not be marked less visible than the class itself.
 
 Inside a method, a constructor, or a destructor, a struct's or a class's own fields and methods are reached through `this`, as in `this.width` and `this.area()`, because a bare name there is a local, a parameter, or a top-level declaration and never a member.
@@ -1585,7 +1585,7 @@ The accepted escapes are `\n`, `\r`, `\t`, `\b`, `\f`, `\0`, `\\`, `\"`, `\'`, `
 - `==` and `!=` compare **contents**, not identity, so `"ab" == "a" + "b"` is true.
 - `s.length` returns the number of UTF-8 **bytes** as a `long`.
 - `+` concatenates strings. When one side is a string, a number (integer, `char`, or floating-point) or a `bool` on the other side is converted to text implicitly (the same way `.toString()` would). Every other type is rejected here, structs and classes included even though they have a text form; interpolate those or call `.toString()` instead.
-- `.toString()` produces a string from a value explicitly: integer types format as decimal, floating-point types by the rule below, a `char` as the one character it denotes (its Unicode scalar encoded as UTF-8 bytes, so `'A'` is `"A"` and `'7'` is `"7"`, not their code points; write `c as int` first for the number), `bool` as `true` or `false`, a string returns itself, a struct produces its JSON form or what its own `toString` returns, a class or interface value produces what its runtime type's `toString` override returns, or that type's name when no class in its chain declares one, and an array produces the same JSON-style list interpolation renders.
+- `.toString()` produces a string from a value explicitly: integer types format as decimal, floating-point types by the rule below, a `char` as the one character it denotes (its Unicode scalar encoded as UTF-8 bytes, so `'A'` is `"A"` and `'7'` is `"7"`, not their code points; write `c as int` first for the number), `bool` as `true` or `false`, a string returns itself, a struct produces its JSON form or what its own parameterless `toString` returns, a class or interface value produces what its runtime type's parameterless `toString` override returns, or that type's name when no class in its chain declares one, and an array produces the same JSON-style list interpolation renders.
   It can be written directly on a literal, as in `42.toString()`.
 - Everything else text can do is a member the standard library declares, described with the rest of the library: searching, substrings, trimming, splitting, case conversion, padding, `toBytes` and `string.fromBytes`, and the character and byte views.
   Strings have no `<`, `<=`, `>` or `>=` operators; order them with `compareTo`, which the library declares as well.
@@ -1616,9 +1616,9 @@ let status = "done={finished}, items={count}";                // bool and intege
 let braces = "use \{these\} verbatim";                        // "use {these} verbatim"
 ```
 
-Holes accept string, integer (including `char`), floating-point, `bool`, and enum values, structs whose fields are all serializable (rendered as JSON) or that declare their own `toString`, class and interface values, rendered from the runtime type: its `toString` override, or its type name when no class in the chain declares one, and arrays of any of these; convert other types explicitly with `.toString()` first.
+Holes accept string, integer (including `char`), floating-point, `bool`, and enum values, structs whose fields are all serializable (rendered as JSON) or that declare their own parameterless `toString`, class and interface values, rendered from the runtime type: its parameterless `toString` override, or its type name when no class in the chain declares one, and arrays of any of these; convert other types explicitly with `.toString()` first.
 An array renders as a JSON-style list, `[` its elements joined by `, ` and `]`: each element as struct serialization would write it, so strings arrive quoted and escaped, an absent nullable element reads `null`, and a struct element is its JSON object even when the struct declares its own `toString`, exactly as a struct nested in another struct is.
-A class or interface element renders through its runtime type's `toString`, and a struct element whose fields have no JSON form makes the array an error naming the field, whatever `toString` the struct declares.
+A class or interface element renders through its runtime type's parameterless `toString`, and a struct element whose fields have no JSON form makes the array an error naming the field, whatever `toString` the struct declares.
 A hole may hold one nullable level over any of those: it renders the value's own text where the value is there and `null` where it is not, so a `string?`, an `int?`, or a nullable struct, class, or enum needs no check first. A value nullable at more than one level is an error, because every absent level would read the same.
 A `char` hole renders as its character rather than its numeric code point, so `"{'A'}"` is `"A"`; interpolate `c as int` when the number is wanted.
 Inside a generic body a hole may hold a value of a type-parameter type; the requirement is then checked against the concrete type of each instantiation.

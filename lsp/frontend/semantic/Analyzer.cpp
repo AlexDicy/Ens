@@ -1532,7 +1532,7 @@ void Analyzer::collectStructs(const ast::SourceFile& file) {
             checkHashMethodSignature(m, sym, isCtor);
             checkEqualsMethodSignature(m, sym, isCtor);
             checkToStringMethodSignature(m, sym, isCtor);
-            const char* behavior = builtinBehaviorReplaced(t, mname, sym, m.isOverride());
+            const char* behavior = builtinBehaviorReplaced(t, mname, sym);
             checkStructOverrideMarker(m, t, mname, sym, isCtor, behavior);
             checkStructAbstractMarker(m, t, mname, isCtor);
             analysis.setSymbol(m.node.greenNode(), sym);
@@ -1917,9 +1917,9 @@ static bool equalsSignatureConforms(const Symbol* sym) {
     return sym->returnType && sym->returnType->kind == TypeKind::Bool;
 }
 
-// A struct or a class renders as text through `toString`, so a declaration must match the
-// contract that text form needs: no arguments, a `string` result, and no `throws`
-// for a caller that has nowhere to write `try`.
+// A struct or a class renders as text through a `toString` that takes no parameters, and such a
+// declaration has to give a `string` result with no `throws`, for a caller that has nowhere to
+// write `try`. One that takes parameters is an ordinary method.
 static bool toStringSignatureConforms(const Symbol* sym) {
     return sym && sym->paramTypes.empty() && !sym->declaredThrows && sym->returnType &&
         sym->returnType->isString();
@@ -2057,7 +2057,7 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
         }
 
         const char* behavior = isDtor ? nullptr
-                                      : builtinBehaviorReplaced(t, mname, sym, m.isOverride());
+                                      : builtinBehaviorReplaced(t, mname, sym);
         Visibility methodVisibility = isDtor ? Visibility::Private
                      : behavior ? builtinReplacementVisibility(m.visibilityModifier(), t, mname,
                                                                behavior)
@@ -2101,6 +2101,7 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
         checkThrowsClausePlacement(m, isCtor);
         checkHashMethodSignature(m, sym, isCtor);
         checkEqualsMethodSignature(m, sym, isCtor);
+        checkToStringMethodSignature(m, sym, isCtor);
         if (isCtor) {
             if (m.isOverride() || m.isAbstract())
                 errorAtNode(m.node, "A constructor cannot be 'override' or 'abstract'.");
@@ -2127,7 +2128,8 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
         // compiler provides. It is written with 'override' like any other override.
         // `reservedIntent` also covers the near-miss shapes, which get their own
         // signature diagnostics rather than a spurious "nothing to override".
-        bool reservedIntent = mname == u"hash" || mname == u"toString" ||
+        bool reservedIntent = mname == u"hash" ||
+            (mname == u"toString" && sym->paramTypes.empty()) ||
             (mname == u"equals" && equalsSignatureIntent(sym));
         bool reservedConforming = (mname == u"hash" && hashSignatureConforms(sym)) ||
                                   (mname == u"toString" && toStringSignatureConforms(sym)) ||
@@ -2177,6 +2179,11 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
                     "inherited and nothing here can call it. Mark it 'protected' in '" +
                     asciiOf(privateBase->name) + "' to allow overriding, or drop 'override' to "
                     "declare a method of this class's own.");
+            } else if (mname == u"toString" && !sym->paramTypes.empty()) {
+                errorAtNode(m.node, "Method 'toString' of '" + asciiOf(si->name) + "' is marked "
+                    "'override' but no base class or implemented interface declares it; a "
+                    "'toString' that takes parameters is an ordinary method rather than the text "
+                    "form every class answers with. Remove 'override'.");
             } else {
                 errorAtNode(m.node, "Method '" + asciiOf(mname) + "' is marked 'override' but no "
                     "base class or implemented interface declares it.");
@@ -2597,40 +2604,45 @@ void Analyzer::checkEqualsMethodSignature(const ast::FuncDecl& fn, Symbol* sym, 
     }
 }
 
+// A `toString` taking parameters is an ordinary method on either kind, so this says nothing
+// about it.
 void Analyzer::checkToStringMethodSignature(const ast::FuncDecl& fn, Symbol* sym,
                                             bool isConstructor) {
     if (isConstructor || !sym || sym->name != u"toString") return;
+    if (!sym->paramTypes.empty()) return;
     if (fn.isThrows()) {
         errorAtNode(fn.throwsToken().value_or(fn.node),
             "A method named 'toString' cannot be marked 'throws'; a value's text form is used "
             "where there is no room for a 'try', such as an interpolation hole. Remove 'throws', "
             "or rename the method.");
     }
-    if (!sym->paramTypes.empty() || !sym->returnType || !sym->returnType->isString()) {
+    if (!sym->returnType || !sym->returnType->isString()) {
         errorAtNode(fn.node, "A method named 'toString' must have the signature "
             "'toString() -> string'; it defines how values of this type render as text (for "
-            "example in an interpolation hole).");
+            "example in an interpolation hole). Give it a 'string' result, or a parameter to "
+            "make it an ordinary method.");
     }
 }
 
 // The behavior a member takes over from the language, or null for an ordinary
-// member: a type's text form, and the hash and equality a value is keyed by. What
-// an `equals` replaces differs by kind: a struct's memberwise comparison, a
-// class's identity. A class's text form (its type name) is replaced by a
-// declaration that writes the `override` marker. A conforming `toString` has to
-// write it. One whose signature differs is an ordinary method the language never calls.
+// member. The three are a type's text form and the hash and equality a value is
+// keyed by. What an `equals` replaces differs by kind, a struct's memberwise
+// comparison against a class's identity. The text form is claimed by a `toString`
+// that takes no parameters, on either kind. One that takes parameters is an ordinary
+// method the language never calls.
 const char* Analyzer::builtinBehaviorReplaced(const Type* owner,
                                               const std::u16string& memberName,
-                                              const Symbol* sym, bool declaresOverride) const {
+                                              const Symbol* sym) const {
     if (!owner || !owner->structInfo || !sym) return nullptr;
+    bool claimsTextForm = memberName == u"toString" && sym->paramTypes.empty();
     if (owner->isStruct()) {
-        if (memberName == u"toString") return "text form";
+        if (claimsTextForm) return "text form";
         if (memberName == u"hash") return "content hash";
         if (memberName == u"equals" && equalsSignatureIntent(sym)) return "memberwise equality";
         return nullptr;
     }
     if (owner->isClass() && !owner->isInterface()) {
-        if (memberName == u"toString" && declaresOverride) return "text form";
+        if (claimsTextForm) return "text form";
         if (memberName == u"hash") return "identity hash";
         if (memberName == u"equals" && equalsSignatureIntent(sym)) return "identity equality";
     }
@@ -2764,22 +2776,26 @@ void Analyzer::checkStructConformanceMarkers() {
             auto* info = analysis.find(m.node.greenNode());
             Symbol* sym = info ? info->resolvedSymbol : nullptr;
             if (!sym) continue;
-            const char* behavior = builtinBehaviorReplaced(t, *memberName, sym, m.isOverride());
+            const char* behavior = builtinBehaviorReplaced(t, *memberName, sym);
             Type* declaring = interfaceDeclaringMethod(si, *memberName, sym,
                                                        /*bySignature=*/true);
             if (behavior || (declaring && m.isOverride())) continue;
             if (m.isOverride()) {
+                std::string replaceable = *memberName == u"toString"
+                    ? "a 'toString' that takes parameters is an ordinary method rather than the "
+                      "struct's text form"
+                    : "only 'toString', 'hash', and 'equals' replace a built-in behavior of a "
+                      "struct";
                 if (si->implementedInterfaces.empty()) {
                     errorAtNode(m.node, "Method '" + asciiOf(*memberName) + "' of '" +
                         ownerName + "' is marked 'override' but structs do not inherit, so "
-                        "there is nothing to override; only 'toString', 'hash', and 'equals' "
-                        "replace a built-in behavior of a struct. Remove 'override'.");
+                        "there is nothing to override; " + replaceable + ". Remove 'override'.");
                 } else {
                     errorAtNode(m.node, "Method '" + asciiOf(*memberName) + "' of '" +
                         ownerName + "' is marked 'override' but no interface that '" +
                         ownerName + "' implements declares '" + asciiOf(*memberName) +
-                        "', and a struct inherits nothing; only 'toString', 'hash', and "
-                        "'equals' replace a built-in behavior of a struct. Remove 'override'.");
+                        "', and a struct inherits nothing; " + replaceable +
+                        ". Remove 'override'.");
                 }
             } else if (declaring) {
                 errorAtNode(m.node, "Method '" + asciiOf(*memberName) + "' of struct '" +
@@ -6383,7 +6399,7 @@ Type* Analyzer::analyzeCall(const ast::CallExpression& expr) {
                 if (recvT->isTypeParam()) {
                     bool declaresToString = false;
                     for (StructInfo* b : boundsOfTypeParam(recvT)) {
-                        if (b && b->classDeclaringMethod(u"toString")) {
+                        if (b && b->classDeclaringZeroArgMethod(u"toString")) {
                             declaresToString = true;
                             break;
                         }

@@ -194,10 +194,11 @@ struct StructInfo {
 // True when the two function symbols take exactly the same parameter types.
 bool sameParameterTypes(const Symbol* a, const Symbol* b);
 
-// A struct's own `toString`, or null when it declares none. Both an explicit
+// A struct's own text form, or null when it declares none. Both an explicit
 // `.toString()` and an interpolation hole ask this one question to decide whether a
-// struct has a text form of its own instead of its JSON form. Its declaration is
-// held to `toString() -> string` without `throws`, so it always stands in.
+// struct renders itself instead of rendering its JSON form. Only a `toString` taking
+// no parameters is the text form, and that one is held to `toString() -> string`
+// without `throws`, so it always stands in.
 const MethodInfo* declaredToString(const StructInfo* info);
 
 class Type {
