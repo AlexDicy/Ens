@@ -1598,6 +1598,10 @@ A value with nothing after its decimal point loses the point too, so `3.0` is `"
 Exponent form is used when the value's decimal exponent is below -4 or reaches the number of significant digits shown, and is written as `e`, a sign, and at least two digits: `1e-5` is `"1e-05"` and `1e21` is `"1e+21"`, while `0.0001` and `1234567` are written out in full.
 The three values that are not numbers render as `"inf"`, `"-inf"` and `"nan"`, whatever the C library underneath would have called them.
 
+A `float` and a `double` also have a natural order, which is what `compareTo` answers and what a sort with no comparison given uses, and it gives every value a place, including the ones the operators leave unordered.
+In that order a `NaN` sits above every number, infinities included, and level with another `NaN`, and negative zero sits just below zero.
+The operators keep their IEEE meaning, so `==` calls a `NaN` unequal to itself and the two zeros equal, and `<`, `<=`, `>` and `>=` all answer false when either side is a `NaN`, while `!=` answers true.
+
 ```ens
 let greeting = "Hello, " + name + "!";
 let n = greeting.length;            // long, the byte count
@@ -2005,7 +2009,7 @@ A container aborts the program rather than answering a value it does not have, s
 - `List<T>` from `@std.collections.list` is a growable sequence holding its values in the order they were put in: `push(value)`, `pushAll(values)`, `pop()` taking the last value off and answering it, `get(index)`, `set(index, value)`, `first()`, `last()`, `insert(index, value)`, `removeAt(index)`, `remove(value)` removing the first value equal to it, `clear()`, `reserve(capacity)`, `copy()`, and `toArray()` answering a fresh right-sized `T[]` holding the current contents.
   `indexOf(value)` and `indexWhere(test)` answer where the first match sits, or `-1` when there is none, and `removeWhere(test)` removes every value a test accepts in one pass and answers how many went.
   `sort(order)` puts the values in the order a comparison describes, which answers negative when its first argument sorts first, and `sort()` with no argument uses the natural order.
-  A list of integers, characters, or strings sorts with no comparison given, and any other element type sorts that way once it implements `Comparable`.
+  A list of numbers, characters, or strings sorts with no comparison given, and any other element type sorts that way once it implements `Comparable`.
   `sorted` answers a new list rather than reordering this one, and `reverse` and `reversed` are the same pair for turning the order around.
   Whether values the order calls equal keep the order they arrived in is not promised.
   `List.of(values)` answers a list holding an array's values, and `List.withCapacity(capacity)` an empty list with room for that many.
@@ -2024,7 +2028,7 @@ A container aborts the program rather than answering a value it does not have, s
   Iterating a deque yields its values from the front to the back.
 - `PriorityQueue<T>` from `@std.collections.priorityqueue` takes values out smallest first: `push(value)`, `pop()` removing and answering the smallest value, and `peek()` reading it without removing it, plus `clear()` and `copy()`.
   "Smallest" is what the comparison given to the constructor says, or the natural order of the element type for the constructor that takes nothing.
-  Integers, characters, and strings have that order already, and any other type has it once it implements `Comparable`.
+  Numbers, characters, and strings have that order already, and any other type has it once it implements `Comparable`.
   Iterating a priority queue yields every value once, in no particular order.
 - `SortedMap<K, V>` from `@std.collections.sortedmap` has the operations of `Map` apart from `withCapacity`, plus `firstKey()` and `lastKey()`, and walks its entries and its views in key order.
   That order is the natural order of the key type, under the same rule as a priority queue's, or the comparison given to the constructor.
