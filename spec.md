@@ -66,11 +66,11 @@ Structs automatically implement `copy()` and are `(de)serializable` by default, 
 ```ens
 struct Rectangle {
     protected uint width;
-    uint height;
+    protected uint height;
     string name = "unnamed rectangle ({width}x{height})"; // automatically initialized in order, after width and height have initialized. Defaults are evaluated in declaration order; a default may only reference fields declared earlier.
 
     getHalfArea() -> double {
-        return (width * height) / 2;
+        return (this.width * this.height) / 2;
     }
 }
 ```
@@ -142,7 +142,7 @@ calculateArea(Rectangle rectangle) -> uint {
 ```
 
 ```ens
-class Animation<S: Shape + Comparable> {
+class Animation<S: Shape + Comparable<S>> {
     S? shape;
 
     // A constructor is introduced by the `constructor` keyword. It can be a full method or a shorthand which initializes the fields. Methods can have optional parameters, optional parameters must provide a default value. This syntax allows to use either new Animation(); or new Animation(myShape);
@@ -175,19 +175,20 @@ class Animation<S: Shape + Comparable> {
 A class may extend one other class with `extends`. A subclass inherits the base class's fields and methods, and a value of a subclass may be used wherever the base class, or `Base?`, is expected. Arrays are not covariant: a `Derived[]` is not also a `Base[]`.
 
 ```ens
-class Shape {
+public class Shape {
     protected int sides;
-    constructor(this.sides = 0);
-    area() -> int { return 0; }
+    protected constructor(this.sides = 0);
+    public area() -> int { return 0; }
+    public describe() -> string { return "a shape with {this.sides} sides"; }
 }
 
-class Square extends Shape {
+public class Square extends Shape {
     int side;
     constructor(int s) {
         super(4);          // run the base constructor first
         this.side = s;
     }
-    override area() -> int { return this.side * this.side; }
+    public override area() -> int { return this.side * this.side; }
 }
 ```
 
@@ -210,6 +211,9 @@ A `toString` override cannot be `abstract`: every class already answers with its
 A class method that has the text form's shape and does not write `override` is an error, because it would replace the default every class already answers with while reading as though it did not.
 A method named `toString` whose shape differs, such as one that takes an argument, is an ordinary method; calls reach it by name, and interpolation holes and the built-in text form do not use it.
 Like a `toString` on a struct, one written `override` follows its class's visibility when unmarked and may not be marked less visible than the class itself.
+
+Inside a method, a constructor, or a destructor, a struct's or a class's own fields and methods are reached through `this`, as in `this.width` and `this.area()`, because a bare name there is a local, a parameter, or a top-level declaration and never a member.
+A field's default value is the one place a member is named on its own: a default may read the fields declared before it, as `string name = "{width}x{height}";` does.
 
 `super.method(...)` calls the base class's implementation, bypassing any override. A constructor may call `super(...)` as its first statement to run the base constructor; if it does not, the base class must be constructible with no arguments. `protected` members (see above) are reachable from subclasses.
 
@@ -379,12 +383,12 @@ firstOf(names);           // T inferred as string from the List<string>
 count(new Range(1, 3));   // T inferred as int because Range implements Iterable<int>
 ```
 
-A type parameter may declare bounds with `T: Base + Comparable`, joined by `+`: at most one bound may be a class (conventionally written first) and every other bound must be an interface, and listing the same bound twice is an error.
+A type parameter may declare bounds with `T: Base + Comparable<T>`, joined by `+`: at most one bound may be a class (conventionally written first) and every other bound must be an interface, and listing the same bound twice is an error.
 A bound may not name a `final` class: no type except that class itself could satisfy it, so write the class type directly instead.
 Every type argument must satisfy all bounds, being the class or a subclass of it and implementing each interface; a violation is a compile error naming the failing bound.
 An interface bound is also satisfied through interface extension: a class implementing an interface that extends the bound satisfies it, and so does the extending interface itself as a type argument.
 The body may use the members of every bound on a value of that parameter.
-The `Animation<S: Shape + Comparable>` example above uses exactly this form.
+The `Animation<S: Shape + Comparable<S>>` example above uses exactly this form.
 
 ```ens
 class Drawer<T: Shape> {
@@ -393,8 +397,8 @@ class Drawer<T: Shape> {
     area() -> int { return this.shape.area(); }
 }
 
-summarize<S: Shape + Comparable>(S value) -> string {
-    return value.describe() + " / " + value.compareTo(9);
+summarize<S: Shape + Comparable<S>>(S value) -> string {
+    return value.describe() + " / " + value.compareTo(value);
 }
 ```
 
@@ -783,14 +787,14 @@ Methods that throw must be called with `try` as a prefix, even if caught. `Catch
 ```ens
 class TestRepository {
     getName() -> string? {
-        return try queryName();
+        return try this.queryName();
     } catch (DatabaseError e) { // and other catch blocks if multiple exceptions are thrown
         eprint("Database error occurred: {e}");
         return null;
     }
 
     getNameUnsafe() -> string throws {
-        return try queryName();
+        return try this.queryName();
     } catch (DatabaseError e) {
         eprint("Database error occurred: {e}");
 
@@ -799,7 +803,7 @@ class TestRepository {
     }
 
     getNameUnsafeNoCatch() -> string throws {
-        return try queryName();
+        return try this.queryName();
     }
 
     queryName() -> string throws {
