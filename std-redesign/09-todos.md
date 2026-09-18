@@ -8,6 +8,8 @@ Two consistency items the C4 and pre-C5 work surfaced, both independent of the l
 An array literal holding `this` inside a generic body (`[this, this]` for a `T[]` parameter, or `Box<T>[] xs = [this];`) is refused, because the literal's element type is the bare template and assignability equates the template with its self-instantiation only at the top level, not under `[]`; since 2026-09-04 the refusal even reads "expected 'Box<T>[]', got 'Box<T>[]'". The clean resolution is `this` carrying the self-instantiation itself, or the equation applying structurally.
 A subclass method whose name a private base field uses is still refused, since `checkFieldMethodCollision` searches the flattened field list without the exemption private base fields gained on 2026-09-04; consistency would let it through, and it is a conservative refusal rather than an unsoundness.
 A bare function reference stored into a local with no declared type, `let callback = twice;`, passes sema and then fails in codegen with "does not support a local of type '<error>' yet" (found 2026-09-08, no imports involved); an accepted program that cannot be compiled is a soundness matter, so it does not wait for the diagnostics review.
+`float` and `double` still do not implement `Comparable`, so `List<double>.sort()` and `SortedMap<double, V>` are refused, while the seven integer types and `char` landed on 2026-09-18.
+No document says where `NaN` and negative zero sort, and the two candidates are Java's total order, with `NaN` above every number and `-0.0` below `0.0`, or Rust's refusal to give a floating-point type a total order at all.
 
 ## C8 and C9
 

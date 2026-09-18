@@ -2004,7 +2004,8 @@ A container aborts the program rather than answering a value it does not have, s
 
 - `List<T>` from `@std.collections.list` is a growable sequence holding its values in the order they were put in: `push(value)`, `pushAll(values)`, `pop()` taking the last value off and answering it, `get(index)`, `set(index, value)`, `first()`, `last()`, `insert(index, value)`, `removeAt(index)`, `remove(value)` removing the first value equal to it, `clear()`, `reserve(capacity)`, `copy()`, and `toArray()` answering a fresh right-sized `T[]` holding the current contents.
   `indexOf(value)` and `indexWhere(test)` answer where the first match sits, or `-1` when there is none, and `removeWhere(test)` removes every value a test accepts in one pass and answers how many went.
-  `sort(order)` puts the values in the order a comparison describes, which answers negative when its first argument sorts first, and `sort()` with no argument uses the natural order where the element type implements `Comparable`.
+  `sort(order)` puts the values in the order a comparison describes, which answers negative when its first argument sorts first, and `sort()` with no argument uses the natural order.
+  A list of integers, characters, or strings sorts with no comparison given, and any other element type sorts that way once it implements `Comparable`.
   `sorted` answers a new list rather than reordering this one, and `reverse` and `reversed` are the same pair for turning the order around.
   Whether values the order calls equal keep the order they arrived in is not promised.
   `List.of(values)` answers a list holding an array's values, and `List.withCapacity(capacity)` an empty list with room for that many.
@@ -2022,7 +2023,8 @@ A container aborts the program rather than answering a value it does not have, s
   There is no `set(index, value)`, because writing through a position is a list's operation.
   Iterating a deque yields its values from the front to the back.
 - `PriorityQueue<T>` from `@std.collections.priorityqueue` takes values out smallest first: `push(value)`, `pop()` removing and answering the smallest value, and `peek()` reading it without removing it, plus `clear()` and `copy()`.
-  "Smallest" is what the comparison given to the constructor says, or the natural order of the element type for the constructor that takes nothing, which exists only where that type implements `Comparable`.
+  "Smallest" is what the comparison given to the constructor says, or the natural order of the element type for the constructor that takes nothing.
+  Integers, characters, and strings have that order already, and any other type has it once it implements `Comparable`.
   Iterating a priority queue yields every value once, in no particular order.
 - `SortedMap<K, V>` from `@std.collections.sortedmap` has the operations of `Map` apart from `withCapacity`, plus `firstKey()` and `lastKey()`, and walks its entries and its views in key order.
   That order is the natural order of the key type, under the same rule as a priority queue's, or the comparison given to the constructor.
