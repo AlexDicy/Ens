@@ -38,9 +38,9 @@ printArea() { // private by default; no need to specify -> void
     uint width = 20;
     uint height = 18;
     let area = calculateArea(width, height);
-    Log.info("Calculated Area: {area}");
+    print("Calculated Area: {area}");
     area = calculateArea(height: 56, width: 90);
-    Log.info("New area: {area}");
+    print("New area: {area}");
 }
 ```
 
@@ -98,14 +98,14 @@ A `const` field without a default value removes the struct's default the same wa
 Two values of the same struct type compare with `==` and `!=` field by field, in declaration order, stopping at the first field that differs.
 Each field compares by its own `==`: primitives and enums by value (so IEEE rules hold, and a `float` or `double` field that is `NaN` never equals itself), strings by content, class fields by reference identity unless the two objects' run-time class opted into content equality, `external` handle fields by identity, array fields element by element, a nested struct memberwise unless it declared its own equality, and a nullable field null-aware (both `null` are equal, one `null` is unequal, otherwise the inner values compare).
 Comparing two different struct types is an error, and so is comparing structs whose type has a field with no `==` of its own, such as a function value or an array of them; the error names the offending field.
-A struct customizes equality by declaring `equals(S other) -> bool` - a method taking a single parameter of the struct's own type `S` - which then decides `==` and `!=` for that struct everywhere it is compared, including as a field of another struct, as an array element and as a collection key.
+A struct customizes equality by declaring `equals(S other) -> bool`, a method taking a single parameter of the struct's own type `S`, which then decides `==` and `!=` for that struct everywhere it is compared, including as a field of another struct, as an array element and as a collection key.
 Such an `equals` replaces the memberwise comparison the language provides, so it is written `override`, and it must be paired with an `override hash() -> long`: a struct that declares one must declare the other, exactly as a class must, so equal values always hash equally.
 A method named `equals` whose single parameter is some other type is an ordinary method, and `==` on that struct stays memberwise.
 
 A struct serializes to a JSON string through `.toString()` and in interpolation holes, honoring the default-serialization promise.
 The form is a JSON object listing every field, including private and protected ones, in declaration order: `{"field": value, ...}`.
 Numbers render as decimals, `bool` as `true` or `false`, strings and enum members as JSON-quoted text (with `"`, `\`, and control characters escaped), a `char` as a one-character quoted string with its scalar encoded to UTF-8 and escaped the same way, an absent nullable field as `null`, and a nested struct as its own JSON object.
-A struct that declares its own `toString` method uses that method instead; because it replaces the built-in form, it is written `override toString() -> string`, taking no arguments and never `throws` - an interpolation hole has nowhere to write a `try`.
+A struct that declares its own `toString` method uses that method instead; because it replaces the built-in form, it is written `override toString() -> string`, taking no arguments and never `throws`, since an interpolation hole has nowhere to write a `try`.
 A struct is serializable only when every field is: a value type, a string, an enum, one of those made nullable, a nested such struct, or an array of any of these, which serializes as a JSON list.
 A field that is a class or an external handle has no JSON form, and neither does an array whose elements are; such a field makes serializing the struct an error that names it, mirroring the `==` rule.
 
@@ -132,7 +132,7 @@ External functions and generic functions cannot be overloaded.
 ```ens
 calculateArea(Rectangle rectangle) -> uint {
     uint area = rectangle.width * rectangle.height;
-    Log.info("Calculated Area: {area} for rectangle: {rectangle}");
+    print("Calculated Area: {area} for rectangle: {rectangle}");
 
     // example: calculateArea({width: 20, height: 5});
     // outputs: Calculated Area: 100 for rectangle: {"width": 20, "height": 5, "name": "unnamed rectangle (20x5)"}
@@ -155,7 +155,7 @@ class Animation<S: Shape + Comparable> {
     // }
 
     start() -> bool {
-        Log.debug("Has shape? {this.shape != null ? "Yes" : "No"}.");
+        print("Has shape? {this.shape != null ? "Yes" : "No"}.");
 
         if (this.shape != null) {
             return true;
@@ -591,7 +591,7 @@ No other module may define a top-level `main`; the compiler rejects one wherever
 
 `main` is declared either as `main()` or as `main() -> int`, and it may add `throws` or `noreturn` like any other function.
 The `int` it returns becomes the process exit code, a `main()` that returns nothing exits with 0, and an exception that escapes `main` is reported on stderr and exits with 1.
-Any other return type is an error, and so are parameters and type parameters: nothing passes arguments to `main`, and a program reads its command line through `system.arguments()` from `@std.system`.
+Any other return type is an error, and so are parameters and type parameters: nothing passes arguments to `main`, and a program reads its command line through `environment.arguments()` from `@std.environment`, which answers the arguments without the program's own name.
 
 Importing from packages follows the format `@packageorg.packagename.path`.
 
@@ -785,14 +785,14 @@ class TestRepository {
     getName() -> string? {
         return try queryName();
     } catch (DatabaseError e) { // and other catch blocks if multiple exceptions are thrown
-        Log.warn("Database error occurred: {e}");
+        eprint("Database error occurred: {e}");
         return null;
     }
 
     getNameUnsafe() -> string throws {
         return try queryName();
     } catch (DatabaseError e) {
-        Log.warn("Database error occurred: {e}");
+        eprint("Database error occurred: {e}");
 
         // the current caught exception can be rethrown as-is, rethrow can only be used inside of catch blocks.
         rethrow;
@@ -842,11 +842,11 @@ A handler can read the trace from a caught error, either preformatted or as stru
 
 ```ens
 } catch (ParseError e) {
-    Log.warn(e.stackTrace());                // the trace as a string
+    eprint(e.stackTrace());                // the trace as a string
 
     StackFrame[] frames = e.stackFrames();   // or as structured frames
     StackFrame origin = frames[0];
-    Log.warn("thrown by {origin.function} at {origin.file}:{origin.line}");
+    eprint("thrown by {origin.function} at {origin.file}:{origin.line}");
 }
 ```
 
@@ -878,7 +878,7 @@ The `@std.testing` module provides `TestFailure`, an `Error` subclass whose cons
 - `testing.assertEqual(actual, expected)` and `testing.assertNotEqual(actual, expected)` compare two values of the same type with `==`.
   A failure over short values shows both; over multi-line text it names the first line that differs, and over long single-line text the first differing offset with an excerpt around it, so two long values are never printed whole.
 - `testing.assertTrue(condition, message)` and `testing.assertFalse(condition, message)` check a condition; the message is optional, and interpolation at the call site can add context (`"sum was {sum}"`).
-- `testing.fail(message)` fails unconditionally.
+- `testing.fail(message)` fails unconditionally, and it never returns, so a call to it closes the path it sits on.
 - `testing.assertNear(actual, expected, tolerance)` accepts a `double` within `tolerance` of the expected value, for results that arrive through arithmetic rather than exactly; a NaN on either side is never within any tolerance.
 - `testing.assertThrows<E>(body)` runs a `(() -> void throws E)` body and answers the `E` it threw, so the test goes on to check its kind or its message; a body that returns without throwing fails the test.
 
@@ -1005,7 +1005,7 @@ draw(Outer? outer) {
 ```
 
 A narrowing holds after an `if`/`else` (or a `switch`) when it holds at the end of every branch that can fall through: the branches are intersected at the merge.
-A branch that always exits - by `return`, `throw`, or `panic`, and, inside a loop, also by `break` or `continue` - reaches nothing below the merge, so it places no constraint on the result.
+A branch that always exits, by `return`, `throw`, or `panic`, and, inside a loop, also by `break` or `continue`, reaches nothing below the merge, so it places no constraint on the result.
 This makes the `else` above optional, and it lets a value narrow when the branches prove the fact in different ways: after `if (x == null) { x = fallback(); }` the value is non-null below, because the then-branch reassigned it to a non-null value while the else-path failed the `== null` check, so both paths reaching the merge prove it.
 A loop guard clause therefore narrows the checked value for the rest of the iteration:
 
@@ -1378,7 +1378,7 @@ enum Command {
 
 const Command command = Command.Submit;
 if (command == Command.Submit) {
-    Log.info("running {command}");   // running Submit
+    print("running {command}");   // running Submit
 }
 ```
 
@@ -1436,8 +1436,8 @@ return switch (status) {          // over an int, default required
 };
 
 switch (command) {                // statement form: block or expression arms
-    Initialize -> { Log.info("starting"); },
-    default -> Log.info("ignored"),
+    Initialize -> { print("starting"); },
+    default -> print("ignored"),
 }
 
 let length = switch (name) {      // name is string?, the null case is handled
@@ -1696,7 +1696,7 @@ The account describes an optimization that ran, so `-O0` prints nothing, the opt
 
 ---
 
-The standard library is an external package, imported with `@`, and is opt-in apart from the implicitly imported `std.core`: its other exported declarations are visible only after they are imported.
+The standard library is an external package, imported with `@`, and is opt-in apart from the implicitly imported `@std.core` and `@std.io.print`: its other exported declarations are visible only after they are imported.
 
 The standard library also declares members of the primitive types, so what a `string`, a `bool`, a `char`, or a numeric type can do is written there in ordinary Ens source rather than built into the compiler.
 Such a member is called like any other, on a literal as readily as on a variable, and a static of a primitive is reached through the type name, as in `string.fromBytes(bytes)`.
@@ -1709,121 +1709,277 @@ Storing a primitive in an interface-typed variable, field, array element, or par
 Only the standard library declares a primitive's members, and a program that writes `primitive` is told so.
 The word stays an ordinary identifier everywhere else, so a variable, field, parameter, method, or function may be named `primitive`.
 
-The `std.system` module wraps common operating system facilities and reports failures as exceptions. Import the module to call its functions through the `system` namespace, and import any types you use by name:
+The library is a set of module families under `@std`, and an import names a module rather than a family, so the chapters below give the module every type and function lives in.
+`@std.core` and `@std.io.print` are the two modules the compiler imports for every program.
+The families are `@std.collections` for the walking contracts and the containers, `@std.text` for the members of `string` together with `StringBuilder` and the parsers, `@std.io` for byte streams and the streams a program is born with, `@std.fs` for paths and files, `@std.environment` for what surrounds a running program, `@std.process` for starting other programs, `@std.thread` for a wait, `@std.testing` for what a test throws, and `@std.ffi` for reading a C string.
+A family's own name is a module too where one type stands at its head, which is why `@std.fs` is where `Path` lives while `@std.collections` is a prefix alone.
+The library's own calls into the operating system live in `@std.system`, which is internal to the library rather than part of what a program writes.
 
-```ens
-import @std.system;
-import File from @std.system;
+---
 
-writeGreeting() -> int throws {
-    File file = try system.openFile("greeting.txt", "w");
-    byte[] bytes = new byte[2];
-    bytes[0] = 'h';
-    bytes[1] = 'i';
-    let written = try file.write(bytes);
-    return file.close();
-}
-```
+`@std.io` moves bytes, and two contracts from `@std.io.streams` describe every stream in it.
+`Reader` declares `read(byte[] buffer) -> long throws IoError`, which fills as much of the buffer as it has ready and answers how many bytes it wrote.
+That answer is `0` only once the stream has ended, so a shorter answer than the buffer means ask again rather than that the bytes have run out.
+`Writer` declares `write(byte[] data) throws IoError`, which takes all of `data` and keeps nothing, and `flush() throws IoError`, which hands over everything accepted but not yet passed on.
+`streams.copy(source, target)` moves everything the source has left into the target and answers how many bytes moved, flushing and closing neither, so the caller decides when the target has everything.
 
-`system.exists(path)` reports whether a file or directory exists at the path, without throwing: only a missing path reports `false`.
-`system.isFile(path)` and `system.isDirectory(path)` answer the same way for one kind each, so a missing path reports `false` from both.
+`@std.io` itself answers the streams a program is born with: `io.out()` is standard output as a `Writer`, `io.err()` is standard error, and `io.in()` is standard input as a `BufferedReader`.
+Standard output is buffered, so a line written there reaches the operating system once that buffer fills or something hands it over, and standard error is not, so what a program reports survives a crash.
+The buffer belongs to the stream rather than to the writer, so it makes no difference which of the writers `io.out()` answers a program keeps.
+`io.in()` answers the same reader every call, because bytes read ahead cannot be put back and two readers of one input would steal from each other.
+`io.flush()` hands over everything accepted by `io.out()` and not yet given to the operating system.
 
-`system.listDirectory(folder)` returns the names of everything directly inside `folder`: the names alone, without the folder in front of them and without the `.` and `..` entries, in ascending order by their bytes.
-A walk over a tree therefore visits the same names in the same order whatever order the file system enumerates them in.
-A folder that could not be read raises a `SystemError`.
-
-`system.createDirectory(path)` creates the directory the path names together with every parent of it that is missing, and leaves a directory that is already there alone.
-`system.createNewDirectory(path)` creates it the same way but answers whether this call is the one that created it: `true` when it did, and `false` when a directory was already there.
-Every missing parent above it is still created the lenient way; only the directory the path itself names is claimed, so two programs asking for the same name at the same instant get different answers and exactly one of them may treat the folder as its own.
-`system.removeFile(path)` removes one file and refuses a directory; `system.removeDirectory(path)` removes one directory, which has to be empty already, because what to do with what is inside it is the caller's decision.
-Each of the four raises a `SystemError` when it does not succeed, and `createNewDirectory` raises one for a path where a file of that name is already there, since no folder can be claimed at that name.
-
-`system.move(from, to)` moves the file or folder `from` names, together with everything under it, to `to`, and answers whether this call is the one that moved it: `true` when it did, and `false` when something was already at `to`.
-The move happens in one step, so no other program ever sees half of it and two programs racing for the same name get different answers; that is also why both paths have to be on the same volume, since a move across volumes would have to copy.
-A move that failed for any other reason raises a `SystemError`.
-
-`system.currentDirectory()` returns the directory the program was started in, and `system.executablePath()` the path of the running program itself, both with `/` between their parts on every platform, so the `@std.path` functions read them as they are.
-Neither can be changed: a program builds the paths it works with rather than moving itself somewhere else.
-
-`system.environment()` returns the variables the program inherited as `NAME=VALUE` entries in ascending order by their bytes, and `system.getEnvironmentVariable(name)` returns one variable's value, or `null` when it is not set.
-The environment cannot be changed either; a program that wants a child to see something else passes it when it starts that child.
-
-`system.platform()` names the system the program was built for as `"windows"`, `"linux"` or `"macos"`, the same three names a package manifest uses for a native binding.
-Any other system the compiler can target reports `"linux"`, whose behavior it shares.
-
-`system.writeError(message)` writes `message` and a newline to standard error, the stream a program reports its problems on, the way `print` writes to standard output.
-
-What `print` writes is buffered, so a line it wrote may still be inside the program when the next statement runs, but the order a program can observe is guaranteed: everything printed before an `eprint`, before a `system.writeError`, before a child process starts, and before a panic is reported has left the program first, whichever stream those go to and whether the streams are a terminal or the same file.
+`print(message)` and `eprint(message)` come from `@std.io.print`, which every program has with no import written, and each writes its message and a newline, the first to standard output and the second to standard error.
+Neither throws: saying something is not an operation a program should have to handle the failure of, so a write the operating system refuses is dropped.
+What `print` writes is buffered, so a line it wrote may still be inside the program when the next statement runs, but the order a program can observe is guaranteed: everything printed before an `eprint`, before a write to `io.err()`, before a child process starts, and before a panic is reported has left the program first, whichever stream those go to and whether the streams are a terminal or the same file.
 A panic therefore never loses what was printed before it.
-`system.flush()` hands over what is still buffered on demand, for an order only the program itself knows about.
+`io.flush()` is that same guarantee on demand, for an order only the program itself knows about.
 
-`system.run(command)` runs one command line through the operating system's command interpreter.
-`system.run(program, arguments)` starts `program` with `arguments` and waits for it, leaving both output streams with the running program, so what the child writes appears where it would have appeared as it is written.
-`system.runCaptured(program, arguments, stdoutPath, stderrPath)` writes what the child sent to its standard output and its standard error into the two files instead, and an empty path leaves that one stream alone, so one call can capture one stream and pass the other through.
-Both have a further form taking a `string[]` of `NAME=VALUE` overrides after the arguments: those entries are laid over the environment the program inherited, replacing the entries naming the same variable and leaving every other variable in place, so a child never loses the search path it needs to find the programs it runs.
-Two names match without regard to case on Windows, the way that system matches them, and exactly everywhere else, where `PATH` and `path` name two different variables and both reach the child.
-No command interpreter takes part in these forms, so every argument reaches the program exactly as written, whatever spaces or quotes it holds, and nothing is expanded on the way.
-Each returns the child's exit code; a program that could not be started reports `127`, the code a shell reports for the same failure, and a capture file that could not be opened for writing raises a `SystemError`.
-A wait the system could not answer raises a `SystemError` as well, because the child's exit code is then unknown and no code stands for unknown.
+A stream that fails raises an `IoError` from `@std.io.streams`, whose `kind` is the condition a program acts on: `Closed` for a stream that is no longer open, `Interrupted` for a call the system cut short before it moved anything, and `Other` for what the message alone describes.
+Beside the kind, `nativeError` carries the number the system itself reported, which a program logs rather than acts on.
+It is the C library's `errno` wherever the failing call was the C library's, which is every stream but a child's pipes; a child's pipes are the system's own, so a write to one reports a Win32 number on Windows and an `errno` everywhere else.
+It is `0` where nothing was asked of the system, as it is for bytes that spell no character.
+The kinds name only what a stream can establish, so a number with more than one cause behind it arrives as an `Other` with that number beside it.
+A condition only a path could be asked about, such as a file system with no room left, reaches a caller holding a `Writer` as an `Other` too, since only a caller holding the path knows what the stream is a stream of.
 
-```ens
-import @std.system;
+`BufferedReader` and `BufferedWriter` from `@std.io.buffered` turn many small reads and writes into few large ones, each wrapping one stream and taking a capacity that defaults to 8192 bytes, where a capacity below one byte is raised to one.
+`BufferedReader` adds the reads a raw source cannot offer.
+`readLine()` answers the next line without its ending, and `null` once the stream has ended; a carriage return before the newline belongs to the ending, and a last line that ends in no newline is a line of its own.
+`readAll()` answers everything left as bytes, and `readAllText()` answers it as text, refusing bytes that spell no character since text in Ens is always valid UTF-8.
+That refusal is an `IoError` of kind `Other` naming the offset where the bytes stop spelling text, and it carries the `EncodingError` underneath as its cause.
+`BufferedWriter` passes what it holds on when it fills, when `flush` is called, and when the wrapper is dropped, and the flush a drop does keeps any failure to itself, so a program that has to know whether the bytes arrived calls `flush` itself.
 
-int status = try system.runCaptured("git", ["commit", "-m", "a message with spaces"],
-    "build/git.out", "build/git.err");
-int built = try system.run("make", ["all"], ["CC=clang"]);
-```
+`TextWriter` from `@std.io.text` writes text onto a byte stream as that text's UTF-8 bytes: `write(text)`, `writeLine(text)`, which adds a newline and never a carriage return, `writeLine()` for an empty line, and `flush()`.
+Each call reaches the target once, so a line written through it arrives whole rather than in pieces something else could get between.
+It is not a `Writer` itself, because it is not a destination for bytes.
 
-`system.start(program, arguments)` starts `program` the same way but hands back a `ChildProcess` while it is still running, so this program reads what the child writes as it is written instead of after it has finished.
-It has the same further form taking a `string[]` of `NAME=VALUE` overrides after the arguments.
-`readLine()` returns the next line of the child's output without its ending, waiting as long as the child takes to write it, and `null` once the output has ended; output that does not end in a newline is a line of its own, handed over last, and a carriage return before a newline belongs to the ending.
-What the child sent to its standard output and what it sent to its standard error arrive together, in the order it wrote them, which is what a program relaying another program's output needs; use `runCaptured` when the two have to stay apart.
-`waitForOutput(milliseconds)` reports whether `readLine()` can go ahead without waiting for the child: `true` when a whole line is there to be had, and `true` once the output has ended, because reading then answers `null` at once.
-`false` means that many milliseconds went by with neither, and the child may still be about to write something; a bound of `0` asks about this moment alone.
-It is what a program that must not wait forever on another one asks before reading, since reading itself waits for as long as the child takes.
-`kill()` stops the child, whose output then ends where it was stopped and whose exit code is `137`, the code a system reports for a program ended from outside, unless the child had already finished on its own and reported a code of its own.
-Stopping a child that has already finished is not a failure, so a program that stops one it has given up on need not first find out whether it is still there.
-`wait()` returns the child's exit code, waiting for the child to finish first, and answers the same code however often it is asked.
-Output that has not been read is read and thrown away before that wait, because a child whose output nobody reads would be stopped by a full pipe: read every line first where the output matters.
-A child that was stopped is not read out first, so asking a stopped child for its code always comes back.
-A wait the system could not answer raises a `SystemError`, since the child's code is then unknown and unknown is not a code.
-Letting a `ChildProcess` go without waiting for it hands back the pipe its output was arriving on and this program's hold on the child, which keeps running with nothing left reading it.
-A program that could not be started at all raises a `SystemError` on the systems that report that while the child is being created, and elsewhere shows up as a child that ends with `127`.
+`BytesReader` and `BytesWriter` from `@std.io.memory` are streams over bytes already in memory, which is what drives anything written against `Reader` or `Writer` with no operating system taking part.
+A `BytesReader` hands out the array it was given, in order, sharing that array rather than copying it, and answers `0` for ever once the last of it is gone.
+A `BytesWriter` collects everything written into one growing array, which `toBytes()` answers as a copy, `length()` measures, and `clear()` forgets.
+Neither of them can fail, so a call on either needs no `try`.
 
 ```ens
-import @std.system;
-import ChildProcess from @std.system;
+import @std.io;
+import BufferedWriter from @std.io.buffered;
+import IoError from @std.io.streams;
+import TextWriter from @std.io.text;
 
-ChildProcess child = try system.start("git", ["clone", url]);
-string? line = try child.readLine();
-while (line != null) {
-    print(line);
-    line = try child.readLine();
+report(string[] names) throws IoError {
+    let lines = new TextWriter(new BufferedWriter(io.out()));
+    for (let name in names) {
+        try lines.writeLine(name);
+    }
+    try lines.flush();
 }
-int status = try child.wait();
+
+askName() -> string throws IoError {
+    print("your name?");
+    string? typed = try io.in().readLine();
+    return typed ?? "";
+}
 ```
 
-The `@std.path` module works on paths as text, with `/` separating the parts on every platform, and never looks at the file system.
-`join(base, relative)` puts one separator between two parts, and gives back the relative part alone when the base is empty.
-`parentFolder(path)` returns the folder one level up: `""` when the path names no folder, and `/` at the root.
-`fileName(path)` returns the last part of the path.
-`extension(path)` returns the text after the last `.` of that last part without the dot, and `stem(path)` returns the part before it, so `notes.txt` reads as `notes` and `txt`.
+---
+
+`@std.fs` holds `Path`, the struct every operation on the file system is a method of.
+A path is built from text, as in `Path("src/main.ens")`, and `/` separates the parts of a path on every platform.
+Text written the way one operating system writes a path arrives through `Path.fromNative(text, platform)`, which turns each `\` into `/` on Windows and keeps the text exactly everywhere else, where `\` is an ordinary character in a name and converting it would name a different file.
+`toString()` answers the text the path was built from, and `compareTo` orders paths by that text, which is what `Path` implements `Comparable<Path>` with, so a list of paths sorts and a `SortedMap<Path, V>` keys by them.
+Two paths are equal only when their text is equal, so `a/b` and `a/./b` name the same place and are different paths until they are normalized.
+The empty path is a real value, and `isEmpty()` reports it.
+
+The rules about the text never look at the disk, so their answers are the same whatever exists.
+`join(part)` answers this path and `part` with one separator between them, and answers the part alone when the part is absolute or this path is empty; the part may be a `string` or a `Path`.
+`parent()` answers the directory one level up, and `null` at a root and for a name with no directory written before it; a path that ends in a separator names the same place as one that does not, so both answer the same.
+`fileName()` answers the last part of the path, and `""` at a root.
+`extension()` answers the text after the last `.` of that last part without the dot, and `stem()` answers the part before it, so `notes.txt` reads as `notes` and `txt`.
 A name with no `.`, and one whose only `.` starts it the way a hidden file is named, has no extension and is its own stem.
-`normalize(path)` drops the `.` parts and the repeated separators, and resolves every `..` that has a part before it to remove.
-`isAbsolute(path)` reports whether the path names a place on its own, which a path starting at a root does, and so does one starting at a drive letter the way Windows writes one.
-`absolute(path, workingDirectory)` reads a relative path against that folder and normalizes the result, leaving an already absolute path only normalized.
-The folder is given rather than read from the running program, which is what keeps every function in this module a rule about text.
-Because every function here works in `/` form, `fromNative(text, platform)` is the conversion at the boundary, where a path written the way an operating system writes one arrives.
-On `"windows"` it turns each `\` into `/`; on every other platform it gives the text back unchanged, because `\` is an ordinary character in a name there and converting it would name a different file.
-The platform is named by the caller rather than read from the running program, so either platform's answer can be asked for anywhere.
+`isAbsolute()` reports whether the path names a place on its own, which a path starting at a root does, and so does one starting at a drive letter with a separator after it or at a server share; drive-relative text such as `C:foo` does not, because it names a place only against whatever that drive's current directory happens to be.
+`normalize()` drops the `.` parts and the repeated separators and resolves every `..` that has a part before it to remove, keeps a `..` with nothing left to remove in a relative path, drops one at a root, answers `.` for a path that turns out to name nowhere in particular, and keeps both separators of a path starting `//`.
+Symbolic links are text like any other here, so a normalized path can name a different place than the path it came from.
+`absolute(workingDirectory)` reads a relative path against that directory and normalizes the result, leaving a path that is already absolute only normalized, and `absolute()` reads it against the directory the program was started in.
+
+The operations that follow do look at the disk, and each of them raises a `FileSystemError` when it could not do what it was asked.
+`metadata()` answers what is at the path as a `Metadata?`, and `null` when nothing is there, so a caller reads that null as an answer while every other failure is raised.
+`exists()`, `isFile()` and `isDirectory()` are shorthands over it and never throw: a missing path answers `false`, and so does a failure that is not an absence, since a question that cannot throw has no other answer.
+Answering `true` proves nothing about a moment later, so opening a file and catching `NotFound` beats asking first and opening second.
+`realPath()` answers the path with every symbolic link resolved, as the operating system resolves it, which needs every part of the path to be there, because a link is resolved by reading it and a `..` written after one names a different place than removing it from the text would.
+Windows may still answer for a path whose middle part is missing, since Win32 removes every `..` before it resolves anything.
+
+`readBytes()` and `readText()` answer everything the file at the path holds, and `readText` refuses bytes that spell no character.
+`writeBytes(content)` and `writeText(content)` write that content as everything the file holds, creating the file when nothing is there and replacing what was there when something is.
+`writeBytesAtomic(content)` and `writeTextAtomic(content)` write to a file beside the path and move that file over the path in one step, so a reader sees the old content or the new and never a half-written file.
+`open()` answers the file open for reading, `create()` answers it open for writing and holding nothing, and `append()` answers it open for writing at its end; the last two create the file when nothing is there yet, and a directory is refused when the file is opened rather than at the first read.
+
+A `File` from `@std.fs.file` is both a `Reader` and a `Writer`, so an open file goes wherever either contract goes, and reading or writing one raises an `IoError` whose message names the path.
+Writing a file that was opened for reading is refused by the operating system and arrives as that error.
+`close()` hands the file back and reports a write that could not be finished, and asking twice is allowed with silence as the second answer.
+A file that is dropped without being closed is closed anyway, with any failure kept to itself, so a file that was written and matters is closed with `close`.
+
+`entries()` answers what is directly inside the directory, in ascending byte order of name, with the entries naming the directory itself and its parent left out.
+The directory is read to its end before anything is answered, so a walk visits the same names in the same order however the file system enumerates them.
+`walk(followLinks)` answers every entry under the directory, depth first, each directory's entries in the order `entries` answers.
+A symbolic link is reported and not descended into, which is what `followLinks` defaulting to `false` means, and a `followLinks` of `true` descends into a link that names a directory while stepping over a place the walk has already been, so a cycle cannot trap the walk either way.
+Both answer an `Iterable<Entry>`, which a `for`-in loop walks, and an `Entry` from `@std.fs.entry` is a struct holding the entry's `path`, its own `name` with no directory written in front of it, and its `kind`, which says `Symlink` for a link rather than what the link points to.
+
+`createDirectories()` creates the directory and every missing directory above it, leaving a path that is already a directory alone.
+`createDirectoryExclusive()` creates them the same way and answers whether this call is the one that created the directory itself, so two programs racing for the same name get different answers and the one answered `true` may treat the directory as its own.
+`moveTo(destination)` moves what is at the path in one step and answers whether this call is the one that moved it, which is `false` when something was already at the destination; both paths have to be on the same volume, because a move across volumes would have to copy.
+`copyTo(destination)` copies the file at the path, replacing whatever was at the destination, and the copy carries the source's permissions and never its set-user-id, set-group-id or sticky bits, because a copy hands over permissions and not privileges.
+`removeFile()` removes one file and refuses a directory, and `removeDirectory()` removes one directory, which has to be empty already, because what is inside a directory is the caller's to decide about.
+`removeRecursively()` is that decision: everything under the path, then the path itself, stopping at the first thing it could not remove.
+A symbolic link is removed as the link it is and never followed, so a link into a tree does not take the removal with it.
+
+`Metadata` from `@std.fs.metadata` is a struct holding `kind`, `length` in bytes, which is `0` for a directory, and `modifiedMillis`, when the content last changed in milliseconds since 1970-01-01 UTC.
+Its `kind` is an `EntryKind`, one of `File`, `Directory`, `Symlink` and `Other`, the last being something the system keeps that is none of the first three, such as a device or a socket.
+An answer that followed a symbolic link describes what the link points to, so such an answer never says `Symlink`.
+
+`TemporaryDirectory` and `TemporaryFile` from `@std.fs.temporary` each guard something that exists for as long as the value does.
+`TemporaryDirectory.create(prefix)` and `TemporaryFile.create(prefix)` make one under the directory this system keeps work in progress in, which is what `TMP`, `TEMP` or `TMPDIR` names, and `/tmp` on a system other than Windows whose environment names none.
+The name is one no other call answers and starts with `prefix`, so something left behind by a program that crashed says what made it.
+`path()` answers where it is, and the value's destructor removes it, a directory with everything in it, keeping any failure to itself.
+`keep()` dismisses that removal and answers the path, which the caller then owns.
+
+A `FileSystemError` from `@std.fs.error` carries the `path` the operation could not finish on, a `kind`, and a `nativeError`.
+The kinds are `NotFound` for nothing at the path or a missing directory written above it, `PermissionDenied` for an operation refused, `AlreadyExists` for something already there that the operation will not replace, `NotADirectory` for a path written above this one that names a file, `IsADirectory` for a directory named where a file was wanted, `DirectoryNotEmpty` for a directory that still holds entries, `NoSpace` for a file system with no room left or a quota used up, and `Other` for anything else the system reported, whose own number the message carries.
+The set is closed, so a program that answers for every member answers for everything the module reports.
+Windows has no error number that says a directory was named, so a directory named where a file was wanted reports `PermissionDenied` there and `IsADirectory` everywhere else.
+`nativeError` is the number the system itself reported, which a program logs rather than acts on: on Windows a failure a file-system call reported carries a Win32 number and one a stream call reported carries the C library's `errno`, because that is what each of them answers, while every other platform carries `errno` throughout.
+It is `0` where nothing was asked of the system.
+
+```ens
+import @std.fs;
+import FileSystemError from @std.fs.error;
+import Path from @std.fs;
+
+saveReport(Path folder, string text) throws FileSystemError {
+    try folder.createDirectories();
+    try folder.join("report.txt").writeTextAtomic(text);
+}
+
+listing(Path folder) throws FileSystemError {
+    for (let found in try folder.entries()) {
+        print("{found.name} is a {found.kind}");
+    }
+}
+```
+
+---
+
+`@std.environment` answers what surrounds the running program.
+`environment.arguments()` answers the arguments the program was started with as a `string[]`, not counting the program's own name, which every system passes as the first of them.
+The program's own identity is `environment.executablePath()`, which answers the path of the running program itself, or `null` when the operating system would not report it.
+`environment.currentDirectory()` answers the directory the program was started in, and `.` when the operating system would not report it; it is read and never written, so a program that wants to work somewhere else joins this onto the paths it uses.
+`environment.platform()` answers the system the program was built for as a `Platform`, one of `Windows`, `Linux` and `MacOS`, which was fixed when the program was compiled and cannot change while it runs.
+`Linux` is also the answer on every other system the compiler can target, whose behavior it treats as Linux's.
+
+`Environment` from the same module is a set of variables, matched by name the way one system matches them: on Windows two names that differ only in ASCII case are one variable, and everywhere else they are two.
+The matching is a rule about the values rather than about the machine, so a set built for any system behaves the same on every system, and `platform()` on the set says which system's rule it uses.
+`Environment.current()` answers the variables this process inherited, as a snapshot: changing it changes nothing outside the program, and a child is given the variables it should see at the moment it is started.
+`Environment.empty(platform)` answers no variables at all, matched by that platform's rule.
+`get(name)` answers a variable's value or `null`, `set(name, value)` gives it a value, `remove(name)` takes it out and answers whether it was there, `contains(name)` reports whether the set holds it, `length()` and `isEmpty()` measure the set, `names()` answers the names in ascending byte order, and `copy()` answers a second set holding the same variables under the same rule.
+A name is kept as it was written, so a Windows set holding `PATH` that is given `path` reports `path` from then on.
+An empty name, and one holding `=`, names no variable a child could be given, so writing one stops the program the way an index out of range does.
+
+```ens
+import @std.environment;
+import Environment from @std.environment;
+
+describeRun() {
+    for (let argument in environment.arguments()) {
+        print(argument);
+    }
+    let variables = Environment.current();
+    print(variables.get("PATH") ?? "no PATH");
+}
+```
+
+---
+
+`@std.process` starts other programs.
+No command interpreter takes part unless one is asked for by name, so every argument reaches the program exactly as written, whatever spaces or quotes it holds, and nothing is expanded on the way.
+`process.run(program, arguments, workingDirectory, environment, captureOutput)` runs a program, waits for it to finish, and answers a `CommandOutput`.
+Everything after the program is optional: the arguments default to none, the working directory and the environment to this process's own, and `captureOutput` to `false`.
+The child reads and writes this process's own three streams, so what it writes appears where it would have appeared as it is written; with `captureOutput` its two output streams are collected into the answer instead, and only its input stays this process's own.
+A captured run answers once both of those streams have ended, so a grandchild that inherited them delays the answer until it lets go of them too.
+The `environment` given is exactly what the child sees rather than something laid over what it would have inherited, so patching means `Environment.current()` and `set`, and a clean slate means `Environment.empty(platform)` and `set`.
+
+A `program` with no separator in it is looked for in the `PATH` directories of the environment the child will receive, never in the current directory, and on Windows as `name.exe` unless the name already has an extension.
+So `run(Path("build"))` never finds a `build.cmd`, while `run(Path("build.cmd"))` does find one where a `PATH` directory holds it, since a name that has an extension is looked for exactly as it is written.
+Windows then runs that script through its own command interpreter, which the caller of `run` never asked for, so a program that means to run a script says so with `runShell`.
+A `program` with a separator in it names one place, read against this process's directory when it is relative.
+On a system other than Windows, every `PATH` directory holding a file of that name is offered to the system in turn, and one the system refuses as a permission is passed over for the next, so that refusal is reported only when no later candidate runs.
+On Windows the first file found is the only candidate, because nothing there marks one file of that name as the one to run in preference to another.
+
+`process.runShell(commandLine, workingDirectory, environment, captureOutput)` runs one command line through the operating system's command interpreter, with everything that implies: the shell splits, expands and interprets the line.
+An argument built from something the program read belongs in `run`, which interprets nothing.
+The interpreter is `/bin/sh` with the line after `-c`, and on Windows the program `%ComSpec%` names, or `cmd.exe` found on `PATH` when it is not set, with the line after `/S /C` so `cmd` runs it as written.
+Failing to start the interpreter is an error; a line that ran and failed is a status to inspect.
+
+A `CommandOutput` is a struct holding the `status` the program ended with and the `stdout` and `stderr` it wrote, which are empty text unless the run captured them.
+A captured byte that spells no character is read as the replacement character, so both texts are text like any other.
+An `ExitStatus` is a struct holding a `code` and a `signal`, of which exactly one means something: a program that exited has its code and a signal of `0`, and one a signal ended has that signal and a code of `0`.
+`succeeded()` reports whether the program exited by itself with a code of `0`.
+Windows has no signals, so a child that crashed there reports its own status as a negative code, while one ended by this library's `kill()` reports signal `9` and code `0`, the numbers a POSIX system reports for the same act, so one check tells a landed kill from an exit on every platform.
+
+`process.spawn(program, arguments, workingDirectory, environment)` starts a program and hands it back as a `ChildProcess` while it is still running, with a pipe on each of its three streams, so this process writes what the child reads and reads what it writes.
+`stdout()` and `stderr()` answer a `BufferedReader` over one of the child's output streams, `input()` answers a `Writer` onto its input, and `closeInput()` is how the child learns the input has ended.
+Each of the three answers the same value every call, as `io.in()` does and for the same reason.
+Draining one of the output streams to its end while the child fills the other can leave both sides waiting, since a full pipe stops the child, so a program reads the stream the child actually writes to, or captures through `run`.
+`waitForOutput(timeoutMillis)` reports whether reading can go ahead without waiting for the child: `true` when either stream has bytes or has ended, and `false` when that many milliseconds went by with neither, where a bound of `0` asks about this moment alone.
+Reading itself waits as long as the child takes, so a program content to wait never has to ask.
+`wait()` answers the exit status, waiting for the child to finish first and reading and throwing away output nobody read meanwhile, because a child whose output nobody reads is stopped by a full pipe.
+`wait(timeoutMillis)` is the same call bounded, answering `null` once that many milliseconds have passed with the child still running.
+Either one answers the same status however often it is asked.
+`kill()` ends the child now and answers without waiting for it, and a child that had already ended is left as it is and keeps the code it ended with.
+A `ChildProcess` that is dropped lets the child go: it keeps running with nothing reading it, and on a POSIX system it stays a finished child nothing has collected until this program exits, which is why ending a child is explicit through `kill` or `wait`.
+
+A write to a pipe whose reader has gone, which includes a write to a child that has closed its input and any write after `closeInput`, raises an `IoError` of kind `Closed`.
+It never ends this program instead: the signal a system would otherwise deliver for such a write is refused before any of the program's own code runs, since ending there would run not one destructor.
+
+Failing to start a program raises a `ProcessError`, which carries the `program` as the caller wrote it, a `kind`, and a `nativeError`.
+The kinds are `NotFound` for a name no `PATH` directory holds a program under and for nothing at the path written, `PermissionDenied` for a file the system refused to run, and `Other` for anything else the system reported.
+`nativeError` is the system's own number, a Win32 number on Windows and an `errno` everywhere else, and `0` where nothing was asked of the system, as it is for that name no `PATH` directory holds.
+A program that started and then failed is not a failure this module reports but a `status` to inspect.
+
+```ens
+import Path from @std.fs;
+import IoError from @std.io.streams;
+import @std.process;
+import ProcessError from @std.process;
+
+gitVersion() -> string throws ProcessError {
+    let finished = try process.run(Path("git"), ["--version"], captureOutput: true);
+    if (!finished.status.succeeded()) {
+        return "";
+    }
+    return finished.stdout.trim();
+}
+
+relay(string url) -> int throws ProcessError, IoError {
+    let child = try process.spawn(Path("git"), ["clone", url]);
+    string? line = try child.stdout().readLine();
+    while (line != null) {
+        print(line);
+        line = try child.stdout().readLine();
+    }
+    let status = try child.wait();
+    return status.code;
+}
+```
+
+---
+
+`@std.thread` holds one call: `Thread.sleep(millis)` blocks the thread it is called on until the monotonic clock has advanced by that many milliseconds.
+The count is a floor and never a ceiling, so nothing bounds how long a loaded machine leaves the thread waiting, and a count of zero or less returns without waiting at all.
 
 ---
 
 Every value has a `hash()` method returning a `long`. Value types (primitives, enums, strings, structs) and arrays hash by their contents, so equal values hash equally; classes hash by identity, matching how `==` compares them.
 An optional hashes as its payload does while it is present and as one fixed value once it is absent, so every absent value hashes equally whatever its type.
-A class or a struct can declare its own `hash() -> long` to control its hashing, paired with `equals(T other) -> bool` - a method taking a single parameter of the declaring type `T` itself - to control equality.
+A class or a struct can declare its own `hash() -> long` to control its hashing, paired with `equals(T other) -> bool`, a method taking a single parameter of the declaring type `T` itself, to control equality.
 A method named `hash` must have exactly that signature, and neither `hash` nor `equals` can be `throws`, because the language takes a value's hash and compares two values where there is no room for a `try`; `equals` must return `bool`.
-When a class declares such an `equals`, `==` and `!=` on that class compare by content - an identity and null check first, then `equals` - rather than by reference identity; when a struct declares one, `==` and `!=` call it instead of comparing the fields.
+When a class declares such an `equals`, `==` and `!=` on that class compare by content, running an identity and null check first and then `equals`, rather than by reference identity; when a struct declares one, `==` and `!=` call it instead of comparing the fields.
 Both `hash` and `equals` are written with `override`, since they replace behavior the language provides: a class's identity hash and equality, a struct's content hash and memberwise equality.
 The two are a matched pair: a type that declares one must declare the other, so equal values always hash equally.
 A declared `hash` decides the hashing of its type everywhere the value appears, including as a field of an enclosing struct, as an array element, and through a type parameter; a declared `equals` decides `==` the same way.
@@ -1833,26 +1989,40 @@ Because the language calls `hash` and `equals` wherever the type is used, both f
 For a class, which implementation runs is decided by the value's type at run time, not by the type written in the source.
 An object of a class that declares `hash` and `equals` keeps them when it is held in a variable, field, array or collection typed as a base class or as an interface, so two such objects that are equal as their own class stay equal and hash alike where the code holding them only knows the base type.
 Because a class's `equals` takes its own class, two objects compare by content only when their run-time types are the same one; objects of different run-time types are never equal, even when one class inherits the other's `equals`.
-A class that declares neither method - including a base class whose subclasses declare them - keeps identity equality and the identity hash for objects of exactly that class.
+A class that declares neither method, a base class whose subclasses declare them included, keeps identity equality and the identity hash for objects of exactly that class.
 
-The collection modules build on hashing and iteration:
+Three contracts describe what a container is, and the collection modules build them on hashing and iteration.
+`Iterator<T>` from `@std.collections.iterator` declares `next() -> T?`, `Iterable<T>` in the same module declares `makeIterator() -> Iterator<T>`, which is what a `for`-in loop asks for, and `Collection<T>` from `@std.collections.collection` extends `Iterable<T>` with `length()`, `isEmpty()` and `contains(value)`.
+All three are read-only, so what changes a container is declared on the container itself.
+`List`, `Set`, `Deque` and `PriorityQueue` are `Collection<T>`s, while `Map` and `SortedMap` are `Iterable<Entry<K, V>>`s.
+Every container is a reference type, as a class is, and each answers `copy()` with a second container holding the same values, which leaves the values themselves shared between the two.
+A container aborts the program rather than answering a value it does not have, so an index outside the container, and `pop`, `popFront`, `popBack`, `first`, `last`, `peek`, `firstKey` or `lastKey` on an empty one, are mistakes in the caller rather than conditions to recover from.
 
-- `List<T>` from `@std.collections.list` is a growable array: `push(value)`, `pop()` removing and returning the last value, `get(index)`, `set(index, value)`, and `length()`, plus `toArray()` returning a fresh right-sized `T[]` holding the current contents. Iterating a list yields its values in insertion order.
-- `Map<K, V>` from `@std.collections.map` maps keys to values: `set(key, value)` inserts or overwrites, `get(key)` returns `V?` (`null` when absent), plus `contains(key)`, `remove(key)`, `length()`, and `keys()` / `values()`, which are views onto the live map.
-  Iterating a map yields `Entry<K, V>` entries (from `@std.collections.entry`) with `key` and `value` fields.
+- `List<T>` from `@std.collections.list` is a growable sequence holding its values in the order they were put in: `push(value)`, `pushAll(values)`, `pop()` taking the last value off and answering it, `get(index)`, `set(index, value)`, `first()`, `last()`, `insert(index, value)`, `removeAt(index)`, `remove(value)` removing the first value equal to it, `clear()`, `reserve(capacity)`, `copy()`, and `toArray()` answering a fresh right-sized `T[]` holding the current contents.
+  `indexOf(value)` and `indexWhere(test)` answer where the first match sits, or `-1` when there is none, and `removeWhere(test)` removes every value a test accepts in one pass and answers how many went.
+  `sort(order)` puts the values in the order a comparison describes, which answers negative when its first argument sorts first, and `sort()` with no argument uses the natural order where the element type implements `Comparable`.
+  `sorted` answers a new list rather than reordering this one, and `reverse` and `reversed` are the same pair for turning the order around.
+  Whether values the order calls equal keep the order they arrived in is not promised.
+  `List.of(values)` answers a list holding an array's values, and `List.withCapacity(capacity)` an empty list with room for that many.
+  Iterating a list yields its values in insertion order.
+- `Map<K, V>` from `@std.collections.map` finds values by key: `set(key, value)` inserts or overwrites, `get(key)` answers `V?` and `null` when the key is absent, and `getOrInsert(key, make)` answers the value under the key, storing what `make` builds when there is none, plus `contains(key)`, `remove(key)`, `removeWhere(test)`, `clear()`, `length()`, `isEmpty()`, `copy()`, `Map.withCapacity(capacity)`, and `keys()` and `values()`, which are views onto the live map.
+  Iterating a map yields `Entry<K, V>` entries from `@std.collections.entry`, each a struct with a `key` and a `value` field, while the two views yield the keys and the values themselves.
+  For a map whose values are themselves nullable, a stored null and an absent key are told apart by the two levels `get` answers at: the outer null means the key is absent.
+  The order a walk visits a map's entries in is not specified and may change between releases, so a program that needs an order sorts what it read or holds a `SortedMap` instead.
   Adding or removing entries in a map or a set while it, or one of a map's views, is being walked aborts the program; overwriting the value under a key the map already holds does not.
   Make the change after the walk, or remove with `removeWhere`.
-- `Set<T>` from `@std.collections.set` stores each value once: `add(value)` returns whether the value was new, plus `contains(value)`, `remove(value)`, `length()`, and `toArray()`.
-  Iterating a set yields its values.
-- `Deque<T>` from `@std.collections.deque` grows and shrinks at either end: `pushFront(value)` and `pushBack(value)`, `popFront()` and `popBack()` removing and returning a value, `first()`, `last()`, and `get(index)` counting from the front, plus `toArray()`.
+- `Set<T>` from `@std.collections.set` stores each value once: `add(value)` answers whether the value was new, plus `contains(value)`, `remove(value)`, `removeWhere(test)`, `clear()`, `length()`, `isEmpty()`, `copy()` and `toArray()`, and `union`, `intersection`, `difference` and `isSubsetOf` over a second set.
+  `Set.of(values)` and `Set.withCapacity(capacity)` answer a set the way the list statics answer a list.
+  Iterating a set yields its values, in an order that is not specified either.
+- `Deque<T>` from `@std.collections.deque` grows and shrinks at either end: `pushFront(value)` and `pushBack(value)`, `popFront()` and `popBack()` removing and answering a value, `first()`, `last()`, and `get(index)` counting from the front, plus `clear()`, `reserve(capacity)`, `copy()`, `toArray()` and `Deque.withCapacity(capacity)`.
+  There is no `set(index, value)`, because writing through a position is a list's operation.
   Iterating a deque yields its values from the front to the back.
-- `PriorityQueue<T>` from `@std.collections.priorityqueue` takes values out smallest first: `push(value)`, `pop()` removing and returning the smallest value, and `peek()` reading it without removing it.
-  "Smallest" follows the natural order of a `Comparable` element, or the comparison given to the constructor.
+- `PriorityQueue<T>` from `@std.collections.priorityqueue` takes values out smallest first: `push(value)`, `pop()` removing and answering the smallest value, and `peek()` reading it without removing it, plus `clear()` and `copy()`.
+  "Smallest" is what the comparison given to the constructor says, or the natural order of the element type for the constructor that takes nothing, which exists only where that type implements `Comparable`.
   Iterating a priority queue yields every value once, in no particular order.
-- `SortedMap<K, V>` from `@std.collections.sortedmap` has the operations of `Map` plus `firstKey()` and `lastKey()`, and walks its entries in key order, following the natural order of a `Comparable` key or the comparison given to the constructor.
+- `SortedMap<K, V>` from `@std.collections.sortedmap` has the operations of `Map` apart from `withCapacity`, plus `firstKey()` and `lastKey()`, and walks its entries and its views in key order.
+  That order is the natural order of the key type, under the same rule as a priority queue's, or the comparison given to the constructor.
   Adding or removing entries while a sorted map or one of its views is being walked aborts the program, as it does for a `Map`.
-- `List.sort(order)` puts a list in the order a comparison describes, and `sort()` with no argument uses the natural order when the element type implements `Comparable`.
-  Whether values the order calls equal keep the order they arrived in is not promised.
 
 ```ens
 import Map from @std.collections.map;
@@ -1870,7 +2040,7 @@ for (let entry in ages) {
 }
 ```
 
-Keys are matched with `==` and bucketed with `hash()`: strings by contents, value types by value, and classes by identity - unless a key's run-time class declares `equals` (with its paired `hash`), in which case that key matches by content.
+Keys are matched with `==` and bucketed with `hash()`: strings by contents, value types by value, and classes by identity, unless a key's run-time class declares `equals` with its paired `hash`, in which case that key matches by content.
 A map or set keyed by a base class or an interface therefore finds the entry a derived key stored, because the key's own class decides how it is matched and bucketed; two keys of different run-time classes never match.
 Struct keys are supported and match by content: their fields compare with `==` and hash by content, so a key rebuilt from equal field values finds the entry stored under the original.
 A struct key that declares its own `equals` and `hash` is matched and bucketed by that pair instead, so a field the pair ignores does not change which entry a key finds.
@@ -1879,11 +2049,12 @@ A collection cannot be a key for the same reason, nor can a struct whose fields,
 An external handle or a function value cannot be a key either, because neither has a hash to bucket by.
 
 What text can do is declared on `string` itself, so every member below is called on the text and needs no import.
+`byteAt(index)` answers one of the UTF-8 bytes, and an index outside the text aborts the program.
 `isEmpty()`, `contains(needle)`, `indexOf(needle)`, `indexOf(needle, from)` and `lastIndexOf(needle)` search by exact bytes, answering the byte offset of an occurrence or `-1`; an empty needle is found at offset `0`, and looking back, at the end.
 `startsWith(prefix)` and `endsWith(suffix)` report whether the first or last bytes are exactly that part; an empty part always matches, and a part longer than the text never does.
 `substring(start, end)` and `substring(start)` answer the bytes of a half-open byte range as new text; a range outside the text, or one that cuts through the middle of a character, aborts the program.
 `trim()`, `trimStart()` and `trimEnd()` drop the whitespace at both ends or at one, where whitespace is a space or one of the ASCII layout controls: tab, line feed, vertical tab, form feed, and carriage return.
-`replace(needle, replacement)`, `repeat(times)`, `padStart(width, filler)` and `padEnd(width, filler)` build new text; a negative `times` aborts, text already `width` bytes wide is returned as it is, and a filler of several bytes is only ever added whole.
+`replace(needle, replacement)`, `repeat(times)`, `padStart(width, filler)` and `padEnd(width, filler)` build new text; an empty needle occurs nowhere to replace and gives the text back as it was, a negative `times` aborts, text already `width` bytes wide is returned as it is, and a filler of several bytes is only ever added whole.
 `split(separator)` answers the parts between the occurrences of the separator, so two neighboring separators give an empty part and text holding none gives one part, and an empty separator does the same.
 `lines()` splits on `\n` and drops a carriage return before it, so text written with either line ending reads the same; text ending in a newline has a last, empty line.
 `toLowerAscii()`, `toUpperAscii()` and `equalsIgnoreCaseAscii(other)` convert or compare the ASCII letters only and keep every other byte as it is; the names say so because the full Unicode rules are a different operation.

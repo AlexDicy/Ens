@@ -484,6 +484,7 @@ Naming it for the thread rather than for the wait leaves the place the rest of t
 ## @std.system (internal)
 
 One file, every `external` declaration in the library, all `public`, nothing `export`.
+`start`, `ChildProcess` and `SystemError` stay `export` until the compiler's package tooling moves to the threaded reader, since `selfhost/packages/src/tools.ens` reaches them across a package boundary.
 Contents: the file bridges (open, read, write, close, metadata, listing, create, remove, rename, realpath), the stream bridges (write, read, flush, close over one of the C library's own handles), the process bridges (spawn with OS-level redirection, pipe read, wait with and without timeout, kill, release), the environment bridges (variables snapshot, argv, executable path, cwd), and the three error-number tables.
 The name `errorKindFromCode` says code rather than errno because Windows reports Win32 error codes there, not errno.
 It has a companion, `errorKindFromErrno`, because the two numbering spaces meet inside `@std.fs`: a file-system call on Windows answers Win32 while a stream call there answers the C library's errno, so a failure has to be read through the table belonging to the call that produced it.
