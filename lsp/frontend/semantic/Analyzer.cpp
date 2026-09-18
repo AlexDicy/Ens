@@ -1917,6 +1917,14 @@ static bool equalsSignatureConforms(const Symbol* sym) {
     return sym->returnType && sym->returnType->kind == TypeKind::Bool;
 }
 
+// A struct or a class renders as text through `toString`, so a declaration must match the
+// contract that text form needs: no arguments, a `string` result, and no `throws`
+// for a caller that has nowhere to write `try`.
+static bool toStringSignatureConforms(const Symbol* sym) {
+    return sym && sym->paramTypes.empty() && !sym->declaredThrows && sym->returnType &&
+        sym->returnType->isString();
+}
+
 // The base declaration a member of this class would replace. A private one is skipped: only
 // the class that declared it can name it, so it is not inherited, and this class's own member
 // of that name is an unrelated one of its own. A visible declaration further up the chain is
@@ -2115,15 +2123,14 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
                     "'protected': a subclass has to implement it, and an unmarked member is "
                     "private to '" + asciiOf(si->name) + "'. Mark it 'protected'.");
         }
-        // A conforming `hash` or `equals` overrides the compiler's built-in
-        // identity hash/equality, so it is written with 'override' like any
-        // other override, and a marked `toString` replaces the type-name text
-        // form the same way. `reservedIntent` also covers the near-miss shapes,
-        // which get their own signature diagnostics rather than a spurious
-        // "nothing to override".
+        // A conforming `hash`, `equals` or `toString` overrides a behavior the
+        // compiler provides. It is written with 'override' like any other override.
+        // `reservedIntent` also covers the near-miss shapes, which get their own
+        // signature diagnostics rather than a spurious "nothing to override".
         bool reservedIntent = mname == u"hash" || mname == u"toString" ||
             (mname == u"equals" && equalsSignatureIntent(sym));
         bool reservedConforming = (mname == u"hash" && hashSignatureConforms(sym)) ||
+                                  (mname == u"toString" && toStringSignatureConforms(sym)) ||
                                   (mname == u"equals" && equalsSignatureConforms(sym));
         if (m.isOverride()) {
             if (baseBySig) {
@@ -2183,6 +2190,9 @@ void Analyzer::layoutOneClass(const ast::ClassDecl& cd) {
             errorAtNode(m.node, "Method '" + asciiOf(mname) + "' of '" + asciiOf(si->name) +
                 "' implements a method declared in interface '" + ifaceT->toString() +
                 "'; mark it 'override'");
+        } else if (reservedConforming && mname == u"toString") {
+            errorAtNode(m.node, "Method 'toString' of '" + asciiOf(si->name) +
+                "' replaces the text form every class answers with; mark it 'override'.");
         } else if (reservedConforming) {
             errorAtNode(m.node, "Method '" + asciiOf(mname) + "' overrides the built-in " +
                 (mname == u"hash" ? std::string("identity hash") : std::string("identity equality")) +
@@ -2587,14 +2597,6 @@ void Analyzer::checkEqualsMethodSignature(const ast::FuncDecl& fn, Symbol* sym, 
     }
 }
 
-// A struct renders as text through `toString`, so a declaration must match the
-// contract that text form needs: no arguments, a `string` result, and no `throws`
-// for a caller that has nowhere to write `try`.
-static bool toStringSignatureConforms(const Symbol* sym) {
-    return sym && sym->paramTypes.empty() && !sym->declaredThrows && sym->returnType &&
-        sym->returnType->isString();
-}
-
 void Analyzer::checkToStringMethodSignature(const ast::FuncDecl& fn, Symbol* sym,
                                             bool isConstructor) {
     if (isConstructor || !sym || sym->name != u"toString") return;
@@ -2614,9 +2616,9 @@ void Analyzer::checkToStringMethodSignature(const ast::FuncDecl& fn, Symbol* sym
 // The behavior a member takes over from the language, or null for an ordinary
 // member: a type's text form, and the hash and equality a value is keyed by. What
 // an `equals` replaces differs by kind: a struct's memberwise comparison, a
-// class's identity. A class's text form (its type name) is replaced only by a
-// declaration that writes the `override` marker; a class `toString` without it is
-// an ordinary method the language never calls.
+// class's identity. A class's text form (its type name) is replaced by a
+// declaration that writes the `override` marker. A conforming `toString` has to
+// write it. One whose signature differs is an ordinary method the language never calls.
 const char* Analyzer::builtinBehaviorReplaced(const Type* owner,
                                               const std::u16string& memberName,
                                               const Symbol* sym, bool declaresOverride) const {
