@@ -1493,6 +1493,8 @@ An element type with no `==` of its own, such as a function value, makes the com
 An array cannot be a `Map` or `Set` key, because its contents, and so its hash, can change while it sits in the table.
 The same holds for a `List`, `Map`, or `Set` used as a key, and for a struct key whose fields, at any depth, hold an array or a collection; the error names the field.
 An external handle or a function value has no hash at all, so neither can be a key, and calling `hash()` on one, directly or through a type parameter, is an error naming the type.
+A `float` or a `double` has no hash either, because equality and hashing disagree on two of their values.
+A `NaN` is equal to no value, so nothing could find it again, and negative zero is equal to zero but hashes differently, so one key would become two entries.
 
 ```ens
 int[] xs = new int[5];        // 5 ints, zero-initialized
@@ -1991,7 +1993,7 @@ When a class declares such an `equals`, `==` and `!=` on that class compare by c
 Both `hash` and `equals` are written with `override`, since they replace behavior the language provides: a class's identity hash and equality, a struct's content hash and memberwise equality.
 The two are a matched pair: a type that declares one must declare the other, so equal values always hash equally.
 A declared `hash` decides the hashing of its type everywhere the value appears, including as a field of an enclosing struct, as an array element, and through a type parameter; a declared `equals` decides `==` the same way.
-A type parameter needs no bound to be hashed, since every type but an external handle or a function value answers `hash()`, which is why `Map` and `Set` name their key types without one; an instantiation at one of those two types is an error naming the type.
+A type parameter needs no bound to be hashed, since every type but an external handle, a function value, and a floating-point number answers `hash()`, which is why `Map` and `Set` name their key types without one; an instantiation at one of those is an error naming the type.
 Because the language calls `hash` and `equals` wherever the type is used, both follow their type's visibility when unmarked and may not be marked less visible than the type itself.
 
 For a class, which implementation runs is decided by the value's type at run time, not by the type written in the source.
@@ -2057,6 +2059,9 @@ A struct key that declares its own `equals` and `hash` is matched and bucketed b
 An array cannot be a key: it compares and hashes by content, and its content can change while it sits in the table, so the entry would silently become unfindable.
 A collection cannot be a key for the same reason, nor can a struct whose fields, at any depth, hold an array or a collection; the error names the field.
 An external handle or a function value cannot be a key either, because neither has a hash to bucket by.
+Nor can a `float` or a `double`, nor a struct whose fields hold one at any depth unless it declares its own `equals` and `hash`.
+A `NaN` is equal to no value, so nothing could find it again, and negative zero is equal to zero but hashes differently, so one key would become two entries.
+A `SortedMap` keys numbers by their order instead, which needs no hash.
 
 What text can do is declared on `string` itself, so every member below is called on the text and needs no import.
 `byteAt(index)` answers one of the UTF-8 bytes, and an index outside the text aborts the program.

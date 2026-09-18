@@ -8,10 +8,6 @@ Two consistency items the C4 and pre-C5 work surfaced, both independent of the l
 An array literal holding `this` inside a generic body (`[this, this]` for a `T[]` parameter, or `Box<T>[] xs = [this];`) is refused, because the literal's element type is the bare template and assignability equates the template with its self-instantiation only at the top level, not under `[]`; since 2026-09-04 the refusal even reads "expected 'Box<T>[]', got 'Box<T>[]'". The clean resolution is `this` carrying the self-instantiation itself, or the equation applying structurally.
 A subclass method whose name a private base field uses is still refused, since `checkFieldMethodCollision` searches the flattened field list without the exemption private base fields gained on 2026-09-04; consistency would let it through, and it is a conservative refusal rather than an unsoundness.
 A bare function reference stored into a local with no declared type, `let callback = twice;`, passes sema and then fails in codegen with "does not support a local of type '<error>' yet" (found 2026-09-08, no imports involved); an accepted program that cannot be compiled is a soundness matter, so it does not wait for the diagnostics review.
-A `Map<double, V>` and a `SortedMap<double, V>` disagree about the two values `==` treats specially (found 2026-09-18 while giving the floating-point types their order).
-The map keys through `==` and the synthesized hash, so a NaN key can never be read back and every `set` with a NaN adds another unreachable entry, while the sorted map keys through `compareTo`, where every NaN is one key.
-Negative zero splits the other way: `==` calls it equal to zero, the hash folds its bit pattern and so differs, and `compareTo` orders it below zero; the map survives that only because its slot index masks the low bits and the sign is the one bit that differs, so a hash that mixed its bits would break it.
-Aligning them means a key equality for the floating-point types that is not `==`, canonicalizing NaN and keeping the two zeros apart, which is what Java's `Double.equals` and `hashCode` do, and it waits on a ruling.
 
 ## C8 and C9
 

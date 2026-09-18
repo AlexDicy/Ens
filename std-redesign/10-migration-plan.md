@@ -70,6 +70,9 @@ Within each milestone the std change and its consumer updates are one commit, so
   Split into three commits: C4a, the compiler's key-type and hash rules; C4b, `List`, `Map`, and `Set` rewritten with `Entry`, `Collection`, the views, the modification counter, `removeWhere`, and every consumer, deleting `Pair` and the sorting module; C4c, `Deque`, `PriorityQueue`, and `SortedMap`.
   C4b surfaced two compiler bugs the seed has to carry before the library can land: `this` inside a generic body was typed as the bare template, so a container could not hand itself to its iterator, and the synthesized array-content helpers were named without their module, so two modules comparing the same array type collided at link time.
   Both are fixed in their own commits and a seed release sits between them and the library.
+  C4a's exclusion list grew on 2026-09-18, when `float` and `double` joined the types a `Map` or a `Set` cannot key by, beside arrays, collections, external handles and function values.
+  A NaN is equal to no value, so nothing could find it again, and negative zero is equal to zero but hashes differently, so one key would become two entries; the refusal points at `SortedMap`, which keys by the order `Comparable` gives rather than by a hash.
+  A struct whose fields hold one at any depth follows from the same walk, unless it declares its own `equals` and `hash`.
 - C5: `@std.io` written from scratch: `io.ens` plus the four submodules; `print`/`eprint` rerouted through the prelude onto `io.out()`.
   The two prelude functions live in `@std.io.print` (ratified 2026-09-03), since the prelude lends every export of a listed module; the compiler stops seeding `print` as a builtin and lists `std.io.print` as implicitly imported.
   C5 needs two seeds, which the plan first missed by reasoning only about `print`.
