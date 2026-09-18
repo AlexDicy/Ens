@@ -117,7 +117,13 @@ Consumer migration inside C means the selfhost compiler, build, cli, and lsp sou
 
 ## Phase D: deletion and the record
 
-- D1: delete the old public `@std.system`, `@std.path`, `@std.text.strings`, `LineBuffer`, and the old process overload family; the name `@std.system` now means only the internal native module.
+- D1: the deletion, in three commits, because one commit could not stay green at every step and a diff of that size could not be reviewed.
+  D1a moved the eleven fixtures that outlive the old surface onto `@std.fs`, `@std.environment` and `@std.process`, and renamed the two that test what survives to `tests/std_system_start_stream.ens` and `tests/std_system_start_timeout.ens` (8787cb4).
+  Its one finding was that `fs_bridges` measures the bridge's own open against a control opened by the C library, so the control had to stay the library's open and now lives in the fixture rather than being borrowed from an export that was about to go.
+  D1b deleted the old public surface: 28 exports with their six private helpers, `@std.path`, `@std.text.strings`, twelve libc declarations, the six bridges whose last caller went with them, and twelve fixtures.
+  What survives in `@std.system` is exactly what `selfhost/packages/src/tools.ens` reaches across a package boundary until threads land: `start` in both overloads, `ChildProcess` and `SystemError`, and behind them `inherited`, `childVariables`, `startedChild`, the six child bridges, `LineBuffer` from `@std.text.lines`, and `@std.process.blocks`.
+  So `LineBuffer` does not go at D1 after all, and the old `platform() -> string` became a private helper over `platformCode()`, which leaves those three as the file's only exported names.
+  D1c is what remains: the emitters and emitter tests of the six bridges the library stopped declaring, which are dead code the moment D1b lands.
 - D2: rewrite the std chapters of `spec.md` to describe the new library, honoring the spec-scope rule: user-facing behavior only.
 - D3: mark this folder's documents as implemented, moving anything still open into the issue tracker or the TODO file.
 - D4: cut the release whose seed makes the new std the one every consumer builds against.

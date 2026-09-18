@@ -26,6 +26,7 @@ That call is a different one from the new `ChildProcess.waitForOutput(timeoutMil
 Two things follow from that family outliving D1, both of them limits on what D1 can reach.
 `@std.text.lines` and its `LineBuffer` survive it, because the old `ChildProcess` is their only consumer and D1 cannot delete that, so the module goes when the threaded reader replaces it and not before.
 And `@std.system` keeps exported names for as long as `selfhost/packages/src/tools.ens` reaches `SystemError`, `start` and `ChildProcess` across a package boundary, so the "all `public`, nothing `export`" that 07-fs-process-environment.md describes is not reachable at D1 either.
+D1b confirmed both: those three are the only exported names left in the file, and `@std.text.lines` is still there for the `ChildProcess` behind them.
 
 ## Limits the C7b bridges accept
 

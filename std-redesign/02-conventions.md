@@ -68,7 +68,7 @@ A conversion that can fail or lose information gets its own name (`string.fromBy
 
 ## Documentation
 
-Doc comments state the rule, then the edge cases, in prose; `@std.path`'s voice is the model.
+Doc comments state the rule, then the edge cases, in prose; `Path`'s own methods in `@std.fs` are the model.
 No design rationale in source comments.
 Compiled documentation examples are deferred.
 

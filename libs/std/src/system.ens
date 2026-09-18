@@ -1,7 +1,5 @@
-import List from @std.collections.list;
 import @std.process.blocks;
 import LineBuffer from @std.text.lines;
-import EncodingError from @std.text;
 
 public external type CFile;
 public external type Folder;
@@ -14,25 +12,9 @@ external type ChildHandle;
 // only shape Win32 accepts. Building both here keeps the quoting rules in Ens instead of in two code
 // generators.
 external from libc {
-    fopen(string path, string mode) -> CFile?;
-    fread(byte[] buffer, ulong size, ulong count, CFile stream) -> ulong;
-    fwrite(byte[] buffer, ulong size, ulong count, CFile stream) -> ulong;
-    ferror(CFile stream) -> int;
-    feof(CFile stream) -> int;
-    fclose(CFile stream) -> int;
-    fflush(CFile? stream) -> int;
     ens_standard_output() -> CFile;
     ens_standard_error() -> CFile;
     ens_standard_input() -> CFile;
-    getenv(string name) -> string?;
-    getcwd(byte[] buffer, int size) -> string?;
-    remove(string path) -> int;
-    rmdir(string path) -> int;
-    rename(string path, string newPath) -> int;
-    ens_run_process(string command) -> int;
-    ens_spawn_process(string program, byte[] argumentBlock, long argumentCount,
-                      string commandLine, byte[] environmentBlock, long environmentCount,
-                      long environmentBytes, string stdoutPath, string stderrPath) -> long;
     ens_start_process(string program, byte[] argumentBlock, long argumentCount,
                       string commandLine, byte[] environmentBlock, long environmentCount,
                       long environmentBytes) -> ChildHandle?;
@@ -41,9 +23,6 @@ external from libc {
     ens_kill_child(ChildHandle child) -> int;
     ens_wait_child(ChildHandle child) -> long;
     ens_release_child(ChildHandle child);
-    ens_path_kind(string path) -> int;
-    ens_list_directory(string folder) -> string[]?;
-    ens_create_directory(string path) -> int;
     ens_fs_error_kind(int code) -> int;
     ens_fs_metadata(string path, int followLinks, out long kind, out long length,
                     out long modifiedMillis) -> int;
@@ -82,47 +61,12 @@ external from libc {
     ens_executable_path(byte[] buffer, long capacity) -> long;
     ens_environment() -> string[];
     ens_platform() -> int;
-    ens_write_error(string message);
     atof(string text) -> double;
     ens_arguments() -> string[];
 }
 
 export class SystemError extends Error {
     export constructor(string m, Error? cause = null) { super(m, cause); }
-}
-
-export final class File {
-    CFile handle;
-
-    protected constructor(this.handle);
-
-    export read(byte[] buffer) -> ulong throws {
-        let count = fread(buffer, 1, buffer.length as ulong, this.handle);
-        if (ferror(this.handle) != 0) {
-            throw new SystemError("file read failed");
-        }
-        return count;
-    }
-
-    export write(byte[] buffer) -> ulong throws {
-        let count = fwrite(buffer, 1, buffer.length as ulong, this.handle);
-        if (ferror(this.handle) != 0) {
-            throw new SystemError("file write failed");
-        }
-        return count;
-    }
-
-    export close() -> int {
-        return fclose(this.handle);
-    }
-}
-
-export openFile(string path, string mode) -> File throws {
-    CFile? handle = fopen(path, mode);
-    if (handle == null) {
-        throw new SystemError("could not open file");
-    }
-    return new File(handle);
 }
 
 // The three streams every process is born with, and the calls over one of their handles. All of
@@ -479,334 +423,6 @@ public parsedDouble(string text) -> double {
     return atof(text);
 }
 
-// Reports whether a file or directory exists at `path`, without throwing.
-export exists(string path) -> bool {
-    return ens_path_kind(path) != 0;
-}
-
-// Reports whether `path` names a file rather than a directory. A missing path reports false, so
-// this never throws.
-export isFile(string path) -> bool {
-    return ens_path_kind(path) == 1;
-}
-
-// Reports whether `path` names a directory rather than a file. A missing path reports false, so
-// this never throws.
-export isDirectory(string path) -> bool {
-    return ens_path_kind(path) == 2;
-}
-
-// The names of everything directly inside `folder`, without '.' and '..' and without the folder in
-// front of them, in ascending order by their bytes so a walk over a tree visits the same names in
-// the same order however the file system enumerates them.
-export listDirectory(string folder) -> string[] throws {
-    string[]? found = ens_list_directory(folder);
-    if (found == null) {
-        throw new SystemError("could not read the folder '{folder}'");
-    }
-    let names = new List<string>();
-    for (let name in found) {
-        names.push(name);
-    }
-    names.sort();
-    return names.toArray();
-}
-
-// Creates the directory `path` names, and every parent of it that is missing. A path that is
-// already a directory is left alone.
-export createDirectory(string path) throws {
-    if (path.length == 0) {
-        throw new SystemError("could not create a folder: no path was given");
-    }
-    createParents(path);
-    createLevel(path);
-    if (ens_path_kind(path) != 2) {
-        throw new SystemError("could not create the folder '{path}'");
-    }
-}
-
-// Creates the directory `path` names and answers whether this call is the one that created it: true
-// when it did, false when a directory was already there. Every missing parent above it is created the
-// way 'createDirectory' creates them, and only the directory `path` itself names is claimed, so two
-// programs asking for the same name at the same instant get different answers and exactly one of them
-// may treat the folder as its own.
-export createNewDirectory(string path) -> bool throws {
-    if (path.length == 0) {
-        throw new SystemError("could not create a folder: no path was given");
-    }
-    createParents(path);
-    int outcome = ens_create_directory(path);
-    if (outcome == 0) {
-        return true;
-    }
-    if (outcome == 1) {
-        if (ens_path_kind(path) != 2) {
-            throw new SystemError("could not create the folder '{path}': a file of that name is "
-                + "already there. Remove it, or ask for a folder under another name");
-        }
-        return false;
-    }
-    throw new SystemError("could not create the folder '{path}'");
-}
-
-// Every level above `path` that is missing. A parent that is already there is left alone, and one
-// that could not be created is left to the call that needs it to report.
-createParents(string path) {
-    byte[] raw = path.toBytes();
-    for (long i = 1; i < raw.length; i++) {
-        if (raw[i] == '/') {
-            createLevel(path.substring(0, i));
-        }
-    }
-}
-
-// Creates one level of a path when nothing is there yet. A root - a lone '/', a drive letter, or
-// the start of a network share - is left alone, because no call creates one.
-createLevel(string level) {
-    if (level.length == 0 || level == "/" || driveRoot(level)) {
-        return;
-    }
-    if (ens_path_kind(level) == 2) {
-        return;
-    }
-    let created = ens_create_directory(level);
-}
-
-driveRoot(string level) -> bool {
-    return level.length == 2 && level.endsWith(":");
-}
-
-// Removes the file `path` names. A directory is refused, because removing one is
-// 'removeDirectory'.
-export removeFile(string path) throws {
-    if (ens_path_kind(path) == 2) {
-        throw new SystemError("could not remove the file '{path}': it is a folder, so remove it "
-            + "with removeDirectory");
-    }
-    if (remove(path) != 0) {
-        throw new SystemError("could not remove the file '{path}'");
-    }
-}
-
-// Removes the directory `path` names, which has to be empty already: removing what is inside it
-// first is the caller's to decide.
-export removeDirectory(string path) throws {
-    if (rmdir(path) != 0) {
-        throw new SystemError("could not remove the folder '{path}'");
-    }
-}
-
-// Moves the file or folder `from` names to `to` and answers whether this call is the one that moved
-// it: true when it did, and false when something was already at `to`. The move happens in one step,
-// so no other program ever sees half of it and two programs racing for the same name get different
-// answers; that is also why both paths have to be on the same volume, since a move across volumes
-// would have to copy. A move that failed for any other reason raises a `SystemError`.
-export move(string from, string to) -> bool throws {
-    if (ens_path_kind(to) != 0) {
-        return false;
-    }
-    if (rename(from, to) == 0) {
-        return true;
-    }
-    if (ens_path_kind(to) != 0) {
-        return false;
-    }
-    throw new SystemError("could not move '{from}' to '{to}'");
-}
-
-// The directory the program was started in, with '/' between its parts, or "." when the operating
-// system would not report it. It is read, never written: a program that wants to work somewhere
-// else joins that folder onto the paths it uses.
-export currentDirectory() -> string {
-    long capacity = 4096;
-    while (capacity <= 65536) {
-        byte[] buffer = new byte[capacity];
-        string? folder = getcwd(buffer, capacity as int);
-        if (folder != null) {
-            return nativePathText(folder);
-        }
-        capacity = capacity * 8;
-    }
-    return ".";
-}
-
-// The path of the running program itself, with '/' between its parts, or "" when the operating
-// system would not report it.
-export executablePath() -> string {
-    long capacity = 4096;
-    while (capacity <= 65536) {
-        byte[] buffer = new byte[capacity];
-        long written = ens_executable_path(buffer, capacity);
-        if (written > 0) {
-            return nativePathText(string.fromBytesLossy(buffer.slice(0, written)));
-        }
-        capacity = capacity * 8;
-    }
-    return "";
-}
-
-// Text the operating system reported, written the way the two functions above have always
-// answered a path: with '/' between the parts on Windows, and byte for byte everywhere else,
-// where '\' is an ordinary character in a name.
-nativePathText(string text) -> string {
-    if (platform() != "windows") {
-        return text;
-    }
-    return text.replace("\\", "/");
-}
-
-// The environment this process inherited, as 'NAME=VALUE' entries in ascending order by their
-// bytes. It is a snapshot: nothing here changes the environment, and a child is given the
-// variables it should see at the moment it is started.
-export environment() -> string[] {
-    let entries = new List<string>();
-    for (let entry in ens_environment()) {
-        entries.push(entry);
-    }
-    entries.sort();
-    return entries.toArray();
-}
-
-// The system the program was built for, named the way a package manifest names one in a native
-// binding: "windows", "linux" or "macos". Any other system the compiler can target reports "linux",
-// whose behavior it shares.
-export platform() -> string {
-    return switch (ens_platform()) {
-        0 -> "windows",
-        2 -> "macos",
-        default -> "linux",
-    };
-}
-
-export getEnvironmentVariable(string name) -> string? {
-    return getenv(name);
-}
-
-export arguments() -> string[] {
-    return ens_arguments();
-}
-
-export readAllBytes(string path) -> byte[] throws {
-    CFile? handle = fopen(path, "rb");
-    if (handle == null) {
-        throw new SystemError("could not open file '{path}'");
-    }
-    byte[] content = new byte[4096];
-    long total = 0;
-    byte[] chunk = new byte[4096];
-    while (feof(handle) == 0) {
-        long count = fread(chunk, 1, chunk.length as ulong, handle) as long;
-        if (ferror(handle) != 0) {
-            let closed = fclose(handle);
-            throw new SystemError("could not read file '{path}'");
-        }
-        if (total + count > content.length) {
-            long capacity = content.length * 2;
-            while (capacity < total + count) {
-                capacity = capacity * 2;
-            }
-            byte[] grown = new byte[capacity];
-            for (long i = 0; i < total; i = i + 1) {
-                grown[i] = content[i];
-            }
-            content = grown;
-        }
-        for (long i = 0; i < count; i = i + 1) {
-            content[total + i] = chunk[i];
-        }
-        total = total + count;
-    }
-    let closed = fclose(handle);
-    return content.slice(0, total);
-}
-
-// A file as text. Bytes that spell no character are refused as this module's own failure, with the
-// encoding error beneath it, so reading a file needs no second error type.
-export readAllText(string path) -> string throws {
-    return try string.fromBytes(try readAllBytes(path));
-} catch (EncodingError problem) {
-    throw new SystemError("the byte at offset {problem.offset} begins no UTF-8 character",
-        problem);
-}
-
-export writeAllBytes(string path, byte[] content) throws {
-    CFile? handle = fopen(path, "wb");
-    if (handle == null) {
-        throw new SystemError("could not open file '{path}'");
-    }
-    let written = fwrite(content, 1, content.length as ulong, handle);
-    if (written != content.length as ulong) {
-        let closed = fclose(handle);
-        throw new SystemError("could not write file '{path}'");
-    }
-    if (fclose(handle) != 0) {
-        throw new SystemError("could not write file '{path}'");
-    }
-}
-
-export writeAllText(string path, string content) throws {
-    try writeAllBytes(path, content.toBytes());
-}
-
-// Writes `message` and a newline to standard error, the stream a program reports its problems on,
-// the way 'print' writes to standard output.
-export writeError(string message) {
-    ens_write_error(message);
-}
-
-// Hands everything the program has written but not yet given to the operating system over to it, so
-// a line printed before this call has left the program by the time the next statement runs. The
-// runtime already does this wherever the order is observable - before a diagnostic, before a child
-// starts, and before a panic is reported - so this is for the orders only the program itself knows,
-// such as a line that has to be out before it waits for something.
-export flush() {
-    let flushed = fflush(null);
-}
-
-// Runs `command` through the operating system's command interpreter and returns its exit code.
-export run(string command) -> int throws {
-    let status = ens_run_process(command);
-    if (status == -1) {
-        throw new SystemError("could not run command");
-    }
-    return status;
-}
-
-// Runs `program` with `arguments` and waits for it to finish, leaving both output streams with
-// this process so what the program writes appears as it is written. No shell takes part, so an
-// argument reaches the program exactly as written here, spaces, quotes and all. Returns the
-// program's exit code, or 127 when it could not be started.
-export run(string program, string[] arguments) -> int throws {
-    return try started(program, arguments, inherited(), "", "");
-}
-
-// Runs `program` with `arguments` and waits for it to finish, leaving both output streams with this
-// process so what the program writes appears as it is written. `environmentOverrides` are
-// 'NAME=VALUE' entries applied over the environment this process inherited, so the child keeps every
-// variable it is not given anew. No shell takes part, so an argument reaches the program exactly as
-// written here, spaces, quotes and all. Returns the program's exit code, or 127 when it could not be
-// started.
-export run(string program, string[] arguments, string[] environmentOverrides) -> int throws {
-    return try started(program, arguments, environmentOverrides, "", "");
-}
-
-// Runs `program` with `arguments` and writes everything it sent to its standard output and
-// standard error into the two files. An empty path leaves that stream with this process instead of
-// capturing it. Returns the program's exit code, or 127 when it could not be started.
-export runCaptured(string program, string[] arguments, string stdoutPath, string stderrPath) -> int throws {
-    return try started(program, arguments, inherited(), stdoutPath, stderrPath);
-}
-
-// Runs `program` with `arguments` and writes everything it sent to its standard output and standard
-// error into the two files. An empty path leaves that stream with this process instead of capturing
-// it. `environmentOverrides` are 'NAME=VALUE' entries applied over the environment this process
-// inherited, so the child keeps every variable it is not given anew. Returns the program's exit
-// code, or 127 when it could not be started.
-export runCaptured(string program, string[] arguments, string[] environmentOverrides,
-                   string stdoutPath, string stderrPath) -> int throws {
-    return try started(program, arguments, environmentOverrides, stdoutPath, stderrPath);
-}
-
 // A program this one started and is still running, whose output this one reads as it is written.
 // What the child sent to its standard output and what it sent to its standard error arrive together,
 // in the order it wrote them, which is the order a reader of both streams would have seen.
@@ -961,7 +577,17 @@ childVariables(string[] environmentOverrides) -> string[] {
     if (environmentOverrides.length == 0) {
         return inherited();
     }
-    return blocks.mergedEnvironment(ens_environment(), environmentOverrides, platform());
+    return blocks.mergedEnvironment(ens_environment(), environmentOverrides, platformName());
+}
+
+// The name a merge matches variable names by, which is what 'mergedEnvironment' reads. Only the
+// child family needs it, so it is spelled here rather than exported.
+platformName() -> string {
+    return switch (platformCode()) {
+        0 -> "windows",
+        2 -> "macos",
+        default -> "linux",
+    };
 }
 
 startedChild(string program, string[] arguments, string[] environmentOverrides) -> ChildProcess throws {
@@ -977,30 +603,3 @@ startedChild(string program, string[] arguments, string[] environmentOverrides) 
     return new ChildProcess(child, program);
 }
 
-started(string program, string[] arguments, string[] environmentOverrides, string stdoutPath,
-        string stderrPath) -> int throws {
-    string[] variables = childVariables(environmentOverrides);
-    byte[] block = blocks.environmentBlock(variables);
-    long status = ens_spawn_process(program, blocks.argumentBlock(arguments), arguments.length,
-        blocks.commandLineOf(program, arguments), block, variables.length, block.length,
-        stdoutPath, stderrPath);
-    if (status == -2) {
-        throw new SystemError("could not wait for '{program}' to finish");
-    }
-    if (status < 0) {
-        throw new SystemError("could not capture the output of '{program}' into "
-            + capturedInto(stdoutPath, stderrPath));
-    }
-    return status as int;
-}
-
-// The capture files a spawn was asked for, for the message when they could not be opened.
-capturedInto(string stdoutPath, string stderrPath) -> string {
-    if (stdoutPath.length == 0) {
-        return "'{stderrPath}'";
-    }
-    if (stderrPath.length == 0) {
-        return "'{stdoutPath}'";
-    }
-    return "'{stdoutPath}' and '{stderrPath}'";
-}

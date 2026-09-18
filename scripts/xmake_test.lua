@@ -1403,12 +1403,12 @@ task("test")
             -- a program that echoes its arguments and ends with the code the first one names
             local echo = path.join(root, "echo")
             writePackage(echo, 'package demo.echo {\n    ens "0.1";\n}\n', {
-                ["src/main.ens"] = 'import @std.system;\n\nmain() -> int {\n'
-                    .. '    string[] argv = system.arguments();\n'
-                    .. '    for (long i = 1; i < argv.length; i++) {\n'
-                    .. '        print("argument {i}: {argv[i]}");\n    }\n'
-                    .. '    if (argv.length > 1) {\n'
-                    .. '        return parsed(argv[1]);\n    }\n    return 0;\n}\n\n'
+                ["src/main.ens"] = 'import @std.environment;\n\nmain() -> int {\n'
+                    .. '    string[] argv = environment.arguments();\n'
+                    .. '    for (long i = 0; i < argv.length; i++) {\n'
+                    .. '        print("argument {i + 1}: {argv[i]}");\n    }\n'
+                    .. '    if (argv.length > 0) {\n'
+                    .. '        return parsed(argv[0]);\n    }\n    return 0;\n}\n\n'
                     .. 'parsed(string text) -> int {\n'
                     .. '    if (text == "7") {\n        return 7;\n    }\n    return 0;\n}\n',
             })
