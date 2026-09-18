@@ -62,13 +62,6 @@ task("test")
         -- compiler, so a fresh clone needs it built before anything can reach an executable.
         local lld_library = path.join(build_dir, is_host("windows") and "ens-lld.dll"
             or (is_host("macosx") and "libens-lld.dylib" or "libens-lld.so"))
-        if not os.isfile(lld_library) then
-            print("Building the ens-lld linker bridge...")
-            os.exec("xmake build ens-lld")
-        end
-        if not os.isfile(lld_library) then
-            os.raise("Could not locate the linker bridge at " .. lld_library)
-        end
 
         -- the seed: the published `ens` this tree pins for this host. Its one job is to build the
         -- compiler out of this tree, and nothing else in the suite runs it. Nothing it produces is
@@ -642,6 +635,22 @@ task("test")
             -- the seed loads LLVM and the linker bridge at run time, and on Windows the loader
             -- looks beside the executable first.
             placeNativeLibraries(native_libraries, seed_dir)
+        end
+
+        -- the linker bridge, built every run. The build is incremental. A run whose bridge sources
+        -- are unchanged pays nothing for it. A run that skipped it would link every fixture through
+        -- whatever bridge an earlier build left behind. The build carries the environment a link
+        -- carries. On Windows that puts the LLVM package's bin folder on PATH, where the bridge
+        -- resolves its own linker.
+        local function buildLinkerBridge()
+            local env, _, env_error = llvmEnvironment()
+            if not env then
+                os.raise("could not build the linker bridge: %s", env_error)
+            end
+            os.execv("xmake", {"build", "ens-lld"}, {envs = env})
+            if not os.isfile(lld_library) then
+                os.raise("Could not locate the linker bridge at " .. lld_library)
+            end
         end
 
         -- build the compiler every job then drives: the seed compiles `selfhost/driver` out of this
@@ -2943,7 +2952,9 @@ task("test")
 
         -- the compiler has to exist before any job that compiles Ens starts, and the jobs run in
         -- parallel, so the seed is placed and the compiler built here rather than on demand inside
-        -- one of them.
+        -- one of them. The bridge is first. The compiler is the first program linked through it.
+        print("Building the ens-lld linker bridge...")
+        buildLinkerBridge()
         locateSeed()
         print(string.format("Building the compiler with the pinned %s seed...", seed_host))
         local host_started = os.mclock()

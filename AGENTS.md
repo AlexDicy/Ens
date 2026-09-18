@@ -63,7 +63,8 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
   Any change that touches `lsp/`, and any repository-wide rename or move that its sources could be reading, is gated by closing a running `ens-lsp.exe` and running `xmake build ens-lsp` by hand.
 - Run everything: `xmake test` (subset: `xmake test <name>...`).
   The full suite must be green before every commit, with no exceptions.
-  `xmake test` builds `ens-lld` itself when it is missing, so it is the one command that always works from a clean checkout.
+  `xmake test` builds `ens-lld` itself before any job starts, so it is the one command that always works from a clean checkout, and an edit to the bridge is gated by the run that follows it rather than by the run after that.
+  On Windows it builds the bridge with the LLVM package's `bin` folder on PATH whatever the calling shell has, so the bridge's own linker resolves the same way in a suite run as it does by hand.
 - `xmake test` starts by building the compiler it then tests: the **seed** for this host compiles `selfhost/driver` into `build/host/ens`, and every job that compiles Ens drives that.
   Everything Ens-related is therefore built by the Ens compiler as this tree defines it, so nothing frozen into the seed can shape what the suite measures.
   It is built before the jobs start, because they run in parallel and all of them need it.
