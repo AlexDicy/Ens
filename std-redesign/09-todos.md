@@ -54,15 +54,12 @@ A negative control settled it.
 Moving `Statx.modeOffset` from 28 to 29 in a disposable copy of the tree left every retarget test passing, while a wrong return type failed loudly.
 So the verified triples are that many well-formed halves rather than that many checked layouts, and only `tests/fs_bridges` running on a host of that platform can say whether an offset or a system-call number is right.
 
-## Scratch folders on Windows
+## Limits the scratch retry accepts
 
-`ens test` and `ens run` on Windows sometimes leave their scratch folder behind, measured 2026-09-17 at about 2.3 percent of suites.
-The cause is Malwarebytes holding the executable that just ran for under two milliseconds with a share mode that denies delete, so `DeleteFileW` answers ERROR_SHARING_VIOLATION (32), which the library reports as `PermissionDenied`.
-It is not the image section, not the linker's output mapping, and not this process: a linked executable that is never run was refused zero times in 400 suites, and the holder was named by sampling `FileProcessIdsUsingFileInformation`.
-Ruled 2026-09-17: `scratch.discard` retries while the kind is `PermissionDenied`, on Windows only, through a fixed schedule of `Thread.sleep` calls that doubles from one millisecond to a 64 ms cap and adds up to about two seconds; the budget is counted in sleeps, so no clock is exported for it.
-Windows only, because no open handle can refuse unlink or rmdir elsewhere, so a refusal there is genuine and a retry would only delay the report.
-`Path.removeRecursively` keeps stopping at the first refusal (ruled 2026-09-17, the Rust shape rather than Go's remove-what-you-can), so a refusal that outlasts the budget still costs the whole folder rather than one file.
-Unmeasured: the hold for a binary larger than 431 KB, whether a machine without Malwarebytes shows it at all, and why a native repro outside the compiler never fired.
+The budget is sized against the 431 KB suite binary, the only size measured, so a scanner that holds a much larger program for longer than about two seconds still leaves the folder behind.
+Malwarebytes is the only scanner the refusal was ever reproduced under, so nothing says whether another one holds a file longer or does not hold it at all.
+A native reproduction outside the compiler never fired over 200 iterations, so the retry answers to the rate measured inside `ens test` rather than to a standalone reproduction of the race.
+`Path.removeRecursively` keeps stopping at the first refusal (ruled 2026-09-17, the Rust shape rather than Go's remove-what-you-can), so a refusal that outlasts the budget costs the whole folder rather than the one file that was held.
 
 ## Phase D
 

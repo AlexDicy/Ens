@@ -2,9 +2,13 @@
 // pointed at is left exactly as it was found. A free name is found by trying names in turn, since
 // there is no clock to build one from, and claimed in one step so two runs cannot take the same.
 import Path from @std.fs;
+import ErrorKind from @std.fs.error;
 import FileSystemError from @std.fs.error;
 import Environment from @std.environment;
 import Platform from @std.environment;
+import @std.environment;
+import Thread from @std.thread;
+import List from @std.collections.list;
 import home;
 
 // A folder to work in, or the reason there is none.
@@ -70,15 +74,58 @@ export createUnder(Path root, string prefix) -> Scratch {
 }
 
 // Removes the folder and everything under it. Answers with "" when nothing is left, or with what
-// stopped it, which a caller reports without letting it decide the run's own outcome.
+// stopped it, which a caller reports without letting it decide the run's own outcome. A refusal
+// another program's open file caused is waited out before it is reported.
 export discard(Path folder) -> string {
     if (folder.isEmpty() || !folder.isDirectory()) {
         return "";
     }
+    FileSystemError? refused = attempted(folder);
+    if (refused == null) {
+        return "";
+    }
+    if (!waitingCanClear(refused.kind, environment.platform())) {
+        return refusalText(folder, refused);
+    }
+    return waitedOut(folder, refused);
+}
+
+// Asks again over the schedule of waits, until the folder is gone or the waits run out. A virus
+// scanner opens a program the moment it is run. A removal that lands inside that opening is
+// refused. Waiting a moment and asking again is what gets past it.
+waitedOut(Path folder, FileSystemError first) -> string {
+    FileSystemError last = first;
+    for (let wait in Retry.schedule()) {
+        Thread.sleep(wait);
+        FileSystemError? refused = attempted(folder);
+        if (refused == null) {
+            return "";
+        }
+        last = refused;
+        if (!waitingCanClear(last.kind, environment.platform())) {
+            return refusalText(folder, last);
+        }
+    }
+    return refusalText(folder, last);
+}
+
+// One attempt at the removal. Answers null when the folder is gone, or the refusal that stopped it.
+attempted(Path folder) -> FileSystemError? {
     try folder.removeRecursively();
-    return "";
+    return null;
 } catch (FileSystemError refused) {
+    return refused;
+}
+
+// What a caller is told about a folder that is still there.
+refusalText(Path folder, FileSystemError refused) -> string {
     return "'{folder}' could not be removed after the run: {refused.message}";
+}
+
+// Whether waiting can clear a refusal. Only Windows refuses a removal over a file another program
+// holds open. A refusal anywhere else is the answer rather than a moment to wait out.
+public waitingCanClear(ErrorKind kind, Platform platform) -> bool {
+    return platform == Platform.Windows && kind == ErrorKind.PermissionDenied;
 }
 
 // Whether this run is the one that took the folder. Asking whether a name is free and then creating it
@@ -94,6 +141,33 @@ final class Attempts {
     // running many builds at once never runs out, and few enough that a folder full of leftovers
     // is reported rather than scanned forever.
     protected static const long limit = 512;
+}
+
+// The waits a refused removal is asked again over, starting at a single millisecond. Each wait
+// doubles until it reaches the longest. The schedule ends on the first wait that carries the total
+// past the budget.
+public final class Retry {
+    // The longest single wait, in milliseconds, which the doubling stops at.
+    public static const long longestMillis = 64;
+
+    // How long the waits add up to, in milliseconds, before a refusal is reported. The last wait
+    // may carry the total a little past it.
+    public static const long budgetMillis = 2000;
+
+    // Every wait, in milliseconds, in the order they are taken.
+    public static schedule() -> long[] {
+        let waits = new List<long>();
+        long total = 0;
+        long wait = 1;
+        while (total < Retry.budgetMillis) {
+            waits.push(wait);
+            total = total + wait;
+            if (wait < Retry.longestMillis) {
+                wait = wait * 2;
+            }
+        }
+        return waits.toArray();
+    }
 }
 
 temporaryVariables(Platform platform) -> string[] {
