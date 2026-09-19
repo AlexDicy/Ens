@@ -137,11 +137,25 @@ primitive double {
 
     // Whether this is one of the two infinities.
     export isInfinite() -> bool;
+
+    // The IEEE bits of this value, with its sign in the top bit. `double.fromBits` reads them back
+    // as the value they came from, a NaN's payload included.
+    export toBits() -> ulong;
+
+    // The value these bits spell. Every pattern spells one, so none of them is refused.
+    export static fromBits(ulong bits) -> double;
+
+    // The bits of this value, with every NaN written as 0x7FF8000000000000 and every other value
+    // left as it is. Two values `compareTo` calls equal answer the same pattern, and the two zeros
+    // answer different patterns, which is what a struct's own `hash` needs from a floating-point
+    // field.
+    export toCanonicalBits() -> ulong;
 }
 ```
 
 The radix member is declared for every integer type, and decimal keeps the no-argument `toString` the language already provides.
 The three predicates are declared for `float` as well, and exactly one of them answers true for any value either type holds.
+The three bit members are declared for `float` too, at its own width, so `toBits` and `toCanonicalBits` answer a `uint`, `fromBits` takes one, and the NaN the canonical form writes is `0x7FC00000`.
 
 ## Parsing
 

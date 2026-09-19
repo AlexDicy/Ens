@@ -1500,6 +1500,8 @@ The same holds for a `List`, `Map`, or `Set` used as a key, and for a struct key
 An external handle or a function value has no hash at all, so neither can be a key, and calling `hash()` on one, directly or through a type parameter, is an error naming the type.
 A `float` or a `double` has no hash either, because equality and hashing disagree on two of their values.
 A `NaN` is equal to no value, so nothing could find it again, and negative zero is equal to zero but hashes differently, so one key would become two entries.
+A struct whose fields hold one of them at any depth gets its hash back by declaring its own `equals` and `hash`, comparing each such field with `compareTo` and hashing it with `toCanonicalBits`.
+A `NaN` then matches a `NaN`, and the two zeros stay two keys, as a `SortedMap` orders them.
 
 ```ens
 int[] xs = new int[5];        // 5 ints, zero-initialized
@@ -1612,6 +1614,12 @@ The operators keep their IEEE meaning, so `==` calls a `NaN` unequal to itself a
 `isNaN()`, `isFinite()` and `isInfinite()` are the three questions the library asks about a `float` or a `double`, and exactly one of them answers true for any value.
 Every number is finite, both zeros and the subnormals included, and is neither of the other two.
 The two infinities answer only `isInfinite()`, and a `NaN` answers only `isNaN()`.
+
+`toBits()` answers the bits a value is made of, a `uint` for a `float` and a `ulong` for a `double`, and `float.fromBits(bits)` and `double.fromBits(bits)` read them back.
+Every pattern spells a value, so none of them is refused, and a value read back out of its own bits is the value it came from, a `NaN`'s payload included.
+`toCanonicalBits()` answers the same bits with every `NaN` written as one pattern and every other value left as it is.
+That pattern is `0x7FF8000000000000` for a `double` and `0x7FC00000` for a `float`.
+Two values `compareTo` calls equal therefore have the same canonical bits, and the two zeros have different ones, which is what a struct hashing a floating-point field needs.
 
 ```ens
 let greeting = "Hello, " + name + "!";
@@ -2071,6 +2079,7 @@ An external handle or a function value cannot be a key either, because neither h
 Nor can a `float` or a `double`, nor a struct whose fields hold one at any depth unless it declares its own `equals` and `hash`.
 A `NaN` is equal to no value, so nothing could find it again, and negative zero is equal to zero but hashes differently, so one key would become two entries.
 A `SortedMap` keys numbers by their order instead, which needs no hash.
+The pair such a struct declares compares each of those fields with `compareTo` and hashes it with `toCanonicalBits`, so a `NaN` matches a `NaN` and the two zeros stay two keys, exactly as that order puts them.
 
 What text can do is declared on `string` itself, so every member below is called on the text and needs no import.
 `byteAt(index)` answers one of the UTF-8 bytes, and an index outside the text aborts the program.
