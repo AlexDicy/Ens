@@ -146,6 +146,10 @@ Consumer migration inside C means the selfhost compiler, build, cli, and lsp sou
   The first commit, landed 2026-09-19, is the compiler half plus the predicates that need no bridge: `emit/bitpatterns.ens` emits `ens_double_bits`, `ens_double_from_bits`, `ens_float_bits` and `ens_float_from_bits`, each one same-width bitcast wrapped in a function defined once per module, and `@std.text.numbers` gains `isNaN`, `isFinite` and `isInfinite` on `float` and `double`, the first by a value's inequality with itself and the other two by magnitude against the largest finite double.
   `tests/bits_bridges` declares the four bridges itself, in an `external from libc` block, because nothing in the standard library reaches them yet.
   The second commit will add `toBits`, `fromBits` and `toCanonicalBits` over those bridges and rewrite the diagnostics that refuse a float as a hashed key, so the `equals` and `hash` pair a struct with a float field has to declare is short and correct to write.
+- The diagnostics review's naming item, ruled 2026-09-08 and landed 2026-09-19: every sema diagnostic spells a type the way the file it is reported in can name it, so a fix it suggests compiles where it is read.
+  The link phase reads each module's imports backwards into a `TypeNames` its link table owns, and `LinkResult` carries one per file for the passes that report outside the file they are reading, which is the obligation pass and the instantiation-overflow refusal.
+  `displayAgainst` went with it: two types that spelled alike were qualified by their modules only when they stood beside each other, and a name a file bound already tells them apart wherever they appear.
+  No message changed a word beyond the type spellings, which moved four unit-test assertions and no fixture pin, since every fixture that names a type across a module boundary reaches it by a named import.
 - D3: mark this folder's documents as implemented, moving anything still open into the issue tracker or the TODO file.
 - D4: cut the release whose seed makes the new std the one every consumer builds against.
 

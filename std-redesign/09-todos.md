@@ -65,9 +65,14 @@ A native reproduction outside the compiler never fired over 200 iterations, so t
 ## Phase D
 
 A dedicated review pass over the diagnostic messages introduced across the whole migration (requested 2026-08-27).
-Its first item, ruled 2026-09-08 with import aliasing: a diagnostic names a type as the file it is reported in can name it, the alias where one is bound, `alias.Type` where the type is reached through a module alias, and the module-qualified name only where the file has no name for it, because today a suggested fix such as "write '((int) -> void throws Boom)'" can name a type the file bound under another name and so fail to compile when followed.
 
 ## After Phase D
+
+Code generation still names a type without the names of the file the message lands in: `unsupportedEntryShape` in `selfhost/codegen/src/driver.ens` reads the return type of an entry point through the context-free spelling, because codegen holds no link tables (2026-09-19).
+It is the only user-facing message left on that path; the 321 other uses in `selfhost/codegen/src` are EIR dumps and `Internal:` bug-catchers, which the context-free spelling is for.
+
+`TypeNames` belongs to a file and not to a declaration, so it does not know a type parameter's scope: inside `class Holder<Kind>` a diagnostic about an imported `Kind` reads `Kind`, which is what that body calls the parameter (accepted 2026-09-19).
+Threading the declaration's active type parameters into every spelling would fix it, and the context-free spelling this replaced was blind to the same thing.
 
 A `FileDiagnostic` carries one related location, so an obligation failure shows the line that supplied the type arguments and the line inside the generic that holds the judgment, and nothing of the generics in between (2026-09-19).
 A cascade two or more generics deep therefore shows its two ends only, which a chain of notes would fix once a diagnostic can carry a list of related locations.

@@ -567,6 +567,9 @@ Aliasing is how one file uses two modules that share a last segment, or two type
 An alias may be written whether or not a conflict exists, an alias equal to the name it replaces changes nothing, and one file may alias the same module more than once.
 A function cannot be imported by name with an alias any more than without one.
 
+A diagnostic names a type the way the file it is reported in can name it: the alias where an import bound one, `alias.Type` where a module alias is what reaches it, and the module-qualified name where the file has no name for it at all.
+So a type a message suggests writing can be written exactly as the message spells it.
+
 A file and a folder with the same name may sit side by side: `io.ens` next to an `io/` folder makes `import io;` resolve to the file, while `import io.streams;` resolves to `streams.ens` inside the folder.
 
 Source files are UTF-8 text.

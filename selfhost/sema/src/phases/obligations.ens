@@ -10,6 +10,8 @@ import model.convert;
 import model.types;
 import Type from model.types;
 import TypeStore from model.types;
+import TypeNames from model.types;
+import TypeNameDirectory from model.types;
 import Signature from model.types;
 import DeclaredType from model.types;
 import InstantiationType from model.types;
@@ -366,10 +368,11 @@ public final class ObligationRegistry {
 // receives, and returns the diagnostics, each anchored where the type arguments were written,
 // naming the instantiation written there, and carrying the generic's own line as a note. The
 // mentions carry every instantiation the program's declarations reference, with the constraint
-// scope each was resolved under.
-public check(TypeStore store, ObligationRegistry registry, List<InstantiationMention> mentions)
-        -> FileDiagnostic[] {
-    let pass = new ObligationPass(store, registry, mentions);
+// scope each was resolved under. A refusal reads with the names of the file it lands in, so the
+// message uses the consumer's and the note inside the generic uses the generic file's own.
+public check(TypeStore store, TypeNameDirectory names, ObligationRegistry registry,
+             List<InstantiationMention> mentions) -> FileDiagnostic[] {
+    let pass = new ObligationPass(store, names, registry, mentions);
     return pass.run();
 }
 
@@ -419,6 +422,7 @@ class AssignmentKey {
 
 class ObligationPass {
     TypeStore store;
+    TypeNameDirectory names;
     ObligationRegistry registry;
     List<InstantiationMention> mentions;
     List<FileDiagnostic> collected;
@@ -427,8 +431,10 @@ class ObligationPass {
     Map<GreenNode, List<InstantiationMention>> openMentionsByOwner;
     Set<GreenNode> productive;
 
-    protected constructor(TypeStore store, ObligationRegistry registry, List<InstantiationMention> mentions) {
+    protected constructor(TypeStore store, TypeNameDirectory names, ObligationRegistry registry,
+                List<InstantiationMention> mentions) {
         this.store = store;
+        this.names = names;
         this.registry = registry;
         this.mentions = mentions;
         this.collected = new List<FileDiagnostic>();
@@ -462,7 +468,8 @@ class ObligationPass {
         for (long i = 0; i < concreteMentions.length(); i++) {
             let mention = concreteMentions.get(i);
             let instantiation = mention.instantiation();
-            if (hasRefusedKey(instantiation.template(), instantiation.arguments())) {
+            if (hasRefusedKey(instantiation.template(), instantiation.arguments(),
+                    this.namesAt(mention.origin()))) {
                 continue;
             }
             this.push(instantiation.template().declaration(), instantiation.arguments(),
@@ -594,7 +601,8 @@ class ObligationPass {
                 }
                 let substituted = this.substituteAll(instantiation.arguments(), assignment);
                 if (substituted != null
-                        && !hasRefusedKey(instantiation.template(), substituted)) {
+                        && !hasRefusedKey(instantiation.template(), substituted,
+                            this.namesAt(assignment.origin))) {
                     this.push(declaration, substituted, assignment.origin,
                         assignment.depth + 1);
                 }
@@ -652,14 +660,18 @@ class ObligationPass {
         if (!this.guardsHold(obligation.guards(), assignment)) {
             return;
         }
+        // The refusal lands where the type arguments were written and the note lands inside the
+        // generic, so each of the two reads with the names of its own file.
+        let whereWritten = this.namesAt(assignment.origin);
+        let insideGeneric = this.names.namesFor(entry.file());
         switch (obligation) {
             is InterpolationObligation hole -> {
                 let concrete = this.substituteOne(hole.hole(), assignment);
                 if (concrete != null) {
                     this.report(entry, assignment, obligation.span(),
-                        interpolationIssue(assignment.origin.display(), concrete),
+                        interpolationIssue(assignment.origin.display(), concrete, whereWritten),
                         "'{obligation.ownerDisplay()}' interpolates a value of type "
-                            + "'{types.display(hole.hole())}' here");
+                            + "'{insideGeneric.of(hole.hole())}' here");
                 }
             },
             is TypeTestObligation test -> {
@@ -668,48 +680,55 @@ class ObligationPass {
                 if (source != null && target != null) {
                     this.report(entry, assignment, obligation.span(),
                         typeTestIssue(assignment.origin.display(), source, target,
-                            test.isCast()),
+                            test.isCast(), whereWritten),
                         typeTestNote(obligation.ownerDisplay(), test.source(), test.target(),
-                            test.isCast()));
+                            test.isCast(), insideGeneric));
                 }
             },
             is EqualityObligation equality -> {
                 let concrete = this.substituteOne(equality.structType(), assignment);
                 if (concrete != null) {
                     this.report(entry, assignment, obligation.span(),
-                        equalityComparabilityIssue(assignment.origin.display(), concrete),
+                        equalityComparabilityIssue(assignment.origin.display(), concrete,
+                            whereWritten),
                         "'{obligation.ownerDisplay()}' compares two values of type "
-                            + "'{types.display(equality.structType())}' with '==' here");
+                            + "'{insideGeneric.of(equality.structType())}' with '==' here");
                 }
             },
             is HashObligation hashed -> {
                 let concrete = this.substituteOne(hashed.receiver(), assignment);
                 if (concrete != null) {
                     this.report(entry, assignment, obligation.span(),
-                        hashabilityIssue(assignment.origin.display(), concrete),
+                        hashabilityIssue(assignment.origin.display(), concrete, whereWritten),
                         "'{obligation.ownerDisplay()}' calls 'hash()' on a value of type "
-                            + "'{types.display(hashed.receiver())}' here");
+                            + "'{insideGeneric.of(hashed.receiver())}' here");
                 }
             },
             is KeyTypeObligation keyed -> {
                 let concrete = this.substituteOne(keyed.key(), assignment);
                 if (concrete != null) {
                     this.report(entry, assignment, obligation.span(),
-                        keyTypeIssue(assignment.origin.display(), keyed.container(), concrete),
-                        "'{keyed.container().name()}' is keyed by "
-                            + "'{types.display(keyed.key())}' here");
+                        keyTypeIssue(assignment.origin.display(), keyed.container(), concrete,
+                            whereWritten),
+                        "'{insideGeneric.nameOf(keyed.container())}' is keyed by "
+                            + "'{insideGeneric.of(keyed.key())}' here");
                 }
             },
             is ArrayElementObligation created -> {
                 let concrete = this.substituteOne(created.element(), assignment);
                 if (concrete != null) {
                     this.report(entry, assignment, obligation.span(),
-                        arrayElementIssue(assignment.origin.display(), concrete),
+                        arrayElementIssue(assignment.origin.display(), concrete, whereWritten),
                         "'{obligation.ownerDisplay()}' creates an array of "
-                            + "'{types.display(created.element())}' here");
+                            + "'{insideGeneric.of(created.element())}' here");
                 }
             },
         }
+    }
+
+    // The names of the file a refusal these type arguments earn is reported in.
+    namesAt(Origin origin) -> TypeNames {
+        return this.names.namesFor(origin.file());
     }
 
     substituteOne(Type open, Assignment assignment) -> Type? {
@@ -732,13 +751,14 @@ class ObligationPass {
 
 // The note beside a refused type test, naming the generic and the types its own line was
 // written with.
-typeTestNote(string owner, Type source, Type target, bool isCast) -> string {
+typeTestNote(string owner, Type source, Type target, bool isCast,
+             TypeNames names) -> string {
     if (isCast) {
-        return "'{owner}' casts a value of type '{types.display(source)}' to "
-            + "'{types.display(target)}' here";
+        return "'{owner}' casts a value of type '{names.of(source)}' to "
+            + "'{names.of(target)}' here";
     }
-    return "'{owner}' tests a value of type '{types.display(source)}' against "
-        + "'{types.display(target)}' here";
+    return "'{owner}' tests a value of type '{names.of(source)}' against "
+        + "'{names.of(target)}' here";
 }
 
 final class Limits {
@@ -774,7 +794,7 @@ public collectOwners(Type type, Set<GreenNode> owners) {
 
 // How an instantiation reads in a diagnostic, 'Slots<Path>', from the name written and the
 // concrete arguments it was given.
-public displayFor(string name, Type[] arguments) -> string {
+public displayFor(string name, Type[] arguments, TypeNames names) -> string {
     let builder = new StringBuilder();
     builder.append(name);
     builder.append("<");
@@ -782,7 +802,7 @@ public displayFor(string name, Type[] arguments) -> string {
         if (i > 0) {
             builder.append(", ");
         }
-        builder.append(types.display(arguments[i]));
+        builder.append(names.of(arguments[i]));
     }
     builder.append(">");
     return builder.toString();
@@ -809,9 +829,9 @@ suggestedFix(string instantiation, string written, string supplied) -> string {
 
 // What a reader passes instead of a type argument nullable at more than one level, naming the
 // shape one level shallower.
-oneLevelArgumentFix(OptionalType nested) -> string {
+oneLevelArgumentFix(OptionalType nested, TypeNames names) -> string {
     return "Pass a type argument nullable at one level at most, such as "
-        + "'{types.display(nested.inner())}'.";
+        + "'{names.of(nested.inner())}'.";
 }
 
 // Why a value of this type cannot fill an interpolation hole, or null when it can. A struct that
@@ -819,20 +839,21 @@ oneLevelArgumentFix(OptionalType nested) -> string {
 // without interpolates as its JSON form, which needs every field to be JSON-able. A class or
 // interface value always fills a hole: its runtime type's 'toString' override answers, or that
 // type's name when no class in the chain declares one.
-public interpolationIssue(Type analyzed) -> string? {
-    return interpolationIssueOf("", analyzed, analyzed);
+public interpolationIssue(Type analyzed, TypeNames names) -> string? {
+    return interpolationIssueOf("", analyzed, analyzed, names);
 }
 
 // The same judgment for a hole inside a generic body, refused for the arguments of the
 // 'instantiation' a reader wrote and reported at that reader's own line.
-public interpolationIssue(string instantiation, Type analyzed) -> string? {
-    return interpolationIssueOf(instantiation, analyzed, analyzed);
+public interpolationIssue(string instantiation, Type analyzed, TypeNames names) -> string? {
+    return interpolationIssueOf(instantiation, analyzed, analyzed, names);
 }
 
 // 'shown' is the type the hole holds, which every refusal names, and 'judged' is what decides
 // whether there is any text to print: for a nullable hole that is its payload, since one level
 // prints the payload's text or 'null'.
-interpolationIssueOf(string instantiation, Type shown, Type judged) -> string? {
+interpolationIssueOf(string instantiation, Type shown, Type judged, TypeNames names)
+        -> string? {
     if (isJsonableLeaf(judged)) {
         return null;
     }
@@ -840,17 +861,17 @@ interpolationIssueOf(string instantiation, Type shown, Type judged) -> string? {
         if (types.declaredToString(judged) != null) {
             return null;
         }
-        return structTextIssue(instantiation, shown, judged);
+        return structTextIssue(instantiation, shown, judged, names);
     }
     if (types.isClassLike(judged)) {
         return null;
     }
     if (judged is ArrayType) {
-        return arrayTextIssue(instantiation, shown, judged);
+        return arrayTextIssue(instantiation, shown, judged, names);
     }
     if (judged is FunctionType) {
         return refusalSubject(instantiation) + " interpolate a value of type "
-            + "'{types.display(shown)}': a function value has no text form. "
+            + "'{names.of(shown)}': a function value has no text form. "
             + suggestedFix(instantiation,
                 "Interpolate what the function returns, or a name you keep beside it.",
                 "Pass a name you keep beside the function, or a type argument whose values have "
@@ -861,17 +882,17 @@ interpolationIssueOf(string instantiation, Type shown, Type judged) -> string? {
     if (judged is OptionalType) {
         if (judged.inner() is OptionalType) {
             return refusalSubject(instantiation) + " interpolate a value of type "
-                + "'{types.display(shown)}' because it may be null at more than one level. "
+                + "'{names.of(shown)}' because it may be null at more than one level. "
                 + suggestedFix(instantiation,
                     "Unwrap one level at a time, with a null check ('if (value != null)') or a "
                         + "fallback ('value ?? null'), until what remains is "
-                        + "'{types.display(convert.coreOf(shown))}'.",
-                    oneLevelArgumentFix(judged));
+                        + "'{names.of(convert.coreOf(shown))}'.",
+                    oneLevelArgumentFix(judged, names));
         }
-        return interpolationIssueOf(instantiation, shown, judged.inner());
+        return interpolationIssueOf(instantiation, shown, judged.inner(), names);
     }
     return refusalSubject(instantiation) + " interpolate a value of type "
-        + "'{types.display(shown)}'; only string, integer, bool, enum, class, and "
+        + "'{names.of(shown)}'; only string, integer, bool, enum, class, and "
         + "JSON-serializable struct values are supported here. "
         + suggestedFix(instantiation, "Convert it with '.toString()' first.",
             "Pass the text you want instead, or a type argument of one of those kinds.");
@@ -890,7 +911,8 @@ innermostElementOf(ArrayType array) -> Type {
 // Why a value of this array type has no text form, or null when it does. Elements format as
 // struct serialization writes them, so a struct element is its JSON form even with its own
 // 'toString'.
-arrayTextIssue(string instantiation, Type shown, ArrayType array) -> string? {
+arrayTextIssue(string instantiation, Type shown, ArrayType array, TypeNames names)
+        -> string? {
     Type element = innermostElementOf(array);
     if (convert.containsTypeParam(element)) {
         return null;
@@ -899,18 +921,18 @@ arrayTextIssue(string instantiation, Type shown, ArrayType array) -> string? {
         return null;
     }
     if (types.isStructLike(element)) {
-        return structTextIssue(instantiation, element, element);
+        return structTextIssue(instantiation, element, element, names);
     }
     if (element is FunctionType) {
         return refusalSubject(instantiation) + " interpolate a value of type "
-            + "'{types.display(shown)}': its elements are function values, which have no text "
+            + "'{names.of(shown)}': its elements are function values, which have no text "
             + "form. " + suggestedFix(instantiation,
                 "Interpolate names you keep beside the functions instead.",
                 "Pass a type argument whose elements have a text form, such as names you keep "
                     + "beside the functions.");
     }
     return refusalSubject(instantiation) + " interpolate a value of type "
-        + "'{types.display(shown)}'; its element type '{types.display(element)}' has no text "
+        + "'{names.of(shown)}'; its element type '{names.of(element)}' has no text "
         + "form. " + suggestedFix(instantiation,
             "Interpolate a value you keep beside the elements instead.",
             "Pass a type argument whose elements have a text form.");
@@ -933,17 +955,19 @@ isJsonableLeaf(Type type) -> bool {
 // Why 'is' or 'as?' between these concrete types is malformed, always true, or never true, or
 // null when the test is meaningful. The target is already known to be a plain class or
 // interface shape.
-public typeTestIssue(Type source, Type target, bool isCast) -> string? {
-    return typeTestIssueOf("", source, target, isCast);
+public typeTestIssue(Type source, Type target, bool isCast, TypeNames names) -> string? {
+    return typeTestIssueOf("", source, target, isCast, names);
 }
 
 // The same judgment for a test inside a generic body, refused for the arguments of the
 // 'instantiation' a reader wrote and reported at that reader's own line.
-public typeTestIssue(string instantiation, Type source, Type target, bool isCast) -> string? {
-    return typeTestIssueOf(instantiation, source, target, isCast);
+public typeTestIssue(string instantiation, Type source, Type target, bool isCast,
+                     TypeNames names) -> string? {
+    return typeTestIssueOf(instantiation, source, target, isCast, names);
 }
 
-typeTestIssueOf(string instantiation, Type source, Type target, bool isCast) -> string? {
+typeTestIssueOf(string instantiation, Type source, Type target, bool isCast,
+                TypeNames names) -> string? {
     string operator = "is";
     if (isCast) {
         operator = "as?";
@@ -953,31 +977,31 @@ typeTestIssueOf(string instantiation, Type source, Type target, bool isCast) -> 
     if (target is OptionalType) {
         if (instantiation.length > 0) {
             return "'{instantiation}' cannot use '{operator}' against "
-                + "'{types.display(target)}': it is nullable, and '{operator}' never answers "
+                + "'{names.of(target)}': it is nullable, and '{operator}' never answers "
                 + "for null. Pass a type argument that is not nullable, such as "
-                + "'{types.display(convert.coreOf(target))}'.";
+                + "'{names.of(convert.coreOf(target))}'.";
         }
-        return "The target of '{operator}' resolves to '{types.display(target)}', which is "
+        return "The target of '{operator}' resolves to '{names.of(target)}', which is "
             + "nullable, and '{operator}' never answers for null. Test against "
-            + "'{types.display(convert.coreOf(target))}' instead.";
+            + "'{names.of(convert.coreOf(target))}' instead.";
     }
     if (!types.isClassLike(target)) {
         if (instantiation.length > 0) {
             return "'{instantiation}' cannot use '{operator}' against "
-                + "'{types.display(target)}': only a class or an interface can be tested at run "
+                + "'{names.of(target)}': only a class or an interface can be tested at run "
                 + "time. Pass a class or an interface as the type argument.";
         }
-        return "The target of '{operator}' resolves to '{types.display(target)}', and only a "
+        return "The target of '{operator}' resolves to '{names.of(target)}', and only a "
             + "class or an interface can be tested at run time.";
     }
     if (source is OptionalType && source.inner() is OptionalType) {
         return refusalSubject(instantiation) + " use '{operator}' on a value of type "
-            + "'{types.display(source)}', which is nullable at more than one level, and "
+            + "'{names.of(source)}', which is nullable at more than one level, and "
             + "'{operator}' looks through only one. " + suggestedFix(instantiation,
                 "Unwrap one level first: check the value for null ('if (value != null)') or "
                     + "supply a fallback ('value ?? null'), then test the "
-                    + "'{types.display(source.inner())}' that remains.",
-                oneLevelArgumentFix(source));
+                    + "'{names.of(source.inner())}' that remains.",
+                oneLevelArgumentFix(source, names));
     }
     Type sourceCore = convert.bareOf(source);
     if (!types.isClassLike(sourceCore)) {
@@ -986,17 +1010,17 @@ typeTestIssueOf(string instantiation, Type source, Type target, bool isCast) -> 
             action = "cast.";
         }
         string refused = refusalSubject(instantiation) + " use '{operator}' on a value of type "
-            + "'{types.display(source)}'; only class values can be {action}";
+            + "'{names.of(source)}'; only class values can be {action}";
         string kind = types.valueKindWord(sourceCore);
         if (kind.length > 0 && types.isInterfaceLike(target)
                 && types.conformsTo(sourceCore, target)) {
-            refused = refused + " '{types.display(sourceCore)}' does implement "
-                + "'{types.display(target)}', but only as a generic bound: '{operator}' works "
+            refused = refused + " '{names.of(sourceCore)}' does implement "
+                + "'{names.of(target)}', but only as a generic bound: '{operator}' works "
                 + "over a value that carries the interface, and a {kind} is never wrapped in "
                 + "one.";
             if (instantiation.length > 0) {
                 return refused + " Pass a class that implements "
-                    + "'{types.display(target)}' instead.";
+                    + "'{names.of(target)}' instead.";
             }
             return refused;
         }
@@ -1012,23 +1036,23 @@ typeTestIssueOf(string instantiation, Type source, Type target, bool isCast) -> 
         if (isCast) {
             if (instantiation.length > 0) {
                 return "'{instantiation}' casts a value of type "
-                    + "'{types.displayAgainst(source, target)}' to "
-                    + "'{types.displayAgainst(target, source)}', which it always is, so the cast "
+                    + "'{names.of(source)}' to "
+                    + "'{names.of(target)}', which it always is, so the cast "
                     + "is never needed. Use the value directly, or a type argument the cast can "
                     + "answer either way.";
             }
-            return "'as? {types.displayAgainst(target, source)}' is not needed here: a value of "
-                + "type '{types.displayAgainst(source, target)}' always converts to "
-                + "'{types.displayAgainst(target, source)}?'. Use the value directly.";
+            return "'as? {names.of(target)}' is not needed here: a value of "
+                + "type '{names.of(source)}' always converts to "
+                + "'{names.of(target)}?'. Use the value directly.";
         }
         if (instantiation.length > 0) {
             return "'{instantiation}' tests a value of type "
-                + "'{types.displayAgainst(source, target)}' against "
-                + "'{types.displayAgainst(target, source)}', which it always is, so the answer "
+                + "'{names.of(source)}' against "
+                + "'{names.of(target)}', which it always is, so the answer "
                 + "would always be true. Use a type argument the test can answer either way.";
         }
-        return "A value of type '{types.displayAgainst(source, target)}' is always a "
-            + "'{types.displayAgainst(target, source)}'; this 'is' test would always be true. "
+        return "A value of type '{names.of(source)}' is always a "
+            + "'{names.of(target)}'; this 'is' test would always be true. "
             + "Remove it.";
     }
     if (types.isInterfaceLike(sourceCore)) {
@@ -1037,9 +1061,9 @@ typeTestIssueOf(string instantiation, Type source, Type target, bool isCast) -> 
     if (types.isInterfaceLike(target)) {
         if (isFinalClass(sourceCore)) {
             if (instantiation.length > 0) {
-                return "'{instantiation}' " + testsAgainst(source, target, isCast)
+                return "'{instantiation}' " + testsAgainst(source, target, isCast, names)
                     + ", which it can never be: "
-                    + "'{types.displayAgainst(sourceCore, target)}' is 'final' and does not "
+                    + "'{names.of(sourceCore)}' is 'final' and does not "
                     + "implement it, so " + neverOutcome(isCast)
                     + " Use a type argument the test can answer either way.";
             }
@@ -1047,16 +1071,16 @@ typeTestIssueOf(string instantiation, Type source, Type target, bool isCast) -> 
             if (isCast) {
                 outcome = "This 'as?' cast would always be null.";
             }
-            return "A value of type '{types.displayAgainst(source, target)}' can never be a "
-                + "'{types.displayAgainst(target, source)}': "
-                + "'{types.displayAgainst(sourceCore, target)}' is 'final' and does not "
+            return "A value of type '{names.of(source)}' can never be a "
+                + "'{names.of(target)}': "
+                + "'{names.of(sourceCore)}' is 'final' and does not "
                 + "implement it. {outcome} Remove it.";
         }
         return null;
     }
     if (!types.isSubclassOf(target, sourceCore)) {
         if (instantiation.length > 0) {
-            return "'{instantiation}' " + testsAgainst(source, target, isCast)
+            return "'{instantiation}' " + testsAgainst(source, target, isCast, names)
                 + ", which it can never be, so " + neverOutcome(isCast)
                 + " Use a type argument the test can answer either way.";
         }
@@ -1064,20 +1088,20 @@ typeTestIssueOf(string instantiation, Type source, Type target, bool isCast) -> 
         if (isCast) {
             outcome = "this 'as?' cast would always be null.";
         }
-        return "A value of type '{types.displayAgainst(source, target)}' can never be a "
-            + "'{types.displayAgainst(target, source)}'; {outcome} Remove it.";
+        return "A value of type '{names.of(source)}' can never be a "
+            + "'{names.of(target)}'; {outcome} Remove it.";
     }
     return null;
 }
 
 // What a generic's own line does with the two types, as a refusal reported elsewhere retells it.
-testsAgainst(Type source, Type target, bool isCast) -> string {
+testsAgainst(Type source, Type target, bool isCast, TypeNames names) -> string {
     if (isCast) {
-        return "casts a value of type '{types.displayAgainst(source, target)}' to "
-            + "'{types.displayAgainst(target, source)}'";
+        return "casts a value of type '{names.of(source)}' to "
+            + "'{names.of(target)}'";
     }
-    return "tests a value of type '{types.displayAgainst(source, target)}' against "
-        + "'{types.displayAgainst(target, source)}'";
+    return "tests a value of type '{names.of(source)}' against "
+        + "'{names.of(target)}'";
 }
 
 // What a test that can never pass would answer.
@@ -1098,17 +1122,19 @@ isFinalClass(Type type) -> bool {
 
 // Why values of this struct or array type cannot be compared with '==', or null when they can.
 // Names the offending field's dotted path and its type.
-public equalityComparabilityIssue(Type structType) -> string? {
-    return equalityComparabilityIssueOf("", structType);
+public equalityComparabilityIssue(Type structType, TypeNames names) -> string? {
+    return equalityComparabilityIssueOf("", structType, names);
 }
 
 // The same judgment for a '==' inside a generic body, refused for the arguments of the
 // 'instantiation' a reader wrote and reported at that reader's own line.
-public equalityComparabilityIssue(string instantiation, Type structType) -> string? {
-    return equalityComparabilityIssueOf(instantiation, structType);
+public equalityComparabilityIssue(string instantiation, Type structType, TypeNames names)
+        -> string? {
+    return equalityComparabilityIssueOf(instantiation, structType, names);
 }
 
-equalityComparabilityIssueOf(string instantiation, Type structType) -> string? {
+equalityComparabilityIssueOf(string instantiation, Type structType, TypeNames names)
+        -> string? {
     if (structType is ArrayType) {
         Type leaf = innermostElementOf(structType);
         if (convert.containsTypeParam(leaf)) {
@@ -1116,9 +1142,9 @@ equalityComparabilityIssueOf(string instantiation, Type structType) -> string? {
         }
         if (leaf is FunctionType) {
             return equalitySubject(instantiation, structType,
-                    "'{types.display(structType)}' cannot be compared with '=='")
+                    "'{names.of(structType)}' cannot be compared with '=='", names)
                 + ": an array compares element by element, and its element type "
-                + "'{types.display(leaf)}' has no '=='; {noEqualityReason(leaf)}. "
+                + "'{names.of(leaf)}' has no '=='; {noEqualityReason(leaf)}. "
                 + suggestedFix(instantiation, "Compare the elements you need directly instead.",
                     "Use a type argument whose elements have an '==' of their own.");
         }
@@ -1126,9 +1152,9 @@ equalityComparabilityIssueOf(string instantiation, Type structType) -> string? {
             let inElement = firstIncomparableField(leaf, new Set<Type>());
             if (inElement != null) {
                 return equalitySubject(instantiation, structType,
-                        "'{types.display(structType)}' cannot be compared with '=='")
+                        "'{names.of(structType)}' cannot be compared with '=='", names)
                     + ": an array compares element by element, and element field "
-                    + "'{inElement.path()}' has type '{types.display(inElement.leaf())}', which "
+                    + "'{inElement.path()}' has type '{names.of(inElement.leaf())}', which "
                     + "has no '=='; {noEqualityReason(inElement.leaf())}. "
                     + suggestedFix(instantiation,
                         "Compare the elements you need directly instead.",
@@ -1146,49 +1172,50 @@ equalityComparabilityIssueOf(string instantiation, Type structType) -> string? {
         return null;
     }
     return equalitySubject(instantiation, structType,
-            "Struct '{authority.name()}' cannot be compared with '=='")
-        + ". Field '{found.path()}' has type '{types.display(found.leaf())}', which has no "
+            "Struct '{names.nameOf(authority)}' cannot be compared with '=='", names)
+        + ". Field '{found.path()}' has type '{names.of(found.leaf())}', which has no "
         + "'=='; {noEqualityReason(found.leaf())}. "
         + suggestedFix(instantiation, "Compare the fields you need directly instead.",
-            "Use a type argument with an '==' of its own, or give '{authority.name()}' its own "
+            "Use a type argument with an '==' of its own, or give '{names.nameOf(authority)}' its own "
                 + "'equals' and 'hash'.");
 }
 
 // The subject of a '==' refusal: 'written' names what cannot be compared where the comparison
 // was written, while a reader who only chose the type argument reads their own instantiation.
-equalitySubject(string instantiation, Type compared, string written) -> string {
+equalitySubject(string instantiation, Type compared, string written, TypeNames names)
+        -> string {
     if (instantiation.length == 0) {
         return written;
     }
     return "'{instantiation}' cannot compare two values of type "
-        + "'{types.display(compared)}' with '=='";
+        + "'{names.of(compared)}' with '=='";
 }
 
 // Why a value of this type has no 'hash', or null when it has one. An optional hashes as its
 // payload does, so the payload's type decides.
-public hashabilityIssue(Type receiver) -> string? {
-    return hashabilityIssueOf("", receiver);
+public hashabilityIssue(Type receiver, TypeNames names) -> string? {
+    return hashabilityIssueOf("", receiver, names);
 }
 
 // The same judgment for a 'hash()' call inside a generic body, refused for the arguments of the
 // 'instantiation' a reader wrote and reported at that reader's own line.
-public hashabilityIssue(string instantiation, Type receiver) -> string? {
-    return hashabilityIssueOf(instantiation, receiver);
+public hashabilityIssue(string instantiation, Type receiver, TypeNames names) -> string? {
+    return hashabilityIssueOf(instantiation, receiver, names);
 }
 
-hashabilityIssueOf(string instantiation, Type receiver) -> string? {
+hashabilityIssueOf(string instantiation, Type receiver, TypeNames names) -> string? {
     Type core = convert.coreOf(receiver);
     if (core is FunctionType) {
         if (instantiation.length > 0) {
             return "'{instantiation}' cannot hash a value of type "
-                + "'{types.display(receiver)}': {noHashReason(core)}. Keep a name or tag beside "
+                + "'{names.of(receiver)}': {noHashReason(core)}. Keep a name or tag beside "
                 + "the function and pass that instead.";
         }
-        return functionMemberIssue("hash", receiver);
+        return functionMemberIssue("hash", receiver, names);
     }
     if (core is ExternalType) {
         return refusalSubject(instantiation) + " hash a value of type "
-            + "'{types.display(receiver)}': {noHashReason(core)}. "
+            + "'{names.of(receiver)}': {noHashReason(core)}. "
             + suggestedFix(instantiation,
                 "Wrap the handle in a class, which hashes by identity, or hash a value you keep "
                     + "beside it.",
@@ -1197,7 +1224,7 @@ hashabilityIssueOf(string instantiation, Type receiver) -> string? {
     }
     if (convert.isFloatType(core)) {
         return refusalSubject(instantiation) + " hash a value of type "
-            + "'{types.display(receiver)}': {noHashReason(core)}. "
+            + "'{names.of(receiver)}': {noHashReason(core)}. "
             + suggestedFix(instantiation,
                 "Hash an exact value instead, such as the integer the number came from.",
                 "Pass an exact value instead, such as the integer the number came from.");
@@ -1209,9 +1236,9 @@ hashabilityIssueOf(string instantiation, Type receiver) -> string? {
         }
         if (isOpaqueLeaf(leaf, true)) {
             return hashSubject(instantiation, receiver,
-                    "'{types.display(receiver)}' cannot be hashed")
+                    "'{names.of(receiver)}' cannot be hashed", names)
                 + ": an array hashes element by element, and its element type "
-                + "'{types.display(leaf)}' has no hash; {noHashReason(leaf)}. "
+                + "'{names.of(leaf)}' has no hash; {noHashReason(leaf)}. "
                 + suggestedFix(instantiation,
                     "Hash a value you keep beside the elements instead.",
                     "Use a type argument whose elements have a hash of their own.");
@@ -1220,9 +1247,9 @@ hashabilityIssueOf(string instantiation, Type receiver) -> string? {
             let inElement = firstUnhashableField(leaf, new Set<Type>());
             if (inElement != null) {
                 return hashSubject(instantiation, receiver,
-                        "'{types.display(receiver)}' cannot be hashed")
+                        "'{names.of(receiver)}' cannot be hashed", names)
                     + ": an array hashes element by element, and element field "
-                    + "'{inElement.path()}' has type '{types.display(inElement.leaf())}', which "
+                    + "'{inElement.path()}' has type '{names.of(inElement.leaf())}', which "
                     + "has no hash; {noHashReason(inElement.leaf())}. "
                     + suggestedFix(instantiation,
                         "Hash the fields you need directly instead.",
@@ -1240,27 +1267,28 @@ hashabilityIssueOf(string instantiation, Type receiver) -> string? {
         return null;
     }
     return hashSubject(instantiation, receiver,
-            "Struct '{authority.name()}' cannot be hashed")
-        + ". Field '{found.path()}' has type '{types.display(found.leaf())}', which has no "
+            "Struct '{names.nameOf(authority)}' cannot be hashed", names)
+        + ". Field '{found.path()}' has type '{names.of(found.leaf())}', which has no "
         + "hash; {noHashReason(found.leaf())}. "
         + suggestedFix(instantiation, "Hash the fields you need directly instead.",
-            "Use a type argument with a hash of its own, or give '{authority.name()}' its own "
+            "Use a type argument with a hash of its own, or give '{names.nameOf(authority)}' its own "
                 + "'equals' and 'hash'.");
 }
 
 // The subject of a hash refusal: 'written' names what has no hash where the call was written,
 // while a reader who only chose the type argument reads their own instantiation.
-hashSubject(string instantiation, Type receiver, string written) -> string {
+hashSubject(string instantiation, Type receiver, string written, TypeNames names)
+        -> string {
     if (instantiation.length == 0) {
         return written;
     }
-    return "'{instantiation}' cannot hash a value of type '{types.display(receiver)}'";
+    return "'{instantiation}' cannot hash a value of type '{names.of(receiver)}'";
 }
 
 // Why a member cannot be read or called on a function value, whatever the member.
-public functionMemberIssue(string name, Type functionType) -> string {
+public functionMemberIssue(string name, Type functionType, TypeNames names) -> string {
     return "A function value has no members, so '{name}' cannot be used on "
-        + "'{types.display(functionType)}': it has no identity and no text form. Call the "
+        + "'{names.of(functionType)}': it has no identity and no text form. Call the "
         + "value with '(...)', or keep the data you need beside it.";
 }
 
@@ -1326,23 +1354,25 @@ public keyedContainerOf(DeclaredType template) -> KeyedContainer? {
 // Why a value of this type cannot be the key argument of this container, or null when it can. A
 // key that hashes by content must not change while it sits in the container, and a key with no
 // hash at all is refused here so the error lands on the mention rather than inside the library.
-public keyTypeIssue(DeclaredType container, Type key) -> string? {
-    return keyTypeIssueOf("", container, key);
+public keyTypeIssue(DeclaredType container, Type key, TypeNames names) -> string? {
+    return keyTypeIssueOf("", container, key, names);
 }
 
 // The same judgment for a keyed container written inside a generic body, refused for the
 // arguments of the 'instantiation' a reader wrote and reported at that reader's own line.
-public keyTypeIssue(string instantiation, DeclaredType container, Type key) -> string? {
-    return keyTypeIssueOf(instantiation, container, key);
+public keyTypeIssue(string instantiation, DeclaredType container, Type key,
+                    TypeNames names) -> string? {
+    return keyTypeIssueOf(instantiation, container, key, names);
 }
 
-keyTypeIssueOf(string instantiation, DeclaredType container, Type key) -> string? {
+keyTypeIssueOf(string instantiation, DeclaredType container, Type key, TypeNames names)
+        -> string? {
     let keyed = keyedContainerOf(container);
     if (keyed == null) {
         return null;
     }
     Type core = convert.coreOf(key);
-    string refused = refusalSubject(instantiation) + " use '{types.display(key)}' as "
+    string refused = refusalSubject(instantiation) + " use '{names.of(key)}' as "
         + "{keyed.role()}: ";
     if (core is ArrayType) {
         return refused + "an array's contents, and so {keyed.upset()}, can change while it "
@@ -1379,7 +1409,7 @@ keyTypeIssueOf(string instantiation, DeclaredType container, Type key) -> string
     let changeable = firstChangeableField(core, new Set<Type>());
     if (changeable != null) {
         return refused + "its field '{changeable.path()}' has type "
-            + "'{types.display(changeable.leaf())}', whose contents can change while the "
+            + "'{names.of(changeable.leaf())}', whose contents can change while the "
             + "{keyed.noun()} sits in {keyed.home()}. Key by the fields whose contents cannot "
             + "change, or by a value you keep beside the {keyed.noun()}.";
     }
@@ -1388,14 +1418,14 @@ keyTypeIssueOf(string instantiation, DeclaredType container, Type key) -> string
     }
     let opaque = firstUnhashableField(core, new Set<Type>());
     if (opaque != null) {
-        string fix = " Give '{types.display(key)}' its own 'equals' and 'hash', or key by the "
+        string fix = " Give '{names.of(key)}' its own 'equals' and 'hash', or key by the "
             + "fields that have one.";
         if (convert.isFloatType(opaque.leaf())) {
-            fix = " Give '{types.display(key)}' its own 'equals' and 'hash', or key by the fields "
+            fix = " Give '{names.of(key)}' its own 'equals' and 'hash', or key by the fields "
                 + "that are exact.";
         }
         return refused + "its field '{opaque.path()}' has type "
-            + "'{types.display(opaque.leaf())}', which has no hash; "
+            + "'{names.of(opaque.leaf())}', which has no hash; "
             + "{noHashReason(opaque.leaf())}." + fix;
     }
     return null;
@@ -1403,12 +1433,12 @@ keyTypeIssueOf(string instantiation, DeclaredType container, Type key) -> string
 
 // True for a keyed container instantiated at a refused key. The mention that formed it was
 // reported where it was written, so the container's own bodies are never judged for it.
-hasRefusedKey(DeclaredType template, Type[] arguments) -> bool {
+hasRefusedKey(DeclaredType template, Type[] arguments, TypeNames names) -> bool {
     let keyed = keyedContainerOf(template);
     if (keyed == null || keyed.keyIndex() >= arguments.length) {
         return false;
     }
-    return keyTypeIssue(template, arguments[keyed.keyIndex()]) != null;
+    return keyTypeIssue(template, arguments[keyed.keyIndex()], names) != null;
 }
 
 // The standard collections by template name and declaring module; 'Deque', 'PriorityQueue', and
@@ -1433,15 +1463,16 @@ isDeclaredAs(DeclaredType template, string name, string module) -> bool {
 
 // Why a value of struct type 'structType' cannot serialize to JSON, or null when every field
 // is JSON-able. Names the offending field's dotted path and its type.
-public structJsonabilityIssue(Type structType) -> string? {
-    return structTextIssue("", structType, structType);
+public structJsonabilityIssue(Type structType, TypeNames names) -> string? {
+    return structTextIssue("", structType, structType, names);
 }
 
 // Why a value of struct type 'structType' cannot serialize to JSON, or null when every field is
 // JSON-able. Names the offending field's dotted path and its type. 'shown' is the type the hole was
 // written with, which may hold the struct behind a nullable level, so that is what the refusal
 // names.
-structTextIssue(string instantiation, Type shown, Type structType) -> string? {
+structTextIssue(string instantiation, Type shown, Type structType, TypeNames names)
+        -> string? {
     let authority = types.authorityOf(structType);
     if (authority == null) {
         return null;
@@ -1450,19 +1481,19 @@ structTextIssue(string instantiation, Type shown, Type structType) -> string? {
     if (found == null) {
         return null;
     }
-    string subject = "Struct '{authority.name()}' cannot be converted to a string.";
+    string subject = "Struct '{names.nameOf(authority)}' cannot be converted to a string.";
     if (instantiation.length > 0) {
         subject = "'{instantiation}' cannot interpolate a value of type "
-            + "'{types.display(shown)}': struct '{authority.name()}' has no text form.";
+            + "'{names.of(shown)}': struct '{names.nameOf(authority)}' has no text form.";
     } else if (shown != structType) {
-        subject = "Cannot interpolate a value of type '{types.display(shown)}': struct "
-            + "'{authority.name()}' has no text form.";
+        subject = "Cannot interpolate a value of type '{names.of(shown)}': struct "
+            + "'{names.nameOf(authority)}' has no text form.";
     }
-    return subject + " Field '{found.path()}' has type '{types.display(found.leaf())}', which "
+    return subject + " Field '{found.path()}' has type '{names.of(found.leaf())}', which "
         + "has no string form; only value types, strings, enums, their nullable forms, and "
         + "nested such structs serialize to JSON. "
         + suggestedFix(instantiation, "Convert or drop the field.",
-            "Give '{authority.name()}' a 'toString' of its own, or pass a type argument that "
+            "Give '{names.nameOf(authority)}' a 'toString' of its own, or pass a type argument that "
                 + "has a text form.");
 }
 
@@ -1671,23 +1702,24 @@ firstNonJsonableField(Type structType, Set<Type> visiting) -> OffendingField? {
 // Why a freshly allocated array of this element type would not hold valid values, or null when it
 // would. A reference element is offered the fill loop the wording names, because filling as the
 // array is created is what makes it sound; a struct's own field says which one is at fault.
-public arrayElementIssue(Type element, bool hasFillName, string fillName) -> string? {
-    return arrayElementIssueOf("", element, hasFillName, fillName);
+public arrayElementIssue(Type element, bool hasFillName, string fillName, TypeNames names)
+        -> string? {
+    return arrayElementIssueOf("", element, hasFillName, fillName, names);
 }
 
 // The same judgment for a 'new T[n]' inside a generic body, refused for the arguments of the
 // 'instantiation' a reader wrote and reported at that reader's own line. The fill loop belongs
 // to whoever wrote the allocation, so this reader is offered the type argument instead.
-public arrayElementIssue(string instantiation, Type element) -> string? {
-    return arrayElementIssueOf(instantiation, element, false, "");
+public arrayElementIssue(string instantiation, Type element, TypeNames names) -> string? {
+    return arrayElementIssueOf(instantiation, element, false, "", names);
 }
 
-arrayElementIssueOf(string instantiation, Type element, bool hasFillName, string fillName)
-        -> string? {
+arrayElementIssueOf(string instantiation, Type element, bool hasFillName, string fillName,
+                    TypeNames names) -> string? {
     if (element is ErrorType || convert.isDefaultable(element)) {
         return null;
     }
-    string shown = types.display(element);
+    string shown = names.of(element);
     string hint = "";
     if (isReferenceElement(element)) {
         if (hasFillName) {
@@ -1702,13 +1734,14 @@ arrayElementIssueOf(string instantiation, Type element, bool hasFillName, string
             " Pass a type argument that makes the element type nullable, so a slot can start as "
                 + "null.");
     } else if (types.isStructLike(element)) {
-        hint = offendingFieldHint(instantiation, element, shown);
+        hint = offendingFieldHint(instantiation, element, shown, names);
     }
     return refusalSubject(instantiation) + " use '{shown}' as an array element type because "
         + "freshly-allocated slots would not be valid values of '{shown}'.{hint}";
 }
 
-offendingFieldHint(string instantiation, Type element, string shown) -> string {
+offendingFieldHint(string instantiation, Type element, string shown, TypeNames names)
+        -> string {
     let fields = types.fieldsOf(element);
     if (fields == null) {
         return "";
@@ -1727,7 +1760,7 @@ offendingFieldHint(string instantiation, Type element, string shown) -> string {
         }
         if (!convert.isDefaultable(field.type())) {
             return " Field '{field.name()}' of '{shown}' has type "
-                + "'{types.display(field.type())}' which cannot start as a default zero value. "
+                + "'{names.of(field.type())}' which cannot start as a default zero value. "
                 + suggestedFix(instantiation, "Make that field nullable.",
                     "Make that field nullable, or pass a type argument that makes the element "
                         + "type nullable.");

@@ -1242,7 +1242,7 @@ export class TypeStore {
     Map<InstantiationKey, InstantiationType> instantiations;
     List<InstantiationType> pendingFills;
     List<InstantiationType> instantiationChain;
-    List<FileDiagnostic> instantiationOverflows;
+    List<InstantiationOverflow> instantiationOverflows;
 
     public constructor() {
         this.primitives = new Map<PrimitiveKind, PrimitiveType>();
@@ -1257,7 +1257,7 @@ export class TypeStore {
         this.instantiations = new Map<InstantiationKey, InstantiationType>();
         this.pendingFills = new List<InstantiationType>();
         this.instantiationChain = new List<InstantiationType>();
-        this.instantiationOverflows = new List<FileDiagnostic>();
+        this.instantiationOverflows = new List<InstantiationOverflow>();
     }
 
     export primitive(PrimitiveKind kind) -> PrimitiveType {
@@ -1374,25 +1374,21 @@ export class TypeStore {
         return this.instantiations.values();
     }
 
-    // The diagnostics for instantiation chains that never terminate, cleared as they are taken.
-    public takeInstantiationOverflows() -> FileDiagnostic[] {
-        FileDiagnostic[] taken = this.instantiationOverflows.toArray();
-        this.instantiationOverflows = new List<FileDiagnostic>();
-        return taken;
+    // The diagnostics for instantiation chains that never terminate, each spelled through the
+    // names of the generic's own file, and cleared as they are taken.
+    public takeInstantiationOverflows(TypeNameDirectory names) -> FileDiagnostic[] {
+        let taken = new List<FileDiagnostic>();
+        for (long i = 0; i < this.instantiationOverflows.length(); i++) {
+            taken.push(this.instantiationOverflows.get(i).diagnostic(names));
+        }
+        this.instantiationOverflows = new List<InstantiationOverflow>();
+        return taken.toArray();
     }
 
     recordInstantiationOverflow() {
-        let root = this.instantiationChain.get(0);
-        let firstNested = this.instantiationChain.get(1);
-        let secondNested = this.instantiationChain.get(2);
-        string rootName = display(root);
-        string message = "Instantiating '" + rootName + "' never finishes: each instantiation "
-            + "requires another ('" + rootName + "' needs '" + display(firstNested)
-            + "', which needs '" + display(secondNested)
-            + "', ...). Break the recursive type argument.";
-        let template = root.template();
-        this.instantiationOverflows.push(
-            new FileDiagnostic(template.filePath(), message, overflowSpan(template)));
+        this.instantiationOverflows.push(new InstantiationOverflow(
+            this.instantiationChain.get(0), this.instantiationChain.get(1),
+            this.instantiationChain.get(2)));
     }
 
     // Fills one queued instantiation early, for a base link the layout phase needs now.
@@ -1640,6 +1636,27 @@ export class TypeStore {
     }
 }
 
+// An instantiation chain that never terminates, kept as the three instantiations at its head so
+// the refusal is spelled when it is taken, through the names of the generic's own file.
+class InstantiationOverflow {
+    InstantiationType overflowRoot;
+    InstantiationType firstNested;
+    InstantiationType secondNested;
+
+    protected constructor(this.overflowRoot, this.firstNested, this.secondNested);
+
+    protected diagnostic(TypeNameDirectory names) -> FileDiagnostic {
+        let template = this.overflowRoot.template();
+        let spelling = names.namesFor(template.filePath());
+        string rootName = spelling.of(this.overflowRoot);
+        string message = "Instantiating '" + rootName + "' never finishes: each instantiation "
+            + "requires another ('" + rootName + "' needs '" + spelling.of(this.firstNested)
+            + "', which needs '" + spelling.of(this.secondNested)
+            + "', ...). Break the recursive type argument.";
+        return new FileDiagnostic(template.filePath(), message, overflowSpan(template));
+    }
+}
+
 final class Limits {
     // The instantiation nesting a well-formed program stays far below. A chain that reaches it is
     // a polymorphically recursive template that would never terminate.
@@ -1699,22 +1716,143 @@ referencesTemplate(Type type, DeclaredType template) -> bool {
     }
 }
 
-// The type as it reads in a diagnostic, spelled the way the language writes it: 'int',
-// 'Box<string>?', 'T[]', '(int, int) -> int', '((int) -> bool)?'.
+// The names one file has for the program's declared types: what it declares, what its imports
+// bind, the modules its imports let it qualify with, and the modules whose types it names with
+// no import written. A diagnostic reported in that file spells every type it names through
+// these, so a fix it suggests reads as the file can write it.
+public final class TypeNames {
+    string namingFilePath;
+    string namingModulePath;
+    string namingPackagePrefix;
+    TypeStore namingStore;
+
+    // The modules whose types a bare name may answer with, in the order unqualified resolution
+    // reads them. Empty for names that belong to no file, which name no type at all.
+    string[] implicitModulePaths;
+    Map<DeclaredType, string> importedNames;
+    Map<string, string> namespaceAliases;
+    Set<string> boundTypeNames;
+
+    public constructor(string filePath, string modulePath, string packagePrefix, TypeStore store,
+                string[] implicitPaths, Map<DeclaredType, string> imported,
+                Map<string, string> aliases, Set<string> boundNames) {
+        this.namingFilePath = filePath;
+        this.namingModulePath = modulePath;
+        this.namingPackagePrefix = packagePrefix;
+        this.namingStore = store;
+        this.implicitModulePaths = implicitPaths;
+        this.importedNames = imported;
+        this.namespaceAliases = aliases;
+        this.boundTypeNames = boundNames;
+    }
+
+    // The file these names belong to, which is the file a diagnostic spelled with them lands in.
+    public filePath() -> string {
+        return this.namingFilePath;
+    }
+
+    // The type as it reads in a diagnostic in this file, spelled the way the language writes it:
+    // 'int', 'Box<string>?', 'Sort[]', 'kinds.Kind[]', '(Sort) -> bool', '((int) -> bool)?'.
+    public of(Type type) -> string {
+        return spelled(type, this);
+    }
+
+    // The nullable spelling of a type, for a diagnostic suggesting a type that allows null. It is
+    // not always the type's own spelling with a '?' added, because a function type needs
+    // parentheses first: '((int) -> bool)?' is a function reference that may be null, while
+    // '(int) -> bool?' is a function whose return may be.
+    public nullableOf(Type type) -> string {
+        return spelledSuffixed(type, this) + "?";
+    }
+
+    // The name this file has for a declared type, without the type parameters its own spelling
+    // carries: the name the file declares or imports it under, 'alias.Type' where an imported
+    // module is what reaches it, and the module-qualified name where the file has no name for it.
+    public nameOf(DeclaredType declared) -> string {
+        if (declared is PrimitiveBinding) {
+            return declared.name();
+        }
+        if (declared.filePath() == this.namingFilePath) {
+            return declared.name();
+        }
+        let imported = this.importedNames.get(declared);
+        if (imported != null) {
+            return imported;
+        }
+        if (this.bareNameAnswers(declared)) {
+            return declared.name();
+        }
+        let alias = this.namespaceAliases.get(declared.modulePath());
+        if (alias != null && this.reaches(declared)) {
+            return "{alias}.{declared.name()}";
+        }
+        return "{declared.modulePath()}.{declared.name()}";
+    }
+
+    // Whether the bare name answers with this very type here: the file declares nothing else
+    // under it, no import binds it, and an implicitly imported module is what carries it.
+    bareNameAnswers(DeclaredType declared) -> bool {
+        string name = declared.name();
+        if (this.namingStore.findDeclared(this.namingModulePath, name) != null) {
+            return false;
+        }
+        if (this.boundTypeNames.contains(name)) {
+            return false;
+        }
+        return this.implicitAnswer(name) == declared;
+    }
+
+    // The type an implicitly imported module contributes under this name here, or null when none
+    // of them does; the resolver's own fallback, read the same way.
+    implicitAnswer(string name) -> DeclaredType? {
+        for (let modulePath in this.implicitModulePaths) {
+            let declared = this.namingStore.findDeclared(modulePath, name);
+            if (declared != null && this.reaches(declared)) {
+                return declared;
+            }
+        }
+        return null;
+    }
+
+    // Whether this file may name the type at all, by the visibility it was declared with.
+    reaches(DeclaredType declared) -> bool {
+        return isVisibleFrom(declared.visibility(), declared.modulePath(),
+            declared.packagePrefix(), this.namingModulePath, this.namingPackagePrefix);
+    }
+}
+
+// The names every file of one program has for its types, for a diagnostic built outside the file
+// it lands in. A file this program never linked names nothing but the primitive bindings, whose
+// names are keywords, and spells every other declared type module-qualified however it is
+// visible, because nothing says what that file could write.
+public final class TypeNameDirectory {
+    Map<string, TypeNames> namesByFile;
+    TypeNames unnamedFile;
+
+    public constructor(TypeNames[] files, TypeStore store) {
+        this.namesByFile = new Map<string, TypeNames>();
+        for (let names in files) {
+            this.namesByFile.set(names.filePath(), names);
+        }
+        this.unnamedFile = new TypeNames("", "", "", store, [],
+            new Map<DeclaredType, string>(), new Map<string, string>(), new Set<string>());
+    }
+
+    // The names of the file at this path.
+    public namesFor(string filePath) -> TypeNames {
+        return this.namesByFile.get(filePath) ?? this.unnamedFile;
+    }
+}
+
+// The type as it reads where no file names it: every declared type by its own declared name. For
+// an EIR dump and for an 'Internal:' message; a diagnostic spells a type through the names of the
+// file it is reported in, which is what TypeNames answers.
 export display(Type type) -> string {
-    return displayBeside(type, null);
+    return spelled(type, null);
 }
 
-// The type as it reads beside another one in the same diagnostic. A declared type that spells
-// like the one standing at its position in the other type, such as two enums named 'Kind' from
-// two modules, is shown with the module declaring it, so the message tells the two apart.
-export displayAgainst(Type shown, Type other) -> string {
-    return displayBeside(shown, other);
-}
-
-// beside is the type at the same position in the type shown alongside, or null when the two
-// shapes have parted or there is no other type.
-displayBeside(Type type, Type? beside) -> string {
+// names is the file the spelling is for, or null where no file names the type.
+spelled(Type type, TypeNames? names) -> string {
     switch (type) {
         is PrimitiveType primitive -> {
             return primitiveName(primitive.kind());
@@ -1729,28 +1867,12 @@ displayBeside(Type type, Type? beside) -> string {
             return "<error>";
         },
         is OptionalType optional -> {
-            Type? innerBeside = null;
-            if (beside is OptionalType) {
-                innerBeside = beside.inner();
-            }
-            return displaySuffixed(optional.inner(), innerBeside) + "?";
+            return spelledSuffixed(optional.inner(), names) + "?";
         },
         is ArrayType array -> {
-            Type? elementBeside = null;
-            if (beside is ArrayType) {
-                elementBeside = beside.element();
-            }
-            return displaySuffixed(array.element(), elementBeside) + "[]";
+            return spelledSuffixed(array.element(), names) + "[]";
         },
         is FunctionType functionType -> {
-            Type[] parametersBeside = [];
-            Type? returnBeside = null;
-            Type[] thrownBeside = [];
-            if (beside is FunctionType) {
-                parametersBeside = beside.parameterTypes();
-                returnBeside = beside.returnType();
-                thrownBeside = beside.thrownTypes();
-            }
             let builder = new StringBuilder();
             builder.append("(");
             Type[] parameters = functionType.parameterTypes();
@@ -1758,10 +1880,10 @@ displayBeside(Type type, Type? beside) -> string {
                 if (i > 0) {
                     builder.append(", ");
                 }
-                builder.append(displayBeside(parameters[i], typeAt(parametersBeside, i)));
+                builder.append(spelled(parameters[i], names));
             }
             builder.append(") -> ");
-            builder.append(displayBeside(functionType.returnType(), returnBeside));
+            builder.append(spelled(functionType.returnType(), names));
             Type[] thrown = functionType.thrownTypes();
             for (long i = 0; i < thrown.length; i++) {
                 if (i > 0) {
@@ -1769,32 +1891,26 @@ displayBeside(Type type, Type? beside) -> string {
                 } else {
                     builder.append(" throws ");
                 }
-                builder.append(displayBeside(thrown[i], typeAt(thrownBeside, i)));
+                builder.append(spelled(thrown[i], names));
             }
             return builder.toString();
         },
         is DeclaredType declared -> {
-            return displayDeclared(declared, beside);
+            return spelledDeclared(declared, names);
         },
         is TypeParamType parameter -> {
             return parameter.name();
         },
         is InstantiationType instantiation -> {
-            Type? templateBeside = null;
-            Type[] argumentsBeside = [];
-            if (beside is InstantiationType) {
-                templateBeside = beside.template();
-                argumentsBeside = beside.arguments();
-            }
             let builder = new StringBuilder();
-            builder.append(declaredName(instantiation.template(), templateBeside));
+            builder.append(nameIn(instantiation.template(), names));
             builder.append("<");
             Type[] arguments = instantiation.arguments();
             for (long i = 0; i < arguments.length; i++) {
                 if (i > 0) {
                     builder.append(", ");
                 }
-                builder.append(displayBeside(arguments[i], typeAt(argumentsBeside, i)));
+                builder.append(spelled(arguments[i], names));
             }
             builder.append(">");
             return builder.toString();
@@ -1802,21 +1918,14 @@ displayBeside(Type type, Type? beside) -> string {
     }
 }
 
-typeAt(Type[] candidates, long index) -> Type? {
-    if (index < candidates.length) {
-        return candidates[index];
-    }
-    return null;
-}
-
 // A generic template stands at its own type parameters, so it reads 'Box<T>' rather than 'Box'.
-displayDeclared(DeclaredType declared, Type? beside) -> string {
+spelledDeclared(DeclaredType declared, TypeNames? names) -> string {
     string[] parameters = declared.typeParameters();
     if (parameters.length == 0) {
-        return declaredName(declared, beside);
+        return nameIn(declared, names);
     }
     let builder = new StringBuilder();
-    builder.append(declaredName(declared, beside));
+    builder.append(nameIn(declared, names));
     builder.append("<");
     for (long i = 0; i < parameters.length; i++) {
         if (i > 0) {
@@ -1828,29 +1937,20 @@ displayDeclared(DeclaredType declared, Type? beside) -> string {
     return builder.toString();
 }
 
-// The name carries its module only when the type beside it is a different type of the same name.
-declaredName(DeclaredType declared, Type? beside) -> string {
-    if (beside is DeclaredType && beside != declared && beside.name() == declared.name()) {
-        return declared.modulePath() + "." + declared.name();
+nameIn(DeclaredType declared, TypeNames? names) -> string {
+    if (names == null) {
+        return declared.name();
     }
-    return declared.name();
+    return names.nameOf(declared);
 }
 
 // A type under a '?' or '[]' suffix. A function type takes parentheses there, because the
 // suffixes of the written form bind to the return type instead.
-displaySuffixed(Type type, Type? beside) -> string {
+spelledSuffixed(Type type, TypeNames? names) -> string {
     if (type is FunctionType) {
-        return "(" + displayBeside(type, beside) + ")";
+        return "(" + spelled(type, names) + ")";
     }
-    return displayBeside(type, beside);
-}
-
-// The nullable spelling of a type, for a diagnostic suggesting a type that allows null. It is not
-// always the type's own spelling with a '?' added, because a function type needs parentheses
-// first: '((int) -> bool)?' is a function reference that may be null, while '(int) -> bool?' is a
-// function whose return may be.
-export displayNullable(Type type) -> string {
-    return displaySuffixed(type, null) + "?";
+    return spelled(type, names);
 }
 
 public primitiveName(PrimitiveKind kind) -> string {

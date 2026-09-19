@@ -12,6 +12,8 @@ import program.implicit;
 import model.types;
 import Type from model.types;
 import TypeStore from model.types;
+import TypeNames from model.types;
+import TypeNameDirectory from model.types;
 import DeclaredType from model.types;
 import List from @std.collections.list;
 import Map from @std.collections.map;
@@ -49,10 +51,12 @@ public class ImportedNamespace extends NameBinding {
 public class ModuleLinkTable {
     string tableModulePath;
     Map<string, NameBinding> nameBindings;
+    TypeNames tableNames;
 
-    protected constructor(string modulePath, Map<string, NameBinding> bindings) {
+    protected constructor(string modulePath, Map<string, NameBinding> bindings, TypeNames names) {
         this.tableModulePath = modulePath;
         this.nameBindings = bindings;
+        this.tableNames = names;
     }
 
     protected modulePath() -> string {
@@ -61,6 +65,12 @@ public class ModuleLinkTable {
 
     public binding(string name) -> NameBinding? {
         return this.nameBindings.get(name);
+    }
+
+    // This table read backwards: the name this file has for each type it can name, which is how
+    // every diagnostic reported in the file spells the types it names.
+    public names() -> TypeNames {
+        return this.tableNames;
     }
 
     bindingCount() -> long {
@@ -72,14 +82,19 @@ public class LinkResult {
     ModuleLinkTable[] linkTables;
     FileDiagnostic[] linkDiagnostics;
     Map<string, ModuleLinkTable> tablesByPath;
+    TypeNameDirectory nameDirectory;
 
-    protected constructor(ModuleLinkTable[] tables, FileDiagnostic[] diagnostics) {
+    protected constructor(ModuleLinkTable[] tables, FileDiagnostic[] diagnostics,
+                TypeStore store) {
         this.linkTables = tables;
         this.linkDiagnostics = diagnostics;
         this.tablesByPath = new Map<string, ModuleLinkTable>();
+        let names = new List<TypeNames>();
         for (let table in tables) {
             this.tablesByPath.set(table.modulePath(), table);
+            names.push(table.names());
         }
+        this.nameDirectory = new TypeNameDirectory(names.toArray(), store);
     }
 
     // One table per module, in the graph's module order.
@@ -89,6 +104,12 @@ public class LinkResult {
 
     public tableFor(string modulePath) -> ModuleLinkTable? {
         return this.tablesByPath.get(modulePath);
+    }
+
+    // The names every linked file has for the program's types, for a diagnostic built where
+    // the file it lands in is one of several.
+    public namesByFile() -> TypeNameDirectory {
+        return this.nameDirectory;
     }
 
     public diagnostics() -> FileDiagnostic[] {
@@ -123,7 +144,7 @@ public linkProgram(Module[] modules, FileDeclarations[] declarations, TypeStore 
         tables.push(bindModuleImports(store, modules[i], declarations[i], declarationsByPath,
             collected));
     }
-    return new LinkResult(tables.toArray(), diagnostics.sorted(collected));
+    return new LinkResult(tables.toArray(), diagnostics.sorted(collected), store);
 }
 
 // Links each primitive binding to the primitive it names. A binding is a statement about a type
@@ -299,7 +320,34 @@ bindModuleImports(TypeStore store, Module module, FileDeclarations declarations,
                 "Module '{target}' has no type named '{record.name()}'.");
         }
     }
-    return new ModuleLinkTable(module.canonicalPath(), bindings);
+    return new ModuleLinkTable(module.canonicalPath(), bindings,
+        moduleNames(store, module, records, bindings));
+}
+
+// One module's imports read backwards: the name its file has for each type an import binds, and
+// the alias each imported module is qualified with. Import order decides, so a file that binds one
+// type or one module twice reads with the first of those imports.
+moduleNames(TypeStore store, Module module, ImportRecord[] records,
+            Map<string, NameBinding> bindings) -> TypeNames {
+    let importedNames = new Map<DeclaredType, string>();
+    let namespaceAliases = new Map<string, string>();
+    let importedTypeNames = new Set<string>();
+    for (let record in records) {
+        string name = record.boundName();
+        let binding = bindings.get(name);
+        if (binding is ImportedType) {
+            let ignored = importedTypeNames.add(name);
+            if (!importedNames.contains(binding.target())) {
+                importedNames.set(binding.target(), name);
+            }
+        } else if (binding is ImportedNamespace) {
+            if (!namespaceAliases.contains(binding.modulePath())) {
+                namespaceAliases.set(binding.modulePath(), name);
+            }
+        }
+    }
+    return new TypeNames(module.filePath(), module.canonicalPath(), module.packagePrefix(), store,
+        implicit.implicitImportPaths(), importedNames, namespaceAliases, importedTypeNames);
 }
 
 bindNamespace(Module module, ImportRecord record, string target, FileDeclarations declarations,
