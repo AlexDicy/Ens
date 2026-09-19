@@ -11,7 +11,7 @@ Today `List.pop()` on empty silently corrupts the count; under this rule it pani
 ## Error taxonomy
 
 One error class per module, each carrying a `kind` enum that is also per module.
-The classes: `IoError`, `FileSystemError`, `ProcessError`, `TestFailure`, plus abstract `Error` in core.
+The classes: `IoError`, `FileSystemError`, `ProcessError`, `EncodingError`, `TestFailure`, plus abstract `Error` in core, and the `SystemError` the surviving `@std.system` keeps until its process family goes (see 09-todos.md).
 Typed-throws lists stay one type long, so a new failure condition is a new enum member and no signature changes.
 A per-condition class hierarchy was rejected: it is Java checked exceptions, where every new failure mode propagates a signature change to every caller.
 
@@ -57,7 +57,7 @@ Std never retains a collection a caller passed in.
 PascalCase types, camelCase members, PascalCase enum members, full words over abbreviations.
 Sanctioned exceptions, written down as exceptions: `fs`, `io` and `NaN` as terms of art, the last of them keeping its capitals inside `isNaN`.
 Verb pairs: the imperative mutates in place, the past participle returns a new value (`sort`/`sorted`, `reverse`/`reversed`).
-Conversions: `toX()` copies, `asX()` is a cheap view sharing storage, `X.parse(text)` goes from text to value.
+Conversions: `toX()` copies, `asX()` is a cheap view sharing storage, and text becomes a value through the free `parseX(text)` functions of `@std.text.parse`, each answering null for text that spells anything else.
 `length()` everywhere, `isEmpty()` alongside it, and `size` is never introduced: `string.length` and `array.length` are already builtins, so `size()` on containers would make the primitive and library spellings disagree.
 Bool naming: `is` when the answer is an adjective about the receiver (`isEmpty`, `isAbsolute`), a plain verb when a natural one exists (`contains`, `startsWith`, `exists`), never a bare adjective.
 Booleans in public API only for a genuine two-state choice read as a named argument at the call site; an enum when a third state is plausible.
@@ -102,4 +102,3 @@ Non-resource cleanup gets a guard type, such as a temporary directory that remov
 The prelude injects `print` and `eprint` only; `@std.core` stays implicitly imported and holds errors and the two contracts.
 Per-file modules stay; imports name files.
 One internal module owns every `external` declaration, so no user program can reach a libc symbol through std, and no other std module declares `external`.
-Naming hazard to remember: `@std.system` is being reused for the internal native module while the current public `@std.system` still exists, so the same name means opposite things until the migration completes.

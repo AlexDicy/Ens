@@ -20,7 +20,7 @@ export abstract class Error {
     export const Error? cause;
 
     // Return addresses captured where this error was thrown, symbolicated only when read.
-    private long[]? frames;
+    long[]? frames;
 
     protected constructor(this.message, this.cause = null);
 
@@ -28,11 +28,11 @@ export abstract class Error {
     export override toString() -> string;
 
     // The frames as text, innermost first, and empty for an error that was built but never thrown.
-    export stackTrace() -> string;
+    export final stackTrace() -> string;
 
     // The same frames as values. The compiler lowers both of these to the trace runtime, so the
     // bodies here are never emitted.
-    export stackFrames() -> StackFrame[];
+    export final stackFrames() -> StackFrame[];
 }
 
 // One frame of a captured trace: what was running, and where in the source.

@@ -23,7 +23,8 @@ export class FileSystemError extends Error {
     // where nothing was asked of the system.
     export const int nativeError;
 
-    export constructor(this.message, this.kind, this.path, this.nativeError, Error? cause = null);
+    export constructor(string message, this.kind, this.path, this.nativeError,
+                       Error? cause = null);
 }
 
 export enum ErrorKind {
@@ -127,17 +128,18 @@ export struct Path implements Comparable<Path> {
 
     // ---- directories ----
 
-    // What is directly inside this directory, one entry at a time, in ascending byte order of
-    // name, so a walk visits the same names in the same order however the file system enumerates
-    // them. '.' and '..' are not entries.
-    export entries() -> Iterator<Entry> throws FileSystemError;
+    // What is directly inside this directory, in ascending byte order of name, so a walk visits
+    // the same names in the same order however the file system enumerates them. The directory is
+    // read fully before anything is answered, which is what lets that order be promised. '.' and
+    // '..' are not entries.
+    export entries() -> Iterable<Entry> throws FileSystemError;
 
     // Every entry under this directory, depth first, each directory's entries in the same order as
     // `entries`. A symbolic link is reported and not descended into, so a walk over a tree of
     // links visits each place once. A `followLinks` of true descends into a link that names a
     // directory, and a link reaching a place the walk has already been is reported and not entered
     // twice, so a cycle cannot trap the walk either way.
-    export walk(bool followLinks = false) -> Iterator<Entry> throws FileSystemError;
+    export walk(bool followLinks = false) -> Iterable<Entry> throws FileSystemError;
 
     // Creates this directory and every missing parent. A path that is already a directory is left
     // alone.
@@ -224,9 +226,10 @@ export struct Entry {
 ```ens
 // @std.fs.temporary
 // A directory or file that exists for as long as the value does. Made under the system's temporary
-// location with a name no other call answers, and removed when the value is dropped.
+// location with a name no other call answers, and removed when the value is dropped. The name
+// starts with `prefix`, so one left behind by a program that crashed says what made it.
 export final class TemporaryDirectory {
-    export static create() -> TemporaryDirectory throws FileSystemError;
+    export static create(string prefix) -> TemporaryDirectory throws FileSystemError;
     export path() -> Path;
 
     // Dismisses the cleanup and answers the path, which the caller now owns.
@@ -237,7 +240,7 @@ export final class TemporaryDirectory {
 }
 
 export final class TemporaryFile {
-    export static create() -> TemporaryFile throws FileSystemError;
+    export static create(string prefix) -> TemporaryFile throws FileSystemError;
     export path() -> Path;
     export keep() -> Path;
 
@@ -265,14 +268,17 @@ One `File` type for both directions; writing a read-opened file throws `IoError`
 `metadata()` returns null for the one expected absence and throws for everything else, which keeps `exists()` a non-throwing shorthand.
 TOCTOU guidance lives on `exists()` itself.
 `currentDirectory()` lives in `@std.environment`; `absolute()` with no argument reads it from there, and the circular import this needs is legal.
-Statics like `TemporaryDirectory.create()` exist because constructors cannot throw (selfhost/sema/src/phases/members.ens:501); `Path.open()` returning `File` is the same rule.
+Statics like `TemporaryDirectory.create(prefix)` exist because constructors cannot throw (selfhost/sema/src/phases/members.ens:1106); `Path.open()` returning `File` is the same rule.
 
 ## @std.process
 
 ```
 libs/std/src/process.ens          run, runShell, spawn, CommandOutput, ExitStatus,
                                   ChildProcess, ProcessError, ErrorKind
-libs/std/src/process/native.ens   argument blocks, Win32 quoting (package-internal)
+libs/std/src/process/blocks.ens   argument and environment blocks, the environment merge, Win32
+                                  quoting (package-internal)
+libs/std/src/process/native.ens   environment entries, PATH search, the Win32 command-line head,
+                                  the numbers a closed pipe reports (package-internal)
 ```
 
 ```ens
@@ -289,7 +295,7 @@ export class ProcessError extends Error {
     // directory holds.
     export const int nativeError;
 
-    export constructor(this.message, this.kind, this.program, this.nativeError,
+    export constructor(string message, this.kind, this.program, this.nativeError,
                        Error? cause = null);
 }
 
@@ -437,6 +443,10 @@ export final class Environment {
     // No variables at all, matched by `platform`'s rule.
     export static empty(Platform platform) -> Environment;
 
+    // The system whose name matching this set uses, so a caller holding the set need not carry the
+    // answer alongside it.
+    export platform() -> Platform;
+
     export get(string name) -> string?;
     export set(string name, string value);
     export remove(string name) -> bool;
@@ -485,7 +495,7 @@ Naming it for the thread rather than for the wait leaves the place the rest of t
 
 One file, every `external` declaration in the library, all `public`, nothing `export`.
 `start`, `ChildProcess` and `SystemError` stay `export` until the compiler's package tooling moves to the threaded reader, since `selfhost/packages/src/tools.ens` reaches them across a package boundary.
-Contents: the file bridges (open, read, write, close, metadata, listing, create, remove, rename, realpath), the stream bridges (write, read, flush, close over one of the C library's own handles), the process bridges (spawn with OS-level redirection, pipe read, wait with and without timeout, kill, release), the environment bridges (variables snapshot, argv, executable path, cwd), and the three error-number tables.
+Contents: the file bridges (open, metadata, realpath, create, remove, rename, copy permissions, and the three a listing is read through), the stream bridges (write, read, flush, close over one of the C library's own handles), the process bridges (spawn with OS-level redirection, pipe read and write, input close, wait with and without timeout, kill, release) plus the six the surviving `ChildProcess` still needs, the environment bridges (variables snapshot, argv, executable path, cwd, platform), the clock pair a bounded wait is held against, the four floating-point bit bridges, and the four error-number tables.
 The name `errorKindFromCode` says code rather than errno because Windows reports Win32 error codes there, not errno.
 It has a companion, `errorKindFromErrno`, because the two numbering spaces meet inside `@std.fs`: a file-system call on Windows answers Win32 while a stream call there answers the C library's errno, so a failure has to be read through the table belonging to the call that produced it.
 Reading one for the other would not merely lose a kind, it would name the wrong one, since 21 is `EISDIR` as an errno and `ERROR_NOT_READY` as a Win32 code.

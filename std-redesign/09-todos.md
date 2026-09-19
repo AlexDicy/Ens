@@ -2,17 +2,16 @@
 
 Every item names when it is done: a milestone of 10-migration-plan.md, a phase, or the work that follows the redesign.
 
-## Any time before Phase D
+## Compiler consistency items
 
-Two consistency items the C4 and pre-C5 work surfaced, both independent of the library migration, so they wait on nothing and block nothing.
-An array literal holding `this` inside a generic body (`[this, this]` for a `T[]` parameter, or `Box<T>[] xs = [this];`) is refused, because the literal's element type is the bare template and assignability equates the template with its self-instantiation only at the top level, not under `[]`; since 2026-09-04 the refusal even reads "expected 'Box<T>[]', got 'Box<T>[]'". The clean resolution is `this` carrying the self-instantiation itself, or the equation applying structurally.
+Three consistency items the C4 and pre-C5 work surfaced, all independent of the library migration, so they wait on nothing and block nothing.
+An array literal holding `this` inside a generic body is accepted by sema and then refused in lowering: `Box<T>[] xs = [this, this];`, and the same literal passed as a `Box<T>[]` argument, each report `Internal: lowering produced unbalanced ownership` on the generic's own function, with `%0 is used after its reference was given up`, while the one-element `[this]` compiles and links (measured 2026-09-19 on 720b53e).
+This item recorded a sema refusal reading "expected 'Box<T>[]', got 'Box<T>[]'" instead, so what was a conservative refusal is now an accepted program that cannot be compiled, the same soundness class as the bare function reference below.
 A subclass method whose name a private base field uses is still refused, since `checkFieldMethodCollision` searches the flattened field list without the exemption private base fields gained on 2026-09-04; consistency would let it through, and it is a conservative refusal rather than an unsoundness.
 A bare function reference stored into a local with no declared type, `let callback = twice;`, passes sema and then fails in codegen with "does not support a local of type '<error>' yet" (found 2026-09-08, no imports involved); an accepted program that cannot be compiled is a soundness matter, so it does not wait for the diagnostics review.
 
-## C8 and C9
+## Limits the process work accepts
 
-OS-level redirection for `run(captureOutput: true)`, wait-with-timeout, and kill in the native bridges.
-Every failure from the standard streams carries `ErrorKind.Other` until the library half of the error-kind milestone lands; the five stream bridges (12546a4) already answer the errno, and `io.ens` names `Closed` and `Interrupted` from it once the seed carries them.
 A child is owned by one thread at a time until the threaded runtime gives it a lock or a documented single-owner rule.
 The Windows output record's `pending`, `filled`, `consumed` and `ended` fields are plain stores, correct under that ownership and a race once two threads touch one child.
 
@@ -65,7 +64,7 @@ A native reproduction outside the compiler never fired over 200 iterations, so t
 ## After Phase D
 
 Code generation still names a type without the names of the file the message lands in: `unsupportedEntryShape` in `selfhost/codegen/src/driver.ens` reads the return type of an entry point through the context-free spelling, because codegen holds no link tables (2026-09-19).
-It is the only user-facing message left on that path; the 321 other uses in `selfhost/codegen/src` are EIR dumps and `Internal:` bug-catchers, which the context-free spelling is for.
+It is the only user-facing message left on that path; the 320 other lines that read it in `selfhost/codegen/src` are EIR dumps and `Internal:` bug-catchers, which the context-free spelling is for.
 
 `TypeNames` belongs to a file and not to a declaration, so it does not know a type parameter's scope: inside `class Holder<Kind>` a diagnostic about an imported `Kind` reads `Kind`, which is what that body calls the parameter (accepted 2026-09-19).
 Threading the declaration's active type parameters into every spelling would fix it, and the context-free spelling this replaced was blind to the same thing.
@@ -81,7 +80,8 @@ They are pinned by `tests/binding_intrinsics_abort` and `tests/stack_trace_panic
 The path and the failure each appear twice, and `scripts/xmake_test.lua:1323` pins the substring `could not read` alone, so the wording is free to change.
 
 `ens check libs/std` cannot check the standard library in any invocation, because the checker loads std as an ordinary package beside the implicit `@std` (2026-09-19).
-With `--stdlib libs` that reports 31 problems of the form `expected 'Path', got 'Path'`, since `Path` is loaded twice, and without it 201 cross-package visibility problems, since `@std.system`'s `public` names are then read across a package boundary.
+With `--stdlib libs` that reports 32 problems, 31 of them naming a type against itself, `expected 'Path', got 'Path'` and once the same of `Platform`, since `Path` is loaded twice.
+Without it there are 199, of which 126 are cross-package visibility refusals, since the `public` names of `@std.system` and `@std.collections.rawarray` are then read across a package boundary, and the other 73 follow from them (both counts measured 2026-09-19).
 So a standard-library change has no sema gate faster than `ens test libs/std`, which takes about nine seconds.
 The two loads of one file spell alike in that message because the per-file names read a type declared in the reporting file bare, which is truthful for one declaration and unreadable for two loads of it.
 
@@ -123,7 +123,7 @@ The current C++ server is temporary; these are carried to its replacement rather
 It reports a spurious entry-point placement error on a single-file program, because it names a lone file's module after the file rather than treating the file as the program's main module, which is what `ens build <file>` does.
 Its parser bounds no nesting, so deep shapes reach its stack; the replacement needs the bound the compiler's parser has.
 It no longer checks what a lambda's body throws, because a lambda is held to the throws list of its target function type and the server does not track a lambda's target; the compiler owns the rule, so the cost is one missing diagnostic rather than a wrong one.
-Three diagnostics anchor to the wrong node: the interface-widening error to the whole class declaration (`ThrowsAnalyzer.cpp:470`), "'try' is not needed here" to the call instead of the keyword (`ThrowsAnalyzer.cpp:261`), and "cannot be 'final'" to the whole method declaration; underneath, `lsp/server/DiagnosticBridge.cpp` computes a range as `startCh + length` on one line, so a multi-line node's range runs past its line.
+Three diagnostics anchor to the wrong node: the interface-widening error to the whole class declaration (`ThrowsAnalyzer.cpp:486`), "'try' is not needed here" to the call instead of the keyword (`ThrowsAnalyzer.cpp:298`), and "cannot be 'final'" to the whole method declaration; underneath, `lsp/server/DiagnosticBridge.cpp` computes a range as `startCh + length` on one line, so a multi-line node's range runs past its line.
 Its type model carries no thrown-type list on a function type, so a type argument that appears only in a `throws` list can never be inferred there.
 It does not treat a value of `Bag<int>`, where `Bag<T> extends Iterable<T>`, as an `Iterable<int>`, which `tests/interface_extends.ens` shows as spurious assignment and `override` errors.
 Its parser rejects a local declaration whose type is a parenthesized function type with a `throws` list, `(() -> int throws Failure) safe = ...`, and misreads every statement after it in the block.
@@ -135,7 +135,7 @@ It also lacks the conformance hint the compiler appends when a struct or a primi
 
 ## Reminders
 
-Constructors cannot be `throws` (selfhost/sema/src/phases/members.ens:501, deliberate), which is why anything whose creation does I/O uses a static factory: `TemporaryDirectory.create()`, `TemporaryFile.create()`, `Path.open()`.
+Constructors cannot be `throws` (selfhost/sema/src/phases/members.ens:1106, deliberate), which is why anything whose creation does I/O uses a static factory: `TemporaryDirectory.create(prefix)`, `TemporaryFile.create(prefix)`, `Path.open()`.
 Threads are coming (outside this redesign): they unlock separate-stream reading without deadlock hazard, a possible live merged-output mode, and parallel test isolation.
 
 ## Deferred by explicit decision

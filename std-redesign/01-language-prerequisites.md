@@ -49,7 +49,7 @@ Type arguments are never written on the method name; method-position brackets st
 ## Nested optionals
 
 The silent collapse of `T??` to `T?` is removed.
-The collapse lives in `selfhost/sema/src/model/types.ens:958-973` and, for editor diagnostics, `lsp/frontend/semantic/TypeContext.cpp:23-31`.
+It lived in `selfhost/sema/src/model/types.ens` and, for editor diagnostics, in `lsp/frontend/semantic/TypeContext.cpp`, where an optional over an optional now interns as a type of its own.
 
 Layout: a tagged pair only when nested.
 `string?` stays a bare pointer and `int?` stays `{i1, i32}`, so nothing existing gets bigger or slower.
@@ -73,21 +73,21 @@ The `??` token is split in the lexer so `T??` lexes as two `?` suffixes, and the
 ## `const` on fields
 
 `export const string message;` becomes legal: write-once, assigned by the constructor or a struct literal, readable everywhere, assignable nowhere else.
-`spec.md:193` currently restricts `const` to locals.
+`spec.md` restricted `const` to locals; it now gives a const field its own rules, in a struct as in a class.
 Needed because `Error`, `StackFrame`, `Metadata`, `ExitStatus`, and `Entry` are immutable data whose fields are otherwise writable from outside.
 A private field plus an accessor was rejected because a field and a method cannot share a name.
 
 ## `toString` on classes
 
 Classes may override `toString` the way structs already do.
-`spec.md` currently lists `toString` as overridable for structs only.
+`spec.md` listed `toString` as overridable for structs only; it now gives a class the same override and holds both kinds to one shape rule.
 `toString()` is total: it never throws and never returns null.
 Any conversion that can fail or lose information gets its own name and signature.
 
 Ratified 2026-08-28: `toString` is universal for class values, like `hash`: a class with no override in its chain answers with its runtime type's name, so a subclass prints its own name through a base reference.
 Interpolation holes and explicit `.toString()` accept every class value through the same dispatch; `+` concatenation keeps rejecting classes, matching structs.
 A class replacement is written `override toString() -> string` with a body, under the struct shape rules.
-Until the Phase B seed release, a class method named `toString` without `override` stays what it is today, an ordinary method outside the dispatch; requiring the marker everywhere is deferred to Phase D, because the pinned seed still compiles today's std sources.
+The transition that let an unmarked class `toString` pass as an ordinary method closed in Phase D: a parameterless `toString` on a class or a struct must now read `override toString() -> string`, and one that takes parameters is an ordinary method.
 
 ## Conditional members
 
@@ -112,20 +112,20 @@ Nothing in std needs that, and a `where` clause can be added later without confl
 
 A std module written in Ens declares a primitive's members; the compiler links the module to the primitive.
 `"text".split(",")` then works like a builtin, and go-to-definition lands in readable Ens source.
-The declaration is `primitive string implements ... { }`, with `primitive` a contextual keyword legal only in std; `this` inside is the primitive value, statics are allowed, and the intrinsic core is not declared in the binding because the compiler owns it.
+The declaration is `primitive string implements ... { }`, with `primitive` a contextual keyword legal only in std; `this` inside is the primitive value, statics are allowed, and the intrinsic core is declared in the binding with no body, so a reader sees the operations the rest of it stands on (ratified 2026-09-05).
 
 A binding can declare interface conformances, which is how primitives participate in generics: `primitive string implements Comparable<string>`.
 Numeric primitives get `Comparable` the same way, which is what makes `SortedMap<long, V>` work with no special case.
 `string` does not implement `Iterable<char>`: iteration is explicit through `chars()` and `bytes()`, and `for (let c in text)` does not compile.
 
-The intrinsic core is minimal: `length`, byte access, unchecked slice-to-string, `+`, `==`.
+The intrinsic core is minimal: `length`, `+` and `==` from the compiler, plus the four body-less members `byteAt`, `toBytes`, `fromBytesUnchecked` and `sliceUnchecked`.
 Everything else, meaning `indexOf`, `startsWith`, `trim`, `substring`, `compareTo`, `split`, `lines`, and case conversion, is Ens code over those.
 
 ## Module resolution: file next to folder
 
 `io.ens` next to `io/` works today; `selfhost/codegen/tests/support.ens` coexists with `support/`.
 The standard streams design relies on it: `@std.io` is the file, `@std.io.streams` is a file in the folder.
-This needs a pinning test fixture and a line in the spec, since it currently works by construction rather than by promise.
+`tests/module_file_next_to_folder` pins it and `spec.md` promises it, so it no longer works by construction alone.
 
 ## Considered and declined
 
@@ -143,15 +143,15 @@ Visibility inheritance for `override` members was considered (option C) and set 
 ## Verification notes
 
 ARC must release live locals on the throw path, since cleanup now rests entirely on destructors.
-This is believed true, because a throw is a return on a second channel, but it deserves a dedicated test before the library relies on it.
+`tests/arc_exceptions.ens` is the test for it: a weak reference reads null only if the strong owner was released while the exception unwound.
 
 Making `Error` abstract breaks 23 existing sites: 13 across 12 fixtures in `tests/`, and 10 embedded in `selfhost/` unit tests.
 Accepted: most of those sites are the lazy-default pattern the ruling exists to prevent, and most should throw `TestFailure`.
 
 A `protected constructor` on an exported class is reachable from cross-package subclasses.
-Verified empirically and in the sema; `spec.md:366` states it as a guarantee.
+Verified empirically and in the sema, and `spec.md` states it as a guarantee: protected members of an exported non-final class are visible to subclasses in consuming packages too.
 Caveat: an open exported class holds protected member signatures to an export-grade floor, so parameters added to `Error`'s constructor must be exported types.
-The protected-constructor case had no test fixture before this investigation; one should be added.
+`tests/visibility_protected_cross_package` is the fixture the case had lacked.
 
 ## Class-typed generic bounds
 

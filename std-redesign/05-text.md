@@ -13,6 +13,8 @@ primitive string implements Comparable<string> {
     // The intrinsic core. A member with no body names something the compiler provides, so this
     // list is complete and the rest of the binding is Ens code over it.
     export byteAt(long index) -> byte;
+
+    // The UTF-8 bytes, copied.
     export toBytes() -> byte[];
 
     // The only unexported members, and the one place the valid-UTF-8 guarantee could be broken.
@@ -68,9 +70,6 @@ primitive string implements Comparable<string> {
     // with accents.
     export override compareTo(string other) -> int;
 
-    // The UTF-8 bytes, copied.
-    export toBytes() -> byte[];
-
     // The characters and the raw bytes, walked without copying. Text does not iterate on its own:
     // a walk always names which view it reads.
     export chars() -> Iterable<char>;
@@ -113,7 +112,7 @@ export final class StringBuilder {
     export clear();
     export reserve(long capacity);
 
-    export toString() -> string;
+    export override toString() -> string;
 }
 ```
 
@@ -122,13 +121,13 @@ export final class StringBuilder {
 ```ens
 // @std.text.numbers
 // What the number types can do beyond the operators the compiler provides.
-primitive long {
+primitive long implements Comparable<long> {
     // The value in `radix`, from 2 through 36, using lowercase digits; a radix outside that range
     // aborts the program. A negative value keeps its sign.
     export toString(int radix) -> string;
 }
 
-primitive double {
+primitive double implements Comparable<double> {
     // Whether this is a NaN, the one value '==' calls unequal to itself.
     export isNaN() -> bool;
 
@@ -156,6 +155,7 @@ primitive double {
 The radix member is declared for every integer type, and decimal keeps the no-argument `toString` the language already provides.
 The three predicates are declared for `float` as well, and exactly one of them answers true for any value either type holds.
 The three bit members are declared for `float` too, at its own width, so `toBits` and `toCanonicalBits` answer a `uint`, `fromBits` takes one, and the NaN the canonical form writes is `0x7FC00000`.
+Every numeric binding and `char` also declare `override compareTo`, which is the conformance that lets a primitive satisfy a `Comparable` bound.
 
 ## Parsing
 
@@ -170,6 +170,11 @@ export parseInt(string text) -> int?;
 export parseLong(string text, int radix) -> long?;
 export parseDouble(string text) -> double?;
 export parseBool(string text) -> bool?;
+
+// The nearest `double` to the number the text spells, for text already found to spell one, with one
+// rounding at the end. This is the conversion a literal in source reads, so a number written in
+// source and the same number read here are one value.
+export nearestDouble(string text) -> double;
 ```
 
 ## Decisions embodied here
@@ -199,6 +204,6 @@ A binding member declared with no body names an intrinsic, and naming one the co
 export class EncodingError extends Error {
     // The byte offset of the first invalid sequence.
     export const long offset;
-    export constructor(this.message, this.offset, Error? cause = null);
+    export constructor(string message, this.offset, Error? cause = null);
 }
 ```
