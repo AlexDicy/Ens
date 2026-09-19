@@ -66,9 +66,11 @@ A native reproduction outside the compiler never fired over 200 iterations, so t
 
 A dedicated review pass over the diagnostic messages introduced across the whole migration (requested 2026-08-27).
 Its first item, ruled 2026-09-08 with import aliasing: a diagnostic names a type as the file it is reported in can name it, the alias where one is bound, `alias.Type` where the type is reached through a module alias, and the module-qualified name only where the file has no name for it, because today a suggested fix such as "write '((int) -> void throws Boom)'" can name a type the file bound under another name and so fail to compile when followed.
-A failed bound on a library generic is reported at the consumer's own line, while a failed obligation such as an array element that cannot be defaulted is reported at the library's line under an `In 'Slots<Path>'` prefix, so a user is pointed into source they did not write (found 2026-09-08); the review decides whether an obligation failure moves to the instantiation mention with the library's line as a second location, following the bound check.
 
 ## After Phase D
+
+A `FileDiagnostic` carries one related location, so an obligation failure shows the line that supplied the type arguments and the line inside the generic that holds the judgment, and nothing of the generics in between (2026-09-19).
+A cascade two or more generics deep therefore shows its two ends only, which a chain of notes would fix once a diagnostic can carry a list of related locations.
 
 Emission is not reachability-based, so every function of every loaded module is lowered and linked whether or not a program can reach it (`lowerModule` in `selfhost/codegen/src/driver.ens` lowers "every function it defines", and no linker dead-strip flag is passed either).
 Two costs measured, which compound: routing `print` through `@std.system` took a hello-world from 2 modules and 151,552 bytes to 12 modules and 238,592 bytes (2026-09-05), and C6 then added all of `std.text.string`, 32 KB of a hello-world's 160 KB of objects, since `lower/index.ens` pushes every bodied binding member into its module's function list.

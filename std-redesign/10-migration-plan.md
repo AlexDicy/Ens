@@ -136,6 +136,12 @@ Consumer migration inside C means the selfhost compiler, build, cli, and lsp sou
   Nothing in `emit/nativeshapes.ens` or `emit/errorkinds.ens` became dead, since neither deleted emitter imported either of them and every shape there still serves a bridge that stays.
   Two emitter tests proved properties that outlive their vehicle and moved rather than went: the define-once property onto `ens_fs_create_directory`, and the literal-cache tests onto the C-string lift, which is the surviving primitive that consumes a payload pointer.
 - D2: rewrite the std chapters of `spec.md` to describe the new library, honoring the spec-scope rule: user-facing behavior only.
+- The diagnostics review's location item, ruled and landed 2026-09-19: a judgment a generic body defers to its type arguments is reported where those arguments were written, not inside the generic.
+  All six kinds were reported at the generic's own line under an `In 'Slots<Path>': ` prefix, which pointed a reader into a library they had only used: an array element that needs a default value, a hash, an interpolated value, a type test, a struct `==`, and a keyed container's key.
+  Each now lands on the mention or the call that supplied the arguments and names the instantiation written there, with the generic's own line beside it as a `note:` line naming that generic, which a `RelatedLocation` on `FileDiagnostic` holds and both formatters print inside the entry the error already occupied, so a note counts as no problem of its own.
+  Every one of those messages was rewritten for the reader who chose the type argument, which for most of the kinds is a second wording beside the one the line that wrote the code reads.
+  A cascade hands that origin down unchanged, so a judgment reached through any depth of library generics still lands on a line that reader wrote and names only what they wrote, with the innermost generic in the note; the generics in between are not shown, which 09-todos.md records.
+  The fixtures pin the new note lines through the `@expect-note` directive this added.
 - D3: mark this folder's documents as implemented, moving anything still open into the issue tracker or the TODO file.
 - D4: cut the release whose seed makes the new std the one every consumer builds against.
 

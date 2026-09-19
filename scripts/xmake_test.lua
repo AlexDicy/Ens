@@ -14,6 +14,10 @@
 -- every one of them names a substring the compiler's output must contain, so a file whose problems
 -- are reported together says so by listing them all.
 --     // @expect-error Undefined function 'testFunction'
+-- @expect-note asserts a note line the same way, for a diagnostic that points at a second place.
+-- Both are substrings of the whole log, so a note is not tied to one error; a fixture carrying a
+-- note without an error is refused as a fixture error.
+--     // @expect-note an array of 'T' is created here
 -- a folder test's main.ens may use @ens-test (optionally with extra arguments) to run
 -- `ens test <folder> ...` instead of compile+run, asserting on its two streams the same way.
 -- the token {dir} in the extra arguments expands to the folder's absolute path.
@@ -2784,6 +2788,7 @@ task("test")
             local expected_stderr   = nil   -- the same, for the standard error stream
             local expected_stderr_contains = {}
             local expected_errors   = {}
+            local expected_notes    = {}    -- @expect-note: note lines the diagnostics point with
             local ens_test_args     = job.ens_test_args   -- @ens-test: run `ens test` on the folder instead
             local stdlib_root       = nil   -- @stdlib: a std/ package to compile against instead of libs/
             local content = (ens_file and io.readfile(ens_file)) or ""
@@ -2812,6 +2817,8 @@ task("test")
                 end
                 local error_str = line:match("^%s*//%s*@expect%-error%s+(.*)$")
                 if error_str then table.insert(expected_errors, error_str) end
+                local note_str = line:match("^%s*//%s*@expect%-note%s+(.*)$")
+                if note_str then table.insert(expected_notes, note_str) end
                 local enstest_str = line:match("^%s*//%s*@ens%-test%s*(.*)$")
                 if enstest_str then
                     ens_test_args = {}
@@ -2819,6 +2826,15 @@ task("test")
                         table.insert(ens_test_args, token)
                     end
                 end
+            end
+
+            -- a note is one diagnostic's second location, so it is only ever asserted beside the
+            -- diagnostic carrying it; a fixture pinning a note alone says nothing about which
+            -- error that note belongs to.
+            if #expected_notes > 0 and #expected_errors == 0 then
+                return {name = name, ok = false, short = "@expect-note without @expect-error",
+                    full = string.format("%s: @expect-note needs the @expect-error whose note it "
+                        .. "is; add that line or drop the note", name)}
             end
 
             -- compare a process result against the @exit directive and, per stream, its exact-line
@@ -2915,6 +2931,11 @@ task("test")
                 for _, expected in ipairs(expected_errors) do
                     if not compile_log_text:find(expected, 1, true) then
                         table.insert(why, string.format("error %q not found in stderr", expected))
+                    end
+                end
+                for _, expected in ipairs(expected_notes) do
+                    if not compile_log_text:find(expected, 1, true) then
+                        table.insert(why, string.format("note %q not found in stderr", expected))
                     end
                 end
                 if #why == 0 then

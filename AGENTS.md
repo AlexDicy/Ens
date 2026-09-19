@@ -83,10 +83,12 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
 ### Test conventions
 
 - A fixture is a `tests/*.ens` file, a `tests/<dir>/main.ens` folder program, or a `tests/<dir>/src/main.ens` package.
-  Header directives drive assertions: `// @exit N`, `// @stdout ...`, `// @expect-error <substring>`, `// @ens-test <args>`.
+  Header directives drive assertions: `// @exit N`, `// @stdout ...`, `// @expect-error <substring>`, `// @expect-note <substring>`, `// @ens-test <args>`.
   A fixture carrying `@ens-test` runs through `ens test`; every other fixture is compiled by `ens build`, and `codegencheck` compiles all of them through the self-hosted pipeline as well.
   An `@expect-error` substring is the diagnostic's wording, so it is what holds the message to its bar: never shorten one to make a run pass, and never point one at a weaker message than the compiler can give.
   The directive accumulates: a fixture whose problems are reported together lists all of them, and `@expect-error build failed with N problems` pins the count, which is how a fixture holds the compiler to reporting nothing extra.
+  `@expect-note <substring>` pins the note line of a diagnostic that points at a second place, and is held to the same wording bar.
+  Both directives match the whole log, so a note is not tied to the error it was written beside, and a fixture carrying `@expect-note` without `@expect-error` is refused as a fixture error.
 - Group related scenarios into one or two files (happy paths vs errors), not one file per scenario.
 - Unit test coverage matters: new code ships with tests for its own logic (the self-hosted packages keep unit tests in their `tests/` folders), not just end-to-end fixtures.
 - A package's `tests/` folder mirrors the grouping of its `src/` folder; put new tests in the subfolder matching the code under test.

@@ -386,6 +386,8 @@ count(new Range(1, 3));   // T inferred as int because Range implements Iterable
 A type parameter may declare bounds with `T: Base + Comparable<T>`, joined by `+`: at most one bound may be a class (conventionally written first) and every other bound must be an interface, and listing the same bound twice is an error.
 A bound may not name a `final` class: no type except that class itself could satisfy it, so write the class type directly instead.
 Every type argument must satisfy all bounds, being the class or a subclass of it and implementing each interface; a violation is a compile error naming the failing bound.
+A judgment a generic body defers to its type arguments, such as an array element that needs a default value or an interpolated value that needs a text form, is reported where those arguments were written and names the instantiation written there.
+The line inside the generic that could not be judged without them is reported beside it as a note naming that generic.
 An interface bound is also satisfied through interface extension: a class implementing an interface that extends the bound satisfies it, and so does the extending interface itself as a type argument.
 The body may use the members of every bound on a value of that parameter.
 The `Animation<S: Shape + Comparable<S>>` example above uses exactly this form.
@@ -1185,7 +1187,7 @@ An interface target over a class scrutinee is an error only in the impossible ca
 An interface scrutinee may be tested against any class or interface target; the outcome is decided by the value's runtime type.
 
 A type parameter may be the target of `is`, `as?`, and a switch `is`-arm, and the test is judged per instantiation against the concrete type argument, following every rule above.
-So `value is T` narrows `value` to `T` where it matches, an instantiation whose argument makes the test vacuous or impossible is a compile error naming that instantiation, and one whose argument is not a class or an interface is refused the same way.
+So `value is T` narrows `value` to `T` where it matches, an instantiation whose argument makes the test vacuous or impossible is a compile error where that argument was written, and one whose argument is not a class or an interface is refused the same way.
 
 `if (x is Derived)` narrows `x` to `Derived` inside the branch, following the same rules as null narrowing above: the same paths narrow (locals, member chains, subscripts), `x is Derived && x.derivedMethod()` narrows the right side of `&&`, conjunctions narrow the branch, a loop condition narrows the body, and the same writes and calls drop the narrowing.
 Failing the test proves nothing about the value's type, so the plain else branch of a positive `is` does not narrow.
@@ -1508,7 +1510,7 @@ let n = xs.length;            // long
 - The **innermost** element type must be one whose default value is meaningful, unless the array is filled as it is created (see the fill loop below).
   A non-nullable reference type (class, array, external, string) is otherwise rejected as the element; use the nullable form, `Box?[]` rather than `Box[]`.
   The same rule extends through struct fields: a struct containing a non-nullable reference field cannot be used as an array element.
-  An element type that is a type parameter is judged once per instantiation the program actually uses, and the message names the instantiation it was judged for, because whether a freshly allocated slot is a valid value depends on the type argument.
+  An element type that is a type parameter is judged once per instantiation the program actually uses, and the refusal is reported where that instantiation's type arguments were written, because whether a freshly allocated slot is a valid value depends on the type argument.
 - `new T[a][b]` allocates a fully-populated multidimensional grid in one call: an outer array of length `a`, each slot holding a freshly-allocated `T[]` of length `b`. The same shape extends to higher dimensions (`new T[a][b][c]`). Because every intermediate level is allocated, types like `int[][]` are valid here even though no intermediate slot is nullable.
 - `new T[a][]` allocates only the outer array; inner slots stay `null`. The result type is `T[]?[]`, the deepest unallocated level is reflected in the type by adding a `?`. Trailing empty brackets compose: `new T[a][b][]` produces `T[]?[][]`. Sized brackets must come before any empty ones in a single `new` expression.
 - `arr[i]` reads or writes an element. Bounds are checked at every access; an out-of-range index aborts the program.
