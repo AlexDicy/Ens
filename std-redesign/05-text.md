@@ -121,15 +121,27 @@ export final class StringBuilder {
 
 ```ens
 // @std.text.numbers
-// What the integer types can do beyond the operators the compiler provides.
+// What the number types can do beyond the operators the compiler provides.
 primitive long {
     // The value in `radix`, from 2 through 36, using lowercase digits; a radix outside that range
     // aborts the program. A negative value keeps its sign.
     export toString(int radix) -> string;
 }
+
+primitive double {
+    // Whether this is a NaN, the one value '==' calls unequal to itself.
+    export isNaN() -> bool;
+
+    // Whether this is a number, which every NaN and both infinities are not.
+    export isFinite() -> bool;
+
+    // Whether this is one of the two infinities.
+    export isInfinite() -> bool;
+}
 ```
 
-The same member is declared for every integer type, and decimal keeps the no-argument `toString` the language already provides.
+The radix member is declared for every integer type, and decimal keeps the no-argument `toString` the language already provides.
+The three predicates are declared for `float` as well, and exactly one of them answers true for any value either type holds.
 
 ## Parsing
 

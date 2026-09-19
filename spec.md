@@ -1606,6 +1606,10 @@ A `float` and a `double` also have a natural order, which is what `compareTo` an
 In that order a `NaN` sits above every number, infinities included, and level with another `NaN`, and negative zero sits just below zero.
 The operators keep their IEEE meaning, so `==` calls a `NaN` unequal to itself and the two zeros equal, and `<`, `<=`, `>` and `>=` all answer false when either side is a `NaN`, while `!=` answers true.
 
+`isNaN()`, `isFinite()` and `isInfinite()` are the three questions the library asks about a `float` or a `double`, and exactly one of them answers true for any value.
+Every number is finite, both zeros and the subnormals included, and is neither of the other two.
+The two infinities answer only `isInfinite()`, and a `NaN` answers only `isNaN()`.
+
 ```ens
 let greeting = "Hello, " + name + "!";
 let n = greeting.length;            // long, the byte count

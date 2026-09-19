@@ -55,7 +55,7 @@ Std never retains a collection a caller passed in.
 ## Naming
 
 PascalCase types, camelCase members, PascalCase enum members, full words over abbreviations.
-Sanctioned exceptions, written down as exceptions: `fs` and `io` as terms of art.
+Sanctioned exceptions, written down as exceptions: `fs`, `io` and `NaN` as terms of art, the last of them keeping its capitals inside `isNaN`.
 Verb pairs: the imperative mutates in place, the past participle returns a new value (`sort`/`sorted`, `reverse`/`reversed`).
 Conversions: `toX()` copies, `asX()` is a cheap view sharing storage, `X.parse(text)` goes from text to value.
 `length()` everywhere, `isEmpty()` alongside it, and `size` is never introduced: `string.length` and `array.length` are already builtins, so `size()` on containers would make the primitive and library spellings disagree.

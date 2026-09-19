@@ -142,6 +142,10 @@ Consumer migration inside C means the selfhost compiler, build, cli, and lsp sou
   Every one of those messages was rewritten for the reader who chose the type argument, which for most of the kinds is a second wording beside the one the line that wrote the code reads.
   A cascade hands that origin down unchanged, so a judgment reached through any depth of library generics still lands on a line that reader wrote and names only what they wrote, with the innermost generic in the note; the generics in between are not shown, which 09-todos.md records.
   The fixtures pin the new note lines through the `@expect-note` directive this added.
+- The floating-point bit toolkit lands in two commits with a seed cut between them, because nothing in Ens can read a double's bits and std can only call a bridge once the pinned seed knows it exists.
+  The first commit, landed 2026-09-19, is the compiler half plus the predicates that need no bridge: `emit/bitpatterns.ens` emits `ens_double_bits`, `ens_double_from_bits`, `ens_float_bits` and `ens_float_from_bits`, each one same-width bitcast wrapped in a function defined once per module, and `@std.text.numbers` gains `isNaN`, `isFinite` and `isInfinite` on `float` and `double`, the first by a value's inequality with itself and the other two by magnitude against the largest finite double.
+  `tests/bits_bridges` declares the four bridges itself, in an `external from libc` block, because nothing in the standard library reaches them yet.
+  The second commit will add `toBits`, `fromBits` and `toCanonicalBits` over those bridges and rewrite the diagnostics that refuse a float as a hashed key, so the `equals` and `hash` pair a struct with a float field has to declare is short and correct to write.
 - D3: mark this folder's documents as implemented, moving anything still open into the issue tracker or the TODO file.
 - D4: cut the release whose seed makes the new std the one every consumer builds against.
 

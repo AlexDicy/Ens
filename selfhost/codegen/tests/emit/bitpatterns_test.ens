@@ -1,0 +1,108 @@
+// The four bridges that read a floating-point value's bits and put them back, held to the verifier
+// from whichever host runs the suite. A value and its bits are the same bytes everywhere, so every
+// target is expected to emit the same single conversion.
+import @std.testing;
+import @ens.llvm.target;
+import EmissionHost from support;
+import emit.bitpatterns;
+import List from @std.collections.list;
+
+// Every target a bridge is emitted for, the host's own first so a run always covers it.
+triples() -> string[] {
+    return [target.hostTargetTriple(), "x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu", "x86_64-apple-darwin23", "aarch64-apple-darwin23"];
+}
+
+// One target's module with all four bridges in it, each called once so its declared signature is
+// exercised where a program would reach it.
+emitted(string triple) -> string throws {
+    let host = new EmissionHost("bitpatterns_{triple}");
+    host.retarget(triple);
+    let runtime = host.runtime;
+    runtime.call(bitpatterns.doubleBitsRuntime(runtime), [runtime.doubleType.constReal(1.0)], "");
+    runtime.call(bitpatterns.doubleFromBitsRuntime(runtime), [runtime.int64(1)], "");
+    runtime.call(bitpatterns.floatBitsRuntime(runtime), [runtime.floatType.constReal(1.0)], "");
+    runtime.call(bitpatterns.floatFromBitsRuntime(runtime), [runtime.int32(1)], "");
+    string text = host.text();
+    try host.finish();
+    return text;
+}
+
+// What one definition's body does, without its define line, its block label, or the blank lines
+// between them.
+instructionsOf(string definition) -> string[] {
+    let steps = new List<string>();
+    for (let line in definition.lines()) {
+        string step = line.trim();
+        if (step.length == 0 || step.startsWith("define ") || step.endsWith(":")) {
+            continue;
+        }
+        steps.push(step);
+    }
+    return steps.toArray();
+}
+
+// Holds one bridge to its whole shape on every target: the definition its declared types imply,
+// the one conversion inside it, and the return of what that produced.
+oneReinterpretation(string name, string given, string answered) throws {
+    for (let triple in triples()) {
+        string module = try emitted(triple);
+        string header = "define internal {answered} @{name}({given} ";
+        long start = module.indexOf(header);
+        try testing.assertTrue(start >= 0, "'{triple}' never defined '{header}': {module}");
+        string definition = module.substring(start, module.length);
+        long end = definition.indexOf("\n}");
+        try testing.assertTrue(end >= 0, "'{triple}' left '{name}' unclosed: {definition}");
+        let steps = instructionsOf(definition.substring(0, end));
+        try testing.assertTrue(steps.length == 2,
+            "'{triple}' gives '{name}' {steps.length} instructions rather than a conversion and "
+            + "a return: {definition}");
+        try testing.assertTrue(steps[0].indexOf("bitcast {given} ") >= 0
+            && steps[0].endsWith(" to {answered}"),
+            "'{triple}' does not convert {given} to {answered} in '{name}': {steps[0]}");
+        try testing.assertTrue(steps[1].startsWith("ret {answered} "),
+            "'{triple}' does not return the {answered} it produced in '{name}': {steps[1]}");
+    }
+}
+
+test "a double's bits are one bitcast to i64" {
+    try oneReinterpretation("ens_double_bits", "double", "i64");
+}
+
+test "a double is read back out of an i64 by one bitcast" {
+    try oneReinterpretation("ens_double_from_bits", "i64", "double");
+}
+
+test "a float's bits are one bitcast to i32" {
+    try oneReinterpretation("ens_float_bits", "float", "i32");
+}
+
+test "a float is read back out of an i32 by one bitcast" {
+    try oneReinterpretation("ens_float_from_bits", "i32", "float");
+}
+
+// The four are four bridges, since neither width answers for the other and neither direction
+// answers for its own opposite.
+test "the four bridges are four functions, each defined once" {
+    let host = new EmissionHost("bitpatterns_once");
+    let runtime = host.runtime;
+    let names = ["ens_double_bits", "ens_double_from_bits", "ens_float_bits",
+        "ens_float_from_bits"];
+    let first = [bitpatterns.doubleBitsRuntime(runtime), bitpatterns.doubleFromBitsRuntime(runtime),
+        bitpatterns.floatBitsRuntime(runtime), bitpatterns.floatFromBitsRuntime(runtime)];
+    let again = [bitpatterns.doubleBitsRuntime(runtime), bitpatterns.doubleFromBitsRuntime(runtime),
+        bitpatterns.floatBitsRuntime(runtime), bitpatterns.floatFromBitsRuntime(runtime)];
+    for (long i = 0; i < first.length; i++) {
+        try testing.assertTrue(first[i].function == again[i].function,
+            "the second use redefined '{names[i]}'");
+        for (long other = i + 1; other < first.length; other++) {
+            try testing.assertTrue(first[i].function != first[other].function,
+                "'{names[i]}' and '{names[other]}' share one bridge");
+        }
+    }
+    runtime.call(first[0], [runtime.doubleType.constReal(1.0)], "");
+    runtime.call(first[1], [runtime.int64(1)], "");
+    runtime.call(first[2], [runtime.floatType.constReal(1.0)], "");
+    runtime.call(first[3], [runtime.int32(1)], "");
+    try host.finish();
+}
