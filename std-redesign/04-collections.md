@@ -301,7 +301,7 @@ No `firstOrNull`, `lastOrNull`, or `popOrNull`; `first`, `last`, and `pop` abort
 Removing the first match or the first few stays index and key based (`indexWhere` plus `removeAt`, `remove(key)`, `firstKey`), so no walk is involved and nothing aborts.
 It was weighed against the standing worry that closures get overused: it is a leaf predicate like `indexWhere`, and no further closure-taking method is added without the same weighing.
 Collections compare structurally and cannot be map keys; mutable collections join the rejected-key-type list in the compiler.
-A struct is refused as a key when any of its fields, transitively, holds an array or a collection (ratified 2026-09-02).
+A struct is refused as a hashed key when any of its fields, transitively, holds an array or a collection (ratified 2026-09-02), unless it declares its own `equals` and `hash`, and a `SortedMap` key is never refused for what its fields hold, because the `compareTo` the author wrote is what orders it (ratified 2026-09-19).
 Sorting lives on `List` as a comparator overload plus a conditional natural-order overload; there is no sorting module.
 `binarySearch` was cut and can return later.
 `PriorityQueue` is a min-heap and its iteration order is unspecified; both facts are documented because a max-heap default and an ordered-looking iterator are recurring surprises elsewhere.

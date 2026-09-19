@@ -2075,6 +2075,8 @@ Struct keys are supported and match by content: their fields compare with `==` a
 A struct key that declares its own `equals` and `hash` is matched and bucketed by that pair instead, so a field the pair ignores does not change which entry a key finds.
 An array cannot be a key: it compares and hashes by content, and its content can change while it sits in the table, so the entry would silently become unfindable.
 A collection cannot be a key for the same reason, nor can a struct whose fields, at any depth, hold an array or a collection; the error names the field.
+A struct holding one is still accepted as a key when it declares its own `equals` and `hash`, because that pair is what decides which entry a key finds, and a field it ignores cannot move one.
+A `SortedMap` accepts a struct whose fields hold one whether or not it declares that pair, since the `compareTo` it declares is what puts its keys in order.
 An external handle or a function value cannot be a key either, because neither has a hash to bucket by.
 Nor can a `float` or a `double`, nor a struct whose fields hold one at any depth unless it declares its own `equals` and `hash`.
 A `NaN` is equal to no value, so nothing could find it again, and negative zero is equal to zero but hashes differently, so one key would become two entries.
