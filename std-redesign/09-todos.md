@@ -99,6 +99,8 @@ The other thing a real consumer wanted is a relative path: `selfhost/build/src/s
 A call through a function value held in a field retains and releases the closure around every call, and a function-typed parameter is retained at entry and released at exit, so a comparator handed down a recursion pays two atomics per level (measured 2026-09-03 at -O2: 2ns per call through a parameter inside one function, 16ns through a field).
 Escape analysis in code generation elides both (ratified 2026-09-04 as a post-redesign pass); until then `SortedMap` reads `this.order` at every step and recurses in its lookup rather than looping, since a loop retains and releases every node it moves onto.
 When `@std.time` is designed, `Metadata.modifiedMillis` and `wait(long timeoutMillis)` take a proper duration or instant type; the names carry the unit until then.
+`nearestDouble` allocates a digit buffer and a reading on every call, which the libc conversion it replaced did not, so a program parsing millions of doubles in a loop would notice.
+The remedy when it matters is a fast path in front of the same rounding for the short inputs that need no buffer, and a buffer the conversion reuses.
 
 ## The language server's replacement
 

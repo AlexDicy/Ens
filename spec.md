@@ -2092,6 +2092,8 @@ The `@std.text.parse` module reads values out of text.
 Surrounding whitespace, a radix prefix such as `0x`, and digit grouping are all refused rather than guessed at, so text a program means to accept in those shapes is trimmed or rewritten before it is parsed.
 An integer is at most one `-` or `+` and then digits; in another base the letters stand for the digits above nine, in either case.
 A double has the shape a floating-point literal has, without the underscores a literal may group its digits with, and reads back exactly what the text form of a `double` wrote.
+`nearestDouble(text)` is the conversion under it, for text already known to spell a number: it answers the nearest `double` rather than a nullable one, with a magnitude past the range reading as an infinity and one below it as zero or a subnormal.
+Both round once, to the nearest value, and a number exactly halfway between two doubles reads as the one with the even last bit, which is also how the compiler folds a floating-point literal, so a number written in source and the same text read here are one value.
 `parseBool` reads `true` and `false` spelled exactly that way and nothing else.
 A radix outside 2 through 36 aborts, as it does when writing: the radix is the caller's own, where the text is the data.
 

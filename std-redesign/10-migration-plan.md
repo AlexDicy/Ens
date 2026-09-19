@@ -73,6 +73,8 @@ Within each milestone the std change and its consumer updates are one commit, so
   C4a's exclusion list grew on 2026-09-18, when `float` and `double` joined the types a `Map` or a `Set` cannot key by, beside arrays, collections, external handles and function values.
   A NaN is equal to no value, so nothing could find it again, and negative zero is equal to zero but hashes differently, so one key would become two entries; the refusal points at `SortedMap`, which keys by the order `Comparable` gives rather than by a hash.
   A struct whose fields hold one at any depth follows from the same walk, unless it declares its own `equals` and `hash`.
+  Reviewing that work found the compiler's own floating-point literals were not correctly rounded, and fixing it on 2026-09-19 replaced the scaling loop with a correctly rounded conversion in `@std.text.parse` that both the compiler and `parseDouble` now read, dropping the `atof` bridge with its last caller.
+  The old loop was one unit out on 230 of the 308 positive powers of ten and on 85 of 320 negative ones, on Planck's constant and on the elementary charge, and it had already made `parseDouble` refuse the largest value a `double` holds, because the library's own bound was written as a literal.
 - C5: `@std.io` written from scratch: `io.ens` plus the four submodules; `print`/`eprint` rerouted through the prelude onto `io.out()`.
   The two prelude functions live in `@std.io.print` (ratified 2026-09-03), since the prelude lends every export of a listed module; the compiler stops seeding `print` as a builtin and lists `std.io.print` as implicitly imported.
   C5 needs two seeds, which the plan first missed by reasoning only about `print`.

@@ -1,7 +1,6 @@
 // Reading a value out of text. Every parser answers null for text that spells anything else:
 // surrounding whitespace, a radix prefix, and digit grouping are all refused rather than guessed
 // at, and so is text spelling a number the type cannot hold.
-import @std.system;
 
 // The `long` the text spells in base 10, or null. At most one '-' or '+' comes first, then nothing
 // but digits.
@@ -65,7 +64,7 @@ export parseDouble(string text) -> double? {
     if (!spellsDouble(text)) {
         return null;
     }
-    double value = system.parsedDouble(text);
+    double value = nearestDouble(text);
     // A magnitude a double cannot hold arrives as an infinity, and the shape above spells no
     // infinity of its own, so one means the text asked for more than the type holds. A magnitude
     // too small to tell from zero arrives as zero, which the type does hold.
@@ -153,4 +152,423 @@ final class DoubleRange {
     // The largest magnitude a double holds, so a value above it is the infinity a too-large text
     // converted to.
     protected static const double largest = 1.7976931348623157e308;
+}
+
+// The nearest `double` to the number the text spells, with one rounding at the end. A number
+// written in source and the same number read here are therefore one value. The text has already
+// been found to spell a number, and anything else reads as zero. A magnitude past the range reads
+// as an infinity and one below it as zero or a subnormal, so this never fails. Underscores and a
+// trailing 'f', 'F', 'd' or 'D' are ignored, the way a literal carries them.
+export nearestDouble(string text) -> double {
+    let reading = new Reading();
+    let digits = read(text, reading);
+    double magnitude = magnitudeOf(digits);
+    if (reading.negative) {
+        // Multiplied rather than subtracted from zero, so a negative zero stays negative.
+        return magnitude * minusOne();
+    }
+    return magnitude;
+}
+
+// Scales the digits into [0.5, 1) while counting the power of two that takes them back. The
+// exponent it lands on says how many mantissa bits to read.
+magnitudeOf(Digits digits) -> double {
+    if (digits.isZero()) {
+        return 0.0;
+    }
+    if (digits.point > Bounds.decided) {
+        return infinity();
+    }
+    if (digits.point < 0 - Bounds.decided) {
+        return 0.0;
+    }
+    long exponent = 0;
+    while (digits.atLeastOne()) {
+        long bits = 1;
+        if (digits.point >= Bounds.stridePoint) {
+            bits = Bounds.shiftBits;
+        }
+        digits.shiftRight(bits);
+        exponent = exponent + bits;
+    }
+    while (digits.belowHalf()) {
+        long bits = 1;
+        if (digits.point <= 0 - Bounds.stridePoint) {
+            bits = Bounds.shiftBits;
+        }
+        digits.shiftLeft(bits);
+        exponent = exponent - bits;
+    }
+    if (exponent > Bounds.largest) {
+        return infinity();
+    }
+    if (exponent >= Bounds.smallestNormal) {
+        return scaled(mantissa(digits, Bounds.mantissaBits), exponent - Bounds.mantissaBits);
+    }
+    return scaled(mantissa(digits, exponent - Bounds.smallestSubnormal), Bounds.smallestSubnormal);
+}
+
+// The mantissa the value carries at this width, rounded once. A width at or below zero belongs to a
+// value under the smallest subnormal, which rounds to nothing or to that subnormal.
+mantissa(Digits digits, long width) -> ulong {
+    long remaining = width;
+    while (remaining > 0) {
+        long bits = remaining;
+        if (bits > Bounds.shiftBits) {
+            bits = Bounds.shiftBits;
+        }
+        digits.shiftLeft(bits);
+        remaining = remaining - bits;
+    }
+    while (remaining < 0) {
+        long bits = 0 - remaining;
+        if (bits > Bounds.shiftBits) {
+            bits = Bounds.shiftBits;
+        }
+        digits.shiftRight(bits);
+        remaining = remaining + bits;
+    }
+    return digits.roundedInteger();
+}
+
+// The mantissa times a power of two. The mantissa holds at most 54 bits and the product is a value
+// the type holds, so the multiplication rounds nothing. A product past the range overflows to the
+// infinity that magnitude asks for.
+scaled(ulong value, long exponent) -> double {
+    if (value == 0) {
+        return 0.0;
+    }
+    return (value as double) * powerOfTwo(exponent);
+}
+
+// Two to a power, by doubling or halving from one, which is exact for every power a double holds.
+powerOfTwo(long exponent) -> double {
+    double result = 1.0;
+    long remaining = exponent;
+    while (remaining > 0) {
+        result = result * 2.0;
+        remaining = remaining - 1;
+    }
+    while (remaining < 0) {
+        result = result / 2.0;
+        remaining = remaining + 1;
+    }
+    return result;
+}
+
+infinity() -> double {
+    return powerOfTwo(Bounds.largest);
+}
+
+minusOne() -> double {
+    return 0.0 - 1.0;
+}
+
+// What a sign at the front of the text said, which the digits themselves never carry.
+final class Reading {
+    protected bool negative;
+
+    protected constructor() {
+        this.negative = false;
+    }
+}
+
+// The digits and the decimal exponent the text spells. A leading zero counts only against the
+// exponent, and a digit after the first significant one is placed by where it stands.
+read(string text, Reading reading) -> Digits {
+    let digits = new Digits();
+    byte[] raw = text.toBytes();
+    bool seenPoint = false;
+    bool inExponent = false;
+    bool exponentNegative = false;
+    bool anyDigit = false;
+    long leadingZeros = 0;
+    long exponent = 0;
+    for (long i = 0; i < raw.length; i++) {
+        byte value = raw[i];
+        if (value == '_' || value == 'f' || value == 'F' || value == 'd' || value == 'D'
+                || value == '+') {
+            continue;
+        }
+        if (value == '-') {
+            if (inExponent) {
+                exponentNegative = true;
+            } else {
+                reading.negative = true;
+            }
+            continue;
+        }
+        if (value == '.') {
+            seenPoint = true;
+            continue;
+        }
+        if (value == 'e' || value == 'E') {
+            inExponent = true;
+            continue;
+        }
+        if (value < '0' || value > '9') {
+            continue;
+        }
+        long digit = value - '0';
+        if (inExponent) {
+            if (exponent < Bounds.decided * 4) {
+                exponent = exponent * 10 + digit;
+            }
+            continue;
+        }
+        if (!anyDigit && digit == 0) {
+            if (seenPoint) {
+                leadingZeros = leadingZeros + 1;
+            }
+            continue;
+        }
+        anyDigit = true;
+        digits.append(digit);
+        if (!seenPoint) {
+            digits.point = digits.point + 1;
+        }
+    }
+    if (exponentNegative) {
+        exponent = 0 - exponent;
+    }
+    digits.point = digits.point + exponent - leadingZeros;
+    digits.normalize();
+    return digits;
+}
+
+// The digits and the decimal exponent, as `0.d[0]d[1]...d[count-1] * 10^point`. `truncated` records
+// that digits were dropped off the end, which is what tells a value exactly halfway between two
+// doubles from one just above it.
+final class Digits {
+    protected byte[] held;
+    protected long count;
+    protected long point;
+    protected bool truncated;
+
+    protected constructor() {
+        this.held = new byte[Bounds.capacity];
+        this.count = 0;
+        this.point = 0;
+        this.truncated = false;
+    }
+
+    // Reads a digit past either end as the zero that stands there.
+    protected digit(long index) -> long {
+        if (index < 0 || index >= this.count) {
+            return 0;
+        }
+        return this.held[index] as long;
+    }
+
+    protected append(long digit) {
+        if (this.count >= Bounds.capacity) {
+            if (digit != 0) {
+                this.truncated = true;
+            }
+            return;
+        }
+        this.held[this.count] = digit as byte;
+        this.count = this.count + 1;
+    }
+
+    // Multiplies by 2^bits. Carries land in front of the first digit, so the digits move down the
+    // buffer to make room first. A buffer with no room left drops digits off the end instead. Off
+    // the front they would change the value rather than only a tie.
+    protected shiftLeft(long bits) {
+        if (this.count + Bounds.lead > Bounds.capacity) {
+            this.dropLast(this.count + Bounds.lead - Bounds.capacity);
+        }
+        for (long i = this.count - 1; i >= 0; i--) {
+            this.held[i + Bounds.lead] = this.held[i];
+        }
+        for (long i = 0; i < Bounds.lead; i++) {
+            this.held[i] = 0;
+        }
+        this.count = this.count + Bounds.lead;
+        this.point = this.point + Bounds.lead;
+        ulong carry = 0;
+        for (long i = this.count - 1; i >= 0; i--) {
+            ulong scaled = ((this.held[i] as ulong) << (bits as ulong)) + carry;
+            this.held[i] = (scaled % 10) as byte;
+            carry = scaled / 10;
+        }
+        this.normalize();
+    }
+
+    // Divides by 2^bits. The quotient is shorter at the front and longer at the end. The end is
+    // where a full buffer stops taking digits.
+    protected shiftRight(long bits) {
+        ulong mask = ((1 as ulong) << (bits as ulong)) - 1;
+        ulong remainder = 0;
+        long write = 0;
+        long dropped = 0;
+        for (long read = 0; read < this.count; read++) {
+            ulong value = remainder * 10 + (this.held[read] as ulong);
+            remainder = value & mask;
+            ulong quotient = value >> (bits as ulong);
+            if (quotient == 0 && write == 0) {
+                dropped = dropped + 1;
+                continue;
+            }
+            if (write < Bounds.capacity) {
+                this.held[write] = quotient as byte;
+                write = write + 1;
+            } else if (quotient != 0) {
+                this.truncated = true;
+            }
+        }
+        while (remainder > 0) {
+            ulong value = remainder * 10;
+            remainder = value & mask;
+            ulong quotient = value >> (bits as ulong);
+            if (quotient == 0 && write == 0) {
+                dropped = dropped + 1;
+                continue;
+            }
+            if (write >= Bounds.capacity) {
+                if (quotient != 0 || remainder != 0) {
+                    this.truncated = true;
+                }
+                break;
+            }
+            this.held[write] = quotient as byte;
+            write = write + 1;
+        }
+        this.count = write;
+        this.point = this.point - dropped;
+        this.normalize();
+    }
+
+    // Forgets the last digits, the only direction a full buffer may lose any. A dropped digit that
+    // was not a zero leaves the value a shade low. 'truncated' says so.
+    dropLast(long howMany) {
+        long keep = this.count - howMany;
+        if (keep < 0) {
+            keep = 0;
+        }
+        for (long i = keep; i < this.count; i++) {
+            if (this.held[i] != 0) {
+                this.truncated = true;
+            }
+        }
+        this.count = keep;
+    }
+
+    // Leaves the first digit significant and the last digit non-zero. Every later judgment then
+    // reads one shape.
+    protected normalize() {
+        long lead = 0;
+        while (lead < this.count && this.held[lead] == 0) {
+            lead = lead + 1;
+        }
+        if (lead > 0) {
+            for (long i = lead; i < this.count; i++) {
+                this.held[i - lead] = this.held[i];
+            }
+            this.count = this.count - lead;
+            this.point = this.point - lead;
+        }
+        while (this.count > 0 && this.held[this.count - 1] == 0) {
+            this.count = this.count - 1;
+        }
+        if (this.count == 0) {
+            this.point = 0;
+            this.truncated = false;
+        }
+    }
+
+    protected isZero() -> bool {
+        return this.count == 0;
+    }
+
+    // At least one, which the digits standing before the point say on their own.
+    protected atLeastOne() -> bool {
+        return this.count > 0 && this.point > 0;
+    }
+
+    protected belowHalf() -> bool {
+        if (this.count == 0) {
+            return true;
+        }
+        if (this.point > 0) {
+            return false;
+        }
+        if (this.point < 0) {
+            return true;
+        }
+        return this.digit(0) < 5;
+    }
+
+    // The value rounded to the nearest integer, ties to even, which is the one rounding this
+    // conversion performs. The caller has already scaled the value so that integer is the mantissa
+    // it asked for.
+    protected roundedInteger() -> ulong {
+        ulong whole = 0;
+        for (long i = 0; i < this.point; i++) {
+            whole = whole * 10 + (this.digit(i) as ulong);
+        }
+        if (!this.roundsUp()) {
+            return whole;
+        }
+        return whole + 1;
+    }
+
+    // Whether what stands past the point carries the value more than halfway to the next integer.
+    // Dropped digits count as more. An exact half is decided by the last bit of the integer itself.
+    roundsUp() -> bool {
+        // A point below zero leaves zeros standing between it and the first digit, so the value
+        // carries less than a tenth and rounds to nothing.
+        if (this.point < 0) {
+            return false;
+        }
+        long leading = this.digit(this.point);
+        if (leading > 5) {
+            return true;
+        }
+        if (leading < 5) {
+            return false;
+        }
+        for (long i = this.point + 1; i < this.count; i++) {
+            if (this.digit(i) != 0) {
+                return true;
+            }
+        }
+        if (this.truncated) {
+            return true;
+        }
+        if (this.point <= 0) {
+            return false;
+        }
+        return this.digit(this.point - 1) % 2 == 1;
+    }
+}
+
+final class Bounds {
+    // Enough digits to decide any rounding a double asks for, since the longest decimal sitting
+    // exactly halfway between two doubles is shorter than this.
+    protected static const long capacity = 800;
+
+    // The room a left shift needs in front of the first digit for the carries it makes.
+    protected static const long lead = 20;
+
+    // A decimal exponent past this decides the answer on its own, which keeps the scaling loops
+    // short for text that names no double at all.
+    protected static const long decided = 400;
+
+    // The most bits one shift moves, so a digit shifted left and a remainder scaled by ten both
+    // stay inside a 'ulong'.
+    protected static const long shiftBits = 50;
+
+    // A decimal exponent this far from zero is scaled in the widest steps, since the value cannot
+    // cross a half either way in one of them.
+    protected static const long stridePoint = 17;
+
+    // Where a double stops being normal, where it stops entirely, and where it overflows, each as a
+    // power of two.
+    protected static const long smallestNormal = -1021;
+    protected static const long smallestSubnormal = -1074;
+    protected static const long largest = 1024;
+
+    // The bits a normal double's mantissa holds.
+    protected static const long mantissaBits = 53;
 }
