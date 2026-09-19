@@ -62,10 +62,6 @@ Malwarebytes is the only scanner the refusal was ever reproduced under, so nothi
 A native reproduction outside the compiler never fired over 200 iterations, so the retry answers to the rate measured inside `ens test` rather than to a standalone reproduction of the race.
 `Path.removeRecursively` keeps stopping at the first refusal (ruled 2026-09-17, the Rust shape rather than Go's remove-what-you-can), so a refusal that outlasts the budget costs the whole folder rather than the one file that was held.
 
-## Phase D
-
-A dedicated review pass over the diagnostic messages introduced across the whole migration (requested 2026-08-27).
-
 ## After Phase D
 
 Code generation still names a type without the names of the file the message lands in: `unsupportedEntryShape` in `selfhost/codegen/src/driver.ens` reads the return type of an entry point through the context-free spelling, because codegen holds no link tables (2026-09-19).
@@ -76,6 +72,18 @@ Threading the declaration's active type parameters into every spelling would fix
 
 A `FileDiagnostic` carries one related location, so an obligation failure shows the line that supplied the type arguments and the line inside the generic that holds the judgment, and nothing of the generics in between (2026-09-19).
 A cascade two or more generics deep therefore shows its two ends only, which a chain of notes would fix once a diagnostic can carry a list of related locations.
+
+The language's own runtime panics name neither the index nor the bound, while the standard library's collections name both (2026-09-19).
+`array index out of bounds` in `selfhost/codegen/src/emit/addresses.ens`, `string byte index out of bounds` in `emit/text.ens`, and `slice range out of bounds` with `{member} range out of bounds` in `lower/builtins.ens` say only that a bound was passed, where `List` says `list index 2 is out of bounds for length 1`.
+They are pinned by `tests/binding_intrinsics_abort` and `tests/stack_trace_panic`, and the standard library's review pass left them alone because they are the compiler's text rather than the library's.
+
+`selfhost/driver/src/cst.ens:19` wraps a `FileSystemError` message in a prefix of its own, so `ens cst-dump gone.ens` prints `ens: could not read 'gone.ens': could not open 'gone.ens': nothing is there` (2026-09-19).
+The path and the failure each appear twice, and `scripts/xmake_test.lua:1323` pins the substring `could not read` alone, so the wording is free to change.
+
+`ens check libs/std` cannot check the standard library in any invocation, because the checker loads std as an ordinary package beside the implicit `@std` (2026-09-19).
+With `--stdlib libs` that reports 31 problems of the form `expected 'Path', got 'Path'`, since `Path` is loaded twice, and without it 201 cross-package visibility problems, since `@std.system`'s `public` names are then read across a package boundary.
+So a standard-library change has no sema gate faster than `ens test libs/std`, which takes about nine seconds.
+The two loads of one file spell alike in that message because the per-file names read a type declared in the reporting file bare, which is truthful for one declaration and unreadable for two loads of it.
 
 Emission is not reachability-based, so every function of every loaded module is lowered and linked whether or not a program can reach it (`lowerModule` in `selfhost/codegen/src/driver.ens` lowers "every function it defines", and no linker dead-strip flag is passed either).
 Two costs measured, which compound: routing `print` through `@std.system` took a hello-world from 2 modules and 151,552 bytes to 12 modules and 238,592 bytes (2026-09-05), and C6 then added all of `std.text.string`, 32 KB of a hello-world's 160 KB of objects, since `lower/index.ens` pushes every bodied binding member into its module's function list.

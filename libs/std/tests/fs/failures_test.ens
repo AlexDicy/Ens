@@ -5,7 +5,10 @@ import Path from @std.fs;
 import ErrorKind from @std.fs.error;
 import @std.fs.error;
 import FileSystemError from @std.fs.error;
+import File from @std.fs.file;
 import TemporaryDirectory from @std.fs.temporary;
+import ErrorKind as IoErrorKind from @std.io.streams;
+import IoError from @std.io.streams;
 import EncodingError from @std.text;
 import Platform from @std.environment;
 import @std.environment;
@@ -35,7 +38,9 @@ test "opening a path where nothing is there says nothing is there" {
     try testing.assertEqual(bytes.kind, ErrorKind.NotFound);
 }
 
-test "writing under a directory that is not there says nothing is there" {
+// An operation that creates names the file it makes, so an absence there is the directory above
+// rather than the file, and the message says which of the two is missing.
+test "writing under a directory that is not there names the missing directory" {
     let scratch = try TemporaryDirectory.create("ens-std-fs-no-parent");
     Path under = scratch.path().join("missing/notes.txt");
 
@@ -43,7 +48,15 @@ test "writing under a directory that is not there says nothing is there" {
         try under.writeText("content");
     });
     try testing.assertEqual(refused.kind, ErrorKind.NotFound);
-    try testing.assertEqual(refused.message, "could not create '{under}': nothing is there");
+    try testing.assertEqual(refused.message, "could not create '{under}': the directory it would "
+        + "go in is not there. Create it with createDirectories() first");
+
+    let appending = try testing.assertThrows<FileSystemError>(() -> {
+        let stream = try under.append();
+    });
+    try testing.assertEqual(appending.kind, ErrorKind.NotFound);
+    try testing.assertEqual(appending.message, "could not append to '{under}': the directory it "
+        + "would go in is not there. Create it with createDirectories() first");
 }
 
 // A directory is refused at the open on every system, so no caller is handed a file that fails on
@@ -154,6 +167,47 @@ test "creating a directory with no path given is refused" {
     });
     try testing.assertEqual(refused.kind, ErrorKind.NotFound);
     try testing.assertEqual(refused.message, "could not create a directory: no path was given");
+}
+
+// An open names the file it works on, so the empty path is refused before anything is asked of the
+// system, which is why there is no number to carry. A create and an open say so in their own
+// terms, and together with the directory and the program above they make one family of refusals.
+test "opening, creating or appending to a file with no path given is refused" {
+    let created = try testing.assertThrows<FileSystemError>(() -> {
+        let stream = try Path("").create();
+    });
+    try testing.assertEqual(created.kind, ErrorKind.NotFound);
+    try testing.assertEqual(created.message, "could not create a file: no path was given");
+    try testing.assertEqual(created.nativeError, 0);
+
+    let appended = try testing.assertThrows<FileSystemError>(() -> {
+        let stream = try Path("").append();
+    });
+    try testing.assertEqual(appended.kind, ErrorKind.NotFound);
+    try testing.assertEqual(appended.message, "could not create a file: no path was given");
+
+    let opened = try testing.assertThrows<FileSystemError>(() -> {
+        let stream = try Path("").open();
+    });
+    try testing.assertEqual(opened.kind, ErrorKind.NotFound);
+    try testing.assertEqual(opened.message, "could not open a file: no path was given");
+    try testing.assertEqual(opened.nativeError, 0);
+
+    // Reading is opening, so it is refused in the same words rather than in the reader's.
+    let read = try testing.assertThrows<FileSystemError>(() -> {
+        let text = try Path("").readText();
+    });
+    try testing.assertEqual(read.message, "could not open a file: no path was given");
+
+    // Claiming a name is creating a file, so it answers as a create. Nothing in the library
+    // reaches it with an empty path, since a temporary name always has text, and it is asked here
+    // so the whole family is held to one answer.
+    let claimed = try testing.assertThrows<FileSystemError>(() -> {
+        let mine = try File.claim(Path(""));
+    });
+    try testing.assertEqual(claimed.kind, ErrorKind.NotFound);
+    try testing.assertEqual(claimed.message, "could not create a file: no path was given");
+    try testing.assertEqual(claimed.nativeError, 0);
 }
 
 // The message names both paths, and the error carries the source, because that is the path the
@@ -300,6 +354,40 @@ test "an atomic write that cannot claim its sibling reports the path the caller 
     } else {
         try testing.assertTrue(cause is FileSystemError, "the cause names the refusal itself");
     }
+}
+
+// Reading, writing and copying get as far as the bytes, so their failures arrive from a stream
+// call and are worded the way every other failure over a path is. Neither a refused read nor a
+// full file system can be staged in a test, so these are built the way those operations build
+// them.
+test "a failure a stream call reported reads as a failure over the path" {
+    Path notes = Path("notes.txt");
+    Path copy = Path("copy.txt");
+    let refused = new IoError("could not read from 'notes.txt': permission was refused",
+        IoErrorKind.Other, 13);
+
+    let read = error.failedFromErrno("read", notes, 13, refused);
+    try testing.assertEqual(read.message, "could not read 'notes.txt': permission was refused");
+    try testing.assertEqual(read.kind, ErrorKind.PermissionDenied);
+    try testing.assertEqual(read.path, notes);
+    try testing.assertEqual(read.nativeError, 13);
+    let cause = read.cause;
+    if (cause == null) {
+        try testing.fail("the stream failure should arrive as the cause");
+    } else {
+        try testing.assertTrue(cause is IoError, "the cause names the stream failure");
+    }
+
+    let written = error.failedFromErrno("write", notes, 28, refused);
+    try testing.assertEqual(written.message,
+        "could not write 'notes.txt': the file system has no room left");
+    try testing.assertEqual(written.kind, ErrorKind.NoSpace);
+
+    let copied = error.failedBetweenFromErrno("copy", notes, copy, 13, refused);
+    try testing.assertEqual(copied.message,
+        "could not copy 'notes.txt' to 'copy.txt': permission was refused");
+    // The error carries the source, because that is the path the caller named the operation on.
+    try testing.assertEqual(copied.path, notes);
 }
 
 // A full file system is what `writeBytes` and `copyTo` classify through, and it cannot be staged in
