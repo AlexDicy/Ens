@@ -164,11 +164,44 @@ Recovery from a lost asset means rebuilding it from that tag, which needs the se
 ## Diagnostics
 
 Diagnostics are the user experience of the language and are held to a high bar.
+The rules below cover every text a user can read: a compiler diagnostic, the message an error is raised with, a panic, and a failing assertion's text.
+They were agreed with Alex on 2026-09-19 and are numbered so a review can cite one.
 
-- User-facing messages use the real type/symbol names from the user's program, plain language a beginner can follow, a suggested fix, and where natural a concrete example of the correct form.
-- Never copy a weak message for parity with anything; write the good version.
-- Messages prefixed `Internal:` are bug-catchers for states no valid program can reach; they may cite implementation details and are exempt from the wording bar.
-  Use the prefix only when the error genuinely cannot reach a user.
+What a message contains:
+
+1. It names the thing in the user's program it is about by its real name, the type, member, variable, path, program or value, never a placeholder.
+2. It says what happened, why, and what to do next, in that order, and stops after the why when nothing further can honestly be suggested.
+3. The fix names the exact token to write, remove or change, with a concrete example where one helps: "Remove 'out' from the argument", "use 'E?[]' so a slot can start as null".
+4. It is true for every case it covers; a code path with a different cause gets its own text.
+5. A suggested fix compiles when pasted into the file it is read in, spelled with that file's own names for types.
+6. A failure inside a library generic is reported where the user wrote the instantiation, names what they wrote, and points at the library line as a note.
+
+Who understands it:
+
+7. A novice with no experience of Ens or of any other language can follow it, so a concept the message depends on is explained in ordinary words at the point of use: "'this' is the object a method was called on, so it is only available inside a method. Pass the object as a parameter, or move this code into a method."
+8. Ens's own vocabulary as the spec uses it is allowed (class, struct, interface, nullable, generic, type argument) where the message makes it understandable from context, such as an example showing the '<...>' list; words from other languages and from compiler internals are not (lvalue, operand, borrow, move, trait, template, monomorphize, obligation, ABI, errno, bitcast).
+9. A term of art with no plain substitute, such as NaN or UTF-8, gets a gloss the first time it matters: "a NaN, the value a calculation such as 0.0 / 0.0 produces, is not equal to any value, including itself".
+10. No narrative that treats code as a person: a value is not asked and does not answer, say, give up, know or read as anything; state the condition.
+11. Describe the values, never the machinery: "line 3 is missing" passes, "they agree through line 2" fails.
+
+Form:
+
+12. One message reports one problem once; a wrapper never repeats a path or a failure its inner message already states.
+13. A compiler diagnostic is one or more sentences with a capital first letter and full stops, the fix as its own sentence; a library message or panic is lowercase with no trailing period, because it is printed inside another line, and its advice follows a full stop: "could not create 'x/notes.txt': the directory it would go in is not there. Create it with createDirectories() first".
+14. Code, names and literals are quoted with single quotes and nothing else is quoted; messages of one family share one shape and one vocabulary.
+15. Complete but not longer than necessary: no filler, no reassurance, no hedging, no second way of saying the same thing.
+
+Register:
+
+16. `Internal:` marks a bug-catcher no valid program can reach; it may cite implementation detail and is exempt from the rules above; anything a user can reach has no prefix and follows every rule.
+17. A panic that catches a caller's misuse says what was tried, on what, then the check: "tried to pop from an empty list. Check isEmpty() first".
+
+How a check runs:
+
+18. Every message is rendered with a representative value and read as text, in every combination its helpers produce.
+19. A changed message moves its pin, an `@expect-error` or `@expect-note` line or an exact-text assertion, and never weakens it to a substring a worse message would satisfy; a message with no pin gains one.
+
+Never copy a weak message for parity with anything; write the good version.
 
 ## Code style
 
