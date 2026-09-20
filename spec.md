@@ -1301,7 +1301,7 @@ The loop calls `makeIterator()` once, then draws values with `next()` until it a
 `next()` answers the value it moved onto, or null once the walk is over, and every call after that answers null too.
 When the element type is itself nullable, `next()` answers a nested optional, so a `null` held by a present result is an element and only an absent result ends the loop.
 A value whose static type is `Iterable<T>` itself, or an interface extending it, can also be iterated.
-Text is not a sequence of its own, so a `string` cannot be iterated directly: a walk over text names the view it reads, and the loop takes the array that view produces.
+A `string` cannot be iterated directly: walk `text.chars()` for its characters or `text.bytes()` for its bytes, and the loop takes the array that walk produces.
 
 ```ens
 import Iterable from @std.collections.iterator;

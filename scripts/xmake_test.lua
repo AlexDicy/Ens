@@ -2228,7 +2228,7 @@ task("test")
                 'main() -> int {\n    return 0;\n}\n')
             run({"build", "."}, {curdir = using_sub, envs = withCache(cache)}, 1,
                 "uses git submodules", "has to be self-contained",
-                "declare what the submodule holds as a dependency")
+                "Declare what the submodule holds as a dependency")
 
             -- a tag that moved is caught against the lock, naming both digests
             local using_retag = path.join(root, "usingretag")
@@ -2248,7 +2248,7 @@ task("test")
             os.tryrm(path.join(cache, "trees"))
             run({"build", "."}, in_retag, 1,
                 "are not the files ens.lock records", "the lock has sha256:",
-                "hashes to sha256:", "may have been moved", "delete ens.lock")
+                "hashes to sha256:", "may have moved", "delete ens.lock")
 
             -- losing the last git dependency removes the lock, and --locked refuses that too
             write_package(using_retag, "demo.retag")
@@ -2265,7 +2265,8 @@ task("test")
 
             -- a lock nobody may edit by hand says so rather than being read as one
             io.writefile(lock_file, "hand written\n")
-            run({"build", "."}, in_app, 1, "never edited by hand", "delete it and build again")
+            run({"build", "."}, in_app, 1, "is written by the build",
+                "delete it and build again")
 
             if #failures == 0 then
                 return {name = name, ok = true}
@@ -2436,8 +2437,8 @@ task("test")
             io.writefile(path.join(bad, "src", "main.ens"),
                 'main() -> int {\n    return 0;\n}\n')
             run({"build", "."}, {curdir = bad, envs = withCache(cache)}, 1,
-                "hashes to " .. good, "manifest declares " .. wrong, "will not be used",
-                "put the new hash in the manifest")
+                "hashes to " .. good, "manifest declares " .. wrong,
+                "is not the library the manifest means", "put the new hash in the manifest")
             if os.isdir(path.join(cache, "artifacts", wrong:gsub("^sha256:", ""))) then
                 table.insert(failures, "a library whose digest did not match was cached anyway")
             end
