@@ -788,7 +788,7 @@ public collectStaticMethod(TypeResolver resolver, Reporter reporter, DeclaredTyp
         resolver.pushMemberConstraints(owner.declaration(), constraints);
     }
     let signature = buildSignature(resolver, reporter, member, methodName, nameSpan, false,
-        false, allowBodiless, modifiers.declaresNoreturn, null, names.nameOf(owner), []);
+        false, allowBodiless, modifiers.declaresNoreturn, null, names, []);
     if (constraints.length > 0) {
         resolver.popMemberConstraints();
     }
@@ -948,12 +948,14 @@ public findMethodNamed(List<Method>? methods, string name) -> Method? {
     return null;
 }
 
-// Resolves one callable's signature: parameters (with the 'this.field' shorthand against the
-// receiver's fields), the return type, and the declared throws list.
+// Resolves one callable's signature, meaning its parameters, its return type and its declared
+// throws list. A 'this.field' parameter binds the field its name reaches on the receiver. A
+// private field of a base class is not inherited, so a receiver that did not declare it has no
+// field of that name to bind.
 public buildSignature(TypeResolver resolver, Reporter reporter,
                       FunctionDeclarationNode declaration, string name, Span nameSpan,
                       bool isConstructor, bool isInterfaceMethod, bool allowBodiless,
-                      bool isNoreturn, List<Field>? receiverFields, string receiverName,
+                      bool isNoreturn, DeclaredType? receiverType, TypeNames names,
                       TypeParamType[] typeParameters) -> Signature {
     let store = resolver.typeStore();
     if (declaration.body() == null && declaration.semicolon() != null && !allowBodiless) {
@@ -978,13 +980,16 @@ public buildSignature(TypeResolver resolver, Reporter reporter,
             if (!isConstructor) {
                 reporter.report("'this.{parameterName}' parameters are only allowed in a "
                     + "constructor.", parameterSpan);
+            } else if (receiverType == null) {
+                reporter.report("Internal: a constructor with no receiver type has the "
+                    + "parameter 'this.{parameterName}'.", parameterSpan);
             } else {
-                let bound = findField(receiverFields, parameterName);
+                let bound = types.inheritedOrOwnField(receiverType, parameterName);
                 if (bound != null) {
                     parameterType = bound.type();
                 } else {
-                    reporter.report("No field '{parameterName}' on type '{receiverName}'.",
-                        parameterSpan);
+                    reportUnboundShorthand(reporter, receiverType, parameterName, parameterSpan,
+                        names);
                 }
             }
         } else {
@@ -1023,6 +1028,30 @@ public buildSignature(TypeResolver resolver, Reporter reporter,
     return new Signature(name, parameters.toArray(), returnType, throwsClause != null,
         isNoreturn, throwsTypes.toArray(), throwsSpans.toArray(), typeParameters,
         declaration.green(), nameSpan);
+}
+
+// Reports a 'this.field' parameter that binds no field of the receiver. The name can still be a
+// private field of a base class, which the receiver does not inherit. The refusal names that
+// field, rather than reporting a field nothing declares.
+reportUnboundShorthand(Reporter reporter, DeclaredType receiverType, string parameterName,
+                       Span parameterSpan, TypeNames names) {
+    let uninherited = findField(types.fieldsOf(receiverType), parameterName);
+    if (uninherited == null) {
+        reporter.report("No field '{parameterName}' on type '{names.nameOf(receiverType)}'.",
+            parameterSpan);
+        return;
+    }
+    // The class that declares the field is where a fix goes, so a generic base reads as its
+    // declaration's name rather than as the instantiation the subclass extends.
+    string declaringName = names.of(uninherited.definingType());
+    let declaring = types.authorityOf(uninherited.definingType());
+    if (declaring != null) {
+        declaringName = names.nameOf(declaring);
+    }
+    reporter.report("'{parameterName}' is private to '{declaringName}', so "
+        + "'{names.nameOf(receiverType)}' has no field by that name. Declare one in "
+        + "'{names.nameOf(receiverType)}', or mark '{parameterName}' 'protected' in "
+        + "'{declaringName}'.", parameterSpan);
 }
 
 // 'noreturn' is legal on free functions and methods, including abstract and interface methods,
