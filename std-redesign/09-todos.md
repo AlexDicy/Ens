@@ -4,8 +4,7 @@ Every item names when it is done: a milestone of 10-migration-plan.md, a phase, 
 
 ## Compiler consistency items
 
-Two consistency items the C4 and pre-C5 work surfaced, all independent of the library migration, so they wait on nothing and block nothing.
-A subclass method whose name a private base field uses is still refused, since `checkFieldMethodCollision` searches the flattened field list without the exemption private base fields gained on 2026-09-04; consistency would let it through, and it is a conservative refusal rather than an unsoundness.
+One consistency item is left from the C4 and pre-C5 work, independent of the library migration, so it waits on nothing and blocks nothing.
 A bare function reference stored into a local with no declared type, `let callback = twice;`, passes sema and then fails in codegen with "does not support a local of type '<error>' yet" (found 2026-09-08, no imports involved); an accepted program that cannot be compiled is a soundness matter, so it does not wait for the diagnostics review.
 
 ## Limits the process work accepts
