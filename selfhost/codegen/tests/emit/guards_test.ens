@@ -1,0 +1,145 @@
+// The panics behind a checked access, read as the text a program sees and as the routines that
+// write it. Every sentence is asserted whole with representative numbers in it, because a message
+// split into pieces is only right when the pieces read as one line.
+import @std.testing;
+import EirAccess from eir.model;
+import EirRangeSubject from eir.model;
+import EmissionHost from support;
+import GuardText from emit.guards;
+import Length from emit.guards;
+import emit.guards;
+
+// The sentence one index guard raises for that index and that bound.
+indexed(GuardText text, long index, long length) -> string {
+    return text.opening + index + text.middle + length + text.closing;
+}
+
+// The sentence one range guard raises for that range and that bound, joined the way the runtime
+// routine joins the two ends.
+ranged(GuardText text, long start, long end, long length) -> string {
+    return text.opening + start + ".." + end + text.middle + length + text.closing;
+}
+
+test "an element read outside the array names the index and the length" {
+    try testing.assertEqual(indexed(guards.elementText(EirAccess.Read), 9, 2),
+        "tried to read index 9 of an array of length 2. Check the index against length first");
+}
+
+test "an element write outside the array says what it was trying to do" {
+    try testing.assertEqual(indexed(guards.elementText(EirAccess.Write), 5, 3),
+        "tried to write index 5 of an array of length 3. Check the index against length first");
+}
+
+test "a byte read outside the string counts the string in bytes" {
+    try testing.assertEqual(indexed(guards.byteText(), 7, 5),
+        "tried to read byte 7 of a string of 5 bytes. Check the index against length first");
+}
+
+// A range guard fails for a start below zero, a start past the end, or an end past the bound, so
+// its one sentence has to hold for all three.
+test "a range outside an array names the member, both ends and the length" {
+    try testing.assertEqual(ranged(guards.rangeText("slice", EirRangeSubject.Array), 2, 9, 5),
+        "tried to take the slice 2..9 of an array of length 5. Check that the start is at least "
+        + "0 and at most the end, and that the end is at most length");
+}
+
+test "a range outside a string counts the string in bytes" {
+    try testing.assertEqual(
+        ranged(guards.rangeText("sliceUnchecked", EirRangeSubject.String), 2, 9, 5),
+        "tried to take the sliceUnchecked 2..9 of a string of 5 bytes. Check that the start is "
+        + "at least 0 and at most the end, and that the end is at most length");
+}
+
+test "a negative array length names the length that was asked for" {
+    try testing.assertEqual("{Length.opening}-1{Length.closing}",
+        "tried to create an array of length -1. Check that the length is at least 0");
+}
+
+// A module with all three message routines in it, each called once so its declared signature is
+// exercised where a guard would reach it.
+everyRoutine(string name) -> string throws {
+    let host = new EmissionHost(name);
+    let runtime = host.runtime;
+    runtime.call(guards.countMessageRuntime(runtime), [runtime.nullPointer(), runtime.int64(1),
+        runtime.nullPointer()], "");
+    runtime.call(guards.indexMessageRuntime(runtime), [runtime.nullPointer(), runtime.int64(1),
+        runtime.nullPointer(), runtime.nullPointer(), runtime.nullPointer()], "");
+    runtime.call(guards.rangeMessageRuntime(runtime), [runtime.nullPointer(), runtime.int64(1),
+        runtime.int64(2), runtime.nullPointer(), runtime.int64(3), runtime.nullPointer()], "");
+    string text = host.text();
+    try host.finish();
+    return text;
+}
+
+// One routine's whole body, from its definition to the brace that closes it.
+routineBody(string module, string name) -> string throws {
+    long start = module.indexOf("define internal ptr @{name}(");
+    try testing.assertTrue(start >= 0, "'{name}' was never defined: {module}");
+    string rest = module.substring(start, module.length);
+    long end = rest.indexOf("\n}");
+    try testing.assertTrue(end >= 0, "'{name}' was left unclosed: {rest}");
+    return rest.substring(0, end);
+}
+
+// The subject is passed whole and its length read inside, so the length a guard compared is dead
+// once the failing branch is taken.
+test "an index message reads the bound off the subject it is handed" {
+    string module = try everyRoutine("guards_index");
+    try testing.assertTrue(module.indexOf("c\"%s%lld%s%lld%s\\00\"") >= 0,
+        "the index pattern is not the one that writes two numbers: {module}");
+    string body = try routineBody(module, "ens_index_message");
+    try testing.assertTrue(body.indexOf("call i32 (ptr, i64, ptr, ...) @snprintf(") >= 0,
+        "the index message is not written through snprintf: {body}");
+    try testing.assertTrue(body.indexOf("@ens_string_from_cstr(ptr %buffer)") >= 0,
+        "the index message is not copied out of its buffer: {body}");
+    try testing.assertTrue(body.indexOf("@ens_capture_trace(") < 0,
+        "the index message takes a trace of its own, whose innermost frame is this routine and "
+        + "not the guard: {body}");
+}
+
+test "a count message writes the one number it is given" {
+    string module = try everyRoutine("guards_count");
+    try testing.assertTrue(module.indexOf("c\"%s%lld%s\\00\"") >= 0,
+        "the count pattern is not the one that writes a single number: {module}");
+    string body = try routineBody(module, "ens_count_message");
+    try testing.assertTrue(body.indexOf("@ens_string_from_cstr(ptr %buffer)") >= 0,
+        "the count message is not copied out of its buffer: {body}");
+}
+
+test "a range message joins its two ends itself" {
+    string module = try everyRoutine("guards_range");
+    try testing.assertTrue(module.indexOf("c\"%s%lld..%lld%s%lld%s\\00\"") >= 0,
+        "the range pattern is not the one that writes '..' between the ends: {module}");
+    string body = try routineBody(module, "ens_range_message");
+    try testing.assertTrue(body.indexOf("@ens_string_from_cstr(ptr %buffer)") >= 0,
+        "the range message is not copied out of its buffer: {body}");
+    try testing.assertTrue(body.indexOf("@ens_capture_trace(") < 0,
+        "the range message takes a trace of its own, whose innermost frame is this routine and "
+        + "not the guard: {body}");
+}
+
+// The three are three routines, one per count of numbers reported, and a program defines only the
+// ones it reaches.
+test "the three message routines are three functions, each defined once" {
+    let host = new EmissionHost("guards_once");
+    let runtime = host.runtime;
+    let first = [guards.countMessageRuntime(runtime), guards.indexMessageRuntime(runtime),
+        guards.rangeMessageRuntime(runtime)];
+    let again = [guards.countMessageRuntime(runtime), guards.indexMessageRuntime(runtime),
+        guards.rangeMessageRuntime(runtime)];
+    let names = ["ens_count_message", "ens_index_message", "ens_range_message"];
+    for (long i = 0; i < first.length; i++) {
+        try testing.assertTrue(first[i].function == again[i].function,
+            "the second use redefined '{names[i]}'");
+        for (long other = i + 1; other < first.length; other++) {
+            try testing.assertTrue(first[i].function != first[other].function,
+                "'{names[i]}' and '{names[other]}' share one routine");
+        }
+    }
+    runtime.call(first[0], [runtime.nullPointer(), runtime.int64(1), runtime.nullPointer()], "");
+    runtime.call(first[1], [runtime.nullPointer(), runtime.int64(1), runtime.nullPointer(),
+        runtime.nullPointer(), runtime.nullPointer()], "");
+    runtime.call(first[2], [runtime.nullPointer(), runtime.int64(1), runtime.int64(2),
+        runtime.nullPointer(), runtime.int64(3), runtime.nullPointer()], "");
+    try host.finish();
+}

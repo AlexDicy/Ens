@@ -61,19 +61,16 @@ A native reproduction outside the compiler never fired over 200 iterations, so t
 
 ## After Phase D
 
-Code generation still names a type without the names of the file the message lands in: `unsupportedEntryShape` in `selfhost/codegen/src/driver.ens` reads the return type of an entry point through the context-free spelling, because codegen holds no link tables (2026-09-19).
-It is the only user-facing message left on that path; the 320 other lines that read it in `selfhost/codegen/src` are EIR dumps and `Internal:` bug-catchers, which the context-free spelling is for.
-
 `TypeNames` belongs to a file and not to a declaration, so it does not know a type parameter's scope: inside `class Holder<Kind>` a diagnostic about an imported `Kind` reads `Kind`, which is what that body calls the parameter (accepted 2026-09-19).
 Threading the declaration's active type parameters into every spelling would fix it, and the context-free spelling this replaced was blind to the same thing.
 
 A `FileDiagnostic` carries one related location, so an obligation failure shows the line that supplied the type arguments and the line inside the generic that holds the judgment, and nothing of the generics in between (2026-09-19).
 A cascade two or more generics deep therefore shows its two ends only, which a chain of notes would fix once a diagnostic can carry a list of related locations.
 
-The language's own runtime panics name neither the index nor the bound, while the standard library's collections name both (2026-09-19).
-`array index out of bounds` in `selfhost/codegen/src/emit/addresses.ens`, `string byte index out of bounds` in `emit/text.ens`, and `slice range out of bounds` with `{member} range out of bounds` in `lower/builtins.ens` say only that a bound was passed.
-The shape to reach is the one the collections now carry, `tried to read index 2 of a list of length 1. Check the index against length() first`, with the operation, the index and the bound in it (settled 2026-09-20).
-They are pinned by `tests/binding_intrinsics_abort` and `tests/stack_trace_panic`, and the standard library's review pass left them alone because they are the compiler's text rather than the library's.
+`ens_resolve_addr` answers with the registered symbol whose start is nearest at or below an address, with no upper bound, so a frame inside an internal runtime routine the symbol table has no entry for is attributed to the symbol that precedes it in the layout (2026-09-20).
+Any such routine on the stack while `ens_capture_trace` runs therefore puts a line in the trace that names a function the program was never inside.
+A "not a user frame" flag in the symbol table, registered for the internal routines and tested where the capture keeps an address, would fix it.
+That is why a bounds, byte or range guard captures its trace itself and keeps the message it built live across the call, which costs one callee-saved register in every function holding such a guard: moving the capture into the routine that writes the text is free, and was measured putting a spurious innermost line in the traces of `tests/stack_trace_panic` and `tests/binding_intrinsics_range_abort`.
 
 `ens check libs/std` cannot check the standard library in any invocation, because the checker loads std as an ordinary package beside the implicit `@std` (2026-09-19).
 With `--stdlib libs` that reports 32 problems, 31 of them naming a type against itself, `expected 'Path', got 'Path'` and once the same of `Platform`, since `Path` is loaded twice.

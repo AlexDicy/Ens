@@ -1,0 +1,228 @@
+// The guards a checked access is fronted by, and the panic each of them raises. A guard is a
+// compare and a branch, and its failing branch alone writes text, through a runtime routine that
+// joins three constant pieces and the numbers the access was given. The trace is captured at the
+// guard rather than inside that routine, because the resolver reads an address in a routine it
+// holds no entry for as belonging to the symbol before it.
+import EirAccess from eir.model;
+import EirRangeSubject from eir.model;
+import BasicBlock from @ens.llvm.blocks;
+import Value from @ens.llvm.values;
+import @ens.llvm.globals;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import ModuleEmitter from emit.context;
+import EmissionFrame from emit.context;
+import Runtime from emit.runtime;
+import RuntimeFunction from emit.runtime;
+import emit.exceptions;
+
+// How many bytes one panic's text is written into. The longest of them spells a member name,
+// three integers and some forty characters of advice, so none of them reaches the end of it.
+final class Message {
+    protected static const long capacity = 512;
+}
+
+// What a caller does about a broken range. A range guard has three ways to fail, so one sentence
+// covers all three rather than the length alone.
+final class Range {
+    protected static const string advice =
+        "Check that the start is at least 0 and at most the end, and that the end is at most "
+        + "length";
+}
+
+// The text a negative array length raises, around the length the program asked for. The
+// allocator is what checks the length, so both pieces of it reach that routine as arguments.
+public final class Length {
+    public static const string opening = "tried to create an array of length ";
+    public static const string closing = ". Check that the length is at least 0";
+}
+
+// The constant text of one guard's message: the pieces the numbers it reports are written
+// between, in the order they are read.
+public final class GuardText {
+    public string opening;
+    public string middle;
+    public string closing;
+
+    public constructor(this.opening, this.middle, this.closing);
+}
+
+// The text an element access outside the array raises, around the index and the array's length.
+public elementText(EirAccess access) -> GuardText {
+    let attempt = switch (access) {
+        Read -> "read",
+        Write -> "write",
+    };
+    return new GuardText("tried to {attempt} index ", " of an array of length ",
+        ". Check the index against length first");
+}
+
+// The text a byte read outside the string raises, around the offset and the string's length.
+public byteText() -> GuardText {
+    return new GuardText("tried to read byte ", " of a string of ",
+        " bytes. Check the index against length first");
+}
+
+// The text a range outside its subject raises, around the range's two ends and the bound. A
+// string's bound is a count of bytes and an array's a count of elements, so the two subjects
+// name theirs differently.
+public rangeText(string member, EirRangeSubject subject) -> GuardText {
+    if (subject == EirRangeSubject.String) {
+        return new GuardText("tried to take the {member} ", " of a string of ",
+            " bytes. " + Range.advice);
+    }
+    return new GuardText("tried to take the {member} ", " of an array of length ",
+        ". " + Range.advice);
+}
+
+// Aborts when the index is outside the array, naming the index, the array's length, and what the
+// access would have done with the element. The array is handed over rather than its length,
+// because the length the compare read is then dead once the branch is taken.
+public abortWhenElementOutside(ModuleEmitter emitter, EmissionFrame frame, Value outside,
+                               Value index, Value array, EirAccess access, long line) {
+    let resume = openFailure(emitter, frame, outside, "bounds");
+    closeFailure(emitter, frame, indexMessage(emitter, elementText(access), index, array), line,
+        resume);
+}
+
+// Aborts when the byte offset is outside the string, naming the offset and how many bytes the
+// string holds.
+public abortWhenByteOutside(ModuleEmitter emitter, EmissionFrame frame, Value outside, Value index,
+                            Value text, long line) {
+    let resume = openFailure(emitter, frame, outside, "byteat");
+    closeFailure(emitter, frame, indexMessage(emitter, byteText(), index, text), line, resume);
+}
+
+// Aborts when the range is not inside its subject, naming the member it was asked for under, both
+// ends of the range, and the bound it had to stay inside.
+public abortWhenRangeOutside(ModuleEmitter emitter, EmissionFrame frame, Value outside, Value start,
+                             Value end, Value length, string member, EirRangeSubject subject,
+                             long line) {
+    let resume = openFailure(emitter, frame, outside, "range");
+    let message = rangeMessage(emitter, rangeText(member, subject), start, end, length);
+    closeFailure(emitter, frame, message, line, resume);
+}
+
+// Opens a guard's failing branch: the builder is left in a fresh block the check branches to, and
+// the returned block is where a passing check carries on.
+openFailure(ModuleEmitter emitter, EmissionFrame frame, Value outside, string label)
+        -> BasicBlock {
+    let failBlock = emitter.context.appendBasicBlock(frame.declared(), "{label}.fail");
+    let okBlock = emitter.context.appendBasicBlock(frame.declared(), "{label}.ok");
+    instructions.buildCondBr(emitter.builder, outside, failBlock, okBlock);
+    emitter.builder.positionAtEnd(failBlock);
+    return okBlock;
+}
+
+// Ends a guard's failing branch with the panic, then puts the builder in the block a passing
+// check carries on in.
+closeFailure(ModuleEmitter emitter, EmissionFrame frame, Value message, long line,
+             BasicBlock resume) {
+    exceptions.abortWith(emitter, frame, message, line);
+    instructions.buildUnreachable(emitter.builder);
+    emitter.builder.positionAtEnd(resume);
+}
+
+// The text naming one index and the length the subject carries, written where the guard failed.
+indexMessage(ModuleEmitter emitter, GuardText text, Value index, Value subject) -> Value {
+    return emitter.runtime.call(indexMessageRuntime(emitter.runtime),
+        [emitter.message(text.opening), index, emitter.message(text.middle),
+        emitter.message(text.closing), subject], "panic.text");
+}
+
+// The text naming both ends of one range and its bound, written where the guard failed.
+rangeMessage(ModuleEmitter emitter, GuardText text, Value start, Value end,
+             Value length) -> Value {
+    return emitter.runtime.call(rangeMessageRuntime(emitter.runtime),
+        [emitter.message(text.opening), start, end, emitter.message(text.middle), length,
+        emitter.message(text.closing)], "panic.text");
+}
+
+// ptr ens_count_message(ptr opening, i64 count, ptr closing): the two texts with the count
+// written in decimal between them, as an owned string. It is the one-number member of the family,
+// for a refusal that reports what it was given and nothing it was measured against.
+public countMessageRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([runtime.pointerType, runtime.int64Type,
+        runtime.pointerType]);
+    let known = runtime.existing("ens_count_message", type);
+    if (known != null) {
+        return known;
+    }
+    let write = runtime.snprintf();
+    let lift = runtime.stringFromCString();
+    let definition = runtime.beginDefinition("ens_count_message", type);
+    let buffer = messageBuffer(runtime);
+    runtime.call(write, [buffer, runtime.int64(Message.capacity), pattern(runtime, "%s%lld%s"),
+        runtime.payloadData(runtime.parameter(definition, 0)),
+        runtime.parameter(definition, 1),
+        runtime.payloadData(runtime.parameter(definition, 2))], "");
+    instructions.buildRet(runtime.builder, runtime.call(lift, [buffer], "text"));
+    return runtime.endDefinition(definition);
+}
+
+// ptr ens_index_message(ptr opening, i64 index, ptr middle, ptr closing, ptr subject): the three
+// texts with the index and the count the subject's payload carries written in decimal between
+// them, as an owned string. Each text is a string object, which is what ens_panic takes its
+// message as. The subject arrives whole rather than as its length, and last rather than where its
+// number is read, so a guard hands over what it already holds and moves nothing.
+public indexMessageRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([runtime.pointerType, runtime.int64Type,
+        runtime.pointerType, runtime.pointerType, runtime.pointerType]);
+    let known = runtime.existing("ens_index_message", type);
+    if (known != null) {
+        return known;
+    }
+    let write = runtime.snprintf();
+    let lift = runtime.stringFromCString();
+    let definition = runtime.beginDefinition("ens_index_message", type);
+    let buffer = messageBuffer(runtime);
+    runtime.call(write, [buffer, runtime.int64(Message.capacity),
+        pattern(runtime, "%s%lld%s%lld%s"),
+        runtime.payloadData(runtime.parameter(definition, 0)),
+        runtime.parameter(definition, 1),
+        runtime.payloadData(runtime.parameter(definition, 2)),
+        runtime.payloadLength(runtime.parameter(definition, 4)),
+        runtime.payloadData(runtime.parameter(definition, 3))], "");
+    instructions.buildRet(runtime.builder, runtime.call(lift, [buffer], "text"));
+    return runtime.endDefinition(definition);
+}
+
+// ptr ens_range_message(ptr opening, i64 start, i64 end, ptr middle, i64 length, ptr closing): the
+// same for a range, whose two ends this joins with the '..' a program reads them under. The bound
+// arrives as a number, because a range is checked against a length its caller worked out rather
+// than against one object's own.
+public rangeMessageRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([runtime.pointerType, runtime.int64Type,
+        runtime.int64Type, runtime.pointerType, runtime.int64Type, runtime.pointerType]);
+    let known = runtime.existing("ens_range_message", type);
+    if (known != null) {
+        return known;
+    }
+    let write = runtime.snprintf();
+    let lift = runtime.stringFromCString();
+    let definition = runtime.beginDefinition("ens_range_message", type);
+    let buffer = messageBuffer(runtime);
+    runtime.call(write, [buffer, runtime.int64(Message.capacity),
+        pattern(runtime, "%s%lld..%lld%s%lld%s"),
+        runtime.payloadData(runtime.parameter(definition, 0)),
+        runtime.parameter(definition, 1),
+        runtime.parameter(definition, 2),
+        runtime.payloadData(runtime.parameter(definition, 3)),
+        runtime.parameter(definition, 4),
+        runtime.payloadData(runtime.parameter(definition, 5))], "");
+    instructions.buildRet(runtime.builder, runtime.call(lift, [buffer], "text"));
+    return runtime.endDefinition(definition);
+}
+
+// The stack room one message is written into. A message longer than this is cut at its end, and
+// the terminator snprintf writes leaves what fits readable either way.
+messageBuffer(Runtime runtime) -> Value {
+    return memory.buildAlloca(runtime.builder,
+        runtime.int8Type.arrayType(Message.capacity as ulong), "buffer");
+}
+
+// The conversions one message is written under. It is this file's own text in every case, so
+// nothing a program names is ever read as a conversion.
+pattern(Runtime runtime, string text) -> Value {
+    return globals.buildGlobalString(runtime.builder, text, ".message.pattern");
+}
