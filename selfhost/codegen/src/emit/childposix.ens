@@ -36,7 +36,7 @@ public posixStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let failedBlock = runtime.block(definition, "start.failed");
 
     // The child inherits a copy of whatever is still buffered in this process's streams, which it
-    // would write out a second time; handing the buffers over first keeps a printed line ahead of the
+    // would write out a second time; flushing the buffers first keeps a printed line ahead of the
     // child's output and unduplicated.
     runtime.flushBuffered();
     let descriptors = memory.buildAlloca(builder, runtime.int32Type.arrayType(2 as ulong), "pipe");
@@ -122,28 +122,28 @@ public posixRead(Runtime runtime, TypeRef type) -> RuntimeFunction {
 }
 
 // poll takes the bound as it is given, so nothing here sleeps or spins. A child that has closed its
-// end of the pipe wakes the wait too, which is the answer a reader wants: reading would return at once
-// and say the output has ended.
+// end of the pipe wakes the wait too, which is the right result for a reader: reading would return at once
+// and report the end of the output.
 public posixPoll(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let pollDescriptors = runtime.libc("poll", runtime.int32Type.functionType([runtime.pointerType,
         runtime.int64Type, runtime.int32Type]));
     let definition = runtime.beginDefinition("ens_poll_child", type);
     let builder = runtime.builder;
-    let askBlock = runtime.block(definition, "poll.ask");
+    let callBlock = runtime.block(definition, "poll.call");
     let quietBlock = runtime.block(definition, "poll.quiet");
     let interruptedBlock = runtime.block(definition, "poll.interrupted");
     let readyBlock = runtime.block(definition, "poll.ready");
     let spentBlock = runtime.block(definition, "poll.spent");
     let failedBlock = runtime.block(definition, "poll.failed");
 
-    // One 'struct pollfd': the descriptor, the events asked about, and the events that happened.
+    // One 'struct pollfd': the descriptor, the events requested, and the events that happened.
     let watched = memory.buildAlloca(builder, runtime.int8Type.arrayType(8 as ulong), "watched");
     let descriptor = descriptorAt(runtime, definition, 8);
     let bound = instructions.buildTrunc(builder, runtime.parameter(definition, 1),
         runtime.int32Type, "bound");
-    instructions.buildBr(builder, askBlock);
+    instructions.buildBr(builder, callBlock);
 
-    builder.positionAtEnd(askBlock);
+    builder.positionAtEnd(callBlock);
     memory.buildStore(builder, descriptor, runtime.offsetPointer(watched, 0, ""));
     // POLLIN, and no event reported yet.
     memory.buildStore(builder, runtime.int16Type.constInt(1, false),
@@ -159,12 +159,12 @@ public posixPoll(Runtime runtime, TypeRef type) -> RuntimeFunction {
         instructions.buildICmpEQ(builder, woken, runtime.int32(0), ""), spentBlock,
         interruptedBlock);
 
-    // EINTR: a signal arrived while waiting, which is no answer about the child, so the wait is asked
+    // EINTR: a signal interrupted the wait, which reports nothing about the child, so the wait is called
     // again rather than reported as a failure.
     builder.positionAtEnd(interruptedBlock);
     let why = runtime.lastError();
     instructions.buildCondBr(builder,
-        instructions.buildICmpEQ(builder, why, runtime.int32(4), ""), askBlock, failedBlock);
+        instructions.buildICmpEQ(builder, why, runtime.int32(4), ""), callBlock, failedBlock);
 
     builder.positionAtEnd(readyBlock);
     instructions.buildRet(builder, runtime.int32(1));
@@ -177,7 +177,7 @@ public posixPoll(Runtime runtime, TypeRef type) -> RuntimeFunction {
     return runtime.endDefinition(definition);
 }
 
-// Ending a child that has already ended is nothing to do, which the system says with ESRCH; every
+// Ending a child that has already ended is nothing to do, which the system reports as ESRCH; every
 // other refusal is a failure. The signal is the one no program can decline, and a child ended by it
 // reports 128 and the signal's number, which is the code a stopped child reports everywhere.
 public posixKill(Runtime runtime, TypeRef type) -> RuntimeFunction {
@@ -204,8 +204,8 @@ public posixKill(Runtime runtime, TypeRef type) -> RuntimeFunction {
     return runtime.endDefinition(definition);
 }
 
-// A wait nothing could answer reports -1 rather than the exit code of a child that never reported
-// one, because the caller has to be able to tell the two apart.
+// A wait that failed reports -1 rather than the exit code of a child that never reported
+// one, because the caller has to distinguish the two.
 public posixWait(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let definition = runtime.beginDefinition("ens_wait_child", type);
     let builder = runtime.builder;

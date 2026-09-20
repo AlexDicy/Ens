@@ -1,4 +1,4 @@
-// The Windows halves of the child bridges. The child is told which handles it inherits through a
+// The Windows halves of the child bridges. The child is given the handles it inherits through a
 // handle list, so two threads starting children at once share no handle by accident and no lock is
 // needed, and each output pipe is a named pipe whose reading end can be waited on.
 import Value from @ens.llvm.values;
@@ -178,7 +178,7 @@ public windowsStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
         instructions.buildICmpEQ(builder, initialized, runtime.int32(0), ""), uninitializedBlock,
         initializedBlock);
 
-    // A list the system never wrote is not one it may be asked to delete.
+    // A list the system never wrote is not one it may be given to delete.
     builder.positionAtEnd(uninitializedBlock);
     runtime.call(release, [list], "");
     memory.buildStore(builder, runtime.nullPointer(), listSlot);
@@ -213,7 +213,7 @@ public windowsStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
     memory.buildStore(builder, started, startedSlot);
     instructions.buildBr(builder, cleanupBlock);
 
-    // Whatever was made for the child alone is given back whether or not it started.
+    // Whatever was made for the child alone is released whether or not it started.
     builder.positionAtEnd(cleanupBlock);
     let deleteBlock = runtime.block(definition, "start.cleanup.list");
     let releasedBlock = runtime.block(definition, "start.cleanup.released");
@@ -326,7 +326,7 @@ public windowsRead(Runtime runtime, TypeRef type) -> RuntimeFunction {
         instructions.buildICmpEQ(builder, issued, runtime.int32(Win32Error.brokenPipe), ""),
         endedBlock, failedBlock);
 
-    // A completion of no bytes is a zero-length write by the child, and the loop asks again.
+    // A completion of no bytes is a zero-length write by the child, and the loop posts another read.
     builder.positionAtEnd(awaitBlock);
     runtime.call(waitForOne, [memory.buildLoad(builder, runtime.pointerType,
         runtime.offsetPointer(record, OutputRecord.event, ""), "event"),
@@ -373,7 +373,7 @@ public windowsWrite(Runtime runtime, TypeRef type) -> RuntimeFunction {
         runtime.pointerType, runtime.int32Type, runtime.pointerType, runtime.pointerType]));
     let definition = runtime.beginDefinition("ens_process_write", type);
     let builder = runtime.builder;
-    let writeBlock = runtime.block(definition, "write.ask");
+    let writeBlock = runtime.block(definition, "write.call");
     let closedBlock = runtime.block(definition, "write.closed");
     let writtenBlock = runtime.block(definition, "write.done");
     let failedBlock = runtime.block(definition, "write.failed");
@@ -426,8 +426,8 @@ public windowsWait(Runtime runtime, TypeRef type) -> RuntimeFunction {
         runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
     let definition = runtime.beginDefinition("ens_process_wait", type);
     let builder = runtime.builder;
-    let rememberedBlock = runtime.block(definition, "wait.remembered");
-    let askBlock = runtime.block(definition, "wait.ask");
+    let collectedBlock = runtime.block(definition, "wait.collected");
+    let callBlock = runtime.block(definition, "wait.call");
     let codeBlock = runtime.block(definition, "wait.code");
     let decodeBlock = runtime.block(definition, "wait.decode");
     let waitFailedBlock = runtime.block(definition, "wait.failed");
@@ -440,15 +440,15 @@ public windowsWait(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let process = memory.buildLoad(builder, runtime.pointerType,
         childprocess.childField(runtime, block, WindowsChild.process), "process");
     instructions.buildCondBr(builder, instructions.buildICmpNE(builder,
-        childprocess.loadField(runtime, block, WindowsChild.reaped), runtime.int32(0), ""), rememberedBlock,
-        askBlock);
+        childprocess.loadField(runtime, block, WindowsChild.reaped), runtime.int32(0), ""), collectedBlock,
+        callBlock);
 
-    builder.positionAtEnd(rememberedBlock);
+    builder.positionAtEnd(collectedBlock);
     memory.buildStore(builder, childprocess.loadField(runtime, block, WindowsChild.code), codeSlot);
     memory.buildStore(builder, childprocess.loadField(runtime, block, WindowsChild.signal), signalSlot);
     instructions.buildRet(builder, runtime.int32(0));
 
-    builder.positionAtEnd(askBlock);
+    builder.positionAtEnd(callBlock);
     let waited = runtime.call(waitForOne, [process, runtime.int32(ProcessCreation.infinite)],
         "waited");
     let waitError = runtime.lastError();
@@ -490,15 +490,15 @@ public windowsWait(Runtime runtime, TypeRef type) -> RuntimeFunction {
     return runtime.endDefinition(definition);
 }
 
-// Asking the system to end a process that has ended is a failure on Windows, so the child is asked
-// first whether it is still running, and asked again when the ending itself is refused.
+// Ending a process that has ended is a failure on Windows, so the child is checked
+// first whether it is still running, and checked again when the ending itself fails.
 public windowsKill(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let waitForOne = waitForOneFunction(runtime);
     let terminate = runtime.libc("TerminateProcess",
         runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type]));
     let definition = runtime.beginDefinition("ens_process_kill", type);
     let builder = runtime.builder;
-    let askBlock = runtime.block(definition, "kill.ask");
+    let callBlock = runtime.block(definition, "kill.call");
     let stopBlock = runtime.block(definition, "kill.stop");
     let refusedBlock = runtime.block(definition, "kill.refused");
     let stoppedBlock = runtime.block(definition, "kill.stopped");
@@ -508,9 +508,9 @@ public windowsKill(Runtime runtime, TypeRef type) -> RuntimeFunction {
         childprocess.childField(runtime, block, WindowsChild.process), "process");
     instructions.buildCondBr(builder, instructions.buildICmpNE(builder,
         childprocess.loadField(runtime, block, WindowsChild.reaped), runtime.int32(0), ""), goneBlock,
-        askBlock);
+        callBlock);
 
-    builder.positionAtEnd(askBlock);
+    builder.positionAtEnd(callBlock);
     instructions.buildCondBr(builder, instructions.buildICmpEQ(builder,
         runtime.call(waitForOne, [process, runtime.int32(0)], "ended"),
         runtime.int32(ProcessCreation.waitObject), ""), goneBlock, stopBlock);
@@ -556,15 +556,15 @@ public windowsRelease(Runtime runtime, TypeRef type) -> RuntimeFunction {
     return runtime.endDefinition(definition);
 }
 
-// Widens the text into the slot when `wanted` holds, going to `failedBlock` with the out-of-memory
+// Widens the text into the slot when `enabled` holds, going to `failedBlock` with the out-of-memory
 // code kept when the conversion fails.
 widenInto(Runtime runtime, RuntimeDefinition definition, RuntimeFunction widen, Value text,
-          Value bytes, Value wanted, Value slot, Value reasonSlot, BasicBlock failedBlock,
+          Value bytes, Value enabled, Value slot, Value reasonSlot, BasicBlock failedBlock,
           string label) {
     let builder = runtime.builder;
     let widenBlock = runtime.block(definition, "widen.{label}.convert");
     let doneBlock = runtime.block(definition, "widen.{label}.done");
-    instructions.buildCondBr(builder, wanted, widenBlock, doneBlock);
+    instructions.buildCondBr(builder, enabled, widenBlock, doneBlock);
 
     builder.positionAtEnd(widenBlock);
     let wide = runtime.call(widen, [text, bytes], "{label}.wide");
@@ -782,7 +782,7 @@ standardHandleCopy(Runtime runtime, RuntimeDefinition definition, long standard,
     builder.positionAtEnd(doneBlock);
 }
 
-// Packs the child's handles that exist into the list, answering how many there are.
+// Packs the child's handles that exist into the list, returning how many there are.
 packHandles(Runtime runtime, Value[] slots, Value list) -> Value {
     let builder = runtime.builder;
     Value count = runtime.int64(0);
@@ -796,7 +796,7 @@ packHandles(Runtime runtime, Value[] slots, Value list) -> Value {
     return count;
 }
 
-// Posts a read into the record's staging buffer, marking it pending, and answers 0, or the code
+// Posts a read into the record's staging buffer, marking it pending, and returns 0, or the code
 // the posting was refused with.
 issueRead(Runtime runtime, Value record) -> Value {
     let builder = runtime.builder;
@@ -833,7 +833,7 @@ noteClosed(Runtime runtime, Value record, Value gone) {
 }
 
 // Takes the bytes a pending read delivered into the record, marking it no longer pending, and
-// answers 0, or the code the read ended with.
+// returns 0, or the code the read ended with.
 completeRead(Runtime runtime, Value record) -> Value {
     let builder = runtime.builder;
     let overlappedResult = runtime.libc("GetOverlappedResult", runtime.int32Type.functionType([
@@ -921,7 +921,7 @@ public windowsPoll(Runtime runtime, TypeRef type) -> RuntimeFunction {
     builder.positionAtEnd(waitFailedBlock);
     instructions.buildRet(builder, why);
 
-    // The wait names only the first waitable that is signaled, so each is asked afterwards.
+    // The wait names only the first waitable that is signaled, so each is checked afterwards.
     builder.positionAtEnd(waitedBlock);
     settleRecord(runtime, definition, output, PollReady.output, readySlot, failureSlot,
         failedBlock, "output");
@@ -1056,13 +1056,13 @@ liveRecord(Runtime runtime, Value record) -> Value {
             runtime.int32(0), ""), "live");
 }
 
-// Puts the handle at the next free slot of the waitables when `wanted` holds.
+// Puts the handle at the next free slot of the waitables when `enabled` holds.
 addWaitable(Runtime runtime, RuntimeDefinition definition, Value handles, Value countSlot,
-            Value handle, Value wanted, string label) {
+            Value handle, Value enabled, string label) {
     let builder = runtime.builder;
     let addBlock = runtime.block(definition, "{label}.add");
     let doneBlock = runtime.block(definition, "{label}.added");
-    instructions.buildCondBr(builder, wanted, addBlock, doneBlock);
+    instructions.buildCondBr(builder, enabled, addBlock, doneBlock);
 
     builder.positionAtEnd(addBlock);
     let count = memory.buildLoad(builder, runtime.int32Type, countSlot, "count");
@@ -1163,7 +1163,7 @@ zeroBytes(Runtime runtime, Value base, long bytes) {
     }
 }
 
-// INVALID_HANDLE_VALUE, which is what a failed open answers instead of a null pointer.
+// INVALID_HANDLE_VALUE, which is what a failed open returns instead of a null pointer.
 invalidHandle(Runtime runtime, Value handle) -> Value {
     let builder = runtime.builder;
     return instructions.buildICmpEQ(builder,

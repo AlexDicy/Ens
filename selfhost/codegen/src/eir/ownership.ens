@@ -1,9 +1,9 @@
 // The ownership verifier over the value temps of a reference type, run on every lowered function.
 // A temp is Undefined, Borrowed while it holds no reference of its own, Retained while a borrowed
-// temp also holds a +1 of its own, Owned while it holds a +1 nobody else will give up, or Consumed
-// once that +1 has been handed on.
-// A retained borrow that gives its +1 up is Borrowed again, because the borrow it was read as
-// outlives the reference it handed over, so one borrowed value can fill two owning places.
+// temp also holds a +1 of its own, Owned while it holds a +1 nothing else will release, or Consumed
+// once that +1 has been passed on.
+// A retained borrow whose +1 is consumed is Borrowed again, because the borrow it was before the retain
+// outlives the reference it passed on, so one borrowed value can fill two owning places.
 // Undefined and Conflict pass through every transition unchanged, so the states reach a fixpoint
 // in any block order.
 // A block replayed before its predecessors have settled then contributes nothing to its successors.
@@ -161,7 +161,7 @@ class OwnershipVerifier {
                     if (successor < 0 || successor >= blockCount) {
                         continue;
                     }
-                    // A terminator's definitions arrive owned along their own edge - a try
+                    // A terminator's definitions are owned along their own edge - a try
                     // call's result where it returned, its error where it unwound - and the
                     // fresh definition replaces whatever stale state a loop carried around, the
                     // way an instruction's result does.
@@ -263,7 +263,7 @@ class OwnershipVerifier {
                     this.report("{block.label()}: %{retain.value} is retained while it already "
                         + "owns a reference, which leaks one");
                 }
-                states.set(retain.value, afterRetaining(held));
+                states.set(retain.value, stateAfterRetain(held));
             },
             is EirRelease release -> {
                 if (!this.isTracked(release.value)) {
@@ -279,7 +279,7 @@ class OwnershipVerifier {
                             + "reference was already given up");
                     }
                 }
-                states.set(release.value, afterGivingUp(held));
+                states.set(release.value, stateAfterConsume(held));
             },
             is EirStoreSlot store -> {
                 if (this.slotBorrows(store.slot)) {
@@ -292,7 +292,7 @@ class OwnershipVerifier {
                 this.consume(block, store.value, states, reporting,
                     "stored through %{store.address}");
             },
-            // A conversion between two spellings of one reference is a rename, so the +1 travels
+            // A conversion between two spellings of one reference is a rename, so the +1 passes
             // to the result rather than being duplicated or dropped.
             is EirCast cast -> {
                 if (!this.isTracked(cast.result)) {
@@ -305,7 +305,7 @@ class OwnershipVerifier {
                 let carried = states.get(cast.operand);
                 states.set(cast.result, carried);
                 if (ownsReference(carried)) {
-                    states.set(cast.operand, afterGivingUp(carried));
+                    states.set(cast.operand, stateAfterConsume(carried));
                 }
             },
             // Wrapping puts what the payload holds inside a pair, which this pass tracks through
@@ -317,7 +317,7 @@ class OwnershipVerifier {
                 }
                 let held = states.get(wrap.value);
                 if (ownsReference(held)) {
-                    states.set(wrap.value, afterGivingUp(held));
+                    states.set(wrap.value, stateAfterConsume(held));
                 }
             },
             default -> {
@@ -349,7 +349,7 @@ class OwnershipVerifier {
                     + "already given up");
             }
         }
-        states.set(value, afterGivingUp(held));
+        states.set(value, stateAfterConsume(held));
     }
 
     applyTerminator(EirBlock block, EirTerminator terminator, List<Ownership> states, bool reporting) {
@@ -359,7 +359,7 @@ class OwnershipVerifier {
                 this.checkNothingOwned(block, states, reporting, "the function returns");
             },
             // The error's +1 transfers into the caller's slot; everything else must already have
-            // been given up, exactly as at a return.
+            // been consumed, exactly as at a return.
             is EirPropagate propagated -> {
                 this.consume(block, propagated.error, states, reporting, "propagated");
                 this.checkNothingOwned(block, states, reporting, "the error propagates");
@@ -434,7 +434,7 @@ public producesOwned(EirInstruction instruction) -> bool {
         is EirWeakLoad ignored -> {
             return true;
         },
-        // A stack-pinned allocation owns nothing: it dies with the frame, not with a release.
+        // A stack-pinned allocation owns nothing: it is freed with the frame, not with a release.
         is EirArrayNew allocation -> {
             return !allocation.onStack();
         },
@@ -492,7 +492,7 @@ public producesOwned(EirInstruction instruction) -> bool {
             return true;
         },
         // The only tracked value a foreign call can produce is a declared string result, which
-        // arrives as a fresh owned lift of the C buffer; the lift itself likewise.
+        // is a fresh owned lift of the C buffer; the lift itself likewise.
         is EirForeignCall ignored -> {
             return true;
         },
@@ -547,15 +547,15 @@ payloadTemps(EirFunction function) -> bool[] {
     return payloads;
 }
 
-// True while a temp holds a +1 somebody still has to give up.
+// True while a temp holds a +1 that still has to be released or consumed.
 ownsReference(Ownership held) -> bool {
     return held == Ownership.Retained || held == Ownership.Owned;
 }
 
-// Where a retain leaves a temp. A borrowed temp gains a +1 of its own beside the borrow, and a
+// The state of a temp after a retain. A borrowed temp gains a +1 of its own beside the borrow, and a
 // temp holding nothing becomes the only owner of the one it gains.
-afterRetaining(Ownership held) -> Ownership {
-    if (saysNothing(held)) {
+stateAfterRetain(Ownership held) -> Ownership {
+    if (isIndeterminate(held)) {
         return held;
     }
     if (held == Ownership.Borrowed) {
@@ -564,10 +564,10 @@ afterRetaining(Ownership held) -> Ownership {
     return Ownership.Owned;
 }
 
-// Where a temp stands once the +1 it held is given up. A retained borrow is the borrow it was read
-// as again, and an owned temp is left holding nothing.
-afterGivingUp(Ownership held) -> Ownership {
-    if (saysNothing(held)) {
+// The state of a temp once the +1 it held is consumed. A retained borrow is the borrow it was
+// before the retain again, and an owned temp is left holding nothing.
+stateAfterConsume(Ownership held) -> Ownership {
+    if (isIndeterminate(held)) {
         return held;
     }
     if (held == Ownership.Retained) {
@@ -576,9 +576,9 @@ afterGivingUp(Ownership held) -> Ownership {
     return Ownership.Consumed;
 }
 
-// True for the two states that answer nothing about a reference.
+// True for the two states that determine nothing about a reference.
 // One is a temp no path has defined yet, the other is one whose paths already disagree.
-saysNothing(Ownership held) -> bool {
+isIndeterminate(Ownership held) -> bool {
     return held == Ownership.Undefined || held == Ownership.Conflict;
 }
 

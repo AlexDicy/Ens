@@ -1,5 +1,5 @@
 // The POSIX halves of the child bridges. Every pipe end is close-on-exec and nothing between fork
-// and exec allocates or locks, so a second thread starting a child at the same moment sees none of
+// and exec allocates or locks, so a second thread starting a child at the same moment observes none of
 // this one's descriptors and a child that could not exec reports why through a pipe of its own.
 import Value from @ens.llvm.values;
 import TypeRef from @ens.llvm.types;
@@ -171,8 +171,8 @@ public posixStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
     runtime.call(exitChild, [runtime.int32(127)], "");
     instructions.buildUnreachable(builder);
 
-    // The parent hands back every end the child holds and reads the report pipe. Nothing arrives
-    // when the exec replaced the child, and an errno arrives when it did not.
+    // The parent closes every end the child holds and reads the report pipe. Nothing is written
+    // when the exec replaced the child, and an errno is written when it did not.
     builder.positionAtEnd(parentBlock);
     instructions.buildCondBr(builder,
         instructions.buildICmpSLT(builder, child, runtime.int32(0), ""), failedBlock, heldBlock);
@@ -230,7 +230,7 @@ public posixRead(Runtime runtime, TypeRef type) -> RuntimeFunction {
         runtime.pointerType, runtime.int64Type]));
     let definition = runtime.beginDefinition("ens_process_read", type);
     let builder = runtime.builder;
-    let readBlock = runtime.block(definition, "read.ask");
+    let readBlock = runtime.block(definition, "read.call");
     let refusedBlock = runtime.block(definition, "read.refused");
     let doneBlock = runtime.block(definition, "read.done");
     let invalidBlock = runtime.block(definition, "read.invalid");
@@ -275,7 +275,7 @@ public posixWrite(Runtime runtime, TypeRef type) -> RuntimeFunction {
         runtime.pointerType, runtime.int64Type]));
     let definition = runtime.beginDefinition("ens_process_write", type);
     let builder = runtime.builder;
-    let writeBlock = runtime.block(definition, "write.ask");
+    let writeBlock = runtime.block(definition, "write.call");
     let refusedBlock = runtime.block(definition, "write.refused");
     let doneBlock = runtime.block(definition, "write.done");
     let closedBlock = runtime.block(definition, "write.closed");
@@ -315,7 +315,7 @@ public posixCloseInput(Runtime runtime, TypeRef type) -> RuntimeFunction {
         runtime.int32Type.functionType([runtime.int32Type]));
     let definition = runtime.beginDefinition("ens_process_close_input", type);
     let builder = runtime.builder;
-    let closeBlock = runtime.block(definition, "close.ask");
+    let closeBlock = runtime.block(definition, "close.call");
     let closedBlock = runtime.block(definition, "close.done");
     let slot = childprocess.childField(runtime, runtime.parameter(definition, 0),
         PosixChild.input);
@@ -342,8 +342,8 @@ public posixWait(Runtime runtime, TypeRef type) -> RuntimeFunction {
         runtime.pointerType, runtime.int32Type]));
     let definition = runtime.beginDefinition("ens_process_wait", type);
     let builder = runtime.builder;
-    let rememberedBlock = runtime.block(definition, "wait.remembered");
-    let askBlock = runtime.block(definition, "wait.ask");
+    let collectedBlock = runtime.block(definition, "wait.collected");
+    let callBlock = runtime.block(definition, "wait.call");
     let refusedBlock = runtime.block(definition, "wait.refused");
     let decodeBlock = runtime.block(definition, "wait.decode");
     let failedBlock = runtime.block(definition, "wait.failed");
@@ -353,25 +353,25 @@ public posixWait(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let statusSlot = memory.buildAlloca(builder, runtime.int32Type, "status");
     memory.buildStore(builder, runtime.int32(0), statusSlot);
     instructions.buildCondBr(builder, instructions.buildICmpNE(builder,
-        childprocess.loadField(runtime, block, PosixChild.reaped), runtime.int32(0), ""), rememberedBlock,
-        askBlock);
+        childprocess.loadField(runtime, block, PosixChild.reaped), runtime.int32(0), ""), collectedBlock,
+        callBlock);
 
-    builder.positionAtEnd(rememberedBlock);
+    builder.positionAtEnd(collectedBlock);
     memory.buildStore(builder, childprocess.loadField(runtime, block, PosixChild.code), codeSlot);
     memory.buildStore(builder, childprocess.loadField(runtime, block, PosixChild.signal), signalSlot);
     instructions.buildRet(builder, runtime.int32(0));
 
-    builder.positionAtEnd(askBlock);
-    let answer = runtime.call(waitForChild, [childprocess.loadField(runtime, block, PosixChild.pid),
+    builder.positionAtEnd(callBlock);
+    let result = runtime.call(waitForChild, [childprocess.loadField(runtime, block, PosixChild.pid),
         statusSlot, runtime.int32(0)], "answer");
     let why = runtime.lastError();
     instructions.buildCondBr(builder,
-        instructions.buildICmpSLT(builder, answer, runtime.int32(0), ""), refusedBlock,
+        instructions.buildICmpSLT(builder, result, runtime.int32(0), ""), refusedBlock,
         decodeBlock);
 
     builder.positionAtEnd(refusedBlock);
     instructions.buildCondBr(builder,
-        instructions.buildICmpEQ(builder, why, runtime.int32(Errno.interrupted), ""), askBlock,
+        instructions.buildICmpEQ(builder, why, runtime.int32(Errno.interrupted), ""), callBlock,
         failedBlock);
 
     builder.positionAtEnd(failedBlock);
@@ -394,7 +394,7 @@ public posixPoll(Runtime runtime, TypeRef type) -> RuntimeFunction {
 }
 
 // One poll over the two pipes and the pidfd, whose readiness is the child's end. Without a pidfd
-// the child's end has nothing to wait on, so the poll turns every few milliseconds and asks
+// the child's end has nothing to wait on, so the poll turns every few milliseconds and checks
 // waitpid between turns, and that is the only place this bridge turns.
 linuxPoll(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let pollDescriptors = runtime.libc("poll", runtime.int32Type.functionType([runtime.pointerType,
@@ -406,12 +406,12 @@ linuxPoll(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let builder = runtime.builder;
     let turnBlock = runtime.block(definition, "poll.turn");
     let idleBlock = runtime.block(definition, "poll.idle");
-    let pollBlock = runtime.block(definition, "poll.ask");
+    let pollBlock = runtime.block(definition, "poll.call");
     let refusedBlock = runtime.block(definition, "poll.refused");
     let collectBlock = runtime.block(definition, "poll.collect");
-    let askBlock = runtime.block(definition, "poll.ask.child");
+    let callBlock = runtime.block(definition, "poll.call.child");
     let collectedBlock = runtime.block(definition, "poll.collected");
-    let decideBlock = runtime.block(definition, "poll.decide");
+    let settleBlock = runtime.block(definition, "poll.settle");
     let doneBlock = runtime.block(definition, "poll.done");
     let failedBlock = runtime.block(definition, "poll.failed");
     let block = runtime.parameter(definition, 0);
@@ -446,7 +446,7 @@ linuxPoll(Runtime runtime, TypeRef type) -> RuntimeFunction {
         instructions.buildOr(builder, outputLive, errorsLive, ""), ""), "idle");
     instructions.buildCondBr(builder, idle, idleBlock, pollBlock);
 
-    // A collected child whose streams have both ended leaves nothing to ask the system about.
+    // A collected child whose streams have both ended leaves nothing to query the system about.
     builder.positionAtEnd(idleBlock);
     memory.buildStore(builder, runtime.int32(PollReady.ended), readySlot);
     instructions.buildRet(builder, runtime.int32(0));
@@ -481,22 +481,22 @@ linuxPoll(Runtime runtime, TypeRef type) -> RuntimeFunction {
     mask = instructions.buildOr(builder, mask, reportedBit(runtime, watched, 2, PollReady.ended),
         "mask");
     memory.buildStore(builder, mask, readySlot);
-    instructions.buildCondBr(builder, turning, askBlock, decideBlock);
+    instructions.buildCondBr(builder, turning, callBlock, settleBlock);
 
-    builder.positionAtEnd(askBlock);
-    let answer = runtime.call(waitForChild, [childprocess.loadField(runtime, block,
+    builder.positionAtEnd(callBlock);
+    let result = runtime.call(waitForChild, [childprocess.loadField(runtime, block,
         PosixChild.pid), statusSlot, runtime.int32(WaitStatus.noHang)], "answer");
     instructions.buildCondBr(builder,
-        instructions.buildICmpSGT(builder, answer, runtime.int32(0), ""), collectedBlock,
-        decideBlock);
+        instructions.buildICmpSGT(builder, result, runtime.int32(0), ""), collectedBlock,
+        settleBlock);
 
     builder.positionAtEnd(collectedBlock);
     cacheStatus(runtime, block, memory.buildLoad(builder, runtime.int32Type, statusSlot, "raw"));
     memory.buildStore(builder, instructions.buildOr(builder, mask,
         runtime.int32(PollReady.ended), ""), readySlot);
-    instructions.buildBr(builder, decideBlock);
+    instructions.buildBr(builder, settleBlock);
 
-    builder.positionAtEnd(decideBlock);
+    builder.positionAtEnd(settleBlock);
     instructions.buildCondBr(builder, finished(runtime, now, readySlot, bounded, deadline),
         doneBlock, turnBlock);
 
@@ -521,7 +521,7 @@ darwinPoll(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let definition = runtime.beginDefinition("ens_process_poll", type);
     let builder = runtime.builder;
     let turnBlock = runtime.block(definition, "poll.turn");
-    let askBlock = runtime.block(definition, "poll.ask.child");
+    let callBlock = runtime.block(definition, "poll.call.child");
     let collectedBlock = runtime.block(definition, "poll.collected");
     let registerBlock = runtime.block(definition, "poll.register");
     let idleBlock = runtime.block(definition, "poll.idle");
@@ -529,7 +529,7 @@ darwinPoll(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let queueFailedBlock = runtime.block(definition, "poll.queue.failed");
     let refusedBlock = runtime.block(definition, "poll.refused");
     let collectBlock = runtime.block(definition, "poll.collect");
-    let decideBlock = runtime.block(definition, "poll.decide");
+    let settleBlock = runtime.block(definition, "poll.settle");
     let doneBlock = runtime.block(definition, "poll.done");
     let failedBlock = runtime.block(definition, "poll.failed");
     let block = runtime.parameter(definition, 0);
@@ -554,13 +554,13 @@ darwinPoll(Runtime runtime, TypeRef type) -> RuntimeFunction {
     builder.positionAtEnd(turnBlock);
     instructions.buildCondBr(builder, instructions.buildICmpNE(builder,
         childprocess.loadField(runtime, block, PosixChild.reaped), runtime.int32(0), ""),
-        registerBlock, askBlock);
+        registerBlock, callBlock);
 
-    builder.positionAtEnd(askBlock);
-    let answer = runtime.call(waitForChild, [childprocess.loadField(runtime, block,
+    builder.positionAtEnd(callBlock);
+    let result = runtime.call(waitForChild, [childprocess.loadField(runtime, block,
         PosixChild.pid), statusSlot, runtime.int32(WaitStatus.noHang)], "answer");
     instructions.buildCondBr(builder,
-        instructions.buildICmpSGT(builder, answer, runtime.int32(0), ""), collectedBlock,
+        instructions.buildICmpSGT(builder, result, runtime.int32(0), ""), collectedBlock,
         registerBlock);
 
     builder.positionAtEnd(collectedBlock);
@@ -612,7 +612,7 @@ darwinPoll(Runtime runtime, TypeRef type) -> RuntimeFunction {
     runtime.call(closeDescriptor, [queue], "");
     instructions.buildCondBr(builder,
         instructions.buildICmpSLT(builder, woken, runtime.int32(0), ""), refusedBlock,
-        decideBlock);
+        settleBlock);
 
     builder.positionAtEnd(refusedBlock);
     instructions.buildCondBr(builder,
@@ -622,7 +622,7 @@ darwinPoll(Runtime runtime, TypeRef type) -> RuntimeFunction {
     builder.positionAtEnd(failedBlock);
     instructions.buildRet(builder, why);
 
-    builder.positionAtEnd(decideBlock);
+    builder.positionAtEnd(settleBlock);
     for (long index = 0; index < 3; index++) {
         collectEvent(runtime, definition, events, index, woken, readySlot, failureSlot,
             failedBlock);
@@ -635,7 +635,7 @@ darwinPoll(Runtime runtime, TypeRef type) -> RuntimeFunction {
     return runtime.endDefinition(definition);
 }
 
-// A child already collected is nothing to stop, and so is one the system no longer knows.
+// A child already collected is nothing to stop, and so is one the system no longer has a record of.
 public posixKill(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let killProcess = runtime.libc("kill",
         runtime.int32Type.functionType([runtime.int32Type, runtime.int32Type]));
@@ -694,7 +694,7 @@ public posixRelease(Runtime runtime, TypeRef type) -> RuntimeFunction {
     return runtime.endDefinition(definition);
 }
 
-// Opens the pipe the slot pair begins at when the mode asks for one, marking both ends
+// Opens the pipe the slot pair begins at when the mode requires one, marking both ends
 // close-on-exec, and goes to `failedBlock` with the reason kept when either call refuses.
 openPipe(Runtime runtime, RuntimeDefinition definition, RuntimeFunction makePipe,
          RuntimeFunction control, Value ends, long firstSlot, Value mode, Value reasonSlot,
@@ -755,7 +755,7 @@ changeWorkingDirectory(Runtime runtime, RuntimeDefinition definition,
     builder.positionAtEnd(doneBlock);
 }
 
-// Moves a child's end that sits at one of the three standard descriptors up above them, so that
+// Moves a child's end that is at one of the three standard descriptors up above them, so that
 // aiming another end at that descriptor cannot close it first. The copy is close-on-exec like the
 // original, and the original closes itself at exec.
 liftLowEnd(Runtime runtime, RuntimeDefinition definition, RuntimeFunction control,
@@ -808,19 +808,19 @@ attachEnd(Runtime runtime, RuntimeDefinition definition, Value ends, long slot, 
     builder.positionAtEnd(doneBlock);
 }
 
-// Reads up to four bytes into the slot, asking again after a signal interrupts, and answers how
-// many arrived. A read the pipe itself refused answers as nothing arriving, since the child has
-// either exec'd or ended with 127 and a wait tells the two apart.
+// Reads up to four bytes into the slot, calling again after a signal interrupts, and returns how
+// many were read. A read the pipe itself refused is reported as no bytes, since the child has
+// either exec'd or ended with 127 and a wait distinguishes the two.
 retryingRead(Runtime runtime, RuntimeDefinition definition, RuntimeFunction readDescriptor,
              Value descriptor, Value slot, string label) -> Value {
     let builder = runtime.builder;
-    let askBlock = runtime.block(definition, "{label}.read.ask");
+    let callBlock = runtime.block(definition, "{label}.read.call");
     let refusedBlock = runtime.block(definition, "{label}.read.refused");
     let doneBlock = runtime.block(definition, "{label}.read.done");
     let lengthSlot = memory.buildAlloca(builder, runtime.int64Type, "{label}.length");
-    instructions.buildBr(builder, askBlock);
+    instructions.buildBr(builder, callBlock);
 
-    builder.positionAtEnd(askBlock);
+    builder.positionAtEnd(callBlock);
     let count = runtime.call(readDescriptor, [descriptor, slot, runtime.int64(4)], "count");
     let why = runtime.lastError();
     memory.buildStore(builder, count, lengthSlot);
@@ -830,7 +830,7 @@ retryingRead(Runtime runtime, RuntimeDefinition definition, RuntimeFunction read
     builder.positionAtEnd(refusedBlock);
     memory.buildStore(builder, runtime.int64(0), lengthSlot);
     instructions.buildCondBr(builder,
-        instructions.buildICmpEQ(builder, why, runtime.int32(Errno.interrupted), ""), askBlock,
+        instructions.buildICmpEQ(builder, why, runtime.int32(Errno.interrupted), ""), callBlock,
         doneBlock);
 
     builder.positionAtEnd(doneBlock);
@@ -884,8 +884,8 @@ streamEndedSlot(Runtime runtime, Value block, Value stream) -> Value {
         childprocess.childField(runtime, block, PosixChild.errorsEnded), "ended.slot");
 }
 
-isStream(Runtime runtime, Value stream, long wanted) -> Value {
-    return instructions.buildICmpEQ(runtime.builder, stream, runtime.int32(wanted), "");
+isStream(Runtime runtime, Value stream, long expected) -> Value {
+    return instructions.buildICmpEQ(runtime.builder, stream, runtime.int32(expected), "");
 }
 
 endSlot(Runtime runtime, Value ends, long slot) -> Value {
@@ -954,7 +954,7 @@ boundedTurn(Runtime runtime, Value bounded, Value remaining) -> Value {
         remaining, runtime.int64(PollTurn.millis), "turn");
 }
 
-// True when the mask holds anything or the deadline has passed, which is when a poll answers.
+// True when the mask holds anything or the deadline has passed, which is when a poll returns.
 finished(Runtime runtime, RuntimeFunction now, Value readySlot, Value bounded, Value deadline)
         -> Value {
     let builder = runtime.builder;
@@ -966,7 +966,7 @@ finished(Runtime runtime, RuntimeFunction now, Value readySlot, Value bounded, V
 }
 
 // Fills one 'struct pollfd' with the stream's descriptor, or with -1 where the stream is no pipe or
-// has ended, which poll skips, and answers whether the stream is live.
+// has ended, which poll skips, and returns whether the stream is live.
 watchDescriptor(Runtime runtime, Value watched, long index, Value descriptor, Value block,
                 long endedOffset) -> Value {
     let builder = runtime.builder;
@@ -984,7 +984,7 @@ watchDescriptor(Runtime runtime, Value watched, long index, Value descriptor, Va
     return live;
 }
 
-// The bit for an entry whose returned events say a read would not wait.
+// The bit for an entry whose returned events mean a read would not wait.
 reportedBit(Runtime runtime, Value watched, long index, long bit) -> Value {
     let builder = runtime.builder;
     let returned = memory.buildLoad(builder, runtime.int16Type, runtime.offsetPointer(watched,
@@ -995,7 +995,7 @@ reportedBit(Runtime runtime, Value watched, long index, long bit) -> Value {
 }
 
 // Registers a read filter on the stream's descriptor when the stream is a pipe that has not ended,
-// naming the bit it answers with in the event's user data.
+// naming the bit it reports in the event's user data.
 registerStream(Runtime runtime, RuntimeDefinition definition, Value changes, Value countSlot,
                Value descriptor, Value block, long endedOffset, long bit, string label) {
     let builder = runtime.builder;
@@ -1055,7 +1055,7 @@ writeEvent(Runtime runtime, Value changes, Value countSlot, Value ident, long fi
 }
 
 // Adds the bit a returned event carries to the mask. An error event carries an errno in its data,
-// and one saying the child is gone counts as the child's end, since waitpid then answers at once.
+// and one reporting that the child is gone counts as the child's end, since waitpid then returns at once.
 collectEvent(Runtime runtime, RuntimeDefinition definition, Value events, long index, Value woken,
              Value readySlot, Value failureSlot, BasicBlock failedBlock) {
     let builder = runtime.builder;

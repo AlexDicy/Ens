@@ -61,10 +61,6 @@ A native reproduction outside the compiler never fired over 200 iterations, so t
 
 ## After Phase D
 
-Comments and identifiers across `selfhost/` and `libs/` are to be swept for narrative phrasing that treats code as a person, such as a function that "gives up", "says nothing", "answers", "asks" or "reads as" (requested 2026-09-19).
-Recent milestones introduced names such as `saysNothing`, `afterGivingUp` and `afterRetaining` and comments in the same voice, while the house style is a plain statement of what a value is, what a function computes or returns, and what a condition means.
-Each such name and comment is to be reworded to the literal form; the rule is number 10 of the Diagnostics section in AGENTS.md and joins every agent brief so the style does not come back.
-
 Every diagnostic the compiler reports and every message or panic text the standard library raises is to be checked once more against the numbered rules of the Diagnostics section in AGENTS.md, agreed with Alex on 2026-09-19 (requested 2026-09-19).
 The two review passes so far checked the rubric in 02-conventions.md and the real-names rule, and this pass checks the wording itself.
 
