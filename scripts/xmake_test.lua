@@ -1108,24 +1108,28 @@ task("test")
             run({"build", "--output"}, nil, 2, "needs a value", "-o<file>")
             run({"build", "-O"}, nil, 2, "-O<level>", "--optimization-level <level>")
             run({"build", "--optimization-level=9"}, nil, 2, "takes a level from 0 to 3")
-            run({"build", "-q", "-v"}, nil, 2, "opposite things")
+            run({"build", "-q", "-v"}, nil, 2,
+                "ens: '--quiet' and '--verbose' are opposites; keep the one you meant")
             run({"build", "--target", "pdp11-dec-unix"}, nil, 2, "pdp11-dec-unix")
             run({"build", hello, "extra"}, nil, 2, "unexpected argument 'extra'")
-            run({"build", path.join(tests_dir, "no_such_place")}, nil, 2, "does not exist")
+            -- every problem the command reports in its own words carries the 'ens: ' prefix, the
+            -- one a compiler diagnostic never has because it names its own file and position
+            run({"build", path.join(tests_dir, "no_such_place")}, nil, 2,
+                "ens: '", "' does not exist")
             run({"build", path.join(root, "notes.txt")}, nil, 2, "not an Ens source file")
             run({"build"}, in_work, 2, "no ens.package manifest was found")
 
             -- a single file: named output, then the default name in the folder the command ran in
             local hello_exe = path.join(root, "hello_out.exe")
-            run({"build", hello, "--output", hello_exe}, nil, 0, "built")
+            run({"build", hello, "--output", hello_exe}, nil, 0, ": Built '")
             run_program(hello_exe, 0, "Hello, world!")
-            run({"build", hello}, in_work, 0, "built")
+            run({"build", hello}, in_work, 0, ": Built '")
             run_program(path.join(work, "hello" .. exe_suffix), 0, "Hello, world!")
 
             -- every optimization level is a shipped configuration, so every one is run
             for _, level in ipairs({"-O0", "-O1", "-O2", "-O3"}) do
                 local leveled = path.join(root, "hello" .. level .. ".exe")
-                run({"build", hello, level, "--output", leveled}, nil, 0, "built")
+                run({"build", hello, level, "--output", leveled}, nil, 0, ": Built '")
                 run_program(leveled, 0, "Hello, world!")
             end
 
@@ -1157,7 +1161,7 @@ task("test")
             io.writefile(path.join(objects, "src", "main.ens"),
                 'main() -> int {\n    print("objects");\n    return 0;\n}\n')
 
-            run({"build", objects, "--output", path.join(root, "objects.exe")}, nil, 0, "built")
+            run({"build", objects, "--output", path.join(root, "objects.exe")}, nil, 0, ": Built '")
             local triple = path.filename(os.dirs(path.join(objects, ".ens", "*"))[1] or "none")
             expectFolders(objects, triple .. "/O2", "a default build")
             if #os.files(path.join(objects, ".ens", "*", "O2", "*" .. obj_suffix)) == 0 then
@@ -1176,14 +1180,14 @@ task("test")
                 end
             end
             expectNoStaging(path.join(objects, ".ens", triple, "O2"), "a build")
-            run({"build", objects, "--output", path.join(root, "objects.exe")}, nil, 0, "built")
+            run({"build", objects, "--output", path.join(root, "objects.exe")}, nil, 0, ": Built '")
             expectNoStaging(path.join(objects, ".ens", triple, "O2"), "a build over its own objects")
             run_program(path.join(root, "objects.exe"), 0, "objects")
 
             -- an edited source reaches the object at its path rather than the previous one staying
             io.writefile(path.join(objects, "src", "main.ens"),
                 'main() -> int {\n    print("objects again");\n    return 0;\n}\n')
-            run({"build", objects, "--output", path.join(root, "objects.exe")}, nil, 0, "built")
+            run({"build", objects, "--output", path.join(root, "objects.exe")}, nil, 0, ": Built '")
             run_program(path.join(root, "objects.exe"), 0, "objects again")
 
             -- and nowhere else: not beside the executable, and not in the folder it was run from
@@ -1196,7 +1200,7 @@ task("test")
             -- a second level does not share the first one's folder, so an object built at one level
             -- can never be picked up by a build at another
             run({"build", objects, "-O0", "--output", path.join(root, "objects0.exe")}, nil, 0,
-                "built")
+                ": Built '")
             expectFolders(objects, triple .. "/O0 " .. triple .. "/O2", "a build at another level")
 
             -- the folder says to ignore everything under it, so nothing has to be added to a
@@ -1210,7 +1214,7 @@ task("test")
             local named_objects = path.join(root, "named-objects")
             os.mkdir(named_objects)
             run({"build", objects, "--objects", named_objects, "--output",
-                path.join(root, "objects2.exe")}, nil, 0, "built")
+                path.join(root, "objects2.exe")}, nil, 0, ": Built '")
             if #os.files(path.join(named_objects, "*" .. obj_suffix)) == 0 then
                 table.insert(failures, "'--objects' did not decide where the objects went")
             end
@@ -1229,7 +1233,7 @@ task("test")
                 table.insert(failures, string.format("ens build -q said %q", quiet_out))
             end
             run({"build", hello, "--output", path.join(root, "loud.exe"), "-v"}, nil, 0,
-                "emitted", "object file(s)")
+                "Emitted 14 object files from 14 modules")
             run({"build", hello, "--output", path.join(root, "arc.exe"), "--explain-arc"}, nil, 0,
                 "elided across the program")
 
@@ -1237,11 +1241,11 @@ task("test")
             -- refuses an output, while keeping its object files the way a program keeps its own.
             -- The library's build root is in the fixture tree, so what an earlier run left there
             -- goes first and the assertion is about this run.
-            run({"build", path.join(tests_dir, "pkg_import_main")}, in_work, 0, "built")
+            run({"build", path.join(tests_dir, "pkg_import_main")}, in_work, 0, ": Built '")
             run_program(path.join(work, "main" .. exe_suffix), 0, "Hello, Ada! [acme.tools]")
             local library_root = path.join(tests_dir, "pkg_import_dep")
             os.tryrm(path.join(library_root, ".ens"))
-            run({"build", library_root}, in_work, 0, "as a library")
+            run({"build", library_root}, in_work, 0, "Compiled 17 modules as a library")
             if os.isfile(path.join(work, "tools" .. exe_suffix)) then
                 table.insert(failures, "building a library left an executable behind")
             end
@@ -1263,8 +1267,8 @@ task("test")
             -- a workspace root builds every member, the library before the application that
             -- depends on it even though the manifest lists the application first
             local workspace = path.join(tests_dir, "cli_workspace")
-            run({"build", workspace}, in_work, 0, "[1/2] demo.lib: compiled",
-                "[2/2] demo.app: built")
+            run({"build", workspace}, in_work, 0, "[1/2] demo.lib: Compiled 14 modules as a "
+                .. "library", "[2/2] demo.app: Built '")
             run({"build", workspace, "--output", path.join(root, "x.exe")}, nil, 2, "--output")
             run({"check", workspace}, nil, 0, "[1/2] demo.lib", "[2/2] demo.app")
 
@@ -1283,7 +1287,7 @@ task("test")
             io.writefile(path.join(split, "lib", "src", "greet.ens"),
                 'export greet() -> string {\n    return "hi";\n}\n')
             run({"build", split}, nil, 2, "disagree on the Ens version", "split.app", "split.lib",
-                '"0.1"', '"0.2"')
+                "'0.1'", "'0.2'")
 
             -- a source folder reached through a symbolic link is compiled, which is how a checkout
             -- that shares one folder between two packages builds at all. The link is made with the
@@ -1312,7 +1316,7 @@ task("test")
             end
             if link_made then
                 run({"build", linked_root, "--output", path.join(root, "linked.exe")}, nil, 0,
-                    "built")
+                    ": Built '")
                 run_program(path.join(root, "linked.exe"), 0, "through the link")
             end
 
@@ -1320,7 +1324,10 @@ task("test")
             run({"cst-dump", hello}, nil, 0, "SourceFile")
             run({"cst-analyze", hello}, nil, 0)
             run({"cst-analyze", path.join(root, "broken.ens")}, nil, 1, "broken.ens:")
-            run({"cst-dump", path.join(root, "gone.ens")}, nil, 2, "could not read")
+            -- one problem said once: the failure names the operation and the path, and the command
+            -- adds its prefix and nothing else
+            run({"cst-dump", path.join(root, "gone.ens")}, nil, 2, "ens: could not open '",
+                "gone.ens': nothing is there", "!could not read")
 
             if #failures == 0 then
                 return {name = name, ok = true}
@@ -1424,7 +1431,7 @@ task("test")
             assertTempEmpty("ens run with arguments")
             run({"run", echo, "--", "7"}, nil, 7, "argument 1: 7")
             run({"run", path.join(tests_dir, "hello.ens")}, nil, 0, "Hello, world!")
-            run({"run", echo, "-v"}, nil, 0, "building echo for", "running")
+            run({"run", echo, "-v"}, nil, 0, "Building 'echo' for", "Running '")
 
             -- a target with no main() is a usage problem, not a build failure
             run({"run", path.join(tests_dir, "pkg_import_dep")}, nil, 2, "is not a program to run",
@@ -1539,7 +1546,7 @@ task("test")
             writePackage(bare, 'package demo.bare {\n    ens "0.1";\n}\n', {
                 ["src/math.ens"] = 'export one() -> long {\n    return 1;\n}\n',
             })
-            run({"test", bare}, nil, 0, "there are no tests in", "_test.ens")
+            run({"test", bare}, nil, 0, "There are no tests in", "_test.ens")
             run({"test", suite, "--tests", path.join(root, "nowhere")}, nil, 2, "is not a folder")
 
             -- '--tests' names where the tests of one target live
@@ -1565,7 +1572,7 @@ task("test")
                 "folder the tests live in")
             run({"test", one, "--tests", path.join(suite, "tests")}, nil, 2,
                 "'--tests' names one folder of tests")
-            run({"test", one}, nil, 0, "there are no tests in")
+            run({"test", one}, nil, 0, "There are no tests in")
 
             -- a workspace root tests every member: each member's results arrive under its own name,
             -- and the run ends by saying what the whole workspace came to
@@ -1608,7 +1615,7 @@ task("test")
 
             -- a member with no tests of its own is not one of the members the total counts
             os.rm(beta_tests)
-            run({"test", suites}, nil, 0, "there are no tests in",
+            run({"test", suites}, nil, 0, "There are no tests in",
                 "1/1 tests passed across 1 member")
 
             if #failures == 0 then
@@ -1706,14 +1713,14 @@ task("test")
 
             -- add writes the file, list says the folder works, and the build resolves through it
             run({"override", "add", "acme.json", "../json"}, in_ws, 0,
-                "Added the override for package 'acme.json': ../json")
+                "Added the override for package 'acme.json': '../json'")
             expect_file("add", 'overrides {\n    override acme.json "../json";\n}\n')
-            run({"override", "list"}, in_ws, 0, "acme.json -> ../json", "!not usable")
+            run({"override", "list"}, in_ws, 0, "'acme.json' -> '../json'", "!not usable")
             -- the build says what it is taking from the override, because nothing in the program
             -- does, and a check says it too
-            local notice = "Using the override for package 'acme.json': "
-                .. path.absolute(path.join(root, "json")):gsub("\\", "/")
-            run({"build"}, in_ws, 0, "demo.app: built", notice)
+            local notice = "Using the override for package 'acme.json': '"
+                .. path.absolute(path.join(root, "json")):gsub("\\", "/") .. "'"
+            run({"build"}, in_ws, 0, "demo.app: Built '", notice)
             run({"check"}, in_ws, 0, notice)
 
             -- it survives '--quiet' and rides the error stream beside the problems: quiet hides an
@@ -1729,7 +1736,8 @@ task("test")
             end
 
             -- both members take the package from the same override, and the build says so once
-            local _, said = run({"build"}, in_ws, 0, "demo.app: built", "demo.tool: compiled")
+            local _, said = run({"build"}, in_ws, 0, "demo.app: Built '",
+                "demo.tool: Compiled 15 modules as a library")
             local times = 0
             for _ in said:gmatch("Using the override for package 'acme%.json'") do
                 times = times + 1
@@ -1766,16 +1774,17 @@ task("test")
                 .. '\n'
                 .. '    override beta.tools "../missing";\n}\n')
             run({"override", "add", "acme.json", "../json"}, in_ws, 0,
-                "Replaced the override for package 'acme.json': now ../json")
+                "Replaced the override for package 'acme.json': now '../json'")
             expect_file("replace", '// local checkouts\noverrides {\n'
                 .. '    override acme.json "../json";  // wrong on purpose\n'
                 .. '\n'
                 .. '    override beta.tools "../missing";\n}\n')
 
             -- list reports a valid target and an invalid one, with the reason for the invalid one
-            local _, listed = run({"override", "list"}, in_ws, 0, "acme.json -> ../json",
-                "beta.tools -> ../missing", "not usable", "there is no ens.package manifest at")
-            if listed:find("acme.json -> ../json (", 1, true) then
+            local _, listed = run({"override", "list"}, in_ws, 0, "'acme.json' -> '../json'",
+                "'beta.tools' -> '../missing'", "not usable",
+                "there is no ens.package manifest at")
+            if listed:find("'acme.json' -> '../json' (", 1, true) then
                 table.insert(failures, string.format("a usable override was reported with a "
                     .. "reason:\n%s", listed))
             end
@@ -1790,7 +1799,7 @@ task("test")
             -- workspace, so running from a subfolder still records one path
             os.mkdir(path.join(ws_dir, "notes"))
             run({"override", "add", "acme.json", "../../json"},
-                {curdir = path.join(ws_dir, "notes"), envs = env}, 0, "now ../json")
+                {curdir = path.join(ws_dir, "notes"), envs = env}, 0, "now '../json'")
             expect_file("from a subfolder", '// local checkouts\noverrides {\n'
                 .. '    override acme.json "../json";  // wrong on purpose\n'
                 .. '\n}\n')
@@ -1812,6 +1821,18 @@ task("test")
             io.writefile(path.join(plain, "ens.overrides"), 'workspace {\n    member "x";\n}\n')
             run({"override", "list"}, {curdir = plain, envs = env}, 1,
                 "does not hold an overrides declaration")
+
+            -- a file that does not parse is one problem sentence of the command's own, with the
+            -- reading's own diagnostic under it at the line and column it is about
+            local unreadable = path.join(root, "unreadable")
+            os.mkdir(unreadable)
+            io.writefile(path.join(unreadable, "ens.package"),
+                'package demo.unreadable {\n    ens "0.1";\n}\n')
+            io.writefile(path.join(unreadable, "ens.overrides"), 'overrides {\n    nonsense\n')
+            run({"override", "list"}, {curdir = unreadable, envs = env}, 1,
+                "ens: '", "ens.overrides' cannot be read. Fix the file by hand before editing it "
+                    .. "with 'ens override'",
+                "ens.overrides:2:5: error: ")
 
             if #failures == 0 then
                 return {name = name, ok = true}
@@ -2037,11 +2058,15 @@ task("test")
             end
 
             -- the first build fetches, locks, links, and the program runs against the
-            -- transitively raised beta.utils 1.1. The tag listing is read, never shown.
-            run({"build", "."}, in_app, 0,
-                "Fetched alex.json 1.0 from " .. url_json .. " (tag 1.0)",
-                "Fetched acme.tools 1.0",
-                "Fetched beta.utils 1.1",
+            -- transitively raised beta.utils 1.1. The tag listing is read, never shown, and a
+            -- verbose run says which step each wait is on.
+            run({"build", ".", "-v"}, in_app, 0,
+                "Settling 3 packages",
+                "Listing the tags at '" .. url_json .. "'",
+                "Fetching the tag '1.0' of 'alex.json' from '" .. url_json .. "'",
+                "Fetched 'alex.json' 1.0 from '" .. url_json .. "' (tag '1.0')",
+                "Fetched 'acme.tools' 1.0",
+                "Fetched 'beta.utils' 1.1",
                 "Updated ens.lock: locked acme.tools 1.0, locked alex.json 1.0, "
                     .. "locked beta.utils 1.1",
                 "!refs/tags/")
@@ -2080,11 +2105,11 @@ task("test")
             -- a locked build asks the network nothing: the repositories are gone and it still
             -- reproduces, with the lock untouched
             os.mv(repos, repos .. ".away")
-            run({"build", "."}, in_app, 0, "gitapp: built", "!Fetched", "!Updated ens.lock")
+            run({"build", "."}, in_app, 0, "gitapp: Built '", "!Fetched", "!Updated ens.lock")
             if lock_text() ~= locked then
                 table.insert(failures, "a build that fetched nothing rewrote ens.lock")
             end
-            run({"build", ".", "--offline"}, in_app, 0, "gitapp: built", "!Fetched")
+            run({"build", ".", "--offline"}, in_app, 0, "gitapp: Built '", "!Fetched")
             run({"check", ".", "--offline", "--locked"}, in_app, 0, "nothing to report")
 
             -- a cold cache under --offline fails by name, and says how to fix it
@@ -2106,7 +2131,7 @@ task("test")
             -- the update fetches the raised version through its annotated 'v' tag and says what
             -- changed and nothing more
             run({"build", "."}, in_app, 0,
-                "Fetched alex.json 1.1 from " .. url_json .. " (tag v1.1)",
+                "Fetched 'alex.json' 1.1 from '" .. url_json .. "' (tag 'v1.1')",
                 "Updated ens.lock: updated alex.json 1.0 -> 1.1", "!locked beta.utils")
             run_program(path.join(app, "gitapp" .. exe_suffix), 0, "json 1.1 | tools(utils 1.1)")
             if not lock_text():find("package alex.json 1.1", 1, true) then
@@ -2138,7 +2163,7 @@ task("test")
                 'main() -> int {\n    return 0;\n}\n')
             run({"build", "."}, {curdir = spanning, envs = withCache(cache)}, 1,
                 "the requirements on package 'beta.utils' span major versions",
-                'requires "1.1"', 'requires "2.0"',
+                "requires '1.1'", "requires '2.0'",
                 "one of the two requirements has to change")
 
             -- every package has to agree on where a dependency comes from
@@ -2174,7 +2199,7 @@ task("test")
                 'import @ws.core.api;\n\nmain() -> int {\n    print(api.describe());\n'
                 .. '    return 0;\n}\n')
             run({"build", "."}, {curdir = using_ws, envs = withCache(cache)}, 0,
-                "Fetched ws.core 1.0")
+                "Fetched 'ws.core' 1.0")
             run_program(path.join(using_ws, "wsapp" .. exe_suffix), 0, "core(extra)")
             local ws_lock = (io.readfile(path.join(using_ws, "ens.lock")) or "")
             if not ws_lock:find("package ws.core 1.0", 1, true) then
@@ -2214,7 +2239,7 @@ task("test")
                 'import @rt.pkg.thing;\n\nmain() -> int {\n    print(thing.tag());\n'
                 .. '    return 0;\n}\n')
             local in_retag = {curdir = using_retag, envs = withCache(cache)}
-            run({"build", "."}, in_retag, 0, "Fetched rt.pkg 1.0")
+            run({"build", "."}, in_retag, 0, "Fetched 'rt.pkg' 1.0")
             run_program(path.join(using_retag, "retag" .. exe_suffix), 0, "retag 1")
             io.writefile(path.join(retag_dir, "src", "thing.ens"),
                 'export tag() -> string {\n    return "retag 2";\n}\n')
@@ -2337,7 +2362,7 @@ task("test")
             io.writefile(path.join(app, "src", "main.ens"),
                 'main() -> int {\n    print("prebuilt linked");\n    return 0;\n}\n')
             local in_app = {curdir = app, envs = withCache(cache)}
-            run({"build", "."}, in_app, 0, "prebuilt: built")
+            run({"build", "."}, in_app, 0, "prebuilt: Built '")
             run_program(path.join(app, "prebuilt" .. exe_suffix), 0, "prebuilt linked")
             local stored = path.join(cache, "artifacts", good:gsub("^sha256:", ""), "extras.lib")
             if not os.isfile(stored) then
@@ -2359,7 +2384,7 @@ task("test")
             end
 
             -- and it stays current: a second build changes nothing, and '--locked' is satisfied
-            run({"build", ".", "--locked"}, in_app, 0, "prebuilt: built",
+            run({"build", ".", "--locked"}, in_app, 0, "prebuilt: Built '",
                 "!ens.lock no longer matches")
             if ((io.readfile(only_lock) or ""):gsub("\r\n", "\n")) ~= locked_text then
                 table.insert(failures, "a second artifact-only build rewrote ens.lock")
@@ -2367,7 +2392,7 @@ task("test")
 
             -- a cached library needs no network, even with the file it came from gone
             os.mv(files, files .. ".away")
-            run({"build", ".", "--offline"}, in_app, 0, "prebuilt: built")
+            run({"build", ".", "--offline"}, in_app, 0, "prebuilt: Built '")
             run({"build", ".", "--offline"}, {curdir = app, envs = withCache(cold)}, 1,
                 "'--offline' forbids downloading the prebuilt library for native 'extras'",
                 "without '--offline'")
@@ -2426,7 +2451,7 @@ task("test")
             io.writefile(path.join(capitals, "src", "main.ens"),
                 'main() -> int {\n    print("capitals linked");\n    return 0;\n}\n')
             run({"build", "."}, {curdir = capitals, envs = withCache(cache)}, 0,
-                "capitals: built")
+                "capitals: Built '")
             run_program(path.join(capitals, "capitals" .. exe_suffix), 0, "capitals linked")
 
             -- the lock records the bindings of the build's own package and of every fetched one,
@@ -2463,7 +2488,7 @@ task("test")
                 'import @art.dep.dep;\n\nmain() -> int {\n    print(dep.tag());\n'
                 .. '    return 0;\n}\n')
             run({"build", "."}, {curdir = recorded, envs = withCache(cache)}, 0,
-                "Fetched art.dep 1.0", "Updated ens.lock: locked art.dep 1.0")
+                "Fetched 'art.dep' 1.0", "Updated ens.lock: locked art.dep 1.0")
             run_program(path.join(recorded, "lockapp" .. exe_suffix), 0, "dep with a prebuilt library")
             local lock = ((io.readfile(path.join(recorded, "ens.lock")) or ""):gsub("\r\n", "\n"))
             local own = "root demo.lockapp\n"
@@ -2496,7 +2521,8 @@ task("test")
             io.writefile(path.join(ws, "member", "src", "main.ens"),
                 'import @art.dep.dep;\n\nmain() -> int {\n    print(dep.tag());\n'
                 .. '    return 0;\n}\n')
-            run({"build", "."}, {curdir = ws, envs = withCache(cache)}, 0, "demo.member: built")
+            run({"build", "."}, {curdir = ws, envs = withCache(cache)}, 0,
+                "demo.member: Built '")
             run_program(member_artifact(ws, "member"), 0, "dep with a prebuilt library")
             local ws_lock = ((io.readfile(path.join(ws, "ens.lock")) or ""):gsub("\r\n", "\n"))
             local recorded_member = "member demo.member\n"
@@ -2513,7 +2539,7 @@ task("test")
                     "a workspace's lock named a root package:\n%s", ws_lock))
             end
             run({"build", ".", "--locked"}, {curdir = ws, envs = withCache(cache)}, 0,
-                "demo.member: built", "!ens.lock no longer matches")
+                "demo.member: Built '", "!ens.lock no longer matches")
             if ((io.readfile(path.join(ws, "ens.lock")) or ""):gsub("\r\n", "\n")) ~= ws_lock then
                 table.insert(failures, "a second build rewrote the member's lock")
             end
@@ -2645,7 +2671,7 @@ task("test")
             -- for, and the command line reaches it exactly as it was written here, spaces and all
             local spaced_out = path.join(root, "spaced out.exe")
             run(host_exe, {"build", pkg, "--output", spaced_out, "-v"}, chains, 0,
-                "written for Ens 9.9", hopped_to, "built")
+                "written for Ens 9.9", hopped_to, ": Built '")
             run_program(spaced_out, 0, "built by a delegate")
 
             -- the exit code of the toolchain that did the work is this command's own
@@ -2658,45 +2684,45 @@ task("test")
             -- name that is not installed instead of ignoring it
             local by_option = path.join(root, "by option.exe")
             run(host_exe, {"build", hello, "--output", by_option, "--toolchain", "9.9", "-v"},
-                chains, 0, "'--toolchain 9.9'", hopped_to, "built")
+                chains, 0, "'--toolchain 9.9'", hopped_to, ": Built '")
             run_program(by_option, 0, "Hello, world!")
             run(host_exe, {"build", hello, "--toolchain", "9.9"}, nothing_installed, 2,
-                "'--toolchain 9.9'", "holds no toolchain at all", "ask for 'local'",
+                "'--toolchain 9.9'", "holds no toolchain at all", "name 'local'",
                 slashed(path.join(empty, "9.9", "ens" .. exe_suffix)))
 
             -- both ways of keeping the work here
             run(host_exe, {"build", pkg, "--output", path.join(root, "kept.exe"), "-v",
-                "--toolchain", "local"}, chains, 0, "built", not_hopped)
+                "--toolchain", "local"}, chains, 0, ": Built '", not_hopped)
             run(host_exe, {"build", pkg, "--output", path.join(root, "pinned.exe"), "-v"},
-                {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "local"}, 0, "built", not_hopped)
+                {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "local"}, 0, ": Built '", not_hopped)
 
             -- ENS_TOOLCHAIN is the option's environment spelling, and the option wins over it
             run(host_exe, {"build", hello, "--output", path.join(root, "by variable.exe"), "-v"},
                 {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "9.9"}, 0, "ENS_TOOLCHAIN=9.9",
-                hopped_to, "built")
+                hopped_to, ": Built '")
             run(host_exe, {"build", hello, "--output", path.join(root, "overridden.exe"), "-v",
                 "--toolchain", "local"}, {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "9.9"}, 0,
-                "built", not_hopped)
+                ": Built '", not_hopped)
 
             -- a version declared but not installed is what a manifest's declaration has always
             -- been: a statement, not a requirement. It builds here, and says so only when asked.
             local anyway = path.join(root, "anyway.exe")
             run(host_exe, {"build", pkg, "--output", anyway, "-v"}, nothing_installed, 0,
                 "written for Ens 9.9", "holds no toolchain at all", "this toolchain is building it",
-                "built")
+                ": Built '")
             run_program(anyway, 0, "built by a delegate")
             run(host_exe, {"build", pkg, "--output", path.join(root, "quiet.exe")},
-                nothing_installed, 0, "built", "!9.9")
+                nothing_installed, 0, ": Built '", "!9.9")
 
             -- the loop guard, from the delegate's side: the copy sees the very declaration that
             -- reached it and asks for 9.9 outright, and still does the work itself
             run(installed_exe, {"build", pkg, "--output", path.join(root, "guarded.exe"), "-v",
                 "--toolchain", "9.9"}, {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "local"}, 0,
-                "ENS_TOOLCHAIN=local", "built", not_hopped)
+                "ENS_TOOLCHAIN=local", ": Built '", not_hopped)
 
             -- and from outside: one hop is all there is, however the chain starts
             local _, chained = run(installed_exe, {"build", pkg, "--output",
-                path.join(root, "once.exe"), "-v"}, chains, 0, "built")
+                path.join(root, "once.exe"), "-v"}, chains, 0, ": Built '")
             local hops = 0
             local at = 1
             while true do
@@ -2717,7 +2743,7 @@ task("test")
             run(host_exe, {"run", pkg, "-v"}, chains, 0, hopped_to, "built by a delegate")
             run(host_exe, {"run", pkg, "-v", "--toolchain", "local"}, chains, 0,
                 "built by a delegate", not_hopped)
-            run(host_exe, {"test", pkg, "-v"}, chains, 0, hopped_to, "there are no tests in")
+            run(host_exe, {"test", pkg, "-v"}, chains, 0, hopped_to, "There are no tests in")
             run(host_exe, {"run", hello, "--toolchain", "9.9"}, nothing_installed, 2,
                 "'--toolchain 9.9'", "holds no toolchain at all")
             run(host_exe, {"test", pkg, "--toolchain", "9.9"}, nothing_installed, 2,

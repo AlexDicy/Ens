@@ -37,18 +37,21 @@ export enum BuildOutcome {
     Failed,
 }
 
-// What building one unit came to.
+// What building one unit came to. Its problems come in two kinds, and a unit reports one of them:
+// diagnostic lines already name the file and position they are about, or what another tool wrote,
+// while sentences are the build's own words and print under the 'ens: ' prefix.
 export final class UnitReport {
     BuildOutcome result;
     Path producedArtifact;
-    string[] problemLines;
+    string[] diagnosticLines;
+    string[] sentenceLines;
     long modules;
     long objects;
     string[] account;
     string[] noticeLines;
 
-    protected constructor(this.result, this.producedArtifact, this.problemLines, this.modules,
-                this.objects, this.account, this.noticeLines);
+    protected constructor(this.result, this.producedArtifact, this.diagnosticLines,
+                this.sentenceLines, this.modules, this.objects, this.account, this.noticeLines);
 
     export outcome() -> BuildOutcome {
         return this.result;
@@ -59,8 +62,16 @@ export final class UnitReport {
         return this.producedArtifact;
     }
 
-    export problems() -> string[] {
-        return this.problemLines;
+    export diagnostics() -> string[] {
+        return this.diagnosticLines;
+    }
+
+    export sentences() -> string[] {
+        return this.sentenceLines;
+    }
+
+    export problemCount() -> long {
+        return this.diagnosticLines.length + this.sentenceLines.length;
     }
 
     export moduleCount() -> long {
@@ -89,7 +100,7 @@ export run(FileLoader loader, BuildOptions options, Packaging packaging, BuildTa
     if (resolved.kind() == TargetKind.Workspace) {
         return runWorkspace(loader, options, packaging, resolved, reporter);
     }
-    reporter.step("building for {options.targetTriple()}");
+    reporter.step("Building for '{options.targetTriple()}'");
     return runUnit(loader, options, packaging, program.unitOf(resolved), resolved.artifactName(),
         options.output(), discoverToolchain(options), reporter, 1, 1, Path(""));
 }
@@ -112,10 +123,11 @@ runWorkspace(FileLoader loader, BuildOptions options, Packaging packaging, Build
     }
     WorkspaceMember[] members = order.members();
     if (members.length == 0) {
-        reporter.note("this workspace lists no members, so there is nothing to build");
+        reporter.note("This workspace lists no members, so there is nothing to build");
         return 0;
     }
-    reporter.step("building {members.length} member(s) for {options.targetTriple()}");
+    reporter.step("Building " + report.memberCount(members.length)
+        + " for '{options.targetTriple()}'");
     let toolchain = discoverToolchain(options);
     // A member's program is named after its package, and a workspace's member folder is
     // conventionally named after the program it holds, so the two names are the same one. Keeping a
@@ -140,7 +152,7 @@ runUnit(FileLoader loader, BuildOptions options, Packaging packaging, Unit unit,
         string artifactStem, Path namedOutput, Toolchain toolchain, Reporter reporter,
         long index, long total, Path artifactFolder) -> int {
     string label = report.progress(index, total, unit.label());
-    reporter.step("{label}: reading {unit.sourceFolder()}");
+    reporter.step("{label}: Reading '{unit.sourceFolder()}'");
     let built = buildUnit(loader, options, packaging, unit, artifactStem, namedOutput, toolchain,
         artifactFolder);
     reporter.notices(built.notices());
@@ -153,9 +165,10 @@ runUnit(FileLoader loader, BuildOptions options, Packaging packaging, Unit unit,
 }
 
 reportFailure(Reporter reporter, string label, UnitReport built) -> int {
-    reporter.problems(built.problems());
+    reporter.diagnostics(built.diagnostics());
+    reporter.sentences(built.sentences());
     reporter.problem("{label}: build failed with "
-        + report.problemCount(built.problems().length));
+        + report.problemCount(built.problemCount()));
     return 1;
 }
 
@@ -167,15 +180,17 @@ reportLibrary(Reporter reporter, string label, Unit unit, Path namedOutput,
             + "check it");
         return 2;
     }
-    reporter.note("{label}: compiled {built.moduleCount()} module(s) as a library");
+    reporter.note("{label}: Compiled " + report.moduleCount(built.moduleCount())
+        + " as a library");
     return 0;
 }
 
 reportExecutable(Reporter reporter, string label, UnitReport built) -> int {
-    reporter.problems(built.problems());
-    reporter.step("{label}: emitted {built.objectCount()} object file(s) from "
-        + "{built.moduleCount()} module(s)");
-    reporter.note("{label}: built {built.artifact()}");
+    reporter.diagnostics(built.diagnostics());
+    reporter.sentences(built.sentences());
+    reporter.step("{label}: Emitted " + report.objectCount(built.objectCount()) + " from "
+        + report.moduleCount(built.moduleCount()));
+    reporter.note("{label}: Built '{built.artifact()}'");
     return 0;
 }
 
@@ -195,7 +210,8 @@ export finishUnit(BuildOptions options, Packaging packaging, Loaded loaded, stri
                   Path artifactFolder = Path("")) -> UnitReport {
     let analysis = loaded.analysis();
     if (analysis == null) {
-        return failed(loaded.problems(), loaded.moduleCount(), loaded.notices());
+        return new UnitReport(BuildOutcome.Failed, Path(""), loaded.diagnostics(),
+            loaded.sentences(), loaded.moduleCount(), 0, nothing(), loaded.notices());
     }
     if (!loaded.definesEntry()) {
         return buildLibrary(options, analysis, loaded, artifactStem);
@@ -227,7 +243,7 @@ export finishUnit(BuildOptions options, Packaging packaging, Loaded loaded, stri
         return failed([emitted.failure], loaded.moduleCount(), loaded.notices());
     }
     if (emitted.diagnostics.length > 0) {
-        return failed(diagnostics.formatAll(emitted.diagnostics, loaded.catalog()),
+        return failedWithDiagnostics(diagnostics.formatAll(emitted.diagnostics, loaded.catalog()),
             loaded.moduleCount(), loaded.notices());
     }
     if (emitted.objects.length == 0) {
@@ -252,7 +268,8 @@ export finishUnit(BuildOptions options, Packaging packaging, Loaded loaded, stri
             loaded.notices());
     }
     return new UnitReport(BuildOutcome.BuiltExecutable, output, linkerNoise(linked.output()),
-        loaded.moduleCount(), emitted.objects.length, emitted.account, loaded.notices());
+        nothing(), loaded.moduleCount(), emitted.objects.length, emitted.account,
+        loaded.notices());
 }
 
 // A library is compiled the whole way, object files included, and produces no executable: the point
@@ -270,12 +287,11 @@ buildLibrary(BuildOptions options, ProgramAnalysis analysis, Loaded loaded,
         return failed([emitted.failure], loaded.moduleCount(), loaded.notices());
     }
     if (emitted.diagnostics.length > 0) {
-        return failed(diagnostics.formatAll(emitted.diagnostics, loaded.catalog()),
+        return failedWithDiagnostics(diagnostics.formatAll(emitted.diagnostics, loaded.catalog()),
             loaded.moduleCount(), loaded.notices());
     }
-    string[] clean = [];
-    return new UnitReport(BuildOutcome.ValidatedLibrary, Path(""), clean, loaded.moduleCount(),
-        emitted.objects.length, emitted.account, loaded.notices());
+    return new UnitReport(BuildOutcome.ValidatedLibrary, Path(""), nothing(), nothing(),
+        loaded.moduleCount(), emitted.objects.length, emitted.account, loaded.notices());
 }
 
 // Everything this machine contributes to a link for the target, looked up once for the whole
@@ -398,9 +414,10 @@ export objectsFolderFor(BuildOptions options) -> Path {
     return configured.join("O" + settings.levelText(options.codegen().optimizationLevel()));
 }
 
-// Anything the linker printed on a link that still succeeded, which is worth passing on unchanged. The
-// linker ends what it prints with a line break and the reporter ends every line it writes with one,
-// so the linker's is dropped rather than shown as a blank line.
+// Anything the linker printed on a link that still succeeded, which is worth passing on unchanged
+// and so goes in the report's diagnostic lines rather than its sentences. The linker ends what it
+// prints with a line break and the reporter ends every line it writes with one, so the linker's is
+// dropped rather than shown as a blank line.
 public linkerNoise(string reported) -> string[] {
     string text = reported.trim();
     if (text.length == 0) {
@@ -463,13 +480,24 @@ ignoreEverythingIn(Path folder) {
     try file.writeText("*\n");
 } catch (FileSystemError refused) { }
 
-// A unit that never reached an artifact, for the problems a caller found in it before a build did.
-export failedUnit(string[] problems, long moduleCount, string[] notices) -> UnitReport {
-    return failed(problems, moduleCount, notices);
+// A unit that never reached an artifact, for a sentence a caller found in it before a build did.
+export failedUnit(string[] sentences, long moduleCount, string[] notices) -> UnitReport {
+    return failed(sentences, moduleCount, notices);
 }
 
-failed(string[] problems, long moduleCount, string[] notices) -> UnitReport {
-    string[] nothing = [];
-    return new UnitReport(BuildOutcome.Failed, Path(""), problems, moduleCount, 0, nothing,
-        notices);
+// A unit that failed in the build's own words.
+failed(string[] sentences, long moduleCount, string[] notices) -> UnitReport {
+    return new UnitReport(BuildOutcome.Failed, Path(""), nothing(), sentences, moduleCount, 0,
+        nothing(), notices);
+}
+
+// A unit that failed with diagnostics the compiler formatted.
+failedWithDiagnostics(string[] lines, long moduleCount, string[] notices) -> UnitReport {
+    return new UnitReport(BuildOutcome.Failed, Path(""), lines, nothing(), moduleCount, 0,
+        nothing(), notices);
+}
+
+nothing() -> string[] {
+    string[] none = [];
+    return none;
 }

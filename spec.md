@@ -194,7 +194,7 @@ public class Square extends Shape {
 
 Methods are overridable by default. An override must be marked `override` and must match a method declared in a base class; this catches typos and accidental shadowing. Mark a method or a class `final` to forbid overriding or extending it.
 An override also carries the visibility marker of the method it overrides, as the visibility section describes, so `protected override sound()` replaces a `protected sound()`.
-An override's parameter types must match exactly, while its return type may be narrower where a value of it is held the same way: a class, interface, array, string, function or external handle reference, or one of those with its `?` dropped, because both spellings are one pointer.
+An override's parameter types must match exactly, while its return type may be narrower where a value of it is held the same way: a class, interface, array, string, function or external handle reference, or one of those with its `?` dropped, because both spellings are one reference.
 A narrower number, a nullable value type with its `?` dropped, and one level dropped from a doubly nullable type are each rejected, because a caller reaching the method through the type that declared it would read the declared shape and find the other one.
 The same rule governs the method a class or a struct provides for an interface requirement.
 `override` on a method that overrides nothing is an error, so the marker always names something real: a base or interface method, or a behavior the language provides for the type, which means `toString`, `hash`, and `equals` for a struct and for a class alike.
@@ -206,7 +206,7 @@ A class with no `toString` override anywhere in its chain answers with its runti
 A generic class renders with its arguments the way diagnostics spell them, such as `Box<int>`.
 A class replaces that default by declaring `override toString() -> string` with a body, under the shape rule below: no parameters, a `string` result, and never `throws`.
 The replacement dispatches from the runtime type, so a subclass's `toString` wins through a base-class-typed or interface-typed reference, and a subclass may override an ancestor's `toString` like any other method.
-A `toString` override cannot be `abstract`: every class already answers with its type name, so there is no text form left unwritten.
+A `toString` override cannot be `abstract`: every class already has a text form, its type's name, so there is no text form left unwritten.
 The name `toString` is reserved for the text form wherever a declaration under it takes no parameters, on a struct and on a class alike: such a declaration must read `override toString() -> string`, and every other shape a parameterless one could have is an error naming that form.
 So a parameterless `toString` that answers something other than a `string`, one that declares `throws`, and one that leaves the marker off are each refused, the last because it would replace the text form the type already has while reading as though it did not.
 A method named `toString` that takes parameters is an ordinary method of either kind, so calls reach it by name, and interpolation holes and the built-in text form do not use it.
@@ -1301,7 +1301,7 @@ The loop calls `makeIterator()` once, then draws values with `next()` until it a
 `next()` answers the value it moved onto, or null once the walk is over, and every call after that answers null too.
 When the element type is itself nullable, `next()` answers a nested optional, so a `null` held by a present result is an element and only an absent result ends the loop.
 A value whose static type is `Iterable<T>` itself, or an interface extending it, can also be iterated.
-Text is not a sequence of its own, so a `string` cannot be iterated directly: a walk over text says which view it reads, and the loop takes the array that view produces.
+Text is not a sequence of its own, so a `string` cannot be iterated directly: a walk over text names the view it reads, and the loop takes the array that view produces.
 
 ```ens
 import Iterable from @std.collections.iterator;

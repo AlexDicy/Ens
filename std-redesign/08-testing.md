@@ -15,8 +15,12 @@ export class TestFailure extends Error {
 export assertEqual<T>(T actual, T expected) throws TestFailure;
 export assertNotEqual<T>(T actual, T expected) throws TestFailure;
 
-export assertTrue(bool condition, string message = "expected condition to be true") throws TestFailure;
-export assertFalse(bool condition, string message = "expected condition to be false") throws TestFailure;
+export assertTrue(bool condition,
+                  string message = "expected the condition to be true, and it was false")
+        throws TestFailure;
+export assertFalse(bool condition,
+                   string message = "expected the condition to be false, and it was true")
+        throws TestFailure;
 
 export noreturn fail(string message) throws TestFailure;
 
