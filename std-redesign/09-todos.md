@@ -2,11 +2,6 @@
 
 Every item names when it is done: a milestone of 10-migration-plan.md, a phase, or the work that follows the redesign.
 
-## Compiler consistency items
-
-One consistency item is left from the C4 and pre-C5 work, independent of the library migration, so it waits on nothing and blocks nothing.
-A bare function reference stored into a local with no declared type, `let callback = twice;`, passes sema and then fails in codegen with "does not support a local of type '<error>' yet" (found 2026-09-08, no imports involved); an accepted program that cannot be compiled is a soundness matter, so it does not wait for the diagnostics review.
-
 ## Limits the process work accepts
 
 A child is owned by one thread at a time until the threaded runtime gives it a lock or a documented single-owner rule.
@@ -109,6 +104,21 @@ When `@std.time` is designed, `Metadata.modifiedMillis` and `wait(long timeoutMi
 `nearestDouble` allocates a digit buffer and a reading on every call, which the libc conversion it replaced did not, so a program parsing millions of doubles in a loop would notice.
 The remedy when it matters is a fast path in front of the same rounding for the short inputs that need no buffer, and a buffer the conversion reuses.
 
+Four user-facing messages are weaker than the rules in AGENTS.md ask for, all found while the name-as-value work landed on 2026-09-21.
+`No field '<name>' on type '<type>'.` names the problem and offers no fix, and it now has a pin in `tests/name_as_value_errors.ens`, so rewording it moves a pin rather than going unmeasured.
+The cross-package member refusal ends "Mark it 'export' to use it from another package." without naming the module to mark it in, while the sibling message for a top-level function does say "in module '<path>'".
+So a writer who does not own that package cannot tell from the text where the fix belongs.
+A module-qualified function name used as a value reports "Module 'renderer' has no type named 'configure'" even when `configure` exists and is public, which is false, and it answers a question about a function with a sentence about types.
+Fixing it means separating three causes in `analyzeNamespaceMemberType`: a name that exists and is reachable, one that exists and is private, and one that does not exist, with `types.notVisibleMessage` carrying the private case.
+The instance-method-as-value message states the fact before the fix, "'bump' is a method of 'Counter', and a method's name is not a value. Call it as 'bump(...)'.", while the pre-existing static sibling does not, "Static method 'make' of 'Counter' must be called; write 'Counter.make(...)'.", so the family converges when either one next moves.
+
+A parenthesized left side of `=` skips the const-field rule, because `analyzeAssignment` keys `checkConstFieldWrite` on the target node being a member expression (verified identical before and after 2fb2f32, so it predates that work).
+`(this.value) = 99;` inside the declaring constructor and `(held.value) = 99;` from outside it both report "The left side of '=' must be a variable, field, or array element." and nothing about const.
+That message is also false on its own terms there, since the left side is a field in parentheses, so the rule and the wording are one item.
+
+The sema test suite's stand-in `@std.core` declares `Error.message` without `const`, while `libs/std/src/core.ens` declares it `export const string message` on an abstract class.
+So a test program that assigns that field through a subclass constructor is clean against the stand-in and refused against the real library, which is how a fixture carried a second problem nobody saw until it was checked against `libs` (2026-09-21).
+
 ## The language server's replacement
 
 The current C++ server is temporary; these are carried to its replacement rather than fixed in it.
@@ -124,6 +134,8 @@ It lacks the compiler's dedicated function-value and array-element interpolation
 It reports "Imported name 'Comparable' conflicts with an existing declaration" for `import Comparable from @std.core;`, because an implicitly imported name is bound before explicit imports and the two are treated as rival declarations rather than the same one; the compiler accepts the redundant import.
 It checks no struct conformance, so a struct that implements an interface without providing a requirement, or provides one whose signature does not match, is reported by the compiler alone.
 It also lacks the conformance hint the compiler appends when a struct or a primitive flows into an interface-typed slot, so its message stops at "Cannot assign value of type 'Note' to variable of type 'Speaker'".
+It resolves a constructor's `this.field` shorthand with a plain `findFieldIndex` at `lsp/frontend/semantic/Analyzer.cpp:3613`, and `analyzeImplicitConstructorAssignments` at line 3762 does the same, so it accepts two shorthands the compiler refuses as of 3ba7b80 and a53a21a: one binding a private base field, and one binding a field that is public in another package.
+It runs no `checkMemberAccess` on that path, though it has one at line 5375 for ordinary member expressions, so the fix there is the same shape as the compiler's (2026-09-21).
 
 ## Reminders
 
