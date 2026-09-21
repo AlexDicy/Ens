@@ -975,3 +975,154 @@ test "two types spelled alike are distinguished by the names their file bound" {
     try sema_support.assertMentions(analysis.bodyDiagnostics(),
         "Cannot assign value of type 'SizeKind' to variable of type 'int'");
 }
+
+// A function's name stands for no value, so every position that writes a value refuses it. The
+// suggested fix declares the function type a lambda calling that function fits.
+test "a function's name is not a value in any position" {
+    let analysis = try analyzeOne("twice(int value) -> int \{\n"
+        + "    return value * 2;\n"
+        + "\}\n"
+        + "applies((int) -> int f, int value) -> int \{\n"
+        + "    return f(value);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let untyped = twice;\n"
+        + "    (int) -> int declared = twice;\n"
+        + "    let passed = applies(twice, 3);\n"
+        + "    twice = 4;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string refused = "'twice' is a function, and a function's name is not a value. Call it as "
+        + "'twice(...)', or hold a lambda in a declared function type, as in "
+        + "'(int) -> int callback = (value) -> twice(value);'.";
+    for (long i = 0; i < 4; i++) {
+        try sema_support.assertDiagnostic(reported, i, "/proj/src/main.ens", refused);
+    }
+    try testing.assertEqual(reported.length, 4L);
+}
+
+// The suggested declaration spells the function's own type, so it carries the 'throws' list and
+// the 'try' a call to a raising function needs.
+test "the suggested function type carries the throws list" {
+    let analysis = try analyzeOne("risky(int value) -> int throws Error \{\n"
+        + "    if (value < 0) \{\n"
+        + "        throw new Error(\"negative\");\n"
+        + "    \}\n"
+        + "    return value;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let held = risky;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertDiagnostic(analysis.bodyDiagnostics(), 0, "/proj/src/main.ens",
+        "'risky' is a function, and a function's name is not a value. Call it as 'risky(...)', "
+        + "or hold a lambda in a declared function type, as in '((int) -> int throws Error) "
+        + "callback = (value) -> try risky(value);'.");
+    try testing.assertEqual(analysis.bodyDiagnostics().length, 1L);
+}
+
+// One function type has to cover the name for the fix to spell one, and a name several
+// declarations share, a generic, and a 'throws' whose types the body decides leave none.
+test "a function name no one function type covers is refused without a declaration" {
+    let analysis = try analyzeOne("overloaded(int value) -> int \{\n"
+        + "    return value;\n"
+        + "\}\n"
+        + "overloaded(string value) -> string \{\n"
+        + "    return value;\n"
+        + "\}\n"
+        + "kept<T>(T value) -> T \{\n"
+        + "    return value;\n"
+        + "\}\n"
+        + "inferred(int value) -> int throws \{\n"
+        + "    if (value < 0) \{\n"
+        + "        throw new Error(\"negative\");\n"
+        + "    \}\n"
+        + "    return value;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let a = overloaded;\n"
+        + "    let b = kept;\n"
+        + "    let c = inferred;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string[] named = ["overloaded", "kept", "inferred"];
+    for (long i = 0; i < named.length; i++) {
+        try sema_support.assertDiagnostic(reported, i, "/proj/src/main.ens",
+            "'{named[i]}' is a function, and a function's name is not a value. Call it as "
+            + "'{named[i]}(...)', or hold a lambda in a declared function type.");
+    }
+    try testing.assertEqual(reported.length, 3L);
+}
+
+// A module name only qualifies what the module declares. The message names the module the way
+// the file does, the last segment of its path or the alias an import bound it to.
+test "a module's name is not a value" {
+    let loader = new FakeFileLoader();
+    aliasingLibrary(loader);
+    loader.add("/proj/src/main.ens",
+        "import lib.colors;\n"
+        + "import lib.sizes as sizing;\n"
+        + "main() -> int \{\n"
+        + "    let named = colors;\n"
+        + "    let aliased = sizing;\n"
+        + "    return sizing.measure(new sizing.Ruler(2));\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "'colors' names a module, not a value. A module name reaches what the module declares, "
+        + "as in 'colors.member(...)'.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "'sizing' names a module, not a value. A module name reaches what the module declares, "
+        + "as in 'sizing.member(...)'.");
+    try testing.assertEqual(reported.length, 2L);
+}
+
+// A method is reached by calling it, through 'this', through a value, or through '?.'. The name
+// on its own is refused in each of the three, and a write to it is refused as a write.
+test "a method's name is not a value" {
+    let analysis = try analyzeOne("public class Counter \{\n"
+        + "    int count;\n"
+        + "\n"
+        + "    public constructor() \{\n"
+        + "        this.count = 0;\n"
+        + "    \}\n"
+        + "\n"
+        + "    public bump(int by) -> int \{\n"
+        + "        this.count = this.count + by;\n"
+        + "        return this.count;\n"
+        + "    \}\n"
+        + "\n"
+        + "    public readsItsOwn() \{\n"
+        + "        let held = this.bump;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let counter = new Counter();\n"
+        + "    let named = counter.bump;\n"
+        + "    Counter? maybe = counter;\n"
+        + "    let safe = maybe?.bump;\n"
+        + "    counter.bump = 3;\n"
+        + "    maybe?.bump = 3;\n"
+        + "    (counter.bump) = 3;\n"
+        + "    return counter.bump(1);\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string refused = "'bump' is a method of 'Counter', and a method's name is not a value. Call "
+        + "it as 'bump(...)'.";
+    for (long i = 0; i < 3; i++) {
+        try sema_support.assertDiagnostic(reported, i, "/proj/src/main.ens", refused);
+    }
+    try sema_support.assertDiagnostic(reported, 3, "/proj/src/main.ens",
+        "'bump' is a method of 'Counter', so it cannot be assigned.");
+    // A '?.' and a parenthesized left side each report the left side alone, so the count holds
+    // the method to one diagnostic on those two lines rather than two.
+    for (long i = 4; i < 6; i++) {
+        try sema_support.assertDiagnostic(reported, i, "/proj/src/main.ens",
+            "The left side of '=' must be a variable, field, or array element.");
+    }
+    try testing.assertEqual(reported.length, 6L);
+}

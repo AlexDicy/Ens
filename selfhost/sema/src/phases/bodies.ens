@@ -326,6 +326,14 @@ class MissingMember extends MemberLookup {
     protected constructor();
 }
 
+// Where a member access appears, which decides what a method under its name is reported as. The
+// expression around a covered access reports that method itself.
+enum MemberPosition {
+    Read,
+    Write,
+    Covered,
+}
+
 class BodyChecker implements NoreturnCalls {
     ModuleContext context;
     Map<string, ModuleContext> contextsByPath;
@@ -3363,7 +3371,8 @@ class BodyChecker implements NoreturnCalls {
                 }
                 return local.binding.type();
             },
-            is FunctionName ignored -> {
+            is FunctionName functions -> {
+                this.reportFunctionAsValue(name, functions.entries, node.name().span());
                 return this.store.errorType();
             },
             is TypeName named -> {
@@ -3371,6 +3380,7 @@ class BodyChecker implements NoreturnCalls {
                 return this.store.errorType();
             },
             is NamespaceName ignored -> {
+                this.reportModuleAsValue(name, node.name().span());
                 return this.store.errorType();
             },
         }
@@ -3380,6 +3390,55 @@ class BodyChecker implements NoreturnCalls {
         this.reporter.report("'{name}' is a type, not a value. A type name reaches a static "
             + "member, as in '{name}.member(...)'; to work with an instance, construct one or "
             + "name one.", at);
+    }
+
+    reportFunctionAsValue(string name, List<FunctionEntry> entries, Span at) {
+        string message = "'{name}' is a function, and a function's name is not a value. Call it "
+            + "as '{name}(...)', or hold a lambda in a declared function type";
+        let example = this.lambdaDeclarationFor(name, entries);
+        if (example == null) {
+            this.reporter.report(message + ".", at);
+            return;
+        }
+        this.reporter.report(message + ", as in '{example}'.", at);
+    }
+
+    reportModuleAsValue(string name, Span at) {
+        this.reporter.report("'{name}' names a module, not a value. A module name reaches what "
+            + "the module declares, as in '{name}.member(...)'.", at);
+    }
+
+    // A declaration holding a lambda that calls the named function, or null when the name has no
+    // one function type to write. Several overloads, a generic, an 'out' parameter, and a
+    // 'throws' whose types the body decides each leave none.
+    lambdaDeclarationFor(string name, List<FunctionEntry> entries) -> string? {
+        if (entries.length() != 1) {
+            return null;
+        }
+        let signature = entries.get(0).signature();
+        Type[] thrown = signature.throwsTypes();
+        if (signature.isGeneric() || (signature.declaresThrows() && thrown.length == 0)) {
+            return null;
+        }
+        let parameterTypes = new List<Type>();
+        let passed = new StringBuilder();
+        for (let parameter in signature.parameters()) {
+            if (parameter.isOut()) {
+                return null;
+            }
+            if (parameterTypes.length() > 0) {
+                passed.append(", ");
+            }
+            parameterTypes.push(parameter.type());
+            passed.append(parameter.name());
+        }
+        string typeText = this.names.of(this.store.functionOf(parameterTypes.toArray(),
+            signature.returnType(), thrown));
+        string arguments = passed.toString();
+        if (thrown.length > 0) {
+            return "({typeText}) callback = ({arguments}) -> try {name}({arguments});";
+        }
+        return "{typeText} callback = ({arguments}) -> {name}({arguments});";
     }
 
     // The enclosing type's name when it declares a static under the given name, for the
@@ -3843,6 +3902,34 @@ class BodyChecker implements NoreturnCalls {
         }
     }
 
+    // Analyzes the left side of a write. A member access that is the left side itself takes the
+    // write position. One under a '?.' or inside parentheses is covered, because those left
+    // sides carry the message that they cannot be assigned.
+    analyzeWriteTarget(Expression target, MemberPosition position = MemberPosition.Write)
+            -> Type {
+        switch (target) {
+            is MemberExpressionNode member -> {
+                Type analyzed = this.analyzeMemberValue(member, position);
+                this.result.setType(member.green(), analyzed);
+                return analyzed;
+            },
+            is SafeMemberExpressionNode member -> {
+                Type analyzed = this.analyzeSafeMemberValue(member, MemberPosition.Covered);
+                this.result.setType(member.green(), analyzed);
+                return analyzed;
+            },
+            is ParenthesizedExpressionNode parenthesized -> {
+                Type analyzed = this.analyzeWriteTarget(parenthesized.inner(),
+                    MemberPosition.Covered);
+                this.result.setType(parenthesized.green(), analyzed);
+                return analyzed;
+            },
+            default -> {
+                return this.analyzeExpression(target);
+            },
+        }
+    }
+
     analyzeAssignment(AssignmentExpressionNode node) -> Type {
         // A plain `x = ...` is a definite assignment of x, so its own identifier on the left is
         // a write, not a read to check. A compound `x += ...` reads x first, and a member or
@@ -3856,7 +3943,7 @@ class BodyChecker implements NoreturnCalls {
                 this.assignmentTarget = resolved.binding;
             }
         }
-        Type targetType = this.analyzeExpression(target);
+        Type targetType = this.analyzeWriteTarget(target);
         this.assignmentTarget = previousTarget;
         if (!this.isLValue(node.target())) {
             this.reporter.report("The left side of '=' must be a variable, field, or array "
@@ -4843,7 +4930,10 @@ class BodyChecker implements NoreturnCalls {
         }
     }
 
-    analyzeMemberValue(MemberExpressionNode node) -> Type {
+    // A covered access reports no method here. A call is covered because it takes the method
+    // this resolves to from the side table this sets.
+    analyzeMemberValue(MemberExpressionNode node, MemberPosition position = MemberPosition.Read)
+            -> Type {
         let object = node.object();
         string name = node.member().text();
         if (object is IdentifierExpressionNode) {
@@ -4946,6 +5036,9 @@ class BodyChecker implements NoreturnCalls {
                         node.member().span());
                 }
                 this.result.setMethod(node.green(), found.candidates.get(0));
+                if (position != MemberPosition.Covered) {
+                    this.reportMethodAsValue(name, core, position, node.member().span());
+                }
                 return this.store.errorType();
             },
             is MissingMember ignored -> {
@@ -4960,6 +5053,16 @@ class BodyChecker implements NoreturnCalls {
                 return this.store.errorType();
             },
         }
+    }
+
+    reportMethodAsValue(string name, Type owner, MemberPosition position, Span at) {
+        string method = "'{name}' is a method of '{this.names.of(owner)}'";
+        if (position == MemberPosition.Write) {
+            this.reporter.report(method + ", so it cannot be assigned.", at);
+            return;
+        }
+        this.reporter.report(method + ", and a method's name is not a value. Call it as "
+            + "'{name}(...)'.", at);
     }
 
     // The C# rule: a static is reachable only through the declaring type's name, so reaching it
@@ -4993,7 +5096,8 @@ class BodyChecker implements NoreturnCalls {
         return false;
     }
 
-    analyzeSafeMemberValue(SafeMemberExpressionNode node) -> Type {
+    analyzeSafeMemberValue(SafeMemberExpressionNode node,
+                                   MemberPosition position = MemberPosition.Read) -> Type {
         Type objectType = this.analyzeExpression(node.object());
         if (objectType is ErrorType) {
             return this.store.errorType();
@@ -5037,6 +5141,9 @@ class BodyChecker implements NoreturnCalls {
                         node.member().span());
                 }
                 this.result.setMethod(node.green(), found.candidates.get(0));
+                if (position != MemberPosition.Covered) {
+                    this.reportMethodAsValue(name, inner, position, node.member().span());
+                }
                 return this.store.errorType();
             },
             is MissingMember ignored -> {
@@ -6094,7 +6201,7 @@ class BodyChecker implements NoreturnCalls {
         if (intercepted != null) {
             return intercepted;
         }
-        Type memberType = this.analyzeMemberValue(member);
+        Type memberType = this.analyzeMemberValue(member, MemberPosition.Covered);
         this.result.setType(member.green(), memberType);
         let method = this.result.methodOf(member.green());
         if (method == null) {
@@ -6142,7 +6249,7 @@ class BodyChecker implements NoreturnCalls {
                 return this.store.errorType();
             }
         }
-        Type memberType = this.analyzeSafeMemberValue(member);
+        Type memberType = this.analyzeSafeMemberValue(member, MemberPosition.Covered);
         this.result.setType(member.green(), memberType);
         let method = this.result.methodOf(member.green());
         if (method == null) {
