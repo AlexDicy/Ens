@@ -118,13 +118,16 @@ When `@std.time` is designed, `Metadata.modifiedMillis` and `wait(long timeoutMi
 `nearestDouble` allocates a digit buffer and a reading on every call, which the libc conversion it replaced did not, so a program parsing millions of doubles in a loop would notice.
 The remedy when it matters is a fast path in front of the same rounding for the short inputs that need no buffer, and a buffer the conversion reuses.
 
-Four user-facing messages are weaker than the rules in AGENTS.md ask for, all found while the name-as-value work landed on 2026-09-21.
-`No field '<name>' on type '<type>'.` names the problem and offers no fix, and it now has a pin in `tests/name_as_value_errors.ens`, so rewording it moves a pin rather than going unmeasured.
-The cross-package member refusal ends "Mark it 'export' to use it from another package." without naming the module to mark it in, while the sibling message for a top-level function does say "in module '<path>'".
-So a writer who does not own that package cannot tell from the text where the fix belongs.
-A module-qualified function name used as a value reports "Module 'renderer' has no type named 'configure'" even when `configure` exists and is public, which is false, and it answers a question about a function with a sentence about types.
-Fixing it means separating three causes in `analyzeNamespaceMemberType`: a name that exists and is reachable, one that exists and is private, and one that does not exist, with `types.notVisibleMessage` carrying the private case.
-The instance-method-as-value message states the fact before the fix, "'bump' is a method of 'Counter', and a method's name is not a value. Call it as 'bump(...)'.", while the pre-existing static sibling does not, "Static method 'make' of 'Counter' must be called; write 'Counter.make(...)'.", so the family converges when either one next moves.
+The four user-facing messages recorded here as weaker than the rules in AGENTS.md ask for were rewritten on 2026-09-21.
+A module-qualified name that names no type of its module now reports what it is, so a function the reading file can reach reads as a function, one it cannot reach reads as the refusal `types.notVisibleMessage` builds, and a name the module declares nothing under reads "'nosuch' is not declared in module 'renderer'".
+The member and the constructor refusal both name the module the fix goes in, "Mark it 'export' in module 'acme.parts' to use it from another package.", which is the clause the top-level function and type refusals already carried.
+"No field 'missing' on type 'Absent'." gained the one fix that is true in every case it fires on, "Drop 'this.' and give the parameter a type, as in 'int missing'.", since a field cannot be declared under a name a method already holds.
+The static-method-as-value message converged on the instance shape, "'make' is a static method of 'Widget', and a method's name is not a value. Call it as 'Widget.make(...)'.".
+Two rules hold across the family now, that a name which is not a value is refused with the fact before the fix and a write to one is refused as a write, and that a visibility refusal names the module the fix goes in on every rung from a top-level function to a constructor.
+The lambda a function-as-value message offers is left out where the reporting file has no name for a type in the signature, because the module-qualified fallback spelling resolves in no file.
+Two questions in the same family are open.
+A static reached through a module-qualified type name, `renderer.Maker.build()`, reports the instance rule and that spelling then fails with "Undefined name 'Maker'", so whether a module-qualified static head is supported at all is undecided.
+A static-as-value message on a bare generic head can spell its fix only as `Holder.make(...)`, which fails when the call cannot infer the type arguments, while `Holder<T>.make(...)` would name a type parameter the use site does not have in scope.
 
 A parenthesized left side of `=` skips the const-field rule, because `analyzeAssignment` keys `checkConstFieldWrite` on the target node being a member expression (verified identical before and after 2fb2f32, so it predates that work).
 `(this.value) = 99;` inside the declaring constructor and `(held.value) = 99;` from outside it both report "The left side of '=' must be a variable, field, or array element." and nothing about const.
@@ -152,6 +155,7 @@ It resolves a constructor's `this.field` shorthand with a plain `findFieldIndex`
 It runs no `checkMemberAccess` on that path, though it has one at line 5378 for ordinary member expressions, so the fix there is the same shape as the compiler's (2026-09-21).
 Its remaining `findFieldIndex` call sites carry no private-base-field exemption, so hover, go-to-definition and rename (`lsp/server/LanguageServer.cpp`) can resolve a name to a private base field that a subclass member shadows, though the sites that report a diagnostic now carry the exemption (2026-09-21).
 It checks no duplicate struct field, so a struct that declares one name twice is reported by the compiler alone, which says "Field 'y' is already declared in 'Pixel'"; its struct field loop at `lsp/frontend/semantic/Analyzer.cpp:1495-1515` pushes every field without the `findFieldIndex` check the class loop makes at line 2023 (2026-09-21).
+Its own copies of three of the messages rewritten on 2026-09-21 keep the weaker wording, the `this.field` shorthand refusal at `lsp/frontend/semantic/Analyzer.cpp:2537` and the cross-package member and constructor refusals at lines 5391 and 5634.
 
 ## Reminders
 
