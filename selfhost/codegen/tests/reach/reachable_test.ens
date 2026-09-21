@@ -1,0 +1,328 @@
+// The walk itself, one test per kind of EIR node that names something. Each program reaches the
+// body under test through the node the test is about and through nothing else, so a node the walk
+// stops reading leaves that body unreached.
+import @std.testing;
+import TestFailure from @std.testing;
+import PrimitiveKind from @ens.sema.model.types;
+import Type from @ens.sema.model.types;
+import EirDynamicEquals from eir.model;
+import EirDynamicHash from eir.model;
+import EirDynamicToString from eir.model;
+import EirInstruction from eir.model;
+import EirRuntimeTypeName from eir.model;
+import eir.walk;
+import ReachedProgram from reach.reachable;
+import reach.reachable;
+import LoweredProgram from support;
+import support;
+
+test "a call names its callee and a call nothing makes names nobody" {
+    let program = try support.lowerWholeProgram(
+        "called() -> int \{\n"
+        + "    return 1;\n"
+        + "\}\n"
+        + "uncalled() -> int \{\n"
+        + "    return called();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return called();\n"
+        + "\}\n");
+    let reached = walked(program);
+    try testing.assertTrue(reached.reaches("main$called"), "the entry point calls 'called'");
+    try testing.assertFalse(reached.reaches("main$uncalled"),
+        "a function that calls a reached one is not reached itself");
+}
+
+test "a throwing call names its callee from the terminator that ends the block" {
+    let program = try support.lowerWholeProgram(
+        "refuses() -> int throws \{\n"
+        + "    throw new Error(\"no\");\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return try refuses();\n"
+        + "\} catch (Error caught) \{\n"
+        + "    return 1;\n"
+        + "\}\n");
+    let reached = walked(program);
+    try testing.assertTrue(reached.reaches("main$refuses"), "the try call names its callee");
+    try testing.assertTrue(try namesSymbol(program, "ens.main", "main$refuses"),
+        "the entry point's terminator is what names it");
+}
+
+test "a class allocation names the destructor of the class it makes" {
+    let program = try support.lowerWholeProgram(
+        "class Made \{\n"
+        + "    protected string held;\n"
+        + "\n"
+        + "    protected constructor(this.held);\n"
+        + "\}\n"
+        + "class Unmade \{\n"
+        + "    protected string held;\n"
+        + "\n"
+        + "    protected constructor(this.held);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let made = new Made(\"a\");\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reached = walked(program);
+    try testing.assertTrue(reached.reaches("_dtor$main$Made"),
+        "the allocation names the destructor its object header carries");
+    try testing.assertFalse(reached.reaches("_dtor$main$Unmade"),
+        "a class nothing allocates has no reference to its destructor");
+    try testing.assertFalse(reached.reaches("main$Unmade$constructor"),
+        "nor to its constructor");
+}
+
+test "a synthesized destructor names the one the class writes" {
+    let program = try support.lowerWholeProgram(
+        "class Held \{\n"
+        + "    protected string text;\n"
+        + "\n"
+        + "    protected constructor(this.text);\n"
+        + "\n"
+        + "    destructor() \{\n"
+        + "        print(this.text);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let held = new Held(\"a\");\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reached = walked(program);
+    try testing.assertTrue(reached.reaches("_dtor$main$Held"), "the allocation names it");
+    try testing.assertTrue(reached.reaches("main$Held$destructor"),
+        "the synthesized destructor calls the one the class writes");
+}
+
+test "a closure names its body and the destructor of its captures" {
+    let program = try support.lowerWholeProgram(
+        "class Box \{\n"
+        + "    protected int value;\n"
+        + "\n"
+        + "    protected constructor(this.value);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let box = new Box(7);\n"
+        + "    (int) -> int add = (a) -> a + box.value;\n"
+        + "    return add(1);\n"
+        + "\}\n");
+    let reached = walked(program);
+    try testing.assertTrue(reached.reaches("main$lambda0"),
+        "the closure names the body its code pointer holds");
+    try testing.assertTrue(reached.reaches("main$lambda0$dtor"),
+        "and the destructor that gives the captured reference back");
+}
+
+test "a foreign call names a C symbol the program defines no body for" {
+    let program = try support.lowerWholeProgram(
+        "external from libc \{\n"
+        + "    abs(int value) -> int;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return abs(0 - 1);\n"
+        + "\}\n");
+    let reached = walked(program);
+    try testing.assertTrue(try namesSymbol(program, "ens.main", "abs"),
+        "the call names the C function it runs");
+    try testing.assertFalse(reached.reaches("abs"),
+        "nothing the program lowers defines that name");
+}
+
+test "reading a lazy const names its initializer and the storage it fills" {
+    let program = try support.lowerWholeProgram(
+        "build() -> long \{\n"
+        + "    return 7;\n"
+        + "\}\n"
+        + "public class Holder \{\n"
+        + "    public lazy const long value = build();\n"
+        + "\}\n"
+        + "public class Unread \{\n"
+        + "    public lazy const long value = build();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return Holder.value as int;\n"
+        + "\}\n");
+    let reached = walked(program);
+    try testing.assertTrue(reached.reaches("_lazyinit$main$Holder$value"),
+        "the read calls the initializer on its cold edge");
+    try testing.assertTrue(reached.reaches("main$build"),
+        "and the initializer takes what it calls with it");
+    try testing.assertFalse(reached.reaches("_lazyinit$main$Unread$value"),
+        "nothing reads the other const");
+    try testing.assertTrue(try namesSymbol(program, "ens.main", "_lazystate$main$Holder$value"),
+        "the read names the state byte it tests");
+    try testing.assertTrue(try namesSymbol(program, "ens.main", "_lazyvalue$main$Holder$value"),
+        "and the storage it reads the value out of");
+}
+
+test "a type test and a checked cast name the descriptor of their target" {
+    let program = try support.lowerWholeProgram(
+        "class Shape \{\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "class Circle extends Shape \{\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "class Square extends Shape \{\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "class Absent extends Shape \{\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "pick() -> Shape \{\n"
+        + "    return new Shape();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Shape one = pick();\n"
+        + "    let cast = one as? Square;\n"
+        + "    if (one is Circle) \{\n"
+        + "        return 1;\n"
+        + "    \}\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reached = walked(program);
+    try testing.assertTrue(
+        reached.namesDescriptor(try support.classNamed(program.analysis, "Circle")),
+        "the type test names the descriptor it tests against");
+    try testing.assertTrue(
+        reached.namesDescriptor(try support.classNamed(program.analysis, "Square")),
+        "the checked cast names the descriptor it casts to");
+    try testing.assertTrue(
+        reached.namesDescriptor(try support.classNamed(program.analysis, "Shape")),
+        "the allocation names its own descriptor, and both targets name it as their parent");
+    try testing.assertFalse(
+        reached.namesDescriptor(try support.classNamed(program.analysis, "Absent")),
+        "a class the reached code never mentions is named by nothing");
+}
+
+// Nothing here allocates an Animal, so the interface descriptor the dispatched call reads is the
+// only one any reached body names.
+test "a call dispatched through an interface names that interface's descriptor" {
+    let program = try support.lowerWholeProgram(
+        "interface Speaker \{\n"
+        + "    speak() -> string;\n"
+        + "\}\n"
+        + "class Animal implements Speaker \{\n"
+        + "    protected constructor();\n"
+        + "\n"
+        + "    protected override speak() -> string \{\n"
+        + "        return \"...\";\n"
+        + "    \}\n"
+        + "\}\n"
+        + "find() -> Speaker? \{\n"
+        + "    return null;\n"
+        + "\}\n"
+        + "say(Speaker who) -> string \{\n"
+        + "    return who.speak();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let found = find();\n"
+        + "    if (found != null) \{\n"
+        + "        let said = say(found);\n"
+        + "    \}\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reached = walked(program);
+    try testing.assertTrue(reached.namesDescriptor(try declaredType(program, "Speaker")),
+        "the dispatched call reads the method table of the interface it goes through");
+    try testing.assertFalse(reached.namesDescriptor(try declaredType(program, "Animal")),
+        "nothing reached allocates an Animal, so nothing names its descriptor");
+}
+
+test "a named descriptor drags the descriptors its own initializer names" {
+    let program = try support.lowerWholeProgram(
+        "interface Speaker \{\n"
+        + "    speak() -> string;\n"
+        + "\}\n"
+        + "class Animal implements Speaker \{\n"
+        + "    protected constructor();\n"
+        + "\n"
+        + "    protected override speak() -> string \{\n"
+        + "        return \"...\";\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Dog extends Animal \{\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "class Cat extends Animal \{\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let made = new Dog();\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reached = walked(program);
+    try testing.assertTrue(reached.namesDescriptor(try declaredType(program, "Dog")),
+        "the allocation names the descriptor it stores in the object header");
+    try testing.assertTrue(reached.namesDescriptor(try declaredType(program, "Animal")),
+        "Dog's descriptor names its parent");
+    try testing.assertTrue(reached.namesDescriptor(try declaredType(program, "Speaker")),
+        "and every interface its conformance table lists");
+    try testing.assertFalse(reached.namesDescriptor(try declaredType(program, "Cat")),
+        "a sibling nothing allocates is named by nothing");
+}
+
+// The plan behind this work lists these four beside the nodes that name a symbol. They name none:
+// each one calls a runtime helper that reads the descriptor the value itself carries, which is
+// what makes the language-called slots of every emitted descriptor roots.
+test "the runtime-type instructions name no symbol and no descriptor" {
+    let program = try support.lowerWholeProgram("main() \{\}\n");
+    let store = program.analysis.store();
+    Type boolType = store.primitive(PrimitiveKind.Bool);
+    Type longType = store.primitive(PrimitiveKind.Long);
+    Type text = store.stringType();
+    try assertNamesNothing(new EirDynamicEquals(1, boolType, 0, 0), "dynamic_equals");
+    try assertNamesNothing(new EirDynamicHash(1, longType, 0), "dynamic_hash");
+    try assertNamesNothing(new EirDynamicToString(1, text, 0), "dynamic_to_string");
+    try assertNamesNothing(new EirRuntimeTypeName(1, text, 0), "runtime_type_name");
+}
+
+// The walk over a program lowered the way the driver lowers it.
+walked(LoweredProgram program) -> ReachedProgram {
+    return reachable.analyze(program.index, program.plans, program.modules);
+}
+
+// Whether one body names a symbol, read through the shared instruction walk the reachability walk
+// reads it through.
+namesSymbol(LoweredProgram program, string bodySymbol, string named) -> bool throws {
+    let body = try support.functionBySymbol(program, bodySymbol);
+    let blocks = body.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        let block = blocks.get(b);
+        let instructions = block.instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            for (let symbol in walk.symbolsOf(instructions.get(i))) {
+                if (symbol == named) {
+                    return true;
+                }
+            }
+        }
+        let terminator = block.terminator();
+        if (terminator == null) {
+            continue;
+        }
+        for (let symbol in walk.terminatorSymbolsOf(terminator)) {
+            if (symbol == named) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+assertNamesNothing(EirInstruction instruction, string described) throws {
+    try testing.assertTrue(walk.symbolsOf(instruction).length == 0,
+        "{described} names a symbol");
+    try testing.assertTrue(walk.descriptorTypesOf(instruction).length == 0,
+        "{described} names a descriptor");
+}
+
+// The type one of the test program's own declarations names, class or interface alike.
+declaredType(LoweredProgram program, string name) -> Type throws {
+    let found = program.analysis.store().findDeclared("main", name);
+    if (found == null) {
+        throw new TestFailure("no type named '{name}'");
+    }
+    return found;
+}

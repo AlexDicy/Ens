@@ -1,0 +1,161 @@
+// The closure check over a reachability walk's result. Every symbol a reached body names, and
+// every implementation an emitted descriptor names, must itself be reached or be a symbol the
+// program defines no body for at all. A symbol that is neither is one a build would drop while
+// something it keeps still points at it, which is an unresolved symbol at link time.
+//
+// It reads the bodies as the optimization pipeline left them, because those are the ones emission
+// writes, while the walk read the bodies lowering produced.
+import EirFunction from eir.model;
+import eir.walk;
+import DescriptorPlan from layout.descriptors;
+import DescriptorPlans from layout.descriptors;
+import FunctionInfo from lower.index;
+import ModuleBodies from reach.reachable;
+import ReachedProgram from reach.reachable;
+import @ens.sema.model.types;
+import List from @std.collections.list;
+import Set from @std.collections.set;
+
+// One reference out of the reached set, with both ends and the module the reference is made in.
+public final class DanglingReference {
+    string unreachedSymbol;
+    string referringName;
+    string owningModulePath;
+    string reportedMessage;
+
+    protected constructor(this.unreachedSymbol, this.referringName, this.owningModulePath,
+                this.reportedMessage);
+
+    // The symbol the walk did not reach.
+    public symbol() -> string {
+        return this.unreachedSymbol;
+    }
+
+    // What still names it, either a function's linker symbol or a described type's name.
+    public referrer() -> string {
+        return this.referringName;
+    }
+
+    public modulePath() -> string {
+        return this.owningModulePath;
+    }
+
+    // The whole internal diagnostic, naming both ends and the module.
+    public message() -> string {
+        return this.reportedMessage;
+    }
+}
+
+// Every reference out of the reached set, over the reached bodies and every emitted descriptor.
+// An empty list is what a closed root set produces.
+public check(List<ModuleBodies> modules, DescriptorPlans plans,
+             ReachedProgram reached) -> List<DanglingReference> {
+    let found = new List<DanglingReference>();
+    let defined = definedSymbols(modules);
+    for (long m = 0; m < modules.length(); m++) {
+        let unit = modules.get(m);
+        let bodies = unit.bodies();
+        for (long b = 0; b < bodies.length(); b++) {
+            let body = bodies.get(b);
+            if (!reached.reaches(body.symbol())) {
+                continue;
+            }
+            checkBody(body, unit.modulePath(), defined, reached, found);
+        }
+    }
+    let all = plans.all();
+    for (long i = 0; i < all.length(); i++) {
+        checkDescriptor(all.get(i), defined, reached, found);
+    }
+    return found;
+}
+
+// Every symbol the lowered program defines a body for, which is what separates a dropped body from
+// a foreign name.
+definedSymbols(List<ModuleBodies> modules) -> Set<string> {
+    let defined = new Set<string>();
+    for (long m = 0; m < modules.length(); m++) {
+        let bodies = modules.get(m).bodies();
+        for (long b = 0; b < bodies.length(); b++) {
+            let ignored = defined.add(bodies.get(b).symbol());
+        }
+    }
+    return defined;
+}
+
+// One reached body's own references, read through the same walk the reachability walk reads.
+checkBody(EirFunction body, string modulePath, Set<string> defined, ReachedProgram reached,
+          List<DanglingReference> found) {
+    let blocks = body.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        let block = blocks.get(b);
+        let instructions = block.instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            for (let named in walk.symbolsOf(instructions.get(i))) {
+                record(named, body.symbol(), modulePath, defined, reached, found);
+            }
+        }
+        let terminator = block.terminator();
+        if (terminator == null) {
+            continue;
+        }
+        for (let named in walk.terminatorSymbolsOf(terminator)) {
+            record(named, body.symbol(), modulePath, defined, reached, found);
+        }
+    }
+}
+
+// One descriptor's slots: its method table, the method table of each interface it conforms to, and
+// the three slots the language calls. The descriptor's initializer holds the address of each one,
+// so a slot naming an unreached body is a reference the linker would have to resolve. Each report
+// names which kind of slot holds the address.
+checkDescriptor(DescriptorPlan plan, Set<string> defined, ReachedProgram reached,
+                List<DanglingReference> found) {
+    let vtable = plan.vtable();
+    for (long slot = 0; slot < vtable.length; slot++) {
+        recordSlot(vtable[slot], "method slot {slot}", plan, defined, reached, found);
+    }
+    for (let conformance in plan.conformances()) {
+        string conformed = types.display(conformance.interfaceType());
+        let implementations = conformance.implementations();
+        for (long slot = 0; slot < implementations.length; slot++) {
+            recordSlot(implementations[slot], "'{conformed}' slot {slot}", plan, defined,
+                reached, found);
+        }
+    }
+    recordSlot(plan.hashSlot(), "the 'hash' slot", plan, defined, reached, found);
+    recordSlot(plan.equalsSlot(), "the 'equals' slot", plan, defined, reached, found);
+    recordSlot(plan.toStringSlot(), "the 'toString' slot", plan, defined, reached, found);
+}
+
+recordSlot(FunctionInfo? implementation, string slotName, DescriptorPlan plan,
+           Set<string> defined, ReachedProgram reached, List<DanglingReference> found) {
+    if (implementation == null) {
+        return;
+    }
+    string symbol = implementation.symbol();
+    if (!isUnreachedBody(symbol, defined, reached)) {
+        return;
+    }
+    found.push(new DanglingReference(symbol, plan.name(), plan.modulePath(),
+        "Internal: the reachability walk did not reach '{symbol}', which the descriptor of "
+        + "'{plan.name()}' in module '{plan.modulePath()}' references from {slotName}; the root "
+        + "set is not closed."));
+}
+
+record(string symbol, string referrer, string modulePath, Set<string> defined,
+       ReachedProgram reached, List<DanglingReference> found) {
+    if (!isUnreachedBody(symbol, defined, reached)) {
+        return;
+    }
+    found.push(new DanglingReference(symbol, referrer, modulePath,
+        "Internal: the reachability walk did not reach '{symbol}', which '{referrer}' in module "
+        + "'{modulePath}' references; the root set is not closed."));
+}
+
+// True when the program defines a body under this symbol and the walk did not reach it. A foreign
+// C name, a runtime helper emission synthesizes on demand and a lazy const's storage all define no
+// body here, so none of them is one of these.
+isUnreachedBody(string symbol, Set<string> defined, ReachedProgram reached) -> bool {
+    return defined.contains(symbol) && !reached.reaches(symbol);
+}

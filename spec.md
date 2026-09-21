@@ -756,6 +756,9 @@ Commands use the same three exit codes: `0` when the command did what was asked,
 - `--target <triple>` builds for a target other than this machine's own, such as `x86_64-unknown-linux-gnu` or `arm64-apple-macosx14.0`.
 - `--stdlib <folder>` names the folder holding `std/` instead of letting the build look for one by walking up from the sources; `ENS_STDLIB` does the same thing.
 - `--explain-arc` reports what the reference-counting optimizer elided, as described in the section on memory management.
+- `--explain-reachability` reports how much of the program is reached from its entry point: one line per module giving how many function bodies it defines and how many of them are reached, then the name of every body nothing reaches.
+  A program with no entry point is a library, and what a library reaches is counted from its `export` declarations instead.
+  The account is not about an optimization, so it reports at every level, and `ens check` prints nothing because it stops before code generation.
 - `--offline` and `--locked` govern package fetching and `ens.lock`, as described above.
 - `--quiet` reports problems and nothing else, and `--verbose` reports each step as it runs; asking for both is an error.
 - `--toolchain <version>` chooses which installed version of Ens does the work.

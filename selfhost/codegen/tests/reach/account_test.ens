@@ -1,0 +1,276 @@
+// The account '--explain-reachability' prints: one header line per module that defines bodies, the
+// name of every body nothing reaches under it, and the program's own totals last. The build that
+// asks for it emits exactly what a build that does not asks for.
+import @std.testing;
+import TestFailure from @std.testing;
+import Path from @std.fs;
+import @ens.llvm.target;
+import ProgramAnalysis from @ens.sema.pipeline;
+import CodegenSettings from settings;
+import OptimizationLevel from settings;
+import driver;
+import reach.account;
+import reach.reachable;
+import support;
+import List from @std.collections.list;
+
+// A program whose 'main' module reaches one of its two functions, so every shape of line the
+// account has appears in it.
+partlyReachedProgram() -> string {
+    return "class Kept \{\n"
+        + "    protected string held;\n"
+        + "\n"
+        + "    protected constructor(this.held);\n"
+        + "\}\n"
+        + "class Dropped \{\n"
+        + "    protected string held;\n"
+        + "\n"
+        + "    protected constructor(this.held);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let kept = new Kept(\"a\");\n"
+        + "    return 0;\n"
+        + "\}\n";
+}
+
+test "a module's line counts its bodies and lists the ones nothing reaches" {
+    string mainLine = try lineStartingWith(try accountOf(partlyReachedProgram()), "main:");
+    try testing.assertEqual(mainLine, "main: 5 function bodies, 3 reached, 2 not reached");
+}
+
+// The totals the account closes with are its module lines added up, and the number of bodies it
+// says nothing reaches is the number of names it went on to list.
+test "the program's totals add up its module lines and match the names it listed" {
+    string[] lines = try accountOf(partlyReachedProgram());
+    long bodies = 0;
+    long reached = 0;
+    long notReached = 0;
+    long named = 0;
+    for (let line in lines) {
+        if (line.startsWith("  ")) {
+            named++;
+            continue;
+        }
+        if (line.endsWith("across the program")) {
+            continue;
+        }
+        long[] counts = numbersIn(afterModulePath(line));
+        if (line.endsWith("all reached")) {
+            try testing.assertEqual(counts.length, 1);
+            bodies = bodies + counts[0];
+            reached = reached + counts[0];
+            continue;
+        }
+        try testing.assertEqual(counts.length, 3);
+        try testing.assertEqual(counts[0], counts[1] + counts[2]);
+        bodies = bodies + counts[0];
+        reached = reached + counts[1];
+        notReached = notReached + counts[2];
+    }
+    try testing.assertEqual(notReached, named);
+    string last = lines[lines.length - 1];
+    long[] closing = numbersIn(last);
+    try testing.assertEqual(closing.length, 4);
+    string expected = "{bodies} function bodies, {reached} reached from "
+        + roots(closing[2]) + ", {bodies - reached} not reached across the program";
+    try testing.assertTrue(last == expected, "the totals read '{last}', not '{expected}'");
+}
+
+test "an unreached body is named, and a synthesized one is marked as one" {
+    string[] lines = try accountOf(partlyReachedProgram());
+    try testing.assertTrue(has(lines, "  'main$Dropped$constructor'"),
+        "the constructor nothing calls is named:\n" + joined(lines));
+    try testing.assertTrue(has(lines, "  '_dtor$main$Dropped' (synthesized)"),
+        "the destructor lowering built is named and marked:\n" + joined(lines));
+    try testing.assertFalse(has(lines, "  'main$Kept$constructor'"),
+        "a reached body is not listed:\n" + joined(lines));
+}
+
+test "the account closes with the program's own totals" {
+    string[] lines = try accountOf(partlyReachedProgram());
+    string last = lines[lines.length - 1];
+    try testing.assertTrue(last.endsWith("not reached across the program"),
+        "unexpected closing line: {last}");
+    try testing.assertTrue(last.contains("reached from"), "the total names the root count: {last}");
+}
+
+test "a program that reaches everything it defines says so in one word" {
+    string[] lines = try accountOf("main() \{\}\n");
+    string mainLine = try lineStartingWith(lines, "main:");
+    try testing.assertEqual(mainLine, "main: 1 function body, all reached");
+}
+
+test "a build that asks for the account gets it, and one that does not gets nothing" {
+    let analysis = try support.analyzeMain(partlyReachedProgram());
+    string folder = try scratchFolder();
+    string[] everyPass = [];
+    let explained = driver.emitProgram(analysis, folder, "reached.",
+        new CodegenSettings(OptimizationLevel.Default, target.hostTargetTriple(), everyPass,
+            false, false, true));
+    try testing.assertTrue(explained.succeeded(), "the program must emit");
+    string[] account = explained.explanation();
+    try testing.assertTrue(account.length > 0, "an explained build must account for itself");
+    try testing.assertTrue(account[account.length - 1].endsWith("across the program"),
+        "unexpected closing line: {account[account.length - 1]}");
+    let quiet = driver.emitProgram(analysis, folder, "quiet.",
+        new CodegenSettings(OptimizationLevel.Default, target.hostTargetTriple(), everyPass,
+            false, false, false));
+    try testing.assertTrue(quiet.succeeded(), "the program must emit either way");
+    try testing.assertEqual(quiet.explanation().length, 0);
+    try testing.assertEqual(quiet.objects().length(), explained.objects().length());
+    try emptyFolder(Path(folder));
+}
+
+// Both accounts share one channel, so a build that asks for both gets each under a line naming it,
+// while a build that asks for one gets exactly the lines it got before the other existed.
+test "two accounts in one channel are each named, and one alone is not" {
+    let analysis = try support.analyzeMain(partlyReachedProgram());
+    string folder = try scratchFolder();
+    string[] reachabilityOnly = try accountFor(analysis, folder, "reachonly.", false, true);
+    try testing.assertTrue(indexOf(reachabilityOnly, "what the program reaches:") < 0,
+        "one account is printed under no heading:\n" + joined(reachabilityOnly));
+    try testing.assertTrue(
+        reachabilityOnly[reachabilityOnly.length - 1].endsWith("not reached across the program"),
+        "unexpected closing line: {reachabilityOnly[reachabilityOnly.length - 1]}");
+
+    string[] arcOnly = try accountFor(analysis, folder, "arconly.", true, false);
+    try testing.assertTrue(
+        indexOf(arcOnly, "what the reference-counting optimizer elided:") < 0,
+        "one account is printed under no heading:\n" + joined(arcOnly));
+    try testing.assertTrue(arcOnly[arcOnly.length - 1].endsWith("elided across the program"),
+        "unexpected closing line: {arcOnly[arcOnly.length - 1]}");
+
+    string[] both = try accountFor(analysis, folder, "both.", true, true);
+    try testing.assertEqual(both[0], "what the program reaches:");
+    long blank = indexOf(both, "");
+    try testing.assertTrue(blank > 0, "the two accounts are separated:\n" + joined(both));
+    try testing.assertTrue(both[blank - 1].endsWith("not reached across the program"),
+        "the reachability totals close the first account: {both[blank - 1]}");
+    try testing.assertEqual(both[blank + 1], "what the reference-counting optimizer elided:");
+    try testing.assertTrue(both[both.length - 1].endsWith("elided across the program"),
+        "unexpected closing line: {both[both.length - 1]}");
+    try emptyFolder(Path(folder));
+}
+
+// One emission's account, with each of the two explanations asked for or not.
+accountFor(ProgramAnalysis analysis, string folder, string prefix, bool arc,
+           bool reachability) -> string[] throws {
+    string[] everyPass = [];
+    let emitted = driver.emitProgram(analysis, folder, prefix,
+        new CodegenSettings(OptimizationLevel.Default, target.hostTargetTriple(), everyPass,
+            false, arc, reachability));
+    if (!emitted.succeeded()) {
+        throw new TestFailure("the program must emit: "
+            + emitted.diagnostics()[0].message());
+    }
+    return emitted.explanation();
+}
+
+indexOf(string[] lines, string wanted) -> long {
+    for (long i = 0; i < lines.length; i++) {
+        if (lines[i] == wanted) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// The account of one program, lowered the way the driver lowers it.
+accountOf(string programText) -> string[] throws {
+    let program = try support.lowerWholeProgram(programText);
+    return account.lines(program.index, program.modules,
+        reachable.analyze(program.index, program.plans, program.modules));
+}
+
+// How the closing line spells a root count, singular included.
+roots(long count) -> string {
+    if (count == 1) {
+        return "1 root";
+    }
+    return "{count} roots";
+}
+
+// What a module line says after its module path, so a path is never read as one of its numbers.
+afterModulePath(string line) -> string {
+    long colon = line.indexOf(": ");
+    if (colon < 0) {
+        return line;
+    }
+    return line.substring(colon + 2, line.length);
+}
+
+// Every number in one line, in the order they appear, with a leading '-' read as part of one.
+numbersIn(string line) -> long[] {
+    let found = new List<long>();
+    long value = 0;
+    bool inside = false;
+    bool negative = false;
+    for (long i = 0; i < line.length; i++) {
+        long digit = (line.byteAt(i) as long) - 48L;
+        if (digit >= 0 && digit <= 9) {
+            if (!inside && i > 0 && line.byteAt(i - 1) == 45 as byte) {
+                negative = true;
+            }
+            value = value * 10 + digit;
+            inside = true;
+            continue;
+        }
+        if (inside) {
+            found.push(signed(value, negative));
+        }
+        value = 0;
+        inside = false;
+        negative = false;
+    }
+    if (inside) {
+        found.push(signed(value, negative));
+    }
+    return found.toArray();
+}
+
+signed(long value, bool negative) -> long {
+    if (negative) {
+        return 0 - value;
+    }
+    return value;
+}
+
+lineStartingWith(string[] lines, string start) -> string throws {
+    for (let line in lines) {
+        if (line.startsWith(start)) {
+            return line;
+        }
+    }
+    throw new TestFailure("no line starts with '{start}':\n" + joined(lines));
+}
+
+has(string[] lines, string wanted) -> bool {
+    for (let line in lines) {
+        if (line == wanted) {
+            return true;
+        }
+    }
+    return false;
+}
+
+joined(string[] lines) -> string {
+    string all = "";
+    for (let line in lines) {
+        all = all + line + "\n";
+    }
+    return all;
+}
+
+scratchFolder() -> string throws {
+    Path folder = Path("ens-codegen-reach-test-objects");
+    try emptyFolder(folder);
+    try folder.createDirectories();
+    return folder.toString();
+}
+
+emptyFolder(Path folder) throws {
+    if (!folder.isDirectory()) {
+        return;
+    }
+    try folder.removeRecursively();
+}

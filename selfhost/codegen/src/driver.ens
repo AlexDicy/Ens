@@ -29,6 +29,11 @@ import mono.closure;
 import CodegenSettings from settings;
 import PassContext from passes.optimize;
 import passes.optimize;
+import ModuleBodies from reach.reachable;
+import ReachedProgram from reach.reachable;
+import reach.account;
+import reach.reachable;
+import reach.references;
 import lower.arraycontent;
 import lower.destructors;
 import lower.index;
@@ -43,10 +48,10 @@ import Map from @std.collections.map;
 export final class EmitResult {
     List<string> objectFiles;
     FileDiagnostic[] emitDiagnostics;
-    string[] arcAccount;
+    string[] buildAccount;
 
     public constructor(this.objectFiles, this.emitDiagnostics, string[] explanation = []) {
-        this.arcAccount = explanation;
+        this.buildAccount = explanation;
     }
 
     export objects() -> List<string> {
@@ -57,10 +62,10 @@ export final class EmitResult {
         return this.emitDiagnostics;
     }
 
-    // What the optimization pipeline elided and why, when the settings request it; nothing
-    // otherwise.
-    export arcExplanation() -> string[] {
-        return this.arcAccount;
+    // What the build accounted for, when the settings request an account: which function bodies
+    // the program reaches, and what the optimization pipeline elided and why. Nothing otherwise.
+    export explanation() -> string[] {
+        return this.buildAccount;
     }
 
     export succeeded() -> bool {
@@ -112,16 +117,101 @@ export emitProgram(ProgramAnalysis analysis, string outputFolder, string filePre
     if (collisions.length() > 0) {
         return new EmitResult(new List<string>(), collisions.toArray());
     }
+    let reached = reachable.analyze(programIndex, plans, moduleBodies(lowered));
+    let reachability = reachabilityAccount(programIndex, lowered, reached, settings);
     let pipeline = optimizeModules(lowered, plans, settings);
     let optimizationProblems = gathered(pipeline.modules);
     if (optimizationProblems.length() > 0) {
         return new EmitResult(new List<string>(), optimizationProblems.toArray());
     }
+    let dangling = danglingReferences(programIndex, pipeline.modules, plans, reached);
+    if (dangling.length() > 0) {
+        return new EmitResult(new List<string>(), dangling.toArray());
+    }
     let stackFrame = analysis.store().findDeclared(StandardLibrary.coreModule, "StackFrame");
     let errorClass = analysis.store().findDeclared(StandardLibrary.coreModule, "Error");
     let emitted = emitModules(pipeline.modules, plans, stackFrame, errorClass, outputFolder,
         filePrefix, settings);
-    return new EmitResult(emitted.paths, emitted.problems.toArray(), pipeline.account.toArray());
+    return new EmitResult(emitted.paths, emitted.problems.toArray(),
+        combinedAccount(reachability, pipeline.account));
+}
+
+// The lines a build's accounts print, in the one channel that carries them. A build that asked for
+// a single account gets its lines and nothing besides. A build that asked for both gets each of
+// them under a line naming what it is about, because a module's reachability line and a function's
+// reference-counting line are both a bare name at the left margin.
+combinedAccount(List<string> reachability, List<string> arc) -> string[] {
+    if (reachability.length() == 0 || arc.length() == 0) {
+        let single = new List<string>();
+        appendLines(single, reachability);
+        appendLines(single, arc);
+        return single.toArray();
+    }
+    let both = new List<string>();
+    both.push("what the program reaches:");
+    appendLines(both, reachability);
+    both.push("");
+    both.push("what the reference-counting optimizer elided:");
+    appendLines(both, arc);
+    return both.toArray();
+}
+
+// The account of which function bodies the program's roots reach, for a build that asked for one,
+// and nothing for every other build. Nothing is dropped whether a build asks or not: every module
+// is emitted exactly as it was before the walk existed.
+reachabilityAccount(ProgramIndex programIndex, List<LoweredModule> lowered,
+                    ReachedProgram reached, CodegenSettings settings) -> List<string> {
+    let explained = new List<string>();
+    if (!settings.explainsReachability()) {
+        return explained;
+    }
+    for (let line in account.lines(programIndex, moduleBodies(lowered), reached)) {
+        explained.push(line);
+    }
+    return explained;
+}
+
+// Everything a kept definition names that the walk did not reach, as the internal diagnostics such
+// a reference is. Every build runs this check, at every optimization level, so a root set that is
+// not closed stops the build that found it rather than a link somewhere later.
+danglingReferences(ProgramIndex programIndex, List<LoweredModule> optimized,
+                   DescriptorPlans plans, ReachedProgram reached) -> List<FileDiagnostic> {
+    let problems = new List<FileDiagnostic>();
+    let files = filePathsByModule(programIndex);
+    for (let found in references.check(moduleBodies(optimized), plans, reached)) {
+        problems.push(new FileDiagnostic(files.get(found.modulePath()) ?? found.modulePath(),
+            found.message(), source.makeSpan(0, 0)));
+    }
+    return problems;
+}
+
+// Where every module of the program was read from, so a problem about one reads as a problem in a
+// file. A module nothing registered a file for stands in for itself by name.
+filePathsByModule(ProgramIndex programIndex) -> Map<string, string> {
+    let files = new Map<string, string>();
+    let modules = programIndex.modules();
+    for (long m = 0; m < modules.length(); m++) {
+        let module = modules.get(m).context().module();
+        files.set(module.canonicalPath(), module.filePath());
+    }
+    return files;
+}
+
+// Every module's lowered bodies, as the reachability walk and its account read them.
+moduleBodies(List<LoweredModule> lowered) -> List<ModuleBodies> {
+    let bodies = new List<ModuleBodies>();
+    for (long m = 0; m < lowered.length(); m++) {
+        let unit = lowered.get(m);
+        bodies.push(new ModuleBodies(unit.definitions.context().module().canonicalPath(),
+            unit.functions));
+    }
+    return bodies;
+}
+
+appendLines(List<string> account, List<string> found) {
+    for (long i = 0; i < found.length(); i++) {
+        account.push(found.get(i));
+    }
 }
 
 // Every defined function must own its linker symbol program-wide: the passes key their

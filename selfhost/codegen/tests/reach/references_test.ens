@@ -1,0 +1,356 @@
+// The closure check: every symbol a reached body or an emitted descriptor names must itself be
+// reached, or name no body the program defines. Each test walks a program from a root set it
+// chooses, so a root set with a hole in it is what the check is read against.
+import @std.testing;
+import TestFailure from @std.testing;
+import EirFunction from eir.model;
+import eir.walk;
+import DanglingReference from reach.references;
+import ModuleBodies from reach.reachable;
+import ReachedProgram from reach.reachable;
+import Root from reach.roots;
+import reach.reachable;
+import reach.references;
+import reach.roots;
+import PassOutcome from passes.optimize;
+import LoweredProgram from support;
+import support;
+import List from @std.collections.list;
+
+// A program with a hierarchy, an interface, a lambda with a capture, a lazy const and a foreign
+// call, so the check reads every kind of reference a body can make.
+richProgram() -> string {
+    return "external from libc \{\n"
+        + "    abs(int value) -> int;\n"
+        + "\}\n"
+        + "interface Speaker \{\n"
+        + "    speak() -> int;\n"
+        + "\}\n"
+        + "abstract class Shape implements Speaker \{\n"
+        + "    protected constructor();\n"
+        + "    protected abstract area() -> int;\n"
+        + "\n"
+        + "    protected override speak() -> int \{\n"
+        + "        return this.area();\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Square extends Shape \{\n"
+        + "    protected string label;\n"
+        + "\n"
+        + "    protected constructor(this.label);\n"
+        + "\n"
+        + "    protected override area() -> int \{\n"
+        + "        return 4;\n"
+        + "    \}\n"
+        + "\n"
+        + "    override hash() -> long \{\n"
+        + "        return 1L;\n"
+        + "    \}\n"
+        + "\n"
+        + "    override equals(Square other) -> bool \{\n"
+        + "        return true;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class Holder \{\n"
+        + "    public lazy const long value = 7L;\n"
+        + "\}\n"
+        + "pick() -> Speaker \{\n"
+        + "    return new Square(\"s\");\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let box = new Square(\"b\");\n"
+        + "    (int) -> int add = (a) -> a + box.area();\n"
+        + "    return abs(pick().speak() + add(1) + (Holder.value as int)) - 9;\n"
+        + "\}\n";
+}
+
+test "a program walked from its own roots names nothing outside the reached set" {
+    let program = try support.lowerWholeProgram(richProgram());
+    let found = checked(program, ownRoots(program));
+    try testing.assertTrue(found.length() == 0, "unexpected: " + firstMessage(found));
+}
+
+// A root set without the descriptor slots leaves one body unreached per slot, and each report says
+// which slot still holds its address: the three kinds are collected from three different places.
+test "a root set without the descriptor slots names the slot each body sits in" {
+    let program = try support.lowerWholeProgram(
+        "interface Speaker \{\n"
+        + "    speak() -> string;\n"
+        + "\}\n"
+        + "abstract class Shape \{\n"
+        + "    protected constructor();\n"
+        + "    protected abstract area() -> int;\n"
+        + "\}\n"
+        + "class Square extends Shape implements Speaker \{\n"
+        + "    protected constructor();\n"
+        + "\n"
+        + "    protected override area() -> int \{\n"
+        + "        return 4;\n"
+        + "    \}\n"
+        + "\n"
+        + "    protected override speak() -> string \{\n"
+        + "        return \"s\";\n"
+        + "    \}\n"
+        + "\n"
+        + "    override hash() -> long \{\n"
+        + "        return 1L;\n"
+        + "    \}\n"
+        + "\n"
+        + "    override equals(Square other) -> bool \{\n"
+        + "        return true;\n"
+        + "    \}\n"
+        + "\n"
+        + "    override toString() -> string \{\n"
+        + "        return \"square\";\n"
+        + "    \}\n"
+        + "\}\n"
+        + "pick() -> Shape \{\n"
+        + "    return new Square();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return pick().area() - 4;\n"
+        + "\}\n");
+    let found = checked(program, entryOnly(program));
+    try testing.assertEqual(found.length(), 5);
+    try assertReported(found, "main$Square$area",
+        "which the descriptor of 'Square' in module 'main' references from method slot 0");
+    try assertReported(found, "main$Square$speak",
+        "which the descriptor of 'Square' in module 'main' references from 'Speaker' slot 0");
+    try assertReported(found, "main$Square$hash",
+        "which the descriptor of 'Square' in module 'main' references from the 'hash' slot");
+    try assertReported(found, "main$Square$equals",
+        "which the descriptor of 'Square' in module 'main' references from the 'equals' slot");
+    try assertReported(found, "main$Square$toString",
+        "which the descriptor of 'Square' in module 'main' references from the 'toString' slot");
+    try assertMentions(found.get(0).message(), "the root set is not closed");
+}
+
+// A walk that never sees a module's bodies cannot reach them, which is the shape a walk missing an
+// edge leaves behind: the body is there, something reached names it, and the walk did not.
+test "a call naming a body the walk never saw is caught at the call" {
+    let loader = new support.MemoryFileLoader();
+    loader.add("/src/lib/helper.ens",
+        "public used() -> int \{\n"
+        + "    return 1;\n"
+        + "\}\n");
+    loader.add("/src/main.ens",
+        "import lib.helper;\n"
+        + "main() -> int \{\n"
+        + "    return helper.used() - 1;\n"
+        + "\}\n");
+    let program = try support.lowerLoadedProgram(try support.analyzeLoaded(loader));
+    let reached = reachable.analyzeFrom(program.plans, onlyModule(program, "main"),
+        ownRoots(program));
+    let found = references.check(program.modules, program.plans, reached);
+    try testing.assertEqual(found.length(), 1);
+    try testing.assertEqual(found.get(0).symbol(), "lib.helper$used");
+    try testing.assertEqual(found.get(0).referrer(), "ens.main");
+    try testing.assertEqual(found.get(0).modulePath(), "main");
+    try assertMentions(found.get(0).message(), "which 'ens.main' in module 'main' references");
+}
+
+test "a foreign name and a lazy const's storage are no references out of the set" {
+    let program = try support.lowerWholeProgram(richProgram());
+    let reached = reachable.analyzeFrom(program.plans, program.modules, entryOnly(program));
+    try testing.assertFalse(reached.reaches("main$Square$area"),
+        "this root set is meant to leave bodies unreached");
+    let found = references.check(program.modules, program.plans, reached);
+    for (long i = 0; i < found.length(); i++) {
+        try testing.assertFalse(found.get(i).symbol() == "abs",
+            "a C name is no body this program defines");
+        try assertUnlike(found.get(i).symbol(), "_lazyvalue");
+        try assertUnlike(found.get(i).symbol(), "_lazystate");
+    }
+}
+
+test "what an unreached body names is not checked" {
+    let program = try support.lowerWholeProgram(
+        "deeper() -> int \{\n"
+        + "    return 1;\n"
+        + "\}\n"
+        + "unused() -> int \{\n"
+        + "    return deeper();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reached = reachable.analyzeFrom(program.plans, program.modules, ownRoots(program));
+    try testing.assertFalse(reached.reaches("main$unused"), "nothing calls 'unused'");
+    try testing.assertFalse(reached.reaches("main$deeper"), "nor reaches what it calls");
+    let found = references.check(program.modules, program.plans, reached);
+    try testing.assertTrue(found.length() == 0, "unexpected: " + firstMessage(found));
+}
+
+// Devirtualization retargets a dispatched call, which names a symbol the dispatched form named
+// nowhere. The check reads the bodies the pipeline produced for exactly that reason, and the
+// retargeted symbol is reached because it sits in a descriptor slot.
+test "a symbol devirtualization introduces is inside the reached set" {
+    let program = try support.lowerWholeProgram(
+        "class Animal \{\n"
+        + "    protected constructor();\n"
+        + "\n"
+        + "    protected speak() -> int \{\n"
+        + "        return 1;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Dog extends Animal \{\n"
+        + "    protected constructor();\n"
+        + "\n"
+        + "    protected override speak() -> int \{\n"
+        + "        return 2;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "call() -> int \{\n"
+        + "    let d = new Dog();\n"
+        + "    return d.speak();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return call() - 2;\n"
+        + "\}\n");
+    let reached = reachable.analyzeFrom(program.plans, program.modules, ownRoots(program));
+    try testing.assertFalse(names(try support.functionBySymbol(program, "main$call"),
+        "main$Dog$speak"), "the dispatched call names no callee");
+    let outcome = try support.pipelineOutcome(program, "main$call", support.testSettings());
+    try testing.assertTrue(names(outcome.function(), "main$Dog$speak"),
+        "the pass retargeted the call");
+    let found = references.check(withBody(program, outcome.function()), program.plans, reached);
+    try testing.assertTrue(found.length() == 0, "unexpected: " + firstMessage(found));
+}
+
+// The plan behind this work names this shape as one a root set derived from syntax would miss: the
+// lambda is written in a generic class's field default in one module, its body is lowered in the
+// module that declares the template, the closure is built inside a constructor there, and a third
+// module is what calls that constructor.
+test "a lambda in a generic record's field default is reached through the constructor" {
+    let loader = new support.MemoryFileLoader();
+    loader.add("/src/lib/holder.ens",
+        "public class Holder<T> \{\n"
+        + "    public (T) -> T transform = (x) -> x;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public applied(T value) -> T \{\n"
+        + "        return this.transform(value);\n"
+        + "    \}\n"
+        + "\}\n");
+    loader.add("/src/lib/maker.ens",
+        "import Holder from lib.holder;\n"
+        + "public make() -> Holder<int> \{\n"
+        + "    return new Holder<int>();\n"
+        + "\}\n");
+    loader.add("/src/main.ens",
+        "import lib.maker;\n"
+        + "main() -> int \{\n"
+        + "    return maker.make().applied(0);\n"
+        + "\}\n");
+    let program = try support.lowerLoadedProgram(try support.analyzeLoaded(loader));
+    let reached = reachable.analyzeFrom(program.plans, program.modules, ownRoots(program));
+    try testing.assertTrue(reached.reaches("lib.holder$lambda0__int__"),
+        "the constructor builds the closure over the default's lambda");
+    let found = references.check(program.modules, program.plans, reached);
+    try testing.assertTrue(found.length() == 0, "unexpected: " + firstMessage(found));
+}
+
+// The check over one program's own root set.
+checked(LoweredProgram program, List<Root> started) -> List<DanglingReference> {
+    return references.check(program.modules, program.plans,
+        reachable.analyzeFrom(program.plans, program.modules, started));
+}
+
+ownRoots(LoweredProgram program) -> List<Root> {
+    return roots.collect(program.index, program.plans);
+}
+
+// The entry point alone, which is the root set with every descriptor slot left out of it.
+entryOnly(LoweredProgram program) -> List<Root> {
+    let started = new List<Root>();
+    for (let root in ownRoots(program)) {
+        if (root.origin() == "the program entry") {
+            started.push(root);
+        }
+    }
+    return started;
+}
+
+// One module's bodies, for a walk that is given less of the program than the check reads.
+onlyModule(LoweredProgram program, string modulePath) -> List<ModuleBodies> {
+    let kept = new List<ModuleBodies>();
+    for (long m = 0; m < program.modules.length(); m++) {
+        if (program.modules.get(m).modulePath() == modulePath) {
+            kept.push(program.modules.get(m));
+        }
+    }
+    return kept;
+}
+
+// The program's modules with one body replaced by the version a pass produced.
+withBody(LoweredProgram program, EirFunction replacement) -> List<ModuleBodies> {
+    let rebuilt = new List<ModuleBodies>();
+    for (long m = 0; m < program.modules.length(); m++) {
+        let unit = program.modules.get(m);
+        let bodies = new List<EirFunction>();
+        for (long b = 0; b < unit.bodies().length(); b++) {
+            let body = unit.bodies().get(b);
+            if (body.symbol() == replacement.symbol()) {
+                bodies.push(replacement);
+            } else {
+                bodies.push(body);
+            }
+        }
+        rebuilt.push(new ModuleBodies(unit.modulePath(), bodies));
+    }
+    return rebuilt;
+}
+
+// Whether one body names a symbol, read the way the check reads it.
+names(EirFunction body, string symbol) -> bool {
+    let blocks = body.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        let block = blocks.get(b);
+        let instructions = block.instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            for (let named in walk.symbolsOf(instructions.get(i))) {
+                if (named == symbol) {
+                    return true;
+                }
+            }
+        }
+        let terminator = block.terminator();
+        if (terminator == null) {
+            continue;
+        }
+        for (let named in walk.terminatorSymbolsOf(terminator)) {
+            if (named == symbol) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+firstMessage(List<DanglingReference> found) -> string {
+    if (found.length() == 0) {
+        return "nothing";
+    }
+    return found.get(0).message();
+}
+
+// Asserts one symbol is reported, with the wording that names where the reference comes from.
+assertReported(List<DanglingReference> found, string symbol, string wanted) throws {
+    for (long i = 0; i < found.length(); i++) {
+        if (found.get(i).symbol() == symbol) {
+            try assertMentions(found.get(i).message(), wanted);
+            return;
+        }
+    }
+    throw new TestFailure("'{symbol}' is not reported at all");
+}
+
+assertMentions(string message, string wanted) throws {
+    try testing.assertTrue(message.contains(wanted), "'{wanted}' is missing from: {message}");
+}
+
+assertUnlike(string symbol, string unwanted) throws {
+    try testing.assertFalse(symbol.contains(unwanted),
+        "'{symbol}' should not be reported at all");
+}

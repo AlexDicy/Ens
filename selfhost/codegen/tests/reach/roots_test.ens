@@ -1,0 +1,158 @@
+// The root set the walk starts from: the program's entry point, every slot of every descriptor it
+// emits, and the exports of a program with no entry point. Each program here reaches the function
+// under test through one root and through nothing else, so a missing root leaves it unreached.
+import @std.testing;
+import TestFailure from @std.testing;
+import ReachedProgram from reach.reachable;
+import reach.reachable;
+import reach.roots;
+import LoweredProgram from support;
+import support;
+
+test "the entry point is a root and takes what it calls with it" {
+    let program = try support.lowerWholeProgram(
+        "used() -> int \{\n"
+        + "    return 1;\n"
+        + "\}\n"
+        + "unused() -> int \{\n"
+        + "    return 2;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return used();\n"
+        + "\}\n");
+    let reached = walked(program);
+    try testing.assertTrue(reached.reaches("ens.main"), "the entry point is a root");
+    try testing.assertTrue(reached.reaches("main$used"), "the entry point calls 'used'");
+    try testing.assertFalse(reached.reaches("main$unused"), "nothing calls 'unused'");
+}
+
+test "a method reached only through a vtable slot is reached" {
+    let program = try support.lowerWholeProgram(
+        "abstract class Shape \{\n"
+        + "    protected constructor();\n"
+        + "    protected abstract area() -> int;\n"
+        + "\}\n"
+        + "class Square extends Shape \{\n"
+        + "    protected constructor();\n"
+        + "\n"
+        + "    protected override area() -> int \{\n"
+        + "        return 4;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "pick() -> Shape \{\n"
+        + "    return new Square();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return pick().area();\n"
+        + "\}\n");
+    let reached = walked(program);
+    try testing.assertTrue(reached.reaches("main$Square$area"),
+        "Square's slot holds the implementation the dispatched call runs");
+    try testing.assertEqual(try originOf(program, "main$Square$area"),
+        "a method slot of 'Square'");
+}
+
+test "an interface slot is a root of its own, apart from the vtable" {
+    let program = try support.lowerWholeProgram(
+        "interface Speaker \{\n"
+        + "    speak() -> string;\n"
+        + "\}\n"
+        + "class Animal implements Speaker \{\n"
+        + "    protected constructor();\n"
+        + "\n"
+        + "    protected override speak() -> string \{\n"
+        + "        return \"...\";\n"
+        + "    \}\n"
+        + "\}\n"
+        + "say(Speaker who) -> string \{\n"
+        + "    return who.speak();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let said = say(new Animal());\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reached = walked(program);
+    try testing.assertTrue(reached.reaches("main$Animal$speak"),
+        "the implementation sits in Animal's Speaker table and in no vtable");
+    try testing.assertEqual(try originOf(program, "main$Animal$speak"),
+        "a 'Speaker' slot of 'Animal'");
+}
+
+test "the hash, equals and toString slots are roots" {
+    let program = try support.lowerWholeProgram(
+        "class Widget \{\n"
+        + "    protected constructor();\n"
+        + "\n"
+        + "    override hash() -> long \{\n"
+        + "        return 1L;\n"
+        + "    \}\n"
+        + "\n"
+        + "    override equals(Widget other) -> bool \{\n"
+        + "        return true;\n"
+        + "    \}\n"
+        + "\n"
+        + "    override toString() -> string \{\n"
+        + "        return \"widget\";\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let made = new Widget();\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reached = walked(program);
+    try testing.assertTrue(reached.reaches("main$Widget$hash"), "the 'hash' slot is a root");
+    try testing.assertTrue(reached.reaches("main$Widget$equals"), "the 'equals' slot is a root");
+    try testing.assertTrue(reached.reaches("main$Widget$toString"),
+        "the 'toString' slot is a root");
+    try testing.assertEqual(try originOf(program, "main$Widget$hash"),
+        "the 'hash' slot of 'Widget'");
+}
+
+test "a program with no entry point roots at its exports and not at its public names" {
+    let loader = new support.MemoryFileLoader();
+    loader.add("/src/main.ens",
+        "export offered() -> int \{\n"
+        + "    return helper();\n"
+        + "\}\n"
+        + "helper() -> int \{\n"
+        + "    return 1;\n"
+        + "\}\n"
+        + "public reachable() -> int \{\n"
+        + "    return 2;\n"
+        + "\}\n");
+    let program = try support.lowerLoadedProgram(try support.analyzeLoaded(loader));
+    let reached = walked(program);
+    try testing.assertTrue(reached.reaches("main$offered"), "an export is a root");
+    try testing.assertTrue(reached.reaches("main$helper"), "an export takes its callees with it");
+    try testing.assertFalse(reached.reaches("main$reachable"),
+        "a public name is not a root of a library build");
+    try testing.assertEqual(try originOf(program, "main$offered"), "an export of 'main'");
+}
+
+test "an export is no root of a program that has an entry point" {
+    let program = try support.lowerWholeProgram(
+        "export offered() -> int \{\n"
+        + "    return 1;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try testing.assertFalse(walked(program).reaches("main$offered"),
+        "a program is the whole world, so nothing outside it calls an export");
+}
+
+// The walk over a program lowered the way the driver lowers it.
+walked(LoweredProgram program) -> ReachedProgram {
+    return reachable.analyze(program.index, program.plans, program.modules);
+}
+
+// What the root set says about where one symbol was taken from.
+originOf(LoweredProgram program, string symbol) -> string throws {
+    let collected = roots.collect(program.index, program.plans);
+    for (long i = 0; i < collected.length(); i++) {
+        if (collected.get(i).symbol() == symbol) {
+            return collected.get(i).origin();
+        }
+    }
+    throw new TestFailure("'{symbol}' is no root");
+}

@@ -1,0 +1,182 @@
+// The reachability walk over lowered EIR. From the program's roots it follows every linker symbol
+// a reached body names and marks the body defined under it, so a body is reached exactly when a
+// chain of references leads to it from a root. EIR names every symbol emission references for an
+// instruction, the ones lowering introduces included, so the walk reads the bodies rather than the
+// declarations they came from.
+//
+// The result is a set of symbols, and nothing here changes what a build emits.
+import EirFunction from eir.model;
+import eir.walk;
+import DescriptorPlans from layout.descriptors;
+import ProgramIndex from lower.index;
+import Root from reach.roots;
+import reach.roots;
+import Type from @ens.sema.model.types;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+import Set from @std.collections.set;
+
+// One module's lowered function bodies, the way the driver holds them once lowering is done.
+public final class ModuleBodies {
+    string owningModulePath;
+    List<EirFunction> loweredBodies;
+
+    public constructor(this.owningModulePath, this.loweredBodies);
+
+    public modulePath() -> string {
+        return this.owningModulePath;
+    }
+
+    public bodies() -> List<EirFunction> {
+        return this.loweredBodies;
+    }
+}
+
+// What one walk found: the bodies its roots reach, the descriptors the reached bodies name, and
+// the roots it started from.
+public final class ReachedProgram {
+    Set<string> reachedSymbols;
+    Set<Type> namedDescriptors;
+    List<Root> startingRoots;
+
+    protected constructor(this.reachedSymbols, this.namedDescriptors, this.startingRoots);
+
+    // Whether the roots reach the body defined under this symbol. False for a symbol no lowered
+    // body defines, such as a foreign C name.
+    public reaches(string symbol) -> bool {
+        return this.reachedSymbols.contains(symbol);
+    }
+
+    public reachedCount() -> long {
+        return this.reachedSymbols.length();
+    }
+
+    // How many types' descriptors the reached bodies name, counting the parent and the implemented
+    // interfaces each named descriptor names in turn.
+    public descriptorCount() -> long {
+        return this.namedDescriptors.length();
+    }
+
+    // Whether the reached bodies name this type's descriptor, parents and interfaces included.
+    public namesDescriptor(Type described) -> bool {
+        return this.namedDescriptors.contains(described);
+    }
+
+    public roots() -> List<Root> {
+        return this.startingRoots;
+    }
+}
+
+// Walks the lowered program from the roots its index and its descriptors give it. Nothing is
+// dropped here; the result is a set the caller reads.
+public analyze(ProgramIndex index, DescriptorPlans plans,
+               List<ModuleBodies> modules) -> ReachedProgram {
+    return analyzeFrom(plans, modules, roots.collect(index, plans));
+}
+
+// Walks the lowered program from a root list a caller chose, which is how a test walks from an
+// incomplete one.
+public analyzeFrom(DescriptorPlans plans, List<ModuleBodies> modules,
+                   List<Root> started) -> ReachedProgram {
+    let walked = new Walk(plans, modules);
+    return walked.run(started);
+}
+
+// One walk in progress: the bodies keyed by symbol, what it has reached, and the symbols it still
+// has to scan. It lives no longer than the analyze call that made it, so two walks share nothing.
+final class Walk {
+    DescriptorPlans plans;
+    Map<string, EirFunction> bodyBySymbol;
+    Set<string> reached;
+    Set<Type> descriptors;
+    List<string> pending;
+
+    protected constructor(DescriptorPlans plans, List<ModuleBodies> modules) {
+        this.plans = plans;
+        this.bodyBySymbol = new Map<string, EirFunction>();
+        this.reached = new Set<string>();
+        this.descriptors = new Set<Type>();
+        this.pending = new List<string>();
+        for (long m = 0; m < modules.length(); m++) {
+            let bodies = modules.get(m).bodies();
+            for (long b = 0; b < bodies.length(); b++) {
+                this.bodyBySymbol.set(bodies.get(b).symbol(), bodies.get(b));
+            }
+        }
+    }
+
+    protected run(List<Root> started) -> ReachedProgram {
+        for (long i = 0; i < started.length(); i++) {
+            this.reach(started.get(i).symbol());
+        }
+        while (!this.pending.isEmpty()) {
+            this.scan(this.pending.pop());
+        }
+        return new ReachedProgram(this.reached, this.descriptors, started);
+    }
+
+    // Marks the body under one symbol reached and queues it for scanning. A symbol the lowered
+    // program defines no body for is left out, which is what a foreign C name and a lazy const's
+    // storage symbol are.
+    reach(string symbol) {
+        if (this.bodyBySymbol.get(symbol) == null) {
+            return;
+        }
+        if (!this.reached.add(symbol)) {
+            return;
+        }
+        this.pending.push(symbol);
+    }
+
+    // Follows everything one reached body names.
+    scan(string symbol) {
+        let body = this.bodyBySymbol.get(symbol);
+        if (body == null) {
+            return;
+        }
+        let blocks = body.blocks();
+        for (long b = 0; b < blocks.length(); b++) {
+            let block = blocks.get(b);
+            let instructions = block.instructions();
+            for (long i = 0; i < instructions.length(); i++) {
+                let instruction = instructions.get(i);
+                for (let named in walk.symbolsOf(instruction)) {
+                    this.reach(named);
+                }
+                for (let described in walk.descriptorTypesOf(instruction)) {
+                    this.nameDescriptor(described);
+                }
+            }
+            let terminator = block.terminator();
+            if (terminator == null) {
+                continue;
+            }
+            for (let named in walk.terminatorSymbolsOf(terminator)) {
+                this.reach(named);
+            }
+            for (let described in walk.terminatorDescriptorTypesOf(terminator)) {
+                this.nameDescriptor(described);
+            }
+        }
+    }
+
+    // Records one descriptor a body names, with the parent and interface descriptors that
+    // descriptor's own initializer names. Every descriptor slot is a root, so a named descriptor
+    // adds no body to the walk.
+    nameDescriptor(Type described) {
+        if (!this.descriptors.add(described)) {
+            return;
+        }
+        let plan = this.plans.planFor(described);
+        if (plan == null) {
+            return;
+        }
+        let parent = plan.parent();
+        if (parent != null) {
+            this.nameDescriptor(parent);
+        }
+        for (let conformance in plan.conformances()) {
+            this.nameDescriptor(conformance.interfaceType());
+        }
+    }
+}
