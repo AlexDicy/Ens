@@ -1,10 +1,12 @@
 // The closure check: every symbol a reached body or an emitted descriptor names must itself be
-// reached, or name no body the program defines. Each test walks a program from a root set it
+// reached, or name no body the program defines, and every global a reached body names and every
+// base a descriptor names must be defined too. Each test walks a program from a root set it
 // chooses, so a root set with a hole in it is what the check is read against.
 import @std.testing;
 import TestFailure from @std.testing;
 import EirFunction from eir.model;
 import eir.walk;
+import DescriptorPlans from layout.descriptors;
 import DanglingReference from reach.references;
 import ModuleBodies from reach.reachable;
 import ReachedProgram from reach.reachable;
@@ -155,11 +157,16 @@ test "a call naming a body the walk never saw is caught at the call" {
     try testing.assertEqual(emitted.get(0).symbol(), "lib.helper$used");
 }
 
-test "a foreign name and a lazy const's storage are no references out of the set" {
+// A foreign C name names no body this program defines, so it is no reference out of the set. A
+// lazy const's storage is checked rather than exempt, and it passes because every read of the
+// value names the initializer that defines the storage, so reaching the read reaches it too.
+test "a foreign name is no reference out of the set, and a lazy read reaches its storage" {
     let program = try support.lowerWholeProgram(richProgram());
     let reached = reachable.analyzeFrom(program.plans, program.modules, entryOnly(program));
     try testing.assertFalse(reached.reaches("main$Square$area"),
         "this root set is meant to leave bodies unreached");
+    try testing.assertTrue(reached.reaches("_lazyinit$main$Holder$value"),
+        "the read of 'Holder.value' names the initializer its storage is defined by");
     let found = references.check(program.modules, program.modules, program.plans, reached);
     for (long i = 0; i < found.length(); i++) {
         try testing.assertFalse(found.get(i).symbol() == "abs",
@@ -167,6 +174,68 @@ test "a foreign name and a lazy const's storage are no references out of the set
         try assertUnlike(found.get(i).symbol(), "_lazyvalue");
         try assertUnlike(found.get(i).symbol(), "_lazystate");
     }
+}
+
+// A global is data, so no body is lowered under its symbol and the rule for a dropped body cannot
+// answer for it. Withholding the declaring module from the walk is what reaches this state, because
+// no program names a lazy const's storage without naming its initializer beside it.
+test "a global no reached body defines is reported at the body naming it" {
+    let loader = new support.MemoryFileLoader();
+    loader.add("/src/lib/store.ens",
+        "public class Store \{\n"
+        + "    public lazy const long value = 7L;\n"
+        + "\}\n");
+    loader.add("/src/main.ens",
+        "import Store from lib.store;\n"
+        + "main() -> int \{\n"
+        + "    return (Store.value as int) - 7;\n"
+        + "\}\n");
+    let program = try support.lowerLoadedProgram(try support.analyzeLoaded(loader));
+    let reached = reachable.analyzeFrom(program.plans, onlyModule(program, "main"),
+        ownRoots(program));
+    let found = references.check(program.modules, program.modules, program.plans, reached);
+    try testing.assertEqual(found.length(), 3);
+    try assertReported(found, "_lazyvalue$lib.store$Store$value",
+        "reached no definition of the global '_lazyvalue$lib.store$Store$value', which "
+        + "'ens.main' in module 'main' references");
+    try assertReported(found, "_lazystate$lib.store$Store$value",
+        "reached no definition of the global '_lazystate$lib.store$Store$value'");
+    try assertReported(found, "_lazyinit$lib.store$Store$value",
+        "did not reach '_lazyinit$lib.store$Store$value'");
+    try assertMentions(found.get(0).message(), "the root set is not closed");
+}
+
+// A descriptor's initializer holds its base's address as well as its slots, and a plan is what
+// gives a descriptor its one definition site, so a base with no plan is one nothing defines. The
+// test leaves the base's plan out, because planning covers every declared type and no program
+// reaches this state on its own.
+test "a base no descriptor is planned for is reported at the descriptor naming it" {
+    let program = try support.lowerWholeProgram(
+        "abstract class Shape \{\n"
+        + "    protected constructor();\n"
+        + "    protected abstract area() -> int;\n"
+        + "\}\n"
+        + "class Square extends Shape \{\n"
+        + "    protected constructor();\n"
+        + "\n"
+        + "    protected override area() -> int \{\n"
+        + "        return 4;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return new Square().area() - 4;\n"
+        + "\}\n");
+    let reached = reachable.analyzeFrom(program.plans, program.modules, ownRoots(program));
+    let found = references.check(program.modules, program.modules,
+        plansWithout(program, "Shape"), reached);
+    try testing.assertEqual(found.length(), 1);
+    try testing.assertEqual(found.get(0).symbol(), "_typedesc$main$Shape");
+    try testing.assertEqual(found.get(0).referrer(), "Square");
+    try testing.assertEqual(found.get(0).modulePath(), "main");
+    try assertMentions(found.get(0).message(),
+        "no descriptor is planned for 'Shape', so nothing defines '_typedesc$main$Shape', which "
+        + "the descriptor of 'Square' in module 'main' names as its base");
+    try assertMentions(found.get(0).message(), "the root set is not closed");
 }
 
 test "what an unreached body names is not checked" {
@@ -286,6 +355,17 @@ reachedOnly(LoweredProgram program, ReachedProgram reached) -> List<ModuleBodies
         let unit = program.modules.get(m);
         kept.push(new ModuleBodies(unit.modulePath(),
             gate.reachedBodies(unit.bodies(), reached)));
+    }
+    return kept;
+}
+
+// The program's plans with one type's left out, which is the state a planning gap leaves behind.
+plansWithout(LoweredProgram program, string typeName) -> DescriptorPlans {
+    let kept = new DescriptorPlans();
+    for (let plan in program.plans.all()) {
+        if (plan.name() != typeName) {
+            kept.add(plan);
+        }
     }
     return kept;
 }

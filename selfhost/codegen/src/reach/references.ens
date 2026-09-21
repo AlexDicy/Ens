@@ -3,12 +3,23 @@
 // program defines no body for at all. A symbol that is neither is one a build drops while
 // something it keeps still points at it, which is an unresolved symbol at link time.
 //
+// A global is data rather than a body, so it is checked against the definitions instead: one a
+// reached body names has to be defined by a reached body.
+//
+// Everything either can name is covered: a call's callee, the destructor a class allocation names,
+// a closure's target and its destructor, a lazy const's storage, and for a descriptor its method
+// slots, its interface slots, the three the language calls, and the base it names. Only a foreign
+// call's C name is left out, because the program defines no body for it.
+//
 // It reads the bodies as the optimization pipeline left them, because those are the ones emission
 // writes, while the walk read the bodies lowering produced.
 import EirFunction from eir.model;
+import EirGlobalAddress from eir.model;
+import EirInstruction from eir.model;
 import eir.walk;
 import DescriptorPlan from layout.descriptors;
 import DescriptorPlans from layout.descriptors;
+import layout.descriptors;
 import FunctionInfo from lower.index;
 import ModuleBodies from reach.reachable;
 import ReachedProgram from reach.reachable;
@@ -55,6 +66,7 @@ public check(List<ModuleBodies> emitted, List<ModuleBodies> lowered, DescriptorP
              ReachedProgram reached) -> List<DanglingReference> {
     let found = new List<DanglingReference>();
     let defined = definedSymbols(lowered);
+    let globals = definedGlobals(lowered, reached);
     for (long m = 0; m < emitted.length(); m++) {
         let unit = emitted.get(m);
         let bodies = unit.bodies();
@@ -63,12 +75,12 @@ public check(List<ModuleBodies> emitted, List<ModuleBodies> lowered, DescriptorP
             if (!reached.reaches(body.symbol())) {
                 continue;
             }
-            checkBody(body, unit.modulePath(), defined, reached, found);
+            checkBody(body, unit.modulePath(), defined, globals, reached, found);
         }
     }
     let all = plans.all();
     for (long i = 0; i < all.length(); i++) {
-        checkDescriptor(all.get(i), defined, reached, found);
+        checkDescriptor(all.get(i), plans, defined, reached, found);
     }
     return found;
 }
@@ -87,16 +99,18 @@ definedSymbols(List<ModuleBodies> modules) -> Set<string> {
 }
 
 // One reached body's own references, read through the same walk the reachability walk reads.
-checkBody(EirFunction body, string modulePath, Set<string> defined, ReachedProgram reached,
-          List<DanglingReference> found) {
+checkBody(EirFunction body, string modulePath, Set<string> defined, Set<string> globals,
+          ReachedProgram reached, List<DanglingReference> found) {
     let blocks = body.blocks();
     for (long b = 0; b < blocks.length(); b++) {
         let block = blocks.get(b);
         let instructions = block.instructions();
         for (long i = 0; i < instructions.length(); i++) {
-            for (let named in walk.symbolsOf(instructions.get(i))) {
+            let instruction = instructions.get(i);
+            for (let named in walk.symbolsOf(instruction)) {
                 record(named, body.symbol(), modulePath, defined, reached, found);
             }
+            recordGlobal(instruction, body.symbol(), modulePath, globals, found);
         }
         let terminator = block.terminator();
         if (terminator == null) {
@@ -111,9 +125,9 @@ checkBody(EirFunction body, string modulePath, Set<string> defined, ReachedProgr
 // One descriptor's slots: its method table, the method table of each interface it conforms to, and
 // the three slots the language calls. The descriptor's initializer holds the address of each one,
 // so a slot naming an unreached body is a reference the linker would have to resolve. Each report
-// names which kind of slot holds the address.
-checkDescriptor(DescriptorPlan plan, Set<string> defined, ReachedProgram reached,
-                List<DanglingReference> found) {
+// names which kind of slot holds the address, and the base is reported apart from the slots.
+checkDescriptor(DescriptorPlan plan, DescriptorPlans plans, Set<string> defined,
+                ReachedProgram reached, List<DanglingReference> found) {
     let vtable = plan.vtable();
     for (long slot = 0; slot < vtable.length; slot++) {
         recordSlot(vtable[slot], "method slot {slot}", plan, defined, reached, found);
@@ -129,6 +143,22 @@ checkDescriptor(DescriptorPlan plan, Set<string> defined, ReachedProgram reached
     recordSlot(plan.hashSlot(), "the 'hash' slot", plan, defined, reached, found);
     recordSlot(plan.equalsSlot(), "the 'equals' slot", plan, defined, reached, found);
     recordSlot(plan.toStringSlot(), "the 'toString' slot", plan, defined, reached, found);
+    recordBase(plan, plans, found);
+}
+
+// The base a descriptor's initializer holds the address of, which has to be a descriptor the
+// program planned, since a plan is what gives a descriptor its one definition site. A type with no
+// plan is one nothing defines a descriptor for anywhere.
+recordBase(DescriptorPlan plan, DescriptorPlans plans, List<DanglingReference> found) {
+    let base = plan.parent();
+    if (base == null || plans.planFor(base) != null) {
+        return;
+    }
+    string symbol = descriptors.descriptorSymbol(base);
+    found.push(new DanglingReference(symbol, plan.name(), plan.modulePath(),
+        "Internal: no descriptor is planned for '{types.display(base)}', so nothing defines "
+        + "'{symbol}', which the descriptor of '{plan.name()}' in module '{plan.modulePath()}' "
+        + "names as its base; the root set is not closed."));
 }
 
 recordSlot(FunctionInfo? implementation, string slotName, DescriptorPlan plan,
@@ -156,9 +186,56 @@ record(string symbol, string referrer, string modulePath, Set<string> defined,
         + "'{modulePath}' references; the root set is not closed."));
 }
 
+// Every global a body the walk reached defines, which are the definitions emission writes.
+definedGlobals(List<ModuleBodies> modules, ReachedProgram reached) -> Set<string> {
+    let defined = new Set<string>();
+    for (long m = 0; m < modules.length(); m++) {
+        let bodies = modules.get(m).bodies();
+        for (long b = 0; b < bodies.length(); b++) {
+            let body = bodies.get(b);
+            if (!reached.reaches(body.symbol())) {
+                continue;
+            }
+            collectDefinedGlobals(body, defined);
+        }
+    }
+    return defined;
+}
+
+collectDefinedGlobals(EirFunction body, Set<string> defined) {
+    let blocks = body.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        let instructions = blocks.get(b).instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (!(instruction is EirGlobalAddress) || !instruction.defines) {
+                continue;
+            }
+            let ignored = defined.add(instruction.symbol);
+        }
+    }
+}
+
+// One global a reached body names, which a reached body has to define or the link has nothing to
+// resolve it to. Every global is a lazy const's storage, and a read of one names the initializer
+// that defines it in the same body, which is what keeps this quiet.
+recordGlobal(EirInstruction instruction, string referrer, string modulePath,
+             Set<string> globals, List<DanglingReference> found) {
+    if (!(instruction is EirGlobalAddress)) {
+        return;
+    }
+    if (globals.contains(instruction.symbol)) {
+        return;
+    }
+    found.push(new DanglingReference(instruction.symbol, referrer, modulePath,
+        "Internal: the reachability walk reached no definition of the global "
+        + "'{instruction.symbol}', which '{referrer}' in module '{modulePath}' references; the "
+        + "root set is not closed."));
+}
+
 // True when the program defines a body under this symbol and the walk did not reach it. A foreign
-// C name, a runtime helper emission synthesizes on demand and a lazy const's storage all define no
-// body here, so none of them is one of these.
+// C name and a runtime helper emission synthesizes on demand define no body here, so neither is
+// one of these. A lazy const's storage defines none either, and recordGlobal is what covers it.
 isUnreachedBody(string symbol, Set<string> defined, ReachedProgram reached) -> bool {
     return defined.contains(symbol) && !reached.reaches(symbol);
 }
