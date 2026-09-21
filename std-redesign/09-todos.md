@@ -72,7 +72,7 @@ Without it there are 199, of which 126 are cross-package visibility refusals, si
 So a standard-library change has no sema gate faster than `ens test libs/std`, which takes about nine seconds.
 The two loads of one file spell alike in that message because the per-file names read a type declared in the reporting file bare, which is truthful for one declaration and unreadable for two loads of it.
 
-Emission is not reachability-based, so every function of every loaded module is lowered and linked whether or not a program can reach it (`lowerModule` in `selfhost/codegen/src/driver.ens` lowers "every function it defines", and no linker dead-strip flag is passed either).
+Emission was not reachability-based until 2026-09-21, so every function of every loaded module was lowered and linked whether or not a program could reach it, and the paragraphs below are the record of what that cost.
 Two costs measured, which compound: routing `print` through `@std.system` took a hello-world from 2 modules and 151,552 bytes to 12 modules and 238,592 bytes (2026-09-05), and C6 then added all of `std.text.string`, 32 KB of a hello-world's 160 KB of objects, since `lower/index.ens` pushes every bodied binding member into its module's function list.
 Together they cost 21% of suite wall time and 34% of `codegencheck`'s, measured against a 177-second baseline; the bootstrap moved only 5%, so the Ens scanning members are not the cost and a fixed per-program charge is.
 C9 removes the `@std.system` half by shrinking that module, but the binding half is permanent, since bindings load implicitly into every program.
@@ -91,6 +91,20 @@ The suite was timed across that split as well, two runs at each commit with a ch
 So the split took between 94 and 157 seconds off a suite that had been running 429 to 480, a fifth to a third of it, almost all of it in `codegencheck` at -O2; the repeats differ by 12s after and 51s before, so the direction and the rough size hold while the precise figure does not.
 That is no recomputation of the 21% above, which was measured against a 177-second baseline on an older tree, and it is not a second saving beside the object numbers either, since an executable carries what the linker keeps of those objects and nothing passes a dead-strip flag.
 What it says is that until 673a29d the charge reachability-based emission is meant to lift had grown to about a quarter of this suite.
+
+That charge is lifted for function bodies and object files, landed 2026-09-21 in fc7ded5 and 39ae7ce, and untouched for module counts.
+`selfhost/codegen/src/reach/` holds the walk, the account `--explain-reachability` prints, the closure check that refuses to emit while any reference points at a dropped body, and the two rules that keep an object for `@std.core` and for a module that owns a descriptor.
+The filter sits between lowering and the optimization pipeline, so every function of every program is still lowered and still verified, and `codegencheck` keeps its coverage of the lowering paths with an empty skiplist and no fixture edit.
+Measured at -O2 on windows-x64: a hello-world went from 183,054 to 40,977 bytes of objects and from 272,384 to 166,400 bytes of executable, the compiler's own binary from 8,500,736 to 6,711,808 bytes, `codegencheck` from 133 to 78 seconds, and the Linux suite from 4m32s to 2m56s.
+The root set is three things and it is smaller than the 2026-09-05 ratification described: the entry point, every slot of every emitted descriptor with interface-table slots counted apart from vtable slots, and every `export` when there is no entry point.
+Destructors, lambdas, constructors, lazy initializers, generic members and tests are deliberately not roots, because EIR names every symbol a function references and the walk reaches each one through its referencing site.
+Rooting destructors from their class, which the ratification implies, would have discarded 74 of the 132 droppable fixture functions measured before the work began.
+The ratification's remark about a linker dead-strip flag is a dead end: LLVM emits one `.text` per object and `_ens_symtab` takes the address of every recorded function from a live global constructor, so relinking a hello-world with and without `/OPT:REF` gives a byte-identical result.
+
+The module count stays where it was, because descriptors are still emitted unconditionally, so every module that declares a type keeps an object and a hello-world stays at 14 modules while writing 13 of them.
+Moving it means gating descriptors and therefore reachable types, which needs a ruling on how a call dispatched through a hierarchy roots its slot, and re-rooting the monomorphization closure, which `mono/requests.ens` cannot do today because it collects only generic calls.
+Lowering on demand is the other stage left, and it buys the lowering and verifier time at the price of that coverage: 132 functions across 59 of the 303 runnable fixtures are unreachable from their own entry point, and 21 of them are the declaration the fixture exists for.
+Neither stage is ratified.
 
 `Path.walk` offers no way to leave a folder out, so a caller that must not descend into one writes its own descent, and with it its own cycle guard.
 `selfhost/packages/src/hashing.ens` is that caller: a tree's digest leaves `.git` out, and that has to be decided before the folder is entered rather than after everything under it has been handed over.
