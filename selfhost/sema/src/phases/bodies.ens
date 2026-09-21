@@ -3857,13 +3857,21 @@ class BodyChecker implements NoreturnCalls {
                 + "floating-point variable, for example '{example}'.", span);
             return operandType;
         }
+        // Parentheses around the operand name the same storage, so every rule below reads
+        // through them. The parentheses themselves are refused here.
+        Expression changed = unwrapParentheses(operand);
         if (!this.isLValue(operand)) {
+            if (!(operand is ParenthesizedExpressionNode) || !this.isLValue(changed)) {
+                this.reporter.report("The '{operator}' operator can only change a variable, a "
+                    + "field, or an array element, for example '{example}'.", span);
+                return operandType;
+            }
             this.reporter.report("The '{operator}' operator can only change a variable, a "
-                + "field, or an array element, for example '{example}'.", span);
-            return operandType;
+                + "field, or an array element, and a parenthesized expression is none of those. "
+                + parenthesesAdvice(changed, operator, isPrefix), span);
         }
-        if (operand is IdentifierExpressionNode) {
-            let binding = this.result.bindingOf(operand.green());
+        if (changed is IdentifierExpressionNode) {
+            let binding = this.result.bindingOf(changed.green());
             if (binding != null && this.reportCapturedWrite(binding, "change", span)) {
                 return operandType;
             }
@@ -3874,8 +3882,8 @@ class BodyChecker implements NoreturnCalls {
                 return operandType;
             }
         }
-        if (operand is MemberExpressionNode) {
-            let staticField = this.result.staticConstFieldOf(operand.green());
+        if (changed is MemberExpressionNode) {
+            let staticField = this.result.staticConstFieldOf(changed.green());
             if (staticField != null) {
                 this.reporter.report("The '{operator}' operator cannot change "
                     + "'{staticConstDisplay(staticField, this.names)}': a "
@@ -3883,9 +3891,9 @@ class BodyChecker implements NoreturnCalls {
                     + "initializer gives it.", span);
                 return operandType;
             }
-            let objectType = this.result.typeOf(operand.object().green());
+            let objectType = this.result.typeOf(changed.object().green());
             if (objectType != null) {
-                let field = types.inheritedOrOwnField(objectType, operand.member().text());
+                let field = types.inheritedOrOwnField(objectType, changed.member().text());
                 if (field != null && field.isConst()) {
                     this.reporter.report("The '{operator}' operator cannot change field "
                         + "'{field.name()}': a 'const' field is assigned once when the object "
@@ -3895,8 +3903,24 @@ class BodyChecker implements NoreturnCalls {
                 }
             }
         }
-        this.invalidateForWrite(operand);
+        this.invalidateForWrite(changed);
         return operandType;
+    }
+
+    // Why a target cannot be written. Parentheses around a target that names storage are refused
+    // for themselves, and anything else for naming no storage.
+    writeTargetMessage(Expression target, string operator) -> string {
+        Expression writtenTarget = unwrapParentheses(target);
+        if (!(target is ParenthesizedExpressionNode) || !this.isLValue(writtenTarget)) {
+            return "The left side of '{operator}' must be a variable, field, or array element.";
+        }
+        let spelling = simpleSpelling(writtenTarget);
+        string advice = "Remove the parentheses.";
+        if (spelling != null) {
+            advice = "Remove the parentheses, so the left side reads '{spelling}'.";
+        }
+        return "The left side of '{operator}' must be a variable, field, or array element, and "
+            + "a parenthesized expression is none of those. " + advice;
     }
 
     // A member write through a class reference mutates the heap object, so any object works; a
@@ -3926,8 +3950,9 @@ class BodyChecker implements NoreturnCalls {
     }
 
     // Analyzes the left side of a write. A member access that is the left side itself takes the
-    // write position. One under a '?.' or inside parentheses is covered, because those left
-    // sides carry the message that they cannot be assigned.
+    // write position, and so does one inside parentheses, which are refused on their own. One
+    // under a '?.' is covered, because that left side carries the message that it cannot be
+    // assigned.
     analyzeWriteTarget(Expression target, MemberPosition position = MemberPosition.Write)
             -> Type {
         switch (target) {
@@ -3942,8 +3967,7 @@ class BodyChecker implements NoreturnCalls {
                 return analyzed;
             },
             is ParenthesizedExpressionNode parenthesized -> {
-                Type analyzed = this.analyzeWriteTarget(parenthesized.inner(),
-                    MemberPosition.Covered);
+                Type analyzed = this.analyzeWriteTarget(parenthesized.inner(), position);
                 this.result.setType(parenthesized.green(), analyzed);
                 return analyzed;
             },
@@ -3959,21 +3983,24 @@ class BodyChecker implements NoreturnCalls {
         // subscript target reads its base, which must already be assigned.
         bool simpleAssign = node.operator().kind() == SyntaxKind.Equals;
         let target = node.target();
+        // Parentheses around a target name the same storage, so every rule below reads through
+        // them. The parentheses themselves are refused where the target is checked.
+        let writtenTarget = unwrapParentheses(target);
         let previousTarget = this.assignmentTarget;
-        if (simpleAssign && target is IdentifierExpressionNode) {
-            let resolved = this.resolveName(target.name().text());
+        if (simpleAssign && writtenTarget is IdentifierExpressionNode) {
+            let resolved = this.resolveName(writtenTarget.name().text());
             if (resolved is LocalName) {
                 this.assignmentTarget = resolved.binding;
             }
         }
         Type targetType = this.analyzeWriteTarget(target);
         this.assignmentTarget = previousTarget;
-        if (!this.isLValue(node.target())) {
-            this.reporter.report("The left side of '=' must be a variable, field, or array "
-                + "element.", node.span());
+        if (!this.isLValue(target)) {
+            this.reporter.report(this.writeTargetMessage(target, node.operator().text()),
+                node.span());
         }
-        if (target is MemberExpressionNode) {
-            let staticTarget = this.result.staticConstFieldOf(target.green());
+        if (writtenTarget is MemberExpressionNode) {
+            let staticTarget = this.result.staticConstFieldOf(writtenTarget.green());
             if (staticTarget != null) {
                 this.reporter.report("Cannot assign to "
                     + "'{staticConstDisplay(staticTarget, this.names)}': a "
@@ -3982,7 +4009,7 @@ class BodyChecker implements NoreturnCalls {
                     + "field.", node.span());
             }
         }
-        Type assignTarget = this.declaredTargetType(node.target(), targetType);
+        Type assignTarget = this.declaredTargetType(writtenTarget, targetType);
         Type valueType = this.analyzeExpressionAdapt(node.value(), assignTarget);
         // What the store actually lands: the right side for '=', the operator's result for 'OP='.
         Type storedType = valueType;
@@ -4003,22 +4030,21 @@ class BodyChecker implements NoreturnCalls {
         if (assignTarget != targetType) {
             this.result.setType(node.target().green(), assignTarget);
         }
-        this.invalidateForWrite(node.target());
-        let assignTargetNode = node.target();
-        if (assignTargetNode is IdentifierExpressionNode) {
-            let binding = this.result.bindingOf(assignTargetNode.green());
+        this.invalidateForWrite(writtenTarget);
+        if (writtenTarget is IdentifierExpressionNode) {
+            let binding = this.result.bindingOf(writtenTarget.green());
             if (binding != null) {
                 this.establishAssignmentNarrowing(binding, storedType);
                 if (this.unconditionalPosition) {
                     this.markAssigned(binding);
                 }
             }
-        } else if (assignTargetNode is MemberExpressionNode) {
-            let objectType = this.result.typeOf(assignTargetNode.object().green());
+        } else if (writtenTarget is MemberExpressionNode) {
+            let objectType = this.result.typeOf(writtenTarget.object().green());
             if (objectType != null) {
-                let field = types.inheritedOrOwnField(objectType, assignTargetNode.member().text());
+                let field = types.inheritedOrOwnField(objectType, writtenTarget.member().text());
                 if (field != null) {
-                    bool throughThis = assignTargetNode.object() is ThisExpressionNode;
+                    bool throughThis = writtenTarget.object() is ThisExpressionNode;
                     if (field.isConst()) {
                         this.checkConstFieldWrite(node, field, throughThis, simpleAssign);
                     }
@@ -8115,6 +8141,20 @@ stringWalkAdvice(Expression iterated) -> string {
     }
     return "Iterate '{spelling}.chars()' to visit its characters, or '{spelling}.bytes()' to "
         + "visit its bytes.";
+}
+
+// How to drop the parentheses around what '++' or '--' changes, naming the result when the
+// operand can be spelled.
+parenthesesAdvice(Expression changed, string operator, bool isPrefix) -> string {
+    let spelling = simpleSpelling(changed);
+    if (spelling == null) {
+        return "Remove the parentheses.";
+    }
+    string example = "{spelling}{operator}";
+    if (isPrefix) {
+        example = "{operator}{spelling}";
+    }
+    return "Remove the parentheses, so it reads '{example}'.";
 }
 
 // The source spelling of an expression simple enough to quote in an example: a name, 'this',

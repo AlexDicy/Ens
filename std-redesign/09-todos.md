@@ -132,9 +132,15 @@ A static-as-value message on a bare generic head can spell its fix only as `Hold
 Both the bare and the module-qualified type-as-value refusal end with "construct one or name one", which does not apply when the type is an enum, since an enum's constants are named rather than constructed, and a message that told the two apart would need the report site to know the type's kind (2026-09-21).
 Until that module-qualified refusal landed, `let held = renderer.Widget;` passed sema and reached code generation, where only the catch-all "Internal: expression has no recorded type" caught it, so a user's own program could reach that bug-catcher (2026-09-21).
 
-A parenthesized left side of `=` skips the const-field rule, because `analyzeAssignment` keys `checkConstFieldWrite` on the target node being a member expression (verified identical before and after 2fb2f32, so it predates that work).
-`(this.value) = 99;` inside the declaring constructor and `(held.value) = 99;` from outside it both report "The left side of '=' must be a variable, field, or array element." and nothing about const.
-That message is also false on its own terms there, since the left side is a field in parentheses, so the rule and the wording are one item.
+A parenthesized write target reads through its parentheses since 2026-09-21, so every rule about the target they hold applies and the refusal is about the parentheses.
+`(this.value) = 99;` reports "The left side of '=' must be a variable, field, or array element, and a parenthesized expression is none of those. Remove the parentheses, so the left side reads 'this.value'." with the 'const' refusal the unparenthesized line already carried beside it, and `(x)++` reports the same shape for '++' and '--'.
+The rule and the wording were one item as recorded, since leaving the const rule out kept two false messages standing, "is not assigned on every path through this constructor" for a constructor whose only write to a 'const' field was parenthesized, and "'x' is used before it is assigned a value" for `int x; (x) = 1;`.
+Two shapes still report that a left side must be a variable, field, or array element where it is one.
+Parentheses inside a target rather than around it, `(point).x = 2;` on a struct local, keep that sentence, while `(held).value = 1;` on a class and `(slots)[0] = 5;` on an array are accepted, so what the message can say waits on whether the struct shape should be refused at all.
+A write through `?.` or `?[`, `maybe?.value = 3;` and `slots?[0] = 4;`, keeps it too, and the fix there is a sentence about null rather than about parentheses.
+
+A write to `this` inside a method, `this = other;`, passes sema and is caught in code generation with "The compiler does not support assigning to this target yet." (2026-09-21).
+So a user's own program reaches a message that reads as an unimplemented feature, and the refusal belongs in sema, where `isLValue` answers true for `this`.
 
 The sema test suite's stand-in `@std.core` declares `Error.message` without `const`, while `libs/std/src/core.ens` declares it `export const string message` on an abstract class.
 So a test program that assigns that field through a subclass constructor is clean against the stand-in and refused against the real library, which is how a fixture carried a second problem nobody saw until it was checked against `libs` (2026-09-21).
