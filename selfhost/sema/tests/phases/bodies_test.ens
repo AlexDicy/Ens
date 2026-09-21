@@ -1408,3 +1408,277 @@ test "parentheses around a value, a condition and a call are untouched" {
         + "\}\n");
     try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
 }
+
+// 'this' names the object a method runs on, and no line can point it at a different one. A
+// class, a struct, a constructor, a destructor and a compound operator reach one refusal, which
+// redirects the write to a field, and parentheses around 'this' report that refusal rather than
+// the one that says to remove them.
+test "'this' cannot be assigned" {
+    let analysis = try analyzeOne("public class Box \{\n"
+        + "    public int value = 0;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public constructor(Box other) \{\n"
+        + "        this = other;\n"
+        + "    \}\n"
+        + "\n"
+        + "    destructor() \{\n"
+        + "        this = new Box();\n"
+        + "    \}\n"
+        + "\n"
+        + "    public replace(Box other) \{\n"
+        + "        this = other;\n"
+        + "        (this) = other;\n"
+        + "        this += other;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public struct Point \{\n"
+        + "    public int x = 0;\n"
+        + "\n"
+        + "    public replace(Point other) \{\n"
+        + "        this = other;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string plain = "'this' is not a variable, so it cannot be assigned. Assign the fields that "
+        + "should change, as in 'this.value = ...'.";
+    for (long i = 0; i < 4; i++) {
+        try sema_support.assertDiagnostic(reported, i, "/proj/src/main.ens", plain);
+    }
+    try sema_support.assertDiagnostic(reported, 4, "/proj/src/main.ens",
+        "'this' is not a variable, so it cannot be assigned. Assign the fields that should "
+        + "change, as in 'this.value += ...'.");
+    try sema_support.assertDiagnostic(reported, 5, "/proj/src/main.ens",
+        "'+=' needs numbers on both sides, got 'Box' and 'Box'.");
+    try sema_support.assertDiagnostic(reported, 6, "/proj/src/main.ens",
+        "'this' is not a variable, so it cannot be assigned. Assign the fields that should "
+        + "change, as in 'this.x = ...'.");
+    try testing.assertEqual(reported.length, 7L);
+}
+
+// The field the refusal names is one the writing code can reach: a 'const' field takes its value
+// at construction, a 'static' one is reached through the type name, and a private field of a
+// base class is out of reach, so the refusal stops after saying what happened. An inherited
+// field the subclass can reach is named like one of its own.
+test "assigning 'this' names a field only where there is one to name" {
+    let analysis = try analyzeOne("public class Frozen \{\n"
+        + "    public const int kept = 1;\n"
+        + "    public static const int shared = 2;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public replace(Frozen other) \{\n"
+        + "        this = other;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class Base \{\n"
+        + "    int hidden = 0;\n"
+        + "    public int shown = 0;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "public class Derived extends Base \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public replace(Derived other) \{\n"
+        + "        this = other;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "'this' is not a variable, so it cannot be assigned.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "'this' is not a variable, so it cannot be assigned. Assign the fields that should "
+        + "change, as in 'this.shown = ...'.");
+    try testing.assertEqual(reported.length, 2L);
+}
+
+// A member of a built-in type runs on a value, so '++', '--' and a compound operator reach the
+// same refusal as a plain assignment there, and none of them names a field, because a built-in
+// type has none.
+test "a primitive's member cannot write the value it runs on" {
+    let loader = new FakeFileLoader();
+    loader.addToCore("primitive int \{\n"
+        + "    export replaced() \{\n"
+        + "        this = 5;\n"
+        + "    \}\n"
+        + "\n"
+        + "    export stepped() \{\n"
+        + "        this++;\n"
+        + "        --this;\n"
+        + "    \}\n"
+        + "\n"
+        + "    export grown() \{\n"
+        + "        this += 1;\n"
+        + "    \}\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens", "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    let reported = analysis.bodyDiagnostics();
+    string core = "/stdlib/std/src/core.ens";
+    try sema_support.assertDiagnostic(reported, 0, core,
+        "'this' is not a variable, so it cannot be assigned.");
+    try sema_support.assertDiagnostic(reported, 1, core,
+        "'this' is not a variable, so '++' cannot change it.");
+    try sema_support.assertDiagnostic(reported, 2, core,
+        "'this' is not a variable, so '--' cannot change it.");
+    try sema_support.assertDiagnostic(reported, 3, core,
+        "'this' is not a variable, so it cannot be assigned.");
+    try testing.assertEqual(reported.length, 4L);
+}
+
+// 'super' names the same object as 'this', seen as its base class, so it is refused the same way
+// and the example reaches a field of the base, which the line after '++' writes to cleanly.
+// '++' and '--' on it keep the message about numbers, because a base class is never a number.
+test "'super' cannot be assigned" {
+    let analysis = try analyzeOne("public class Base \{\n"
+        + "    public int value = 0;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "public class Derived extends Base \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public constructor(Base other) \{\n"
+        + "        super = other;\n"
+        + "    \}\n"
+        + "\n"
+        + "    public replace(Base other) \{\n"
+        + "        super = other;\n"
+        + "        (super) = other;\n"
+        + "        super += other;\n"
+        + "        super++;\n"
+        + "        super.value = other.value;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class Sealed \{\n"
+        + "    int hidden = 0;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "public class Reopened extends Sealed \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public replace(Sealed other) \{\n"
+        + "        super = other;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string plain = "'super' is not a variable, so it cannot be assigned. Assign the fields that "
+        + "should change, as in 'super.value = ...'.";
+    for (long i = 0; i < 3; i++) {
+        try sema_support.assertDiagnostic(reported, i, "/proj/src/main.ens", plain);
+    }
+    try sema_support.assertDiagnostic(reported, 3, "/proj/src/main.ens",
+        "'super' is not a variable, so it cannot be assigned. Assign the fields that should "
+        + "change, as in 'super.value += ...'.");
+    try sema_support.assertDiagnostic(reported, 4, "/proj/src/main.ens",
+        "'+=' needs numbers on both sides, got 'Base' and 'Base'.");
+    try sema_support.assertDiagnostic(reported, 5, "/proj/src/main.ens",
+        "The '++' operator works only on numbers, and this value has type 'Base'. Use it on an "
+        + "integer or a floating-point variable, for example 'count++'.");
+    // 'Sealed' keeps its only field to itself, so 'Reopened' reaches none through 'super' and
+    // the refusal names no field.
+    try sema_support.assertDiagnostic(reported, 6, "/proj/src/main.ens",
+        "'super' is not a variable, so it cannot be assigned.");
+    try testing.assertEqual(reported.length, 7L);
+}
+
+// Where the keyword reaches no type at all, the write is not refused a second time: a static
+// method, a function, and a class with no base class each report what the keyword needs, once,
+// with or without parentheses around it.
+test "assigning a keyword that reaches no type reports only that" {
+    let analysis = try analyzeOne("public class Lone \{\n"
+        + "    public int value = 0;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public replace(Lone other) \{\n"
+        + "        super = other;\n"
+        + "    \}\n"
+        + "\n"
+        + "    public static swap(Lone other) \{\n"
+        + "        this = other;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "replaceFree(Lone other) \{\n"
+        + "    this = other;\n"
+        + "    (this) = other;\n"
+        + "    super = other;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "'super' cannot be used in 'Lone' because it has no base class.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "'this' names the object a method was called on, and a static method is called on none. "
+        + "Take the object as a parameter, or drop 'static'.");
+    string inFunction = "'this' names the object a method was called on, and a function has "
+        + "none. Take the object as a parameter, or move the code into a method of its type.";
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens", inFunction);
+    try sema_support.assertDiagnostic(reported, 3, "/proj/src/main.ens", inFunction);
+    try sema_support.assertDiagnostic(reported, 4, "/proj/src/main.ens",
+        "'super' reaches the base class of the object a method was called on, and a function "
+        + "has none. Move the code into a method of the subclass.");
+    try testing.assertEqual(reported.length, 5L);
+}
+
+// Everything else a method does with 'this' stays legal: it writes fields through it, passes it,
+// returns it, calls methods on it, and a class's method captures it in a lambda.
+test "reading and passing 'this' stays legal" {
+    let analysis = try analyzeOne("public class Box \{\n"
+        + "    public int value = 0;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public own() -> Box \{\n"
+        + "        this.value = 7;\n"
+        + "        this.value++;\n"
+        + "        takes(this);\n"
+        + "        return this.itself();\n"
+        + "    \}\n"
+        + "\n"
+        + "    public itself() -> Box \{\n"
+        + "        () -> int read = () -> this.value;\n"
+        + "        this.value = read();\n"
+        + "        return this;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public struct Point \{\n"
+        + "    public int x = 0;\n"
+        + "\n"
+        + "    public write() -> int \{\n"
+        + "        this.x = 4;\n"
+        + "        this.x++;\n"
+        + "        takesPoint(this);\n"
+        + "        return this.read();\n"
+        + "    \}\n"
+        + "\n"
+        + "    public read() -> int \{\n"
+        + "        return this.x;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "takes(Box box) \{\n"
+        + "\}\n"
+        + "takesPoint(Point point) \{\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+}

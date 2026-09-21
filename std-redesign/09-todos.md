@@ -139,8 +139,12 @@ Two shapes still report that a left side must be a variable, field, or array ele
 Parentheses inside a target rather than around it, `(point).x = 2;` on a struct local, keep that sentence, while `(held).value = 1;` on a class and `(slots)[0] = 5;` on an array are accepted, so what the message can say waits on whether the struct shape should be refused at all.
 A write through `?.` or `?[`, `maybe?.value = 3;` and `slots?[0] = 4;`, keeps it too, and the fix there is a sentence about null rather than about parentheses.
 
-A write to `this` inside a method, `this = other;`, passes sema and is caught in code generation with "The compiler does not support assigning to this target yet." (2026-09-21).
-So a user's own program reaches a message that reads as an unimplemented feature, and the refusal belongs in sema, where `isLValue` answers true for `this`.
+A write to `this` or to `super` is refused in sema since 2026-09-21, with "'this' is not a variable, so it cannot be assigned. Assign the fields that should change, as in 'this.value = ...'." where the type the keyword reaches has a field the writing code can reach, and with the first sentence alone where it has none.
+That covers a method, a constructor, a destructor, a compound operator and `(this) = other;`, in a class and in a struct, and `super` takes the same sentence with a field of the base class in the example.
+`this++` and `--this` reached two "Internal: lowering produced malformed EIR" reports instead, which only a member of a primitive could reach, since the numeric check refuses a class or a struct first; sema refuses them with "'this' is not a variable, so '++' cannot change it." (2026-09-21).
+
+"The compiler does not support assigning to this target yet." is written at two sites in `selfhost/codegen/src/lower/assignments.ens`, and rule 16 applies to one of them and maybe not the other, so neither is reworded until they are told apart.
+The site in `lower` is now reachable from no program sema accepts, since sema admits only an identifier, a field, or an array element as a write target, which would make it a bug-catcher that takes the `Internal:` prefix; the site in `lowerThroughAddress` fires when an address cannot be computed for a field or an array element, which sema does accept, and no program reaching it has been found (2026-09-21).
 
 The sema test suite's stand-in `@std.core` declares `Error.message` without `const`, while `libs/std/src/core.ens` declares it `export const string message` on an abstract class.
 So a test program that assigns that field through a subclass constructor is clean against the stand-in and refused against the real library, which is how a fixture carried a second problem nobody saw until it was checked against `libs` (2026-09-21).
