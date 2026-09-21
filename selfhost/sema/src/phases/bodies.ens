@@ -3931,6 +3931,33 @@ class BodyChecker implements NoreturnCalls {
             + "'{keyword}.{field} {operator} ...'.", at);
     }
 
+    // Refuses a write through '?.' or '?[', which read null when the value in front of them is
+    // null, leaving nowhere to store into. The example spells the same write without its '?'
+    // inside a null check. A target that reads no value of its own gets no advice, because
+    // dropping the '?' would not make that write valid either.
+    reportSafeWrite(string reader, Expression object, Expression target, Type reached,
+                    string operator, Span at) {
+        let checked = simpleSpelling(object);
+        string subject = "the value in front of it";
+        if (checked != null) {
+            subject = "'{checked}'";
+        }
+        string refusal = "'{reader}' cannot appear on the left side of '{operator}', because "
+            + "there is nothing to write to when {subject} is null.";
+        if (reached is ErrorType) {
+            this.reporter.report(refusal, at);
+            return;
+        }
+        let plain = plainSafeWrite(target);
+        if (checked == null || plain == null) {
+            this.reporter.report(refusal + " Check for null first, then write the same line "
+                + "without the '?'.", at);
+            return;
+        }
+        this.reporter.report(refusal + " Check for null first, as in 'if ({checked} != null) "
+            + "\{ {plain} {operator} ...; \}'.", at);
+    }
+
     // The name of a field a write through 'this' or 'super' can land in, or null when the type
     // it reaches has none. A 'const' field takes its value at construction and a 'static' one is
     // reached through the type name, so neither is named here.
@@ -3996,10 +4023,9 @@ class BodyChecker implements NoreturnCalls {
         }
     }
 
-    // Analyzes the left side of a write. A member access that is the left side itself takes the
-    // write position, and so does one inside parentheses, which are refused on their own. One
-    // under a '?.' is covered, because that left side carries the message that it cannot be
-    // assigned.
+    // Analyzes the left side of a write. A member access takes the write position wherever it
+    // stands, as the left side itself, under a '?.', or inside parentheses, because each of
+    // those left sides is refused on its own as well.
     analyzeWriteTarget(Expression target, MemberPosition position = MemberPosition.Write)
             -> Type {
         switch (target) {
@@ -4009,7 +4035,7 @@ class BodyChecker implements NoreturnCalls {
                 return analyzed;
             },
             is SafeMemberExpressionNode member -> {
-                Type analyzed = this.analyzeSafeMemberValue(member, MemberPosition.Covered);
+                Type analyzed = this.analyzeSafeMemberValue(member, position);
                 this.result.setType(member.green(), analyzed);
                 return analyzed;
             },
@@ -4042,15 +4068,27 @@ class BodyChecker implements NoreturnCalls {
         }
         Type targetType = this.analyzeWriteTarget(target);
         this.assignmentTarget = previousTarget;
-        if (writtenTarget is ThisExpressionNode) {
-            this.reportReceiverAssignment("this", targetType, node.operator().text(),
-                node.span());
-        } else if (writtenTarget is SuperExpressionNode) {
-            this.reportReceiverAssignment("super", targetType, node.operator().text(),
-                node.span());
-        } else if (!this.isLValue(target)) {
-            this.reporter.report(this.writeTargetMessage(target, node.operator().text()),
-                node.span());
+        string operator = node.operator().text();
+        switch (writtenTarget) {
+            is ThisExpressionNode ignored -> {
+                this.reportReceiverAssignment("this", targetType, operator, node.span());
+            },
+            is SuperExpressionNode ignored -> {
+                this.reportReceiverAssignment("super", targetType, operator, node.span());
+            },
+            is SafeMemberExpressionNode safe -> {
+                this.reportSafeWrite("?.", safe.object(), safe, targetType, operator,
+                    node.span());
+            },
+            is SafeSubscriptExpressionNode safe -> {
+                this.reportSafeWrite("?[", safe.object(), safe, targetType, operator,
+                    node.span());
+            },
+            default -> {
+                if (!this.isLValue(target)) {
+                    this.reporter.report(this.writeTargetMessage(target, operator), node.span());
+                }
+            },
         }
         if (writtenTarget is MemberExpressionNode) {
             let staticTarget = this.result.staticConstFieldOf(writtenTarget.green());
@@ -8194,6 +8232,31 @@ stringWalkAdvice(Expression iterated) -> string {
     }
     return "Iterate '{spelling}.chars()' to visit its characters, or '{spelling}.bytes()' to "
         + "visit its bytes.";
+}
+
+// 'maybe.value' or 'slots[0]', the way a write through '?.' or '?[' reads once its '?' is gone,
+// or null when a part of it is too long to quote.
+plainSafeWrite(Expression target) -> string? {
+    switch (target) {
+        is SafeMemberExpressionNode member -> {
+            let object = simpleSpelling(member.object());
+            if (object == null) {
+                return null;
+            }
+            return "{object}.{member.member().text()}";
+        },
+        is SafeSubscriptExpressionNode subscript -> {
+            let object = simpleSpelling(subscript.object());
+            let index = simpleSpelling(subscript.index());
+            if (object == null || index == null) {
+                return null;
+            }
+            return "{object}[{index}]";
+        },
+        default -> {
+            return null;
+        },
+    }
 }
 
 // How to drop the parentheses around what '++' or '--' changes, naming the result when the

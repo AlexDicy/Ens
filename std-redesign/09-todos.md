@@ -95,9 +95,11 @@ An enum constant reached the same way, `renderer.Kind.Large`, reports that same 
 A static-as-value message on a bare generic head can spell its fix only as `Holder.make(...)`, which fails when the call cannot infer the type arguments, while `Holder<T>.make(...)` would name a type parameter the use site does not have in scope.
 Both the bare and the module-qualified type-as-value refusal end with "construct one or name one", which does not apply when the type is an enum, since an enum's constants are named rather than constructed, and a message that told the two apart would need the report site to know the type's kind (2026-09-21).
 
-Two shapes still report that a left side must be a variable, field, or array element where it is one.
+One shape still reports that a left side must be a variable, field, or array element where it is one.
 Parentheses inside a target rather than around it, `(point).x = 2;` on a struct local, keep that sentence, while `(held).value = 1;` on a class and `(slots)[0] = 5;` on an array are accepted, so what the message can say waits on whether the struct shape should be refused at all.
-A write through `?.` or `?[`, `maybe?.value = 3;` and `slots?[0] = 4;`, keeps it too, and the fix there is a sentence about null rather than about parentheses.
+
+`++`, `--` and a compound assignment on a nullable name the type and stop there: `x++` on an `int?` reports "The '++' operator works only on numbers, and this value has type 'int?'. Use it on an integer or a floating-point variable, for example 'count++'.", and `x += 1` reports "'+=' needs numbers on both sides, got 'int?' and 'int'.", neither of which mentions the null check that makes the line work (2026-09-21).
+This is a nullability item rather than a safe-navigation one: a plain nullable local reads the same as `maybe?.value++`, whose text is pinned so a change has to move the pin.
 
 "The compiler does not support assigning to this target yet." is written at two sites in `selfhost/codegen/src/lower/assignments.ens`, and rule 16 applies to one of them and maybe not the other, so neither is reworded until they are told apart.
 The site in `lower` is now reachable from no program sema accepts, since sema admits only an identifier, a field, or an array element as a write target, which would make it a bug-catcher that takes the `Internal:` prefix; the site in `lowerThroughAddress` fires when an address cannot be computed for a field or an array element, which sema does accept, and no program reaching it has been found (2026-09-21).
