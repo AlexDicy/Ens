@@ -2587,7 +2587,10 @@ void Analyzer::checkFieldMethodCollision(StructInfo* owner, const std::u16string
     if (isConstructor || !owner) return;
     int fidx = owner->findFieldIndex(methodName);
     if (fidx < 0) return;
-    StructInfo* fieldOwner = owner->fields[fidx].definingClass ? owner->fields[fidx].definingClass : owner;
+    const FieldInfo& field = owner->fields[fidx];
+    // A private base field is not inherited, so its name is free for a subclass method or static.
+    if (fidx < owner->baseFieldCount && field.visibility == Visibility::Private) return;
+    StructInfo* fieldOwner = field.definingClass ? field.definingClass : owner;
     errorAtNode(diag, "'" + asciiOf(methodName) + "' is already declared as a field of '" +
         asciiOf(fieldOwner->name) + "'; a field and a method cannot share a name.");
 }
@@ -7150,6 +7153,17 @@ Type* Analyzer::lazyConstType(Type* head, const ast::MemberExpression& expr) {
     return field.type;
 }
 
+// The field index a member access reads on a type, or -1 when a method takes the name ahead
+// of the field. A private base field is not inherited, so a method the subclass declares under
+// that name takes it. Without such a method the field index stands, so reading a private base
+// field is still reported as a privacy error.
+static int fieldIndexForMemberAccess(StructInfo* si, const std::u16string& memberName) {
+    int idx = si->findFieldIndex(memberName);
+    if (idx < 0 || idx >= si->baseFieldCount) return idx;
+    if (si->fields[idx].visibility != Visibility::Private) return idx;
+    return si->classDeclaringMethod(memberName) ? -1 : idx;
+}
+
 Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
     auto obj = expr.object();
     if (!obj) return typeCtx.getError();
@@ -7308,7 +7322,7 @@ Type* Analyzer::analyzeMember(const ast::MemberExpression& expr) {
     }
     auto memberName = expr.memberText();
     if (!memberName) return typeCtx.getError();
-    int idx = objT->structInfo->findFieldIndex(*memberName);
+    int idx = fieldIndexForMemberAccess(objT->structInfo, *memberName);
     if (idx >= 0) {
         const FieldInfo& fld = objT->structInfo->fields[idx];
         checkMemberAccess(expr.node, *memberName, fld.visibility, fld.definingClass);
@@ -7372,7 +7386,7 @@ Type* Analyzer::analyzeSafeMember(const ast::SafeMemberExpression& expr) {
         return typeCtx.getError();
     }
 
-    int idx = inner->structInfo->findFieldIndex(*memberName);
+    int idx = fieldIndexForMemberAccess(inner->structInfo, *memberName);
     if (idx >= 0) {
         const FieldInfo& fld = inner->structInfo->fields[idx];
         checkMemberAccess(expr.node, *memberName, fld.visibility, fld.definingClass);

@@ -148,8 +148,10 @@ It lacks the compiler's dedicated function-value and array-element interpolation
 It reports "Imported name 'Comparable' conflicts with an existing declaration" for `import Comparable from @std.core;`, because an implicitly imported name is bound before explicit imports and the two are treated as rival declarations rather than the same one; the compiler accepts the redundant import.
 It checks no struct conformance, so a struct that implements an interface without providing a requirement, or provides one whose signature does not match, is reported by the compiler alone.
 It also lacks the conformance hint the compiler appends when a struct or a primitive flows into an interface-typed slot, so its message stops at "Cannot assign value of type 'Note' to variable of type 'Speaker'".
-It resolves a constructor's `this.field` shorthand with a plain `findFieldIndex` at `lsp/frontend/semantic/Analyzer.cpp:3613`, and `analyzeImplicitConstructorAssignments` at line 3762 does the same, so it accepts two shorthands the compiler refuses as of 3ba7b80 and a53a21a: one binding a private base field, and one binding a field that is public in another package.
-It runs no `checkMemberAccess` on that path, though it has one at line 5375 for ordinary member expressions, so the fix there is the same shape as the compiler's (2026-09-21).
+It resolves a constructor's `this.field` shorthand with a plain `findFieldIndex` at `lsp/frontend/semantic/Analyzer.cpp:3616`, and `analyzeImplicitConstructorAssignments` at line 3765 does the same, so it accepts two shorthands the compiler refuses as of 3ba7b80 and a53a21a: one binding a private base field, and one binding a field that is public in another package.
+It runs no `checkMemberAccess` on that path, though it has one at line 5378 for ordinary member expressions, so the fix there is the same shape as the compiler's (2026-09-21).
+Its remaining `findFieldIndex` call sites carry no private-base-field exemption, so hover, go-to-definition and rename (`lsp/server/LanguageServer.cpp`) can resolve a name to a private base field that a subclass member shadows, though the sites that report a diagnostic now carry the exemption (2026-09-21).
+It checks no duplicate struct field, so a struct that declares one name twice is reported by the compiler alone, which says "Field 'y' is already declared in 'Pixel'"; its struct field loop at `lsp/frontend/semantic/Analyzer.cpp:1495-1515` pushes every field without the `findFieldIndex` check the class loop makes at line 2023 (2026-09-21).
 
 ## Reminders
 
