@@ -5,6 +5,7 @@ import EirFunction from eir.model;
 import Type from @ens.sema.model.types;
 import StandardLibrary from @ens.sema.program.implicit;
 import CodegenSettings from settings;
+import DescriptorPlan from layout.descriptors;
 import DescriptorPlans from layout.descriptors;
 import ModuleEmitter from emit.context;
 import Signal from emit.nativeshapes;
@@ -44,14 +45,15 @@ export final class EntryPoint {
     }
 }
 
-// Emits one module's functions and the descriptors it owns as a native object file for the target
-// the settings name. The core module additionally defines the trace runtime every other module
-// declares; stackFrameType carries the struct its symbolication fills, and errorType the class
-// whose payload the entry wrapper reads. Returns "" on success and a description of the failure
-// otherwise.
+// Emits one module's functions, plus the descriptors this object is the definition site of, as a
+// native object file for the target the settings name. The core module additionally defines the
+// trace runtime every other module declares; stackFrameType carries the struct its symbolication
+// fills, and errorType the class whose payload the entry wrapper reads. Returns "" on success and
+// a description of the failure otherwise.
 public emitModule(string moduleName, List<EirFunction> functions, EntryPoint? entry,
-                  DescriptorPlans plans, Type? stackFrameType, Type? errorType,
-                  string objectPath, CodegenSettings settings) -> string {
+                  DescriptorPlans plans, List<DescriptorPlan> definedDescriptors,
+                  Type? stackFrameType, Type? errorType, string objectPath,
+                  CodegenSettings settings) -> string {
     string triple = settings.targetTriple();
     let emitter = new ModuleEmitter(moduleName, plans, triple);
     emitter.recordStackFrameType(stackFrameType);
@@ -63,14 +65,14 @@ public emitModule(string moduleName, List<EirFunction> functions, EntryPoint? en
         return "could not resolve the target '{triple}'";
     }
     let machine = resolved.createTargetMachine(triple, settings.llvmOptimizationLevel());
-    string outcome = emitInto(emitter, machine, functions, entry, objectPath);
+    string outcome = emitInto(emitter, machine, functions, entry, definedDescriptors, objectPath);
     machine.dispose();
     emitter.dispose();
     return outcome;
 }
 
 emitInto(ModuleEmitter emitter, TargetMachine machine, List<EirFunction> functions,
-         EntryPoint? entry, string objectPath) -> string {
+         EntryPoint? entry, List<DescriptorPlan> definedDescriptors, string objectPath) -> string {
     let layout = machine.createDataLayout();
     emitter.recordDataLayout(layout);
     target.setModuleDataLayout(emitter.module, layout);
@@ -89,12 +91,17 @@ emitInto(ModuleEmitter emitter, TargetMachine machine, List<EirFunction> functio
             return problem;
         }
     }
-    emitter.descriptors.defineModuleDescriptors(emitter, emitter.name());
+    emitter.descriptors.defineModuleDescriptors(emitter, definedDescriptors);
     if (emitter.name() == StandardLibrary.coreModule) {
         traceruntime.defineTraceRuntime(emitter);
     }
     emitter.traces.emitRegistration(emitter.runtime);
     forceUnwindTables(emitter);
+    if (!definesAnyFunction(emitter)) {
+        return "module '{emitter.name()}' defines no function, and an object holding no code "
+            + "leaves the first function of the object after it without unwind information on "
+            + "Mach-O";
+    }
     string verdict = analysis.verify(emitter.module);
     if (verdict.length > 0) {
         return "module '{emitter.name()}' failed LLVM verification: {verdict}";
@@ -116,6 +123,20 @@ forceUnwindTables(ModuleEmitter emitter) {
         }
         current = globals.nextFunction(current);
     }
+}
+
+// Whether this object will hold any code at all. An object holding none makes the Mach-O linker
+// leave the first function of the object after it without unwind information, which empties every
+// stack trace captured there, so emission refuses to write one.
+definesAnyFunction(ModuleEmitter emitter) -> bool {
+    let current = globals.firstFunction(emitter.module);
+    while (current != null) {
+        if (!globals.isDeclaration(current)) {
+            return true;
+        }
+        current = globals.nextFunction(current);
+    }
+    return false;
 }
 
 // The C entry point: record the process arguments in the ens globals and forward the user

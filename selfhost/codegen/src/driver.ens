@@ -1,8 +1,8 @@
 // The code-generation driver: from a checked ProgramAnalysis to one native object file per Ens
-// module the program still defines something in. Every module is lowered and verified before the
-// reachability walk drops anything, and the optimized output is re-verified before emission
-// whatever the level, so an unoptimized build is never an unchecked one, and a program that fails
-// to lower writes no object files at all.
+// module the program still reaches a body in, plus one for the core module whatever it reaches.
+// Every module is lowered and verified before the reachability walk drops anything, and the
+// optimized output is re-verified before emission whatever the level, so an unoptimized build is
+// never an unchecked one, and a program that fails to lower writes no object files at all.
 import ProgramAnalysis from @ens.sema.pipeline;
 import StandardLibrary from @ens.sema.program.implicit;
 import FileDiagnostic from @ens.sema.support.diagnostics;
@@ -47,6 +47,7 @@ import EntryPoint from emit.emit;
 import emit.emit;
 import List from @std.collections.list;
 import Map from @std.collections.map;
+import Set from @std.collections.set;
 
 export final class EmitResult {
     List<string> objectFiles;
@@ -97,8 +98,8 @@ final class EmittedObjects {
     protected constructor(this.paths, this.problems);
 }
 
-// Compiles the analyzed program into object files under outputFolder, one per module it defines
-// something in, named filePrefix plus the sanitized module path. The analysis must be clean;
+// Compiles the analyzed program into object files under outputFolder, one per module the program
+// reaches a body in, named filePrefix plus the sanitized module path. The analysis must be clean;
 // codegen diagnostics after a clean analysis describe unsupported constructs or bugs.
 export emitProgram(ProgramAnalysis analysis, string outputFolder, string filePrefix,
                    CodegenSettings settings) -> EmitResult {
@@ -122,7 +123,7 @@ export emitProgram(ProgramAnalysis analysis, string outputFolder, string filePre
     }
     let reached = reachable.analyze(programIndex, plans, moduleBodies(lowered));
     let reachability = reachabilityAccount(programIndex, lowered, reached, settings);
-    let kept = reachedModules(lowered, plans, reached);
+    let kept = reachedModules(lowered, reached);
     let pipeline = optimizeModules(kept, plans, settings);
     let optimizationProblems = gathered(pipeline.modules);
     if (optimizationProblems.length() > 0) {
@@ -176,21 +177,30 @@ reachabilityAccount(ProgramIndex programIndex, List<LoweredModule> lowered,
 }
 
 // Every module as emission sees it, holding the bodies the program reaches and nothing else. A
-// module the program reaches no body in is left out altogether unless it still has an object file
-// to write.
-reachedModules(List<LoweredModule> lowered, DescriptorPlans plans,
-               ReachedProgram reached) -> List<LoweredModule> {
+// module the program reaches no body in is left out altogether, and the descriptors it owns are
+// defined in the core module's object instead.
+reachedModules(List<LoweredModule> lowered, ReachedProgram reached) -> List<LoweredModule> {
     let kept = new List<LoweredModule>();
     for (long m = 0; m < lowered.length(); m++) {
         let unit = lowered.get(m);
         let bodies = gate.reachedBodies(unit.functions, reached);
         string modulePath = unit.definitions.context().module().canonicalPath();
-        if (!gate.writesObject(modulePath, bodies.length(), plans)) {
+        if (!gate.writesObject(modulePath, bodies.length())) {
             continue;
         }
         kept.push(new LoweredModule(unit.definitions, bodies, unit.entry, unit.problems));
     }
     return kept;
+}
+
+// The modules emission writes an object for, which is what decides where a descriptor owned by a
+// module writing none of its own is defined.
+writingModules(List<LoweredModule> kept) -> Set<string> {
+    let writing = new Set<string>();
+    for (long m = 0; m < kept.length(); m++) {
+        let ignored = writing.add(kept.get(m).definitions.context().module().canonicalPath());
+    }
+    return writing;
 }
 
 // Everything a kept definition names that the walk did not reach, as the internal diagnostics such
@@ -513,13 +523,15 @@ emitModules(List<LoweredModule> lowered, DescriptorPlans plans, Type? stackFrame
             CodegenSettings settings) -> EmittedObjects {
     let objects = new List<string>();
     let problems = new List<FileDiagnostic>();
+    let writing = writingModules(lowered);
     for (long m = 0; m < lowered.length(); m++) {
         let unit = lowered.get(m);
         string moduleName = unit.definitions.context().module().canonicalPath();
         string objectPath = outputFolder + "/" + filePrefix
             + symbols.sanitizeModulePath(moduleName) + settings.objectExtension();
         string failure = emit.emitModule(moduleName, unit.functions, unit.entry, plans,
-            stackFrame, errorClass, objectPath, settings);
+            gate.definedDescriptors(moduleName, plans, writing), stackFrame, errorClass,
+            objectPath, settings);
         if (failure.length > 0) {
             problems.push(new FileDiagnostic(unit.definitions.context().module().filePath(),
                 "Internal: emission failed: " + failure, source.makeSpan(0, 0)));

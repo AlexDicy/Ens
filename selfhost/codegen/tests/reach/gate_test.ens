@@ -1,9 +1,10 @@
 // What emission is left with once the walk has answered: the bodies of a module the program
-// reaches, and whether a module with none of them left still writes an object file.
+// reaches, whether a module with none of them left still writes an object file, and which object
+// each of the program's descriptors is defined in once one of them writes none.
 import @std.testing;
 import TestFailure from @std.testing;
 import EirFunction from eir.model;
-import DescriptorPlans from layout.descriptors;
+import DescriptorPlan from layout.descriptors;
 import ReachedProgram from reach.reachable;
 import reach.gate;
 import reach.reachable;
@@ -13,6 +14,8 @@ import LoweredProgram from support;
 import MemoryFileLoader from support;
 import support;
 import List from @std.collections.list;
+import Map from @std.collections.map;
+import Set from @std.collections.set;
 
 // A program whose modules cover both rules: 'main' declares a type nothing constructs, and
 // 'lib.helper' declares none and exports one function the program never calls.
@@ -60,29 +63,80 @@ test "a module keeps the bodies the program reaches and drops the rest" {
 }
 
 test "a module the program reaches no body in writes no object file" {
-    try testing.assertFalse(gate.writesObject("lib.helper", 0, new DescriptorPlans()),
+    try testing.assertFalse(gate.writesObject("lib.helper", 0),
         "a module with nothing left to define has no object file to write");
 }
 
 test "a module with a body left to define writes an object file" {
-    try testing.assertTrue(gate.writesObject("lib.helper", 1, new DescriptorPlans()),
+    try testing.assertTrue(gate.writesObject("lib.helper", 1),
         "a module still defining a body writes the object file it is defined in");
 }
 
 test "the core module writes an object file whatever the program reaches" {
-    try testing.assertTrue(gate.writesObject(StandardLibrary.coreModule, 0,
-        new DescriptorPlans()), "the core module's object defines the trace runtime");
+    try testing.assertTrue(gate.writesObject(StandardLibrary.coreModule, 0),
+        "the core module's object defines the trace runtime");
 }
 
-test "a module that owns a descriptor writes an object file whatever the program reaches" {
+test "a module writing an object defines the descriptors it owns" {
     let program = try support.lowerLoadedProgram(
         try support.analyzeLoaded(twoModuleProgram()));
-    try testing.assertTrue(gate.writesObject("main", 0, program.plans),
-        "'main' declares the class whose descriptor its object defines");
-    try testing.assertFalse(gate.writesObject("lib.helper", 0, program.plans),
-        "'lib.helper' declares no type, so no descriptor is defined in its object");
+    let writing = writingSet(["main", StandardLibrary.coreModule]);
+    try testing.assertTrue(
+        defines(gate.definedDescriptors("main", program.plans, writing), "_typedesc$main$Note"),
+        "'main' declares the class its own object defines the descriptor of");
+    try testing.assertFalse(
+        defines(gate.definedDescriptors(StandardLibrary.coreModule, program.plans, writing),
+            "_typedesc$main$Note"),
+        "the core module defines nothing a module writing its own object owns");
+    try assertDefinedOnce(program, ["main", StandardLibrary.coreModule]);
 }
 
+// A module the program reaches no body in writes no object, so the descriptors it owns have no
+// definition site of their own and the core module's object becomes theirs.
+test "the core module defines the descriptors of a module writing no object" {
+    let program = try support.lowerLoadedProgram(
+        try support.analyzeLoaded(twoModuleProgram()));
+    let writing = writingSet([StandardLibrary.coreModule]);
+    try testing.assertTrue(
+        defines(gate.definedDescriptors(StandardLibrary.coreModule, program.plans, writing),
+            "_typedesc$main$Note"),
+        "'main' writes no object, so its descriptor is defined in the core module's");
+    try assertDefinedOnce(program, [StandardLibrary.coreModule]);
+}
+
+
+writingSet(string[] modulePaths) -> Set<string> {
+    let writing = new Set<string>();
+    for (let modulePath in modulePaths) {
+        let ignored = writing.add(modulePath);
+    }
+    return writing;
+}
+
+defines(List<DescriptorPlan> defined, string symbol) -> bool {
+    for (let plan in defined) {
+        if (plan.symbol() == symbol) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Every descriptor the program planned is defined in exactly one of the objects it writes, which
+// is what keeps the link resolving and keeps nothing defined twice.
+assertDefinedOnce(LoweredProgram program, string[] writingModules) throws {
+    let writing = writingSet(writingModules);
+    let counts = new Map<string, long>();
+    for (let modulePath in writingModules) {
+        for (let plan in gate.definedDescriptors(modulePath, program.plans, writing)) {
+            counts.set(plan.symbol(), (counts.get(plan.symbol()) ?? 0) + 1);
+        }
+    }
+    for (let plan in program.plans.all()) {
+        try testing.assertTrue((counts.get(plan.symbol()) ?? 0) == 1,
+            "'{plan.symbol()}' is defined {counts.get(plan.symbol()) ?? 0} time(s), not once");
+    }
+}
 // One walk of the whole program from its own roots.
 walked(LoweredProgram program) -> ReachedProgram {
     return reachable.analyzeFrom(program.plans, program.modules,

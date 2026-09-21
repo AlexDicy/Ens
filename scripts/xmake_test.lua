@@ -1233,7 +1233,7 @@ task("test")
                 table.insert(failures, string.format("ens build -q said %q", quiet_out))
             end
             run({"build", hello, "--output", path.join(root, "loud.exe"), "-v"}, nil, 0,
-                "Emitted 13 object files from 14 modules")
+                "Emitted 8 object files from 14 modules")
             run({"build", hello, "--output", path.join(root, "arc.exe"), "--explain-arc"}, nil, 0,
                 "elided across the program")
 

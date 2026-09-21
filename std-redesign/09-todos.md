@@ -72,10 +72,17 @@ Without it there are 199, of which 126 are cross-package visibility refusals, si
 So a standard-library change has no sema gate faster than `ens test libs/std`, which takes about nine seconds.
 The two loads of one file spell alike in that message because the per-file names read a type declared in the reporting file bare, which is truthful for one declaration and unreadable for two loads of it.
 
-Reachability-based emission gates function bodies and object files and not module counts, because descriptors are still emitted unconditionally, so every module that declares a type keeps an object and a hello-world stays at 14 modules while writing 13 of them.
-Moving it means gating descriptors and therefore reachable types, which needs a ruling on how a call dispatched through a hierarchy roots its slot, and re-rooting the monomorphization closure, which `mono/requests.ens` cannot do today because it collects only generic calls.
+Reachability-based emission gates function bodies and object files and not module counts: a module the program reaches no body in writes no object at all, and the descriptors it owns are defined in the core module's object instead, so a hello-world writes 8 of the 14 modules it loads (measured 2026-09-22 at -O2 on windows-x64, 39,022 bytes of objects against 40,993 before, and the same 166,400-byte executable).
+Moving the module count means gating descriptors and therefore reachable types, which needs a ruling on how a call dispatched through a hierarchy roots its slot, and re-rooting the monomorphization closure, which `mono/requests.ens` cannot do today because it collects only generic calls.
 Lowering on demand is the other stage left, and it buys the lowering and verifier time at the price of the coverage it removes: 132 functions across 59 of the 303 runnable fixtures are unreachable from their own entry point, and 21 of them are the declaration the fixture exists for.
 Neither stage is ratified.
+
+An object file holding no code makes `ld64.lld` write a `__unwind_info` entry with encoding 0, meaning no unwind information, at the address where the next object's code begins, which shadows that function's own entry (measured 2026-09-22 over arm64 macOS objects).
+libunwind then finds no unwind information for any address in that function, the step out of it fails, and `_Unwind_Backtrace` ends the walk before the callback sees the frame, so `ens_capture_trace` keeps nothing and the trace prints empty.
+Dropping the code-free objects from the link drops every such entry, which is what proved it.
+Skipping the entry for a zero-sized input `__text` subsection, or ordering it before a real entry at the same address, is the upstream fix, and we consume a released lld through `runtime/lld/ens_lld.cpp`, so it is not actionable here: `reach.gate` never writing a code-free object is what keeps us clear of it.
+The hazard predates reachability-based emission, which is the part a reader will need most: the pre-gating build already wrote two code-free objects, for the body-less `std.collections.collection` and `std.collections.iterator`, and their entries landed on `EncodingError.constructor` and `RawArray.read`, where no trace goes.
+Gating added four more and moved every module's address, which put one of them on the function a trace is captured in and turned `tests/exc_main_unhandled` and `tests/stack_trace_propagation` red on macOS while both other platforms stayed green.
 
 `Path.walk` offers no way to leave a folder out, so a caller that must not descend into one writes its own descent, and with it its own cycle guard.
 `selfhost/packages/src/hashing.ens` is that caller: a tree's digest leaves `.git` out, and that has to be decided before the folder is entered rather than after everything under it has been handed over.
