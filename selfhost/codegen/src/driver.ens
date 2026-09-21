@@ -1,6 +1,8 @@
 // The code-generation driver: from a checked ProgramAnalysis to one native object file per Ens
-// module. The optimized output is re-verified before emission whatever the level, so an unoptimized
-// build is never an unchecked one, and a program that fails to lower writes no object files at all.
+// module the program still defines something in. Every module is lowered and verified before the
+// reachability walk drops anything, and the optimized output is re-verified before emission
+// whatever the level, so an unoptimized build is never an unchecked one, and a program that fails
+// to lower writes no object files at all.
 import ProgramAnalysis from @ens.sema.pipeline;
 import StandardLibrary from @ens.sema.program.implicit;
 import FileDiagnostic from @ens.sema.support.diagnostics;
@@ -32,6 +34,7 @@ import passes.optimize;
 import ModuleBodies from reach.reachable;
 import ReachedProgram from reach.reachable;
 import reach.account;
+import reach.gate;
 import reach.reachable;
 import reach.references;
 import lower.arraycontent;
@@ -94,9 +97,9 @@ final class EmittedObjects {
     protected constructor(this.paths, this.problems);
 }
 
-// Compiles the analyzed program into object files under outputFolder, one per module that
-// defines functions, named filePrefix plus the sanitized module path. The analysis must be
-// clean; codegen diagnostics after a clean analysis describe unsupported constructs or bugs.
+// Compiles the analyzed program into object files under outputFolder, one per module it defines
+// something in, named filePrefix plus the sanitized module path. The analysis must be clean;
+// codegen diagnostics after a clean analysis describe unsupported constructs or bugs.
 export emitProgram(ProgramAnalysis analysis, string outputFolder, string filePrefix,
                    CodegenSettings settings) -> EmitResult {
     let programIndex = index.buildIndex(analysis);
@@ -119,12 +122,13 @@ export emitProgram(ProgramAnalysis analysis, string outputFolder, string filePre
     }
     let reached = reachable.analyze(programIndex, plans, moduleBodies(lowered));
     let reachability = reachabilityAccount(programIndex, lowered, reached, settings);
-    let pipeline = optimizeModules(lowered, plans, settings);
+    let kept = reachedModules(lowered, plans, reached);
+    let pipeline = optimizeModules(kept, plans, settings);
     let optimizationProblems = gathered(pipeline.modules);
     if (optimizationProblems.length() > 0) {
         return new EmitResult(new List<string>(), optimizationProblems.toArray());
     }
-    let dangling = danglingReferences(programIndex, pipeline.modules, plans, reached);
+    let dangling = danglingReferences(programIndex, pipeline.modules, lowered, plans, reached);
     if (dangling.length() > 0) {
         return new EmitResult(new List<string>(), dangling.toArray());
     }
@@ -157,8 +161,8 @@ combinedAccount(List<string> reachability, List<string> arc) -> string[] {
 }
 
 // The account of which function bodies the program's roots reach, for a build that asked for one,
-// and nothing for every other build. Nothing is dropped whether a build asks or not: every module
-// is emitted exactly as it was before the walk existed.
+// and nothing for every other build. It reads the whole lowered program, so it names the bodies
+// emission drops as well as counting the ones it writes.
 reachabilityAccount(ProgramIndex programIndex, List<LoweredModule> lowered,
                     ReachedProgram reached, CodegenSettings settings) -> List<string> {
     let explained = new List<string>();
@@ -171,14 +175,34 @@ reachabilityAccount(ProgramIndex programIndex, List<LoweredModule> lowered,
     return explained;
 }
 
+// Every module as emission sees it, holding the bodies the program reaches and nothing else. A
+// module the program reaches no body in is left out altogether unless it still has an object file
+// to write.
+reachedModules(List<LoweredModule> lowered, DescriptorPlans plans,
+               ReachedProgram reached) -> List<LoweredModule> {
+    let kept = new List<LoweredModule>();
+    for (long m = 0; m < lowered.length(); m++) {
+        let unit = lowered.get(m);
+        let bodies = gate.reachedBodies(unit.functions, reached);
+        string modulePath = unit.definitions.context().module().canonicalPath();
+        if (!gate.writesObject(modulePath, bodies.length(), plans)) {
+            continue;
+        }
+        kept.push(new LoweredModule(unit.definitions, bodies, unit.entry, unit.problems));
+    }
+    return kept;
+}
+
 // Everything a kept definition names that the walk did not reach, as the internal diagnostics such
 // a reference is. Every build runs this check, at every optimization level, so a root set that is
-// not closed stops the build that found it rather than a link somewhere later.
+// not closed stops the build that found it rather than the link that follows it.
 danglingReferences(ProgramIndex programIndex, List<LoweredModule> optimized,
-                   DescriptorPlans plans, ReachedProgram reached) -> List<FileDiagnostic> {
+                   List<LoweredModule> lowered, DescriptorPlans plans,
+                   ReachedProgram reached) -> List<FileDiagnostic> {
     let problems = new List<FileDiagnostic>();
     let files = filePathsByModule(programIndex);
-    for (let found in references.check(moduleBodies(optimized), plans, reached)) {
+    for (let found in references.check(moduleBodies(optimized), moduleBodies(lowered), plans,
+            reached)) {
         problems.push(new FileDiagnostic(files.get(found.modulePath()) ?? found.modulePath(),
             found.message(), source.makeSpan(0, 0)));
     }
@@ -481,9 +505,9 @@ checkLowered(EirFunction function, string filePath, Span span) -> List<FileDiagn
     return problems;
 }
 
-// Writes one object file per module. Only a program that lowered and verified cleanly gets here,
-// so a failed compile leaves no objects behind. Emission stops at the first module that fails,
-// because a module that cannot be emitted means the compiler is broken, not the program.
+// Writes one object file per module it is given. Only a program that lowered and verified cleanly
+// gets here, so a failed compile leaves no objects behind. Emission stops at the first module that
+// fails, because a module that cannot be emitted means the compiler is broken, not the program.
 emitModules(List<LoweredModule> lowered, DescriptorPlans plans, Type? stackFrame,
             Type? errorClass, string outputFolder, string filePrefix,
             CodegenSettings settings) -> EmittedObjects {

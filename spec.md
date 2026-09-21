@@ -735,6 +735,8 @@ It is written to the folder the command was run in unless `--output` names a fil
 A package whose main module defines no `main()` is a library: it is compiled and checked just as thoroughly, no executable is written, and `--output` is refused because there is none to write.
 A workspace root refuses `--output` for the same reason: it builds more than one artifact.
 
+Code generation follows what the program reaches, so a function body nothing reaches is not generated.
+A module the program reaches nothing in gets no object file of its own.
 A build keeps the object files it produced under the build root, in `.ens/<target triple>/O<level>/`.
 The build root is the folder holding the manifest that governs the sources, so where the objects go does not move when `--output` names an executable somewhere else; sources that no manifest governs keep theirs beside themselves.
 Every target triple and every optimization level has a folder of its own, so an object built for one configuration is never read by a build of another.

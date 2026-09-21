@@ -921,8 +921,8 @@ task("test")
         end
 
         -- the bootstrap fixpoint: the Ens-written compiler compiles itself, twice, with identical
-        -- output. Stage 2 has the compiler under test compile its own sources (stage2/ens plus one
-        -- object per module), stage 3 has stage2's ens compile the same sources again. The gate
+        -- output. Stage 2 has the compiler under test compile its own sources (stage2/ens plus the
+        -- object files it wrote), stage 3 has stage2's ens compile the same sources again. The gate
         -- holds when the two stages' objects hold the same modules with identical bytes; the
         -- executables are compared as a note only, because linker output may carry timestamps.
         --
@@ -1233,7 +1233,7 @@ task("test")
                 table.insert(failures, string.format("ens build -q said %q", quiet_out))
             end
             run({"build", hello, "--output", path.join(root, "loud.exe"), "-v"}, nil, 0,
-                "Emitted 14 object files from 14 modules")
+                "Emitted 13 object files from 14 modules")
             run({"build", hello, "--output", path.join(root, "arc.exe"), "--explain-arc"}, nil, 0,
                 "elided across the program")
 
