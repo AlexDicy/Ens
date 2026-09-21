@@ -72,38 +72,9 @@ Without it there are 199, of which 126 are cross-package visibility refusals, si
 So a standard-library change has no sema gate faster than `ens test libs/std`, which takes about nine seconds.
 The two loads of one file spell alike in that message because the per-file names read a type declared in the reporting file bare, which is truthful for one declaration and unreadable for two loads of it.
 
-Emission was not reachability-based until 2026-09-21, so every function of every loaded module was lowered and linked whether or not a program could reach it, and the paragraphs below are the record of what that cost.
-Two costs measured, which compound: routing `print` through `@std.system` took a hello-world from 2 modules and 151,552 bytes to 12 modules and 238,592 bytes (2026-09-05), and C6 then added all of `std.text.string`, 32 KB of a hello-world's 160 KB of objects, since `lower/index.ens` pushes every bodied binding member into its module's function list.
-Together they cost 21% of suite wall time and 34% of `codegencheck`'s, measured against a 177-second baseline; the bootstrap moved only 5%, so the Ens scanning members are not the cost and a fixed per-program charge is.
-C9 removes the `@std.system` half by shrinking that module, but the binding half is permanent, since bindings load implicitly into every program.
-Ratified 2026-09-05: carry both until after Phase D, then make emission reachability-based, rooted at the entry point plus what data can reach (vtable and interface-table slots, the `hash`/`equals`/`toString` descriptor slots, and every `export` in a library build).
-
-C7c added a third charge of the same kind, and it is recorded here so it is visible to whoever lifts it rather than argued from memory.
-The twelve `ens_fs_*` bridges plus `ens_current_directory` are declared in `@std.system` rather than in the `@std.fs` files that call them, so every program synthesizes all thirteen though a hello-world reaches none of them.
-Measured on 2026-09-06 at -O2, with the declarations first in the `@std.fs` files and then in `@std.system`: a hello-world went from 167,771 to 177,901 bytes of objects and from 276,480 to 282,624 bytes of executable on windows-x64, and from 207,376 to 217,088 bytes of objects on linux-x64.
-The module count did not move, staying at 15 either way, because `@std.system` is already in every program through the `@std.io.print` prelude.
-The single place was chosen over the per-program cost with that measurement in hand (ratified 2026-09-06), so the `@std.system` half of the charge grows before C9 shrinks it, and what removes it in the end is reachability-based emission rather than the module's size.
-Moving the consumers then paid the charge back and more, because `@std.path` became a shim over `Path` and so could no longer be reached from `@std.system`, which took `std.path` out of the prelude chain: a hello-world ended at 14 modules and 166,543 bytes of objects on windows-x64 and 202,400 on linux-x64, below the 15 modules and 167,771 bytes it started C7c at.
-C8 then lost all of that and more, unmeasured at the time: it pointed `@std.system` at `@std.process.native`, which imports `Environment`, `Platform` and `Path`, so every program loaded `@std.environment` and the whole of `@std.fs` behind it, and a hello-world reached 26 modules and 420,360 bytes of objects on windows-x64 and 506,792 on linux-x64.
-Splitting the shapes that are a rule about values alone into `@std.process.blocks`, which imports only `List` and `StringBuilder`, put it back to 14 modules and 180,987 bytes on windows-x64 and 215,248 on linux-x64 (measured 2026-09-16 at -O2).
-What stands above the C7c figure is `@std.system`'s own object, 71,027 bytes of the 180,987, which is where C8's ten new bridges and their wrappers sit and what the single-place ruling accepts.
-The suite was timed across that split as well, two runs at each commit with a checkout before every run so all four met the same caches: 335s and 323s after it, 480s and 429s before it (2026-09-17).
-So the split took between 94 and 157 seconds off a suite that had been running 429 to 480, a fifth to a third of it, almost all of it in `codegencheck` at -O2; the repeats differ by 12s after and 51s before, so the direction and the rough size hold while the precise figure does not.
-That is no recomputation of the 21% above, which was measured against a 177-second baseline on an older tree, and it is not a second saving beside the object numbers either, since an executable carries what the linker keeps of those objects and nothing passes a dead-strip flag.
-What it says is that until 673a29d the charge reachability-based emission is meant to lift had grown to about a quarter of this suite.
-
-That charge is lifted for function bodies and object files, landed 2026-09-21 in fc7ded5 and 39ae7ce, and untouched for module counts.
-`selfhost/codegen/src/reach/` holds the walk, the account `--explain-reachability` prints, the closure check that refuses to emit while any reference points at a dropped body, and the two rules that keep an object for `@std.core` and for a module that owns a descriptor.
-The filter sits between lowering and the optimization pipeline, so every function of every program is still lowered and still verified, and `codegencheck` keeps its coverage of the lowering paths with an empty skiplist and no fixture edit.
-Measured at -O2 on windows-x64: a hello-world went from 183,054 to 40,977 bytes of objects and from 272,384 to 166,400 bytes of executable, the compiler's own binary from 8,500,736 to 6,711,808 bytes, `codegencheck` from 133 to 78 seconds, and the Linux suite from 4m32s to 2m56s.
-The root set is three things and it is smaller than the 2026-09-05 ratification described: the entry point, every slot of every emitted descriptor with interface-table slots counted apart from vtable slots, and every `export` when there is no entry point.
-Destructors, lambdas, constructors, lazy initializers, generic members and tests are deliberately not roots, because EIR names every symbol a function references and the walk reaches each one through its referencing site.
-Rooting destructors from their class, which the ratification implies, would have discarded 74 of the 132 droppable fixture functions measured before the work began.
-The ratification's remark about a linker dead-strip flag is a dead end: LLVM emits one `.text` per object and `_ens_symtab` takes the address of every recorded function from a live global constructor, so relinking a hello-world with and without `/OPT:REF` gives a byte-identical result.
-
-The module count stays where it was, because descriptors are still emitted unconditionally, so every module that declares a type keeps an object and a hello-world stays at 14 modules while writing 13 of them.
+Reachability-based emission gates function bodies and object files and not module counts, because descriptors are still emitted unconditionally, so every module that declares a type keeps an object and a hello-world stays at 14 modules while writing 13 of them.
 Moving it means gating descriptors and therefore reachable types, which needs a ruling on how a call dispatched through a hierarchy roots its slot, and re-rooting the monomorphization closure, which `mono/requests.ens` cannot do today because it collects only generic calls.
-Lowering on demand is the other stage left, and it buys the lowering and verifier time at the price of that coverage: 132 functions across 59 of the 303 runnable fixtures are unreachable from their own entry point, and 21 of them are the declaration the fixture exists for.
+Lowering on demand is the other stage left, and it buys the lowering and verifier time at the price of the coverage it removes: 132 functions across 59 of the 303 runnable fixtures are unreachable from their own entry point, and 21 of them are the declaration the fixture exists for.
 Neither stage is ratified.
 
 `Path.walk` offers no way to leave a folder out, so a caller that must not descend into one writes its own descent, and with it its own cycle guard.
@@ -118,30 +89,15 @@ When `@std.time` is designed, `Metadata.modifiedMillis` and `wait(long timeoutMi
 `nearestDouble` allocates a digit buffer and a reading on every call, which the libc conversion it replaced did not, so a program parsing millions of doubles in a loop would notice.
 The remedy when it matters is a fast path in front of the same rounding for the short inputs that need no buffer, and a buffer the conversion reuses.
 
-The four user-facing messages recorded here as weaker than the rules in AGENTS.md ask for were rewritten on 2026-09-21.
-A module-qualified name that names no type of its module now reports what it is, so a function the reading file can reach reads as a function, one it cannot reach reads as the refusal `types.notVisibleMessage` builds, and a name the module declares nothing under reads "'nosuch' is not declared in module 'renderer'".
-The member and the constructor refusal both name the module the fix goes in, "Mark it 'export' in module 'acme.parts' to use it from another package.", which is the clause the top-level function and type refusals already carried.
-"No field 'missing' on type 'Absent'." gained the one fix that is true in every case it fires on, "Drop 'this.' and give the parameter a type, as in 'int missing'.", since a field cannot be declared under a name a method already holds.
-The static-method-as-value message converged on the instance shape, "'make' is a static method of 'Widget', and a method's name is not a value. Call it as 'Widget.make(...)'.".
-Two rules hold across the family now, that a name which is not a value is refused with the fact before the fix and a write to one is refused as a write, and that a visibility refusal names the module the fix goes in on every rung from a top-level function to a constructor.
-The lambda a function-as-value message offers is left out where the reporting file has no name for a type in the signature, because the module-qualified fallback spelling resolves in no file.
-Two questions in the same family are open.
+Two questions about a name used as a value are open.
 A static reached through a module-qualified type name, `renderer.Maker.build()`, reports "'renderer.Maker' is a type, not a value." since such a head became a refusal on 2026-09-21, so whether a module-qualified static head is supported at all is undecided.
 An enum constant reached the same way, `renderer.Kind.Large`, reports that same refusal, so the question covers every type a module declares.
 A static-as-value message on a bare generic head can spell its fix only as `Holder.make(...)`, which fails when the call cannot infer the type arguments, while `Holder<T>.make(...)` would name a type parameter the use site does not have in scope.
 Both the bare and the module-qualified type-as-value refusal end with "construct one or name one", which does not apply when the type is an enum, since an enum's constants are named rather than constructed, and a message that told the two apart would need the report site to know the type's kind (2026-09-21).
-Until that module-qualified refusal landed, `let held = renderer.Widget;` passed sema and reached code generation, where only the catch-all "Internal: expression has no recorded type" caught it, so a user's own program could reach that bug-catcher (2026-09-21).
 
-A parenthesized write target reads through its parentheses since 2026-09-21, so every rule about the target they hold applies and the refusal is about the parentheses.
-`(this.value) = 99;` reports "The left side of '=' must be a variable, field, or array element, and a parenthesized expression is none of those. Remove the parentheses, so the left side reads 'this.value'." with the 'const' refusal the unparenthesized line already carried beside it, and `(x)++` reports the same shape for '++' and '--'.
-The rule and the wording were one item as recorded, since leaving the const rule out kept two false messages standing, "is not assigned on every path through this constructor" for a constructor whose only write to a 'const' field was parenthesized, and "'x' is used before it is assigned a value" for `int x; (x) = 1;`.
 Two shapes still report that a left side must be a variable, field, or array element where it is one.
 Parentheses inside a target rather than around it, `(point).x = 2;` on a struct local, keep that sentence, while `(held).value = 1;` on a class and `(slots)[0] = 5;` on an array are accepted, so what the message can say waits on whether the struct shape should be refused at all.
 A write through `?.` or `?[`, `maybe?.value = 3;` and `slots?[0] = 4;`, keeps it too, and the fix there is a sentence about null rather than about parentheses.
-
-A write to `this` or to `super` is refused in sema since 2026-09-21, with "'this' is not a variable, so it cannot be assigned. Assign the fields that should change, as in 'this.value = ...'." where the type the keyword reaches has a field the writing code can reach, and with the first sentence alone where it has none.
-That covers a method, a constructor, a destructor, a compound operator and `(this) = other;`, in a class and in a struct, and `super` takes the same sentence with a field of the base class in the example.
-`this++` and `--this` reached two "Internal: lowering produced malformed EIR" reports instead, which only a member of a primitive could reach, since the numeric check refuses a class or a struct first; sema refuses them with "'this' is not a variable, so '++' cannot change it." (2026-09-21).
 
 "The compiler does not support assigning to this target yet." is written at two sites in `selfhost/codegen/src/lower/assignments.ens`, and rule 16 applies to one of them and maybe not the other, so neither is reworded until they are told apart.
 The site in `lower` is now reachable from no program sema accepts, since sema admits only an identifier, a field, or an array element as a write target, which would make it a bug-catcher that takes the `Internal:` prefix; the site in `lowerThroughAddress` fires when an address cannot be computed for a field or an array element, which sema does accept, and no program reaching it has been found (2026-09-21).
