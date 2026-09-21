@@ -126,8 +126,11 @@ The static-method-as-value message converged on the instance shape, "'make' is a
 Two rules hold across the family now, that a name which is not a value is refused with the fact before the fix and a write to one is refused as a write, and that a visibility refusal names the module the fix goes in on every rung from a top-level function to a constructor.
 The lambda a function-as-value message offers is left out where the reporting file has no name for a type in the signature, because the module-qualified fallback spelling resolves in no file.
 Two questions in the same family are open.
-A static reached through a module-qualified type name, `renderer.Maker.build()`, reports the instance rule and that spelling then fails with "Undefined name 'Maker'", so whether a module-qualified static head is supported at all is undecided.
+A static reached through a module-qualified type name, `renderer.Maker.build()`, reports "'renderer.Maker' is a type, not a value." since such a head became a refusal on 2026-09-21, so whether a module-qualified static head is supported at all is undecided.
+An enum constant reached the same way, `renderer.Kind.Large`, reports that same refusal, so the question covers every type a module declares.
 A static-as-value message on a bare generic head can spell its fix only as `Holder.make(...)`, which fails when the call cannot infer the type arguments, while `Holder<T>.make(...)` would name a type parameter the use site does not have in scope.
+Both the bare and the module-qualified type-as-value refusal end with "construct one or name one", which does not apply when the type is an enum, since an enum's constants are named rather than constructed, and a message that told the two apart would need the report site to know the type's kind (2026-09-21).
+Until that module-qualified refusal landed, `let held = renderer.Widget;` passed sema and reached code generation, where only the catch-all "Internal: expression has no recorded type" caught it, so a user's own program could reach that bug-catcher (2026-09-21).
 
 A parenthesized left side of `=` skips the const-field rule, because `analyzeAssignment` keys `checkConstFieldWrite` on the target node being a member expression (verified identical before and after 2fb2f32, so it predates that work).
 `(this.value) = 99;` inside the declaring constructor and `(held.value) = 99;` from outside it both report "The left side of '=' must be a variable, field, or array element." and nothing about const.
@@ -156,6 +159,7 @@ It runs no `checkMemberAccess` on that path, though it has one at line 5378 for 
 Its remaining `findFieldIndex` call sites carry no private-base-field exemption, so hover, go-to-definition and rename (`lsp/server/LanguageServer.cpp`) can resolve a name to a private base field that a subclass member shadows, though the sites that report a diagnostic now carry the exemption (2026-09-21).
 It checks no duplicate struct field, so a struct that declares one name twice is reported by the compiler alone, which says "Field 'y' is already declared in 'Pixel'"; its struct field loop at `lsp/frontend/semantic/Analyzer.cpp:1495-1515` pushes every field without the `findFieldIndex` check the class loop makes at line 2023 (2026-09-21).
 Its own copies of three of the messages rewritten on 2026-09-21 keep the weaker wording, the `this.field` shorthand refusal at `lsp/frontend/semantic/Analyzer.cpp:2537` and the cross-package member and constructor refusals at lines 5391 and 5634.
+It accepts a module-qualified type name as a value at `lsp/frontend/semantic/Analyzer.cpp:7181-7187`, recording the type as the expression's own, which the compiler refuses as of 2026-09-21.
 
 ## Reminders
 
